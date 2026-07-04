@@ -24,6 +24,7 @@ export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
+export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { ReplyPreviewVm } from "./gen/ReplyPreviewVm";
 export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
@@ -535,6 +536,26 @@ export async function editMessage(
   body: string,
 ): Promise<void> {
   await invoke<void>("edit_message", { accountId, roomId, itemKey, body });
+}
+
+/**
+ * Toggle the account's emoji reaction on a message (FR-12, AD-13, Story 3.5).
+ * `itemKey` is the message's opaque render `key` (`unique_id`); the Rust core
+ * resolves it and calls the SDK's `toggle_reaction` through the single dispatch
+ * gate — adding the reaction if absent, retracting it if the account already
+ * reacted with `emoji`. The updated pill state arrives back over the room's
+ * existing timeline subscription as a `Set` diff (nothing is stored or synthesized
+ * on the frontend). Resolves on successful dispatch; rejects with the
+ * {@link IpcError} envelope (`code: "sendFailed"`) on failure — `retriable: false`
+ * when the target is gone.
+ */
+export async function toggleReaction(
+  accountId: string,
+  roomId: string,
+  itemKey: string,
+  emoji: string,
+): Promise<void> {
+  await invoke<void>("toggle_reaction", { accountId, roomId, itemKey, emoji });
 }
 
 /**

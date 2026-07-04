@@ -69,6 +69,7 @@ pub fn run() {
             ipc::send_text,
             ipc::send_reply,
             ipc::edit_message,
+            ipc::toggle_reaction,
             ipc::send_retry,
             ipc::session_restore,
             ipc::inbox_subscribe,

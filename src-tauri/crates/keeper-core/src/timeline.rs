@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt};
 use matrix_sdk::ruma::events::room::message::MessageType;
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, RoomId};
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use matrix_sdk::Client;
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::timeline::{
@@ -29,7 +29,9 @@ use matrix_sdk_ui::timeline::{
 
 use crate::account::TimelineSink;
 use crate::error::TimelineError;
-use crate::vm::{ReplyPreviewVm, SendState, TimelineBatch, TimelineItemVm, TimelineOp};
+use crate::vm::{
+    ReactionGroupVm, ReplyPreviewVm, SendState, TimelineBatch, TimelineItemVm, TimelineOp,
+};
 
 /// A Rust-side index of `event_id → render key` (unique_id), maintained by the
 /// timeline producer while it maps items. It lets a reply's quoted-original
@@ -156,9 +158,68 @@ fn reply_preview_from_details(
     }
 }
 
+/// Aggregate a message's emoji reactions into per-emoji [`ReactionGroupVm`]s
+/// (Story 3.5, FR-12, NFR-9).
+///
+/// Pure: `content` and `own_user_id` are the only inputs. Reads
+/// `content.reactions()` (`ReactionsByKeyBySender`, i.e.
+/// `IndexMap<emoji, IndexMap<OwnedUserId, ReactionInfo>>`) and emits one group per
+/// key **in the SDK's per-key insertion order**, with:
+/// - `count` = the inner sender-map length (per-sender uniqueness is guaranteed by
+///   the SDK, so this is the number of distinct reactors), and
+/// - `is_own` = the account's own `user_id` is a key in that emoji's inner sender
+///   map (catches a confirmed remote reaction and a pending local one alike).
+///
+/// Returns an empty vec for a non-reacted or non-message content. NO per-sender
+/// user id or reaction event id crosses into the returned VMs (AD-1) — only the
+/// aggregated `{ emoji, count, is_own }`.
+pub fn reaction_groups(
+    content: &TimelineItemContent,
+    own_user_id: &UserId,
+) -> Vec<ReactionGroupVm> {
+    let Some(reactions) = content.reactions() else {
+        return Vec::new();
+    };
+    // `ReactionsByKeyBySender` derefs to `IndexMap<emoji, IndexMap<OwnedUserId,
+    // ReactionInfo>>` (per-key insertion order, per-sender uniqueness). Project
+    // each key's inner sender map to `(emoji, count, is_own)` via the pure,
+    // dependency-free [`aggregate_reactions`] helper (the SDK types have no public
+    // constructor, so the aggregation logic is tested on that plain shape).
+    let groups = reactions.iter().map(|(emoji, by_sender)| {
+        (
+            emoji.as_str(),
+            by_sender.len(),
+            by_sender.contains_key(own_user_id),
+        )
+    });
+    aggregate_reactions(groups)
+}
+
+/// Pure aggregation of an ordered `(emoji, distinct_reactor_count, is_own)`
+/// sequence into per-emoji [`ReactionGroupVm`]s, preserving the input order
+/// (which mirrors the SDK's per-key insertion order) (Story 3.5, FR-12).
+///
+/// Split from [`reaction_groups`] so the count / own-highlight / order mapping is
+/// unit-testable without an SDK `TimelineItemContent` (whose reaction map has no
+/// public constructor). Introduces no new crate dependency — it names none of the
+/// SDK's `IndexMap`/`ReactionInfo` types.
+fn aggregate_reactions<'a>(
+    groups: impl Iterator<Item = (&'a str, usize, bool)>,
+) -> Vec<ReactionGroupVm> {
+    groups
+        .map(|(emoji, count, is_own)| ReactionGroupVm {
+            emoji: emoji.to_owned(),
+            // Saturate rather than wrap: an absurd reactor count stays honest
+            // (`u32::MAX`) instead of a truncated `as` cast (project no-silent-loss).
+            count: u32::try_from(count).unwrap_or(u32::MAX),
+            is_own,
+        })
+        .collect()
+}
+
 /// Map one SDK [`TimelineItem`] to exactly one [`TimelineItemVm`], resolving a
 /// reply's quoted-original key through the producer's `event_id → unique_id`
-/// `index`.
+/// `index` and aggregating reactions against the account's own `own_user_id`.
 ///
 /// An event item carrying a text `m.room.message` becomes a
 /// [`TimelineItemVm::Message`] (with `is_edited` from `message.is_edited()` and a
@@ -171,7 +232,7 @@ fn reply_preview_from_details(
 /// virtual items) becomes a [`TimelineItemVm::Other`] carrying only the stable
 /// opaque key, so diff indices stay aligned. All accessors are sync
 /// (`VectorDiff::map` is sync).
-pub fn item_to_vm(item: &TimelineItem, index: &ReplyIndex) -> TimelineItemVm {
+pub fn item_to_vm(item: &TimelineItem, index: &ReplyIndex, own_user_id: &UserId) -> TimelineItemVm {
     let key = item.unique_id().0.clone();
     let TimelineItemKind::Event(ev) = item.kind() else {
         return TimelineItemVm::Other { key };
@@ -200,6 +261,7 @@ pub fn item_to_vm(item: &TimelineItem, index: &ReplyIndex) -> TimelineItemVm {
                 send_state: ev.send_state().map(map_send_state),
                 is_edited: message.is_edited(),
                 reply: reply_preview(ev.content(), index),
+                reactions: reaction_groups(ev.content(), own_user_id),
             }
         }
         // An event that cannot be decrypted yet: surface an honest stub. No
@@ -273,6 +335,7 @@ fn index_item(index: &mut ReplyIndex, item: &TimelineItem) {
 fn map_diff_indexing(
     diff: VectorDiff<Arc<TimelineItem>>,
     index: &mut ReplyIndex,
+    own_user_id: &UserId,
 ) -> VectorDiff<TimelineItemVm> {
     match &diff {
         VectorDiff::Clear => index.clear(),
@@ -299,7 +362,7 @@ fn map_diff_indexing(
         | VectorDiff::Remove { .. }
         | VectorDiff::Truncate { .. } => {}
     }
-    diff.map(|item| item_to_vm(&item, index))
+    diff.map(|item| item_to_vm(&item, index, own_user_id))
 }
 
 /// A boxed, `Send` timeline diff stream (the concrete `impl Stream` from
@@ -319,6 +382,10 @@ pub struct OpenTimeline {
     timeline: Arc<Timeline>,
     initial: Vector<Arc<TimelineItem>>,
     stream: TimelineDiffStream,
+    /// The account's own Matrix user id (from `client.user_id()` at open time).
+    /// Threaded into [`item_to_vm`] so reaction aggregation can flag the user's
+    /// own reaction (`reaction senders are separate from `ev.is_own()`).
+    own_user_id: OwnedUserId,
 }
 
 impl OpenTimeline {
@@ -344,6 +411,13 @@ pub async fn open_timeline(
     let room = client
         .get_room(room_id)
         .ok_or(TimelineError::RoomNotFound)?;
+    // The account's own user id, captured once at open time so reaction
+    // aggregation can flag the user's own reaction (reaction senders are separate
+    // from an event's own-ness). A live, restored account always has one.
+    let own_user_id = client
+        .user_id()
+        .ok_or_else(|| TimelineError::Build("no user id on the live client".to_owned()))?
+        .to_owned();
     let timeline = room
         .timeline()
         .await
@@ -353,6 +427,7 @@ pub async fn open_timeline(
         timeline: Arc::new(timeline),
         initial,
         stream: Box::pin(stream),
+        own_user_id,
     })
 }
 
@@ -367,6 +442,7 @@ pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: Ti
         timeline,
         initial,
         mut stream,
+        own_user_id,
     } = open;
 
     // The producer-owned `event_id → unique_id` index. Built from the snapshot,
@@ -378,7 +454,10 @@ pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: Ti
     }
 
     let reset = TimelineOp::Reset {
-        items: initial.iter().map(|i| item_to_vm(i, &index)).collect(),
+        items: initial
+            .iter()
+            .map(|i| item_to_vm(i, &index, &own_user_id))
+            .collect(),
     };
     if !sink(TimelineBatch { ops: vec![reset] }) {
         tracing::info!(room_id = %room_id, "timeline channel closed before first batch");
@@ -388,7 +467,7 @@ pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: Ti
     while let Some(diffs) = stream.next().await {
         let ops = diffs
             .into_iter()
-            .map(|d| timeline_diff_to_op(map_diff_indexing(d, &mut index)))
+            .map(|d| timeline_diff_to_op(map_diff_indexing(d, &mut index, &own_user_id)))
             .collect();
         if !sink(TimelineBatch { ops }) {
             tracing::info!(room_id = %room_id, "timeline channel closed, stopping producer");
@@ -423,6 +502,7 @@ mod tests {
             send_state: None,
             is_edited: false,
             reply: None,
+            reactions: Vec::new(),
         }
     }
 
@@ -543,6 +623,44 @@ mod tests {
         assert_eq!(vm.in_reply_to_key, Some("unique-orig".to_owned()));
         assert_eq!(vm.sender, "");
         assert_eq!(vm.body, "");
+    }
+
+    #[test]
+    fn aggregate_reactions_empty_yields_no_groups() {
+        let out = aggregate_reactions(std::iter::empty());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn aggregate_reactions_counts_per_emoji_and_flags_own_preserving_order() {
+        // Mirrors the I/O matrix "aggregate multiple reactors" row: 👍 by 3 (not
+        // own), ❤️ by 1 (own). Input order is the SDK's per-key insertion order.
+        let groups = vec![("👍", 3usize, false), ("❤️", 1usize, true)];
+        let out = aggregate_reactions(groups.into_iter());
+        assert_eq!(
+            out,
+            vec![
+                ReactionGroupVm {
+                    emoji: "👍".to_owned(),
+                    count: 3,
+                    is_own: false,
+                },
+                ReactionGroupVm {
+                    emoji: "❤️".to_owned(),
+                    count: 1,
+                    is_own: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_reactions_flags_own_true_when_present() {
+        let out = aggregate_reactions(std::iter::once(("🔥", 2usize, true)));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].emoji, "🔥");
+        assert_eq!(out[0].count, 2);
+        assert!(out[0].is_own);
     }
 
     #[test]

@@ -436,6 +436,32 @@ pub struct ReplyPreviewVm {
     pub body: String,
 }
 
+/// One aggregated emoji-reaction group on a timeline message (Story 3.5, FR-12,
+/// NFR-9).
+///
+/// Derived in the timeline producer from `content.reactions()` — one group per
+/// distinct emoji key, in the SDK's per-key insertion order. Carries **only**
+/// non-secret render data: the emoji string, the count of distinct reactors, and
+/// whether the current account is one of them. NO per-sender user ids, reaction
+/// event ids, or relation logic ever cross IPC on this VM (AD-1) — those stay
+/// inside `keeper-core`. The frontend renders a click-to-toggle pill from these
+/// three fields alone and dispatches a toggle by the message's opaque render key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ReactionGroupVm {
+    /// The reaction emoji / key (an arbitrary Matrix reaction string, passed
+    /// through verbatim).
+    pub emoji: String,
+    /// The number of distinct reactors for this emoji (per-sender uniqueness is
+    /// guaranteed by the SDK, so this is the inner sender-map length).
+    #[ts(type = "number")]
+    pub count: u32,
+    /// Whether the current account has reacted with this emoji (its own user id
+    /// is present in the emoji's inner sender map). Drives the own-highlight pill.
+    pub is_own: bool,
+}
+
 /// A single timeline item rendered in the conversation pane (FR-8, NFR-9,
 /// AD-8/AD-9/AD-20).
 ///
@@ -479,6 +505,11 @@ pub enum TimelineItemVm {
         /// The quoted-original preview when this message is a reply
         /// (`content.in_reply_to()`), else `null` (Story 3.4, FR-10).
         reply: Option<ReplyPreviewVm>,
+        /// The aggregated emoji-reaction groups on this message, in the SDK's
+        /// per-key insertion order (empty when none) (Story 3.5, FR-12). Each
+        /// group carries only `{ emoji, count, is_own }` — never a per-sender
+        /// user id or reaction event id.
+        reactions: Vec<ReactionGroupVm>,
     },
     /// An event that could not be decrypted yet (`MsgLikeKind::UnableToDecrypt`).
     /// Renders an explicit honest stub instead of a blank row (Story 3.1). Carries
@@ -1452,6 +1483,7 @@ mod tests {
             send_state: Some(SendState::Sending),
             is_edited: false,
             reply: None,
+            reactions: Vec::new(),
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(
@@ -1473,6 +1505,7 @@ mod tests {
             send_state: None,
             is_edited: false,
             reply: None,
+            reactions: Vec::new(),
         }
     }
 
@@ -1534,6 +1567,18 @@ mod tests {
                 sender_display_name: Some("Bob".to_owned()),
                 body: "the original".to_owned(),
             }),
+            reactions: vec![
+                ReactionGroupVm {
+                    emoji: "👍".to_owned(),
+                    count: 3,
+                    is_own: false,
+                },
+                ReactionGroupVm {
+                    emoji: "❤️".to_owned(),
+                    count: 1,
+                    is_own: true,
+                },
+            ],
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"isEdited\":true"), "json was: {json}");
@@ -1541,6 +1586,11 @@ mod tests {
             json.contains("\"inReplyToKey\":\"unique-orig\""),
             "json was: {json}"
         );
+        // The reaction groups carry only emoji/count/is_own — no user-id or
+        // event-id material.
+        assert!(json.contains("\"emoji\":\"👍\""), "json was: {json}");
+        assert!(json.contains("\"count\":3"), "json was: {json}");
+        assert!(json.contains("\"isOwn\":true"), "json was: {json}");
         let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize message vm");
         assert_eq!(back, vm);
     }
@@ -1585,6 +1635,7 @@ mod tests {
             send_state: None,
             is_edited: false,
             reply: None,
+            reactions: Vec::new(),
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(
@@ -1593,7 +1644,35 @@ mod tests {
         );
         assert!(json.contains("\"sendState\":null"), "json was: {json}");
         assert!(json.contains("\"reply\":null"), "json was: {json}");
+        // An empty reaction set serializes as an empty array (no pill row).
+        assert!(json.contains("\"reactions\":[]"), "json was: {json}");
         let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn reaction_group_vm_round_trips_camel_case_and_carries_no_identity() {
+        let vm = ReactionGroupVm {
+            emoji: "🎉".to_owned(),
+            count: 4,
+            is_own: true,
+        };
+        let json = serde_json::to_string(&vm).expect("serialize reaction group vm");
+        assert!(json.contains("\"emoji\":\"🎉\""), "json was: {json}");
+        assert!(json.contains("\"count\":4"), "json was: {json}");
+        assert!(json.contains("\"isOwn\":true"), "json was: {json}");
+        // Only emoji/count/is_own cross IPC — never a per-sender user id or a
+        // reaction event id.
+        assert!(
+            !json.contains("sender") && !json.contains("userId") && !json.contains("eventId"),
+            "json leaked identity material: {json}"
+        );
+        assert!(
+            !json.contains('@') && !json.contains('$'),
+            "json leaked user-id/event-id material: {json}"
+        );
+        let back: ReactionGroupVm =
+            serde_json::from_str(&json).expect("deserialize reaction group vm");
         assert_eq!(back, vm);
     }
 

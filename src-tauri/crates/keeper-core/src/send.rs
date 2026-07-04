@@ -148,6 +148,44 @@ pub async fn submit_edit(
     Ok(())
 }
 
+/// Toggle the current account's emoji reaction on the message addressed by
+/// `item_key` (its opaque `unique_id`) through the send gate (FR-41, AD-13,
+/// Story 3.5, FR-12).
+///
+/// Resolves the key to the live timeline item and its `identifier()`
+/// (`TimelineEventItemId`) via the same items scan as [`submit_edit`], then calls
+/// `Timeline::toggle_reaction` — the sole call site of that SDK method. The call
+/// adds the reaction if absent and retracts it if the account already reacted with
+/// `emoji` (symmetric toggle); the returned added/removed bool is ignored — the
+/// updated reaction set arrives as a `Set` diff through the room's existing
+/// `Timeline::subscribe()` stream, so keeper synthesizes nothing.
+///
+/// Errors: an unresolvable key → [`SendError::TargetNotFound`]; an SDK dispatch
+/// failure → [`SendError::Dispatch`].
+pub async fn toggle_reaction(
+    timeline: &Timeline,
+    item_key: &str,
+    emoji: &str,
+) -> Result<(), SendError> {
+    let item_id = {
+        let items = timeline.items().await;
+        items
+            .iter()
+            .find(|item| item.unique_id().0 == item_key)
+            .and_then(|item| item.as_event())
+            .map(|ev| ev.identifier())
+            .ok_or(SendError::TargetNotFound)?
+    };
+    // SOLE-REACTION-GATE: the one and only `Timeline::toggle_reaction` call site
+    // (FR-41). The added/removed bool is intentionally ignored — the diff stream
+    // carries the resulting pill state.
+    timeline
+        .toggle_reaction(&item_id, emoji)
+        .await
+        .map_err(|e| SendError::Dispatch(e.to_string()))?;
+    Ok(())
+}
+
 /// Re-drive an already-dispatched, wedged local echo (NOT a new dispatch).
 ///
 /// Locates the timeline item whose `unique_id().0 == item_key`, takes its
@@ -215,6 +253,9 @@ mod tests {
         let submit_edit_start = source
             .find("pub async fn submit_edit")
             .expect("submit_edit fn must exist");
+        let toggle_reaction_start = source
+            .find("pub async fn toggle_reaction")
+            .expect("toggle_reaction fn must exist");
         let retry_start = source
             .find("pub async fn retry")
             .expect("retry fn must exist");
@@ -256,8 +297,26 @@ mod tests {
         );
         let edit_call = edit_sites[0];
         assert!(
-            edit_call > submit_edit_start && edit_call < retry_start,
-            "the sole `.edit(` call must be inside `submit_edit` (offset {edit_call} not within {submit_edit_start}..{retry_start})"
+            edit_call > submit_edit_start && edit_call < toggle_reaction_start,
+            "the sole `.edit(` call must be inside `submit_edit` (offset {edit_call} not within {submit_edit_start}..{toggle_reaction_start})"
+        );
+
+        // The single reaction-dispatch call site: `.toggle_reaction(`. Doc
+        // references say `Timeline::toggle_reaction` (no `.`), so they don't match.
+        let reaction_sites: Vec<usize> = source
+            .match_indices(".toggle_reaction(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            reaction_sites.len(),
+            1,
+            "expected exactly one `.toggle_reaction(` call site (the sole reaction gate); found {}",
+            reaction_sites.len()
+        );
+        let reaction_call = reaction_sites[0];
+        assert!(
+            reaction_call > toggle_reaction_start && reaction_call < retry_start,
+            "the sole `.toggle_reaction(` call must be inside `toggle_reaction` (offset {reaction_call} not within {toggle_reaction_start}..{retry_start})"
         );
     }
 }

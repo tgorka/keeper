@@ -536,6 +536,30 @@ pub async fn edit_message(
         .map_err(to_ipc_error)
 }
 
+/// Toggle the account's emoji reaction on a message through the single dispatch
+/// gate (FR-12, FR-41, AD-13, Story 3.5). `itemKey` is the message's opaque render
+/// `key` (its `unique_id`); the Rust core resolves it to the SDK
+/// `TimelineEventItemId` and calls `Timeline::toggle_reaction` — adding the
+/// reaction if absent, retracting it if the account already reacted with `emoji`.
+/// The updated reaction set arrives back over the existing timeline subscription
+/// as a `Set` diff (no state is synthesized). A missing target funnels through
+/// [`to_ipc_error`] to a non-retriable `SendFailed`; an SDK dispatch failure to a
+/// retriable `SendFailed`.
+#[tauri::command]
+pub async fn toggle_reaction(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    item_key: String,
+    emoji: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .toggle_reaction(&account_id, &room_id, &item_key, &emoji)
+        .await
+        .map_err(to_ipc_error)
+}
+
 /// Subscribe to an account's connection status (FR-8/FR-9, UX-DR18, AD-8).
 ///
 /// Lazily activates the account (reusing the room-list/timeline path), then

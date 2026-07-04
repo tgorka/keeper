@@ -28,6 +28,7 @@ import {
   sendReply,
   sendText,
   subscribeTimeline,
+  toggleReaction,
   unsubscribeTimeline,
 } from "@/lib/ipc/client";
 import { useAccountStatus } from "@/lib/stores/account-status";
@@ -275,6 +276,21 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     [items],
   );
 
+  // Toggle an emoji reaction on a message (Story 3.5, FR-12). Fired by both the
+  // action-bar Popover pick and a click on an existing pill. Reactions are
+  // stateless on the frontend: fire the IPC and let the diff stream re-render the
+  // pills. A rejection (e.g. the target reconciled away → `TargetNotFound`) is
+  // swallowed so it is never an unhandled promise.
+  const onToggleReaction = useCallback(
+    (key: string, emoji: string) => {
+      if (accountId === null || selectedRoomId === null) {
+        return;
+      }
+      toggleReaction(accountId, selectedRoomId, key, emoji).catch(() => {});
+    },
+    [accountId, selectedRoomId],
+  );
+
   const onCancelPending = useCallback(() => composerStore.getState().cancel(), []);
 
   const onJumpTo = useCallback((key: string) => {
@@ -421,6 +437,7 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
                     onEdit={onEdit}
                     onJumpTo={onJumpTo}
                     selected={selectedKey === row.item.key}
+                    onToggleReaction={onToggleReaction}
                   />
                 </li>
               ),

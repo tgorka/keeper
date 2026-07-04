@@ -1236,6 +1236,31 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Toggle the account's emoji `emoji` reaction on the message addressed by
+    /// `item_key` (its opaque render key) on `room_id`/`account_id` through the
+    /// single dispatch gate (FR-41, AD-13, Story 3.5, FR-12). Resolves the live
+    /// `Arc<Timeline>` and delegates to [`send::toggle_reaction`]; the updated
+    /// reaction set arrives as a `Set` diff through the room's existing timeline
+    /// subscription — this synthesizes nothing. The toggle is symmetric: it adds
+    /// the reaction if absent and retracts it if the account already reacted.
+    ///
+    /// Errors: an unparsable/unknown room id → [`SendError::RoomNotFound`]; no open
+    /// timeline → [`SendError::NoOpenTimeline`]; an unresolvable target →
+    /// [`SendError::TargetNotFound`]; an SDK dispatch failure → [`SendError::Dispatch`].
+    pub async fn toggle_reaction(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        item_key: &str,
+        emoji: &str,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let timeline = self.open_timeline_for(account_id, &room_id).await?;
+        send::toggle_reaction(&timeline, item_key, emoji).await?;
+        tracing::info!(account_id = %account_id, room_id = %room_id, "reaction toggled");
+        Ok(())
+    }
+
     /// Retry a failed outgoing message by re-driving its wedged local echo
     /// (`item_key` = the item's `unique_id`) through the controlled send path —
     /// `SendHandle::unwedge()`, not a new content dispatch (FR-41). Resolves the

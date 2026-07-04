@@ -14,6 +14,7 @@ function msg(overrides: Partial<MessageVm> = {}): MessageVm {
     sendState: null,
     isEdited: false,
     reply: null,
+    reactions: [],
     ...overrides,
   };
 }
@@ -310,5 +311,78 @@ describe("MessageBubble", () => {
     render(<MessageBubble item={msg()} grouped={false} selected={true} />);
     const body = screen.getByText("hello there").closest("div");
     expect(body).toHaveClass("ring-2");
+  });
+
+  it("renders no reaction pill row when there are no reactions", () => {
+    render(
+      <MessageBubble item={msg({ reactions: [] })} grouped={false} onToggleReaction={() => {}} />,
+    );
+    // Pills are the only toggle buttons (`aria-pressed`); asserting none exist in
+    // either pressed state catches a stray pill of ANY emoji, not a fixed subset.
+    expect(screen.queryByRole("button", { pressed: true })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { pressed: false })).not.toBeInTheDocument();
+  });
+
+  it("renders one pill per emoji group with its count", () => {
+    render(
+      <MessageBubble
+        item={msg({
+          reactions: [
+            { emoji: "👍", count: 3, isOwn: false },
+            { emoji: "❤️", count: 1, isOwn: true },
+          ],
+        })}
+        grouped={false}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "👍 3" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "❤️ 1, you reacted" })).toBeInTheDocument();
+  });
+
+  it("marks an own-reaction pill as pressed and a non-own pill as not pressed", () => {
+    render(
+      <MessageBubble
+        item={msg({
+          reactions: [
+            { emoji: "👍", count: 3, isOwn: false },
+            { emoji: "❤️", count: 1, isOwn: true },
+          ],
+        })}
+        grouped={false}
+        onToggleReaction={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "👍 3" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: "❤️ 1, you reacted" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("toggles a reaction with the message key and emoji when a pill is clicked", () => {
+    const onToggleReaction = vi.fn();
+    render(
+      <MessageBubble
+        item={msg({ key: "k42", reactions: [{ emoji: "🔥", count: 2, isOwn: false }] })}
+        grouped={false}
+        onToggleReaction={onToggleReaction}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "🔥 2" }));
+    expect(onToggleReaction).toHaveBeenCalledWith("k42", "🔥");
+  });
+
+  it("toggles a reaction from the action-bar Popover pick", () => {
+    const onToggleReaction = vi.fn();
+    render(
+      <MessageBubble
+        item={msg({ key: "k7" })}
+        grouped={false}
+        onToggleReaction={onToggleReaction}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Add reaction" }));
+    fireEvent.click(screen.getByRole("button", { name: "React with 😂" }));
+    expect(onToggleReaction).toHaveBeenCalledWith("k7", "😂");
   });
 });

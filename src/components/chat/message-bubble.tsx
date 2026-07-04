@@ -14,7 +14,7 @@ import { MessageActions } from "@/components/chat/message-actions";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { formatMessageTime } from "@/lib/format-time";
-import type { ReplyPreviewVm, TimelineItemVm } from "@/lib/ipc/client";
+import type { ReactionGroupVm, ReplyPreviewVm, TimelineItemVm } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
 
 /** The `message`-variant of {@link TimelineItemVm} (the only kind this renders). */
@@ -64,6 +64,13 @@ interface MessageBubbleProps {
    * selection ring renders on the bubble.
    */
   selected?: boolean;
+  /**
+   * Toggle an emoji reaction on this message (Story 3.5, FR-12). Wired to both the
+   * action-bar Popover pick and a click on an existing reaction pill. Reactions are
+   * stateless on the frontend — this fires the IPC and the diff stream updates the
+   * pills. When absent, the action bar's React affordance and the pills are inert.
+   */
+  onToggleReaction?: (key: string, emoji: string) => void;
 }
 
 /**
@@ -91,6 +98,7 @@ export function MessageBubble({
   onEdit,
   onJumpTo,
   selected = false,
+  onToggleReaction,
 }: MessageBubbleProps) {
   const displayName = item.senderDisplayName ?? item.sender;
   const time = formatMessageTime(item.timestamp);
@@ -161,17 +169,26 @@ export function MessageBubble({
             </div>
           </div>
           {/* Action bar: revealed on hover/focus-within of the bubble row. */}
-          {(onReply || onEdit) && (
+          {(onReply || onEdit || onToggleReaction) && (
             <div className="opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
               <MessageActions
                 messageKey={item.key}
                 canEdit={canEdit}
+                onReact={(k, emoji) => onToggleReaction?.(k, emoji)}
                 onReply={(k) => onReply?.(k)}
                 onEdit={(k) => onEdit?.(k)}
               />
             </div>
           )}
         </div>
+        {/* Reaction pill row under the bubble; skipped entirely when empty. */}
+        {item.reactions.length > 0 && (
+          <ReactionPills
+            reactions={item.reactions}
+            isOwn={isOwn}
+            onToggle={onToggleReaction ? (emoji) => onToggleReaction(item.key, emoji) : undefined}
+          />
+        )}
         <SendStateCaption
           state={sendState}
           isOwn={isOwn}
@@ -228,6 +245,48 @@ function ReplyQuote({ reply, isOwn, onJumpTo }: ReplyQuoteProps) {
     );
   }
   return <div className={surface}>{content}</div>;
+}
+
+interface ReactionPillsProps {
+  reactions: ReactionGroupVm[];
+  isOwn: boolean;
+  onToggle?: (emoji: string) => void;
+}
+
+/**
+ * The click-to-toggle reaction pill row under a bubble (Story 3.5, FR-12). One
+ * pill per aggregated emoji group (in the Rust-provided per-key order), showing the
+ * emoji and its count. Own-reaction pills are visually highlighted (primary tint).
+ * Clicking a pill toggles that reaction via `onToggle` — the diff stream then
+ * updates the row (reactions are stateless on the frontend). Rendered only when the
+ * group is non-empty (the parent skips it otherwise). The row aligns to the bubble
+ * side (right for own messages).
+ */
+function ReactionPills({ reactions, isOwn, onToggle }: ReactionPillsProps) {
+  return (
+    <div className={cn("mt-1 flex flex-wrap gap-1", isOwn ? "justify-end" : "justify-start")}>
+      {reactions.map((group) => (
+        <button
+          key={group.emoji}
+          type="button"
+          disabled={onToggle == null}
+          aria-pressed={onToggle != null ? group.isOwn : undefined}
+          aria-label={`${group.emoji} ${group.count}${group.isOwn ? ", you reacted" : ""}`}
+          onClick={() => onToggle?.(group.emoji)}
+          className={cn(
+            "flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs leading-none transition-colors",
+            onToggle != null && "cursor-pointer hover:bg-accent",
+            group.isOwn
+              ? "border-primary/40 bg-primary/10 text-foreground"
+              : "border-border bg-muted text-muted-foreground",
+          )}
+        >
+          <span aria-hidden="true">{group.emoji}</span>
+          <span className="tabular-nums">{group.count}</span>
+        </button>
+      ))}
+    </div>
+  );
 }
 
 interface SendStateCaptionProps {
