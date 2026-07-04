@@ -36,3 +36,8 @@ matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "sso-lo
 matrix-sdk-ui = "0.18"
 # Platform ports
 dirs = "6"
+# Keychain (macOS Keychain via the OS-native backend) — shell-only, the only genuinely new crate.
+keyring = { version = "3", features = ["apple-native"] }
+# Account registry + opaque account ids (both already present transitively via matrix-sdk).
+ulid = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }

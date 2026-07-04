@@ -9,10 +9,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use keeper_core::auth;
 use keeper_core::demo::snapshot_then_diff;
-use keeper_core::error::{CoreError, PlatformError};
+use keeper_core::error::{AuthError, CoreError, PlatformError};
 use keeper_core::platform::Platform;
-use keeper_core::vm::{DemoBatch, IpcError, IpcErrorCode, PingVm};
+use keeper_core::vm::{AccountVm, DemoBatch, IpcError, IpcErrorCode, PingVm};
 use tauri::ipc::Channel;
 use tauri::State;
 
@@ -42,6 +43,9 @@ impl Default for AppState {
 /// Monotonic source of subscription ids handed back to the frontend.
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// macOS Keychain service name under which all keeper secrets are stored (AD-3).
+const KEYCHAIN_SERVICE: &str = "dev.tgorka.keeper";
+
 /// Concrete [`Platform`] implementation for the desktop shell.
 ///
 /// The data-dir port is fully wired via `dirs`; the remaining ports return
@@ -57,22 +61,33 @@ impl Platform for DesktopPlatform {
         Ok(base.join("dev.tgorka.keeper"))
     }
 
-    fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
-        Err(CoreError::Unsupported(
-            "keychain_set not wired until a later story".to_owned(),
-        ))
+    fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
+            .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
+        entry
+            .set_password(value)
+            .map_err(|e| PlatformError::Keychain(format!("could not store secret: {e}")))?;
+        Ok(())
     }
 
-    fn keychain_get(&self, _key: &str) -> Result<Option<String>, CoreError> {
-        Err(CoreError::Unsupported(
-            "keychain_get not wired until a later story".to_owned(),
-        ))
+    fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
+            .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
+        match entry.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(PlatformError::Keychain(format!("could not read secret: {e}")).into()),
+        }
     }
 
-    fn keychain_delete(&self, _key: &str) -> Result<(), CoreError> {
-        Err(CoreError::Unsupported(
-            "keychain_delete not wired until a later story".to_owned(),
-        ))
+    fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
+            .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
+        match entry.delete_credential() {
+            // Deleting a missing entry is a no-op (rollback safety).
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(PlatformError::Keychain(format!("could not delete secret: {e}")).into()),
+        }
     }
 
     fn notify(&self, _title: &str, _body: &str) -> Result<(), CoreError> {
@@ -96,7 +111,16 @@ fn to_ipc_error(err: CoreError) -> IpcError {
             (IpcErrorCode::Unsupported, false)
         }
         CoreError::Platform(PlatformError::DirUnavailable(_)) => (IpcErrorCode::Internal, false),
+        CoreError::Platform(PlatformError::Keychain(_)) => (IpcErrorCode::Internal, false),
         CoreError::Internal(_) => (IpcErrorCode::Internal, false),
+        CoreError::Auth(AuthError::ServerUnreachable(_)) => (IpcErrorCode::ServerUnreachable, true),
+        CoreError::Auth(AuthError::InvalidCredentials) => (IpcErrorCode::InvalidCredentials, false),
+        CoreError::Auth(AuthError::UnsupportedLoginType(_)) => {
+            (IpcErrorCode::UnsupportedLoginType, false)
+        }
+        CoreError::Auth(AuthError::SlidingSyncUnsupported) => {
+            (IpcErrorCode::SlidingSyncUnsupported, false)
+        }
     };
     IpcError {
         code,
@@ -155,6 +179,25 @@ pub fn demo_subscribe(channel: Channel<DemoBatch>) -> Result<u64, IpcError> {
     Ok(subscription_id)
 }
 
+/// Password login command (FR-1, FR-5).
+///
+/// Delegates the full ordered flow (store-less SSS probe → persistent login →
+/// Keychain + registry, with rollback on failure) to `keeper-core`. The
+/// `password` argument is transient: it drives the SDK login only and is never
+/// returned, stored, or logged. On success resolves to a non-secret
+/// [`AccountVm`]; on failure funnels the `CoreError` through [`to_ipc_error`].
+#[tauri::command]
+pub async fn login_password(
+    state: State<'_, AppState>,
+    homeserver: String,
+    username: String,
+    password: String,
+) -> Result<AccountVm, IpcError> {
+    auth::login_password(state.platform.as_ref(), &homeserver, &username, &password)
+        .await
+        .map_err(to_ipc_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,11 +233,43 @@ mod tests {
     }
 
     #[test]
-    fn desktop_platform_keychain_is_unsupported_not_panicking() {
-        let p = DesktopPlatform;
-        assert!(matches!(
-            p.keychain_get("k"),
-            Err(CoreError::Unsupported(_))
-        ));
+    fn keychain_error_maps_to_internal_code() {
+        let ipc = to_ipc_error(CoreError::Platform(PlatformError::Keychain(
+            "boom".to_owned(),
+        )));
+        assert_eq!(ipc.code, IpcErrorCode::Internal);
+        assert!(!ipc.retriable);
+    }
+
+    #[test]
+    fn auth_server_unreachable_maps_to_retriable_code() {
+        let ipc = to_ipc_error(CoreError::Auth(AuthError::ServerUnreachable(
+            "x".to_owned(),
+        )));
+        assert_eq!(ipc.code, IpcErrorCode::ServerUnreachable);
+        assert!(ipc.retriable, "unreachable server should be retriable");
+    }
+
+    #[test]
+    fn auth_invalid_credentials_maps_to_non_retriable_code() {
+        let ipc = to_ipc_error(CoreError::Auth(AuthError::InvalidCredentials));
+        assert_eq!(ipc.code, IpcErrorCode::InvalidCredentials);
+        assert!(!ipc.retriable);
+    }
+
+    #[test]
+    fn auth_unsupported_login_type_maps_to_non_retriable_code() {
+        let ipc = to_ipc_error(CoreError::Auth(AuthError::UnsupportedLoginType(
+            "x".to_owned(),
+        )));
+        assert_eq!(ipc.code, IpcErrorCode::UnsupportedLoginType);
+        assert!(!ipc.retriable);
+    }
+
+    #[test]
+    fn auth_sliding_sync_unsupported_maps_to_non_retriable_code() {
+        let ipc = to_ipc_error(CoreError::Auth(AuthError::SlidingSyncUnsupported));
+        assert_eq!(ipc.code, IpcErrorCode::SlidingSyncUnsupported);
+        assert!(!ipc.retriable);
     }
 }

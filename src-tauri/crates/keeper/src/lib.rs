@@ -9,7 +9,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(ipc::AppState::new())
-        .invoke_handler(tauri::generate_handler![ipc::app_ping, ipc::demo_subscribe])
+        .invoke_handler(tauri::generate_handler![
+            ipc::app_ping,
+            ipc::demo_subscribe,
+            ipc::login_password
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

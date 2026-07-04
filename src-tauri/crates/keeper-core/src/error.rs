@@ -19,6 +19,40 @@ pub enum PlatformError {
     /// A required directory could not be resolved on this platform.
     #[error("could not resolve platform directory: {0}")]
     DirUnavailable(String),
+
+    /// An OS keychain operation (store/retrieve/delete a secret) failed.
+    ///
+    /// The message is a non-secret description of the failure — it never
+    /// contains the secret value that was being stored or retrieved.
+    #[error("keychain operation failed: {0}")]
+    Keychain(String),
+}
+
+/// Errors originating in the password login flow.
+///
+/// A stable, secret-free taxonomy: no message ever contains a password, token,
+/// or `MatrixSession` material. Each variant maps to a distinct `IpcErrorCode`
+/// in the shell's single `to_ipc_error` funnel.
+#[derive(Debug, Error)]
+pub enum AuthError {
+    /// The homeserver could not be reached (DNS/connection/build/probe
+    /// failure). The wrapped string is a non-secret transport description.
+    #[error("could not reach homeserver: {0}")]
+    ServerUnreachable(String),
+
+    /// The homeserver rejected the supplied username/password.
+    #[error("invalid username or password")]
+    InvalidCredentials,
+
+    /// The homeserver does not offer `m.login.password`. The wrapped string is
+    /// a non-secret description of the unsupported login flow.
+    #[error("password login is not supported by this homeserver: {0}")]
+    UnsupportedLoginType(String),
+
+    /// The homeserver does not support Simplified Sliding Sync (MSC4186), which
+    /// keeper requires. Detected before any persistent state is created.
+    #[error("homeserver does not support Simplified Sliding Sync")]
+    SlidingSyncUnsupported,
 }
 
 /// The hexagon error root. Every fallible core operation surfaces one of these.
@@ -27,6 +61,10 @@ pub enum CoreError {
     /// A platform port failed or is unavailable.
     #[error(transparent)]
     Platform(#[from] PlatformError),
+
+    /// A password login attempt failed with a named, actionable cause.
+    #[error(transparent)]
+    Auth(#[from] AuthError),
 
     /// A requested capability is not supported on this platform/build. Honest,
     /// non-panicking signal used by not-yet-wired [`crate::platform::Platform`]

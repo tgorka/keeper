@@ -31,3 +31,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
+# macOS Keychain access for the keychain_* Platform ports (shell-only glue).
+keyring = { workspace = true }

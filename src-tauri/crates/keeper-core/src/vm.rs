@@ -38,6 +38,34 @@ pub enum IpcErrorCode {
     Unsupported,
     /// An unexpected internal error occurred in the backend.
     Internal,
+    /// The homeserver does not support Simplified Sliding Sync (MSC4186).
+    SlidingSyncUnsupported,
+    /// The supplied username/password was rejected by the homeserver.
+    InvalidCredentials,
+    /// The homeserver could not be reached (DNS/connection/transport failure).
+    ServerUnreachable,
+    /// The homeserver does not offer password login (`m.login.password`).
+    UnsupportedLoginType,
+}
+
+/// Non-secret account registry projection returned to the frontend on a
+/// successful login (FR-1, NFR-9).
+///
+/// Carries **only** the opaque keeper account id, the Matrix user id, and the
+/// resolved homeserver URL. Tokens, refresh tokens, device/crypto keys, and any
+/// `MatrixSession` material never appear here — they live only in the macOS
+/// Keychain and never cross IPC back to TypeScript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AccountVm {
+    /// Opaque keeper-generated account id (a ULID). Used in paths, rows, VMs,
+    /// and Keychain entries.
+    pub account_id: String,
+    /// The Matrix user id this account signed in as (e.g. `@alice:example.org`).
+    pub user_id: String,
+    /// The resolved homeserver base URL (after well-known discovery).
+    pub homeserver_url: String,
 }
 
 /// The single error envelope every fallible command rejects with (AD-8, AD-21).
@@ -132,6 +160,46 @@ mod tests {
         };
         let json = serde_json::to_string(&err).expect("serialize error");
         assert!(json.contains("\"accountId\":\"01ABC\""), "json was: {json}");
+    }
+
+    #[test]
+    fn account_vm_round_trips_camel_case() {
+        let vm = AccountVm {
+            account_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            user_id: "@alice:example.org".to_owned(),
+            homeserver_url: "https://matrix.example.org/".to_owned(),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize account vm");
+        assert!(json.contains("\"accountId\":"), "json was: {json}");
+        assert!(json.contains("\"userId\":"), "json was: {json}");
+        assert!(json.contains("\"homeserverUrl\":"), "json was: {json}");
+        // No token/session material is present on the VM.
+        assert!(!json.contains("token"), "json leaked a token field: {json}");
+        let back: AccountVm = serde_json::from_str(&json).expect("deserialize account vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn new_error_codes_serialize_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::SlidingSyncUnsupported)
+                .expect("serialize sss code"),
+            "\"slidingSyncUnsupported\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::InvalidCredentials).expect("serialize creds code"),
+            "\"invalidCredentials\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::ServerUnreachable)
+                .expect("serialize unreachable code"),
+            "\"serverUnreachable\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::UnsupportedLoginType)
+                .expect("serialize login-type code"),
+            "\"unsupportedLoginType\""
+        );
     }
 
     #[test]

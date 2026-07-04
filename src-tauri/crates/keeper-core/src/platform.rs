@@ -21,15 +21,16 @@ pub trait Platform: Send + Sync {
     fn data_dir(&self) -> Result<PathBuf, CoreError>;
 
     /// Store a secret (e.g. an access token) in the OS keychain under `key`.
-    /// Not wired in Story 1.1 — returns [`CoreError::Unsupported`].
+    /// Wired in Story 1.3 via the shell's `DesktopPlatform` (macOS Keychain,
+    /// service `dev.tgorka.keeper`, backed by `keyring`).
     fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError>;
 
     /// Retrieve a secret previously stored under `key`, if present.
-    /// Not wired in Story 1.1 — returns [`CoreError::Unsupported`].
+    /// Wired in Story 1.3 via the shell's `DesktopPlatform` (macOS Keychain).
     fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError>;
 
     /// Delete a secret stored under `key`.
-    /// Not wired in Story 1.1 — returns [`CoreError::Unsupported`].
+    /// Wired in Story 1.3 via the shell's `DesktopPlatform` (macOS Keychain).
     fn keychain_delete(&self, key: &str) -> Result<(), CoreError>;
 
     /// Post a desktop notification (title + body).

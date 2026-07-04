@@ -9,11 +9,14 @@
 import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type { IpcError } from "./gen/IpcError";
 
+export type { AccountVm } from "./gen/AccountVm";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
 export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { PingVm } from "./gen/PingVm";
+
+import type { AccountVm } from "./gen/AccountVm";
 
 /**
  * Structural guard for the {@link IpcError} envelope so we can rethrow it
@@ -50,6 +53,22 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
       retriable: false,
     } satisfies IpcError;
   }
+}
+
+/**
+ * Password login (FR-1, FR-5). Sends the homeserver, username, and password to
+ * the Rust core, which runs the store-less SSS probe, logs in, persists the
+ * session to the Keychain, and writes the account registry row. Resolves with
+ * the non-secret {@link AccountVm}; rejects with the {@link IpcError} envelope
+ * (whose `code` distinguishes bad credentials / unreachable / unsupported login
+ * type / non-SSS). The password is transient — it is never returned or stored.
+ */
+export async function loginPassword(
+  homeserver: string,
+  username: string,
+  password: string,
+): Promise<AccountVm> {
+  return await invoke<AccountVm>("login_password", { homeserver, username, password });
 }
 
 /**
