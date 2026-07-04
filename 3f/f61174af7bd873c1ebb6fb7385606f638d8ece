@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_8a8bc6b6bf6017::t_c791bd7ebc4242 1-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3ff61174af7bd873c1ebb6fb7385606f638d8ece",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
