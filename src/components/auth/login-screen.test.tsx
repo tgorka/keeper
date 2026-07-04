@@ -5,8 +5,12 @@ import { accountsStore } from "@/lib/stores/accounts";
 
 // Mock the typed IPC wrapper so the component never touches Tauri.
 const loginPassword = vi.fn();
+const loginOidc = vi.fn();
+const cancelOidc = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   loginPassword: (...args: [string, string, string]) => loginPassword(...args),
+  loginOidc: (...args: [string]) => loginOidc(...args),
+  cancelOidc: (...args: []) => cancelOidc(...args),
 }));
 
 // Import after the mock is registered.
@@ -34,6 +38,9 @@ describe("LoginScreen", () => {
   beforeEach(() => {
     accountsStore.getState().clear();
     loginPassword.mockReset();
+    loginOidc.mockReset();
+    cancelOidc.mockReset();
+    cancelOidc.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -178,5 +185,104 @@ describe("LoginScreen", () => {
     fillAndSubmit();
     await screen.findByText("Wrong username or password.");
     expect(accountsStore.getState().accounts).toEqual([]);
+  });
+
+  it("invokes login_oidc with the entered homeserver on the SSO button", async () => {
+    loginOidc.mockResolvedValue(account);
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "  mas.example  " } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    await waitFor(() => {
+      expect(loginOidc).toHaveBeenCalledWith("mas.example");
+    });
+  });
+
+  it("records the account and calls onDone on OIDC success", async () => {
+    loginOidc.mockResolvedValue(account);
+    const onDone = vi.fn();
+    render(<LoginScreen addMode onDone={onDone} />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    await waitFor(() => {
+      expect(accountsStore.getState().accounts).toEqual([account]);
+    });
+    expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
+  it("guards a blank homeserver on the SSO button without calling the backend", async () => {
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "   " } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    expect(
+      await screen.findByText("Enter your homeserver, username, and password."),
+    ).toBeInTheDocument();
+    expect(loginOidc).not.toHaveBeenCalled();
+  });
+
+  it("shows the pending state and a Cancel button while OIDC is in flight", async () => {
+    // A never-resolving promise keeps the flow pending.
+    loginOidc.mockReturnValue(new Promise(() => {}));
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    expect(await screen.findByText("Complete sign-in in your browser…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+  });
+
+  it("calls cancel_oidc when Cancel is clicked during a pending OIDC flow", async () => {
+    loginOidc.mockReturnValue(new Promise(() => {}));
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    await screen.findByText("Complete sign-in in your browser…");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => {
+      expect(cancelOidc).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("returns quietly to the form (no error) when the OIDC flow is cancelled", async () => {
+    loginOidc.mockRejectedValue(ipcError("oauthCancelled"));
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    // The form (Homeserver field) is back and no destructive alert is shown.
+    await waitFor(() => {
+      expect(screen.getByLabelText("Homeserver")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Couldn't sign in")).not.toBeInTheDocument();
+    expect(accountsStore.getState().accounts).toEqual([]);
+  });
+
+  it("shows the unsupported message for oauthUnsupported", async () => {
+    loginOidc.mockRejectedValue(ipcError("oauthUnsupported"));
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    expect(
+      await screen.findByText("This homeserver doesn't offer single sign-on (OIDC)."),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the timeout message for oauthTimedOut", async () => {
+    loginOidc.mockRejectedValue(ipcError("oauthTimedOut"));
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    expect(
+      await screen.findByText(
+        "Single sign-on timed out. It wasn't completed in the browser in time.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the failed message for oauthFailed", async () => {
+    loginOidc.mockRejectedValue(ipcError("oauthFailed"));
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    expect(
+      await screen.findByText("Single sign-on didn't complete. Please try again."),
+    ).toBeInTheDocument();
   });
 });

@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use keeper_core::account::AccountManager;
@@ -15,6 +16,7 @@ use keeper_core::demo::snapshot_then_diff;
 use keeper_core::error::{
     AccountError, AuthError, CoreError, InboxError, PlatformError, SendError, TimelineError,
 };
+use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, ConnectionStatusBatch, DemoBatch, InboxBatch, IpcError, IpcErrorCode, PingVm,
@@ -31,16 +33,22 @@ use tauri::State;
 /// [`AccountManager`] owns the live `Client`/`SyncService` and per-subscription
 /// tasks (AD-19).
 pub struct AppState {
-    pub platform: Box<dyn Platform>,
+    pub platform: Arc<dyn Platform>,
     pub accounts: AccountManager,
+    /// In-flight OIDC (OAuth 2.0 / MSC3861) callback registry (Story 2.2). The
+    /// deep-link `on_open_url` handler resolves incoming `keeper://oauth/callback`
+    /// URLs against it; each `login_oidc` call registers its pending flow here,
+    /// and `cancel_oidc` aborts all pending flows.
+    pub oauth_flows: Arc<OAuthFlowRegistry>,
 }
 
 impl AppState {
     /// Construct the desktop app state with the real platform implementation.
     pub fn new() -> Self {
         Self {
-            platform: Box::new(DesktopPlatform),
+            platform: Arc::new(DesktopPlatform),
             accounts: AccountManager::new(),
+            oauth_flows: Arc::new(OAuthFlowRegistry::new()),
         }
     }
 }
@@ -101,6 +109,13 @@ impl Platform for DesktopPlatform {
         }
     }
 
+    fn open_url(&self, url: &str) -> Result<(), CoreError> {
+        // Open in the system default browser (no explicit `with` program). Used
+        // by the OIDC flow to present the OAuth authorization URL for consent.
+        tauri_plugin_opener::open_url(url, None::<&str>)
+            .map_err(|e| CoreError::Internal(format!("could not open the system browser: {e}")))
+    }
+
     fn notify(&self, _title: &str, _body: &str) -> Result<(), CoreError> {
         Err(CoreError::Unsupported(
             "notify not wired until a later story".to_owned(),
@@ -132,6 +147,14 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         CoreError::Auth(AuthError::SlidingSyncUnsupported) => {
             (IpcErrorCode::SlidingSyncUnsupported, false)
         }
+        // OIDC not offered by the homeserver: nothing to retry — the user must
+        // pick a different login mechanism.
+        CoreError::Auth(AuthError::OAuthUnsupported) => (IpcErrorCode::OauthUnsupported, false),
+        // A cancelled / timed-out / failed OIDC flow is retriable: the user can
+        // start the browser sign-in again.
+        CoreError::Auth(AuthError::OAuthCancelled) => (IpcErrorCode::OauthCancelled, true),
+        CoreError::Auth(AuthError::OAuthTimedOut) => (IpcErrorCode::OauthTimedOut, true),
+        CoreError::Auth(AuthError::OAuthFailed(_)) => (IpcErrorCode::OauthFailed, true),
         // Any account activation / sync-start failure is retriable: the
         // frontend can attempt the subscribe again.
         CoreError::Account(
@@ -233,6 +256,43 @@ pub async fn login_password(
         .map_err(to_ipc_error)
 }
 
+/// OIDC (OAuth 2.0 / MSC3861) login command (Story 2.2).
+///
+/// Runs the shared add-account flow with the OIDC mechanism: the whole browser
+/// round-trip (open the system browser, await the `keeper://oauth/callback` deep
+/// link, finish the token exchange) happens inside the core `authenticate` step.
+/// The pending flow is keyed by its OAuth `state` in the shared registry so the
+/// deep-link `on_open_url` handler can route the callback back to it; a
+/// concurrent `cancel_oidc` aborts it. On success resolves to a non-secret
+/// [`AccountVm`]; on failure (unsupported / timed-out / cancelled / failed /
+/// non-SSS) funnels the `CoreError` through [`to_ipc_error`]. No token or
+/// authorization `code`/`state` ever crosses back to JavaScript.
+#[tauri::command]
+pub async fn login_oidc(
+    state: State<'_, AppState>,
+    homeserver: String,
+) -> Result<AccountVm, IpcError> {
+    auth::login_oidc(
+        state.platform.as_ref(),
+        &homeserver,
+        state.oauth_flows.clone(),
+    )
+    .await
+    .map_err(to_ipc_error)
+}
+
+/// Cancel any in-progress OIDC flow(s) (Story 2.2).
+///
+/// Aborts every pending flow in the registry (there is at most one add-account
+/// flow at a time in the UI); the awaiting `authenticate` resolves as cancelled,
+/// `add_account` rolls back, and the UI returns quietly to the form. Idempotent —
+/// with no pending flow it is a no-op.
+#[tauri::command]
+pub fn cancel_oidc(state: State<'_, AppState>) -> Result<(), IpcError> {
+    state.oauth_flows.cancel_all();
+    Ok(())
+}
+
 /// Subscribe to an account's sliding-sync room list (FR-8, AD-8/9/19/20).
 ///
 /// Lazily activates the account (session restore + `SyncService`), then streams
@@ -248,7 +308,7 @@ pub async fn room_list_subscribe(
     let sink = Box::new(move |batch: RoomListBatch| channel.send(batch).is_ok());
     state
         .accounts
-        .subscribe_room_list(state.platform.as_ref(), &account_id, sink)
+        .subscribe_room_list(&state.platform, &account_id, sink)
         .await
         .map_err(to_ipc_error)
 }
@@ -286,7 +346,7 @@ pub async fn timeline_subscribe(
     let sink = Box::new(move |batch: TimelineBatch| channel.send(batch).is_ok());
     state
         .accounts
-        .subscribe_timeline(state.platform.as_ref(), &account_id, &room_id, sink)
+        .subscribe_timeline(&state.platform, &account_id, &room_id, sink)
         .await
         .map_err(to_ipc_error)
 }
@@ -342,7 +402,7 @@ pub async fn connection_status_subscribe(
     let sink = Box::new(move |batch: ConnectionStatusBatch| channel.send(batch).is_ok());
     state
         .accounts
-        .subscribe_connection_status(state.platform.as_ref(), &account_id, sink)
+        .subscribe_connection_status(&state.platform, &account_id, sink)
         .await
         .map_err(to_ipc_error)
 }
@@ -405,7 +465,7 @@ pub async fn inbox_subscribe(
     let sink = Box::new(move |batch: InboxBatch| channel.send(batch).is_ok());
     state
         .accounts
-        .subscribe_inbox(state.platform.as_ref(), sink)
+        .subscribe_inbox(&state.platform, sink)
         .await
         .map_err(to_ipc_error)
 }
@@ -430,7 +490,7 @@ pub async fn inbox_unsubscribe(
 pub async fn sign_out(state: State<'_, AppState>, account_id: String) -> Result<(), IpcError> {
     state
         .accounts
-        .sign_out(state.platform.as_ref(), &account_id)
+        .sign_out(&state.platform, &account_id)
         .await
         .map_err(to_ipc_error)
 }
@@ -508,6 +568,36 @@ mod tests {
         let ipc = to_ipc_error(CoreError::Auth(AuthError::SlidingSyncUnsupported));
         assert_eq!(ipc.code, IpcErrorCode::SlidingSyncUnsupported);
         assert!(!ipc.retriable);
+    }
+
+    #[test]
+    fn auth_oauth_unsupported_maps_to_non_retriable_code() {
+        let ipc = to_ipc_error(CoreError::Auth(AuthError::OAuthUnsupported));
+        assert_eq!(ipc.code, IpcErrorCode::OauthUnsupported);
+        assert!(!ipc.retriable, "an unsupported server is not retriable");
+    }
+
+    #[test]
+    fn auth_oauth_timed_out_maps_to_retriable_code() {
+        let ipc = to_ipc_error(CoreError::Auth(AuthError::OAuthTimedOut));
+        assert_eq!(ipc.code, IpcErrorCode::OauthTimedOut);
+        assert!(ipc.retriable, "a timed-out sign-in may be retried");
+    }
+
+    #[test]
+    fn auth_oauth_cancelled_maps_to_retriable_code() {
+        let ipc = to_ipc_error(CoreError::Auth(AuthError::OAuthCancelled));
+        assert_eq!(ipc.code, IpcErrorCode::OauthCancelled);
+        assert!(ipc.retriable, "a cancelled sign-in may be retried");
+    }
+
+    #[test]
+    fn auth_oauth_failed_maps_to_retriable_code() {
+        let ipc = to_ipc_error(CoreError::Auth(AuthError::OAuthFailed(
+            "access_denied".to_owned(),
+        )));
+        assert_eq!(ipc.code, IpcErrorCode::OauthFailed);
+        assert!(ipc.retriable, "a failed sign-in may be retried");
     }
 
     #[test]

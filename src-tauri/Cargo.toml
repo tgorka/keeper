@@ -22,6 +22,7 @@ unwrap_used = "warn"
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-deep-link = "2"
 # Serialization + IPC bindings
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -36,6 +37,8 @@ matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "sso-lo
 matrix-sdk-ui = "0.18"
 # Async stream adapters for the room-list producer (already in the tree via matrix-sdk).
 futures-util = "0.3"
+# URL parsing for the OIDC callback registry + redirect metadata (already in the tree via matrix-sdk).
+url = "2"
 # Platform ports
 dirs = "6"
 # Keychain (macOS Keychain via the OS-native backend) — shell-only, the only genuinely new crate.

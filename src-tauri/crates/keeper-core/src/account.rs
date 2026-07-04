@@ -21,12 +21,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
 };
 use matrix_sdk::ruma::{OwnedRoomId, RoomId};
-use matrix_sdk::store::RoomLoadSettings;
 use matrix_sdk::Client;
 use matrix_sdk_ui::eyeball_im::VectorDiff;
 use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
@@ -81,6 +79,16 @@ pub type InboxSink = Box<dyn Fn(InboxBatch) -> bool + Send + Sync>;
 /// entry.
 type OpenTimelines = Arc<Mutex<HashMap<u64, (OwnedRoomId, Arc<Timeline>)>>>;
 
+/// The live artifacts produced by [`activate`]: the `Client`, its `SyncService`,
+/// and the two lifetime-of-account supervisor task handles (reconnect supervisor
+/// and session persister) that the caller stores on the [`AccountHandle`].
+type ActivatedAccount = (
+    Client,
+    std::sync::Arc<SyncService>,
+    JoinHandle<()>,
+    JoinHandle<()>,
+);
+
 /// A live, supervised account: its `Client`, `SyncService`, and the abort
 /// handles of its room-list subscriptions.
 struct AccountHandle {
@@ -103,6 +111,13 @@ struct AccountHandle {
     /// mechanism. Aborted in [`AccountManager::shutdown`] and on partial
     /// activation teardown.
     reconnect_supervisor: JoinHandle<()>,
+    /// Lifetime-of-account session-persister task (Story 2.2): re-persists the
+    /// Keychain blob when the SDK rotates OAuth tokens. It holds its own `Client`
+    /// clone, so it MUST be aborted in [`AccountManager::shutdown`] before
+    /// `sign_out_cleanup` runs — otherwise it keeps the store's SQLite handles
+    /// open past store-dir deletion and could re-persist the just-deleted
+    /// Keychain key on a late token refresh (resurrecting a signed-out secret).
+    session_persister: JoinHandle<()>,
 }
 
 /// A live merged-inbox subscription (AD-20): the merger the per-account
@@ -143,7 +158,7 @@ impl AccountManager {
     /// subscription id.
     pub async fn subscribe_room_list(
         &self,
-        platform: &dyn Platform,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         sink: BatchSink,
     ) -> Result<u64, CoreError> {
@@ -155,7 +170,8 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor) = activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor, session_persister) =
+                    activate(platform, account_id).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -164,6 +180,7 @@ impl AccountManager {
                         subscriptions: Arc::new(Mutex::new(HashMap::new())),
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
+                        session_persister,
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for room list");
@@ -196,6 +213,7 @@ impl AccountManager {
                     if should_remove {
                         if let Some(dead) = accounts.remove(account_id) {
                             dead.reconnect_supervisor.abort();
+                            dead.session_persister.abort();
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -252,14 +270,14 @@ impl AccountManager {
     /// down. Adding the Nth account is identical to the 2nd — no count limit.
     pub async fn subscribe_inbox(
         &self,
-        platform: &dyn Platform,
+        platform: &Arc<dyn Platform>,
         sink: InboxSink,
     ) -> Result<u64, CoreError> {
         // Only one inbox subscription at a time: tear down any prior one so its
         // producers stop feeding a stale merger/channel.
         self.unsubscribe_inbox_inner().await;
 
-        let accounts = auth::find_restorable_accounts(platform)?;
+        let accounts = auth::find_restorable_accounts(platform.as_ref())?;
         let merger = InboxMerger::new(sink);
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -344,14 +362,15 @@ impl AccountManager {
     /// `RoomList` back to the caller rather than spawning a producer.
     async fn acquire_room_list(
         &self,
-        platform: &dyn Platform,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
     ) -> Result<RoomList, CoreError> {
         let (sync, did_activate) = {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor) = activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor, session_persister) =
+                    activate(platform, account_id).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -360,6 +379,7 @@ impl AccountManager {
                         subscriptions: Arc::new(Mutex::new(HashMap::new())),
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
+                        session_persister,
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for inbox");
@@ -382,6 +402,7 @@ impl AccountManager {
                     if should_remove {
                         if let Some(dead) = accounts.remove(account_id) {
                             dead.reconnect_supervisor.abort();
+                            dead.session_persister.abort();
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -402,7 +423,7 @@ impl AccountManager {
     /// subscription id.
     pub async fn subscribe_timeline(
         &self,
-        platform: &dyn Platform,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         room_id: &str,
         sink: TimelineSink,
@@ -418,7 +439,8 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor) = activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor, session_persister) =
+                    activate(platform, account_id).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -427,6 +449,7 @@ impl AccountManager {
                         subscriptions: Arc::new(Mutex::new(HashMap::new())),
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
+                        session_persister,
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for timeline");
@@ -463,6 +486,7 @@ impl AccountManager {
                     if should_remove {
                         if let Some(dead) = accounts.remove(account_id) {
                             dead.reconnect_supervisor.abort();
+                            dead.session_persister.abort();
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -534,7 +558,7 @@ impl AccountManager {
     /// the existing `SyncUnavailable` code (retriable).
     pub async fn subscribe_connection_status(
         &self,
-        platform: &dyn Platform,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         sink: ConnectionSink,
     ) -> Result<u64, CoreError> {
@@ -546,7 +570,8 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor) = activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor, session_persister) =
+                    activate(platform, account_id).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -555,6 +580,7 @@ impl AccountManager {
                         subscriptions: Arc::new(Mutex::new(HashMap::new())),
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
+                        session_persister,
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for connection status");
@@ -750,6 +776,12 @@ impl AccountManager {
             // abort the reconnect supervisor and any remaining producer tasks.
             handle.sync.stop().await;
             handle.reconnect_supervisor.abort();
+            // Abort and await the session-persister so its `Client` clone (and
+            // the store's SQLite handles it keeps alive) is dropped before
+            // `sign_out_cleanup` deletes the store dir, and so it can never
+            // re-persist the just-deleted Keychain key on a late token refresh.
+            handle.session_persister.abort();
+            let _ = handle.session_persister.await;
             let mut subs = handle.subscriptions.lock().await;
             for (_, task) in subs.drain() {
                 task.abort();
@@ -771,11 +803,11 @@ impl AccountManager {
     /// idempotent — so sign-out converges whether or not the account was live.
     pub async fn sign_out(
         &self,
-        platform: &dyn Platform,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
     ) -> Result<(), CoreError> {
         self.shutdown(account_id).await;
-        crate::auth::sign_out_cleanup(platform, account_id)?;
+        crate::auth::sign_out_cleanup(platform.as_ref(), account_id)?;
         Ok(())
     }
 }
@@ -792,31 +824,42 @@ impl AccountManager {
 /// for the caller to store on the `AccountHandle`.
 #[tracing::instrument(skip(platform), fields(account_id = %account_id))]
 async fn activate(
-    platform: &dyn Platform,
+    platform: &Arc<dyn Platform>,
     account_id: &str,
-) -> Result<(Client, std::sync::Arc<SyncService>, JoinHandle<()>), CoreError> {
+) -> Result<ActivatedAccount, CoreError> {
     let session_json = platform
         .keychain_get(&session_keychain_key(account_id))?
         .ok_or(AccountError::SessionMissing)?;
-    let session: MatrixSession = serde_json::from_str(&session_json)
-        .map_err(|e| AccountError::RestoreFailed(format!("could not read stored session: {e}")))?;
+    // Legacy-tolerant read: a tagged `StoredSession` (password or OAuth), or a
+    // pre-2.2 bare `MatrixSession` blob read as a password session.
+    let stored = auth::StoredSession::from_json(&session_json)
+        .map_err(|e| AccountError::RestoreFailed(e.to_string()))?;
 
     let data_dir = platform.data_dir()?;
     let row = registry::get_account(&data_dir, account_id)?.ok_or(AccountError::SessionMissing)?;
     let sdk_dir = data_dir.join("accounts").join(account_id).join("sdk");
 
+    // OAuth refresh tokens are one-time-use (MAS); `handle_refresh_tokens()` lets
+    // the SDK rotate them, and the session-change watcher below re-persists the
+    // rotated blob so a restart-after-refresh restores cleanly.
     let client = Client::builder()
         .homeserver_url(&row.homeserver_url)
         .sqlite_store(&sdk_dir, None)
+        .handle_refresh_tokens()
         .build()
         .await
         .map_err(|e| AccountError::RestoreFailed(e.to_string()))?;
 
-    client
-        .matrix_auth()
-        .restore_session(session, RoomLoadSettings::default())
+    stored
+        .restore_into(&client)
         .await
         .map_err(|e| AccountError::RestoreFailed(e.to_string()))?;
+
+    // Re-persist the Keychain blob whenever the SDK rotates the session tokens,
+    // so the (one-time-use) rotated OAuth refresh token survives a restart. A
+    // best-effort background task keyed by this account.
+    let session_persister =
+        spawn_session_persister(platform.clone(), client.clone(), account_id.to_owned());
 
     let sync = SyncService::builder(client.clone())
         .with_offline_mode()
@@ -836,7 +879,86 @@ async fn activate(
             .instrument(tracing::info_span!("reconnect_supervisor", account_id = %account_id)),
     );
 
-    Ok((client, sync, reconnect_supervisor))
+    Ok((client, sync, reconnect_supervisor, session_persister))
+}
+
+/// Re-persist the account's live session blob to the Keychain (best-effort).
+///
+/// Reads the current [`crate::auth::StoredSession`] from the live `client` — so
+/// it always reflects the newest rotated tokens — and writes it via the
+/// [`Platform`] keychain port. Failures are logged, never propagated.
+fn persist_current_session(platform: &dyn Platform, client: &Client, account_id: &str) {
+    let Some(stored) = auth::StoredSession::from_client(client) else {
+        return;
+    };
+    match stored.to_json() {
+        Ok(json) => {
+            let key = session_keychain_key(account_id);
+            if let Err(e) = platform.keychain_set(&key, &json) {
+                tracing::warn!(
+                    account_id = %account_id,
+                    error = %e,
+                    "could not re-persist refreshed session to keychain"
+                );
+            } else {
+                tracing::info!(
+                    account_id = %account_id,
+                    "refreshed session tokens re-persisted to keychain"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            account_id = %account_id,
+            error = %e,
+            "could not serialize refreshed session"
+        ),
+    }
+}
+
+/// Spawn a best-effort background task that re-persists the account's Keychain
+/// session blob whenever the SDK rotates its tokens (Story 2.2).
+///
+/// MAS OAuth refresh tokens are one-time-use, so an in-session refresh must be
+/// written back or the next cold-start restore would fail. Subscribes to
+/// `client.subscribe_to_session_changes()` and, on `TokensRefreshed`, re-reads
+/// and writes the live session. A `UnknownToken` (revoked/invalid) change is
+/// logged but not acted on here — the account simply needs re-login on next
+/// launch. The returned `JoinHandle` is stored on the `AccountHandle` and
+/// aborted in [`AccountManager::shutdown`]; the task also ends on its own when
+/// the broadcast sender is dropped (the `Client` was torn down).
+fn spawn_session_persister(
+    platform: Arc<dyn Platform>,
+    client: Client,
+    account_id: String,
+) -> JoinHandle<()> {
+    let mut changes = client.subscribe_to_session_changes();
+    tokio::spawn(async move {
+        use matrix_sdk::SessionChange;
+        loop {
+            match changes.recv().await {
+                Ok(SessionChange::TokensRefreshed) => {
+                    persist_current_session(platform.as_ref(), &client, &account_id);
+                }
+                // A revoked/unknown token: the account needs re-login next launch.
+                Ok(_) => {
+                    tracing::info!(
+                        account_id = %account_id,
+                        "session token became invalid; account will need re-login"
+                    );
+                }
+                // Lagged: one or more changes were dropped from the buffer. The
+                // dropped change may have been the final rotation before the
+                // client is torn down, so persist the current (latest) live
+                // session now rather than waiting for a next event that may
+                // never come — otherwise the one-time-use refresh token is lost.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    persist_current_session(platform.as_ref(), &client, &account_id);
+                }
+                // Sender dropped: the client was torn down; end the task.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 /// Lifetime-of-account reconnect supervisor: observe `sync.state()` and, on every
@@ -1217,6 +1339,9 @@ mod tests {
         fn keychain_delete(&self, _key: &str) -> Result<(), CoreError> {
             Ok(())
         }
+        fn open_url(&self, _url: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
         fn notify(&self, _title: &str, _body: &str) -> Result<(), CoreError> {
             Ok(())
         }
@@ -1236,9 +1361,9 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let platform = FakePlatform {
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
             data_dir: data_dir.clone(),
-        };
+        });
         let manager = AccountManager::new();
 
         // The account was never activated (absent from the manager map): shutdown

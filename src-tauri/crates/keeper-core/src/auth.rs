@@ -11,14 +11,27 @@
 //! row is written — so a non-SSS/unreachable/rejected server leaves **zero**
 //! persistent state and there is never a half-configured account.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use matrix_sdk::authentication::matrix::MatrixSession;
+use matrix_sdk::authentication::oauth::{ClientId, OAuthSession, UserSession};
+use matrix_sdk::authentication::AuthSession;
 use matrix_sdk::ruma::api::FeatureFlag;
+use matrix_sdk::store::RoomLoadSettings;
 use matrix_sdk::Client;
 use ulid::Ulid;
 
 use crate::error::{AuthError, CoreError};
+use crate::oauth::{registration_data, OAuthCallback, OAuthFlowRegistry};
 use crate::platform::Platform;
 use crate::registry;
 use crate::vm::AccountVm;
+
+/// How long an OIDC browser round-trip may take before it is abandoned as timed
+/// out. Long enough for a real consent (including a fresh login on the IdP),
+/// short enough that an abandoned flow never hangs the add-account UI forever.
+const OAUTH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The mechanism-specific credential→session step of an account add (AD-17).
 ///
@@ -40,10 +53,15 @@ use crate::vm::AccountVm;
 /// its `From` impl.
 pub trait AuthProvider {
     /// Authenticate `client`. On success the client must carry a live session
-    /// (`client.matrix_auth().session().is_some()`).
+    /// (`client.session().is_some()`).
+    ///
+    /// `platform` is provided so a mechanism can drive an OS side effect during
+    /// authentication — the OIDC impl uses it to open the OAuth authorization
+    /// URL in the system browser. The password impl ignores it.
     fn authenticate(
         &self,
         client: &Client,
+        platform: &dyn Platform,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 
@@ -61,7 +79,11 @@ pub struct PasswordAuthProvider<'a> {
 }
 
 impl AuthProvider for PasswordAuthProvider<'_> {
-    async fn authenticate(&self, client: &Client) -> Result<(), CoreError> {
+    async fn authenticate(
+        &self,
+        client: &Client,
+        _platform: &dyn Platform,
+    ) -> Result<(), CoreError> {
         client
             .matrix_auth()
             .login_username(self.username, self.password)
@@ -70,6 +92,208 @@ impl AuthProvider for PasswordAuthProvider<'_> {
             .await
             .map_err(|e| map_login_error(&e))?;
         Ok(())
+    }
+}
+
+/// The OIDC (OAuth 2.0 / MSC3861) `AuthProvider` (Story 2.2, AD-17).
+///
+/// Drives matrix-sdk's `client.oauth()` flow: dynamic client registration →
+/// authorization URL → open the system browser (via the [`Platform`] port) →
+/// await the `keeper://oauth/callback?code&state` deep link (matched by the
+/// registry) → `finish_login`. The entire browser round-trip runs inside a
+/// single [`AuthProvider::authenticate`] call because matrix-sdk stashes the
+/// PKCE verifier / state in the in-memory `OAuth` handle, so `build()` and
+/// `finish_login()` must use the same live `Client`.
+///
+/// Holds an `Arc<OAuthFlowRegistry>` so the shell's deep-link handler can route
+/// the incoming callback to this flow by its OAuth `state`.
+pub struct OidcAuthProvider {
+    /// The shared in-flight callback registry (register/resolve/cancel).
+    pub flows: Arc<OAuthFlowRegistry>,
+}
+
+impl AuthProvider for OidcAuthProvider {
+    async fn authenticate(
+        &self,
+        client: &Client,
+        platform: &dyn Platform,
+    ) -> Result<(), CoreError> {
+        let oauth = client.oauth();
+
+        // Discover the authorization server; a not-supported response means this
+        // homeserver does not offer OIDC (before any browser work).
+        oauth.server_metadata().await.map_err(|e| {
+            if e.is_not_supported() {
+                CoreError::Auth(AuthError::OAuthUnsupported)
+            } else {
+                CoreError::Auth(AuthError::ServerUnreachable(e.to_string()))
+            }
+        })?;
+
+        // Build the authorization URL (registers the client dynamically and
+        // stashes PKCE/state in the in-memory oauth handle).
+        let data = oauth
+            .login(
+                crate::oauth::redirect_uri()?,
+                None,
+                Some(registration_data()?),
+                None,
+            )
+            .build()
+            .await
+            .map_err(|e| CoreError::Auth(AuthError::OAuthFailed(e.to_string())))?;
+
+        // Register the pending flow BEFORE opening the browser so a fast
+        // callback can never race ahead of the receiver.
+        let state = data.state.secret().clone();
+        let rx = self.flows.register(state.clone());
+        // Guarantee the registry entry (and its `state` secret) is removed on
+        // EVERY exit path below — timeout, cancel, browser-open failure,
+        // finish_login error, or success. `resolve` only removes the entry on a
+        // matched callback, so without this an abandoned flow would leak it.
+        let _flow_guard = FlowGuard {
+            flows: self.flows.as_ref(),
+            state: &state,
+        };
+        platform.open_url(data.url.as_str())?;
+
+        // Await the callback, but never hang: a ~5-minute timeout abandons the
+        // flow (add_account then rolls back, leaving zero residue).
+        let outcome = match tokio::time::timeout(OAUTH_TIMEOUT, rx).await {
+            Err(_) => return Err(CoreError::Auth(AuthError::OAuthTimedOut)),
+            // The sender was dropped (registry cleared without a callback) —
+            // treat as cancelled.
+            Ok(Err(_)) => return Err(CoreError::Auth(AuthError::OAuthCancelled)),
+            Ok(Ok(outcome)) => outcome,
+        };
+
+        match outcome {
+            OAuthCallback::Cancelled => Err(CoreError::Auth(AuthError::OAuthCancelled)),
+            OAuthCallback::Error(e) => Err(CoreError::Auth(AuthError::OAuthFailed(e))),
+            OAuthCallback::Redirect(url) => {
+                let parsed = url::Url::parse(&url).map_err(|e| {
+                    CoreError::Auth(AuthError::OAuthFailed(format!("invalid callback URL: {e}")))
+                })?;
+                oauth
+                    .finish_login(parsed.into())
+                    .await
+                    .map_err(|e| CoreError::Auth(AuthError::OAuthFailed(e.to_string())))?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// RAII guard that removes an in-flight OIDC flow's registry entry on drop,
+/// guaranteeing no residual pending entry (nor leaked `state` secret) survives
+/// any exit path from [`OidcAuthProvider::authenticate`] — timeout, cancel,
+/// browser-open failure, or error. A matched callback already removes the entry
+/// via `resolve`; this covers every other path, and `remove` is idempotent so a
+/// double-removal on the success path is harmless.
+struct FlowGuard<'a> {
+    flows: &'a OAuthFlowRegistry,
+    state: &'a str,
+}
+
+impl Drop for FlowGuard<'_> {
+    fn drop(&mut self) {
+        self.flows.remove(self.state);
+    }
+}
+
+/// The keeper-owned, tagged Keychain session shape (Design Notes, Story 2.2).
+///
+/// matrix-sdk's `AuthSession` / `OAuthSession` are **not** `Serialize`, but
+/// [`MatrixSession`] and [`UserSession`] are. So keeper persists this tagged
+/// enum and reconstructs the SDK session on restore. Tokens live only inside
+/// this blob in the macOS Keychain — never on disk unencrypted, never across IPC.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind")]
+pub enum StoredSession {
+    /// A native Matrix (password) session.
+    Password(MatrixSession),
+    /// An OAuth 2.0 / MSC3861 session: the dynamically-registered client id plus
+    /// the user session (meta + tokens).
+    Oauth {
+        /// The OAuth client id obtained during dynamic registration.
+        client_id: String,
+        /// The OAuth user session (SessionMeta + SessionTokens).
+        user: UserSession,
+    },
+}
+
+impl StoredSession {
+    /// Extract the persistable session from a freshly-authenticated `client`.
+    ///
+    /// Prefers the OAuth session (an OIDC login populates `oauth().full_session()`
+    /// but *not* `matrix_auth().session()`); falls back to a native Matrix
+    /// session. Returns `None` if the client carries no session (a bug — the
+    /// caller surfaces it as an internal error).
+    pub fn from_client(client: &Client) -> Option<Self> {
+        if let Some(oauth) = client.oauth().full_session() {
+            return Some(StoredSession::Oauth {
+                client_id: oauth.client_id.as_str().to_owned(),
+                user: oauth.user,
+            });
+        }
+        match client.session() {
+            Some(AuthSession::Matrix(m)) => Some(StoredSession::Password(m)),
+            // An OAuth session is handled above; any future auth kind is not
+            // persistable here.
+            _ => None,
+        }
+    }
+
+    /// Serialize this session to the JSON blob stored in the Keychain.
+    pub fn to_json(&self) -> Result<String, CoreError> {
+        serde_json::to_string(self)
+            .map_err(|e| CoreError::Internal(format!("could not serialize session: {e}")))
+    }
+
+    /// Deserialize a Keychain blob **legacy-tolerantly**. A blob carrying a
+    /// `"kind"` discriminant is a tagged [`StoredSession`] and MUST parse as one
+    /// — a parse failure there is a real error, surfaced rather than masked. Only
+    /// a genuinely untagged pre-2.2 blob falls back to a bare [`MatrixSession`]
+    /// read as [`StoredSession::Password`]. This guarantees an existing password
+    /// account is never dropped by the tag change, without silently mis-reading a
+    /// future tagged variant (e.g. a different auth kind) as a password session.
+    pub fn from_json(json: &str) -> Result<Self, CoreError> {
+        let is_tagged = serde_json::from_str::<serde_json::Value>(json)
+            .ok()
+            .is_some_and(|v| v.get("kind").is_some());
+        if is_tagged {
+            return serde_json::from_str::<StoredSession>(json)
+                .map_err(|e| CoreError::Internal(format!("could not read stored session: {e}")));
+        }
+        let legacy: MatrixSession = serde_json::from_str(json)
+            .map_err(|e| CoreError::Internal(format!("could not read stored session: {e}")))?;
+        Ok(StoredSession::Password(legacy))
+    }
+
+    /// Restore this session into `client` (rebuilding the SDK auth state),
+    /// loading rooms with `RoomLoadSettings::default()`. OAuth sessions restore
+    /// via `client.oauth().restore_session`; password sessions via
+    /// `client.restore_session`.
+    pub async fn restore_into(self, client: &Client) -> Result<(), CoreError> {
+        match self {
+            StoredSession::Password(m) => client
+                .restore_session(m)
+                .await
+                .map_err(|e| CoreError::Internal(format!("could not restore session: {e}"))),
+            StoredSession::Oauth { client_id, user } => {
+                let session = OAuthSession {
+                    client_id: ClientId::new(client_id),
+                    user,
+                };
+                client
+                    .oauth()
+                    .restore_session(session, RoomLoadSettings::default())
+                    .await
+                    .map_err(|e| {
+                        CoreError::Internal(format!("could not restore OAuth session: {e}"))
+                    })
+            }
+        }
     }
 }
 
@@ -144,6 +368,23 @@ pub async fn login_password(
     add_account(platform, homeserver, &provider).await
 }
 
+/// Perform an OIDC (OAuth 2.0 / MSC3861) login against `homeserver` (Story 2.2).
+///
+/// A thin wrapper over the shared [`add_account`] orchestration with the
+/// [`OidcAuthProvider`] mechanism, so an OIDC account runs the identical
+/// store-less SSS gate → persistent store → authenticate → Keychain → registry
+/// path (with rollback on any failure) as a password account. The whole browser
+/// round-trip runs inside `authenticate`; `flows` routes the deep-link callback
+/// back to it, and `cancel_all` on the same registry aborts a pending flow.
+pub async fn login_oidc(
+    platform: &dyn Platform,
+    homeserver: &str,
+    flows: Arc<OAuthFlowRegistry>,
+) -> Result<AccountVm, CoreError> {
+    let provider = OidcAuthProvider { flows };
+    add_account(platform, homeserver, &provider).await
+}
+
 /// Shared add-account orchestration used by every [`AuthProvider`] mechanism
 /// (AD-17). The strict ordering: store-less SSS capability gate (Phase A) →
 /// persistent store dir → `provider.authenticate` → Keychain session → registry
@@ -197,27 +438,34 @@ pub async fn add_account<P: AuthProvider>(
 
     // From this point on, persistent state may exist; wrap failures in rollback.
     let result = async {
+        // OAuth token refresh is one-time-use (MAS); build the persistent client
+        // with `handle_refresh_tokens()` so a rotated token doesn't wedge the
+        // session between add and the first restore.
         let client = Client::builder()
             .homeserver_url(resolved.clone())
             .sqlite_store(&sdk_dir, None)
+            .handle_refresh_tokens()
             .build()
             .await
             .map_err(|e| CoreError::Auth(AuthError::ServerUnreachable(e.to_string())))?;
 
         // Mechanism-specific credential→session step (AD-17).
-        provider.authenticate(&client).await?;
+        provider.authenticate(&client, platform).await?;
 
-        let session = client
-            .matrix_auth()
-            .session()
+        // Extract the persistable session — password *or* OAuth — as the
+        // keeper-owned tagged `StoredSession`.
+        let stored = StoredSession::from_client(&client)
             .ok_or_else(|| CoreError::Internal("no session after successful login".to_owned()))?;
 
-        let user_id = session.meta.user_id.to_string();
-        let device_id = session.meta.device_id.to_string();
+        let meta = client
+            .session()
+            .ok_or_else(|| CoreError::Internal("no session after successful login".to_owned()))?
+            .into_meta();
+        let user_id = meta.user_id.to_string();
+        let device_id = meta.device_id.to_string();
 
         // Persist the session only to the Keychain (never to keeper.db / IPC).
-        let session_json = serde_json::to_string(&session)
-            .map_err(|e| CoreError::Internal(format!("could not serialize session: {e}")))?;
+        let session_json = stored.to_json()?;
         platform.keychain_set(&keychain_key, &session_json)?;
 
         // Assign the lowest unused hue on the 8-hue wheel (else count % 8) and
@@ -359,6 +607,94 @@ mod tests {
         );
     }
 
+    /// Build a `MatrixSession` from its flattened JSON shape (user_id, device_id,
+    /// access_token, refresh_token?) without depending on the concrete field
+    /// types staying constructor-stable.
+    fn sample_matrix_session() -> MatrixSession {
+        serde_json::from_value(serde_json::json!({
+            "user_id": "@alice:example.org",
+            "device_id": "DEVID",
+            "access_token": "secret-access-token",
+            "refresh_token": "secret-refresh-token",
+        }))
+        .expect("matrix session json")
+    }
+
+    fn sample_user_session() -> UserSession {
+        serde_json::from_value(serde_json::json!({
+            "user_id": "@bob:example.org",
+            "device_id": "OIDCDEV",
+            "access_token": "oauth-access-token",
+            "refresh_token": "oauth-refresh-token",
+        }))
+        .expect("user session json")
+    }
+
+    #[test]
+    fn stored_session_password_round_trips() {
+        let stored = StoredSession::Password(sample_matrix_session());
+        let json = stored.to_json().expect("serialize");
+        // The tag is present so restore can dispatch.
+        assert!(json.contains("\"kind\":\"Password\""));
+        let back = StoredSession::from_json(&json).expect("deserialize");
+        match back {
+            StoredSession::Password(m) => {
+                assert_eq!(m.meta.user_id.as_str(), "@alice:example.org");
+                assert_eq!(m.tokens.access_token, "secret-access-token");
+            }
+            StoredSession::Oauth { .. } => panic!("expected Password"),
+        }
+    }
+
+    #[test]
+    fn stored_session_oauth_round_trips() {
+        let stored = StoredSession::Oauth {
+            client_id: "client-abc".to_owned(),
+            user: sample_user_session(),
+        };
+        let json = stored.to_json().expect("serialize");
+        assert!(json.contains("\"kind\":\"Oauth\""));
+        let back = StoredSession::from_json(&json).expect("deserialize");
+        match back {
+            StoredSession::Oauth { client_id, user } => {
+                assert_eq!(client_id, "client-abc");
+                assert_eq!(user.meta.user_id.as_str(), "@bob:example.org");
+                assert_eq!(user.tokens.access_token, "oauth-access-token");
+            }
+            StoredSession::Password(_) => panic!("expected Oauth"),
+        }
+    }
+
+    #[test]
+    fn stored_session_reads_legacy_bare_matrix_session() {
+        // A pre-2.2 blob is a bare, untagged MatrixSession JSON.
+        let legacy = serde_json::to_string(&sample_matrix_session()).expect("serialize legacy");
+        assert!(!legacy.contains("\"kind\""), "legacy blob must have no tag");
+        let back =
+            StoredSession::from_json(&legacy).expect("legacy read must not drop the account");
+        match back {
+            StoredSession::Password(m) => {
+                assert_eq!(m.meta.user_id.as_str(), "@alice:example.org");
+                assert_eq!(m.tokens.access_token, "secret-access-token");
+            }
+            StoredSession::Oauth { .. } => panic!("legacy bare session must read as Password"),
+        }
+    }
+
+    #[test]
+    fn stored_session_tagged_but_corrupt_blob_errors_not_masked() {
+        // A blob that IS tagged (has "kind") but is otherwise malformed must
+        // surface a real error — not silently fall back to a bare MatrixSession
+        // read, which could mis-tag a future variant as a password session.
+        let corrupt = r#"{"kind":"Oauth","client_id":"c1"}"#; // missing `user`
+        assert!(corrupt.contains("\"kind\""), "blob must be tagged");
+        let err = StoredSession::from_json(corrupt);
+        assert!(
+            err.is_err(),
+            "a tagged-but-corrupt blob must error, not fall back to Password"
+        );
+    }
+
     /// Fake platform that records the keys passed to `keychain_delete`, so the
     /// rollback tests can assert the session secret is cleaned up.
     #[derive(Default)]
@@ -381,6 +717,9 @@ mod tests {
                 .lock()
                 .expect("lock poisoned")
                 .push(key.to_owned());
+            Ok(())
+        }
+        fn open_url(&self, _url: &str) -> Result<(), CoreError> {
             Ok(())
         }
         fn notify(&self, _title: &str, _body: &str) -> Result<(), CoreError> {
@@ -470,6 +809,9 @@ mod tests {
         }
         fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
             self.keychain.lock().expect("lock poisoned").remove(key);
+            Ok(())
+        }
+        fn open_url(&self, _url: &str) -> Result<(), CoreError> {
             Ok(())
         }
         fn notify(&self, _title: &str, _body: &str) -> Result<(), CoreError> {

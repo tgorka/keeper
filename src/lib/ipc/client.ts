@@ -88,6 +88,32 @@ export async function loginPassword(
 }
 
 /**
+ * OIDC (OAuth 2.0 / MSC3861) login (Story 2.2). Sends the homeserver to the Rust
+ * core, which runs the store-less SSS probe, opens the system browser for OAuth
+ * consent, awaits the `keeper://oauth/callback` deep link, finishes the token
+ * exchange, persists the session to the Keychain, and writes the registry row.
+ * Resolves with the non-secret {@link AccountVm}; rejects with the
+ * {@link IpcError} envelope (whose `code` distinguishes non-SSS / OIDC
+ * unsupported / timed out / cancelled / failed). No token or authorization
+ * `code`/`state` ever crosses back to JavaScript.
+ *
+ * This call stays pending for the whole browser round-trip; use
+ * {@link cancelOidc} to abort it.
+ */
+export async function loginOidc(homeserver: string): Promise<AccountVm> {
+  return await invoke<AccountVm>("login_oidc", { homeserver });
+}
+
+/**
+ * Cancel any in-progress OIDC flow (Story 2.2). The pending {@link loginOidc}
+ * call then rejects with `code: "oauthCancelled"` and the Rust core rolls back
+ * any partial state. Idempotent — a no-op when no flow is pending.
+ */
+export async function cancelOidc(): Promise<void> {
+  await invoke<void>("cancel_oidc");
+}
+
+/**
  * Report every persisted account that can be restored on launch (FR-8, AD-20).
  * Identity only — the Rust core lists the registry rows and returns each whose
  * Keychain session is present as a non-secret {@link AccountVm} (with hue).

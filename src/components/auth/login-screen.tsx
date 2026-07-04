@@ -1,11 +1,11 @@
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import type { AccountVm, IpcError, IpcErrorCode } from "@/lib/ipc/client";
-import { loginPassword } from "@/lib/ipc/client";
+import { cancelOidc, loginOidc, loginPassword } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 
 /** Documentation link surfaced for the non-SSS error (Design Notes). */
@@ -30,6 +30,12 @@ function errorCopy(code: FormErrorCode): string {
       return "Couldn't reach that homeserver. Check the address and your connection.";
     case "unsupportedLoginType":
       return "This homeserver doesn't support password login.";
+    case "oauthUnsupported":
+      return "This homeserver doesn't offer single sign-on (OIDC).";
+    case "oauthTimedOut":
+      return "Single sign-on timed out. It wasn't completed in the browser in time.";
+    case "oauthFailed":
+      return "Single sign-on didn't complete. Please try again.";
     default:
       return "Something went wrong signing in. Please try again.";
   }
@@ -72,6 +78,28 @@ export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) 
   const [password, setPassword] = useState("");
   const [errorCode, setErrorCode] = useState<FormErrorCode | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // `true` while an OIDC flow is pending (the browser round-trip). The form is
+  // replaced with a "complete sign-in in your browser" state + Cancel.
+  const [oidcPending, setOidcPending] = useState(false);
+
+  // Mirror `oidcPending` into a ref so the unmount cleanup can read the latest
+  // value without re-subscribing.
+  const oidcPendingRef = useRef(false);
+  useEffect(() => {
+    oidcPendingRef.current = oidcPending;
+  }, [oidcPending]);
+  // On unmount (e.g. the add-account overlay is dismissed mid-flow), abort any
+  // still-pending OIDC flow so no orphaned backend flow lingers until timeout.
+  useEffect(
+    () => () => {
+      if (oidcPendingRef.current) {
+        void cancelOidc().catch(() => {
+          // Best-effort: the backend flow also times out on its own.
+        });
+      }
+    },
+    [],
+  );
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -103,6 +131,42 @@ export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) 
     }
   }
 
+  async function handleOidc() {
+    setErrorCode(null);
+    // The homeserver is the only field OIDC needs; guard blank input.
+    const trimmedHomeserver = homeserver.trim();
+    if (trimmedHomeserver === "") {
+      setErrorCode("missingFields");
+      return;
+    }
+    setOidcPending(true);
+    try {
+      const account: AccountVm = await loginOidc(trimmedHomeserver);
+      addAccount(account);
+      onDone?.();
+    } catch (err) {
+      // A user cancel returns quietly to the form (no scary error); every other
+      // named failure renders inline with Retry.
+      if (isIpcError(err) && err.code === "oauthCancelled") {
+        // no-op: fall through to the form
+      } else {
+        setErrorCode(isIpcError(err) ? err.code : "internal");
+      }
+    } finally {
+      setOidcPending(false);
+    }
+  }
+
+  async function handleCancelOidc() {
+    // Ask the backend to abort the pending flow; the pending `loginOidc` above
+    // then rejects with `oauthCancelled` and we return to the form.
+    try {
+      await cancelOidc();
+    } catch {
+      // Best-effort: even if the cancel command fails, the flow will time out.
+    }
+  }
+
   return (
     <div className="flex h-screen items-center justify-center bg-background p-6 text-foreground">
       <Card className="w-full max-w-sm">
@@ -115,80 +179,92 @@ export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) 
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <form className="flex flex-col gap-4" onSubmit={handleSubmit} noValidate>
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="homeserver">Homeserver</Label>
-              <Input
-                id="homeserver"
-                name="homeserver"
-                type="text"
-                autoComplete="url"
-                placeholder="example.org"
-                value={homeserver}
-                onChange={(e) => setHomeserver(e.target.value)}
-                required
-              />
-            </div>
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="username">Username</Label>
-              <Input
-                id="username"
-                name="username"
-                type="text"
-                autoComplete="username"
-                placeholder="alice"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                required
-              />
-            </div>
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="password">Password</Label>
-              <Input
-                id="password"
-                name="password"
-                type="password"
-                autoComplete="current-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-              />
-            </div>
-
-            {errorCode && (
-              <Alert variant="destructive" className="bg-destructive/10">
-                <AlertTitle>Couldn't sign in</AlertTitle>
-                <AlertDescription>
-                  {errorCopy(errorCode)}
-                  {errorCode === "slidingSyncUnsupported" && (
-                    <>
-                      {" "}
-                      <a href={SSS_DOC_URL} target="_blank" rel="noreferrer">
-                        Learn more about Simplified Sliding Sync
-                      </a>
-                      .
-                    </>
-                  )}
-                </AlertDescription>
-              </Alert>
-            )}
-
-            <div className="flex flex-col gap-2">
-              <Button type="submit" disabled={submitting}>
-                {submitting ? "Signing in…" : addMode ? "Add account" : "Sign in"}
+          {oidcPending ? (
+            <div className="flex flex-col gap-4">
+              <p className="text-sm text-muted-foreground">Complete sign-in in your browser…</p>
+              <Button type="button" variant="outline" onClick={handleCancelOidc}>
+                Cancel
               </Button>
-              {addMode && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  disabled={submitting}
-                  onClick={() => onDone?.()}
-                >
-                  Cancel
-                </Button>
-              )}
             </div>
-          </form>
+          ) : (
+            <form className="flex flex-col gap-4" onSubmit={handleSubmit} noValidate>
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="homeserver">Homeserver</Label>
+                <Input
+                  id="homeserver"
+                  name="homeserver"
+                  type="text"
+                  autoComplete="url"
+                  placeholder="example.org"
+                  value={homeserver}
+                  onChange={(e) => setHomeserver(e.target.value)}
+                  required
+                />
+              </div>
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="username">Username</Label>
+                <Input
+                  id="username"
+                  name="username"
+                  type="text"
+                  autoComplete="username"
+                  placeholder="alice"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  required
+                />
+              </div>
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="password">Password</Label>
+                <Input
+                  id="password"
+                  name="password"
+                  type="password"
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  required
+                />
+              </div>
+
+              {errorCode && (
+                <Alert variant="destructive" className="bg-destructive/10">
+                  <AlertTitle>Couldn't sign in</AlertTitle>
+                  <AlertDescription>
+                    {errorCopy(errorCode)}
+                    {errorCode === "slidingSyncUnsupported" && (
+                      <>
+                        {" "}
+                        <a href={SSS_DOC_URL} target="_blank" rel="noreferrer">
+                          Learn more about Simplified Sliding Sync
+                        </a>
+                        .
+                      </>
+                    )}
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              <div className="flex flex-col gap-2">
+                <Button type="submit" disabled={submitting}>
+                  {submitting ? "Signing in…" : addMode ? "Add account" : "Sign in"}
+                </Button>
+                <Button type="button" variant="outline" disabled={submitting} onClick={handleOidc}>
+                  Sign in with single sign-on
+                </Button>
+                {addMode && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={submitting}
+                    onClick={() => onDone?.()}
+                  >
+                    Cancel
+                  </Button>
+                )}
+              </div>
+            </form>
+          )}
         </CardContent>
       </Card>
     </div>

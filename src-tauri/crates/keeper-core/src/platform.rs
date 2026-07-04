@@ -33,6 +33,13 @@ pub trait Platform: Send + Sync {
     /// Wired in Story 1.3 via the shell's `DesktopPlatform` (macOS Keychain).
     fn keychain_delete(&self, key: &str) -> Result<(), CoreError>;
 
+    /// Open `url` in the user's default system browser (Story 2.2, OIDC login).
+    ///
+    /// Used by the OIDC `AuthProvider` to present the OAuth authorization URL for
+    /// browser consent. Kept as a port so `keeper-core` stays tauri-free — the
+    /// concrete browser-open lives in the `keeper` shell.
+    fn open_url(&self, url: &str) -> Result<(), CoreError>;
+
     /// Post a desktop notification (title + body).
     /// Not wired in Story 1.1 — returns [`CoreError::Unsupported`].
     fn notify(&self, title: &str, body: &str) -> Result<(), CoreError>;

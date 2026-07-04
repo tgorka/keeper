@@ -22,6 +22,8 @@ matrix-sdk = { workspace = true }
 matrix-sdk-ui = { workspace = true }
 # Async stream adapters for the room-list producer task.
 futures-util = { workspace = true }
+# URL parsing for the OIDC callback registry and OAuth redirect metadata.
+url = { workspace = true }
 # Account registry (keeper.db, WAL) and opaque ULID account ids.
 rusqlite = { workspace = true }
 ulid = { workspace = true }

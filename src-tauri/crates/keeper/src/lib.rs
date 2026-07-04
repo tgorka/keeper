@@ -7,17 +7,38 @@
 
 mod ipc;
 
+use tauri::Manager;
+use tauri_plugin_deep_link::DeepLinkExt;
+
 /// Application entry point. Registers the plugin set and the typed IPC command
 /// surface, then runs the Tauri event loop.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_deep_link::init())
         .manage(ipc::AppState::new())
+        .setup(|app| {
+            // Forward every incoming `keeper://oauth/callback` deep link to the
+            // OAuth-callback registry, which matches it to its in-flight OIDC
+            // flow by the `state` query param (Story 2.2). An unmatched / spurious
+            // callback is ignored inside `resolve`. The registry lives in the
+            // managed `AppState` and is cloned into the `'static` handler.
+            let flows = app.state::<ipc::AppState>().oauth_flows.clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    let handled = flows.resolve(url.as_str());
+                    tracing::debug!(handled, "deep-link: received keeper:// URL");
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             ipc::app_ping,
             ipc::demo_subscribe,
             ipc::login_password,
+            ipc::login_oidc,
+            ipc::cancel_oidc,
             ipc::room_list_subscribe,
             ipc::room_list_unsubscribe,
             ipc::timeline_subscribe,

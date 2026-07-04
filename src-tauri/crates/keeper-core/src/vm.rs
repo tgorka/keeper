@@ -46,6 +46,22 @@ pub enum IpcErrorCode {
     ServerUnreachable,
     /// The homeserver does not offer password login (`m.login.password`).
     UnsupportedLoginType,
+    /// The homeserver does not offer OIDC (OAuth 2.0 / MSC3861) login.
+    /// Non-retriable — the user must pick a different login mechanism.
+    /// Serializes as `"oauthUnsupported"`.
+    OauthUnsupported,
+    /// The OIDC browser round-trip did not complete before the timeout.
+    /// Retriable — the sign-in may be started again. Serializes as
+    /// `"oauthTimedOut"`.
+    OauthTimedOut,
+    /// The user cancelled the in-progress OIDC flow. Retriable — the sign-in may
+    /// be started again; the UI returns quietly to the form. Serializes as
+    /// `"oauthCancelled"`.
+    OauthCancelled,
+    /// The OIDC flow failed (a server `error=` callback or a token-exchange
+    /// failure). Retriable — the sign-in may be started again. Serializes as
+    /// `"oauthFailed"`.
+    OauthFailed,
     /// The account could not start (or continue) syncing: the persisted session
     /// was missing, session restore failed, or `SyncService` failed to start.
     /// Retriable — the subscribe may be attempted again.
@@ -659,6 +675,23 @@ mod tests {
             serde_json::to_string(&IpcErrorCode::UnsupportedLoginType)
                 .expect("serialize login-type code"),
             "\"unsupportedLoginType\""
+        );
+        // Story 2.2 OIDC codes — locked to the frontend wire contract.
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::OauthUnsupported).expect("serialize oauth-unsup"),
+            "\"oauthUnsupported\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::OauthTimedOut).expect("serialize oauth-timeout"),
+            "\"oauthTimedOut\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::OauthCancelled).expect("serialize oauth-cancel"),
+            "\"oauthCancelled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::OauthFailed).expect("serialize oauth-failed"),
+            "\"oauthFailed\""
         );
     }
 

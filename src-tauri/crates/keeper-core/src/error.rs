@@ -53,6 +53,29 @@ pub enum AuthError {
     /// keeper requires. Detected before any persistent state is created.
     #[error("homeserver does not support Simplified Sliding Sync")]
     SlidingSyncUnsupported,
+
+    /// The homeserver does not offer OAuth 2.0 / MSC3861 delegated auth, so an
+    /// OIDC (single sign-on) login cannot be performed. Detected before any
+    /// persistent state is created; non-retriable.
+    #[error("homeserver does not support OIDC (OAuth 2.0 / MSC3861) login")]
+    OAuthUnsupported,
+
+    /// The OIDC browser round-trip did not complete before the timeout (the
+    /// browser was abandoned / the callback never arrived). Retriable.
+    #[error("single sign-on timed out; the sign-in was not completed in time")]
+    OAuthTimedOut,
+
+    /// The user cancelled the in-progress OIDC flow (explicit Cancel). Not a
+    /// scary error — the UI returns quietly to the form. Retriable.
+    #[error("single sign-on was cancelled")]
+    OAuthCancelled,
+
+    /// The OIDC flow failed. The wrapped string is a non-secret description of
+    /// the failure (e.g. a server `error=` callback param or an exchange
+    /// failure) — it never contains the authorization `code`, `state`, tokens,
+    /// or session material. Retriable.
+    #[error("single sign-on failed: {0}")]
+    OAuthFailed(String),
 }
 
 /// Errors originating in account activation / room-list supervision (AD-19,
