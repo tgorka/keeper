@@ -9,20 +9,25 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use keeper_core::account::AccountManager;
 use keeper_core::auth;
 use keeper_core::demo::snapshot_then_diff;
-use keeper_core::error::{AuthError, CoreError, PlatformError};
+use keeper_core::error::{AccountError, AuthError, CoreError, PlatformError};
 use keeper_core::platform::Platform;
-use keeper_core::vm::{AccountVm, DemoBatch, IpcError, IpcErrorCode, PingVm};
+use keeper_core::vm::{AccountVm, DemoBatch, IpcError, IpcErrorCode, PingVm, RoomListBatch};
 use tauri::ipc::Channel;
 use tauri::State;
 
-/// Tauri-managed application state holding the injected platform port.
+/// Tauri-managed application state holding the injected platform port and the
+/// single-account supervisor.
 ///
 /// Keeps the concrete [`Platform`] behind a trait object so the command layer
-/// depends only on the port, never a concrete type (AD-24).
+/// depends only on the port, never a concrete type (AD-24). The
+/// [`AccountManager`] owns the live `Client`/`SyncService` and per-subscription
+/// tasks (AD-19).
 pub struct AppState {
     pub platform: Box<dyn Platform>,
+    pub accounts: AccountManager,
 }
 
 impl AppState {
@@ -30,6 +35,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             platform: Box::new(DesktopPlatform),
+            accounts: AccountManager::new(),
         }
     }
 }
@@ -121,6 +127,13 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         CoreError::Auth(AuthError::SlidingSyncUnsupported) => {
             (IpcErrorCode::SlidingSyncUnsupported, false)
         }
+        // Any account activation / sync-start failure is retriable: the
+        // frontend can attempt the subscribe again.
+        CoreError::Account(
+            AccountError::SessionMissing
+            | AccountError::RestoreFailed(_)
+            | AccountError::SyncStart(_),
+        ) => (IpcErrorCode::SyncUnavailable, true),
     };
     IpcError {
         code,
@@ -198,6 +211,41 @@ pub async fn login_password(
         .map_err(to_ipc_error)
 }
 
+/// Subscribe to an account's sliding-sync room list (FR-8, AD-8/9/19/20).
+///
+/// Lazily activates the account (session restore + `SyncService`), then streams
+/// [`RoomListBatch`]es over `channel` — a `Reset` snapshot first, then diffs —
+/// and returns the subscription id. The sink forwards each batch to the channel;
+/// a closed channel simply drops the batch (the frontend has unsubscribed).
+#[tauri::command]
+pub async fn room_list_subscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    channel: Channel<RoomListBatch>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |batch: RoomListBatch| channel.send(batch).is_ok());
+    state
+        .accounts
+        .subscribe_room_list(state.platform.as_ref(), &account_id, sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unsubscribe exactly one room-list subscription, aborting its producer task
+/// (AD-19). Other account state is untouched. Idempotent.
+#[tauri::command]
+pub async fn room_list_unsubscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_room_list(&account_id, subscription_id)
+        .await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +319,30 @@ mod tests {
         let ipc = to_ipc_error(CoreError::Auth(AuthError::SlidingSyncUnsupported));
         assert_eq!(ipc.code, IpcErrorCode::SlidingSyncUnsupported);
         assert!(!ipc.retriable);
+    }
+
+    #[test]
+    fn account_session_missing_maps_to_retriable_sync_unavailable() {
+        let ipc = to_ipc_error(CoreError::Account(AccountError::SessionMissing));
+        assert_eq!(ipc.code, IpcErrorCode::SyncUnavailable);
+        assert!(ipc.retriable, "sync unavailable should be retriable");
+    }
+
+    #[test]
+    fn account_restore_failed_maps_to_retriable_sync_unavailable() {
+        let ipc = to_ipc_error(CoreError::Account(AccountError::RestoreFailed(
+            "boom".to_owned(),
+        )));
+        assert_eq!(ipc.code, IpcErrorCode::SyncUnavailable);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn account_sync_start_maps_to_retriable_sync_unavailable() {
+        let ipc = to_ipc_error(CoreError::Account(AccountError::SyncStart(
+            "boom".to_owned(),
+        )));
+        assert_eq!(ipc.code, IpcErrorCode::SyncUnavailable);
+        assert!(ipc.retriable);
     }
 }

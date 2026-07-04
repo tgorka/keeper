@@ -30,6 +30,8 @@ describe("App", () => {
     render(<App />);
     expect(screen.getByRole("navigation", { name: "Views" })).toBeInTheDocument();
     expect(screen.getByRole("main")).toBeInTheDocument();
-    expect(screen.getByText("Synced. No conversations yet.")).toBeInTheDocument();
+    // The room-list subscribe has not delivered a batch yet, so the chat list
+    // sits in its loading state.
+    expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
   });
 });

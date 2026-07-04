@@ -15,8 +15,12 @@ export type { DemoItem } from "./gen/DemoItem";
 export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { PingVm } from "./gen/PingVm";
+export type { RoomListBatch } from "./gen/RoomListBatch";
+export type { RoomListOp } from "./gen/RoomListOp";
+export type { RoomVm } from "./gen/RoomVm";
 
 import type { AccountVm } from "./gen/AccountVm";
+import type { RoomListBatch } from "./gen/RoomListBatch";
 
 /**
  * Structural guard for the {@link IpcError} envelope so we can rethrow it
@@ -88,4 +92,26 @@ export async function subscribe<TBatch>(
   // before the handler is set would be dropped. Keep this order when copying.
   channel.onmessage = onBatch;
   return await invoke<number>(cmd, { ...args, channel });
+}
+
+/**
+ * Subscribe to an account's sliding-sync room list (FR-8, AD-8). Opens a
+ * `Channel`, forwards each {@link RoomListBatch} to `onBatch` in arrival order
+ * (a `Reset` snapshot before any diff), and resolves with the subscription id.
+ * Rejects with the {@link IpcError} envelope (`code: "syncUnavailable"`) if the
+ * account cannot start syncing.
+ */
+export async function subscribeRoomList(
+  accountId: string,
+  onBatch: (batch: RoomListBatch) => void,
+): Promise<number> {
+  return await subscribe<RoomListBatch>("room_list_subscribe", onBatch, { accountId });
+}
+
+/**
+ * Unsubscribe exactly one room-list subscription, aborting its backend producer
+ * task (AD-19). Idempotent — unsubscribing an unknown id is a no-op.
+ */
+export async function unsubscribeRoomList(accountId: string, id: number): Promise<void> {
+  await invoke<void>("room_list_unsubscribe", { accountId, subscriptionId: id });
 }

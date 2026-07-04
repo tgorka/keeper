@@ -2808,6 +2808,7 @@ dependencies = [
 name = "keeper-core"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "matrix-sdk",
  "matrix-sdk-ui",
  "rusqlite",

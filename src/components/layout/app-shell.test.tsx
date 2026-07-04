@@ -6,13 +6,15 @@ describe("AppShell", () => {
   it("renders the semantic landmarks", () => {
     render(<AppShell />);
     expect(screen.getByRole("navigation", { name: "Views" })).toBeInTheDocument();
-    expect(screen.getByRole("list", { name: "Conversations" })).toBeInTheDocument();
+    // With no account set, the chat list pane sits in its loading state.
+    expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
     expect(screen.getByRole("main")).toBeInTheDocument();
   });
 
   it("renders the placeholder copy without any Matrix data", () => {
     render(<AppShell />);
-    expect(screen.getByText("Synced. No conversations yet.")).toBeInTheDocument();
+    // No account → the chat list is in its loading state (not the empty state).
+    expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
     expect(screen.getByText("Select a conversation to start reading.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Chats" })).toBeInTheDocument();
   });

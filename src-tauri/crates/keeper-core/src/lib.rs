@@ -5,6 +5,7 @@
 //! dependency anywhere in its tree. New backend code defaults into this crate;
 //! the `keeper` shell holds only IPC/plugin/protocol glue.
 
+pub mod account;
 pub mod auth;
 pub mod demo;
 pub mod error;

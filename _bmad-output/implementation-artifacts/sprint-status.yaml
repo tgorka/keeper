@@ -52,7 +52,7 @@ development_status:
   1-1-cargo-workspace-split-and-typed-ipc-foundation: done
   1-2-app-shell-three-pane-frame-and-keeper-theme: done
   1-3-password-login-with-sliding-sync-verification: done
-  1-4-sliding-sync-room-list: backlog
+  1-4-sliding-sync-room-list: done
   1-5-timeline-view-receive-text: backlog
   1-6-send-text-with-local-echo-and-visible-send-states: backlog
   1-7-offline-resilience-queued-sends-and-reconnect-convergence: backlog

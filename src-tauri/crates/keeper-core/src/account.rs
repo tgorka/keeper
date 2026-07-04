@@ -1,0 +1,653 @@
+//! Single-account supervision and the sliding-sync room-list producer (AD-8,
+//! AD-9, AD-19, AD-20).
+//!
+//! The [`AccountManager`] is a single-account-capable holder keyed by
+//! `account_id`. A room-list subscribe lazily *activates* the account — it
+//! restores the persisted `MatrixSession` from the Keychain, rebuilds the
+//! `Client` against its existing SQLite store, and starts a `SyncService` +
+//! `RoomListService` under a supervised tokio task (this is also the Story 1.8
+//! cold-start restore path). Activation is idempotent: a second subscribe reuses
+//! the live account, never a second `Client`/`SyncService`.
+//!
+//! Ordering is owned entirely by the SDK. `entries_with_dynamic_adapters`
+//! yields a recency-sorted `VectorDiff` sequence; keeper converts each item to a
+//! [`RoomVm`] and forwards the diff verbatim as a [`RoomListOp`] — nothing is
+//! sorted here or in TypeScript (AD-20). No token, session, or message
+//! plaintext beyond the rendered preview crosses IPC or reaches a `tracing` log
+//! (NFR-9).
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use futures_util::StreamExt;
+use matrix_sdk::authentication::matrix::MatrixSession;
+use matrix_sdk::ruma::events::{
+    AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
+};
+use matrix_sdk::store::RoomLoadSettings;
+use matrix_sdk::Client;
+use matrix_sdk_ui::eyeball_im::VectorDiff;
+use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
+use matrix_sdk_ui::room_list_service::{RoomList, RoomListItem, RoomListLoadingState};
+use matrix_sdk_ui::sync_service::SyncService;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+
+use crate::auth::session_keychain_key;
+use crate::error::{AccountError, CoreError};
+use crate::platform::Platform;
+use crate::registry;
+use crate::vm::{RoomListBatch, RoomListOp, RoomVm};
+
+/// Number of rooms in the initial fixed window (seeded windowing per AD-20).
+const ROOM_LIST_PAGE_SIZE: usize = 200;
+
+/// Defensive upper bound on a rendered message preview before it crosses IPC.
+const MAX_PREVIEW_CHARS: usize = 256;
+
+/// Sink that receives each produced [`RoomListBatch`]. The shell wraps a Tauri
+/// `Channel::send`; tests capture into a vector. Returns `true` if the batch was
+/// delivered, `false` if the channel is closed (the producer then stops).
+pub type BatchSink = Box<dyn Fn(RoomListBatch) -> bool + Send + Sync>;
+
+/// A live, supervised account: its `Client`, `SyncService`, and the abort
+/// handles of its room-list subscriptions.
+struct AccountHandle {
+    client: Client,
+    sync: std::sync::Arc<SyncService>,
+    /// Live subscriptions, keyed by subscription id → the producer task.
+    subscriptions: Arc<Mutex<HashMap<u64, JoinHandle<()>>>>,
+}
+
+/// Single-account-capable supervisor (AD-19). Owns the live account state; the
+/// shell manages exactly one instance in its `AppState`.
+#[derive(Default)]
+pub struct AccountManager {
+    accounts: Mutex<HashMap<String, AccountHandle>>,
+}
+
+/// Monotonic source of subscription ids handed back to the frontend.
+static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+
+impl AccountManager {
+    /// Construct an empty manager with no live accounts.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Subscribe to the account's room list, activating the account if it is not
+    /// already live. Spawns a supervised producer task that emits a `Reset`
+    /// snapshot batch first, then diff batches, into `sink`. Returns the new
+    /// subscription id.
+    pub async fn subscribe_room_list(
+        &self,
+        platform: &dyn Platform,
+        account_id: &str,
+        sink: BatchSink,
+    ) -> Result<u64, CoreError> {
+        // Activate under the manager lock so a concurrent subscribe cannot build
+        // a second Client/SyncService for the same account. `did_activate`
+        // records whether *this* call brought the account live, so a failure
+        // before any subscription attaches can tear it back down.
+        let (client, sync, subs_arc, did_activate) = {
+            let mut accounts = self.accounts.lock().await;
+            let did_activate = !accounts.contains_key(account_id);
+            if did_activate {
+                let (client, sync) = activate(platform, account_id).await?;
+                accounts.insert(
+                    account_id.to_owned(),
+                    AccountHandle {
+                        client,
+                        sync,
+                        subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                    },
+                );
+                tracing::info!(account_id = %account_id, "account activated for room list");
+            }
+            let handle = accounts.get(account_id).ok_or_else(|| {
+                CoreError::Internal("account handle vanished after activation".to_owned())
+            })?;
+            (
+                handle.client.clone(),
+                handle.sync.clone(),
+                handle.subscriptions.clone(),
+                did_activate,
+            )
+        };
+
+        let room_list = match sync.room_list_service().all_rooms().await {
+            Ok(room_list) => room_list,
+            Err(e) => {
+                // Don't leave a partial live account running (AD-21: "no partial
+                // live account is retained"). If this call just activated the
+                // account and nothing else has attached a subscription yet, stop
+                // its SyncService and drop the handle. The emptiness guard keeps
+                // a racing sibling subscribe's live subscription intact.
+                if did_activate {
+                    let mut accounts = self.accounts.lock().await;
+                    let should_remove = match accounts.get(account_id) {
+                        Some(handle) => handle.subscriptions.lock().await.is_empty(),
+                        None => false,
+                    };
+                    if should_remove {
+                        if let Some(dead) = accounts.remove(account_id) {
+                            dead.sync.stop().await;
+                            tracing::info!(
+                                account_id = %account_id,
+                                "torn down partial account after room-list start failure"
+                            );
+                        }
+                    }
+                }
+                return Err(AccountError::SyncStart(e.to_string()).into());
+            }
+        };
+
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let account_id_owned = account_id.to_owned();
+        let reaper_subs = subs_arc.clone();
+        let task = tokio::spawn(async move {
+            // `client` is captured to keep the account alive for the task's
+            // lifetime; the producer reads from the room list only.
+            let _keep_alive = client;
+            run_producer(room_list, sink, &account_id_owned).await;
+            // A naturally-completed producer reaps its own subscription entry.
+            reaper_subs.lock().await.remove(&subscription_id);
+        });
+
+        {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(_) => {
+                    subs_arc.lock().await.insert(subscription_id, task);
+                }
+                None => {
+                    task.abort();
+                    return Err(AccountError::SyncStart(
+                        "account removed during subscribe".to_owned(),
+                    )
+                    .into());
+                }
+            }
+        }
+        tracing::info!(account_id = %account_id, subscription_id, "room list subscribed");
+        Ok(subscription_id)
+    }
+
+    /// Abort exactly the producer task for `subscription_id`; other account
+    /// state is untouched. Idempotent — unsubscribing an unknown id is a no-op.
+    pub async fn unsubscribe_room_list(&self, account_id: &str, subscription_id: u64) {
+        let accounts = self.accounts.lock().await;
+        if let Some(handle) = accounts.get(account_id) {
+            if let Some(task) = handle.subscriptions.lock().await.remove(&subscription_id) {
+                task.abort();
+                tracing::info!(account_id = %account_id, subscription_id, "room list unsubscribed");
+            }
+        }
+    }
+
+    /// Tear down the whole account: abort every subscription and drop the live
+    /// `Client`/`SyncService`.
+    pub async fn shutdown(&self, account_id: &str) {
+        let mut accounts = self.accounts.lock().await;
+        if let Some(handle) = accounts.remove(account_id) {
+            // Stop the SyncService first so no further diffs are produced, then
+            // abort any remaining producer tasks.
+            handle.sync.stop().await;
+            let mut subs = handle.subscriptions.lock().await;
+            for (_, task) in subs.drain() {
+                task.abort();
+            }
+            tracing::info!(account_id = %account_id, "account shut down");
+        }
+    }
+}
+
+/// Lazily rebuild the `Client` from the persisted session and start a
+/// `SyncService`. Also the Story 1.8 cold-start restore path.
+async fn activate(
+    platform: &dyn Platform,
+    account_id: &str,
+) -> Result<(Client, std::sync::Arc<SyncService>), CoreError> {
+    let session_json = platform
+        .keychain_get(&session_keychain_key(account_id))?
+        .ok_or(AccountError::SessionMissing)?;
+    let session: MatrixSession = serde_json::from_str(&session_json)
+        .map_err(|e| AccountError::RestoreFailed(format!("could not read stored session: {e}")))?;
+
+    let data_dir = platform.data_dir()?;
+    let row = registry::get_account(&data_dir, account_id)?.ok_or(AccountError::SessionMissing)?;
+    let sdk_dir = data_dir.join("accounts").join(account_id).join("sdk");
+
+    let client = Client::builder()
+        .homeserver_url(&row.homeserver_url)
+        .sqlite_store(&sdk_dir, None)
+        .build()
+        .await
+        .map_err(|e| AccountError::RestoreFailed(e.to_string()))?;
+
+    client
+        .matrix_auth()
+        .restore_session(session, RoomLoadSettings::default())
+        .await
+        .map_err(|e| AccountError::RestoreFailed(e.to_string()))?;
+
+    let sync = SyncService::builder(client.clone())
+        .build()
+        .await
+        .map_err(|e| AccountError::SyncStart(e.to_string()))?;
+    sync.start().await;
+
+    Ok((client, std::sync::Arc::new(sync)))
+}
+
+/// Drive the recency-sorted entries stream, converting each `VectorDiff` batch
+/// into a [`RoomListBatch`] and forwarding it to `sink`. The stream yields
+/// nothing until the filter is set, then a `Reset` and live diffs.
+async fn run_producer(room_list: RoomList, sink: BatchSink, account_id: &str) {
+    let mut loading_state = room_list.loading_state();
+    let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
+    if !controller.set_filter(Box::new(new_filter_non_left())) {
+        tracing::warn!(account_id = %account_id, "room list filter not applied (stream dropped)");
+        return;
+    }
+    // Keep the controller alive for the stream's lifetime; dropping it would
+    // terminate the entries stream.
+    let _controller = controller;
+
+    let mut total = loaded_total(&loading_state.get());
+    // Once the loading-state stream terminates, its `select!` branch is disabled
+    // so it is never re-polled after returning `None`.
+    let mut loading_done = false;
+
+    futures_util::pin_mut!(stream);
+    loop {
+        tokio::select! {
+            maybe_diffs = stream.next() => {
+                match maybe_diffs {
+                    Some(diffs) => {
+                        let mut ops = Vec::with_capacity(diffs.len());
+                        for diff in diffs {
+                            ops.push(diff_to_op(diff).await);
+                        }
+                        if !(sink)(RoomListBatch { ops, total }) {
+                            tracing::info!(account_id = %account_id, "room list channel closed, stopping producer");
+                            break;
+                        }
+                    }
+                    None => {
+                        tracing::info!(account_id = %account_id, "room list stream ended");
+                        break;
+                    }
+                }
+            }
+            maybe_state = loading_state.next(), if !loading_done => {
+                match maybe_state {
+                    Some(state) => total = loaded_total(&state),
+                    None => loading_done = true,
+                }
+            }
+        }
+    }
+}
+
+/// Extract the known room total from a [`RoomListLoadingState`], if loaded.
+fn loaded_total(state: &RoomListLoadingState) -> Option<u32> {
+    match state {
+        RoomListLoadingState::Loaded {
+            maximum_number_of_rooms,
+        } => *maximum_number_of_rooms,
+        RoomListLoadingState::NotLoaded => None,
+    }
+}
+
+/// Convert a `VectorDiff<RoomListItem>` into a [`RoomListOp`], resolving each
+/// carried item to a [`RoomVm`] (async) before delegating to the pure
+/// [`vector_diff_to_op`] seam.
+async fn diff_to_op(diff: VectorDiff<RoomListItem>) -> RoomListOp {
+    let mapped = map_vector_diff(diff).await;
+    vector_diff_to_op(mapped)
+}
+
+/// Map every `RoomListItem` in a diff to a [`RoomVm`], preserving the variant.
+///
+/// Kept separate from [`vector_diff_to_op`] because item→VM conversion is async
+/// (display name / latest event) while the diff→op conversion is pure.
+async fn map_vector_diff(diff: VectorDiff<RoomListItem>) -> VectorDiff<RoomVm> {
+    match diff {
+        VectorDiff::Append { values } => {
+            let mut vms = Vec::with_capacity(values.len());
+            for item in values {
+                vms.push(room_item_to_vm(&item).await);
+            }
+            VectorDiff::Append { values: vms.into() }
+        }
+        VectorDiff::Clear => VectorDiff::Clear,
+        VectorDiff::PushFront { value } => VectorDiff::PushFront {
+            value: room_item_to_vm(&value).await,
+        },
+        VectorDiff::PushBack { value } => VectorDiff::PushBack {
+            value: room_item_to_vm(&value).await,
+        },
+        VectorDiff::PopFront => VectorDiff::PopFront,
+        VectorDiff::PopBack => VectorDiff::PopBack,
+        VectorDiff::Insert { index, value } => VectorDiff::Insert {
+            index,
+            value: room_item_to_vm(&value).await,
+        },
+        VectorDiff::Set { index, value } => VectorDiff::Set {
+            index,
+            value: room_item_to_vm(&value).await,
+        },
+        VectorDiff::Remove { index } => VectorDiff::Remove { index },
+        VectorDiff::Truncate { length } => VectorDiff::Truncate { length },
+        VectorDiff::Reset { values } => {
+            let mut vms = Vec::with_capacity(values.len());
+            for item in values {
+                vms.push(room_item_to_vm(&item).await);
+            }
+            VectorDiff::Reset { values: vms.into() }
+        }
+    }
+}
+
+/// Resolve a [`RoomListItem`] to a non-secret [`RoomVm`]: display name plus a
+/// latest-event text preview and timestamp.
+async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
+    let room_id = item.room_id().to_string();
+    let resolved = item.display_name().await;
+    if resolved.is_err() {
+        tracing::debug!(room_id = %room_id, "display name resolve failed, using fallback");
+    }
+    let display_name = resolved
+        .ok()
+        .map(|n| n.to_string())
+        .filter(|n| !n.trim().is_empty())
+        .or_else(|| {
+            item.cached_display_name()
+                .map(|n| n.to_string())
+                .filter(|n| !n.trim().is_empty())
+        })
+        .unwrap_or_else(|| room_id.clone());
+    let avatar_url = item.avatar_url().map(|u| u.to_string());
+    let (last_message, timestamp) = latest_event_preview(item);
+
+    RoomVm {
+        room_id,
+        display_name,
+        last_message,
+        timestamp,
+        avatar_url,
+    }
+}
+
+/// Extract the plain-text preview + timestamp from a room's latest event.
+///
+/// A remote `m.room.message` yields its body (truncated) and origin ts; every
+/// other event kind yields `None` for the preview and the room's latest-event
+/// timestamp when available. No SDK preview helper exists — this decodes the raw
+/// event directly.
+fn latest_event_preview(item: &RoomListItem) -> (Option<String>, Option<i64>) {
+    use matrix_sdk::latest_events::LatestEventValue;
+
+    let fallback_ts = item.latest_event_timestamp().map(|ts| ts.get().into());
+
+    match item.latest_event() {
+        LatestEventValue::Remote(event) => {
+            let event_ts = event.timestamp().map(|ts| ts.get().into());
+            decode_message_preview(event.raw(), event_ts, fallback_ts)
+        }
+        // Local / invite / none: no rendered remote-message preview.
+        _ => (None, fallback_ts),
+    }
+}
+
+/// Decode the preview + timestamp from a raw remote timeline event.
+///
+/// A remote `m.room.message` yields its truncated body; every other event kind
+/// yields `None`. In both cases the timestamp is the event's origin ts when
+/// present, else `fallback_ts`. Pure, so it is unit-testable without a live
+/// `Client`.
+fn decode_message_preview(
+    raw: &matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent>,
+    event_ts: Option<i64>,
+    fallback_ts: Option<i64>,
+) -> (Option<String>, Option<i64>) {
+    match raw.deserialize() {
+        Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+            SyncMessageLikeEvent::Original(original),
+        ))) => (
+            Some(truncate_preview(original.content.body())),
+            event_ts.or(fallback_ts),
+        ),
+        // Any other event kind: no text preview.
+        _ => (None, event_ts.or(fallback_ts)),
+    }
+}
+
+/// Truncate a preview to [`MAX_PREVIEW_CHARS`] characters (by `char`, so a
+/// multi-byte grapheme is never split mid-byte).
+fn truncate_preview(body: &str) -> String {
+    if body.chars().count() <= MAX_PREVIEW_CHARS {
+        body.to_owned()
+    } else {
+        body.chars().take(MAX_PREVIEW_CHARS).collect()
+    }
+}
+
+/// Pure conversion of an already-`RoomVm` `VectorDiff` into a [`RoomListOp`].
+///
+/// This is the unit-tested seam: it needs no live `Client`. Every eyeball-im
+/// variant maps one-to-one to the corresponding op.
+pub fn vector_diff_to_op(diff: VectorDiff<RoomVm>) -> RoomListOp {
+    match diff {
+        VectorDiff::Append { values } => RoomListOp::Append {
+            rooms: values.into_iter().collect(),
+        },
+        VectorDiff::Clear => RoomListOp::Clear,
+        VectorDiff::PushFront { value } => RoomListOp::PushFront { room: value },
+        VectorDiff::PushBack { value } => RoomListOp::PushBack { room: value },
+        VectorDiff::PopFront => RoomListOp::PopFront,
+        VectorDiff::PopBack => RoomListOp::PopBack,
+        VectorDiff::Insert { index, value } => RoomListOp::Insert {
+            index: index as u32,
+            room: value,
+        },
+        VectorDiff::Set { index, value } => RoomListOp::Set {
+            index: index as u32,
+            room: value,
+        },
+        VectorDiff::Remove { index } => RoomListOp::Remove {
+            index: index as u32,
+        },
+        VectorDiff::Truncate { length } => RoomListOp::Truncate {
+            length: length as u32,
+        },
+        VectorDiff::Reset { values } => RoomListOp::Reset {
+            rooms: values.into_iter().collect(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use matrix_sdk_ui::eyeball_im::Vector;
+
+    fn room(id: &str) -> RoomVm {
+        RoomVm {
+            room_id: id.to_owned(),
+            display_name: id.to_owned(),
+            last_message: None,
+            timestamp: None,
+            avatar_url: None,
+        }
+    }
+
+    #[test]
+    fn truncate_preview_keeps_short_bodies() {
+        assert_eq!(truncate_preview("hello"), "hello");
+    }
+
+    #[test]
+    fn truncate_preview_caps_long_bodies_by_char() {
+        let long = "x".repeat(MAX_PREVIEW_CHARS + 50);
+        let out = truncate_preview(&long);
+        assert_eq!(out.chars().count(), MAX_PREVIEW_CHARS);
+    }
+
+    #[test]
+    fn truncate_preview_does_not_split_multibyte_chars() {
+        let long = "é".repeat(MAX_PREVIEW_CHARS + 10);
+        let out = truncate_preview(&long);
+        assert_eq!(out.chars().count(), MAX_PREVIEW_CHARS);
+        // Valid UTF-8 (would panic on a mid-byte split).
+        assert!(out.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn loaded_total_reads_loaded_maximum() {
+        assert_eq!(
+            loaded_total(&RoomListLoadingState::Loaded {
+                maximum_number_of_rooms: Some(9),
+            }),
+            Some(9)
+        );
+        assert_eq!(loaded_total(&RoomListLoadingState::NotLoaded), None);
+    }
+
+    #[test]
+    fn op_reset() {
+        let diff = VectorDiff::Reset {
+            values: Vector::from_iter([room("a"), room("b")]),
+        };
+        assert_eq!(
+            vector_diff_to_op(diff),
+            RoomListOp::Reset {
+                rooms: vec![room("a"), room("b")],
+            }
+        );
+    }
+
+    #[test]
+    fn op_append() {
+        let diff = VectorDiff::Append {
+            values: Vector::from_iter([room("a")]),
+        };
+        assert_eq!(
+            vector_diff_to_op(diff),
+            RoomListOp::Append {
+                rooms: vec![room("a")],
+            }
+        );
+    }
+
+    #[test]
+    fn op_clear() {
+        assert_eq!(
+            vector_diff_to_op(VectorDiff::<RoomVm>::Clear),
+            RoomListOp::Clear
+        );
+    }
+
+    #[test]
+    fn op_push_front_and_back() {
+        assert_eq!(
+            vector_diff_to_op(VectorDiff::PushFront { value: room("a") }),
+            RoomListOp::PushFront { room: room("a") }
+        );
+        assert_eq!(
+            vector_diff_to_op(VectorDiff::PushBack { value: room("b") }),
+            RoomListOp::PushBack { room: room("b") }
+        );
+    }
+
+    #[test]
+    fn op_pop_front_and_back() {
+        assert_eq!(
+            vector_diff_to_op(VectorDiff::<RoomVm>::PopFront),
+            RoomListOp::PopFront
+        );
+        assert_eq!(
+            vector_diff_to_op(VectorDiff::<RoomVm>::PopBack),
+            RoomListOp::PopBack
+        );
+    }
+
+    #[test]
+    fn op_insert_and_set() {
+        assert_eq!(
+            vector_diff_to_op(VectorDiff::Insert {
+                index: 2,
+                value: room("a"),
+            }),
+            RoomListOp::Insert {
+                index: 2,
+                room: room("a"),
+            }
+        );
+        assert_eq!(
+            vector_diff_to_op(VectorDiff::Set {
+                index: 5,
+                value: room("b"),
+            }),
+            RoomListOp::Set {
+                index: 5,
+                room: room("b"),
+            }
+        );
+    }
+
+    #[test]
+    fn decode_message_preview_extracts_room_message_body() {
+        let raw: matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent> = serde_json::from_str(
+            r#"{
+                "type": "m.room.message",
+                "event_id": "$evt:example.org",
+                "sender": "@bob:example.org",
+                "origin_server_ts": 1000,
+                "content": { "msgtype": "m.text", "body": "hello" }
+            }"#,
+        )
+        .expect("valid raw timeline event");
+        let (preview, ts) = decode_message_preview(&raw, Some(1000), Some(500));
+        assert_eq!(preview, Some("hello".to_owned()));
+        assert_eq!(ts, Some(1000));
+    }
+
+    #[test]
+    fn decode_message_preview_ignores_non_message_events() {
+        let raw: matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent> = serde_json::from_str(
+            r#"{
+                "type": "m.reaction",
+                "event_id": "$rx:example.org",
+                "sender": "@bob:example.org",
+                "origin_server_ts": 1000,
+                "content": {
+                    "m.relates_to": {
+                        "rel_type": "m.annotation",
+                        "event_id": "$evt:example.org",
+                        "key": "👍"
+                    }
+                }
+            }"#,
+        )
+        .expect("valid raw timeline event");
+        let (preview, ts) = decode_message_preview(&raw, None, Some(500));
+        assert_eq!(preview, None);
+        assert_eq!(ts, Some(500));
+    }
+
+    #[test]
+    fn op_remove_and_truncate() {
+        assert_eq!(
+            vector_diff_to_op(VectorDiff::<RoomVm>::Remove { index: 4 }),
+            RoomListOp::Remove { index: 4 }
+        );
+        assert_eq!(
+            vector_diff_to_op(VectorDiff::<RoomVm>::Truncate { length: 3 }),
+            RoomListOp::Truncate { length: 3 }
+        );
+    }
+}

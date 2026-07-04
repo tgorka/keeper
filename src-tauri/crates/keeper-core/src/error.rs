@@ -55,6 +55,29 @@ pub enum AuthError {
     SlidingSyncUnsupported,
 }
 
+/// Errors originating in account activation / room-list supervision (AD-19,
+/// AD-21).
+///
+/// A secret-free taxonomy: no message ever contains a token, session material,
+/// or message plaintext. All variants map to `IpcErrorCode::SyncUnavailable`
+/// (retriable) in the shell's single funnel.
+#[derive(Debug, Error)]
+pub enum AccountError {
+    /// No persisted `MatrixSession` was found in the Keychain for this account.
+    #[error("no stored session for this account")]
+    SessionMissing,
+
+    /// Rebuilding the `Client` or restoring the session failed. The wrapped
+    /// string is a non-secret description of the failure.
+    #[error("could not restore the account session: {0}")]
+    RestoreFailed(String),
+
+    /// The `SyncService` (or its room list) failed to build or start. The
+    /// wrapped string is a non-secret description of the failure.
+    #[error("could not start syncing: {0}")]
+    SyncStart(String),
+}
+
 /// The hexagon error root. Every fallible core operation surfaces one of these.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -65,6 +88,10 @@ pub enum CoreError {
     /// A password login attempt failed with a named, actionable cause.
     #[error(transparent)]
     Auth(#[from] AuthError),
+
+    /// Account activation or room-list supervision failed.
+    #[error(transparent)]
+    Account(#[from] AccountError),
 
     /// A requested capability is not supported on this platform/build. Honest,
     /// non-panicking signal used by not-yet-wired [`crate::platform::Platform`]

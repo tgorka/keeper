@@ -46,6 +46,116 @@ pub enum IpcErrorCode {
     ServerUnreachable,
     /// The homeserver does not offer password login (`m.login.password`).
     UnsupportedLoginType,
+    /// The account could not start (or continue) syncing: the persisted session
+    /// was missing, session restore failed, or `SyncService` failed to start.
+    /// Retriable — the subscribe may be attempted again.
+    SyncUnavailable,
+}
+
+/// A single room row rendered in the chat list (FR-8, NFR-9, AD-20).
+///
+/// Carries **only** non-secret render data. `timestamp` is `i64` milliseconds
+/// since the Unix epoch (UTC) — never an ISO string. `lastMessage` is the
+/// plain-text body of the room's latest event when it is an `m.room.message`
+/// (text/notice/emote); `null` for any other event kind. No tokens, session
+/// material, or event ids cross IPC on this VM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RoomVm {
+    /// Opaque Matrix room id (passed through verbatim as a string).
+    pub room_id: String,
+    /// The SDK-computed room display name.
+    pub display_name: String,
+    /// Plain-text preview of the latest `m.room.message`, or `null`.
+    pub last_message: Option<String>,
+    /// Latest-event timestamp: ms since the Unix epoch (UTC), or `null`.
+    #[ts(type = "number | null")]
+    pub timestamp: Option<i64>,
+    /// Optional room avatar URL (an `mxc://` URI), or `null`.
+    pub avatar_url: Option<String>,
+}
+
+/// One index-based room-list operation mirroring an eyeball-im `VectorDiff`
+/// (AD-8, AD-20).
+///
+/// The SDK's `entries_with_dynamic_adapters` stream is recency-sorted; keeper
+/// forwards its `VectorDiff` sequence verbatim as these ops. The frontend
+/// applies them to a plain array by index and **never** re-sorts. Serialized as
+/// an internally tagged enum so the frontend can switch on `op`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[ts(export)]
+pub enum RoomListOp {
+    /// Full reset — replace the current contents with `rooms`.
+    Reset {
+        /// The complete current window, in order.
+        rooms: Vec<RoomVm>,
+    },
+    /// Append `rooms` to the end, in order.
+    Append {
+        /// Rooms to append.
+        rooms: Vec<RoomVm>,
+    },
+    /// Remove all rooms.
+    Clear,
+    /// Insert `room` at the front (index 0).
+    PushFront {
+        /// The room to prepend.
+        room: RoomVm,
+    },
+    /// Append `room` to the end.
+    PushBack {
+        /// The room to append.
+        room: RoomVm,
+    },
+    /// Remove the first room.
+    PopFront,
+    /// Remove the last room.
+    PopBack,
+    /// Insert `room` at `index`, shifting the tail right.
+    Insert {
+        /// The insertion index.
+        #[ts(type = "number")]
+        index: u32,
+        /// The room to insert.
+        room: RoomVm,
+    },
+    /// Replace the room at `index` in place.
+    Set {
+        /// The index to overwrite.
+        #[ts(type = "number")]
+        index: u32,
+        /// The replacement room.
+        room: RoomVm,
+    },
+    /// Remove the room at `index`, shifting the tail left.
+    Remove {
+        /// The index to remove.
+        #[ts(type = "number")]
+        index: u32,
+    },
+    /// Truncate the list to `length` rooms.
+    Truncate {
+        /// The new length.
+        #[ts(type = "number")]
+        length: u32,
+    },
+}
+
+/// A batch of room-list ops delivered over the subscription's `Channel` (AD-8).
+///
+/// The stream always opens with a batch whose first op is a
+/// [`RoomListOp::Reset`] carrying the current window, then diff batches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RoomListBatch {
+    /// The ordered ops to apply, in sequence.
+    pub ops: Vec<RoomListOp>,
+    /// The total number of rooms the server knows about, when known.
+    #[ts(type = "number | null")]
+    pub total: Option<u32>,
 }
 
 /// Non-secret account registry projection returned to the frontend on a
@@ -200,6 +310,98 @@ mod tests {
                 .expect("serialize login-type code"),
             "\"unsupportedLoginType\""
         );
+    }
+
+    #[test]
+    fn sync_unavailable_code_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::SyncUnavailable).expect("serialize sync code"),
+            "\"syncUnavailable\""
+        );
+    }
+
+    fn sample_room() -> RoomVm {
+        RoomVm {
+            room_id: "!abc:example.org".to_owned(),
+            display_name: "Alice".to_owned(),
+            last_message: Some("hi there".to_owned()),
+            timestamp: Some(1_720_000_000_000),
+            avatar_url: Some("mxc://example.org/av".to_owned()),
+        }
+    }
+
+    #[test]
+    fn room_vm_round_trips_camel_case() {
+        let vm = sample_room();
+        let json = serde_json::to_string(&vm).expect("serialize room vm");
+        assert!(json.contains("\"roomId\":"), "json was: {json}");
+        assert!(json.contains("\"displayName\":"), "json was: {json}");
+        assert!(json.contains("\"lastMessage\":"), "json was: {json}");
+        assert!(json.contains("\"avatarUrl\":"), "json was: {json}");
+        // No token/session material may appear on the VM.
+        assert!(!json.contains("token"), "json leaked a token field: {json}");
+        let back: RoomVm = serde_json::from_str(&json).expect("deserialize room vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn room_vm_null_fields_round_trip() {
+        let vm = RoomVm {
+            room_id: "!x:example.org".to_owned(),
+            display_name: "Room".to_owned(),
+            last_message: None,
+            timestamp: None,
+            avatar_url: None,
+        };
+        let json = serde_json::to_string(&vm).expect("serialize");
+        assert!(json.contains("\"lastMessage\":null"), "json was: {json}");
+        assert!(json.contains("\"timestamp\":null"), "json was: {json}");
+        let back: RoomVm = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn room_list_op_tags_and_round_trips() {
+        let reset = RoomListOp::Reset {
+            rooms: vec![sample_room()],
+        };
+        let json = serde_json::to_string(&reset).expect("serialize reset");
+        assert!(json.contains("\"op\":\"reset\""), "json was: {json}");
+        let back: RoomListOp = serde_json::from_str(&json).expect("deserialize reset");
+        assert_eq!(back, reset);
+
+        let insert = RoomListOp::Insert {
+            index: 3,
+            room: sample_room(),
+        };
+        let json = serde_json::to_string(&insert).expect("serialize insert");
+        assert!(json.contains("\"op\":\"insert\""), "json was: {json}");
+        assert!(json.contains("\"index\":3"), "json was: {json}");
+        let back: RoomListOp = serde_json::from_str(&json).expect("deserialize insert");
+        assert_eq!(back, insert);
+
+        let clear = RoomListOp::Clear;
+        assert_eq!(
+            serde_json::to_string(&clear).expect("serialize clear"),
+            "{\"op\":\"clear\"}"
+        );
+    }
+
+    #[test]
+    fn room_list_batch_round_trips() {
+        let batch = RoomListBatch {
+            ops: vec![
+                RoomListOp::Reset {
+                    rooms: vec![sample_room()],
+                },
+                RoomListOp::PopFront,
+            ],
+            total: Some(7),
+        };
+        let json = serde_json::to_string(&batch).expect("serialize batch");
+        assert!(json.contains("\"total\":7"), "json was: {json}");
+        let back: RoomListBatch = serde_json::from_str(&json).expect("deserialize batch");
+        assert_eq!(back, batch);
     }
 
     #[test]

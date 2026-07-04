@@ -12,7 +12,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ipc::app_ping,
             ipc::demo_subscribe,
-            ipc::login_password
+            ipc::login_password,
+            ipc::room_list_subscribe,
+            ipc::room_list_unsubscribe
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
