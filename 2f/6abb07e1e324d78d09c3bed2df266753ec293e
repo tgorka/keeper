@@ -1,0 +1,166 @@
+src/lib/stores/rooms.ts
+  s_d3788c68a44cb1::t_529736eaa6883f 2,5-15,19,22-27,29-31,34-36,38,40-43,50,53,64,70-73
+src/hooks/use-sign-out.test.ts
+  s_d3788c68a44cb1::t_5f20c158a43bcb 3,17-39,58-70,72,80-85,87-89,93-98,100,103,105-110
+src/components/chat/chat-row.test.tsx
+  s_d3788c68a44cb1::t_c5263bc401615f 4,6,8-9,33-46,116,118-123,125
+src/components/layout/sidebar-pane.test.tsx
+  s_d3788c68a44cb1::t_99d58694d50df0 22,87
+src-tauri/crates/keeper-core/src/error.rs
+  s_d3788c68a44cb1::t_75163c4fc0f6e9 129-142
+  s_d3788c68a44cb1::t_61c8f1a8fbf6b2 158-161
+_bmad-output/implementation-artifacts/spec-2-1-account-manager-unlimited-concurrent-accounts.md
+  s_d3788c68a44cb1::t_6f7fa3ceebc9c2 5,7
+  s_d3788c68a44cb1::t_2e87644131380a 6
+  s_d3788c68a44cb1::t_4bf1f43d250d11 97
+  s_d3788c68a44cb1::t_cd469d5c9dae00 1-4,8-82,98-106,108,123-145
+  s_d3788c68a44cb1::t_070a1ed83d299a 83-96
+  s_d3788c68a44cb1::t_50d8513673e4e0 146-169
+  s_d3788c68a44cb1::t_1241d5f8c1ef0f 107,109-122
+src-tauri/crates/keeper-core/src/account.rs
+  s_d3788c68a44cb1::t_2df2f7c3e37f26 268
+  s_d3788c68a44cb1::t_463b167db28396 109-112,116
+  s_d3788c68a44cb1::t_ac497e0b5fd4ee 213,215-225
+  s_d3788c68a44cb1::t_28d35f23c57bd2 38
+  s_d3788c68a44cb1::t_d94144bf8157cb 486-497
+  s_d3788c68a44cb1::t_f34bdfcb4cdbca 575,577-587
+  s_d3788c68a44cb1::t_cb142fdb2e8200 246-267,269-295,299,301-334,336-397
+  s_d3788c68a44cb1::t_7bc5d07b00cc5c 731-745
+  s_d3788c68a44cb1::t_6e8aa5d5772578 834-837
+  s_d3788c68a44cb1::t_c445373cdac1a1 966-1014
+  s_d3788c68a44cb1::t_448e9eec3b4d4b 108,113-115,117-122,126-128
+  s_d3788c68a44cb1::t_cb9007aac62271 793
+  s_d3788c68a44cb1::t_867ee35df60975 300
+  s_d3788c68a44cb1::t_1c5236ad7aa367 296-298
+  s_d3788c68a44cb1::t_1966e08eca4172 335
+  s_d3788c68a44cb1::t_11c6d27940cd15 726-728,730,746
+  s_d3788c68a44cb1::t_f93e122960d0c5 73-77
+  s_d3788c68a44cb1::t_0e64d5ad0477d8 40-42,48-49
+src/lib/ipc/gen/InboxRoomVm.ts
+  s_d3788c68a44cb1::t_84077d2d44635f 1-41
+src/lib/stores/rooms.test.ts
+  s_d3788c68a44cb1::t_2021eb40d823d3 44
+  s_d3788c68a44cb1::t_53ee385b4dca8e 2,5,7-8,17,27,43,45-49,68,82,105-111,113
+src/components/auth/login-screen.test.tsx
+  s_d3788c68a44cb1::t_c89237d91e1dbe 180
+  s_d3788c68a44cb1::t_2c2996baa0466b 65,69-100
+  s_d3788c68a44cb1::t_22afb08daab454 19
+  s_d3788c68a44cb1::t_bf02c307564243 101
+src/hooks/use-connection-status.test.ts
+  s_d3788c68a44cb1::t_99d58694d50df0 25,54,72,96
+_bmad-output/implementation-artifacts/epic-2-context.md
+  s_d3788c68a44cb1::t_64c7db761512c8 1-53
+src/hooks/use-session-restore.ts
+  s_d3788c68a44cb1::t_6b39f1b9ff56cb 5-12,22,26-27
+src/lib/stores/accounts.test.ts
+  s_d3788c68a44cb1::t_79701b49f03df8 5-15,25-31,34-40,43-66,68-73,76-78,92
+src-tauri/crates/keeper-core/src/lib.rs
+  s_d3788c68a44cb1::t_45dea5c293f36c 16
+src/lib/ipc/client.ts
+  s_d3788c68a44cb1::t_77c5905ff2f168 91-95,97-98
+  s_d3788c68a44cb1::t_67ed8c326428d5 153-172
+  s_d3788c68a44cb1::t_88bc8cdc9586ad 17-19,33
+src/hooks/use-sign-out.ts
+  s_d3788c68a44cb1::t_0e385018d2faa6 2,4-8,10-13,17,22-24,26-31,33-44
+src/lib/ipc/gen/InboxBatch.ts
+  s_d3788c68a44cb1::t_84077d2d44635f 1-21
+src-tauri/crates/keeper-core/src/inbox.rs
+  s_d3788c68a44cb1::t_1c5236ad7aa367 272-275,281-288,306-313
+  s_d3788c68a44cb1::t_c1db977216a294 1-271,276-280,289-305,314-427
+src/lib/ipc/gen/AccountVm.ts
+  s_d3788c68a44cb1::t_84077d2d44635f 7-11,26-32
+src/lib/account-hue.ts
+  s_d3788c68a44cb1::t_8b96006c1dddf6 1-21
+src-tauri/crates/keeper-core/src/registry.rs
+  s_d3788c68a44cb1::t_7af93a26e10661 315,325
+  s_d3788c68a44cb1::t_626eeb5ca473ed 218,228
+  s_d3788c68a44cb1::t_a24bf49ab88c81 23-25,28-32,55,59-78
+  s_d3788c68a44cb1::t_7f4d97d4319b6a 430
+  s_d3788c68a44cb1::t_3197eaea484527 79,94-96,99-100,108,112-121,127-166
+  s_d3788c68a44cb1::t_f3602b8623d8c0 188,200
+  s_d3788c68a44cb1::t_b710e090b608da 271,282
+  s_d3788c68a44cb1::t_5d454c7ab56455 339-419
+  s_d3788c68a44cb1::t_3527c68cdb61d9 80
+  s_d3788c68a44cb1::t_e30a841f4ed758 167
+src/hooks/use-connection-status.ts
+  s_d3788c68a44cb1::t_a09c93815399c3 4-12,21
+src/App.test.tsx
+  s_d3788c68a44cb1::t_d7c8f838915db7 61
+  s_d3788c68a44cb1::t_8dd3c04b684aa7 11,14-20,31
+src/lib/ipc/gen/InboxOp.ts
+  s_d3788c68a44cb1::t_84077d2d44635f 1-42
+src-tauri/crates/keeper-core/src/vm.rs
+  s_d3788c68a44cb1::t_724016ad22ba42 354-358,370-470
+  s_d3788c68a44cb1::t_185aa67cbad068 573,579,586-640
+  s_d3788c68a44cb1::t_c64f72b1369d73 641
+src/components/chat/chat-row.tsx
+  s_d3788c68a44cb1::t_071e5cdd283e0f 2,4-10,13,15-16,20-22,51,55,60-67
+src/components/layout/chat-list-pane.tsx
+  s_d3788c68a44cb1::t_c2c6bc9d78dc2c 2,4-14,20-21,26-33,35,48,53-55,61,65,79,96,100-102
+  s_d3788c68a44cb1::t_851f328099c6dc 41
+  s_d3788c68a44cb1::t_e53bc296125419 82
+src/components/layout/account-footer.tsx
+  s_d3788c68a44cb1::t_2021eb40d823d3 65
+  s_d3788c68a44cb1::t_5232b346f5c8ce 2-3,5-11,13-17,19,33,35,44-45,49,54-55,57,80,105,128-172
+  s_d3788c68a44cb1::t_b7bc8b06645412 173-174
+src/lib/stores/accounts.ts
+  s_d3788c68a44cb1::t_e95f783c823518 2,5-7,9-12,19-20,28-33,36,45,47-54,56
+src/components/layout/conversation-pane.test.tsx
+  s_d3788c68a44cb1::t_2021eb40d823d3 229-231,243-245
+  s_d3788c68a44cb1::t_71da39be2a41ec 30,88,106,143,189,201,211,266,286,306,326,365
+src-tauri/crates/keeper-core/src/auth.rs
+  s_d3788c68a44cb1::t_d7795ceb4e529a 134-136,142-150,154-157,207-208,223-225,233,240
+  s_d3788c68a44cb1::t_f8699808209696 36-40,47
+  s_d3788c68a44cb1::t_1c5236ad7aa367 573-577
+  s_d3788c68a44cb1::t_8f07c287f972f9 23-35,41-46,48-63,65-75,592
+  s_d3788c68a44cb1::t_3ec12033b53f02 151-153
+  s_d3788c68a44cb1::t_883c39a770ad32 258,260-270,272,276,278-282,284-294,296
+  s_d3788c68a44cb1::t_9515d74e2aa1db 609,619
+  s_d3788c68a44cb1::t_836e0a89d94d85 484,486-487,492,502,509-514,519-541,544-545,547-549,551-558,562-572,578-591
+  s_d3788c68a44cb1::t_f9b27187e26fce 64
+  s_d3788c68a44cb1::t_3ddaca6dde246e 593
+src-tauri/crates/keeper/src/lib.rs
+  s_d3788c68a44cb1::t_7acb7dac9c9e75 30-31
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_d3788c68a44cb1::t_d73cb7f84b1873 20-25
+src-tauri/crates/keeper/src/ipc.rs
+  s_d3788c68a44cb1::t_75c6bd53238736 383-388,390-421
+  s_d3788c68a44cb1::t_107444eceab1fd 16,20-21
+  s_d3788c68a44cb1::t_b85e303171c046 142-144
+src/components/auth/login-screen.tsx
+  s_d3788c68a44cb1::t_f240438ec56d24 176-190
+  s_d3788c68a44cb1::t_4552ce01c41e6c 47-57,59,63-66,68-69,97-98,110-115
+src/index.css
+  s_d3788c68a44cb1::t_07af010b5a383e 156-165
+  s_d3788c68a44cb1::t_f5d6730c9f0c2f 101-112
+src/App.tsx
+  s_d3788c68a44cb1::t_487af7b745b1d8 5,11-13,29-44
+src/components/layout/conversation-pane.tsx
+  s_d3788c68a44cb1::t_f9c4ef8eda0be7 78-80,89-90
+src/lib/stores/add-account.ts
+  s_d3788c68a44cb1::t_3d010556d34d1d 1-30
+src/components/layout/account-footer.test.tsx
+  s_d3788c68a44cb1::t_2021eb40d823d3 56,99
+  s_d3788c68a44cb1::t_39a469830fc4aa 5-6,15,17-22,34,41,45-55,57,60-61,63-65,68-69,72,77,81-82,85,95-96,98,100
+src/hooks/use-session-restore.test.ts
+  s_d3788c68a44cb1::t_77e786bfdb007a 14-21,35-37,43,46-47,53,56,63
+src/components/layout/chat-list-pane.test.tsx
+  s_d3788c68a44cb1::t_2021eb40d823d3 130,203
+  s_d3788c68a44cb1::t_df01d446dcbd93 3,7-10,12-13,22,29-40,45-46,57-58,65-66,70,81-83,87-95,98,105-106,110,116,119-121,125,141-144,154-155,159,165,170-172,180,182,187-188,192,196
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2f6abb07e1e324d78d09c3bed2df266753ec293e",
+  "prompts": {},
+  "sessions": {
+    "s_d3788c68a44cb1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e7396ce9-5397-475d-bbad-f2717b785e31",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
