@@ -1,0 +1,27 @@
+src/components/settings/device-verification-dialog.tsx
+  s_6441bc19097b76::t_948f5ab63944a3 145
+_bmad-output/implementation-artifacts/spec-3-2-device-verification-emoji-sas-and-qr.md
+  s_6441bc19097b76::t_857009f23863e6 7
+  s_6441bc19097b76::t_8ec86737cf0b41 103-112
+  s_6441bc19097b76::t_d16cdf6d700ae8 204-225
+src-tauri/crates/keeper-core/src/verification.rs
+  s_6441bc19097b76::t_7cc58d87efd2a2 447-452
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_6441bc19097b76::t_aa07f4281b43a3 63-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d38afc28116f7e18b79ead062300ff9c764adc59",
+  "prompts": {},
+  "sessions": {
+    "s_6441bc19097b76": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f21cbe84-5779-4be7-a1a3-adba44457779",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
