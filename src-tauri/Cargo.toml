@@ -1,40 +1,38 @@
-[package]
-name = "keeper"
+[workspace]
+resolver = "2"
+members = ["crates/keeper-core", "crates/keeper"]
+
+[workspace.package]
 version = "0.1.0"
-description = "Keeper — an open-source, Beeper-style Matrix messenger client (Tauri)"
 authors = ["Tomasz Gorka"]
 license = "Apache-2.0"
 repository = "https://github.com/tgorka/keeper"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[lints.rust]
+# Shared lints — single source of truth; each crate opts in with `[lints] workspace = true`.
+[workspace.lints.rust]
 unsafe_code = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 
-[lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "keeper_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
-
-[dependencies]
+[workspace.dependencies]
+# Tauri shell
 tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+# Serialization + IPC bindings
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "sso-login"] }
-matrix-sdk-ui = "0.18"
+ts-rs = "12"
+# Async runtime + observability
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
-
+# Matrix core (homed in keeper-core; unused in 1.1 but owned here per AD-6)
+matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "sso-login"] }
+matrix-sdk-ui = "0.18"
+# Platform ports
+dirs = "6"

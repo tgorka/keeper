@@ -1,0 +1,22 @@
+[package]
+name = "keeper-core"
+description = "Keeper hexagon core — Matrix state, IPC view models, and platform ports (tauri-free)"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ts-rs = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# Homed here as the architectural owner (AD-6); not yet exercised in Story 1.1.
+matrix-sdk = { workspace = true }
+matrix-sdk-ui = { workspace = true }

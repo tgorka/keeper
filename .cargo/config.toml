@@ -1,0 +1,6 @@
+# ts-rs writes `#[ts(export)]` bindings here. `relative = true` makes cargo
+# expand this to an absolute path anchored at this config file's directory
+# (the project root), so ts-rs uses it verbatim instead of falling back to its
+# per-crate `bindings/` default — regardless of which crate is compiling.
+[env]
+TS_RS_EXPORT_DIR = { value = "src/lib/ipc/gen", relative = true }

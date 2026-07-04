@@ -4,10 +4,16 @@
   "version": "0.1.0",
   "identifier": "dev.tgorka.keeper",
   "build": {
-    "beforeDevCommand": "bun run dev",
+    "beforeDevCommand": {
+      "script": "bun run dev",
+      "cwd": "../../.."
+    },
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bun run build",
-    "frontendDist": "../dist"
+    "beforeBuildCommand": {
+      "script": "bun run build",
+      "cwd": "../../.."
+    },
+    "frontendDist": "../../../dist"
   },
   "app": {
     "windows": [

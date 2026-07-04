@@ -1,0 +1,200 @@
+//! IPC command layer for the keeper shell (AD-8, AD-21).
+//!
+//! This is the single place where [`CoreError`] is mapped to the `IpcError`
+//! envelope, where `#[tauri::command]`s live, and where the concrete
+//! [`Platform`] port is implemented. No business logic lives here — commands
+//! delegate to `keeper-core`.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use keeper_core::demo::snapshot_then_diff;
+use keeper_core::error::{CoreError, PlatformError};
+use keeper_core::platform::Platform;
+use keeper_core::vm::{DemoBatch, IpcError, IpcErrorCode, PingVm};
+use tauri::ipc::Channel;
+use tauri::State;
+
+/// Tauri-managed application state holding the injected platform port.
+///
+/// Keeps the concrete [`Platform`] behind a trait object so the command layer
+/// depends only on the port, never a concrete type (AD-24).
+pub struct AppState {
+    pub platform: Box<dyn Platform>,
+}
+
+impl AppState {
+    /// Construct the desktop app state with the real platform implementation.
+    pub fn new() -> Self {
+        Self {
+            platform: Box::new(DesktopPlatform),
+        }
+    }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Monotonic source of subscription ids handed back to the frontend.
+static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Concrete [`Platform`] implementation for the desktop shell.
+///
+/// The data-dir port is fully wired via `dirs`; the remaining ports return
+/// [`CoreError::Unsupported`] until later stories fill them (honest, never
+/// panicking).
+pub struct DesktopPlatform;
+
+impl Platform for DesktopPlatform {
+    fn data_dir(&self) -> Result<PathBuf, CoreError> {
+        let base = dirs::data_dir().ok_or_else(|| {
+            PlatformError::DirUnavailable("no OS data directory available".to_owned())
+        })?;
+        Ok(base.join("dev.tgorka.keeper"))
+    }
+
+    fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported(
+            "keychain_set not wired until a later story".to_owned(),
+        ))
+    }
+
+    fn keychain_get(&self, _key: &str) -> Result<Option<String>, CoreError> {
+        Err(CoreError::Unsupported(
+            "keychain_get not wired until a later story".to_owned(),
+        ))
+    }
+
+    fn keychain_delete(&self, _key: &str) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported(
+            "keychain_delete not wired until a later story".to_owned(),
+        ))
+    }
+
+    fn notify(&self, _title: &str, _body: &str) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported(
+            "notify not wired until a later story".to_owned(),
+        ))
+    }
+
+    fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
+        Err(CoreError::Unsupported(
+            "sidecar_path not wired until a later story".to_owned(),
+        ))
+    }
+}
+
+/// The single `CoreError -> IpcError` mapping (AD-21). Every fallible command
+/// funnels its errors through here exactly once.
+fn to_ipc_error(err: CoreError) -> IpcError {
+    let (code, retriable) = match &err {
+        CoreError::Platform(PlatformError::Unsupported(_)) | CoreError::Unsupported(_) => {
+            (IpcErrorCode::Unsupported, false)
+        }
+        CoreError::Platform(PlatformError::DirUnavailable(_)) => (IpcErrorCode::Internal, false),
+        CoreError::Internal(_) => (IpcErrorCode::Internal, false),
+    };
+    IpcError {
+        code,
+        message: err.to_string(),
+        account_id: None,
+        retriable,
+    }
+}
+
+/// Current wall-clock time in milliseconds since the Unix epoch (UTC).
+///
+/// A skewed clock is clamped (never panics), but the anomaly is surfaced via
+/// `tracing` rather than swallowed — a silently-wrong timestamp is a debugging
+/// trap for later timeline-ordering stories that consume `ts`.
+fn now_ms() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).unwrap_or_else(|_| {
+            tracing::warn!("system clock beyond i64::MAX ms; clamping timestamp to i64::MAX");
+            i64::MAX
+        }),
+        Err(_) => {
+            tracing::warn!("system clock is before the Unix epoch; clamping timestamp to 0");
+            0
+        }
+    }
+}
+
+/// Liveness command — resolves to a [`PingVm`].
+///
+/// Exercises the [`Platform`] port end-to-end by resolving the data directory
+/// through the injected implementation, proving the platform-free seam.
+#[tauri::command]
+pub fn app_ping(state: State<'_, AppState>) -> Result<PingVm, IpcError> {
+    // Resolve the data dir through the port to prove the seam; discard the
+    // path (Story 1.1 does not create it yet).
+    let _data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    Ok(PingVm {
+        message: "pong".to_owned(),
+        ts: now_ms(),
+    })
+}
+
+/// Open the demo subscription. Emits the snapshot-then-diff batches produced by
+/// the tauri-free core over `channel` in order, then returns the subscription
+/// id. The first batch delivered is always the snapshot.
+#[tauri::command]
+pub fn demo_subscribe(channel: Channel<DemoBatch>) -> Result<u64, IpcError> {
+    let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+    for batch in snapshot_then_diff() {
+        channel.send(batch).map_err(|e| {
+            to_ipc_error(CoreError::Internal(format!(
+                "failed to send demo batch: {e}"
+            )))
+        })?;
+    }
+    Ok(subscription_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn now_ms_is_positive() {
+        assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn unsupported_core_error_maps_to_unsupported_code() {
+        let ipc = to_ipc_error(CoreError::Unsupported("nope".to_owned()));
+        assert_eq!(ipc.code, IpcErrorCode::Unsupported);
+        assert!(!ipc.retriable);
+        assert_eq!(ipc.account_id, None);
+    }
+
+    #[test]
+    fn dir_unavailable_maps_to_internal_code() {
+        let ipc = to_ipc_error(CoreError::Platform(PlatformError::DirUnavailable(
+            "x".to_owned(),
+        )));
+        assert_eq!(ipc.code, IpcErrorCode::Internal);
+    }
+
+    #[test]
+    fn desktop_platform_data_dir_is_wired() {
+        let p = DesktopPlatform;
+        let dir = p
+            .data_dir()
+            .expect("data_dir should resolve on the test host");
+        assert!(dir.ends_with("dev.tgorka.keeper"));
+    }
+
+    #[test]
+    fn desktop_platform_keychain_is_unsupported_not_panicking() {
+        let p = DesktopPlatform;
+        assert!(matches!(
+            p.keychain_get("k"),
+            Err(CoreError::Unsupported(_))
+        ));
+    }
+}
