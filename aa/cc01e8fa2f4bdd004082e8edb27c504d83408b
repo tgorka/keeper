@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-3-4-replies-and-edits.md
+  s_27e9fb77a9f2a1::t_44cf19f1b5e1a8 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "aacc01e8fa2f4bdd004082e8edb27c504d83408b",
+  "prompts": {},
+  "sessions": {
+    "s_27e9fb77a9f2a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "413508c7-06ac-4349-906e-849e2de3bbc1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
