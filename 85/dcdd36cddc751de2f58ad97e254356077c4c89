@@ -1,0 +1,136 @@
+src-tauri/Cargo.lock
+  s_c431d4da6cc1c3::t_27ca825eb686c7 2811
+src-tauri/crates/keeper-core/src/lib.rs
+  s_c431d4da6cc1c3::t_079040d25dbb3b 8
+src-tauri/Cargo.toml
+  s_c431d4da6cc1c3::t_94f8808f167fd9 37-38
+src-tauri/crates/keeper-core/src/vm.rs
+  s_c431d4da6cc1c3::t_792f286aa3687c 315-406
+  s_c431d4da6cc1c3::t_00913a326896e4 49-158
+src/components/chat/chat-row.test.tsx
+  s_c431d4da6cc1c3::t_e34a6a3dcb3476 69-71
+  s_c431d4da6cc1c3::t_fec38a77498f71 47-55,99-100
+  s_c431d4da6cc1c3::t_2190740209f1f6 2-46,101-107
+  s_c431d4da6cc1c3::t_d95d734eee3162 62,64-66,68,80-81,83
+  s_c431d4da6cc1c3::t_b6a08dbe02e7f8 58-60,72-73,79,82,84-85,88,97
+  s_c431d4da6cc1c3::t_088bbe458beb30 1
+  s_c431d4da6cc1c3::t_961ba3807d5494 56-57,61,63,67,74-78,86-87,89-96,98
+src-tauri/crates/keeper-core/src/account.rs
+  s_189ac6dd7d15e4::t_370e3bd71fd1ff 90-93,95-96,115,119-145
+  s_c431d4da6cc1c3::t_488e6e6195b6f5 510,512,517
+  s_c431d4da6cc1c3::t_91fe615a04173d 50-52
+  s_c431d4da6cc1c3::t_6d2cf4ece849ac 324,350
+  s_c431d4da6cc1c3::t_a5f408216ac1f1 195-197
+  s_c431d4da6cc1c3::t_a584ec9e509094 149,155-156,161-171
+  s_c431d4da6cc1c3::t_d7e5bde5c0a2d8 603-642
+  s_c431d4da6cc1c3::t_6da170aa299191 30
+  s_c431d4da6cc1c3::t_de70754a58f00e 60
+  s_c431d4da6cc1c3::t_85c9942eee7e1b 359-363,366-371
+  s_c431d4da6cc1c3::t_ee34e10f2ec6d9 398-399,403-425
+  s_c431d4da6cc1c3::t_327817f31ef6d0 1-20,22-29,31-34,36-49,53-59,61-89,94,97-102,104-110,117-118,146-148,150-154,157-160,172-194,198-250,255-258,263-273,278-284,289-295,297-323,325-349,351-358,372-397,400-402,426-475,477-509,511,513-516,518-602,643-653
+  s_c431d4da6cc1c3::t_9ba6b318f8ad81 103,111-114,116
+  s_c431d4da6cc1c3::t_36b8661ebb39ef 296
+  s_c431d4da6cc1c3::t_1b7cf4e828f5fc 21
+  s_c431d4da6cc1c3::t_f6dbf50c6b1a9b 259
+  s_c431d4da6cc1c3::t_9cdb35b5a50f5f 251-254,260-262,274-277,285-288
+  s_c431d4da6cc1c3::t_25f2023a79b6b1 476
+  s_c431d4da6cc1c3::t_c32eb73bf1cd10 35
+  s_c431d4da6cc1c3::t_e0743bbaad4a03 364-365
+_bmad-output/implementation-artifacts/spec-1-4-sliding-sync-room-list.md
+  s_189ac6dd7d15e4::t_1a80a97be16628 234-240
+  s_189ac6dd7d15e4::t_facfe848deb6de 9
+  s_c431d4da6cc1c3::t_0aa4afb041c7a8 8
+  s_c431d4da6cc1c3::t_54dc214b8cfd89 85-90,92-96
+  s_c431d4da6cc1c3::t_b445c32f4213e3 5
+  s_c431d4da6cc1c3::t_44b6e0e597b60c 1-4,6,10-84,91,97-109,142-192
+  s_189ac6dd7d15e4::t_7c9651afe36db6 7
+  s_c431d4da6cc1c3::t_586dd23d5f76ea 110-131
+  s_189ac6dd7d15e4::t_7a98e64241b474 132-141
+  s_c431d4da6cc1c3::t_de4f15ff742723 193-233
+src/lib/stores/rooms.ts
+  s_c431d4da6cc1c3::t_ec4e6ba6fd957c 48-50,56-58,64-66
+  s_c431d4da6cc1c3::t_6adb2db96a6265 91
+  s_c431d4da6cc1c3::t_dc0534c5b3d6cc 1-47,51-55,59-63,67-90,92-102
+src-tauri/crates/keeper-core/Cargo.toml
+  s_c431d4da6cc1c3::t_87c1bf88da5d0e 23-24
+src/lib/format-time.test.ts
+  s_c431d4da6cc1c3::t_0425956b6f08aa 36-42
+  s_c431d4da6cc1c3::t_1949c93acaf985 1-35,43
+src/components/layout/app-shell.test.tsx
+  s_c431d4da6cc1c3::t_396320f1ecbd71 9-10,16-17
+src/lib/ipc/gen/IpcErrorCode.ts
+  s_c431d4da6cc1c3::t_b6ad1168ceef0c 9
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_c431d4da6cc1c3::t_b6aa06f849c40c 11-13
+src-tauri/crates/keeper/src/ipc.rs
+  s_c431d4da6cc1c3::t_0fc84b16aef138 323-341,345-347
+  s_c431d4da6cc1c3::t_4d1e880cbdd4e5 12,15,17,21-22,25-27,30,38
+  s_c431d4da6cc1c3::t_1621948bb3f63a 226
+  s_c431d4da6cc1c3::t_5422076220643b 214-225,227-248
+  s_c431d4da6cc1c3::t_13761440aa2f72 130-136
+  s_c431d4da6cc1c3::t_6d2cf4ece849ac 342-344
+src/components/chat/chat-row.tsx
+  s_c431d4da6cc1c3::t_0438538559cc4d 37-39
+  s_c431d4da6cc1c3::t_0222fbce4498c1 12
+  s_c431d4da6cc1c3::t_261fa0a169df4e 40
+  s_c431d4da6cc1c3::t_81481953abc163 54
+  s_c431d4da6cc1c3::t_0e82dc0ab4fd4e 1-11,13-36,41-53,55-68
+src/components/layout/chat-list-pane.tsx
+  s_c431d4da6cc1c3::t_83ebc7559f18f1 1-13,16-19,21-23,25-31,36-38,48-55,57,59-69,72-77,79-87,104
+  s_c431d4da6cc1c3::t_177d53206866bd 14-15,24,32-35,39-47,56,58,78,88,90-103
+  s_c431d4da6cc1c3::t_bd74247aa1180e 89
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_c431d4da6cc1c3::t_b8668790044643 55
+src/App.test.tsx
+  s_c431d4da6cc1c3::t_2144834311c705 33-35
+src/lib/stores/rooms.test.ts
+  s_c431d4da6cc1c3::t_2749e77339381d 1-60,64-81,85-89,93-108,112-114,143-149
+  s_c431d4da6cc1c3::t_8a79d765c8e2df 115-142
+  s_c431d4da6cc1c3::t_0222fbce4498c1 61-63,82-84,90-92,109-111
+src/lib/ipc/gen/RoomVm.ts
+  s_c431d4da6cc1c3::t_b6ad1168ceef0c 1-32
+src/lib/ipc/gen/RoomListBatch.ts
+  s_c431d4da6cc1c3::t_b6ad1168ceef0c 1-18
+src-tauri/crates/keeper-core/src/error.rs
+  s_c431d4da6cc1c3::t_176d8d8c7cc99b 58-80
+  s_c431d4da6cc1c3::t_d6f94c919eca26 92-95
+src/lib/format-time.ts
+  s_c431d4da6cc1c3::t_d8356c89bd9ce8 1-19,23-42
+  s_c431d4da6cc1c3::t_644ddbe7903607 20-22
+src/lib/ipc/client.ts
+  s_c431d4da6cc1c3::t_f5f1d7fab55c08 96-117
+  s_c431d4da6cc1c3::t_2211a7b294af23 18-20,23
+src/components/layout/chat-list-pane.test.tsx
+  s_c431d4da6cc1c3::t_06278d43902409 135-173
+  s_c431d4da6cc1c3::t_d59a6834a4d364 70-72,81
+  s_c431d4da6cc1c3::t_0df3a63ab66928 42,46-66
+  s_c431d4da6cc1c3::t_e710d82499f909 1-41,43-45,67-69,73-80,82-134,174-175
+src-tauri/crates/keeper/src/lib.rs
+  s_c431d4da6cc1c3::t_52e24d6a73f679 15-17
+src/lib/ipc/gen/RoomListOp.ts
+  s_c431d4da6cc1c3::t_b6ad1168ceef0c 1-53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "85dcdd36cddc751de2f58ad97e254356077c4c89",
+  "prompts": {},
+  "sessions": {
+    "s_189ac6dd7d15e4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8ac44eb6-ca3d-48fb-ad39-ba5de240cc12",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    },
+    "s_c431d4da6cc1c3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "565c2e3d-8e31-454f-a83d-9e0300bee7b4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
