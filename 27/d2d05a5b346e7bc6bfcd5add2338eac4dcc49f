@@ -1,0 +1,263 @@
+_bmad/gds/module-help.csv
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-30
+_bmad/scripts/resolve_customization.py
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-240
+src/vite-env.d.ts
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1
+src/lib/utils.ts
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1-2,5
+  s_8a8bc6b6bf6017::t_a1a0b93a01bcdd 3-4,6
+src/components/ui/tooltip.tsx
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1-2,4,16,19-20,23-24,40,48,51
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 3,5-15,17-18,21-22,25-39,41-47,49-50
+src/hooks/use-mobile.ts
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2,4-5,7-8,10,19
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,3,6,9,11-18
+src/test/setup.ts
+  s_8a8bc6b6bf6017::t_8122621141eea6 1
+_bmad/cis/module-help.csv
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-7
+.github/workflows/ci.yml
+  s_8a8bc6b6bf6017::t_b0bcf9a40cf004 1-61
+src-tauri/src/lib.rs
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-14
+_bmad/bmb/config.yaml
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-14
+index.html
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-14
+vitest.config.ts
+  s_8a8bc6b6bf6017::t_1a74696c46b281 1-23
+_bmad/gds/workflows/1-preproduction/research/technical-steps/step-04-architectural-patterns.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-230
+_bmad/gds/workflows/1-preproduction/research/technical-steps/step-05-implementation-research.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-260
+src-tauri/.gitignore
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-7
+_bmad/gds/workflows/1-preproduction/research/market-steps/step-06-research-completion.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-499
+src/components/ui/input-group.tsx
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,3-8,17,21,29-30,40-41,56,58,62,65-71,73-77,95,103,107,110,116,120,123,129,133,141,143
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2,9-16,18-20,22-28,31-39,42-55,57,59-61,63-64,72,78-94,96-102,104-106,108-109,111-115,117-119,121-122,124-128,130-132,134-140,142
+src/components/ui/input.tsx
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,3,12,16,19
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2,4-11,13-15,17-18
+src/index.css
+  s_8a8bc6b6bf6017::t_02ef1d881c6ad7 1
+  s_8a8bc6b6bf6017::t_a1a0b93a01bcdd 2-51,84-86,118-122,124-125,127-128
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 52-83,87-117,123,126,129-130
+src/components/ui/dialog.tsx
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2,8,11-12,15-16,19-20,23-33,35-37,39-46,48-55,57-62,65-70,72-75,78-85,87-90,92-100,102-103,105-110,112-122,124-126,128-140
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,3-7,9-10,13-14,17-18,21-22,34,38,47,56,63-64,71,76-77,86,91,101,104,111,123,127,141
+src-tauri/src/main.rs
+  s_8a8bc6b6bf6017::t_d40c7cf5727f18 5
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-4,6
+_bmad/custom/config.toml
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-7
+_bmad/tea/module-help.csv
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-11
+_bmad/gds/workflows/1-preproduction/research/technical-steps/step-06-research-synthesis.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-486
+src/components/ui/sheet.tsx
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1-5,8,11-12,15-16,19-20,32,36,46-47,57,64-65,72,82,92,95,102,115,122,124,126-127
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 6-7,9-10,13-14,17-18,21-31,33-35,37-45,48-56,58-63,66-71,73-81,83-91,93-94,96-101,103-114,116-121,123,125
+src/components/ui/sidebar.tsx
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1-7,14-25,28-37,40,42,45,57-59,61-62,66-67,70,72,74,78,80-81,85-86,91-93,95,97-99,103,115-116,131,138,150-152,154,162,168,194,215,227,240,243-244,254-255,262,266,283,287,296,300,303,311,322,333,336,344,354,358,369,377,385,389,397,405,409,412,420,431,442,464-465,476-478,480-481,492,495,501,514,523-524,526,536,540,543,550,554,562,566-567,576,587,597,601,604,612,622-624,626,636,640,668
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 8-13,26-27,38-39,41,43-44,46-56,60,63-65,68-69,71,73,75-77,79,82-84,87-90,94,96,100-102,104-114,117-130,132-137,139-149,153,155-161,163-167,169-193,195-214,216-226,228-239,241-242,245-253,256-261,263-265,267-282,284-286,288-295,297-299,301-302,304-310,312-321,323-332,334-335,337-343,345-353,355-357,359-368,370-376,378-384,386-388,390-396,398-404,406-408,410-411,413-419,421-430,432-441,443-463,466-475,479,482-491,493-494,496-500,502-513,515-522,525,527-535,537-539,541-542,544-549,551-553,555-561,563-565,568-575,577-586,588-596,598-600,602-603,605-611,613-621,625,627-635,637-639,641-667
+src/components/ui/avatar.tsx
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2,5,7-12,14-20,22-24,26-27,29-31,33-34,36-46,48-50,52-62,64-66,68-75,77-79,81-82,84-88,90-92,94-95
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,3-4,6,13,21,25,28,32,35,47,51,63,67,76,80,83,89,93,96
+lefthook.yml
+  s_8a8bc6b6bf6017::t_7d2658a48305de 4
+  s_8a8bc6b6bf6017::t_cb6f4d84861ad5 15
+  s_8a8bc6b6bf6017::t_541f134b1e5242 1-3,5-14,16-29,31-32
+  s_8a8bc6b6bf6017::t_b7141c38b55fe1 30
+_bmad/bmm/config.yaml
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-16
+_bmad/_config/bmad-help.csv
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-99
+_bmad/gds/workflows/1-preproduction/research/technical-steps/step-01-init.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-137
+src/App.tsx
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-2,5-9
+  s_8a8bc6b6bf6017::t_0e8839f96a9cb3 3-4
+src/components/ui/card.tsx
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2,4-15,17-19,21-28,30-32,34-41,43-45,47-55,57-62,64-65,67-70,73-80,82-84,86-87
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,3,16,20,29,33,42,46,56,63,66,71-72,81,85,88
+_bmad/gds/workflows/1-preproduction/research/market-steps/step-04-customer-decisions.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-259
+_bmad/custom/.gitignore
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1
+_bmad/tea/workflows/testarch/README.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-77
+_bmad/gds/workflows/1-preproduction/research/technical-steps/step-03-integration-patterns.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-248
+_bmad/scripts/memlog.py
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-224
+_bmad/config.user.toml
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-17
+.vscode/extensions.json
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-3
+src/main.tsx
+  s_8a8bc6b6bf6017::t_a591f60d09d059 4
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-3,5-10
+_bmad/core/module-help.csv
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-14
+_bmad/gds/workflows/1-preproduction/research/research.template.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-29
+_bmad/gds/workflows/1-preproduction/research/workflow-technical-research.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-54
+components.json
+  s_8a8bc6b6bf6017::t_a1a0b93a01bcdd 1-25
+src/components/ui/button.tsx
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 4,6-40,43-51,53,55-63,65-66
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1-3,5,41-42,52,54,64,67
+src/components/ui/dropdown-menu.tsx
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,3-6,8-9,15,21,36-39,43,46-47,56-57,66,70,80,88,98,103,109,118,126,135,140,148,156,160,173,176,182,186,189-190,199,207,214,224-227,230,235,239-240,247-249
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2,7,10-14,16-20,22-35,40-42,44-45,48-55,58-65,67-69,71-79,81-87,89-97,99-102,104-108,110-117,119-125,127-134,136-139,141-147,149-155,157-159,161-172,174-175,177-181,183-185,187-188,191-198,200-206,208-213,215-223,228-229,231-234,236-238,241-246
+src-tauri/Cargo.toml
+  s_8a8bc6b6bf6017::t_d40c7cf5727f18 2,23
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1,3,8-10,18-22,24-34
+  s_8a8bc6b6bf6017::t_3ce25b4655ca27 4-7,11-17
+_bmad/gds/workflows/1-preproduction/research/market-steps/step-01-init.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-184
+_bmad/core/config.yaml
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-10
+_bmad/bmm/module-help.csv
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-31
+_bmad/_config/manifest.yaml
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-57
+src/components/ui/skeleton.tsx
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2-9,11-12
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,10,13
+src/components/ui/sonner.tsx
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2,12-13,15-20,26-41,44
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,3-11,14,21-25,42-43,45
+biome.json
+  s_8a8bc6b6bf6017::t_f59c8ea623c00a 17-18
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 11-16
+  s_8a8bc6b6bf6017::t_34562964f81614 1-10,19-29,31-55,64-68
+  s_8a8bc6b6bf6017::t_d0c58c89941c7e 30,63
+  s_8a8bc6b6bf6017::t_50f0bb0121a03a 56-62
+src-tauri/capabilities/default.json
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 6
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-5,7
+vite.config.ts
+  s_8a8bc6b6bf6017::t_52cf899127c98a 3,5-9,17-39
+  s_8a8bc6b6bf6017::t_f633de9f73b5c2 1-2,4,10-16
+_bmad/config.toml
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-195
+_bmad/_config/files-manifest.csv
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-1327
+src/components/ui/badge.tsx
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 4,6-12,14-15,18-23,26-31,34-41,43-44
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1-3,5,13,16-17,24-25,32-33,42,45
+_bmad-output/planning-artifacts/research-market-2026-07-03.md
+  s_8a8bc6b6bf6017::t_07ecbc2593303b 226-237
+  s_8a8bc6b6bf6017::t_63d51486731ca4 1-109,124-140,155-189,210-225,238-246,248-319,350-351,387-396
+  s_8a8bc6b6bf6017::t_4a63957a0ba3a7 141-154
+  s_8a8bc6b6bf6017::t_ab546018725a1e 247
+  s_8a8bc6b6bf6017::t_6b9b6ee66b724a 320-349
+  s_8a8bc6b6bf6017::t_80ca6f88cc3ba1 110-123
+  s_8a8bc6b6bf6017::t_1679f84fbdf1aa 190-209
+  s_8a8bc6b6bf6017::t_b068402d4e9971 352-386
+src/components/ui/label.tsx
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1-2,4,6,12,16,19
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 3,5,7-11,13-15,17-18
+_bmad/gds/workflows/1-preproduction/research/market-steps/step-02-customer-behavior.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-236
+package.json
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 30,32,37
+  s_8a8bc6b6bf6017::t_7970e0d98af30b 10-21
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1,3-9,22-23,34-35,41-42,47-49,53-54,56-57
+  s_8a8bc6b6bf6017::t_61e282bb354ce1 25-27,43-46,50-52,55
+  s_8a8bc6b6bf6017::t_a1a0b93a01bcdd 24,28-29,31,33,36,38-40
+  s_8a8bc6b6bf6017::t_d40c7cf5727f18 2
+src/components/ui/textarea.tsx
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,3,11,15,18
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2,4-10,12-14,16-17
+_bmad/gds/workflows/1-preproduction/research/technical-steps/step-02-technical-overview.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-239
+_bmad/gds/workflows/1-preproduction/research/market-steps/step-05-competitive-analysis.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-198
+src/components/ui/switch.tsx
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1-2,4,11,19,28,31
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 3,5-10,12-18,20-27,29-30
+_bmad/tea/config.yaml
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-26
+tsconfig.json
+  s_8a8bc6b6bf6017::t_442ff1129bbf84 21-27
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-20,28-31
+src-tauri/tauri.conf.json
+  s_8a8bc6b6bf6017::t_d40c7cf5727f18 3,5,15
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-2,4,6-14,16-35
+_bmad/cis/config.yaml
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-13
+src/components/ui/command.tsx
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2,6-11,15,17-21,23-25,27-36,41-48,50-54,56-68,70-77,79-80,82-86,88-90,92-103,105-115,117-119,121-132,134-145,147-152,154-155,157-161,163-165,167-173,175,177
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,3-5,12-14,16,22,26,37-40,49,55,69,78,81,87,91,104,116,120,133,146,153,156,162,166,174,176,178-179
+src/App.test.tsx
+  s_8a8bc6b6bf6017::t_d02d3b5e7d00c6 1-10
+_bmad/gds/config.yaml
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-21
+_bmad-output/planning-artifacts/research-technical-2026-07-03.md
+  s_8a8bc6b6bf6017::t_079d5f740798d2 1-310
+tsconfig.node.json
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-10
+src-tauri/build.rs
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-3
+_bmad/bmb/module-help.csv
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-11
+docs/credentials.md
+  s_8a8bc6b6bf6017::t_6476ce09ab3bdb 1-53
+rust-toolchain.toml
+  s_8a8bc6b6bf6017::t_0be8b21dba9566 1-3
+src/components/ui/popover.tsx
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 3,5,8-9,12-27,29-32,34-35,38-46,48-50,52-53,55-60,62-71
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1-2,4,6-7,10-11,28,33,36-37,47,51,54,61,72
+src/components/ui/separator.tsx
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,3-4,6,21,25,28
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2,5,7-20,22-24,26-27
+_bmad/scripts/resolve_config.py
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-178
+src/components/ui/tabs.tsx
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 2,6,8-17,19-20,22-35,38-42,44-50,52-53,55-62,64-66,68-69,71-76,78-79
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1,3-5,7,18,21,36-37,43,51,54,63,67,70,77,80
+_bmad/gds/workflows/1-preproduction/research/market-steps/step-03-customer-pain-points.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-249
+_bmad/_config/skill-manifest.csv
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-101
+.gitignore
+  s_8a8bc6b6bf6017::t_52cf899127c98a 1-24
+  s_8a8bc6b6bf6017::t_dffda3f1cc338c 25-35
+_bmad/gds/workflows/1-preproduction/research/workflow-market-research.md
+  s_8a8bc6b6bf6017::t_6b6329a306444d 1-54
+src/components/ui/context-menu.tsx
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 5,8-19,21-22,25-26,29-30,33-37,39-44,46-50,55-57,59-66,69-76,78-80,82-89,91-97,99-104,106-114,119-120,122-130,132-138,140-145,147-150,152-159,161-167,169-173,175-178,180-186,188-194,196-198,200-211,213-214,216-220,222-224,226-229,231,233-234,238-242
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1-4,6-7,20,23-24,27-28,31-32,38,45,51-54,58,67-68,77,81,90,98,105,115-118,121,131,139,146,151,160,168,174,179,187,195,199,212,215,221,225,230,232,235-237,243-244
+src/components/ui/scroll-area.tsx
+  s_8a8bc6b6bf6017::t_48a6704d84ed88 1-2,4,26,41,50,53
+  s_8a8bc6b6bf6017::t_73c4ce6a427a69 3,5-25,27-40,42-49,51-52
+README.md
+  s_8a8bc6b6bf6017::t_e80a614399c4b1 1,3-4,6-8,10-70
+  s_8a8bc6b6bf6017::t_52cf899127c98a 2,5,9
+bun.lock
+  s_8a8bc6b6bf6017::t_8d773dc223629c 1-1302
+src-tauri/Cargo.lock
+  s_8a8bc6b6bf6017::t_2fff0a0a96f215 1-4896
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "27d2d05a5b346e7bc6bfcd5add2338eac4dcc49f",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
