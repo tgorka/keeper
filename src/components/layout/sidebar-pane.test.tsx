@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm } from "@/lib/ipc/client";
 
@@ -7,6 +7,16 @@ import type { AccountVm } from "@/lib/ipc/client";
 vi.mock("@/hooks/use-sign-out", () => ({
   useSignOut: () => vi.fn(),
 }));
+
+// The Settings dialog loads the encryption posture on open; stub just that
+// wrapper so mounting the sidebar never reaches Tauri.
+vi.mock("@/lib/ipc/client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
+  return {
+    ...actual,
+    encryptionPosture: vi.fn(() => Promise.resolve(false)),
+  };
+});
 
 import { SidebarPane } from "@/components/layout/sidebar-pane";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -93,5 +103,19 @@ describe("SidebarPane account footer", () => {
   it("shows no account row when signed out", () => {
     renderSidebar();
     expect(screen.queryByText(account.userId)).not.toBeInTheDocument();
+  });
+});
+
+describe("SidebarPane settings", () => {
+  it("opens the Settings dialog when the Settings button is clicked", async () => {
+    renderSidebar();
+    // The dialog is closed initially.
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toBeInTheDocument();
+    expect(screen.getByText("Archive & Storage")).toBeInTheDocument();
   });
 });

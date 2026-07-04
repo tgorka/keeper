@@ -1,5 +1,7 @@
 import { MessageSquare, Radio, Settings, WifiOff } from "lucide-react";
+import { useState } from "react";
 import { AccountFooter } from "@/components/layout/account-footer";
+import { SettingsDialog } from "@/components/settings/settings-dialog";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useConnectionStore } from "@/lib/stores/connection";
@@ -25,6 +27,9 @@ const OFFLINE_PILL_TEXT = "Offline — showing your local archive. Messages queu
 
 export function SidebarPane({ collapsed }: SidebarPaneProps) {
   const offline = useConnectionStore((s) => s.status === "offline");
+  // Controlled state for the Settings dialog (Story 2.6). Only the Settings view
+  // button opens it; Chats/Bridges stay inert.
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   return (
     <nav
@@ -39,6 +44,9 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
       <ul className={cn("flex flex-col gap-1 p-2", collapsed && "items-center")}>
         {VIEWS.map((view) => {
           const Icon = view.icon;
+          // Only the Settings entry is interactive (opens the Settings dialog);
+          // Chats/Bridges remain inert until later stories wire them.
+          const onClick = view.label === "Settings" ? () => setSettingsOpen(true) : undefined;
           if (collapsed) {
             return (
               <li key={view.label}>
@@ -50,6 +58,7 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                       size="icon"
                       aria-label={view.label}
                       className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                      onClick={onClick}
                     >
                       <Icon aria-hidden="true" />
                     </Button>
@@ -65,6 +74,7 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                 type="button"
                 variant="ghost"
                 className="w-full justify-start gap-2 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                onClick={onClick}
               >
                 <Icon aria-hidden="true" />
                 {view.label}
@@ -107,6 +117,7 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
           ))}
         <AccountFooter collapsed={collapsed} />
       </div>
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
     </nav>
   );
 }

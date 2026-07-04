@@ -150,6 +150,26 @@ export async function cancelBeeper(): Promise<void> {
 }
 
 /**
+ * Persist the app-wide at-rest encryption posture (Story 2.6, AD-22). Sends the
+ * chosen posture (`true` = encrypt SDK stores with a per-account passphrase,
+ * `false` = FileVault only) to the Rust core, which writes it to `keeper.db`. The
+ * passphrase itself is generated and stored (Keychain only) later, inside the
+ * next account add — nothing secret crosses IPC. Resolves once persisted.
+ */
+export async function setEncryptionPosture(enabled: boolean): Promise<void> {
+  await invoke<void>("set_encryption_posture", { enabled });
+}
+
+/**
+ * Read the app-wide at-rest encryption posture (Story 2.6). Resolves with `true`
+ * (on), `false` (off), or `null` (unchosen — the fresh-install state that gates
+ * the first-run choice). The Rust `Option<bool>` serializes to `boolean | null`.
+ */
+export async function encryptionPosture(): Promise<boolean | null> {
+  return await invoke<boolean | null>("encryption_posture");
+}
+
+/**
  * Report every persisted account that can be restored on launch (FR-8, AD-20).
  * Identity only — the Rust core lists the registry rows and returns each whose
  * Keychain session is present as a non-secret {@link AccountVm} (with hue).

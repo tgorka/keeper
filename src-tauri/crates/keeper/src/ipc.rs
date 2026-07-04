@@ -353,6 +353,25 @@ pub fn cancel_beeper(state: State<'_, AppState>) -> Result<(), IpcError> {
     Ok(())
 }
 
+/// Persist the app-wide at-rest encryption posture (Story 2.6, AD-22). Writes
+/// `on`/`off` to the `settings` table in `keeper.db`. Sync — the value is a
+/// non-secret app-wide flag; the per-account passphrase is generated and stored
+/// (Keychain only) later, inside `add_account`. Failures funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub fn set_encryption_posture(state: State<'_, AppState>, enabled: bool) -> Result<(), IpcError> {
+    auth::set_encryption_posture(state.platform.as_ref(), enabled).map_err(to_ipc_error)
+}
+
+/// Read the app-wide at-rest encryption posture (Story 2.6). Resolves to
+/// `Some(true)` (on), `Some(false)` (off), or `None` (unchosen — the fresh-install
+/// state that gates the first-run choice). `Option<bool>` serializes to
+/// `boolean | null` across IPC. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn encryption_posture(state: State<'_, AppState>) -> Result<Option<bool>, IpcError> {
+    auth::get_encryption_posture(state.platform.as_ref()).map_err(to_ipc_error)
+}
+
 /// Subscribe to an account's sliding-sync room list (FR-8, AD-8/9/19/20).
 ///
 /// Lazily activates the account (session restore + `SyncService`), then streams

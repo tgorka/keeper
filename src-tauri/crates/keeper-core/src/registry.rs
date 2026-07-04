@@ -52,8 +52,52 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
         [],
     )
     .map_err(|e| CoreError::Internal(format!("could not ensure accounts schema: {e}")))?;
+    // App-wide key/value settings (Story 2.6). Holds the non-secret `sdk_encryption`
+    // posture; never any secret material (passphrases live only in the Keychain).
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS settings(\
+            key TEXT PRIMARY KEY, \
+            value TEXT NOT NULL\
+        )",
+        [],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not ensure settings schema: {e}")))?;
     ensure_hue_index_column(&conn)?;
     Ok(conn)
+}
+
+/// Read a single settings value by key, or `None` when unset.
+///
+/// Non-secret key/value store in `keeper.db` (Story 2.6). Never holds secret
+/// material.
+pub fn get_setting(data_dir: &Path, key: &str) -> Result<Option<String>, CoreError> {
+    let conn = open(data_dir)?;
+    let value = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            rusqlite::params![key],
+            |r| r.get::<_, String>(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(CoreError::Internal(format!(
+                "could not read setting: {other}"
+            ))),
+        })?;
+    Ok(value)
+}
+
+/// Write (insert or overwrite) a single settings value by key.
+pub fn set_setting(data_dir: &Path, key: &str, value: &str) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not write setting: {e}")))?;
+    Ok(())
 }
 
 /// Add the nullable `hue_index` column to `accounts` if it is not present yet.
@@ -414,6 +458,31 @@ mod tests {
             .expect("get")
             .expect("row present");
         assert_eq!(row.hue_index, Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setting_roundtrip_and_overwrite() {
+        let dir = temp_dir();
+        // Unset key reads as None.
+        assert_eq!(
+            get_setting(&dir, "sdk_encryption").expect("get unset"),
+            None
+        );
+        // Write then read back.
+        set_setting(&dir, "sdk_encryption", "on").expect("set on");
+        assert_eq!(
+            get_setting(&dir, "sdk_encryption").expect("get on"),
+            Some("on".to_owned())
+        );
+        // Overwrite replaces the value (ON CONFLICT DO UPDATE).
+        set_setting(&dir, "sdk_encryption", "off").expect("set off");
+        assert_eq!(
+            get_setting(&dir, "sdk_encryption").expect("get off"),
+            Some("off".to_owned())
+        );
+        // An unrelated key is independent.
+        assert_eq!(get_setting(&dir, "other").expect("get other"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

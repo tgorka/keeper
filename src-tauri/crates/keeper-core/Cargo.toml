@@ -29,3 +29,6 @@ reqwest = { workspace = true }
 # Account registry (keeper.db, WAL) and opaque ULID account ids.
 rusqlite = { workspace = true }
 ulid = { workspace = true }
+# Random per-account SDK-store passphrase generation (Story 2.6, at-rest encryption).
+# matrix-sdk 0.18 already resolves rand 0.8 transitively; permissive (MIT/Apache).
+rand = "0.8"

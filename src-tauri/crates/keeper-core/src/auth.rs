@@ -313,6 +313,57 @@ pub fn session_keychain_key(account_id: &str) -> String {
     format!("session/{account_id}")
 }
 
+/// Keychain key under which an account's SDK-store passphrase is stored (Story
+/// 2.6, AD-22). Present iff the account's matrix-sdk-sqlite store is
+/// passphrase-encrypted; the entry is self-describing, so `activate` passes
+/// `Some(passphrase)` exactly when this key exists. Namespaced by account id so
+/// sign-out / rollback delete exactly one account's passphrase.
+pub fn store_passphrase_keychain_key(account_id: &str) -> String {
+    format!("store_passphrase/{account_id}")
+}
+
+/// Settings key holding the app-wide at-rest-encryption posture (`"on"`/`"off"`).
+const SDK_ENCRYPTION_SETTING: &str = "sdk_encryption";
+
+/// Read the app-wide SDK-store encryption posture (Story 2.6, AD-22).
+///
+/// `Some(true)` when opted in (`"on"`), `Some(false)` when opted out (`"off"`),
+/// and `None` when unchosen (unset or an unrecognized value) — the fresh-install
+/// state that gates the first-run choice.
+pub fn get_encryption_posture(platform: &dyn Platform) -> Result<Option<bool>, CoreError> {
+    let data_dir = platform.data_dir()?;
+    Ok(
+        match registry::get_setting(&data_dir, SDK_ENCRYPTION_SETTING)?.as_deref() {
+            Some("on") => Some(true),
+            Some("off") => Some(false),
+            _ => None,
+        },
+    )
+}
+
+/// Persist the app-wide SDK-store encryption posture (Story 2.6). Writes `"on"`
+/// when opted in, `"off"` otherwise.
+pub fn set_encryption_posture(platform: &dyn Platform, enabled: bool) -> Result<(), CoreError> {
+    let data_dir = platform.data_dir()?;
+    let value = if enabled { "on" } else { "off" };
+    registry::set_setting(&data_dir, SDK_ENCRYPTION_SETTING, value)
+}
+
+/// Generate a fresh random per-account SDK-store passphrase (Story 2.6, NFR-9).
+///
+/// 32 alphanumeric characters from a cryptographically-seeded thread RNG. The
+/// value is written **only** to the macOS Keychain — never returned over IPC,
+/// logged, or written to `keeper.db`/disk.
+fn generate_store_passphrase() -> String {
+    use rand::distributions::Alphanumeric;
+    use rand::Rng;
+    rand::thread_rng()
+        .sample_iter(Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
+}
+
 /// Map a matrix-sdk login error to the secret-free [`AuthError`] taxonomy.
 ///
 /// An authentication rejection (`M_FORBIDDEN` / `M_UNAUTHORIZED`) means bad
@@ -346,9 +397,17 @@ fn map_login_error(err: &matrix_sdk::Error) -> CoreError {
 /// Best-effort rollback of persistent state created during Phase B.
 ///
 /// Removes the SDK store directory and deletes any Keychain entry that may have
-/// been written. Both steps are best-effort: a missing Keychain entry is not an
-/// error, and cleanup failures are logged but do not mask the original error.
-fn rollback(platform: &dyn Platform, sdk_dir: &std::path::Path, keychain_key: &str) {
+/// been written — both the session (`keychain_key`) and, when encryption is on,
+/// the SDK-store passphrase (`passphrase_key`). Every step is best-effort: a
+/// missing Keychain entry is not an error (a posture-off add never wrote the
+/// passphrase entry), and cleanup failures are logged but do not mask the
+/// original error.
+fn rollback(
+    platform: &dyn Platform,
+    sdk_dir: &std::path::Path,
+    keychain_key: &str,
+    passphrase_key: &str,
+) {
     if let Err(e) = std::fs::remove_dir_all(sdk_dir) {
         // ENOENT is fine (dir may not have been created yet); log others.
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -357,6 +416,9 @@ fn rollback(platform: &dyn Platform, sdk_dir: &std::path::Path, keychain_key: &s
     }
     if let Err(e) = platform.keychain_delete(keychain_key) {
         tracing::warn!(error = %e, "rollback: could not delete keychain entry");
+    }
+    if let Err(e) = platform.keychain_delete(passphrase_key) {
+        tracing::warn!(error = %e, "rollback: could not delete store passphrase entry");
     }
 }
 
@@ -447,12 +509,27 @@ pub async fn add_account<P: AuthProvider>(
 
     // From this point on, persistent state may exist; wrap failures in rollback.
     let result = async {
+        // At-rest encryption posture (Story 2.6, AD-22): when opted in, generate a
+        // fresh per-account passphrase, store it ONLY in the Keychain, and build
+        // the SDK store with it. matrix-sdk-sqlite derives the store cipher at
+        // creation time, so this must happen before `Client::builder()`. Posture
+        // off/absent leaves the store on the FileVault posture (`None`). The
+        // passphrase never crosses IPC, is never logged, and is never written to
+        // keeper.db/disk (NFR-9).
+        let passphrase = if get_encryption_posture(platform)?.unwrap_or(false) {
+            let pw = generate_store_passphrase();
+            platform.keychain_set(&store_passphrase_keychain_key(&account_id), &pw)?;
+            Some(pw)
+        } else {
+            None
+        };
+
         // OAuth token refresh is one-time-use (MAS); build the persistent client
         // with `handle_refresh_tokens()` so a rotated token doesn't wedge the
         // session between add and the first restore.
         let client = Client::builder()
             .homeserver_url(resolved.clone())
-            .sqlite_store(&sdk_dir, None)
+            .sqlite_store(&sdk_dir, passphrase.as_deref())
             .handle_refresh_tokens()
             .build()
             .await
@@ -506,7 +583,12 @@ pub async fn add_account<P: AuthProvider>(
         }
         Err(err) => {
             tracing::warn!(account_id = %account_id, "login failed; rolling back persistent state");
-            rollback(platform, &sdk_dir, &keychain_key);
+            rollback(
+                platform,
+                &sdk_dir,
+                &keychain_key,
+                &store_passphrase_keychain_key(&account_id),
+            );
             Err(err)
         }
     }
@@ -574,6 +656,19 @@ pub fn sign_out_cleanup(platform: &dyn Platform, account_id: &str) -> Result<(),
     registry::delete_account(&data_dir, account_id)?;
     platform.keychain_delete(&session_keychain_key(account_id))?;
 
+    // Also delete the SDK-store passphrase (Story 2.6), best-effort: a posture-off
+    // account never wrote it, and `keychain_delete` already tolerates a missing
+    // entry, so this must never fail sign-out over a stray/absent secret. A genuine
+    // (non-`NoEntry`) failure is logged — like `rollback` and the store-dir removal —
+    // so a stranded secret leaves a forensic trail rather than passing silently.
+    if let Err(e) = platform.keychain_delete(&store_passphrase_keychain_key(account_id)) {
+        tracing::warn!(
+            account_id = %account_id,
+            error = %e,
+            "sign-out: could not delete store passphrase entry (best-effort; account already non-restorable)"
+        );
+    }
+
     // Store-dir removal is best-effort and LAST: a transient failure here (e.g. a
     // file lock) must not resurrect a restorable account, so — like `rollback` — we
     // log and swallow it rather than propagate. A missing dir is expected (never
@@ -614,6 +709,26 @@ mod tests {
             session_keychain_key("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
             "session/01ARZ3NDEKTSV4RRFFQ69G5FAV"
         );
+    }
+
+    #[test]
+    fn store_passphrase_key_is_namespaced_by_account() {
+        assert_eq!(
+            store_passphrase_keychain_key("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            "store_passphrase/01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
+    }
+
+    #[test]
+    fn generate_store_passphrase_is_long_alphanumeric_and_distinct() {
+        let a = generate_store_passphrase();
+        let b = generate_store_passphrase();
+        assert!(a.len() >= 32, "passphrase must be at least 32 chars");
+        assert!(
+            a.chars().all(|c| c.is_ascii_alphanumeric()),
+            "passphrase must be alphanumeric"
+        );
+        assert_ne!(a, b, "two generated passphrases must differ");
     }
 
     /// Build a `MatrixSession` from its flattened JSON shape (user_id, device_id,
@@ -761,13 +876,21 @@ mod tests {
         std::fs::write(sdk_dir.join("sub").join("f"), b"x").expect("write file");
         assert!(sdk_dir.exists());
 
-        rollback(&platform, &sdk_dir, "session/01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        rollback(
+            &platform,
+            &sdk_dir,
+            "session/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "store_passphrase/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
 
         assert!(!sdk_dir.exists(), "store dir should be removed by rollback");
         assert_eq!(
             platform.deleted.lock().expect("lock poisoned").as_slice(),
-            ["session/01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()],
-            "rollback must delete exactly the account's keychain entry"
+            [
+                "session/01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                "store_passphrase/01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            ],
+            "rollback must delete the account's session and store-passphrase entries"
         );
     }
 
@@ -777,8 +900,10 @@ mod tests {
         let sdk_dir = temp_dir("rollback-missing");
         // Directory never created: rollback must not panic and must still attempt
         // the keychain cleanup (a missing dir is not an error).
-        rollback(&platform, &sdk_dir, "session/x");
-        assert_eq!(platform.deleted.lock().expect("lock poisoned").len(), 1);
+        rollback(&platform, &sdk_dir, "session/x", "store_passphrase/x");
+        // Both the session and store-passphrase entries are attempted (both
+        // best-effort / tolerant of absence).
+        assert_eq!(platform.deleted.lock().expect("lock poisoned").len(), 2);
     }
 
     /// Fake platform with a fixed data dir and an in-memory keychain map, so the
@@ -1028,6 +1153,87 @@ mod tests {
         sign_out_cleanup(&platform, id).expect("cleanup of absent state should be ok");
         // And a second call is likewise a no-op.
         sign_out_cleanup(&platform, id).expect("second cleanup should be ok");
+        let _ = std::fs::remove_dir_all(&platform.data_dir);
+    }
+
+    #[test]
+    fn encryption_posture_roundtrips_and_defaults_to_none_when_unset() {
+        let platform = FakePlatform::new(temp_dir("posture"));
+        // Unchosen (fresh install) reads as None — the state that gates the choice.
+        assert_eq!(
+            get_encryption_posture(&platform).expect("get unset"),
+            None,
+            "posture is unchosen on a fresh install"
+        );
+        // Opt in.
+        set_encryption_posture(&platform, true).expect("set on");
+        assert_eq!(
+            get_encryption_posture(&platform).expect("get on"),
+            Some(true)
+        );
+        // Opt out overwrites.
+        set_encryption_posture(&platform, false).expect("set off");
+        assert_eq!(
+            get_encryption_posture(&platform).expect("get off"),
+            Some(false)
+        );
+        let _ = std::fs::remove_dir_all(&platform.data_dir);
+    }
+
+    #[test]
+    fn sign_out_cleanup_deletes_the_store_passphrase_entry() {
+        let platform = FakePlatform::new(temp_dir("cleanup-passphrase"));
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        registry::insert_account(
+            &platform.data_dir,
+            id,
+            "@alice:example.org",
+            "https://matrix.example.org/",
+            "DEVID",
+            1,
+            0,
+        )
+        .expect("insert row");
+        platform
+            .keychain_set(&session_keychain_key(id), "session-json")
+            .expect("set session");
+        // Seed a store passphrase as an encrypted (posture-on) account would have.
+        platform
+            .keychain_set(&store_passphrase_keychain_key(id), "opaque-passphrase")
+            .expect("set passphrase");
+
+        sign_out_cleanup(&platform, id).expect("cleanup should succeed");
+
+        assert!(
+            platform
+                .keychain_get(&store_passphrase_keychain_key(id))
+                .expect("get")
+                .is_none(),
+            "store passphrase entry should be deleted on sign-out"
+        );
+        let _ = std::fs::remove_dir_all(&platform.data_dir);
+    }
+
+    #[test]
+    fn sign_out_cleanup_succeeds_without_a_store_passphrase_entry() {
+        let platform = FakePlatform::new(temp_dir("cleanup-no-passphrase"));
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        registry::insert_account(
+            &platform.data_dir,
+            id,
+            "@alice:example.org",
+            "https://matrix.example.org/",
+            "DEVID",
+            1,
+            0,
+        )
+        .expect("insert row");
+        platform
+            .keychain_set(&session_keychain_key(id), "session-json")
+            .expect("set session");
+        // Posture-off account: no passphrase entry was ever written. Cleanup must
+        // still succeed (the delete tolerates a missing entry).
+        sign_out_cleanup(&platform, id).expect("cleanup without passphrase should succeed");
         let _ = std::fs::remove_dir_all(&platform.data_dir);
     }
 }

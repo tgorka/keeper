@@ -42,6 +42,8 @@ pub fn run() {
             ipc::beeper_request_code,
             ipc::login_beeper,
             ipc::cancel_beeper,
+            ipc::set_encryption_posture,
+            ipc::encryption_posture,
             ipc::room_list_subscribe,
             ipc::room_list_unsubscribe,
             ipc::timeline_subscribe,

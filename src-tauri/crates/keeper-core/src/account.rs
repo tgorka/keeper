@@ -839,12 +839,18 @@ async fn activate(
     let row = registry::get_account(&data_dir, account_id)?.ok_or(AccountError::SessionMissing)?;
     let sdk_dir = data_dir.join("accounts").join(account_id).join("sdk");
 
+    // At-rest encryption (Story 2.6, AD-22): the per-account SDK-store passphrase
+    // is self-describing — present in the Keychain iff the store was created
+    // encrypted, so re-open it with `Some(passphrase)` exactly then, else `None`
+    // (FileVault posture). The passphrase never leaves Rust.
+    let passphrase = platform.keychain_get(&auth::store_passphrase_keychain_key(account_id))?;
+
     // OAuth refresh tokens are one-time-use (MAS); `handle_refresh_tokens()` lets
     // the SDK rotate them, and the session-change watcher below re-persists the
     // rotated blob so a restart-after-refresh restores cleanly.
     let client = Client::builder()
         .homeserver_url(&row.homeserver_url)
-        .sqlite_store(&sdk_dir, None)
+        .sqlite_store(&sdk_dir, passphrase.as_deref())
         .handle_refresh_tokens()
         .build()
         .await
