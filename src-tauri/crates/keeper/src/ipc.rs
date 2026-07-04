@@ -377,6 +377,31 @@ pub async fn send_retry(
         .map_err(to_ipc_error)
 }
 
+/// Report the persisted account that can be restored on launch, if any (FR-8,
+/// Story 1.8). Identity only — delegates to the core, which lists the registry
+/// rows and returns the first whose Keychain session is present as a non-secret
+/// [`AccountVm`]. Resolves to `null` on a cold install (or a row whose session is
+/// gone). No eager activation: the existing lazy room-list subscribe restores the
+/// session. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub async fn session_restore(state: State<'_, AppState>) -> Result<Option<AccountVm>, IpcError> {
+    auth::find_restorable_account(state.platform.as_ref()).map_err(to_ipc_error)
+}
+
+/// Sign out an account locally (AD-10, Story 1.8). Delegates to the core, which
+/// tears down the account's live supervision tasks then deletes exactly its SDK
+/// store dir, Keychain session entry, and registry row — no server-side logout,
+/// works offline, and is idempotent whether or not the account was ever
+/// activated. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub async fn sign_out(state: State<'_, AppState>, account_id: String) -> Result<(), IpcError> {
+    state
+        .accounts
+        .sign_out(state.platform.as_ref(), &account_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

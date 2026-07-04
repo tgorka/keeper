@@ -93,6 +93,38 @@ pub fn delete_account(data_dir: &Path, account_id: &str) -> Result<(), CoreError
     Ok(())
 }
 
+/// List every account row in the registry, in insertion order.
+///
+/// Returns an empty vector when the registry has no rows (a cold, never-signed-in
+/// install). Used by the session-restore path to find a persisted account.
+pub fn list_accounts(data_dir: &Path) -> Result<Vec<AccountRow>, CoreError> {
+    let conn = open(data_dir)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT account_id, user_id, homeserver_url, device_id, created_ts \
+             FROM accounts ORDER BY created_ts ASC",
+        )
+        .map_err(|e| CoreError::Internal(format!("could not prepare account list: {e}")))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(AccountRow {
+                account_id: r.get(0)?,
+                user_id: r.get(1)?,
+                homeserver_url: r.get(2)?,
+                device_id: r.get(3)?,
+                created_ts: r.get(4)?,
+            })
+        })
+        .map_err(|e| CoreError::Internal(format!("could not query account list: {e}")))?;
+    let mut accounts = Vec::new();
+    for row in rows {
+        accounts.push(
+            row.map_err(|e| CoreError::Internal(format!("could not read account row: {e}")))?,
+        );
+    }
+    Ok(accounts)
+}
+
 /// Fetch a single account row by id, if present.
 pub fn get_account(data_dir: &Path, account_id: &str) -> Result<Option<AccountRow>, CoreError> {
     let conn = open(data_dir)?;
@@ -174,6 +206,43 @@ mod tests {
         let dir = temp_dir();
         // No insert; deleting a non-existent row must succeed (rollback safety).
         delete_account(&dir, "does-not-exist").expect("delete of missing row should be ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_accounts_empty_then_returns_inserted_rows() {
+        let dir = temp_dir();
+
+        // Empty registry lists nothing.
+        let empty = list_accounts(&dir).expect("list on empty registry");
+        assert!(empty.is_empty(), "fresh registry should list no accounts");
+
+        insert_account(
+            &dir,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "@alice:example.org",
+            "https://matrix.example.org/",
+            "DEVID123",
+            1,
+        )
+        .expect("insert first");
+        insert_account(
+            &dir,
+            "01BX5ZZKBKACTAV9WEVGEMMVRZ",
+            "@bob:example.org",
+            "https://matrix.example.org/",
+            "DEVID456",
+            2,
+        )
+        .expect("insert second");
+
+        let rows = list_accounts(&dir).expect("list two rows");
+        assert_eq!(rows.len(), 2);
+        // Ordered by created_ts ascending.
+        assert_eq!(rows[0].account_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(rows[0].user_id, "@alice:example.org");
+        assert_eq!(rows[1].account_id, "01BX5ZZKBKACTAV9WEVGEMMVRZ");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

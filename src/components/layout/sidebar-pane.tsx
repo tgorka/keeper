@@ -1,4 +1,5 @@
 import { MessageSquare, Radio, Settings, WifiOff } from "lucide-react";
+import { AccountFooter } from "@/components/layout/account-footer";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useConnectionStore } from "@/lib/stores/connection";
@@ -72,33 +73,40 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
           );
         })}
       </ul>
-      {/* Persistent offline pill (UX-DR18): a sidebar-footer element shown only
-          while disconnected, using the amber `held` tokens. Non-interactive and
-          keyboard-irrelevant; `role="status"` announces the connectivity change
-          without a toast. No toasts for connectivity, ever. */}
-      {offline &&
-        (collapsed ? (
-          <div
-            role="status"
-            aria-label={OFFLINE_PILL_TEXT}
-            className="mt-auto flex shrink-0 items-center justify-center border-border border-t bg-held/10 p-3 text-held"
-          >
-            <WifiOff aria-hidden="true" className="size-5" />
-            {/* Real text content in addition to aria-label so the `role="status"`
-                live region is reliably announced by screen readers that read a
-                live region's *content* (not its label) when the rail is
-                collapsed; visually hidden behind the icon. */}
-            <span className="sr-only">{OFFLINE_PILL_TEXT}</span>
-          </div>
-        ) : (
-          <div
-            role="status"
-            className="mt-auto flex shrink-0 items-start gap-2 border-border border-t bg-held/10 p-3 text-held text-xs"
-          >
-            <WifiOff aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-            <span>{OFFLINE_PILL_TEXT}</span>
-          </div>
-        ))}
+      {/* Persistent sidebar-footer region (pushed to the bottom with `mt-auto`):
+          the offline pill directly ABOVE the account row, both inside the footer
+          region. The account row is always mounted while signed in; the pill
+          shows only while disconnected. */}
+      <div className="mt-auto flex shrink-0 flex-col">
+        {/* Persistent offline pill (UX-DR18): shown only while disconnected, using
+            the amber `held` tokens. Non-interactive and keyboard-irrelevant;
+            `role="status"` announces the connectivity change without a toast. No
+            toasts for connectivity, ever. */}
+        {offline &&
+          (collapsed ? (
+            <div
+              role="status"
+              aria-label={OFFLINE_PILL_TEXT}
+              className="flex shrink-0 items-center justify-center border-border border-t bg-held/10 p-3 text-held"
+            >
+              <WifiOff aria-hidden="true" className="size-5" />
+              {/* Real text content in addition to aria-label so the `role="status"`
+                  live region is reliably announced by screen readers that read a
+                  live region's *content* (not its label) when the rail is
+                  collapsed; visually hidden behind the icon. */}
+              <span className="sr-only">{OFFLINE_PILL_TEXT}</span>
+            </div>
+          ) : (
+            <div
+              role="status"
+              className="flex shrink-0 items-start gap-2 border-border border-t bg-held/10 p-3 text-held text-xs"
+            >
+              <WifiOff aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+              <span>{OFFLINE_PILL_TEXT}</span>
+            </div>
+          ))}
+        <AccountFooter collapsed={collapsed} />
+      </div>
     </nav>
   );
 }

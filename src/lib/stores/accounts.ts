@@ -14,8 +14,17 @@ import type { AccountVm } from "@/lib/ipc/client";
 export interface AccountsState {
   /** The currently signed-in account, or `null` when signed out. */
   currentAccount: AccountVm | null;
+  /**
+   * Whether the one-shot boot session-restore attempt has completed (Story 1.8).
+   * `false` until then so `App` holds a splash instead of flashing the login
+   * screen for a restorable user; flips `true` on both restore success and
+   * failure (fail-safe to login).
+   */
+  hydrated: boolean;
   /** Record a successful login. Gates the shell. */
   setCurrentAccount: (account: AccountVm) => void;
+  /** Mark the boot restore attempt as complete (success or failure). */
+  markHydrated: () => void;
   /** Clear the current account (sign out). */
   clear: () => void;
 }
@@ -26,7 +35,9 @@ export interface AccountsState {
  */
 export const accountsStore = createStore<AccountsState>()((set) => ({
   currentAccount: null,
+  hydrated: false,
   setCurrentAccount: (account) => set({ currentAccount: account }),
+  markHydrated: () => set({ hydrated: true }),
   clear: () => set({ currentAccount: null }),
 }));
 

@@ -25,7 +25,9 @@ pub fn run() {
             ipc::connection_status_subscribe,
             ipc::connection_status_unsubscribe,
             ipc::send_text,
-            ipc::send_retry
+            ipc::send_retry,
+            ipc::session_restore,
+            ipc::sign_out
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

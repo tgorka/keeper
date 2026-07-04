@@ -84,6 +84,28 @@ export async function loginPassword(
 }
 
 /**
+ * Report the persisted account that can be restored on launch, if any (FR-8,
+ * Story 1.8). Identity only — the Rust core lists the registry rows and returns
+ * the first whose Keychain session is present as a non-secret {@link AccountVm}.
+ * Resolves with the account, or `null` on a cold install (or a row whose session
+ * is gone). No token or session material ever crosses IPC.
+ */
+export async function sessionRestore(): Promise<AccountVm | null> {
+  return await invoke<AccountVm | null>("session_restore");
+}
+
+/**
+ * Sign out an account locally (AD-10, Story 1.8). The Rust core tears down the
+ * account's live supervision tasks then deletes exactly its SDK store dir,
+ * Keychain session entry, and registry row — no server-side logout, works
+ * offline, idempotent. Rejects with the {@link IpcError} envelope on a cleanup
+ * failure.
+ */
+export async function signOut(accountId: string): Promise<void> {
+  await invoke<void>("sign_out", { accountId });
+}
+
+/**
  * Open a streaming subscription. Creates a `Channel`, forwards each delivered
  * batch to `onBatch` in arrival order (snapshot before any diff, per AD-8), and
  * resolves with the backend-assigned subscription id.

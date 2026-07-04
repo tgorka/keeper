@@ -552,6 +552,25 @@ impl AccountManager {
             tracing::info!(account_id = %account_id, "account shut down");
         }
     }
+
+    /// Sign out an account: tear down its live in-memory state, then delete its
+    /// persisted state (SDK store dir + Keychain session + registry row) — local
+    /// only, no server-side logout (AD-10, Story 1.8).
+    ///
+    /// `shutdown` runs *first* so the SDK's SQLite handles are released before the
+    /// store dir is removed, and it is a no-op when the account was never
+    /// activated (restored-but-never-subscribed). [`crate::auth::sign_out_cleanup`]
+    /// then removes exactly this account's three persisted targets, each
+    /// idempotent — so sign-out converges whether or not the account was live.
+    pub async fn sign_out(
+        &self,
+        platform: &dyn Platform,
+        account_id: &str,
+    ) -> Result<(), CoreError> {
+        self.shutdown(account_id).await;
+        crate::auth::sign_out_cleanup(platform, account_id)?;
+        Ok(())
+    }
 }
 
 /// Lazily rebuild the `Client` from the persisted session and start a
@@ -918,7 +937,68 @@ pub fn vector_diff_to_op(diff: VectorDiff<RoomVm>) -> RoomListOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::CoreError;
     use matrix_sdk_ui::eyeball_im::Vector;
+    use std::path::PathBuf;
+
+    /// Fake platform with a fixed data dir; keychain ops are no-ops. Enough for
+    /// the sign-out idempotency test (the account is never active, so cleanup
+    /// touches only already-absent state).
+    struct FakePlatform {
+        data_dir: PathBuf,
+    }
+
+    impl Platform for FakePlatform {
+        fn data_dir(&self) -> Result<PathBuf, CoreError> {
+            Ok(self.data_dir.clone())
+        }
+        fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn keychain_get(&self, _key: &str) -> Result<Option<String>, CoreError> {
+            Ok(None)
+        }
+        fn keychain_delete(&self, _key: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn notify(&self, _title: &str, _body: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
+            Err(CoreError::Unsupported("sidecar unused in tests".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_out_is_idempotent_when_account_not_active() {
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!(
+            "keeper-account-signout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let platform = FakePlatform {
+            data_dir: data_dir.clone(),
+        };
+        let manager = AccountManager::new();
+
+        // The account was never activated (absent from the manager map): shutdown
+        // is a no-op and cleanup touches only already-absent persisted state.
+        manager
+            .sign_out(&platform, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .await
+            .expect("sign_out of an inactive account should succeed");
+        // A second sign-out is likewise a no-op.
+        manager
+            .sign_out(&platform, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .await
+            .expect("second sign_out should succeed");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
 
     fn room(id: &str) -> RoomVm {
         RoomVm {

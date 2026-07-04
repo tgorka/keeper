@@ -11,6 +11,9 @@ const account: AccountVm = {
 describe("accountsStore", () => {
   beforeEach(() => {
     accountsStore.getState().clear();
+    // `clear()` deliberately preserves `hydrated`; reset it here so each test
+    // starts from the un-hydrated boot state regardless of run order.
+    accountsStore.setState({ hydrated: false });
   });
 
   it("starts with no current account", () => {
@@ -33,5 +36,21 @@ describe("accountsStore", () => {
     const stored = accountsStore.getState().currentAccount;
     expect(stored).not.toBeNull();
     expect(JSON.stringify(stored)).not.toContain("token");
+  });
+
+  it("starts un-hydrated (splash gate closed)", () => {
+    expect(accountsStore.getState().hydrated).toBe(false);
+  });
+
+  it("marks hydrated on markHydrated", () => {
+    accountsStore.getState().markHydrated();
+    expect(accountsStore.getState().hydrated).toBe(true);
+  });
+
+  it("keeps hydrated across a clear (sign-out does not reopen the splash)", () => {
+    accountsStore.getState().markHydrated();
+    accountsStore.getState().setCurrentAccount(account);
+    accountsStore.getState().clear();
+    expect(accountsStore.getState().hydrated).toBe(true);
   });
 });
