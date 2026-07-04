@@ -78,6 +78,24 @@ pub enum AccountError {
     SyncStart(String),
 }
 
+/// Errors originating in per-room timeline subscription (AD-8, AD-19, AD-21).
+///
+/// A secret-free taxonomy: no message ever contains a token, session material,
+/// or message plaintext. All variants map to `IpcErrorCode::TimelineUnavailable`
+/// (retriable) in the shell's single funnel.
+#[derive(Debug, Error)]
+pub enum TimelineError {
+    /// The requested room was not found on the live `Client` (unknown or
+    /// unparsable room id).
+    #[error("room not found")]
+    RoomNotFound,
+
+    /// The SDK `Timeline` failed to build for the room. The wrapped string is a
+    /// non-secret description of the failure.
+    #[error("could not open the room timeline: {0}")]
+    Build(String),
+}
+
 /// The hexagon error root. Every fallible core operation surfaces one of these.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -92,6 +110,10 @@ pub enum CoreError {
     /// Account activation or room-list supervision failed.
     #[error(transparent)]
     Account(#[from] AccountError),
+
+    /// A per-room timeline subscription failed to open.
+    #[error(transparent)]
+    Timeline(#[from] TimelineError),
 
     /// A requested capability is not supported on this platform/build. Honest,
     /// non-panicking signal used by not-yet-wired [`crate::platform::Platform`]

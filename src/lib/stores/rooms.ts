@@ -12,70 +12,35 @@
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import type { RoomListBatch, RoomListOp, RoomVm } from "@/lib/ipc/client";
+import { applyDiffOp } from "@/lib/stores/vector-diff";
 
 export interface RoomsState {
   /** The ordered room window, exactly as Rust streamed it. */
   rooms: RoomVm[];
   /** Total rooms the server knows about, or `null` when not yet loaded. */
   total: number | null;
+  /**
+   * The currently selected room id, or `null` when none is open. Ephemeral UI
+   * state (not mirrored from Rust) — it only records which room the conversation
+   * pane should stream; the timeline itself stays authoritative in Rust.
+   */
+  selectedRoomId: string | null;
   /** Apply one streamed batch (its ops in sequence), updating `total`. */
   applyBatch: (batch: RoomListBatch) => void;
+  /** Select a room to open (or `null` to close). */
+  selectRoom: (roomId: string | null) => void;
   /** Reset to the empty state (on unsubscribe / account change). */
   clear: () => void;
 }
 
 /**
- * Fold a single op onto `rooms`, returning a new array (immutable). Pure: no
- * network, no derivation of truth, and — critically — no sorting.
+ * Fold a single op onto `rooms`, returning a new array (immutable). Delegates to
+ * the shared, range-guarded {@link applyDiffOp} reducer — pure, and never sorts.
+ * `RoomListOp` (its single-item ops carry `room`, list ops carry `rooms`) is
+ * assignable to the reducer's canonical `DiffOp` union.
  */
 function applyOp(rooms: RoomVm[], op: RoomListOp): RoomVm[] {
-  switch (op.op) {
-    case "reset":
-      return [...op.rooms];
-    case "append":
-      return [...rooms, ...op.rooms];
-    case "clear":
-      return [];
-    case "pushFront":
-      return [op.room, ...rooms];
-    case "pushBack":
-      return [...rooms, op.room];
-    case "popFront":
-      return rooms.slice(1);
-    case "popBack":
-      return rooms.slice(0, -1);
-    case "insert": {
-      if (op.index < 0 || op.index > rooms.length) {
-        return rooms;
-      }
-      const next = [...rooms];
-      next.splice(op.index, 0, op.room);
-      return next;
-    }
-    case "set": {
-      if (op.index < 0 || op.index >= rooms.length) {
-        return rooms;
-      }
-      const next = [...rooms];
-      next[op.index] = op.room;
-      return next;
-    }
-    case "remove": {
-      if (op.index < 0 || op.index >= rooms.length) {
-        return rooms;
-      }
-      const next = [...rooms];
-      next.splice(op.index, 1);
-      return next;
-    }
-    case "truncate":
-      return rooms.slice(0, op.length);
-    default: {
-      // Exhaustiveness guard: a new op variant must be handled here.
-      const _never: never = op;
-      return _never;
-    }
-  }
+  return applyDiffOp(rooms, op);
 }
 
 /**
@@ -85,11 +50,18 @@ function applyOp(rooms: RoomVm[], op: RoomListOp): RoomVm[] {
 export const roomsStore = createStore<RoomsState>()((set) => ({
   rooms: [],
   total: null,
+  selectedRoomId: null,
   applyBatch: (batch) =>
     set((state) => ({
       rooms: batch.ops.reduce(applyOp, state.rooms),
       total: batch.total ?? state.total,
     })),
+  selectRoom: (roomId) => set({ selectedRoomId: roomId }),
+  // `selectedRoomId` is deliberately preserved across a room-list `clear()` so
+  // refreshing the streamed window (a Reset) does not close the open
+  // conversation. Selection is reset explicitly via `selectRoom(null)` (e.g. on
+  // sign-out, Story 1.8); the conversation pane independently clears its own
+  // rendered timeline when the account goes away.
   clear: () => set({ rooms: [], total: null }),
 }));
 

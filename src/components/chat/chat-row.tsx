@@ -3,9 +3,8 @@
  *
  * Full-width, keyboard-operable `<button>` showing the room avatar, display
  * name, last-message preview, and timestamp. Selecting it (click / Enter /
- * Space) records a room id via `onSelect` at most — it never opens or streams a
- * timeline (that is Story 1.5). Carries a visible focus ring and an accessible
- * label.
+ * Space) records a room id via `onSelect`; the selected row is highlighted and
+ * marked `aria-current`. Carries a visible focus ring and an accessible label.
  */
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { formatRoomTimestamp } from "@/lib/format-time";
@@ -16,6 +15,8 @@ interface ChatRowProps {
   room: RoomVm;
   /** Optional selection callback; receives the room id. */
   onSelect?: (roomId: string) => void;
+  /** Whether this row is the currently open conversation. */
+  selected?: boolean;
 }
 
 /**
@@ -33,7 +34,7 @@ function initials(displayName: string): string {
   return (words[0][0] + words[words.length - 1][0]).toUpperCase();
 }
 
-export function ChatRow({ room, onSelect }: ChatRowProps) {
+export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
   const timestamp = room.timestamp === null ? null : formatRoomTimestamp(room.timestamp) || null;
   // An `mxc://` URI cannot load in the webview (the media scheme handler is a
   // later epic); only a browser-loadable http(s) URL is rendered as an image.
@@ -44,10 +45,11 @@ export function ChatRow({ room, onSelect }: ChatRowProps) {
       type="button"
       onClick={() => onSelect?.(room.roomId)}
       aria-label={`Conversation with ${room.displayName}`}
+      aria-current={selected ? "true" : undefined}
       className={cn(
         "flex h-16 w-full shrink-0 items-center gap-3 px-3 text-left",
         "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-        "hover:bg-accent",
+        selected ? "bg-accent" : "hover:bg-accent",
       )}
     >
       <Avatar size="lg">

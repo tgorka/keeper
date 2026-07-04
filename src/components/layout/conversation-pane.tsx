@@ -1,6 +1,26 @@
+/**
+ * Conversation pane: the read-only per-room timeline (FR-8/FR-9, AD-4/AD-8/AD-19).
+ *
+ * On `selectedRoomId` change it clears the timeline store (newest-mount-wins),
+ * subscribes to the room's timeline channel, and mirrors the streamed ops into
+ * the ordered {@link timelineStore} (never sorting). Rendered `Message` items
+ * become grouped {@link MessageBubble}s inside a bottom-anchored scroll region
+ * with a 720 px-max centered column; `Other` items are skipped (they exist only
+ * to keep diff indices aligned). Cleanup — StrictMode double-mount, room change,
+ * unmount — unsubscribes the backend task and clears the store, so timelines
+ * never leak or stack. A failed subscribe surfaces an honest inline error
+ * instead of a silent spinner (AD-21). No composer here — send is Story 1.6.
+ */
 import { PanelRight } from "lucide-react";
-import type { Ref } from "react";
+import { type Ref, useEffect, useRef, useState } from "react";
+import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import type { TimelineBatch, TimelineItemVm } from "@/lib/ipc/client";
+import { subscribeTimeline, unsubscribeTimeline } from "@/lib/ipc/client";
+import { useAccountsStore } from "@/lib/stores/accounts";
+import { useRoomsStore } from "@/lib/stores/rooms";
+import { timelineStore, useTimelineStore } from "@/lib/stores/timeline";
 
 interface ConversationPaneProps {
   detailOpen: boolean;
@@ -8,7 +28,105 @@ interface ConversationPaneProps {
   toggleRef?: Ref<HTMLButtonElement>;
 }
 
+/** A `Message` item paired with whether it continues a same-sender run. */
+interface RenderedMessage {
+  item: MessageVm;
+  grouped: boolean;
+}
+
+/**
+ * Project the streamed timeline into the renderable message sequence, computing
+ * grouping in a single pass: a `Message` is `grouped` when the immediately
+ * preceding **rendered** message has the same sender. `Other` items are skipped
+ * but break a run (an interleaved non-text item ungroups the next message).
+ */
+function toRenderedMessages(items: TimelineItemVm[]): RenderedMessage[] {
+  const rendered: RenderedMessage[] = [];
+  let prevSender: string | null = null;
+  for (const item of items) {
+    if (item.kind !== "message") {
+      // A non-rendered item breaks the same-sender run.
+      prevSender = null;
+      continue;
+    }
+    rendered.push({ item, grouped: prevSender === item.sender });
+    prevSender = item.sender;
+  }
+  return rendered;
+}
+
 export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: ConversationPaneProps) {
+  const accountId = useAccountsStore((s) => s.currentAccount?.accountId ?? null);
+  const selectedRoomId = useRoomsStore((s) => s.selectedRoomId);
+  const items = useTimelineStore((s) => s.items);
+  const [errored, setErrored] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (accountId === null || selectedRoomId === null) {
+      // No room open, or the account went away (e.g. sign-out, Story 1.8): drop
+      // any rendered timeline so a previous room's / account's messages never
+      // linger, and reset the load/error state.
+      timelineStore.getState().clear();
+      setErrored(false);
+      setLoaded(false);
+      return;
+    }
+
+    setErrored(false);
+    setLoaded(false);
+    // Establish clean state at mount so the newest mount always wins; clearing
+    // in cleanup instead would race the next room's mount.
+    timelineStore.getState().clear();
+    let subscriptionId: number | null = null;
+    let cancelled = false;
+
+    // Gate the sink so it no-ops after cleanup (post-unmount / StrictMode late
+    // batches never mutate the store).
+    const onBatch = (b: TimelineBatch) => {
+      if (!cancelled) {
+        timelineStore.getState().applyBatch(b);
+        setLoaded(true);
+      }
+    };
+    subscribeTimeline(accountId, selectedRoomId, onBatch)
+      .then((id) => {
+        if (cancelled) {
+          // Unmounted / room changed before the id resolved — tear down now.
+          void unsubscribeTimeline(accountId, id);
+          return;
+        }
+        subscriptionId = id;
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setErrored(true);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      if (subscriptionId !== null) {
+        void unsubscribeTimeline(accountId, subscriptionId);
+      }
+      timelineStore.getState().clear();
+    };
+  }, [accountId, selectedRoomId]);
+
+  // Bottom-anchor the scroll region: keep the newest message in view whenever
+  // the streamed timeline changes (a `Reset` snapshot or a live diff). This is a
+  // plain always-scroll-to-bottom — no auto-follow tuning / jump-to-bottom
+  // (Epic 3 polish). Short lists rest at the bottom via the `mt-auto` content.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && items.length > 0) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [items]);
+
+  const messages = toRenderedMessages(items);
+
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col bg-background">
       <div className="flex shrink-0 items-center justify-end border-border border-b p-2">
@@ -25,11 +143,46 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
           <PanelRight aria-hidden="true" />
         </Button>
       </div>
-      <div className="flex flex-1 items-center justify-center p-8">
-        <p className="max-w-sm text-center text-muted-foreground text-sm">
-          Select a conversation to start reading.
-        </p>
-      </div>
+      {selectedRoomId === null ? (
+        <div className="flex flex-1 items-center justify-center p-8">
+          <p className="max-w-sm text-center text-muted-foreground text-sm">
+            Select a conversation to start reading.
+          </p>
+        </div>
+      ) : errored ? (
+        <div className="flex flex-1 items-center justify-center p-8">
+          <p className="max-w-sm text-center text-muted-foreground text-sm">
+            Couldn't open this conversation. Check your connection and try again.
+          </p>
+        </div>
+      ) : !loaded ? (
+        <div
+          role="status"
+          aria-label="Loading messages"
+          className="mx-auto flex w-full max-w-[720px] flex-1 flex-col justify-end gap-3 p-4"
+        >
+          {[0, 1, 2].map((i) => (
+            <Skeleton key={i} className="h-10 w-1/2 rounded-[14px]" />
+          ))}
+        </div>
+      ) : messages.length === 0 ? (
+        <div className="flex flex-1 items-center justify-center p-8">
+          <p className="max-w-sm text-center text-muted-foreground text-sm">No messages yet.</p>
+        </div>
+      ) : (
+        <div ref={scrollRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+          <ol
+            aria-label="Messages"
+            className="mx-auto mt-auto flex w-full max-w-[720px] flex-col px-4 py-4"
+          >
+            {messages.map(({ item, grouped }) => (
+              <li key={item.key}>
+                <MessageBubble item={item} grouped={grouped} />
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
     </main>
   );
 }

@@ -18,9 +18,13 @@ export type { PingVm } from "./gen/PingVm";
 export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
+export type { TimelineBatch } from "./gen/TimelineBatch";
+export type { TimelineItemVm } from "./gen/TimelineItemVm";
+export type { TimelineOp } from "./gen/TimelineOp";
 
 import type { AccountVm } from "./gen/AccountVm";
 import type { RoomListBatch } from "./gen/RoomListBatch";
+import type { TimelineBatch } from "./gen/TimelineBatch";
 
 /**
  * Structural guard for the {@link IpcError} envelope so we can rethrow it
@@ -114,4 +118,28 @@ export async function subscribeRoomList(
  */
 export async function unsubscribeRoomList(accountId: string, id: number): Promise<void> {
   await invoke<void>("room_list_unsubscribe", { accountId, subscriptionId: id });
+}
+
+/**
+ * Subscribe to a room's timeline (FR-8, FR-9, AD-4/AD-8). Opens a `Channel`,
+ * forwards each {@link TimelineBatch} to `onBatch` in arrival order (a `Reset`
+ * snapshot before any diff), and resolves with the subscription id. Rejects with
+ * the {@link IpcError} envelope (`code: "timelineUnavailable"`) if the room's
+ * timeline cannot be opened.
+ */
+export async function subscribeTimeline(
+  accountId: string,
+  roomId: string,
+  onBatch: (batch: TimelineBatch) => void,
+): Promise<number> {
+  return await subscribe<TimelineBatch>("timeline_subscribe", onBatch, { accountId, roomId });
+}
+
+/**
+ * Unsubscribe exactly one timeline subscription, aborting its backend producer
+ * task and dropping its `Timeline` (AD-19). Idempotent — unsubscribing an
+ * unknown id is a no-op.
+ */
+export async function unsubscribeTimeline(accountId: string, id: number): Promise<void> {
+  await invoke<void>("timeline_unsubscribe", { accountId, subscriptionId: id });
 }

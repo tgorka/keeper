@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatRoomTimestamp } from "@/lib/format-time";
+import { formatMessageTime, formatRoomTimestamp } from "@/lib/format-time";
 
 describe("formatRoomTimestamp", () => {
   it("shows a clock time (HH:MM) for a same-day timestamp", () => {
@@ -39,5 +39,22 @@ describe("formatRoomTimestamp", () => {
     expect(formatRoomTimestamp(0)).toBe("");
     expect(formatRoomTimestamp(-1)).toBe("");
     expect(formatRoomTimestamp(Number.POSITIVE_INFINITY)).toBe("");
+  });
+});
+
+describe("formatMessageTime", () => {
+  it("shows a clock time (HH:MM) for a valid timestamp", () => {
+    const ms = new Date(2026, 6, 4, 9, 30, 0).getTime();
+    const out = formatMessageTime(ms);
+    expect(out).toMatch(/\d{1,2}:\d{2}/);
+    // Never a date part — just the clock.
+    expect(out).not.toMatch(/[A-Za-z]{3,}/);
+  });
+
+  it("returns an empty string for non-finite or non-positive timestamps", () => {
+    expect(formatMessageTime(Number.NaN)).toBe("");
+    expect(formatMessageTime(0)).toBe("");
+    expect(formatMessageTime(-1)).toBe("");
+    expect(formatMessageTime(Number.POSITIVE_INFINITY)).toBe("");
   });
 });

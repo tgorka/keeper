@@ -20,6 +20,8 @@ import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 export function ChatListPane() {
   const accountId = useAccountsStore((s) => s.currentAccount?.accountId ?? null);
   const rooms = useRoomsStore((s) => s.rooms);
+  const selectedRoomId = useRoomsStore((s) => s.selectedRoomId);
+  const selectRoom = useRoomsStore((s) => s.selectRoom);
   const [errored, setErrored] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
@@ -80,7 +82,11 @@ export function ChatListPane() {
           <ul aria-label="Conversations" className="flex flex-col">
             {rooms.map((room) => (
               <li key={room.roomId}>
-                <ChatRow room={room} />
+                <ChatRow
+                  room={room}
+                  onSelect={selectRoom}
+                  selected={room.roomId === selectedRoomId}
+                />
               </li>
             ))}
           </ul>

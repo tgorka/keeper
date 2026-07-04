@@ -104,4 +104,16 @@ describe("ChatRow", () => {
     fireEvent.click(screen.getByRole("button"));
     expect(onSelect).toHaveBeenCalledWith("!xyz:example.org");
   });
+
+  it("marks the selected row with aria-current and a highlight", () => {
+    render(<ChatRow room={room()} selected />);
+    const button = screen.getByRole("button");
+    expect(button).toHaveAttribute("aria-current", "true");
+    expect(button).toHaveClass("bg-accent");
+  });
+
+  it("does not mark an unselected row with aria-current", () => {
+    render(<ChatRow room={room()} selected={false} />);
+    expect(screen.getByRole("button")).not.toHaveAttribute("aria-current");
+  });
 });

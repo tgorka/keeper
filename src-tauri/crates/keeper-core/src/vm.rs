@@ -50,6 +50,10 @@ pub enum IpcErrorCode {
     /// was missing, session restore failed, or `SyncService` failed to start.
     /// Retriable — the subscribe may be attempted again.
     SyncUnavailable,
+    /// A room's timeline could not be opened: the room was not found or the SDK
+    /// `Timeline` failed to build. Retriable — the subscribe may be attempted
+    /// again.
+    TimelineUnavailable,
 }
 
 /// A single room row rendered in the chat list (FR-8, NFR-9, AD-20).
@@ -156,6 +160,130 @@ pub struct RoomListBatch {
     /// The total number of rooms the server knows about, when known.
     #[ts(type = "number | null")]
     pub total: Option<u32>,
+}
+
+/// A single timeline item rendered in the conversation pane (FR-8, NFR-9,
+/// AD-8/AD-9/AD-20).
+///
+/// Carries **only** non-secret render data. `timestamp` is `i64` milliseconds
+/// since the Unix epoch (UTC) — never an ISO string. Exactly one VM is produced
+/// per SDK `TimelineItem` so diff indices stay aligned; virtual, state,
+/// redacted, undecryptable, and non-text items become an [`TimelineItemVm::Other`]
+/// carrying only a stable opaque `key`. No tokens, session material, event raw
+/// JSON, or crypto state cross IPC on this VM. Serialized as an internally
+/// tagged enum so the frontend can switch on `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum TimelineItemVm {
+    /// A renderable text message (`m.room.message` of msgtype text/notice/emote).
+    Message {
+        /// Stable opaque render key (the item's `unique_id`).
+        key: String,
+        /// The sender's Matrix user id (opaque, passed through verbatim).
+        sender: String,
+        /// The resolved sender display name, or `null` when unavailable.
+        sender_display_name: Option<String>,
+        /// The decoded plain-text body of the already-decrypted message
+        /// (defensively truncated before crossing IPC).
+        body: String,
+        /// The message origin timestamp: ms since the Unix epoch (UTC).
+        #[ts(type = "number")]
+        timestamp: i64,
+        /// Whether the current account sent this message.
+        is_own: bool,
+    },
+    /// Any non-text item (non-text msgtype, state/membership/profile change,
+    /// redacted, undecryptable, or a virtual date-divider/read-marker item).
+    /// Carried only to keep diff indices aligned; the frontend renders nothing.
+    Other {
+        /// Stable opaque render key (the item's `unique_id`).
+        key: String,
+    },
+}
+
+/// One index-based timeline operation mirroring an eyeball-im `VectorDiff`
+/// (AD-8, AD-9, AD-20).
+///
+/// The SDK `Timeline`'s `subscribe` stream yields a `VectorDiff` sequence;
+/// keeper forwards it verbatim as these ops (one VM per SDK item). The frontend
+/// applies them to a plain array by index and **never** re-sorts, filters, or
+/// re-indexes. Serialized as an internally tagged enum so the frontend can
+/// switch on `op`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[ts(export)]
+pub enum TimelineOp {
+    /// Full reset — replace the current contents with `items`.
+    Reset {
+        /// The complete current timeline, in order.
+        items: Vec<TimelineItemVm>,
+    },
+    /// Append `items` to the end, in order.
+    Append {
+        /// Items to append.
+        items: Vec<TimelineItemVm>,
+    },
+    /// Remove all items.
+    Clear,
+    /// Insert `item` at the front (index 0).
+    PushFront {
+        /// The item to prepend.
+        item: TimelineItemVm,
+    },
+    /// Append `item` to the end.
+    PushBack {
+        /// The item to append.
+        item: TimelineItemVm,
+    },
+    /// Remove the first item.
+    PopFront,
+    /// Remove the last item.
+    PopBack,
+    /// Insert `item` at `index`, shifting the tail right.
+    Insert {
+        /// The insertion index.
+        #[ts(type = "number")]
+        index: u32,
+        /// The item to insert.
+        item: TimelineItemVm,
+    },
+    /// Replace the item at `index` in place.
+    Set {
+        /// The index to overwrite.
+        #[ts(type = "number")]
+        index: u32,
+        /// The replacement item.
+        item: TimelineItemVm,
+    },
+    /// Remove the item at `index`, shifting the tail left.
+    Remove {
+        /// The index to remove.
+        #[ts(type = "number")]
+        index: u32,
+    },
+    /// Truncate the timeline to `length` items.
+    Truncate {
+        /// The new length.
+        #[ts(type = "number")]
+        length: u32,
+    },
+}
+
+/// A batch of timeline ops delivered over the subscription's `Channel` (AD-8).
+///
+/// The stream always opens with a batch whose first op is a
+/// [`TimelineOp::Reset`] carrying the cached snapshot, then diff batches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TimelineBatch {
+    /// The ordered ops to apply, in sequence.
+    pub ops: Vec<TimelineOp>,
 }
 
 /// Non-secret account registry projection returned to the frontend on a
@@ -401,6 +529,120 @@ mod tests {
         let json = serde_json::to_string(&batch).expect("serialize batch");
         assert!(json.contains("\"total\":7"), "json was: {json}");
         let back: RoomListBatch = serde_json::from_str(&json).expect("deserialize batch");
+        assert_eq!(back, batch);
+    }
+
+    #[test]
+    fn timeline_unavailable_code_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::TimelineUnavailable)
+                .expect("serialize timeline code"),
+            "\"timelineUnavailable\""
+        );
+    }
+
+    fn sample_message() -> TimelineItemVm {
+        TimelineItemVm::Message {
+            key: "unique-1".to_owned(),
+            sender: "@bob:example.org".to_owned(),
+            sender_display_name: Some("Bob".to_owned()),
+            body: "hello world".to_owned(),
+            timestamp: 1_720_000_000_000,
+            is_own: false,
+        }
+    }
+
+    #[test]
+    fn timeline_item_vm_message_tags_and_round_trips() {
+        let vm = sample_message();
+        let json = serde_json::to_string(&vm).expect("serialize message vm");
+        assert!(json.contains("\"kind\":\"message\""), "json was: {json}");
+        assert!(
+            json.contains("\"senderDisplayName\":\"Bob\""),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"isOwn\":false"), "json was: {json}");
+        // No token/session/event-id material may appear on the VM.
+        assert!(!json.contains("token"), "json leaked a token field: {json}");
+        let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize message vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn timeline_item_vm_other_tags_and_round_trips() {
+        let vm = TimelineItemVm::Other {
+            key: "unique-2".to_owned(),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize other vm");
+        assert!(json.contains("\"kind\":\"other\""), "json was: {json}");
+        assert!(json.contains("\"key\":\"unique-2\""), "json was: {json}");
+        let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize other vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn timeline_item_vm_null_display_name_round_trips() {
+        let vm = TimelineItemVm::Message {
+            key: "k".to_owned(),
+            sender: "@a:example.org".to_owned(),
+            sender_display_name: None,
+            body: "hi".to_owned(),
+            timestamp: 1,
+            is_own: true,
+        };
+        let json = serde_json::to_string(&vm).expect("serialize");
+        assert!(
+            json.contains("\"senderDisplayName\":null"),
+            "json was: {json}"
+        );
+        let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn timeline_op_tags_and_round_trips() {
+        let reset = TimelineOp::Reset {
+            items: vec![sample_message()],
+        };
+        let json = serde_json::to_string(&reset).expect("serialize reset");
+        assert!(json.contains("\"op\":\"reset\""), "json was: {json}");
+        let back: TimelineOp = serde_json::from_str(&json).expect("deserialize reset");
+        assert_eq!(back, reset);
+
+        let insert = TimelineOp::Insert {
+            index: 4,
+            item: sample_message(),
+        };
+        let json = serde_json::to_string(&insert).expect("serialize insert");
+        assert!(json.contains("\"op\":\"insert\""), "json was: {json}");
+        assert!(json.contains("\"index\":4"), "json was: {json}");
+        let back: TimelineOp = serde_json::from_str(&json).expect("deserialize insert");
+        assert_eq!(back, insert);
+
+        let clear = TimelineOp::Clear;
+        assert_eq!(
+            serde_json::to_string(&clear).expect("serialize clear"),
+            "{\"op\":\"clear\"}"
+        );
+    }
+
+    #[test]
+    fn timeline_batch_round_trips() {
+        let batch = TimelineBatch {
+            ops: vec![
+                TimelineOp::Reset {
+                    items: vec![sample_message()],
+                },
+                TimelineOp::PushBack {
+                    item: TimelineItemVm::Other {
+                        key: "k2".to_owned(),
+                    },
+                },
+            ],
+        };
+        let json = serde_json::to_string(&batch).expect("serialize batch");
+        assert!(json.contains("\"ops\":"), "json was: {json}");
+        let back: TimelineBatch = serde_json::from_str(&json).expect("deserialize batch");
         assert_eq!(back, batch);
     }
 

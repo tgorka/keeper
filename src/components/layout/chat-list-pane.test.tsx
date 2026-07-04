@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm, IpcError, RoomListBatch } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
@@ -29,6 +29,7 @@ function ipcError(code: IpcError["code"]): IpcError {
 beforeEach(() => {
   accountsStore.getState().clear();
   roomsStore.getState().clear();
+  roomsStore.getState().selectRoom(null);
   subscribeRoomList.mockReset();
   unsubscribeRoomList.mockReset();
 });
@@ -36,6 +37,7 @@ beforeEach(() => {
 afterEach(() => {
   accountsStore.getState().clear();
   roomsStore.getState().clear();
+  roomsStore.getState().selectRoom(null);
 });
 
 describe("ChatListPane", () => {
@@ -100,6 +102,48 @@ describe("ChatListPane", () => {
       expect(screen.getByText("Alpha Room")).toBeInTheDocument();
     });
     expect(screen.getByText("first")).toBeInTheDocument();
+  });
+
+  it("selects a room and highlights it when a row is clicked", async () => {
+    const captured: { onBatch: ((b: RoomListBatch) => void) | null } = { onBatch: null };
+    subscribeRoomList.mockImplementation((_accountId, onBatch: (b: RoomListBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    accountsStore.getState().setCurrentAccount(account);
+    render(<ChatListPane />);
+
+    captured.onBatch?.({
+      ops: [
+        {
+          op: "reset",
+          rooms: [
+            {
+              roomId: "!a:example.org",
+              displayName: "Alpha Room",
+              lastMessage: null,
+              timestamp: null,
+              avatarUrl: null,
+            },
+          ],
+        },
+      ],
+      total: 1,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Alpha Room")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Conversation with Alpha Room" }));
+
+    expect(roomsStore.getState().selectedRoomId).toBe("!a:example.org");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Conversation with Alpha Room" })).toHaveAttribute(
+        "aria-current",
+        "true",
+      );
+    });
   });
 
   it("unsubscribes and clears the store on unmount", async () => {

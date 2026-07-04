@@ -12,9 +12,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use keeper_core::account::AccountManager;
 use keeper_core::auth;
 use keeper_core::demo::snapshot_then_diff;
-use keeper_core::error::{AccountError, AuthError, CoreError, PlatformError};
+use keeper_core::error::{AccountError, AuthError, CoreError, PlatformError, TimelineError};
 use keeper_core::platform::Platform;
-use keeper_core::vm::{AccountVm, DemoBatch, IpcError, IpcErrorCode, PingVm, RoomListBatch};
+use keeper_core::vm::{
+    AccountVm, DemoBatch, IpcError, IpcErrorCode, PingVm, RoomListBatch, TimelineBatch,
+};
 use tauri::ipc::Channel;
 use tauri::State;
 
@@ -134,6 +136,11 @@ fn to_ipc_error(err: CoreError) -> IpcError {
             | AccountError::RestoreFailed(_)
             | AccountError::SyncStart(_),
         ) => (IpcErrorCode::SyncUnavailable, true),
+        // A room-not-found or timeline-build failure is retriable: the frontend
+        // can attempt the subscribe again.
+        CoreError::Timeline(TimelineError::RoomNotFound | TimelineError::Build(_)) => {
+            (IpcErrorCode::TimelineUnavailable, true)
+        }
     };
     IpcError {
         code,
@@ -246,6 +253,44 @@ pub async fn room_list_unsubscribe(
     Ok(())
 }
 
+/// Subscribe to a room's timeline (FR-8, FR-9, AD-4/AD-8/AD-19).
+///
+/// Reuses the account's live session (activating it lazily), opens the room's
+/// SDK `Timeline`, and streams [`TimelineBatch`]es over `channel` — a `Reset`
+/// snapshot first, then diffs — returning the subscription id. The sink forwards
+/// each batch to the channel; a closed channel simply drops the batch (the
+/// frontend has unsubscribed). A room-not-found / timeline-build failure funnels
+/// through [`to_ipc_error`] to `TimelineUnavailable`.
+#[tauri::command]
+pub async fn timeline_subscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    channel: Channel<TimelineBatch>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |batch: TimelineBatch| channel.send(batch).is_ok());
+    state
+        .accounts
+        .subscribe_timeline(state.platform.as_ref(), &account_id, &room_id, sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unsubscribe exactly one timeline subscription, aborting its producer task and
+/// dropping its `Timeline` (AD-19). Other account state is untouched. Idempotent.
+#[tauri::command]
+pub async fn timeline_unsubscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_timeline(&account_id, subscription_id)
+        .await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +388,20 @@ mod tests {
             "boom".to_owned(),
         )));
         assert_eq!(ipc.code, IpcErrorCode::SyncUnavailable);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn timeline_room_not_found_maps_to_retriable_timeline_unavailable() {
+        let ipc = to_ipc_error(CoreError::Timeline(TimelineError::RoomNotFound));
+        assert_eq!(ipc.code, IpcErrorCode::TimelineUnavailable);
+        assert!(ipc.retriable, "timeline unavailable should be retriable");
+    }
+
+    #[test]
+    fn timeline_build_maps_to_retriable_timeline_unavailable() {
+        let ipc = to_ipc_error(CoreError::Timeline(TimelineError::Build("boom".to_owned())));
+        assert_eq!(ipc.code, IpcErrorCode::TimelineUnavailable);
         assert!(ipc.retriable);
     }
 }

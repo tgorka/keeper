@@ -25,6 +25,7 @@ use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
 };
+use matrix_sdk::ruma::{OwnedRoomId, RoomId};
 use matrix_sdk::store::RoomLoadSettings;
 use matrix_sdk::Client;
 use matrix_sdk_ui::eyeball_im::VectorDiff;
@@ -35,10 +36,11 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::auth::session_keychain_key;
-use crate::error::{AccountError, CoreError};
+use crate::error::{AccountError, CoreError, TimelineError};
 use crate::platform::Platform;
 use crate::registry;
-use crate::vm::{RoomListBatch, RoomListOp, RoomVm};
+use crate::timeline;
+use crate::vm::{RoomListBatch, RoomListOp, RoomVm, TimelineBatch};
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
 const ROOM_LIST_PAGE_SIZE: usize = 200;
@@ -50,6 +52,11 @@ const MAX_PREVIEW_CHARS: usize = 256;
 /// `Channel::send`; tests capture into a vector. Returns `true` if the batch was
 /// delivered, `false` if the channel is closed (the producer then stops).
 pub type BatchSink = Box<dyn Fn(RoomListBatch) -> bool + Send + Sync>;
+
+/// Sink that receives each produced [`TimelineBatch`]. The shell wraps a Tauri
+/// `Channel::send`; tests capture into a vector. Returns `true` if the batch was
+/// delivered, `false` if the channel is closed (the producer then stops).
+pub type TimelineSink = Box<dyn Fn(TimelineBatch) -> bool + Send + Sync>;
 
 /// A live, supervised account: its `Client`, `SyncService`, and the abort
 /// handles of its room-list subscriptions.
@@ -175,16 +182,143 @@ impl AccountManager {
         Ok(subscription_id)
     }
 
+    /// Subscribe to a room's timeline, activating the account if it is not
+    /// already live (reusing the same `Client`/`SyncService` as the room list —
+    /// never a second one). Spawns a supervised producer that emits a `Reset`
+    /// snapshot first, then diff batches, into `sink`. Returns the new
+    /// subscription id.
+    pub async fn subscribe_timeline(
+        &self,
+        platform: &dyn Platform,
+        account_id: &str,
+        room_id: &str,
+        sink: TimelineSink,
+    ) -> Result<u64, CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+
+        // Reuse the live handle under the manager lock, activating idempotently
+        // if needed — never a second Client/SyncService. `did_activate` records
+        // whether *this* call brought the account live, so a build failure before
+        // any subscription attaches can tear it back down (AD-21).
+        let (client, subs_arc, did_activate) = {
+            let mut accounts = self.accounts.lock().await;
+            let did_activate = !accounts.contains_key(account_id);
+            if did_activate {
+                let (client, sync) = activate(platform, account_id).await?;
+                accounts.insert(
+                    account_id.to_owned(),
+                    AccountHandle {
+                        client,
+                        sync,
+                        subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                    },
+                );
+                tracing::info!(account_id = %account_id, "account activated for timeline");
+            }
+            let handle = accounts.get(account_id).ok_or_else(|| {
+                CoreError::Internal("account handle vanished after activation".to_owned())
+            })?;
+            (
+                handle.client.clone(),
+                handle.subscriptions.clone(),
+                did_activate,
+            )
+        };
+
+        // Build the timeline *synchronously* so a missing room / build failure
+        // surfaces to the caller as `TimelineUnavailable` — an honest inline
+        // error, not a silent spinner (AC-4) — rather than being buried in the
+        // spawned task. Only the diff-forwarding loop runs in the background.
+        let open = match timeline::open_timeline(&client, &room_id).await {
+            Ok(open) => open,
+            Err(e) => {
+                // Don't leave a partial live account running (AD-21). If this call
+                // just activated the account and nothing else has attached a
+                // subscription yet, stop its SyncService and drop the handle. The
+                // emptiness guard keeps a racing sibling subscribe's live
+                // subscription intact.
+                if did_activate {
+                    let mut accounts = self.accounts.lock().await;
+                    let should_remove = match accounts.get(account_id) {
+                        Some(handle) => handle.subscriptions.lock().await.is_empty(),
+                        None => false,
+                    };
+                    if should_remove {
+                        if let Some(dead) = accounts.remove(account_id) {
+                            dead.sync.stop().await;
+                            tracing::info!(
+                                account_id = %account_id,
+                                "torn down partial account after timeline build failure"
+                            );
+                        }
+                    }
+                }
+                return Err(e.into());
+            }
+        };
+
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let reaper_subs = subs_arc.clone();
+        let room_id_task = room_id.clone();
+        let room_id_log = room_id.clone();
+        let task = tokio::spawn(async move {
+            timeline::forward_timeline(open, room_id_task, sink).await;
+            // A naturally-completed producer reaps its own subscription entry.
+            reaper_subs.lock().await.remove(&subscription_id);
+        });
+
+        {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(_) => {
+                    subs_arc.lock().await.insert(subscription_id, task);
+                }
+                None => {
+                    // The account was shut down in the spawn→register gap;
+                    // shutdown already stopped its sync, so aborting the orphaned
+                    // producer here leaks nothing.
+                    task.abort();
+                    return Err(TimelineError::Build(
+                        "account removed during subscribe".to_owned(),
+                    )
+                    .into());
+                }
+            }
+        }
+        tracing::info!(account_id = %account_id, subscription_id, room_id = %room_id_log, "timeline subscribed");
+        Ok(subscription_id)
+    }
+
     /// Abort exactly the producer task for `subscription_id`; other account
     /// state is untouched. Idempotent — unsubscribing an unknown id is a no-op.
     pub async fn unsubscribe_room_list(&self, account_id: &str, subscription_id: u64) {
+        if self.abort_subscription(account_id, subscription_id).await {
+            tracing::info!(account_id = %account_id, subscription_id, "room list unsubscribed");
+        }
+    }
+
+    /// Abort exactly the timeline producer task for `subscription_id`, dropping
+    /// its `Timeline` (the SDK drop handle cancels its background tasks). Other
+    /// account state — the room-list stream and any sibling timeline — is
+    /// untouched. Idempotent.
+    pub async fn unsubscribe_timeline(&self, account_id: &str, subscription_id: u64) {
+        if self.abort_subscription(account_id, subscription_id).await {
+            tracing::info!(account_id = %account_id, subscription_id, "timeline unsubscribed");
+        }
+    }
+
+    /// Shared abort body: remove and abort exactly one subscription task from an
+    /// account's subscription map. Returns whether a task was found and aborted.
+    async fn abort_subscription(&self, account_id: &str, subscription_id: u64) -> bool {
         let accounts = self.accounts.lock().await;
         if let Some(handle) = accounts.get(account_id) {
             if let Some(task) = handle.subscriptions.lock().await.remove(&subscription_id) {
                 task.abort();
-                tracing::info!(account_id = %account_id, subscription_id, "room list unsubscribed");
+                return true;
             }
         }
+        false
     }
 
     /// Tear down the whole account: abort every subscription and drop the live

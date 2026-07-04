@@ -147,3 +147,13 @@ describe("roomsStore.applyBatch", () => {
     expect(roomsStore.getState().total).toBeNull();
   });
 });
+
+describe("roomsStore.selectRoom", () => {
+  it("records the selected room id and clears it with null", () => {
+    expect(roomsStore.getState().selectedRoomId).toBeNull();
+    roomsStore.getState().selectRoom("!a:example.org");
+    expect(roomsStore.getState().selectedRoomId).toBe("!a:example.org");
+    roomsStore.getState().selectRoom(null);
+    expect(roomsStore.getState().selectedRoomId).toBeNull();
+  });
+});
