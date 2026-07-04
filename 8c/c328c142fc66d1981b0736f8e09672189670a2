@@ -1,0 +1,134 @@
+src/lib/ipc/gen/TimelineItemVm.ts
+  s_12250b2cf29d7d::t_bcf515b66f7746 2,66-71,77-78
+  s_12250b2cf29d7d::t_9ae97a41d77b33 72-76
+src-tauri/crates/keeper-core/src/account.rs
+  s_12250b2cf29d7d::t_60fb11db9446f1 492
+  s_12250b2cf29d7d::t_e0fd54e34d045e 1288-1335
+  s_12250b2cf29d7d::t_8336f89d8dcbd7 41-43,45
+src/components/chat/message-bubble.test.tsx
+  s_12250b2cf29d7d::t_91bec64abd13c9 18
+src/components/chat/media-attachment.test.tsx
+  s_12250b2cf29d7d::t_ee3decb7746ada 92-113
+  s_12250b2cf29d7d::t_41d789ed3a52d3 1-91,114-126
+src-tauri/Cargo.toml
+  s_12250b2cf29d7d::t_9eb534bf92157a 48-50
+src/lib/stores/timeline.test.ts
+  s_12250b2cf29d7d::t_795caf309efe6a 18
+src-tauri/crates/keeper/src/media_protocol.rs
+  s_12250b2cf29d7d::t_ca4ce9b96ea754 324-326,329-340,350-352,372-374
+  s_12250b2cf29d7d::t_c0c5a1a79b8a2f 18
+  s_12250b2cf29d7d::t_90f0ab872f47b9 1-17,19-26,32-66,73-296,301-307,312-323,327-328,341-349,353-371,375-385
+  s_12250b2cf29d7d::t_10f6b6afc46285 27-31,67-72,297-300,308-311
+src-tauri/crates/keeper/src/ipc.rs
+  s_12250b2cf29d7d::t_0ee60b35c0bd0e 18-19
+  s_12250b2cf29d7d::t_96df0056f18cdf 221-228
+src-tauri/crates/keeper/src/lib.rs
+  s_12250b2cf29d7d::t_d0926719aa4f99 9
+  s_12250b2cf29d7d::t_67390074af699f 22-28
+src/lib/ipc/client.ts
+  s_12250b2cf29d7d::t_c81193835c3c26 25-26
+_bmad-output/implementation-artifacts/spec-3-6-receive-media-thumbnails-protocol-streaming-preview.md
+  s_12250b2cf29d7d::t_24a8e2b843bd18 9
+  s_12250b2cf29d7d::t_fef7456e702e62 137-167
+  s_12250b2cf29d7d::t_052ca15e01639e 8
+  s_12250b2cf29d7d::t_719ee59d3fec98 1-4,6-7,10-77,91-102,113-136
+  s_12250b2cf29d7d::t_219ec4b2d28133 5
+  s_12250b2cf29d7d::t_b069b22a931be7 78-90
+  s_12250b2cf29d7d::t_5b7559496b468d 103-112
+src/components/chat/media-attachment.tsx
+  s_12250b2cf29d7d::t_a385cd7876d23b 1-15,17-128,130-131,133-140,142-143,145-154,166,169-170,173-240
+  s_12250b2cf29d7d::t_9baa97c767b650 16
+  s_12250b2cf29d7d::t_d78e05afadebb9 129,132,141,144,155-165,167-168,171-172
+src-tauri/crates/keeper-core/src/timeline.rs
+  s_12250b2cf29d7d::t_8ddce04a936ecc 32
+  s_12250b2cf29d7d::t_d6c08156053681 447-448
+  s_12250b2cf29d7d::t_1e7c47c2f872cc 499-503
+  s_12250b2cf29d7d::t_7a917e7acbdc6d 525
+  s_12250b2cf29d7d::t_a1a9ccd8a51d00 326-332,348-359
+  s_12250b2cf29d7d::t_90de169a357566 547
+  s_12250b2cf29d7d::t_00ed05eb3a0b02 475
+  s_12250b2cf29d7d::t_fe23ccfe1db3d3 563,566-569,581
+  s_12250b2cf29d7d::t_6fd54c4ce615be 592-600
+  s_12250b2cf29d7d::t_10f6b6afc46285 34-35,749-753
+  s_12250b2cf29d7d::t_25d5b0f0241a32 372
+  s_12250b2cf29d7d::t_57c5b3e66212a8 69-157
+  s_12250b2cf29d7d::t_debab454135b0a 636
+  s_12250b2cf29d7d::t_608e5260adbfec 726-748,754-839
+src/components/chat/media-preview-overlay.tsx
+  s_12250b2cf29d7d::t_521897f4ad2209 60-67,69-91,95,97,105,108,121-128
+  s_12250b2cf29d7d::t_fdf51c134d13f2 11-13
+  s_12250b2cf29d7d::t_1521303af62432 1-10,14-59,68,92-94,96,98-104,106-107,109-120,129-131
+src-tauri/crates/keeper-core/Cargo.toml
+  s_12250b2cf29d7d::t_5605cf761dd45a 31-32
+src-tauri/crates/keeper-core/src/lib.rs
+  s_12250b2cf29d7d::t_8acc3d2dc924c2 18
+src/components/chat/message-bubble.tsx
+  s_12250b2cf29d7d::t_b43feba0e7687e 76-81
+  s_12250b2cf29d7d::t_b1a9ffd5b5696e 8-11
+  s_12250b2cf29d7d::t_5029d3f927633e 110
+  s_12250b2cf29d7d::t_7b585cec57e4bb 166
+  s_12250b2cf29d7d::t_b7daa37d11724d 14
+  s_12250b2cf29d7d::t_5fe7a3aaa363a5 155-165
+src-tauri/crates/keeper-core/src/error.rs
+  s_12250b2cf29d7d::t_41e877ff01702b 258-282
+  s_12250b2cf29d7d::t_6beaf1e50f6607 318-323
+src/components/chat/media-preview-overlay.test.tsx
+  s_12250b2cf29d7d::t_d94890f4344048 35-37,43,50,56
+  s_12250b2cf29d7d::t_9e056783ad77d6 1-34,38-42,44-49,51-55,57-60,75-81
+  s_12250b2cf29d7d::t_11311ed8369a74 61-74
+src/lib/ipc/gen/MediaVm.ts
+  s_12250b2cf29d7d::t_bcf515b66f7746 1-45,47-50,52-55,57-61
+  s_12250b2cf29d7d::t_b5dedbc872361e 46,51,56
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_12250b2cf29d7d::t_1536fffea0853c 99-110
+src-tauri/crates/keeper-core/src/media.rs
+  s_12250b2cf29d7d::t_dc2b07f2e0dcfe 1-17,20-29,31-138,140-186,189-238,244-299,306-362,367-419,421-422,425-446,448-456,458-465,467-514
+  s_12250b2cf29d7d::t_1d10ce096b4c68 239-243
+  s_12250b2cf29d7d::t_ff52bb07f7831b 18-19
+  s_12250b2cf29d7d::t_3f27c24e255cdb 420,423-424
+  s_12250b2cf29d7d::t_10f6b6afc46285 30,187-188,300-305,363-366,447,457,466
+  s_12250b2cf29d7d::t_9866715d7e5663 139
+src/components/layout/conversation-pane.tsx
+  s_12250b2cf29d7d::t_4bbe2fa4547d71 461
+  s_12250b2cf29d7d::t_2dcef7e852a8a2 20
+  s_12250b2cf29d7d::t_9ff664ed26c932 129-131
+  s_12250b2cf29d7d::t_428a45c387b330 154,160
+  s_12250b2cf29d7d::t_fc460b2ce7f3ca 306-307,309-312
+  s_12250b2cf29d7d::t_fbe79435e04052 484-487
+  s_12250b2cf29d7d::t_4e7b4e617a28de 300-305,308,313
+src-tauri/Cargo.lock
+  s_12250b2cf29d7d::t_6803900cc52566 2856
+src-tauri/crates/keeper-core/src/vm.rs
+  s_12250b2cf29d7d::t_800e1bc80cba32 588-593
+  s_12250b2cf29d7d::t_2389e12793d3b1 1568
+  s_12250b2cf29d7d::t_a1ea6e8d667382 1665
+  s_12250b2cf29d7d::t_3943cbfcb5d1e1 1916
+  s_12250b2cf29d7d::t_ad12b77f7fef05 1926
+  s_12250b2cf29d7d::t_2749d1d78bc95d 521,525,529
+  s_12250b2cf29d7d::t_123503fe0b83bf 584-587
+  s_12250b2cf29d7d::t_a6a26369d59571 465-520,522-524,526-528,530-535
+  s_12250b2cf29d7d::t_841102c466f376 1723,1732
+  s_12250b2cf29d7d::t_8efb6464f7ea6c 1591
+  s_12250b2cf29d7d::t_8a0da424c4e103 1812-1915,1917-1925,1927-1937
+src/components/layout/conversation-pane.test.tsx
+  s_12250b2cf29d7d::t_bb0762c6515820 739-794
+  s_12250b2cf29d7d::t_545447a8840359 60,146,247,288,302,479,523,593,645,705,719
+src/lib/ipc/gen/MediaKindVm.ts
+  s_12250b2cf29d7d::t_bcf515b66f7746 1-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8cc328c142fc66d1981b0736f8e09672189670a2",
+  "prompts": {},
+  "sessions": {
+    "s_12250b2cf29d7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "16b78dae-30e8-4708-9588-8632df4dbae2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
