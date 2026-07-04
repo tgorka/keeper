@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-1-8-session-restore-and-sign-out.md
+  s_146b97fd664967::t_f3f4cb5a13d2ea 5,9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a97d8507f04c82f767e71b3a7b94fdd52b2188f7",
+  "prompts": {},
+  "sessions": {
+    "s_146b97fd664967": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "66130c5b-8659-4526-b209-2f8498236162",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
