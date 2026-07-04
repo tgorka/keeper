@@ -1,0 +1,32 @@
+# Git hooks managed by lefthook (https://lefthook.dev)
+# Hooks are installed automatically on `bun install` (package.json "prepare" script).
+
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: biome
+      glob: "*.{ts,tsx,js,jsx,json,css}"
+      run: bunx biome check --write --no-errors-on-unmatched {staged_files}
+      stage_fixed: true
+    - name: rustfmt
+      glob: "src-tauri/**/*.rs"
+      root: src-tauri/
+      run: PATH="$HOME/.cargo/bin:$PATH" cargo fmt --check
+    - name: no-secrets
+      run: |
+        if git diff --cached -U0 | grep -iE '^\+.*(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|syt_[A-Za-z0-9_-]{20,})'; then
+          echo "Possible secret in staged changes — aborting commit."
+          exit 1
+        fi
+
+pre-push:
+  parallel: true
+  jobs:
+    - name: typecheck
+      run: bunx tsc --noEmit
+    - name: clippy
+      root: src-tauri/
+      run: PATH="$HOME/.cargo/bin:$PATH" cargo clippy --all-targets -- -D warnings
+    - name: frontend-tests
+      run: bun run test
