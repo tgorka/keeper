@@ -1,0 +1,29 @@
+src/components/ui/alert.tsx
+  s_8a8bc6b6bf6017::t_424edebbd213ba 1-73
+src/components/ui/checkbox.tsx
+  s_8a8bc6b6bf6017::t_868e7e74deec6d 1-28
+src/components/ui/kbd.tsx
+  s_8a8bc6b6bf6017::t_c379d188203782 1-26
+src/components/ui/progress.tsx
+  s_8a8bc6b6bf6017::t_4b9a5954ecbb73 1-29
+src/components/ui/radio-group.tsx
+  s_8a8bc6b6bf6017::t_161665171f0842 1-44
+src/components/ui/select.tsx
+  s_8a8bc6b6bf6017::t_dea4a4742e1814 1-182
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e5d051144f9e73f067343252d6f58e9e538cac47",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
