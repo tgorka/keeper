@@ -1,0 +1,135 @@
+# generated: 2026-07-03
+# last_updated: 2026-07-03
+# project: keeper
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: _bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog -> in-progress: Automatically when first story is created (via create-story)
+#   - in-progress -> done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; sprint-status surfaces open ones
+
+generated: 2026-07-03
+last_updated: 2026-07-03
+project: keeper
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+
+development_status:
+  epic-1: backlog
+  1-1-cargo-workspace-split-and-typed-ipc-foundation: backlog
+  1-2-app-shell-three-pane-frame-and-keeper-theme: backlog
+  1-3-password-login-with-sliding-sync-verification: backlog
+  1-4-sliding-sync-room-list: backlog
+  1-5-timeline-view-receive-text: backlog
+  1-6-send-text-with-local-echo-and-visible-send-states: backlog
+  1-7-offline-resilience-queued-sends-and-reconnect-convergence: backlog
+  1-8-session-restore-and-sign-out: backlog
+  epic-1-retrospective: optional
+  epic-2: backlog
+  2-1-account-manager-unlimited-concurrent-accounts: backlog
+  2-2-oidc-login-mas-msc3861: backlog
+  2-3-beeper-email-code-login: backlog
+  2-4-beeper-coverage-disclosure: backlog
+  2-5-account-switcher-and-per-account-state: backlog
+  2-6-at-rest-encryption-first-run-choice: backlog
+  epic-2-retrospective: optional
+  epic-3: backlog
+  3-1-encrypted-rooms-decrypt-encrypt-and-honest-utd-states: backlog
+  3-2-device-verification-emoji-sas-and-qr: backlog
+  3-3-key-backup-enable-and-restore: backlog
+  3-4-replies-and-edits: backlog
+  3-5-reactions: backlog
+  3-6-receive-media-thumbnails-protocol-streaming-preview: backlog
+  3-7-send-media-and-files: backlog
+  3-8-delete-for-everyone-redaction: backlog
+  3-9-receipts-typing-and-history-pagination: backlog
+  epic-3-retrospective: optional
+  epic-4: backlog
+  4-1-unread-management: backlog
+  4-2-archive-view-with-auto-return: backlog
+  4-3-pins: backlog
+  4-4-favorites: backlog
+  4-5-spaces-as-room-group-views: backlog
+  4-6-network-account-attribution-and-network-filter: backlog
+  epic-4-retrospective: optional
+  epic-5: backlog
+  5-1-archive-ingestion-pipeline: backlog
+  5-2-durability-against-remote-rewrites-edit-history: backlog
+  5-3-offline-full-text-search-engine: backlog
+  5-4-search-ui-global-and-in-chat: backlog
+  5-5-export-to-json-and-markdown: backlog
+  5-6-archive-first-pagination: backlog
+  5-7-archive-survives-sign-out-and-deletes-only-on-command: backlog
+  epic-5-retrospective: optional
+  epic-6: backlog
+  6-1-bridges-surface-with-data-driven-risk-tiers: backlog
+  6-2-bridge-discovery: backlog
+  6-3-native-bridge-login-via-provisioning-api: backlog
+  6-4-bridge-bot-fallback-driver: backlog
+  6-5-bridge-session-health-and-re-login-prompts: backlog
+  6-6-start-new-chats-via-bridge: backlog
+  6-7-bbctl-integration-for-beeper-self-hosted-bridges: backlog
+  6-8-first-run-wizard: backlog
+  epic-6-retrospective: optional
+  epic-7: backlog
+  7-1-persistent-per-chat-drafts: backlog
+  7-2-cross-device-draft-mirroring-with-local-wins-conflicts: backlog
+  7-3-approval-pane: backlog
+  7-4-explicit-approval-invariant-enforced-and-tested: backlog
+  epic-7-retrospective: optional
+  epic-8: backlog
+  8-1-incognito-read-receipts-with-scoped-policy: backlog
+  8-2-typing-presence-suppression-coupling-caveats-and-manual-release: backlog
+  8-3-undo-send-window: backlog
+  8-4-post-dispatch-delete-for-everyone: backlog
+  epic-8-retrospective: optional
+  epic-9: backlog
+  9-1-command-palette: backlog
+  9-2-keyboard-navigation-and-quick-switcher: backlog
+  9-3-cheat-sheet-and-native-menu-bar-from-the-action-registry: backlog
+  9-4-global-hotkey: backlog
+  epic-9-retrospective: optional
+  epic-10: backlog
+  10-1-native-notifications-from-the-sync-loop: backlog
+  10-2-mutes-mention-only-and-do-not-disturb: backlog
+  10-3-background-operation-and-honest-quit: backlog
+  10-4-click-through-and-bridge-health-alerts: backlog
+  epic-10-retrospective: optional
+  epic-11: backlog
+  11-1-signed-notarized-release-pipeline: backlog
+  11-2-signed-auto-updates-and-egress-honesty: backlog
+  11-3-performance-and-reliability-release-gates: backlog
+  epic-11-retrospective: optional
