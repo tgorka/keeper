@@ -1,0 +1,116 @@
+src-tauri/crates/keeper-core/src/account.rs
+  s_03c1f1e4d8220e::t_f4bff7ff2bfaa2 274,282,287-288,290,292,294-297,301-305
+  s_03c1f1e4d8220e::t_2e772062d79a2d 19
+src/test/setup.ts
+  s_03c1f1e4d8220e::t_15306669295c4b 4-15
+src-tauri/crates/keeper/src/ipc.rs
+  s_03c1f1e4d8220e::t_6358cd6077f43f 518-520,525,531
+src/lib/stores/account-status.ts
+  s_03c1f1e4d8220e::t_1c66c19f70e285 1-58
+src/components/layout/account-footer.tsx
+  s_03c1f1e4d8220e::t_6c6389fdf7b73a 42
+  s_03c1f1e4d8220e::t_cfb774ee1fdf95 101-102
+  s_03c1f1e4d8220e::t_f72d5a40b950ab 129-157
+  s_03c1f1e4d8220e::t_6b5c39eabf798f 160-165,170,172-179,181-185,187,189
+  s_03c1f1e4d8220e::t_cebbb0321c7cbd 219
+  s_03c1f1e4d8220e::t_881ac898642558 2,4-13,15-16,18,20-21,32-37,40-41,43,46,56-58,60-72,74-78,82,85-86,89-96,108,112-128,159,193,195-202,204-218,224-248,250-253
+src/hooks/use-sign-out.ts
+  s_03c1f1e4d8220e::t_833ce62d86c042 34-39
+src/lib/stores/rooms.test.ts
+  s_03c1f1e4d8220e::t_9072c2b933fd55 28
+  s_03c1f1e4d8220e::t_235226fb17cfdb 117-152
+package.json
+  s_8a8bc6b6bf6017::t_591f91cc7525a6 10-12
+docs/credentials.md
+  s_8a8bc6b6bf6017::t_839304cce73190 29
+src/components/layout/account-settings-dialog.tsx
+  s_03c1f1e4d8220e::t_b76fcffb9d5231 1-24,26-61,64-83
+  s_03c1f1e4d8220e::t_9aa1aafda3e823 25
+  s_03c1f1e4d8220e::t_8cf11e77b67b48 62-63
+src/components/layout/sidebar-pane.test.tsx
+  s_03c1f1e4d8220e::t_1d978839281c77 90-93
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_03c1f1e4d8220e::t_c927c9896afe9d 35-37
+src/lib/stores/rooms.ts
+  s_03c1f1e4d8220e::t_2c7eb1c1ec86ed 39-45,50-56
+  s_03c1f1e4d8220e::t_1f1cc1f2e1cd45 79,86-88
+src/components/layout/account-settings-dialog.test.tsx
+  s_03c1f1e4d8220e::t_2d929872cc83ad 1-35,38-50
+  s_03c1f1e4d8220e::t_8911aba8c6b0b7 36-37
+README.md
+  s_8a8bc6b6bf6017::t_839304cce73190 41
+src/hooks/use-account-statuses.test.ts
+  s_03c1f1e4d8220e::t_860fbead552587 1-131
+src/lib/ipc/client.ts
+  s_03c1f1e4d8220e::t_31845fd0aef457 220-224,226-230
+src/components/layout/account-footer.test.tsx
+  s_03c1f1e4d8220e::t_5d8b2f9e5bb150 220-224
+  s_03c1f1e4d8220e::t_1a60a8cd838f34 45-48,50-51
+  s_03c1f1e4d8220e::t_3764fece5fb4da 52-53
+  s_03c1f1e4d8220e::t_02bb1dcf89e31a 6-7,15,18,35-36,49,57-58,62,66-67,73-74,77-78,84,89-95,98-102,105-117,120,124-125,127-128,130-132,134-137,140,143-154,157-158,161,163-169,172-173,175-177,180-196,198-202,205,208-216,218-219,225
+  s_03c1f1e4d8220e::t_30261be49d5776 60-61,63-65
+  s_03c1f1e4d8220e::t_06a21900726c09 179,197
+src/components/layout/chat-list-pane.test.tsx
+  s_03c1f1e4d8220e::t_112be011728b5e 243-261
+  s_03c1f1e4d8220e::t_f4a935ddf4c66f 105-106
+  s_03c1f1e4d8220e::t_591b3764bb3673 46,55
+  s_03c1f1e4d8220e::t_06a21900726c09 69-74,88-93,129-134,198-203
+  s_03c1f1e4d8220e::t_ef565b36f7e88a 12-13
+  s_03c1f1e4d8220e::t_cdd2170d0ffedf 222-242
+src/lib/matrix-id.ts
+  s_03c1f1e4d8220e::t_1a7efb99b8369e 1-31
+src/hooks/use-account-statuses.ts
+  s_03c1f1e4d8220e::t_06a21900726c09 23
+  s_03c1f1e4d8220e::t_82204c80c9fc43 1-22,24-59,66-79
+  s_03c1f1e4d8220e::t_59fa4f5b983388 60-65
+.github/workflows/ci.yml
+  s_8a8bc6b6bf6017::t_0a7288cae440c6 61
+src/lib/stores/account-status.test.ts
+  s_03c1f1e4d8220e::t_f701eb3add0ba0 1-48
+src-tauri/crates/keeper-core/src/inbox.rs
+  s_03c1f1e4d8220e::t_936d02b0e03f0f 451-494,500-548
+  s_03c1f1e4d8220e::t_3c329b2adcce09 387-393,395-396
+  s_03c1f1e4d8220e::t_a2ee1f2687bcad 58-62,69-74,79,87-92,94-98,107
+  s_03c1f1e4d8220e::t_d9b41bdf88f1c7 495-499
+src/components/layout/app-shell.tsx
+  s_03c1f1e4d8220e::t_e54f9508e2fc72 8
+  s_03c1f1e4d8220e::t_505d3308e2e728 17-19
+_bmad-output/implementation-artifacts/spec-2-5-account-switcher-and-per-account-state.md
+  s_03c1f1e4d8220e::t_30f97b97120d7f 7
+  s_03c1f1e4d8220e::t_8157cd2f85069e 89
+  s_03c1f1e4d8220e::t_df1e62d3941a71 119-164
+  s_03c1f1e4d8220e::t_5483dfe3966bcf 1-4,8,10-77,90-118
+  s_03c1f1e4d8220e::t_c68e14c84e5872 78-88
+  s_03c1f1e4d8220e::t_e064eb95a7cf6b 5,9
+  s_03c1f1e4d8220e::t_aebab3ad7b9301 6
+src/components/layout/chat-list-pane.tsx
+  s_03c1f1e4d8220e::t_be41ae0bd34ef4 78
+  s_03c1f1e4d8220e::t_a7f5c881fc6cff 99
+  s_03c1f1e4d8220e::t_6e0699406420f7 13-17
+  s_03c1f1e4d8220e::t_b2073fe9d3160a 37
+  s_03c1f1e4d8220e::t_99c10a75008b28 44-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fc4067c079b18b31bde5cf02dffab37cb2b9aa3d",
+  "prompts": {},
+  "sessions": {
+    "s_03c1f1e4d8220e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "04b44f41-0d5a-483d-8763-66e6ea41e2b7",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    },
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
