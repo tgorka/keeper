@@ -27,6 +27,7 @@ const account: AccountVm = {
   userId: "@alice:example.org",
   homeserverUrl: "https://matrix.example.org/",
   hueIndex: 0,
+  provider: "password",
 };
 
 function ipcError(code: IpcErrorCode): IpcError {
@@ -98,6 +99,7 @@ describe("LoginScreen", () => {
       userId: "@bob:example.org",
       homeserverUrl: "https://matrix.example.org/",
       hueIndex: 1,
+      provider: "password",
     };
     accountsStore.getState().addAccount(existing);
     loginPassword.mockResolvedValue(account);

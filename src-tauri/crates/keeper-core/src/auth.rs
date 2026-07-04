@@ -35,7 +35,7 @@ use crate::error::{AuthError, CoreError};
 use crate::oauth::{registration_data, OAuthCallback, OAuthFlowRegistry};
 use crate::platform::Platform;
 use crate::registry;
-use crate::vm::AccountVm;
+use crate::vm::{AccountVm, Provider};
 
 /// How long an OIDC browser round-trip may take before it is abandoned as timed
 /// out. Long enough for a real consent (including a fresh login on the IdP),
@@ -72,6 +72,11 @@ pub trait AuthProvider {
         client: &Client,
         platform: &dyn Platform,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    /// The durable login-mechanism tag for this provider (Story 2.5). Stamped by
+    /// [`add_account`] into the `keeper.db` registry row and the [`AccountVm`] so
+    /// provider-specific UI keys off a stable discriminant, not the homeserver.
+    fn provider(&self) -> Provider;
 }
 
 /// The password `AuthProvider` — the first and, in Story 2.1, only impl.
@@ -101,6 +106,10 @@ impl AuthProvider for PasswordAuthProvider<'_> {
             .await
             .map_err(|e| map_login_error(&e))?;
         Ok(())
+    }
+
+    fn provider(&self) -> Provider {
+        Provider::Password
     }
 }
 
@@ -190,6 +199,10 @@ impl AuthProvider for OidcAuthProvider {
                 Ok(())
             }
         }
+    }
+
+    fn provider(&self) -> Provider {
+        Provider::Oidc
     }
 }
 
@@ -557,6 +570,10 @@ pub async fn add_account<P: AuthProvider>(
         // Assign the lowest unused hue on the 8-hue wheel (else count % 8) and
         // persist it with the registry row so it is stable across restarts.
         let hue_index = registry::next_hue_index(&data_dir)?;
+        // Stamp the durable login-mechanism tag (Story 2.5): the authenticating
+        // provider knows its own kind, so persist it with the registry row and
+        // surface it on the VM (never inferred from the host at add time).
+        let provider = provider.provider();
         registry::insert_account(
             &data_dir,
             &account_id,
@@ -565,6 +582,7 @@ pub async fn add_account<P: AuthProvider>(
             &device_id,
             now_ms(),
             hue_index,
+            provider.as_registry_str(),
         )?;
 
         Ok::<AccountVm, CoreError>(AccountVm {
@@ -572,6 +590,7 @@ pub async fn add_account<P: AuthProvider>(
             user_id,
             homeserver_url: resolved.to_string(),
             hue_index,
+            provider,
         })
     }
     .await;
@@ -610,29 +629,82 @@ pub fn find_restorable_accounts(platform: &dyn Platform) -> Result<Vec<AccountVm
     let data_dir = platform.data_dir()?;
     let mut restorable = Vec::new();
     for row in registry::list_accounts(&data_dir)? {
-        if platform
-            .keychain_get(&session_keychain_key(&row.account_id))?
-            .is_none()
-        {
+        let session_json = platform.keychain_get(&session_keychain_key(&row.account_id))?;
+        let Some(session_json) = session_json else {
             tracing::info!(
                 account_id = %row.account_id,
                 "registry row has no keychain session; skipping as not restorable"
             );
             continue;
-        }
+        };
         // Backfill a legacy NULL hue in place so the VM always carries one.
         let hue_index = match row.hue_index {
             Some(hue) => hue,
             None => registry::backfill_hue_index(&data_dir, &row.account_id)?,
+        };
+        // Resolve the durable provider tag. A row created after Story 2.5 already
+        // carries it; a legacy NULL row is inferred ONCE from the stored session
+        // shape and homeserver host, then persisted so the inference never runs
+        // again (this is the only place a legacy blob is parsed).
+        let provider = match row
+            .provider
+            .as_deref()
+            .and_then(Provider::from_registry_str)
+        {
+            Some(provider) => provider,
+            None => {
+                let inferred = infer_legacy_provider(&session_json, &row.homeserver_url);
+                registry::backfill_provider(
+                    &data_dir,
+                    &row.account_id,
+                    inferred.as_registry_str(),
+                )?;
+                inferred
+            }
         };
         restorable.push(AccountVm {
             account_id: row.account_id,
             user_id: row.user_id,
             homeserver_url: row.homeserver_url,
             hue_index,
+            provider,
         });
     }
     Ok(restorable)
+}
+
+/// Infer the [`Provider`] for a legacy registry row (created before the
+/// `provider` column) from its stored Keychain session and homeserver (Story
+/// 2.5 migration). An `Oauth`-shaped [`StoredSession`] → `Oidc`; otherwise a
+/// homeserver whose host is Beeper's (`matrix.beeper.com`) → `Beeper`; else
+/// `Password`. A session blob that fails to parse falls back to the host signal,
+/// so a legacy Beeper row is still recognized even if its blob is unreadable.
+fn infer_legacy_provider(session_json: &str, homeserver_url: &str) -> Provider {
+    if let Ok(StoredSession::Oauth { .. }) = StoredSession::from_json(session_json) {
+        return Provider::Oidc;
+    }
+    if is_beeper_homeserver(homeserver_url) {
+        return Provider::Beeper;
+    }
+    Provider::Password
+}
+
+/// Whether `homeserver_url` resolves to Beeper's homeserver host
+/// (`matrix.beeper.com`), matched exactly on the host component. A malformed URL
+/// is not Beeper. Reuses [`BEEPER_HOMESERVER`]'s host as the single source.
+fn is_beeper_homeserver(homeserver_url: &str) -> bool {
+    let beeper_host = url::Url::parse(BEEPER_HOMESERVER)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned));
+    match (
+        url::Url::parse(homeserver_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned)),
+        beeper_host,
+    ) {
+        (Some(host), Some(beeper)) => host.eq_ignore_ascii_case(&beeper),
+        _ => false,
+    }
 }
 
 /// Delete exactly one account's persisted state — its SDK store dir, its Keychain
@@ -976,6 +1048,7 @@ mod tests {
             "DEVID",
             1,
             3,
+            "password",
         )
         .expect("insert row");
         platform
@@ -1008,6 +1081,7 @@ mod tests {
                 "DEV",
                 1,
                 hue,
+                "password",
             )
             .expect("insert row");
             platform
@@ -1023,6 +1097,7 @@ mod tests {
             "DEV",
             2,
             2,
+            "password",
         )
         .expect("insert sessionless row");
 
@@ -1042,8 +1117,17 @@ mod tests {
         std::fs::create_dir_all(dir).expect("create dir");
         // Simulate a legacy row (NULL hue) by inserting via a pre-hue schema path:
         // insert normally then null the column out.
-        registry::insert_account(dir, "legacy", "@l:e.org", "https://e.org/", "DEV", 1, 0)
-            .expect("insert row");
+        registry::insert_account(
+            dir,
+            "legacy",
+            "@l:e.org",
+            "https://e.org/",
+            "DEV",
+            1,
+            0,
+            "password",
+        )
+        .expect("insert row");
         {
             let conn = rusqlite::Connection::open(dir.join("keeper.db")).expect("open db");
             conn.execute(
@@ -1067,6 +1151,147 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Insert a row that predates the `provider` column by nulling it out after a
+    /// normal insert, mirroring the legacy-hue simulation. Returns the dir used.
+    fn insert_legacy_provider_row(
+        platform: &FakePlatform,
+        account_id: &str,
+        homeserver_url: &str,
+        session_json: &str,
+    ) {
+        let dir = &platform.data_dir;
+        std::fs::create_dir_all(dir).expect("create dir");
+        registry::insert_account(
+            dir,
+            account_id,
+            "@l:e.org",
+            homeserver_url,
+            "DEV",
+            1,
+            0,
+            "password",
+        )
+        .expect("insert row");
+        {
+            let conn = rusqlite::Connection::open(dir.join("keeper.db")).expect("open db");
+            conn.execute(
+                "UPDATE accounts SET provider = NULL WHERE account_id = ?1",
+                rusqlite::params![account_id],
+            )
+            .expect("null provider");
+        }
+        platform
+            .keychain_set(&session_keychain_key(account_id), session_json)
+            .expect("set session");
+    }
+
+    #[test]
+    fn stamps_provider_from_the_registry_row_on_restore() {
+        // A row that already carries a provider tag surfaces it verbatim (no
+        // inference): the `"password"` stamped by insert_account round-trips.
+        let platform = FakePlatform::new(temp_dir("provider-stamped"));
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        registry::insert_account(
+            &platform.data_dir,
+            id,
+            "@alice:example.org",
+            "https://matrix.example.org/",
+            "DEVID",
+            1,
+            0,
+            "oidc",
+        )
+        .expect("insert row");
+        platform
+            .keychain_set(&session_keychain_key(id), "session-json")
+            .expect("set session");
+
+        let vms = find_restorable_accounts(&platform).expect("find should succeed");
+        assert_eq!(vms.len(), 1);
+        assert_eq!(vms[0].provider, Provider::Oidc);
+        let _ = std::fs::remove_dir_all(&platform.data_dir);
+    }
+
+    #[test]
+    fn migrates_legacy_null_provider_beeper_by_host() {
+        let platform = FakePlatform::new(temp_dir("provider-migrate-beeper"));
+        // Legacy Beeper row: a Password-shaped session on matrix.beeper.com.
+        let session = StoredSession::Password(sample_matrix_session())
+            .to_json()
+            .expect("session json");
+        insert_legacy_provider_row(&platform, "legacy", "https://matrix.beeper.com/", &session);
+
+        let vms = find_restorable_accounts(&platform).expect("find should succeed");
+        assert_eq!(vms.len(), 1);
+        assert_eq!(vms[0].provider, Provider::Beeper);
+        // Persisted once so the inference never runs again.
+        let row = registry::get_account(&platform.data_dir, "legacy")
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.provider.as_deref(), Some("beeper"));
+        let _ = std::fs::remove_dir_all(&platform.data_dir);
+    }
+
+    #[test]
+    fn migrates_legacy_null_provider_oidc_by_session_shape() {
+        let platform = FakePlatform::new(temp_dir("provider-migrate-oidc"));
+        // Legacy OIDC row: an Oauth-shaped session (host is irrelevant).
+        let session = StoredSession::Oauth {
+            client_id: "client-abc".to_owned(),
+            user: sample_user_session(),
+        }
+        .to_json()
+        .expect("session json");
+        insert_legacy_provider_row(&platform, "legacy", "https://matrix.beeper.com/", &session);
+
+        let vms = find_restorable_accounts(&platform).expect("find should succeed");
+        assert_eq!(vms.len(), 1);
+        // Oauth shape wins over the Beeper host.
+        assert_eq!(vms[0].provider, Provider::Oidc);
+        let row = registry::get_account(&platform.data_dir, "legacy")
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.provider.as_deref(), Some("oidc"));
+        let _ = std::fs::remove_dir_all(&platform.data_dir);
+    }
+
+    #[test]
+    fn migrates_legacy_null_provider_password_by_default() {
+        let platform = FakePlatform::new(temp_dir("provider-migrate-password"));
+        // Legacy non-Beeper password row: Password session, non-Beeper host.
+        let session = StoredSession::Password(sample_matrix_session())
+            .to_json()
+            .expect("session json");
+        insert_legacy_provider_row(&platform, "legacy", "https://matrix.example.org/", &session);
+
+        let vms = find_restorable_accounts(&platform).expect("find should succeed");
+        assert_eq!(vms.len(), 1);
+        assert_eq!(vms[0].provider, Provider::Password);
+        let row = registry::get_account(&platform.data_dir, "legacy")
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.provider.as_deref(), Some("password"));
+        let _ = std::fs::remove_dir_all(&platform.data_dir);
+    }
+
+    #[test]
+    fn provider_stamping_maps_each_provider_impl() {
+        // The AuthProvider::provider() tag for each impl (unit-level, no network).
+        let password = PasswordAuthProvider {
+            username: "u",
+            password: "p",
+        };
+        assert_eq!(password.provider(), Provider::Password);
+        let oidc = OidcAuthProvider {
+            flows: Arc::new(OAuthFlowRegistry::default()),
+        };
+        assert_eq!(oidc.provider(), Provider::Oidc);
+        let beeper = beeper::BeeperAuthProvider {
+            jwt: "jwt".to_owned(),
+        };
+        assert_eq!(beeper.provider(), Provider::Beeper);
+    }
+
     #[test]
     fn sign_out_cleanup_deletes_exactly_the_three_targets() {
         let platform = FakePlatform::new(temp_dir("cleanup-exact"));
@@ -1083,6 +1308,7 @@ mod tests {
             "DEVID",
             1,
             0,
+            "password",
         )
         .expect("insert row");
         registry::insert_account(
@@ -1093,6 +1319,7 @@ mod tests {
             "DEVID2",
             2,
             1,
+            "password",
         )
         .expect("insert sibling row");
         platform
@@ -1192,6 +1419,7 @@ mod tests {
             "DEVID",
             1,
             0,
+            "password",
         )
         .expect("insert row");
         platform
@@ -1226,6 +1454,7 @@ mod tests {
             "DEVID",
             1,
             0,
+            "password",
         )
         .expect("insert row");
         platform

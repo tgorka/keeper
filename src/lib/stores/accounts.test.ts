@@ -8,6 +8,7 @@ function account(id: string, hue = 0): AccountVm {
     userId: `@user-${id}:example.org`,
     homeserverUrl: "https://matrix.example.org/",
     hueIndex: hue,
+    provider: "password",
   };
 }
 
@@ -92,5 +93,62 @@ describe("accountsStore", () => {
     accountsStore.getState().addAccount(alice);
     accountsStore.getState().clear();
     expect(accountsStore.getState().hydrated).toBe(true);
+  });
+});
+
+describe("accountsStore inbox filter", () => {
+  beforeEach(() => {
+    accountsStore.getState().clear();
+    accountsStore.setState({ filterAccountId: null });
+  });
+
+  it("starts with no filter", () => {
+    expect(accountsStore.getState().filterAccountId).toBeNull();
+  });
+
+  it("toggleFilter sets the filter to the clicked account", () => {
+    accountsStore.getState().toggleFilter(alice.accountId);
+    expect(accountsStore.getState().filterAccountId).toBe(alice.accountId);
+  });
+
+  it("toggleFilter on the active account clears the filter", () => {
+    accountsStore.getState().toggleFilter(alice.accountId);
+    accountsStore.getState().toggleFilter(alice.accountId);
+    expect(accountsStore.getState().filterAccountId).toBeNull();
+  });
+
+  it("toggleFilter on a different account switches the filter", () => {
+    accountsStore.getState().toggleFilter(alice.accountId);
+    accountsStore.getState().toggleFilter(bob.accountId);
+    expect(accountsStore.getState().filterAccountId).toBe(bob.accountId);
+  });
+
+  it("removeAccount clears the filter when the filtered account is removed", () => {
+    accountsStore.getState().addAccount(alice);
+    accountsStore.getState().addAccount(bob);
+    accountsStore.getState().toggleFilter(alice.accountId);
+    accountsStore.getState().removeAccount(alice.accountId);
+    expect(accountsStore.getState().filterAccountId).toBeNull();
+  });
+
+  it("removeAccount keeps the filter when a different account is removed", () => {
+    accountsStore.getState().addAccount(alice);
+    accountsStore.getState().addAccount(bob);
+    accountsStore.getState().toggleFilter(alice.accountId);
+    accountsStore.getState().removeAccount(bob.accountId);
+    expect(accountsStore.getState().filterAccountId).toBe(alice.accountId);
+  });
+
+  it("hydrateAll clears any stale filter", () => {
+    accountsStore.getState().toggleFilter(alice.accountId);
+    accountsStore.getState().hydrateAll([bob]);
+    expect(accountsStore.getState().filterAccountId).toBeNull();
+  });
+
+  it("addAccount clears an active filter so the new account is not hidden", () => {
+    accountsStore.getState().addAccount(alice);
+    accountsStore.getState().toggleFilter(alice.accountId);
+    accountsStore.getState().addAccount(bob);
+    expect(accountsStore.getState().filterAccountId).toBeNull();
   });
 });

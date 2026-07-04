@@ -20,6 +20,7 @@ export type { InboxRoomVm } from "./gen/InboxRoomVm";
 export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { PingVm } from "./gen/PingVm";
+export type { Provider } from "./gen/Provider";
 export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";

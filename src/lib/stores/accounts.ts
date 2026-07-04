@@ -19,6 +19,14 @@ export interface AccountsState {
   /** Every signed-in account, in restore/add order. Empty when signed out. */
   accounts: AccountVm[];
   /**
+   * The account id the merged inbox is filtered to, or `null` for no filter
+   * (Story 2.5). Ephemeral frontend display state over the already-merged rooms
+   * store — clicking a switcher row toggles it; it never changes the backend
+   * inbox subscription. Cleared on sign-out of the filtered account and on
+   * hydrate (a fresh account set).
+   */
+  filterAccountId: string | null;
+  /**
    * Whether the one-shot boot session-restore attempt has completed (Story 1.8).
    * `false` until then so `App` holds a splash instead of flashing the login
    * screen for a restorable user; flips `true` on both restore success and
@@ -31,6 +39,8 @@ export interface AccountsState {
   addAccount: (account: AccountVm) => void;
   /** Remove one account by id (sign out). */
   removeAccount: (accountId: string) => void;
+  /** Toggle the inbox filter to `accountId`; clicking the active one clears it. */
+  toggleFilter: (accountId: string) => void;
   /** Mark the boot restore attempt as complete (success or failure). */
   markHydrated: () => void;
   /** Clear all accounts (full sign-out / reset). */
@@ -43,15 +53,27 @@ export interface AccountsState {
  */
 export const accountsStore = createStore<AccountsState>()((set) => ({
   accounts: [],
+  filterAccountId: null,
   hydrated: false,
-  hydrateAll: (accounts) => set({ accounts }),
+  // A fresh account set drops any stale filter (a filtered account may be gone).
+  hydrateAll: (accounts) => set({ accounts, filterAccountId: null }),
   addAccount: (account) =>
     set((state) => {
       const rest = state.accounts.filter((a) => a.accountId !== account.accountId);
-      return { accounts: [...rest, account] };
+      // Adding an account drops any active filter so the freshly added account's
+      // Chats are never hidden by a filter set on a previous account.
+      return { accounts: [...rest, account], filterAccountId: null };
     }),
   removeAccount: (accountId) =>
-    set((state) => ({ accounts: state.accounts.filter((a) => a.accountId !== accountId) })),
+    set((state) => ({
+      accounts: state.accounts.filter((a) => a.accountId !== accountId),
+      // Clear the filter when the filtered account is the one removed.
+      filterAccountId: state.filterAccountId === accountId ? null : state.filterAccountId,
+    })),
+  toggleFilter: (accountId) =>
+    set((state) => ({
+      filterAccountId: state.filterAccountId === accountId ? null : accountId,
+    })),
   markHydrated: () => set({ hydrated: true }),
   clear: () => set({ accounts: [] }),
 }));

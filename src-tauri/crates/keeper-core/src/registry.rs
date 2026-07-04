@@ -63,6 +63,7 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
     )
     .map_err(|e| CoreError::Internal(format!("could not ensure settings schema: {e}")))?;
     ensure_hue_index_column(&conn)?;
+    ensure_provider_column(&conn)?;
     Ok(conn)
 }
 
@@ -122,6 +123,31 @@ fn ensure_hue_index_column(conn: &Connection) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Add the nullable `provider` column to `accounts` if it is not present yet
+/// (Story 2.5).
+///
+/// Idempotent and non-destructive, exactly like [`ensure_hue_index_column`]:
+/// reads the table's column list and only runs `ALTER TABLE ... ADD COLUMN` when
+/// `provider` is missing, so an install that predates the column upgrades in
+/// place without dropping any account row. A row created before this column
+/// existed keeps `NULL` until [`backfill_provider`] infers and persists its tag.
+fn ensure_provider_column(conn: &Connection) -> Result<(), CoreError> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(accounts)")
+        .map_err(|e| CoreError::Internal(format!("could not inspect accounts schema: {e}")))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| CoreError::Internal(format!("could not read accounts columns: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| CoreError::Internal(format!("could not read accounts columns: {e}")))?;
+    drop(stmt);
+    if !existing.iter().any(|c| c == "provider") {
+        conn.execute("ALTER TABLE accounts ADD COLUMN provider TEXT", [])
+            .map_err(|e| CoreError::Internal(format!("could not add provider column: {e}")))?;
+    }
+    Ok(())
+}
+
 /// A single non-secret account row from the registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRow {
@@ -138,10 +164,19 @@ pub struct AccountRow {
     /// Per-account hue index (0..8), or `None` for a legacy row created before
     /// the hue column existed and not yet backfilled.
     pub hue_index: Option<u8>,
+    /// The login-mechanism tag (`"password" | "oidc" | "beeper"`), or `None` for
+    /// a legacy row created before the provider column existed and not yet
+    /// backfilled by inference.
+    pub provider: Option<String>,
 }
 
-/// Insert one account row with its assigned hue index. Fails if `account_id`
-/// already exists (PRIMARY KEY).
+/// Insert one account row with its assigned hue index and login-mechanism
+/// `provider` tag. Fails if `account_id` already exists (PRIMARY KEY).
+///
+/// Takes each non-secret column positionally (one flat registry row); grouping
+/// them into a struct would add a layer without changing the single call site in
+/// `add_account`.
+#[allow(clippy::too_many_arguments)]
 pub fn insert_account(
     data_dir: &Path,
     account_id: &str,
@@ -150,18 +185,20 @@ pub fn insert_account(
     device_id: &str,
     created_ts: i64,
     hue_index: u8,
+    provider: &str,
 ) -> Result<(), CoreError> {
     let conn = open(data_dir)?;
     conn.execute(
-        "INSERT INTO accounts(account_id, user_id, homeserver_url, device_id, created_ts, hue_index) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO accounts(account_id, user_id, homeserver_url, device_id, created_ts, hue_index, provider) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             account_id,
             user_id,
             homeserver_url,
             device_id,
             created_ts,
-            hue_index as i64
+            hue_index as i64,
+            provider
         ],
     )
     .map_err(|e| CoreError::Internal(format!("could not insert account row: {e}")))?;
@@ -209,6 +246,25 @@ pub fn backfill_hue_index(data_dir: &Path, account_id: &str) -> Result<u8, CoreE
     Ok(hue)
 }
 
+/// Backfill a `NULL` `provider` for a legacy account row with an inferred tag
+/// (Story 2.5). Idempotent: a row that already has a provider is left untouched
+/// (the `UPDATE ... WHERE provider IS NULL` guard makes a second call a no-op).
+/// The caller performs the inference (stored-session shape + homeserver host);
+/// this only persists it once so the inference never runs again.
+pub fn backfill_provider(
+    data_dir: &Path,
+    account_id: &str,
+    provider: &str,
+) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    conn.execute(
+        "UPDATE accounts SET provider = ?1 WHERE account_id = ?2 AND provider IS NULL",
+        rusqlite::params![provider, account_id],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not backfill provider: {e}")))?;
+    Ok(())
+}
+
 /// Delete an account row by id. Idempotent — deleting a missing row is not an
 /// error, so this is safe to call from the login rollback path.
 pub fn delete_account(data_dir: &Path, account_id: &str) -> Result<(), CoreError> {
@@ -229,7 +285,7 @@ pub fn list_accounts(data_dir: &Path) -> Result<Vec<AccountRow>, CoreError> {
     let conn = open(data_dir)?;
     let mut stmt = conn
         .prepare(
-            "SELECT account_id, user_id, homeserver_url, device_id, created_ts, hue_index \
+            "SELECT account_id, user_id, homeserver_url, device_id, created_ts, hue_index, provider \
              FROM accounts ORDER BY created_ts ASC",
         )
         .map_err(|e| CoreError::Internal(format!("could not prepare account list: {e}")))?;
@@ -242,6 +298,7 @@ pub fn list_accounts(data_dir: &Path) -> Result<Vec<AccountRow>, CoreError> {
                 device_id: r.get(3)?,
                 created_ts: r.get(4)?,
                 hue_index: r.get::<_, Option<i64>>(5)?.map(|h| h as u8),
+                provider: r.get::<_, Option<String>>(6)?,
             })
         })
         .map_err(|e| CoreError::Internal(format!("could not query account list: {e}")))?;
@@ -259,7 +316,7 @@ pub fn get_account(data_dir: &Path, account_id: &str) -> Result<Option<AccountRo
     let conn = open(data_dir)?;
     let row = conn
         .query_row(
-            "SELECT account_id, user_id, homeserver_url, device_id, created_ts, hue_index \
+            "SELECT account_id, user_id, homeserver_url, device_id, created_ts, hue_index, provider \
              FROM accounts WHERE account_id = ?1",
             rusqlite::params![account_id],
             |r| {
@@ -270,6 +327,7 @@ pub fn get_account(data_dir: &Path, account_id: &str) -> Result<Option<AccountRo
                     device_id: r.get(3)?,
                     created_ts: r.get(4)?,
                     hue_index: r.get::<_, Option<i64>>(5)?.map(|h| h as u8),
+                    provider: r.get::<_, Option<String>>(6)?,
                 })
             },
         )
@@ -313,6 +371,7 @@ mod tests {
             "DEVID123",
             1_720_000_000_000,
             0,
+            "password",
         )
         .expect("insert should succeed");
 
@@ -324,6 +383,7 @@ mod tests {
         assert_eq!(row.device_id, "DEVID123");
         assert_eq!(row.created_ts, 1_720_000_000_000);
         assert_eq!(row.hue_index, Some(0));
+        assert_eq!(row.provider.as_deref(), Some("password"));
 
         delete_account(&dir, "01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("delete should succeed");
         let gone = get_account(&dir, "01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("read after delete");
@@ -357,6 +417,7 @@ mod tests {
             "DEVID123",
             1,
             0,
+            "password",
         )
         .expect("insert first");
         insert_account(
@@ -367,6 +428,7 @@ mod tests {
             "DEVID456",
             2,
             1,
+            "oidc",
         )
         .expect("insert second");
 
@@ -395,10 +457,21 @@ mod tests {
         let dir = temp_dir();
         // Fresh registry → hue 0.
         assert_eq!(next_hue_index(&dir).expect("next"), 0);
-        insert_account(&dir, "a", "@a:e.org", "https://e.org/", "D", 1, 0).expect("insert a");
+        insert_account(
+            &dir,
+            "a",
+            "@a:e.org",
+            "https://e.org/",
+            "D",
+            1,
+            0,
+            "password",
+        )
+        .expect("insert a");
         // hue 0 in use → next is 1.
         assert_eq!(next_hue_index(&dir).expect("next"), 1);
-        insert_account(&dir, "b", "@b:e.org", "https://e.org/", "D", 2, 1).expect("insert b");
+        insert_account(&dir, "b", "@b:e.org", "https://e.org/", "D", 2, 1, "oidc")
+            .expect("insert b");
         assert_eq!(next_hue_index(&dir).expect("next"), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -406,8 +479,19 @@ mod tests {
     #[test]
     fn hue_assignment_reuses_freed_index_after_removal() {
         let dir = temp_dir();
-        insert_account(&dir, "a", "@a:e.org", "https://e.org/", "D", 1, 0).expect("insert a");
-        insert_account(&dir, "b", "@b:e.org", "https://e.org/", "D", 2, 1).expect("insert b");
+        insert_account(
+            &dir,
+            "a",
+            "@a:e.org",
+            "https://e.org/",
+            "D",
+            1,
+            0,
+            "password",
+        )
+        .expect("insert a");
+        insert_account(&dir, "b", "@b:e.org", "https://e.org/", "D", 2, 1, "oidc")
+            .expect("insert b");
         // Free hue 0.
         delete_account(&dir, "a").expect("delete a");
         // The lowest unused is now 0 again.
@@ -462,6 +546,60 @@ mod tests {
     }
 
     #[test]
+    fn migration_adds_provider_column_to_legacy_table_without_dropping_rows() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("create dir");
+        // Create a pre-provider `accounts` table (it has hue_index but no
+        // provider) and a row, as a Story-2.1/2.4 install would have on disk.
+        {
+            let conn = Connection::open(db_path(&dir)).expect("open legacy db");
+            conn.execute(
+                "CREATE TABLE accounts(\
+                    account_id TEXT PRIMARY KEY, \
+                    user_id TEXT NOT NULL, \
+                    homeserver_url TEXT NOT NULL, \
+                    device_id TEXT NOT NULL, \
+                    created_ts INTEGER NOT NULL, \
+                    hue_index INTEGER\
+                )",
+                [],
+            )
+            .expect("create legacy table");
+            conn.execute(
+                "INSERT INTO accounts(account_id, user_id, homeserver_url, device_id, created_ts, hue_index) \
+                 VALUES ('legacy', '@old:e.org', 'https://matrix.beeper.com/', 'DEV', 1, 0)",
+                [],
+            )
+            .expect("insert legacy row");
+        }
+
+        // The next `open` (via list) migrates in place: the legacy row survives
+        // with a NULL provider.
+        let rows = list_accounts(&dir).expect("list after migration");
+        assert_eq!(rows.len(), 1, "legacy row must survive migration");
+        assert_eq!(rows[0].account_id, "legacy");
+        assert_eq!(rows[0].provider, None, "legacy row provider starts NULL");
+
+        // Backfill persists the inferred tag and is idempotent.
+        backfill_provider(&dir, "legacy", "beeper").expect("backfill");
+        let row = get_account(&dir, "legacy")
+            .expect("get")
+            .expect("row present");
+        assert_eq!(row.provider.as_deref(), Some("beeper"));
+        // A second call with a different value is a no-op (WHERE provider IS NULL).
+        backfill_provider(&dir, "legacy", "password").expect("backfill idempotent");
+        let row = get_account(&dir, "legacy")
+            .expect("get")
+            .expect("row present");
+        assert_eq!(
+            row.provider.as_deref(),
+            Some("beeper"),
+            "backfill must not overwrite an already-tagged provider"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn setting_roundtrip_and_overwrite() {
         let dir = temp_dir();
         // Unset key reads as None.
@@ -497,6 +635,7 @@ mod tests {
             "DEVID456",
             1,
             0,
+            "password",
         )
         .expect("insert should succeed");
 

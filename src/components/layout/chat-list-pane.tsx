@@ -34,6 +34,10 @@ export function ChatListPane() {
   const rooms = useRoomsStore((s) => s.rooms);
   const selected = useRoomsStore((s) => s.selected);
   const selectRoom = useRoomsStore((s) => s.selectRoom);
+  // Account switcher filter (Story 2.5): a pure display filter over the already-
+  // merged, Rust-ordered rooms — it hides non-matching rows without touching the
+  // merged subscription or the sort. `null` shows every account.
+  const filterAccountId = useAccountsStore((s) => s.filterAccountId);
   const [errored, setErrored] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
@@ -81,6 +85,11 @@ export function ChatListPane() {
     };
   }, [accountKey]);
 
+  // Apply the account switcher filter as a pure display filter (no re-sort, no
+  // mutation): when a filter is active, hide rows not owned by that account.
+  const visibleRooms =
+    filterAccountId === null ? rooms : rooms.filter((room) => room.accountId === filterAccountId);
+
   return (
     <div className="flex h-full w-[320px] shrink-0 flex-col border-border border-r bg-background">
       {errored ? (
@@ -89,10 +98,10 @@ export function ChatListPane() {
             Couldn't start syncing. Check your connection and try again.
           </p>
         </div>
-      ) : rooms.length > 0 ? (
+      ) : visibleRooms.length > 0 ? (
         <ScrollArea className="flex-1">
           <ul aria-label="Conversations" className="flex flex-col">
-            {rooms.map((room) => (
+            {visibleRooms.map((room) => (
               <li key={`${room.accountId}:${room.roomId}`}>
                 <ChatRow
                   room={room}

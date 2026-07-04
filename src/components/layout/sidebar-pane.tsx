@@ -4,7 +4,7 @@ import { AccountFooter } from "@/components/layout/account-footer";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { useConnectionStore } from "@/lib/stores/connection";
+import { useShellOffline } from "@/lib/stores/account-status";
 import { cn } from "@/lib/utils";
 
 interface SidebarView {
@@ -26,7 +26,7 @@ interface SidebarPaneProps {
 const OFFLINE_PILL_TEXT = "Offline — showing your local archive. Messages queue until you're back.";
 
 export function SidebarPane({ collapsed }: SidebarPaneProps) {
-  const offline = useConnectionStore((s) => s.status === "offline");
+  const offline = useShellOffline();
   // Controlled state for the Settings dialog (Story 2.6). Only the Settings view
   // button opens it; Chats/Bridges stay inert.
   const [settingsOpen, setSettingsOpen] = useState(false);

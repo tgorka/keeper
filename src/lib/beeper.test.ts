@@ -1,46 +1,50 @@
 import { describe, expect, it } from "vitest";
-import { BEEPER_HOMESERVER_HOST, isBeeperAccount } from "@/lib/beeper";
-import type { AccountVm } from "@/lib/ipc/client";
+import { isBeeperAccount } from "@/lib/beeper";
+import type { AccountVm, Provider } from "@/lib/ipc/client";
 
-function account(homeserverUrl: string): AccountVm {
+function account(provider: Provider): AccountVm {
   return {
     accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
     userId: "@alice:beeper.com",
-    homeserverUrl,
+    homeserverUrl: "https://matrix.beeper.com/",
     hueIndex: 0,
+    provider,
   };
 }
 
 describe("isBeeperAccount", () => {
-  it("is true for the Beeper homeserver", () => {
-    expect(isBeeperAccount(account("https://matrix.beeper.com"))).toBe(true);
+  it("is true for a Beeper-provider account", () => {
+    expect(isBeeperAccount(account("beeper"))).toBe(true);
   });
 
-  it("is true for the Beeper homeserver with a trailing slash", () => {
-    expect(isBeeperAccount(account("https://matrix.beeper.com/"))).toBe(true);
+  it("is false for a password-provider account", () => {
+    expect(isBeeperAccount(account("password"))).toBe(false);
   });
 
-  it("is true for the Beeper homeserver with an explicit port", () => {
-    expect(isBeeperAccount(account("https://matrix.beeper.com:443/"))).toBe(true);
+  it("is false for an oidc-provider account", () => {
+    expect(isBeeperAccount(account("oidc"))).toBe(false);
   });
 
-  it("is false for a different homeserver", () => {
-    expect(isBeeperAccount(account("https://matrix.example.org/"))).toBe(false);
-  });
-
-  it("is false for a malformed URL and never throws", () => {
-    expect(isBeeperAccount(account("not a url"))).toBe(false);
-  });
-
-  it("is false for an empty URL and never throws", () => {
-    expect(isBeeperAccount(account(""))).toBe(false);
-  });
-
-  it("is false for a lookalike host (exact host match, not substring)", () => {
-    expect(isBeeperAccount(account("https://matrix.beeper.com.evil.example"))).toBe(false);
-  });
-
-  it("exposes the Beeper homeserver host constant", () => {
-    expect(BEEPER_HOMESERVER_HOST).toBe("matrix.beeper.com");
+  it("keys off the provider tag, not the homeserver host", () => {
+    // A non-Beeper provider resolved onto the Beeper host is still not Beeper.
+    expect(
+      isBeeperAccount({
+        accountId: "x",
+        userId: "@x:beeper.com",
+        homeserverUrl: "https://matrix.beeper.com/",
+        hueIndex: 0,
+        provider: "password",
+      }),
+    ).toBe(false);
+    // A Beeper provider on any host is Beeper.
+    expect(
+      isBeeperAccount({
+        accountId: "y",
+        userId: "@y:example.org",
+        homeserverUrl: "https://matrix.example.org/",
+        hueIndex: 0,
+        provider: "beeper",
+      }),
+    ).toBe(true);
   });
 });

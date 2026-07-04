@@ -252,6 +252,10 @@ impl AuthProvider for BeeperAuthProvider {
             })?;
         Ok(())
     }
+
+    fn provider(&self) -> crate::vm::Provider {
+        crate::vm::Provider::Beeper
+    }
 }
 
 /// Build the `AuthError::BeeperUnavailable` for a secret-free failure message.

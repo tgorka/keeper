@@ -35,6 +35,7 @@ const account: AccountVm = {
   userId: "@alice:example.org",
   homeserverUrl: "https://matrix.example.org/",
   hueIndex: 0,
+  provider: "password",
 };
 
 describe("App", () => {

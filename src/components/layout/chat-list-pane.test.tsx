@@ -20,6 +20,15 @@ const account: AccountVm = {
   userId: "@alice:example.org",
   homeserverUrl: "https://matrix.example.org/",
   hueIndex: 0,
+  provider: "password",
+};
+
+const bob: AccountVm = {
+  accountId: "01BX5ZZKBKACTAV9WEVGEMMVRZ",
+  userId: "@bob:example.org",
+  homeserverUrl: "https://matrix.example.org/",
+  hueIndex: 1,
+  provider: "password",
 };
 
 function ipcError(code: IpcError["code"]): IpcError {
@@ -40,6 +49,7 @@ function inboxRoom(roomId: string, accountId: string, displayName: string, lastM
 
 beforeEach(() => {
   accountsStore.getState().clear();
+  accountsStore.setState({ filterAccountId: null });
   roomsStore.getState().clear();
   roomsStore.getState().selectRoom(null);
   subscribeInbox.mockReset();
@@ -48,6 +58,7 @@ beforeEach(() => {
 
 afterEach(() => {
   accountsStore.getState().clear();
+  accountsStore.setState({ filterAccountId: null });
   roomsStore.getState().clear();
   roomsStore.getState().selectRoom(null);
 });
@@ -84,15 +95,7 @@ describe("ChatListPane", () => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    accountsStore.getState().hydrateAll([
-      account,
-      {
-        accountId: "01BX5ZZKBKACTAV9WEVGEMMVRZ",
-        userId: "@bob:example.org",
-        homeserverUrl: "https://matrix.example.org/",
-        hueIndex: 1,
-      },
-    ]);
+    accountsStore.getState().hydrateAll([account, bob]);
     render(<ChatListPane />);
 
     expect(subscribeInbox).toHaveBeenCalledWith(expect.any(Function));
@@ -206,5 +209,48 @@ describe("ChatListPane", () => {
     });
 
     expect(roomsStore.getState().rooms).toEqual([]);
+  });
+
+  it("applies the account filter as a pure display filter, hiding other accounts' rooms", async () => {
+    const captured: { onBatch: ((b: InboxBatch) => void) | null } = { onBatch: null };
+    subscribeInbox.mockImplementation((onBatch: (b: InboxBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    accountsStore.getState().hydrateAll([account, bob]);
+    render(<ChatListPane />);
+
+    captured.onBatch?.({
+      ops: [
+        {
+          op: "reset",
+          rooms: [
+            inboxRoom("!a:example.org", account.accountId, "Alpha Room", "first"),
+            inboxRoom("!b:example.org", bob.accountId, "Beta Room", "second"),
+          ],
+        },
+      ],
+      total: 2,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Alpha Room")).toBeInTheDocument();
+    });
+    expect(screen.getByText("Beta Room")).toBeInTheDocument();
+
+    // Filter to account (alice): only its room stays; the merged subscription is
+    // untouched (no re-subscribe).
+    accountsStore.getState().toggleFilter(account.accountId);
+    await waitFor(() => {
+      expect(screen.queryByText("Beta Room")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("Alpha Room")).toBeInTheDocument();
+    expect(subscribeInbox).toHaveBeenCalledTimes(1);
+
+    // Clearing the filter shows every account's rooms again.
+    accountsStore.getState().toggleFilter(account.accountId);
+    await waitFor(() => {
+      expect(screen.getByText("Beta Room")).toBeInTheDocument();
+    });
   });
 });

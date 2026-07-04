@@ -1,8 +1,8 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm, IpcError, TimelineBatch } from "@/lib/ipc/client";
+import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
-import { connectionStore } from "@/lib/stores/connection";
 import { roomsStore } from "@/lib/stores/rooms";
 import { timelineStore } from "@/lib/stores/timeline";
 
@@ -28,6 +28,7 @@ const account: AccountVm = {
   userId: "@alice:example.org",
   homeserverUrl: "https://matrix.example.org/",
   hueIndex: 0,
+  provider: "password",
 };
 
 function ipcError(code: IpcError["code"]): IpcError {
@@ -59,7 +60,7 @@ beforeEach(() => {
   roomsStore.getState().clear();
   roomsStore.getState().selectRoom(null);
   timelineStore.getState().clear();
-  connectionStore.getState().reset();
+  accountStatusStore.getState().reset();
   subscribeTimeline.mockReset();
   unsubscribeTimeline.mockReset();
   sendText.mockReset();
@@ -73,7 +74,7 @@ afterEach(() => {
   roomsStore.getState().clear();
   roomsStore.getState().selectRoom(null);
   timelineStore.getState().clear();
-  connectionStore.getState().reset();
+  accountStatusStore.getState().reset();
 });
 
 describe("ConversationPane", () => {
@@ -360,8 +361,9 @@ describe("ConversationPane", () => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    // Drive the connection store offline (the pane reads it as a pure projection).
-    connectionStore.getState().applyBatch({ status: "offline" });
+    // Drive the open conversation's account offline (the pane reads its account's
+    // status as a pure projection).
+    accountStatusStore.getState().setStatus(account.accountId, "offline");
     roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     render(<ConversationPane {...noopProps()} />);
 

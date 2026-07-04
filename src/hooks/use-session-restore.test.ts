@@ -17,6 +17,7 @@ function account(id: string, hue = 0): AccountVm {
     userId: `@user-${id}:example.org`,
     homeserverUrl: "https://matrix.example.org/",
     hueIndex: hue,
+    provider: "password",
   };
 }
 

@@ -63,7 +63,7 @@ development_status:
   2-2-oidc-login-mas-msc3861: done
   2-3-beeper-email-code-login: done
   2-4-beeper-coverage-disclosure: done
-  2-5-account-switcher-and-per-account-state: backlog
+  2-5-account-switcher-and-per-account-state: done
   2-6-at-rest-encryption-first-run-choice: done
   epic-2-retrospective: optional
   epic-3: backlog

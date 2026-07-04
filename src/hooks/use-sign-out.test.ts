@@ -9,8 +9,8 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import { useSignOut } from "@/hooks/use-sign-out";
+import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
-import { connectionStore } from "@/lib/stores/connection";
 import { roomsStore } from "@/lib/stores/rooms";
 import { timelineStore } from "@/lib/stores/timeline";
 
@@ -20,6 +20,7 @@ function account(id: string, hue = 0): AccountVm {
     userId: `@user-${id}:example.org`,
     homeserverUrl: "https://matrix.example.org/",
     hueIndex: hue,
+    provider: "password",
   };
 }
 
@@ -43,7 +44,7 @@ beforeEach(() => {
   roomsStore.getState().clear();
   roomsStore.getState().selectRoom(null);
   timelineStore.getState().clear();
-  connectionStore.getState().reset();
+  accountStatusStore.getState().reset();
   signOut.mockReset();
   signOut.mockResolvedValue(undefined);
 });
@@ -97,7 +98,7 @@ describe("useSignOut", () => {
       ops: [{ op: "reset", rooms: [room("!a:example.org", alice.accountId)] }],
       total: 1,
     });
-    connectionStore.getState().applyBatch({ status: "offline" });
+    accountStatusStore.getState().setStatus(alice.accountId, "offline");
 
     const { result } = renderHook(() => useSignOut());
     await result.current(alice.accountId);
@@ -106,7 +107,19 @@ describe("useSignOut", () => {
     expect(roomsStore.getState().rooms).toEqual([]);
     expect(roomsStore.getState().total).toBeNull();
     expect(timelineStore.getState().items).toEqual([]);
-    expect(connectionStore.getState().status).toBe("online");
+    // The signed-out account's per-account status entry is removed.
+    expect(accountStatusStore.getState().statuses).toEqual({});
     expect(accountsStore.getState().accounts).toEqual([]);
+  });
+
+  it("removes the signed-out account's status entry, keeping the others", async () => {
+    accountsStore.getState().hydrateAll([alice, bob]);
+    accountStatusStore.getState().setStatus(alice.accountId, "online");
+    accountStatusStore.getState().setStatus(bob.accountId, "offline");
+
+    const { result } = renderHook(() => useSignOut());
+    await result.current(alice.accountId);
+
+    expect(accountStatusStore.getState().statuses).toEqual({ [bob.accountId]: "offline" });
   });
 });

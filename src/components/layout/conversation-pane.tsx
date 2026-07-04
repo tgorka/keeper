@@ -22,7 +22,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { TimelineBatch, TimelineItemVm } from "@/lib/ipc/client";
 import { retrySend, sendText, subscribeTimeline, unsubscribeTimeline } from "@/lib/ipc/client";
-import { useConnectionStore } from "@/lib/stores/connection";
+import { useAccountStatus } from "@/lib/stores/account-status";
 import { useRoomsStore } from "@/lib/stores/rooms";
 import { timelineStore, useTimelineStore } from "@/lib/stores/timeline";
 
@@ -79,7 +79,9 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
   const accountId = selected?.accountId ?? null;
   const selectedRoomId = selected?.roomId ?? null;
   const items = useTimelineStore((s) => s.items);
-  const offline = useConnectionStore((s) => s.status === "offline");
+  // The open conversation's account status drives the "Queued" caption. An empty
+  // key (no room open) reads as `undefined` → not offline.
+  const offline = useAccountStatus(accountId ?? "") === "offline";
   const [errored, setErrored] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);

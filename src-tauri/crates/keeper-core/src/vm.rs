@@ -370,14 +370,57 @@ pub struct TimelineBatch {
     pub ops: Vec<TimelineOp>,
 }
 
+/// The durable login-mechanism discriminant of an account (Story 2.5, AD-17).
+///
+/// Set once at add time by the authenticating [`AuthProvider`] and persisted in
+/// the non-secret `keeper.db` registry row (never in the Keychain session blob,
+/// never a secret). Surfaced on [`AccountVm::provider`] so the frontend can key
+/// provider-specific UI (e.g. the Beeper coverage disclosure) off a stable tag
+/// rather than the resolved homeserver host. Serializes to its lowercase name
+/// (`"password" | "oidc" | "beeper"`) — the frontend wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum Provider {
+    /// A native Matrix password (`m.login.password`) login.
+    Password,
+    /// An OIDC (OAuth 2.0 / MSC3861) login.
+    Oidc,
+    /// A Beeper unofficial email-code (JWT) login against `matrix.beeper.com`.
+    Beeper,
+}
+
+impl Provider {
+    /// The lowercase string persisted in the `keeper.db` `provider` column and
+    /// serialized over IPC (`"password" | "oidc" | "beeper"`).
+    pub fn as_registry_str(&self) -> &'static str {
+        match self {
+            Provider::Password => "password",
+            Provider::Oidc => "oidc",
+            Provider::Beeper => "beeper",
+        }
+    }
+
+    /// Parse a registry `provider` column value back into a [`Provider`], or
+    /// `None` for an unrecognized / absent tag (a legacy NULL row).
+    pub fn from_registry_str(value: &str) -> Option<Self> {
+        match value {
+            "password" => Some(Provider::Password),
+            "oidc" => Some(Provider::Oidc),
+            "beeper" => Some(Provider::Beeper),
+            _ => None,
+        }
+    }
+}
+
 /// Non-secret account registry projection returned to the frontend on a
 /// successful login (FR-1, NFR-9).
 ///
 /// Carries **only** the opaque keeper account id, the Matrix user id, the
-/// resolved homeserver URL, and the per-account hue index. Tokens, refresh
-/// tokens, device/crypto keys, and any `MatrixSession` material never appear
-/// here — they live only in the macOS Keychain and never cross IPC back to
-/// TypeScript.
+/// resolved homeserver URL, the per-account hue index, and the durable
+/// login-mechanism [`Provider`] tag. Tokens, refresh tokens, device/crypto keys,
+/// and any `MatrixSession` material never appear here — they live only in the
+/// macOS Keychain and never cross IPC back to TypeScript.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -394,6 +437,10 @@ pub struct AccountVm {
     /// as a 3 px chat-row edge bar and (later) a switcher dot.
     #[ts(type = "number")]
     pub hue_index: u8,
+    /// The durable login-mechanism tag, stamped at add time and persisted in
+    /// `keeper.db`. Drives provider-specific UI (e.g. Beeper coverage) off a
+    /// stable discriminant rather than the resolved homeserver host.
+    pub provider: Provider,
 }
 
 /// A single merged-inbox room row, attributed to its owning account (AD-20).
@@ -593,16 +640,54 @@ mod tests {
             user_id: "@alice:example.org".to_owned(),
             homeserver_url: "https://matrix.example.org/".to_owned(),
             hue_index: 3,
+            provider: Provider::Password,
         };
         let json = serde_json::to_string(&vm).expect("serialize account vm");
         assert!(json.contains("\"accountId\":"), "json was: {json}");
         assert!(json.contains("\"userId\":"), "json was: {json}");
         assert!(json.contains("\"homeserverUrl\":"), "json was: {json}");
         assert!(json.contains("\"hueIndex\":3"), "json was: {json}");
+        assert!(
+            json.contains("\"provider\":\"password\""),
+            "json was: {json}"
+        );
         // No token/session material is present on the VM.
         assert!(!json.contains("token"), "json leaked a token field: {json}");
         let back: AccountVm = serde_json::from_str(&json).expect("deserialize account vm");
         assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn provider_serializes_lowercase_and_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&Provider::Password).expect("serialize password"),
+            "\"password\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Provider::Oidc).expect("serialize oidc"),
+            "\"oidc\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Provider::Beeper).expect("serialize beeper"),
+            "\"beeper\""
+        );
+        for provider in [Provider::Password, Provider::Oidc, Provider::Beeper] {
+            let json = serde_json::to_string(&provider).expect("serialize provider");
+            let back: Provider = serde_json::from_str(&json).expect("deserialize provider");
+            assert_eq!(back, provider);
+        }
+    }
+
+    #[test]
+    fn provider_registry_str_round_trips() {
+        for provider in [Provider::Password, Provider::Oidc, Provider::Beeper] {
+            assert_eq!(
+                Provider::from_registry_str(provider.as_registry_str()),
+                Some(provider)
+            );
+        }
+        assert_eq!(Provider::from_registry_str("unknown"), None);
+        assert_eq!(Provider::from_registry_str(""), None);
     }
 
     fn sample_inbox_room() -> InboxRoomVm {
