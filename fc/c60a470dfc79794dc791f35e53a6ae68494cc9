@@ -1,0 +1,78 @@
+src-tauri/crates/keeper-core/src/account.rs
+  s_146b97fd664967::t_d6cbd89bfb424d 555-573
+  s_146b97fd664967::t_9d57f85215983d 940,942-1001
+src/hooks/use-session-restore.test.ts
+  s_146b97fd664967::t_0ed334b43fce7c 1-61
+src/hooks/use-sign-out.test.ts
+  s_146b97fd664967::t_a235a97c0f9f3e 1-131
+src/App.tsx
+  s_146b97fd664967::t_52781f7e1c98a8 3,7-9,11-25
+src-tauri/crates/keeper-core/src/registry.rs
+  s_146b97fd664967::t_6d43d7e63879ce 213-248
+  s_146b97fd664967::t_08dc4517ac9261 96-120,124-127
+  s_146b97fd664967::t_86bab3700620c7 121-123
+  s_146b97fd664967::t_01b454a54dd1ae 212
+src-tauri/crates/keeper-core/src/auth.rs
+  s_146b97fd664967::t_85d13347fa703e 187-228,237,243-244,250-256
+  s_146b97fd664967::t_2b2bc884c42de1 353-381,388-483,487-543
+  s_146b97fd664967::t_86bab3700620c7 382-387,484-486
+  s_146b97fd664967::t_ce3b307d3ecbd7 229-236,238-242,245-249
+_bmad-output/implementation-artifacts/spec-1-8-session-restore-and-sign-out.md
+  s_146b97fd664967::t_dbbb291f30b6db 99-112
+  s_146b97fd664967::t_cad0cb089148ff 136-174
+  s_146b97fd664967::t_39f26848f6d3b1 1-4,6-7,9-77,83,91-98,113-135
+  s_146b97fd664967::t_13cedcf9752baf 8
+  s_146b97fd664967::t_b25af74d77d7fc 5
+  s_146b97fd664967::t_a1382fe3d873fc 78-82,84-90
+src/hooks/use-session-restore.ts
+  s_146b97fd664967::t_b97ca20510f202 1-44
+src/App.test.tsx
+  s_146b97fd664967::t_ed7ba52030a230 2,4,16,29,34-42,45-46,52,54
+  s_146b97fd664967::t_a216aebb9dd4ee 5-15
+src/components/layout/account-footer.test.tsx
+  s_146b97fd664967::t_125922b20b3344 1,50,56,58,68,70,83
+  s_146b97fd664967::t_8991ed01573582 2-49,51-55,57,59-67,69,71-82,84-85
+src/components/layout/sidebar-pane.test.tsx
+  s_146b97fd664967::t_331affcc581898 2-10,13,18-22
+  s_146b97fd664967::t_48ef7fa0d2085d 34,39
+  s_146b97fd664967::t_2f3e52da79e18f 57-58,60
+  s_146b97fd664967::t_fffa7a5e598367 83-96
+  s_146b97fd664967::t_486cc59e431941 23
+src/hooks/use-sign-out.ts
+  s_146b97fd664967::t_6e572d6f0cd107 1-43
+src/lib/stores/accounts.test.ts
+  s_146b97fd664967::t_4927159b181eda 40-55
+  s_146b97fd664967::t_9b793c2bd1a165 14-16
+src/components/layout/account-footer.tsx
+  s_146b97fd664967::t_f8a8384332ae48 1-33,35-61,63-127
+  s_146b97fd664967::t_5ec4c6f376352d 34
+  s_146b97fd664967::t_3bb1de88110f32 62
+src/lib/stores/accounts.ts
+  s_146b97fd664967::t_9be9bad96a03dd 38,40
+  s_146b97fd664967::t_e30cd4884cae1f 17-23,26-27
+src/lib/ipc/client.ts
+  s_146b97fd664967::t_c7b53891bdb255 86-107
+src/components/layout/sidebar-pane.tsx
+  s_146b97fd664967::t_ad28c00e3fdb55 2
+  s_146b97fd664967::t_b9b2a72480fe47 76-109
+src-tauri/crates/keeper/src/lib.rs
+  s_146b97fd664967::t_dfd08f37e5afd4 28-30
+src-tauri/crates/keeper/src/ipc.rs
+  s_146b97fd664967::t_ea3489e3572869 380-404
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fcc60a470dfc79794dc791f35e53a6ae68494cc9",
+  "prompts": {},
+  "sessions": {
+    "s_146b97fd664967": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "66130c5b-8659-4526-b209-2f8498236162",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
