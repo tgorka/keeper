@@ -6,6 +6,7 @@
 #![recursion_limit = "256"]
 
 mod ipc;
+mod media_protocol;
 
 use tauri::Manager;
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -18,6 +19,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .manage(ipc::AppState::new())
+        // The exclusive decrypted-media transport (Story 3.6, AD-4): decrypted
+        // bytes reach the webview only over this Range-capable `keeper-media://`
+        // protocol, served from the SDK media cache — never as base64/JSON over
+        // IPC. The handler runs the async SDK fetch off-thread.
+        .register_asynchronous_uri_scheme_protocol("keeper-media", |ctx, request, responder| {
+            media_protocol::handle(ctx.app_handle().clone(), &request, responder);
+        })
         .setup(|app| {
             // Forward every incoming `keeper://oauth/callback` deep link to the
             // OAuth-callback registry, which matches it to its in-flight OIDC

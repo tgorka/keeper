@@ -29,8 +29,10 @@ use matrix_sdk_ui::timeline::{
 
 use crate::account::TimelineSink;
 use crate::error::TimelineError;
+use crate::media::{self, MediaVariant};
 use crate::vm::{
-    ReactionGroupVm, ReplyPreviewVm, SendState, TimelineBatch, TimelineItemVm, TimelineOp,
+    MediaKindVm, MediaVm, ReactionGroupVm, ReplyPreviewVm, SendState, TimelineBatch,
+    TimelineItemVm, TimelineOp,
 };
 
 /// A Rust-side index of `event_id → render key` (unique_id), maintained by the
@@ -62,6 +64,95 @@ pub fn text_body(msgtype: &MessageType) -> Option<String> {
         return None;
     }
     Some(body.clone())
+}
+
+/// Saturating conversion of a ruma `UInt` (a `u64` newtype) to `u32` for a VM
+/// numeric field: a value beyond `u32::MAX` clamps to `u32::MAX` (honest, never a
+/// wrapping `as` cast). Pure.
+fn uint_to_u32(value: matrix_sdk::ruma::UInt) -> u32 {
+    u32::try_from(u64::from(value)).unwrap_or(u32::MAX)
+}
+
+/// Map a media `MessageType` (`Image`/`Video`/`Audio`/`File`) to a [`MediaVm`]
+/// carrying only opaque `keeper-media://` URLs + display metadata (Story 3.6,
+/// FR-13, AD-4, NFR-9). Pure — no `MediaSource`, key, `mxc`, or event id ever
+/// enters the returned VM; the URLs are built from the opaque
+/// `account_id`/`room_id`/`item_key` coordinates by [`media::media_url`].
+///
+/// A text/notice/emote/other msgtype yields `None`. `thumbnail_url` is set only
+/// for image/video (where a bubble thumbnail is renderable); audio/file get a
+/// `null` thumbnail (the bubble renders inline audio / a file chip instead).
+/// `filename` uses `.filename()` (falls back to the body); dimensions/mimetype/
+/// size come from `info` when present. The caption is the message body when it is
+/// a distinct caption (`.caption()`), else `None`.
+pub fn media_vm(
+    msgtype: &MessageType,
+    account_id: &str,
+    room_id: &str,
+    item_key: &str,
+) -> Option<MediaVm> {
+    let full_url = media::media_url(account_id, room_id, item_key, MediaVariant::Full);
+    let thumb_url = || media::media_url(account_id, room_id, item_key, MediaVariant::Thumbnail);
+
+    match msgtype {
+        MessageType::Image(c) => {
+            let info = c.info.as_deref();
+            Some(MediaVm {
+                kind: MediaKindVm::Image,
+                url: full_url,
+                thumbnail_url: Some(thumb_url()),
+                filename: c.filename().to_owned(),
+                mimetype: info.and_then(|i| i.mimetype.clone()),
+                size: info.and_then(|i| i.size).map(uint_to_u32),
+                width: info.and_then(|i| i.width).map(uint_to_u32),
+                height: info.and_then(|i| i.height).map(uint_to_u32),
+                caption: c.caption().map(str::to_owned),
+            })
+        }
+        MessageType::Video(c) => {
+            let info = c.info.as_deref();
+            Some(MediaVm {
+                kind: MediaKindVm::Video,
+                url: full_url,
+                thumbnail_url: Some(thumb_url()),
+                filename: c.filename().to_owned(),
+                mimetype: info.and_then(|i| i.mimetype.clone()),
+                size: info.and_then(|i| i.size).map(uint_to_u32),
+                width: info.and_then(|i| i.width).map(uint_to_u32),
+                height: info.and_then(|i| i.height).map(uint_to_u32),
+                caption: c.caption().map(str::to_owned),
+            })
+        }
+        MessageType::Audio(c) => {
+            let info = c.info.as_deref();
+            Some(MediaVm {
+                kind: MediaKindVm::Audio,
+                url: full_url,
+                thumbnail_url: None,
+                filename: c.filename().to_owned(),
+                mimetype: info.and_then(|i| i.mimetype.clone()),
+                size: info.and_then(|i| i.size).map(uint_to_u32),
+                width: None,
+                height: None,
+                caption: c.caption().map(str::to_owned),
+            })
+        }
+        MessageType::File(c) => {
+            let info = c.info.as_deref();
+            Some(MediaVm {
+                kind: MediaKindVm::File,
+                url: full_url,
+                thumbnail_url: None,
+                filename: c.filename().to_owned(),
+                mimetype: info.and_then(|i| i.mimetype.clone()),
+                size: info.and_then(|i| i.size).map(uint_to_u32),
+                width: None,
+                height: None,
+                caption: c.caption().map(str::to_owned),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Map an SDK [`EventSendState`] (a local echo's send state) to the VM
@@ -232,7 +323,13 @@ fn aggregate_reactions<'a>(
 /// virtual items) becomes a [`TimelineItemVm::Other`] carrying only the stable
 /// opaque key, so diff indices stay aligned. All accessors are sync
 /// (`VectorDiff::map` is sync).
-pub fn item_to_vm(item: &TimelineItem, index: &ReplyIndex, own_user_id: &UserId) -> TimelineItemVm {
+pub fn item_to_vm(
+    item: &TimelineItem,
+    index: &ReplyIndex,
+    own_user_id: &UserId,
+    account_id: &str,
+    room_id: &str,
+) -> TimelineItemVm {
     let key = item.unique_id().0.clone();
     let TimelineItemKind::Event(ev) = item.kind() else {
         return TimelineItemVm::Other { key };
@@ -248,8 +345,18 @@ pub fn item_to_vm(item: &TimelineItem, index: &ReplyIndex, own_user_id: &UserId)
 
     match &msg_like.kind {
         MsgLikeKind::Message(message) => {
-            let Some(body) = text_body(message.msgtype()) else {
-                return TimelineItemVm::Other { key };
+            let msgtype = message.msgtype();
+            let media = media_vm(msgtype, account_id, room_id, &key);
+            // The body is the text body for a text message, or the media caption
+            // (which may be empty) for a media message. A non-text, non-media
+            // msgtype with no media VM (e.g. location) stays an `Other`.
+            let body = match (&media, text_body(msgtype)) {
+                // Media message: the caption is the body (empty when none).
+                (Some(m), _) => m.caption.clone().unwrap_or_default(),
+                // Text message: its decoded body.
+                (None, Some(text)) => text,
+                // Neither media nor renderable text (e.g. location): render nothing.
+                (None, None) => return TimelineItemVm::Other { key },
             };
             TimelineItemVm::Message {
                 key,
@@ -262,6 +369,7 @@ pub fn item_to_vm(item: &TimelineItem, index: &ReplyIndex, own_user_id: &UserId)
                 is_edited: message.is_edited(),
                 reply: reply_preview(ev.content(), index),
                 reactions: reaction_groups(ev.content(), own_user_id),
+                media: media.map(Box::new),
             }
         }
         // An event that cannot be decrypted yet: surface an honest stub. No
@@ -336,6 +444,8 @@ fn map_diff_indexing(
     diff: VectorDiff<Arc<TimelineItem>>,
     index: &mut ReplyIndex,
     own_user_id: &UserId,
+    account_id: &str,
+    room_id: &str,
 ) -> VectorDiff<TimelineItemVm> {
     match &diff {
         VectorDiff::Clear => index.clear(),
@@ -362,7 +472,7 @@ fn map_diff_indexing(
         | VectorDiff::Remove { .. }
         | VectorDiff::Truncate { .. } => {}
     }
-    diff.map(|item| item_to_vm(&item, index, own_user_id))
+    diff.map(|item| item_to_vm(&item, index, own_user_id, account_id, room_id))
 }
 
 /// A boxed, `Send` timeline diff stream (the concrete `impl Stream` from
@@ -386,6 +496,11 @@ pub struct OpenTimeline {
     /// Threaded into [`item_to_vm`] so reaction aggregation can flag the user's
     /// own reaction (`reaction senders are separate from `ev.is_own()`).
     own_user_id: OwnedUserId,
+    /// The opaque keeper account id, threaded into [`item_to_vm`] so a media
+    /// message's `keeper-media://` URLs carry the correct account coordinate
+    /// (Story 3.6, AD-4). Never a token or secret — the same opaque id the
+    /// frontend already holds.
+    account_id: String,
 }
 
 impl OpenTimeline {
@@ -407,6 +522,7 @@ impl OpenTimeline {
 pub async fn open_timeline(
     client: &Client,
     room_id: &RoomId,
+    account_id: &str,
 ) -> Result<OpenTimeline, TimelineError> {
     let room = client
         .get_room(room_id)
@@ -428,6 +544,7 @@ pub async fn open_timeline(
         initial,
         stream: Box::pin(stream),
         own_user_id,
+        account_id: account_id.to_owned(),
     })
 }
 
@@ -443,7 +560,12 @@ pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: Ti
         initial,
         mut stream,
         own_user_id,
+        account_id,
     } = open;
+
+    // The room id string is stable for the whole producer; capture it once for the
+    // media-URL coordinates threaded into every mapped item.
+    let room_id_str = room_id.to_string();
 
     // The producer-owned `event_id → unique_id` index. Built from the snapshot,
     // then kept current across each diff so a reply resolves an earlier-mapped
@@ -456,7 +578,7 @@ pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: Ti
     let reset = TimelineOp::Reset {
         items: initial
             .iter()
-            .map(|i| item_to_vm(i, &index, &own_user_id))
+            .map(|i| item_to_vm(i, &index, &own_user_id, &account_id, &room_id_str))
             .collect(),
     };
     if !sink(TimelineBatch { ops: vec![reset] }) {
@@ -467,7 +589,15 @@ pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: Ti
     while let Some(diffs) = stream.next().await {
         let ops = diffs
             .into_iter()
-            .map(|d| timeline_diff_to_op(map_diff_indexing(d, &mut index, &own_user_id)))
+            .map(|d| {
+                timeline_diff_to_op(map_diff_indexing(
+                    d,
+                    &mut index,
+                    &own_user_id,
+                    &account_id,
+                    &room_id_str,
+                ))
+            })
             .collect();
         if !sink(TimelineBatch { ops }) {
             tracing::info!(room_id = %room_id, "timeline channel closed, stopping producer");
@@ -503,6 +633,7 @@ mod tests {
             is_edited: false,
             reply: None,
             reactions: Vec::new(),
+            media: None,
         }
     }
 
@@ -590,6 +721,120 @@ mod tests {
         )
         .expect("construct image msgtype");
         assert_eq!(text_body(&mt), None);
+    }
+
+    fn image_msgtype() -> MessageType {
+        MessageType::new(
+            "m.image",
+            "photo.png".to_owned(),
+            json_object(serde_json::json!({
+                "url": "mxc://example.org/abc",
+                "info": { "w": 800, "h": 600, "mimetype": "image/png", "size": 12345 }
+            })),
+        )
+        .expect("construct image msgtype")
+    }
+
+    #[test]
+    fn media_vm_maps_image_with_dims_and_thumbnail() {
+        let vm = media_vm(&image_msgtype(), "acct", "!room:h", "unique-1")
+            .expect("image maps to a media vm");
+        assert_eq!(vm.kind, MediaKindVm::Image);
+        assert_eq!(vm.filename, "photo.png");
+        assert_eq!(vm.mimetype.as_deref(), Some("image/png"));
+        assert_eq!(vm.size, Some(12345));
+        assert_eq!(vm.width, Some(800));
+        assert_eq!(vm.height, Some(600));
+        // Both variant URLs are opaque `keeper-media://` (never mxc).
+        assert!(
+            vm.url.starts_with("keeper-media://media/"),
+            "url: {}",
+            vm.url
+        );
+        assert!(!vm.url.contains("mxc"), "url leaked mxc: {}", vm.url);
+        let thumb = vm.thumbnail_url.expect("image carries a thumbnail url");
+        assert!(thumb.ends_with("/thumb"), "thumb: {thumb}");
+        assert!(vm.url.ends_with("/full"), "full: {}", vm.url);
+    }
+
+    #[test]
+    fn media_vm_maps_video_with_thumbnail() {
+        let mt = MessageType::new(
+            "m.video",
+            "clip.mp4".to_owned(),
+            json_object(serde_json::json!({
+                "url": "mxc://example.org/vid",
+                "info": { "w": 1280, "h": 720, "mimetype": "video/mp4", "size": 999 }
+            })),
+        )
+        .expect("construct video msgtype");
+        let vm = media_vm(&mt, "acct", "!room:h", "k").expect("video maps");
+        assert_eq!(vm.kind, MediaKindVm::Video);
+        assert_eq!(vm.width, Some(1280));
+        assert_eq!(vm.height, Some(720));
+        assert!(vm.thumbnail_url.is_some(), "video carries a thumbnail url");
+    }
+
+    #[test]
+    fn media_vm_maps_audio_inline_no_thumbnail() {
+        let mt = MessageType::new(
+            "m.audio",
+            "clip.ogg".to_owned(),
+            json_object(serde_json::json!({
+                "url": "mxc://example.org/aud",
+                "info": { "mimetype": "audio/ogg", "size": 4096 }
+            })),
+        )
+        .expect("construct audio msgtype");
+        let vm = media_vm(&mt, "acct", "!room:h", "k").expect("audio maps");
+        assert_eq!(vm.kind, MediaKindVm::Audio);
+        assert_eq!(vm.mimetype.as_deref(), Some("audio/ogg"));
+        assert_eq!(vm.size, Some(4096));
+        // Audio has no bubble thumbnail and no dimensions.
+        assert_eq!(vm.thumbnail_url, None);
+        assert_eq!(vm.width, None);
+        assert_eq!(vm.height, None);
+    }
+
+    #[test]
+    fn media_vm_maps_file_chip_no_thumbnail() {
+        let mt = MessageType::new(
+            "m.file",
+            "report.pdf".to_owned(),
+            json_object(serde_json::json!({
+                "url": "mxc://example.org/file",
+                "info": { "mimetype": "application/pdf", "size": 54321 }
+            })),
+        )
+        .expect("construct file msgtype");
+        let vm = media_vm(&mt, "acct", "!room:h", "k").expect("file maps");
+        assert_eq!(vm.kind, MediaKindVm::File);
+        assert_eq!(vm.filename, "report.pdf");
+        assert_eq!(vm.mimetype.as_deref(), Some("application/pdf"));
+        assert_eq!(vm.size, Some(54321));
+        assert_eq!(vm.thumbnail_url, None);
+    }
+
+    #[test]
+    fn media_vm_returns_none_for_text() {
+        let mt = MessageType::Text(TextMessageEventContent::plain("hello"));
+        assert_eq!(media_vm(&mt, "a", "r", "k"), None);
+    }
+
+    #[test]
+    fn media_vm_uses_body_as_filename_fallback() {
+        // No explicit `filename` field → `.filename()` falls back to the body.
+        let mt = MessageType::new(
+            "m.image",
+            "the body caption".to_owned(),
+            json_object(serde_json::json!({ "url": "mxc://example.org/x" })),
+        )
+        .expect("construct image msgtype");
+        let vm = media_vm(&mt, "a", "r", "k").expect("image maps");
+        assert_eq!(vm.filename, "the body caption");
+        // No `info` → no dimensions / mimetype / size.
+        assert_eq!(vm.mimetype, None);
+        assert_eq!(vm.size, None);
     }
 
     #[test]

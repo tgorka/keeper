@@ -38,8 +38,11 @@ use tracing::Instrument;
 
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
-use crate::error::{AccountError, BackupError, CoreError, InboxError, SendError, TimelineError};
+use crate::error::{
+    AccountError, BackupError, CoreError, InboxError, MediaError, SendError, TimelineError,
+};
 use crate::inbox::InboxMerger;
+use crate::media::{self, MediaBytes, MediaHandle, MediaVariant};
 use crate::platform::Platform;
 use crate::registry;
 use crate::send::{self, SendTrigger};
@@ -486,7 +489,7 @@ impl AccountManager {
         // surfaces to the caller as `TimelineUnavailable` — an honest inline
         // error, not a silent spinner (AC-4) — rather than being buried in the
         // spawned task. Only the diff-forwarding loop runs in the background.
-        let open = match timeline::open_timeline(&client, &room_id).await {
+        let open = match timeline::open_timeline(&client, &room_id, account_id).await {
             Ok(open) => open,
             Err(e) => {
                 // Don't leave a partial live account running (AD-21). If this call
@@ -1280,6 +1283,54 @@ impl AccountManager {
         send::retry(&timeline, item_key).await?;
         tracing::info!(account_id = %account_id, room_id = %room_id, "outgoing message retry re-driven");
         Ok(())
+    }
+
+    /// Resolve a `keeper-media://` handle to its decrypted bytes for the
+    /// custom-protocol handler (Story 3.6, FR-13, AD-4). Resolves the account's
+    /// live `Client` and the room's open `Arc<Timeline>`, then delegates to
+    /// [`media::fetch_media`] — the sole `get_media_content` gate, which downloads
+    /// and (for E2EE) decrypts the attachment from the SDK media cache.
+    ///
+    /// The decrypted bytes are returned to the protocol handler and served over
+    /// `keeper-media://` — they never cross the IPC command surface (AD-4). Logs
+    /// carry the opaque room id only — never a URL, key, or `mxc`.
+    ///
+    /// Errors: an unparsable/unknown room id, an account that isn't live, or a
+    /// room with no open timeline → [`MediaError::NotFound`]; an unresolvable item
+    /// / non-media item → [`MediaError::NotFound`]; an SDK fetch/decrypt failure →
+    /// [`MediaError::Fetch`].
+    pub async fn fetch_media(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        item_key: &str,
+        variant: MediaVariant,
+    ) -> Result<MediaBytes, CoreError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| MediaError::NotFound)?;
+        let (client, timeline) = {
+            let accounts = self.accounts.lock().await;
+            let handle = accounts.get(account_id).ok_or(MediaError::NotFound)?;
+            let timelines = handle.timelines.lock().await;
+            // Pick the newest timeline instance for the room (a StrictMode remount
+            // can transiently register two) — `unique_id`s are only stable within
+            // one instance, mirroring `open_timeline_for`.
+            let timeline = timelines
+                .iter()
+                .filter(|(_, (open_room, _))| *open_room == room_id)
+                .max_by_key(|(subscription_id, _)| **subscription_id)
+                .map(|(_, (_, tl))| tl.clone())
+                .ok_or(MediaError::NotFound)?;
+            (handle.client.clone(), timeline)
+        };
+        let handle = MediaHandle {
+            account_id: account_id.to_owned(),
+            room_id: room_id.to_string(),
+            item_key: item_key.to_owned(),
+            variant,
+        };
+        let bytes = media::fetch_media(&client, &timeline, &handle).await?;
+        tracing::debug!(account_id = %account_id, room_id = %room_id, "media resolved for protocol");
+        Ok(bytes)
     }
 
     /// Resolve the exact open `Arc<Timeline>` for `room_id` on the live account,

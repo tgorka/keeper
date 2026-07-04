@@ -45,6 +45,9 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 futures-util = "0.3"
 # URL parsing for the OIDC callback registry + redirect metadata (already in the tree via matrix-sdk).
 url = "2"
+# Percent-decoding `keeper-media://` URL path segments (Story 3.6). Already in the
+# tree via url/matrix-sdk — a direct dep adds no new crate; permissive (MIT/Apache).
+percent-encoding = "2"
 # HTTP client for the Beeper unofficial email-code login flow (Story 2.3, AD-17).
 # rustls-only to match matrix-sdk's TLS backend — no second TLS stack (no native-tls/OpenSSL).
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

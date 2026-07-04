@@ -5,11 +5,13 @@
  * (`isOwn: true`) use the primary surface aligned right. Both use a 14 px radius.
  * Consecutive same-sender messages are `grouped`: only the first shows the
  * avatar and sender name, the rest hide them and tuck under the same column.
- * Renders text only — no media (later epic). A reply shows the quoted original
- * inline (clickable → jump to original) and an edited message shows an "Edited"
- * caption (Story 3.4); a hover/focus action bar offers Reply and Edit (own).
+ * A media message renders a {@link MediaAttachment} above the caption (Story 3.6);
+ * a text message renders its body. A reply shows the quoted original inline
+ * (clickable → jump to original) and an edited message shows an "Edited" caption
+ * (Story 3.4); a hover/focus action bar offers Reply and Edit (own).
  */
 
+import { MediaAttachment } from "@/components/chat/media-attachment";
 import { MessageActions } from "@/components/chat/message-actions";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
@@ -71,6 +73,12 @@ interface MessageBubbleProps {
    * pills. When absent, the action bar's React affordance and the pills are inert.
    */
   onToggleReaction?: (key: string, emoji: string) => void;
+  /**
+   * Open the Quick-Look preview overlay for a media message, by its opaque render
+   * `key` (Story 3.6). Wired to an image/video attachment's click/Enter. When
+   * absent, the media renders but is not click-to-open.
+   */
+  onOpenPreview?: (key: string) => void;
 }
 
 /**
@@ -99,6 +107,7 @@ export function MessageBubble({
   onJumpTo,
   selected = false,
   onToggleReaction,
+  onOpenPreview,
 }: MessageBubbleProps) {
   const displayName = item.senderDisplayName ?? item.sender;
   const time = formatMessageTime(item.timestamp);
@@ -143,7 +152,18 @@ export function MessageBubble({
             )}
           >
             {item.reply && <ReplyQuote reply={item.reply} isOwn={isOwn} onJumpTo={onJumpTo} />}
-            <p className="whitespace-pre-wrap break-words">{item.body}</p>
+            {item.media && (
+              <div className="mb-1">
+                <MediaAttachment
+                  media={item.media}
+                  messageKey={item.key}
+                  onOpenPreview={onOpenPreview}
+                />
+              </div>
+            )}
+            {/* Text/caption: rendered only when there is a body (a media message
+                may carry an empty caption). */}
+            {item.body !== "" && <p className="whitespace-pre-wrap break-words">{item.body}</p>}
             <div className="mt-1 flex items-center justify-end gap-1">
               {item.isEdited && (
                 <span

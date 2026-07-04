@@ -17,6 +17,7 @@
 import { PanelRight } from "lucide-react";
 import { type KeyboardEvent, type Ref, useCallback, useEffect, useRef, useState } from "react";
 import { Composer } from "@/components/chat/composer";
+import { MediaPreviewOverlay } from "@/components/chat/media-preview-overlay";
 import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble";
 import { UtdStub } from "@/components/chat/utd-stub";
 import { Button } from "@/components/ui/button";
@@ -125,6 +126,9 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
   const offline = useAccountStatus(accountId ?? "") === "offline";
   const [errored, setErrored] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  // The opaque render key of the media message whose preview overlay is open, or
+  // `null` when closed (Story 3.6).
+  const [previewKey, setPreviewKey] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // The body to prefill the composer with when entering edit mode (the target
@@ -147,11 +151,13 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
       composerStore.getState().clearSelection();
       setErrored(false);
       setLoaded(false);
+      setPreviewKey(null);
       return;
     }
 
     setErrored(false);
     setLoaded(false);
+    setPreviewKey(null);
     // Establish clean state at mount so the newest mount always wins; clearing
     // in cleanup instead would race the next room's mount.
     timelineStore.getState().clear();
@@ -290,6 +296,20 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     },
     [accountId, selectedRoomId],
   );
+
+  // Open the Quick-Look preview overlay for a media message (Story 3.6). The
+  // resolved media VM is looked up from the live timeline by key at render time.
+  const onOpenPreview = useCallback((key: string) => setPreviewKey(key), []);
+  const onClosePreview = useCallback(() => setPreviewKey(null), []);
+
+  // The media VM to preview, resolved from the current timeline by `previewKey`.
+  // A `null` (item scrolled away / room changed / non-media target) closes the
+  // overlay cleanly.
+  const previewMedia =
+    previewKey === null
+      ? null
+      : (items.find((it): it is MessageVm => it.kind === "message" && it.key === previewKey)
+          ?.media ?? null);
 
   const onCancelPending = useCallback(() => composerStore.getState().cancel(), []);
 
@@ -438,6 +458,7 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
                     onJumpTo={onJumpTo}
                     selected={selectedKey === row.item.key}
                     onToggleReaction={onToggleReaction}
+                    onOpenPreview={onOpenPreview}
                   />
                 </li>
               ),
@@ -460,6 +481,10 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
           </div>
         </div>
       )}
+      {/* Quick-Look media preview overlay (Story 3.6). Rendered once; open state
+          is driven by the resolved media VM (null closes it). Esc/backdrop close
+          and radix returns focus to the timeline bubble. */}
+      <MediaPreviewOverlay media={previewMedia} onClose={onClosePreview} />
     </main>
   );
 }

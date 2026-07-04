@@ -2853,6 +2853,7 @@ dependencies = [
  "futures-util",
  "matrix-sdk",
  "matrix-sdk-ui",
+ "percent-encoding",
  "qrcode",
  "rand 0.8.6",
  "reqwest",

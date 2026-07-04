@@ -57,6 +57,7 @@ function message(key: string, sender: string, body: string): TimelineBatch["ops"
       isEdited: false,
       reply: null,
       reactions: [],
+      media: null,
     },
   };
 }
@@ -142,6 +143,7 @@ describe("ConversationPane", () => {
               isEdited: false,
               reply: null,
               reactions: [],
+              media: null,
             },
             { kind: "other", key: "o1" },
           ],
@@ -242,6 +244,7 @@ describe("ConversationPane", () => {
             isEdited: false,
             reply: null,
             reactions: [],
+            media: null,
           },
         },
       ],
@@ -282,6 +285,7 @@ describe("ConversationPane", () => {
               isEdited: false,
               reply: null,
               reactions: [],
+              media: null,
             },
             {
               kind: "message",
@@ -295,6 +299,7 @@ describe("ConversationPane", () => {
               isEdited: false,
               reply: null,
               reactions: [],
+              media: null,
             },
           ],
         },
@@ -471,6 +476,7 @@ describe("ConversationPane", () => {
               isEdited: false,
               reply: null,
               reactions: [],
+              media: null,
             },
           ],
         },
@@ -514,6 +520,7 @@ describe("ConversationPane", () => {
               isEdited: false,
               reply: null,
               reactions: [],
+              media: null,
             },
           ],
         },
@@ -583,6 +590,7 @@ describe("ConversationPane", () => {
               isEdited: false,
               reply: null,
               reactions: [],
+              media: null,
             },
           ],
         },
@@ -634,6 +642,7 @@ describe("ConversationPane", () => {
               isEdited: false,
               reply: null,
               reactions: [],
+              media: null,
             },
           ],
         },
@@ -693,6 +702,7 @@ describe("ConversationPane", () => {
               isEdited: false,
               reply: null,
               reactions: [],
+              media: null,
             },
             {
               kind: "message",
@@ -706,6 +716,7 @@ describe("ConversationPane", () => {
               isEdited: false,
               reply: null,
               reactions: [],
+              media: null,
             },
           ],
         },
@@ -724,5 +735,61 @@ describe("ConversationPane", () => {
     composerStore.getState().select("mine-1");
     fireEvent.keyDown(list, { key: "e" });
     await waitFor(() => expect(screen.getByText("Editing your message")).toBeInTheDocument());
+  });
+
+  it("opens the media preview overlay when an image bubble is clicked", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+
+    captured.onBatch?.({
+      ops: [
+        {
+          op: "reset",
+          items: [
+            {
+              kind: "message",
+              key: "media-1",
+              sender: "@bob:example.org",
+              senderDisplayName: "Bob",
+              body: "",
+              timestamp: 1,
+              isOwn: false,
+              sendState: null,
+              isEdited: false,
+              reply: null,
+              reactions: [],
+              media: {
+                kind: "image",
+                url: "keeper-media://media/acct/room/media-1/full",
+                thumbnailUrl: "keeper-media://media/acct/room/media-1/thumb",
+                filename: "photo.png",
+                mimetype: "image/png",
+                size: 12345,
+                width: 800,
+                height: 600,
+                caption: null,
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    // No overlay before the click.
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    const openButton = await screen.findByRole("button", { name: "Open image photo.png" });
+    fireEvent.click(openButton);
+
+    // The Quick-Look overlay opens with the full-res image.
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toBeInTheDocument();
+    const previews = screen.getAllByAltText("photo.png") as HTMLImageElement[];
+    expect(previews.some((i) => i.getAttribute("src")?.endsWith("/full"))).toBe(true);
   });
 });

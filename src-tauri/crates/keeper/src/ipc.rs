@@ -15,8 +15,8 @@ use keeper_core::auth;
 use keeper_core::auth::BeeperFlowRegistry;
 use keeper_core::demo::snapshot_then_diff;
 use keeper_core::error::{
-    AccountError, AuthError, BackupError, CoreError, InboxError, PlatformError, SendError,
-    TimelineError, VerificationError,
+    AccountError, AuthError, BackupError, CoreError, InboxError, MediaError, PlatformError,
+    SendError, TimelineError, VerificationError,
 };
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
@@ -218,6 +218,14 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         CoreError::Backup(
             BackupError::Unavailable(_) | BackupError::RestoreFailed(_) | BackupError::Action(_),
         ) => (IpcErrorCode::BackupFailed, true),
+        // Media resolution/fetch errors never reach the IPC command surface —
+        // decrypted bytes travel only over the `keeper-media://` protocol, which
+        // maps these to HTTP status codes itself (Story 3.6, AD-4). This arm keeps
+        // the funnel exhaustive; a media failure is an internal, non-retriable IPC
+        // error should one ever surface here.
+        CoreError::Media(MediaError::NotFound | MediaError::Fetch(_)) => {
+            (IpcErrorCode::Internal, false)
+        }
     };
     IpcError {
         code,

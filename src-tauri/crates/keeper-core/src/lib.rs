@@ -15,6 +15,7 @@ pub mod backup;
 pub mod demo;
 pub mod error;
 pub mod inbox;
+pub mod media;
 pub mod oauth;
 pub mod platform;
 pub mod registry;

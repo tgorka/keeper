@@ -255,6 +255,31 @@ pub enum BackupError {
     Action(String),
 }
 
+/// Errors originating in media resolution / fetch for the `keeper-media://`
+/// protocol (Story 3.6, FR-13, AD-4, AD-21).
+///
+/// A secret-free taxonomy: no message ever contains an `mxc` uri, `EncryptedFile`
+/// key material, a decryption key, or plaintext — only non-secret descriptions.
+/// The protocol handler maps these to HTTP status codes directly (404 for
+/// `NotFound`, 404 for a `Fetch` failure it retries), so they do **not** flow
+/// through the `CoreError → IpcError` funnel — no media bytes or errors cross the
+/// IPC command surface (bytes travel only over the custom protocol).
+#[derive(Debug, Error)]
+pub enum MediaError {
+    /// The `keeper-media://` handle could not be resolved to a live media source:
+    /// the account is not live, the room has no open timeline, the `item_key` is
+    /// not in the timeline, or the resolved item is not a media message. The
+    /// protocol handler serves a 404; the frontend retries once it is resolvable.
+    #[error("media not found")]
+    NotFound,
+
+    /// The SDK failed to download or decrypt the media content. The wrapped string
+    /// is a non-secret description of the failure — never key material or
+    /// plaintext. The protocol handler serves a 404; the frontend can retry.
+    #[error("could not fetch media: {0}")]
+    Fetch(String),
+}
+
 /// The hexagon error root. Every fallible core operation surfaces one of these.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -289,6 +314,12 @@ pub enum CoreError {
     /// A server-side key-backup enable / restore action failed.
     #[error(transparent)]
     Backup(#[from] BackupError),
+
+    /// A `keeper-media://` media resolution / fetch failed (Story 3.6). Surfaced
+    /// to the protocol handler for an HTTP status; never crosses the IPC command
+    /// funnel.
+    #[error(transparent)]
+    Media(#[from] MediaError),
 
     /// A requested capability is not supported on this platform/build. Honest,
     /// non-panicking signal used by not-yet-wired [`crate::platform::Platform`]

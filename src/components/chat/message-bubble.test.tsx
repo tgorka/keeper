@@ -15,6 +15,7 @@ function msg(overrides: Partial<MessageVm> = {}): MessageVm {
     isEdited: false,
     reply: null,
     reactions: [],
+    media: null,
     ...overrides,
   };
 }

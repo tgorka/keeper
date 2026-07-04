@@ -72,7 +72,7 @@ development_status:
   3-3-key-backup-enable-and-restore: done
   3-4-replies-and-edits: done
   3-5-reactions: done
-  3-6-receive-media-thumbnails-protocol-streaming-preview: backlog
+  3-6-receive-media-thumbnails-protocol-streaming-preview: done
   3-7-send-media-and-files: backlog
   3-8-delete-for-everyone-redaction: backlog
   3-9-receipts-typing-and-history-pagination: backlog

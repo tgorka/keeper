@@ -462,6 +462,77 @@ pub struct ReactionGroupVm {
     pub is_own: bool,
 }
 
+/// The media class of an attached message (Story 3.6, FR-13, AD-4, NFR-9).
+///
+/// A Rust-authoritative projection of the media `MessageType` (`Image`/`Video`/
+/// `Audio`/`File`) — the only render-facing discriminant the frontend needs to
+/// pick a renderer (thumbnail image / video poster / inline audio / file chip).
+/// Serializes to its camelCase name. NO `mxc`/`EncryptedFile`/key material is ever
+/// implied by this tag — the bytes travel only over the `keeper-media://` protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum MediaKindVm {
+    /// An image attachment (`m.image`). Renders a thumbnail; opens full-res in the
+    /// preview overlay.
+    Image,
+    /// A video attachment (`m.video`). Renders a poster; plays via `<video>` over
+    /// the Range protocol in the overlay.
+    Video,
+    /// An audio attachment (`m.audio`). Plays inline via `<audio controls>` over
+    /// the protocol.
+    Audio,
+    /// An arbitrary file attachment (`m.file`). Renders a file chip (icon + name +
+    /// size); no auto-download of bytes over IPC.
+    File,
+}
+
+/// The render-facing metadata of a media attachment on a message (Story 3.6,
+/// FR-13, AD-4, NFR-9).
+///
+/// Carries **only** opaque `keeper-media://` URL strings plus display metadata —
+/// never a `MediaSource`, `EncryptedFile`, `mxc://` URI, decryption key, or event
+/// id (those stay inside `keeper-core`). `url` is the full-content protocol URL;
+/// `thumbnail_url` is the thumbnail-variant protocol URL when a thumbnail is
+/// available. The decrypted bytes are served exclusively over the
+/// `keeper-media://` custom protocol (AD-4) — never as base64/JSON over IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MediaVm {
+    /// The media class (image/video/audio/file), driving the renderer choice.
+    pub kind: MediaKindVm,
+    /// The opaque `keeper-media://…/full` protocol URL for the full content. The
+    /// preview overlay and inline audio/video load from this; the SDK decrypts
+    /// E2EE bytes behind the protocol handler. Never an `mxc` URI.
+    pub url: String,
+    /// The opaque `keeper-media://…/thumb` protocol URL for the thumbnail variant,
+    /// present when a thumbnail is renderable (image/video), else `null`. The
+    /// bubble renders this before the full content loads. Never an `mxc` URI.
+    pub thumbnail_url: Option<String>,
+    /// The attachment's display filename (from `.filename()`, falling back to the
+    /// message body). Rendered in the file chip and as the media alt text.
+    pub filename: String,
+    /// The attachment's MIME type from `info.mimetype` (e.g. `"image/png"`), or
+    /// `null` when the sender omitted it.
+    pub mimetype: Option<String>,
+    /// The attachment size in bytes from `info.size`, or `null` when omitted. The
+    /// file chip renders a human-readable size from this.
+    #[ts(type = "number | null")]
+    pub size: Option<u32>,
+    /// The intrinsic width in pixels (image/video `info.w`), or `null`. Used to
+    /// reserve layout so the thumbnail does not reflow on load.
+    #[ts(type = "number | null")]
+    pub width: Option<u32>,
+    /// The intrinsic height in pixels (image/video `info.h`), or `null`. Used to
+    /// reserve layout so the thumbnail does not reflow on load.
+    #[ts(type = "number | null")]
+    pub height: Option<u32>,
+    /// The media caption (the message `body` when it differs from the filename),
+    /// or `null`. Rendered under the attachment.
+    pub caption: Option<String>,
+}
+
 /// A single timeline item rendered in the conversation pane (FR-8, NFR-9,
 /// AD-8/AD-9/AD-20).
 ///
@@ -510,6 +581,16 @@ pub enum TimelineItemVm {
         /// group carries only `{ emoji, count, is_own }` — never a per-sender
         /// user id or reaction event id.
         reactions: Vec<ReactionGroupVm>,
+        /// The media attachment when this message is an image/video/audio/file
+        /// msgtype (Story 3.6, FR-13), else `null` for a text message. Carries only
+        /// opaque `keeper-media://` URLs + display metadata — never a `MediaSource`,
+        /// key, `mxc` URI, or event id (AD-4, NFR-9). `body` remains the caption.
+        ///
+        /// Boxed so the (media-less) text-message case does not pay the full
+        /// [`MediaVm`] size on every timeline item (`clippy::large_enum_variant`);
+        /// `Box` is serde/ts-rs-transparent, so the wire shape and the generated
+        /// binding stay `MediaVm | null`.
+        media: Option<Box<MediaVm>>,
     },
     /// An event that could not be decrypted yet (`MsgLikeKind::UnableToDecrypt`).
     /// Renders an explicit honest stub instead of a blank row (Story 3.1). Carries
@@ -1484,6 +1565,7 @@ mod tests {
             is_edited: false,
             reply: None,
             reactions: Vec::new(),
+            media: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(
@@ -1506,6 +1588,7 @@ mod tests {
             is_edited: false,
             reply: None,
             reactions: Vec::new(),
+            media: None,
         }
     }
 
@@ -1579,6 +1662,7 @@ mod tests {
                     is_own: true,
                 },
             ],
+            media: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"isEdited\":true"), "json was: {json}");
@@ -1636,6 +1720,7 @@ mod tests {
             is_edited: false,
             reply: None,
             reactions: Vec::new(),
+            media: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(
@@ -1644,6 +1729,7 @@ mod tests {
         );
         assert!(json.contains("\"sendState\":null"), "json was: {json}");
         assert!(json.contains("\"reply\":null"), "json was: {json}");
+        assert!(json.contains("\"media\":null"), "json was: {json}");
         // An empty reaction set serializes as an empty array (no pill row).
         assert!(json.contains("\"reactions\":[]"), "json was: {json}");
         let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize");
@@ -1721,6 +1807,132 @@ mod tests {
         assert!(json.contains("\"ops\":"), "json was: {json}");
         let back: TimelineBatch = serde_json::from_str(&json).expect("deserialize batch");
         assert_eq!(back, batch);
+    }
+
+    #[test]
+    fn media_kind_vm_serializes_camel_case_and_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&MediaKindVm::Image).expect("serialize image"),
+            "\"image\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MediaKindVm::Video).expect("serialize video"),
+            "\"video\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MediaKindVm::Audio).expect("serialize audio"),
+            "\"audio\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MediaKindVm::File).expect("serialize file"),
+            "\"file\""
+        );
+        for kind in [
+            MediaKindVm::Image,
+            MediaKindVm::Video,
+            MediaKindVm::Audio,
+            MediaKindVm::File,
+        ] {
+            let json = serde_json::to_string(&kind).expect("serialize kind");
+            let back: MediaKindVm = serde_json::from_str(&json).expect("deserialize kind");
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
+    fn media_vm_round_trips_camel_case_and_carries_no_key_material() {
+        let vm = MediaVm {
+            kind: MediaKindVm::Image,
+            url: "keeper-media://media/acct/room/item/full".to_owned(),
+            thumbnail_url: Some("keeper-media://media/acct/room/item/thumb".to_owned()),
+            filename: "photo.png".to_owned(),
+            mimetype: Some("image/png".to_owned()),
+            size: Some(12_345),
+            width: Some(800),
+            height: Some(600),
+            caption: Some("a nice photo".to_owned()),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize media vm");
+        assert!(json.contains("\"kind\":\"image\""), "json was: {json}");
+        assert!(
+            json.contains("\"url\":\"keeper-media://"),
+            "json was: {json}"
+        );
+        assert!(
+            json.contains("\"thumbnailUrl\":\"keeper-media://"),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"size\":12345"), "json was: {json}");
+        assert!(json.contains("\"width\":800"), "json was: {json}");
+        // No mxc / EncryptedFile / key / event-id material may appear on the VM.
+        assert!(!json.contains("mxc://"), "json leaked an mxc uri: {json}");
+        assert!(!json.contains("mxc"), "json leaked mxc material: {json}");
+        assert!(
+            !json.contains("\"key\"") && !json.contains("iv") && !json.contains("hashes"),
+            "json leaked EncryptedFile key material: {json}"
+        );
+        assert!(
+            !json.contains("eventId") && !json.contains('$'),
+            "json leaked event-id material: {json}"
+        );
+        let back: MediaVm = serde_json::from_str(&json).expect("deserialize media vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn media_vm_null_fields_round_trip() {
+        let vm = MediaVm {
+            kind: MediaKindVm::File,
+            url: "keeper-media://media/a/r/i/full".to_owned(),
+            thumbnail_url: None,
+            filename: "report.pdf".to_owned(),
+            mimetype: None,
+            size: None,
+            width: None,
+            height: None,
+            caption: None,
+        };
+        let json = serde_json::to_string(&vm).expect("serialize");
+        assert!(json.contains("\"thumbnailUrl\":null"), "json was: {json}");
+        assert!(json.contains("\"mimetype\":null"), "json was: {json}");
+        assert!(json.contains("\"size\":null"), "json was: {json}");
+        let back: MediaVm = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn timeline_item_vm_message_with_media_round_trips_no_key_material() {
+        let vm = TimelineItemVm::Message {
+            key: "unique-media".to_owned(),
+            sender: "@alice:example.org".to_owned(),
+            sender_display_name: Some("Alice".to_owned()),
+            body: "look at this".to_owned(),
+            timestamp: 1_720_000_000_000,
+            is_own: false,
+            send_state: None,
+            is_edited: false,
+            reply: None,
+            reactions: Vec::new(),
+            media: Some(Box::new(MediaVm {
+                kind: MediaKindVm::Video,
+                url: "keeper-media://media/a/r/i/full".to_owned(),
+                thumbnail_url: Some("keeper-media://media/a/r/i/thumb".to_owned()),
+                filename: "clip.mp4".to_owned(),
+                mimetype: Some("video/mp4".to_owned()),
+                size: Some(999),
+                width: Some(1280),
+                height: Some(720),
+                caption: None,
+            })),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize message vm");
+        assert!(json.contains("\"media\":{"), "json was: {json}");
+        assert!(json.contains("\"kind\":\"video\""), "json was: {json}");
+        // No mxc / key / event-id material may cross on the media-carrying message.
+        assert!(!json.contains("mxc"), "json leaked mxc material: {json}");
+        assert!(!json.contains("eventId"), "json leaked event id: {json}");
+        let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize message vm");
+        assert_eq!(back, vm);
     }
 
     #[test]

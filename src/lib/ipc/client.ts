@@ -22,6 +22,8 @@ export type { InboxOp } from "./gen/InboxOp";
 export type { InboxRoomVm } from "./gen/InboxRoomVm";
 export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
+export type { MediaKindVm } from "./gen/MediaKindVm";
+export type { MediaVm } from "./gen/MediaVm";
 export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";

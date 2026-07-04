@@ -15,6 +15,7 @@ function message(key: string, sender = "@bob:example.org"): TimelineItemVm {
     isEdited: false,
     reply: null,
     reactions: [],
+    media: null,
   };
 }
 
