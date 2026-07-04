@@ -4,11 +4,13 @@ import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
 import { SidebarPane } from "@/components/layout/sidebar-pane";
 import { VerifyBanner } from "@/components/layout/verify-banner";
+import { DeviceVerificationDialog } from "@/components/settings/device-verification-dialog";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAccountStatuses } from "@/hooks/use-account-statuses";
 import { useEncryptionStatuses } from "@/hooks/use-encryption-statuses";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { useVerification } from "@/hooks/use-verification";
 
 export function AppShell() {
   const { sidebarCollapsed, detailFloating } = useShellLayout();
@@ -19,6 +21,9 @@ export function AppShell() {
   // Stream every account's device-verification status into the encryption store:
   // the verify banner and the Settings badge are pure projections of that map.
   useEncryptionStatuses();
+  // Subscribe every account's interactive verification flow: an incoming request
+  // auto-opens the device-verification modal, and keeper-started flows stream here.
+  useVerification();
   const [detailOpen, setDetailOpen] = useState(false);
   const toggleRef = useRef<HTMLButtonElement>(null);
 
@@ -62,6 +67,8 @@ export function AppShell() {
           {detailOpen && !detailFloating && <DetailPanel />}
         </div>
       </div>
+
+      <DeviceVerificationDialog />
 
       {detailFloating && (
         <Sheet open={detailOpen} onOpenChange={handleSheetOpenChange}>

@@ -16,12 +16,13 @@ use keeper_core::auth::BeeperFlowRegistry;
 use keeper_core::demo::snapshot_then_diff;
 use keeper_core::error::{
     AccountError, AuthError, CoreError, InboxError, PlatformError, SendError, TimelineError,
+    VerificationError,
 };
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, ConnectionStatusBatch, DemoBatch, EncryptionStatusBatch, InboxBatch, IpcError,
-    IpcErrorCode, PingVm, RoomListBatch, TimelineBatch,
+    IpcErrorCode, PingVm, RoomListBatch, TimelineBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -190,6 +191,13 @@ fn to_ipc_error(err: CoreError) -> IpcError {
             | SendError::EchoNotFound
             | SendError::Dispatch(_),
         ) => (IpcErrorCode::SendFailed, true),
+        // Any verification failure (crypto not ready / flow not found / SDK action
+        // failure) is retriable: the user can restart verification.
+        CoreError::Verification(
+            VerificationError::Unavailable(_)
+            | VerificationError::FlowNotFound
+            | VerificationError::Action(_),
+        ) => (IpcErrorCode::VerificationFailed, true),
     };
     IpcError {
         code,
@@ -539,6 +547,142 @@ pub async fn encryption_status_unsubscribe(
     Ok(())
 }
 
+/// Subscribe to an account's interactive device self-verification flow (Story
+/// 3.2, FR-14, AD-1, AD-8).
+///
+/// Lazily activates the account, then streams [`VerificationFlowVm`] snapshots
+/// over `channel` — the flow's state machine (waiting → compare emoji / show QR →
+/// confirmed → done/cancelled/failed). An *incoming* request (the peer started it)
+/// surfaces here as a `Requested` snapshot so the UI can auto-open the modal. The
+/// sink forwards each snapshot to the channel; a closed channel drops the snapshot
+/// (the frontend unsubscribed). NO `Verification`/SAS/QR object, key, or plaintext
+/// crosses IPC — only the rendered VM. Activation failure funnels through
+/// [`to_ipc_error`] to `SyncUnavailable`.
+#[tauri::command]
+pub async fn verification_subscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    channel: Channel<VerificationFlowVm>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |vm: VerificationFlowVm| channel.send(vm).is_ok());
+    state
+        .accounts
+        .subscribe_verification(&state.platform, &account_id, sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unsubscribe exactly one verification subscription, aborting its producer task
+/// and clearing the account's flow sender (AD-19). Idempotent.
+#[tauri::command]
+pub async fn verification_unsubscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_verification(&account_id, subscription_id)
+        .await;
+    Ok(())
+}
+
+/// Start an interactive self-verification from keeper against the user's other
+/// session (Story 3.2, FR-14). Requests the verification in Rust and feeds the new
+/// flow id into the live verification producer so it streams over the existing
+/// verification subscription. Requires an active verification subscription.
+/// Failures funnel through [`to_ipc_error`] to `VerificationFailed`.
+#[tauri::command]
+pub async fn verification_start(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .verification_start(&account_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Accept an incoming verification request the peer started (Story 3.2). Moves the
+/// flow from `Requested` to `Ready`. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub async fn verification_accept(
+    state: State<'_, AppState>,
+    account_id: String,
+    flow_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .verification_accept(&account_id, &flow_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Start the emoji/SAS sub-flow on a ready request (Story 3.2). The SAS state
+/// transition arrives over the verification stream. Failures funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub async fn verification_start_sas(
+    state: State<'_, AppState>,
+    account_id: String,
+    flow_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .verification_start_sas(&account_id, &flow_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Confirm the SAS emoji match on our side (Story 3.2). On both sides confirming,
+/// the SDK completes verification and 3.1's `verification_state()` stream flips the
+/// account to `Verified`. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub async fn verification_confirm(
+    state: State<'_, AppState>,
+    account_id: String,
+    flow_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .verification_confirm(&account_id, &flow_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Signal that the SAS emoji do NOT match (Story 3.2). Cancels the flow with the
+/// SDK mismatch code, which surfaces as `Failed`. Failures funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub async fn verification_mismatch(
+    state: State<'_, AppState>,
+    account_id: String,
+    flow_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .verification_mismatch(&account_id, &flow_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Cancel the verification flow (Story 3.2) — the user closed the modal / pressed
+/// Esc. Cancels the active SAS or the request; a missing flow is a no-op. Failures
+/// funnel through [`to_ipc_error`].
+#[tauri::command]
+pub async fn verification_cancel(
+    state: State<'_, AppState>,
+    account_id: String,
+    flow_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .verification_cancel(&account_id, &flow_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
 /// Retry a failed outgoing message by re-driving its wedged local echo through
 /// the controlled send path (`unwedge`, not a new dispatch — FR-41). `item_key`
 /// is the timeline item's opaque `unique_id`. A missing echo / no open timeline
@@ -790,6 +934,31 @@ mod tests {
     fn send_dispatch_maps_to_retriable_send_failed() {
         let ipc = to_ipc_error(CoreError::Send(SendError::Dispatch("boom".to_owned())));
         assert_eq!(ipc.code, IpcErrorCode::SendFailed);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn verification_unavailable_maps_to_retriable_verification_failed() {
+        let ipc = to_ipc_error(CoreError::Verification(VerificationError::Unavailable(
+            "no identity".to_owned(),
+        )));
+        assert_eq!(ipc.code, IpcErrorCode::VerificationFailed);
+        assert!(ipc.retriable, "verification failure should be retriable");
+    }
+
+    #[test]
+    fn verification_flow_not_found_maps_to_retriable_verification_failed() {
+        let ipc = to_ipc_error(CoreError::Verification(VerificationError::FlowNotFound));
+        assert_eq!(ipc.code, IpcErrorCode::VerificationFailed);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn verification_action_maps_to_retriable_verification_failed() {
+        let ipc = to_ipc_error(CoreError::Verification(VerificationError::Action(
+            "boom".to_owned(),
+        )));
+        assert_eq!(ipc.code, IpcErrorCode::VerificationFailed);
         assert!(ipc.retriable);
     }
 }

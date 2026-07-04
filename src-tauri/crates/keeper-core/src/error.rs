@@ -175,6 +175,32 @@ pub enum InboxError {
     StreamStart(String),
 }
 
+/// Errors originating in interactive device self-verification (Story 3.2, FR-14,
+/// AD-1, AD-21).
+///
+/// A secret-free taxonomy: no message ever contains a SAS key, decimal, QR
+/// crypto, session material, or plaintext — only non-secret descriptions. All
+/// variants map to `IpcErrorCode::VerificationFailed` (retriable) in the shell's
+/// single funnel.
+#[derive(Debug, Error)]
+pub enum VerificationError {
+    /// Verification could not be started or driven because the account's crypto
+    /// identity is not ready (no cross-signing identity yet, no signed-in user).
+    /// The wrapped string is a non-secret description.
+    #[error("verification is not available yet: {0}")]
+    Unavailable(String),
+
+    /// No live verification flow was found for the given flow id (it already
+    /// reached a terminal state, or the id is unknown).
+    #[error("verification flow not found")]
+    FlowNotFound,
+
+    /// An SDK verification action (accept / start_sas / confirm / mismatch /
+    /// cancel / request) failed. The wrapped string is a non-secret description.
+    #[error("verification action failed: {0}")]
+    Action(String),
+}
+
 /// The hexagon error root. Every fallible core operation surfaces one of these.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -201,6 +227,10 @@ pub enum CoreError {
     /// An outgoing message could not be enqueued for send.
     #[error(transparent)]
     Send(#[from] SendError),
+
+    /// An interactive device self-verification action failed.
+    #[error(transparent)]
+    Verification(#[from] VerificationError),
 
     /// A requested capability is not supported on this platform/build. Honest,
     /// non-panicking signal used by not-yet-wired [`crate::platform::Platform`]

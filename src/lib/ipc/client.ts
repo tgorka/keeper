@@ -26,10 +26,13 @@ export type { Provider } from "./gen/Provider";
 export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
+export type { SasEmojiVm } from "./gen/SasEmojiVm";
 export type { SendState } from "./gen/SendState";
 export type { TimelineBatch } from "./gen/TimelineBatch";
 export type { TimelineItemVm } from "./gen/TimelineItemVm";
 export type { TimelineOp } from "./gen/TimelineOp";
+export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
+export type { VerificationPhase } from "./gen/VerificationPhase";
 
 import type { AccountVm } from "./gen/AccountVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
@@ -37,6 +40,7 @@ import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 import type { InboxBatch } from "./gen/InboxBatch";
 import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { TimelineBatch } from "./gen/TimelineBatch";
+import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 
 /**
  * Structural guard for the {@link IpcError} envelope so we can rethrow it
@@ -326,6 +330,90 @@ export async function subscribeEncryptionStatus(
  */
 export async function unsubscribeEncryptionStatus(accountId: string, id: number): Promise<void> {
   await invoke<void>("encryption_status_unsubscribe", { accountId, subscriptionId: id });
+}
+
+/**
+ * Subscribe to an account's interactive device self-verification flow (Story 3.2,
+ * FR-14, AD-1). Opens a `Channel`, forwards each {@link VerificationFlowVm}
+ * snapshot to `onBatch` in arrival order (the flow's state machine: waiting →
+ * compare emoji / show QR → confirmed → done/cancelled/failed), and resolves with
+ * the subscription id. An *incoming* request the peer started surfaces here as a
+ * `requested` snapshot so the UI can auto-open the modal. NO crypto/key/plaintext
+ * crosses IPC — only the rendered VM. Rejects with the {@link IpcError} envelope
+ * (`code: "syncUnavailable"`) if the account cannot start syncing.
+ */
+export async function subscribeVerification(
+  accountId: string,
+  onBatch: (batch: VerificationFlowVm) => void,
+): Promise<number> {
+  return await subscribe<VerificationFlowVm>("verification_subscribe", onBatch, { accountId });
+}
+
+/**
+ * Unsubscribe exactly one verification subscription, aborting its backend producer
+ * task and clearing the account's flow sender (AD-19). Idempotent — unsubscribing
+ * an unknown id is a no-op.
+ */
+export async function unsubscribeVerification(accountId: string, id: number): Promise<void> {
+  await invoke<void>("verification_unsubscribe", { accountId, subscriptionId: id });
+}
+
+/**
+ * Start an interactive self-verification from keeper against the user's other
+ * session (Story 3.2, FR-14). The Rust core requests the verification and streams
+ * the resulting flow over the existing verification subscription. Requires an
+ * active verification subscription. Rejects with the {@link IpcError} envelope
+ * (`code: "verificationFailed"`) on failure.
+ */
+export async function verificationStart(accountId: string): Promise<void> {
+  await invoke<void>("verification_start", { accountId });
+}
+
+/**
+ * Accept an incoming verification request the peer started (Story 3.2). Moves the
+ * flow from `requested` to `ready`. `flowId` is the flow's opaque id from the
+ * streamed {@link VerificationFlowVm}. Rejects with the {@link IpcError} envelope
+ * (`code: "verificationFailed"`) on failure.
+ */
+export async function verificationAccept(accountId: string, flowId: string): Promise<void> {
+  await invoke<void>("verification_accept", { accountId, flowId });
+}
+
+/**
+ * Start the emoji/SAS sub-flow on a ready request (Story 3.2). The SAS state
+ * transition arrives over the verification stream. Rejects with the
+ * {@link IpcError} envelope (`code: "verificationFailed"`) on failure.
+ */
+export async function verificationStartSas(accountId: string, flowId: string): Promise<void> {
+  await invoke<void>("verification_start_sas", { accountId, flowId });
+}
+
+/**
+ * Confirm the SAS emoji match on our side (Story 3.2). When both sides confirm,
+ * the SDK completes verification and Story 3.1's encryption-status stream flips
+ * the account to `verified`. Rejects with the {@link IpcError} envelope (`code:
+ * "verificationFailed"`) on failure.
+ */
+export async function verificationConfirm(accountId: string, flowId: string): Promise<void> {
+  await invoke<void>("verification_confirm", { accountId, flowId });
+}
+
+/**
+ * Signal that the SAS emoji do NOT match (Story 3.2). Cancels the flow with the
+ * SDK mismatch code, which surfaces as `failed`. Rejects with the {@link IpcError}
+ * envelope (`code: "verificationFailed"`) on failure.
+ */
+export async function verificationMismatch(accountId: string, flowId: string): Promise<void> {
+  await invoke<void>("verification_mismatch", { accountId, flowId });
+}
+
+/**
+ * Cancel the verification flow (Story 3.2) — the user closed the modal or pressed
+ * Esc. Cancels the active SAS or the request; a missing flow is a no-op. Rejects
+ * with the {@link IpcError} envelope (`code: "verificationFailed"`) on failure.
+ */
+export async function verificationCancel(accountId: string, flowId: string): Promise<void> {
+  await invoke<void>("verification_cancel", { accountId, flowId });
 }
 
 /**

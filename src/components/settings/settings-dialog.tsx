@@ -6,6 +6,7 @@ import {
   SDK_STORE_UNENCRYPTED_STATUS,
   STORAGE_HONESTY_SENTENCE,
 } from "@/components/settings/at-rest-encryption-choice";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
@@ -16,6 +17,7 @@ import {
 import { encryptionPosture } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useEncryptionStatus } from "@/lib/stores/encryption-status";
+import { verificationStore } from "@/lib/stores/verification";
 
 interface SettingsDialogProps {
   /** Whether the dialog is open (controlled by the caller). */
@@ -95,11 +97,11 @@ const ENCRYPTION_HONESTY_SENTENCE =
   "Verifying this device unlocks encrypted history and lets other people trust your messages.";
 
 /**
- * Read-only Encryption section (Story 3.1): lists each signed-in account's device
+ * Encryption section (Story 3.1 + 3.2): lists each signed-in account's device
  * state (Verified / Not verified) from the encryption-status store, plus the
- * honest sentence on what verifying unlocks. There is intentionally NO interactive
- * Verify button here — the interactive verify flow lands in Story 3.2; 3.1 only
- * makes the honest state visible.
+ * honest sentence on what verifying unlocks. An account whose device is
+ * `unverified` gets an interactive "Verify" button (Story 3.2) that opens the
+ * device-verification modal for that account.
  */
 function EncryptionSection() {
   const accounts = useAccountsStore((s) => s.accounts);
@@ -143,7 +145,19 @@ function EncryptionAccountRow({ accountId, children }: { accountId: string; chil
       >
         {children}
       </span>
-      <span className={tone}>{label}</span>
+      <span className="flex items-center gap-2">
+        <span className={tone}>{label}</span>
+        {status === "unverified" ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            onClick={() => verificationStore.getState().openFor(accountId)}
+          >
+            Verify
+          </Button>
+        ) : null}
+      </span>
     </li>
   );
 }

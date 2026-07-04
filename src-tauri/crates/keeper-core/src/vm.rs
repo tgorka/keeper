@@ -82,6 +82,11 @@ pub enum IpcErrorCode {
     /// failures are *not* this code; they surface as the `Failed` send-state on
     /// the timeline item instead.
     SendFailed,
+    /// An interactive device self-verification action failed (Story 3.2): crypto
+    /// not ready, the flow id was not found, or an SDK action (accept / start_sas
+    /// / confirm / mismatch / cancel / request) failed. Retriable — the user can
+    /// restart verification. Serializes as `"verificationFailed"`.
+    VerificationFailed,
 }
 
 /// The delivery state of an outgoing (local-echo) message (FR-9, AD-13, UX-DR10).
@@ -173,6 +178,81 @@ pub enum EncryptionStatus {
 pub struct EncryptionStatusBatch {
     /// The current device-verification status.
     pub status: EncryptionStatus,
+}
+
+/// One emoji of the SAS short-authentication string (Story 3.2, FR-14, NFR-9).
+///
+/// A rendered projection of the SDK `Emoji` — its Unicode `symbol` and the
+/// human-readable `name` (the SDK's `description`). Both are non-secret display
+/// strings; NO SAS key, decimal, or crypto material crosses IPC on this VM. The
+/// webview renders the symbol with its `name` in `mono` type (epic typography).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SasEmojiVm {
+    /// The emoji symbol (e.g. `"🐶"`).
+    pub symbol: String,
+    /// The emoji's human-readable name (e.g. `"Dog"`).
+    pub name: String,
+}
+
+/// The phase of an interactive self-verification flow (Story 3.2, FR-14,
+/// UX verification-flow states).
+///
+/// A Rust-authoritative projection of the SDK's native `VerificationRequestState`
+/// / `SasState` machine. The webview renders each phase distinctly (waiting,
+/// comparing, confirmed, done, cancelled, failed) using the SDK's own vocabulary —
+/// it never invents crypto UX. Only the enum tag crosses IPC. `Cancelled` and
+/// `Failed` are intentionally distinct: a clean user/peer cancel is `Cancelled`;
+/// a mismatch / timeout / other terminal cancel code is `Failed` (with a reason).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum VerificationPhase {
+    /// A request exists but is not yet ready — waiting for the other device to
+    /// accept (or for us to accept an incoming request).
+    Requested,
+    /// The request is ready; a QR code may be shown and SAS can be started.
+    Ready,
+    /// SAS keys are exchanged — the two sides compare the emoji.
+    Comparing,
+    /// We confirmed the emoji match; waiting for the other device to confirm.
+    Confirmed,
+    /// The verification completed successfully. Story 3.1's `verification_state()`
+    /// stream then flips the account to `Verified`, clearing the banner/badge.
+    Done,
+    /// The flow was cleanly cancelled (by the user or the peer).
+    Cancelled,
+    /// The flow failed (emoji mismatch, timeout, or another terminal cancel
+    /// code). Carries a human-readable `reason`.
+    Failed,
+}
+
+/// A snapshot of an interactive self-verification flow, delivered over the
+/// verification subscription's `Channel` (Story 3.2, FR-14, AD-1, NFR-9).
+///
+/// The single view model the webview renders for the whole flow. Carries **only**
+/// non-secret render data: the opaque `flow_id`, the current [`VerificationPhase`],
+/// the SAS emoji list (symbols + names) when comparing, a pre-rendered QR SVG
+/// string when a QR is available, and a human `reason` on cancel/failure. NO
+/// `Verification`/`Sas`/`QrVerification` object, SAS key, decimal, or plaintext
+/// ever crosses IPC on this VM (AD-1). Actions reference the flow by `flow_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct VerificationFlowVm {
+    /// The SDK verification flow id (opaque, passed through verbatim). Actions
+    /// (accept/start_sas/confirm/mismatch/cancel) reference the flow by this id.
+    pub flow_id: String,
+    /// The current flow phase.
+    pub phase: VerificationPhase,
+    /// The 7 SAS emoji to compare, present only in the `Comparing` phase.
+    pub emojis: Option<Vec<SasEmojiVm>>,
+    /// A pre-rendered QR-code SVG string (keeper's own QR for the peer to scan),
+    /// present when a QR is available in the `Ready` phase.
+    pub qr_code_svg: Option<String>,
+    /// A human-readable reason, present on `Cancelled` / `Failed`.
+    pub reason: Option<String>,
 }
 
 /// A single room row rendered in the chat list (FR-8, NFR-9, AD-20).
@@ -849,6 +929,15 @@ mod tests {
     }
 
     #[test]
+    fn verification_failed_code_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::VerificationFailed)
+                .expect("serialize verification-failed code"),
+            "\"verificationFailed\""
+        );
+    }
+
+    #[test]
     fn sync_unavailable_code_serializes_camel_case() {
         assert_eq!(
             serde_json::to_string(&IpcErrorCode::SyncUnavailable).expect("serialize sync code"),
@@ -1055,6 +1144,119 @@ mod tests {
         );
         let back: EncryptionStatusBatch = serde_json::from_str(&json).expect("deserialize batch");
         assert_eq!(back, batch);
+    }
+
+    #[test]
+    fn sas_emoji_vm_round_trips_camel_case() {
+        let vm = SasEmojiVm {
+            symbol: "🐶".to_owned(),
+            name: "Dog".to_owned(),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize emoji vm");
+        assert!(json.contains("\"symbol\":\"🐶\""), "json was: {json}");
+        assert!(json.contains("\"name\":\"Dog\""), "json was: {json}");
+        let back: SasEmojiVm = serde_json::from_str(&json).expect("deserialize emoji vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn verification_phase_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&VerificationPhase::Requested).expect("serialize requested"),
+            "\"requested\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VerificationPhase::Ready).expect("serialize ready"),
+            "\"ready\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VerificationPhase::Comparing).expect("serialize comparing"),
+            "\"comparing\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VerificationPhase::Confirmed).expect("serialize confirmed"),
+            "\"confirmed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VerificationPhase::Done).expect("serialize done"),
+            "\"done\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VerificationPhase::Cancelled).expect("serialize cancelled"),
+            "\"cancelled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VerificationPhase::Failed).expect("serialize failed"),
+            "\"failed\""
+        );
+    }
+
+    #[test]
+    fn verification_phase_round_trips() {
+        for phase in [
+            VerificationPhase::Requested,
+            VerificationPhase::Ready,
+            VerificationPhase::Comparing,
+            VerificationPhase::Confirmed,
+            VerificationPhase::Done,
+            VerificationPhase::Cancelled,
+            VerificationPhase::Failed,
+        ] {
+            let json = serde_json::to_string(&phase).expect("serialize phase");
+            let back: VerificationPhase = serde_json::from_str(&json).expect("deserialize phase");
+            assert_eq!(back, phase);
+        }
+    }
+
+    #[test]
+    fn verification_flow_vm_round_trips_camel_case() {
+        let vm = VerificationFlowVm {
+            flow_id: "$flow123".to_owned(),
+            phase: VerificationPhase::Comparing,
+            emojis: Some(vec![
+                SasEmojiVm {
+                    symbol: "🐶".to_owned(),
+                    name: "Dog".to_owned(),
+                },
+                SasEmojiVm {
+                    symbol: "🐱".to_owned(),
+                    name: "Cat".to_owned(),
+                },
+            ]),
+            qr_code_svg: None,
+            reason: None,
+        };
+        let json = serde_json::to_string(&vm).expect("serialize flow vm");
+        assert!(json.contains("\"flowId\":\"$flow123\""), "json was: {json}");
+        assert!(json.contains("\"phase\":\"comparing\""), "json was: {json}");
+        assert!(json.contains("\"qrCodeSvg\":null"), "json was: {json}");
+        // No SAS key / decimal / crypto material may appear on the VM.
+        assert!(!json.contains("key"), "json leaked a key field: {json}");
+        assert!(
+            !json.contains("decimal"),
+            "json leaked a decimal field: {json}"
+        );
+        let back: VerificationFlowVm = serde_json::from_str(&json).expect("deserialize flow vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn verification_flow_vm_qr_and_reason_round_trip() {
+        let vm = VerificationFlowVm {
+            flow_id: "$flow456".to_owned(),
+            phase: VerificationPhase::Failed,
+            emojis: None,
+            qr_code_svg: Some("<svg>…</svg>".to_owned()),
+            reason: Some("The expected key did not match the verified one".to_owned()),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize flow vm");
+        assert!(json.contains("\"qrCodeSvg\":\"<svg>"), "json was: {json}");
+        assert!(
+            json.contains("\"reason\":\"The expected"),
+            "json was: {json}"
+        );
+        let back: VerificationFlowVm = serde_json::from_str(&json).expect("deserialize flow vm");
+        assert_eq!(back, vm);
     }
 
     #[test]

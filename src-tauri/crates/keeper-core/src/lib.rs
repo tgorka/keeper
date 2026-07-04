@@ -19,4 +19,5 @@ pub mod platform;
 pub mod registry;
 pub mod send;
 pub mod timeline;
+pub mod verification;
 pub mod vm;

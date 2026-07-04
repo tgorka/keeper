@@ -32,7 +32,7 @@ use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
 use matrix_sdk_ui::room_list_service::{RoomList, RoomListItem, RoomListLoadingState};
 use matrix_sdk_ui::sync_service::{State, SyncService};
 use matrix_sdk_ui::timeline::Timeline;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
@@ -43,6 +43,7 @@ use crate::platform::Platform;
 use crate::registry;
 use crate::send::{self, SendTrigger};
 use crate::timeline;
+use crate::verification::{self, VerificationSink};
 use crate::vm::{
     ConnectionStatus, ConnectionStatusBatch, EncryptionStatus, EncryptionStatusBatch, InboxBatch,
     RoomListBatch, RoomListOp, RoomVm, TimelineBatch,
@@ -109,6 +110,12 @@ struct AccountHandle {
     /// completion), so no `Timeline` (and its SDK tasks) leaks (AD-19). The
     /// room-list subscription registers nothing here.
     timelines: OpenTimelines,
+    /// Flow-id sender into the account's live verification producer (Story 3.2),
+    /// present iff a verification subscription is active. `verification_start`
+    /// requests a self-verification and forwards its new flow id here so the
+    /// producer picks it up and drives it. Set on subscribe, cleared on
+    /// unsubscribe/shutdown.
+    verification_flow_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
     /// Lifetime-of-account reconnect supervisor task (not tied to any UI
     /// subscription). Observes `sync.state()` and, on every transition into
     /// `Running`, calls `client.send_queue().set_enabled(true)` so a room queue
@@ -187,6 +194,7 @@ impl AccountManager {
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
                         session_persister,
+                        verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for room list");
@@ -386,6 +394,7 @@ impl AccountManager {
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
                         session_persister,
+                        verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for inbox");
@@ -456,6 +465,7 @@ impl AccountManager {
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
                         session_persister,
+                        verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for timeline");
@@ -587,6 +597,7 @@ impl AccountManager {
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
                         session_persister,
+                        verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for connection status");
@@ -685,6 +696,7 @@ impl AccountManager {
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
                         session_persister,
+                        verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for encryption status");
@@ -744,6 +756,212 @@ impl AccountManager {
         if self.abort_subscription(account_id, subscription_id).await {
             tracing::info!(account_id = %account_id, subscription_id, "encryption status unsubscribed");
         }
+    }
+
+    /// Subscribe to the account's interactive self-verification flow (Story 3.2),
+    /// activating the account if it is not already live (reusing the same
+    /// `Client` — never a second one). Spawns a supervised
+    /// [`verification::run_producer`] that observes incoming self-verification
+    /// requests and requests keeper starts, and streams a [`VerificationFlowVm`]
+    /// state machine into `sink`. Returns the subscription id.
+    ///
+    /// Mirrors [`subscribe_encryption_status`]'s lazy-activation, supervised-task,
+    /// and self-reap lifecycle. Additionally installs the producer's flow-id sender
+    /// on the [`AccountHandle`] so [`AccountManager::verification_start`] can hand a
+    /// keeper-started flow to the running producer; it is cleared on unsubscribe or
+    /// shutdown. An activation failure maps to the existing `SyncUnavailable` code.
+    pub async fn subscribe_verification(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        sink: VerificationSink,
+    ) -> Result<u64, CoreError> {
+        let (client, subs_arc, flow_tx_slot, did_activate) = {
+            let mut accounts = self.accounts.lock().await;
+            let did_activate = !accounts.contains_key(account_id);
+            if did_activate {
+                let (client, sync, reconnect_supervisor, session_persister) =
+                    activate(platform, account_id).await?;
+                accounts.insert(
+                    account_id.to_owned(),
+                    AccountHandle {
+                        client,
+                        sync,
+                        subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                        timelines: Arc::new(Mutex::new(HashMap::new())),
+                        reconnect_supervisor,
+                        session_persister,
+                        verification_flow_tx: Arc::new(Mutex::new(None)),
+                    },
+                );
+                tracing::info!(account_id = %account_id, "account activated for verification");
+            }
+            let handle = accounts.get(account_id).ok_or_else(|| {
+                CoreError::Internal("account handle vanished after activation".to_owned())
+            })?;
+            (
+                handle.client.clone(),
+                handle.subscriptions.clone(),
+                handle.verification_flow_tx.clone(),
+                did_activate,
+            )
+        };
+
+        // The producer drains this channel for keeper-started flow ids; the sender
+        // is stored on the handle for `verification_start`.
+        let (flow_tx, flow_rx) = mpsc::unbounded_channel::<String>();
+        *flow_tx_slot.lock().await = Some(flow_tx);
+
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let account_id_owned = account_id.to_owned();
+        let span = tracing::info_span!("verification_producer", account_id = %account_id);
+        let reaper_subs = subs_arc.clone();
+        let reaper_flow_tx = flow_tx_slot.clone();
+        let task = tokio::spawn(
+            async move {
+                verification::run_producer(client, sink, flow_rx, &account_id_owned).await;
+                // A naturally-completed producer reaps its own subscription entry
+                // and clears the flow sender so a later `verification_start` fails
+                // fast rather than pushing into a dead producer.
+                reaper_subs.lock().await.remove(&subscription_id);
+                *reaper_flow_tx.lock().await = None;
+            }
+            .instrument(span),
+        );
+
+        {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(_) => {
+                    subs_arc.lock().await.insert(subscription_id, task);
+                }
+                None => {
+                    task.abort();
+                    *flow_tx_slot.lock().await = None;
+                    if did_activate {
+                        return Err(AccountError::SyncStart(
+                            "account removed during subscribe".to_owned(),
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        tracing::info!(account_id = %account_id, subscription_id, "verification subscribed");
+        Ok(subscription_id)
+    }
+
+    /// Abort exactly the verification producer task for `subscription_id` and
+    /// clear the account's flow sender. Other account state is untouched.
+    /// Idempotent.
+    pub async fn unsubscribe_verification(&self, account_id: &str, subscription_id: u64) {
+        {
+            let accounts = self.accounts.lock().await;
+            if let Some(handle) = accounts.get(account_id) {
+                *handle.verification_flow_tx.lock().await = None;
+            }
+        }
+        if self.abort_subscription(account_id, subscription_id).await {
+            tracing::info!(account_id = %account_id, subscription_id, "verification unsubscribed");
+        }
+    }
+
+    /// Resolve the account's live `Client`, or a typed error if it is not live.
+    async fn client_for(&self, account_id: &str) -> Result<Client, CoreError> {
+        let accounts = self.accounts.lock().await;
+        accounts
+            .get(account_id)
+            .map(|h| h.client.clone())
+            .ok_or_else(|| {
+                crate::error::VerificationError::Unavailable(
+                    "account is not live; subscribe to verification first".to_owned(),
+                )
+                .into()
+            })
+    }
+
+    /// Start an interactive self-verification from keeper (Story 3.2). Requests
+    /// the verification via the account's `Client`, then forwards the new flow id
+    /// into the live verification producer so it surfaces in the stream. Requires
+    /// an active verification subscription (its producer holds the flow receiver).
+    pub async fn verification_start(&self, account_id: &str) -> Result<(), CoreError> {
+        let client = self.client_for(account_id).await?;
+        // Require a live producer BEFORE creating an SDK request, so we never leave a
+        // dangling `m.key.verification.request` on the other device that keeper won't
+        // drive — and never report a false success (the flow must actually stream).
+        let sender = {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(handle) => handle.verification_flow_tx.lock().await.clone(),
+                None => None,
+            }
+        };
+        let Some(sender) = sender else {
+            return Err(crate::error::VerificationError::Unavailable(
+                "no active verification subscription; subscribe before starting".to_owned(),
+            )
+            .into());
+        };
+        let flow_id = verification::start(&client).await?;
+        // Hand the new flow id to the live producer so it drives the stream. If the
+        // producer died between the check above and here, surface an honest error
+        // rather than a silent dangling request.
+        sender.send(flow_id).map_err(|_| {
+            crate::error::VerificationError::Unavailable(
+                "verification producer stopped before the flow could start".to_owned(),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Accept an incoming verification request (the peer started it).
+    pub async fn verification_accept(
+        &self,
+        account_id: &str,
+        flow_id: &str,
+    ) -> Result<(), CoreError> {
+        let client = self.client_for(account_id).await?;
+        verification::accept(&client, flow_id).await
+    }
+
+    /// Start the emoji/SAS sub-flow on a ready request.
+    pub async fn verification_start_sas(
+        &self,
+        account_id: &str,
+        flow_id: &str,
+    ) -> Result<(), CoreError> {
+        let client = self.client_for(account_id).await?;
+        verification::start_sas(&client, flow_id).await
+    }
+
+    /// Confirm the SAS emoji match (our side).
+    pub async fn verification_confirm(
+        &self,
+        account_id: &str,
+        flow_id: &str,
+    ) -> Result<(), CoreError> {
+        let client = self.client_for(account_id).await?;
+        verification::confirm(&client, flow_id).await
+    }
+
+    /// Signal that the SAS emoji do not match (cancels with the mismatch code).
+    pub async fn verification_mismatch(
+        &self,
+        account_id: &str,
+        flow_id: &str,
+    ) -> Result<(), CoreError> {
+        let client = self.client_for(account_id).await?;
+        verification::mismatch(&client, flow_id).await
+    }
+
+    /// Cancel the flow (user closed the modal / pressed Esc).
+    pub async fn verification_cancel(
+        &self,
+        account_id: &str,
+        flow_id: &str,
+    ) -> Result<(), CoreError> {
+        let client = self.client_for(account_id).await?;
+        verification::cancel(&client, flow_id).await
     }
 
     /// Abort exactly the producer task for `subscription_id`; other account

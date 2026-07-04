@@ -20,6 +20,10 @@ thiserror = { workspace = true }
 # Homed here as the architectural owner (AD-6); not yet exercised in Story 1.1.
 matrix-sdk = { workspace = true }
 matrix-sdk-ui = { workspace = true }
+# QR-code SVG rendering for device-verification display (Story 3.2). Renders the
+# `qrcode::QrCode` from `QrVerification::to_qr_code()` to an SVG string in Rust —
+# the webview never decodes QR crypto.
+qrcode = { workspace = true }
 # Async stream adapters for the room-list producer task.
 futures-util = { workspace = true }
 # URL parsing for the OIDC callback registry and OAuth redirect metadata.

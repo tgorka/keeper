@@ -33,8 +33,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 # Matrix core (homed in keeper-core; unused in 1.1 but owned here per AD-6)
-matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "sso-login"] }
+matrix-sdk = { version = "0.18", features = ["e2e-encryption", "qrcode", "sqlite", "sso-login"] }
 matrix-sdk-ui = "0.18"
+# QR-code rendering for device-verification *display* (Story 3.2). The matrix-sdk
+# `qrcode` feature (above) pulls this same crate for `QrVerification::to_qr_code`;
+# depended on directly for the `svg` renderer. `default-features = false` drops
+# the `image`/`pic` renderers so no image codecs are linked. MIT/Apache — passes
+# `cargo deny check`.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # Async stream adapters for the room-list producer (already in the tree via matrix-sdk).
 futures-util = "0.3"
 # URL parsing for the OIDC callback registry + redirect metadata (already in the tree via matrix-sdk).
