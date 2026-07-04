@@ -1,6 +1,6 @@
 ---
 title: "Addendum: keeper Product Brief"
-status: draft
+status: final
 created: 2026-07-03
 updated: 2026-07-03
 ---
@@ -40,7 +40,7 @@ Depth that belongs in downstream documents (PRD, UX spec, architecture) or that 
 | Conditional | iMessage (user's own Mac only; beeper/platform-imessage, MIT) | "Advanced, macOS-only, may break on OS updates" |
 | Out of scope | iMessage without a Mac, official X DM API, WeChat | Do not promise |
 
-DMA wildcard: WhatsApp third-party interop live in the EU since Nov 2025 (BirdyChat, Haiket). Monitor as upside; do not build against it.
+DMA (Digital Markets Act) wildcard: WhatsApp third-party interop has been live in the EU since Nov 2025 (BirdyChat, Haiket). Monitor as upside; do not build against it.
 
 ## 4. Beeper account coverage (exact surface)
 
@@ -50,15 +50,15 @@ A keeper-connected Beeper account sees: Matrix-native chats + Beeper Cloud bridg
 
 Adopted from market research §5 / Appendix A, adjusted to owner inputs:
 
-- **Must (MVP):** Matrix core (login/E2EE/SSS/text/replies/edits/reactions/media), unified inbox + archive + unread, unlimited multi-account, bridge management UI, local archive + FTS + export, favorites + pins, ⌘K + hotkeys, native notifications (per-chat/network mute, mention-only), incognito (receipts + typing), persistent drafts, undo-send (owner requirement — promoted from Should), Spaces as room-group views (owner requirement — promoted from Should).
+- **Must (MVP):** Matrix core (login/E2EE/SSS/text/replies/edits/reactions/media), unified inbox + archive + unread, unlimited multi-account, bridge management UI, local archive + FTS + export, favorites + pins, ⌘K + hotkeys, native notifications (per-chat/network mute, mention-only), incognito (receipts + typing), drafts with explicit-approval review pane (owner requirement — promoted from Could), undo-send (owner requirement — promoted from Should), Spaces as room-group views (owner requirement — promoted from Should).
 - **Should (v1.x):** low-priority view, message requests, labels/filtered views, snooze/reminders (local), scheduled send (local, "app must be running"), note-to-self, bridge health dashboard + alerting.
-- **Could (validate first):** draft-approval workflow + propose-only local API/MCP (approval-gated sends), voice-note transcription via local Whisper, iMessage helper (v1.x, advanced flag), themes.
+- **Could (validate first):** agent-proposed drafts — a propose-only local API/MCP feeding the approval pane (approval-gated sends), voice-note transcription via local Whisper, iMessage helper (v1.x, advanced flag), themes.
 - **Won't (this cycle):** calls (Element Call embed post-MVP), server-side anything, mobile apps, in-client bridges, automation/broadcast features.
 
 ## 6. Rejected alternatives (rationale record)
 
 - **Electron / state-in-JS / matrix-js-sdk in frontend** — kills the perf and trust story; one source of truth in Rust.
-- **Native VoIP (webrtc-rs)** — years of work; SDK has no support (issue #3295); Element Call widget is the sanctioned path.
+- **Native VoIP (webrtc-rs)** — years of work; SDK has no support (matrix-rust-sdk issue #3295); Element Call widget is the sanctioned path.
 - **Running bridges inside the client (Beeper on-device style)** — massive scope; keeper manages external bridges instead; reassess post-v1.
 - **Hosted bridge/homeserver service** — violates client-only positioning and inherits ToS liability.
 - **Betting core flows on Beeper private APIs** — isolated behind provider traits only.
@@ -71,7 +71,7 @@ Adopted from market research §5 / Appendix A, adjusted to owner inputs:
 
 ## 8. Open items carried forward
 
-- Validate draft-approval demand with ~10 design partners before promoting beyond a flag (market §6.3 Q2).
+- Validate demand for agent-proposed drafts (propose-only API/MCP) with ~10 design partners before promoting beyond a flag (market §6.3 Q2); the human approval pane itself is already MVP scope per the owner's required feature list.
 - Technical spike before PRD commitments: matrix-rust-sdk 0.18 in a Tauri 2 shell on macOS — SSS, E2EE, FTS-over-SQLite (market §6.4 step 2).
 - 5–8 problem interviews with self-hosted-bridge users to rank bridge UX vs archive vs incognito vs approval-drafts (market §6.4 step 3).
 - Homeserver recommendation for the companion-stack docs (Synapse vs conduwuit).

@@ -1,6 +1,6 @@
 ---
 title: "Product Brief: keeper"
-status: draft
+status: final
 created: 2026-07-03
 updated: 2026-07-03
 ---
@@ -9,11 +9,11 @@ updated: 2026-07-03
 
 ## Executive Summary
 
-keeper is an open-source (Apache-2.0), Beeper-style universal messenger client built on Matrix: one fast, native-feeling macOS app for every chat network the user bridges — Telegram, WhatsApp, Signal, Slack, Discord, and more — with a permanent, searchable, exportable local archive of every message. It is a **client only**: no servers, no hosted bridges, no message ever passing through project infrastructure. Users bring their own Matrix homeserver and bridges (or a Beeper account), and keeper makes that stack feel like a polished product instead of a terminal hobby.
+keeper is an open-source (Apache-2.0), Beeper-style universal messenger client built on Matrix: one fast, native-feeling macOS app for every chat network the user bridges — Telegram, WhatsApp, Signal, Slack, Discord, and more. It keeps a permanent, searchable, exportable local archive of every message. It is a **client only**: no servers, no hosted bridges, no message ever passing through project infrastructure. Users bring their own Matrix homeserver and bridges (or a Beeper account), and keeper makes that stack feel like a polished product instead of a terminal hobby.
 
 The market has split into two halves that don't meet. Beeper proved the unified-inbox category ($125M acquisition, three paid tiers) but keeps its clients closed and paywalls exactly what power users want most — multi-account, incognito, scheduled send. Open-source Matrix clients (Element X, Cinny) have world-class protocol tech but zero bridge UX and no unified-inbox product thinking. Nobody ships an open-source, native desktop client with first-class bridge management and Beeper-grade inbox polish. keeper sits precisely in that gap, at a moment when Matrix 2.0 is stable, the mautrix bridge ecosystem is healthy and Beeper-funded, and Beeper's July 2025 paywall created a visible cohort of annoyed power users.
 
-Technically, keeper embeds matrix-rust-sdk — the engine behind Element X — directly in a Tauri 2 Rust backend, with a thin React/TypeScript UI rendering Rust-owned view models. No Electron, no crypto in JavaScript, no FFI layer. No shipping client uses this architecture yet; keeper would be first.
+Technically, keeper embeds matrix-rust-sdk — the engine behind Element X — directly in a Tauri 2 Rust backend, with a thin React/TypeScript UI rendering Rust-owned view models. No Electron, no crypto in JavaScript, no FFI layer. No mature shipping client uses this architecture yet; keeper would be the first.
 
 ## The Problem
 
@@ -33,7 +33,7 @@ A macOS-native messenger that makes a user-owned Matrix + bridges stack feel bet
 - **Unlimited multi-account, free forever.** Several Matrix accounts at once (e.g., beeper.com + self-hosted), unlimited networks. The headline wedge against Beeper's paywall.
 - **Native bridge management** — keeper's core differentiator. Detect bridges on the connected homeserver, drive logins through native UI (QR rendering, code entry via the bridgev2 provisioning API), surface connection health, and prompt re-login before messages silently drop.
 - **Local-first archive.** Every synced message persisted in SQLite with offline full-text search and JSON/Markdown export. History survives network retention limits and, where feasible, even logout. The trust pillar.
-- **Privacy and control for free:** incognito mode (suppress read receipts via `m.read.private` and typing indicators, global or per-room) and undo-send (configurable delay window, default 10 s, before dispatch; redaction after).
+- **Privacy and control for free:** incognito mode (keep read receipts private via `m.read.private` and suppress typing indicators — global or per-room) and undo-send (messages held for a configurable delay, default 10 s, before dispatch; after dispatch, "delete for everyone" falls back to Matrix redaction).
 - **Keyboard-first:** ⌘K command palette, quick-switcher, global hotkeys — the Texts/Beeper heritage this segment expects.
 
 Flagship networks at MVP: **Telegram, WhatsApp, Signal** — highest usage, proven bridges, lowest risk — with the rest of the mautrix ecosystem (Slack, Discord, Instagram, Messenger, X, LinkedIn, Google Voice) supported through the same bridge UX with honest per-network risk labeling.
@@ -41,10 +41,10 @@ Flagship networks at MVP: **Telegram, WhatsApp, Signal** — highest usage, prov
 ## What Makes This Different
 
 1. **Open source where Beeper is closed, free where Beeper charges.** Every wedge feature — unlimited accounts, incognito, undo-send, local archive — attacks a documented Beeper complaint or paywall line.
-2. **The only client with real bridge UX.** Element treats bridge bots as weird chat rooms; bbctl is a CLI. keeper wraps login, health, and re-auth in native product surface. Nothing on the market does this.
-3. **Architecture as advantage.** Rust core (matrix-rust-sdk + SQLite + crypto) with a webview that only renders view models — Element X's proven design minus the FFI layer, against Beeper's Electron. This is the difference between scaling to 100k+ events and dying like state-in-JS clients.
-4. **Client-only is a trust posture, not a limitation.** keeper never operates bridges, so ToS exposure stays with the user's own homeserver — the same liability posture as Element. Honest per-network risk labels (Telegram green → Meta/X amber → iMessage "advanced, Mac-only") are a feature, not fine print.
-5. **A credible path to safe agentic messaging.** Approval-gated drafts — where an AI or external tool can *propose* replies but only the human can send — exists in no competitor (Beeper's MCP API sends unsupervised). Post-MVP experiment, but a genuinely novel bet.
+2. **The only client with real bridge UX.** Element treats bridge bots as weird chat rooms; bbctl, Beeper's bridge-management tool, is a CLI. keeper wraps login, health, and re-auth in native product surface. Nothing we found on the market does this.
+3. **Architecture as advantage.** Rust core (matrix-rust-sdk + SQLite + crypto) with a webview that only renders view models — Element X's proven design minus the FFI layer, against Beeper's Electron. This is the difference between scaling to 100k+ events and bogging down like clients that keep chat state in JavaScript.
+4. **Client-only is a trust posture, not a limitation.** keeper never operates bridges, so ToS exposure stays with the user, on their own homeserver — the same liability posture as Element. Honest per-network risk labels (Telegram green → Meta/X amber → iMessage "advanced, Mac-only") are a feature, not fine print.
+5. **A credible path to safe agentic messaging.** Approval-gated drafts — replies queue in a review pane and send only on explicit approval — appear in no competitor we found (Beeper's MCP API sends unsupervised). The approval pane ships in MVP; opening it to AI/agent-*proposed* drafts is the post-MVP experiment, and a genuinely novel bet.
 
 Honest caveat: keeper has no brand, one platform at launch, and depends on users having a homeserver and bridges. The moat is product focus in an empty niche plus a structural gift — Beeper funds the bridges, Element funds the SDK, and keeper rides both upstream for free.
 
@@ -59,16 +59,16 @@ Secondary: the post-paywall Beeper cohort — users who hit the 5-account cap or
 - **Daily driver test:** the maintainer and early adopters retire Beeper/Element for daily messaging within 3 months of first beta.
 - **MVP demo bar:** Telegram, WhatsApp, and Signal work flawlessly end-to-end — native bridge login, send/receive with E2EE, media, reactions, search — on a self-hosted homeserver and on a Beeper account (cloud + bbctl bridges).
 - **Reliability:** no silent message loss; bridge health surfaced within 60 s of a session drop; notifications delivered while the app runs in background.
-- **Performance:** cold start to interactive inbox < 2 s; local full-text search across 100k+ events < 200 ms; idle RAM a fraction of Electron peers.
+- **Performance:** cold start to interactive inbox < 2 s; local full-text search across 100k+ events < 200 ms; idle RAM a fraction of what Electron peers use.
 - **Archive trust:** export produces complete, readable JSON/Markdown; archive survives re-login.
 - **OSS traction (12 months):** 1,000+ GitHub stars, listing on awesome-selfhosted, external contributors landing merged PRs, and an HN/r/selfhosted launch that validates the "open-source Beeper" framing.
 
 ## Scope
 
 **MVP (macOS desktop, text-first):**
-Matrix core (login: password + OIDC/MAS + Beeper email-code JWT; E2EE with cross-signing and verification; Simplified Sliding Sync MSC4186); unified inbox with archive, favorites, pins; unlimited multi-account; bridge management UI (bot commands + bridgev2 provisioning, bbctl integration for Beeper self-hosted bridges); local archive with FTS and export; text, replies, edits, reactions, media, files; persistent per-chat drafts; incognito mode; undo-send delay window; ⌘K palette, hotkeys, native notifications; Spaces as room-group views.
+Matrix core (login: password + OIDC/MAS + Beeper email-code JWT; E2EE with cross-signing and verification; Simplified Sliding Sync MSC4186); unified inbox with archive, favorites, pins; unlimited multi-account; bridge management UI (bot commands + bridgev2 provisioning, bbctl integration for Beeper self-hosted bridges); local archive with FTS and export; text, replies, edits, reactions, media, files; persistent per-chat drafts with an explicit-approval review pane (drafts held locally and in Matrix account data; sent only on approve, discardable — per the owner's required feature list); incognito mode; undo-send delay window; ⌘K palette, hotkeys, native notifications; Spaces as room-group views.
 
-**Fast-follow (v1.x):** snooze/reminders (local-only), scheduled send (honest "app must be running"), message-request filtering, bridge health dashboard, note-to-self, iMessage via the user's own Mac (beeper/platform-imessage, MIT — "advanced, may break on macOS updates"), draft-approval workflow prototype behind a flag.
+**Fast-follow (v1.x):** snooze/reminders (local-only), scheduled send (honest "app must be running"), message-request filtering, bridge health dashboard, note-to-self, iMessage via the user's own Mac (beeper/platform-imessage, MIT — "advanced, may break on macOS updates"), agent-proposed drafts (a propose-only local API/MCP feeding the approval pane) prototyped behind a flag.
 
 **Explicitly out (this cycle):** voice/video calls (post-MVP via embedded Element Call widget — MatrixRTC is still pre-spec and rough on self-hosted setups); any server-side component; mobile apps (iPhone is next, after macOS proves the core); bridges running inside the client; WhatsApp automation/broadcast of any kind; hosted services.
 
