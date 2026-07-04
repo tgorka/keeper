@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-1-1-cargo-workspace-split-and-typed-ipc-foundation.md
+  s_ec1a79f9c7d4dd::t_115df12baa5fad 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c05a8217118a0ea02f09bfffbca304da3a4be676",
+  "prompts": {},
+  "sessions": {
+    "s_ec1a79f9c7d4dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96f3e3a8-904c-49fc-8f16-d6156ba58edc",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
