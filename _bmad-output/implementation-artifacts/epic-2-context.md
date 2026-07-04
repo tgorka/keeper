@@ -51,3 +51,18 @@ This epic breaks the single-account limit established by the walking skeleton an
 - Stories 2.2, 2.3, 2.5, and 2.6 all depend on 2.1. Story 2.4 (coverage disclosure) depends on 2.3 (Beeper login).
 - FR-6 (account management) and FR-18 (unified inbox) are only partially completed here: full unified-inbox organization lands in Epic 4, and the keep/delete-archive sign-out semantics complete in Story 5.7.
 - Story 2.3's OQ-3 verification produces degradation notes consumed by later epics (bridges, incognito, notifications).
+
+## Coordinator note for Story 2.5 re-drive (attempt 2)
+
+Attempt 1 was deferred after exhausting review cycles. Root cause: the attempt-1 spec
+declared the story frontend-only, which contradicted review findings that require a small
+Rust change. For attempt 2 the coordinator explicitly LIFTS that restriction:
+
+- DO add a durable account-kind/provider discriminant (e.g. `provider: password | oidc |
+  beeper`) to `StoredSession` + `AccountVm`, set by each auth provider at add time, and key
+  `isBeeperAccount` off it instead of the resolved homeserver host. Migrate existing
+  sessions (one-time host-match fallback, then persist the tag).
+- DO consolidate connection-status subscriptions: make `use-account-statuses` the single
+  subscriber and derive the shell offline pill from the per-account map, retiring or
+  reducing `use-connection-status`/`connectionStore` to a selector.
+- Other 2.5 entries in deferred-work.md remain valid; address them where in reach.
