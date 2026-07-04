@@ -1,0 +1,39 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_a8b641362c9b27::t_474e103f3a7156 14-16
+src/components/layout/conversation-pane.tsx
+  s_a8b641362c9b27::t_6e2e614c9e06f9 117-122,124-127
+  s_a8b641362c9b27::t_c98f9bd71171c6 173,176,184
+  s_a8b641362c9b27::t_5235cf6eccb67e 123
+  s_a8b641362c9b27::t_12a8e0a7562063 15
+  s_a8b641362c9b27::t_98d751d25356db 7
+  s_a8b641362c9b27::t_be5826a191072e 64
+_bmad-output/implementation-artifacts/spec-1-5-timeline-view-receive-text.md
+  s_a8b641362c9b27::t_14af81e0288755 121,124-130
+  s_32eeaabc8fae50::t_e8d7f03fd8af84 5
+  s_a8b641362c9b27::t_7ede7226b06d2f 7
+  s_a8b641362c9b27::t_c86251e8c0a1b9 225-234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3383e96c46a337839c35ebbe1bbdcf99f68ac591",
+  "prompts": {},
+  "sessions": {
+    "s_32eeaabc8fae50": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "009200fd-a4bf-4409-a955-5d95bacdd83d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_a8b641362c9b27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0832bc7e-b5e0-415c-90e2-73e73c8376b0",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
