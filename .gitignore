@@ -30,6 +30,9 @@ coverage
 .env
 .env.*
 !.env.example
+!.env.1p
 *.pem
 *.p12
 *.keychain
+.bmad-loop/runs/
+.bmad-loop/cache/
