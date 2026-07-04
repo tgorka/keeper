@@ -1,0 +1,77 @@
+src-tauri/crates/keeper/src/ipc.rs
+  s_90b7f29ae29fd1::t_aba841aad26724 165-167
+  s_90b7f29ae29fd1::t_7f895b6da4fa96 15
+  s_90b7f29ae29fd1::t_e6532fb7130a54 307-355
+  s_90b7f29ae29fd1::t_e81c402197fd90 168
+  s_90b7f29ae29fd1::t_0206bf41e55e6e 664-671
+  s_90b7f29ae29fd1::t_a2a9aa6a0e6982 44-48,58
+  s_90b7f29ae29fd1::t_4f59a18bd989e6 663
+src-tauri/crates/keeper-core/src/error.rs
+  s_90b7f29ae29fd1::t_6586160e5350ad 79-90
+src-tauri/Cargo.toml
+  s_90b7f29ae29fd1::t_5a7e08a873c5cc 42-43
+  s_90b7f29ae29fd1::t_96b2b022dc2437 44
+src/components/auth/login-screen.test.tsx
+  s_90b7f29ae29fd1::t_528a47c377967c 59-62
+  s_90b7f29ae29fd1::t_be619db50a418c 443-459
+  s_90b7f29ae29fd1::t_80bdeaac755a15 10-12,17-19
+  s_90b7f29ae29fd1::t_afc18176e44172 45,49-51
+  s_90b7f29ae29fd1::t_c666bd9c44619d 43-44,46-48
+  s_90b7f29ae29fd1::t_6973fad2eef07c 307-442
+src-tauri/crates/keeper/src/lib.rs
+  s_90b7f29ae29fd1::t_b423d1e640c85d 42-44
+src-tauri/crates/keeper-core/src/vm.rs
+  s_90b7f29ae29fd1::t_c207ae72db4914 65-70
+  s_90b7f29ae29fd1::t_d5195c8d68043c 702-707
+src/lib/ipc/gen/IpcErrorCode.ts
+  s_90b7f29ae29fd1::t_3ac2f1bdea0d10 9
+src-tauri/crates/keeper-core/src/auth/beeper.rs
+  s_90b7f29ae29fd1::t_69417c436aaad0 81-84,89
+  s_90b7f29ae29fd1::t_ec8218886c78e2 232-238,241-245,249-252
+  s_90b7f29ae29fd1::t_ad80f24b6df40c 409-416
+  s_90b7f29ae29fd1::t_e81c402197fd90 119-121,125-126,148,165,176-178,317-319
+  s_90b7f29ae29fd1::t_7c0b99d896151c 1-80,85-88,90-118,122-124,127-147,149-164,166-175,179-231,239-240,246-248,253-282,287-301,305-316,320-387,396-408,417-443
+  s_90b7f29ae29fd1::t_dc58262d86ff39 388-395
+  s_90b7f29ae29fd1::t_061e0da433302a 283-286
+  s_90b7f29ae29fd1::t_97b9125bcfb46e 302-304
+_bmad-output/implementation-artifacts/spec-2-3-beeper-email-code-login.md
+  s_90b7f29ae29fd1::t_aba4442836e23f 75-84
+  s_90b7f29ae29fd1::t_3929157b87e680 1-4,8-74,85-130
+  s_90b7f29ae29fd1::t_c13049ead04a20 131-149
+  s_90b7f29ae29fd1::t_28a81faf3f4f71 6
+  s_90b7f29ae29fd1::t_e58861d17f9d7b 150-174
+  s_90b7f29ae29fd1::t_15307e34b54fed 5,7
+src-tauri/crates/keeper-core/Cargo.toml
+  s_90b7f29ae29fd1::t_f9ccfdf4543c0b 27-28
+src-tauri/crates/keeper-core/src/auth.rs
+  s_90b7f29ae29fd1::t_ee91efaf095543 17-25
+src/components/auth/login-screen.tsx
+  s_90b7f29ae29fd1::t_b14349d9076bb2 7,9-16,23-31,82,84-88,92-106,111-138,233-243,245-310,312-347,356-357,359-377,381-404,408-445,447-513
+  s_90b7f29ae29fd1::t_357fd4cb5c7cfd 348-355,358
+  s_90b7f29ae29fd1::t_c0fe6abee1bab3 378-380
+  s_90b7f29ae29fd1::t_454312e10bfb9f 405-407
+  s_90b7f29ae29fd1::t_d616b5bb2a0362 311
+  s_90b7f29ae29fd1::t_9db212d5d7500a 107-110
+src/lib/ipc/client.ts
+  s_90b7f29ae29fd1::t_1629219bb923ff 116-151
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_90b7f29ae29fd1::t_31c47ea8b2f0ca 29-31
+src-tauri/Cargo.lock
+  s_90b7f29ae29fd1::t_15be61f74c0e25 2856
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "881846e247b6b60b9337e206b90c810177a5581c",
+  "prompts": {},
+  "sessions": {
+    "s_90b7f29ae29fd1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4f1af10-ad11-45e9-b58a-42356678447c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
