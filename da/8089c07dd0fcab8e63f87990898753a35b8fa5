@@ -1,0 +1,121 @@
+src/lib/ipc/gen/PingVm.ts
+  s_ec1a79f9c7d4dd::t_74a3f43e8404fd 13-17,19
+  s_ec1a79f9c7d4dd::t_b9936fbf16c388 1-12,18
+biome.json
+  s_ec1a79f9c7d4dd::t_ff3b21b01b04b7 14
+src/lib/ipc/client.ts
+  s_ec1a79f9c7d4dd::t_348cbc51552c33 1-8,10-48,50-65,70-72
+  s_c03b34bd708b4a::t_496193a538c66f 9
+  s_ec1a79f9c7d4dd::t_64c2f468fd3236 49
+  s_ec1a79f9c7d4dd::t_896a333df63e65 66-69
+.cargo/config.toml
+  s_ec1a79f9c7d4dd::t_d0df22e9b32001 1-6
+src-tauri/crates/keeper-core/src/error.rs
+  s_ec1a79f9c7d4dd::t_b3ae1321662f05 1-40
+src-tauri/crates/keeper/src/ipc.rs
+  s_ec1a79f9c7d4dd::t_465c84d30e297c 128-130,132-135
+  s_ec1a79f9c7d4dd::t_fe5bbfd2fc2951 1-16,41-61,63-67,69-73,75-79,81-85,87-104,106-109,114,125-127,131,136-137,139-162,165-177,179-200
+  s_c03b34bd708b4a::t_a1dc39e07abf46 31,62,68,74,80,86,105,138,178
+  s_ec1a79f9c7d4dd::t_0ebe394e132f85 17-30,32-40
+  s_ec1a79f9c7d4dd::t_7b99c52f985c2c 163-164
+  s_ec1a79f9c7d4dd::t_af02ab74cd81aa 110-113,115-124
+package.json
+  s_ec1a79f9c7d4dd::t_0ba4f46cb05adc 20,22
+  s_ec1a79f9c7d4dd::t_40bd4fc6a2ae0f 21
+  s_ec1a79f9c7d4dd::t_4a4d2921979f82 10
+  s_ec1a79f9c7d4dd::t_f8e1b55189327b 18-19
+_bmad-output/implementation-artifacts/epic-1-context.md
+  s_9b3a31de4dc7d9::t_7672ef34050cc7 1-62
+src-tauri/crates/keeper/src/lib.rs
+  s_ec1a79f9c7d4dd::t_f1833b3afed0db 1-6,12
+  s_ec1a79f9c7d4dd::t_06deb8101f5b62 11
+src-tauri/crates/keeper-core/Cargo.toml
+  s_ec1a79f9c7d4dd::t_6d0c81a5badcaf 1-22
+src/lib/ipc/gen/DemoBatch.ts
+  s_ec1a79f9c7d4dd::t_b9936fbf16c388 1-23
+src-tauri/crates/keeper-core/src/vm.rs
+  s_ec1a79f9c7d4dd::t_0b9b00cd5d54f5 20-25
+  s_ec1a79f9c7d4dd::t_700d14db8a76de 1-19,26-141,143-148
+  s_c03b34bd708b4a::t_b9c213409152ad 142
+_bmad-output/implementation-artifacts/spec-1-1-cargo-workspace-split-and-typed-ipc-foundation.md
+  s_ec1a79f9c7d4dd::t_6c8e72f886014b 132-160
+  s_ec1a79f9c7d4dd::t_4adb591d42631f 70-80
+  s_ec1a79f9c7d4dd::t_898967dd94b00e 117-118
+  s_ec1a79f9c7d4dd::t_47ca9b1fbf4904 93-106
+  s_ec1a79f9c7d4dd::t_115df12baa5fad 8
+  s_ec1a79f9c7d4dd::t_da570a891ef697 1-4,6,9-69,81-92,107-116,119-131
+  s_ec1a79f9c7d4dd::t_311ec9d16ff9c1 7
+  s_ec1a79f9c7d4dd::t_237bdfd3542fd2 5
+src-tauri/crates/keeper-core/src/lib.rs
+  s_ec1a79f9c7d4dd::t_807741c8eb2e6f 1-11
+src/lib/ipc/client.test.ts
+  s_ec1a79f9c7d4dd::t_e2376659380453 45
+  s_ec1a79f9c7d4dd::t_e5b4ed4c9ba198 73-75
+  s_ec1a79f9c7d4dd::t_187954d1ba1007 5-14,16-22
+  s_ec1a79f9c7d4dd::t_6ec38cc4364c67 1-4,15,23-44,46-72,76-82
+src-tauri/crates/keeper-core/src/demo.rs
+  s_ec1a79f9c7d4dd::t_75f33603e89b64 20
+  s_ec1a79f9c7d4dd::t_bf9bf4b1ce14bc 1-19,21-23,25-30,32-82
+  s_ec1a79f9c7d4dd::t_113ec4be9743e5 24
+  s_ec1a79f9c7d4dd::t_2dfce302b4f88f 31
+src/lib/ipc/gen/DemoItem.ts
+  s_ec1a79f9c7d4dd::t_b9936fbf16c388 1-15
+src-tauri/.gitignore
+  s_ec1a79f9c7d4dd::t_d5031ccba67c07 8
+src-tauri/crates/keeper/Cargo.toml
+  s_ec1a79f9c7d4dd::t_9cbe5ba046027f 1-33
+src-tauri/crates/keeper-core/src/platform.rs
+  s_ec1a79f9c7d4dd::t_0ec62816f4b38b 1-42
+src/lib/ipc/gen/IpcError.ts
+  s_ec1a79f9c7d4dd::t_b9936fbf16c388 1-23
+src-tauri/crates/keeper/tauri.conf.json
+  s_ec1a79f9c7d4dd::t_ed3d3a51adcb90 7-16
+src-tauri/Cargo.lock
+  s_ec1a79f9c7d4dd::t_1e7482a67b88a6 2783-2784,2796-2809,5719-5727,6154-6175
+src/lib/ipc/gen/IpcErrorCode.ts
+  s_ec1a79f9c7d4dd::t_b9936fbf16c388 1-9
+src-tauri/Cargo.toml
+  s_ec1a79f9c7d4dd::t_ff6442d3676d86 1-5,12-13,16,20-21,23,25,28-29,34-38
+.bmad-loop/policy.toml
+  s_8a8bc6b6bf6017::t_8610b4d49a1815 96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "da8089c07dd0fcab8e63f87990898753a35b8fa5",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_9b3a31de4dc7d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad3b654c047af1271",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_c03b34bd708b4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "94010a49-3dc4-49e3-afc0-d4a46041f53a",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_ec1a79f9c7d4dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96f3e3a8-904c-49fc-8f16-d6156ba58edc",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
