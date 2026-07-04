@@ -21,6 +21,14 @@ function account(id: string, userId: string, hue = 0): AccountVm {
 const alice = account("01ARZ3NDEKTSV4RRFFQ69G5FAV", "@alice:example.org", 0);
 const bob = account("01BX5ZZKBKACTAV9WEVGEMMVRZ", "@bob:example.org", 1);
 
+/** A Beeper account is identified solely by its `matrix.beeper.com` homeserver. */
+const beeper: AccountVm = {
+  accountId: "01CX5ZZKBKACTAV9WEVGEMMVRZ",
+  userId: "@carol:beeper.com",
+  homeserverUrl: "https://matrix.beeper.com/",
+  hueIndex: 2,
+};
+
 function renderFooter(collapsed = false) {
   return render(
     <TooltipProvider>
@@ -98,5 +106,26 @@ describe("AccountFooter", () => {
     expect(screen.queryByText(alice.userId)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: `Sign out ${alice.userId}` })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add account" })).toBeInTheDocument();
+  });
+
+  it("exposes a Beeper coverage control that opens the disclosure for a Beeper account", async () => {
+    accountsStore.getState().hydrateAll([beeper]);
+    renderFooter();
+    const control = screen.getByRole("button", { name: `Beeper coverage for ${beeper.userId}` });
+    fireEvent.click(control);
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByText(
+        "WhatsApp connected in the official Beeper app will not appear here.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("does not render a coverage control for a non-Beeper account", () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter();
+    expect(
+      screen.queryByRole("button", { name: `Beeper coverage for ${alice.userId}` }),
+    ).not.toBeInTheDocument();
   });
 });

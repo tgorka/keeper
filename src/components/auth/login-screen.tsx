@@ -1,4 +1,5 @@
 import { type FormEvent, useEffect, useRef, useState } from "react";
+import { BeeperCoverageDisclosure } from "@/components/auth/beeper-coverage-disclosure";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -339,6 +340,11 @@ function BeeperTab({ addMode, addAccount, onDone }: TabProps) {
   const [missingFields, setMissingFields] = useState(false);
   // `true` once a Beeper call has failed; renders the distinct named state.
   const [failed, setFailed] = useState(false);
+  // Set to the returned account once `loginBeeper` succeeds; gates completion
+  // behind the coverage disclosure (FR-7). While non-null the disclosure +
+  // "I understand" acknowledgment is rendered instead of the form, and
+  // `addAccount`/`onDone` run only on acknowledgment.
+  const [pendingAccount, setPendingAccount] = useState<AccountVm | null>(null);
 
   // Mirror `pending` into a ref so the unmount cleanup reads the latest value.
   const pendingRef = useRef(false);
@@ -351,6 +357,9 @@ function BeeperTab({ addMode, addAccount, onDone }: TabProps) {
   // idle with `pending === false`), so the unmount cleanup must key off this, not
   // `pending`, or an abandoned code step would leak a registry entry.
   const flowStartedRef = useRef(false);
+  // Guards the disclosure acknowledgment so a rapid double-click can't fire
+  // `addAccount`/`onDone` twice before the surrounding UI tears down.
+  const acknowledgedRef = useRef(false);
   // On unmount mid-flow (overlay dismissed, tab switched away), clear any pending
   // Beeper request id in the backend registry so no residue lingers.
   useEffect(
@@ -405,8 +414,9 @@ function BeeperTab({ addMode, addAccount, onDone }: TabProps) {
       // The backend consumed the request id (`take`) to complete login, so there
       // is no registry residue left to cancel on unmount.
       flowStartedRef.current = false;
-      addAccount(account);
-      onDone?.();
+      // Auth succeeded — hold the account and render the coverage disclosure
+      // gate. `addAccount`/`onDone` run only on explicit acknowledgment (FR-7).
+      setPendingAccount(account);
     } catch {
       setFailed(true);
     } finally {
@@ -445,6 +455,29 @@ function BeeperTab({ addMode, addAccount, onDone }: TabProps) {
             </Button>
           )}
         </div>
+      </div>
+    );
+  }
+
+  if (pendingAccount !== null) {
+    // Auth already succeeded and persisted in the backend; the only forward path
+    // into the inbox is an explicit acknowledgment (no Cancel at this step).
+    return (
+      <div className="flex flex-col gap-4">
+        <BeeperCoverageDisclosure />
+        <Button
+          type="button"
+          onClick={() => {
+            if (acknowledgedRef.current) {
+              return;
+            }
+            acknowledgedRef.current = true;
+            addAccount(pendingAccount);
+            onDone?.();
+          }}
+        >
+          I understand
+        </Button>
       </div>
     );
   }

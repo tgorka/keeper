@@ -328,7 +328,7 @@ describe("LoginScreen", () => {
     expect(screen.getByRole("button", { name: "Verify" })).toBeInTheDocument();
   });
 
-  it("verifies the code, records the account, and calls onDone", async () => {
+  it("shows the coverage disclosure after login and does not record the account yet", async () => {
     beeperRequestCode.mockResolvedValue(undefined);
     loginBeeper.mockResolvedValue(account);
     const onDone = vi.fn();
@@ -342,6 +342,31 @@ describe("LoginScreen", () => {
     await waitFor(() => {
       expect(loginBeeper).toHaveBeenCalledWith("alice@beeper.com", "424242");
     });
+    // The coverage disclosure gate is shown before the account enters the inbox.
+    expect(
+      await screen.findByText(
+        "WhatsApp connected in the official Beeper app will not appear here.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "I understand" })).toBeInTheDocument();
+    // Neither addAccount nor onDone has run yet.
+    expect(accountsStore.getState().accounts).toEqual([]);
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it("records the account and calls onDone once when the disclosure is acknowledged", async () => {
+    beeperRequestCode.mockResolvedValue(undefined);
+    loginBeeper.mockResolvedValue(account);
+    const onDone = vi.fn();
+    render(<LoginScreen addMode onDone={onDone} />);
+    await openBeeperTab();
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "alice@beeper.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send code" }));
+    await screen.findByLabelText("Login code");
+    fireEvent.change(screen.getByLabelText("Login code"), { target: { value: "424242" } });
+    fireEvent.click(screen.getByRole("button", { name: "Verify" }));
+    const acknowledge = await screen.findByRole("button", { name: "I understand" });
+    fireEvent.click(acknowledge);
     await waitFor(() => {
       expect(accountsStore.getState().accounts).toEqual([account]);
     });

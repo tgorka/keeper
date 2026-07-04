@@ -16,8 +16,9 @@
  * Renders only the Add Account button when there are no accounts (it is never
  * count-gated), and nothing else.
  */
-import { LogOut, Plus } from "lucide-react";
+import { Info, LogOut, Plus } from "lucide-react";
 import { useState } from "react";
+import { BeeperCoverageDisclosure } from "@/components/auth/beeper-coverage-disclosure";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -30,6 +31,7 @@ import {
 } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSignOut } from "@/hooks/use-sign-out";
+import { isBeeperAccount } from "@/lib/beeper";
 import type { AccountVm } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useAddAccountStore } from "@/lib/stores/add-account";
@@ -41,12 +43,73 @@ interface AccountFooterProps {
 
 const FOCUS_RING = "focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none";
 
+/**
+ * Per-Beeper-account coverage control (FR-7): an info icon Button that opens a
+ * Dialog rendering the shared {@link BeeperCoverageDisclosure}. Rendered only
+ * for Beeper accounts, in both collapsed (Tooltip-wrapped) and expanded layouts,
+ * mirroring the sign-out control's structure. Its own Dialog is separate from
+ * the row's sign-out Dialog.
+ */
+function BeeperCoverageControl({ userId, collapsed }: { userId: string; collapsed: boolean }) {
+  const [open, setOpen] = useState(false);
+  const label = `Beeper coverage for ${userId}`;
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      {collapsed ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label={label}
+              className={FOCUS_RING}
+              onClick={() => setOpen(true)}
+            >
+              <Info aria-hidden="true" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="right">{label}</TooltipContent>
+        </Tooltip>
+      ) : (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label={label}
+          className={cn("shrink-0", FOCUS_RING)}
+          onClick={() => setOpen(true)}
+        >
+          <Info aria-hidden="true" />
+        </Button>
+      )}
+
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Beeper coverage</DialogTitle>
+          <DialogDescription>What keeper can and cannot sync for this Account.</DialogDescription>
+        </DialogHeader>
+        <BeeperCoverageDisclosure />
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button type="button" variant="outline" className={FOCUS_RING}>
+              Close
+            </Button>
+          </DialogClose>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 /** One account row (expanded or collapsed) with its own sign-out dialog. */
 function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boolean }) {
   const signOut = useSignOut();
   const [open, setOpen] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
   const userId = account.userId;
+  const isBeeper = isBeeperAccount(account);
 
   async function handleConfirm() {
     setSigningOut(true);
@@ -64,26 +127,30 @@ function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boo
     <Dialog open={open} onOpenChange={setOpen}>
       <div className={cn("flex shrink-0", collapsed ? "justify-center" : "items-center gap-2")}>
         {collapsed ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                aria-label={`Sign out ${userId}`}
-                className={FOCUS_RING}
-                onClick={() => setOpen(true)}
-              >
-                <LogOut aria-hidden="true" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="right">{`Sign out ${userId}`}</TooltipContent>
-          </Tooltip>
+          <>
+            {isBeeper && <BeeperCoverageControl userId={userId} collapsed={collapsed} />}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Sign out ${userId}`}
+                  className={FOCUS_RING}
+                  onClick={() => setOpen(true)}
+                >
+                  <LogOut aria-hidden="true" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="right">{`Sign out ${userId}`}</TooltipContent>
+            </Tooltip>
+          </>
         ) : (
           <>
             <span className="min-w-0 flex-1 truncate text-muted-foreground text-sm" title={userId}>
               {userId}
             </span>
+            {isBeeper && <BeeperCoverageControl userId={userId} collapsed={collapsed} />}
             <Button
               type="button"
               variant="ghost"

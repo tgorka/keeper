@@ -62,7 +62,7 @@ development_status:
   2-1-account-manager-unlimited-concurrent-accounts: done
   2-2-oidc-login-mas-msc3861: done
   2-3-beeper-email-code-login: done
-  2-4-beeper-coverage-disclosure: backlog
+  2-4-beeper-coverage-disclosure: done
   2-5-account-switcher-and-per-account-state: backlog
   2-6-at-rest-encryption-first-run-choice: backlog
   epic-2-retrospective: optional
