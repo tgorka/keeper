@@ -137,6 +137,44 @@ pub struct ConnectionStatusBatch {
     pub status: ConnectionStatus,
 }
 
+/// The account's live device-verification (encryption) posture, mapped from the
+/// SDK `client.encryption().verification_state()` (Story 3.1, FR, AD-8).
+///
+/// A Rust-authoritative honest signal streamed over the encryption-status
+/// channel: `Unknown` before crypto has synced (never nag), `Verified` once this
+/// device's user identity has signed it, `Unverified` for a freshly-logged-in
+/// device that cannot yet read encrypted history. The "verify this device" banner
+/// and the Settings badge are pure projections of this one status. Only the enum
+/// tag crosses IPC — never any key, session, or crypto material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum EncryptionStatus {
+    /// The verification state is not yet known — crypto has not synced. No banner
+    /// and no badge (avoid a false nag before the OlmMachine reports).
+    Unknown,
+    /// This device is verified — its user identity has signed it. The banner and
+    /// badge both clear.
+    Verified,
+    /// This device is unverified — encrypted history is locked until the user
+    /// verifies it (Story 3.2) or restores key backup (Story 3.3). Drives the
+    /// banner / badge.
+    Unverified,
+}
+
+/// A batch delivered over the encryption-status subscription's `Channel` (AD-8).
+///
+/// The status is a scalar snapshot, so each batch carries the full current
+/// [`EncryptionStatus`] — inherently idempotent, safe to re-subscribe. The stream
+/// opens with the current mapped status, then emits on change (deduped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct EncryptionStatusBatch {
+    /// The current device-verification status.
+    pub status: EncryptionStatus,
+}
+
 /// A single room row rendered in the chat list (FR-8, NFR-9, AD-20).
 ///
 /// Carries **only** non-secret render data. `timestamp` is `i64` milliseconds
@@ -281,8 +319,26 @@ pub enum TimelineItemVm {
         /// (received or reconciled) message that carries no send state.
         send_state: Option<SendState>,
     },
+    /// An event that could not be decrypted yet (`MsgLikeKind::UnableToDecrypt`).
+    /// Renders an explicit honest stub instead of a blank row (Story 3.1). Carries
+    /// **only** non-secret render data — a stable opaque render key, the sender
+    /// user id, a resolved display name, and the timestamp. NO ciphertext, session
+    /// id, or any crypto/key material ever crosses IPC on this VM (NFR-9, AD-1).
+    /// When room keys arrive later, the SDK re-maps this item to a
+    /// [`TimelineItemVm::Message`] via a `Set` diff — no extra code needed.
+    Utd {
+        /// Stable opaque render key (the item's `unique_id`).
+        key: String,
+        /// The sender's Matrix user id (opaque, passed through verbatim).
+        sender: String,
+        /// The resolved sender display name, or `null` when unavailable.
+        sender_display_name: Option<String>,
+        /// The event origin timestamp: ms since the Unix epoch (UTC).
+        #[ts(type = "number")]
+        timestamp: i64,
+    },
     /// Any non-text item (non-text msgtype, state/membership/profile change,
-    /// redacted, undecryptable, or a virtual date-divider/read-marker item).
+    /// redacted, or a virtual date-divider/read-marker item).
     /// Carried only to keep diff indices aligned; the frontend renders nothing.
     Other {
         /// Stable opaque render key (the item's `unique_id`).
@@ -956,6 +1012,91 @@ mod tests {
         assert!(json.contains("\"status\":\"offline\""), "json was: {json}");
         let back: ConnectionStatusBatch = serde_json::from_str(&json).expect("deserialize batch");
         assert_eq!(back, batch);
+    }
+
+    #[test]
+    fn encryption_status_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&EncryptionStatus::Unknown).expect("serialize unknown"),
+            "\"unknown\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EncryptionStatus::Verified).expect("serialize verified"),
+            "\"verified\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EncryptionStatus::Unverified).expect("serialize unverified"),
+            "\"unverified\""
+        );
+    }
+
+    #[test]
+    fn encryption_status_round_trips() {
+        for status in [
+            EncryptionStatus::Unknown,
+            EncryptionStatus::Verified,
+            EncryptionStatus::Unverified,
+        ] {
+            let json = serde_json::to_string(&status).expect("serialize status");
+            let back: EncryptionStatus = serde_json::from_str(&json).expect("deserialize status");
+            assert_eq!(back, status);
+        }
+    }
+
+    #[test]
+    fn encryption_status_batch_round_trips() {
+        let batch = EncryptionStatusBatch {
+            status: EncryptionStatus::Unverified,
+        };
+        let json = serde_json::to_string(&batch).expect("serialize batch");
+        assert!(
+            json.contains("\"status\":\"unverified\""),
+            "json was: {json}"
+        );
+        let back: EncryptionStatusBatch = serde_json::from_str(&json).expect("deserialize batch");
+        assert_eq!(back, batch);
+    }
+
+    #[test]
+    fn timeline_item_vm_utd_tags_and_round_trips() {
+        let vm = TimelineItemVm::Utd {
+            key: "unique-3".to_owned(),
+            sender: "@carol:example.org".to_owned(),
+            sender_display_name: Some("Carol".to_owned()),
+            timestamp: 1_720_000_000_000,
+        };
+        let json = serde_json::to_string(&vm).expect("serialize utd vm");
+        assert!(json.contains("\"kind\":\"utd\""), "json was: {json}");
+        assert!(json.contains("\"key\":\"unique-3\""), "json was: {json}");
+        assert!(
+            json.contains("\"senderDisplayName\":\"Carol\""),
+            "json was: {json}"
+        );
+        // No ciphertext / session / key material may appear on the VM.
+        assert!(
+            !json.contains("session"),
+            "json leaked a session field: {json}"
+        );
+        assert!(!json.contains("token"), "json leaked a token field: {json}");
+        let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize utd vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn timeline_item_vm_utd_null_display_name_round_trips() {
+        let vm = TimelineItemVm::Utd {
+            key: "k".to_owned(),
+            sender: "@a:example.org".to_owned(),
+            sender_display_name: None,
+            timestamp: 1,
+        };
+        let json = serde_json::to_string(&vm).expect("serialize");
+        assert!(
+            json.contains("\"senderDisplayName\":null"),
+            "json was: {json}"
+        );
+        let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, vm);
     }
 
     #[test]

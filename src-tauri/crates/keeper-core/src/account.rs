@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use matrix_sdk::encryption::VerificationState;
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
 };
@@ -43,8 +44,8 @@ use crate::registry;
 use crate::send::{self, SendTrigger};
 use crate::timeline;
 use crate::vm::{
-    ConnectionStatus, ConnectionStatusBatch, InboxBatch, RoomListBatch, RoomListOp, RoomVm,
-    TimelineBatch,
+    ConnectionStatus, ConnectionStatusBatch, EncryptionStatus, EncryptionStatusBatch, InboxBatch,
+    RoomListBatch, RoomListOp, RoomVm, TimelineBatch,
 };
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
@@ -67,6 +68,11 @@ pub type TimelineSink = Box<dyn Fn(TimelineBatch) -> bool + Send + Sync>;
 /// Tauri `Channel::send`; tests capture into a vector. Returns `true` if the
 /// batch was delivered, `false` if the channel is closed (the producer stops).
 pub type ConnectionSink = Box<dyn Fn(ConnectionStatusBatch) -> bool + Send + Sync>;
+
+/// Sink that receives each produced [`EncryptionStatusBatch`]. The shell wraps a
+/// Tauri `Channel::send`; tests capture into a vector. Returns `true` if the batch
+/// was delivered, `false` if the channel is closed (the producer then stops).
+pub type EncryptionSink = Box<dyn Fn(EncryptionStatusBatch) -> bool + Send + Sync>;
 
 /// Sink that receives each merged [`InboxBatch`]. The shell wraps a Tauri
 /// `Channel::send`; tests capture into a vector. Returns `true` if the batch was
@@ -643,6 +649,103 @@ impl AccountManager {
         }
     }
 
+    /// Subscribe to the account's encryption (device-verification) status,
+    /// activating the account if it is not already live (reusing the same
+    /// `Client`/`SyncService` — never a second one). Spawns a supervised producer
+    /// over `client.encryption().verification_state()` that emits the current
+    /// mapped [`EncryptionStatus`] as an initial snapshot, then a deduped diff on
+    /// every change, into `sink`. Returns the subscription id.
+    ///
+    /// Mirrors [`subscribe_connection_status`]'s lazy-activation +
+    /// supervised-task + self-reap lifecycle: the `JoinHandle` is registered in
+    /// the subscriptions map and aborted on unsubscribe / shutdown. An activation
+    /// failure maps to the existing `SyncUnavailable` code (retriable).
+    pub async fn subscribe_encryption_status(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        sink: EncryptionSink,
+    ) -> Result<u64, CoreError> {
+        // Activate under the manager lock so a concurrent subscribe cannot build
+        // a second Client/SyncService for the same account. `did_activate`
+        // records whether *this* call brought the account live, so a failure
+        // before any subscription attaches can tear it back down (AD-21).
+        let (client, subs_arc, did_activate) = {
+            let mut accounts = self.accounts.lock().await;
+            let did_activate = !accounts.contains_key(account_id);
+            if did_activate {
+                let (client, sync, reconnect_supervisor, session_persister) =
+                    activate(platform, account_id).await?;
+                accounts.insert(
+                    account_id.to_owned(),
+                    AccountHandle {
+                        client,
+                        sync,
+                        subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                        timelines: Arc::new(Mutex::new(HashMap::new())),
+                        reconnect_supervisor,
+                        session_persister,
+                    },
+                );
+                tracing::info!(account_id = %account_id, "account activated for encryption status");
+            }
+            let handle = accounts.get(account_id).ok_or_else(|| {
+                CoreError::Internal("account handle vanished after activation".to_owned())
+            })?;
+            (
+                handle.client.clone(),
+                handle.subscriptions.clone(),
+                did_activate,
+            )
+        };
+
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let account_id_owned = account_id.to_owned();
+        let span = tracing::info_span!("encryption_status_producer", account_id = %account_id);
+        let reaper_subs = subs_arc.clone();
+        let task = tokio::spawn(
+            async move {
+                run_encryption_status_producer(&client, sink, &account_id_owned).await;
+                // `client` is kept alive for the whole producer via `run_...`'s
+                // borrow; the account also holds its own clone.
+                let _keep_alive = client;
+                // A naturally-completed producer reaps its own subscription entry.
+                reaper_subs.lock().await.remove(&subscription_id);
+            }
+            .instrument(span),
+        );
+
+        {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(_) => {
+                    subs_arc.lock().await.insert(subscription_id, task);
+                }
+                None => {
+                    // The account was shut down in the spawn→register gap;
+                    // aborting the orphaned producer here leaks nothing.
+                    task.abort();
+                    if did_activate {
+                        return Err(AccountError::SyncStart(
+                            "account removed during subscribe".to_owned(),
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        tracing::info!(account_id = %account_id, subscription_id, "encryption status subscribed");
+        Ok(subscription_id)
+    }
+
+    /// Abort exactly the encryption-status producer task for `subscription_id`;
+    /// other account state is untouched. Idempotent.
+    pub async fn unsubscribe_encryption_status(&self, account_id: &str, subscription_id: u64) {
+        if self.abort_subscription(account_id, subscription_id).await {
+            tracing::info!(account_id = %account_id, subscription_id, "encryption status unsubscribed");
+        }
+    }
+
     /// Abort exactly the producer task for `subscription_id`; other account
     /// state is untouched. Idempotent — unsubscribing an unknown id is a no-op.
     pub async fn unsubscribe_room_list(&self, account_id: &str, subscription_id: u64) {
@@ -1038,6 +1141,45 @@ fn map_connection_status(state: &State) -> ConnectionStatus {
         State::Idle | State::Terminated | State::Error(_) | State::Offline => {
             ConnectionStatus::Offline
         }
+    }
+}
+
+/// Drive the device-verification stream: emit the current mapped
+/// [`EncryptionStatus`] as an initial snapshot, then a batch on every
+/// `verification_state()` change, deduping consecutive-equal statuses (the
+/// snapshot-then-diff contract, AD-8). Stops when the sink reports the channel is
+/// closed or the subscriber ends. Reads only the SDK verification state — no key,
+/// session, or plaintext material is touched (NFR-9, AD-1).
+async fn run_encryption_status_producer(client: &Client, sink: EncryptionSink, account_id: &str) {
+    let mut states = client.encryption().verification_state();
+    let mut last = map_encryption_status(&states.get());
+    if !(sink)(EncryptionStatusBatch { status: last }) {
+        tracing::info!(account_id = %account_id, "encryption status channel closed, stopping producer");
+        return;
+    }
+    while let Some(state) = states.next().await {
+        let status = map_encryption_status(&state);
+        if status == last {
+            continue;
+        }
+        last = status;
+        if !(sink)(EncryptionStatusBatch { status }) {
+            tracing::info!(account_id = %account_id, "encryption status channel closed, stopping producer");
+            break;
+        }
+    }
+    tracing::info!(account_id = %account_id, "encryption status stream ended");
+}
+
+/// Pure mapping of the SDK [`VerificationState`] to an [`EncryptionStatus`]:
+/// `Unknown` → `Unknown` (crypto not synced — no nag), `Verified` → `Verified`,
+/// `Unverified` → `Unverified`. The "verify this device" banner and the Settings
+/// badge derive from this one signal; the banner shows only on `Unverified`.
+fn map_encryption_status(state: &VerificationState) -> EncryptionStatus {
+    match state {
+        VerificationState::Unknown => EncryptionStatus::Unknown,
+        VerificationState::Verified => EncryptionStatus::Verified,
+        VerificationState::Unverified => EncryptionStatus::Unverified,
     }
 }
 
@@ -1566,6 +1708,22 @@ mod tests {
         for state in [State::Idle, State::Terminated, State::Offline] {
             assert_eq!(map_connection_status(&state), ConnectionStatus::Offline);
         }
+    }
+
+    #[test]
+    fn map_encryption_status_covers_all_variants() {
+        assert_eq!(
+            map_encryption_status(&VerificationState::Unknown),
+            EncryptionStatus::Unknown
+        );
+        assert_eq!(
+            map_encryption_status(&VerificationState::Verified),
+            EncryptionStatus::Verified
+        );
+        assert_eq!(
+            map_encryption_status(&VerificationState::Unverified),
+            EncryptionStatus::Unverified
+        );
     }
 
     #[test]

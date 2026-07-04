@@ -93,10 +93,14 @@ fn truncate_body(body: String) -> String {
 /// Map one SDK [`TimelineItem`] to exactly one [`TimelineItemVm`].
 ///
 /// An event item carrying a text `m.room.message` becomes a
-/// [`TimelineItemVm::Message`]; everything else (non-text msgtype, other
-/// content kinds, redacted, undecryptable, and virtual items) becomes a
-/// [`TimelineItemVm::Other`] carrying only the stable opaque key, so diff
-/// indices stay aligned. All accessors are sync (`VectorDiff::map` is sync).
+/// [`TimelineItemVm::Message`]; an event the SDK could not decrypt
+/// (`MsgLikeKind::UnableToDecrypt`) becomes a [`TimelineItemVm::Utd`] carrying
+/// only its stable key, sender, resolved display name, and timestamp — never any
+/// ciphertext, session id, or key material (NFR-9, AD-1) — so the frontend can
+/// render an honest stub instead of a blank row. Everything else (non-text
+/// msgtype, other content kinds, redacted, and virtual items) becomes a
+/// [`TimelineItemVm::Other`] carrying only the stable opaque key, so diff indices
+/// stay aligned. All accessors are sync (`VectorDiff::map` is sync).
 pub fn item_to_vm(item: &TimelineItem) -> TimelineItemVm {
     let key = item.unique_id().0.clone();
     let TimelineItemKind::Event(ev) = item.kind() else {
@@ -105,26 +109,37 @@ pub fn item_to_vm(item: &TimelineItem) -> TimelineItemVm {
     let TimelineItemContent::MsgLike(msg_like) = ev.content() else {
         return TimelineItemVm::Other { key };
     };
-    let MsgLikeKind::Message(message) = &msg_like.kind else {
-        return TimelineItemVm::Other { key };
-    };
-    let Some(body) = text_body(message.msgtype()) else {
-        return TimelineItemVm::Other { key };
-    };
 
     let sender_display_name = match ev.sender_profile() {
         TimelineDetails::Ready(profile) => profile.display_name.clone(),
         _ => None,
     };
 
-    TimelineItemVm::Message {
-        key,
-        sender: ev.sender().to_string(),
-        sender_display_name,
-        body: truncate_body(body),
-        timestamp: i64::from(ev.timestamp().0),
-        is_own: ev.is_own(),
-        send_state: ev.send_state().map(map_send_state),
+    match &msg_like.kind {
+        MsgLikeKind::Message(message) => {
+            let Some(body) = text_body(message.msgtype()) else {
+                return TimelineItemVm::Other { key };
+            };
+            TimelineItemVm::Message {
+                key,
+                sender: ev.sender().to_string(),
+                sender_display_name,
+                body: truncate_body(body),
+                timestamp: i64::from(ev.timestamp().0),
+                is_own: ev.is_own(),
+                send_state: ev.send_state().map(map_send_state),
+            }
+        }
+        // An event that cannot be decrypted yet: surface an honest stub. No
+        // ciphertext/session material is read from the `EncryptedMessage` — only
+        // the sender, display name, and timestamp cross IPC (NFR-9, AD-1).
+        MsgLikeKind::UnableToDecrypt(_) => TimelineItemVm::Utd {
+            key,
+            sender: ev.sender().to_string(),
+            sender_display_name,
+            timestamp: i64::from(ev.timestamp().0),
+        },
+        _ => TimelineItemVm::Other { key },
     }
 }
 

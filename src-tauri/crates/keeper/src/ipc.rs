@@ -20,8 +20,8 @@ use keeper_core::error::{
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
-    AccountVm, ConnectionStatusBatch, DemoBatch, InboxBatch, IpcError, IpcErrorCode, PingVm,
-    RoomListBatch, TimelineBatch,
+    AccountVm, ConnectionStatusBatch, DemoBatch, EncryptionStatusBatch, InboxBatch, IpcError,
+    IpcErrorCode, PingVm, RoomListBatch, TimelineBatch,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -497,6 +497,44 @@ pub async fn connection_status_unsubscribe(
     state
         .accounts
         .unsubscribe_connection_status(&account_id, subscription_id)
+        .await;
+    Ok(())
+}
+
+/// Subscribe to an account's encryption (device-verification) status (Story 3.1,
+/// AD-8).
+///
+/// Lazily activates the account (reusing the room-list/timeline/connection path),
+/// then streams [`EncryptionStatusBatch`]es over `channel` — an initial snapshot
+/// of the current status, then deduped changes — and returns the subscription id.
+/// The sink forwards each batch to the channel; a closed channel simply drops the
+/// batch (the frontend has unsubscribed). An activation failure funnels through
+/// [`to_ipc_error`] to the existing `SyncUnavailable` code.
+#[tauri::command]
+pub async fn encryption_status_subscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    channel: Channel<EncryptionStatusBatch>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |batch: EncryptionStatusBatch| channel.send(batch).is_ok());
+    state
+        .accounts
+        .subscribe_encryption_status(&state.platform, &account_id, sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unsubscribe exactly one encryption-status subscription, aborting its producer
+/// task (AD-19). Other account state is untouched. Idempotent.
+#[tauri::command]
+pub async fn encryption_status_unsubscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_encryption_status(&account_id, subscription_id)
         .await;
     Ok(())
 }

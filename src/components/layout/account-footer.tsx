@@ -30,6 +30,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -55,6 +56,8 @@ import type { AccountVm, ConnectionStatus } from "@/lib/ipc/client";
 import { useAccountStatus } from "@/lib/stores/account-status";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useAddAccountStore } from "@/lib/stores/add-account";
+import { useShowVerifyBadgeForAccount } from "@/lib/stores/encryption-status";
+import { settingsUiStore, useSettingsOpen } from "@/lib/stores/settings-ui";
 import { cn } from "@/lib/utils";
 
 interface AccountFooterProps {
@@ -207,50 +210,58 @@ function SignOutDialog({
 /** The per-row menu (Settings / Beeper coverage / Sign out…) plus the dialogs it
  * opens. Rendered in both collapsed and expanded rows. */
 function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed: boolean }) {
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  // The Settings dialog open-state is shared (Story 3.1) so the verify banner and
+  // the UTD stub can open it too; the per-row menu drives the same store. The
+  // single dialog instance is mounted once in {@link AccountFooter}.
+  const setSettingsOpen = settingsUiStore.getState().setSettingsOpen;
   const [coverageOpen, setCoverageOpen] = useState(false);
   const [signOutOpen, setSignOutOpen] = useState(false);
+  // The persistent verify badge: shown on THIS account's row once the banner is
+  // dismissed while THIS device is still unverified (it collapses to a Settings
+  // badge, not gone). Account-scoped so a verified account's row stays clean.
+  const showVerifyBadge = useShowVerifyBadgeForAccount(account.accountId);
   const userId = account.userId;
   const isBeeper = isBeeperAccount(account);
   const menuLabel = `Account menu for ${userId}`;
+
+  const trigger = (
+    <DropdownMenuTrigger asChild>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-sm"
+        aria-label={menuLabel}
+        className={cn("relative shrink-0", FOCUS_RING)}
+      >
+        <MoreVertical aria-hidden="true" />
+        {showVerifyBadge && (
+          <Badge
+            aria-hidden="true"
+            className="-top-0.5 -right-0.5 absolute size-2 rounded-full p-0"
+          />
+        )}
+      </Button>
+    </DropdownMenuTrigger>
+  );
 
   return (
     <>
       <DropdownMenu>
         {collapsed ? (
           <Tooltip>
-            <TooltipTrigger asChild>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={menuLabel}
-                  className={cn("shrink-0", FOCUS_RING)}
-                >
-                  <MoreVertical aria-hidden="true" />
-                </Button>
-              </DropdownMenuTrigger>
-            </TooltipTrigger>
+            <TooltipTrigger asChild>{trigger}</TooltipTrigger>
             <TooltipContent side="right">{menuLabel}</TooltipContent>
           </Tooltip>
         ) : (
-          <DropdownMenuTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              aria-label={menuLabel}
-              className={cn("shrink-0", FOCUS_RING)}
-            >
-              <MoreVertical aria-hidden="true" />
-            </Button>
-          </DropdownMenuTrigger>
+          trigger
         )}
         <DropdownMenuContent align="end" side="right">
           <DropdownMenuItem onSelect={() => setSettingsOpen(true)}>
             <Settings aria-hidden="true" />
             Settings
+            {showVerifyBadge && (
+              <Badge aria-hidden="true" className="ml-auto size-2 rounded-full p-0" />
+            )}
           </DropdownMenuItem>
           {isBeeper && (
             <DropdownMenuItem onSelect={() => setCoverageOpen(true)}>
@@ -265,7 +276,6 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
         </DropdownMenuContent>
       </DropdownMenu>
 
-      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       {isBeeper && (
         <BeeperCoverageDialog userId={userId} open={coverageOpen} onOpenChange={setCoverageOpen} />
       )}
@@ -350,6 +360,11 @@ function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boo
 export function AccountFooter({ collapsed }: AccountFooterProps) {
   const accounts = useAccountsStore((s) => s.accounts);
   const openAddAccount = useAddAccountStore((s) => s.openAddAccount);
+  // A single shared Settings dialog for the whole footer, driven by the shared
+  // open-state store (Story 3.1) so the verify banner / UTD stub open the same
+  // one — never one per account row.
+  const settingsOpen = useSettingsOpen();
+  const setSettingsOpen = settingsUiStore.getState().setSettingsOpen;
 
   return (
     <div
@@ -358,6 +373,7 @@ export function AccountFooter({ collapsed }: AccountFooterProps) {
         collapsed && "items-center",
       )}
     >
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       {accounts.map((account) => (
         <AccountRow key={account.accountId} account={account} collapsed={collapsed} />
       ))}

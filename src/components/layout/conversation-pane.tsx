@@ -18,6 +18,7 @@ import { PanelRight } from "lucide-react";
 import { type Ref, useCallback, useEffect, useRef, useState } from "react";
 import { Composer } from "@/components/chat/composer";
 import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble";
+import { UtdStub } from "@/components/chat/utd-stub";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { TimelineBatch, TimelineItemVm } from "@/lib/ipc/client";
@@ -32,43 +33,66 @@ interface ConversationPaneProps {
   toggleRef?: Ref<HTMLButtonElement>;
 }
 
-/**
- * A `Message` item paired with whether it continues a same-sender run
- * (`grouped`) and whether it ends one (`groupTail` — the transient send-state
- * caption renders only on the tail).
- */
-interface RenderedMessage {
-  item: MessageVm;
-  grouped: boolean;
-  groupTail: boolean;
-}
+/** The `utd`-variant of {@link TimelineItemVm} (rendered as an honest stub). */
+type UtdVm = Extract<TimelineItemVm, { kind: "utd" }>;
 
 /**
- * Project the streamed timeline into the renderable message sequence, computing
+ * A renderable timeline row. A `message` row is a text bubble paired with whether
+ * it continues a same-sender run (`grouped`) and whether it ends one (`groupTail`
+ * — the transient send-state caption renders only on the tail). A `utd` row is an
+ * undecryptable-event stub (never grouped); it breaks same-sender runs but is
+ * emitted (not skipped like `other`), so it renders inline and never blank.
+ */
+type RenderedRow =
+  | { kind: "message"; item: MessageVm; grouped: boolean; groupTail: boolean }
+  | { kind: "utd"; item: UtdVm };
+
+/**
+ * Project the streamed timeline into the renderable row sequence, computing
  * grouping in a single pass: a `Message` is `grouped` when the immediately
  * preceding **rendered** message has the same sender, and is the run's
  * `groupTail` when the immediately following **rendered** message has a different
- * sender (or there is none). `Other` items are skipped but break a run (an
- * interleaved non-text item ungroups the next message and ends the current run).
+ * sender (or there is none). A `utd` item is emitted as its own row and breaks a
+ * same-sender run (like `other`, but visible). `Other` items are skipped but also
+ * break a run (an interleaved non-text item ungroups the next message and ends
+ * the current run).
  */
-function toRenderedMessages(items: TimelineItemVm[]): RenderedMessage[] {
-  const rendered: RenderedMessage[] = [];
+function toRenderedRows(items: TimelineItemVm[]): RenderedRow[] {
+  const rendered: RenderedRow[] = [];
   let prevSender: string | null = null;
+
+  /** Mark the last rendered message (if any) as a group tail — a boundary. */
+  const closeRun = () => {
+    const last = rendered[rendered.length - 1];
+    if (last?.kind === "message") {
+      last.groupTail = true;
+    }
+    prevSender = null;
+  };
+
   for (const item of items) {
-    if (item.kind !== "message") {
-      // A non-rendered item breaks the same-sender run: the previous rendered
-      // message is now a group tail.
-      if (rendered.length > 0) {
-        rendered[rendered.length - 1].groupTail = true;
-      }
-      prevSender = null;
+    if (item.kind === "utd") {
+      // A UTD stub breaks the run but is itself rendered (never blank).
+      closeRun();
+      rendered.push({ kind: "utd", item });
       continue;
     }
-    if (rendered.length > 0 && prevSender === item.sender) {
-      // This message continues the run, so the previous one is not the tail.
-      rendered[rendered.length - 1].groupTail = false;
+    if (item.kind !== "message") {
+      // A non-rendered item breaks the same-sender run.
+      closeRun();
+      continue;
     }
-    rendered.push({ item, grouped: prevSender === item.sender, groupTail: true });
+    const last = rendered[rendered.length - 1];
+    if (last?.kind === "message" && prevSender === item.sender) {
+      // This message continues the run, so the previous one is not the tail.
+      last.groupTail = false;
+    }
+    rendered.push({
+      kind: "message",
+      item,
+      grouped: prevSender === item.sender,
+      groupTail: true,
+    });
     prevSender = item.sender;
   }
   return rendered;
@@ -148,7 +172,7 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     }
   }, [items]);
 
-  const messages = toRenderedMessages(items);
+  const rows = toRenderedRows(items);
   const roomLoaded = accountId !== null && selectedRoomId !== null && loaded && !errored;
 
   const onSend = useCallback(
@@ -212,7 +236,7 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
             <Skeleton key={i} className="h-10 w-1/2 rounded-[14px]" />
           ))}
         </div>
-      ) : messages.length === 0 ? (
+      ) : rows.length === 0 ? (
         <div className="flex flex-1 items-center justify-center p-8">
           <p className="max-w-sm text-center text-muted-foreground text-sm">No messages yet.</p>
         </div>
@@ -222,17 +246,23 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
             aria-label="Messages"
             className="mx-auto mt-auto flex w-full max-w-[720px] flex-col px-4 py-4"
           >
-            {messages.map(({ item, grouped, groupTail }) => (
-              <li key={item.key}>
-                <MessageBubble
-                  item={item}
-                  grouped={grouped}
-                  groupTail={groupTail}
-                  onRetry={onRetry}
-                  offline={offline}
-                />
-              </li>
-            ))}
+            {rows.map((row) =>
+              row.kind === "utd" ? (
+                <li key={row.item.key}>
+                  <UtdStub />
+                </li>
+              ) : (
+                <li key={row.item.key}>
+                  <MessageBubble
+                    item={row.item}
+                    grouped={row.grouped}
+                    groupTail={row.groupTail}
+                    onRetry={onRetry}
+                    offline={offline}
+                  />
+                </li>
+              ),
+            )}
           </ol>
         </div>
       )}

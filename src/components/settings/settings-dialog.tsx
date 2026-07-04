@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
@@ -13,6 +14,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { encryptionPosture } from "@/lib/ipc/client";
+import { useAccountsStore } from "@/lib/stores/accounts";
+import { useEncryptionStatus } from "@/lib/stores/encryption-status";
 
 interface SettingsDialogProps {
   /** Whether the dialog is open (controlled by the caller). */
@@ -81,7 +84,66 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           <p>{sdkStatus}</p>
           <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>
         </div>
+        <EncryptionSection />
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** The honest copy explaining what verifying a device unlocks (Story 3.1). */
+const ENCRYPTION_HONESTY_SENTENCE =
+  "Verifying this device unlocks encrypted history and lets other people trust your messages.";
+
+/**
+ * Read-only Encryption section (Story 3.1): lists each signed-in account's device
+ * state (Verified / Not verified) from the encryption-status store, plus the
+ * honest sentence on what verifying unlocks. There is intentionally NO interactive
+ * Verify button here — the interactive verify flow lands in Story 3.2; 3.1 only
+ * makes the honest state visible.
+ */
+function EncryptionSection() {
+  const accounts = useAccountsStore((s) => s.accounts);
+
+  return (
+    <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
+      <p className="font-medium">Encryption</p>
+      {accounts.length === 0 ? (
+        <p className="text-muted-foreground">No accounts signed in.</p>
+      ) : (
+        <ul className="flex flex-col gap-1.5">
+          {accounts.map((account) => (
+            <EncryptionAccountRow key={account.accountId} accountId={account.accountId}>
+              {account.userId}
+            </EncryptionAccountRow>
+          ))}
+        </ul>
+      )}
+      <p className="text-muted-foreground">{ENCRYPTION_HONESTY_SENTENCE}</p>
+    </div>
+  );
+}
+
+/** One account's device-verification state row. Three honest states, never
+ * over-claiming: `verified` reads "Verified"; an explicit `unverified` reads
+ * "Not verified"; and `unknown`/pending (crypto not yet reported) reads a neutral
+ * "Checking…" — the same "no false nag before crypto syncs" rule the banner
+ * honors, so a device mid-sync is never labelled a problem. */
+function EncryptionAccountRow({ accountId, children }: { accountId: string; children: ReactNode }) {
+  const status = useEncryptionStatus(accountId);
+  const label =
+    status === "verified" ? "Verified" : status === "unverified" ? "Not verified" : "Checking…";
+  // Only an explicit `unverified` gets the attention tone; verified and the
+  // transient checking state stay muted.
+  const tone = status === "unverified" ? "text-held text-xs" : "text-muted-foreground text-xs";
+  return (
+    <li className="flex items-center justify-between gap-2">
+      <span
+        className="truncate font-mono text-xs"
+        title={typeof children === "string" ? children : undefined}
+      >
+        {children}
+      </span>
+      <span className={tone}>{label}</span>
+    </li>
   );
 }

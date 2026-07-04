@@ -3,9 +3,11 @@ import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
 import { SidebarPane } from "@/components/layout/sidebar-pane";
+import { VerifyBanner } from "@/components/layout/verify-banner";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAccountStatuses } from "@/hooks/use-account-statuses";
+import { useEncryptionStatuses } from "@/hooks/use-encryption-statuses";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 
 export function AppShell() {
@@ -14,6 +16,9 @@ export function AppShell() {
   // switcher glyphs, the shell offline pill, and the "Queued" send caption are
   // all pure projections of that single map.
   useAccountStatuses();
+  // Stream every account's device-verification status into the encryption store:
+  // the verify banner and the Settings badge are pure projections of that map.
+  useEncryptionStatuses();
   const [detailOpen, setDetailOpen] = useState(false);
   const toggleRef = useRef<HTMLButtonElement>(null);
 
@@ -45,6 +50,7 @@ export function AppShell() {
             window stays movable and the traffic lights float over empty space
             above the panes rather than overlapping pane content in any state. */}
         <div data-tauri-drag-region className="h-7 shrink-0" />
+        <VerifyBanner />
         <div className="flex min-h-0 flex-1">
           <SidebarPane collapsed={sidebarCollapsed} />
           <ChatListPane />

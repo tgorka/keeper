@@ -14,6 +14,8 @@ export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
+export type { EncryptionStatus } from "./gen/EncryptionStatus";
+export type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 export type { InboxBatch } from "./gen/InboxBatch";
 export type { InboxOp } from "./gen/InboxOp";
 export type { InboxRoomVm } from "./gen/InboxRoomVm";
@@ -31,6 +33,7 @@ export type { TimelineOp } from "./gen/TimelineOp";
 
 import type { AccountVm } from "./gen/AccountVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
+import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 import type { InboxBatch } from "./gen/InboxBatch";
 import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { TimelineBatch } from "./gen/TimelineBatch";
@@ -299,6 +302,30 @@ export async function subscribeConnectionStatus(
  */
 export async function unsubscribeConnectionStatus(accountId: string, id: number): Promise<void> {
   await invoke<void>("connection_status_unsubscribe", { accountId, subscriptionId: id });
+}
+
+/**
+ * Subscribe to an account's encryption (device-verification) status (Story 3.1,
+ * AD-8). Opens a `Channel`, forwards each {@link EncryptionStatusBatch} to
+ * `onBatch` in arrival order (an initial snapshot before any change), and resolves
+ * with the subscription id. Rejects with the {@link IpcError} envelope (`code:
+ * "syncUnavailable"`) if the account cannot start syncing.
+ */
+export async function subscribeEncryptionStatus(
+  accountId: string,
+  onBatch: (batch: EncryptionStatusBatch) => void,
+): Promise<number> {
+  return await subscribe<EncryptionStatusBatch>("encryption_status_subscribe", onBatch, {
+    accountId,
+  });
+}
+
+/**
+ * Unsubscribe exactly one encryption-status subscription, aborting its backend
+ * producer task (AD-19). Idempotent — unsubscribing an unknown id is a no-op.
+ */
+export async function unsubscribeEncryptionStatus(accountId: string, id: number): Promise<void> {
+  await invoke<void>("encryption_status_unsubscribe", { accountId, subscriptionId: id });
 }
 
 /**

@@ -50,6 +50,8 @@ pub fn run() {
             ipc::timeline_unsubscribe,
             ipc::connection_status_subscribe,
             ipc::connection_status_unsubscribe,
+            ipc::encryption_status_subscribe,
+            ipc::encryption_status_unsubscribe,
             ipc::send_text,
             ipc::send_retry,
             ipc::session_restore,

@@ -135,6 +135,103 @@ describe("ConversationPane", () => {
     expect(screen.getByLabelText("Messages")).toBeInTheDocument();
   });
 
+  it("renders a streamed UTD item as an honest stub (never blank)", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+
+    captured.onBatch?.({
+      ops: [
+        {
+          op: "reset",
+          items: [
+            {
+              kind: "utd",
+              key: "u1",
+              sender: "@carol:example.org",
+              senderDisplayName: "Carol",
+              timestamp: 1,
+            },
+          ],
+        },
+      ],
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Can't decrypt yet — verify this device or restore key backup"),
+      ).toBeInTheDocument();
+    });
+    // The stub carries a working inline Verify affordance.
+    expect(screen.getByRole("button", { name: "Verify" })).toBeInTheDocument();
+  });
+
+  it("replaces a UTD stub with the decrypted message when keys arrive (Set diff)", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+
+    // An undecryptable event first renders as the honest stub.
+    captured.onBatch?.({
+      ops: [
+        {
+          op: "reset",
+          items: [
+            {
+              kind: "utd",
+              key: "u1",
+              sender: "@carol:example.org",
+              senderDisplayName: "Carol",
+              timestamp: 1,
+            },
+          ],
+        },
+      ],
+    });
+    await waitFor(() => {
+      expect(
+        screen.getByText("Can't decrypt yet — verify this device or restore key backup"),
+      ).toBeInTheDocument();
+    });
+
+    // Keys arrive: the SDK retries decryption and re-maps the item in place via a
+    // `Set` diff at the same index/key — no extra client code, the stub self-heals.
+    captured.onBatch?.({
+      ops: [
+        {
+          op: "set",
+          index: 0,
+          item: {
+            kind: "message",
+            key: "u1",
+            sender: "@carol:example.org",
+            senderDisplayName: "Carol",
+            body: "now decrypted",
+            timestamp: 1,
+            isOwn: false,
+            sendState: null,
+          },
+        },
+      ],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("now decrypted")).toBeInTheDocument();
+    });
+    // The stub is gone — it was transient, replaced by the decrypted bubble.
+    expect(
+      screen.queryByText("Can't decrypt yet — verify this device or restore key backup"),
+    ).not.toBeInTheDocument();
+  });
+
   it("groups consecutive same-sender messages under a single name", async () => {
     const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
     subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {

@@ -24,6 +24,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { addAccountStore } from "@/lib/stores/add-account";
+import { encryptionStatusStore } from "@/lib/stores/encryption-status";
+import { settingsUiStore } from "@/lib/stores/settings-ui";
 
 function account(id: string, userId: string, hue = 0, provider: Provider = "password"): AccountVm {
   return {
@@ -68,6 +70,8 @@ beforeEach(() => {
   accountsStore.getState().clear();
   accountsStore.setState({ filterAccountId: null });
   accountStatusStore.getState().reset();
+  encryptionStatusStore.getState().reset();
+  settingsUiStore.getState().setSettingsOpen(false);
   addAccountStore.getState().closeAddAccount();
   signOutHandler.mockReset();
   signOutHandler.mockResolvedValue(undefined);

@@ -43,7 +43,23 @@ isOwn: boolean,
  * The delivery state of an outgoing local echo, or `null` for a remote
  * (received or reconciled) message that carries no send state.
  */
-sendState: SendState | null, } | { "kind": "other", 
+sendState: SendState | null, } | { "kind": "utd", 
+/**
+ * Stable opaque render key (the item's `unique_id`).
+ */
+key: string, 
+/**
+ * The sender's Matrix user id (opaque, passed through verbatim).
+ */
+sender: string, 
+/**
+ * The resolved sender display name, or `null` when unavailable.
+ */
+senderDisplayName: string | null, 
+/**
+ * The event origin timestamp: ms since the Unix epoch (UTC).
+ */
+timestamp: number, } | { "kind": "other", 
 /**
  * Stable opaque render key (the item's `unique_id`).
  */
