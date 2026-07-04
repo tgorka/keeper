@@ -87,6 +87,53 @@ pub enum IpcErrorCode {
     /// / confirm / mismatch / cancel / request) failed. Retriable — the user can
     /// restart verification. Serializes as `"verificationFailed"`.
     VerificationFailed,
+    /// A recovery key pasted for key-backup restore could not be decoded — it is
+    /// malformed (wrong length / not a valid base58 recovery key) (Story 3.3,
+    /// FR-14). Named so the modal can say "that doesn't look like a recovery key"
+    /// rather than a generic failure. Serializes as `"backupMalformedKey"`.
+    BackupMalformedKey,
+    /// A well-formed recovery key failed the MAC check for this account — it does
+    /// not match (Story 3.3, FR-14). Named so the modal can say "recovery key
+    /// didn't match this account" rather than a generic failure. Serializes as
+    /// `"backupIncorrectKey"`.
+    BackupIncorrectKey,
+    /// Enabling key backup raced an existing server-side backup: a backup already
+    /// exists on the homeserver (Story 3.3). Named so the modal can offer restore
+    /// instead of a generic failure. Serializes as `"backupExists"`.
+    BackupExists,
+    /// A key-backup enable/restore action failed for another reason (crypto not
+    /// ready, network, or another SDK error). Retriable — the user can try again.
+    /// Serializes as `"backupFailed"`.
+    BackupFailed,
+}
+
+/// The account's live server-side key-backup posture, mapped from the SDK
+/// `client.encryption().recovery().state()` (Story 3.3, FR-14, AD-8).
+///
+/// A Rust-authoritative honest signal streamed over the backup-status channel:
+/// `Unknown` before crypto has synced ("Checking…"), `Disabled` when no backup is
+/// set up (offer "Set up backup"), `Enabled` once this device is connected to the
+/// backup ("Backup on"), `Incomplete` when a backup exists on the server but this
+/// device is not yet connected — the fresh-login restore case ("Needs your
+/// recovery key"). The Settings backup row is a pure projection of this one
+/// status. Only the enum tag crosses IPC — never any key or secret-storage
+/// material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum BackupStatus {
+    /// The recovery state is not yet known — crypto has not synced. Renders
+    /// "Checking…" (avoid a false claim before the OlmMachine reports).
+    Unknown,
+    /// No default secret-storage key exists / recovery is disabled — no backup is
+    /// set up. The Settings row offers "Set up backup".
+    Disabled,
+    /// Secret storage is set up and this device has all the secrets locally —
+    /// backup is on. The Settings row reads "Backup on".
+    Enabled,
+    /// A backup exists on the server but this device is missing some secrets — the
+    /// fresh-login restore case. The Settings row offers "Restore".
+    Incomplete,
 }
 
 /// The delivery state of an outgoing (local-echo) message (FR-9, AD-13, UX-DR10).
@@ -935,6 +982,64 @@ mod tests {
                 .expect("serialize verification-failed code"),
             "\"verificationFailed\""
         );
+    }
+
+    #[test]
+    fn backup_error_codes_serialize_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::BackupMalformedKey)
+                .expect("serialize backup-malformed code"),
+            "\"backupMalformedKey\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::BackupIncorrectKey)
+                .expect("serialize backup-incorrect code"),
+            "\"backupIncorrectKey\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::BackupExists)
+                .expect("serialize backup-exists code"),
+            "\"backupExists\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::BackupFailed)
+                .expect("serialize backup-failed code"),
+            "\"backupFailed\""
+        );
+    }
+
+    #[test]
+    fn backup_status_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&BackupStatus::Unknown).expect("serialize unknown"),
+            "\"unknown\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackupStatus::Disabled).expect("serialize disabled"),
+            "\"disabled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackupStatus::Enabled).expect("serialize enabled"),
+            "\"enabled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackupStatus::Incomplete).expect("serialize incomplete"),
+            "\"incomplete\""
+        );
+    }
+
+    #[test]
+    fn backup_status_round_trips() {
+        for status in [
+            BackupStatus::Unknown,
+            BackupStatus::Disabled,
+            BackupStatus::Enabled,
+            BackupStatus::Incomplete,
+        ] {
+            let json = serde_json::to_string(&status).expect("serialize status");
+            let back: BackupStatus = serde_json::from_str(&json).expect("deserialize status");
+            assert_eq!(back, status);
+        }
     }
 
     #[test]

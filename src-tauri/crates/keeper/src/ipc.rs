@@ -15,14 +15,14 @@ use keeper_core::auth;
 use keeper_core::auth::BeeperFlowRegistry;
 use keeper_core::demo::snapshot_then_diff;
 use keeper_core::error::{
-    AccountError, AuthError, CoreError, InboxError, PlatformError, SendError, TimelineError,
-    VerificationError,
+    AccountError, AuthError, BackupError, CoreError, InboxError, PlatformError, SendError,
+    TimelineError, VerificationError,
 };
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
-    AccountVm, ConnectionStatusBatch, DemoBatch, EncryptionStatusBatch, InboxBatch, IpcError,
-    IpcErrorCode, PingVm, RoomListBatch, TimelineBatch, VerificationFlowVm,
+    AccountVm, BackupStatus, ConnectionStatusBatch, DemoBatch, EncryptionStatusBatch, InboxBatch,
+    IpcError, IpcErrorCode, PingVm, RoomListBatch, TimelineBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -198,6 +198,20 @@ fn to_ipc_error(err: CoreError) -> IpcError {
             | VerificationError::FlowNotFound
             | VerificationError::Action(_),
         ) => (IpcErrorCode::VerificationFailed, true),
+        // Key-backup errors carry *named* codes so an invalid recovery key is
+        // never a generic failure (FR-14): a malformed key and a
+        // well-formed-but-wrong key are distinguished, and an existing-backup
+        // race offers restore. All are retriable — the user can try again.
+        CoreError::Backup(BackupError::MalformedRecoveryKey) => {
+            (IpcErrorCode::BackupMalformedKey, true)
+        }
+        CoreError::Backup(BackupError::IncorrectRecoveryKey) => {
+            (IpcErrorCode::BackupIncorrectKey, true)
+        }
+        CoreError::Backup(BackupError::AlreadyExistsOnServer) => (IpcErrorCode::BackupExists, true),
+        CoreError::Backup(
+            BackupError::Unavailable(_) | BackupError::RestoreFailed(_) | BackupError::Action(_),
+        ) => (IpcErrorCode::BackupFailed, true),
     };
     IpcError {
         code,
@@ -683,6 +697,118 @@ pub async fn verification_cancel(
         .map_err(to_ipc_error)
 }
 
+/// Subscribe to an account's server-side key-backup status (Story 3.3, FR-14,
+/// AD-8).
+///
+/// Lazily activates the account (reusing the shared session path), then streams
+/// [`BackupStatus`] snapshots over `channel` — an initial snapshot of the current
+/// status, then deduped changes — and returns the subscription id. The sink
+/// forwards each status to the channel; a closed channel drops the status (the
+/// frontend unsubscribed). NO recovery key or secret-storage material crosses IPC
+/// — only the enum tag. An activation failure funnels through [`to_ipc_error`] to
+/// the existing `SyncUnavailable` code.
+#[tauri::command]
+pub async fn backup_status_subscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    channel: Channel<BackupStatus>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |status: BackupStatus| channel.send(status).is_ok());
+    state
+        .accounts
+        .subscribe_backup_status(&state.platform, &account_id, sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unsubscribe exactly one backup-status subscription, aborting its backend
+/// producer task (AD-19). Other account state is untouched. Idempotent.
+#[tauri::command]
+pub async fn backup_status_unsubscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_backup_status(&account_id, subscription_id)
+        .await;
+    Ok(())
+}
+
+/// Enable server-side key backup for the account (Story 3.3, FR-14). Delegates to
+/// the core, which creates the backup + secret store and returns the base58
+/// **recovery key** *once* — the deliberate boundary exception, meant for the
+/// human to save (shown once in `mono`). A race with an existing server backup
+/// funnels through [`to_ipc_error`] to the named `backupExists` code so the modal
+/// can offer restore; any other failure maps to `backupFailed`. The recovery key
+/// is never logged.
+#[tauri::command]
+pub async fn backup_enable(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<String, IpcError> {
+    state
+        .accounts
+        .backup_enable(&account_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Restore from server-side key backup with a recovery key (Story 3.3, FR-14).
+/// Delegates to the core, which opens the secret store and imports secrets; the
+/// SDK then downloads room keys automatically, so 3.1's streams re-render
+/// previously-undecryptable rows with no extra code. An invalid key funnels
+/// through [`to_ipc_error`] to a *named* code (`backupMalformedKey` vs
+/// `backupIncorrectKey`), never a generic failure. The recovery key is never
+/// logged.
+#[tauri::command]
+pub async fn backup_restore(
+    state: State<'_, AppState>,
+    account_id: String,
+    recovery_key: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .backup_restore(&account_id, &recovery_key)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Save a recovery key to the OS Keychain (Story 3.3, FR-14) — the user's opt-in
+/// after seeing the key once. Delegates to the core, which writes it at
+/// `recovery_key/<account_id>` via the [`Platform`] keychain port. A write
+/// failure funnels through [`to_ipc_error`] so the modal can keep the key visible
+/// for manual copy. The recovery key is never logged.
+#[tauri::command]
+pub async fn backup_save_recovery_key(
+    state: State<'_, AppState>,
+    account_id: String,
+    recovery_key: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .backup_save_recovery_key(&state.platform, &account_id, &recovery_key)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Read a previously-saved recovery key from the OS Keychain (Story 3.3) to
+/// prefill the restore textarea, or `None` if none was saved. `Option<String>`
+/// serializes to `string | null` across IPC. Failures funnel through
+/// [`to_ipc_error`]. The recovery key is never logged.
+#[tauri::command]
+pub async fn backup_saved_recovery_key(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Option<String>, IpcError> {
+    state
+        .accounts
+        .backup_saved_recovery_key(&state.platform, &account_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
 /// Retry a failed outgoing message by re-driving its wedged local echo through
 /// the controlled send path (`unwedge`, not a new dispatch — FR-41). `item_key`
 /// is the timeline item's opaque `unique_id`. A missing echo / no open timeline
@@ -959,6 +1085,50 @@ mod tests {
             "boom".to_owned(),
         )));
         assert_eq!(ipc.code, IpcErrorCode::VerificationFailed);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn backup_malformed_key_maps_to_named_code() {
+        let ipc = to_ipc_error(CoreError::Backup(BackupError::MalformedRecoveryKey));
+        assert_eq!(ipc.code, IpcErrorCode::BackupMalformedKey);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn backup_incorrect_key_maps_to_named_code() {
+        let ipc = to_ipc_error(CoreError::Backup(BackupError::IncorrectRecoveryKey));
+        assert_eq!(ipc.code, IpcErrorCode::BackupIncorrectKey);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn backup_already_exists_maps_to_backup_exists_code() {
+        let ipc = to_ipc_error(CoreError::Backup(BackupError::AlreadyExistsOnServer));
+        assert_eq!(ipc.code, IpcErrorCode::BackupExists);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn backup_unavailable_maps_to_backup_failed_code() {
+        let ipc = to_ipc_error(CoreError::Backup(BackupError::Unavailable("x".to_owned())));
+        assert_eq!(ipc.code, IpcErrorCode::BackupFailed);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn backup_restore_failed_maps_to_backup_failed_code() {
+        let ipc = to_ipc_error(CoreError::Backup(BackupError::RestoreFailed(
+            "boom".to_owned(),
+        )));
+        assert_eq!(ipc.code, IpcErrorCode::BackupFailed);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn backup_action_maps_to_backup_failed_code() {
+        let ipc = to_ipc_error(CoreError::Backup(BackupError::Action("boom".to_owned())));
+        assert_eq!(ipc.code, IpcErrorCode::BackupFailed);
         assert!(ipc.retriable);
     }
 }

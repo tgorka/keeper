@@ -17,6 +17,7 @@ import {
 import { encryptionPosture } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useEncryptionStatus } from "@/lib/stores/encryption-status";
+import { keyBackupStore, useKeyBackupStatus } from "@/lib/stores/key-backup";
 import { verificationStore } from "@/lib/stores/verification";
 
 interface SettingsDialogProps {
@@ -138,26 +139,76 @@ function EncryptionAccountRow({ accountId, children }: { accountId: string; chil
   // transient checking state stay muted.
   const tone = status === "unverified" ? "text-held text-xs" : "text-muted-foreground text-xs";
   return (
-    <li className="flex items-center justify-between gap-2">
-      <span
-        className="truncate font-mono text-xs"
-        title={typeof children === "string" ? children : undefined}
-      >
-        {children}
-      </span>
+    <li className="flex flex-col gap-1">
+      <div className="flex items-center justify-between gap-2">
+        <span
+          className="truncate font-mono text-xs"
+          title={typeof children === "string" ? children : undefined}
+        >
+          {children}
+        </span>
+        <span className="flex items-center gap-2">
+          <span className={tone}>{label}</span>
+          {status === "unverified" ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              onClick={() => verificationStore.getState().openFor(accountId)}
+            >
+              Verify
+            </Button>
+          ) : null}
+        </span>
+      </div>
+      <BackupAccountRow accountId={accountId} />
+    </li>
+  );
+}
+
+/** One account's key-backup state line (Story 3.3, FR-14, AC3): four honest
+ * states sourced from the Rust core. `disabled` → a "Set up backup" button
+ * (enable); `incomplete` → a "Restore" button (the fresh-login "Needs your
+ * recovery key" case); `enabled` → "Backup on"; `unknown`/pending → "Checking…"
+ * (no false claim before crypto syncs). */
+function BackupAccountRow({ accountId }: { accountId: string }) {
+  const status = useKeyBackupStatus(accountId);
+  const label =
+    status === "enabled"
+      ? "Backup on"
+      : status === "disabled"
+        ? "Not set up"
+        : status === "incomplete"
+          ? "Needs your recovery key"
+          : "Checking…";
+  // Only `incomplete` (locked history awaiting restore) gets the attention tone.
+  const tone = status === "incomplete" ? "text-held text-xs" : "text-muted-foreground text-xs";
+  return (
+    <div className="flex items-center justify-between gap-2 pl-1">
+      <span className="text-muted-foreground text-xs">Key backup</span>
       <span className="flex items-center gap-2">
         <span className={tone}>{label}</span>
-        {status === "unverified" ? (
+        {status === "disabled" ? (
           <Button
             type="button"
             variant="outline"
             size="xs"
-            onClick={() => verificationStore.getState().openFor(accountId)}
+            onClick={() => keyBackupStore.getState().openEnable(accountId)}
           >
-            Verify
+            Set up backup
+          </Button>
+        ) : null}
+        {status === "incomplete" ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            onClick={() => keyBackupStore.getState().openRestore(accountId)}
+          >
+            Restore
           </Button>
         ) : null}
       </span>
-    </li>
+    </div>
   );
 }

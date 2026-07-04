@@ -201,6 +201,49 @@ pub enum VerificationError {
     Action(String),
 }
 
+/// Errors originating in server-side key backup enable / restore (Story 3.3,
+/// FR-14, AD-1, AD-21).
+///
+/// A secret-free taxonomy: no message ever contains the recovery key, a
+/// secret-storage key, backup key material, or plaintext — only non-secret
+/// descriptions. The base58 recovery key returned by `enable` is a value on the
+/// success path, never inside an error. Each variant maps to a distinct
+/// `IpcErrorCode` in the shell's single funnel so invalid keys are *named*, never
+/// generic.
+#[derive(Debug, Error)]
+pub enum BackupError {
+    /// Backup enable/restore could not proceed because the account's recovery
+    /// subsystem is not available yet (crypto not synced). The wrapped string is
+    /// a non-secret description.
+    #[error("key backup is not available yet: {0}")]
+    Unavailable(String),
+
+    /// Enabling backup raced an existing server-side backup — a backup already
+    /// exists on the homeserver, so the user should restore instead of enabling.
+    #[error("a key backup already exists on the server")]
+    AlreadyExistsOnServer,
+
+    /// The pasted recovery key could not be decoded (wrong length / not a valid
+    /// base58 recovery key). Distinct from a well-formed-but-wrong key.
+    #[error("the recovery key is malformed")]
+    MalformedRecoveryKey,
+
+    /// A well-formed recovery key failed the MAC check — it does not match this
+    /// account's backup. Distinct from a malformed key.
+    #[error("the recovery key did not match this account")]
+    IncorrectRecoveryKey,
+
+    /// Restore failed for another reason (network / other SDK error). The wrapped
+    /// string is a non-secret description of the failure.
+    #[error("could not restore from key backup: {0}")]
+    RestoreFailed(String),
+
+    /// An SDK backup action (enable) failed for a reason other than an existing
+    /// server backup. The wrapped string is a non-secret description.
+    #[error("key backup action failed: {0}")]
+    Action(String),
+}
+
 /// The hexagon error root. Every fallible core operation surfaces one of these.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -231,6 +274,10 @@ pub enum CoreError {
     /// An interactive device self-verification action failed.
     #[error(transparent)]
     Verification(#[from] VerificationError),
+
+    /// A server-side key-backup enable / restore action failed.
+    #[error(transparent)]
+    Backup(#[from] BackupError),
 
     /// A requested capability is not supported on this platform/build. Honest,
     /// non-panicking signal used by not-yet-wired [`crate::platform::Platform`]

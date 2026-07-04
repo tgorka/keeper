@@ -16,6 +16,7 @@ import type { AccountVm } from "@/lib/ipc/client";
 import { encryptionPosture } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
+import { keyBackupStore } from "@/lib/stores/key-backup";
 import { verificationStore } from "@/lib/stores/verification";
 
 const mockPosture = vi.mocked(encryptionPosture);
@@ -35,6 +36,7 @@ describe("SettingsDialog", () => {
     mockPosture.mockClear();
     accountsStore.getState().clear();
     encryptionStatusStore.getState().reset();
+    keyBackupStore.getState().reset();
     verificationStore.setState({ flow: null, modalOpen: false, activeAccountId: null });
   });
 
@@ -42,6 +44,7 @@ describe("SettingsDialog", () => {
     vi.clearAllMocks();
     accountsStore.getState().clear();
     encryptionStatusStore.getState().reset();
+    keyBackupStore.getState().reset();
     verificationStore.setState({ flow: null, modalOpen: false, activeAccountId: null });
   });
 
@@ -93,5 +96,51 @@ describe("SettingsDialog", () => {
     render(<SettingsDialog open onOpenChange={() => {}} />);
 
     expect(screen.queryByRole("button", { name: "Verify" })).not.toBeInTheDocument();
+  });
+
+  it("shows a 'Set up backup' button for a disabled backup and opens enable", () => {
+    mockPosture.mockResolvedValue(null);
+    accountsStore.getState().hydrateAll([account("alice")]);
+    keyBackupStore.getState().setStatus("alice", "disabled");
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(screen.getByText("Not set up")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Set up backup" }));
+    expect(keyBackupStore.getState().modalOpen).toBe(true);
+    expect(keyBackupStore.getState().mode).toBe("enable");
+    expect(keyBackupStore.getState().accountId).toBe("alice");
+  });
+
+  it("shows a 'Restore' button for an incomplete backup and opens restore", () => {
+    mockPosture.mockResolvedValue(null);
+    accountsStore.getState().hydrateAll([account("alice")]);
+    keyBackupStore.getState().setStatus("alice", "incomplete");
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(screen.getByText("Needs your recovery key")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+    expect(keyBackupStore.getState().modalOpen).toBe(true);
+    expect(keyBackupStore.getState().mode).toBe("restore");
+    expect(keyBackupStore.getState().accountId).toBe("alice");
+  });
+
+  it("shows 'Backup on' with no button for an enabled backup", () => {
+    mockPosture.mockResolvedValue(null);
+    accountsStore.getState().hydrateAll([account("alice")]);
+    keyBackupStore.getState().setStatus("alice", "enabled");
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(screen.getByText("Backup on")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Set up backup" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Restore" })).not.toBeInTheDocument();
+  });
+
+  it("shows 'Checking…' for a pending backup status", () => {
+    mockPosture.mockResolvedValue(null);
+    accountsStore.getState().hydrateAll([account("alice")]);
+    // No backup status set → pending.
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(screen.getAllByText("Checking…").length).toBeGreaterThan(0);
   });
 });

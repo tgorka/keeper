@@ -37,7 +37,8 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::auth::{self, session_keychain_key};
-use crate::error::{AccountError, CoreError, InboxError, SendError, TimelineError};
+use crate::backup::{self, BackupSink};
+use crate::error::{AccountError, BackupError, CoreError, InboxError, SendError, TimelineError};
 use crate::inbox::InboxMerger;
 use crate::platform::Platform;
 use crate::registry;
@@ -758,6 +759,151 @@ impl AccountManager {
         }
     }
 
+    /// Subscribe to the account's server-side key-backup status (Story 3.3),
+    /// activating the account if it is not already live (reusing the same
+    /// `Client` — never a second one). Spawns a supervised
+    /// [`backup::run_status_producer`] over `recovery().state_stream()` that emits
+    /// the current mapped [`BackupStatus`] as an initial snapshot, then a deduped
+    /// diff on every change, into `sink`. Returns the subscription id.
+    ///
+    /// Mirrors [`subscribe_encryption_status`]'s lazy-activation, supervised-task,
+    /// and self-reap lifecycle: the `JoinHandle` is registered in the
+    /// subscriptions map and aborted on unsubscribe / shutdown. An activation
+    /// failure maps to the existing `SyncUnavailable` code (retriable).
+    pub async fn subscribe_backup_status(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        sink: BackupSink,
+    ) -> Result<u64, CoreError> {
+        // Activate under the manager lock so a concurrent subscribe cannot build
+        // a second Client/SyncService for the same account. `did_activate` records
+        // whether *this* call brought the account live, so a failure before any
+        // subscription attaches can tear it back down (AD-21).
+        let (client, subs_arc, did_activate) = {
+            let mut accounts = self.accounts.lock().await;
+            let did_activate = !accounts.contains_key(account_id);
+            if did_activate {
+                let (client, sync, reconnect_supervisor, session_persister) =
+                    activate(platform, account_id).await?;
+                accounts.insert(
+                    account_id.to_owned(),
+                    AccountHandle {
+                        client,
+                        sync,
+                        subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                        timelines: Arc::new(Mutex::new(HashMap::new())),
+                        reconnect_supervisor,
+                        session_persister,
+                        verification_flow_tx: Arc::new(Mutex::new(None)),
+                    },
+                );
+                tracing::info!(account_id = %account_id, "account activated for backup status");
+            }
+            let handle = accounts.get(account_id).ok_or_else(|| {
+                CoreError::Internal("account handle vanished after activation".to_owned())
+            })?;
+            (
+                handle.client.clone(),
+                handle.subscriptions.clone(),
+                did_activate,
+            )
+        };
+
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let account_id_owned = account_id.to_owned();
+        let span = tracing::info_span!("backup_status_producer", account_id = %account_id);
+        let reaper_subs = subs_arc.clone();
+        let task = tokio::spawn(
+            async move {
+                backup::run_status_producer(client, sink, &account_id_owned).await;
+                // A naturally-completed producer reaps its own subscription entry.
+                reaper_subs.lock().await.remove(&subscription_id);
+            }
+            .instrument(span),
+        );
+
+        {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(_) => {
+                    subs_arc.lock().await.insert(subscription_id, task);
+                }
+                None => {
+                    // The account was shut down in the spawn→register gap;
+                    // aborting the orphaned producer here leaks nothing.
+                    task.abort();
+                    if did_activate {
+                        return Err(AccountError::SyncStart(
+                            "account removed during subscribe".to_owned(),
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        tracing::info!(account_id = %account_id, subscription_id, "backup status subscribed");
+        Ok(subscription_id)
+    }
+
+    /// Abort exactly the backup-status producer task for `subscription_id`; other
+    /// account state is untouched. Idempotent.
+    pub async fn unsubscribe_backup_status(&self, account_id: &str, subscription_id: u64) {
+        if self.abort_subscription(account_id, subscription_id).await {
+            tracing::info!(account_id = %account_id, subscription_id, "backup status unsubscribed");
+        }
+    }
+
+    /// Enable server-side key backup for the account (Story 3.3, FR-14). Resolves
+    /// the live `Client` and delegates to [`backup::enable`], returning the base58
+    /// recovery key *once* (the deliberate boundary exception — shown once to the
+    /// human). A race with an existing server backup surfaces as the named
+    /// `AlreadyExistsOnServer`. The recovery key is never logged.
+    pub async fn backup_enable(&self, account_id: &str) -> Result<String, CoreError> {
+        let client = self.client_for_backup(account_id).await?;
+        backup::enable(&client).await
+    }
+
+    /// Restore from server-side key backup with a recovery key (Story 3.3,
+    /// FR-14). Resolves the live `Client` and delegates to [`backup::restore`];
+    /// the SDK downloads room keys automatically afterward, so 3.1's streams
+    /// re-render UTD rows for free. Invalid keys surface as named errors
+    /// (malformed vs incorrect). The recovery key is never logged.
+    pub async fn backup_restore(
+        &self,
+        account_id: &str,
+        recovery_key: &str,
+    ) -> Result<(), CoreError> {
+        let client = self.client_for_backup(account_id).await?;
+        backup::restore(&client, recovery_key).await
+    }
+
+    /// Save a recovery key to the OS Keychain at `recovery_key/<account_id>`
+    /// (Story 3.3, FR-14) — the user's opt-in after seeing the key once. The key
+    /// never touches `tracing`; a Keychain write failure surfaces so the modal can
+    /// keep the key visible for manual copy.
+    pub async fn backup_save_recovery_key(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        recovery_key: &str,
+    ) -> Result<(), CoreError> {
+        platform.keychain_set(&recovery_key_keychain_key(account_id), recovery_key)?;
+        tracing::info!(account_id = %account_id, "recovery key saved to keychain");
+        Ok(())
+    }
+
+    /// Read a previously-saved recovery key from the OS Keychain at
+    /// `recovery_key/<account_id>` (Story 3.3) to prefill the restore textarea,
+    /// or `None` if none was saved. The key never touches `tracing`.
+    pub async fn backup_saved_recovery_key(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+    ) -> Result<Option<String>, CoreError> {
+        platform.keychain_get(&recovery_key_keychain_key(account_id))
+    }
+
     /// Subscribe to the account's interactive self-verification flow (Story 3.2),
     /// activating the account if it is not already live (reusing the same
     /// `Client` — never a second one). Spawns a supervised
@@ -875,6 +1021,25 @@ impl AccountManager {
             .ok_or_else(|| {
                 crate::error::VerificationError::Unavailable(
                     "account is not live; subscribe to verification first".to_owned(),
+                )
+                .into()
+            })
+    }
+
+    /// Resolve the account's live `Client` for a backup action, surfacing a *named*
+    /// [`BackupError::Unavailable`] (→ `backupFailed`) when the account is not live
+    /// — never a verification error code. Backup status is subscribed at app-shell
+    /// mount (which lazily activates the account), so in practice the account is
+    /// live before any enable/restore button is reachable; this keeps the failure
+    /// honest inside this story's named-backup-error taxonomy regardless.
+    async fn client_for_backup(&self, account_id: &str) -> Result<Client, CoreError> {
+        let accounts = self.accounts.lock().await;
+        accounts
+            .get(account_id)
+            .map(|h| h.client.clone())
+            .ok_or_else(|| {
+                BackupError::Unavailable(
+                    "account is not live; subscribe to backup status first".to_owned(),
                 )
                 .into()
             })
@@ -1131,6 +1296,14 @@ impl AccountManager {
         crate::auth::sign_out_cleanup(platform.as_ref(), account_id)?;
         Ok(())
     }
+}
+
+/// Keychain key under which an account's saved base58 recovery key is stored
+/// (Story 3.3, FR-14) — the user's opt-in save after enabling key backup.
+/// Namespaced by account id so it is scoped exactly to one account. The stored
+/// value is the human-facing recovery key, never any other secret.
+fn recovery_key_keychain_key(account_id: &str) -> String {
+    format!("recovery_key/{account_id}")
 }
 
 /// Lazily rebuild the `Client` from the persisted session and start a

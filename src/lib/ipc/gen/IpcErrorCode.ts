@@ -6,4 +6,4 @@
  * Variants serialize to their camelCase names (e.g. `"unsupported"`) and are
  * part of the frontend contract — rename with care.
  */
-export type IpcErrorCode = "unsupported" | "internal" | "slidingSyncUnsupported" | "invalidCredentials" | "serverUnreachable" | "unsupportedLoginType" | "oauthUnsupported" | "oauthTimedOut" | "oauthCancelled" | "oauthFailed" | "beeperUnavailable" | "syncUnavailable" | "timelineUnavailable" | "sendFailed" | "verificationFailed";
+export type IpcErrorCode = "unsupported" | "internal" | "slidingSyncUnsupported" | "invalidCredentials" | "serverUnreachable" | "unsupportedLoginType" | "oauthUnsupported" | "oauthTimedOut" | "oauthCancelled" | "oauthFailed" | "beeperUnavailable" | "syncUnavailable" | "timelineUnavailable" | "sendFailed" | "verificationFailed" | "backupMalformedKey" | "backupIncorrectKey" | "backupExists" | "backupFailed";

@@ -10,6 +10,7 @@ import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type { IpcError } from "./gen/IpcError";
 
 export type { AccountVm } from "./gen/AccountVm";
+export type { BackupStatus } from "./gen/BackupStatus";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 export type { DemoBatch } from "./gen/DemoBatch";
@@ -35,6 +36,7 @@ export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
 
 import type { AccountVm } from "./gen/AccountVm";
+import type { BackupStatus } from "./gen/BackupStatus";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 import type { InboxBatch } from "./gen/InboxBatch";
@@ -414,6 +416,75 @@ export async function verificationMismatch(accountId: string, flowId: string): P
  */
 export async function verificationCancel(accountId: string, flowId: string): Promise<void> {
   await invoke<void>("verification_cancel", { accountId, flowId });
+}
+
+/**
+ * Subscribe to an account's server-side key-backup status (Story 3.3, FR-14,
+ * AD-8). Opens a `Channel`, forwards each {@link BackupStatus} to `onStatus` in
+ * arrival order (an initial snapshot before any change), and resolves with the
+ * subscription id. NO recovery key or secret-storage material crosses IPC — only
+ * the enum tag. Rejects with the {@link IpcError} envelope (`code:
+ * "syncUnavailable"`) if the account cannot start syncing.
+ */
+export async function subscribeBackupStatus(
+  accountId: string,
+  onStatus: (status: BackupStatus) => void,
+): Promise<number> {
+  return await subscribe<BackupStatus>("backup_status_subscribe", onStatus, { accountId });
+}
+
+/**
+ * Unsubscribe exactly one backup-status subscription, aborting its backend
+ * producer task (AD-19). Idempotent — unsubscribing an unknown id is a no-op.
+ */
+export async function unsubscribeBackupStatus(accountId: string, id: number): Promise<void> {
+  await invoke<void>("backup_status_unsubscribe", { accountId, subscriptionId: id });
+}
+
+/**
+ * Enable server-side key backup for the account (Story 3.3, FR-14). The Rust core
+ * creates the backup + secret store and returns the base58 **recovery key** once —
+ * the deliberate boundary exception, meant for the human to save (shown once in
+ * `mono`, never persisted in a JS store beyond the modal's lifecycle). A race with
+ * an existing server backup rejects with the {@link IpcError} envelope (`code:
+ * "backupExists"`) so the modal can offer restore; any other failure rejects with
+ * `code: "backupFailed"`.
+ */
+export async function backupEnable(accountId: string): Promise<string> {
+  return await invoke<string>("backup_enable", { accountId });
+}
+
+/**
+ * Restore from server-side key backup with a recovery key (Story 3.3, FR-14). The
+ * Rust core opens the secret store and imports secrets; the SDK then downloads
+ * room keys automatically, so Story 3.1's streams re-render previously
+ * undecryptable rows with no extra code. An invalid key rejects with the
+ * {@link IpcError} envelope carrying a *named* code — `"backupMalformedKey"` (not
+ * decodable) vs `"backupIncorrectKey"` (well-formed but wrong) — never a generic
+ * failure. `recoveryKey` is transient — never stored in a JS store beyond the
+ * modal's lifecycle.
+ */
+export async function backupRestore(accountId: string, recoveryKey: string): Promise<void> {
+  await invoke<void>("backup_restore", { accountId, recoveryKey });
+}
+
+/**
+ * Save a recovery key to the OS Keychain (Story 3.3, FR-14) — the user's opt-in
+ * after seeing the key once. The Rust core writes it at `recovery_key/<accountId>`
+ * via the platform keychain port. Rejects with the {@link IpcError} envelope on a
+ * write failure so the modal can keep the key visible for manual copy.
+ */
+export async function backupSaveRecoveryKey(accountId: string, recoveryKey: string): Promise<void> {
+  await invoke<void>("backup_save_recovery_key", { accountId, recoveryKey });
+}
+
+/**
+ * Read a previously-saved recovery key from the OS Keychain (Story 3.3) to prefill
+ * the restore textarea, or `null` if none was saved. The Rust `Option<String>`
+ * serializes to `string | null`.
+ */
+export async function backupSavedRecoveryKey(accountId: string): Promise<string | null> {
+  return await invoke<string | null>("backup_saved_recovery_key", { accountId });
 }
 
 /**
