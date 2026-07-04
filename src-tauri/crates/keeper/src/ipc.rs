@@ -12,7 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use keeper_core::account::AccountManager;
 use keeper_core::auth;
 use keeper_core::demo::snapshot_then_diff;
-use keeper_core::error::{AccountError, AuthError, CoreError, PlatformError, TimelineError};
+use keeper_core::error::{
+    AccountError, AuthError, CoreError, PlatformError, SendError, TimelineError,
+};
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, DemoBatch, IpcError, IpcErrorCode, PingVm, RoomListBatch, TimelineBatch,
@@ -141,6 +143,15 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         CoreError::Timeline(TimelineError::RoomNotFound | TimelineError::Build(_)) => {
             (IpcErrorCode::TimelineUnavailable, true)
         }
+        // Any enqueue-time send failure is retriable: the frontend can attempt
+        // the send/retry again. Asynchronous delivery failures never reach here —
+        // they surface as the `Failed` send-state on the timeline item.
+        CoreError::Send(
+            SendError::RoomNotFound
+            | SendError::NoOpenTimeline
+            | SendError::EchoNotFound
+            | SendError::Dispatch(_),
+        ) => (IpcErrorCode::SendFailed, true),
     };
     IpcError {
         code,
@@ -291,6 +302,43 @@ pub async fn timeline_unsubscribe(
     Ok(())
 }
 
+/// Send a plain-text message to a room through the single dispatch gate (FR-9,
+/// FR-41, AD-13). Delegates to the core, which enqueues the message on the room's
+/// open `Timeline`; the local echo and every send-state transition arrive back
+/// over the existing timeline subscription (no echo is synthesized). An
+/// enqueue-time failure funnels through [`to_ipc_error`] to `SendFailed`.
+#[tauri::command]
+pub async fn send_text(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    body: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .send_text(&account_id, &room_id, &body)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Retry a failed outgoing message by re-driving its wedged local echo through
+/// the controlled send path (`unwedge`, not a new dispatch — FR-41). `item_key`
+/// is the timeline item's opaque `unique_id`. A missing echo / no open timeline
+/// funnels through [`to_ipc_error`] to `SendFailed`.
+#[tauri::command]
+pub async fn send_retry(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    item_key: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .retry_send(&account_id, &room_id, &item_key)
+        .await
+        .map_err(to_ipc_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +450,34 @@ mod tests {
     fn timeline_build_maps_to_retriable_timeline_unavailable() {
         let ipc = to_ipc_error(CoreError::Timeline(TimelineError::Build("boom".to_owned())));
         assert_eq!(ipc.code, IpcErrorCode::TimelineUnavailable);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn send_room_not_found_maps_to_retriable_send_failed() {
+        let ipc = to_ipc_error(CoreError::Send(SendError::RoomNotFound));
+        assert_eq!(ipc.code, IpcErrorCode::SendFailed);
+        assert!(ipc.retriable, "send failure should be retriable");
+    }
+
+    #[test]
+    fn send_no_open_timeline_maps_to_retriable_send_failed() {
+        let ipc = to_ipc_error(CoreError::Send(SendError::NoOpenTimeline));
+        assert_eq!(ipc.code, IpcErrorCode::SendFailed);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn send_echo_not_found_maps_to_retriable_send_failed() {
+        let ipc = to_ipc_error(CoreError::Send(SendError::EchoNotFound));
+        assert_eq!(ipc.code, IpcErrorCode::SendFailed);
+        assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn send_dispatch_maps_to_retriable_send_failed() {
+        let ipc = to_ipc_error(CoreError::Send(SendError::Dispatch("boom".to_owned())));
+        assert_eq!(ipc.code, IpcErrorCode::SendFailed);
         assert!(ipc.retriable);
     }
 }

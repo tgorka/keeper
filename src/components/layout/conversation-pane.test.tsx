@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm, IpcError, TimelineBatch } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
@@ -9,10 +9,15 @@ import { timelineStore } from "@/lib/stores/timeline";
 // captures the `onBatch` handler so the test can drive the stream.
 const subscribeTimeline = vi.fn();
 const unsubscribeTimeline = vi.fn();
+const sendText = vi.fn();
+const retrySend = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   subscribeTimeline: (accountId: string, roomId: string, onBatch: (b: TimelineBatch) => void) =>
     subscribeTimeline(accountId, roomId, onBatch),
   unsubscribeTimeline: (accountId: string, id: number) => unsubscribeTimeline(accountId, id),
+  sendText: (accountId: string, roomId: string, body: string) => sendText(accountId, roomId, body),
+  retrySend: (accountId: string, roomId: string, itemKey: string) =>
+    retrySend(accountId, roomId, itemKey),
 }));
 
 import { ConversationPane } from "@/components/layout/conversation-pane";
@@ -38,6 +43,7 @@ function message(key: string, sender: string, body: string): TimelineBatch["ops"
       body,
       timestamp: 1,
       isOwn: false,
+      sendState: null,
     },
   };
 }
@@ -53,6 +59,10 @@ beforeEach(() => {
   timelineStore.getState().clear();
   subscribeTimeline.mockReset();
   unsubscribeTimeline.mockReset();
+  sendText.mockReset();
+  sendText.mockResolvedValue(undefined);
+  retrySend.mockReset();
+  retrySend.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -108,6 +118,7 @@ describe("ConversationPane", () => {
               body: "hi from bob",
               timestamp: 1,
               isOwn: false,
+              sendState: null,
             },
             { kind: "other", key: "o1" },
           ],
@@ -145,6 +156,7 @@ describe("ConversationPane", () => {
               body: "first",
               timestamp: 1,
               isOwn: false,
+              sendState: null,
             },
             {
               kind: "message",
@@ -154,6 +166,7 @@ describe("ConversationPane", () => {
               body: "second",
               timestamp: 2,
               isOwn: false,
+              sendState: null,
             },
           ],
         },
@@ -263,5 +276,85 @@ describe("ConversationPane", () => {
     // A late batch (arriving after cleanup) must not mutate the store.
     captured.onBatch?.({ ops: [message("late", "@bob:example.org", "late body")] });
     expect(timelineStore.getState().items).toEqual([]);
+  });
+
+  it("shows the composer disabled until the room's timeline is loaded", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    accountsStore.getState().setCurrentAccount(account);
+    roomsStore.getState().selectRoom("!room:example.org");
+    render(<ConversationPane {...noopProps()} />);
+
+    // The composer is present (a room is selected) but disabled before load.
+    const textarea = screen.getByLabelText("Message");
+    expect(textarea).toBeDisabled();
+
+    // Once a batch arrives (loaded), the composer becomes enabled.
+    captured.onBatch?.({ ops: [message("k1", "@bob:example.org", "hi")] });
+    await waitFor(() => {
+      expect(screen.getByLabelText("Message")).not.toBeDisabled();
+    });
+  });
+
+  it("wires the composer send to sendText with the account and room ids", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    accountsStore.getState().setCurrentAccount(account);
+    roomsStore.getState().selectRoom("!room:example.org");
+    render(<ConversationPane {...noopProps()} />);
+    captured.onBatch?.({ ops: [message("k1", "@bob:example.org", "hi")] });
+
+    const textarea = await screen.findByLabelText("Message");
+    await waitFor(() => expect(textarea).not.toBeDisabled());
+    fireEvent.change(textarea, { target: { value: "hello there" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(sendText).toHaveBeenCalledWith(account.accountId, "!room:example.org", "hello there");
+    });
+  });
+
+  it("wires a failed bubble's Retry to retrySend with the item key", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    accountsStore.getState().setCurrentAccount(account);
+    roomsStore.getState().selectRoom("!room:example.org");
+    render(<ConversationPane {...noopProps()} />);
+
+    captured.onBatch?.({
+      ops: [
+        {
+          op: "reset",
+          items: [
+            {
+              kind: "message",
+              key: "outgoing-1",
+              sender: account.userId,
+              senderDisplayName: null,
+              body: "did it send?",
+              timestamp: 1,
+              isOwn: true,
+              sendState: "failed",
+            },
+          ],
+        },
+      ],
+    });
+
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    fireEvent.click(retry);
+
+    await waitFor(() => {
+      expect(retrySend).toHaveBeenCalledWith(account.accountId, "!room:example.org", "outgoing-1");
+    });
   });
 });

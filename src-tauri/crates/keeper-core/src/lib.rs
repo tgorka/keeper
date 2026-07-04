@@ -15,5 +15,6 @@ pub mod demo;
 pub mod error;
 pub mod platform;
 pub mod registry;
+pub mod send;
 pub mod timeline;
 pub mod vm;

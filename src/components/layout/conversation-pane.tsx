@@ -9,15 +9,19 @@
  * to keep diff indices aligned). Cleanup — StrictMode double-mount, room change,
  * unmount — unsubscribes the backend task and clears the store, so timelines
  * never leak or stack. A failed subscribe surfaces an honest inline error
- * instead of a silent spinner (AD-21). No composer here — send is Story 1.6.
+ * instead of a silent spinner (AD-21). A bottom {@link Composer} footer (720 px-
+ * centered, `border-t`) sends via the single Rust dispatch gate — disabled until
+ * a room's timeline is loaded — and outgoing bubbles carry a Rust-authoritative
+ * send-state caption with a persistent `Failed — Retry` (FR-9, AD-13).
  */
 import { PanelRight } from "lucide-react";
-import { type Ref, useEffect, useRef, useState } from "react";
+import { type Ref, useCallback, useEffect, useRef, useState } from "react";
+import { Composer } from "@/components/chat/composer";
 import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { TimelineBatch, TimelineItemVm } from "@/lib/ipc/client";
-import { subscribeTimeline, unsubscribeTimeline } from "@/lib/ipc/client";
+import { retrySend, sendText, subscribeTimeline, unsubscribeTimeline } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useRoomsStore } from "@/lib/stores/rooms";
 import { timelineStore, useTimelineStore } from "@/lib/stores/timeline";
@@ -28,28 +32,43 @@ interface ConversationPaneProps {
   toggleRef?: Ref<HTMLButtonElement>;
 }
 
-/** A `Message` item paired with whether it continues a same-sender run. */
+/**
+ * A `Message` item paired with whether it continues a same-sender run
+ * (`grouped`) and whether it ends one (`groupTail` — the transient send-state
+ * caption renders only on the tail).
+ */
 interface RenderedMessage {
   item: MessageVm;
   grouped: boolean;
+  groupTail: boolean;
 }
 
 /**
  * Project the streamed timeline into the renderable message sequence, computing
  * grouping in a single pass: a `Message` is `grouped` when the immediately
- * preceding **rendered** message has the same sender. `Other` items are skipped
- * but break a run (an interleaved non-text item ungroups the next message).
+ * preceding **rendered** message has the same sender, and is the run's
+ * `groupTail` when the immediately following **rendered** message has a different
+ * sender (or there is none). `Other` items are skipped but break a run (an
+ * interleaved non-text item ungroups the next message and ends the current run).
  */
 function toRenderedMessages(items: TimelineItemVm[]): RenderedMessage[] {
   const rendered: RenderedMessage[] = [];
   let prevSender: string | null = null;
   for (const item of items) {
     if (item.kind !== "message") {
-      // A non-rendered item breaks the same-sender run.
+      // A non-rendered item breaks the same-sender run: the previous rendered
+      // message is now a group tail.
+      if (rendered.length > 0) {
+        rendered[rendered.length - 1].groupTail = true;
+      }
       prevSender = null;
       continue;
     }
-    rendered.push({ item, grouped: prevSender === item.sender });
+    if (rendered.length > 0 && prevSender === item.sender) {
+      // This message continues the run, so the previous one is not the tail.
+      rendered[rendered.length - 1].groupTail = false;
+    }
+    rendered.push({ item, grouped: prevSender === item.sender, groupTail: true });
     prevSender = item.sender;
   }
   return rendered;
@@ -126,6 +145,30 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
   }, [items]);
 
   const messages = toRenderedMessages(items);
+  const roomLoaded = accountId !== null && selectedRoomId !== null && loaded && !errored;
+
+  const onSend = useCallback(
+    async (body: string) => {
+      if (accountId === null || selectedRoomId === null) {
+        return;
+      }
+      await sendText(accountId, selectedRoomId, body);
+    },
+    [accountId, selectedRoomId],
+  );
+
+  const onRetry = useCallback(
+    (key: string) => {
+      if (accountId === null || selectedRoomId === null) {
+        return;
+      }
+      // A failed retry (e.g. the echo reconciled away → `EchoNotFound`) leaves
+      // the persistent `Failed — Retry` caption in place, inviting another
+      // attempt; swallow the rejection so it is never an unhandled promise.
+      retrySend(accountId, selectedRoomId, key).catch(() => {});
+    },
+    [accountId, selectedRoomId],
+  );
 
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col bg-background">
@@ -175,12 +218,24 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
             aria-label="Messages"
             className="mx-auto mt-auto flex w-full max-w-[720px] flex-col px-4 py-4"
           >
-            {messages.map(({ item, grouped }) => (
+            {messages.map(({ item, grouped, groupTail }) => (
               <li key={item.key}>
-                <MessageBubble item={item} grouped={grouped} />
+                <MessageBubble
+                  item={item}
+                  grouped={grouped}
+                  groupTail={groupTail}
+                  onRetry={onRetry}
+                />
               </li>
             ))}
           </ol>
+        </div>
+      )}
+      {selectedRoomId !== null && (
+        <div className="shrink-0 border-border border-t">
+          <div className="mx-auto w-full max-w-[720px] px-4 py-3">
+            <Composer key={selectedRoomId} onSend={onSend} disabled={!roomLoaded} />
+          </div>
         </div>
       )}
     </main>

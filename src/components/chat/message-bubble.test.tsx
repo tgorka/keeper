@@ -1,5 +1,5 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble";
 
 function msg(overrides: Partial<MessageVm> = {}): MessageVm {
@@ -11,6 +11,7 @@ function msg(overrides: Partial<MessageVm> = {}): MessageVm {
     body: "hello there",
     timestamp: new Date(2026, 6, 4, 9, 30, 0).getTime(),
     isOwn: false,
+    sendState: null,
     ...overrides,
   };
 }
@@ -63,5 +64,70 @@ describe("MessageBubble", () => {
   it("renders a clock timestamp", () => {
     render(<MessageBubble item={msg()} grouped={false} />);
     expect(screen.getByText(/\d{1,2}:\d{2}/)).toBeInTheDocument();
+  });
+
+  it("renders no send-state caption for a remote message (null sendState)", () => {
+    render(<MessageBubble item={msg({ isOwn: true, sendState: null })} grouped={false} />);
+    expect(screen.queryByText("Sending…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Sent")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
+  it("shows the Sending… caption on the group tail", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sending" })}
+        grouped={false}
+        groupTail={true}
+      />,
+    );
+    expect(screen.getByText("Sending…")).toBeInTheDocument();
+  });
+
+  it("shows the Sent caption on the group tail", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sent" })}
+        grouped={false}
+        groupTail={true}
+      />,
+    );
+    expect(screen.getByText("Sent")).toBeInTheDocument();
+  });
+
+  it("hides the transient caption when not the group tail", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sending" })}
+        grouped={false}
+        groupTail={false}
+      />,
+    );
+    expect(screen.queryByText("Sending…")).not.toBeInTheDocument();
+  });
+
+  it("always shows the persistent Failed — Retry caption, even when not the tail", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "failed" })}
+        grouped={false}
+        groupTail={false}
+      />,
+    );
+    expect(screen.getByText("Failed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  });
+
+  it("calls onRetry with the message key when Retry is activated", () => {
+    const onRetry = vi.fn();
+    render(
+      <MessageBubble
+        item={msg({ key: "outgoing-9", isOwn: true, sendState: "failed" })}
+        grouped={false}
+        onRetry={onRetry}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(onRetry).toHaveBeenCalledWith("outgoing-9");
   });
 });

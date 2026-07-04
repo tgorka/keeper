@@ -21,7 +21,9 @@ pub fn run() {
             ipc::room_list_subscribe,
             ipc::room_list_unsubscribe,
             ipc::timeline_subscribe,
-            ipc::timeline_unsubscribe
+            ipc::timeline_unsubscribe,
+            ipc::send_text,
+            ipc::send_retry
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -32,13 +32,15 @@ use matrix_sdk_ui::eyeball_im::VectorDiff;
 use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
 use matrix_sdk_ui::room_list_service::{RoomList, RoomListItem, RoomListLoadingState};
 use matrix_sdk_ui::sync_service::SyncService;
+use matrix_sdk_ui::timeline::Timeline;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::auth::session_keychain_key;
-use crate::error::{AccountError, CoreError, TimelineError};
+use crate::error::{AccountError, CoreError, SendError, TimelineError};
 use crate::platform::Platform;
 use crate::registry;
+use crate::send::{self, SendTrigger};
 use crate::timeline;
 use crate::vm::{RoomListBatch, RoomListOp, RoomVm, TimelineBatch};
 
@@ -58,6 +60,12 @@ pub type BatchSink = Box<dyn Fn(RoomListBatch) -> bool + Send + Sync>;
 /// delivered, `false` if the channel is closed (the producer then stops).
 pub type TimelineSink = Box<dyn Fn(TimelineBatch) -> bool + Send + Sync>;
 
+/// Registry of an account's live open room timelines, keyed by the *timeline*
+/// subscription id → its room id and the exact `Arc<Timeline>` that produced the
+/// subscribed items (AD-19). Send/retry look it up by room id; teardown drops the
+/// entry.
+type OpenTimelines = Arc<Mutex<HashMap<u64, (OwnedRoomId, Arc<Timeline>)>>>;
+
 /// A live, supervised account: its `Client`, `SyncService`, and the abort
 /// handles of its room-list subscriptions.
 struct AccountHandle {
@@ -65,6 +73,13 @@ struct AccountHandle {
     sync: std::sync::Arc<SyncService>,
     /// Live subscriptions, keyed by subscription id → the producer task.
     subscriptions: Arc<Mutex<HashMap<u64, JoinHandle<()>>>>,
+    /// Live open room timelines, keyed by the *timeline* subscription id → its
+    /// room id and the exact `Arc<Timeline>` that produced the subscribed items.
+    /// Reachable by `send_text`/`retry_send` (looked up by room id) and dropped
+    /// on the same teardown paths as its subscription (unsubscribe + natural
+    /// completion), so no `Timeline` (and its SDK tasks) leaks (AD-19). The
+    /// room-list subscription registers nothing here.
+    timelines: OpenTimelines,
 }
 
 /// Single-account-capable supervisor (AD-19). Owns the live account state; the
@@ -108,6 +123,7 @@ impl AccountManager {
                         client,
                         sync,
                         subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                        timelines: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for room list");
@@ -201,7 +217,7 @@ impl AccountManager {
         // if needed — never a second Client/SyncService. `did_activate` records
         // whether *this* call brought the account live, so a build failure before
         // any subscription attaches can tear it back down (AD-21).
-        let (client, subs_arc, did_activate) = {
+        let (client, subs_arc, timelines_arc, did_activate) = {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
@@ -212,6 +228,7 @@ impl AccountManager {
                         client,
                         sync,
                         subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                        timelines: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for timeline");
@@ -222,6 +239,7 @@ impl AccountManager {
             (
                 handle.client.clone(),
                 handle.subscriptions.clone(),
+                handle.timelines.clone(),
                 did_activate,
             )
         };
@@ -259,13 +277,19 @@ impl AccountManager {
         };
 
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        // Share the exact `Arc<Timeline>` that produces the subscribed items with
+        // send/retry — `unique_id`s are only stable within this one instance.
+        let shared_timeline = open.timeline();
         let reaper_subs = subs_arc.clone();
+        let reaper_timelines = timelines_arc.clone();
         let room_id_task = room_id.clone();
         let room_id_log = room_id.clone();
         let task = tokio::spawn(async move {
             timeline::forward_timeline(open, room_id_task, sink).await;
-            // A naturally-completed producer reaps its own subscription entry.
+            // A naturally-completed producer reaps its own subscription entry and
+            // drops its stored `Arc<Timeline>` so nothing leaks (AD-19).
             reaper_subs.lock().await.remove(&subscription_id);
+            reaper_timelines.lock().await.remove(&subscription_id);
         });
 
         {
@@ -273,6 +297,10 @@ impl AccountManager {
             match accounts.get(account_id) {
                 Some(_) => {
                     subs_arc.lock().await.insert(subscription_id, task);
+                    timelines_arc
+                        .lock()
+                        .await
+                        .insert(subscription_id, (room_id.clone(), shared_timeline));
                 }
                 None => {
                     // The account was shut down in the spawn→register gap;
@@ -309,16 +337,91 @@ impl AccountManager {
     }
 
     /// Shared abort body: remove and abort exactly one subscription task from an
-    /// account's subscription map. Returns whether a task was found and aborted.
+    /// account's subscription map, and drop any open `Arc<Timeline>` registered
+    /// under the same id (a timeline subscription — the SDK drop handle cancels
+    /// its background tasks once the last reference is gone). Returns whether a
+    /// task was found and aborted.
     async fn abort_subscription(&self, account_id: &str, subscription_id: u64) -> bool {
         let accounts = self.accounts.lock().await;
         if let Some(handle) = accounts.get(account_id) {
+            // Drop the stored timeline first (a room-list id simply isn't present
+            // here — a no-op), then abort the producer task.
+            handle.timelines.lock().await.remove(&subscription_id);
             if let Some(task) = handle.subscriptions.lock().await.remove(&subscription_id) {
                 task.abort();
                 return true;
             }
         }
         false
+    }
+
+    /// Send a plain-text message to `room_id` on `account_id` through the single
+    /// dispatch gate (FR-41, AD-13). Resolves the live `AccountHandle` and the
+    /// room's open `Arc<Timeline>`, then delegates to [`send::submit`]. The local
+    /// echo and every send-state transition arrive through the room's existing
+    /// timeline subscription — this call synthesizes nothing.
+    ///
+    /// Errors: an unparsable/unknown room id → [`SendError::RoomNotFound`]; a room
+    /// with no open timeline subscription → [`SendError::NoOpenTimeline`]; an SDK
+    /// enqueue failure → [`SendError::Dispatch`].
+    pub async fn send_text(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        body: &str,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let timeline = self.open_timeline_for(account_id, &room_id).await?;
+        send::submit(&timeline, body, SendTrigger::ComposerSend).await?;
+        tracing::info!(account_id = %account_id, room_id = %room_id, "message dispatched");
+        Ok(())
+    }
+
+    /// Retry a failed outgoing message by re-driving its wedged local echo
+    /// (`item_key` = the item's `unique_id`) through the controlled send path —
+    /// `SendHandle::unwedge()`, not a new content dispatch (FR-41). Resolves the
+    /// same live `Arc<Timeline>` that produced the item so the `unique_id` matches,
+    /// then delegates to [`send::retry`].
+    ///
+    /// Errors: unknown room / no open timeline as [`send_text`]; a missing echo →
+    /// [`SendError::EchoNotFound`].
+    pub async fn retry_send(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        item_key: &str,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let timeline = self.open_timeline_for(account_id, &room_id).await?;
+        send::retry(&timeline, item_key).await?;
+        tracing::info!(account_id = %account_id, room_id = %room_id, "outgoing message retry re-driven");
+        Ok(())
+    }
+
+    /// Resolve the exact open `Arc<Timeline>` for `room_id` on the live account,
+    /// or a typed [`SendError::NoOpenTimeline`] if the account isn't live or no
+    /// timeline for the room is subscribed.
+    async fn open_timeline_for(
+        &self,
+        account_id: &str,
+        room_id: &RoomId,
+    ) -> Result<Arc<Timeline>, CoreError> {
+        let accounts = self.accounts.lock().await;
+        let handle = accounts.get(account_id).ok_or(SendError::NoOpenTimeline)?;
+        let timelines = handle.timelines.lock().await;
+        // A room can be transiently registered under two subscription ids (a
+        // StrictMode remount, or a re-subscribe before the previous producer's
+        // reaper runs). Pick the newest (highest subscription id) so send/retry
+        // always target the timeline instance currently feeding the UI —
+        // `unique_id`s are only stable within one instance, so a stale one would
+        // fail the retry item lookup.
+        let timeline = timelines
+            .iter()
+            .filter(|(_, (open_room, _))| open_room == room_id)
+            .max_by_key(|(subscription_id, _)| **subscription_id)
+            .map(|(_, (_, tl))| tl.clone())
+            .ok_or(SendError::NoOpenTimeline)?;
+        Ok(timeline)
     }
 
     /// Tear down the whole account: abort every subscription and drop the live
@@ -333,6 +436,8 @@ impl AccountManager {
             for (_, task) in subs.drain() {
                 task.abort();
             }
+            // Drop every stored `Arc<Timeline>` so no room timeline leaks.
+            handle.timelines.lock().await.clear();
             tracing::info!(account_id = %account_id, "account shut down");
         }
     }

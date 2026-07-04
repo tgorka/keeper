@@ -8,6 +8,7 @@
  * Renders text only — no media, replies, or reactions (later epics).
  */
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Button } from "@/components/ui/button";
 import { formatMessageTime } from "@/lib/format-time";
 import type { TimelineItemVm } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
@@ -23,6 +24,17 @@ interface MessageBubbleProps {
    * avatar and sender name are hidden so the run reads as one grouped block.
    */
   grouped: boolean;
+  /**
+   * Whether this bubble is the last in its same-sender run. Only the group tail
+   * shows the transient `Sending…`/`Sent` caption (to avoid per-bubble noise); a
+   * `Failed` caption always renders regardless.
+   */
+  groupTail?: boolean;
+  /**
+   * Retry a failed outgoing message by its `key`. Wired by the parent to the
+   * controlled send path; the `Failed — Retry` button calls it.
+   */
+  onRetry?: (key: string) => void;
 }
 
 /**
@@ -40,10 +52,11 @@ function initials(label: string): string {
   return (words[0][0] + words[words.length - 1][0]).toUpperCase();
 }
 
-export function MessageBubble({ item, grouped }: MessageBubbleProps) {
+export function MessageBubble({ item, grouped, groupTail = true, onRetry }: MessageBubbleProps) {
   const displayName = item.senderDisplayName ?? item.sender;
   const time = formatMessageTime(item.timestamp);
   const isOwn = item.isOwn;
+  const sendState = item.sendState;
 
   return (
     <div
@@ -90,7 +103,53 @@ export function MessageBubble({ item, grouped }: MessageBubbleProps) {
             </time>
           )}
         </div>
+        <SendStateCaption
+          state={sendState}
+          messageKey={item.key}
+          groupTail={groupTail}
+          onRetry={onRetry}
+        />
       </div>
     </div>
   );
+}
+
+interface SendStateCaptionProps {
+  state: MessageVm["sendState"];
+  messageKey: string;
+  groupTail: boolean;
+  onRetry?: (key: string) => void;
+}
+
+/**
+ * The outgoing send-state caption (UX-DR10/UX-DR11): microcopy in sentence case,
+ * no error codes, no emoji. `Failed` always renders as a persistent destructive
+ * `Failed — Retry` (the Retry never auto-clears); `Sending…`/`Sent` render muted
+ * and only under the last bubble of a same-sender group. A remote message
+ * (`sendState: null`) renders nothing.
+ */
+function SendStateCaption({ state, messageKey, groupTail, onRetry }: SendStateCaptionProps) {
+  if (state === "failed") {
+    return (
+      <div className="mt-0.5 flex items-center gap-1">
+        <span className="text-destructive text-xs">Failed</span>
+        <span aria-hidden="true" className="text-muted-foreground text-xs">
+          —
+        </span>
+        <Button type="button" variant="destructive" size="xs" onClick={() => onRetry?.(messageKey)}>
+          Retry
+        </Button>
+      </div>
+    );
+  }
+  if (!groupTail) {
+    return null;
+  }
+  if (state === "sending") {
+    return <span className="mt-0.5 text-muted-foreground text-xs">Sending…</span>;
+  }
+  if (state === "sent") {
+    return <span className="mt-0.5 text-muted-foreground text-xs">Sent</span>;
+  }
+  return null;
 }

@@ -11,6 +11,7 @@ function message(key: string, sender = "@bob:example.org"): TimelineItemVm {
     body: `body ${key}`,
     timestamp: 1,
     isOwn: false,
+    sendState: null,
   };
 }
 

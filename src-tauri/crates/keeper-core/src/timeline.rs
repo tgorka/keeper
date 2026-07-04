@@ -22,13 +22,13 @@ use matrix_sdk::ruma::{OwnedRoomId, RoomId};
 use matrix_sdk::Client;
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::timeline::{
-    MsgLikeKind, RoomExt, Timeline, TimelineDetails, TimelineItem, TimelineItemContent,
-    TimelineItemKind,
+    EventSendState, MsgLikeKind, RoomExt, Timeline, TimelineDetails, TimelineItem,
+    TimelineItemContent, TimelineItemKind,
 };
 
 use crate::account::TimelineSink;
 use crate::error::TimelineError;
-use crate::vm::{TimelineBatch, TimelineItemVm, TimelineOp};
+use crate::vm::{SendState, TimelineBatch, TimelineItemVm, TimelineOp};
 
 /// Defensive upper bound on a decoded message body before it crosses IPC.
 const MAX_BODY_CHARS: usize = 4096;
@@ -51,6 +51,30 @@ pub fn text_body(msgtype: &MessageType) -> Option<String> {
         return None;
     }
     Some(body.clone())
+}
+
+/// Map an SDK [`EventSendState`] (a local echo's send state) to the VM
+/// [`SendState`] tag (FR-9, AD-13). Pure — unit-tested via the constructible
+/// variants.
+///
+/// - `NotSentYet` → `Sending` (enqueued / in flight).
+/// - `Sent` → `Sent` (server-acknowledged).
+/// - `SendingFailed { is_recoverable: true }` → `Sending` — a transient failure
+///   the send queue is still auto-retrying, so it reads as in-flight, not failed.
+/// - `SendingFailed { is_recoverable: false }` → `Failed` — an unrecoverable
+///   failure surfaced to the user as the persistent `Failed — Retry` caption.
+fn map_send_state(state: &EventSendState) -> SendState {
+    match state {
+        EventSendState::NotSentYet { .. } => SendState::Sending,
+        EventSendState::Sent { .. } => SendState::Sent,
+        EventSendState::SendingFailed { is_recoverable, .. } => {
+            if *is_recoverable {
+                SendState::Sending
+            } else {
+                SendState::Failed
+            }
+        }
+    }
 }
 
 /// Truncate a decoded body to [`MAX_BODY_CHARS`] characters (by `char`, so a
@@ -100,6 +124,7 @@ pub fn item_to_vm(item: &TimelineItem) -> TimelineItemVm {
         body: truncate_body(body),
         timestamp: i64::from(ev.timestamp().0),
         is_own: ev.is_own(),
+        send_state: ev.send_state().map(map_send_state),
     }
 }
 
@@ -146,10 +171,23 @@ type TimelineDiffStream = Pin<Box<dyn Stream<Item = Vec<VectorDiff<Arc<TimelineI
 /// The live building blocks of a subscribed room timeline: the `Timeline` handle
 /// (kept alive so its drop handle can later cancel the SDK's background tasks),
 /// the cached snapshot, and the live diff stream.
+///
+/// The `Timeline` is an `Arc` so the exact same instance is shared between the
+/// forwarder task and the account's send/retry lookup — `unique_id`s are only
+/// stable within one `Timeline`, so send/retry MUST operate on the instance that
+/// produced the subscribed items (AD-19).
 pub struct OpenTimeline {
-    timeline: Timeline,
+    timeline: Arc<Timeline>,
     initial: Vector<Arc<TimelineItem>>,
     stream: TimelineDiffStream,
+}
+
+impl OpenTimeline {
+    /// The shared `Arc<Timeline>` to register on the account's supervision state
+    /// so send/retry can reach the exact instance that produced the items.
+    pub fn timeline(&self) -> Arc<Timeline> {
+        self.timeline.clone()
+    }
 }
 
 /// Build a room's timeline and open its snapshot-then-diff subscription.
@@ -173,7 +211,7 @@ pub async fn open_timeline(
         .map_err(|e| TimelineError::Build(e.to_string()))?;
     let (initial, stream) = timeline.subscribe().await;
     Ok(OpenTimeline {
-        timeline,
+        timeline: Arc::new(timeline),
         initial,
         stream: Box::pin(stream),
     })
@@ -211,8 +249,11 @@ pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: Ti
         }
     }
     tracing::info!(room_id = %room_id, "timeline stream ended");
-    // `timeline` stays in scope until here; dropping it now cancels the SDK's
-    // background timeline tasks.
+    // `timeline` stays in scope until here; dropping this `Arc` reference now
+    // releases the producer's hold. The SDK's background timeline tasks are
+    // cancelled once the last reference is gone — the account also drops its
+    // stored `Arc<Timeline>` on the same teardown path (natural completion /
+    // unsubscribe), so nothing leaks (AD-19).
     drop(timeline);
 }
 
@@ -232,6 +273,7 @@ mod tests {
             body: "hi".to_owned(),
             timestamp: 1,
             is_own: false,
+            send_state: None,
         }
     }
 
@@ -239,6 +281,39 @@ mod tests {
         TimelineItemVm::Other {
             key: key.to_owned(),
         }
+    }
+
+    #[test]
+    fn map_send_state_not_sent_yet_is_sending() {
+        let state = EventSendState::NotSentYet { progress: None };
+        assert_eq!(map_send_state(&state), SendState::Sending);
+    }
+
+    #[test]
+    fn map_send_state_sent_is_sent() {
+        use matrix_sdk::ruma::owned_event_id;
+        let state = EventSendState::Sent {
+            event_id: owned_event_id!("$evt:example.org"),
+        };
+        assert_eq!(map_send_state(&state), SendState::Sent);
+    }
+
+    #[test]
+    fn map_send_state_recoverable_failure_stays_sending() {
+        let state = EventSendState::SendingFailed {
+            error: Arc::new(matrix_sdk::Error::AuthenticationRequired),
+            is_recoverable: true,
+        };
+        assert_eq!(map_send_state(&state), SendState::Sending);
+    }
+
+    #[test]
+    fn map_send_state_unrecoverable_failure_is_failed() {
+        let state = EventSendState::SendingFailed {
+            error: Arc::new(matrix_sdk::Error::AuthenticationRequired),
+            is_recoverable: false,
+        };
+        assert_eq!(map_send_state(&state), SendState::Failed);
     }
 
     #[test]

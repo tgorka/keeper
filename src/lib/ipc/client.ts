@@ -18,6 +18,7 @@ export type { PingVm } from "./gen/PingVm";
 export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
+export type { SendState } from "./gen/SendState";
 export type { TimelineBatch } from "./gen/TimelineBatch";
 export type { TimelineItemVm } from "./gen/TimelineItemVm";
 export type { TimelineOp } from "./gen/TimelineOp";
@@ -142,4 +143,25 @@ export async function subscribeTimeline(
  */
 export async function unsubscribeTimeline(accountId: string, id: number): Promise<void> {
   await invoke<void>("timeline_unsubscribe", { accountId, subscriptionId: id });
+}
+
+/**
+ * Send a plain-text message to a room (FR-9, AD-13). Delegates to the single Rust
+ * dispatch gate; the message's local echo and every send-state transition arrive
+ * back over the room's existing timeline subscription (no echo is synthesized
+ * here). Resolves on successful enqueue; rejects with the {@link IpcError}
+ * envelope (`code: "sendFailed"`, `retriable: true`) on an enqueue-time failure.
+ */
+export async function sendText(accountId: string, roomId: string, body: string): Promise<void> {
+  await invoke<void>("send_text", { accountId, roomId, body });
+}
+
+/**
+ * Retry a failed outgoing message by re-driving its wedged local echo through the
+ * controlled send path (`unwedge`, not a new dispatch). `itemKey` is the timeline
+ * item's opaque `key` (`unique_id`). Rejects with the {@link IpcError} envelope
+ * (`code: "sendFailed"`) if the echo is gone or the room has no open timeline.
+ */
+export async function retrySend(accountId: string, roomId: string, itemKey: string): Promise<void> {
+  await invoke<void>("send_retry", { accountId, roomId, itemKey });
 }

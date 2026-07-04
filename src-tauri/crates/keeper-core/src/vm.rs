@@ -54,6 +54,33 @@ pub enum IpcErrorCode {
     /// `Timeline` failed to build. Retriable — the subscribe may be attempted
     /// again.
     TimelineUnavailable,
+    /// An outgoing message could not be enqueued for send (room not found, no
+    /// open timeline, the wedged echo was gone, or the SDK dispatch failed).
+    /// Retriable — the send may be attempted again. Asynchronous delivery
+    /// failures are *not* this code; they surface as the `Failed` send-state on
+    /// the timeline item instead.
+    SendFailed,
+}
+
+/// The delivery state of an outgoing (local-echo) message (FR-9, AD-13, UX-DR10).
+///
+/// Derived from the SDK `EventSendState` of a local echo: a message being
+/// enqueued or retried is `Sending`; a message the server acknowledged is
+/// `Sent`; a message whose send failed unrecoverably is `Failed`. A remote
+/// (received or reconciled) item has no send state and maps to `None` on the VM.
+/// Only the enum tag crosses IPC — never the txn id, error object, or event id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum SendState {
+    /// The message is being enqueued or is in flight (including a transient,
+    /// recoverable failure the send queue is still auto-retrying).
+    Sending,
+    /// The homeserver acknowledged the message.
+    Sent,
+    /// The message failed to send unrecoverably; it is actionable via Retry and
+    /// its caption never auto-clears.
+    Failed,
 }
 
 /// A single room row rendered in the chat list (FR-8, NFR-9, AD-20).
@@ -196,6 +223,9 @@ pub enum TimelineItemVm {
         timestamp: i64,
         /// Whether the current account sent this message.
         is_own: bool,
+        /// The delivery state of an outgoing local echo, or `null` for a remote
+        /// (received or reconciled) message that carries no send state.
+        send_state: Option<SendState>,
     },
     /// Any non-text item (non-text msgtype, state/membership/profile change,
     /// redacted, undecryptable, or a virtual date-divider/read-marker item).
@@ -541,6 +571,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn send_failed_code_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::SendFailed).expect("serialize send-failed code"),
+            "\"sendFailed\""
+        );
+    }
+
+    #[test]
+    fn send_state_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&SendState::Sending).expect("serialize sending"),
+            "\"sending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SendState::Sent).expect("serialize sent"),
+            "\"sent\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SendState::Failed).expect("serialize failed"),
+            "\"failed\""
+        );
+    }
+
+    #[test]
+    fn send_state_round_trips() {
+        for state in [SendState::Sending, SendState::Sent, SendState::Failed] {
+            let json = serde_json::to_string(&state).expect("serialize send state");
+            let back: SendState = serde_json::from_str(&json).expect("deserialize send state");
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn timeline_item_vm_message_with_send_state_round_trips() {
+        let vm = TimelineItemVm::Message {
+            key: "unique-1".to_owned(),
+            sender: "@alice:example.org".to_owned(),
+            sender_display_name: Some("Alice".to_owned()),
+            body: "outgoing".to_owned(),
+            timestamp: 1_720_000_000_000,
+            is_own: true,
+            send_state: Some(SendState::Sending),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize message vm");
+        assert!(
+            json.contains("\"sendState\":\"sending\""),
+            "json was: {json}"
+        );
+        let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize message vm");
+        assert_eq!(back, vm);
+    }
+
     fn sample_message() -> TimelineItemVm {
         TimelineItemVm::Message {
             key: "unique-1".to_owned(),
@@ -549,6 +632,7 @@ mod tests {
             body: "hello world".to_owned(),
             timestamp: 1_720_000_000_000,
             is_own: false,
+            send_state: None,
         }
     }
 
@@ -589,12 +673,14 @@ mod tests {
             body: "hi".to_owned(),
             timestamp: 1,
             is_own: true,
+            send_state: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(
             json.contains("\"senderDisplayName\":null"),
             "json was: {json}"
         );
+        assert!(json.contains("\"sendState\":null"), "json was: {json}");
         let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, vm);
     }

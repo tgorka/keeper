@@ -96,6 +96,36 @@ pub enum TimelineError {
     Build(String),
 }
 
+/// Errors originating in the outgoing-send dispatch gate (FR-41, AD-13, AD-21).
+///
+/// A secret-free taxonomy: no message ever contains a token, txn id, message
+/// plaintext, or event id. All variants map to `IpcErrorCode::SendFailed`
+/// (retriable) in the shell's single funnel. These are *enqueue-time* failures
+/// — asynchronous delivery failures surface as the `Failed` send-state on the
+/// timeline item, not as one of these.
+#[derive(Debug, Error)]
+pub enum SendError {
+    /// The target room was not found on the live `Client` (unknown or
+    /// unparsable room id).
+    #[error("room not found")]
+    RoomNotFound,
+
+    /// No open timeline is registered for the room, so send/retry has no live
+    /// `Timeline` to operate on (the room must be open/subscribed to send).
+    #[error("no open timeline for this room")]
+    NoOpenTimeline,
+
+    /// The wedged local echo referenced by a retry was not found in the live
+    /// timeline (it may have already reconciled or been removed).
+    #[error("outgoing message not found")]
+    EchoNotFound,
+
+    /// The SDK failed to enqueue (or re-drive) the send. The wrapped string is a
+    /// non-secret description of the failure — never message plaintext.
+    #[error("could not send the message: {0}")]
+    Dispatch(String),
+}
+
 /// The hexagon error root. Every fallible core operation surfaces one of these.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -114,6 +144,10 @@ pub enum CoreError {
     /// A per-room timeline subscription failed to open.
     #[error(transparent)]
     Timeline(#[from] TimelineError),
+
+    /// An outgoing message could not be enqueued for send.
+    #[error(transparent)]
+    Send(#[from] SendError),
 
     /// A requested capability is not supported on this platform/build. Honest,
     /// non-panicking signal used by not-yet-wired [`crate::platform::Platform`]
