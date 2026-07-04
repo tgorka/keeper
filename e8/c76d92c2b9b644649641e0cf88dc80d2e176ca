@@ -1,0 +1,48 @@
+src-tauri/crates/keeper-core/src/account.rs
+  s_a6d1098ecb192f::t_1da81b7acfe88e 333-340
+src/hooks/use-account-statuses.test.ts
+  s_a6d1098ecb192f::t_6352b76e17efbe 99-143
+src-tauri/crates/keeper-core/src/inbox.rs
+  s_a6d1098ecb192f::t_5f0d8ad73ca996 560-591
+  s_a6d1098ecb192f::t_1221361f2b926c 110-120
+_bmad-output/implementation-artifacts/spec-2-5-account-switcher-and-per-account-state.md
+  s_a6d1098ecb192f::t_0df9cf8c8637af 136-149
+  s_a6d1098ecb192f::t_6a15bef60e3272 179-193
+src/hooks/use-account-statuses.ts
+  s_a6d1098ecb192f::t_63b6bb103957f2 28-34,36-37,45-49,55-60,62,64-65,71,98-100,102-103,106-108
+  s_a6d1098ecb192f::t_a0907dc4e6bcae 22
+  s_a6d1098ecb192f::t_b7bc8051e831ea 51,67,69-70,72,101,104,110-111,114
+  s_a6d1098ecb192f::t_8844cb1113c995 8-14
+  s_a6d1098ecb192f::t_91bc6fe7728d10 52-54,61
+  s_a6d1098ecb192f::t_ac8a25070ae0b9 50
+src/components/layout/account-footer.tsx
+  s_a6d1098ecb192f::t_76d369496f4a87 151-153
+  s_a6d1098ecb192f::t_e71f45bc923c4d 36
+  s_a6d1098ecb192f::t_70068486ba8c0b 115
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_8a8bc6b6bf6017::t_43bf2276063155 66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e8c76d92c2b9b644649641e0cf88dc80d2e176ca",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_a6d1098ecb192f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6ad7cd6-9a8f-4303-b59e-2b3541e0a1ab",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
