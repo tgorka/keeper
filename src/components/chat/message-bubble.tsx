@@ -35,6 +35,13 @@ interface MessageBubbleProps {
    * controlled send path; the `Failed — Retry` button calls it.
    */
   onRetry?: (key: string) => void;
+  /**
+   * Whether the account is currently offline (UX-DR10). A pure projection of the
+   * Rust-streamed connection status: when `true` and this outgoing message is
+   * still `sending`, the transient caption reads amber `Queued — sends when
+   * you're back online` instead of `Sending…`. `sent`/`failed` are unaffected.
+   */
+  offline?: boolean;
 }
 
 /**
@@ -52,7 +59,13 @@ function initials(label: string): string {
   return (words[0][0] + words[words.length - 1][0]).toUpperCase();
 }
 
-export function MessageBubble({ item, grouped, groupTail = true, onRetry }: MessageBubbleProps) {
+export function MessageBubble({
+  item,
+  grouped,
+  groupTail = true,
+  onRetry,
+  offline = false,
+}: MessageBubbleProps) {
   const displayName = item.senderDisplayName ?? item.sender;
   const time = formatMessageTime(item.timestamp);
   const isOwn = item.isOwn;
@@ -105,9 +118,11 @@ export function MessageBubble({ item, grouped, groupTail = true, onRetry }: Mess
         </div>
         <SendStateCaption
           state={sendState}
+          isOwn={isOwn}
           messageKey={item.key}
           groupTail={groupTail}
           onRetry={onRetry}
+          offline={offline}
         />
       </div>
     </div>
@@ -116,19 +131,30 @@ export function MessageBubble({ item, grouped, groupTail = true, onRetry }: Mess
 
 interface SendStateCaptionProps {
   state: MessageVm["sendState"];
+  isOwn: boolean;
   messageKey: string;
   groupTail: boolean;
   onRetry?: (key: string) => void;
+  offline: boolean;
 }
 
 /**
  * The outgoing send-state caption (UX-DR10/UX-DR11): microcopy in sentence case,
  * no error codes, no emoji. `Failed` always renders as a persistent destructive
  * `Failed — Retry` (the Retry never auto-clears); `Sending…`/`Sent` render muted
- * and only under the last bubble of a same-sender group. A remote message
- * (`sendState: null`) renders nothing.
+ * and only under the last bubble of a same-sender group. While the account is
+ * `offline`, a still-`sending` *own* message reads the amber `Queued — sends when
+ * you're back online` (a pure projection of the connection status + `isOwn`)
+ * instead of `Sending…`. A remote message (`sendState: null`) renders nothing.
  */
-function SendStateCaption({ state, messageKey, groupTail, onRetry }: SendStateCaptionProps) {
+function SendStateCaption({
+  state,
+  isOwn,
+  messageKey,
+  groupTail,
+  onRetry,
+  offline,
+}: SendStateCaptionProps) {
   if (state === "failed") {
     return (
       <div className="mt-0.5 flex items-center gap-1">
@@ -146,6 +172,11 @@ function SendStateCaption({ state, messageKey, groupTail, onRetry }: SendStateCa
     return null;
   }
   if (state === "sending") {
+    if (offline && isOwn) {
+      return (
+        <span className="mt-0.5 text-held text-xs">Queued — sends when you're back online</span>
+      );
+    }
     return <span className="mt-0.5 text-muted-foreground text-xs">Sending…</span>;
   }
   if (state === "sent") {

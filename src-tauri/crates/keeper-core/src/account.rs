@@ -31,7 +31,7 @@ use matrix_sdk::Client;
 use matrix_sdk_ui::eyeball_im::VectorDiff;
 use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
 use matrix_sdk_ui::room_list_service::{RoomList, RoomListItem, RoomListLoadingState};
-use matrix_sdk_ui::sync_service::SyncService;
+use matrix_sdk_ui::sync_service::{State, SyncService};
 use matrix_sdk_ui::timeline::Timeline;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -42,7 +42,9 @@ use crate::platform::Platform;
 use crate::registry;
 use crate::send::{self, SendTrigger};
 use crate::timeline;
-use crate::vm::{RoomListBatch, RoomListOp, RoomVm, TimelineBatch};
+use crate::vm::{
+    ConnectionStatus, ConnectionStatusBatch, RoomListBatch, RoomListOp, RoomVm, TimelineBatch,
+};
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
 const ROOM_LIST_PAGE_SIZE: usize = 200;
@@ -59,6 +61,11 @@ pub type BatchSink = Box<dyn Fn(RoomListBatch) -> bool + Send + Sync>;
 /// `Channel::send`; tests capture into a vector. Returns `true` if the batch was
 /// delivered, `false` if the channel is closed (the producer then stops).
 pub type TimelineSink = Box<dyn Fn(TimelineBatch) -> bool + Send + Sync>;
+
+/// Sink that receives each produced [`ConnectionStatusBatch`]. The shell wraps a
+/// Tauri `Channel::send`; tests capture into a vector. Returns `true` if the
+/// batch was delivered, `false` if the channel is closed (the producer stops).
+pub type ConnectionSink = Box<dyn Fn(ConnectionStatusBatch) -> bool + Send + Sync>;
 
 /// Registry of an account's live open room timelines, keyed by the *timeline*
 /// subscription id → its room id and the exact `Arc<Timeline>` that produced the
@@ -80,6 +87,14 @@ struct AccountHandle {
     /// completion), so no `Timeline` (and its SDK tasks) leaks (AD-19). The
     /// room-list subscription registers nothing here.
     timelines: OpenTimelines,
+    /// Lifetime-of-account reconnect supervisor task (not tied to any UI
+    /// subscription). Observes `sync.state()` and, on every transition into
+    /// `Running`, calls `client.send_queue().set_enabled(true)` so a room queue
+    /// that a recoverable error disabled is re-enabled and persisted unsent
+    /// requests are respawned — the load-bearing "dispatch on reconnect"
+    /// mechanism. Aborted in [`AccountManager::shutdown`] and on partial
+    /// activation teardown.
+    reconnect_supervisor: JoinHandle<()>,
 }
 
 /// Single-account-capable supervisor (AD-19). Owns the live account state; the
@@ -116,7 +131,7 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync) = activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor) = activate(platform, account_id).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -124,6 +139,7 @@ impl AccountManager {
                         sync,
                         subscriptions: Arc::new(Mutex::new(HashMap::new())),
                         timelines: Arc::new(Mutex::new(HashMap::new())),
+                        reconnect_supervisor,
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for room list");
@@ -155,6 +171,7 @@ impl AccountManager {
                     };
                     if should_remove {
                         if let Some(dead) = accounts.remove(account_id) {
+                            dead.reconnect_supervisor.abort();
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -221,7 +238,7 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync) = activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor) = activate(platform, account_id).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -229,6 +246,7 @@ impl AccountManager {
                         sync,
                         subscriptions: Arc::new(Mutex::new(HashMap::new())),
                         timelines: Arc::new(Mutex::new(HashMap::new())),
+                        reconnect_supervisor,
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for timeline");
@@ -264,6 +282,7 @@ impl AccountManager {
                     };
                     if should_remove {
                         if let Some(dead) = accounts.remove(account_id) {
+                            dead.reconnect_supervisor.abort();
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -316,6 +335,97 @@ impl AccountManager {
         }
         tracing::info!(account_id = %account_id, subscription_id, room_id = %room_id_log, "timeline subscribed");
         Ok(subscription_id)
+    }
+
+    /// Subscribe to the account's connection status, activating the account if
+    /// it is not already live (reusing the same `Client`/`SyncService` — never a
+    /// second one). Spawns a supervised producer over `sync.state()` that emits
+    /// the current mapped [`ConnectionStatus`] as an initial snapshot, then a
+    /// deduped diff on every change, into `sink`. Returns the subscription id.
+    ///
+    /// Mirrors [`subscribe_room_list`]'s lazy-activation + supervised-task +
+    /// self-reap lifecycle: the `JoinHandle` is registered in the subscriptions
+    /// map and aborted on unsubscribe / shutdown. An activation failure maps to
+    /// the existing `SyncUnavailable` code (retriable).
+    pub async fn subscribe_connection_status(
+        &self,
+        platform: &dyn Platform,
+        account_id: &str,
+        sink: ConnectionSink,
+    ) -> Result<u64, CoreError> {
+        // Activate under the manager lock so a concurrent subscribe cannot build
+        // a second Client/SyncService for the same account. `did_activate`
+        // records whether *this* call brought the account live, so a failure
+        // before any subscription attaches can tear it back down (AD-21).
+        let (client, sync, subs_arc, did_activate) = {
+            let mut accounts = self.accounts.lock().await;
+            let did_activate = !accounts.contains_key(account_id);
+            if did_activate {
+                let (client, sync, reconnect_supervisor) = activate(platform, account_id).await?;
+                accounts.insert(
+                    account_id.to_owned(),
+                    AccountHandle {
+                        client,
+                        sync,
+                        subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                        timelines: Arc::new(Mutex::new(HashMap::new())),
+                        reconnect_supervisor,
+                    },
+                );
+                tracing::info!(account_id = %account_id, "account activated for connection status");
+            }
+            let handle = accounts.get(account_id).ok_or_else(|| {
+                CoreError::Internal("account handle vanished after activation".to_owned())
+            })?;
+            (
+                handle.client.clone(),
+                handle.sync.clone(),
+                handle.subscriptions.clone(),
+                did_activate,
+            )
+        };
+
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let account_id_owned = account_id.to_owned();
+        let reaper_subs = subs_arc.clone();
+        let task = tokio::spawn(async move {
+            // `client` is captured to keep the account alive for the task's
+            // lifetime; the producer reads connectivity from `sync` only.
+            let _keep_alive = client;
+            run_connection_producer(sync, sink, &account_id_owned).await;
+            // A naturally-completed producer reaps its own subscription entry.
+            reaper_subs.lock().await.remove(&subscription_id);
+        });
+
+        {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(_) => {
+                    subs_arc.lock().await.insert(subscription_id, task);
+                }
+                None => {
+                    // The account was shut down in the spawn→register gap;
+                    // aborting the orphaned producer here leaks nothing.
+                    task.abort();
+                    if did_activate {
+                        return Err(AccountError::SyncStart(
+                            "account removed during subscribe".to_owned(),
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        tracing::info!(account_id = %account_id, subscription_id, "connection status subscribed");
+        Ok(subscription_id)
+    }
+
+    /// Abort exactly the connection-status producer task for `subscription_id`;
+    /// other account state is untouched. Idempotent.
+    pub async fn unsubscribe_connection_status(&self, account_id: &str, subscription_id: u64) {
+        if self.abort_subscription(account_id, subscription_id).await {
+            tracing::info!(account_id = %account_id, subscription_id, "connection status unsubscribed");
+        }
     }
 
     /// Abort exactly the producer task for `subscription_id`; other account
@@ -430,8 +540,9 @@ impl AccountManager {
         let mut accounts = self.accounts.lock().await;
         if let Some(handle) = accounts.remove(account_id) {
             // Stop the SyncService first so no further diffs are produced, then
-            // abort any remaining producer tasks.
+            // abort the reconnect supervisor and any remaining producer tasks.
             handle.sync.stop().await;
+            handle.reconnect_supervisor.abort();
             let mut subs = handle.subscriptions.lock().await;
             for (_, task) in subs.drain() {
                 task.abort();
@@ -445,10 +556,18 @@ impl AccountManager {
 
 /// Lazily rebuild the `Client` from the persisted session and start a
 /// `SyncService`. Also the Story 1.8 cold-start restore path.
+///
+/// The `SyncService` is built with `.with_offline_mode()` so it exposes a real
+/// `Offline` state (auto-resumed via `/_matrix/client/versions`). After
+/// `sync.start()`, the send queue is enabled once so any persisted queued sends
+/// from a prior process reload and dispatch (force-quit resilience). A
+/// lifetime-of-account reconnect supervisor is spawned to re-enable the send
+/// queue on every transition back into `Running`; its `JoinHandle` is returned
+/// for the caller to store on the `AccountHandle`.
 async fn activate(
     platform: &dyn Platform,
     account_id: &str,
-) -> Result<(Client, std::sync::Arc<SyncService>), CoreError> {
+) -> Result<(Client, std::sync::Arc<SyncService>, JoinHandle<()>), CoreError> {
     let session_json = platform
         .keychain_get(&session_keychain_key(account_id))?
         .ok_or(AccountError::SessionMissing)?;
@@ -473,12 +592,99 @@ async fn activate(
         .map_err(|e| AccountError::RestoreFailed(e.to_string()))?;
 
     let sync = SyncService::builder(client.clone())
+        .with_offline_mode()
         .build()
         .await
         .map_err(|e| AccountError::SyncStart(e.to_string()))?;
     sync.start().await;
 
-    Ok((client, std::sync::Arc::new(sync)))
+    // Enable the persistent send queue once at activation: this reloads any
+    // unsent requests persisted by a prior process and respawns their tasks
+    // (force-quit resilience). Idempotent.
+    client.send_queue().set_enabled(true).await;
+
+    let sync = std::sync::Arc::new(sync);
+    let reconnect_supervisor = tokio::spawn(run_reconnect_supervisor(
+        client.clone(),
+        sync.clone(),
+        account_id.to_owned(),
+    ));
+
+    Ok((client, sync, reconnect_supervisor))
+}
+
+/// Lifetime-of-account reconnect supervisor: observe `sync.state()` and, on every
+/// transition **into** `Running`, call `client.send_queue().set_enabled(true)`.
+///
+/// A recoverable send error disables a room's queue (it does not self-retry), so
+/// re-enabling the send queue on return to `Running` is what makes queued sends
+/// dispatch automatically on reconnect. `set_enabled(true)` is idempotent and
+/// internally respawns tasks for rooms with unsent requests. The task ends when
+/// the state subscriber closes (the `SyncService` was dropped) or it is aborted
+/// on shutdown/teardown.
+async fn run_reconnect_supervisor(
+    client: Client,
+    sync: std::sync::Arc<SyncService>,
+    account_id: String,
+) {
+    let mut states = sync.state();
+    // Seed with the current state so an initial `Running` isn't treated as a
+    // transition into `Running` (activation already enabled the send queue).
+    let mut was_running = matches!(states.get(), State::Running);
+    while let Some(state) = states.next().await {
+        let is_running = matches!(state, State::Running);
+        if is_running && !was_running {
+            client.send_queue().set_enabled(true).await;
+            tracing::info!(
+                account_id = %account_id,
+                "reconnected: send queue re-enabled and unsent requests respawned"
+            );
+        }
+        was_running = is_running;
+    }
+}
+
+/// Drive the connectivity stream: emit the current mapped [`ConnectionStatus`]
+/// as an initial snapshot, then a batch on every `sync.state()` change, deduping
+/// consecutive-equal statuses (the snapshot-then-diff contract, AD-8). Stops when
+/// the sink reports the channel is closed or the state subscriber ends.
+async fn run_connection_producer(
+    sync: std::sync::Arc<SyncService>,
+    sink: ConnectionSink,
+    account_id: &str,
+) {
+    let mut states = sync.state();
+    let mut last = map_connection_status(&states.get());
+    if !(sink)(ConnectionStatusBatch { status: last }) {
+        tracing::info!(account_id = %account_id, "connection status channel closed, stopping producer");
+        return;
+    }
+    while let Some(state) = states.next().await {
+        let status = map_connection_status(&state);
+        if status == last {
+            continue;
+        }
+        last = status;
+        if !(sink)(ConnectionStatusBatch { status }) {
+            tracing::info!(account_id = %account_id, "connection status channel closed, stopping producer");
+            break;
+        }
+    }
+    tracing::info!(account_id = %account_id, "connection status stream ended");
+}
+
+/// Pure mapping of the SDK `SyncService` state to a [`ConnectionStatus`]:
+/// `Running` is `Online`; every other state (`Idle`, `Terminated`, `Error`,
+/// `Offline`) is `Offline`. The offline pill and the "Queued" caption both derive
+/// from this one signal. Unit-tested over the publicly constructible variants
+/// (`Error(Arc<Error>)` has no public constructor — covered by reasoning).
+fn map_connection_status(state: &State) -> ConnectionStatus {
+    match state {
+        State::Running => ConnectionStatus::Online,
+        State::Idle | State::Terminated | State::Error(_) | State::Offline => {
+            ConnectionStatus::Offline
+        }
+    }
 }
 
 /// Drive the recency-sorted entries stream, converting each `VectorDiff` batch
@@ -876,6 +1082,23 @@ mod tests {
         let (preview, ts) = decode_message_preview(&raw, None, Some(500));
         assert_eq!(preview, None);
         assert_eq!(ts, Some(500));
+    }
+
+    #[test]
+    fn map_connection_status_running_is_online() {
+        assert_eq!(
+            map_connection_status(&State::Running),
+            ConnectionStatus::Online
+        );
+    }
+
+    #[test]
+    fn map_connection_status_non_running_is_offline() {
+        // Every publicly constructible non-Running variant maps to Offline.
+        // `Error(Arc<Error>)` has no public constructor — covered by reasoning.
+        for state in [State::Idle, State::Terminated, State::Offline] {
+            assert_eq!(map_connection_status(&state), ConnectionStatus::Offline);
+        }
     }
 
     #[test]

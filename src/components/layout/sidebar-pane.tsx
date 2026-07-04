@@ -1,6 +1,7 @@
-import { MessageSquare, Radio, Settings } from "lucide-react";
+import { MessageSquare, Radio, Settings, WifiOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useConnectionStore } from "@/lib/stores/connection";
 import { cn } from "@/lib/utils";
 
 interface SidebarView {
@@ -18,7 +19,12 @@ interface SidebarPaneProps {
   collapsed: boolean;
 }
 
+/** Exact offline-pill copy (UX-DR18) — kept verbatim. */
+const OFFLINE_PILL_TEXT = "Offline — showing your local archive. Messages queue until you're back.";
+
 export function SidebarPane({ collapsed }: SidebarPaneProps) {
+  const offline = useConnectionStore((s) => s.status === "offline");
+
   return (
     <nav
       aria-label="Views"
@@ -66,6 +72,33 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
           );
         })}
       </ul>
+      {/* Persistent offline pill (UX-DR18): a sidebar-footer element shown only
+          while disconnected, using the amber `held` tokens. Non-interactive and
+          keyboard-irrelevant; `role="status"` announces the connectivity change
+          without a toast. No toasts for connectivity, ever. */}
+      {offline &&
+        (collapsed ? (
+          <div
+            role="status"
+            aria-label={OFFLINE_PILL_TEXT}
+            className="mt-auto flex shrink-0 items-center justify-center border-border border-t bg-held/10 p-3 text-held"
+          >
+            <WifiOff aria-hidden="true" className="size-5" />
+            {/* Real text content in addition to aria-label so the `role="status"`
+                live region is reliably announced by screen readers that read a
+                live region's *content* (not its label) when the rail is
+                collapsed; visually hidden behind the icon. */}
+            <span className="sr-only">{OFFLINE_PILL_TEXT}</span>
+          </div>
+        ) : (
+          <div
+            role="status"
+            className="mt-auto flex shrink-0 items-start gap-2 border-border border-t bg-held/10 p-3 text-held text-xs"
+          >
+            <WifiOff aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+            <span>{OFFLINE_PILL_TEXT}</span>
+          </div>
+        ))}
     </nav>
   );
 }

@@ -83,6 +83,38 @@ pub enum SendState {
     Failed,
 }
 
+/// The account's live connectivity, as mapped from the SDK `SyncService` state
+/// (FR-8/FR-9, UX-DR10, UX-DR18, AD-8).
+///
+/// A Rust-authoritative signal streamed over the connection-status channel:
+/// `Online` when the `SyncService` is `Running`, `Offline` for every other state
+/// (`Idle`, `Terminated`, `Error`, `Offline`). The frontend renders the offline
+/// pill and the "Queued" send caption as pure projections of this one status —
+/// no timeline item is invented or mutated. Only the enum tag crosses IPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ConnectionStatus {
+    /// The `SyncService` is `Running` — the account is connected and syncing.
+    Online,
+    /// The `SyncService` is not `Running` — the account is disconnected; sends
+    /// queue in the SDK's persistent send queue until connectivity returns.
+    Offline,
+}
+
+/// A batch delivered over the connection-status subscription's `Channel` (AD-8).
+///
+/// The status is a scalar snapshot, so each batch carries the full current
+/// [`ConnectionStatus`] — inherently idempotent, safe to re-subscribe. The stream
+/// opens with the current mapped status, then emits on change (deduped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ConnectionStatusBatch {
+    /// The current connectivity status.
+    pub status: ConnectionStatus,
+}
+
 /// A single room row rendered in the chat list (FR-8, NFR-9, AD-20).
 ///
 /// Carries **only** non-secret render data. `timestamp` is `i64` milliseconds
@@ -602,6 +634,38 @@ mod tests {
             let back: SendState = serde_json::from_str(&json).expect("deserialize send state");
             assert_eq!(back, state);
         }
+    }
+
+    #[test]
+    fn connection_status_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&ConnectionStatus::Online).expect("serialize online"),
+            "\"online\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConnectionStatus::Offline).expect("serialize offline"),
+            "\"offline\""
+        );
+    }
+
+    #[test]
+    fn connection_status_round_trips() {
+        for status in [ConnectionStatus::Online, ConnectionStatus::Offline] {
+            let json = serde_json::to_string(&status).expect("serialize status");
+            let back: ConnectionStatus = serde_json::from_str(&json).expect("deserialize status");
+            assert_eq!(back, status);
+        }
+    }
+
+    #[test]
+    fn connection_status_batch_round_trips() {
+        let batch = ConnectionStatusBatch {
+            status: ConnectionStatus::Offline,
+        };
+        let json = serde_json::to_string(&batch).expect("serialize batch");
+        assert!(json.contains("\"status\":\"offline\""), "json was: {json}");
+        let back: ConnectionStatusBatch = serde_json::from_str(&json).expect("deserialize batch");
+        assert_eq!(back, batch);
     }
 
     #[test]

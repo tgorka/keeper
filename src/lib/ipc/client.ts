@@ -10,6 +10,8 @@ import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type { IpcError } from "./gen/IpcError";
 
 export type { AccountVm } from "./gen/AccountVm";
+export type { ConnectionStatus } from "./gen/ConnectionStatus";
+export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
 export type { IpcError } from "./gen/IpcError";
@@ -24,6 +26,7 @@ export type { TimelineItemVm } from "./gen/TimelineItemVm";
 export type { TimelineOp } from "./gen/TimelineOp";
 
 import type { AccountVm } from "./gen/AccountVm";
+import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 
@@ -143,6 +146,30 @@ export async function subscribeTimeline(
  */
 export async function unsubscribeTimeline(accountId: string, id: number): Promise<void> {
   await invoke<void>("timeline_unsubscribe", { accountId, subscriptionId: id });
+}
+
+/**
+ * Subscribe to an account's connection status (FR-8/FR-9, UX-DR18, AD-8). Opens a
+ * `Channel`, forwards each {@link ConnectionStatusBatch} to `onBatch` in arrival
+ * order (an initial snapshot before any change), and resolves with the
+ * subscription id. Rejects with the {@link IpcError} envelope (`code:
+ * "syncUnavailable"`) if the account cannot start syncing.
+ */
+export async function subscribeConnectionStatus(
+  accountId: string,
+  onBatch: (batch: ConnectionStatusBatch) => void,
+): Promise<number> {
+  return await subscribe<ConnectionStatusBatch>("connection_status_subscribe", onBatch, {
+    accountId,
+  });
+}
+
+/**
+ * Unsubscribe exactly one connection-status subscription, aborting its backend
+ * producer task (AD-19). Idempotent — unsubscribing an unknown id is a no-op.
+ */
+export async function unsubscribeConnectionStatus(accountId: string, id: number): Promise<void> {
+  await invoke<void>("connection_status_unsubscribe", { accountId, subscriptionId: id });
 }
 
 /**

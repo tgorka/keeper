@@ -55,7 +55,7 @@ development_status:
   1-4-sliding-sync-room-list: done
   1-5-timeline-view-receive-text: done
   1-6-send-text-with-local-echo-and-visible-send-states: done
-  1-7-offline-resilience-queued-sends-and-reconnect-convergence: backlog
+  1-7-offline-resilience-queued-sends-and-reconnect-convergence: done
   1-8-session-restore-and-sign-out: backlog
   epic-1-retrospective: optional
   epic-2: backlog

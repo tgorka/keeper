@@ -22,6 +22,8 @@ pub fn run() {
             ipc::room_list_unsubscribe,
             ipc::timeline_subscribe,
             ipc::timeline_unsubscribe,
+            ipc::connection_status_subscribe,
+            ipc::connection_status_unsubscribe,
             ipc::send_text,
             ipc::send_retry
         ])

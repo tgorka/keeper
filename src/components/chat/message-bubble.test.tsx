@@ -118,6 +118,84 @@ describe("MessageBubble", () => {
     expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
   });
 
+  it("shows the amber Queued caption when offline and sending (in place of Sending…)", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sending" })}
+        grouped={false}
+        groupTail={true}
+        offline={true}
+      />,
+    );
+    const caption = screen.getByText("Queued — sends when you're back online");
+    expect(caption).toBeInTheDocument();
+    expect(caption).toHaveClass("text-held");
+    expect(screen.queryByText("Sending…")).not.toBeInTheDocument();
+  });
+
+  it("shows Sending… when online and sending (offline defaults to false)", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sending" })}
+        grouped={false}
+        groupTail={true}
+      />,
+    );
+    expect(screen.getByText("Sending…")).toBeInTheDocument();
+    expect(screen.queryByText("Queued — sends when you're back online")).not.toBeInTheDocument();
+  });
+
+  it("does not show the Queued caption for a sent message even when offline", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sent" })}
+        grouped={false}
+        groupTail={true}
+        offline={true}
+      />,
+    );
+    expect(screen.getByText("Sent")).toBeInTheDocument();
+    expect(screen.queryByText("Queued — sends when you're back online")).not.toBeInTheDocument();
+  });
+
+  it("keeps the Failed — Retry caption when offline (Queued never overrides failed)", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "failed" })}
+        grouped={false}
+        groupTail={true}
+        offline={true}
+      />,
+    );
+    expect(screen.getByText("Failed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.queryByText("Queued — sends when you're back online")).not.toBeInTheDocument();
+  });
+
+  it("hides the Queued caption when offline+sending but not the group tail", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sending" })}
+        grouped={false}
+        groupTail={false}
+        offline={true}
+      />,
+    );
+    expect(screen.queryByText("Queued — sends when you're back online")).not.toBeInTheDocument();
+  });
+
+  it("never shows the Queued caption for a non-own sending message (isOwn guard)", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: false, sendState: "sending" })}
+        grouped={false}
+        groupTail={true}
+        offline={true}
+      />,
+    );
+    expect(screen.queryByText("Queued — sends when you're back online")).not.toBeInTheDocument();
+  });
+
   it("calls onRetry with the message key when Retry is activated", () => {
     const onRetry = vi.fn();
     render(

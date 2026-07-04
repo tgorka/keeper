@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm, IpcError, TimelineBatch } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
+import { connectionStore } from "@/lib/stores/connection";
 import { roomsStore } from "@/lib/stores/rooms";
 import { timelineStore } from "@/lib/stores/timeline";
 
@@ -57,6 +58,7 @@ beforeEach(() => {
   roomsStore.getState().clear();
   roomsStore.getState().selectRoom(null);
   timelineStore.getState().clear();
+  connectionStore.getState().reset();
   subscribeTimeline.mockReset();
   unsubscribeTimeline.mockReset();
   sendText.mockReset();
@@ -70,6 +72,7 @@ afterEach(() => {
   roomsStore.getState().clear();
   roomsStore.getState().selectRoom(null);
   timelineStore.getState().clear();
+  connectionStore.getState().reset();
 });
 
 describe("ConversationPane", () => {
@@ -356,5 +359,43 @@ describe("ConversationPane", () => {
     await waitFor(() => {
       expect(retrySend).toHaveBeenCalledWith(account.accountId, "!room:example.org", "outgoing-1");
     });
+  });
+
+  it("passes offline to bubbles so a sending own message reads Queued", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    // Drive the connection store offline (the pane reads it as a pure projection).
+    connectionStore.getState().applyBatch({ status: "offline" });
+    accountsStore.getState().setCurrentAccount(account);
+    roomsStore.getState().selectRoom("!room:example.org");
+    render(<ConversationPane {...noopProps()} />);
+
+    captured.onBatch?.({
+      ops: [
+        {
+          op: "reset",
+          items: [
+            {
+              kind: "message",
+              key: "outgoing-1",
+              sender: account.userId,
+              senderDisplayName: null,
+              body: "queued while offline",
+              timestamp: 1,
+              isOwn: true,
+              sendState: "sending",
+            },
+          ],
+        },
+      ],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Queued — sends when you're back online")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Sending…")).not.toBeInTheDocument();
   });
 });

@@ -17,7 +17,8 @@ use keeper_core::error::{
 };
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
-    AccountVm, DemoBatch, IpcError, IpcErrorCode, PingVm, RoomListBatch, TimelineBatch,
+    AccountVm, ConnectionStatusBatch, DemoBatch, IpcError, IpcErrorCode, PingVm, RoomListBatch,
+    TimelineBatch,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -319,6 +320,43 @@ pub async fn send_text(
         .send_text(&account_id, &room_id, &body)
         .await
         .map_err(to_ipc_error)
+}
+
+/// Subscribe to an account's connection status (FR-8/FR-9, UX-DR18, AD-8).
+///
+/// Lazily activates the account (reusing the room-list/timeline path), then
+/// streams [`ConnectionStatusBatch`]es over `channel` — an initial snapshot of
+/// the current status, then deduped changes — and returns the subscription id.
+/// The sink forwards each batch to the channel; a closed channel simply drops
+/// the batch (the frontend has unsubscribed). An activation failure funnels
+/// through [`to_ipc_error`] to the existing `SyncUnavailable` code.
+#[tauri::command]
+pub async fn connection_status_subscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    channel: Channel<ConnectionStatusBatch>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |batch: ConnectionStatusBatch| channel.send(batch).is_ok());
+    state
+        .accounts
+        .subscribe_connection_status(state.platform.as_ref(), &account_id, sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unsubscribe exactly one connection-status subscription, aborting its producer
+/// task (AD-19). Other account state is untouched. Idempotent.
+#[tauri::command]
+pub async fn connection_status_unsubscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_connection_status(&account_id, subscription_id)
+        .await;
+    Ok(())
 }
 
 /// Retry a failed outgoing message by re-driving its wedged local echo through

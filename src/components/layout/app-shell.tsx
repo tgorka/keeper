@@ -5,10 +5,14 @@ import { DetailPanel } from "@/components/layout/detail-panel";
 import { SidebarPane } from "@/components/layout/sidebar-pane";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useConnectionStatus } from "@/hooks/use-connection-status";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 
 export function AppShell() {
   const { sidebarCollapsed, detailFloating } = useShellLayout();
+  // Stream the account's connectivity into the connection store for the offline
+  // pill and the "Queued" send caption (both pure projections of this stream).
+  useConnectionStatus();
   const [detailOpen, setDetailOpen] = useState(false);
   const toggleRef = useRef<HTMLButtonElement>(null);
 
