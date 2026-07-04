@@ -38,7 +38,7 @@ Prerequisites: [Rust](https://rustup.rs) (stable), [Bun](https://bun.sh), Xcode 
 
 ```sh
 bun install          # installs deps + git hooks (lefthook)
-bun run tauri dev    # run the desktop app in dev mode
+bun run tauri:dev    # run the desktop app in dev mode
 ```
 
 Quality gates (also run in CI and via git hooks):

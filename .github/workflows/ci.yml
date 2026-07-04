@@ -58,4 +58,4 @@ jobs:
         with:
           workspaces: src-tauri
       - run: bun install --frozen-lockfile
-      - run: bun run tauri build --no-bundle
+      - run: bun run tauri:build -- --no-bundle

@@ -26,7 +26,7 @@ op item get "keeper dev matrix" --reveal --fields label=password
 Or inject into a dev shell via `op run`:
 
 ```sh
-op run --env-file=.env.1p -- bun run tauri dev
+op run --env-file=.env.1p -- bun run tauri:dev
 ```
 
 with `.env.1p` (committed, contains only `op://` references, no secrets):
