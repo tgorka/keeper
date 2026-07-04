@@ -24,6 +24,8 @@ matrix-sdk-ui = { workspace = true }
 futures-util = { workspace = true }
 # URL parsing for the OIDC callback registry and OAuth redirect metadata.
 url = { workspace = true }
+# HTTP client for the Beeper unofficial email-code login flow (Story 2.3, AD-17).
+reqwest = { workspace = true }
 # Account registry (keeper.db, WAL) and opaque ULID account ids.
 rusqlite = { workspace = true }
 ulid = { workspace = true }

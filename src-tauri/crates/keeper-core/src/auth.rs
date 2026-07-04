@@ -14,6 +14,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Beeper unofficial email-code login (Story 2.3, AD-17). All `api.beeper.com`
+/// HTTP is confined to this submodule; the rest of `auth` (the shared
+/// [`add_account`] orchestration, [`StoredSession`], rollback) is reused
+/// unchanged. Re-exported below so the shell references
+/// `keeper_core::auth::{BeeperFlowRegistry, …}` alongside the other providers.
+pub mod beeper;
+
+pub use beeper::{BeeperAuthProvider, BeeperFlowRegistry, BEEPER_HOMESERVER};
+
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::authentication::oauth::{ClientId, OAuthSession, UserSession};
 use matrix_sdk::authentication::AuthSession;

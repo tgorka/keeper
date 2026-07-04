@@ -7,10 +7,16 @@ import { accountsStore } from "@/lib/stores/accounts";
 const loginPassword = vi.fn();
 const loginOidc = vi.fn();
 const cancelOidc = vi.fn();
+const beeperRequestCode = vi.fn();
+const loginBeeper = vi.fn();
+const cancelBeeper = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   loginPassword: (...args: [string, string, string]) => loginPassword(...args),
   loginOidc: (...args: [string]) => loginOidc(...args),
   cancelOidc: (...args: []) => cancelOidc(...args),
+  beeperRequestCode: (...args: [string]) => beeperRequestCode(...args),
+  loginBeeper: (...args: [string, string]) => loginBeeper(...args),
+  cancelBeeper: (...args: []) => cancelBeeper(...args),
 }));
 
 // Import after the mock is registered.
@@ -34,6 +40,15 @@ function fillAndSubmit() {
   fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
 }
 
+/** Switch to the Beeper tab and wait for its content to mount. Radix Tabs
+ * activate on pointer-down in jsdom, so mouseDown precedes the click. */
+async function openBeeperTab() {
+  const tab = screen.getByRole("tab", { name: "Beeper" });
+  fireEvent.mouseDown(tab);
+  fireEvent.click(tab);
+  await screen.findByLabelText("Email");
+}
+
 describe("LoginScreen", () => {
   beforeEach(() => {
     accountsStore.getState().clear();
@@ -41,6 +56,10 @@ describe("LoginScreen", () => {
     loginOidc.mockReset();
     cancelOidc.mockReset();
     cancelOidc.mockResolvedValue(undefined);
+    beeperRequestCode.mockReset();
+    loginBeeper.mockReset();
+    cancelBeeper.mockReset();
+    cancelBeeper.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -284,5 +303,158 @@ describe("LoginScreen", () => {
     expect(
       await screen.findByText("Single sign-on didn't complete. Please try again."),
     ).toBeInTheDocument();
+  });
+
+  it("shows the permanent unofficial-API subtitle on the Beeper tab", async () => {
+    render(<LoginScreen />);
+    await openBeeperTab();
+    expect(screen.getByText("Unofficial API — may break without notice")).toBeInTheDocument();
+    // Beeper asks only for email at the first step — no homeserver field.
+    expect(screen.getByLabelText("Email")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Homeserver")).not.toBeInTheDocument();
+  });
+
+  it("requests a code and advances to the code step on Send code", async () => {
+    beeperRequestCode.mockResolvedValue(undefined);
+    render(<LoginScreen />);
+    await openBeeperTab();
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "  alice@beeper.com " } });
+    fireEvent.click(screen.getByRole("button", { name: "Send code" }));
+    await waitFor(() => {
+      expect(beeperRequestCode).toHaveBeenCalledWith("alice@beeper.com");
+    });
+    // The code step is now shown.
+    expect(await screen.findByLabelText("Login code")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Verify" })).toBeInTheDocument();
+  });
+
+  it("verifies the code, records the account, and calls onDone", async () => {
+    beeperRequestCode.mockResolvedValue(undefined);
+    loginBeeper.mockResolvedValue(account);
+    const onDone = vi.fn();
+    render(<LoginScreen addMode onDone={onDone} />);
+    await openBeeperTab();
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "alice@beeper.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send code" }));
+    await screen.findByLabelText("Login code");
+    fireEvent.change(screen.getByLabelText("Login code"), { target: { value: "424242" } });
+    fireEvent.click(screen.getByRole("button", { name: "Verify" }));
+    await waitFor(() => {
+      expect(loginBeeper).toHaveBeenCalledWith("alice@beeper.com", "424242");
+    });
+    await waitFor(() => {
+      expect(accountsStore.getState().accounts).toEqual([account]);
+    });
+    expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the code field after submit", async () => {
+    beeperRequestCode.mockResolvedValue(undefined);
+    // A never-resolving login keeps the flow pending so we can inspect the field.
+    loginBeeper.mockReturnValue(new Promise(() => {}));
+    render(<LoginScreen />);
+    await openBeeperTab();
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "alice@beeper.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send code" }));
+    await screen.findByLabelText("Login code");
+    fireEvent.change(screen.getByLabelText("Login code"), { target: { value: "424242" } });
+    fireEvent.click(screen.getByRole("button", { name: "Verify" }));
+    await waitFor(() => {
+      expect(screen.getByLabelText<HTMLInputElement>("Login code").value).toBe("");
+    });
+  });
+
+  it("renders the named failure with Retry and a status link on beeperUnavailable", async () => {
+    beeperRequestCode.mockRejectedValue(ipcError("beeperUnavailable"));
+    render(<LoginScreen />);
+    await openBeeperTab();
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "alice@beeper.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send code" }));
+    expect(
+      await screen.findByText(
+        /Beeper login unavailable — this is an unofficial API and may have changed\./,
+      ),
+    ).toBeInTheDocument();
+    const link = screen.getByRole("link", { name: /Beeper status/ });
+    expect(link).toHaveAttribute("href", "https://status.beeper.com");
+    // Retry returns to the email step.
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByLabelText("Email")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send code" })).toBeInTheDocument();
+  });
+
+  it("renders the named failure when verification fails", async () => {
+    beeperRequestCode.mockResolvedValue(undefined);
+    loginBeeper.mockRejectedValue(ipcError("beeperUnavailable"));
+    render(<LoginScreen />);
+    await openBeeperTab();
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "alice@beeper.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send code" }));
+    await screen.findByLabelText("Login code");
+    fireEvent.change(screen.getByLabelText("Login code"), { target: { value: "000000" } });
+    fireEvent.click(screen.getByRole("button", { name: "Verify" }));
+    expect(
+      await screen.findByText(
+        /Beeper login unavailable — this is an unofficial API and may have changed\./,
+      ),
+    ).toBeInTheDocument();
+    expect(accountsStore.getState().accounts).toEqual([]);
+  });
+
+  it("guards a blank Beeper email without calling the backend", async () => {
+    render(<LoginScreen />);
+    await openBeeperTab();
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "   " } });
+    fireEvent.click(screen.getByRole("button", { name: "Send code" }));
+    expect(await screen.findByText("Enter your Beeper email.")).toBeInTheDocument();
+    expect(beeperRequestCode).not.toHaveBeenCalled();
+  });
+
+  it("guards a blank Beeper code without calling the backend", async () => {
+    beeperRequestCode.mockResolvedValue(undefined);
+    render(<LoginScreen />);
+    await openBeeperTab();
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "alice@beeper.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send code" }));
+    await screen.findByLabelText("Login code");
+    fireEvent.change(screen.getByLabelText("Login code"), { target: { value: "   " } });
+    fireEvent.click(screen.getByRole("button", { name: "Verify" }));
+    expect(await screen.findByText("Enter the emailed code.")).toBeInTheDocument();
+    expect(loginBeeper).not.toHaveBeenCalled();
+  });
+
+  it("calls cancel_beeper when unmounted mid-flow", async () => {
+    beeperRequestCode.mockResolvedValue(undefined);
+    // A never-resolving login keeps the flow pending across unmount.
+    loginBeeper.mockReturnValue(new Promise(() => {}));
+    const { unmount } = render(<LoginScreen />);
+    await openBeeperTab();
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "alice@beeper.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send code" }));
+    await screen.findByLabelText("Login code");
+    fireEvent.change(screen.getByLabelText("Login code"), { target: { value: "424242" } });
+    fireEvent.click(screen.getByRole("button", { name: "Verify" }));
+    // Unmount while the login is still pending.
+    unmount();
+    await waitFor(() => {
+      expect(cancelBeeper).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("calls cancel_beeper when unmounted idle on the code step (no verify pending)", async () => {
+    // After Send code the backend holds a request id but the code step sits idle
+    // with pending === false. Abandoning here (overlay dismissed / tab switched)
+    // must still cancel the backend flow so no registry residue lingers.
+    beeperRequestCode.mockResolvedValue(undefined);
+    const { unmount } = render(<LoginScreen />);
+    await openBeeperTab();
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "alice@beeper.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send code" }));
+    // Reach the code step, then unmount without submitting a code.
+    await screen.findByLabelText("Login code");
+    unmount();
+    await waitFor(() => {
+      expect(cancelBeeper).toHaveBeenCalledTimes(1);
+    });
   });
 });

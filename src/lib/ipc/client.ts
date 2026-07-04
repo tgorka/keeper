@@ -114,6 +114,42 @@ export async function cancelOidc(): Promise<void> {
 }
 
 /**
+ * Request a Beeper email login code (Story 2.3, step 1). Sends the email to the
+ * Rust core, which runs Beeper's unofficial `POST /user/login` → `POST
+ * /user/login/email` and stores the intermediate request id server-side (keyed
+ * by email) so it never crosses IPC. Resolves once a code has been emailed;
+ * rejects with the {@link IpcError} envelope (`code: "beeperUnavailable"`,
+ * `retriable: true`) on any Beeper failure — a non-2xx, timeout, transport error,
+ * or a private-API shape change. No bearer token or request id crosses IPC.
+ */
+export async function beeperRequestCode(email: string): Promise<void> {
+  await invoke<void>("beeper_request_code", { email });
+}
+
+/**
+ * Complete a Beeper email-code login (Story 2.3, step 2). Sends the email and the
+ * emailed code to the Rust core, which takes the stored request id, runs `POST
+ * /user/login/response` to obtain the Beeper JWT, then completes login via
+ * `org.matrix.login.jwt` against `matrix.beeper.com` through the shared
+ * add-account pipeline. Resolves with the non-secret {@link AccountVm}; rejects
+ * with the {@link IpcError} envelope (`code: "beeperUnavailable"`, `retriable:
+ * true`) on any Beeper failure (including an abandoned flow with no stored
+ * request id). The emailed `code` is transient — never returned or stored.
+ */
+export async function loginBeeper(email: string, code: string): Promise<AccountVm> {
+  return await invoke<AccountVm>("login_beeper", { email, code });
+}
+
+/**
+ * Cancel any in-progress Beeper login flow (Story 2.3). The Rust core clears the
+ * registry so no pending request id lingers; nothing is persisted. Idempotent —
+ * a no-op when no flow is pending.
+ */
+export async function cancelBeeper(): Promise<void> {
+  await invoke<void>("cancel_beeper");
+}
+
+/**
  * Report every persisted account that can be restored on launch (FR-8, AD-20).
  * Identity only — the Rust core lists the registry rows and returns each whose
  * Keychain session is present as a non-secret {@link AccountVm} (with hue).

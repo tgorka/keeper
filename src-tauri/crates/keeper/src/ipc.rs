@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use keeper_core::account::AccountManager;
 use keeper_core::auth;
+use keeper_core::auth::BeeperFlowRegistry;
 use keeper_core::demo::snapshot_then_diff;
 use keeper_core::error::{
     AccountError, AuthError, CoreError, InboxError, PlatformError, SendError, TimelineError,
@@ -40,6 +41,11 @@ pub struct AppState {
     /// URLs against it; each `login_oidc` call registers its pending flow here,
     /// and `cancel_oidc` aborts all pending flows.
     pub oauth_flows: Arc<OAuthFlowRegistry>,
+    /// In-flight Beeper email-code login registry (Story 2.3). Holds the
+    /// intermediate login-request id between `beeper_request_code` and
+    /// `login_beeper` (keyed by email) so it never crosses IPC; `cancel_beeper`
+    /// clears it. All `api.beeper.com` HTTP is confined to `keeper-core`.
+    pub beeper_flows: Arc<BeeperFlowRegistry>,
 }
 
 impl AppState {
@@ -49,6 +55,7 @@ impl AppState {
             platform: Arc::new(DesktopPlatform),
             accounts: AccountManager::new(),
             oauth_flows: Arc::new(OAuthFlowRegistry::new()),
+            beeper_flows: Arc::new(BeeperFlowRegistry::new()),
         }
     }
 }
@@ -155,6 +162,10 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         CoreError::Auth(AuthError::OAuthCancelled) => (IpcErrorCode::OauthCancelled, true),
         CoreError::Auth(AuthError::OAuthTimedOut) => (IpcErrorCode::OauthTimedOut, true),
         CoreError::Auth(AuthError::OAuthFailed(_)) => (IpcErrorCode::OauthFailed, true),
+        // Every Beeper failure (non-2xx / timeout / transport / shape change /
+        // abandoned flow / JWT-login rejection) collapses to this one retriable
+        // code: the UI returns to the email step to start a fresh flow.
+        CoreError::Auth(AuthError::BeeperUnavailable(_)) => (IpcErrorCode::BeeperUnavailable, true),
         // Any account activation / sync-start failure is retriable: the
         // frontend can attempt the subscribe again.
         CoreError::Account(
@@ -290,6 +301,55 @@ pub async fn login_oidc(
 #[tauri::command]
 pub fn cancel_oidc(state: State<'_, AppState>) -> Result<(), IpcError> {
     state.oauth_flows.cancel_all();
+    Ok(())
+}
+
+/// Request a Beeper email login code (Story 2.3, step 1). Delegates to the core,
+/// which runs `POST /user/login` → `POST /user/login/email` and stores the
+/// intermediate request id (keyed by `email`) in the registry so it never
+/// crosses IPC. Resolves on success (a code has been emailed); any Beeper failure
+/// funnels through [`to_ipc_error`] to the retriable `beeperUnavailable` code. No
+/// bearer token, request id, or JWT ever crosses back to JavaScript.
+#[tauri::command]
+pub async fn beeper_request_code(
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<(), IpcError> {
+    state
+        .beeper_flows
+        .request_code(&email)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Complete a Beeper email-code login (Story 2.3, step 2). Delegates to the core,
+/// which takes the stored request id for `email`, runs `POST
+/// /user/login/response` to obtain the JWT, then completes login via
+/// `org.matrix.login.jwt` through the shared add-account pipeline (store-less SSS
+/// gate → persistent store → Keychain → registry, with rollback on failure). On
+/// success resolves to a non-secret [`AccountVm`]; any Beeper failure (including
+/// an abandoned flow with no stored request id) funnels through [`to_ipc_error`]
+/// to the retriable `beeperUnavailable` code. The emailed `code` is transient —
+/// never returned, stored, or logged.
+#[tauri::command]
+pub async fn login_beeper(
+    state: State<'_, AppState>,
+    email: String,
+    code: String,
+) -> Result<AccountVm, IpcError> {
+    state
+        .beeper_flows
+        .login(state.platform.as_ref(), &email, &code)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Cancel any in-progress Beeper login flow(s) (Story 2.3). Clears the registry
+/// so no pending request id lingers; nothing is persisted. Idempotent — with no
+/// pending flow it is a no-op.
+#[tauri::command]
+pub fn cancel_beeper(state: State<'_, AppState>) -> Result<(), IpcError> {
+    state.beeper_flows.cancel_all();
     Ok(())
 }
 
@@ -598,6 +658,15 @@ mod tests {
         )));
         assert_eq!(ipc.code, IpcErrorCode::OauthFailed);
         assert!(ipc.retriable, "a failed sign-in may be retried");
+    }
+
+    #[test]
+    fn auth_beeper_unavailable_maps_to_retriable_code() {
+        let ipc = to_ipc_error(CoreError::Auth(AuthError::BeeperUnavailable(
+            "the Beeper login service returned an error".to_owned(),
+        )));
+        assert_eq!(ipc.code, IpcErrorCode::BeeperUnavailable);
+        assert!(ipc.retriable, "a Beeper failure may be retried");
     }
 
     #[test]

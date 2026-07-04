@@ -62,6 +62,12 @@ pub enum IpcErrorCode {
     /// failure). Retriable — the sign-in may be started again. Serializes as
     /// `"oauthFailed"`.
     OauthFailed,
+    /// The Beeper unofficial email-code login flow is unavailable (Story 2.3):
+    /// a non-2xx / timeout / transport failure from `api.beeper.com`, a
+    /// missing/renamed field (the private API changed shape), an abandoned flow,
+    /// or a JWT / `org.matrix.login.jwt` rejection. Retriable — the UI returns to
+    /// the email step to start a fresh flow. Serializes as `"beeperUnavailable"`.
+    BeeperUnavailable,
     /// The account could not start (or continue) syncing: the persisted session
     /// was missing, session restore failed, or `SyncService` failed to start.
     /// Retriable — the subscribe may be attempted again.
@@ -692,6 +698,12 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&IpcErrorCode::OauthFailed).expect("serialize oauth-failed"),
             "\"oauthFailed\""
+        );
+        // Story 2.3 Beeper code — locked to the frontend wire contract.
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::BeeperUnavailable)
+                .expect("serialize beeper-unavailable"),
+            "\"beeperUnavailable\""
         );
     }
 

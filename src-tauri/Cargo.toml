@@ -39,6 +39,9 @@ matrix-sdk-ui = "0.18"
 futures-util = "0.3"
 # URL parsing for the OIDC callback registry + redirect metadata (already in the tree via matrix-sdk).
 url = "2"
+# HTTP client for the Beeper unofficial email-code login flow (Story 2.3, AD-17).
+# rustls-only to match matrix-sdk's TLS backend — no second TLS stack (no native-tls/OpenSSL).
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # Platform ports
 dirs = "6"
 # Keychain (macOS Keychain via the OS-native backend) — shell-only, the only genuinely new crate.

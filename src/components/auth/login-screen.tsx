@@ -4,13 +4,30 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { AccountVm, IpcError, IpcErrorCode } from "@/lib/ipc/client";
-import { cancelOidc, loginOidc, loginPassword } from "@/lib/ipc/client";
+import {
+  beeperRequestCode,
+  cancelBeeper,
+  cancelOidc,
+  loginBeeper,
+  loginOidc,
+  loginPassword,
+} from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 
 /** Documentation link surfaced for the non-SSS error (Design Notes). */
 const SSS_DOC_URL =
   "https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/4186-simplified-sliding-sync.md";
+
+/** Beeper status page linked from the "unavailable" failure state (Design Notes). */
+const BEEPER_STATUS_URL = "https://status.beeper.com";
+
+/** The permanent, non-dismissible subtitle on the Beeper tab (Acceptance). */
+const BEEPER_SUBTITLE = "Unofficial API — may break without notice";
+
+/** The distinct named failure copy for a Beeper login failure (Acceptance). */
+const BEEPER_FAILURE = "Beeper login unavailable — this is an unofficial API and may have changed.";
 
 /** Error codes rendered inline: the backend `IpcErrorCode`s plus a client-side
  * "missing fields" guard (the form is `noValidate`, so blank/whitespace input
@@ -62,17 +79,63 @@ interface LoginScreenProps {
 }
 
 /**
- * Password login (FR-1, FR-5, AD-17).
+ * Login surface (FR-1, FR-3, FR-5, AD-17).
  *
- * Collects homeserver + username + password, calls the typed `login_password`
- * command, renders the named error inline, and — on success — records the
- * returned non-secret {@link AccountVm} in the accounts store (`addAccount`,
- * which gates/extends the shell). In `addMode` it is an overlay for adding
- * another account and offers a Cancel control. The password field is cleared
- * after every submit; the password never lives in any store.
+ * Two tabs: "Password" wraps the existing password + single-sign-on (OIDC) form
+ * unchanged; "Beeper" drives the unofficial email-code flow. On success either
+ * tab records the returned non-secret {@link AccountVm} in the accounts store
+ * (`addAccount`, which gates/extends the shell) and, in `addMode`, calls
+ * `onDone`. No token or session material lives in any store.
  */
 export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) {
   const addAccount = useAccountsStore((s) => s.addAccount);
+
+  return (
+    <div className="flex h-screen items-center justify-center bg-background p-6 text-foreground">
+      <Card className="w-full max-w-sm">
+        <CardHeader>
+          <CardTitle>{addMode ? "Add an account" : "Sign in to keeper"}</CardTitle>
+          <CardDescription>
+            {addMode
+              ? "Connect another Matrix account. Your other accounts keep syncing."
+              : "Connect your Matrix account to start chatting."}
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Tabs defaultValue="password">
+            <TabsList className="w-full">
+              {/* Trigger text avoids the exact string "Password"/"Email" so a
+                  tab panel's `aria-labelledby` name never collides with a field
+                  label under Testing Library's `getByLabelText`. */}
+              <TabsTrigger value="password">Password &amp; SSO</TabsTrigger>
+              <TabsTrigger value="beeper">Beeper</TabsTrigger>
+            </TabsList>
+            <TabsContent value="password">
+              <PasswordTab addMode={addMode} addAccount={addAccount} onDone={onDone} />
+            </TabsContent>
+            <TabsContent value="beeper">
+              <BeeperTab addMode={addMode} addAccount={addAccount} onDone={onDone} />
+            </TabsContent>
+          </Tabs>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+interface TabProps {
+  addMode: boolean;
+  addAccount: (account: AccountVm) => void;
+  onDone?: () => void;
+}
+
+/**
+ * Password + single-sign-on (OIDC) tab (FR-1, FR-5, Story 2.2). Collects
+ * homeserver + username + password, calls `login_password`, or drives the OIDC
+ * browser round-trip. The password field is cleared after every submit and never
+ * lives in any store.
+ */
+function PasswordTab({ addMode, addAccount, onDone }: TabProps) {
   const [homeserver, setHomeserver] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -167,106 +230,287 @@ export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) 
     }
   }
 
+  if (oidcPending) {
+    return (
+      <div className="flex flex-col gap-4">
+        <p className="text-sm text-muted-foreground">Complete sign-in in your browser…</p>
+        <Button type="button" variant="outline" onClick={handleCancelOidc}>
+          Cancel
+        </Button>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex h-screen items-center justify-center bg-background p-6 text-foreground">
-      <Card className="w-full max-w-sm">
-        <CardHeader>
-          <CardTitle>{addMode ? "Add an account" : "Sign in to keeper"}</CardTitle>
-          <CardDescription>
-            {addMode
-              ? "Connect another Matrix account. Your other accounts keep syncing."
-              : "Connect your Matrix account to start chatting."}
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          {oidcPending ? (
-            <div className="flex flex-col gap-4">
-              <p className="text-sm text-muted-foreground">Complete sign-in in your browser…</p>
-              <Button type="button" variant="outline" onClick={handleCancelOidc}>
-                Cancel
-              </Button>
-            </div>
-          ) : (
-            <form className="flex flex-col gap-4" onSubmit={handleSubmit} noValidate>
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="homeserver">Homeserver</Label>
-                <Input
-                  id="homeserver"
-                  name="homeserver"
-                  type="text"
-                  autoComplete="url"
-                  placeholder="example.org"
-                  value={homeserver}
-                  onChange={(e) => setHomeserver(e.target.value)}
-                  required
-                />
-              </div>
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="username">Username</Label>
-                <Input
-                  id="username"
-                  name="username"
-                  type="text"
-                  autoComplete="username"
-                  placeholder="alice"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  required
-                />
-              </div>
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="password">Password</Label>
-                <Input
-                  id="password"
-                  name="password"
-                  type="password"
-                  autoComplete="current-password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  required
-                />
-              </div>
+    <form className="flex flex-col gap-4" onSubmit={handleSubmit} noValidate>
+      <div className="flex flex-col gap-2">
+        <Label htmlFor="homeserver">Homeserver</Label>
+        <Input
+          id="homeserver"
+          name="homeserver"
+          type="text"
+          autoComplete="url"
+          placeholder="example.org"
+          value={homeserver}
+          onChange={(e) => setHomeserver(e.target.value)}
+          required
+        />
+      </div>
+      <div className="flex flex-col gap-2">
+        <Label htmlFor="username">Username</Label>
+        <Input
+          id="username"
+          name="username"
+          type="text"
+          autoComplete="username"
+          placeholder="alice"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          required
+        />
+      </div>
+      <div className="flex flex-col gap-2">
+        <Label htmlFor="password">Password</Label>
+        <Input
+          id="password"
+          name="password"
+          type="password"
+          autoComplete="current-password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          required
+        />
+      </div>
 
-              {errorCode && (
-                <Alert variant="destructive" className="bg-destructive/10">
-                  <AlertTitle>Couldn't sign in</AlertTitle>
-                  <AlertDescription>
-                    {errorCopy(errorCode)}
-                    {errorCode === "slidingSyncUnsupported" && (
-                      <>
-                        {" "}
-                        <a href={SSS_DOC_URL} target="_blank" rel="noreferrer">
-                          Learn more about Simplified Sliding Sync
-                        </a>
-                        .
-                      </>
-                    )}
-                  </AlertDescription>
-                </Alert>
-              )}
+      {errorCode && (
+        <Alert variant="destructive" className="bg-destructive/10">
+          <AlertTitle>Couldn't sign in</AlertTitle>
+          <AlertDescription>
+            {errorCopy(errorCode)}
+            {errorCode === "slidingSyncUnsupported" && (
+              <>
+                {" "}
+                <a href={SSS_DOC_URL} target="_blank" rel="noreferrer">
+                  Learn more about Simplified Sliding Sync
+                </a>
+                .
+              </>
+            )}
+          </AlertDescription>
+        </Alert>
+      )}
 
-              <div className="flex flex-col gap-2">
-                <Button type="submit" disabled={submitting}>
-                  {submitting ? "Signing in…" : addMode ? "Add account" : "Sign in"}
-                </Button>
-                <Button type="button" variant="outline" disabled={submitting} onClick={handleOidc}>
-                  Sign in with single sign-on
-                </Button>
-                {addMode && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={submitting}
-                    onClick={() => onDone?.()}
-                  >
-                    Cancel
-                  </Button>
-                )}
-              </div>
-            </form>
+      <div className="flex flex-col gap-2">
+        <Button type="submit" disabled={submitting}>
+          {submitting ? "Signing in…" : addMode ? "Add account" : "Sign in"}
+        </Button>
+        <Button type="button" variant="outline" disabled={submitting} onClick={handleOidc}>
+          Sign in with single sign-on
+        </Button>
+        {addMode && (
+          <Button type="button" variant="outline" disabled={submitting} onClick={() => onDone?.()}>
+            Cancel
+          </Button>
+        )}
+      </div>
+    </form>
+  );
+}
+
+/** The two-step state of the Beeper email-code flow. */
+type BeeperStep = "email" | "code";
+
+/**
+ * Beeper unofficial email-code tab (FR-3, Story 2.3, AD-17). A permanent,
+ * non-dismissible subtitle marks the API as unofficial. Step "email" asks only
+ * for an email (no homeserver — it is fixed to `matrix.beeper.com`) and requests
+ * a code; step "code" submits the emailed code. Every Beeper failure renders the
+ * distinct named "unavailable" state with a Retry (returns to the email step) and
+ * a status link. On unmount mid-flow the pending flow is cancelled.
+ */
+function BeeperTab({ addMode, addAccount, onDone }: TabProps) {
+  const [step, setStep] = useState<BeeperStep>("email");
+  const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
+  // `true` once a code has been requested / verification submitted and the login
+  // has not yet resolved — mirrors the OIDC pending ref for the unmount cleanup.
+  const [pending, setPending] = useState(false);
+  // Client-side blank-input guard shown inline (mirrors the password tab).
+  const [missingFields, setMissingFields] = useState(false);
+  // `true` once a Beeper call has failed; renders the distinct named state.
+  const [failed, setFailed] = useState(false);
+
+  // Mirror `pending` into a ref so the unmount cleanup reads the latest value.
+  const pendingRef = useRef(false);
+  useEffect(() => {
+    pendingRef.current = pending;
+  }, [pending]);
+  // `true` once `beeper_request_code` has stored a request id in the backend
+  // registry (we advanced to the code step) and the login has not yet completed.
+  // The registry entry survives past `pending` going false (the code step sits
+  // idle with `pending === false`), so the unmount cleanup must key off this, not
+  // `pending`, or an abandoned code step would leak a registry entry.
+  const flowStartedRef = useRef(false);
+  // On unmount mid-flow (overlay dismissed, tab switched away), clear any pending
+  // Beeper request id in the backend registry so no residue lingers.
+  useEffect(
+    () => () => {
+      if (pendingRef.current || flowStartedRef.current) {
+        void cancelBeeper().catch(() => {
+          // Best-effort: an abandoned flow leaves only an in-memory entry.
+        });
+      }
+    },
+    [],
+  );
+
+  async function handleSendCode() {
+    setMissingFields(false);
+    setFailed(false);
+    const trimmedEmail = email.trim();
+    if (trimmedEmail === "") {
+      setMissingFields(true);
+      return;
+    }
+    setPending(true);
+    try {
+      await beeperRequestCode(trimmedEmail);
+      // A request id now lives in the backend registry — mark the flow active so
+      // an unmount before verification cancels it.
+      flowStartedRef.current = true;
+      setStep("code");
+    } catch {
+      // Every Beeper failure collapses into the one named unavailable state.
+      setFailed(true);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function handleVerify() {
+    setMissingFields(false);
+    setFailed(false);
+    const trimmedEmail = email.trim();
+    const trimmedCode = code.trim();
+    if (trimmedCode === "") {
+      setMissingFields(true);
+      return;
+    }
+    setPending(true);
+    const submittedCode = trimmedCode;
+    // Clear the code field immediately on submit — it never lingers in UI.
+    setCode("");
+    try {
+      const account: AccountVm = await loginBeeper(trimmedEmail, submittedCode);
+      // The backend consumed the request id (`take`) to complete login, so there
+      // is no registry residue left to cancel on unmount.
+      flowStartedRef.current = false;
+      addAccount(account);
+      onDone?.();
+    } catch {
+      setFailed(true);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  function handleRetry() {
+    // Retry restarts at the email step (a fresh `beeper_request_code`), so a
+    // stale/expired request id is simply replaced.
+    setFailed(false);
+    setCode("");
+    setStep("email");
+  }
+
+  if (failed) {
+    return (
+      <div className="flex flex-col gap-4">
+        <Alert variant="destructive" className="bg-destructive/10">
+          <AlertTitle>Beeper login unavailable</AlertTitle>
+          <AlertDescription>
+            {BEEPER_FAILURE}{" "}
+            <a href={BEEPER_STATUS_URL} target="_blank" rel="noreferrer">
+              Check Beeper status
+            </a>
+            .
+          </AlertDescription>
+        </Alert>
+        <div className="flex flex-col gap-2">
+          <Button type="button" onClick={handleRetry}>
+            Retry
+          </Button>
+          {addMode && (
+            <Button type="button" variant="outline" onClick={() => onDone?.()}>
+              Cancel
+            </Button>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <p className="text-sm text-muted-foreground">{BEEPER_SUBTITLE}</p>
+
+      <div className="flex flex-col gap-2">
+        <Label htmlFor="beeper-email">Email</Label>
+        <Input
+          id="beeper-email"
+          name="beeper-email"
+          type="email"
+          autoComplete="email"
+          placeholder="you@example.com"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          disabled={step === "code" || pending}
+          required
+        />
+      </div>
+
+      {step === "code" && (
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="beeper-code">Login code</Label>
+          <Input
+            id="beeper-code"
+            name="beeper-code"
+            type="text"
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            placeholder="Enter the emailed code"
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            disabled={pending}
+            required
+          />
+        </div>
+      )}
+
+      {missingFields && (
+        <Alert variant="destructive" className="bg-destructive/10">
+          <AlertTitle>Couldn't sign in</AlertTitle>
+          <AlertDescription>
+            {step === "email" ? "Enter your Beeper email." : "Enter the emailed code."}
+          </AlertDescription>
+        </Alert>
+      )}
+
+      <div className="flex flex-col gap-2">
+        {step === "email" ? (
+          <Button type="button" disabled={pending} onClick={handleSendCode}>
+            {pending ? "Sending…" : "Send code"}
+          </Button>
+        ) : (
+          <Button type="button" disabled={pending} onClick={handleVerify}>
+            {pending ? "Verifying…" : "Verify"}
+          </Button>
+        )}
+        {addMode && (
+          <Button type="button" variant="outline" disabled={pending} onClick={() => onDone?.()}>
+            Cancel
+          </Button>
+        )}
+      </div>
     </div>
   );
 }

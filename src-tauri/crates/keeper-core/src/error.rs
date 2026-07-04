@@ -76,6 +76,18 @@ pub enum AuthError {
     /// or session material. Retriable.
     #[error("single sign-on failed: {0}")]
     OAuthFailed(String),
+
+    /// The Beeper unofficial email-code login flow failed (Story 2.3, AD-17).
+    ///
+    /// A single collapse point for *every* Beeper failure: a non-2xx from any
+    /// `api.beeper.com` step, a network/transport error, a request timeout, a
+    /// missing/renamed JSON field (the private API changed shape), an abandoned
+    /// flow whose request id is gone, or a JWT / `org.matrix.login.jwt`
+    /// rejection. The wrapped string is a non-secret description — it never
+    /// contains the emailed code, the JWT, or the bearer token. Retriable — the
+    /// UI returns to the email step to start a fresh flow.
+    #[error("Beeper login is unavailable: {0}")]
+    BeeperUnavailable(String),
 }
 
 /// Errors originating in account activation / room-list supervision (AD-19,
