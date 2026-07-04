@@ -1,0 +1,67 @@
+import { useCallback, useRef, useState } from "react";
+import { ChatListPane } from "@/components/layout/chat-list-pane";
+import { ConversationPane } from "@/components/layout/conversation-pane";
+import { DetailPanel } from "@/components/layout/detail-panel";
+import { SidebarPane } from "@/components/layout/sidebar-pane";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { useShellLayout } from "@/hooks/use-shell-layout";
+
+export function AppShell() {
+  const { sidebarCollapsed, detailFloating } = useShellLayout();
+  const [detailOpen, setDetailOpen] = useState(false);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+
+  const openDetail = useCallback(() => setDetailOpen(true), []);
+  const closeDetail = useCallback(() => {
+    setDetailOpen(false);
+    // Return focus to the toggle control on close.
+    toggleRef.current?.focus();
+  }, []);
+  const toggleDetail = useCallback(() => {
+    setDetailOpen((prev) => !prev);
+  }, []);
+
+  const handleSheetOpenChange = useCallback(
+    (open: boolean) => {
+      if (open) {
+        openDetail();
+      } else {
+        closeDetail();
+      }
+    },
+    [openDetail, closeDetail],
+  );
+
+  return (
+    <TooltipProvider>
+      <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
+        {/* Draggable overlay titlebar band (~28px, standard macOS height) so the
+            window stays movable and the traffic lights float over empty space
+            above the panes rather than overlapping pane content in any state. */}
+        <div data-tauri-drag-region className="h-7 shrink-0" />
+        <div className="flex min-h-0 flex-1">
+          <SidebarPane collapsed={sidebarCollapsed} />
+          <ChatListPane />
+          <ConversationPane
+            detailOpen={detailOpen}
+            onToggleDetail={toggleDetail}
+            toggleRef={toggleRef}
+          />
+          {detailOpen && !detailFloating && <DetailPanel />}
+        </div>
+      </div>
+
+      {detailFloating && (
+        <Sheet open={detailOpen} onOpenChange={handleSheetOpenChange}>
+          <SheetContent side="right" className="w-[320px] p-0 sm:max-w-[320px]">
+            <SheetHeader className="sr-only">
+              <SheetTitle>Details</SheetTitle>
+            </SheetHeader>
+            <DetailPanel floating />
+          </SheetContent>
+        </Sheet>
+      )}
+    </TooltipProvider>
+  );
+}
