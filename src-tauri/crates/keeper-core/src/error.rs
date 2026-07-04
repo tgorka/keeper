@@ -155,6 +155,17 @@ pub enum SendError {
     #[error("outgoing message not found")]
     EchoNotFound,
 
+    /// The reply/edit target (referenced by its opaque render key) was not found
+    /// in the live timeline, or a reply target carried no resolvable event id
+    /// (Story 3.4). Non-retriable — re-issuing the same request won't help.
+    #[error("referenced message not found")]
+    TargetNotFound,
+
+    /// An edit was requested on a message that is not editable — not the user's
+    /// own message, or not a text message (Story 3.4). Non-retriable.
+    #[error("message can't be edited")]
+    NotEditable,
+
     /// The SDK failed to enqueue (or re-drive) the send. The wrapped string is a
     /// non-secret description of the failure — never message plaintext.
     #[error("could not send the message: {0}")]

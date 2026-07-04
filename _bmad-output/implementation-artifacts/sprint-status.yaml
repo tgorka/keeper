@@ -70,7 +70,7 @@ development_status:
   3-1-encrypted-rooms-decrypt-encrypt-and-honest-utd-states: done
   3-2-device-verification-emoji-sas-and-qr: done
   3-3-key-backup-enable-and-restore: done
-  3-4-replies-and-edits: backlog
+  3-4-replies-and-edits: done
   3-5-reactions: backlog
   3-6-receive-media-thumbnails-protocol-streaming-preview: backlog
   3-7-send-media-and-files: backlog

@@ -67,6 +67,8 @@ pub fn run() {
             ipc::backup_save_recovery_key,
             ipc::backup_saved_recovery_key,
             ipc::send_text,
+            ipc::send_reply,
+            ipc::edit_message,
             ipc::send_retry,
             ipc::session_restore,
             ipc::inbox_subscribe,

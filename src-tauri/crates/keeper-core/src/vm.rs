@@ -408,6 +408,34 @@ pub struct RoomListBatch {
     pub total: Option<u32>,
 }
 
+/// The quoted-original preview of a reply message (Story 3.4, FR-10, NFR-9).
+///
+/// Derived in the timeline producer from `content.in_reply_to()`. Carries
+/// **only** non-secret render data: the resolved *original* item's opaque render
+/// `key` when it is loaded in the timeline (so the frontend can scroll to it),
+/// the original sender's Matrix user id, a resolved display name, and the decoded
+/// plain-text body (empty when the original is non-text). NO event ids, txn ids,
+/// or raw event JSON cross IPC on this VM (AD-1) — the jump target is the same
+/// opaque `key` (unique_id) used everywhere, resolved in Rust via the producer's
+/// `event_id → unique_id` index. When the original is not loaded, `in_reply_to_key`
+/// is `null` and the quote renders honestly but is not clickable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ReplyPreviewVm {
+    /// The *original* (replied-to) item's opaque render key (its `unique_id`)
+    /// when that original is currently loaded in the timeline, else `null`. The
+    /// frontend uses it to scroll the original into view; never an event id.
+    pub in_reply_to_key: Option<String>,
+    /// The original sender's Matrix user id (opaque, passed through verbatim).
+    pub sender: String,
+    /// The original sender's resolved display name, or `null` when unavailable.
+    pub sender_display_name: Option<String>,
+    /// The decoded plain-text body of the original message, or an empty string
+    /// when the original is non-text or its details are unavailable.
+    pub body: String,
+}
+
 /// A single timeline item rendered in the conversation pane (FR-8, NFR-9,
 /// AD-8/AD-9/AD-20).
 ///
@@ -445,6 +473,12 @@ pub enum TimelineItemVm {
         /// The delivery state of an outgoing local echo, or `null` for a remote
         /// (received or reconciled) message that carries no send state.
         send_state: Option<SendState>,
+        /// Whether this message has been edited (`message.is_edited()`). The
+        /// bubble renders an "Edited" caption when `true` (Story 3.4, FR-11).
+        is_edited: bool,
+        /// The quoted-original preview when this message is a reply
+        /// (`content.in_reply_to()`), else `null` (Story 3.4, FR-10).
+        reply: Option<ReplyPreviewVm>,
     },
     /// An event that could not be decrypted yet (`MsgLikeKind::UnableToDecrypt`).
     /// Renders an explicit honest stub instead of a blank row (Story 3.1). Carries
@@ -1416,6 +1450,8 @@ mod tests {
             timestamp: 1_720_000_000_000,
             is_own: true,
             send_state: Some(SendState::Sending),
+            is_edited: false,
+            reply: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(
@@ -1435,7 +1471,78 @@ mod tests {
             timestamp: 1_720_000_000_000,
             is_own: false,
             send_state: None,
+            is_edited: false,
+            reply: None,
         }
+    }
+
+    #[test]
+    fn reply_preview_vm_round_trips_camel_case() {
+        let vm = ReplyPreviewVm {
+            in_reply_to_key: Some("unique-orig".to_owned()),
+            sender: "@carol:example.org".to_owned(),
+            sender_display_name: Some("Carol".to_owned()),
+            body: "original body".to_owned(),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize reply preview vm");
+        assert!(
+            json.contains("\"inReplyToKey\":\"unique-orig\""),
+            "json was: {json}"
+        );
+        assert!(
+            json.contains("\"senderDisplayName\":\"Carol\""),
+            "json was: {json}"
+        );
+        // No event-id / txn-id material may appear on the VM.
+        assert!(
+            !json.contains("eventId") && !json.contains("$"),
+            "json leaked event-id material: {json}"
+        );
+        let back: ReplyPreviewVm =
+            serde_json::from_str(&json).expect("deserialize reply preview vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn reply_preview_vm_null_key_round_trips() {
+        let vm = ReplyPreviewVm {
+            in_reply_to_key: None,
+            sender: "@carol:example.org".to_owned(),
+            sender_display_name: None,
+            body: String::new(),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize");
+        assert!(json.contains("\"inReplyToKey\":null"), "json was: {json}");
+        let back: ReplyPreviewVm = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn timeline_item_vm_message_with_reply_and_edited_round_trips() {
+        let vm = TimelineItemVm::Message {
+            key: "unique-9".to_owned(),
+            sender: "@alice:example.org".to_owned(),
+            sender_display_name: Some("Alice".to_owned()),
+            body: "a reply".to_owned(),
+            timestamp: 1_720_000_000_000,
+            is_own: true,
+            send_state: None,
+            is_edited: true,
+            reply: Some(ReplyPreviewVm {
+                in_reply_to_key: Some("unique-orig".to_owned()),
+                sender: "@bob:example.org".to_owned(),
+                sender_display_name: Some("Bob".to_owned()),
+                body: "the original".to_owned(),
+            }),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize message vm");
+        assert!(json.contains("\"isEdited\":true"), "json was: {json}");
+        assert!(
+            json.contains("\"inReplyToKey\":\"unique-orig\""),
+            "json was: {json}"
+        );
+        let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize message vm");
+        assert_eq!(back, vm);
     }
 
     #[test]
@@ -1476,6 +1583,8 @@ mod tests {
             timestamp: 1,
             is_own: true,
             send_state: None,
+            is_edited: false,
+            reply: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(
@@ -1483,6 +1592,7 @@ mod tests {
             "json was: {json}"
         );
         assert!(json.contains("\"sendState\":null"), "json was: {json}");
+        assert!(json.contains("\"reply\":null"), "json was: {json}");
         let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, vm);
     }

@@ -12,6 +12,8 @@ function msg(overrides: Partial<MessageVm> = {}): MessageVm {
     timestamp: new Date(2026, 6, 4, 9, 30, 0).getTime(),
     isOwn: false,
     sendState: null,
+    isEdited: false,
+    reply: null,
     ...overrides,
   };
 }
@@ -207,5 +209,106 @@ describe("MessageBubble", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(onRetry).toHaveBeenCalledWith("outgoing-9");
+  });
+
+  it("renders the Edited caption when isEdited", () => {
+    render(<MessageBubble item={msg({ isEdited: true })} grouped={false} />);
+    expect(screen.getByText("Edited")).toBeInTheDocument();
+  });
+
+  it("does not render the Edited caption for an unedited message", () => {
+    render(<MessageBubble item={msg({ isEdited: false })} grouped={false} />);
+    expect(screen.queryByText("Edited")).not.toBeInTheDocument();
+  });
+
+  it("renders the reply quote (sender + body) above the body", () => {
+    render(
+      <MessageBubble
+        item={msg({
+          body: "my reply",
+          reply: {
+            inReplyToKey: "orig-1",
+            sender: "@carol:example.org",
+            senderDisplayName: "Carol",
+            body: "the original message",
+          },
+        })}
+        grouped={false}
+      />,
+    );
+    expect(screen.getByText("Carol")).toBeInTheDocument();
+    expect(screen.getByText("the original message")).toBeInTheDocument();
+    expect(screen.getByText("my reply")).toBeInTheDocument();
+  });
+
+  it("clicking a resolved reply quote jumps to the original by key", () => {
+    const onJumpTo = vi.fn();
+    render(
+      <MessageBubble
+        item={msg({
+          reply: {
+            inReplyToKey: "orig-1",
+            sender: "@carol:example.org",
+            senderDisplayName: "Carol",
+            body: "the original",
+          },
+        })}
+        grouped={false}
+        onJumpTo={onJumpTo}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Jump to replied message" }));
+    expect(onJumpTo).toHaveBeenCalledWith("orig-1");
+  });
+
+  it("renders an unresolved reply quote as a non-clickable block (null key)", () => {
+    const onJumpTo = vi.fn();
+    render(
+      <MessageBubble
+        item={msg({
+          reply: {
+            inReplyToKey: null,
+            sender: "@carol:example.org",
+            senderDisplayName: "Carol",
+            body: "unloaded original",
+          },
+        })}
+        grouped={false}
+        onJumpTo={onJumpTo}
+      />,
+    );
+    expect(screen.getByText("unloaded original")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Jump to replied message" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers Reply always but Edit only on an own message in the action bar", () => {
+    const { rerender } = render(
+      <MessageBubble
+        item={msg({ isOwn: false })}
+        grouped={false}
+        onReply={() => {}}
+        onEdit={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Reply" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+
+    rerender(
+      <MessageBubble
+        item={msg({ isOwn: true })}
+        grouped={false}
+        onReply={() => {}}
+        onEdit={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
+  });
+
+  it("applies a selection ring when selected", () => {
+    render(<MessageBubble item={msg()} grouped={false} selected={true} />);
+    const body = screen.getByText("hello there").closest("div");
+    expect(body).toHaveClass("ring-2");
   });
 });

@@ -1188,6 +1188,54 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Send a plain-text reply to the message addressed by `in_reply_to_key` (the
+    /// original item's opaque render key) on `room_id`/`account_id` through the
+    /// single dispatch gate (FR-41, AD-13, Story 3.4). Resolves the live
+    /// `Arc<Timeline>` and delegates to [`send::submit_reply`]; the reply's local
+    /// echo (with its own quoted-original preview) and send-state transitions arrive
+    /// through the room's existing timeline subscription — this synthesizes nothing.
+    ///
+    /// Errors: an unparsable/unknown room id → [`SendError::RoomNotFound`]; no open
+    /// timeline → [`SendError::NoOpenTimeline`]; an unresolvable reply target →
+    /// [`SendError::TargetNotFound`]; an SDK enqueue failure → [`SendError::Dispatch`].
+    pub async fn send_reply(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        in_reply_to_key: &str,
+        body: &str,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let timeline = self.open_timeline_for(account_id, &room_id).await?;
+        send::submit_reply(&timeline, in_reply_to_key, body).await?;
+        tracing::info!(account_id = %account_id, room_id = %room_id, "reply dispatched");
+        Ok(())
+    }
+
+    /// Edit the own message addressed by `item_key` (its opaque render key) in
+    /// place on `room_id`/`account_id` through the single dispatch gate (FR-41,
+    /// AD-13, Story 3.4). Resolves the live `Arc<Timeline>` and delegates to
+    /// [`send::submit_edit`]; the `Set` diff that replaces the content (and flips
+    /// `is_edited`) arrives through the room's existing timeline subscription.
+    ///
+    /// Errors: unknown room / no open timeline as [`send_text`]; an unresolvable
+    /// target → [`SendError::TargetNotFound`]; a non-editable target (not own /
+    /// not text) → [`SendError::NotEditable`]; an SDK enqueue failure →
+    /// [`SendError::Dispatch`].
+    pub async fn edit_message(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        item_key: &str,
+        body: &str,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let timeline = self.open_timeline_for(account_id, &room_id).await?;
+        send::submit_edit(&timeline, item_key, body).await?;
+        tracing::info!(account_id = %account_id, room_id = %room_id, "message edit dispatched");
+        Ok(())
+    }
+
     /// Retry a failed outgoing message by re-driving its wedged local echo
     /// (`item_key` = the item's `unique_id`) through the controlled send path —
     /// `SendHandle::unwedge()`, not a new content dispatch (FR-41). Resolves the

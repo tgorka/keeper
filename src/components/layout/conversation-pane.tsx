@@ -15,17 +15,31 @@
  * send-state caption with a persistent `Failed — Retry` (FR-9, AD-13).
  */
 import { PanelRight } from "lucide-react";
-import { type Ref, useCallback, useEffect, useRef, useState } from "react";
+import { type KeyboardEvent, type Ref, useCallback, useEffect, useRef, useState } from "react";
 import { Composer } from "@/components/chat/composer";
 import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble";
 import { UtdStub } from "@/components/chat/utd-stub";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { TimelineBatch, TimelineItemVm } from "@/lib/ipc/client";
-import { retrySend, sendText, subscribeTimeline, unsubscribeTimeline } from "@/lib/ipc/client";
+import {
+  editMessage,
+  retrySend,
+  sendReply,
+  sendText,
+  subscribeTimeline,
+  unsubscribeTimeline,
+} from "@/lib/ipc/client";
 import { useAccountStatus } from "@/lib/stores/account-status";
+import { composerStore, useComposerStore } from "@/lib/stores/composer";
 import { useRoomsStore } from "@/lib/stores/rooms";
 import { timelineStore, useTimelineStore } from "@/lib/stores/timeline";
+
+/** Trim a body to a short single-line preview for the reply banner/quote. */
+function previewOf(body: string): string {
+  const collapsed = body.replace(/\s+/g, " ").trim();
+  return collapsed.length > 120 ? `${collapsed.slice(0, 120)}…` : collapsed;
+}
 
 interface ConversationPaneProps {
   detailOpen: boolean;
@@ -103,6 +117,8 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
   const accountId = selected?.accountId ?? null;
   const selectedRoomId = selected?.roomId ?? null;
   const items = useTimelineStore((s) => s.items);
+  const pending = useComposerStore((s) => s.pending);
+  const selectedKey = useComposerStore((s) => s.selectedKey);
   // The open conversation's account status drives the "Queued" caption. An empty
   // key (no room open) reads as `undefined` → not offline.
   const offline = useAccountStatus(accountId ?? "") === "offline";
@@ -110,12 +126,24 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
   const [loaded, setLoaded] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // The body to prefill the composer with when entering edit mode (the target
+  // message's current body), or `null` outside edit.
+  const editPrefill =
+    pending?.mode === "edit"
+      ? ((): string | null => {
+          const target = items.find((it) => it.kind === "message" && it.key === pending.targetKey);
+          return target?.kind === "message" ? target.body : null;
+        })()
+      : null;
+
   useEffect(() => {
     if (accountId === null || selectedRoomId === null) {
       // No conversation open, or the account went away (e.g. sign-out): drop any
       // rendered timeline so a previous room's / account's messages never
       // linger, and reset the load/error state.
       timelineStore.getState().clear();
+      composerStore.getState().clear();
+      composerStore.getState().clearSelection();
       setErrored(false);
       setLoaded(false);
       return;
@@ -126,6 +154,9 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     // Establish clean state at mount so the newest mount always wins; clearing
     // in cleanup instead would race the next room's mount.
     timelineStore.getState().clear();
+    // A room switch drops any pending reply/edit context and selection.
+    composerStore.getState().clear();
+    composerStore.getState().clearSelection();
     let subscriptionId: number | null = null;
     let cancelled = false;
 
@@ -180,7 +211,26 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
       if (accountId === null || selectedRoomId === null) {
         return;
       }
-      await sendText(accountId, selectedRoomId, body);
+      // Route the dispatch by the pending context: reply / edit / plain text
+      // (all through the single Rust send gate).
+      const current = composerStore.getState().pending;
+      if (current?.mode === "reply") {
+        await sendReply(accountId, selectedRoomId, current.targetKey, body);
+      } else if (current?.mode === "edit") {
+        await editMessage(accountId, selectedRoomId, current.targetKey, body);
+      } else {
+        await sendText(accountId, selectedRoomId, body);
+      }
+      // Clear only the context we just dispatched: if the user started a *new*
+      // reply/edit during the in-flight enqueue, it must survive.
+      const afterSend = composerStore.getState().pending;
+      if (
+        current !== null &&
+        afterSend?.mode === current.mode &&
+        afterSend?.targetKey === current.targetKey
+      ) {
+        composerStore.getState().clear();
+      }
     },
     [accountId, selectedRoomId],
   );
@@ -197,6 +247,109 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     },
     [accountId, selectedRoomId],
   );
+
+  const onReply = useCallback(
+    (key: string) => {
+      const target = items.find((it) => it.kind === "message" && it.key === key);
+      if (target?.kind !== "message") {
+        return;
+      }
+      composerStore.getState().startReply({
+        targetKey: key,
+        sender: target.senderDisplayName ?? target.sender,
+        bodyPreview: previewOf(target.body),
+      });
+    },
+    [items],
+  );
+
+  const onEdit = useCallback(
+    (key: string) => {
+      const target = items.find((it) => it.kind === "message" && it.key === key);
+      // Only own text messages are editable (Rust also gates on `is_editable()`).
+      if (target?.kind !== "message" || !target.isOwn) {
+        return;
+      }
+      composerStore.getState().startEdit({ targetKey: key, body: target.body }, "");
+    },
+    [items],
+  );
+
+  const onCancelPending = useCallback(() => composerStore.getState().cancel(), []);
+
+  const onJumpTo = useCallback((key: string) => {
+    const el = scrollRef.current?.querySelector<HTMLElement>(`[data-msg-key="${CSS.escape(key)}"]`);
+    if (!el) {
+      return;
+    }
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    // Brief highlight so the jump target is obvious.
+    el.classList.add("ring-2", "ring-ring", "ring-offset-1", "ring-offset-background");
+    window.setTimeout(() => {
+      el.classList.remove("ring-2", "ring-ring", "ring-offset-1", "ring-offset-background");
+    }, 1200);
+  }, []);
+
+  // Keyboard affordances (epic): ↑/↓ select a message; `r` reply the selected;
+  // `e` edit the selected (own only); `↑` in an empty composer edits the last own
+  // message; Esc clears the pending context / selection.
+  const onKeyDown = useCallback(
+    (e: KeyboardEvent<HTMLDivElement>) => {
+      // Ignore keys typed into the composer's textarea (except the empty-composer
+      // ↑, handled by the composer/its own guard below via `target` check).
+      const inTextarea = (e.target as HTMLElement).tagName === "TEXTAREA";
+      const messageKeys = items
+        .filter((it): it is MessageVm => it.kind === "message")
+        .map((it) => it.key);
+
+      if (e.key === "Escape") {
+        composerStore.getState().clear();
+        composerStore.getState().clearSelection();
+        return;
+      }
+
+      if (inTextarea) {
+        return;
+      }
+
+      if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        if (messageKeys.length === 0) {
+          return;
+        }
+        e.preventDefault();
+        const cur = composerStore.getState().selectedKey;
+        const idx = cur === null ? -1 : messageKeys.indexOf(cur);
+        const nextIdx =
+          e.key === "ArrowUp"
+            ? Math.max(0, (idx === -1 ? messageKeys.length : idx) - 1)
+            : Math.min(messageKeys.length - 1, idx + 1);
+        composerStore.getState().select(messageKeys[nextIdx]);
+        return;
+      }
+
+      const sel = composerStore.getState().selectedKey;
+      if (e.key === "r" && sel !== null) {
+        e.preventDefault();
+        onReply(sel);
+        return;
+      }
+      if (e.key === "e" && sel !== null) {
+        e.preventDefault();
+        onEdit(sel);
+      }
+    },
+    [items, onReply, onEdit],
+  );
+
+  // `↑` in an empty composer edits the last own text message (epic affordance).
+  const onComposerArrowUp = useCallback(() => {
+    const lastOwn = [...items]
+      .reverse()
+      .find((it): it is MessageVm => it.kind === "message" && it.isOwn);
+    if (lastOwn) {
+      onEdit(lastOwn.key);
+    }
+  }, [items, onEdit]);
 
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col bg-background">
@@ -241,7 +394,12 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
           <p className="max-w-sm text-center text-muted-foreground text-sm">No messages yet.</p>
         </div>
       ) : (
-        <div ref={scrollRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+        // biome-ignore lint/a11y/noStaticElementInteractions: message-list keyboard affordances (↑/↓/r/e) live on the scroll region; individual actions have their own labeled buttons.
+        <div
+          ref={scrollRef}
+          className="flex min-h-0 flex-1 flex-col overflow-y-auto"
+          onKeyDown={onKeyDown}
+        >
           <ol
             aria-label="Messages"
             className="mx-auto mt-auto flex w-full max-w-[720px] flex-col px-4 py-4"
@@ -259,6 +417,10 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
                     groupTail={row.groupTail}
                     onRetry={onRetry}
                     offline={offline}
+                    onReply={onReply}
+                    onEdit={onEdit}
+                    onJumpTo={onJumpTo}
+                    selected={selectedKey === row.item.key}
                   />
                 </li>
               ),
@@ -269,7 +431,15 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
       {selectedRoomId !== null && (
         <div className="shrink-0 border-border border-t">
           <div className="mx-auto w-full max-w-[720px] px-4 py-3">
-            <Composer key={selectedRoomId} onSend={onSend} disabled={!roomLoaded} />
+            <Composer
+              key={selectedRoomId}
+              onSend={onSend}
+              disabled={!roomLoaded}
+              pending={pending}
+              editPrefill={editPrefill}
+              onCancelPending={onCancelPending}
+              onEmptyArrowUp={onComposerArrowUp}
+            />
           </div>
         </div>
       )}

@@ -13,12 +13,13 @@
 //! material, event raw JSON, or crypto state cross IPC; `tracing` logs carry the
 //! opaque room id only — never a message body.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt};
 use matrix_sdk::ruma::events::room::message::MessageType;
-use matrix_sdk::ruma::{OwnedRoomId, RoomId};
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, RoomId};
 use matrix_sdk::Client;
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::timeline::{
@@ -28,7 +29,15 @@ use matrix_sdk_ui::timeline::{
 
 use crate::account::TimelineSink;
 use crate::error::TimelineError;
-use crate::vm::{SendState, TimelineBatch, TimelineItemVm, TimelineOp};
+use crate::vm::{ReplyPreviewVm, SendState, TimelineBatch, TimelineItemVm, TimelineOp};
+
+/// A Rust-side index of `event_id → render key` (unique_id), maintained by the
+/// timeline producer while it maps items. It lets a reply's quoted-original
+/// preview carry the *original's* opaque render `key` — never its event id — so
+/// the frontend jump target stays event-id-free across IPC (NFR-9, AD-1). An
+/// original that is not (yet) mapped simply isn't in the index, yielding a
+/// `null` jump key on the reply preview.
+type ReplyIndex = HashMap<OwnedEventId, String>;
 
 /// Defensive upper bound on a decoded message body before it crosses IPC.
 const MAX_BODY_CHARS: usize = 4096;
@@ -90,18 +99,79 @@ fn truncate_body(body: String) -> String {
     }
 }
 
-/// Map one SDK [`TimelineItem`] to exactly one [`TimelineItemVm`].
+/// Derive the quoted-original preview for a reply message from its
+/// `content.in_reply_to()`, resolving the original's opaque render `key` through
+/// the producer's `event_id → unique_id` `index` (Story 3.4, FR-10, NFR-9).
+///
+/// Pure: `content` and `index` are the only inputs. Returns `None` when the
+/// message is not a reply. When it is:
+/// - `in_reply_to_key` = `index.get(&details.event_id)` — the original's opaque
+///   render key when it is currently mapped in the timeline, else `null` (the
+///   quote still renders honestly but isn't clickable). Never an event id.
+/// - sender / display-name / body come from the embedded original when its
+///   details are `Ready`; otherwise fall back to empty/`None`. The body reuses
+///   [`text_body`] and is empty for a non-text original.
+///
+/// No event ids, txn ids, or raw event JSON cross into the returned VM (AD-1).
+pub fn reply_preview(content: &TimelineItemContent, index: &ReplyIndex) -> Option<ReplyPreviewVm> {
+    let details = content.in_reply_to()?;
+    Some(reply_preview_from_details(&details, index))
+}
+
+/// Pure mapping of an [`InReplyToDetails`] + the `event_id → unique_id` `index`
+/// into a [`ReplyPreviewVm`]. Split from [`reply_preview`] so the key-resolution
+/// and details-availability branches are unit-testable without an SDK `Message`
+/// (whose fields are crate-private).
+fn reply_preview_from_details(
+    details: &matrix_sdk_ui::timeline::InReplyToDetails,
+    index: &ReplyIndex,
+) -> ReplyPreviewVm {
+    let in_reply_to_key = index.get(&details.event_id).cloned();
+
+    let (sender, sender_display_name, body) = match &details.event {
+        TimelineDetails::Ready(embedded) => {
+            let sender = embedded.sender.to_string();
+            let sender_display_name = match &embedded.sender_profile {
+                TimelineDetails::Ready(profile) => profile.display_name.clone(),
+                _ => None,
+            };
+            let body = embedded
+                .content
+                .as_message()
+                .and_then(|m| text_body(m.msgtype()))
+                .map(truncate_body)
+                .unwrap_or_default();
+            (sender, sender_display_name, body)
+        }
+        // The original's details are not loaded: render an honest but sparse
+        // quote (empty sender/body), still not clickable if the key is absent.
+        _ => (String::new(), None, String::new()),
+    };
+
+    ReplyPreviewVm {
+        in_reply_to_key,
+        sender,
+        sender_display_name,
+        body,
+    }
+}
+
+/// Map one SDK [`TimelineItem`] to exactly one [`TimelineItemVm`], resolving a
+/// reply's quoted-original key through the producer's `event_id → unique_id`
+/// `index`.
 ///
 /// An event item carrying a text `m.room.message` becomes a
-/// [`TimelineItemVm::Message`]; an event the SDK could not decrypt
-/// (`MsgLikeKind::UnableToDecrypt`) becomes a [`TimelineItemVm::Utd`] carrying
-/// only its stable key, sender, resolved display name, and timestamp — never any
-/// ciphertext, session id, or key material (NFR-9, AD-1) — so the frontend can
-/// render an honest stub instead of a blank row. Everything else (non-text
-/// msgtype, other content kinds, redacted, and virtual items) becomes a
-/// [`TimelineItemVm::Other`] carrying only the stable opaque key, so diff indices
-/// stay aligned. All accessors are sync (`VectorDiff::map` is sync).
-pub fn item_to_vm(item: &TimelineItem) -> TimelineItemVm {
+/// [`TimelineItemVm::Message`] (with `is_edited` from `message.is_edited()` and a
+/// `reply` preview from `content.in_reply_to()` via [`reply_preview`]); an event
+/// the SDK could not decrypt (`MsgLikeKind::UnableToDecrypt`) becomes a
+/// [`TimelineItemVm::Utd`] carrying only its stable key, sender, resolved display
+/// name, and timestamp — never any ciphertext, session id, or key material
+/// (NFR-9, AD-1) — so the frontend can render an honest stub instead of a blank
+/// row. Everything else (non-text msgtype, other content kinds, redacted, and
+/// virtual items) becomes a [`TimelineItemVm::Other`] carrying only the stable
+/// opaque key, so diff indices stay aligned. All accessors are sync
+/// (`VectorDiff::map` is sync).
+pub fn item_to_vm(item: &TimelineItem, index: &ReplyIndex) -> TimelineItemVm {
     let key = item.unique_id().0.clone();
     let TimelineItemKind::Event(ev) = item.kind() else {
         return TimelineItemVm::Other { key };
@@ -128,6 +198,8 @@ pub fn item_to_vm(item: &TimelineItem) -> TimelineItemVm {
                 timestamp: i64::from(ev.timestamp().0),
                 is_own: ev.is_own(),
                 send_state: ev.send_state().map(map_send_state),
+                is_edited: message.is_edited(),
+                reply: reply_preview(ev.content(), index),
             }
         }
         // An event that cannot be decrypted yet: surface an honest stub. No
@@ -176,6 +248,58 @@ pub fn timeline_diff_to_op(diff: VectorDiff<TimelineItemVm>) -> TimelineOp {
             items: values.into_iter().collect(),
         },
     }
+}
+
+/// Record an event item's `event_id → unique_id` mapping into `index` so a later
+/// reply whose original is this item can resolve its opaque jump key. A virtual
+/// item, or an event item with no event id yet (an unsent local echo), is not
+/// indexed. Idempotent per event id.
+fn index_item(index: &mut ReplyIndex, item: &TimelineItem) {
+    if let Some(ev) = item.as_event() {
+        if let Some(event_id) = ev.event_id() {
+            index.insert(event_id.to_owned(), item.unique_id().0.clone());
+        }
+    }
+}
+
+/// Map one `Arc<TimelineItem>` diff to a [`TimelineItemVm`] diff while keeping the
+/// producer's `event_id → unique_id` `index` current.
+///
+/// Every carried item's `event_id → unique_id` is inserted **before** the batch is
+/// mapped, so a reply and its already-mapped original resolve within the same
+/// snapshot/diff pass. `Clear`/`Reset` reset the index (the whole set of loaded
+/// originals is being replaced). The resulting VMs read the (now-updated) index so
+/// each reply's preview carries its original's opaque render key.
+fn map_diff_indexing(
+    diff: VectorDiff<Arc<TimelineItem>>,
+    index: &mut ReplyIndex,
+) -> VectorDiff<TimelineItemVm> {
+    match &diff {
+        VectorDiff::Clear => index.clear(),
+        VectorDiff::Reset { values } => {
+            index.clear();
+            for item in values {
+                index_item(index, item);
+            }
+        }
+        VectorDiff::Append { values } => {
+            for item in values {
+                index_item(index, item);
+            }
+        }
+        VectorDiff::PushFront { value }
+        | VectorDiff::PushBack { value }
+        | VectorDiff::Insert { value, .. }
+        | VectorDiff::Set { value, .. } => index_item(index, value),
+        // Removals/truncations leave stale entries in the index; that is harmless
+        // — a stale key only ever produces an unresolvable jump the frontend
+        // guards, and a later `Reset` rebuilds the index cleanly.
+        VectorDiff::PopFront
+        | VectorDiff::PopBack
+        | VectorDiff::Remove { .. }
+        | VectorDiff::Truncate { .. } => {}
+    }
+    diff.map(|item| item_to_vm(&item, index))
 }
 
 /// A boxed, `Send` timeline diff stream (the concrete `impl Stream` from
@@ -245,8 +369,16 @@ pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: Ti
         mut stream,
     } = open;
 
+    // The producer-owned `event_id → unique_id` index. Built from the snapshot,
+    // then kept current across each diff so a reply resolves an earlier-mapped
+    // original's opaque render key (never an event id crosses IPC).
+    let mut index: ReplyIndex = HashMap::new();
+    for item in initial.iter() {
+        index_item(&mut index, item);
+    }
+
     let reset = TimelineOp::Reset {
-        items: initial.iter().map(|i| item_to_vm(i)).collect(),
+        items: initial.iter().map(|i| item_to_vm(i, &index)).collect(),
     };
     if !sink(TimelineBatch { ops: vec![reset] }) {
         tracing::info!(room_id = %room_id, "timeline channel closed before first batch");
@@ -256,7 +388,7 @@ pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: Ti
     while let Some(diffs) = stream.next().await {
         let ops = diffs
             .into_iter()
-            .map(|d| timeline_diff_to_op(d.map(|i| item_to_vm(&i))))
+            .map(|d| timeline_diff_to_op(map_diff_indexing(d, &mut index)))
             .collect();
         if !sink(TimelineBatch { ops }) {
             tracing::info!(room_id = %room_id, "timeline channel closed, stopping producer");
@@ -289,6 +421,8 @@ mod tests {
             timestamp: 1,
             is_own: false,
             send_state: None,
+            is_edited: false,
+            reply: None,
         }
     }
 
@@ -387,6 +521,43 @@ mod tests {
         )
         .expect("construct location msgtype");
         assert_eq!(text_body(&mt), None);
+    }
+
+    #[test]
+    fn reply_preview_resolves_key_from_index_when_original_loaded() {
+        use matrix_sdk::ruma::owned_event_id;
+        use matrix_sdk_ui::timeline::{InReplyToDetails, TimelineDetails};
+
+        let event_id = owned_event_id!("$orig:example.org");
+        let mut index = ReplyIndex::new();
+        index.insert(event_id.clone(), "unique-orig".to_owned());
+
+        // Details unavailable (an SDK `Message` can't be built here), so the
+        // sender/body fall back to empty — but the jump key still resolves from
+        // the index, which is the event-id-free mapping under test.
+        let details = InReplyToDetails {
+            event_id,
+            event: TimelineDetails::Unavailable,
+        };
+        let vm = reply_preview_from_details(&details, &index);
+        assert_eq!(vm.in_reply_to_key, Some("unique-orig".to_owned()));
+        assert_eq!(vm.sender, "");
+        assert_eq!(vm.body, "");
+    }
+
+    #[test]
+    fn reply_preview_yields_null_key_when_original_not_indexed() {
+        use matrix_sdk::ruma::owned_event_id;
+        use matrix_sdk_ui::timeline::{InReplyToDetails, TimelineDetails};
+
+        // The original is not in the index (not loaded / already scrolled away):
+        // the quote still renders honestly but is not clickable (`null` key).
+        let details = InReplyToDetails {
+            event_id: owned_event_id!("$missing:example.org"),
+            event: TimelineDetails::Unavailable,
+        };
+        let vm = reply_preview_from_details(&details, &ReplyIndex::new());
+        assert_eq!(vm.in_reply_to_key, None);
     }
 
     #[test]

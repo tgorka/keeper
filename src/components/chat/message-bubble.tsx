@@ -5,12 +5,16 @@
  * (`isOwn: true`) use the primary surface aligned right. Both use a 14 px radius.
  * Consecutive same-sender messages are `grouped`: only the first shows the
  * avatar and sender name, the rest hide them and tuck under the same column.
- * Renders text only — no media, replies, or reactions (later epics).
+ * Renders text only — no media (later epic). A reply shows the quoted original
+ * inline (clickable → jump to original) and an edited message shows an "Edited"
+ * caption (Story 3.4); a hover/focus action bar offers Reply and Edit (own).
  */
+
+import { MessageActions } from "@/components/chat/message-actions";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { formatMessageTime } from "@/lib/format-time";
-import type { TimelineItemVm } from "@/lib/ipc/client";
+import type { ReplyPreviewVm, TimelineItemVm } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
 
 /** The `message`-variant of {@link TimelineItemVm} (the only kind this renders). */
@@ -42,6 +46,24 @@ interface MessageBubbleProps {
    * you're back online` instead of `Sending…`. `sent`/`failed` are unaffected.
    */
   offline?: boolean;
+  /** Begin a reply to this message (Story 3.4). Mounts the action bar's Reply. */
+  onReply?: (key: string) => void;
+  /**
+   * Begin an edit of this message (Story 3.4). The action bar offers Edit only on
+   * an own text message.
+   */
+  onEdit?: (key: string) => void;
+  /**
+   * Jump to (scroll to) the original of a received reply, by the original's opaque
+   * render `key`. The reply quote is clickable only when the parent wires this and
+   * the quote carries a resolved `inReplyToKey`.
+   */
+  onJumpTo?: (key: string) => void;
+  /**
+   * Whether this bubble is the keyboard-selected message (`↑`/`↓`). When `true` a
+   * selection ring renders on the bubble.
+   */
+  selected?: boolean;
 }
 
 /**
@@ -65,16 +87,23 @@ export function MessageBubble({
   groupTail = true,
   onRetry,
   offline = false,
+  onReply,
+  onEdit,
+  onJumpTo,
+  selected = false,
 }: MessageBubbleProps) {
   const displayName = item.senderDisplayName ?? item.sender;
   const time = formatMessageTime(item.timestamp);
   const isOwn = item.isOwn;
   const sendState = item.sendState;
+  // Only own text messages are editable (Rust also gates on `is_editable()`).
+  const canEdit = isOwn;
 
   return (
     <div
+      data-msg-key={item.key}
       className={cn(
-        "flex w-full items-end gap-2",
+        "group flex w-full items-end gap-2",
         isOwn ? "flex-row-reverse" : "flex-row",
         // Tighten the gap between grouped bubbles from the same sender.
         grouped ? "mt-0.5" : "mt-3",
@@ -97,23 +126,50 @@ export function MessageBubble({
             {displayName}
           </span>
         )}
-        <div
-          className={cn(
-            "max-w-[75%] rounded-[14px] px-3 py-2 text-sm",
-            isOwn ? "bg-primary text-primary-foreground" : "bg-muted text-foreground",
-          )}
-        >
-          <p className="whitespace-pre-wrap break-words">{item.body}</p>
-          {time !== "" && (
-            <time
-              dateTime={new Date(item.timestamp).toISOString()}
-              className={cn(
-                "mt-1 block text-right text-[10px] leading-none",
-                isOwn ? "text-primary-foreground/70" : "text-muted-foreground",
+        <div className={cn("flex items-center gap-1", isOwn ? "flex-row-reverse" : "flex-row")}>
+          <div
+            className={cn(
+              "max-w-[75%] rounded-[14px] px-3 py-2 text-sm",
+              isOwn ? "bg-primary text-primary-foreground" : "bg-muted text-foreground",
+              selected && "ring-2 ring-ring ring-offset-1 ring-offset-background",
+            )}
+          >
+            {item.reply && <ReplyQuote reply={item.reply} isOwn={isOwn} onJumpTo={onJumpTo} />}
+            <p className="whitespace-pre-wrap break-words">{item.body}</p>
+            <div className="mt-1 flex items-center justify-end gap-1">
+              {item.isEdited && (
+                <span
+                  className={cn(
+                    "text-[10px] leading-none",
+                    isOwn ? "text-primary-foreground/70" : "text-muted-foreground",
+                  )}
+                >
+                  Edited
+                </span>
               )}
-            >
-              {time}
-            </time>
+              {time !== "" && (
+                <time
+                  dateTime={new Date(item.timestamp).toISOString()}
+                  className={cn(
+                    "block text-right text-[10px] leading-none",
+                    isOwn ? "text-primary-foreground/70" : "text-muted-foreground",
+                  )}
+                >
+                  {time}
+                </time>
+              )}
+            </div>
+          </div>
+          {/* Action bar: revealed on hover/focus-within of the bubble row. */}
+          {(onReply || onEdit) && (
+            <div className="opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
+              <MessageActions
+                messageKey={item.key}
+                canEdit={canEdit}
+                onReply={(k) => onReply?.(k)}
+                onEdit={(k) => onEdit?.(k)}
+              />
+            </div>
           )}
         </div>
         <SendStateCaption
@@ -127,6 +183,51 @@ export function MessageBubble({
       </div>
     </div>
   );
+}
+
+interface ReplyQuoteProps {
+  reply: ReplyPreviewVm;
+  isOwn: boolean;
+  onJumpTo?: (key: string) => void;
+}
+
+/**
+ * The inline quoted-original preview above a reply's body (Story 3.4, FR-10).
+ * Shows the original sender + a one-line body preview. Clickable — jumping to the
+ * original — only when a jump handler is wired and the quote carries a resolved
+ * `inReplyToKey` (the original is loaded); otherwise it renders as a static block
+ * (honest, but not clickable).
+ */
+function ReplyQuote({ reply, isOwn, onJumpTo }: ReplyQuoteProps) {
+  const label = reply.senderDisplayName ?? reply.sender;
+  const clickable = onJumpTo != null && reply.inReplyToKey != null;
+  const jumpKey = reply.inReplyToKey;
+
+  const content = (
+    <>
+      <span className="block font-medium text-xs">{label}</span>
+      <span className="block truncate text-xs opacity-80">{reply.body}</span>
+    </>
+  );
+
+  const surface = cn(
+    "mb-1 block w-full border-l-2 pl-2 text-left",
+    isOwn ? "border-primary-foreground/50" : "border-foreground/30",
+  );
+
+  if (clickable && jumpKey != null) {
+    return (
+      <button
+        type="button"
+        aria-label="Jump to replied message"
+        onClick={() => onJumpTo?.(jumpKey)}
+        className={cn(surface, "cursor-pointer hover:opacity-100")}
+      >
+        {content}
+      </button>
+    );
+  }
+  return <div className={surface}>{content}</div>;
 }
 
 interface SendStateCaptionProps {

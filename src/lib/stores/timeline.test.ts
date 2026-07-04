@@ -12,6 +12,8 @@ function message(key: string, sender = "@bob:example.org"): TimelineItemVm {
     timestamp: 1,
     isOwn: false,
     sendState: null,
+    isEdited: false,
+    reply: null,
   };
 }
 

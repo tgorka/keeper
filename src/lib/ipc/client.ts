@@ -24,6 +24,7 @@ export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
+export type { ReplyPreviewVm } from "./gen/ReplyPreviewVm";
 export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
@@ -496,6 +497,44 @@ export async function backupSavedRecoveryKey(accountId: string): Promise<string 
  */
 export async function sendText(accountId: string, roomId: string, body: string): Promise<void> {
   await invoke<void>("send_text", { accountId, roomId, body });
+}
+
+/**
+ * Send a plain-text reply to a message (FR-10, AD-13, Story 3.4). `inReplyToKey`
+ * is the *original* message's opaque render `key` (`unique_id`); the Rust core
+ * resolves it to the event id and enqueues the reply through the single dispatch
+ * gate. The reply's local echo (with its own quoted-original preview) and every
+ * send-state transition arrive back over the room's existing timeline
+ * subscription (no echo is synthesized here). Resolves on successful enqueue;
+ * rejects with the {@link IpcError} envelope (`code: "sendFailed"`) on failure —
+ * `retriable: false` when the reply target is gone.
+ */
+export async function sendReply(
+  accountId: string,
+  roomId: string,
+  inReplyToKey: string,
+  body: string,
+): Promise<void> {
+  await invoke<void>("send_reply", { accountId, roomId, inReplyToKey, body });
+}
+
+/**
+ * Edit an own text message in place (FR-11, AD-13, Story 3.4). `itemKey` is the
+ * message's opaque render `key` (`unique_id`); the Rust core resolves it, gates on
+ * editability (own + text), and enqueues the edit through the single dispatch
+ * gate. The `Set` diff that updates the content in place (and flips `isEdited`)
+ * arrives back over the room's existing timeline subscription. Resolves on
+ * successful enqueue; rejects with the {@link IpcError} envelope (`code:
+ * "sendFailed"`) on failure — `retriable: false` when the target is gone or not
+ * editable.
+ */
+export async function editMessage(
+  accountId: string,
+  roomId: string,
+  itemKey: string,
+  body: string,
+): Promise<void> {
+  await invoke<void>("edit_message", { accountId, roomId, itemKey, body });
 }
 
 /**
