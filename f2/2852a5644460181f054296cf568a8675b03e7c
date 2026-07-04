@@ -1,0 +1,32 @@
+_bmad-output/implementation-artifacts/spec-1-4-sliding-sync-room-list.md
+  s_c431d4da6cc1c3::t_86f61463951fa6 9
+  s_189ac6dd7d15e4::t_7c9651afe36db6 7
+  s_189ac6dd7d15e4::t_1a80a97be16628 234-240
+  s_189ac6dd7d15e4::t_7a98e64241b474 132-141
+src-tauri/crates/keeper-core/src/account.rs
+  s_189ac6dd7d15e4::t_370e3bd71fd1ff 90-93,95-96,115,119-145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f22852a5644460181f054296cf568a8675b03e7c",
+  "prompts": {},
+  "sessions": {
+    "s_189ac6dd7d15e4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8ac44eb6-ca3d-48fb-ad39-ba5de240cc12",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_c431d4da6cc1c3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "565c2e3d-8e31-454f-a83d-9e0300bee7b4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
