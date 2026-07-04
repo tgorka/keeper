@@ -1,17 +1,16 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountVm, IpcError, RoomListBatch } from "@/lib/ipc/client";
+import type { AccountVm, InboxBatch, IpcError } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { roomsStore } from "@/lib/stores/rooms";
 
-// Mock the typed IPC wrapper so the pane never touches Tauri. `subscribeRoomList`
-// captures the `onBatch` handler so the test can drive the stream.
-const subscribeRoomList = vi.fn();
-const unsubscribeRoomList = vi.fn();
+// Mock the typed IPC wrapper so the pane never touches Tauri. `subscribeInbox`
+// captures the `onBatch` handler so the test can drive the merged stream.
+const subscribeInbox = vi.fn();
+const unsubscribeInbox = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
-  subscribeRoomList: (accountId: string, onBatch: (b: RoomListBatch) => void) =>
-    subscribeRoomList(accountId, onBatch),
-  unsubscribeRoomList: (accountId: string, id: number) => unsubscribeRoomList(accountId, id),
+  subscribeInbox: (onBatch: (b: InboxBatch) => void) => subscribeInbox(onBatch),
+  unsubscribeInbox: (id: number) => unsubscribeInbox(id),
 }));
 
 import { ChatListPane } from "@/components/layout/chat-list-pane";
@@ -20,18 +19,31 @@ const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
   userId: "@alice:example.org",
   homeserverUrl: "https://matrix.example.org/",
+  hueIndex: 0,
 };
 
 function ipcError(code: IpcError["code"]): IpcError {
   return { code, message: "ignored", accountId: null, retriable: true };
 }
 
+function inboxRoom(roomId: string, accountId: string, displayName: string, lastMessage: string) {
+  return {
+    accountId,
+    hueIndex: 0,
+    roomId,
+    displayName,
+    lastMessage,
+    timestamp: null,
+    avatarUrl: null,
+  };
+}
+
 beforeEach(() => {
   accountsStore.getState().clear();
   roomsStore.getState().clear();
   roomsStore.getState().selectRoom(null);
-  subscribeRoomList.mockReset();
-  unsubscribeRoomList.mockReset();
+  subscribeInbox.mockReset();
+  unsubscribeInbox.mockReset();
 });
 
 afterEach(() => {
@@ -42,24 +54,22 @@ afterEach(() => {
 
 describe("ChatListPane", () => {
   it("shows the loading skeleton before the first batch arrives", () => {
-    subscribeRoomList.mockResolvedValue(1);
-    accountsStore.getState().setCurrentAccount(account);
+    subscribeInbox.mockResolvedValue(1);
+    accountsStore.getState().addAccount(account);
     render(<ChatListPane />);
-    // No batch has been delivered yet: neither the list nor the empty state.
     expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
     expect(screen.queryByText("No conversations yet.")).not.toBeInTheDocument();
   });
 
   it("shows the empty state after a batch delivers no rooms", async () => {
-    const captured: { onBatch: ((b: RoomListBatch) => void) | null } = { onBatch: null };
-    subscribeRoomList.mockImplementation((_accountId, onBatch: (b: RoomListBatch) => void) => {
+    const captured: { onBatch: ((b: InboxBatch) => void) | null } = { onBatch: null };
+    subscribeInbox.mockImplementation((onBatch: (b: InboxBatch) => void) => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    accountsStore.getState().setCurrentAccount(account);
+    accountsStore.getState().addAccount(account);
     render(<ChatListPane />);
 
-    // An empty Reset batch marks the list as loaded with zero rooms.
     captured.onBatch?.({ ops: [{ op: "reset", rooms: [] }], total: 0 });
 
     await waitFor(() => {
@@ -68,65 +78,56 @@ describe("ChatListPane", () => {
     expect(screen.queryByLabelText("Loading conversations")).not.toBeInTheDocument();
   });
 
-  it("subscribes with the current account id and renders streamed rows", async () => {
-    const captured: { onBatch: ((b: RoomListBatch) => void) | null } = { onBatch: null };
-    subscribeRoomList.mockImplementation((_accountId, onBatch: (b: RoomListBatch) => void) => {
+  it("subscribes to the merged inbox and renders streamed rows from multiple accounts", async () => {
+    const captured: { onBatch: ((b: InboxBatch) => void) | null } = { onBatch: null };
+    subscribeInbox.mockImplementation((onBatch: (b: InboxBatch) => void) => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    accountsStore.getState().setCurrentAccount(account);
+    accountsStore.getState().hydrateAll([
+      account,
+      {
+        accountId: "01BX5ZZKBKACTAV9WEVGEMMVRZ",
+        userId: "@bob:example.org",
+        homeserverUrl: "https://matrix.example.org/",
+        hueIndex: 1,
+      },
+    ]);
     render(<ChatListPane />);
 
-    expect(subscribeRoomList).toHaveBeenCalledWith(account.accountId, expect.any(Function));
+    expect(subscribeInbox).toHaveBeenCalledWith(expect.any(Function));
 
-    // Drive a Reset snapshot batch through the captured handler.
     captured.onBatch?.({
       ops: [
         {
           op: "reset",
           rooms: [
-            {
-              roomId: "!a:example.org",
-              displayName: "Alpha Room",
-              lastMessage: "first",
-              timestamp: null,
-              avatarUrl: null,
-            },
+            inboxRoom("!a:example.org", account.accountId, "Alpha Room", "first"),
+            inboxRoom("!b:example.org", "01BX5ZZKBKACTAV9WEVGEMMVRZ", "Beta Room", "second"),
           ],
         },
       ],
-      total: 1,
+      total: 2,
     });
 
     await waitFor(() => {
       expect(screen.getByText("Alpha Room")).toBeInTheDocument();
     });
-    expect(screen.getByText("first")).toBeInTheDocument();
+    expect(screen.getByText("Beta Room")).toBeInTheDocument();
   });
 
-  it("selects a room and highlights it when a row is clicked", async () => {
-    const captured: { onBatch: ((b: RoomListBatch) => void) | null } = { onBatch: null };
-    subscribeRoomList.mockImplementation((_accountId, onBatch: (b: RoomListBatch) => void) => {
+  it("selects a row by its account + room ids and highlights it", async () => {
+    const captured: { onBatch: ((b: InboxBatch) => void) | null } = { onBatch: null };
+    subscribeInbox.mockImplementation((onBatch: (b: InboxBatch) => void) => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    accountsStore.getState().setCurrentAccount(account);
+    accountsStore.getState().addAccount(account);
     render(<ChatListPane />);
 
     captured.onBatch?.({
       ops: [
-        {
-          op: "reset",
-          rooms: [
-            {
-              roomId: "!a:example.org",
-              displayName: "Alpha Room",
-              lastMessage: null,
-              timestamp: null,
-              avatarUrl: null,
-            },
-          ],
-        },
+        { op: "reset", rooms: [inboxRoom("!a:example.org", account.accountId, "Alpha Room", "")] },
       ],
       total: 1,
     });
@@ -137,7 +138,10 @@ describe("ChatListPane", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Conversation with Alpha Room" }));
 
-    expect(roomsStore.getState().selectedRoomId).toBe("!a:example.org");
+    expect(roomsStore.getState().selected).toEqual({
+      accountId: account.accountId,
+      roomId: "!a:example.org",
+    });
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Conversation with Alpha Room" })).toHaveAttribute(
         "aria-current",
@@ -147,25 +151,25 @@ describe("ChatListPane", () => {
   });
 
   it("unsubscribes and clears the store on unmount", async () => {
-    subscribeRoomList.mockResolvedValue(7);
-    accountsStore.getState().setCurrentAccount(account);
+    subscribeInbox.mockResolvedValue(7);
+    accountsStore.getState().addAccount(account);
     const { unmount } = render(<ChatListPane />);
 
     await waitFor(() => {
-      expect(subscribeRoomList).toHaveBeenCalled();
+      expect(subscribeInbox).toHaveBeenCalled();
     });
 
     unmount();
 
     await waitFor(() => {
-      expect(unsubscribeRoomList).toHaveBeenCalledWith(account.accountId, 7);
+      expect(unsubscribeInbox).toHaveBeenCalledWith(7);
     });
     expect(roomsStore.getState().rooms).toEqual([]);
   });
 
-  it("shows an inline error when activation fails with syncUnavailable", async () => {
-    subscribeRoomList.mockRejectedValue(ipcError("syncUnavailable"));
-    accountsStore.getState().setCurrentAccount(account);
+  it("shows an inline error when the merged subscribe fails with syncUnavailable", async () => {
+    subscribeInbox.mockRejectedValue(ipcError("syncUnavailable"));
+    accountsStore.getState().addAccount(account);
     render(<ChatListPane />);
 
     await waitFor(() => {
@@ -173,43 +177,30 @@ describe("ChatListPane", () => {
     });
   });
 
-  it("does not subscribe when there is no account", () => {
+  it("does not subscribe when there are no accounts", () => {
     render(<ChatListPane />);
-    expect(subscribeRoomList).not.toHaveBeenCalled();
-    // With no account and no batch, the pane sits in its loading state.
+    expect(subscribeInbox).not.toHaveBeenCalled();
     expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
   });
 
   it("ignores a batch delivered after effect cleanup", async () => {
-    const captured: { onBatch: ((b: RoomListBatch) => void) | null } = { onBatch: null };
-    subscribeRoomList.mockImplementation((_accountId, onBatch: (b: RoomListBatch) => void) => {
+    const captured: { onBatch: ((b: InboxBatch) => void) | null } = { onBatch: null };
+    subscribeInbox.mockImplementation((onBatch: (b: InboxBatch) => void) => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    accountsStore.getState().setCurrentAccount(account);
+    accountsStore.getState().addAccount(account);
     const { unmount } = render(<ChatListPane />);
 
     await waitFor(() => {
-      expect(subscribeRoomList).toHaveBeenCalled();
+      expect(subscribeInbox).toHaveBeenCalled();
     });
 
     unmount();
 
-    // A late batch (arriving after cleanup) must not mutate the store.
     captured.onBatch?.({
       ops: [
-        {
-          op: "reset",
-          rooms: [
-            {
-              roomId: "!late:example.org",
-              displayName: "Late Room",
-              lastMessage: null,
-              timestamp: null,
-              avatarUrl: null,
-            },
-          ],
-        },
+        { op: "reset", rooms: [inboxRoom("!late:example.org", account.accountId, "Late", "")] },
       ],
       total: 1,
     });

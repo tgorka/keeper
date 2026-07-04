@@ -22,7 +22,6 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { TimelineBatch, TimelineItemVm } from "@/lib/ipc/client";
 import { retrySend, sendText, subscribeTimeline, unsubscribeTimeline } from "@/lib/ipc/client";
-import { useAccountsStore } from "@/lib/stores/accounts";
 import { useConnectionStore } from "@/lib/stores/connection";
 import { useRoomsStore } from "@/lib/stores/rooms";
 import { timelineStore, useTimelineStore } from "@/lib/stores/timeline";
@@ -76,8 +75,9 @@ function toRenderedMessages(items: TimelineItemVm[]): RenderedMessage[] {
 }
 
 export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: ConversationPaneProps) {
-  const accountId = useAccountsStore((s) => s.currentAccount?.accountId ?? null);
-  const selectedRoomId = useRoomsStore((s) => s.selectedRoomId);
+  const selected = useRoomsStore((s) => s.selected);
+  const accountId = selected?.accountId ?? null;
+  const selectedRoomId = selected?.roomId ?? null;
   const items = useTimelineStore((s) => s.items);
   const offline = useConnectionStore((s) => s.status === "offline");
   const [errored, setErrored] = useState(false);
@@ -86,8 +86,8 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
 
   useEffect(() => {
     if (accountId === null || selectedRoomId === null) {
-      // No room open, or the account went away (e.g. sign-out, Story 1.8): drop
-      // any rendered timeline so a previous room's / account's messages never
+      // No conversation open, or the account went away (e.g. sign-out): drop any
+      // rendered timeline so a previous room's / account's messages never
       // linger, and reset the load/error state.
       timelineStore.getState().clear();
       setErrored(false);

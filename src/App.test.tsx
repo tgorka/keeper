@@ -8,9 +8,16 @@ import type { AccountVm } from "@/lib/ipc/client";
 // subscribe) keeps its real implementation.
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
+  const pending = () => new Promise(() => {});
   return {
     ...actual,
-    sessionRestore: () => new Promise(() => {}),
+    // Never-resolving stubs so the boot hook and shell subscribes never mutate a
+    // store or reject (each test drives the gate directly).
+    sessionRestore: pending,
+    subscribeInbox: pending,
+    unsubscribeInbox: () => Promise.resolve(),
+    subscribeConnectionStatus: pending,
+    unsubscribeConnectionStatus: () => Promise.resolve(),
   };
 });
 
@@ -21,6 +28,7 @@ const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
   userId: "@alice:example.org",
   homeserverUrl: "https://matrix.example.org/",
+  hueIndex: 0,
 };
 
 describe("App", () => {
@@ -50,7 +58,7 @@ describe("App", () => {
   });
 
   it("renders the app shell landmarks once hydrated with an account set", () => {
-    accountsStore.getState().setCurrentAccount(account);
+    accountsStore.getState().addAccount(account);
     accountsStore.getState().markHydrated();
     render(<App />);
     expect(screen.getByRole("navigation", { name: "Views" })).toBeInTheDocument();

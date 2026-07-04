@@ -19,6 +19,7 @@ const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
   userId: "@alice:example.org",
   homeserverUrl: "https://matrix.example.org/",
+  hueIndex: 0,
 };
 
 function renderSidebar(collapsed = false) {
@@ -83,7 +84,7 @@ describe("SidebarPane offline pill", () => {
 
 describe("SidebarPane account footer", () => {
   it("shows the account row with the signed-in user id when signed in", () => {
-    accountsStore.getState().setCurrentAccount(account);
+    accountsStore.getState().addAccount(account);
     renderSidebar();
     expect(screen.getByText(account.userId)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: `Sign out ${account.userId}` })).toBeInTheDocument();

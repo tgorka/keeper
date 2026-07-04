@@ -13,12 +13,12 @@ use keeper_core::account::AccountManager;
 use keeper_core::auth;
 use keeper_core::demo::snapshot_then_diff;
 use keeper_core::error::{
-    AccountError, AuthError, CoreError, PlatformError, SendError, TimelineError,
+    AccountError, AuthError, CoreError, InboxError, PlatformError, SendError, TimelineError,
 };
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
-    AccountVm, ConnectionStatusBatch, DemoBatch, IpcError, IpcErrorCode, PingVm, RoomListBatch,
-    TimelineBatch,
+    AccountVm, ConnectionStatusBatch, DemoBatch, InboxBatch, IpcError, IpcErrorCode, PingVm,
+    RoomListBatch, TimelineBatch,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -139,6 +139,9 @@ fn to_ipc_error(err: CoreError) -> IpcError {
             | AccountError::RestoreFailed(_)
             | AccountError::SyncStart(_),
         ) => (IpcErrorCode::SyncUnavailable, true),
+        // A merged-inbox stream start failure is retriable: the frontend can
+        // re-subscribe the inbox.
+        CoreError::Inbox(InboxError::StreamStart(_)) => (IpcErrorCode::SyncUnavailable, true),
         // A room-not-found or timeline-build failure is retriable: the frontend
         // can attempt the subscribe again.
         CoreError::Timeline(TimelineError::RoomNotFound | TimelineError::Build(_)) => {
@@ -377,15 +380,45 @@ pub async fn send_retry(
         .map_err(to_ipc_error)
 }
 
-/// Report the persisted account that can be restored on launch, if any (FR-8,
-/// Story 1.8). Identity only — delegates to the core, which lists the registry
-/// rows and returns the first whose Keychain session is present as a non-secret
-/// [`AccountVm`]. Resolves to `null` on a cold install (or a row whose session is
-/// gone). No eager activation: the existing lazy room-list subscribe restores the
-/// session. Failures funnel through [`to_ipc_error`].
+/// Report every persisted account that can be restored on launch (FR-8, AD-20).
+/// Identity only — delegates to the core, which lists the registry rows and
+/// returns each whose Keychain session is present as a non-secret [`AccountVm`]
+/// (with hue). Resolves to an empty array on a cold install; a row whose session
+/// is gone is skipped, not fatal. No eager activation: the lazy inbox subscribe
+/// restores each session. Failures funnel through [`to_ipc_error`].
 #[tauri::command]
-pub async fn session_restore(state: State<'_, AppState>) -> Result<Option<AccountVm>, IpcError> {
-    auth::find_restorable_account(state.platform.as_ref()).map_err(to_ipc_error)
+pub async fn session_restore(state: State<'_, AppState>) -> Result<Vec<AccountVm>, IpcError> {
+    auth::find_restorable_accounts(state.platform.as_ref()).map_err(to_ipc_error)
+}
+
+/// Subscribe to the merged unified inbox across every restorable account (FR-18,
+/// AD-20). Activates each account, opens its room-list stream, and streams one
+/// recency-ordered [`InboxBatch`] over `channel` (a `Reset` window that updates
+/// as accounts sync or are added/removed). Returns the inbox subscription id.
+/// Ordering and filtering are computed in `keeper-core::inbox`, never in JS. A
+/// stream-start failure funnels through [`to_ipc_error`] to `SyncUnavailable`.
+#[tauri::command]
+pub async fn inbox_subscribe(
+    state: State<'_, AppState>,
+    channel: Channel<InboxBatch>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |batch: InboxBatch| channel.send(batch).is_ok());
+    state
+        .accounts
+        .subscribe_inbox(state.platform.as_ref(), sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unsubscribe the merged inbox, aborting every per-account producer feeding it
+/// (AD-20). Idempotent — a mismatched/unknown id is a no-op.
+#[tauri::command]
+pub async fn inbox_unsubscribe(
+    state: State<'_, AppState>,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state.accounts.unsubscribe_inbox(subscription_id).await;
+    Ok(())
 }
 
 /// Sign out an account locally (AD-10, Story 1.8). Delegates to the core, which

@@ -1,20 +1,25 @@
 /**
- * A single 64 px chat-list row (UX-DR3).
+ * A single 64 px chat-list row (UX-DR3, Story 2.1).
  *
- * Full-width, keyboard-operable `<button>` showing the room avatar, display
- * name, last-message preview, and timestamp. Selecting it (click / Enter /
- * Space) records a room id via `onSelect`; the selected row is highlighted and
- * marked `aria-current`. Carries a visible focus ring and an accessible label.
+ * Full-width, keyboard-operable `<button>` showing a 3 px per-account hue edge
+ * bar, the room avatar, display name, last-message preview, and timestamp.
+ * Selecting it (click / Enter / Space) records its `{ accountId, roomId }` via
+ * `onSelect`; the selected row is highlighted and marked `aria-current`. Carries
+ * a visible focus ring and an accessible label. The hue index comes from Rust
+ * (per account) and maps to a CSS `--account-hue-N` variable — no color value is
+ * hardcoded here.
  */
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { accountHueVar } from "@/lib/account-hue";
 import { formatRoomTimestamp } from "@/lib/format-time";
-import type { RoomVm } from "@/lib/ipc/client";
+import type { InboxRoomVm } from "@/lib/ipc/client";
+import type { RoomSelection } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
 
 interface ChatRowProps {
-  room: RoomVm;
-  /** Optional selection callback; receives the room id. */
-  onSelect?: (roomId: string) => void;
+  room: InboxRoomVm;
+  /** Optional selection callback; receives the row's account + room ids. */
+  onSelect?: (selection: RoomSelection) => void;
   /** Whether this row is the currently open conversation. */
   selected?: boolean;
 }
@@ -43,15 +48,23 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
   return (
     <button
       type="button"
-      onClick={() => onSelect?.(room.roomId)}
+      onClick={() => onSelect?.({ accountId: room.accountId, roomId: room.roomId })}
       aria-label={`Conversation with ${room.displayName}`}
       aria-current={selected ? "true" : undefined}
       className={cn(
-        "flex h-16 w-full shrink-0 items-center gap-3 px-3 text-left",
+        "relative flex h-16 w-full shrink-0 items-center gap-3 py-0 pr-3 pl-4 text-left",
         "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
         selected ? "bg-accent" : "hover:bg-accent",
       )}
     >
+      {/* 3 px per-account hue edge bar (UX-DR3). Decorative — the account
+          attribution is conveyed by the row's conversation content. */}
+      <span
+        aria-hidden="true"
+        data-testid="account-hue-bar"
+        className="absolute inset-y-0 left-0 w-[3px]"
+        style={{ backgroundColor: accountHueVar(room.hueIndex) }}
+      />
       <Avatar size="lg">
         {httpAvatar !== null && <AvatarImage src={httpAvatar} alt="" />}
         <AvatarFallback>{initials(room.displayName)}</AvatarFallback>

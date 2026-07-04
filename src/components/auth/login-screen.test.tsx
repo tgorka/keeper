@@ -16,6 +16,7 @@ const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
   userId: "@alice:example.org",
   homeserverUrl: "https://matrix.example.org/",
+  hueIndex: 0,
 };
 
 function ipcError(code: IpcErrorCode): IpcError {
@@ -61,8 +62,41 @@ describe("LoginScreen", () => {
     render(<LoginScreen />);
     fillAndSubmit();
     await waitFor(() => {
-      expect(accountsStore.getState().currentAccount).toEqual(account);
+      expect(accountsStore.getState().accounts).toEqual([account]);
     });
+  });
+
+  it("adds (does not replace) an existing account in add mode and calls onDone", async () => {
+    const existing: AccountVm = {
+      accountId: "01BX5ZZKBKACTAV9WEVGEMMVRZ",
+      userId: "@bob:example.org",
+      homeserverUrl: "https://matrix.example.org/",
+      hueIndex: 1,
+    };
+    accountsStore.getState().addAccount(existing);
+    loginPassword.mockResolvedValue(account);
+    const onDone = vi.fn();
+    render(<LoginScreen addMode onDone={onDone} />);
+
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "example.org" } });
+    fireEvent.change(screen.getByLabelText("Username"), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "hunter2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+
+    await waitFor(() => {
+      expect(accountsStore.getState().accounts.map((a) => a.accountId)).toEqual([
+        existing.accountId,
+        account.accountId,
+      ]);
+    });
+    expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
+  it("calls onDone when Cancel is clicked in add mode", () => {
+    const onDone = vi.fn();
+    render(<LoginScreen addMode onDone={onDone} />);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onDone).toHaveBeenCalledTimes(1);
   });
 
   it("clears the password field after submit", async () => {
@@ -143,6 +177,6 @@ describe("LoginScreen", () => {
     render(<LoginScreen />);
     fillAndSubmit();
     await screen.findByText("Wrong username or password.");
-    expect(accountsStore.getState().currentAccount).toBeNull();
+    expect(accountsStore.getState().accounts).toEqual([]);
   });
 });

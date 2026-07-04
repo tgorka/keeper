@@ -1,56 +1,68 @@
 /**
- * Chat-list pane: the streaming sliding-sync room list (FR-8, AD-8/9/19/20).
+ * Chat-list pane: the merged unified inbox (FR-18, AD-8/9/20).
  *
- * Subscribes to the account's room-list channel on mount, mirrors the streamed
- * ops into the ordered {@link roomsStore} (never sorting), and renders 64 px
- * rows inside a `ScrollArea`. On effect cleanup — including React 19 StrictMode's
- * double-mount and any account change — it unsubscribes the backend task and
- * clears the store, so streams never leak or duplicate. Activation failure
- * surfaces an honest inline error rather than a silent spinner (AD-21).
+ * Subscribes to the Rust-computed merged inbox channel on mount, mirrors the
+ * streamed ops into the recency-ordered {@link roomsStore} (never sorting), and
+ * renders 64 px rows inside a `ScrollArea`. Each row carries its owning account
+ * and hue, so selecting one records `{ accountId, roomId }`. On effect cleanup —
+ * including React 19 StrictMode's double-mount — it unsubscribes the backend
+ * task and clears the store, so streams never leak or duplicate. A stream-start
+ * failure surfaces an honest inline error rather than a silent spinner (AD-21).
+ *
+ * The inbox re-subscribes whenever the set of signed-in accounts changes (an
+ * account added or signed out): the effect keys on the account-id set so the
+ * merged window always covers exactly the live accounts.
  */
 import { useEffect, useState } from "react";
 import { ChatRow } from "@/components/chat/chat-row";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { RoomListBatch } from "@/lib/ipc/client";
-import { subscribeRoomList, unsubscribeRoomList } from "@/lib/ipc/client";
+import type { InboxBatch } from "@/lib/ipc/client";
+import { subscribeInbox, unsubscribeInbox } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 
 export function ChatListPane() {
-  const accountId = useAccountsStore((s) => s.currentAccount?.accountId ?? null);
+  // Key the subscription on the set of account ids: an add/sign-out re-subscribes
+  // the merged inbox so it covers exactly the live accounts.
+  const accountKey = useAccountsStore((s) =>
+    s.accounts
+      .map((a) => a.accountId)
+      .sort()
+      .join(","),
+  );
   const rooms = useRoomsStore((s) => s.rooms);
-  const selectedRoomId = useRoomsStore((s) => s.selectedRoomId);
+  const selected = useRoomsStore((s) => s.selected);
   const selectRoom = useRoomsStore((s) => s.selectRoom);
   const [errored, setErrored] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
-    if (accountId === null) {
+    if (accountKey.length === 0) {
       return;
     }
 
     setErrored(false);
     setLoaded(false);
     // Establish clean state at mount so the newest mount always wins; clearing
-    // in cleanup instead would race the next mount (cross-account bleed).
+    // in cleanup instead would race the next mount.
     roomsStore.getState().clear();
     let subscriptionId: number | null = null;
     let cancelled = false;
 
-    // Gate the sink so it no-ops after cleanup (post-unmount repopulation /
-    // StrictMode late batches never mutate the store).
-    const onBatch = (b: RoomListBatch) => {
+    // Gate the sink so it no-ops after cleanup (post-unmount / StrictMode late
+    // batches never mutate the store).
+    const onBatch = (b: InboxBatch) => {
       if (!cancelled) {
         roomsStore.getState().applyBatch(b);
         setLoaded(true);
       }
     };
-    subscribeRoomList(accountId, onBatch)
+    subscribeInbox(onBatch)
       .then((id) => {
         if (cancelled) {
           // Unmounted before the id resolved — tear down immediately.
-          void unsubscribeRoomList(accountId, id);
+          void unsubscribeInbox(id);
           return;
         }
         subscriptionId = id;
@@ -64,10 +76,10 @@ export function ChatListPane() {
     return () => {
       cancelled = true;
       if (subscriptionId !== null) {
-        void unsubscribeRoomList(accountId, subscriptionId);
+        void unsubscribeInbox(subscriptionId);
       }
     };
-  }, [accountId]);
+  }, [accountKey]);
 
   return (
     <div className="flex h-full w-[320px] shrink-0 flex-col border-border border-r bg-background">
@@ -81,11 +93,13 @@ export function ChatListPane() {
         <ScrollArea className="flex-1">
           <ul aria-label="Conversations" className="flex flex-col">
             {rooms.map((room) => (
-              <li key={room.roomId}>
+              <li key={`${room.accountId}:${room.roomId}`}>
                 <ChatRow
                   room={room}
                   onSelect={selectRoom}
-                  selected={room.roomId === selectedRoomId}
+                  selected={
+                    selected?.roomId === room.roomId && selected?.accountId === room.accountId
+                  }
                 />
               </li>
             ))}

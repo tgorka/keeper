@@ -126,6 +126,20 @@ pub enum SendError {
     Dispatch(String),
 }
 
+/// Errors originating in the merged unified-inbox stream (AD-20, AD-21).
+///
+/// A secret-free taxonomy: no message ever contains a token, session material,
+/// or message plaintext. Maps to `IpcErrorCode::SyncUnavailable` (retriable) in
+/// the shell's single funnel — a failed merge is a sync problem the frontend can
+/// re-subscribe to.
+#[derive(Debug, Error)]
+pub enum InboxError {
+    /// A per-account room-list stream feeding the merge could not start. The
+    /// wrapped string is a non-secret description of the failure.
+    #[error("could not start the merged inbox: {0}")]
+    StreamStart(String),
+}
+
 /// The hexagon error root. Every fallible core operation surfaces one of these.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -140,6 +154,10 @@ pub enum CoreError {
     /// Account activation or room-list supervision failed.
     #[error(transparent)]
     Account(#[from] AccountError),
+
+    /// The merged unified-inbox stream failed to start.
+    #[error(transparent)]
+    Inbox(#[from] InboxError),
 
     /// A per-room timeline subscription failed to open.
     #[error(transparent)]

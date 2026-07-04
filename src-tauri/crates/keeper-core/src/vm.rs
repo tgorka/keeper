@@ -351,10 +351,11 @@ pub struct TimelineBatch {
 /// Non-secret account registry projection returned to the frontend on a
 /// successful login (FR-1, NFR-9).
 ///
-/// Carries **only** the opaque keeper account id, the Matrix user id, and the
-/// resolved homeserver URL. Tokens, refresh tokens, device/crypto keys, and any
-/// `MatrixSession` material never appear here — they live only in the macOS
-/// Keychain and never cross IPC back to TypeScript.
+/// Carries **only** the opaque keeper account id, the Matrix user id, the
+/// resolved homeserver URL, and the per-account hue index. Tokens, refresh
+/// tokens, device/crypto keys, and any `MatrixSession` material never appear
+/// here — they live only in the macOS Keychain and never cross IPC back to
+/// TypeScript.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -366,6 +367,107 @@ pub struct AccountVm {
     pub user_id: String,
     /// The resolved homeserver base URL (after well-known discovery).
     pub homeserver_url: String,
+    /// The account's hue index (0–7) on the 8-hue wheel, assigned at add time
+    /// and persisted in `keeper.db`. The frontend maps it to a CSS hue rendered
+    /// as a 3 px chat-row edge bar and (later) a switcher dot.
+    #[ts(type = "number")]
+    pub hue_index: u8,
+}
+
+/// A single merged-inbox room row, attributed to its owning account (AD-20).
+///
+/// The unified inbox merges every active account's room-list stream into one
+/// recency-ordered list. Each row is a [`RoomVm`]'s render data plus the opaque
+/// keeper `accountId` it belongs to and that account's persisted `hueIndex`
+/// (0–7). Carries **only** non-secret render data — no tokens, session material,
+/// or event ids cross IPC on this VM. The frontend renders the hue as a 3 px
+/// left edge bar and opens the row's timeline on the row's `accountId`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct InboxRoomVm {
+    /// Opaque keeper account id this room belongs to. Drives timeline/send.
+    pub account_id: String,
+    /// The account's hue index (0–7) for the row's edge bar.
+    #[ts(type = "number")]
+    pub hue_index: u8,
+    /// Opaque Matrix room id (passed through verbatim as a string).
+    pub room_id: String,
+    /// The SDK-computed room display name.
+    pub display_name: String,
+    /// Plain-text preview of the latest `m.room.message`, or `null`.
+    pub last_message: Option<String>,
+    /// Latest-event timestamp: ms since the Unix epoch (UTC), or `null`.
+    #[ts(type = "number | null")]
+    pub timestamp: Option<i64>,
+    /// Optional room avatar URL (an `mxc://` URI), or `null`.
+    pub avatar_url: Option<String>,
+}
+
+/// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
+/// (AD-8, AD-20).
+///
+/// The merged inbox is computed in `keeper-core::inbox`; keeper streams its
+/// recency-ordered result as these ops. The frontend applies them to a plain
+/// array by index and **never** re-sorts. Serialized as an internally tagged
+/// enum so the frontend can switch on `op`. The variants mirror [`RoomListOp`]
+/// so the shared frontend diff reducer applies both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[ts(export)]
+pub enum InboxOp {
+    /// Full reset — replace the current contents with `rooms`.
+    Reset {
+        /// The complete current merged window, in recency order.
+        rooms: Vec<InboxRoomVm>,
+    },
+    /// Append `rooms` to the end, in order.
+    Append {
+        /// Rooms to append.
+        rooms: Vec<InboxRoomVm>,
+    },
+    /// Remove all rooms.
+    Clear,
+    /// Insert `room` at `index`, shifting the tail right.
+    Insert {
+        /// The insertion index.
+        #[ts(type = "number")]
+        index: u32,
+        /// The room to insert.
+        room: InboxRoomVm,
+    },
+    /// Replace the room at `index` in place.
+    Set {
+        /// The index to overwrite.
+        #[ts(type = "number")]
+        index: u32,
+        /// The replacement room.
+        room: InboxRoomVm,
+    },
+    /// Remove the room at `index`, shifting the tail left.
+    Remove {
+        /// The index to remove.
+        #[ts(type = "number")]
+        index: u32,
+    },
+}
+
+/// A batch of merged-inbox ops delivered over the subscription's `Channel`
+/// (AD-8, AD-20).
+///
+/// The stream always opens with a batch whose first op is an [`InboxOp::Reset`]
+/// carrying the current merged window, then further batches as accounts sync or
+/// are added/removed. `total` is the sum of the per-account known totals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct InboxBatch {
+    /// The ordered ops to apply, in sequence.
+    pub ops: Vec<InboxOp>,
+    /// The total number of rooms across all accounts the servers know about,
+    /// when known.
+    #[ts(type = "number | null")]
+    pub total: Option<u32>,
 }
 
 /// The single error envelope every fallible command rejects with (AD-8, AD-21).
@@ -468,15 +570,73 @@ mod tests {
             account_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             user_id: "@alice:example.org".to_owned(),
             homeserver_url: "https://matrix.example.org/".to_owned(),
+            hue_index: 3,
         };
         let json = serde_json::to_string(&vm).expect("serialize account vm");
         assert!(json.contains("\"accountId\":"), "json was: {json}");
         assert!(json.contains("\"userId\":"), "json was: {json}");
         assert!(json.contains("\"homeserverUrl\":"), "json was: {json}");
+        assert!(json.contains("\"hueIndex\":3"), "json was: {json}");
         // No token/session material is present on the VM.
         assert!(!json.contains("token"), "json leaked a token field: {json}");
         let back: AccountVm = serde_json::from_str(&json).expect("deserialize account vm");
         assert_eq!(back, vm);
+    }
+
+    fn sample_inbox_room() -> InboxRoomVm {
+        InboxRoomVm {
+            account_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            hue_index: 2,
+            room_id: "!abc:example.org".to_owned(),
+            display_name: "Alice".to_owned(),
+            last_message: Some("hi there".to_owned()),
+            timestamp: Some(1_720_000_000_000),
+            avatar_url: None,
+        }
+    }
+
+    #[test]
+    fn inbox_room_vm_round_trips_camel_case_with_account_and_hue() {
+        let vm = sample_inbox_room();
+        let json = serde_json::to_string(&vm).expect("serialize inbox room vm");
+        assert!(json.contains("\"accountId\":"), "json was: {json}");
+        assert!(json.contains("\"hueIndex\":2"), "json was: {json}");
+        assert!(json.contains("\"roomId\":"), "json was: {json}");
+        assert!(!json.contains("token"), "json leaked a token field: {json}");
+        let back: InboxRoomVm = serde_json::from_str(&json).expect("deserialize inbox room vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn inbox_op_tags_and_round_trips() {
+        let reset = InboxOp::Reset {
+            rooms: vec![sample_inbox_room()],
+        };
+        let json = serde_json::to_string(&reset).expect("serialize reset");
+        assert!(json.contains("\"op\":\"reset\""), "json was: {json}");
+        let back: InboxOp = serde_json::from_str(&json).expect("deserialize reset");
+        assert_eq!(back, reset);
+
+        let remove = InboxOp::Remove { index: 2 };
+        let json = serde_json::to_string(&remove).expect("serialize remove");
+        assert!(json.contains("\"op\":\"remove\""), "json was: {json}");
+        assert!(json.contains("\"index\":2"), "json was: {json}");
+        let back: InboxOp = serde_json::from_str(&json).expect("deserialize remove");
+        assert_eq!(back, remove);
+    }
+
+    #[test]
+    fn inbox_batch_round_trips() {
+        let batch = InboxBatch {
+            ops: vec![InboxOp::Reset {
+                rooms: vec![sample_inbox_room()],
+            }],
+            total: Some(11),
+        };
+        let json = serde_json::to_string(&batch).expect("serialize batch");
+        assert!(json.contains("\"total\":11"), "json was: {json}");
+        let back: InboxBatch = serde_json::from_str(&json).expect("deserialize batch");
+        assert_eq!(back, batch);
     }
 
     #[test]

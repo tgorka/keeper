@@ -98,6 +98,18 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+  /* Per-account hue wheel (8 hues, Story 2.1). The backend assigns a stable
+     hue index 0–7 per account; the frontend maps it to one of these variables
+     and renders it as a 3 px chat-row edge bar. Evenly spaced around the hue
+     circle at a consistent chroma/lightness for the light theme. */
+  --account-hue-0: oklch(0.62 0.19 25);
+  --account-hue-1: oklch(0.68 0.16 70);
+  --account-hue-2: oklch(0.72 0.15 130);
+  --account-hue-3: oklch(0.66 0.14 170);
+  --account-hue-4: oklch(0.64 0.13 220);
+  --account-hue-5: oklch(0.55 0.18 275);
+  --account-hue-6: oklch(0.6 0.2 320);
+  --account-hue-7: oklch(0.62 0.19 355);
 }
 
 .dark {
@@ -141,6 +153,16 @@
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.556 0 0);
+  /* Per-account hue wheel, dark theme: slightly brighter/more saturated so the
+     3 px edge bar reads against the dark background. */
+  --account-hue-0: oklch(0.7 0.19 25);
+  --account-hue-1: oklch(0.76 0.16 70);
+  --account-hue-2: oklch(0.8 0.16 130);
+  --account-hue-3: oklch(0.74 0.14 170);
+  --account-hue-4: oklch(0.72 0.14 220);
+  --account-hue-5: oklch(0.66 0.18 275);
+  --account-hue-6: oklch(0.7 0.2 320);
+  --account-hue-7: oklch(0.7 0.19 355);
 }
 
 @layer base {

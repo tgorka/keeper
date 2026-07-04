@@ -27,6 +27,7 @@ const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
   userId: "@alice:example.org",
   homeserverUrl: "https://matrix.example.org/",
+  hueIndex: 0,
 };
 
 function ipcError(code: IpcError["code"]): IpcError {
@@ -77,7 +78,6 @@ afterEach(() => {
 
 describe("ConversationPane", () => {
   it("shows the placeholder when no room is selected", () => {
-    accountsStore.getState().setCurrentAccount(account);
     render(<ConversationPane {...noopProps()} />);
     expect(screen.getByText("Select a conversation to start reading.")).toBeInTheDocument();
     expect(subscribeTimeline).not.toHaveBeenCalled();
@@ -85,8 +85,7 @@ describe("ConversationPane", () => {
 
   it("subscribes with the account id and room id when a room is selected", async () => {
     subscribeTimeline.mockResolvedValue(1);
-    accountsStore.getState().setCurrentAccount(account);
-    roomsStore.getState().selectRoom("!room:example.org");
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     render(<ConversationPane {...noopProps()} />);
 
     await waitFor(() => {
@@ -104,8 +103,7 @@ describe("ConversationPane", () => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    accountsStore.getState().setCurrentAccount(account);
-    roomsStore.getState().selectRoom("!room:example.org");
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     render(<ConversationPane {...noopProps()} />);
 
     captured.onBatch?.({
@@ -142,8 +140,7 @@ describe("ConversationPane", () => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    accountsStore.getState().setCurrentAccount(account);
-    roomsStore.getState().selectRoom("!room:example.org");
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     render(<ConversationPane {...noopProps()} />);
 
     captured.onBatch?.({
@@ -189,8 +186,7 @@ describe("ConversationPane", () => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    accountsStore.getState().setCurrentAccount(account);
-    roomsStore.getState().selectRoom("!room:example.org");
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     render(<ConversationPane {...noopProps()} />);
 
     captured.onBatch?.({ ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }] });
@@ -202,8 +198,7 @@ describe("ConversationPane", () => {
 
   it("shows an inline error when the subscribe rejects", async () => {
     subscribeTimeline.mockRejectedValue(ipcError("timelineUnavailable"));
-    accountsStore.getState().setCurrentAccount(account);
-    roomsStore.getState().selectRoom("!room:example.org");
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     render(<ConversationPane {...noopProps()} />);
 
     await waitFor(() => {
@@ -213,8 +208,7 @@ describe("ConversationPane", () => {
 
   it("unsubscribes and clears the store on unmount", async () => {
     subscribeTimeline.mockResolvedValue(7);
-    accountsStore.getState().setCurrentAccount(account);
-    roomsStore.getState().selectRoom("!room:example.org");
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     const { unmount } = render(<ConversationPane {...noopProps()} />);
 
     await waitFor(() => {
@@ -232,8 +226,9 @@ describe("ConversationPane", () => {
   it("tears down the old subscription and re-subscribes when the room changes", async () => {
     let nextId = 1;
     subscribeTimeline.mockImplementation(() => Promise.resolve(nextId++));
-    accountsStore.getState().setCurrentAccount(account);
-    roomsStore.getState().selectRoom("!room-a:example.org");
+    roomsStore
+      .getState()
+      .selectRoom({ accountId: account.accountId, roomId: "!room-a:example.org" });
     const { rerender } = render(<ConversationPane {...noopProps()} />);
 
     await waitFor(() => {
@@ -245,7 +240,9 @@ describe("ConversationPane", () => {
     });
 
     // Switch rooms: the effect re-runs (selectedRoomId changed).
-    roomsStore.getState().selectRoom("!room-b:example.org");
+    roomsStore
+      .getState()
+      .selectRoom({ accountId: account.accountId, roomId: "!room-b:example.org" });
     rerender(<ConversationPane {...noopProps()} />);
 
     await waitFor(() => {
@@ -266,8 +263,7 @@ describe("ConversationPane", () => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    accountsStore.getState().setCurrentAccount(account);
-    roomsStore.getState().selectRoom("!room:example.org");
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     const { unmount } = render(<ConversationPane {...noopProps()} />);
 
     await waitFor(() => {
@@ -287,8 +283,7 @@ describe("ConversationPane", () => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    accountsStore.getState().setCurrentAccount(account);
-    roomsStore.getState().selectRoom("!room:example.org");
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     render(<ConversationPane {...noopProps()} />);
 
     // The composer is present (a room is selected) but disabled before load.
@@ -308,8 +303,7 @@ describe("ConversationPane", () => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    accountsStore.getState().setCurrentAccount(account);
-    roomsStore.getState().selectRoom("!room:example.org");
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     render(<ConversationPane {...noopProps()} />);
     captured.onBatch?.({ ops: [message("k1", "@bob:example.org", "hi")] });
 
@@ -329,8 +323,7 @@ describe("ConversationPane", () => {
       captured.onBatch = onBatch;
       return Promise.resolve(1);
     });
-    accountsStore.getState().setCurrentAccount(account);
-    roomsStore.getState().selectRoom("!room:example.org");
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     render(<ConversationPane {...noopProps()} />);
 
     captured.onBatch?.({
@@ -369,8 +362,7 @@ describe("ConversationPane", () => {
     });
     // Drive the connection store offline (the pane reads it as a pure projection).
     connectionStore.getState().applyBatch({ status: "offline" });
-    accountsStore.getState().setCurrentAccount(account);
-    roomsStore.getState().selectRoom("!room:example.org");
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     render(<ConversationPane {...noopProps()} />);
 
     captured.onBatch?.({

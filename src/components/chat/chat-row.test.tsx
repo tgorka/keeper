@@ -1,10 +1,12 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { ChatRow } from "@/components/chat/chat-row";
-import type { RoomVm } from "@/lib/ipc/client";
+import type { InboxRoomVm } from "@/lib/ipc/client";
 
-function room(overrides: Partial<RoomVm> = {}): RoomVm {
+function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
   return {
+    accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    hueIndex: 0,
     roomId: "!abc:example.org",
     displayName: "Alice Smith",
     lastMessage: "hey there",
@@ -28,6 +30,20 @@ describe("ChatRow", () => {
     expect(button).toHaveClass("w-full");
   });
 
+  it("renders a 3 px per-account hue edge bar mapped from the hue index", () => {
+    const { getByTestId } = render(<ChatRow room={room({ hueIndex: 3 })} />);
+    const bar = getByTestId("account-hue-bar");
+    expect(bar).toHaveClass("w-[3px]");
+    // The bar's color is the CSS variable for the account's hue index — no
+    // hardcoded color value.
+    expect(bar.style.backgroundColor).toBe("var(--account-hue-3)");
+  });
+
+  it("wraps an out-of-range hue index into the 0..8 wheel", () => {
+    const { getByTestId } = render(<ChatRow room={room({ hueIndex: 9 })} />);
+    expect(getByTestId("account-hue-bar").style.backgroundColor).toBe("var(--account-hue-1)");
+  });
+
   it("shows avatar fallback initials when no avatar url", () => {
     render(<ChatRow room={room({ displayName: "Alice Smith" })} />);
     expect(screen.getByText("AS")).toBeInTheDocument();
@@ -40,7 +56,6 @@ describe("ChatRow", () => {
 
   it("omits the timestamp when it is null", () => {
     const { container } = render(<ChatRow room={room({ timestamp: null })} />);
-    // Only the display name and empty preview remain; no time text node.
     expect(container.querySelector(".text-xs")).toBeNull();
   });
 
@@ -98,11 +113,16 @@ describe("ChatRow", () => {
     }
   });
 
-  it("calls onSelect with the room id when clicked", () => {
+  it("calls onSelect with the account and room ids when clicked", () => {
     const onSelect = vi.fn();
-    render(<ChatRow room={room({ roomId: "!xyz:example.org" })} onSelect={onSelect} />);
+    render(
+      <ChatRow
+        room={room({ accountId: "acctB", roomId: "!xyz:example.org" })}
+        onSelect={onSelect}
+      />,
+    );
     fireEvent.click(screen.getByRole("button"));
-    expect(onSelect).toHaveBeenCalledWith("!xyz:example.org");
+    expect(onSelect).toHaveBeenCalledWith({ accountId: "acctB", roomId: "!xyz:example.org" });
   });
 
   it("marks the selected row with aria-current and a highlight", () => {

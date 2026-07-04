@@ -44,17 +44,29 @@ function isIpcError(value: unknown): value is IpcError {
   return typeof candidate.code === "string" && typeof candidate.message === "string";
 }
 
+interface LoginScreenProps {
+  /**
+   * When `true`, this login adds another account to a signed-in session
+   * (Story 2.1) rather than being the first sign-in. Renders a Cancel control
+   * and calls {@link LoginScreenProps.onDone} on success or cancel.
+   */
+  addMode?: boolean;
+  /** Called after a successful add, or when the user cancels (add mode only). */
+  onDone?: () => void;
+}
+
 /**
- * Full-screen password login (FR-1, FR-5).
+ * Password login (FR-1, FR-5, AD-17).
  *
  * Collects homeserver + username + password, calls the typed `login_password`
  * command, renders the named error inline, and — on success — records the
- * returned non-secret {@link AccountVm} in the accounts store (which gates the
- * shell). The password field is cleared after every submit; the password never
- * lives in any store.
+ * returned non-secret {@link AccountVm} in the accounts store (`addAccount`,
+ * which gates/extends the shell). In `addMode` it is an overlay for adding
+ * another account and offers a Cancel control. The password field is cleared
+ * after every submit; the password never lives in any store.
  */
-export function LoginScreen() {
-  const setCurrentAccount = useAccountsStore((s) => s.setCurrentAccount);
+export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) {
+  const addAccount = useAccountsStore((s) => s.addAccount);
   const [homeserver, setHomeserver] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -82,7 +94,8 @@ export function LoginScreen() {
         trimmedUsername,
         submittedPassword,
       );
-      setCurrentAccount(account);
+      addAccount(account);
+      onDone?.();
     } catch (err) {
       setErrorCode(isIpcError(err) ? err.code : "internal");
     } finally {
@@ -94,8 +107,12 @@ export function LoginScreen() {
     <div className="flex h-screen items-center justify-center bg-background p-6 text-foreground">
       <Card className="w-full max-w-sm">
         <CardHeader>
-          <CardTitle>Sign in to keeper</CardTitle>
-          <CardDescription>Connect your Matrix account to start chatting.</CardDescription>
+          <CardTitle>{addMode ? "Add an account" : "Sign in to keeper"}</CardTitle>
+          <CardDescription>
+            {addMode
+              ? "Connect another Matrix account. Your other accounts keep syncing."
+              : "Connect your Matrix account to start chatting."}
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <form className="flex flex-col gap-4" onSubmit={handleSubmit} noValidate>
@@ -156,9 +173,21 @@ export function LoginScreen() {
               </Alert>
             )}
 
-            <Button type="submit" disabled={submitting}>
-              {submitting ? "Signing in…" : "Sign in"}
-            </Button>
+            <div className="flex flex-col gap-2">
+              <Button type="submit" disabled={submitting}>
+                {submitting ? "Signing in…" : addMode ? "Add account" : "Sign in"}
+              </Button>
+              {addMode && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={submitting}
+                  onClick={() => onDone?.()}
+                >
+                  Cancel
+                </Button>
+              )}
+            </div>
           </form>
         </CardContent>
       </Card>

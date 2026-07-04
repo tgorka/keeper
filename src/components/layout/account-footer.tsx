@@ -1,16 +1,22 @@
 /**
- * Sidebar-footer account row with local sign-out (AD-10, Story 1.8).
+ * Sidebar-footer account list with per-account local sign-out + Add Account
+ * (AD-10, Story 2.1 — minimal).
  *
- * Shows the signed-in account's Matrix user id (truncated gracefully) and a
- * Sign out control. In the collapsed icon rail it renders an icon-only sign-out
- * affordance. Either control opens a shadcn {@link Dialog} confirming the intent;
- * the confirm button awaits {@link useSignOut} (which deletes the local session
- * and resets the stores → login screen) while cancel is a pure no-op. Baseline
- * a11y: accessible labels and visible focus rings on every control.
+ * Lists every signed-in account (its Matrix user id, truncated) each with a
+ * Sign out control, and an always-present "Add Account" button that opens the
+ * login overlay in add mode. In the collapsed icon rail each account shows an
+ * icon-only sign-out affordance and the add button is a `+` icon. A sign-out
+ * confirmation {@link Dialog} awaits {@link useSignOut} bound to that account's
+ * id (which deletes only that account's local session and drops its rows from
+ * the merged inbox); other accounts keep syncing. Cancel is a pure no-op.
  *
- * Renders nothing when there is no signed-in account.
+ * Intentionally throwaway: Story 2.5 replaces this with the designed switcher
+ * (avatars, hue dots, homeserver line, sync glyph, dropdown, filter).
+ *
+ * Renders only the Add Account button when there are no accounts (it is never
+ * count-gated), and nothing else.
  */
-import { LogOut } from "lucide-react";
+import { LogOut, Plus } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -24,7 +30,9 @@ import {
 } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSignOut } from "@/hooks/use-sign-out";
+import type { AccountVm } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
+import { useAddAccountStore } from "@/lib/stores/add-account";
 import { cn } from "@/lib/utils";
 
 interface AccountFooterProps {
@@ -33,23 +41,20 @@ interface AccountFooterProps {
 
 const FOCUS_RING = "focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none";
 
-export function AccountFooter({ collapsed }: AccountFooterProps) {
-  const userId = useAccountsStore((s) => s.currentAccount?.userId ?? null);
+/** One account row (expanded or collapsed) with its own sign-out dialog. */
+function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boolean }) {
   const signOut = useSignOut();
   const [open, setOpen] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
-
-  if (userId === null) {
-    return null;
-  }
+  const userId = account.userId;
 
   async function handleConfirm() {
     setSigningOut(true);
     try {
-      await signOut();
-      // On success the shell unmounts (account cleared); no need to close.
+      await signOut(account.accountId);
+      // On success this row unmounts (account removed); no need to close.
     } catch {
-      // A cleanup failure keeps the user signed in; reopen the row for a retry.
+      // A cleanup failure keeps the account signed in; close for a retry.
       setSigningOut(false);
       setOpen(false);
     }
@@ -57,12 +62,7 @@ export function AccountFooter({ collapsed }: AccountFooterProps) {
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <div
-        className={cn(
-          "flex shrink-0 border-border border-t p-2",
-          collapsed ? "justify-center" : "items-center gap-2",
-        )}
-      >
+      <div className={cn("flex shrink-0", collapsed ? "justify-center" : "items-center gap-2")}>
         {collapsed ? (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -77,7 +77,7 @@ export function AccountFooter({ collapsed }: AccountFooterProps) {
                 <LogOut aria-hidden="true" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent side="right">Sign out</TooltipContent>
+            <TooltipContent side="right">{`Sign out ${userId}`}</TooltipContent>
           </Tooltip>
         ) : (
           <>
@@ -102,7 +102,7 @@ export function AccountFooter({ collapsed }: AccountFooterProps) {
         <DialogHeader>
           <DialogTitle>Sign out?</DialogTitle>
           <DialogDescription>
-            You'll be signed out of {userId} on this device and returned to the login screen.
+            You'll be signed out of {userId} on this device. Your other accounts keep syncing.
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
@@ -123,5 +123,52 @@ export function AccountFooter({ collapsed }: AccountFooterProps) {
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+export function AccountFooter({ collapsed }: AccountFooterProps) {
+  const accounts = useAccountsStore((s) => s.accounts);
+  const openAddAccount = useAddAccountStore((s) => s.openAddAccount);
+
+  return (
+    <div
+      className={cn(
+        "flex shrink-0 flex-col gap-1 border-border border-t p-2",
+        collapsed && "items-center",
+      )}
+    >
+      {accounts.map((account) => (
+        <AccountRow key={account.accountId} account={account} collapsed={collapsed} />
+      ))}
+
+      {collapsed ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Add account"
+              className={FOCUS_RING}
+              onClick={openAddAccount}
+            >
+              <Plus aria-hidden="true" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="right">Add account</TooltipContent>
+        </Tooltip>
+      ) : (
+        <Button
+          type="button"
+          variant="ghost"
+          aria-label="Add account"
+          className={cn("w-full justify-start gap-2", FOCUS_RING)}
+          onClick={openAddAccount}
+        >
+          <Plus aria-hidden="true" />
+          Add account
+        </Button>
+      )}
+    </div>
   );
 }

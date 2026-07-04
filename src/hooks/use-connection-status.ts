@@ -1,15 +1,15 @@
 /**
  * Connection-status subscription lifecycle (FR-8/FR-9, UX-DR18, AD-8/AD-9).
  *
- * Reads the current account id from the accounts store and, on mount / account
- * change, subscribes to the account's connection-status channel, mirroring each
- * streamed batch into the {@link connectionStore}. On cleanup — StrictMode
- * double-mount, account change, unmount, or account clear — it unsubscribes the
- * backend task and `reset()`s the store, so streams never leak and no stale
- * offline status lingers across accounts. Mounted once by the always-mounted
- * signed-in root (`AppShell`). A subscribe failure is swallowed: the pill is a
- * non-critical projection, so a failed connection stream simply leaves the store
- * at its `"online"` default rather than surfacing an error.
+ * Reads the *first* signed-in account's id from the accounts store and, on
+ * mount / that-account change, subscribes to its connection-status channel,
+ * mirroring each streamed batch into the {@link connectionStore}. The shell-
+ * level offline pill is a single indicator in Story 2.1; per-account sync-state
+ * glyphs are Story 2.5. On cleanup — StrictMode double-mount, account change,
+ * unmount, or account clear — it unsubscribes the backend task and `reset()`s
+ * the store, so streams never leak and no stale offline status lingers. A
+ * subscribe failure is swallowed: the pill is a non-critical projection, so a
+ * failed connection stream simply leaves the store at its `"online"` default.
  */
 import { useEffect } from "react";
 import type { ConnectionStatusBatch } from "@/lib/ipc/client";
@@ -18,7 +18,7 @@ import { useAccountsStore } from "@/lib/stores/accounts";
 import { connectionStore } from "@/lib/stores/connection";
 
 export function useConnectionStatus(): void {
-  const accountId = useAccountsStore((s) => s.currentAccount?.accountId ?? null);
+  const accountId = useAccountsStore((s) => s.accounts[0]?.accountId ?? null);
 
   useEffect(() => {
     if (accountId === null) {

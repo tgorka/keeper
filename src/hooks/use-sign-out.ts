@@ -1,43 +1,45 @@
 /**
- * Sign-out hook (AD-10, Story 1.8).
+ * Sign-out hook (AD-10, Story 1.8 / 2.1).
  *
- * Returns an async handler bound to the current account id. It awaits the
- * Rust-authoritative `sign_out` command (local-only: tears down supervision and
- * deletes the account's SDK store dir + Keychain session + registry row), then
- * resets the frontend stores in a deliberate order:
+ * Returns an async handler that signs out a *specific* account by id. It awaits
+ * the Rust-authoritative `sign_out` command (local-only: tears down that
+ * account's supervision and deletes its SDK store dir + Keychain session +
+ * registry row; the merged inbox drops its rooms while other accounts keep
+ * syncing), then removes the account from the accounts store.
  *
- *   1. `roomsStore.selectRoom(null)` — close the open conversation (room-list
- *      `clear()` deliberately preserves `selectedRoomId`, so it must be reset
- *      explicitly here).
- *   2. `roomsStore.clear()` — drop the streamed room window.
- *   3. `timelineStore.clear()` — drop the open room's mirrored timeline.
- *   4. `connectionStore.reset()` — return the connectivity pill to its default.
- *   5. `accountsStore.clear()` **last** — this unmounts the shell, and the pane
- *      cleanups (timeline/connection unsubscribe) run as the components leave.
- *
- * The handler returns `null` (no-ops) when there is no current account.
+ * When the signed-out account is the one whose conversation is open, the open
+ * selection and the mirrored timeline are cleared too. Signing out the *last*
+ * account additionally resets the room/connection mirror stores and returns the
+ * user to the login screen (the shell unmounts once `accounts` is empty).
  */
 import { useCallback } from "react";
 import { signOut } from "@/lib/ipc/client";
-import { accountsStore, useAccountsStore } from "@/lib/stores/accounts";
+import { accountsStore } from "@/lib/stores/accounts";
 import { connectionStore } from "@/lib/stores/connection";
 import { roomsStore } from "@/lib/stores/rooms";
 import { timelineStore } from "@/lib/stores/timeline";
 
-export function useSignOut(): () => Promise<void> {
-  const accountId = useAccountsStore((s) => s.currentAccount?.accountId ?? null);
-
-  return useCallback(async () => {
-    if (accountId === null) {
-      return;
-    }
+export function useSignOut(): (accountId: string) => Promise<void> {
+  return useCallback(async (accountId: string) => {
     await signOut(accountId);
-    // Reset stores in order; `accountsStore.clear()` last so the shell unmounts
-    // only after the mirror stores are cleared.
-    roomsStore.getState().selectRoom(null);
-    roomsStore.getState().clear();
-    timelineStore.getState().clear();
-    connectionStore.getState().reset();
-    accountsStore.getState().clear();
-  }, [accountId]);
+
+    // If the open conversation belonged to this account, close it and drop its
+    // mirrored timeline so a signed-out account's messages never linger.
+    const selected = roomsStore.getState().selected;
+    if (selected?.accountId === accountId) {
+      roomsStore.getState().selectRoom(null);
+      timelineStore.getState().clear();
+    }
+
+    const remaining = accountsStore.getState().accounts.filter((a) => a.accountId !== accountId);
+    if (remaining.length === 0) {
+      // Last account signed out: reset the mirror stores, then clear accounts
+      // last so the shell unmounts only after the mirrors are clean.
+      roomsStore.getState().selectRoom(null);
+      roomsStore.getState().clear();
+      timelineStore.getState().clear();
+      connectionStore.getState().reset();
+    }
+    accountsStore.getState().removeAccount(accountId);
+  }, []);
 }

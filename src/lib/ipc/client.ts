@@ -14,6 +14,9 @@ export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
+export type { InboxBatch } from "./gen/InboxBatch";
+export type { InboxOp } from "./gen/InboxOp";
+export type { InboxRoomVm } from "./gen/InboxRoomVm";
 export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { PingVm } from "./gen/PingVm";
@@ -27,6 +30,7 @@ export type { TimelineOp } from "./gen/TimelineOp";
 
 import type { AccountVm } from "./gen/AccountVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
+import type { InboxBatch } from "./gen/InboxBatch";
 import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 
@@ -84,14 +88,14 @@ export async function loginPassword(
 }
 
 /**
- * Report the persisted account that can be restored on launch, if any (FR-8,
- * Story 1.8). Identity only — the Rust core lists the registry rows and returns
- * the first whose Keychain session is present as a non-secret {@link AccountVm}.
- * Resolves with the account, or `null` on a cold install (or a row whose session
- * is gone). No token or session material ever crosses IPC.
+ * Report every persisted account that can be restored on launch (FR-8, AD-20).
+ * Identity only — the Rust core lists the registry rows and returns each whose
+ * Keychain session is present as a non-secret {@link AccountVm} (with hue).
+ * Resolves with an array (empty on a cold install); a row whose session is gone
+ * is skipped. No token or session material ever crosses IPC.
  */
-export async function sessionRestore(): Promise<AccountVm | null> {
-  return await invoke<AccountVm | null>("session_restore");
+export async function sessionRestore(): Promise<AccountVm[]> {
+  return await invoke<AccountVm[]>("session_restore");
 }
 
 /**
@@ -144,6 +148,26 @@ export async function subscribeRoomList(
  */
 export async function unsubscribeRoomList(accountId: string, id: number): Promise<void> {
   await invoke<void>("room_list_unsubscribe", { accountId, subscriptionId: id });
+}
+
+/**
+ * Subscribe to the merged unified inbox across every restorable account (FR-18,
+ * AD-20). Opens a `Channel`, forwards each {@link InboxBatch} to `onBatch` in
+ * arrival order (a recency-ordered `Reset` window that updates as accounts sync
+ * or are added/removed), and resolves with the inbox subscription id. Ordering
+ * and filtering are computed in Rust — never re-derived here. Rejects with the
+ * {@link IpcError} envelope (`code: "syncUnavailable"`) on a stream-start failure.
+ */
+export async function subscribeInbox(onBatch: (batch: InboxBatch) => void): Promise<number> {
+  return await subscribe<InboxBatch>("inbox_subscribe", onBatch);
+}
+
+/**
+ * Unsubscribe the merged inbox, aborting every per-account producer feeding it
+ * (AD-20). Idempotent — a mismatched/unknown id is a no-op.
+ */
+export async function unsubscribeInbox(id: number): Promise<void> {
+  await invoke<void>("inbox_unsubscribe", { subscriptionId: id });
 }
 
 /**

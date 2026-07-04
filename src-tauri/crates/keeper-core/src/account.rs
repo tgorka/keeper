@@ -35,15 +35,18 @@ use matrix_sdk_ui::sync_service::{State, SyncService};
 use matrix_sdk_ui::timeline::Timeline;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
-use crate::auth::session_keychain_key;
-use crate::error::{AccountError, CoreError, SendError, TimelineError};
+use crate::auth::{self, session_keychain_key};
+use crate::error::{AccountError, CoreError, InboxError, SendError, TimelineError};
+use crate::inbox::InboxMerger;
 use crate::platform::Platform;
 use crate::registry;
 use crate::send::{self, SendTrigger};
 use crate::timeline;
 use crate::vm::{
-    ConnectionStatus, ConnectionStatusBatch, RoomListBatch, RoomListOp, RoomVm, TimelineBatch,
+    ConnectionStatus, ConnectionStatusBatch, InboxBatch, RoomListBatch, RoomListOp, RoomVm,
+    TimelineBatch,
 };
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
@@ -66,6 +69,11 @@ pub type TimelineSink = Box<dyn Fn(TimelineBatch) -> bool + Send + Sync>;
 /// Tauri `Channel::send`; tests capture into a vector. Returns `true` if the
 /// batch was delivered, `false` if the channel is closed (the producer stops).
 pub type ConnectionSink = Box<dyn Fn(ConnectionStatusBatch) -> bool + Send + Sync>;
+
+/// Sink that receives each merged [`InboxBatch`]. The shell wraps a Tauri
+/// `Channel::send`; tests capture into a vector. Returns `true` if the batch was
+/// delivered, `false` if the channel is closed (the merger stops emitting).
+pub type InboxSink = Box<dyn Fn(InboxBatch) -> bool + Send + Sync>;
 
 /// Registry of an account's live open room timelines, keyed by the *timeline*
 /// subscription id → its room id and the exact `Arc<Timeline>` that produced the
@@ -97,11 +105,27 @@ struct AccountHandle {
     reconnect_supervisor: JoinHandle<()>,
 }
 
-/// Single-account-capable supervisor (AD-19). Owns the live account state; the
-/// shell manages exactly one instance in its `AppState`.
+/// A live merged-inbox subscription (AD-20): the merger the per-account
+/// room-list producers feed, and their abort handles keyed by account id (so a
+/// single account's producer can be torn down on that account's sign-out, not
+/// only on a whole-inbox unsubscribe). There is at most one at a time in the
+/// shell.
+struct InboxHandle {
+    subscription_id: u64,
+    merger: InboxMerger,
+    producers: HashMap<String, JoinHandle<()>>,
+}
+
+/// Multi-account supervisor (AD-3, AD-19, AD-20). Owns the live per-account
+/// state (each a supervised `Client`/`SyncService`) and the single active
+/// merged-inbox subscription; the shell manages exactly one instance in its
+/// `AppState`. No account-count limit is enforced anywhere.
 #[derive(Default)]
 pub struct AccountManager {
     accounts: Mutex<HashMap<String, AccountHandle>>,
+    /// The single active merged-inbox subscription, if any. Sign-out/shutdown
+    /// notify it so a removed account's rooms leave the inbox immediately.
+    inbox: Mutex<Option<InboxHandle>>,
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
@@ -186,15 +210,19 @@ impl AccountManager {
 
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
         let account_id_owned = account_id.to_owned();
+        let span = tracing::info_span!("room_list_producer", account_id = %account_id);
         let reaper_subs = subs_arc.clone();
-        let task = tokio::spawn(async move {
-            // `client` is captured to keep the account alive for the task's
-            // lifetime; the producer reads from the room list only.
-            let _keep_alive = client;
-            run_producer(room_list, sink, &account_id_owned).await;
-            // A naturally-completed producer reaps its own subscription entry.
-            reaper_subs.lock().await.remove(&subscription_id);
-        });
+        let task = tokio::spawn(
+            async move {
+                // `client` is captured to keep the account alive for the task's
+                // lifetime; the producer reads from the room list only.
+                let _keep_alive = client;
+                run_producer(room_list, sink, &account_id_owned).await;
+                // A naturally-completed producer reaps its own subscription entry.
+                reaper_subs.lock().await.remove(&subscription_id);
+            }
+            .instrument(span),
+        );
 
         {
             let accounts = self.accounts.lock().await;
@@ -213,6 +241,158 @@ impl AccountManager {
         }
         tracing::info!(account_id = %account_id, subscription_id, "room list subscribed");
         Ok(subscription_id)
+    }
+
+    /// Subscribe to the merged unified inbox across every restorable account
+    /// (AD-20). Activates each account whose Keychain session is present, opens
+    /// its room-list stream, and feeds each into a shared [`InboxMerger`] that
+    /// emits one recency-ordered [`InboxBatch`] stream into `sink`. Returns the
+    /// inbox subscription id. Replacing an existing inbox subscription (e.g. the
+    /// frontend re-subscribes after adding an account) first tears the old one
+    /// down. Adding the Nth account is identical to the 2nd — no count limit.
+    pub async fn subscribe_inbox(
+        &self,
+        platform: &dyn Platform,
+        sink: InboxSink,
+    ) -> Result<u64, CoreError> {
+        // Only one inbox subscription at a time: tear down any prior one so its
+        // producers stop feeding a stale merger/channel.
+        self.unsubscribe_inbox_inner().await;
+
+        let accounts = auth::find_restorable_accounts(platform)?;
+        let merger = InboxMerger::new(sink);
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+
+        // Register every account slot up front so the merge reflects the full set
+        // even before any batch arrives, then start each account's producer.
+        let mut producers: HashMap<String, JoinHandle<()>> = HashMap::with_capacity(accounts.len());
+        for account in &accounts {
+            merger
+                .register_account(&account.account_id, account.hue_index)
+                .await;
+        }
+        for account in accounts {
+            let account_id = account.account_id.clone();
+            // Activate + acquire the room list. A single account's activation
+            // failure is not fatal to the whole inbox: skip it (its rooms simply
+            // don't appear) so the other accounts keep syncing.
+            let room_list = match self.acquire_room_list(platform, &account_id).await {
+                Ok(room_list) => room_list,
+                Err(e) => {
+                    tracing::warn!(
+                        account_id = %account_id,
+                        error = %e,
+                        "inbox: account could not start; skipping (others keep syncing)"
+                    );
+                    merger.remove_account(&account_id).await;
+                    continue;
+                }
+            };
+            let merger_for_task = merger.clone();
+            let task = tokio::spawn(
+                async move {
+                    run_inbox_producer(room_list, merger_for_task, &account_id).await;
+                }
+                .instrument(
+                    tracing::info_span!("inbox_producer", account_id = %account.account_id),
+                ),
+            );
+            producers.insert(account.account_id.clone(), task);
+        }
+
+        {
+            let mut inbox = self.inbox.lock().await;
+            *inbox = Some(InboxHandle {
+                subscription_id,
+                merger,
+                producers,
+            });
+        }
+        tracing::info!(subscription_id, "merged inbox subscribed");
+        Ok(subscription_id)
+    }
+
+    /// Unsubscribe the merged inbox for `subscription_id`, aborting every
+    /// per-account producer. Idempotent — a mismatched/unknown id is a no-op.
+    pub async fn unsubscribe_inbox(&self, subscription_id: u64) {
+        let matches = {
+            let inbox = self.inbox.lock().await;
+            inbox
+                .as_ref()
+                .is_some_and(|h| h.subscription_id == subscription_id)
+        };
+        if matches {
+            self.unsubscribe_inbox_inner().await;
+            tracing::info!(subscription_id, "merged inbox unsubscribed");
+        }
+    }
+
+    /// Tear down any active inbox subscription: abort its producers and drop the
+    /// handle. Idempotent.
+    async fn unsubscribe_inbox_inner(&self) {
+        let handle = self.inbox.lock().await.take();
+        if let Some(handle) = handle {
+            for (_, task) in handle.producers {
+                task.abort();
+            }
+        }
+    }
+
+    /// Activate `account_id` if needed and return its recency-sorted room list.
+    /// Mirrors the activation/teardown contract of [`subscribe_room_list`]
+    /// (partial-account cleanup on a room-list start failure) but hands the
+    /// `RoomList` back to the caller rather than spawning a producer.
+    async fn acquire_room_list(
+        &self,
+        platform: &dyn Platform,
+        account_id: &str,
+    ) -> Result<RoomList, CoreError> {
+        let (sync, did_activate) = {
+            let mut accounts = self.accounts.lock().await;
+            let did_activate = !accounts.contains_key(account_id);
+            if did_activate {
+                let (client, sync, reconnect_supervisor) = activate(platform, account_id).await?;
+                accounts.insert(
+                    account_id.to_owned(),
+                    AccountHandle {
+                        client,
+                        sync,
+                        subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                        timelines: Arc::new(Mutex::new(HashMap::new())),
+                        reconnect_supervisor,
+                    },
+                );
+                tracing::info!(account_id = %account_id, "account activated for inbox");
+            }
+            let handle = accounts.get(account_id).ok_or_else(|| {
+                CoreError::Internal("account handle vanished after activation".to_owned())
+            })?;
+            (handle.sync.clone(), did_activate)
+        };
+
+        match sync.room_list_service().all_rooms().await {
+            Ok(room_list) => Ok(room_list),
+            Err(e) => {
+                if did_activate {
+                    let mut accounts = self.accounts.lock().await;
+                    let should_remove = match accounts.get(account_id) {
+                        Some(handle) => handle.subscriptions.lock().await.is_empty(),
+                        None => false,
+                    };
+                    if should_remove {
+                        if let Some(dead) = accounts.remove(account_id) {
+                            dead.reconnect_supervisor.abort();
+                            dead.sync.stop().await;
+                            tracing::info!(
+                                account_id = %account_id,
+                                "torn down partial account after inbox room-list start failure"
+                            );
+                        }
+                    }
+                }
+                Err(InboxError::StreamStart(e.to_string()).into())
+            }
+        }
     }
 
     /// Subscribe to a room's timeline, activating the account if it is not
@@ -303,13 +483,18 @@ impl AccountManager {
         let reaper_timelines = timelines_arc.clone();
         let room_id_task = room_id.clone();
         let room_id_log = room_id.clone();
-        let task = tokio::spawn(async move {
-            timeline::forward_timeline(open, room_id_task, sink).await;
-            // A naturally-completed producer reaps its own subscription entry and
-            // drops its stored `Arc<Timeline>` so nothing leaks (AD-19).
-            reaper_subs.lock().await.remove(&subscription_id);
-            reaper_timelines.lock().await.remove(&subscription_id);
-        });
+        let span =
+            tracing::info_span!("timeline_producer", account_id = %account_id, room_id = %room_id);
+        let task = tokio::spawn(
+            async move {
+                timeline::forward_timeline(open, room_id_task, sink).await;
+                // A naturally-completed producer reaps its own subscription entry
+                // and drops its stored `Arc<Timeline>` so nothing leaks (AD-19).
+                reaper_subs.lock().await.remove(&subscription_id);
+                reaper_timelines.lock().await.remove(&subscription_id);
+            }
+            .instrument(span),
+        );
 
         {
             let accounts = self.accounts.lock().await;
@@ -387,15 +572,19 @@ impl AccountManager {
 
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
         let account_id_owned = account_id.to_owned();
+        let span = tracing::info_span!("connection_status_producer", account_id = %account_id);
         let reaper_subs = subs_arc.clone();
-        let task = tokio::spawn(async move {
-            // `client` is captured to keep the account alive for the task's
-            // lifetime; the producer reads connectivity from `sync` only.
-            let _keep_alive = client;
-            run_connection_producer(sync, sink, &account_id_owned).await;
-            // A naturally-completed producer reaps its own subscription entry.
-            reaper_subs.lock().await.remove(&subscription_id);
-        });
+        let task = tokio::spawn(
+            async move {
+                // `client` is captured to keep the account alive for the task's
+                // lifetime; the producer reads connectivity from `sync` only.
+                let _keep_alive = client;
+                run_connection_producer(sync, sink, &account_id_owned).await;
+                // A naturally-completed producer reaps its own subscription entry.
+                reaper_subs.lock().await.remove(&subscription_id);
+            }
+            .instrument(span),
+        );
 
         {
             let accounts = self.accounts.lock().await;
@@ -534,9 +723,27 @@ impl AccountManager {
         Ok(timeline)
     }
 
-    /// Tear down the whole account: abort every subscription and drop the live
-    /// `Client`/`SyncService`.
+    /// Tear down the whole account: remove it from the merged inbox (so its rooms
+    /// leave immediately while other accounts keep syncing), abort every
+    /// subscription, and drop the live `Client`/`SyncService`.
     pub async fn shutdown(&self, account_id: &str) {
+        // Remove the account from the active merged inbox first, so its rows are
+        // dropped from the emitted window, then abort *its* inbox producer and
+        // wait for it to finish. This releases the producer's `RoomList` (and the
+        // SQLite handles it holds through the `Client`) before `sign_out` deletes
+        // the store dir — without it the producer, which lives in `InboxHandle`
+        // rather than the account's `subscriptions`, would keep the store open
+        // until the frontend happened to re-subscribe the whole inbox.
+        {
+            let mut inbox = self.inbox.lock().await;
+            if let Some(handle) = inbox.as_mut() {
+                handle.merger.remove_account(account_id).await;
+                if let Some(task) = handle.producers.remove(account_id) {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        }
         let mut accounts = self.accounts.lock().await;
         if let Some(handle) = accounts.remove(account_id) {
             // Stop the SyncService first so no further diffs are produced, then
@@ -583,6 +790,7 @@ impl AccountManager {
 /// lifetime-of-account reconnect supervisor is spawned to re-enable the send
 /// queue on every transition back into `Running`; its `JoinHandle` is returned
 /// for the caller to store on the `AccountHandle`.
+#[tracing::instrument(skip(platform), fields(account_id = %account_id))]
 async fn activate(
     platform: &dyn Platform,
     account_id: &str,
@@ -623,11 +831,10 @@ async fn activate(
     client.send_queue().set_enabled(true).await;
 
     let sync = std::sync::Arc::new(sync);
-    let reconnect_supervisor = tokio::spawn(run_reconnect_supervisor(
-        client.clone(),
-        sync.clone(),
-        account_id.to_owned(),
-    ));
+    let reconnect_supervisor = tokio::spawn(
+        run_reconnect_supervisor(client.clone(), sync.clone(), account_id.to_owned())
+            .instrument(tracing::info_span!("reconnect_supervisor", account_id = %account_id)),
+    );
 
     Ok((client, sync, reconnect_supervisor))
 }
@@ -742,6 +949,55 @@ async fn run_producer(room_list: RoomList, sink: BatchSink, account_id: &str) {
                     }
                     None => {
                         tracing::info!(account_id = %account_id, "room list stream ended");
+                        break;
+                    }
+                }
+            }
+            maybe_state = loading_state.next(), if !loading_done => {
+                match maybe_state {
+                    Some(state) => total = loaded_total(&state),
+                    None => loading_done = true,
+                }
+            }
+        }
+    }
+}
+
+/// Drive one account's recency-sorted entries stream for the merged inbox:
+/// convert each `VectorDiff` batch into a per-account [`RoomListBatch`] (reusing
+/// the exact same conversion as [`run_producer`]) and hand it to the shared
+/// [`InboxMerger`], which folds it into that account's slot and re-emits the
+/// merged window. Stops when the merger reports the output channel is closed or
+/// the entries stream ends.
+async fn run_inbox_producer(room_list: RoomList, merger: InboxMerger, account_id: &str) {
+    let mut loading_state = room_list.loading_state();
+    let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
+    if !controller.set_filter(Box::new(new_filter_non_left())) {
+        tracing::warn!(account_id = %account_id, "inbox room list filter not applied (stream dropped)");
+        return;
+    }
+    let _controller = controller;
+
+    let mut total = loaded_total(&loading_state.get());
+    let mut loading_done = false;
+
+    futures_util::pin_mut!(stream);
+    loop {
+        tokio::select! {
+            maybe_diffs = stream.next() => {
+                match maybe_diffs {
+                    Some(diffs) => {
+                        let mut ops = Vec::with_capacity(diffs.len());
+                        for diff in diffs {
+                            ops.push(diff_to_op(diff).await);
+                        }
+                        if !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await {
+                            tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
+                            break;
+                        }
+                    }
+                    None => {
+                        tracing::info!(account_id = %account_id, "inbox room list stream ended");
                         break;
                     }
                 }

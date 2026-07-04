@@ -2,7 +2,8 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm } from "@/lib/ipc/client";
 
-// Mock the sign-out hook so the footer never touches Tauri; the handler is a spy.
+// Mock the sign-out hook so the footer never touches Tauri; the handler is a spy
+// that records the account id it was called with.
 const signOutHandler = vi.fn();
 vi.mock("@/hooks/use-sign-out", () => ({
   useSignOut: () => signOutHandler,
@@ -11,12 +12,14 @@ vi.mock("@/hooks/use-sign-out", () => ({
 import { AccountFooter } from "@/components/layout/account-footer";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { accountsStore } from "@/lib/stores/accounts";
+import { addAccountStore } from "@/lib/stores/add-account";
 
-const account: AccountVm = {
-  accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-  userId: "@alice:example.org",
-  homeserverUrl: "https://matrix.example.org/",
-};
+function account(id: string, userId: string, hue = 0): AccountVm {
+  return { accountId: id, userId, homeserverUrl: "https://matrix.example.org/", hueIndex: hue };
+}
+
+const alice = account("01ARZ3NDEKTSV4RRFFQ69G5FAV", "@alice:example.org", 0);
+const bob = account("01BX5ZZKBKACTAV9WEVGEMMVRZ", "@bob:example.org", 1);
 
 function renderFooter(collapsed = false) {
   return render(
@@ -28,44 +31,58 @@ function renderFooter(collapsed = false) {
 
 beforeEach(() => {
   accountsStore.getState().clear();
-  accountsStore.getState().setCurrentAccount(account);
+  addAccountStore.getState().closeAddAccount();
   signOutHandler.mockReset();
   signOutHandler.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
   accountsStore.getState().clear();
+  addAccountStore.getState().closeAddAccount();
 });
 
 describe("AccountFooter", () => {
-  it("renders nothing when signed out", () => {
-    accountsStore.getState().clear();
-    const { container } = renderFooter();
-    expect(container).toBeEmptyDOMElement();
+  it("shows only the Add Account button when there are no accounts", () => {
+    renderFooter();
+    expect(screen.getByRole("button", { name: "Add account" })).toBeInTheDocument();
+    expect(screen.queryByText(alice.userId)).not.toBeInTheDocument();
   });
 
-  it("shows the signed-in user id and a sign-out control", () => {
+  it("lists every signed-in account with its own sign-out control", () => {
+    accountsStore.getState().hydrateAll([alice, bob]);
     renderFooter();
-    expect(screen.getByText(account.userId)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: `Sign out ${account.userId}` })).toBeInTheDocument();
+    expect(screen.getByText(alice.userId)).toBeInTheDocument();
+    expect(screen.getByText(bob.userId)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `Sign out ${alice.userId}` })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `Sign out ${bob.userId}` })).toBeInTheDocument();
   });
 
-  it("confirming the dialog invokes the sign-out handler", async () => {
+  it("the Add Account button opens the add-account overlay", () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter();
+    expect(addAccountStore.getState().open).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+    expect(addAccountStore.getState().open).toBe(true);
+  });
+
+  it("confirming the dialog signs out exactly that account", async () => {
+    accountsStore.getState().hydrateAll([alice, bob]);
     renderFooter();
 
-    fireEvent.click(screen.getByRole("button", { name: `Sign out ${account.userId}` }));
+    fireEvent.click(screen.getByRole("button", { name: `Sign out ${bob.userId}` }));
     const dialog = await screen.findByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: "Sign out" }));
 
     await waitFor(() => {
-      expect(signOutHandler).toHaveBeenCalledTimes(1);
+      expect(signOutHandler).toHaveBeenCalledWith(bob.accountId);
     });
   });
 
-  it("cancelling the dialog does not invoke the handler and closes it", async () => {
+  it("cancelling the dialog does not sign out and closes it", async () => {
+    accountsStore.getState().hydrateAll([alice]);
     renderFooter();
 
-    fireEvent.click(screen.getByRole("button", { name: `Sign out ${account.userId}` }));
+    fireEvent.click(screen.getByRole("button", { name: `Sign out ${alice.userId}` }));
     const dialog = await screen.findByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
 
@@ -75,11 +92,11 @@ describe("AccountFooter", () => {
     expect(signOutHandler).not.toHaveBeenCalled();
   });
 
-  it("renders an icon-only sign-out affordance when collapsed", () => {
+  it("renders icon-only affordances when collapsed", () => {
+    accountsStore.getState().hydrateAll([alice]);
     renderFooter(true);
-    // No visible user id text in the collapsed rail.
-    expect(screen.queryByText(account.userId)).not.toBeInTheDocument();
-    // The labelled icon control is still present and opens the same dialog.
-    expect(screen.getByRole("button", { name: `Sign out ${account.userId}` })).toBeInTheDocument();
+    expect(screen.queryByText(alice.userId)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `Sign out ${alice.userId}` })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add account" })).toBeInTheDocument();
   });
 });

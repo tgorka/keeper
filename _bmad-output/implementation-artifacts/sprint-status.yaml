@@ -59,7 +59,7 @@ development_status:
   1-8-session-restore-and-sign-out: done
   epic-1-retrospective: optional
   epic-2: backlog
-  2-1-account-manager-unlimited-concurrent-accounts: backlog
+  2-1-account-manager-unlimited-concurrent-accounts: done
   2-2-oidc-login-mas-msc3861: backlog
   2-3-beeper-email-code-login: backlog
   2-4-beeper-coverage-disclosure: backlog

@@ -27,6 +27,8 @@ pub fn run() {
             ipc::send_text,
             ipc::send_retry,
             ipc::session_restore,
+            ipc::inbox_subscribe,
+            ipc::inbox_unsubscribe,
             ipc::sign_out
         ])
         .run(tauri::generate_context!())

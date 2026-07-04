@@ -11,11 +11,14 @@ vi.mock("@/lib/ipc/client", () => ({
 import { useSessionRestore } from "@/hooks/use-session-restore";
 import { accountsStore } from "@/lib/stores/accounts";
 
-const account: AccountVm = {
-  accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-  userId: "@alice:example.org",
-  homeserverUrl: "https://matrix.example.org/",
-};
+function account(id: string, hue = 0): AccountVm {
+  return {
+    accountId: id,
+    userId: `@user-${id}:example.org`,
+    homeserverUrl: "https://matrix.example.org/",
+    hueIndex: hue,
+  };
+}
 
 beforeEach(() => {
   accountsStore.getState().clear();
@@ -29,33 +32,34 @@ afterEach(() => {
 });
 
 describe("useSessionRestore", () => {
-  it("hydrates the account and marks hydrated when restore returns one", async () => {
-    sessionRestore.mockResolvedValue(account);
+  it("hydrates all accounts and marks hydrated when restore returns some", async () => {
+    const accounts = [account("a", 0), account("b", 1)];
+    sessionRestore.mockResolvedValue(accounts);
     renderHook(() => useSessionRestore());
 
     await waitFor(() => {
       expect(accountsStore.getState().hydrated).toBe(true);
     });
-    expect(accountsStore.getState().currentAccount).toEqual(account);
+    expect(accountsStore.getState().accounts).toEqual(accounts);
   });
 
-  it("marks hydrated only (no account) when restore returns null", async () => {
-    sessionRestore.mockResolvedValue(null);
+  it("marks hydrated only (no accounts) when restore returns an empty array", async () => {
+    sessionRestore.mockResolvedValue([]);
     renderHook(() => useSessionRestore());
 
     await waitFor(() => {
       expect(accountsStore.getState().hydrated).toBe(true);
     });
-    expect(accountsStore.getState().currentAccount).toBeNull();
+    expect(accountsStore.getState().accounts).toEqual([]);
   });
 
-  it("marks hydrated only (no account) when restore rejects", async () => {
+  it("marks hydrated only (no accounts) when restore rejects", async () => {
     sessionRestore.mockRejectedValue({ code: "internal", message: "boom", retriable: false });
     renderHook(() => useSessionRestore());
 
     await waitFor(() => {
       expect(accountsStore.getState().hydrated).toBe(true);
     });
-    expect(accountsStore.getState().currentAccount).toBeNull();
+    expect(accountsStore.getState().accounts).toEqual([]);
   });
 });

@@ -22,6 +22,7 @@ const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
   userId: "@alice:example.org",
   homeserverUrl: "https://matrix.example.org/",
+  hueIndex: 0,
 };
 
 beforeEach(() => {
@@ -50,7 +51,7 @@ describe("useConnectionStatus", () => {
         return Promise.resolve(1);
       },
     );
-    accountsStore.getState().setCurrentAccount(account);
+    accountsStore.getState().addAccount(account);
     renderHook(() => useConnectionStatus());
 
     expect(subscribeConnectionStatus).toHaveBeenCalledWith(account.accountId, expect.any(Function));
@@ -68,7 +69,7 @@ describe("useConnectionStatus", () => {
 
   it("unsubscribes and resets the store on unmount", async () => {
     subscribeConnectionStatus.mockResolvedValue(7);
-    accountsStore.getState().setCurrentAccount(account);
+    accountsStore.getState().addAccount(account);
     const { unmount } = renderHook(() => useConnectionStatus());
 
     await waitFor(() => {
@@ -92,7 +93,7 @@ describe("useConnectionStatus", () => {
         return Promise.resolve(1);
       },
     );
-    accountsStore.getState().setCurrentAccount(account);
+    accountsStore.getState().addAccount(account);
     const { unmount } = renderHook(() => useConnectionStatus());
 
     await waitFor(() => {

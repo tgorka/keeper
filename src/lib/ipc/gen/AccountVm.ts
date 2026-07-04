@@ -4,10 +4,11 @@
  * Non-secret account registry projection returned to the frontend on a
  * successful login (FR-1, NFR-9).
  *
- * Carries **only** the opaque keeper account id, the Matrix user id, and the
- * resolved homeserver URL. Tokens, refresh tokens, device/crypto keys, and any
- * `MatrixSession` material never appear here — they live only in the macOS
- * Keychain and never cross IPC back to TypeScript.
+ * Carries **only** the opaque keeper account id, the Matrix user id, the
+ * resolved homeserver URL, and the per-account hue index. Tokens, refresh
+ * tokens, device/crypto keys, and any `MatrixSession` material never appear
+ * here — they live only in the macOS Keychain and never cross IPC back to
+ * TypeScript.
  */
 export type AccountVm = { 
 /**
@@ -22,4 +23,10 @@ userId: string,
 /**
  * The resolved homeserver base URL (after well-known discovery).
  */
-homeserverUrl: string, };
+homeserverUrl: string, 
+/**
+ * The account's hue index (0–7) on the 8-hue wheel, assigned at add time
+ * and persisted in `keeper.db`. The frontend maps it to a CSS hue rendered
+ * as a 3 px chat-row edge bar and (later) a switcher dot.
+ */
+hueIndex: number, };

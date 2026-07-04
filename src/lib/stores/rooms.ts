@@ -1,45 +1,56 @@
 /**
- * Room-list mirror store (AD-9, AD-20).
+ * Merged-inbox mirror store (AD-9, AD-20).
  *
  * A vanilla zustand store created at module load *outside* React. It holds only
- * the ordered {@link RoomVm} array streamed from Rust plus the known total — it
- * is a pure mirror of the recency-sorted `VectorDiff` sequence, never a source
- * of truth. `applyBatch` folds each {@link RoomListOp} onto an immutable array
- * by index and **never sorts, re-sorts, or re-orders** (ordering is authoritative
- * from Rust). A `Reset` replaces contents wholesale, which is why re-subscribing
- * (e.g. StrictMode remount) never duplicates rows.
+ * the recency-ordered {@link InboxRoomVm} array streamed from the Rust
+ * `keeper-core::inbox` merge, plus the known total — a pure mirror of the merged
+ * window, never a source of truth. `applyBatch` folds each {@link InboxOp} onto
+ * an immutable array by index and **never sorts, re-sorts, or re-orders**
+ * (ordering across accounts is authoritative from Rust). A `Reset` replaces
+ * contents wholesale, so re-subscribing (StrictMode remount, account add/remove)
+ * never duplicates rows.
+ *
+ * Selection is `{ accountId, roomId }` because rows now come from different
+ * accounts (Story 2.1): the conversation pane binds its timeline/composer to
+ * that pair, not a global "current account".
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
-import type { RoomListBatch, RoomListOp, RoomVm } from "@/lib/ipc/client";
+import type { InboxBatch, InboxOp, InboxRoomVm } from "@/lib/ipc/client";
 import { applyDiffOp } from "@/lib/stores/vector-diff";
 
+/** The open conversation, identified by its owning account and room. */
+export interface RoomSelection {
+  accountId: string;
+  roomId: string;
+}
+
 export interface RoomsState {
-  /** The ordered room window, exactly as Rust streamed it. */
-  rooms: RoomVm[];
-  /** Total rooms the server knows about, or `null` when not yet loaded. */
+  /** The merged inbox window, exactly as Rust streamed it (recency order). */
+  rooms: InboxRoomVm[];
+  /** Total rooms across all accounts the servers know about, or `null`. */
   total: number | null;
   /**
-   * The currently selected room id, or `null` when none is open. Ephemeral UI
-   * state (not mirrored from Rust) — it only records which room the conversation
-   * pane should stream; the timeline itself stays authoritative in Rust.
+   * The currently selected conversation, or `null` when none is open. Ephemeral
+   * UI state (not mirrored from Rust) — it only records which room the
+   * conversation pane should stream, on which account.
    */
-  selectedRoomId: string | null;
+  selected: RoomSelection | null;
   /** Apply one streamed batch (its ops in sequence), updating `total`. */
-  applyBatch: (batch: RoomListBatch) => void;
-  /** Select a room to open (or `null` to close). */
-  selectRoom: (roomId: string | null) => void;
-  /** Reset to the empty state (on unsubscribe / account change). */
+  applyBatch: (batch: InboxBatch) => void;
+  /** Select a conversation to open (or `null` to close). */
+  selectRoom: (selection: RoomSelection | null) => void;
+  /** Reset to the empty state (on unsubscribe / full sign-out). */
   clear: () => void;
 }
 
 /**
  * Fold a single op onto `rooms`, returning a new array (immutable). Delegates to
  * the shared, range-guarded {@link applyDiffOp} reducer — pure, and never sorts.
- * `RoomListOp` (its single-item ops carry `room`, list ops carry `rooms`) is
+ * `InboxOp` (its single-item ops carry `room`, list ops carry `rooms`) is
  * assignable to the reducer's canonical `DiffOp` union.
  */
-function applyOp(rooms: RoomVm[], op: RoomListOp): RoomVm[] {
+function applyOp(rooms: InboxRoomVm[], op: InboxOp): InboxRoomVm[] {
   return applyDiffOp(rooms, op);
 }
 
@@ -50,18 +61,16 @@ function applyOp(rooms: RoomVm[], op: RoomListOp): RoomVm[] {
 export const roomsStore = createStore<RoomsState>()((set) => ({
   rooms: [],
   total: null,
-  selectedRoomId: null,
+  selected: null,
   applyBatch: (batch) =>
     set((state) => ({
       rooms: batch.ops.reduce(applyOp, state.rooms),
       total: batch.total ?? state.total,
     })),
-  selectRoom: (roomId) => set({ selectedRoomId: roomId }),
-  // `selectedRoomId` is deliberately preserved across a room-list `clear()` so
-  // refreshing the streamed window (a Reset) does not close the open
-  // conversation. Selection is reset explicitly via `selectRoom(null)` (e.g. on
-  // sign-out, Story 1.8); the conversation pane independently clears its own
-  // rendered timeline when the account goes away.
+  selectRoom: (selection) => set({ selected: selection }),
+  // `selected` is deliberately preserved across an inbox `clear()` so refreshing
+  // the streamed window (a Reset) does not close the open conversation.
+  // Selection is reset explicitly via `selectRoom(null)` (e.g. on sign-out).
   clear: () => set({ rooms: [], total: null }),
 }));
 

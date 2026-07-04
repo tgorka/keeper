@@ -13,6 +13,7 @@ pub mod account;
 pub mod auth;
 pub mod demo;
 pub mod error;
+pub mod inbox;
 pub mod platform;
 pub mod registry;
 pub mod send;
