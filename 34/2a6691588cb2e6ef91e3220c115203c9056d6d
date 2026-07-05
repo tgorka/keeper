@@ -1,0 +1,34 @@
+_bmad-output/implementation-artifacts/spec-6-2-bridge-discovery.md
+  s_a52155f5be4015::t_e67df66f0ee207 9
+  s_a52155f5be4015::t_8a8dbad2915fc0 176-194
+  s_a52155f5be4015::t_7e14ca3aea762a 7
+  s_a52155f5be4015::t_6f1f5b2a5ead29 118-131
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_b2461982204521::t_ed5c7084c965a9 99
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_a52155f5be4015::t_d06e489f42db29 204-215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "342a6691588cb2e6ef91e3220c115203c9056d6d",
+  "prompts": {},
+  "sessions": {
+    "s_a52155f5be4015": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "505e31e3-bd9e-47d8-bf34-d4df1b5f91b8",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    },
+    "s_b2461982204521": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "82dbde87-caca-4c23-bd4e-242b95bdaba5",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
