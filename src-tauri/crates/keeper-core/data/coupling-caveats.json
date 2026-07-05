@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "caveats": [
+    {
+      "networkId": "whatsapp",
+      "text": "you may also stop seeing others' read receipts",
+      "appliesTo": "read-receipts"
+    }
+  ]
+}

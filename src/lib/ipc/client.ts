@@ -11,6 +11,8 @@ import type { IpcError } from "./gen/IpcError";
 
 export type { AccountVm } from "./gen/AccountVm";
 export type { BackupStatus } from "./gen/BackupStatus";
+export type { BadgeStyle } from "./gen/BadgeStyle";
+export type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 export type { DemoBatch } from "./gen/DemoBatch";
@@ -37,6 +39,7 @@ export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { ReplyPreviewVm } from "./gen/ReplyPreviewVm";
+export type { RiskTier } from "./gen/RiskTier";
 export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
@@ -56,6 +59,7 @@ export type { VerificationPhase } from "./gen/VerificationPhase";
 
 import type { AccountVm } from "./gen/AccountVm";
 import type { BackupStatus } from "./gen/BackupStatus";
+import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { EditVersionVm } from "./gen/EditVersionVm";
 import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
@@ -107,6 +111,19 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
       retriable: false,
     } satisfies IpcError;
   }
+}
+
+/**
+ * Fetch the data-driven bridge catalog (FR-42, Story 6.1). A one-shot read of the
+ * embedded, versioned risk-tier data, projected in the Rust core into the flat set
+ * of surfaced {@link BridgeNetworkVm}s (the out-of-scope tier is excluded). Every
+ * risk tier, tier label, badge style, and acknowledgment copy is authored in the
+ * backend data files — never hardcoded here. Resolves with the catalog; rejects
+ * with the {@link IpcError} envelope (`code: "internal"`) only if the embedded data
+ * fails to parse or validate, so the Bridges view can show an error state.
+ */
+export async function bridgeCatalog(): Promise<BridgeNetworkVm[]> {
+  return await invoke<BridgeNetworkVm[]>("bridge_catalog");
 }
 
 /**

@@ -334,6 +334,28 @@ pub enum ArchiveError {
     ExportIo(String),
 }
 
+/// Errors originating in the data-driven bridge catalog (Story 6.1, Epic 6,
+/// AD-21).
+///
+/// A secret-free taxonomy: the bridge catalog is static, embedded JSON with no
+/// session, token, or network I/O. The only failure mode is a compiled-in data
+/// file that fails to parse or validate at first access — surfaced honestly
+/// through `Result` (never a panic / `.unwrap()`). The wrapped string is a
+/// non-secret description of the parse/validation failure. Maps to
+/// `IpcErrorCode::Internal` in the shell's single funnel (a malformed embedded
+/// asset is an internal invariant violation, not a user-actionable retry).
+///
+/// `Clone` so the [`OnceLock`](std::sync::OnceLock)-cached parse result can hand
+/// each caller an owned copy of the error without re-parsing.
+#[derive(Debug, Clone, Error)]
+pub enum BridgeError {
+    /// An embedded bridge data file (`risk-tiers.json`, `coupling-caveats.json`,
+    /// or `known-bots.json`) failed to parse or validate. The wrapped string names
+    /// the file and the failure — never secret material.
+    #[error("bridge catalog data error: {0}")]
+    Data(String),
+}
+
 /// The hexagon error root. Every fallible core operation surfaces one of these.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -384,6 +406,11 @@ pub enum CoreError {
     /// here.
     #[error(transparent)]
     Archive(#[from] ArchiveError),
+
+    /// The data-driven bridge catalog failed to parse or validate its embedded
+    /// JSON (Story 6.1).
+    #[error(transparent)]
+    Bridge(#[from] BridgeError),
 
     /// A requested capability is not supported on this platform/build. Honest,
     /// non-panicking signal used by not-yet-wired [`crate::platform::Platform`]

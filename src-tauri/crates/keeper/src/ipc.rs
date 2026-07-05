@@ -16,13 +16,13 @@ use keeper_core::auth;
 use keeper_core::auth::BeeperFlowRegistry;
 use keeper_core::demo::snapshot_then_diff;
 use keeper_core::error::{
-    AccountError, ArchiveError, AuthError, BackupError, CoreError, InboxError, MediaError,
-    PlatformError, SendError, SignalError, TimelineError, VerificationError,
+    AccountError, ArchiveError, AuthError, BackupError, BridgeError, CoreError, InboxError,
+    MediaError, PlatformError, SendError, SignalError, TimelineError, VerificationError,
 };
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
-    AccountVm, BackupStatus, ConnectionStatusBatch, DemoBatch, EditVersionVm,
+    AccountVm, BackupStatus, BridgeNetworkVm, ConnectionStatusBatch, DemoBatch, EditVersionVm,
     EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IpcError,
     IpcErrorCode, NetworksSnapshot, PaginationStatusBatch, PingVm, RoomListBatch, SearchFilterVm,
     SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
@@ -308,6 +308,10 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         // export failures are normally streamed on the `Failed` batch; this arm
         // covers the `export_start`-time / synchronous-setup path.)
         CoreError::Archive(ArchiveError::ExportIo(_)) => (IpcErrorCode::Internal, true),
+        // A malformed embedded bridge data file (Story 6.1) is an internal invariant
+        // violation, not a user-actionable retry — the JSON is compiled in. The
+        // Bridges view shows an error state and there is nothing to retry.
+        CoreError::Bridge(BridgeError::Data(_)) => (IpcErrorCode::Internal, false),
     };
     IpcError {
         code,
@@ -375,6 +379,17 @@ pub fn app_ping(state: State<'_, AppState>) -> Result<PingVm, IpcError> {
         message: "pong".to_owned(),
         ts: now_ms(),
     })
+}
+
+/// Return the data-driven bridge catalog (Story 6.1, FR-42). A one-shot read of
+/// the embedded, versioned `risk-tiers.json`, projected into the flat set of
+/// surfaced [`BridgeNetworkVm`]s (out-of-scope tier excluded). Carries only static
+/// non-secret data — no session, network, or discovery I/O. On a malformed embedded
+/// data file the `BridgeError` funnels through [`to_ipc_error`] to `internal`
+/// (non-retriable) so the Bridges view can show an error state.
+#[tauri::command]
+pub fn bridge_catalog() -> Result<Vec<BridgeNetworkVm>, IpcError> {
+    keeper_core::bridges::catalog().map_err(|e| to_ipc_error(e.into()))
 }
 
 /// Open the demo subscription. Emits the snapshot-then-diff batches produced by

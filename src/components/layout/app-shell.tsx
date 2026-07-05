@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 import { ExportDialog } from "@/components/export/export-dialog";
+import { BridgesPane } from "@/components/layout/bridges-pane";
 import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
@@ -11,11 +12,13 @@ import { KeyBackupDialog } from "@/components/settings/key-backup-dialog";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAccountStatuses } from "@/hooks/use-account-statuses";
+import { useBridgesShortcut } from "@/hooks/use-bridges-shortcut";
 import { useEncryptionStatuses } from "@/hooks/use-encryption-statuses";
 import { useKeyBackupStatuses } from "@/hooks/use-key-backup-statuses";
 import { useSearchShortcuts } from "@/hooks/use-search-shortcuts";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useVerification } from "@/hooks/use-verification";
+import { usePrimaryView } from "@/lib/stores/primary-view";
 
 export function AppShell() {
   const { sidebarCollapsed, detailFloating } = useShellLayout();
@@ -34,6 +37,11 @@ export function AppShell() {
   useKeyBackupStatuses();
   // Wire the search entry points (⌘⇧F global, ⌘F in-chat) to the search surface.
   useSearchShortcuts();
+  // Wire ⌘4 to the Bridges surface (Story 6.1).
+  useBridgesShortcut();
+  // Which primary view the shell renders. "bridges" replaces the chat-list +
+  // conversation cluster with the Bridges surface (Story 6.1).
+  const primaryView = usePrimaryView();
   const [detailOpen, setDetailOpen] = useState(false);
   const toggleRef = useRef<HTMLButtonElement>(null);
 
@@ -68,13 +76,19 @@ export function AppShell() {
         <VerifyBanner />
         <div className="flex min-h-0 flex-1">
           <SidebarPane collapsed={sidebarCollapsed} />
-          <ChatListPane />
-          <ConversationPane
-            detailOpen={detailOpen}
-            onToggleDetail={toggleDetail}
-            toggleRef={toggleRef}
-          />
-          {detailOpen && !detailFloating && <DetailPanel />}
+          {primaryView === "bridges" ? (
+            <BridgesPane />
+          ) : (
+            <>
+              <ChatListPane />
+              <ConversationPane
+                detailOpen={detailOpen}
+                onToggleDetail={toggleDetail}
+                toggleRef={toggleRef}
+              />
+              {detailOpen && !detailFloating && <DetailPanel />}
+            </>
+          )}
         </div>
       </div>
 

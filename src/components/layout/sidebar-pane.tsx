@@ -22,6 +22,39 @@ const VIEWS: SidebarView[] = [
   { label: "Settings", icon: Settings },
 ];
 
+/**
+ * A configured bridge's health, for the sidebar worst-state roll-up (Story 6.1).
+ * The real state machine is Story 6.5; here health is a placeholder and nothing is
+ * configured yet, so the roll-up resolves to `null` (no dot).
+ */
+type BridgeHealth = "healthy" | "degraded" | "disconnected";
+
+/** Worst-state precedence: disconnected beats degraded beats healthy. */
+const HEALTH_RANK: Record<BridgeHealth, number> = {
+  healthy: 0,
+  degraded: 1,
+  disconnected: 2,
+};
+
+/**
+ * Roll the set of configured bridge healths up to the single worst state for the
+ * sidebar dot, or `null` when nothing is configured (Story 6.1 placeholder — no
+ * dot). Ready for Story 6.5 to feed real per-bridge health in.
+ */
+function worstBridgeHealth(healths: readonly BridgeHealth[]): BridgeHealth | null {
+  if (healths.length === 0) {
+    return null;
+  }
+  return healths.reduce((worst, h) => (HEALTH_RANK[h] > HEALTH_RANK[worst] ? h : worst));
+}
+
+/** The `--bridge-*` tint class for a rolled-up worst health. */
+const HEALTH_DOT_CLASS: Record<BridgeHealth, string> = {
+  healthy: "bg-bridge-healthy",
+  degraded: "bg-bridge-degraded",
+  disconnected: "bg-bridge-disconnected",
+};
+
 interface SidebarPaneProps {
   collapsed: boolean;
 }
@@ -32,11 +65,16 @@ const OFFLINE_PILL_TEXT = "Offline — showing your local archive. Messages queu
 export function SidebarPane({ collapsed }: SidebarPaneProps) {
   const offline = useShellOffline();
   // Controlled state for the Settings dialog (Story 2.6). Only the Settings view
-  // button opens it; Bridges stays inert.
+  // button opens it.
   const [settingsOpen, setSettingsOpen] = useState(false);
-  // The active primary view (Story 4.2): "Chats" switches to the Unified Inbox,
-  // "Archive" to the Archive window. Reflected as `aria-current` + accent styling.
+  // The active primary view (Story 4.2 / 6.1): "Chats" switches to the Unified
+  // Inbox, "Archive" to the Archive window, "Bridges" to the Bridges surface.
+  // Reflected as `aria-current` + accent styling.
   const primaryView = usePrimaryView();
+  // The sidebar Bridges health roll-up (Story 6.1): the single worst state across
+  // configured bridges. Health is a placeholder here (real state machine is Story
+  // 6.5) and nothing is configured yet, so this resolves to `null` (no dot).
+  const bridgeHealth = worstBridgeHealth([]);
 
   return (
     <nav
@@ -51,8 +89,8 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
       <ul className={cn("flex flex-col gap-1 p-2", collapsed && "items-center")}>
         {VIEWS.map((view) => {
           const Icon = view.icon;
-          // "Chats" and "Archive" switch the primary view; Settings opens the
-          // dialog; Bridges stays inert until a later story wires it.
+          // "Chats", "Archive", and "Bridges" switch the primary view; Settings
+          // opens the dialog.
           const onClick =
             view.label === "Settings"
               ? () => setSettingsOpen(true)
@@ -60,11 +98,27 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                 ? () => primaryViewStore.getState().setView("inbox")
                 : view.label === "Archive"
                   ? () => primaryViewStore.getState().setView("archive")
-                  : undefined;
-          // Reflect the active primary view on the Chats/Archive entries.
+                  : view.label === "Bridges"
+                    ? () => primaryViewStore.getState().setView("bridges")
+                    : undefined;
+          // Reflect the active primary view on the Chats/Archive/Bridges entries.
           const active =
             (view.label === "Chats" && primaryView === "inbox") ||
-            (view.label === "Archive" && primaryView === "archive");
+            (view.label === "Archive" && primaryView === "archive") ||
+            (view.label === "Bridges" && primaryView === "bridges");
+          // The Bridges entry carries the worst-state health roll-up dot (Story
+          // 6.1): shown only when at least one bridge reports non-null health.
+          const healthDot =
+            view.label === "Bridges" && bridgeHealth !== null ? (
+              <span
+                aria-hidden="true"
+                data-slot="bridge-health-rollup"
+                className={cn(
+                  "ml-auto size-2 shrink-0 rounded-full",
+                  HEALTH_DOT_CLASS[bridgeHealth],
+                )}
+              />
+            ) : null;
           if (collapsed) {
             return (
               <li key={view.label}>
@@ -77,12 +131,22 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                       aria-label={view.label}
                       aria-current={active ? "page" : undefined}
                       className={cn(
-                        "focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+                        "relative focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
                         active && "bg-accent text-accent-foreground",
                       )}
                       onClick={onClick}
                     >
                       <Icon aria-hidden="true" />
+                      {healthDot !== null && (
+                        <span
+                          aria-hidden="true"
+                          data-slot="bridge-health-rollup"
+                          className={cn(
+                            "absolute top-1.5 right-1.5 size-2 rounded-full",
+                            bridgeHealth !== null && HEALTH_DOT_CLASS[bridgeHealth],
+                          )}
+                        />
+                      )}
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent side="right">{view.label}</TooltipContent>
@@ -104,6 +168,7 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
               >
                 <Icon aria-hidden="true" />
                 {view.label}
+                {healthDot}
               </Button>
             </li>
           );

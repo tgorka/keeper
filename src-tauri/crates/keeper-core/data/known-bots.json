@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "bots": [
+    { "networkId": "whatsapp", "localparts": ["whatsappbot"] },
+    { "networkId": "telegram", "localparts": ["telegrambot"] },
+    { "networkId": "signal", "localparts": ["signalbot"] },
+    { "networkId": "discord", "localparts": ["discordbot"] },
+    { "networkId": "slack", "localparts": ["slackbot"] },
+    { "networkId": "instagram", "localparts": ["instagrambot"] },
+    { "networkId": "messenger", "localparts": ["messengerbot"] },
+    { "networkId": "google", "localparts": ["googlechatbot"] },
+    { "networkId": "linkedin", "localparts": ["linkedinbot"] }
+  ]
+}

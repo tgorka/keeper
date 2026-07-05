@@ -95,7 +95,7 @@ development_status:
   5-7-archive-survives-sign-out-and-deletes-only-on-command: done
   epic-5-retrospective: optional
   epic-6: backlog
-  6-1-bridges-surface-with-data-driven-risk-tiers: backlog
+  6-1-bridges-surface-with-data-driven-risk-tiers: done
   6-2-bridge-discovery: backlog
   6-3-native-bridge-login-via-provisioning-api: backlog
   6-4-bridge-bot-fallback-driver: backlog

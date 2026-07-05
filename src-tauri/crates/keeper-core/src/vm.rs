@@ -1379,6 +1379,84 @@ pub enum DemoBatch {
     },
 }
 
+/// The data-driven risk tier of a bridged Network (Story 6.1, Epic 6 addendum
+/// §2).
+///
+/// Sourced from `risk-tiers.json` — never hardcoded in TypeScript. Only the four
+/// *surfaced* tiers cross IPC: the out-of-scope tier stays in the data file for
+/// completeness but is excluded from the catalog and has no enum variant.
+/// Serializes to its camelCase name — the frontend wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum RiskTier {
+    /// Low risk — recommended by default, no warning beyond the label.
+    Low,
+    /// Maintenance-heavy — default-on with clear disclosure; expect session churn.
+    Maintenance,
+    /// Volatile / opt-in — connecting may violate ToS and risks a ban; gated by an
+    /// acknowledgment dialog.
+    Volatile,
+    /// Conditional / advanced — e.g. macOS-only iMessage; gated by an
+    /// acknowledgment dialog.
+    Conditional,
+}
+
+/// The visual badge style for a risk tier (Story 6.1, Epic 6 addendum §2).
+///
+/// Sourced from the `badge` field of `risk-tiers.json` — the tier→badge mapping is
+/// data, never hardcoded in TypeScript. The card maps this to the shadcn `Badge`
+/// variant plus the `--bridge-*` colour tokens: `secondary` (Low), `outlineDegraded`
+/// (Maintenance, amber), `filledDisconnected` (Volatile, red), `outline`
+/// (Conditional). Serializes to its camelCase name — the frontend wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum BadgeStyle {
+    /// A plain secondary badge (Low risk).
+    Secondary,
+    /// An outlined badge tinted with the degraded (amber) token (Maintenance-heavy).
+    OutlineDegraded,
+    /// A filled badge tinted with the disconnected (red) token (Volatile / opt-in).
+    FilledDisconnected,
+    /// A plain outlined badge (Conditional / advanced).
+    Outline,
+}
+
+/// One connectable bridged Network in the data-driven Bridges catalog (Story 6.1,
+/// FR-42, Epic 6 addendum §2).
+///
+/// A pure projection of a *surfaced* tier's network entry from `risk-tiers.json`:
+/// the stable `network_id`, display `name`, `glyph` initials, the resolved
+/// [`RiskTier`], its display `tier_label`, the [`BadgeStyle`], whether connecting
+/// `requires_ack`, and the acknowledgment `ack_copy` (present iff `requires_ack`).
+/// The catalog is account-agnostic — the frontend keys a card per Network × Account
+/// — and carries no health, session, or bridge state (health is Story 6.5; discovery
+/// is Story 6.2). All risk/badge/ack copy is data, never hardcoded in TypeScript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BridgeNetworkVm {
+    /// The stable network identifier (e.g. `"whatsapp"`), from the data file.
+    pub network_id: String,
+    /// The Network's display name (e.g. `"WhatsApp"`).
+    pub name: String,
+    /// The glyph initials rendered in the card avatar (e.g. `"WA"`).
+    pub glyph: String,
+    /// The resolved risk tier.
+    pub tier: RiskTier,
+    /// The tier's display label (e.g. `"Maintenance-heavy"`), from the data file.
+    pub tier_label: String,
+    /// The badge style driving the card's risk-tier Badge.
+    pub badge_style: BadgeStyle,
+    /// Whether connecting this Network requires an explicit acknowledgment (the
+    /// volatile / conditional gate).
+    pub requires_ack: bool,
+    /// The acknowledgment copy shown in the connect gate, present iff
+    /// `requires_ack`, else `null`. Sourced from the tier's `acknowledgment` field.
+    pub ack_copy: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1444,6 +1522,48 @@ mod tests {
         assert!(!json.contains("token"), "json leaked a token field: {json}");
         let back: AccountVm = serde_json::from_str(&json).expect("deserialize account vm");
         assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn bridge_network_vm_round_trips_camel_case() {
+        let vm = BridgeNetworkVm {
+            network_id: "whatsapp".to_owned(),
+            name: "WhatsApp".to_owned(),
+            glyph: "WA".to_owned(),
+            tier: RiskTier::Maintenance,
+            tier_label: "Maintenance-heavy".to_owned(),
+            badge_style: BadgeStyle::OutlineDegraded,
+            requires_ack: false,
+            ack_copy: None,
+        };
+        let json = serde_json::to_string(&vm).expect("serialize bridge network vm");
+        assert!(json.contains("\"networkId\":"), "json was: {json}");
+        assert!(json.contains("\"tierLabel\":"), "json was: {json}");
+        assert!(
+            json.contains("\"badgeStyle\":\"outlineDegraded\""),
+            "json was: {json}"
+        );
+        assert!(
+            json.contains("\"tier\":\"maintenance\""),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"requiresAck\":false"), "json was: {json}");
+        assert!(json.contains("\"ackCopy\":null"), "json was: {json}");
+        let back: BridgeNetworkVm =
+            serde_json::from_str(&json).expect("deserialize bridge network vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn risk_tier_and_badge_style_serialize_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&RiskTier::Volatile).expect("serialize tier"),
+            "\"volatile\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BadgeStyle::FilledDisconnected).expect("serialize badge"),
+            "\"filledDisconnected\""
+        );
     }
 
     #[test]

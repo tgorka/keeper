@@ -9,8 +9,12 @@
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 
-/** Which primary window the chat-list pane renders. */
-export type PrimaryView = "inbox" | "archive";
+/**
+ * Which primary window the shell renders: the Unified Inbox, the Archive, or the
+ * Bridges surface (Story 6.1). "inbox"/"archive" pick which window the chat-list
+ * pane shows; "bridges" replaces the chat-list + conversation cluster entirely.
+ */
+export type PrimaryView = "inbox" | "archive" | "bridges";
 
 export interface PrimaryViewState {
   /** The active primary view; defaults to the Unified Inbox. */

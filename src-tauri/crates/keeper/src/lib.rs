@@ -46,6 +46,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             ipc::app_ping,
+            ipc::bridge_catalog,
             ipc::demo_subscribe,
             ipc::login_password,
             ipc::login_oidc,

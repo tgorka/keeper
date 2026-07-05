@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "tiers": [
+    {
+      "id": "low",
+      "label": "Low risk",
+      "badge": "secondary",
+      "requiresAck": false,
+      "acknowledgment": "Recommended by default; no warning beyond label.",
+      "surfaced": true,
+      "networks": [
+        { "id": "matrix", "name": "Matrix", "glyph": "MX" },
+        { "id": "telegram", "name": "Telegram", "glyph": "TG" },
+        { "id": "google", "name": "Google Messages/Chat/Voice", "glyph": "GO" }
+      ]
+    },
+    {
+      "id": "maintenance",
+      "label": "Maintenance-heavy",
+      "badge": "outlineDegraded",
+      "requiresAck": false,
+      "acknowledgment": "Default-on with clear disclosure; expect session churn.",
+      "surfaced": true,
+      "networks": [
+        { "id": "signal", "name": "Signal", "glyph": "SG" },
+        { "id": "whatsapp", "name": "WhatsApp", "glyph": "WA" },
+        { "id": "discord", "name": "Discord", "glyph": "DC" },
+        { "id": "slack", "name": "Slack", "glyph": "SL" }
+      ]
+    },
+    {
+      "id": "volatile",
+      "label": "Volatile — opt-in",
+      "badge": "filledDisconnected",
+      "requiresAck": true,
+      "acknowledgment": "Connecting this network may violate its Terms of Service and risks account suspension or a ban. Expect login friction. Continue only if you accept that risk.",
+      "surfaced": true,
+      "networks": [
+        { "id": "instagram", "name": "Instagram", "glyph": "IG" },
+        { "id": "messenger", "name": "Messenger", "glyph": "MS" },
+        { "id": "linkedin", "name": "LinkedIn", "glyph": "LI" },
+        { "id": "xchat", "name": "X Chat", "glyph": "X" }
+      ]
+    },
+    {
+      "id": "conditional",
+      "label": "Advanced",
+      "badge": "outline",
+      "requiresAck": true,
+      "acknowledgment": "Advanced, macOS-only — may break on OS updates.",
+      "surfaced": true,
+      "networks": [{ "id": "imessage", "name": "iMessage", "glyph": "iM" }]
+    },
+    {
+      "id": "out-of-scope",
+      "label": "Out of scope",
+      "badge": "outline",
+      "requiresAck": false,
+      "acknowledgment": "Out of scope; not surfaced as a connectable card.",
+      "surfaced": false,
+      "networks": [
+        { "id": "imessage-no-mac", "name": "iMessage (no Mac)", "glyph": "iM" },
+        { "id": "wechat", "name": "WeChat", "glyph": "WC" },
+        { "id": "x-dm-api", "name": "X DM API", "glyph": "X" }
+      ]
+    }
+  ]
+}
