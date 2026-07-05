@@ -2437,6 +2437,40 @@ async fn activate(
     // the same single writer — marks only, never erases.
     let redaction_handler = register_redaction_handler(&client, account_id, archive);
 
+    // Archive-first back-pagination enablement (Story 5.6, FR-17). Subscribe the
+    // SDK event cache once here — alongside the archive/redaction handlers and
+    // BEFORE `sync.start()` — so every synced batch (from the very first one)
+    // persists continuously into the on-disk `SqliteEventCacheStore` that
+    // `.sqlite_store()` already provisions in the sdk dir (SPINE persisted-event-
+    // cache storage rule: NFR-1–4 → event cache). `Timeline::paginate_backwards`
+    // then serves older events from local disk first — instant and offline —
+    // reaching the homeserver only at the true gap. `TimelineBuilder::build()`
+    // would otherwise call this lazily on first room open, so without it only
+    // rooms opened this session would persist; subscribing at activation closes
+    // that gap for any Chat. `subscribe()` is idempotent (`get_or_init`), so the
+    // later lazy call is a no-op.
+    //
+    // `subscribe()` spawns SDK-internal background tasks (room-updates writer,
+    // auto-shrink, redecryptor, thread-subscriber) held on the `Client` and
+    // aborted when its last clone drops — not by an explicit teardown in
+    // `shutdown()`. On sign-out `shutdown()` stops sync first (awaited), which
+    // quiesces the room-updates writer before `sign_out_cleanup` removes the sdk
+    // dir; tightening that ordering for the event-cache tasks is tracked as
+    // deferred work.
+    //
+    // Archive-first pagination is an enhancement, not a precondition for a usable
+    // account: a subscribe failure degrades to homeserver-only back-pagination
+    // rather than failing activation (mirrors the infallibly-registered
+    // archive/redaction handlers). In matrix-sdk 0.18 this is effectively
+    // unreachable — `subscribe()` only errors on an already-dropped client.
+    if let Err(e) = client.event_cache().subscribe() {
+        tracing::warn!(
+            account_id = %account_id,
+            error = %e,
+            "event cache subscribe failed; falling back to homeserver-only pagination"
+        );
+    }
+
     // Re-persist the Keychain blob whenever the SDK rotates the session tokens,
     // so the (one-time-use) rotated OAuth refresh token survives a restart. A
     // best-effort background task keyed by this account.

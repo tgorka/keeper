@@ -7,6 +7,13 @@
 //! diff indices stay aligned) and forwards each `VectorDiff` one-to-one — no
 //! sorting or filtering here or in TypeScript (AD-9, AD-20).
 //!
+//! Back-pagination is event-cache-first (Story 5.6, FR-17): because the account
+//! activation path subscribes the SDK event cache before sync starts, older
+//! events resolve from the on-disk persisted event cache before the homeserver
+//! is ever queried — instant and offline — and only reach the homeserver at the
+//! true gap. This module is unchanged by that: older events still arrive as
+//! `PushFront`/`Insert` diffs on the same stream regardless of their source.
+//!
 //! Secret containment (NFR-9): a VM carries only a stable opaque render key, the
 //! sender user id, a resolved display name, the decoded **text** body of an
 //! already-decrypted message, the timestamp, and `is_own`. No tokens, session
@@ -661,6 +668,16 @@ pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: Ti
 /// Back-paginate the room's live timeline by up to `num_events` older events
 /// (Story 3.9, pagination). Returns whether the *start* of the timeline was hit
 /// (the homeserver has no more older history).
+///
+/// Archive-first (Story 5.6, FR-17): with the event cache subscribed at account
+/// activation, this resolves older events from the on-disk persisted event cache
+/// before touching the homeserver — served from local disk, so scrollback within
+/// persisted history is instant and works offline; the homeserver is queried only
+/// at the true gap past the persisted floor. `map_pagination_status` stays honest:
+/// the SDK's `PaginationStatus` does not distinguish a local-cache page from a
+/// network page, so the boundary shows loading only when a page takes real time
+/// (a genuine homeserver fetch); a sub-perceptible local page keeps the seam
+/// invisible.
 ///
 /// Pagination reads history and is NOT a signal (AD-14), so it stays here, not in
 /// `signals`. The older events themselves arrive over the room's existing
