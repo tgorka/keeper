@@ -319,7 +319,10 @@ fn aggregate_reactions<'a>(
 /// [`TimelineItemVm::Utd`] carrying only its stable key, sender, resolved display
 /// name, and timestamp — never any ciphertext, session id, or key material
 /// (NFR-9, AD-1) — so the frontend can render an honest stub instead of a blank
-/// row. Everything else (non-text msgtype, other content kinds, redacted, and
+/// row. A redacted message (`MsgLikeKind::Redacted`) becomes a
+/// [`TimelineItemVm::Redacted`] carrying the same non-secret render data, so a
+/// deletion shows an explicit "Message deleted" stub rather than a silent gap
+/// (Story 3.8). Everything else (non-text msgtype, other content kinds, and
 /// virtual items) becomes a [`TimelineItemVm::Other`] carrying only the stable
 /// opaque key, so diff indices stay aligned. All accessors are sync
 /// (`VectorDiff::map` is sync).
@@ -376,6 +379,16 @@ pub fn item_to_vm(
         // ciphertext/session material is read from the `EncryptedMessage` — only
         // the sender, display name, and timestamp cross IPC (NFR-9, AD-1).
         MsgLikeKind::UnableToDecrypt(_) => TimelineItemVm::Utd {
+            key,
+            sender: ev.sender().to_string(),
+            sender_display_name,
+            timestamp: i64::from(ev.timestamp().0),
+        },
+        // A redacted (deleted-for-everyone) message: surface an explicit honest
+        // stub in place of a blank gap. The redacted event has no body to read;
+        // only the sender, display name, and timestamp cross IPC (NFR-9, AD-1)
+        // (Story 3.8).
+        MsgLikeKind::Redacted => TimelineItemVm::Redacted {
             key,
             sender: ev.sender().to_string(),
             sender_display_name,
@@ -641,6 +654,29 @@ mod tests {
         TimelineItemVm::Other {
             key: key.to_owned(),
         }
+    }
+
+    #[test]
+    fn redacted_vm_serializes_to_tagged_camel_case_shape() {
+        // The `MsgLikeKind::Redacted` arm of `item_to_vm` produces this VM; an SDK
+        // `EventTimelineItem` can't be constructed outside the SDK crate (its
+        // constructor is `pub(super)`), so pin the wire contract the frontend
+        // switches on — `kind: "redacted"` with the same non-secret render fields
+        // as the UTD stub, and no body/content field ever crossing IPC.
+        let vm = TimelineItemVm::Redacted {
+            key: "item-7".to_owned(),
+            sender: "@alice:example.org".to_owned(),
+            sender_display_name: Some("Alice".to_owned()),
+            timestamp: 1_720_000_000_000,
+        };
+        let json = serde_json::to_value(&vm).expect("VM serializes");
+        assert_eq!(json["kind"], "redacted");
+        assert_eq!(json["key"], "item-7");
+        assert_eq!(json["sender"], "@alice:example.org");
+        assert_eq!(json["senderDisplayName"], "Alice");
+        assert_eq!(json["timestamp"], 1_720_000_000_000_i64);
+        // No body/content is carried on a redacted stub (nothing to render).
+        assert!(json.get("body").is_none());
     }
 
     #[test]

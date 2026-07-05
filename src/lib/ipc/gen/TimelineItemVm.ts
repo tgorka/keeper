@@ -91,6 +91,22 @@ senderDisplayName: string | null,
 /**
  * The event origin timestamp: ms since the Unix epoch (UTC).
  */
+timestamp: number, } | { "kind": "redacted", 
+/**
+ * Stable opaque render key (the item's `unique_id`).
+ */
+key: string, 
+/**
+ * The sender's Matrix user id (opaque, passed through verbatim).
+ */
+sender: string, 
+/**
+ * The resolved sender display name, or `null` when unavailable.
+ */
+senderDisplayName: string | null, 
+/**
+ * The event origin timestamp: ms since the Unix epoch (UTC).
+ */
 timestamp: number, } | { "kind": "other", 
 /**
  * Stable opaque render key (the item's `unique_id`).

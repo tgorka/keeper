@@ -610,8 +610,28 @@ pub enum TimelineItemVm {
         #[ts(type = "number")]
         timestamp: i64,
     },
-    /// Any non-text item (non-text msgtype, state/membership/profile change,
-    /// redacted, or a virtual date-divider/read-marker item).
+    /// A message that has been redacted — deleted for everyone (Story 3.8, FR-15).
+    /// Renders an explicit honest "Message deleted" stub instead of a blank row or
+    /// a silent removal (the same honesty principle as [`TimelineItemVm::Utd`]).
+    /// Carries **only** non-secret render data — a stable opaque render key, the
+    /// sender user id, a resolved display name, and the timestamp. The redacted
+    /// event has no body/content to read, and no tombstone/redaction reason crosses
+    /// IPC (NFR-9, AD-1). The SDK turns a live message into this in place via a
+    /// `Set` diff, so diff indices stay aligned — keeper never removes or re-indexes
+    /// a redacted item (local archive retention is Story 5.2).
+    Redacted {
+        /// Stable opaque render key (the item's `unique_id`).
+        key: String,
+        /// The sender's Matrix user id (opaque, passed through verbatim).
+        sender: String,
+        /// The resolved sender display name, or `null` when unavailable.
+        sender_display_name: Option<String>,
+        /// The event origin timestamp: ms since the Unix epoch (UTC).
+        #[ts(type = "number")]
+        timestamp: i64,
+    },
+    /// Any non-text item (non-text msgtype, state/membership/profile change, or a
+    /// virtual date-divider/read-marker item).
     /// Carried only to keep diff indices aligned; the frontend renders nothing.
     Other {
         /// Stable opaque render key (the item's `unique_id`).

@@ -187,6 +187,48 @@ pub async fn toggle_reaction(
     Ok(())
 }
 
+/// Redact (delete for everyone) the message addressed by `item_key` (its opaque
+/// `unique_id`) through the single dispatch gate (FR-15, FR-41, AD-13, Story 3.8).
+///
+/// Resolves the key to the live timeline item and its `identifier()`
+/// (`TimelineEventItemId`) via the same items scan as [`submit_edit`], then calls
+/// `Timeline::redact` — the sole call site of that SDK method. `reason` is an
+/// optional non-secret redaction reason (MVP passes `None`). The `Set` diff that
+/// turns the item into a redacted stub in place arrives through the room's
+/// existing `Timeline::subscribe()` stream, so keeper synthesizes nothing.
+///
+/// Errors: an unresolvable key, or a target that is not the account's own message
+/// → [`SendError::TargetNotFound`]; an SDK dispatch failure → [`SendError::Dispatch`].
+pub async fn redact(
+    timeline: &Timeline,
+    item_key: &str,
+    reason: Option<&str>,
+) -> Result<(), SendError> {
+    let item_id = {
+        let items = timeline.items().await;
+        let event = items
+            .iter()
+            .find(|item| item.unique_id().0 == item_key)
+            .and_then(|item| item.as_event())
+            .ok_or(SendError::TargetNotFound)?;
+        // Defense-in-depth: delete-for-everyone is scoped to the user's OWN messages
+        // (Story 3.8). The webview only offers Delete on own bubbles, but the
+        // destructive, network-visible protocol decision is enforced here in Rust too
+        // (mirrors `submit_edit`'s `is_editable()` gate) — a misbehaving or compromised
+        // caller cannot redact someone else's message through this command.
+        if !event.is_own() {
+            return Err(SendError::TargetNotFound);
+        }
+        event.identifier()
+    };
+    // SOLE-REDACT-GATE: the one and only `Timeline::redact` call site (FR-41).
+    timeline
+        .redact(&item_id, reason)
+        .await
+        .map_err(|e| SendError::Dispatch(e.to_string()))?;
+    Ok(())
+}
+
 /// Re-drive an already-dispatched, wedged local echo (NOT a new dispatch).
 ///
 /// Locates the timeline item whose `unique_id().0 == item_key`, takes its
@@ -325,6 +367,9 @@ mod tests {
         let toggle_reaction_start = source
             .find("pub async fn toggle_reaction")
             .expect("toggle_reaction fn must exist");
+        let redact_start = source
+            .find("pub async fn redact")
+            .expect("redact fn must exist");
         let retry_start = source
             .find("pub async fn retry")
             .expect("retry fn must exist");
@@ -390,8 +435,24 @@ mod tests {
         );
         let reaction_call = reaction_sites[0];
         assert!(
-            reaction_call > toggle_reaction_start && reaction_call < retry_start,
-            "the sole `.toggle_reaction(` call must be inside `toggle_reaction` (offset {reaction_call} not within {toggle_reaction_start}..{retry_start})"
+            reaction_call > toggle_reaction_start && reaction_call < redact_start,
+            "the sole `.toggle_reaction(` call must be inside `toggle_reaction` (offset {reaction_call} not within {toggle_reaction_start}..{redact_start})"
+        );
+
+        // The single redaction-dispatch call site: `.redact(`. Doc references say
+        // `Timeline::redact` (no `.`), so they don't match; `redact` sits between
+        // `toggle_reaction` and `retry` in source order.
+        let redact_sites: Vec<usize> = source.match_indices(".redact(").map(|(i, _)| i).collect();
+        assert_eq!(
+            redact_sites.len(),
+            1,
+            "expected exactly one `.redact(` call site (the sole redaction gate); found {}",
+            redact_sites.len()
+        );
+        let redact_call = redact_sites[0];
+        assert!(
+            redact_call > redact_start && redact_call < retry_start,
+            "the sole `.redact(` call must be inside `redact` (offset {redact_call} not within {redact_start}..{retry_start})"
         );
 
         // The single attachment-dispatch call site: `.send_attachment(`. Doc

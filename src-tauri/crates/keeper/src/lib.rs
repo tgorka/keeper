@@ -81,6 +81,8 @@ pub fn run() {
             ipc::send_reply,
             ipc::edit_message,
             ipc::toggle_reaction,
+            ipc::delete_message,
+            ipc::room_network_label,
             ipc::send_retry,
             ipc::send_attachment_path,
             ipc::send_attachment_bytes,

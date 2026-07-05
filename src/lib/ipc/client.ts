@@ -571,6 +571,38 @@ export async function retrySend(accountId: string, roomId: string, itemKey: stri
 }
 
 /**
+ * Delete an own message for everyone by issuing a Matrix redaction (FR-15, AD-13,
+ * Story 3.8). `itemKey` is the message's opaque render `key` (`unique_id`); the
+ * Rust core resolves it and calls the SDK's `redact` through the single dispatch
+ * gate (no reason). The `Set` diff that turns the message into a "Message deleted"
+ * stub in place arrives back over the room's existing timeline subscription
+ * (nothing is synthesized on the frontend). Resolves on successful dispatch;
+ * rejects with the {@link IpcError} envelope (`code: "sendFailed"`) on failure —
+ * `retriable: false` when the target is gone, `retriable: true` on an SDK dispatch
+ * error the dialog can retry.
+ */
+export async function deleteMessage(
+  accountId: string,
+  roomId: string,
+  itemKey: string,
+): Promise<void> {
+  await invoke<void>("delete_message", { accountId, roomId, itemKey });
+}
+
+/**
+ * Resolve the bridged Network label for the delete confirmation on demand (FR-15,
+ * UX-DR17, Story 3.8). The Rust core reads the Room's MSC2346 `m.bridge` (and
+ * legacy `uk.half-shot.bridge`) state event and returns the Network's display name
+ * ("Telegram", "WhatsApp", …), or `null` for a native Matrix Room (no bridge
+ * state). The Rust `Option<String>` serializes to `string | null` — only the
+ * resolved, non-secret label crosses. Rejects with the {@link IpcError} envelope
+ * (`code: "timelineUnavailable"`) on an unknown room/account.
+ */
+export async function roomNetworkLabel(accountId: string, roomId: string): Promise<string | null> {
+  return await invoke<string | null>("room_network_label", { accountId, roomId });
+}
+
+/**
  * Send a media attachment from an OS file path (FR-13, AD-4, Story 3.7). The
  * composer attach button and native drag-drop both deliver a **path** — the Rust
  * core reads the file itself, so no media bytes cross IPC. `caption` is the trimmed

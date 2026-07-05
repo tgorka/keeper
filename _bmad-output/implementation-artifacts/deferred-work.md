@@ -114,3 +114,6 @@ Items surfaced during review that are out of scope for their originating story.
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-7-send-media-and-files.md`
   summary: Attaching media while a reply context is pending sends the attachment without any reply linkage — media-as-reply silently drops the reply relation.
   evidence: `composer.tsx::send` dispatches attachments via `onSendAttachments` regardless of `pending?.mode === "reply"`, and `AttachmentConfig` has an unused `reply` field; sending media as a reply is outside Story 3.7's ACs (3.4 covered text replies) but is a real product gap once both features coexist.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-8-delete-for-everyone-redaction.md`
+  summary: Timeline stub Alerts (`RedactedStub`, and the pre-existing `UtdStub`) use `role="status"` (an aria-live region), so a room open whose reset batch contains many historical redacted/undecryptable items announces "Message deleted"/the UTD copy repeatedly to screen readers.
+  evidence: `redacted-stub.tsx` and `utd-stub.tsx` both wrap an `Alert role="status"`; for static historical content in a `reset`/`append` batch this floods the live region. Cross-cutting (both stubs); a fix should drop the live role for non-transient stub rows while keeping honest inline text, and be applied consistently to UTD and redacted stubs.

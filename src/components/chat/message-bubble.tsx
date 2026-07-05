@@ -56,6 +56,11 @@ interface MessageBubbleProps {
    */
   onEdit?: (key: string) => void;
   /**
+   * Begin deleting this message for everyone (Story 3.8, FR-15). The action bar
+   * offers Delete only on an own message; the parent opens the confirmation dialog.
+   */
+  onDelete?: (key: string) => void;
+  /**
    * Jump to (scroll to) the original of a received reply, by the original's opaque
    * render `key`. The reply quote is clickable only when the parent wires this and
    * the quote carries a resolved `inReplyToKey`.
@@ -110,6 +115,7 @@ export function MessageBubble({
   offline = false,
   onReply,
   onEdit,
+  onDelete,
   onJumpTo,
   selected = false,
   onToggleReaction,
@@ -122,6 +128,10 @@ export function MessageBubble({
   const sendState = item.sendState;
   // Only own text messages are editable (Rust also gates on `is_editable()`).
   const canEdit = isOwn;
+  // Only own messages that have actually been sent can be deleted for everyone
+  // (Story 3.8, FR-15). An in-flight or failed local echo (`sendState !== null`) has
+  // no remote event to redact — those use Cancel/Retry (Story 3.7), not Delete.
+  const canDelete = isOwn && sendState === null;
 
   return (
     <div
@@ -202,14 +212,16 @@ export function MessageBubble({
             </div>
           </div>
           {/* Action bar: revealed on hover/focus-within of the bubble row. */}
-          {(onReply || onEdit || onToggleReaction) && (
+          {(onReply || onEdit || onDelete || onToggleReaction) && (
             <div className="opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
               <MessageActions
                 messageKey={item.key}
                 canEdit={canEdit}
+                canDelete={canDelete}
                 onReact={(k, emoji) => onToggleReaction?.(k, emoji)}
                 onReply={(k) => onReply?.(k)}
                 onEdit={(k) => onEdit?.(k)}
+                onDelete={(k) => onDelete?.(k)}
               />
             </div>
           )}

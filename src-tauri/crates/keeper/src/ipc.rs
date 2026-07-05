@@ -596,6 +596,48 @@ pub async fn toggle_reaction(
         .map_err(to_ipc_error)
 }
 
+/// Delete an own message for everyone by issuing a Matrix redaction through the
+/// single dispatch gate (FR-15, FR-41, AD-13, Story 3.8). `itemKey` is the
+/// message's opaque render `key` (its `unique_id`); the Rust core resolves it to
+/// the SDK `TimelineEventItemId` and calls `Timeline::redact` with no reason
+/// (`None`). The `Set` diff that turns the message into a redacted stub in place
+/// arrives back over the existing timeline subscription (nothing is synthesized).
+/// A missing target funnels through [`to_ipc_error`] to a non-retriable
+/// `SendFailed`; an SDK dispatch failure to a retriable `SendFailed`.
+#[tauri::command]
+pub async fn delete_message(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    item_key: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .redact_message(&account_id, &room_id, &item_key, None)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Resolve the bridged-Chat Network label for the delete confirmation on demand
+/// (FR-15, UX-DR17, Story 3.8). Delegates to the core, which reads the Room's
+/// MSC2346 `m.bridge` (and legacy `uk.half-shot.bridge`) state event and returns
+/// the Network's display name ("Telegram", "WhatsApp", …), or `None` for a native
+/// Matrix Room (no bridge state). `Option<String>` serializes to `string | null`
+/// across IPC — only the resolved, non-secret label crosses. An unknown
+/// room/account funnels through [`to_ipc_error`] to `TimelineUnavailable`.
+#[tauri::command]
+pub async fn room_network_label(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<Option<String>, IpcError> {
+    state
+        .accounts
+        .room_network_label(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
 /// Subscribe to an account's connection status (FR-8/FR-9, UX-DR18, AD-8).
 ///
 /// Lazily activates the account (reusing the room-list/timeline path), then

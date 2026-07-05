@@ -40,6 +40,7 @@ use tracing::Instrument;
 
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
+use crate::bridge;
 use crate::error::{
     AccountError, BackupError, CoreError, InboxError, MediaError, SendError, TimelineError,
 };
@@ -1239,6 +1240,62 @@ impl AccountManager {
         send::submit_edit(&timeline, item_key, body).await?;
         tracing::info!(account_id = %account_id, room_id = %room_id, "message edit dispatched");
         Ok(())
+    }
+
+    /// Redact (delete for everyone) the message addressed by `item_key` (its
+    /// opaque render key) on `room_id`/`account_id` through the single dispatch
+    /// gate (FR-15, FR-41, AD-13, Story 3.8). Resolves the live `Arc<Timeline>`
+    /// and delegates to [`send::redact`]; the `Set` diff that turns the message
+    /// into a redacted stub in place arrives through the room's existing timeline
+    /// subscription — this synthesizes nothing. `reason` is an optional non-secret
+    /// redaction reason (the IPC command passes `None`).
+    ///
+    /// Errors: an unparsable/unknown room id → [`SendError::RoomNotFound`]; no open
+    /// timeline → [`SendError::NoOpenTimeline`]; an unresolvable target →
+    /// [`SendError::TargetNotFound`]; an SDK dispatch failure → [`SendError::Dispatch`].
+    pub async fn redact_message(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        item_key: &str,
+        reason: Option<&str>,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let timeline = self.open_timeline_for(account_id, &room_id).await?;
+        send::redact(&timeline, item_key, reason).await?;
+        tracing::info!(account_id = %account_id, room_id = %room_id, "message redaction dispatched");
+        Ok(())
+    }
+
+    /// Resolve the bridged-Chat Network label for `room_id`/`account_id` on demand,
+    /// for the delete confirmation's honest framing (FR-15, UX-DR17, Story 3.8).
+    /// Resolves the account's live `Room` and delegates to
+    /// [`bridge::room_bridge_network`], which reads the MSC2346 `m.bridge` (and
+    /// legacy `uk.half-shot.bridge`) state event and returns the Network's display
+    /// name — "Telegram", "WhatsApp", … A native Matrix Room (no bridge state)
+    /// resolves to `None`, so the confirmation uses native framing. Only the
+    /// resolved, non-secret label crosses back (NFR-9); no `RoomVm` is touched.
+    ///
+    /// Errors: an unparsable/unknown room id, or an account that isn't live →
+    /// [`TimelineError::RoomNotFound`].
+    pub async fn room_network_label(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<Option<String>, CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let client = {
+            let accounts = self.accounts.lock().await;
+            let handle = accounts
+                .get(account_id)
+                .ok_or(TimelineError::RoomNotFound)?;
+            handle.client.clone()
+        };
+        let room = client
+            .get_room(&room_id)
+            .ok_or(TimelineError::RoomNotFound)?;
+        Ok(bridge::room_bridge_network(&room).await)
     }
 
     /// Toggle the account's emoji `emoji` reaction on the message addressed by

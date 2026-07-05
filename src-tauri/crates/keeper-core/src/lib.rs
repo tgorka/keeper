@@ -12,6 +12,7 @@
 pub mod account;
 pub mod auth;
 pub mod backup;
+pub mod bridge;
 pub mod demo;
 pub mod error;
 pub mod inbox;

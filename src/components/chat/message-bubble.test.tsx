@@ -94,6 +94,36 @@ describe("MessageBubble", () => {
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
   });
 
+  it("offers Delete on an own sent message but not on an in-flight or failed echo", () => {
+    // A sent own message (null sendState) can be deleted for everyone…
+    const { rerender } = render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: null })}
+        grouped={false}
+        onDelete={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
+
+    // …but an unsent/failed local echo has no remote event to redact — no Delete.
+    rerender(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sending" })}
+        grouped={false}
+        onDelete={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+    rerender(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "failed" })}
+        grouped={false}
+        onDelete={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+  });
+
   it("shows the Sending… caption on the group tail", () => {
     render(
       <MessageBubble

@@ -17,6 +17,8 @@ const retrySend = vi.fn();
 const sendAttachmentPath = vi.fn();
 const sendAttachmentBytes = vi.fn();
 const cancelSend = vi.fn();
+const deleteMessage = vi.fn();
+const roomNetworkLabel = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   subscribeTimeline: (accountId: string, roomId: string, onBatch: (b: TimelineBatch) => void) =>
     subscribeTimeline(accountId, roomId, onBatch),
@@ -40,6 +42,9 @@ vi.mock("@/lib/ipc/client", () => ({
   ) => sendAttachmentBytes(accountId, roomId, bytes, filename, mime, caption),
   cancelSend: (accountId: string, roomId: string, itemKey: string) =>
     cancelSend(accountId, roomId, itemKey),
+  deleteMessage: (accountId: string, roomId: string, itemKey: string) =>
+    deleteMessage(accountId, roomId, itemKey),
+  roomNetworkLabel: (accountId: string, roomId: string) => roomNetworkLabel(accountId, roomId),
 }));
 
 // The conversation pane subscribes to native drag-drop via `getCurrentWebview()`.
@@ -111,6 +116,10 @@ beforeEach(() => {
   sendAttachmentBytes.mockResolvedValue(undefined);
   cancelSend.mockReset();
   cancelSend.mockResolvedValue(undefined);
+  deleteMessage.mockReset();
+  deleteMessage.mockResolvedValue(undefined);
+  roomNetworkLabel.mockReset();
+  roomNetworkLabel.mockResolvedValue(null);
   onDragDropEvent.mockClear();
   onDragDropEvent.mockImplementation(() => Promise.resolve(() => {}));
   composerStore.getState().clear();
@@ -935,5 +944,109 @@ describe("ConversationPane", () => {
     expect(dialog).toBeInTheDocument();
     const previews = screen.getAllByAltText("photo.png") as HTMLImageElement[];
     expect(previews.some((i) => i.getAttribute("src")?.endsWith("/full"))).toBe(true);
+  });
+
+  it("renders a streamed redacted item as an honest 'Message deleted' stub (never blank)", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+
+    captured.onBatch?.({
+      ops: [
+        {
+          op: "reset",
+          items: [
+            {
+              kind: "redacted",
+              key: "r1",
+              sender: "@carol:example.org",
+              senderDisplayName: "Carol",
+              timestamp: 1,
+            },
+          ],
+        },
+      ],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Message deleted")).toBeInTheDocument();
+    });
+  });
+
+  it("`⌫` on a selected own message opens the delete confirmation; a non-own does not", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+    captured.onBatch?.({
+      ops: [
+        {
+          op: "reset",
+          items: [
+            {
+              kind: "message",
+              key: "other-1",
+              sender: "@bob:example.org",
+              senderDisplayName: "Bob",
+              body: "not mine",
+              timestamp: 1,
+              isOwn: false,
+              sendState: null,
+              isEdited: false,
+              reply: null,
+              reactions: [],
+              media: null,
+            },
+            {
+              kind: "message",
+              key: "mine-1",
+              sender: account.userId,
+              senderDisplayName: null,
+              body: "mine",
+              timestamp: 2,
+              isOwn: true,
+              sendState: null,
+              isEdited: false,
+              reply: null,
+              reactions: [],
+              media: null,
+            },
+          ],
+        },
+      ],
+    });
+
+    await screen.findByText("mine");
+    const list = screen.getByLabelText("Messages");
+
+    // `⌫` on a non-own selection is a no-op (delete is own-only).
+    composerStore.getState().select("other-1");
+    fireEvent.keyDown(list, { key: "Backspace" });
+    expect(
+      screen.queryByRole("alertdialog", { name: "Delete this message for everyone" }),
+    ).not.toBeInTheDocument();
+
+    // A modifier chord (⌘/Ctrl/Alt+⌫, e.g. delete-word) on the own selection is left
+    // alone — it must not open the destructive confirmation.
+    composerStore.getState().select("mine-1");
+    fireEvent.keyDown(list, { key: "Backspace", metaKey: true });
+    expect(
+      screen.queryByRole("alertdialog", { name: "Delete this message for everyone" }),
+    ).not.toBeInTheDocument();
+
+    // A bare `⌫` on the own (sent) selection opens the confirmation dialog.
+    fireEvent.keyDown(list, { key: "Backspace" });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("alertdialog", { name: "Delete this message for everyone" }),
+      ).toBeInTheDocument(),
+    );
   });
 });
