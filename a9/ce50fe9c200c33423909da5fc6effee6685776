@@ -1,0 +1,25 @@
+src/components/layout/conversation-pane.tsx
+  s_21e089134ce7b0::t_b51991b43cc9ac 563-567
+src/components/chat/history-boundary.tsx
+  s_21e089134ce7b0::t_eeda5a924d152d 68-71
+_bmad-output/implementation-artifacts/spec-3-9-receipts-typing-and-history-pagination.md
+  s_21e089134ce7b0::t_2257ea55c4f75d 113-123
+  s_21e089134ce7b0::t_c11f85fac29018 199-200
+  s_21e089134ce7b0::t_49ae73ecc4fb58 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a9ce50fe9c200c33423909da5fc6effee6685776",
+  "prompts": {},
+  "sessions": {
+    "s_21e089134ce7b0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "34d3da3d-dcd7-4b2e-b7ed-a1e477b45ace",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
