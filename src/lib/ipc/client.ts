@@ -569,3 +569,90 @@ export async function toggleReaction(
 export async function retrySend(accountId: string, roomId: string, itemKey: string): Promise<void> {
   await invoke<void>("send_retry", { accountId, roomId, itemKey });
 }
+
+/**
+ * Send a media attachment from an OS file path (FR-13, AD-4, Story 3.7). The
+ * composer attach button and native drag-drop both deliver a **path** — the Rust
+ * core reads the file itself, so no media bytes cross IPC. `caption` is the trimmed
+ * composer text (omit when empty). The local echo + every send-state transition
+ * arrive back over the room's existing timeline subscription (no echo is
+ * synthesized here). Resolves on successful enqueue; rejects with the
+ * {@link IpcError} envelope (`code: "sendFailed"`) on an enqueue-time failure.
+ */
+export async function sendAttachmentPath(
+  accountId: string,
+  roomId: string,
+  path: string,
+  caption?: string,
+): Promise<void> {
+  await invoke<void>("send_attachment_path", {
+    accountId,
+    roomId,
+    path,
+    caption: caption ?? null,
+  });
+}
+
+/**
+ * Send a path-less pasted clipboard image (FR-13, AD-4, Story 3.7). The image
+ * **bytes** ride as a **raw binary IPC body** (never base64/JSON — the sanctioned
+ * exception for pastes with no OS path), with `accountId`/`roomId`/`filename`/
+ * `mime`/`caption` in **request headers** (filename + caption percent-encoded so
+ * non-ASCII survives an ASCII-only header). The Rust core reads the raw body,
+ * decodes the headers, and enqueues the attachment through the single dispatch
+ * gate; the local echo + send-state transitions arrive over the room's existing
+ * timeline subscription. Resolves on successful enqueue; rejects with the
+ * {@link IpcError} envelope (`code: "sendFailed"`) on failure.
+ */
+export async function sendAttachmentBytes(
+  accountId: string,
+  roomId: string,
+  bytes: ArrayBuffer,
+  filename: string,
+  mime: string,
+  caption?: string,
+): Promise<void> {
+  const headers: Record<string, string> = {
+    "x-account-id": accountId,
+    "x-room-id": roomId,
+    // Percent-encode text that may contain non-ASCII (filename/caption); the Rust
+    // side percent-decodes. ASCII-safe values (ids/mime) ride verbatim.
+    "x-filename": encodeURIComponent(filename),
+    "x-mime": mime,
+  };
+  if (caption != null && caption !== "") {
+    headers["x-caption"] = encodeURIComponent(caption);
+  }
+  try {
+    // Raw-body invoke: the `ArrayBuffer` becomes the `InvokeBody::Raw` payload;
+    // metadata rides in headers. `invoke` in `@tauri-apps/api/core` maps a
+    // rejection to a value, so mirror the shared client's IpcError normalization.
+    await tauriInvoke<void>("send_attachment_bytes", bytes, { headers });
+  } catch (raw) {
+    if (isIpcError(raw)) {
+      throw raw;
+    }
+    throw {
+      code: "internal",
+      message: typeof raw === "string" ? raw : "unexpected IPC failure",
+      accountId: null,
+      retriable: false,
+    } satisfies IpcError;
+  }
+}
+
+/**
+ * Cancel an in-flight outgoing echo by aborting its SDK send handle (best-effort,
+ * Story 3.7). `itemKey` is the echo's opaque render `key` (`unique_id`). If the
+ * send already dispatched, the abort is a no-op and the message stays sent (the
+ * echo's removal or its no-op arrives over the room's existing timeline
+ * subscription). Rejects with the {@link IpcError} envelope (`code: "sendFailed"`)
+ * if the echo is gone or the room has no open timeline.
+ */
+export async function cancelSend(
+  accountId: string,
+  roomId: string,
+  itemKey: string,
+): Promise<void> {
+  await invoke<void>("cancel_send", { accountId, roomId, itemKey });
+}

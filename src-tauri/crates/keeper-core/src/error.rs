@@ -170,6 +170,14 @@ pub enum SendError {
     /// non-secret description of the failure — never message plaintext.
     #[error("could not send the message: {0}")]
     Dispatch(String),
+
+    /// The SDK failed to enqueue an attachment upload, or to abort an in-flight
+    /// one (Story 3.7, FR-13). The wrapped string is a non-secret description of
+    /// the failure — never the file bytes, path, or `mxc`. Retriable (an
+    /// enqueue-time failure the frontend can attempt again); asynchronous upload
+    /// delivery failures instead surface as the `Failed` send-state on the echo.
+    #[error("could not upload the attachment: {0}")]
+    Upload(String),
 }
 
 /// Errors originating in the merged unified-inbox stream (AD-20, AD-21).

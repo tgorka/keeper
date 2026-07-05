@@ -13,11 +13,12 @@
 
 use matrix_sdk::room::edit::EditedContent;
 use matrix_sdk::ruma::events::room::message::{
-    RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+    RoomMessageEventContent, RoomMessageEventContentWithoutRelation, TextMessageEventContent,
 };
 use matrix_sdk::ruma::events::AnyMessageLikeEventContent;
 use matrix_sdk::ruma::OwnedEventId;
-use matrix_sdk_ui::timeline::Timeline;
+use matrix_sdk_ui::timeline::{AttachmentConfig, AttachmentSource, Timeline};
+use mime::Mime;
 
 use crate::error::SendError;
 
@@ -207,6 +208,74 @@ pub async fn retry(timeline: &Timeline, item_key: &str) -> Result<(), SendError>
     Ok(())
 }
 
+/// The sole media-dispatch gate (FR-41, AD-13, Story 3.7, FR-13): enqueue an
+/// attachment (`bytes` + `filename` + `mime`) on `timeline`'s send queue as an
+/// `m.room.message` media event, optionally carrying `caption` as its caption.
+///
+/// This is the only place in the crate that calls `Timeline::send_attachment(..)`.
+/// `.use_send_queue()` makes the whole text send-plumbing apply to media: the SDK
+/// produces a local-echo timeline item (which the 3.6 receive path renders), drives
+/// the upload in its background send-queue task, encrypts automatically in E2EE
+/// rooms, emits send-state transitions over the room's existing
+/// `Timeline::subscribe()` diff stream, and lets `retry` (`unwedge`) / `cancel`
+/// (`abort`) operate on the echo — so keeper synthesizes nothing. MVP sends with a
+/// minimal `AttachmentConfig` (no client-generated thumbnail / `info`); receivers
+/// fall back to the full asset per 3.6. Bytes never touch `tracing`.
+pub async fn submit_attachment(
+    timeline: &Timeline,
+    bytes: Vec<u8>,
+    filename: &str,
+    mime: Mime,
+    caption: Option<&str>,
+) -> Result<(), SendError> {
+    let source = AttachmentSource::Data {
+        bytes,
+        filename: filename.to_owned(),
+    };
+    // The timeline's `AttachmentConfig` exposes public fields (no builder); MVP
+    // sends with only an optional caption — no client-generated thumbnail / `info`.
+    let config = AttachmentConfig {
+        caption: caption
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(TextMessageEventContent::plain),
+        ..AttachmentConfig::default()
+    };
+    // SOLE-ATTACHMENT-GATE: the one and only `Timeline::send_attachment` call site
+    // (FR-41 guard). `.use_send_queue()` routes it through the text send plumbing.
+    timeline
+        .send_attachment(source, mime, config)
+        .use_send_queue()
+        .await
+        .map_err(|e| SendError::Upload(e.to_string()))?;
+    Ok(())
+}
+
+/// Cancel an in-flight (or queued) local echo by aborting its SDK send handle —
+/// best-effort, symmetric with [`retry`]'s `unwedge` (Story 3.7).
+///
+/// Locates the timeline item whose `unique_id().0 == item_key`, takes its
+/// `local_echo_send_handle()`, and calls `abort()`. `Ok(true)` means the send was
+/// aborted (the SDK emits a `CancelledLocalEvent` diff that removes the echo);
+/// `Ok(false)` means it had already been dispatched — a no-op that leaves the
+/// message sent. Feeds no new content, so it does not touch the single-gate rule.
+pub async fn cancel(timeline: &Timeline, item_key: &str) -> Result<(), SendError> {
+    let items = timeline.items().await;
+    let handle = items
+        .iter()
+        .find(|item| item.unique_id().0 == item_key)
+        .and_then(|item| item.as_event())
+        .and_then(|ev| ev.local_echo_send_handle())
+        .ok_or(SendError::EchoNotFound)?;
+    // Best-effort: `Ok(false)` (already dispatched) is not an error — the message
+    // simply stays sent.
+    handle
+        .abort()
+        .await
+        .map_err(|e| SendError::Upload(e.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     /// FR-41 / AD-13 single-dispatch-gate guard: the SDK content-send call
@@ -259,6 +328,12 @@ mod tests {
         let retry_start = source
             .find("pub async fn retry")
             .expect("retry fn must exist");
+        let submit_attachment_start = source
+            .find("pub async fn submit_attachment")
+            .expect("submit_attachment fn must exist");
+        let cancel_start = source
+            .find("pub async fn cancel")
+            .expect("cancel fn must exist");
         let call = call_sites[0];
         // The single `.send(content)` must live in `submit` — before `submit_reply`
         // (the first fn following `submit`).
@@ -317,6 +392,25 @@ mod tests {
         assert!(
             reaction_call > toggle_reaction_start && reaction_call < retry_start,
             "the sole `.toggle_reaction(` call must be inside `toggle_reaction` (offset {reaction_call} not within {toggle_reaction_start}..{retry_start})"
+        );
+
+        // The single attachment-dispatch call site: `.send_attachment(`. Doc
+        // references say `Timeline::send_attachment` (no `.`), so they don't match;
+        // `submit_attachment` sits between `retry` and `cancel` in source order.
+        let attachment_sites: Vec<usize> = source
+            .match_indices(".send_attachment(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            attachment_sites.len(),
+            1,
+            "expected exactly one `.send_attachment(` call site (the sole attachment gate); found {}",
+            attachment_sites.len()
+        );
+        let attachment_call = attachment_sites[0];
+        assert!(
+            attachment_call > submit_attachment_start && attachment_call < cancel_start,
+            "the sole `.send_attachment(` call must be inside `submit_attachment` (offset {attachment_call} not within {submit_attachment_start}..{cancel_start})"
         );
     }
 }

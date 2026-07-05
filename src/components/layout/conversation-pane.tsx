@@ -14,6 +14,7 @@
  * a room's timeline is loaded — and outgoing bubbles carry a Rust-authoritative
  * send-state caption with a persistent `Failed — Retry` (FR-9, AD-13).
  */
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { PanelRight } from "lucide-react";
 import { type KeyboardEvent, type Ref, useCallback, useEffect, useRef, useState } from "react";
 import { Composer } from "@/components/chat/composer";
@@ -24,8 +25,11 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { TimelineBatch, TimelineItemVm } from "@/lib/ipc/client";
 import {
+  cancelSend,
   editMessage,
   retrySend,
+  sendAttachmentBytes,
+  sendAttachmentPath,
   sendReply,
   sendText,
   subscribeTimeline,
@@ -33,6 +37,7 @@ import {
   unsubscribeTimeline,
 } from "@/lib/ipc/client";
 import { useAccountStatus } from "@/lib/stores/account-status";
+import { attachmentId, attachmentsStore, type PendingAttachment } from "@/lib/stores/attachments";
 import { composerStore, useComposerStore } from "@/lib/stores/composer";
 import { useRoomsStore } from "@/lib/stores/rooms";
 import { timelineStore, useTimelineStore } from "@/lib/stores/timeline";
@@ -149,6 +154,7 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
       timelineStore.getState().clear();
       composerStore.getState().clear();
       composerStore.getState().clearSelection();
+      attachmentsStore.getState().clear();
       setErrored(false);
       setLoaded(false);
       setPreviewKey(null);
@@ -161,9 +167,11 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     // Establish clean state at mount so the newest mount always wins; clearing
     // in cleanup instead would race the next room's mount.
     timelineStore.getState().clear();
-    // A room switch drops any pending reply/edit context and selection.
+    // A room switch drops any pending reply/edit context, selection, and the
+    // attachment tray.
     composerStore.getState().clear();
     composerStore.getState().clearSelection();
+    attachmentsStore.getState().clear();
     let subscriptionId: number | null = null;
     let cancelled = false;
 
@@ -196,6 +204,56 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
         void unsubscribeTimeline(accountId, subscriptionId);
       }
       timelineStore.getState().clear();
+    };
+  }, [accountId, selectedRoomId]);
+
+  // Native drag-drop ingestion (Story 3.7): while a room is open, a file dropped
+  // anywhere on the window yields OS **paths** (Rust reads the files — no bytes
+  // cross IPC), which are pushed into the composer's pending-attachment tray. The
+  // listener is torn down on room close / unmount. `onDragDropEvent` resolves
+  // asynchronously, so a late listener is unlistened immediately if we already
+  // unmounted.
+  useEffect(() => {
+    if (accountId === null || selectedRoomId === null) {
+      return;
+    }
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type !== "drop") {
+          return;
+        }
+        const paths = event.payload.paths;
+        if (paths.length === 0) {
+          return;
+        }
+        // A directory drop can't be read as a single attachment; the Rust file
+        // read of a directory path fails and surfaces as a per-item send error, so
+        // dropping paths verbatim is safe. Bytes never cross here — only paths.
+        attachmentsStore.getState().addMany(
+          paths.map((path): PendingAttachment => {
+            const parts = path.split(/[/\\]/);
+            return {
+              id: attachmentId(),
+              kind: "path",
+              path,
+              filename: parts[parts.length - 1] || path,
+            };
+          }),
+        );
+      })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+          return;
+        }
+        unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
     };
   }, [accountId, selectedRoomId]);
 
@@ -251,6 +309,54 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
       // the persistent `Failed — Retry` caption in place, inviting another
       // attempt; swallow the rejection so it is never an unhandled promise.
       retrySend(accountId, selectedRoomId, key).catch(() => {});
+    },
+    [accountId, selectedRoomId],
+  );
+
+  // Dispatch each pending attachment through the single Rust send gate (Story
+  // 3.7): a path attachment via `sendAttachmentPath` (Rust reads the file), a
+  // pasted-bytes attachment via `sendAttachmentBytes` (raw binary IPC body). The
+  // caption (single-attachment only) rides on the first dispatch. Rejects if any
+  // enqueue fails so the composer keeps the tray for retry.
+  const onSendAttachments = useCallback(
+    async (toSend: PendingAttachment[], caption?: string) => {
+      if (accountId === null || selectedRoomId === null) {
+        return;
+      }
+      for (const attachment of toSend) {
+        if (attachment.kind === "path") {
+          await sendAttachmentPath(accountId, selectedRoomId, attachment.path, caption);
+        } else {
+          await sendAttachmentBytes(
+            accountId,
+            selectedRoomId,
+            attachment.bytes,
+            attachment.filename,
+            attachment.mime,
+            caption,
+          );
+        }
+        // Drop each attachment from the tray the moment it is enqueued so a later
+        // failure in this loop (or a failed trailing text send) never re-dispatches
+        // an already-enqueued item when the user retries — preventing duplicate
+        // media sends. On full success the tray is already empty and the
+        // composer's `clear()` is a harmless no-op.
+        attachmentsStore.getState().remove(attachment.id);
+      }
+    },
+    [accountId, selectedRoomId],
+  );
+
+  // Cancel an in-flight outgoing media echo by aborting its queued send (Story
+  // 3.7). Best-effort: if it already dispatched, the abort is a no-op and the
+  // message stays sent. A rejection (e.g. the echo reconciled away) is swallowed
+  // so it is never an unhandled promise.
+  const onCancelSend = useCallback(
+    (key: string) => {
+      if (accountId === null || selectedRoomId === null) {
+        return;
+      }
+      cancelSend(accountId, selectedRoomId, key).catch(() => {});
     },
     [accountId, selectedRoomId],
   );
@@ -459,6 +565,7 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
                     selected={selectedKey === row.item.key}
                     onToggleReaction={onToggleReaction}
                     onOpenPreview={onOpenPreview}
+                    onCancelSend={onCancelSend}
                   />
                 </li>
               ),
@@ -472,6 +579,7 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
             <Composer
               key={selectedRoomId}
               onSend={onSend}
+              onSendAttachments={onSendAttachments}
               disabled={!roomLoaded}
               pending={pending}
               editPrefill={editPrefill}

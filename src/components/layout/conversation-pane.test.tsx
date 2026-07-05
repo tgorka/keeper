@@ -14,6 +14,9 @@ const sendText = vi.fn();
 const sendReply = vi.fn();
 const editMessage = vi.fn();
 const retrySend = vi.fn();
+const sendAttachmentPath = vi.fn();
+const sendAttachmentBytes = vi.fn();
+const cancelSend = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   subscribeTimeline: (accountId: string, roomId: string, onBatch: (b: TimelineBatch) => void) =>
     subscribeTimeline(accountId, roomId, onBatch),
@@ -25,9 +28,29 @@ vi.mock("@/lib/ipc/client", () => ({
     editMessage(accountId, roomId, itemKey, body),
   retrySend: (accountId: string, roomId: string, itemKey: string) =>
     retrySend(accountId, roomId, itemKey),
+  sendAttachmentPath: (accountId: string, roomId: string, path: string, caption?: string) =>
+    sendAttachmentPath(accountId, roomId, path, caption),
+  sendAttachmentBytes: (
+    accountId: string,
+    roomId: string,
+    bytes: ArrayBuffer,
+    filename: string,
+    mime: string,
+    caption?: string,
+  ) => sendAttachmentBytes(accountId, roomId, bytes, filename, mime, caption),
+  cancelSend: (accountId: string, roomId: string, itemKey: string) =>
+    cancelSend(accountId, roomId, itemKey),
+}));
+
+// The conversation pane subscribes to native drag-drop via `getCurrentWebview()`.
+// Mock it so the listener registers (and unregisters) without a real Tauri webview.
+const onDragDropEvent = vi.fn((_handler?: (e: unknown) => void) => Promise.resolve(() => {}));
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({ onDragDropEvent }),
 }));
 
 import { ConversationPane } from "@/components/layout/conversation-pane";
+import { attachmentsStore } from "@/lib/stores/attachments";
 import { composerStore } from "@/lib/stores/composer";
 
 const account: AccountVm = {
@@ -82,8 +105,17 @@ beforeEach(() => {
   editMessage.mockResolvedValue(undefined);
   retrySend.mockReset();
   retrySend.mockResolvedValue(undefined);
+  sendAttachmentPath.mockReset();
+  sendAttachmentPath.mockResolvedValue(undefined);
+  sendAttachmentBytes.mockReset();
+  sendAttachmentBytes.mockResolvedValue(undefined);
+  cancelSend.mockReset();
+  cancelSend.mockResolvedValue(undefined);
+  onDragDropEvent.mockClear();
+  onDragDropEvent.mockImplementation(() => Promise.resolve(() => {}));
   composerStore.getState().clear();
   composerStore.getState().clearSelection();
+  attachmentsStore.getState().clear();
 });
 
 afterEach(() => {
@@ -94,6 +126,7 @@ afterEach(() => {
   accountStatusStore.getState().reset();
   composerStore.getState().clear();
   composerStore.getState().clearSelection();
+  attachmentsStore.getState().clear();
 });
 
 describe("ConversationPane", () => {
@@ -447,6 +480,117 @@ describe("ConversationPane", () => {
 
     await waitFor(() => {
       expect(sendText).toHaveBeenCalledWith(account.accountId, "!room:example.org", "hello there");
+    });
+  });
+
+  it("pushes a dropped file path into the composer tray", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    const dropped: { handler: ((e: unknown) => void) | null } = { handler: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    onDragDropEvent.mockImplementation((handler?: (e: unknown) => void) => {
+      dropped.handler = handler ?? null;
+      return Promise.resolve(() => {});
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+    captured.onBatch?.({ ops: [message("k1", "@bob:example.org", "hi")] });
+    await waitFor(() => expect(dropped.handler).not.toBeNull());
+
+    // Simulate a native drop event with an OS path (no bytes cross here).
+    dropped.handler?.({ payload: { type: "drop", paths: ["/home/alice/dropped.png"] } });
+
+    await waitFor(() => {
+      expect(screen.getByText("dropped.png")).toBeInTheDocument();
+    });
+    const pending = attachmentsStore.getState().pending;
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ kind: "path", path: "/home/alice/dropped.png" });
+  });
+
+  it("removes each attachment from the tray as it enqueues so a partial failure never re-sends it", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    // First attachment enqueues successfully; the second fails at enqueue time.
+    sendAttachmentPath
+      .mockReset()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(ipcError("sendFailed"));
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+    captured.onBatch?.({ ops: [message("k1", "@bob:example.org", "hi")] });
+
+    const textarea = await screen.findByLabelText("Message");
+    await waitFor(() => expect(textarea).not.toBeDisabled());
+
+    attachmentsStore.getState().addMany([
+      { id: "a1", kind: "path", path: "/tmp/one.png", filename: "one.png" },
+      { id: "a2", kind: "path", path: "/tmp/two.png", filename: "two.png" },
+    ]);
+    await waitFor(() => expect(screen.getByText("two.png")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(sendAttachmentPath).toHaveBeenCalledTimes(2));
+    // The first (enqueued) attachment is gone; only the failed one remains, so a
+    // retry re-dispatches just it — never a duplicate of the already-enqueued file.
+    const pending = attachmentsStore.getState().pending;
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ id: "a2" });
+  });
+
+  it("wires an in-flight media echo's Cancel to cancelSend with the item key", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+
+    captured.onBatch?.({
+      ops: [
+        {
+          op: "reset",
+          items: [
+            {
+              kind: "message",
+              key: "media-1",
+              sender: account.userId,
+              senderDisplayName: null,
+              body: "",
+              timestamp: 1,
+              isOwn: true,
+              sendState: "sending",
+              isEdited: false,
+              reply: null,
+              reactions: [],
+              media: {
+                kind: "image",
+                url: "keeper-media://media/a/r/media-1/full",
+                thumbnailUrl: "keeper-media://media/a/r/media-1/thumb",
+                filename: "photo.png",
+                mimetype: "image/png",
+                size: 2048,
+                width: 400,
+                height: 300,
+                caption: null,
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const cancel = await screen.findByRole("button", { name: "Cancel upload" });
+    fireEvent.click(cancel);
+    await waitFor(() => {
+      expect(cancelSend).toHaveBeenCalledWith(account.accountId, "!room:example.org", "media-1");
     });
   });
 

@@ -17,6 +17,8 @@
 //! (NFR-9).
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -1285,6 +1287,119 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Send a media attachment from an OS file path to `room_id` on `account_id`
+    /// through the single dispatch gate (FR-13, FR-41, AD-4, AD-13, Story 3.7).
+    ///
+    /// Reads the file with `tokio::fs::read` (bytes never cross IPC — the file path
+    /// is the ingestion boundary for the composer attach button + native drag-drop),
+    /// derives the display filename from the path, guesses the MIME type from the
+    /// extension (`application/octet-stream` fallback), and delegates to
+    /// [`send::submit_attachment`]. The local echo + every send-state transition
+    /// arrive over the room's existing timeline subscription — this synthesizes
+    /// nothing. Logs the opaque room id, media kind (mime top-level), and byte size
+    /// only — never the path or file bytes.
+    ///
+    /// Errors: an unparsable/unknown room id → [`SendError::RoomNotFound`]; no open
+    /// timeline → [`SendError::NoOpenTimeline`]; a file that can't be read →
+    /// [`SendError::Upload`]; an SDK enqueue failure → [`SendError::Upload`].
+    pub async fn send_attachment_path(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        path: &Path,
+        caption: Option<&str>,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let timeline = self.open_timeline_for(account_id, &room_id).await?;
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| SendError::Upload(format!("could not read the attached file: {e}")))?;
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| "attachment".to_owned());
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        let size = bytes.len();
+        send::submit_attachment(&timeline, bytes, &filename, mime.clone(), caption).await?;
+        tracing::info!(
+            account_id = %account_id,
+            room_id = %room_id,
+            kind = %mime.type_(),
+            size,
+            "attachment dispatched from path"
+        );
+        Ok(())
+    }
+
+    /// Send a media attachment from raw bytes (a path-less pasted clipboard image)
+    /// to `room_id` on `account_id` through the single dispatch gate (FR-13, FR-41,
+    /// AD-4, AD-13, Story 3.7).
+    ///
+    /// The bytes arrive over a **raw binary IPC body** (never base64/JSON — the
+    /// sanctioned exception for path-less pastes); `mime_str` is the caller-supplied
+    /// MIME (parsed, `application/octet-stream` fallback on a malformed value).
+    /// Delegates to [`send::submit_attachment`]; the local echo + send-state
+    /// transitions arrive over the room's existing timeline subscription. Logs the
+    /// opaque room id, media kind, and byte size only — never the bytes.
+    ///
+    /// Errors: an unparsable/unknown room id → [`SendError::RoomNotFound`]; no open
+    /// timeline → [`SendError::NoOpenTimeline`]; an SDK enqueue failure →
+    /// [`SendError::Upload`].
+    pub async fn send_attachment_bytes(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime_str: &str,
+        caption: Option<&str>,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let timeline = self.open_timeline_for(account_id, &room_id).await?;
+        let mime = mime::Mime::from_str(mime_str).unwrap_or(mime::APPLICATION_OCTET_STREAM);
+        let size = bytes.len();
+        // Defense-in-depth: the paste filename is frontend-supplied, so reduce it to
+        // its final path component — a compromised webview cannot inject directory
+        // separators into the sent event's filename. (The path route already derives
+        // the name via `Path::file_name`.)
+        let safe_name = Path::new(filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment");
+        send::submit_attachment(&timeline, bytes, safe_name, mime.clone(), caption).await?;
+        tracing::info!(
+            account_id = %account_id,
+            room_id = %room_id,
+            kind = %mime.type_(),
+            size,
+            "attachment dispatched from pasted bytes"
+        );
+        Ok(())
+    }
+
+    /// Cancel an in-flight outgoing media (or text) echo by aborting its SDK send
+    /// handle — best-effort, symmetric with [`AccountManager::retry_send`] (Story
+    /// 3.7). `item_key` is the echo's opaque `unique_id`. Resolves the same live
+    /// `Arc<Timeline>` that produced the item and delegates to [`send::cancel`]; the
+    /// echo's removal (or its already-sent no-op) arrives over the room's existing
+    /// timeline subscription.
+    ///
+    /// Errors: unknown room / no open timeline as [`send_text`]; a missing echo →
+    /// [`SendError::EchoNotFound`].
+    pub async fn cancel_send(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        item_key: &str,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let timeline = self.open_timeline_for(account_id, &room_id).await?;
+        send::cancel(&timeline, item_key).await?;
+        tracing::info!(account_id = %account_id, room_id = %room_id, "outgoing send cancel requested");
+        Ok(())
+    }
+
     /// Resolve a `keeper-media://` handle to its decrypted bytes for the
     /// custom-protocol handler (Story 3.6, FR-13, AD-4). Resolves the account's
     /// live `Client` and the room's open `Arc<Timeline>`, then delegates to
@@ -2250,6 +2365,49 @@ mod tests {
         assert_eq!(
             vector_diff_to_op(VectorDiff::<RoomVm>::Truncate { length: 3 }),
             RoomListOp::Truncate { length: 3 }
+        );
+    }
+
+    /// The path→MIME guess that `send_attachment_path` uses to classify an
+    /// attachment (Story 3.7): common extensions map to their image/video/audio
+    /// class, an unknown/missing extension falls back to `application/octet-stream`.
+    #[test]
+    fn mime_guess_maps_extensions_to_media_classes() {
+        let guess = |name: &str| {
+            mime_guess::from_path(Path::new(name))
+                .first_or_octet_stream()
+                .essence_str()
+                .to_owned()
+        };
+        assert_eq!(guess("photo.png"), "image/png");
+        assert_eq!(guess("photo.jpg"), "image/jpeg");
+        assert_eq!(guess("clip.mp4"), "video/mp4");
+        assert_eq!(guess("voice.mp3"), "audio/mpeg");
+        assert_eq!(guess("notes.pdf"), "application/pdf");
+        // Unknown extension and no extension both fall back to octet-stream.
+        assert_eq!(guess("archive.unknownext"), "application/octet-stream");
+        assert_eq!(guess("noextension"), "application/octet-stream");
+    }
+
+    /// The top-level MIME type used in the `send_attachment_*` `tracing` log (the
+    /// only media-classification datum logged — never the bytes/path).
+    #[test]
+    fn mime_top_level_type_classifies_the_kind() {
+        use std::str::FromStr;
+        assert_eq!(
+            mime::Mime::from_str("image/png").expect("valid").type_(),
+            mime::IMAGE
+        );
+        assert_eq!(
+            mime::Mime::from_str("video/mp4").expect("valid").type_(),
+            mime::VIDEO
+        );
+        // A malformed caller-supplied mime falls back to octet-stream (application).
+        assert_eq!(
+            mime::Mime::from_str("not a mime")
+                .unwrap_or(mime::APPLICATION_OCTET_STREAM)
+                .type_(),
+            mime::APPLICATION
         );
     }
 }

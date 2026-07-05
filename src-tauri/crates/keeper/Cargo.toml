@@ -34,3 +34,9 @@ thiserror = { workspace = true }
 dirs = { workspace = true }
 # macOS Keychain access for the keychain_* Platform ports (shell-only glue).
 keyring = { workspace = true }
+# Native file-picker dialog for the composer attach button (Story 3.7). Yields OS
+# file paths (never bytes over IPC). MIT/Apache — passes `cargo deny check`.
+tauri-plugin-dialog = { workspace = true }
+# Percent-decoding raw-body IPC headers (filename/caption) for the pasted-image
+# send path (Story 3.7). Already in the tree via url/matrix-sdk.
+percent-encoding = { workspace = true }

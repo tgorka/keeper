@@ -1,6 +1,22 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Composer } from "@/components/chat/composer";
+import { attachmentsStore } from "@/lib/stores/attachments";
+
+// Mock the native file picker; each test sets its return value.
+const open = vi.fn();
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: (...args: unknown[]) => open(...args),
+}));
+
+/** Reset the shared pending-attachment tray between tests. */
+beforeEach(() => {
+  attachmentsStore.getState().clear();
+  open.mockReset();
+});
+afterEach(() => {
+  attachmentsStore.getState().clear();
+});
 
 describe("Composer", () => {
   it("sends the trimmed body on Enter and clears the draft", async () => {
@@ -184,5 +200,117 @@ describe("Composer", () => {
     fireEvent.change(textarea, { target: { value: "typed" } });
     fireEvent.keyDown(textarea, { key: "ArrowUp" });
     expect(onEmptyArrowUp).not.toHaveBeenCalled();
+  });
+
+  it("adds a chip when a file is picked via the attach button", async () => {
+    open.mockResolvedValue("/home/alice/photo.png");
+    render(<Composer onSend={vi.fn()} onSendAttachments={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Attach file" }));
+    await waitFor(() => {
+      expect(screen.getByText("photo.png")).toBeInTheDocument();
+    });
+    expect(open).toHaveBeenCalledWith({ multiple: true });
+  });
+
+  it("is a no-op when the attach dialog is cancelled", async () => {
+    open.mockResolvedValue(null);
+    render(<Composer onSend={vi.fn()} onSendAttachments={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Attach file" }));
+    await waitFor(() => {
+      expect(open).toHaveBeenCalled();
+    });
+    expect(attachmentsStore.getState().pending).toHaveLength(0);
+  });
+
+  it("adds a chip when an image is pasted", async () => {
+    render(<Composer onSend={vi.fn()} onSendAttachments={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    const file = new File([new Uint8Array([1, 2, 3])], "shot.png", { type: "image/png" });
+    fireEvent.paste(textarea, {
+      clipboardData: { items: [{ type: "image/png", getAsFile: () => file }] },
+    });
+    await waitFor(() => {
+      expect(screen.getByText("shot.png")).toBeInTheDocument();
+    });
+    const pending = attachmentsStore.getState().pending;
+    expect(pending).toHaveLength(1);
+    expect(pending[0].kind).toBe("bytes");
+  });
+
+  it("lets a non-image paste fall through to text (no chip)", () => {
+    render(<Composer onSend={vi.fn()} onSendAttachments={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    fireEvent.paste(textarea, {
+      clipboardData: { items: [{ type: "text/plain", getAsFile: () => null }] },
+    });
+    expect(attachmentsStore.getState().pending).toHaveLength(0);
+  });
+
+  it("removes a chip when its × is clicked (pre-upload cancel)", async () => {
+    open.mockResolvedValue("/home/alice/doc.pdf");
+    render(<Composer onSend={vi.fn()} onSendAttachments={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Attach file" }));
+    await waitFor(() => {
+      expect(screen.getByText("doc.pdf")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Remove doc.pdf" }));
+    expect(screen.queryByText("doc.pdf")).not.toBeInTheDocument();
+    expect(attachmentsStore.getState().pending).toHaveLength(0);
+  });
+
+  it("Send dispatches a single path attachment with the typed text as caption", async () => {
+    open.mockResolvedValue("/home/alice/photo.png");
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    const onSendAttachments = vi.fn().mockResolvedValue(undefined);
+    render(<Composer onSend={onSend} onSendAttachments={onSendAttachments} />);
+    fireEvent.click(screen.getByRole("button", { name: "Attach file" }));
+    await waitFor(() => expect(screen.getByText("photo.png")).toBeInTheDocument());
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    fireEvent.change(textarea, { target: { value: "look at this" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => {
+      expect(onSendAttachments).toHaveBeenCalledWith(
+        [expect.objectContaining({ kind: "path", path: "/home/alice/photo.png" })],
+        "look at this",
+      );
+    });
+    // The text rode as the caption, so no separate text send.
+    expect(onSend).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(attachmentsStore.getState().pending).toHaveLength(0);
+    });
+    expect(textarea.value).toBe("");
+  });
+
+  it("Send dispatches a pasted-bytes attachment via onSendAttachments", async () => {
+    const onSendAttachments = vi.fn().mockResolvedValue(undefined);
+    render(<Composer onSend={vi.fn()} onSendAttachments={onSendAttachments} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    const file = new File([new Uint8Array([1, 2, 3])], "shot.png", { type: "image/png" });
+    fireEvent.paste(textarea, {
+      clipboardData: { items: [{ type: "image/png", getAsFile: () => file }] },
+    });
+    await waitFor(() => expect(screen.getByText("shot.png")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => {
+      expect(onSendAttachments).toHaveBeenCalledWith(
+        [expect.objectContaining({ kind: "bytes", mime: "image/png" })],
+        undefined,
+      );
+    });
+  });
+
+  it("keeps the tray when an attachment send rejects", async () => {
+    open.mockResolvedValue("/home/alice/photo.png");
+    const onSendAttachments = vi.fn().mockRejectedValue(new Error("nope"));
+    render(<Composer onSend={vi.fn()} onSendAttachments={onSendAttachments} />);
+    fireEvent.click(screen.getByRole("button", { name: "Attach file" }));
+    await waitFor(() => expect(screen.getByText("photo.png")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+    });
+    // The tray is kept for retry.
+    expect(attachmentsStore.getState().pending).toHaveLength(1);
   });
 });

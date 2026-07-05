@@ -23,6 +23,7 @@ tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-deep-link = "2"
+tauri-plugin-dialog = "2"
 # Serialization + IPC bindings
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -48,6 +49,13 @@ url = "2"
 # Percent-decoding `keeper-media://` URL path segments (Story 3.6). Already in the
 # tree via url/matrix-sdk — a direct dep adds no new crate; permissive (MIT/Apache).
 percent-encoding = "2"
+# MIME type parsing/matching (Story 3.7, media send). Already in the tree via
+# matrix-sdk; a direct dep adds no new crate. MIT/Apache — passes `cargo deny check`.
+mime = "0.3"
+# Guessing a MIME type from a file path/extension for the media send path (Story
+# 3.7). Returns a `mime::Mime`; `application/octet-stream` fallback. MIT — passes
+# `cargo deny check`.
+mime_guess = "2"
 # HTTP client for the Beeper unofficial email-code login flow (Story 2.3, AD-17).
 # rustls-only to match matrix-sdk's TLS backend — no second TLS stack (no native-tls/OpenSSL).
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

@@ -14,11 +14,45 @@
  * edit restores the pre-edit stashed draft (both "cancel without losing composer
  * text"). Entering edit prefills the textarea with the message body (`editPrefill`).
  */
-import { type KeyboardEvent, useEffect, useRef, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { Paperclip, X } from "lucide-react";
+import { type ClipboardEvent, type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  attachmentId,
+  attachmentsStore,
+  type PendingAttachment,
+  useAttachmentsStore,
+} from "@/lib/stores/attachments";
 import type { PendingContext } from "@/lib/stores/composer";
 import { cn } from "@/lib/utils";
+
+/** Derive a chip display name for a pending attachment (its filename). */
+function chipLabel(attachment: PendingAttachment): string {
+  return attachment.filename;
+}
+
+/** Format a byte count as a short human-readable size (e.g. `1.2 MB`). */
+function formatSize(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
+}
+
+/** The display filename derived from an OS file path (its basename). */
+function basename(path: string): string {
+  const parts = path.split(/[/\\]/);
+  return parts[parts.length - 1] || path;
+}
 
 interface ComposerProps {
   /**
@@ -28,6 +62,15 @@ interface ComposerProps {
    * based on the current `pending`.
    */
   onSend: (body: string) => Promise<void>;
+  /**
+   * Dispatch the pending attachments (Story 3.7). `caption` is the trimmed
+   * composer text, passed only when exactly one attachment is pending (otherwise
+   * `undefined` — a caption maps to a single media event). The parent routes each
+   * attachment to `sendAttachmentPath` / `sendAttachmentBytes`. Resolves when all
+   * are enqueued (the tray + draft then clear); rejects to keep the tray so the
+   * user can retry. Absent → the attach/paste affordances are inert.
+   */
+  onSendAttachments?: (attachments: PendingAttachment[], caption?: string) => Promise<void>;
   /** When `true`, the composer is inert (no room loaded). */
   disabled?: boolean;
   /** The active reply/edit context, or `null`. Drives the banner + Esc routing. */
@@ -53,6 +96,7 @@ interface ComposerProps {
 
 export function Composer({
   onSend,
+  onSendAttachments,
   disabled = false,
   pending = null,
   editPrefill = null,
@@ -62,6 +106,10 @@ export function Composer({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState(false);
+  const attachments = useAttachmentsStore((s) => s.pending);
+  // The attach/paste affordances are available only when the parent wires the
+  // attachment dispatcher and the composer is enabled.
+  const attachEnabled = onSendAttachments != null && !disabled;
 
   // Mirror the live draft in a ref so the prefill effect can stash it without
   // taking `draft` as a dependency (which would re-run the effect every keystroke).
@@ -90,29 +138,116 @@ export function Composer({
     }
   }, [editTargetKey, editPrefill]);
 
-  const canSend = draft.trim().length > 0 && !disabled && !sending;
+  const hasAttachments = attachments.length > 0;
+  // Send is enabled when there is a trimmed body OR at least one pending
+  // attachment (an attachment can be sent with no caption). An edit never carries
+  // attachments.
+  const canSend =
+    (draft.trim().length > 0 || (hasAttachments && pending?.mode !== "edit")) &&
+    !disabled &&
+    !sending;
 
   async function send() {
     const body = draft.trim();
-    if (body.length === 0 || disabled || sending) {
-      // Whitespace-only / disabled / in-flight: never dispatch.
+    const trayAttachments = attachmentsStore.getState().pending;
+    const dispatchAttachments =
+      onSendAttachments != null && pending?.mode !== "edit" && trayAttachments.length > 0;
+    if ((body.length === 0 && !dispatchAttachments) || disabled || sending) {
+      // Whitespace-only with no attachment / disabled / in-flight: never dispatch.
       return;
     }
     setSending(true);
     setError(false);
     try {
-      await onSend(body);
-      // Clear only on success so a failed enqueue keeps the user's text.
-      setDraft("");
+      if (dispatchAttachments && onSendAttachments != null) {
+        // A caption maps to a single media event, so it rides only when exactly
+        // one attachment is pending; with multiple, the text is sent separately.
+        const caption = trayAttachments.length === 1 && body.length > 0 ? body : undefined;
+        await onSendAttachments(trayAttachments, caption);
+        // If the text did not ride as a caption (multiple attachments) but the
+        // user typed a body, dispatch it as its own message.
+        if (caption === undefined && body.length > 0) {
+          await onSend(body);
+        }
+        // Clear only on success so a failed enqueue keeps the tray + text.
+        attachmentsStore.getState().clear();
+        setDraft("");
+      } else {
+        await onSend(body);
+        // Clear only on success so a failed enqueue keeps the user's text.
+        setDraft("");
+      }
     } catch {
       // Enqueue-time failure produces no timeline echo to fall back on, so
-      // surface an honest inline error (AD-21) and keep the draft so the user
-      // can resend. Async delivery failures instead show as the message's
+      // surface an honest inline error (AD-21) and keep the draft/tray so the
+      // user can resend. Async delivery failures instead show as the message's
       // Failed send-state caption.
       setError(true);
     } finally {
       setSending(false);
     }
+  }
+
+  /** Open the native file picker and add each chosen path to the tray. */
+  async function pickFiles() {
+    if (!attachEnabled) {
+      return;
+    }
+    try {
+      const selection = await open({ multiple: true });
+      if (selection == null) {
+        // Dialog cancelled → no-op.
+        return;
+      }
+      const paths = Array.isArray(selection) ? selection : [selection];
+      attachmentsStore.getState().addMany(
+        paths.map((path) => ({
+          id: attachmentId(),
+          kind: "path" as const,
+          path,
+          filename: basename(path),
+        })),
+      );
+    } catch {
+      // A dialog failure is non-fatal — the user can retry; nothing to surface.
+    }
+  }
+
+  /**
+   * Intercept a paste that carries an image: add it as a raw-bytes attachment
+   * (dispatched later as a raw binary IPC body, never base64). A non-image paste
+   * falls through to the default text paste unchanged.
+   */
+  function onPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
+    if (!attachEnabled) {
+      return;
+    }
+    const imageItem = Array.from(e.clipboardData.items).find((it) => it.type.startsWith("image/"));
+    if (!imageItem) {
+      // Not an image → let the default text paste proceed.
+      return;
+    }
+    const file = imageItem.getAsFile();
+    if (!file) {
+      return;
+    }
+    e.preventDefault();
+    void file.arrayBuffer().then((bytes) => {
+      const ext = file.type.split("/")[1] || "png";
+      attachmentsStore.getState().add({
+        id: attachmentId(),
+        kind: "bytes",
+        bytes,
+        filename: file.name && file.name !== "" ? file.name : `pasted-image.${ext}`,
+        mime: file.type,
+        size: file.size,
+      });
+    });
+  }
+
+  /** Remove a pending attachment (a pre-upload cancel). */
+  function removeAttachment(id: string) {
+    attachmentsStore.getState().remove(id);
   }
 
   function cancelPending() {
@@ -184,7 +319,48 @@ export function Composer({
           </Button>
         </div>
       )}
+      {/* Pending-attachment tray (Story 3.7): removable chips above the textarea,
+          each showing the filename (+ size for pasted bytes). Removing a chip is a
+          pre-upload cancel. */}
+      {hasAttachments && pending?.mode !== "edit" && (
+        <ul aria-label="Pending attachments" className="flex flex-wrap gap-1.5">
+          {attachments.map((attachment) => (
+            <li
+              key={attachment.id}
+              className="flex items-center gap-1.5 rounded-md border border-border bg-muted/50 py-1 pr-1 pl-2"
+            >
+              <span className="max-w-[180px] truncate text-xs" title={chipLabel(attachment)}>
+                {chipLabel(attachment)}
+              </span>
+              {attachment.kind === "bytes" && (
+                <span className="text-muted-foreground text-xs">{formatSize(attachment.size)}</span>
+              )}
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`Remove ${chipLabel(attachment)}`}
+                onClick={() => removeAttachment(attachment.id)}
+              >
+                <X aria-hidden="true" className="size-3" />
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
       <div className="flex items-end gap-2">
+        {attachEnabled && pending?.mode !== "edit" && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label="Attach file"
+            disabled={disabled}
+            onClick={() => void pickFiles()}
+          >
+            <Paperclip aria-hidden="true" />
+          </Button>
+        )}
         <Textarea
           aria-label="Message"
           placeholder="Write a message…"
@@ -197,6 +373,7 @@ export function Composer({
             }
           }}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
           rows={1}
           // Autogrow via `field-sizing-content` (from the shadcn base) capped at
           // eight lines, then scroll.

@@ -189,7 +189,8 @@ fn to_ipc_error(err: CoreError) -> IpcError {
             SendError::RoomNotFound
             | SendError::NoOpenTimeline
             | SendError::EchoNotFound
-            | SendError::Dispatch(_),
+            | SendError::Dispatch(_)
+            | SendError::Upload(_),
         ) => (IpcErrorCode::SendFailed, true),
         // A reply/edit target that isn't in the live timeline, or an edit of a
         // non-own/non-text message, is *not* retriable — re-issuing the same
@@ -233,6 +234,33 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         account_id: None,
         retriable,
     }
+}
+
+/// Read a required raw-string request header (ASCII value), mapping a missing /
+/// non-ASCII value to a retriable `SendFailed` IPC error. Used by the raw-body
+/// pasted-attachment command for `accountId`/`roomId`/`mime` (all ASCII).
+fn required_header(headers: &tauri::http::HeaderMap, name: &str) -> Result<String, IpcError> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            to_ipc_error(CoreError::Send(SendError::Upload(format!(
+                "pasted attachment is missing the `{name}` header"
+            ))))
+        })
+}
+
+/// Read an optional percent-encoded request header and decode it back to a UTF-8
+/// string (`None` when absent or malformed). Used for `filename`/`caption`, which
+/// may contain non-ASCII that an ASCII-only header value cannot carry verbatim.
+fn decode_header(headers: &tauri::http::HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(name)?.to_str().ok()?;
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .ok()
+        .map(|cow| cow.into_owned())
+        .filter(|s| !s.is_empty())
 }
 
 /// Current wall-clock time in milliseconds since the Unix epoch (UTC).
@@ -909,6 +937,96 @@ pub async fn send_retry(
         .map_err(to_ipc_error)
 }
 
+/// Send a media attachment from an OS file path through the single dispatch gate
+/// (FR-13, FR-41, AD-4, AD-13, Story 3.7). The composer attach button and native
+/// drag-drop both deliver a **path** — Rust reads the file itself, so no media
+/// bytes cross IPC. `caption` is the trimmed composer text (`None` when empty). The
+/// local echo + every send-state transition arrive back over the existing timeline
+/// subscription (no echo is synthesized). An enqueue-time failure funnels through
+/// [`to_ipc_error`] to `SendFailed`.
+#[tauri::command]
+pub async fn send_attachment_path(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    path: String,
+    caption: Option<String>,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .send_attachment_path(
+            &account_id,
+            &room_id,
+            std::path::Path::new(&path),
+            caption.as_deref(),
+        )
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Send a path-less pasted clipboard image through the single dispatch gate (FR-13,
+/// FR-41, AD-4, AD-13, Story 3.7). The image **bytes** ride as a **raw binary IPC
+/// body** (`InvokeBody::Raw`, ~1× size, never base64/JSON) — the sanctioned
+/// exception for pastes with no OS path — with `accountId`/`roomId`/`filename`/
+/// `mime`/`caption` carried in **request headers** (filename + caption are
+/// percent-encoded so non-ASCII survives an ASCII-only header). Rust reads the raw
+/// body, decodes the headers, and enqueues the attachment; the local echo +
+/// send-state transitions arrive over the existing timeline subscription. A missing
+/// required header, or an enqueue-time failure, funnels through [`to_ipc_error`] to
+/// `SendFailed`.
+#[tauri::command]
+pub async fn send_attachment_bytes(
+    state: State<'_, AppState>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), IpcError> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err(to_ipc_error(CoreError::Send(SendError::Upload(
+            "pasted attachment must be sent as a raw binary body".to_owned(),
+        ))));
+    };
+    let bytes = bytes.clone();
+    let headers = request.headers();
+    let account_id = required_header(headers, "x-account-id")?;
+    let room_id = required_header(headers, "x-room-id")?;
+    // Filename + caption are percent-encoded by the caller so non-ASCII survives an
+    // ASCII-only header value.
+    let filename =
+        decode_header(headers, "x-filename").unwrap_or_else(|| "pasted-image".to_owned());
+    let mime = required_header(headers, "x-mime")?;
+    let caption = decode_header(headers, "x-caption");
+    state
+        .accounts
+        .send_attachment_bytes(
+            &account_id,
+            &room_id,
+            bytes,
+            &filename,
+            &mime,
+            caption.as_deref(),
+        )
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Cancel an in-flight outgoing echo by aborting its SDK send handle (best-effort,
+/// Story 3.7). `item_key` is the echo's opaque `unique_id`. If the send already
+/// dispatched, the abort is a no-op and the message stays sent (the echo's removal
+/// or its no-op arrives over the existing timeline subscription). A missing echo /
+/// no open timeline funnels through [`to_ipc_error`] to `SendFailed`.
+#[tauri::command]
+pub async fn cancel_send(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    item_key: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .cancel_send(&account_id, &room_id, &item_key)
+        .await
+        .map_err(to_ipc_error)
+}
+
 /// Report every persisted account that can be restored on launch (FR-8, AD-20).
 /// Identity only — delegates to the core, which lists the registry rows and
 /// returns each whose Keychain session is present as a non-secret [`AccountVm`]
@@ -1143,6 +1261,50 @@ mod tests {
         let ipc = to_ipc_error(CoreError::Send(SendError::Dispatch("boom".to_owned())));
         assert_eq!(ipc.code, IpcErrorCode::SendFailed);
         assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn send_upload_maps_to_retriable_send_failed() {
+        let ipc = to_ipc_error(CoreError::Send(SendError::Upload("boom".to_owned())));
+        assert_eq!(ipc.code, IpcErrorCode::SendFailed);
+        assert!(ipc.retriable, "an enqueue-time upload failure is retriable");
+    }
+
+    #[test]
+    fn required_header_reads_an_ascii_value() {
+        let mut headers = tauri::http::HeaderMap::new();
+        headers.insert("x-room-id", "!room:example.org".parse().expect("valid"));
+        assert_eq!(
+            required_header(&headers, "x-room-id").expect("present"),
+            "!room:example.org"
+        );
+    }
+
+    #[test]
+    fn required_header_missing_maps_to_send_failed() {
+        let headers = tauri::http::HeaderMap::new();
+        let err = required_header(&headers, "x-account-id").expect_err("missing header");
+        assert_eq!(err.code, IpcErrorCode::SendFailed);
+        assert!(err.retriable);
+    }
+
+    #[test]
+    fn decode_header_percent_decodes_non_ascii() {
+        let mut headers = tauri::http::HeaderMap::new();
+        // "café.png" percent-encoded (the caller encodes non-ASCII filenames).
+        headers.insert("x-filename", "caf%C3%A9.png".parse().expect("valid"));
+        assert_eq!(
+            decode_header(&headers, "x-filename"),
+            Some("café.png".to_owned())
+        );
+    }
+
+    #[test]
+    fn decode_header_absent_and_empty_are_none() {
+        let mut headers = tauri::http::HeaderMap::new();
+        assert_eq!(decode_header(&headers, "x-caption"), None);
+        headers.insert("x-caption", "".parse().expect("valid"));
+        assert_eq!(decode_header(&headers, "x-caption"), None);
     }
 
     #[test]

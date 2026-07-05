@@ -18,6 +18,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
+        // Native file-picker for the composer attach button (Story 3.7). Returns
+        // OS file paths; Rust reads the file — no media bytes cross IPC.
+        .plugin(tauri_plugin_dialog::init())
         .manage(ipc::AppState::new())
         // The exclusive decrypted-media transport (Story 3.6, AD-4): decrypted
         // bytes reach the webview only over this Range-capable `keeper-media://`
@@ -79,6 +82,9 @@ pub fn run() {
             ipc::edit_message,
             ipc::toggle_reaction,
             ipc::send_retry,
+            ipc::send_attachment_path,
+            ipc::send_attachment_bytes,
+            ipc::cancel_send,
             ipc::session_restore,
             ipc::inbox_subscribe,
             ipc::inbox_unsubscribe,

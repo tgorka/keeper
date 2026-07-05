@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble";
+import type { MediaVm } from "@/lib/ipc/client";
 
 function msg(overrides: Partial<MessageVm> = {}): MessageVm {
   return {
@@ -16,6 +17,22 @@ function msg(overrides: Partial<MessageVm> = {}): MessageVm {
     reply: null,
     reactions: [],
     media: null,
+    ...overrides,
+  };
+}
+
+/** A minimal image {@link MediaVm} for the uploading-indicator tests. */
+function imageMedia(overrides: Partial<MediaVm> = {}): MediaVm {
+  return {
+    kind: "image",
+    url: "keeper-media://media/a/r/unique-1/full",
+    thumbnailUrl: "keeper-media://media/a/r/unique-1/thumb",
+    filename: "photo.png",
+    mimetype: "image/png",
+    size: 2048,
+    width: 400,
+    height: 300,
+    caption: null,
     ...overrides,
   };
 }
@@ -385,5 +402,53 @@ describe("MessageBubble", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add reaction" }));
     fireEvent.click(screen.getByRole("button", { name: "React with 😂" }));
     expect(onToggleReaction).toHaveBeenCalledWith("k7", "😂");
+  });
+
+  it("shows an uploading indicator + Cancel on an own media echo while sending", () => {
+    const onCancelSend = vi.fn();
+    render(
+      <MessageBubble
+        item={msg({
+          key: "up-1",
+          isOwn: true,
+          sendState: "sending",
+          body: "",
+          media: imageMedia(),
+        })}
+        grouped={false}
+        onCancelSend={onCancelSend}
+      />,
+    );
+    expect(screen.getByLabelText("Uploading")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel upload" }));
+    expect(onCancelSend).toHaveBeenCalledWith("up-1");
+  });
+
+  it("shows no uploading overlay once an own media echo is sent", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sent", body: "", media: imageMedia() })}
+        grouped={false}
+        onCancelSend={vi.fn()}
+      />,
+    );
+    expect(screen.queryByLabelText("Uploading")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancel upload" })).not.toBeInTheDocument();
+  });
+
+  it("shows the persistent Failed — Retry caption on a failed media echo (no uploading overlay)", () => {
+    const onRetry = vi.fn();
+    render(
+      <MessageBubble
+        item={msg({ key: "f-1", isOwn: true, sendState: "failed", body: "", media: imageMedia() })}
+        grouped={false}
+        onRetry={onRetry}
+        onCancelSend={vi.fn()}
+      />,
+    );
+    expect(screen.queryByLabelText("Uploading")).not.toBeInTheDocument();
+    expect(screen.getByText("Failed")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(onRetry).toHaveBeenCalledWith("f-1");
   });
 });

@@ -79,6 +79,12 @@ interface MessageBubbleProps {
    * absent, the media renders but is not click-to-open.
    */
   onOpenPreview?: (key: string) => void;
+  /**
+   * Cancel an in-flight outgoing media echo by its `key` (Story 3.7). Wired to the
+   * Cancel affordance overlaid on an own media attachment while it is `sending`.
+   * When absent, no Cancel affordance renders.
+   */
+  onCancelSend?: (key: string) => void;
 }
 
 /**
@@ -108,6 +114,7 @@ export function MessageBubble({
   selected = false,
   onToggleReaction,
   onOpenPreview,
+  onCancelSend,
 }: MessageBubbleProps) {
   const displayName = item.senderDisplayName ?? item.sender;
   const time = formatMessageTime(item.timestamp);
@@ -158,6 +165,12 @@ export function MessageBubble({
                   media={item.media}
                   messageKey={item.key}
                   onOpenPreview={onOpenPreview}
+                  // While an own media echo is still sending, overlay an uploading
+                  // indicator + Cancel (Story 3.7); derived purely from the existing
+                  // send-state (no VM change). `sent`/`failed` have no overlay —
+                  // `failed` reuses the SendStateCaption "Failed — Retry" below.
+                  uploading={isOwn && sendState === "sending"}
+                  onCancel={onCancelSend}
                 />
               </div>
             )}
