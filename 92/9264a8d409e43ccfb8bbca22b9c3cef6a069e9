@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-4-6-network-account-attribution-and-network-filter.md
+  s_8dc6e6b59abe2f::t_6d1fa17e471333 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "929264a8d409e43ccfb8bbca22b9c3cef6a069e9",
+  "prompts": {},
+  "sessions": {
+    "s_8dc6e6b59abe2f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "123a8d74-2c10-4308-9598-f4b52ae41810",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
