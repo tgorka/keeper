@@ -29,4 +29,17 @@ timestamp: number | null,
 /**
  * Optional room avatar URL (an `mxc://` URI), or `null`.
  */
-avatarUrl: string | null, };
+avatarUrl: string | null, 
+/**
+ * Authoritative unread flag: `true` when the room has unread messages,
+ * unread mentions, or the manual `m.marked_unread` flag set (AD-20). The
+ * frontend renders this directly (bold name + dot/badge) and never
+ * re-derives it from events.
+ */
+isUnread: boolean, 
+/**
+ * Count of unread mentions (client-side, precise for E2EE). Drives the
+ * filled primary mention badge; a value of 0 shows a plain dot when
+ * `is_unread` is otherwise set.
+ */
+mentionCount: number, };

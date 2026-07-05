@@ -88,6 +88,7 @@ pub fn run() {
             ipc::send_attachment_bytes,
             ipc::cancel_send,
             ipc::mark_room_read,
+            ipc::mark_room_unread,
             ipc::set_typing,
             ipc::paginate_backwards,
             ipc::typing_subscribe,

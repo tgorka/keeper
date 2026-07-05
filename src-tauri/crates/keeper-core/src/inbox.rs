@@ -191,6 +191,8 @@ fn to_inbox_room(account_id: &str, hue_index: u8, room: &RoomVm) -> InboxRoomVm 
         last_message: room.last_message.clone(),
         timestamp: room.timestamp,
         avatar_url: room.avatar_url.clone(),
+        is_unread: room.is_unread,
+        mention_count: room.mention_count,
     }
 }
 
@@ -257,6 +259,8 @@ mod tests {
             last_message: None,
             timestamp: ts,
             avatar_url: None,
+            is_unread: false,
+            mention_count: 0,
         }
     }
 
@@ -298,6 +302,24 @@ mod tests {
         let a2 = &merged[1];
         assert_eq!(a2.account_id, "acctA");
         assert_eq!(a2.hue_index, 0);
+    }
+
+    #[test]
+    fn to_inbox_room_carries_unread_fields() {
+        let src = RoomVm {
+            room_id: "!u:example.org".to_owned(),
+            display_name: "Unread".to_owned(),
+            last_message: None,
+            timestamp: Some(1),
+            avatar_url: None,
+            is_unread: true,
+            mention_count: 3,
+        };
+        let inbox_room = to_inbox_room("acctA", 4, &src);
+        assert!(inbox_room.is_unread);
+        assert_eq!(inbox_room.mention_count, 3);
+        assert_eq!(inbox_room.account_id, "acctA");
+        assert_eq!(inbox_room.hue_index, 4);
     }
 
     #[test]

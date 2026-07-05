@@ -1,7 +1,21 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatRow } from "@/components/chat/chat-row";
 import type { InboxRoomVm } from "@/lib/ipc/client";
+import { roomsStore } from "@/lib/stores/rooms";
+
+// The row round-trips read/unread through the typed IPC client wrappers; mock them
+// so tests assert the command without a live Tauri backend.
+vi.mock("@/lib/ipc/client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
+  return {
+    ...actual,
+    markRoomRead: vi.fn(async () => {}),
+    markRoomUnread: vi.fn(async () => {}),
+  };
+});
+
+import { markRoomRead, markRoomUnread } from "@/lib/ipc/client";
 
 function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
   return {
@@ -12,9 +26,16 @@ function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
     lastMessage: "hey there",
     timestamp: Date.now(),
     avatarUrl: null,
+    isUnread: false,
+    mentionCount: 0,
     ...overrides,
   };
 }
+
+afterEach(() => {
+  roomsStore.getState().clear();
+  vi.clearAllMocks();
+});
 
 describe("ChatRow", () => {
   it("renders display name and preview", () => {
@@ -135,5 +156,129 @@ describe("ChatRow", () => {
   it("does not mark an unselected row with aria-current", () => {
     render(<ChatRow room={room()} selected={false} />);
     expect(screen.getByRole("button")).not.toHaveAttribute("aria-current");
+  });
+
+  it("read row: normal-weight name, no dot, no mention badge", () => {
+    render(<ChatRow room={room({ isUnread: false, mentionCount: 0 })} />);
+    expect(screen.getByText("Alice Smith")).toHaveClass("font-medium");
+    expect(screen.getByText("Alice Smith")).not.toHaveClass("font-semibold");
+    expect(screen.queryByTestId("unread-dot")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("mention-badge")).not.toBeInTheDocument();
+  });
+
+  it("unread without mention: bold name + neutral dot, no badge", () => {
+    render(<ChatRow room={room({ isUnread: true, mentionCount: 0 })} />);
+    expect(screen.getByText("Alice Smith")).toHaveClass("font-semibold");
+    const dot = screen.getByTestId("unread-dot");
+    expect(dot).toBeInTheDocument();
+    expect(dot).toHaveClass("bg-muted-foreground");
+    expect(screen.queryByTestId("mention-badge")).not.toBeInTheDocument();
+  });
+
+  it("unread mention: bold name + filled primary badge showing the count, no dot", () => {
+    render(<ChatRow room={room({ isUnread: true, mentionCount: 3 })} />);
+    expect(screen.getByText("Alice Smith")).toHaveClass("font-semibold");
+    const badge = screen.getByTestId("mention-badge");
+    expect(badge).toHaveTextContent("3");
+    expect(badge).toHaveAttribute("data-variant", "default");
+    expect(screen.queryByTestId("unread-dot")).not.toBeInTheDocument();
+  });
+
+  it("manually-marked unread with zero counts renders as unread (bold + dot)", () => {
+    // Rust folds `is_marked_unread` into `isUnread`, so the row treats it as unread.
+    render(<ChatRow room={room({ isUnread: true, mentionCount: 0 })} />);
+    expect(screen.getByText("Alice Smith")).toHaveClass("font-semibold");
+    expect(screen.getByTestId("unread-dot")).toBeInTheDocument();
+  });
+
+  it("context menu on an unread row shows Mark read and invokes markRoomRead", async () => {
+    render(
+      <ChatRow room={room({ accountId: "acctB", roomId: "!xyz:example.org", isUnread: true })} />,
+    );
+    fireEvent.contextMenu(screen.getByRole("button"));
+    const item = await screen.findByText("Mark read");
+    expect(screen.queryByText("Mark unread")).not.toBeInTheDocument();
+    fireEvent.click(item);
+    expect(markRoomRead).toHaveBeenCalledWith("acctB", "!xyz:example.org");
+    expect(markRoomUnread).not.toHaveBeenCalled();
+    // The overlay flipped the row to read within one frame.
+    expect(roomsStore.getState().optimisticUnread.get("acctB|!xyz:example.org")).toBe(false);
+  });
+
+  it("context menu on a read row shows Mark unread and invokes markRoomUnread", async () => {
+    render(
+      <ChatRow room={room({ accountId: "acctB", roomId: "!xyz:example.org", isUnread: false })} />,
+    );
+    fireEvent.contextMenu(screen.getByRole("button"));
+    const item = await screen.findByText("Mark unread");
+    expect(screen.queryByText("Mark read")).not.toBeInTheDocument();
+    fireEvent.click(item);
+    expect(markRoomUnread).toHaveBeenCalledWith("acctB", "!xyz:example.org");
+    expect(markRoomRead).not.toHaveBeenCalled();
+    expect(roomsStore.getState().optimisticUnread.get("acctB|!xyz:example.org")).toBe(true);
+  });
+
+  it("reflects the optimistic overlay: a read row renders unread when overridden", () => {
+    roomsStore.getState().setOptimisticUnread("acctB", "!xyz:example.org", true);
+    render(
+      <ChatRow room={room({ accountId: "acctB", roomId: "!xyz:example.org", isUnread: false })} />,
+    );
+    expect(screen.getByText("Alice Smith")).toHaveClass("font-semibold");
+    expect(screen.getByTestId("unread-dot")).toBeInTheDocument();
+  });
+
+  it("optimistic read clears the mention badge in the same frame it un-bolds", () => {
+    // A mention row optimistically marked read must drop the badge too, not just
+    // un-bold — a read row never carries a mention badge.
+    roomsStore.getState().setOptimisticUnread("acctB", "!xyz:example.org", false);
+    render(
+      <ChatRow
+        room={room({
+          accountId: "acctB",
+          roomId: "!xyz:example.org",
+          isUnread: true,
+          mentionCount: 3,
+        })}
+      />,
+    );
+    expect(screen.getByText("Alice Smith")).not.toHaveClass("font-semibold");
+    expect(screen.queryByTestId("mention-badge")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("unread-dot")).not.toBeInTheDocument();
+  });
+
+  it("carries the unread state in the button's accessible name", () => {
+    const { rerender } = render(<ChatRow room={room({ isUnread: true, mentionCount: 0 })} />);
+    expect(
+      screen.getByRole("button", { name: "Conversation with Alice Smith, unread" }),
+    ).toBeInTheDocument();
+
+    rerender(<ChatRow room={room({ isUnread: true, mentionCount: 1 })} />);
+    expect(
+      screen.getByRole("button", { name: "Conversation with Alice Smith, 1 unread mention" }),
+    ).toBeInTheDocument();
+
+    rerender(<ChatRow room={room({ isUnread: true, mentionCount: 3 })} />);
+    expect(
+      screen.getByRole("button", { name: "Conversation with Alice Smith, 3 unread mentions" }),
+    ).toBeInTheDocument();
+
+    rerender(<ChatRow room={room({ isUnread: false })} />);
+    expect(
+      screen.getByRole("button", { name: "Conversation with Alice Smith" }),
+    ).toBeInTheDocument();
+  });
+
+  it("reverts the optimistic overlay when the mark command hard-rejects", async () => {
+    vi.mocked(markRoomRead).mockRejectedValueOnce(new Error("inactive account"));
+    render(
+      <ChatRow room={room({ accountId: "acctB", roomId: "!xyz:example.org", isUnread: true })} />,
+    );
+    fireEvent.contextMenu(screen.getByRole("button"));
+    fireEvent.click(await screen.findByText("Mark read"));
+    // The override is dropped so the row falls back to the authoritative stream
+    // rather than stranding a phantom-read overlay the stream never reconciles.
+    await waitFor(() => {
+      expect(roomsStore.getState().optimisticUnread.has("acctB|!xyz:example.org")).toBe(false);
+    });
   });
 });

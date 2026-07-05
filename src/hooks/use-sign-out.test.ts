@@ -33,6 +33,8 @@ function room(id: string, accountId: string): InboxRoomVm {
     lastMessage: null,
     timestamp: null,
     avatarUrl: null,
+    isUnread: false,
+    mentionCount: 0,
   };
 }
 

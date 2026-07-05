@@ -1075,12 +1075,13 @@ pub async fn cancel_send(
         .map_err(to_ipc_error)
 }
 
-/// Mark the open room read (Story 3.9, receipts, AD-14). Delegates to the core,
+/// Mark a room read (Story 3.9 receipts, Story 4.1, AD-14). Delegates to the core,
 /// which dispatches a public `m.read` receipt on the room's latest event through
-/// the receipt/typing signals seam — other Matrix clients observe the advance.
-/// Best-effort: a receipt-dispatch failure is logged and swallowed in the core (no
-/// UI error), so this resolves `Ok` even then. A room-not-found / no-open-timeline
-/// funnels through [`to_ipc_error`] to `TimelineUnavailable`.
+/// the receipt/typing signals seam — other Matrix clients observe the advance — and
+/// clears any manual `m.marked_unread` flag. Works for any inbox row whether or not
+/// its timeline is open. Best-effort: a dispatch failure is logged and swallowed in
+/// the core (no UI error), so this resolves `Ok` even then. A room-not-found /
+/// inactive account funnels through [`to_ipc_error`] to `TimelineUnavailable`.
 #[tauri::command]
 pub async fn mark_room_read(
     state: State<'_, AppState>,
@@ -1090,6 +1091,25 @@ pub async fn mark_room_read(
     state
         .accounts
         .mark_room_read(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Manually mark a room unread (Story 4.1). Delegates to the core, which sets the
+/// `m.marked_unread` account-data flag via `Room::set_unread_flag(true)` so the row
+/// renders unread and the flag syncs to the user's other Matrix clients. Best-effort:
+/// a dispatch failure is logged and swallowed in the core (no UI error), so this
+/// resolves `Ok` even then. A room-not-found / inactive account funnels through
+/// [`to_ipc_error`] to `TimelineUnavailable`.
+#[tauri::command]
+pub async fn mark_room_unread(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .mark_room_unread(&account_id, &room_id)
         .await
         .map_err(to_ipc_error)
 }

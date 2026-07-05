@@ -329,6 +329,16 @@ pub struct RoomVm {
     pub timestamp: Option<i64>,
     /// Optional room avatar URL (an `mxc://` URI), or `null`.
     pub avatar_url: Option<String>,
+    /// Authoritative unread flag: `true` when the room has unread messages,
+    /// unread mentions, or the manual `m.marked_unread` flag set (AD-20). The
+    /// frontend renders this directly (bold name + dot/badge) and never
+    /// re-derives it from events.
+    pub is_unread: bool,
+    /// Count of unread mentions (client-side, precise for E2EE). Drives the
+    /// filled primary mention badge; a value of 0 shows a plain dot when
+    /// `is_unread` is otherwise set.
+    #[ts(type = "number")]
+    pub mention_count: u32,
 }
 
 /// One index-based room-list operation mirroring an eyeball-im `VectorDiff`
@@ -905,6 +915,16 @@ pub struct InboxRoomVm {
     pub timestamp: Option<i64>,
     /// Optional room avatar URL (an `mxc://` URI), or `null`.
     pub avatar_url: Option<String>,
+    /// Authoritative unread flag: `true` when the room has unread messages,
+    /// unread mentions, or the manual `m.marked_unread` flag set (AD-20). The
+    /// frontend renders this directly (bold name + dot/badge) and never
+    /// re-derives it from events.
+    pub is_unread: bool,
+    /// Count of unread mentions (client-side, precise for E2EE). Drives the
+    /// filled primary mention badge; a value of 0 shows a plain dot when
+    /// `is_unread` is otherwise set.
+    #[ts(type = "number")]
+    pub mention_count: u32,
 }
 
 /// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
@@ -1133,6 +1153,8 @@ mod tests {
             last_message: Some("hi there".to_owned()),
             timestamp: Some(1_720_000_000_000),
             avatar_url: None,
+            is_unread: false,
+            mention_count: 0,
         }
     }
 
@@ -1308,6 +1330,8 @@ mod tests {
             last_message: Some("hi there".to_owned()),
             timestamp: Some(1_720_000_000_000),
             avatar_url: Some("mxc://example.org/av".to_owned()),
+            is_unread: false,
+            mention_count: 0,
         }
     }
 
@@ -1333,6 +1357,8 @@ mod tests {
             last_message: None,
             timestamp: None,
             avatar_url: None,
+            is_unread: false,
+            mention_count: 0,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");

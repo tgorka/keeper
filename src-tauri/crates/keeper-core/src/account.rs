@@ -33,7 +33,7 @@ use matrix_sdk_ui::eyeball_im::VectorDiff;
 use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
 use matrix_sdk_ui::room_list_service::{RoomList, RoomListItem, RoomListLoadingState};
 use matrix_sdk_ui::sync_service::{State, SyncService};
-use matrix_sdk_ui::timeline::Timeline;
+use matrix_sdk_ui::timeline::{Timeline, TimelineBuilder};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
@@ -1475,33 +1475,81 @@ impl AccountManager {
 
     /// Mark the room read on `account_id` — dispatch a public `m.read` receipt on
     /// the room's latest event through the receipt/typing signals seam (Story 3.9,
-    /// AD-14). Resolves the room's open `Arc<Timeline>` and delegates to
-    /// [`signals::mark_read`]. Best-effort: a dispatch failure is logged and
-    /// swallowed (returns `Ok(())`) so a receipt failure is never a UI error; other
-    /// clients simply don't observe the advance until the next successful mark.
+    /// 4.1, AD-14) and clear any manual `m.marked_unread` flag. Works for any inbox
+    /// row whether or not its timeline is open (Story 4.1): reuses an already-open
+    /// `Arc<Timeline>` when present, else builds a transient
+    /// `TimelineBuilder::new(&room).build()` purely to advance the receipt through
+    /// [`signals::mark_read`] (keeping the mark-as-read call inside the signals seam).
+    /// The manual-unread flag is account data, not a receipt API, so
+    /// [`matrix_sdk::Room::set_unread_flag`] is cleared here. Best-effort: every
+    /// dispatch failure is logged and swallowed (returns `Ok(())`) so a failure is
+    /// never a UI error; other clients simply don't observe the advance until the
+    /// next successful mark.
     ///
-    /// Errors: an unparsable/unknown room id → [`TimelineError::RoomNotFound`]; a
-    /// room with no open timeline → [`TimelineError::RoomNotFound`] (the room must
-    /// be open to mark it read). A best-effort receipt-dispatch failure is NOT an
-    /// error — it is logged and swallowed.
+    /// Errors: an unparsable/unknown room id, or an account that isn't live →
+    /// [`TimelineError::RoomNotFound`]. A best-effort receipt- or flag-dispatch
+    /// failure is NOT an error — it is logged and swallowed.
     pub async fn mark_room_read(&self, account_id: &str, room_id: &str) -> Result<(), CoreError> {
         let room_id: OwnedRoomId =
             RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
-        let timeline = self
-            .open_timeline_for(account_id, &room_id)
-            .await
-            .map_err(|_| TimelineError::RoomNotFound)?;
-        match signals::mark_read(&timeline).await {
-            Ok(marked) => {
-                if marked {
-                    tracing::debug!(account_id = %account_id, room_id = %room_id, "room marked read");
+        let room = self.room_for(account_id, &room_id).await?;
+
+        // Advance the read receipt through the signals seam (AD-14). Reuse an
+        // already-open timeline when present; otherwise build a transient one just
+        // to dispatch the receipt — the mark-as-read call stays in signals.rs.
+        let timeline = match self.open_timeline_for(account_id, &room_id).await {
+            Ok(timeline) => Some(timeline),
+            Err(_) => match TimelineBuilder::new(&room).build().await {
+                Ok(timeline) => Some(Arc::new(timeline)),
+                Err(e) => {
+                    tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "transient timeline build for mark-read failed (best-effort)");
+                    None
+                }
+            },
+        };
+        if let Some(timeline) = timeline {
+            match signals::mark_read(&timeline).await {
+                Ok(marked) => {
+                    if marked {
+                        tracing::debug!(account_id = %account_id, room_id = %room_id, "room marked read");
+                    }
+                }
+                // Best-effort (I/O matrix): a receipt-dispatch failure is logged and
+                // swallowed — never surfaced as a UI error.
+                Err(e) => {
+                    tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "mark-read dispatch failed (best-effort)");
                 }
             }
-            // Best-effort (I/O matrix): a receipt-dispatch failure is logged and
-            // swallowed — never surfaced as a UI error.
-            Err(e) => {
-                tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "mark-read dispatch failed (best-effort)");
-            }
+        }
+
+        // Clear the manual `m.marked_unread` account-data flag unconditionally. This
+        // is not a receipt API, so it lives here rather than in the signals seam. The
+        // SDK no-ops the write when the flag is already unset, so we skip the racy
+        // `is_marked_unread()` gate (which could miss a flag another client set
+        // concurrently after our read) and let the SDK decide.
+        if let Err(e) = room.set_unread_flag(false).await {
+            tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "clear marked-unread flag failed (best-effort)");
+        }
+        Ok(())
+    }
+
+    /// Manually mark the room unread on `account_id` — set the `m.marked_unread`
+    /// account-data flag via [`matrix_sdk::Room::set_unread_flag`] (Story 4.1).
+    /// Resolves the account's live `Room` via [`Self::room_for`]. The SDK no-ops
+    /// the write when the flag is already set. This is account data, not a receipt
+    /// API, so it lives here rather than in the signals seam. Best-effort: a
+    /// dispatch failure is logged and swallowed (returns `Ok(())`) — never a UI
+    /// error.
+    ///
+    /// Errors: an unparsable/unknown room id, or an account that isn't live →
+    /// [`TimelineError::RoomNotFound`]. A best-effort flag-dispatch failure is NOT
+    /// an error — it is logged and swallowed.
+    pub async fn mark_room_unread(&self, account_id: &str, room_id: &str) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+        if let Err(e) = room.set_unread_flag(true).await {
+            tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "mark-unread dispatch failed (best-effort)");
         }
         Ok(())
     }
@@ -2369,6 +2417,14 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
         .unwrap_or_else(|| room_id.clone());
     let avatar_url = item.avatar_url().map(|u| u.to_string());
     let (last_message, timestamp) = latest_event_preview(item);
+    // `RoomListItem` derefs to `matrix_sdk::Room`; these client-side counts are
+    // precise for E2EE where server counts are not (AD-20). `is_marked_unread`
+    // reflects the manual `m.marked_unread` account-data flag.
+    let (is_unread, mention_count) = room_unread_state(
+        item.is_marked_unread(),
+        item.num_unread_messages(),
+        item.num_unread_mentions(),
+    );
 
     RoomVm {
         room_id,
@@ -2376,7 +2432,21 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
         last_message,
         timestamp,
         avatar_url,
+        is_unread,
+        mention_count,
     }
+}
+
+/// Compute the authoritative unread render state from the SDK's per-room signals.
+///
+/// A room counts as unread when the manual `m.marked_unread` flag is set, or it
+/// has any unread messages, or any unread mentions. `mention_count` is the
+/// unread-mention count saturated into `u32` for the mention badge. Pure so it
+/// can be unit-tested without a live `Client`.
+fn room_unread_state(marked: bool, unread: u64, mentions: u64) -> (bool, u32) {
+    let is_unread = marked || unread > 0 || mentions > 0;
+    let mention_count = u32::try_from(mentions).unwrap_or(u32::MAX);
+    (is_unread, mention_count)
 }
 
 /// Extract the plain-text preview + timestamp from a room's latest event.
@@ -2543,7 +2613,41 @@ mod tests {
             last_message: None,
             timestamp: None,
             avatar_url: None,
+            is_unread: false,
+            mention_count: 0,
         }
+    }
+
+    #[test]
+    fn room_unread_state_unread_no_mention() {
+        // num_unread_messages > 0, no mentions: unread, no count.
+        assert_eq!(room_unread_state(false, 5, 0), (true, 0));
+    }
+
+    #[test]
+    fn room_unread_state_unread_mention() {
+        // num_unread_mentions > 0: unread with the mention count.
+        assert_eq!(room_unread_state(false, 5, 2), (true, 2));
+    }
+
+    #[test]
+    fn room_unread_state_manually_marked_zero_counts() {
+        // is_marked_unread with zero counts: unread, no count.
+        assert_eq!(room_unread_state(true, 0, 0), (true, 0));
+    }
+
+    #[test]
+    fn room_unread_state_read() {
+        // Zero counts, not marked: read.
+        assert_eq!(room_unread_state(false, 0, 0), (false, 0));
+    }
+
+    #[test]
+    fn room_unread_state_saturates_mention_count() {
+        // A u64 mention count above u32::MAX saturates rather than overflowing.
+        let (is_unread, count) = room_unread_state(false, 0, u64::from(u32::MAX) + 1);
+        assert!(is_unread);
+        assert_eq!(count, u32::MAX);
     }
 
     #[test]

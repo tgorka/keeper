@@ -44,6 +44,8 @@ function inboxRoom(roomId: string, accountId: string, displayName: string, lastM
     lastMessage,
     timestamp: null,
     avatarUrl: null,
+    isUnread: false,
+    mentionCount: 0,
   };
 }
 

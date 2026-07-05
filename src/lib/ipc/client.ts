@@ -696,16 +696,29 @@ export async function cancelSend(
 }
 
 /**
- * Mark the open room read (Story 3.9, receipts, AD-14). The Rust core dispatches a
- * public `m.read` receipt on the room's latest event through the receipt/typing
- * signals seam — other Matrix clients observe the advance. Best-effort: a
- * receipt-dispatch failure is swallowed in the core (never a UI error), so this
- * resolves even then. Callers may fire-and-forget and swallow rejections. Rejects
- * with the {@link IpcError} envelope (`code: "timelineUnavailable"`) only when the
- * room isn't open.
+ * Mark a room read (Story 3.9 receipts, Story 4.1, AD-14). The Rust core dispatches
+ * a public `m.read` receipt on the room's latest event through the receipt/typing
+ * signals seam — other Matrix clients observe the advance — and clears any manual
+ * `m.marked_unread` flag. Works for any inbox row whether or not its timeline is
+ * open. Best-effort: a dispatch failure is swallowed in the core (never a UI error),
+ * so this resolves even then. Callers may fire-and-forget and swallow rejections.
+ * Rejects with the {@link IpcError} envelope (`code: "timelineUnavailable"`) only on
+ * an unknown room/inactive account.
  */
 export async function markRoomRead(accountId: string, roomId: string): Promise<void> {
   await invoke<void>("mark_room_read", { accountId, roomId });
+}
+
+/**
+ * Manually mark a room unread (Story 4.1). The Rust core sets the `m.marked_unread`
+ * account-data flag (`Room::set_unread_flag(true)`) so the row renders unread and the
+ * flag syncs to the user's other Matrix clients. Best-effort: a dispatch failure is
+ * swallowed in the core (never a UI error), so this resolves even then. Callers may
+ * fire-and-forget and swallow rejections. Rejects with the {@link IpcError} envelope
+ * (`code: "timelineUnavailable"`) only on an unknown room/inactive account.
+ */
+export async function markRoomUnread(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("mark_room_unread", { accountId, roomId });
 }
 
 /**

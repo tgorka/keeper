@@ -25,11 +25,28 @@ export interface RoomSelection {
   roomId: string;
 }
 
+/**
+ * Key an optimistic-unread override by its owning account and room. Kept as a flat
+ * string so a plain `Map` can carry the overlay without nested lookups.
+ */
+export function unreadOverrideKey(accountId: string, roomId: string): string {
+  return `${accountId}|${roomId}`;
+}
+
 export interface RoomsState {
   /** The merged inbox window, exactly as Rust streamed it (recency order). */
   rooms: InboxRoomVm[];
   /** Total rooms across all accounts the servers know about, or `null`. */
   total: number | null;
+  /**
+   * Ephemeral optimistic-unread overlay (Story 4.1). Keyed by
+   * {@link unreadOverrideKey}, mapping to the *intended* `isUnread` value the user
+   * just chose from the row context menu. This is NOT a source of truth — it
+   * mirrors the send local-echo pattern: it lets a row flip within one frame while
+   * the authoritative Rust stream catches up, and each entry is dropped in
+   * `applyBatch` once the streamed VM for that room matches the intended value.
+   */
+  optimisticUnread: Map<string, boolean>;
   /**
    * The currently selected conversation, or `null` when none is open. Ephemeral
    * UI state (not mirrored from Rust) — it only records which room the
@@ -38,10 +55,70 @@ export interface RoomsState {
   selected: RoomSelection | null;
   /** Apply one streamed batch (its ops in sequence), updating `total`. */
   applyBatch: (batch: InboxBatch) => void;
+  /**
+   * Set an optimistic-unread override for a room (Story 4.1). Records the intended
+   * `isUnread` so the row renders it within one frame; `applyBatch` reconciles it
+   * away once the authoritative stream converges.
+   */
+  setOptimisticUnread: (accountId: string, roomId: string, isUnread: boolean) => void;
+  /**
+   * Drop a room's optimistic-unread override (Story 4.1). Used to revert the
+   * overlay when the mark command hard-rejects, so a phantom override the stream
+   * will never reconcile cannot persist.
+   */
+  clearOptimisticUnread: (accountId: string, roomId: string) => void;
   /** Select a conversation to open (or `null` to close). */
   selectRoom: (selection: RoomSelection | null) => void;
   /** Reset to the empty state (on unsubscribe / full sign-out). */
   clear: () => void;
+}
+
+/**
+ * The room's effective unread state: an active optimistic override wins, else the
+ * authoritative streamed `isUnread` (Story 4.1). The frontend never re-derives
+ * unread from events — this only lets the local echo lead the stream by a frame.
+ */
+export function effectiveIsUnread(
+  room: InboxRoomVm,
+  optimisticUnread: Map<string, boolean>,
+): boolean {
+  const override = optimisticUnread.get(unreadOverrideKey(room.accountId, room.roomId));
+  return override ?? room.isUnread;
+}
+
+/**
+ * Reconcile the optimistic overlay against the freshly-applied window. An override
+ * is dropped when the stream has caught up to it — either the room is present with
+ * an authoritative `isUnread` equal to the intended value (converged), or the room
+ * has left the window entirely (removed/archived elsewhere) and can no longer
+ * reconcile. This prevents stale overrides from leaking unboundedly or masking the
+ * authoritative state. Iterates the (tiny) override set, not the window. Returns the
+ * same map instance when nothing changed so the store can skip a needless update. Pure.
+ */
+function reconcileOptimisticUnread(
+  overrides: Map<string, boolean>,
+  rooms: InboxRoomVm[],
+): Map<string, boolean> {
+  if (overrides.size === 0) {
+    return overrides;
+  }
+  const authoritative = new Map<string, boolean>();
+  for (const room of rooms) {
+    authoritative.set(unreadOverrideKey(room.accountId, room.roomId), room.isUnread);
+  }
+  let next: Map<string, boolean> | null = null;
+  for (const [key, intended] of overrides) {
+    const auth = authoritative.get(key);
+    // Drop when the room is gone from the window (auth === undefined) or the
+    // stream now agrees with the intended value (converged).
+    if (auth === undefined || auth === intended) {
+      if (next === null) {
+        next = new Map(overrides);
+      }
+      next.delete(key);
+    }
+  }
+  return next ?? overrides;
 }
 
 /**
@@ -61,17 +138,40 @@ function applyOp(rooms: InboxRoomVm[], op: InboxOp): InboxRoomVm[] {
 export const roomsStore = createStore<RoomsState>()((set) => ({
   rooms: [],
   total: null,
+  optimisticUnread: new Map<string, boolean>(),
   selected: null,
   applyBatch: (batch) =>
-    set((state) => ({
-      rooms: batch.ops.reduce(applyOp, state.rooms),
-      total: batch.total ?? state.total,
-    })),
+    set((state) => {
+      const rooms = batch.ops.reduce(applyOp, state.rooms);
+      return {
+        rooms,
+        total: batch.total ?? state.total,
+        // Reconcile the overlay against the freshly-applied authoritative window:
+        // drop any override the stream has now caught up to (Story 4.1).
+        optimisticUnread: reconcileOptimisticUnread(state.optimisticUnread, rooms),
+      };
+    }),
+  setOptimisticUnread: (accountId, roomId, isUnread) =>
+    set((state) => {
+      const next = new Map(state.optimisticUnread);
+      next.set(unreadOverrideKey(accountId, roomId), isUnread);
+      return { optimisticUnread: next };
+    }),
+  clearOptimisticUnread: (accountId, roomId) =>
+    set((state) => {
+      const key = unreadOverrideKey(accountId, roomId);
+      if (!state.optimisticUnread.has(key)) {
+        return {};
+      }
+      const next = new Map(state.optimisticUnread);
+      next.delete(key);
+      return { optimisticUnread: next };
+    }),
   selectRoom: (selection) => set({ selected: selection }),
   // `selected` is deliberately preserved across an inbox `clear()` so refreshing
   // the streamed window (a Reset) does not close the open conversation.
   // Selection is reset explicitly via `selectRoom(null)` (e.g. on sign-out).
-  clear: () => set({ rooms: [], total: null }),
+  clear: () => set({ rooms: [], total: null, optimisticUnread: new Map<string, boolean>() }),
 }));
 
 /**
