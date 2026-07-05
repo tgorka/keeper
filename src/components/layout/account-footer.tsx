@@ -51,6 +51,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSignOut } from "@/hooks/use-sign-out";
 import { accountHueVar } from "@/lib/account-hue";
+import { initials } from "@/lib/account-initials";
 import { isBeeperAccount } from "@/lib/beeper";
 import type { AccountVm, ConnectionStatus } from "@/lib/ipc/client";
 import { useAccountStatus } from "@/lib/stores/account-status";
@@ -65,14 +66,6 @@ interface AccountFooterProps {
 }
 
 const FOCUS_RING = "focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none";
-
-/** The first character of the user id (without the leading `@`), uppercased, as
- * the avatar initials fallback. Empty ids fall back to `?`. */
-function initials(userId: string): string {
-  const stripped = userId.startsWith("@") ? userId.slice(1) : userId;
-  const first = stripped.trim().charAt(0);
-  return first ? first.toUpperCase() : "?";
-}
 
 /** The homeserver host for a resolved homeserver URL, or the raw string when it
  * cannot be parsed as a URL. */

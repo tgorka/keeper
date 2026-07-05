@@ -356,6 +356,14 @@ pub struct RoomVm {
     /// are surfaced separately as filter views. Not copied to [`InboxRoomVm`]; the
     /// merge drops `is_space` rooms before partitioning.
     pub is_space: bool,
+    /// The bridged-Network label for this room (Story 4.6, FR-24), resolved from
+    /// the room's MSC2346 `m.bridge` (or legacy `uk.half-shot.bridge`) state via
+    /// [`crate::bridge::room_bridge_network`] — "Telegram", "WhatsApp", "Signal", …
+    /// `None` for a native Matrix room (no bridge state); it then shows no badge and
+    /// is excluded from the distinct-Networks list. Copied through to
+    /// [`InboxRoomVm`] and used both for the avatar Network badge and the ephemeral
+    /// Network filter. Never fabricated — it is untrusted, length-capped state.
+    pub network: Option<String>,
 }
 
 /// One Matrix Space the user belongs to, surfaced as a filter view (Story 4.5,
@@ -395,6 +403,38 @@ pub struct SpaceVm {
 pub struct SpacesSnapshot {
     /// Every joined Space across all accounts, in stable account-id order.
     pub spaces: Vec<SpaceVm>,
+}
+
+/// One bridged Network connected in the merged inbox, surfaced as a filter view
+/// (Story 4.6, FR-24, AD-20).
+///
+/// Carries **only** the Network's display `name`, deduped by name across accounts —
+/// a Network is identified cross-account by its label (a Telegram bridge on two
+/// accounts is one Network row). Derived in the merger from the distinct non-`None`
+/// [`RoomVm::network`] values of the unfiltered merged set (name-sorted, native
+/// rooms excluded). The frontend renders a NETWORKS sidebar row per `NetworkVm`
+/// and, on select, pokes the ephemeral Network filter identified by `name`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NetworkVm {
+    /// The bridged Network's display name (the filter selection key).
+    pub name: String,
+}
+
+/// The full current distinct-Networks list, streamed as a whole-snapshot batch on
+/// the inbox subscription's sixth `Channel` (Story 4.6, AD-20).
+///
+/// Networks are few, so there is no diff protocol: each batch carries the complete
+/// deduped, name-sorted list derived from the *unfiltered* merged set, and the
+/// frontend replaces its list wholesale. Emitted on every merge `emit` (so it stays
+/// live with sync and stable regardless of an active Space/Network filter).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NetworksSnapshot {
+    /// Every distinct connected Network, deduped by name and name-sorted.
+    pub networks: Vec<NetworkVm>,
 }
 
 /// One index-based room-list operation mirroring an eyeball-im `VectorDiff`
@@ -1001,6 +1041,11 @@ pub struct InboxRoomVm {
     /// Inbox/Archive). The frontend renders this directly (Pin/Unpin gating) and
     /// never re-derives it.
     pub is_pinned: bool,
+    /// The bridged-Network label for this row (Story 4.6, FR-24), copied straight
+    /// through from [`RoomVm::network`]. `None` for a native Matrix room (no badge).
+    /// Drives the avatar Network badge and the ephemeral Network filter's retain;
+    /// the frontend renders the badge directly and never re-derives or re-filters it.
+    pub network: Option<String>,
 }
 
 /// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
@@ -1236,6 +1281,7 @@ mod tests {
             is_archived: false,
             is_favourite: false,
             is_pinned: false,
+            network: None,
         }
     }
 
@@ -1416,6 +1462,7 @@ mod tests {
             is_archived: false,
             is_favourite: false,
             is_space: false,
+            network: None,
         }
     }
 
@@ -1446,6 +1493,7 @@ mod tests {
             is_archived: false,
             is_favourite: false,
             is_space: false,
+            network: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");
@@ -1485,6 +1533,62 @@ mod tests {
         assert!(json.contains("\"spaces\":["), "json was: {json}");
         let back: SpacesSnapshot = serde_json::from_str(&json).expect("deserialize snapshot");
         assert_eq!(back, snapshot);
+    }
+
+    #[test]
+    fn network_vm_round_trips_camel_case() {
+        let vm = NetworkVm {
+            name: "Telegram".to_owned(),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize network vm");
+        assert!(json.contains("\"name\":\"Telegram\""), "json was: {json}");
+        let back: NetworkVm = serde_json::from_str(&json).expect("deserialize network vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn networks_snapshot_round_trips() {
+        let snapshot = NetworksSnapshot {
+            networks: vec![
+                NetworkVm {
+                    name: "Signal".to_owned(),
+                },
+                NetworkVm {
+                    name: "Telegram".to_owned(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        assert!(json.contains("\"networks\":["), "json was: {json}");
+        let back: NetworksSnapshot = serde_json::from_str(&json).expect("deserialize snapshot");
+        assert_eq!(back, snapshot);
+    }
+
+    #[test]
+    fn room_vm_network_round_trips() {
+        let vm = RoomVm {
+            network: Some("Telegram".to_owned()),
+            ..sample_room()
+        };
+        let json = serde_json::to_string(&vm).expect("serialize");
+        assert!(
+            json.contains("\"network\":\"Telegram\""),
+            "json was: {json}"
+        );
+        let back: RoomVm = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn inbox_room_vm_network_round_trips() {
+        let vm = InboxRoomVm {
+            network: Some("Signal".to_owned()),
+            ..sample_inbox_room()
+        };
+        let json = serde_json::to_string(&vm).expect("serialize");
+        assert!(json.contains("\"network\":\"Signal\""), "json was: {json}");
+        let back: InboxRoomVm = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, vm);
     }
 
     #[test]

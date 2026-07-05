@@ -24,6 +24,8 @@ export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { MediaKindVm } from "./gen/MediaKindVm";
 export type { MediaVm } from "./gen/MediaVm";
+export type { NetworksSnapshot } from "./gen/NetworksSnapshot";
+export type { NetworkVm } from "./gen/NetworkVm";
 export type { PaginationState } from "./gen/PaginationState";
 export type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 export type { PingVm } from "./gen/PingVm";
@@ -50,6 +52,7 @@ import type { BackupStatus } from "./gen/BackupStatus";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 import type { InboxBatch } from "./gen/InboxBatch";
+import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
@@ -269,9 +272,11 @@ export async function unsubscribeRoomList(accountId: string, id: number): Promis
  *
  * All channels arm their `onmessage` before `invoke` (the ordering is
  * load-bearing per AD-8, so no batch sent by a spawned task is dropped). The Rust
- * command's params are `channel` (inbox), `archive`, `pins`, `favourites`, and
- * `spaces`. The fifth channel (Story 4.5) delivers the aggregated Space list as a
- * whole {@link SpacesSnapshot} (no diff protocol — the frontend replaces its list).
+ * command's params are `channel` (inbox), `archive`, `pins`, `favourites`,
+ * `spaces`, and `networks`. The fifth channel (Story 4.5) delivers the aggregated
+ * Space list as a whole {@link SpacesSnapshot}; the sixth (Story 4.6) delivers the
+ * distinct-Networks list as a whole {@link NetworksSnapshot} (no diff protocol for
+ * either — the frontend replaces its list).
  */
 export async function subscribeInbox(
   onInbox: (batch: InboxBatch) => void,
@@ -279,18 +284,28 @@ export async function subscribeInbox(
   onPins: (batch: InboxBatch) => void,
   onFavourites: (batch: InboxBatch) => void,
   onSpaces: (snapshot: SpacesSnapshot) => void,
+  onNetworks: (snapshot: NetworksSnapshot) => void,
 ): Promise<number> {
   const channel = new Channel<InboxBatch>();
   const archive = new Channel<InboxBatch>();
   const pins = new Channel<InboxBatch>();
   const favourites = new Channel<InboxBatch>();
   const spaces = new Channel<SpacesSnapshot>();
+  const networks = new Channel<NetworksSnapshot>();
   channel.onmessage = onInbox;
   archive.onmessage = onArchive;
   pins.onmessage = onPins;
   favourites.onmessage = onFavourites;
   spaces.onmessage = onSpaces;
-  return await invoke<number>("inbox_subscribe", { channel, archive, pins, favourites, spaces });
+  networks.onmessage = onNetworks;
+  return await invoke<number>("inbox_subscribe", {
+    channel,
+    archive,
+    pins,
+    favourites,
+    spaces,
+    networks,
+  });
 }
 
 /**
@@ -307,6 +322,20 @@ export async function setSpaceFilter(
   spaceId: string | null,
 ): Promise<void> {
   await invoke<void>("set_space_filter", { accountId, spaceId });
+}
+
+/**
+ * Set (or clear) the ephemeral Network filter on the merged inbox (Story 4.6,
+ * FR-24). Pass a Network `name` to narrow every inbox window to rooms bridged to
+ * that Network (the Rust merger re-emits all four windows filtered, across all
+ * accounts — the selection is name-keyed); pass `null` to clear and restore the
+ * full inbox. Composes AND with any active Space filter. The selection is ephemeral
+ * — never persisted, cleared on relaunch. Best-effort: callers may fire-and-forget
+ * and swallow rejection (the stream is truth). Rejects with the {@link IpcError}
+ * envelope only on an unexpected backend failure.
+ */
+export async function setNetworkFilter(network: string | null): Promise<void> {
+  await invoke<void>("set_network_filter", { network });
 }
 
 /**

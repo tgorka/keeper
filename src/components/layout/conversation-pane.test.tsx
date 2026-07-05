@@ -74,8 +74,12 @@ vi.mock("@tauri-apps/api/webview", () => ({
 }));
 
 import { ConversationPane } from "@/components/layout/conversation-pane";
+import type { InboxRoomVm } from "@/lib/ipc/client";
+import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { attachmentsStore } from "@/lib/stores/attachments";
 import { composerStore } from "@/lib/stores/composer";
+import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
+import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
 
 const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -1375,5 +1379,72 @@ describe("ConversationPane — receipts, typing, pagination (Story 3.9)", () => 
       ).toBeInTheDocument(),
     );
     expect(screen.queryByText("Older history loads from your homeserver")).not.toBeInTheDocument();
+  });
+});
+
+function headerRoom(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
+  return {
+    accountId: account.accountId,
+    hueIndex: 0,
+    roomId: "!room:example.org",
+    displayName: "Alice Room",
+    lastMessage: null,
+    timestamp: null,
+    avatarUrl: null,
+    isUnread: false,
+    mentionCount: 0,
+    isArchived: false,
+    isPinned: false,
+    isFavourite: false,
+    network: null,
+    ...overrides,
+  };
+}
+
+describe("ConversationPane — header attribution (Story 4.6)", () => {
+  beforeEach(() => {
+    pinsRoomsStore.getState().clear();
+    favoritesRoomsStore.getState().clear();
+    archiveRoomsStore.getState().clear();
+    subscribeTimeline.mockResolvedValue(1);
+  });
+
+  afterEach(() => {
+    pinsRoomsStore.getState().clear();
+    favoritesRoomsStore.getState().clear();
+    archiveRoomsStore.getState().clear();
+  });
+
+  it("shows the room avatar (with Network badge), name, and account chip", () => {
+    accountsStore.getState().hydrateAll([account]);
+    roomsStore.getState().applyBatch({
+      ops: [{ op: "reset", rooms: [headerRoom({ network: "Telegram" })] }],
+      total: 1,
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+
+    // Room display name in the header.
+    expect(screen.getByText("Alice Room")).toBeInTheDocument();
+    // The Network badge comes free from the reused RoomAvatar.
+    expect(screen.getByLabelText("Telegram network")).toHaveTextContent("T");
+    // The account-initial chip (from the owning account's user id) — queried by a
+    // stable testid so it never collides with other "A" text in the header.
+    expect(screen.getByTestId("account-initial-chip")).toHaveTextContent("A");
+  });
+
+  it("degrades to the account chip alone when the room VM is not in any window", () => {
+    accountsStore.getState().hydrateAll([account]);
+    // No room streamed into any window; only the selection points at it.
+    roomsStore
+      .getState()
+      .selectRoom({ accountId: account.accountId, roomId: "!ghost:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+
+    // No room name / no Network badge (VM absent) ...
+    expect(screen.queryByText("Alice Room")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/network$/)).not.toBeInTheDocument();
+    // ... but the account-initial chip still renders (never a crash).
+    expect(screen.getByTestId("account-initial-chip")).toHaveTextContent("A");
   });
 });

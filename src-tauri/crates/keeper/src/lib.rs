@@ -99,6 +99,7 @@ pub fn run() {
             ipc::unpin_room,
             ipc::reorder_pins,
             ipc::set_space_filter,
+            ipc::set_network_filter,
             ipc::set_typing,
             ipc::paginate_backwards,
             ipc::typing_subscribe,

@@ -21,6 +21,7 @@ function room(
     isArchived: false,
     isPinned: false,
     isFavourite: false,
+    network: null,
     ...overrides,
   };
 }

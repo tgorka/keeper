@@ -52,6 +52,7 @@ function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
     isArchived: false,
     isPinned: false,
     isFavourite: false,
+    network: null,
     ...overrides,
   };
 }
@@ -417,5 +418,15 @@ describe("ChatRow", () => {
     await waitFor(() => {
       expect(roomsStore.getState().optimisticUnread.has("acctB|!xyz:example.org")).toBe(false);
     });
+  });
+
+  it("renders the Network badge on a bridged row (Story 4.6)", () => {
+    render(<ChatRow room={room({ network: "Telegram" })} />);
+    expect(screen.getByLabelText("Telegram network")).toHaveTextContent("T");
+  });
+
+  it("renders no Network badge on a native row", () => {
+    render(<ChatRow room={room({ network: null })} />);
+    expect(screen.queryByLabelText(/network$/)).not.toBeInTheDocument();
   });
 });

@@ -44,7 +44,7 @@ use crate::bridge;
 use crate::error::{
     AccountError, BackupError, CoreError, InboxError, MediaError, SendError, TimelineError,
 };
-use crate::inbox::{InboxMerger, SpacesSink};
+use crate::inbox::{InboxMerger, NetworksSink, SpacesSink};
 use crate::media::{self, MediaBytes, MediaHandle, MediaVariant};
 use crate::platform::Platform;
 use crate::registry;
@@ -315,6 +315,10 @@ impl AccountManager {
     /// existing inbox subscription (e.g. the frontend re-subscribes after adding an
     /// account) first tears the old one down. Adding the Nth account is identical
     /// to the 2nd — no count limit.
+    // Six sinks (Inbox/Archive/Pins/Favorites/Spaces/Networks) plus `self` and the
+    // platform each cross the IPC boundary as a distinct stream; grouping them into a
+    // struct would only obscure the one-to-one channel mapping.
+    #[allow(clippy::too_many_arguments)]
     pub async fn subscribe_inbox(
         &self,
         platform: &Arc<dyn Platform>,
@@ -323,6 +327,7 @@ impl AccountManager {
         pins_sink: InboxSink,
         favourites_sink: InboxSink,
         spaces_sink: SpacesSink,
+        networks_sink: NetworksSink,
     ) -> Result<u64, CoreError> {
         // Only one inbox subscription at a time: tear down any prior one so its
         // producers stop feeding a stale merger/channel.
@@ -340,6 +345,7 @@ impl AccountManager {
             favourites_sink,
             pins,
             spaces_sink,
+            networks_sink,
         );
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -1779,6 +1785,19 @@ impl AccountManager {
         }
     }
 
+    /// Set (or clear) the ephemeral Network filter on the live merger (Story 4.6).
+    /// `network` is `Some(name)` to narrow every inbox window to rooms bridged to
+    /// that Network (across all accounts — the selection is name-keyed), or `None`
+    /// to restore the full inbox. Composes AND with any active Space filter.
+    /// Mirrors [`Self::set_space_filter`]'s poke-the-merger shape: a no-active-inbox
+    /// case is a harmless no-op (the filter is ephemeral, so nothing to persist).
+    pub async fn set_network_filter(&self, network: Option<String>) {
+        let inbox = self.inbox.lock().await;
+        if let Some(handle) = inbox.as_ref() {
+            handle.merger.set_network_filter(network).await;
+        }
+    }
+
     /// Set (or clear) the account's typing notice in the room through the
     /// receipt/typing signals seam (Story 3.9, AD-14). Resolves the account's live
     /// `Room` and delegates to [`signals::set_typing`]. Best-effort: a dispatch
@@ -2792,6 +2811,13 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
     // excludes Space rooms from all four chat windows (Story 4.5) — Spaces are
     // containers, surfaced separately as filter views.
     let is_space = item.is_space();
+    // Resolve the bridged-Network label from the room's local `m.bridge`/legacy
+    // bridge state (Story 4.6) via the same untrusted, length-capped resolver the
+    // delete confirmation uses (`room_network_label` at ~L1349). `RoomListItem`
+    // derefs to `matrix_sdk::Room`, so the `&Room` handle comes free. Reads local
+    // state only (no `/hierarchy` or network fetch); a native room resolves to
+    // `None` and shows no badge / is excluded from the Networks list.
+    let network = bridge::room_bridge_network(item).await;
 
     RoomVm {
         room_id,
@@ -2804,6 +2830,7 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
         is_archived,
         is_favourite,
         is_space,
+        network,
     }
 }
 
@@ -2988,6 +3015,7 @@ mod tests {
             is_archived: false,
             is_favourite: false,
             is_space: false,
+            network: None,
         }
     }
 

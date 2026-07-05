@@ -4,11 +4,13 @@
  * One source of truth for rendering a room's avatar: a browser-loadable image
  * when present, an initials fallback otherwise. Used at `size="lg"` in the 64 px
  * chat row and at `size="xl"` (44 px) in the Pins strip so both surfaces stay
- * pixel-consistent. The overlaid Network badge is intentionally NOT rendered yet —
- * it arrives with resolved Network identity in Story 4.6 (FR-24 attribution); a
- * meaningless placeholder dot would visually regress every existing chat row.
+ * pixel-consistent. When the room is bridged (`network !== null`), a uniform 16 px
+ * neutral Network badge (Story 4.6, FR-24) is overlaid bottom-right showing the
+ * Network label's first code point — the same avatar (and thus badge) is reused in
+ * the conversation header. A native Matrix room (`network === null`) shows no badge.
+ * Network identity is never rendered as per-row/pane coloring (UX-DR3).
  */
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Avatar, AvatarBadge, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import type { InboxRoomVm } from "@/lib/ipc/client";
 
 /**
@@ -40,6 +42,25 @@ export function RoomAvatar({ room, size }: RoomAvatarProps) {
     <Avatar size={size}>
       {httpAvatar !== null && <AvatarImage src={httpAvatar} alt="" />}
       <AvatarFallback>{roomInitials(room.displayName)}</AvatarFallback>
+      {/* Bridged-Network badge (Story 4.6, FR-24): a uniform 16 px neutral chip
+          overlaid bottom-right, showing the Network label's first code point (labels
+          are ASCII protocol names like Telegram/Signal). Same neutral color for every
+          Network (never per-Network coloring, never the primary/mention accent).
+          Rendered only when the room is bridged. */}
+      {room.network !== null && (
+        <AvatarBadge
+          // `size-4!` (important) forces the uniform 16 px badge across every avatar
+          // size: `AvatarBadge`'s own `group-data-[size=lg|xl]/avatar:size-3(.5)`
+          // variants have higher specificity than a plain `size-4` and would otherwise
+          // shrink the badge to 12/14 px on the `lg` (row/header) and `xl` (Pins strip)
+          // avatars this badge is used on.
+          className="size-4! bg-secondary text-[9px] text-secondary-foreground"
+          aria-label={`${room.network} network`}
+          title={room.network}
+        >
+          {[...room.network][0]?.toUpperCase() ?? ""}
+        </AvatarBadge>
+      )}
     </Avatar>
   );
 }

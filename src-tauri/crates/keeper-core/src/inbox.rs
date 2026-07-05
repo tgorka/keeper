@@ -24,7 +24,10 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::vm::{InboxBatch, InboxOp, InboxRoomVm, RoomListBatch, RoomVm, SpaceVm, SpacesSnapshot};
+use crate::vm::{
+    InboxBatch, InboxOp, InboxRoomVm, NetworkVm, NetworksSnapshot, RoomListBatch, RoomVm, SpaceVm,
+    SpacesSnapshot,
+};
 
 /// Sink that receives each produced [`InboxBatch`]. The shell wraps a Tauri
 /// `Channel::send`; tests capture into a vector. Returns `true` if the batch was
@@ -37,6 +40,14 @@ pub type InboxSink = Box<dyn Fn(InboxBatch) -> bool + Send + Sync>;
 /// [`InboxSink`] but carries the whole Space list (no diff protocol — Spaces are
 /// few, so the frontend replaces its list wholesale).
 pub type SpacesSink = Box<dyn Fn(SpacesSnapshot) -> bool + Send + Sync>;
+
+/// Sink that receives each produced [`NetworksSnapshot`] (Story 4.6). The shell
+/// wraps a Tauri `Channel::send`; tests capture into a vector. Returns `true` if
+/// the snapshot was delivered, `false` if the channel is closed. Analogous to
+/// [`SpacesSink`] but carries the whole distinct-Networks list, derived from the
+/// unfiltered merged set on each `emit` (no producer — the Networks list falls out
+/// of the merge).
+pub type NetworksSink = Box<dyn Fn(NetworksSnapshot) -> bool + Send + Sync>;
 
 /// One account's contribution to the merged inbox: its opaque id, hue index, and
 /// the current room window it is streaming.
@@ -93,6 +104,16 @@ struct MergeState {
     /// for the unfiltered inbox (Story 4.5). Ephemeral view state (no persistence).
     /// Set/cleared out-of-band by [`InboxMerger::set_space_filter`].
     selected_space: Option<(String, String)>,
+    /// Receives the whole distinct-Networks list as a [`NetworksSnapshot`] (Story
+    /// 4.6). Derived in [`emit`] from the *unfiltered* merged set (distinct non-`None`
+    /// `network`, deduped by name, name-sorted) and pushed on every emit, so it stays
+    /// live with sync and stable regardless of the active Space/Network filter.
+    networks_sink: NetworksSink,
+    /// The active Network filter, identified by Network name (cross-account), or
+    /// `None` for the unfiltered inbox (Story 4.6). Ephemeral view state (no
+    /// persistence). Set/cleared out-of-band by [`InboxMerger::set_network_filter`].
+    /// Composes AND with `selected_space` (Network retain runs after the Space retain).
+    selected_network: Option<String>,
     /// Set once any sink reports its channel is closed, so later producer
     /// updates stop trying to emit.
     closed: bool,
@@ -120,6 +141,7 @@ impl InboxMerger {
         favourites_sink: InboxSink,
         pins: HashMap<(String, String), i64>,
         spaces_sink: SpacesSink,
+        networks_sink: NetworksSink,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(MergeState {
@@ -133,6 +155,8 @@ impl InboxMerger {
                 account_spaces: HashMap::new(),
                 space_children: HashMap::new(),
                 selected_space: None,
+                networks_sink,
+                selected_network: None,
                 closed: false,
             })),
         }
@@ -240,6 +264,19 @@ impl InboxMerger {
         emit(&mut state);
     }
 
+    /// Set (or clear) the active Network filter and re-emit all four windows (Story
+    /// 4.6). `Some(name)` narrows every window to rooms bridged to that Network
+    /// (cross-account — the selection is name-keyed); `None` restores the full
+    /// inbox. Composes AND with any active Space filter (the Network retain runs
+    /// after the Space retain in [`emit`]). Ephemeral — no persistence. Best-effort
+    /// re-emit as in [`Self::set_space_filter`]: a no-active-subscription case is a
+    /// harmless no-op.
+    pub async fn set_network_filter(&self, network: Option<String>) {
+        let mut state = self.inner.lock().await;
+        state.selected_network = network;
+        emit(&mut state);
+    }
+
     /// Apply one account's per-account [`RoomListBatch`] to its slot, then
     /// re-merge and emit. Returns `false` once the output channel is closed so
     /// the caller's producer can stop.
@@ -277,6 +314,25 @@ fn emit(state: &mut MergeState) -> bool {
     // `merge` already drops `is_space` rooms (containers, never chats) so they
     // never appear in any of the four windows (Story 4.5).
     let mut merged = merge(&state.accounts);
+    // Derive the distinct-Networks list from the *unfiltered* merged set (Story
+    // 4.6), BEFORE any Space/Network retain, so the NETWORKS sidebar list stays
+    // complete and stable regardless of the active filter (it is what the user can
+    // filter *to*, not what is currently shown). Distinct non-`None` `network`,
+    // deduped by name, name-sorted; native rooms (`None`) excluded. Snapshot is
+    // pushed LAST (see end of `emit`).
+    let network_names = distinct_network_names(&merged);
+    // Self-heal the ephemeral Network selection: if the selected Network is no
+    // longer present anywhere in the merged set (its last bridged room left, or an
+    // owner account signed out), clear it. This keeps filter validity
+    // Rust-authoritative (AD-20) — the merger owns the selection just as it owns the
+    // distinct-Networks set — mirroring the `selected_space` cleanup in
+    // `remove_account`, and prevents an indefinitely-empty inbox on a dead
+    // selection. The Network retain below reads the (possibly cleared) selection.
+    if let Some(sel) = &state.selected_network {
+        if !network_names.iter().any(|name| name == sel) {
+            state.selected_network = None;
+        }
+    }
     // Apply the ephemeral Space filter *before* the pins/favorites/inbox/archive
     // partition (Story 4.5), so precedence (Pins > Favorites > Archive/Inbox) and
     // per-window recency order are preserved within the filtered subset and each
@@ -291,6 +347,15 @@ fn emit(state: &mut MergeState) -> bool {
             .get(&(sel_account.clone(), sel_space.clone()))
             .unwrap_or(&empty);
         merged.retain(|room| &room.account_id == sel_account && children.contains(&room.room_id));
+    }
+    // Apply the ephemeral Network filter immediately AFTER the Space retain (Story
+    // 4.6) so the two compose as AND: both narrow the same pre-partition merged set,
+    // and precedence (Pins > Favorites > Archive/Inbox) and per-window recency are
+    // preserved within the intersection. Name-keyed (cross-account); a native room
+    // (`network == None`) never matches a selected Network. An unknown/empty match
+    // yields an empty set, correctly emptying every window.
+    if let Some(selected) = &state.selected_network {
+        merged.retain(|room| room.network.as_deref() == Some(selected.as_str()));
     }
     // Split off pinned rooms first (they win over favourites/archive/unread), then
     // partition the rest. Recency order is preserved within each window.
@@ -354,7 +419,12 @@ fn emit(state: &mut MergeState) -> bool {
         tracing::info!("pins/favorites/inbox/archive channel closed; stopping merged emissions");
         return false;
     }
-    true
+    // Push the distinct-Networks snapshot LAST — after the four windows are emitted
+    // — so a closed networks channel can never suppress a window tick (the windows
+    // are the primary surface; the Networks sidebar list is secondary). Returns the
+    // live/closed state so a networks-channel close still stops future emissions.
+    push_networks(network_names, &state.networks_sink, &mut state.closed);
+    !state.closed
 }
 
 /// Emit the aggregated Space list as one whole [`SpacesSnapshot`] into the spaces
@@ -379,6 +449,39 @@ fn emit_spaces(state: &mut MergeState) -> bool {
         return false;
     }
     true
+}
+
+/// The authoritative distinct-Networks set derived from the *unfiltered* merged set
+/// (Story 4.6): each row's non-`None` `network` (native rooms excluded), deduped by
+/// name and name-sorted, returned as an owned `Vec<String>`. The merger both streams
+/// this set (via [`push_networks`]) and validates `selected_network` against it (the
+/// self-heal in [`emit`]), so a filter can never survive its Network's disappearance.
+/// Two bridges exposing the same protocol displayname collapse into one name-keyed
+/// Network BY DESIGN — the label is the cross-account identity key.
+fn distinct_network_names(merged: &[InboxRoomVm]) -> Vec<String> {
+    let mut names: Vec<String> = merged
+        .iter()
+        .filter_map(|room| room.network.clone())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Push the given distinct-Networks list as one whole [`NetworksSnapshot`] into the
+/// networks sink (Story 4.6). No diff protocol — the snapshot replaces the
+/// frontend's list. Records channel closure into `closed` (setting it + tracing on
+/// close) like [`emit`].
+fn push_networks(names: Vec<String>, sink: &NetworksSink, closed: &mut bool) {
+    if *closed {
+        return;
+    }
+    let networks = names.into_iter().map(|name| NetworkVm { name }).collect();
+    let snapshot = NetworksSnapshot { networks };
+    if !sink(snapshot) {
+        *closed = true;
+        tracing::info!("networks channel closed; stopping merged emissions");
+    }
 }
 
 /// Look up a room's pin order in the pin map, or `None` if it is not pinned.
@@ -444,6 +547,9 @@ fn to_inbox_room(account_id: &str, hue_index: u8, room: &RoomVm) -> InboxRoomVm 
         // `is_pinned` is set in `emit` from the merger's pin map (the pin state is
         // merger-owned, not SDK-sourced); a freshly merged row defaults unpinned.
         is_pinned: false,
+        // The bridged-Network label is SDK/bridge-sourced (from local `m.bridge`
+        // state, resolved on the `RoomVm`), copied straight through (Story 4.6).
+        network: room.network.clone(),
     }
 }
 
@@ -515,6 +621,15 @@ mod tests {
             is_archived: false,
             is_favourite: false,
             is_space: false,
+            network: None,
+        }
+    }
+
+    /// A room bridged to `network` for Network filter/snapshot tests (Story 4.6).
+    fn room_net(id: &str, ts: Option<i64>, network: &str) -> RoomVm {
+        RoomVm {
+            network: Some(network.to_owned()),
+            ..room(id, ts)
         }
     }
 
@@ -595,6 +710,7 @@ mod tests {
             is_archived: true,
             is_favourite: true,
             is_space: false,
+            network: Some("Telegram".to_owned()),
         };
         let inbox_room = to_inbox_room("acctA", 4, &src);
         assert!(inbox_room.is_unread);
@@ -604,6 +720,8 @@ mod tests {
         assert!(inbox_room.is_favourite);
         // `to_inbox_room` defaults unpinned; `emit` stamps the pin flag.
         assert!(!inbox_room.is_pinned);
+        // The bridged-Network label is copied straight through (Story 4.6).
+        assert_eq!(inbox_room.network.as_deref(), Some("Telegram"));
         assert_eq!(inbox_room.account_id, "acctA");
         assert_eq!(inbox_room.hue_index, 4);
     }
@@ -683,43 +801,44 @@ mod tests {
     /// Shared capture buffer for the spaces sink's emitted snapshots.
     type CapturedSpaces = Arc<StdMutex<Vec<SpacesSnapshot>>>;
 
-    /// Build a merger over five capture vecs (inbox, archive, pins, favourites,
-    /// spaces) so partition tests can assert each window independently. Seeds an
-    /// empty pin map; tests that exercise pins push a map via
-    /// [`InboxMerger::update_pins`].
-    fn capturing_merger() -> (
+    /// Shared capture buffer for the networks sink's emitted snapshots (Story 4.6).
+    type CapturedNetworks = Arc<StdMutex<Vec<NetworksSnapshot>>>;
+
+    /// The six capture handles a [`capturing_merger`] returns, alongside the merger:
+    /// `(merger, inbox, archive, pins, favourites, spaces, networks)`.
+    type CapturingMerger = (
         InboxMerger,
         Captured,
         Captured,
         Captured,
         Captured,
         CapturedSpaces,
-    ) {
+        CapturedNetworks,
+    );
+
+    /// Build a merger over six capture vecs (inbox, archive, pins, favourites,
+    /// spaces, networks) so partition tests can assert each window independently.
+    /// Seeds an empty pin map; tests that exercise pins push a map via
+    /// [`InboxMerger::update_pins`].
+    fn capturing_merger() -> CapturingMerger {
         capturing_merger_with_pins(HashMap::new())
     }
 
     /// Like [`capturing_merger`] but seeds the merger's pin map. Returns captures
-    /// in `(merger, inbox, archive, pins, favourites, spaces)` order.
-    fn capturing_merger_with_pins(
-        pins: HashMap<(String, String), i64>,
-    ) -> (
-        InboxMerger,
-        Captured,
-        Captured,
-        Captured,
-        Captured,
-        CapturedSpaces,
-    ) {
+    /// in `(merger, inbox, archive, pins, favourites, spaces, networks)` order.
+    fn capturing_merger_with_pins(pins: HashMap<(String, String), i64>) -> CapturingMerger {
         let inbox: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let archive: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let pins_cap: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let favourites: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let spaces: CapturedSpaces = Arc::new(StdMutex::new(Vec::new()));
+        let networks: CapturedNetworks = Arc::new(StdMutex::new(Vec::new()));
         let inbox_store = inbox.clone();
         let archive_store = archive.clone();
         let pins_store = pins_cap.clone();
         let favourites_store = favourites.clone();
         let spaces_store = spaces.clone();
+        let networks_store = networks.clone();
         let merger = InboxMerger::new(
             Box::new(move |batch: InboxBatch| {
                 inbox_store.lock().expect("lock").push(batch);
@@ -742,8 +861,21 @@ mod tests {
                 spaces_store.lock().expect("lock").push(snapshot);
                 true
             }),
+            Box::new(move |snapshot: NetworksSnapshot| {
+                networks_store.lock().expect("lock").push(snapshot);
+                true
+            }),
         );
-        (merger, inbox, archive, pins_cap, favourites, spaces)
+        (
+            merger, inbox, archive, pins_cap, favourites, spaces, networks,
+        )
+    }
+
+    /// Network names of the last captured [`NetworksSnapshot`] in `store`, or a panic.
+    fn last_networks_names(store: &CapturedNetworks) -> Vec<String> {
+        let snapshots = store.lock().expect("lock");
+        let last = snapshots.last().expect("a snapshot");
+        last.networks.iter().map(|n| n.name.clone()).collect()
     }
 
     /// Space ids of the last captured [`SpacesSnapshot`] in `store`, or a panic.
@@ -786,7 +918,7 @@ mod tests {
 
     #[tokio::test]
     async fn merger_emits_reset_on_add_batch_and_remove() {
-        let (merger, inbox, _archive, _pins, _favourites, _spaces) = capturing_merger();
+        let (merger, inbox, _archive, _pins, _favourites, _spaces, _networks) = capturing_merger();
 
         merger.register_account("acctA", 0).await;
         merger.register_account("acctB", 1).await;
@@ -841,7 +973,7 @@ mod tests {
         //    B archived read (200), A !archived unread (100)]
         // partitions to inbox = [D, C, A] (!is_archived || is_unread) and
         // archive = [B] (is_archived && !is_unread).
-        let (merger, inbox, archive, _pins, _favourites, _spaces) = capturing_merger();
+        let (merger, inbox, archive, _pins, _favourites, _spaces, _networks) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -904,7 +1036,7 @@ mod tests {
         //   inbox      = [D, E]     (!pinned && !fav && (!archived || unread))
         //   archive    = [C]        (!pinned && !fav && archived && !unread)
         let pins = pin_map(&[("acctA", "!a", 0)]);
-        let (merger, inbox, archive, pins_cap, favourites, _spaces) =
+        let (merger, inbox, archive, pins_cap, favourites, _spaces, _networks) =
             capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger
@@ -951,7 +1083,7 @@ mod tests {
         // transient sync state where a room is both must resolve to Favorites: the
         // `!is_favourite` guard on the archive/inbox predicates keeps the windows
         // strictly disjoint (favourite wins over archive here).
-        let (merger, inbox, archive, _pins, favourites, _spaces) = capturing_merger();
+        let (merger, inbox, archive, _pins, favourites, _spaces, _networks) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -977,7 +1109,7 @@ mod tests {
     async fn favourite_leaves_inbox_and_returns_on_unfavourite() {
         // Favouriting removes a room from the chronological Inbox flow; clearing
         // the favourite tag returns it to its recency position (SDK re-emit).
-        let (merger, inbox, _archive, _pins, favourites, _spaces) = capturing_merger();
+        let (merger, inbox, _archive, _pins, favourites, _spaces, _networks) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -1033,7 +1165,7 @@ mod tests {
         //   inbox = [D, E], archive = [C]. A pinned room stays in Pins even when
         //   archived/unread (B is pinned-and-archived here to prove pins win).
         let pins = pin_map(&[("acctA", "!a", 1), ("acctA", "!b", 0)]);
-        let (merger, inbox, archive, pins_cap, _favourites, _spaces) =
+        let (merger, inbox, archive, pins_cap, _favourites, _spaces, _networks) =
             capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger
@@ -1076,7 +1208,7 @@ mod tests {
         // order by (account_id, room_id) — never by recency — and stay put when
         // recency changes, so the strip never flips under the user.
         let pins = pin_map(&[("acctA", "!m", 5), ("acctA", "!n", 5)]);
-        let (merger, _inbox, _archive, pins_cap, _favourites, _spaces) =
+        let (merger, _inbox, _archive, pins_cap, _favourites, _spaces, _networks) =
             capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger
@@ -1123,7 +1255,7 @@ mod tests {
         // A pinned room keeps its Pins-window position when an unpinned chat gets
         // newer activity (only the Inbox window re-orders).
         let pins = pin_map(&[("acctA", "!p", 0)]);
-        let (merger, inbox, _archive, pins_cap, _favourites, _spaces) =
+        let (merger, inbox, _archive, pins_cap, _favourites, _spaces, _networks) =
             capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger
@@ -1168,7 +1300,8 @@ mod tests {
     #[tokio::test]
     async fn update_pins_re_emits_all_three_windows() {
         // Start with no pins: all rooms land in the Inbox window.
-        let (merger, inbox, archive, pins_cap, _favourites, _spaces) = capturing_merger();
+        let (merger, inbox, archive, pins_cap, _favourites, _spaces, _networks) =
+            capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -1212,7 +1345,7 @@ mod tests {
         // A Space room (`is_space`) is a container, never a chat — it must not
         // appear in Inbox/Archive/Pins/Favorites, even if pinned/favourited/archived.
         let pins = pin_map(&[("acctA", "!space", 0)]);
-        let (merger, inbox, archive, pins_cap, favourites, _spaces) =
+        let (merger, inbox, archive, pins_cap, favourites, _spaces, _networks) =
             capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger
@@ -1245,7 +1378,7 @@ mod tests {
     async fn update_spaces_emits_snapshot_in_account_id_order() {
         // Two accounts each contribute a Space; the aggregated snapshot flattens in
         // stable account-id order.
-        let (merger, _inbox, _archive, _pins, _favourites, spaces) = capturing_merger();
+        let (merger, _inbox, _archive, _pins, _favourites, spaces, _networks) = capturing_merger();
         merger.register_account("acctB", 1).await;
         merger.register_account("acctA", 0).await;
         merger
@@ -1273,7 +1406,7 @@ mod tests {
         // another account. With the filter set, only `!s`'s members appear, and the
         // four-way partition + precedence is preserved within the subset.
         let pins = pin_map(&[("acctA", "!a", 0)]);
-        let (merger, inbox, archive, pins_cap, favourites, _spaces) =
+        let (merger, inbox, archive, pins_cap, favourites, _spaces, _networks) =
             capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger.register_account("acctB", 1).await;
@@ -1342,7 +1475,7 @@ mod tests {
     #[tokio::test]
     async fn selected_space_with_no_members_empties_windows() {
         // A selected Space whose membership is empty yields empty windows.
-        let (merger, inbox, _archive, _pins, _favourites, _spaces) = capturing_merger();
+        let (merger, inbox, _archive, _pins, _favourites, _spaces, _networks) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -1372,7 +1505,7 @@ mod tests {
     async fn remove_account_clears_a_selection_it_owned() {
         // Signing out the account that owns the active Space filter clears the
         // filter, drops its Spaces from the snapshot, and re-emits full windows.
-        let (merger, inbox, _archive, _pins, _favourites, spaces) = capturing_merger();
+        let (merger, inbox, _archive, _pins, _favourites, spaces, _networks) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger.register_account("acctB", 1).await;
         merger
@@ -1424,7 +1557,7 @@ mod tests {
         // `RoomUpdates`) must refresh only the spaces snapshot — the four inbox
         // windows cannot change, so they are NOT re-emitted (avoids doubling inbox
         // emissions per sync tick).
-        let (merger, inbox, archive, pins_cap, favourites, spaces) = capturing_merger();
+        let (merger, inbox, archive, pins_cap, favourites, spaces, _networks) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -1472,5 +1605,254 @@ mod tests {
             )
             .await;
         assert_eq!(inbox.lock().expect("lock").len(), inbox_after_filter + 1);
+    }
+
+    #[tokio::test]
+    async fn networks_snapshot_dedups_sorts_and_excludes_native() {
+        // The distinct-Networks list is derived from the unfiltered merged set:
+        // Telegram appears on two accounts (deduped by name), Signal once, and the
+        // native room (`network == None`) is excluded. The result is name-sorted.
+        let (merger, _inbox, _archive, _pins, _favourites, _spaces, networks) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger.register_account("acctB", 1).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_net("!a1", Some(400), "Telegram"),
+                            room_net("!a2", Some(300), "Signal"),
+                            room("!native", Some(200)), // native: excluded
+                        ],
+                    }],
+                    total: Some(3),
+                },
+            )
+            .await;
+        merger
+            .apply_account_batch(
+                "acctB",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_net("!b1", Some(500), "Telegram")], // dup name
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        // Deduped by name across accounts, name-sorted, native excluded.
+        assert_eq!(last_networks_names(&networks), ["Signal", "Telegram"]);
+    }
+
+    #[tokio::test]
+    async fn selected_network_retains_across_accounts() {
+        // Selecting a Network retains only rooms bridged to it, across all accounts;
+        // native rooms and other-Network rooms leave every window. The list stays
+        // complete (derived pre-filter) regardless of the active filter.
+        let (merger, inbox, _archive, _pins, _favourites, _spaces, networks) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger.register_account("acctB", 1).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_net("!a1", Some(400), "Telegram"),
+                            room_net("!a2", Some(300), "Signal"),
+                            room("!native", Some(250)),
+                        ],
+                    }],
+                    total: Some(3),
+                },
+            )
+            .await;
+        merger
+            .apply_account_batch(
+                "acctB",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_net("!b1", Some(500), "Telegram")],
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        // Unfiltered: all non-space rooms present, recency desc.
+        assert_eq!(last_reset_ids(&inbox), ["!b1", "!a1", "!a2", "!native"]);
+
+        merger.set_network_filter(Some("Telegram".to_owned())).await;
+        // Only Telegram rooms across both accounts, recency order.
+        assert_eq!(last_reset_ids(&inbox), ["!b1", "!a1"]);
+        // The Networks list is unchanged by the active filter (derived pre-retain).
+        assert_eq!(last_networks_names(&networks), ["Signal", "Telegram"]);
+
+        // Clearing restores the full inbox.
+        merger.set_network_filter(None).await;
+        assert_eq!(last_reset_ids(&inbox), ["!b1", "!a1", "!a2", "!native"]);
+    }
+
+    #[tokio::test]
+    async fn network_and_space_filters_compose_as_and() {
+        // With BOTH a Space filter and a Network filter active, the inbox shows their
+        // AND intersection. Space `!s` on acctA = {!a (Telegram), !b (Signal)}; the
+        // Network filter = Telegram. Only `!a` (in the Space AND on Telegram) survives.
+        let (merger, inbox, _archive, _pins, _favourites, _spaces, _networks) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_net("!a", Some(400), "Telegram"), // in Space, Telegram
+                            room_net("!b", Some(300), "Signal"),   // in Space, Signal
+                            room_net("!c", Some(200), "Telegram"), // NOT in Space, Telegram
+                        ],
+                    }],
+                    total: Some(3),
+                },
+            )
+            .await;
+        merger
+            .update_spaces(
+                "acctA",
+                vec![space_vm("acctA", "!s")],
+                membership(&[("!s", &["!a", "!b"])]),
+            )
+            .await;
+        merger
+            .set_space_filter(Some(("acctA".to_owned(), "!s".to_owned())))
+            .await;
+        // Space alone: !a and !b.
+        assert_eq!(last_reset_ids(&inbox), ["!a", "!b"]);
+
+        merger.set_network_filter(Some("Telegram".to_owned())).await;
+        // Space ∩ Telegram: only !a (!b is Signal, !c is outside the Space).
+        assert_eq!(last_reset_ids(&inbox), ["!a"]);
+
+        // Clearing the Network filter returns to the Space-only intersection.
+        merger.set_network_filter(None).await;
+        assert_eq!(last_reset_ids(&inbox), ["!a", "!b"]);
+    }
+
+    #[tokio::test]
+    async fn selected_network_absent_from_set_self_heals_to_unfiltered() {
+        // Selecting a Network no room is bridged to anywhere in the merged set
+        // self-heals `selected_network` to `None` on the next `emit` (keeping filter
+        // validity Rust-authoritative, AD-20), rather than emptying every window
+        // indefinitely on a dead selection. The windows show the full unfiltered set.
+        let (merger, inbox, _archive, _pins, _favourites, _spaces, _networks) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_net("!a", Some(200), "Telegram"),
+                            room("!native", Some(100)),
+                        ],
+                    }],
+                    total: Some(2),
+                },
+            )
+            .await;
+        // WhatsApp is absent from the merged set → self-heal to unfiltered.
+        merger.set_network_filter(Some("WhatsApp".to_owned())).await;
+        assert_eq!(last_reset_ids(&inbox), ["!a", "!native"]);
+        {
+            let batches = inbox.lock().expect("lock");
+            assert_eq!(batches.last().expect("batch").total, Some(2));
+        }
+    }
+
+    #[tokio::test]
+    async fn network_space_empty_intersection_empties_windows_without_clearing() {
+        // A genuine empty-intersection case for AND composition: the selected Network
+        // IS present in the merged set AND a Space IS selected, but their intersection
+        // is empty (the Space's only member is on a different Network). The windows are
+        // empty, and the selection is NOT cleared — the Network still exists in the
+        // merged set, so self-heal does not fire.
+        let (merger, inbox, _archive, _pins, _favourites, _spaces, networks) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_net("!a", Some(300), "Signal"),   // in Space, Signal
+                            room_net("!b", Some(200), "Telegram"), // NOT in Space, Telegram
+                        ],
+                    }],
+                    total: Some(2),
+                },
+            )
+            .await;
+        merger
+            .update_spaces(
+                "acctA",
+                vec![space_vm("acctA", "!s")],
+                membership(&[("!s", &["!a"])]),
+            )
+            .await;
+        merger
+            .set_space_filter(Some(("acctA".to_owned(), "!s".to_owned())))
+            .await;
+        // Telegram exists in the set (so it will NOT self-heal), but the Space's only
+        // member is Signal → empty intersection, empty windows.
+        merger.set_network_filter(Some("Telegram".to_owned())).await;
+        assert_eq!(last_reset_ids(&inbox), Vec::<String>::new());
+        // The Networks list is unchanged by the active filter (derived pre-retain):
+        // Telegram remains present, so the selection survives (no self-heal).
+        assert_eq!(last_networks_names(&networks), ["Signal", "Telegram"]);
+
+        // Clearing the Space filter reveals the Telegram room again — proving the
+        // Network selection was retained, not self-healed away.
+        merger.set_space_filter(None).await;
+        assert_eq!(last_reset_ids(&inbox), ["!b"]);
+    }
+
+    #[tokio::test]
+    async fn selected_network_self_heals_when_last_room_removed() {
+        // When the last room bridged to the selected Network leaves (its owner account
+        // signs out), the next `emit` self-heals `selected_network` to `None` and the
+        // surviving rooms return unfiltered.
+        let (merger, inbox, _archive, _pins, _favourites, _spaces, _networks) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger.register_account("acctB", 1).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_net("!a", Some(200), "Signal")],
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        merger
+            .apply_account_batch(
+                "acctB",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_net("!b", Some(100), "Telegram")],
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        merger.set_network_filter(Some("Telegram".to_owned())).await;
+        // Filtered to Telegram: only acctB's room.
+        assert_eq!(last_reset_ids(&inbox), ["!b"]);
+
+        // acctB (the only Telegram-bridged account) signs out. On the re-emit, the
+        // Telegram Network is gone from the set → self-heal to unfiltered; acctA's
+        // Signal room is shown (not empty windows).
+        merger.remove_account("acctB").await;
+        assert_eq!(last_reset_ids(&inbox), ["!a"]);
     }
 }

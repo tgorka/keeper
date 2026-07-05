@@ -16,6 +16,7 @@ function room(id: string, overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
     isArchived: true,
     isPinned: false,
     isFavourite: false,
+    network: null,
     ...overrides,
   };
 }

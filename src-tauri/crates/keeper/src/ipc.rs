@@ -22,8 +22,8 @@ use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, BackupStatus, ConnectionStatusBatch, DemoBatch, EncryptionStatusBatch, InboxBatch,
-    IpcError, IpcErrorCode, PaginationStatusBatch, PingVm, RoomListBatch, SpacesSnapshot,
-    TimelineBatch, TypingBatch, VerificationFlowVm,
+    IpcError, IpcErrorCode, NetworksSnapshot, PaginationStatusBatch, PingVm, RoomListBatch,
+    SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -1433,6 +1433,7 @@ pub async fn inbox_subscribe(
     pins: Channel<InboxBatch>,
     favourites: Channel<InboxBatch>,
     spaces: Channel<SpacesSnapshot>,
+    networks: Channel<NetworksSnapshot>,
 ) -> Result<u64, IpcError> {
     let inbox_sink = Box::new(move |batch: InboxBatch| channel.send(batch).is_ok());
     let archive_sink = Box::new(move |batch: InboxBatch| archive.send(batch).is_ok());
@@ -1440,6 +1441,8 @@ pub async fn inbox_subscribe(
     let favourites_sink = Box::new(move |batch: InboxBatch| favourites.send(batch).is_ok());
     // Fifth channel (Story 4.5): the aggregated Space list as a whole snapshot.
     let spaces_sink = Box::new(move |snapshot: SpacesSnapshot| spaces.send(snapshot).is_ok());
+    // Sixth channel (Story 4.6): the distinct-Networks list as a whole snapshot.
+    let networks_sink = Box::new(move |snapshot: NetworksSnapshot| networks.send(snapshot).is_ok());
     state
         .accounts
         .subscribe_inbox(
@@ -1449,6 +1452,7 @@ pub async fn inbox_subscribe(
             pins_sink,
             favourites_sink,
             spaces_sink,
+            networks_sink,
         )
         .await
         .map_err(to_ipc_error)
@@ -1470,6 +1474,22 @@ pub async fn set_space_filter(
         .accounts
         .set_space_filter(account_id.zip(space_id))
         .await;
+    Ok(())
+}
+
+/// Set (or clear) the ephemeral Network filter on the live merged inbox (Story 4.6,
+/// FR-24). Delegates to the core, which pokes the live merger to re-emit all four
+/// inbox windows narrowed to rooms bridged to the selected Network (mirrors
+/// `set_space_filter`). `network` is `Some(name)` to set a filter (name-keyed,
+/// cross-account), or `None` to clear it; the selection is ephemeral (never
+/// persisted). Composes AND with any active Space filter. Best-effort — a
+/// no-active-inbox case is a harmless no-op.
+#[tauri::command]
+pub async fn set_network_filter(
+    state: State<'_, AppState>,
+    network: Option<String>,
+) -> Result<(), IpcError> {
+    state.accounts.set_network_filter(network).await;
     Ok(())
 }
 

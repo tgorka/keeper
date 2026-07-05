@@ -1,6 +1,12 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountVm, InboxBatch, IpcError, SpacesSnapshot } from "@/lib/ipc/client";
+import type {
+  AccountVm,
+  InboxBatch,
+  IpcError,
+  NetworksSnapshot,
+  SpacesSnapshot,
+} from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -14,6 +20,7 @@ const unsubscribeInbox = vi.fn();
 const setSpaceFilter = vi.fn(
   async (_accountId: string | null, _spaceId: string | null): Promise<void> => {},
 );
+const setNetworkFilter = vi.fn(async (_network: string | null): Promise<void> => {});
 const getFavoritesCollapsed = vi.fn(async (): Promise<boolean> => false);
 const setFavoritesCollapsed = vi.fn(async (_collapsed: boolean): Promise<void> => {});
 vi.mock("@/lib/ipc/client", () => ({
@@ -23,10 +30,12 @@ vi.mock("@/lib/ipc/client", () => ({
     onPins: (b: InboxBatch) => void,
     onFavourites: (b: InboxBatch) => void,
     onSpaces: (s: SpacesSnapshot) => void,
-  ) => subscribeInbox(onInbox, onArchive, onPins, onFavourites, onSpaces),
+    onNetworks: (n: NetworksSnapshot) => void,
+  ) => subscribeInbox(onInbox, onArchive, onPins, onFavourites, onSpaces, onNetworks),
   unsubscribeInbox: (id: number) => unsubscribeInbox(id),
   setSpaceFilter: (accountId: string | null, spaceId: string | null) =>
     setSpaceFilter(accountId, spaceId),
+  setNetworkFilter: (network: string | null) => setNetworkFilter(network),
   getFavoritesCollapsed: () => getFavoritesCollapsed(),
   setFavoritesCollapsed: (v: boolean) => setFavoritesCollapsed(v),
   // Best-effort mutation wrappers the strip/rows may call; no-ops here.
@@ -44,6 +53,7 @@ vi.mock("@/lib/ipc/client", () => ({
 import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { favoritesUiStore } from "@/lib/stores/favorites-ui";
+import { networksStore } from "@/lib/stores/networks";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
 import { spacesStore } from "@/lib/stores/spaces";
 
@@ -81,6 +91,7 @@ function inboxRoom(roomId: string, accountId: string, displayName: string, lastM
     isArchived: false,
     isPinned: false,
     isFavourite: false,
+    network: null,
   };
 }
 
@@ -94,10 +105,12 @@ beforeEach(() => {
   favoritesRoomsStore.getState().clear();
   favoritesUiStore.getState().setCollapsed(false);
   spacesStore.getState().clear();
+  networksStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
   subscribeInbox.mockReset();
   unsubscribeInbox.mockReset();
   setSpaceFilter.mockReset();
+  setNetworkFilter.mockReset();
   getFavoritesCollapsed.mockReset();
   getFavoritesCollapsed.mockResolvedValue(false);
   setFavoritesCollapsed.mockReset();
@@ -152,6 +165,7 @@ describe("ChatListPane", () => {
     render(<ChatListPane />);
 
     expect(subscribeInbox).toHaveBeenCalledWith(
+      expect.any(Function),
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
@@ -849,6 +863,296 @@ describe("ChatListPane", () => {
     });
     await waitFor(() => {
       expect(setSpaceFilter).toHaveBeenCalledWith(account.accountId, "!s:example.org");
+    });
+  });
+});
+
+describe("ChatListPane — Network filter (Story 4.6)", () => {
+  it("feeds the 6th channel into the networks store", async () => {
+    const captured: { onNetworks: ((n: NetworksSnapshot) => void) | null } = { onNetworks: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        _onFavourites: (b: InboxBatch) => void,
+        _onSpaces: (s: SpacesSnapshot) => void,
+        onNetworks: (n: NetworksSnapshot) => void,
+      ) => {
+        captured.onNetworks = onNetworks;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+    await waitFor(() => {
+      expect(captured.onNetworks).not.toBeNull();
+    });
+    captured.onNetworks?.({ networks: [{ name: "Telegram" }, { name: "Signal" }] });
+    expect(networksStore.getState().networks.map((n) => n.name)).toEqual(["Telegram", "Signal"]);
+  });
+
+  it("renders a dismissible Network chip that clears the filter", async () => {
+    subscribeInbox.mockResolvedValue(1);
+    accountsStore.getState().addAccount(account);
+    networksStore.getState().setActiveNetwork("Telegram");
+    render(<ChatListPane />);
+
+    const clearBtn = await screen.findByRole("button", { name: "Clear Telegram filter" });
+    expect(clearBtn).toBeInTheDocument();
+
+    fireEvent.click(clearBtn);
+    await waitFor(() => {
+      expect(setNetworkFilter).toHaveBeenCalledWith(null);
+    });
+    expect(networksStore.getState().activeNetwork).toBeNull();
+  });
+
+  it("shows BOTH chips when a Space and a Network filter compose (AND)", async () => {
+    const captured: { onSpaces: ((s: SpacesSnapshot) => void) | null } = { onSpaces: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        _onFavourites: (b: InboxBatch) => void,
+        onSpaces: (s: SpacesSnapshot) => void,
+      ) => {
+        captured.onSpaces = onSpaces;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    spacesStore
+      .getState()
+      .setActiveSpace({ accountId: account.accountId, spaceId: "!s:example.org" });
+    networksStore.getState().setActiveNetwork("Telegram");
+    render(<ChatListPane />);
+    await waitFor(() => {
+      expect(captured.onSpaces).not.toBeNull();
+    });
+    captured.onSpaces?.({
+      spaces: [
+        {
+          accountId: account.accountId,
+          spaceId: "!s:example.org",
+          name: "Design",
+          avatarUrl: null,
+        },
+      ],
+    });
+
+    // Both chips render side by side (AND composition).
+    expect(await screen.findByRole("button", { name: "Clear Design filter" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear Telegram filter" })).toBeInTheDocument();
+  });
+
+  it("the Network chip's ✕ clears ONLY the Network filter (Space stays active)", async () => {
+    const captured: { onSpaces: ((s: SpacesSnapshot) => void) | null } = { onSpaces: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        _onFavourites: (b: InboxBatch) => void,
+        onSpaces: (s: SpacesSnapshot) => void,
+      ) => {
+        captured.onSpaces = onSpaces;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    spacesStore
+      .getState()
+      .setActiveSpace({ accountId: account.accountId, spaceId: "!s:example.org" });
+    networksStore.getState().setActiveNetwork("Telegram");
+    render(<ChatListPane />);
+    await waitFor(() => {
+      expect(captured.onSpaces).not.toBeNull();
+    });
+    captured.onSpaces?.({
+      spaces: [
+        {
+          accountId: account.accountId,
+          spaceId: "!s:example.org",
+          name: "Design",
+          avatarUrl: null,
+        },
+      ],
+    });
+
+    // Click ONLY the Network chip's ✕.
+    fireEvent.click(await screen.findByRole("button", { name: "Clear Telegram filter" }));
+    await waitFor(() => {
+      expect(setNetworkFilter).toHaveBeenCalledWith(null);
+    });
+    // Network cleared; Space untouched (no null/null poke, selection + chip remain).
+    expect(networksStore.getState().activeNetwork).toBeNull();
+    expect(setSpaceFilter).not.toHaveBeenCalledWith(null, null);
+    expect(spacesStore.getState().activeSpace).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Clear Design filter" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Clear Telegram filter" })).not.toBeInTheDocument();
+  });
+
+  it("the Space chip's ✕ clears ONLY the Space filter (Network stays active)", async () => {
+    const captured: { onSpaces: ((s: SpacesSnapshot) => void) | null } = { onSpaces: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        _onFavourites: (b: InboxBatch) => void,
+        onSpaces: (s: SpacesSnapshot) => void,
+      ) => {
+        captured.onSpaces = onSpaces;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    spacesStore
+      .getState()
+      .setActiveSpace({ accountId: account.accountId, spaceId: "!s:example.org" });
+    networksStore.getState().setActiveNetwork("Telegram");
+    render(<ChatListPane />);
+    await waitFor(() => {
+      expect(captured.onSpaces).not.toBeNull();
+    });
+    captured.onSpaces?.({
+      spaces: [
+        {
+          accountId: account.accountId,
+          spaceId: "!s:example.org",
+          name: "Design",
+          avatarUrl: null,
+        },
+      ],
+    });
+
+    // Click ONLY the Space chip's ✕.
+    fireEvent.click(await screen.findByRole("button", { name: "Clear Design filter" }));
+    await waitFor(() => {
+      expect(setSpaceFilter).toHaveBeenCalledWith(null, null);
+    });
+    // Space cleared; Network untouched (no null poke, selection + chip remain).
+    expect(spacesStore.getState().activeSpace).toBeNull();
+    expect(setNetworkFilter).not.toHaveBeenCalledWith(null);
+    expect(networksStore.getState().activeNetwork).toBe("Telegram");
+    expect(screen.getByRole("button", { name: "Clear Telegram filter" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Clear Design filter" })).not.toBeInTheDocument();
+  });
+
+  it("Esc clears BOTH the Space and Network filters", async () => {
+    subscribeInbox.mockResolvedValue(1);
+    accountsStore.getState().addAccount(account);
+    spacesStore
+      .getState()
+      .setActiveSpace({ accountId: account.accountId, spaceId: "!s:example.org" });
+    networksStore.getState().setActiveNetwork("Telegram");
+    render(<ChatListPane />);
+
+    const chip = await screen.findByRole("button", { name: "Clear Telegram filter" });
+    fireEvent.keyDown(chip, { key: "Escape" });
+    await waitFor(() => {
+      expect(setSpaceFilter).toHaveBeenCalledWith(null, null);
+      expect(setNetworkFilter).toHaveBeenCalledWith(null);
+    });
+    expect(spacesStore.getState().activeSpace).toBeNull();
+    expect(networksStore.getState().activeNetwork).toBeNull();
+  });
+
+  it("shows a ' · '-joined empty-state label under composed filters", async () => {
+    const captured: {
+      onInbox: ((b: InboxBatch) => void) | null;
+      onSpaces: ((s: SpacesSnapshot) => void) | null;
+    } = { onInbox: null, onSpaces: null };
+    subscribeInbox.mockImplementation(
+      (
+        onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        _onFavourites: (b: InboxBatch) => void,
+        onSpaces: (s: SpacesSnapshot) => void,
+      ) => {
+        captured.onInbox = onInbox;
+        captured.onSpaces = onSpaces;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    spacesStore
+      .getState()
+      .setActiveSpace({ accountId: account.accountId, spaceId: "!s:example.org" });
+    networksStore.getState().setActiveNetwork("Telegram");
+    render(<ChatListPane />);
+    await waitFor(() => {
+      expect(captured.onSpaces).not.toBeNull();
+    });
+    captured.onSpaces?.({
+      spaces: [
+        {
+          accountId: account.accountId,
+          spaceId: "!s:example.org",
+          name: "Design",
+          avatarUrl: null,
+        },
+      ],
+    });
+    // Empty filtered inbox.
+    captured.onInbox?.({ ops: [{ op: "reset", rooms: [] }], total: 0 });
+
+    await waitFor(() => {
+      // The label joins the active filter names with " · " (Design · Telegram).
+      expect(screen.getByText(/Design · Telegram/)).toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: "Clear filter" })).toBeInTheDocument();
+  });
+
+  it("re-applies the Network filter after an account-set re-subscribe", async () => {
+    subscribeInbox.mockResolvedValue(1);
+    accountsStore.getState().addAccount(account);
+    networksStore.getState().setActiveNetwork("Telegram");
+    render(<ChatListPane />);
+
+    await waitFor(() => {
+      expect(setNetworkFilter).toHaveBeenCalledWith("Telegram");
+    });
+
+    setNetworkFilter.mockClear();
+    accountsStore.getState().addAccount(bob);
+    await waitFor(() => {
+      expect(subscribeInbox).toHaveBeenCalledTimes(2);
+    });
+    await waitFor(() => {
+      expect(setNetworkFilter).toHaveBeenCalledWith("Telegram");
+    });
+  });
+
+  it("reconciles a stale Network selection absent from a streamed snapshot", async () => {
+    const captured: { onNetworks: ((n: NetworksSnapshot) => void) | null } = { onNetworks: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        _onFavourites: (b: InboxBatch) => void,
+        _onSpaces: (s: SpacesSnapshot) => void,
+        onNetworks: (n: NetworksSnapshot) => void,
+      ) => {
+        captured.onNetworks = onNetworks;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    networksStore.getState().setActiveNetwork("Telegram");
+    render(<ChatListPane />);
+    await waitFor(() => {
+      expect(captured.onNetworks).not.toBeNull();
+    });
+    // A snapshot that no longer lists the active Network reconciles the selection.
+    captured.onNetworks?.({ networks: [{ name: "Signal" }] });
+    await waitFor(() => {
+      expect(networksStore.getState().activeNetwork).toBeNull();
+      expect(setNetworkFilter).toHaveBeenCalledWith(null);
     });
   });
 });

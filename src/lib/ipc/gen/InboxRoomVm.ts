@@ -77,4 +77,11 @@ isFavourite: boolean,
  * Inbox/Archive). The frontend renders this directly (Pin/Unpin gating) and
  * never re-derives it.
  */
-isPinned: boolean, };
+isPinned: boolean, 
+/**
+ * The bridged-Network label for this row (Story 4.6, FR-24), copied straight
+ * through from [`RoomVm::network`]. `None` for a native Matrix room (no badge).
+ * Drives the avatar Network badge and the ephemeral Network filter's retain;
+ * the frontend renders the badge directly and never re-derives or re-filters it.
+ */
+network: string | null, };

@@ -20,9 +20,10 @@ import { FavoritesSection, hydrateFavoritesCollapsed } from "@/components/layout
 import { PinsStrip } from "@/components/layout/pins-strip";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { InboxBatch, SpacesSnapshot } from "@/lib/ipc/client";
+import type { InboxBatch, NetworksSnapshot, SpacesSnapshot } from "@/lib/ipc/client";
 import {
   getFavoritesCollapsed,
+  setNetworkFilter,
   setSpaceFilter,
   subscribeInbox,
   unsubscribeInbox,
@@ -30,6 +31,7 @@ import {
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore, useArchiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { favoritesRoomsStore, useFavoritesRoomsStore } from "@/lib/stores/favorites-rooms";
+import { networksStore, useNetworksStore } from "@/lib/stores/networks";
 import { pinsRoomsStore, usePinsRoomsStore } from "@/lib/stores/pins-rooms";
 import { usePrimaryView } from "@/lib/stores/primary-view";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
@@ -68,6 +70,11 @@ export function ChatListPane() {
             sp.accountId === s.activeSpace?.accountId && sp.spaceId === s.activeSpace?.spaceId,
         )?.name ?? null),
   );
+  // The active Network filter (Story 4.6): another Rust-side inbox filter, keyed by
+  // Network name (cross-account), composing AND with the Space filter. Mirrored here
+  // only to render the dismissible chip + empty state and to re-apply the filter
+  // after an account-set re-subscribe. `null` means unfiltered.
+  const activeNetwork = useNetworksStore((s) => s.activeNetwork);
   const [errored, setErrored] = useState(false);
   // Track skeleton-dismissal per window: the Inbox and Archive stream on
   // independent channels, so gating one view's skeleton on the *other* view's
@@ -79,9 +86,10 @@ export function ChatListPane() {
 
   useEffect(() => {
     if (accountKey.length === 0) {
-      // No signed-in accounts: clear the Space list *and* the selection (a full
-      // sign-out has no Space to filter to).
+      // No signed-in accounts: clear the Space and Network lists *and* their
+      // selections (a full sign-out has nothing to filter to).
       spacesStore.getState().clear();
+      networksStore.getState().clear();
       return;
     }
 
@@ -98,9 +106,14 @@ export function ChatListPane() {
     // list here; the active Space *selection* is preserved across an account-set
     // re-subscribe so the Rust filter can be re-applied below (survive resubscribe).
     spacesStore.getState().applySnapshot({ spaces: [] });
-    // Capture the carried-over selection (from before this run) so we can re-apply
-    // the Rust-side filter once the new subscription is live.
+    // Same for the Network list (Story 4.6): reset only the list; the active Network
+    // *selection* is preserved across an account-set re-subscribe so the Rust filter
+    // can be re-applied below.
+    networksStore.getState().applySnapshot({ networks: [] });
+    // Capture the carried-over selections (from before this run) so we can re-apply
+    // the Rust-side filters once the new subscription is live.
     const carriedSpace = spacesStore.getState().activeSpace;
+    const carriedNetwork = networksStore.getState().activeNetwork;
     let subscriptionId: number | null = null;
     let cancelled = false;
 
@@ -147,7 +160,22 @@ export function ChatListPane() {
         }
       }
     };
-    subscribeInbox(onInbox, onArchive, onPins, onFavourites, onSpaces)
+    const onNetworks = (snapshot: NetworksSnapshot) => {
+      if (!cancelled) {
+        networksStore.getState().applySnapshot(snapshot);
+        // Reconcile a stale selection (Story 4.6): if the active Network is no longer
+        // in the streamed list (its last bridged room left, or an owner account
+        // signed out), clear the selection and the Rust filter — otherwise the merger
+        // stays filtered on a Network with no rooms and empties every window
+        // indefinitely while the chip shows a now-absent Network.
+        const sel = networksStore.getState().activeNetwork;
+        if (sel !== null && !snapshot.networks.some((n) => n.name === sel)) {
+          networksStore.getState().setActiveNetwork(null);
+          void setNetworkFilter(null).catch(() => {});
+        }
+      }
+    };
+    subscribeInbox(onInbox, onArchive, onPins, onFavourites, onSpaces, onNetworks)
       .then((id) => {
         if (cancelled) {
           // Unmounted before the id resolved — tear down immediately.
@@ -161,6 +189,12 @@ export function ChatListPane() {
         if (carriedSpace !== null) {
           void setSpaceFilter(carriedSpace.accountId, carriedSpace.spaceId).catch(() => {});
         }
+        // Re-apply the ephemeral Network filter too (Story 4.6): the Rust merger
+        // starts each new subscription unfiltered, so a carried-over selection must
+        // be re-poked (survive resubscribe, compose AND with the Space filter).
+        if (carriedNetwork !== null) {
+          void setNetworkFilter(carriedNetwork).catch(() => {});
+        }
       })
       .catch(() => {
         if (!cancelled) {
@@ -170,10 +204,11 @@ export function ChatListPane() {
 
     return () => {
       cancelled = true;
-      // Clear the mirrored Space list on unsubscribe; the selection is kept so a
-      // re-subscribe can re-apply the filter (cleared fully only on full sign-out
-      // via the store's own `clear`, when there are no accounts).
+      // Clear the mirrored Space + Network lists on unsubscribe; the selections are
+      // kept so a re-subscribe can re-apply the filters (cleared fully only on full
+      // sign-out via the stores' own `clear`, when there are no accounts).
       spacesStore.getState().applySnapshot({ spaces: [] });
+      networksStore.getState().applySnapshot({ networks: [] });
       if (subscriptionId !== null) {
         void unsubscribeInbox(subscriptionId);
       }
@@ -212,25 +247,49 @@ export function ChatListPane() {
       ? favoritesRooms
       : favoritesRooms.filter((room) => room.accountId === filterAccountId);
   const showFavorites = view === "inbox" && visibleFavorites.length > 0;
-  // Clear the active Space filter (chip ✕ / Esc / active-row toggle): drop the
-  // selection and clear the Rust filter so the full inbox is restored (Story 4.5).
+  // Clear ONLY the Space filter (the Space chip's ✕): drop the Space selection and
+  // its Rust filter, leaving any active Network filter intact (Story 4.5 + 4.6).
   const clearSpaceFilter = () => {
     spacesStore.getState().setActiveSpace(null);
     void setSpaceFilter(null, null).catch(() => {});
   };
+  // Clear ONLY the Network filter (the Network chip's ✕): drop the Network selection
+  // and its Rust filter, leaving any active Space filter intact (Story 4.5 + 4.6).
+  const clearNetworkFilter = () => {
+    networksStore.getState().setActiveNetwork(null);
+    void setNetworkFilter(null).catch(() => {});
+  };
+  // Clear ALL active filters (Esc / empty-state "Clear filter" button): drop both the
+  // Space and Network selections and clear both Rust filters so the full inbox is
+  // restored (Story 4.5 + 4.6). Each chip's ✕ clears only its own dimension
+  // (`clearSpaceFilter`/`clearNetworkFilter`); Esc and the empty-state button clear all.
+  const clearFilters = () => {
+    clearSpaceFilter();
+    clearNetworkFilter();
+  };
 
   // Per-view empty state (UX-DR13): the Archive uses sentence case with a code-font
-  // `E` and no exclamation; the Inbox keeps its existing copy. When a Space filter
-  // is active and the view is empty, show "No chats in {Space name}." with a Clear
-  // action instead (UX-DR13, Story 4.5).
+  // `E` and no exclamation; the Inbox keeps its existing copy. When any filter is
+  // active and the view is empty, show "No chats in {filter names}." (Space · Network
+  // joined by " · " under AND composition) with a Clear action instead (UX-DR13,
+  // Story 4.5 + 4.6).
   const spaceFilterActive = activeSpace !== null;
-  const spaceEmptyLabel = activeSpaceName ?? "this Space";
-  const emptyState = spaceFilterActive ? (
+  const networkFilterActive = activeNetwork !== null;
+  const anyFilterActive = spaceFilterActive || networkFilterActive;
+  const activeFilterLabels: string[] = [];
+  if (spaceFilterActive) {
+    activeFilterLabels.push(activeSpaceName ?? "Space");
+  }
+  if (networkFilterActive && activeNetwork !== null) {
+    activeFilterLabels.push(activeNetwork);
+  }
+  const filterEmptyLabel = activeFilterLabels.join(" · ");
+  const emptyState = anyFilterActive ? (
     <>
-      No chats in {spaceEmptyLabel}.{" "}
+      No chats in {filterEmptyLabel}.{" "}
       <button
         type="button"
-        onClick={clearSpaceFilter}
+        onClick={clearFilters}
         className="text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         Clear filter
@@ -246,34 +305,50 @@ export function ChatListPane() {
   );
 
   return (
-    // biome-ignore lint/a11y/noStaticElementInteractions: container-level Esc handler clears the active Space filter before focus moves (UX-DR); rows stay independently keyboard-operable, so this is additive.
+    // biome-ignore lint/a11y/noStaticElementInteractions: container-level Esc handler clears all active filters before focus moves (UX-DR); rows stay independently keyboard-operable, so this is additive.
     <div
       className="flex h-full w-[320px] shrink-0 flex-col border-border border-r bg-background"
       onKeyDown={(e) => {
-        // Esc from the list clears an active Space filter before moving focus.
-        if (e.key === "Escape" && spaceFilterActive) {
+        // Esc from the list clears ALL active filters (Space + Network) before
+        // moving focus (Story 4.5 + 4.6).
+        if (e.key === "Escape" && anyFilterActive) {
           e.preventDefault();
-          clearSpaceFilter();
+          clearFilters();
         }
       }}
     >
-      {/* Dismissible Space filter chip (Story 4.5): shown above the list when a
-          Space filter is active. The ✕ clears the filter and restores the inbox.
-          Built to hold multiple AND-composed chips (Story 4.6 adds the Network
-          chip alongside). */}
-      {spaceFilterActive && (
+      {/* Dismissible filter chips (Story 4.5 + 4.6): shown above the list when a
+          Space and/or Network filter is active (AND composition — both chips
+          render). Each chip's ✕ clears ONLY its own dimension (the other filter
+          stays active); Esc clears ALL active filters and restores the inbox. */}
+      {anyFilterActive && (
         <div className="flex shrink-0 flex-wrap gap-1 border-border border-b px-3 py-2">
-          <span className="inline-flex items-center gap-1 rounded-full bg-accent px-2 py-0.5 text-accent-foreground text-xs">
-            {activeSpaceName ?? "Space"}
-            <button
-              type="button"
-              onClick={clearSpaceFilter}
-              aria-label={`Clear ${activeSpaceName ?? "Space"} filter`}
-              className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <X aria-hidden="true" className="size-3" />
-            </button>
-          </span>
+          {spaceFilterActive && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-accent px-2 py-0.5 text-accent-foreground text-xs">
+              {activeSpaceName ?? "Space"}
+              <button
+                type="button"
+                onClick={clearSpaceFilter}
+                aria-label={`Clear ${activeSpaceName ?? "Space"} filter`}
+                className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <X aria-hidden="true" className="size-3" />
+              </button>
+            </span>
+          )}
+          {networkFilterActive && activeNetwork !== null && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-accent px-2 py-0.5 text-accent-foreground text-xs">
+              {activeNetwork}
+              <button
+                type="button"
+                onClick={clearNetworkFilter}
+                aria-label={`Clear ${activeNetwork} filter`}
+                className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <X aria-hidden="true" className="size-3" />
+              </button>
+            </span>
+          )}
         </div>
       )}
       {showPins && (

@@ -30,11 +30,16 @@ import { DeleteMessageDialog } from "@/components/chat/delete-message-dialog";
 import { HistoryBoundary, type HistoryBoundaryState } from "@/components/chat/history-boundary";
 import { MediaPreviewOverlay } from "@/components/chat/media-preview-overlay";
 import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble";
+import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import { RedactedStub } from "@/components/chat/redacted-stub";
 import { TypingIndicator } from "@/components/chat/typing-indicator";
 import { UtdStub } from "@/components/chat/utd-stub";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useSelectedRoomVm } from "@/hooks/use-selected-room-vm";
+import { accountHueVar } from "@/lib/account-hue";
+import { initials } from "@/lib/account-initials";
 import type {
   PaginationStatusBatch,
   TimelineBatch,
@@ -62,6 +67,7 @@ import {
   unsubscribeTyping,
 } from "@/lib/ipc/client";
 import { useAccountStatus } from "@/lib/stores/account-status";
+import { useAccountsStore } from "@/lib/stores/accounts";
 import { attachmentId, attachmentsStore, type PendingAttachment } from "@/lib/stores/attachments";
 import { composerStore, useComposerStore } from "@/lib/stores/composer";
 import { useRoomsStore } from "@/lib/stores/rooms";
@@ -184,6 +190,63 @@ function toRenderedRows(items: TimelineItemVm[]): RenderedRow[] {
     prevSender = item.sender;
   }
   return rendered;
+}
+
+/**
+ * The hue-tinted account-initial chip for the conversation header (Story 4.6),
+ * reusing the account-footer's `AccountAvatar` pattern. Shows the selected room's
+ * owning account so a two-account inbox is disambiguated in the header, matching
+ * the row's hue edge bar.
+ */
+function AccountInitialChip({ userId, hueIndex }: { userId: string; hueIndex: number }) {
+  return (
+    <Avatar size="sm" data-testid="account-initial-chip">
+      <AvatarFallback
+        style={{ backgroundColor: accountHueVar(hueIndex) }}
+        className="font-medium text-white"
+      >
+        {initials(userId)}
+      </AvatarFallback>
+    </Avatar>
+  );
+}
+
+/**
+ * The conversation header's identity block (Story 4.6, FR-24): the selected room's
+ * {@link RoomAvatar} (the Network badge comes free) + display name + an
+ * account-initial chip. When the room's VM is not in any streamed window, it
+ * degrades to the account chip alone (looked up from {@link accountsStore} by the
+ * selection's `accountId`) — never a crash. Renders nothing when no room is open or
+ * the account is unknown.
+ */
+function ConversationHeaderIdentity({ accountId }: { accountId: string | null }) {
+  const room = useSelectedRoomVm();
+  const account = useAccountsStore((s) =>
+    accountId === null ? null : (s.accounts.find((a) => a.accountId === accountId) ?? null),
+  );
+
+  if (room !== null) {
+    return (
+      <div className="flex min-w-0 items-center gap-2">
+        <RoomAvatar room={room} size="lg" />
+        <span className="truncate font-medium text-sm" title={room.displayName}>
+          {room.displayName}
+        </span>
+        {account !== null && (
+          <AccountInitialChip userId={account.userId} hueIndex={account.hueIndex} />
+        )}
+      </div>
+    );
+  }
+  // No streamed VM for the selection: degrade to the account chip alone.
+  if (account !== null) {
+    return (
+      <div className="flex min-w-0 items-center gap-2">
+        <AccountInitialChip userId={account.userId} hueIndex={account.hueIndex} />
+      </div>
+    );
+  }
+  return null;
 }
 
 export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: ConversationPaneProps) {
@@ -846,7 +909,8 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
 
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col bg-background">
-      <div className="flex shrink-0 items-center justify-end border-border border-b p-2">
+      <div className="flex shrink-0 items-center justify-between gap-2 border-border border-b p-2">
+        <ConversationHeaderIdentity accountId={accountId} />
         <Button
           ref={toggleRef}
           type="button"
@@ -855,7 +919,7 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
           aria-label="Toggle detail panel"
           aria-pressed={detailOpen}
           onClick={onToggleDetail}
-          className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+          className="shrink-0 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
         >
           <PanelRight aria-hidden="true" />
         </Button>

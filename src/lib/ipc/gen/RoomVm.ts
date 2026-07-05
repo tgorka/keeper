@@ -65,4 +65,14 @@ isFavourite: boolean,
  * are surfaced separately as filter views. Not copied to [`InboxRoomVm`]; the
  * merge drops `is_space` rooms before partitioning.
  */
-isSpace: boolean, };
+isSpace: boolean, 
+/**
+ * The bridged-Network label for this room (Story 4.6, FR-24), resolved from
+ * the room's MSC2346 `m.bridge` (or legacy `uk.half-shot.bridge`) state via
+ * [`crate::bridge::room_bridge_network`] — "Telegram", "WhatsApp", "Signal", …
+ * `None` for a native Matrix room (no bridge state); it then shows no badge and
+ * is excluded from the distinct-Networks list. Copied through to
+ * [`InboxRoomVm`] and used both for the avatar Network badge and the ephemeral
+ * Network filter. Never fabricated — it is untrusted, length-capped state.
+ */
+network: string | null, };
