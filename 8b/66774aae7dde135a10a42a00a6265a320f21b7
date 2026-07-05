@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-5-4-search-ui-global-and-in-chat.md
+  s_844875f3723985::t_fc58199aa8f31b 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8b66774aae7dde135a10a42a00a6265a320f21b7",
+  "prompts": {},
+  "sessions": {
+    "s_844875f3723985": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e1315539-d055-4646-9890-8228f81c0042",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
