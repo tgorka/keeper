@@ -19,17 +19,24 @@
 //! no new virtualization is introduced here (full unified-inbox organization is
 //! Epic 4).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::vm::{InboxBatch, InboxOp, InboxRoomVm, RoomListBatch, RoomVm};
+use crate::vm::{InboxBatch, InboxOp, InboxRoomVm, RoomListBatch, RoomVm, SpaceVm, SpacesSnapshot};
 
 /// Sink that receives each produced [`InboxBatch`]. The shell wraps a Tauri
 /// `Channel::send`; tests capture into a vector. Returns `true` if the batch was
 /// delivered, `false` if the channel is closed (the merger then stops emitting).
 pub type InboxSink = Box<dyn Fn(InboxBatch) -> bool + Send + Sync>;
+
+/// Sink that receives each produced [`SpacesSnapshot`] (Story 4.5). The shell
+/// wraps a Tauri `Channel::send`; tests capture into a vector. Returns `true` if
+/// the snapshot was delivered, `false` if the channel is closed. Analogous to
+/// [`InboxSink`] but carries the whole Space list (no diff protocol — Spaces are
+/// few, so the frontend replaces its list wholesale).
+pub type SpacesSink = Box<dyn Fn(SpacesSnapshot) -> bool + Send + Sync>;
 
 /// One account's contribution to the merged inbox: its opaque id, hue index, and
 /// the current room window it is streaming.
@@ -68,6 +75,24 @@ struct MergeState {
     /// [`InboxMerger::update_pins`] on every pin mutation (Story 4.3). A room in
     /// this map is placed in the Pins window and excluded from Inbox/Archive.
     pins: HashMap<(String, String), i64>,
+    /// Receives the whole aggregated Space list as a [`SpacesSnapshot`] (Story
+    /// 4.5). Pushed on subscribe, on every [`InboxMerger::update_spaces`], and on
+    /// [`InboxMerger::remove_account`].
+    spaces_sink: SpacesSink,
+    /// Each account's joined Spaces (Story 4.5), keyed by account id. Replaced
+    /// whole per account by the spaces producer via [`InboxMerger::update_spaces`].
+    /// Flattened in stable account-id order into the streamed [`SpacesSnapshot`].
+    account_spaces: HashMap<String, Vec<SpaceVm>>,
+    /// Each Space's joined child room ids (Story 4.5), keyed by
+    /// `(account_id, space_id)`. Computed locally from `m.space.child` state
+    /// cross-referenced against the account's joined rooms. When a Space is
+    /// selected, `emit` retains only rooms whose `(account_id, room_id)` is in the
+    /// selected Space's set.
+    space_children: HashMap<(String, String), HashSet<String>>,
+    /// The active Space filter, identified by `(account_id, space_id)`, or `None`
+    /// for the unfiltered inbox (Story 4.5). Ephemeral view state (no persistence).
+    /// Set/cleared out-of-band by [`InboxMerger::set_space_filter`].
+    selected_space: Option<(String, String)>,
     /// Set once any sink reports its channel is closed, so later producer
     /// updates stop trying to emit.
     closed: bool,
@@ -94,6 +119,7 @@ impl InboxMerger {
         pins_sink: InboxSink,
         favourites_sink: InboxSink,
         pins: HashMap<(String, String), i64>,
+        spaces_sink: SpacesSink,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(MergeState {
@@ -103,6 +129,10 @@ impl InboxMerger {
                 inbox_sink,
                 archive_sink,
                 pins,
+                spaces_sink,
+                account_spaces: HashMap::new(),
+                space_children: HashMap::new(),
+                selected_space: None,
                 closed: false,
             })),
         }
@@ -125,7 +155,25 @@ impl InboxMerger {
     /// window so the account's rooms leave the inbox immediately. Idempotent.
     pub async fn remove_account(&self, account_id: &str) {
         let mut state = self.inner.lock().await;
-        if state.accounts.remove(account_id).is_some() {
+        let had_account = state.accounts.remove(account_id).is_some();
+        // Drop the account's Spaces + child memberships (Story 4.5), and clear the
+        // Space filter if it was owned by the removed account so the inbox returns
+        // to the full unfiltered windows.
+        let had_spaces = state.account_spaces.remove(account_id).is_some();
+        state
+            .space_children
+            .retain(|(acct, _), _| acct != account_id);
+        if state
+            .selected_space
+            .as_ref()
+            .is_some_and(|(acct, _)| acct == account_id)
+        {
+            state.selected_space = None;
+        }
+        if had_spaces {
+            emit_spaces(&mut state);
+        }
+        if had_account || had_spaces {
             emit(&mut state);
         }
     }
@@ -138,6 +186,57 @@ impl InboxMerger {
     pub async fn update_pins(&self, pins: HashMap<(String, String), i64>) {
         let mut state = self.inner.lock().await;
         state.pins = pins;
+        emit(&mut state);
+    }
+
+    /// Replace one account's Space list and child-membership map, then re-emit the
+    /// aggregated Space snapshot and all four inbox windows (Story 4.5). Called by
+    /// the per-account spaces producer on every sync batch (mirrors
+    /// [`Self::update_pins`]'s "poke the live merger, re-emit" shape). `spaces` is
+    /// that account's joined Spaces; `memberships` maps each Space's room id to its
+    /// set of joined child room ids. Both are keyed only within the one account —
+    /// this replaces exactly that account's entries and leaves the others intact.
+    pub async fn update_spaces(
+        &self,
+        account_id: &str,
+        spaces: Vec<SpaceVm>,
+        memberships: HashMap<String, HashSet<String>>,
+    ) {
+        let mut state = self.inner.lock().await;
+        // Replace the account's Space list.
+        if spaces.is_empty() {
+            state.account_spaces.remove(account_id);
+        } else {
+            state.account_spaces.insert(account_id.to_owned(), spaces);
+        }
+        // Replace the account's child-membership entries: drop all prior
+        // `(account_id, *)` keys, then insert the fresh ones.
+        state
+            .space_children
+            .retain(|(acct, _), _| acct != account_id);
+        for (space_id, children) in memberships {
+            state
+                .space_children
+                .insert((account_id.to_owned(), space_id), children);
+        }
+        emit_spaces(&mut state);
+        // The four inbox windows only depend on Space data when a filter is
+        // active; when unfiltered, a Space recompute (which fires on every sync
+        // `RoomUpdates`) cannot change them, so skip the redundant window re-emit
+        // and avoid doubling inbox emissions per sync tick.
+        if state.selected_space.is_some() {
+            emit(&mut state);
+        }
+    }
+
+    /// Set (or clear) the active Space filter and re-emit all four windows (Story
+    /// 4.5). `Some((account_id, space_id))` narrows every window to that Space's
+    /// joined children; `None` restores the full unfiltered inbox. Ephemeral — no
+    /// persistence. Best-effort re-emit as in [`Self::update_pins`]: a no-active-
+    /// subscription case is a harmless no-op.
+    pub async fn set_space_filter(&self, selection: Option<(String, String)>) {
+        let mut state = self.inner.lock().await;
+        state.selected_space = selection;
         emit(&mut state);
     }
 
@@ -175,7 +274,24 @@ fn emit(state: &mut MergeState) -> bool {
     if state.closed {
         return false;
     }
-    let merged = merge(&state.accounts);
+    // `merge` already drops `is_space` rooms (containers, never chats) so they
+    // never appear in any of the four windows (Story 4.5).
+    let mut merged = merge(&state.accounts);
+    // Apply the ephemeral Space filter *before* the pins/favorites/inbox/archive
+    // partition (Story 4.5), so precedence (Pins > Favorites > Archive/Inbox) and
+    // per-window recency order are preserved within the filtered subset and each
+    // window `total` reflects the filtered count. When a Space is selected, retain
+    // only rooms owned by that account whose room id is in the Space's joined
+    // children; an unknown selection (e.g. the account went away mid-flight) yields
+    // an empty set, which correctly empties every window.
+    if let Some((sel_account, sel_space)) = &state.selected_space {
+        let empty = HashSet::new();
+        let children = state
+            .space_children
+            .get(&(sel_account.clone(), sel_space.clone()))
+            .unwrap_or(&empty);
+        merged.retain(|room| &room.account_id == sel_account && children.contains(&room.room_id));
+    }
     // Split off pinned rooms first (they win over favourites/archive/unread), then
     // partition the rest. Recency order is preserved within each window.
     let (mut pinned_rooms, rest): (Vec<InboxRoomVm>, Vec<InboxRoomVm>) = merged
@@ -241,6 +357,30 @@ fn emit(state: &mut MergeState) -> bool {
     true
 }
 
+/// Emit the aggregated Space list as one whole [`SpacesSnapshot`] into the spaces
+/// sink (Story 4.5). Flattens `account_spaces` in stable account-id order (so the
+/// frontend's list is deterministic regardless of `HashMap` iteration order); each
+/// account's Spaces keep their producer order. Records channel closure like
+/// [`emit`]. No diff protocol — the snapshot replaces the frontend's list.
+fn emit_spaces(state: &mut MergeState) -> bool {
+    if state.closed {
+        return false;
+    }
+    let mut ids: Vec<&String> = state.account_spaces.keys().collect();
+    ids.sort();
+    let mut spaces: Vec<SpaceVm> = Vec::new();
+    for id in ids {
+        spaces.extend(state.account_spaces[id].iter().cloned());
+    }
+    let snapshot = SpacesSnapshot { spaces };
+    if !(state.spaces_sink)(snapshot) {
+        state.closed = true;
+        tracing::info!("spaces channel closed; stopping merged emissions");
+        return false;
+    }
+    true
+}
+
 /// Look up a room's pin order in the pin map, or `None` if it is not pinned.
 fn pin_order(pins: &HashMap<(String, String), i64>, room: &InboxRoomVm) -> Option<i64> {
     pins.get(&(room.account_id.clone(), room.room_id.clone()))
@@ -263,6 +403,12 @@ fn merge(accounts: &HashMap<String, AccountSlot>) -> Vec<InboxRoomVm> {
     for id in ids {
         let slot = &accounts[id];
         for room in &slot.rooms {
+            // Space rooms are containers, not chats — never in any chat window
+            // (Story 4.5). `is_space` lives only on `RoomVm`, so drop them here
+            // before projecting to `InboxRoomVm`.
+            if room.is_space {
+                continue;
+            }
             rows.push(to_inbox_room(id, slot.hue_index, room));
         }
     }
@@ -368,6 +514,15 @@ mod tests {
             mention_count: 0,
             is_archived: false,
             is_favourite: false,
+            is_space: false,
+        }
+    }
+
+    /// A Space room (`is_space`) for exclusion tests (Story 4.5).
+    fn room_space(id: &str, ts: Option<i64>) -> RoomVm {
+        RoomVm {
+            is_space: true,
+            ..room(id, ts)
         }
     }
 
@@ -439,6 +594,7 @@ mod tests {
             mention_count: 3,
             is_archived: true,
             is_favourite: true,
+            is_space: false,
         };
         let inbox_room = to_inbox_room("acctA", 4, &src);
         assert!(inbox_room.is_unread);
@@ -524,26 +680,46 @@ mod tests {
         }
     }
 
-    /// Build a merger over four capture vecs (inbox, archive, pins, favourites) so
-    /// partition tests can assert each window independently. Seeds an empty pin
-    /// map; tests that exercise pins push a map via [`InboxMerger::update_pins`].
-    fn capturing_merger() -> (InboxMerger, Captured, Captured, Captured, Captured) {
+    /// Shared capture buffer for the spaces sink's emitted snapshots.
+    type CapturedSpaces = Arc<StdMutex<Vec<SpacesSnapshot>>>;
+
+    /// Build a merger over five capture vecs (inbox, archive, pins, favourites,
+    /// spaces) so partition tests can assert each window independently. Seeds an
+    /// empty pin map; tests that exercise pins push a map via
+    /// [`InboxMerger::update_pins`].
+    fn capturing_merger() -> (
+        InboxMerger,
+        Captured,
+        Captured,
+        Captured,
+        Captured,
+        CapturedSpaces,
+    ) {
         capturing_merger_with_pins(HashMap::new())
     }
 
     /// Like [`capturing_merger`] but seeds the merger's pin map. Returns captures
-    /// in `(merger, inbox, archive, pins, favourites)` order.
+    /// in `(merger, inbox, archive, pins, favourites, spaces)` order.
     fn capturing_merger_with_pins(
         pins: HashMap<(String, String), i64>,
-    ) -> (InboxMerger, Captured, Captured, Captured, Captured) {
+    ) -> (
+        InboxMerger,
+        Captured,
+        Captured,
+        Captured,
+        Captured,
+        CapturedSpaces,
+    ) {
         let inbox: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let archive: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let pins_cap: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let favourites: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
+        let spaces: CapturedSpaces = Arc::new(StdMutex::new(Vec::new()));
         let inbox_store = inbox.clone();
         let archive_store = archive.clone();
         let pins_store = pins_cap.clone();
         let favourites_store = favourites.clone();
+        let spaces_store = spaces.clone();
         let merger = InboxMerger::new(
             Box::new(move |batch: InboxBatch| {
                 inbox_store.lock().expect("lock").push(batch);
@@ -562,8 +738,42 @@ mod tests {
                 true
             }),
             pins,
+            Box::new(move |snapshot: SpacesSnapshot| {
+                spaces_store.lock().expect("lock").push(snapshot);
+                true
+            }),
         );
-        (merger, inbox, archive, pins_cap, favourites)
+        (merger, inbox, archive, pins_cap, favourites, spaces)
+    }
+
+    /// Space ids of the last captured [`SpacesSnapshot`] in `store`, or a panic.
+    fn last_spaces_ids(store: &CapturedSpaces) -> Vec<String> {
+        let snapshots = store.lock().expect("lock");
+        let last = snapshots.last().expect("a snapshot");
+        last.spaces.iter().map(|s| s.space_id.clone()).collect()
+    }
+
+    /// A [`SpaceVm`] fixture on `account_id`.
+    fn space_vm(account_id: &str, space_id: &str) -> SpaceVm {
+        SpaceVm {
+            account_id: account_id.to_owned(),
+            space_id: space_id.to_owned(),
+            name: space_id.to_owned(),
+            avatar_url: None,
+        }
+    }
+
+    /// Build a child-membership map from `(space_id, [room_ids])` pairs.
+    fn membership(entries: &[(&str, &[&str])]) -> HashMap<String, HashSet<String>> {
+        entries
+            .iter()
+            .map(|(space, rooms)| {
+                (
+                    space.to_string(),
+                    rooms.iter().map(|r| r.to_string()).collect(),
+                )
+            })
+            .collect()
     }
 
     /// Build a pin map from `(account_id, room_id, order)` triples.
@@ -576,7 +786,7 @@ mod tests {
 
     #[tokio::test]
     async fn merger_emits_reset_on_add_batch_and_remove() {
-        let (merger, inbox, _archive, _pins, _favourites) = capturing_merger();
+        let (merger, inbox, _archive, _pins, _favourites, _spaces) = capturing_merger();
 
         merger.register_account("acctA", 0).await;
         merger.register_account("acctB", 1).await;
@@ -631,7 +841,7 @@ mod tests {
         //    B archived read (200), A !archived unread (100)]
         // partitions to inbox = [D, C, A] (!is_archived || is_unread) and
         // archive = [B] (is_archived && !is_unread).
-        let (merger, inbox, archive, _pins, _favourites) = capturing_merger();
+        let (merger, inbox, archive, _pins, _favourites, _spaces) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -694,7 +904,8 @@ mod tests {
         //   inbox      = [D, E]     (!pinned && !fav && (!archived || unread))
         //   archive    = [C]        (!pinned && !fav && archived && !unread)
         let pins = pin_map(&[("acctA", "!a", 0)]);
-        let (merger, inbox, archive, pins_cap, favourites) = capturing_merger_with_pins(pins);
+        let (merger, inbox, archive, pins_cap, favourites, _spaces) =
+            capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -740,7 +951,7 @@ mod tests {
         // transient sync state where a room is both must resolve to Favorites: the
         // `!is_favourite` guard on the archive/inbox predicates keeps the windows
         // strictly disjoint (favourite wins over archive here).
-        let (merger, inbox, archive, _pins, favourites) = capturing_merger();
+        let (merger, inbox, archive, _pins, favourites, _spaces) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -766,7 +977,7 @@ mod tests {
     async fn favourite_leaves_inbox_and_returns_on_unfavourite() {
         // Favouriting removes a room from the chronological Inbox flow; clearing
         // the favourite tag returns it to its recency position (SDK re-emit).
-        let (merger, inbox, _archive, _pins, favourites) = capturing_merger();
+        let (merger, inbox, _archive, _pins, favourites, _spaces) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -822,7 +1033,8 @@ mod tests {
         //   inbox = [D, E], archive = [C]. A pinned room stays in Pins even when
         //   archived/unread (B is pinned-and-archived here to prove pins win).
         let pins = pin_map(&[("acctA", "!a", 1), ("acctA", "!b", 0)]);
-        let (merger, inbox, archive, pins_cap, _favourites) = capturing_merger_with_pins(pins);
+        let (merger, inbox, archive, pins_cap, _favourites, _spaces) =
+            capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -864,7 +1076,8 @@ mod tests {
         // order by (account_id, room_id) — never by recency — and stay put when
         // recency changes, so the strip never flips under the user.
         let pins = pin_map(&[("acctA", "!m", 5), ("acctA", "!n", 5)]);
-        let (merger, _inbox, _archive, pins_cap, _favourites) = capturing_merger_with_pins(pins);
+        let (merger, _inbox, _archive, pins_cap, _favourites, _spaces) =
+            capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -910,7 +1123,8 @@ mod tests {
         // A pinned room keeps its Pins-window position when an unpinned chat gets
         // newer activity (only the Inbox window re-orders).
         let pins = pin_map(&[("acctA", "!p", 0)]);
-        let (merger, inbox, _archive, pins_cap, _favourites) = capturing_merger_with_pins(pins);
+        let (merger, inbox, _archive, pins_cap, _favourites, _spaces) =
+            capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -954,7 +1168,7 @@ mod tests {
     #[tokio::test]
     async fn update_pins_re_emits_all_three_windows() {
         // Start with no pins: all rooms land in the Inbox window.
-        let (merger, inbox, archive, pins_cap, _favourites) = capturing_merger();
+        let (merger, inbox, archive, pins_cap, _favourites, _spaces) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -991,5 +1205,272 @@ mod tests {
         merger.update_pins(HashMap::new()).await;
         assert_eq!(last_reset_ids(&pins_cap), Vec::<String>::new());
         assert_eq!(last_reset_ids(&inbox), ["!a", "!b", "!c"]);
+    }
+
+    #[tokio::test]
+    async fn is_space_rooms_are_excluded_from_all_windows() {
+        // A Space room (`is_space`) is a container, never a chat — it must not
+        // appear in Inbox/Archive/Pins/Favorites, even if pinned/favourited/archived.
+        let pins = pin_map(&[("acctA", "!space", 0)]);
+        let (merger, inbox, archive, pins_cap, favourites, _spaces) =
+            capturing_merger_with_pins(pins);
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_space("!space", Some(500)), // a Space, even pinned
+                            room_flags("!chat", Some(400), false, false),
+                            // A favourited Space room: still excluded (is_space wins).
+                            RoomVm {
+                                is_space: true,
+                                ..room_fav("!favspace", Some(300), false, false)
+                            },
+                        ],
+                    }],
+                    total: Some(3),
+                },
+            )
+            .await;
+        // Only the plain chat survives, in the Inbox window.
+        assert_eq!(last_reset_ids(&inbox), ["!chat"]);
+        assert_eq!(last_reset_ids(&archive), Vec::<String>::new());
+        assert_eq!(last_reset_ids(&pins_cap), Vec::<String>::new());
+        assert_eq!(last_reset_ids(&favourites), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn update_spaces_emits_snapshot_in_account_id_order() {
+        // Two accounts each contribute a Space; the aggregated snapshot flattens in
+        // stable account-id order.
+        let (merger, _inbox, _archive, _pins, _favourites, spaces) = capturing_merger();
+        merger.register_account("acctB", 1).await;
+        merger.register_account("acctA", 0).await;
+        merger
+            .update_spaces(
+                "acctB",
+                vec![space_vm("acctB", "!sb")],
+                membership(&[("!sb", &["!b1"])]),
+            )
+            .await;
+        merger
+            .update_spaces(
+                "acctA",
+                vec![space_vm("acctA", "!sa")],
+                membership(&[("!sa", &["!a1"])]),
+            )
+            .await;
+        // acctA sorts before acctB regardless of update order.
+        assert_eq!(last_spaces_ids(&spaces), ["!sa", "!sb"]);
+    }
+
+    #[tokio::test]
+    async fn selected_space_filters_all_four_windows_preserving_precedence() {
+        // Golden filter case: a Space `!s` on acctA contains {!a (pin+fav), !b (fav),
+        // !c (archived-read), !d (unread)}. `!e` is NOT in the Space; `!x` is on
+        // another account. With the filter set, only `!s`'s members appear, and the
+        // four-way partition + precedence is preserved within the subset.
+        let pins = pin_map(&[("acctA", "!a", 0)]);
+        let (merger, inbox, archive, pins_cap, favourites, _spaces) =
+            capturing_merger_with_pins(pins);
+        merger.register_account("acctA", 0).await;
+        merger.register_account("acctB", 1).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_fav("!a", Some(600), false, false), // pin + fav, in Space
+                            room_fav("!b", Some(500), false, false), // fav, in Space
+                            room_flags("!c", Some(400), true, false), // archived-read, in Space
+                            room_flags("!d", Some(300), false, true), // unread, in Space
+                            room_flags("!e", Some(200), false, false), // NOT in Space
+                        ],
+                    }],
+                    total: Some(5),
+                },
+            )
+            .await;
+        merger
+            .apply_account_batch(
+                "acctB",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_flags("!x", Some(700), false, false)],
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        merger
+            .update_spaces(
+                "acctA",
+                vec![space_vm("acctA", "!s")],
+                membership(&[("!s", &["!a", "!b", "!c", "!d"])]),
+            )
+            .await;
+
+        // Before filtering: !x (acctB) and !e are present.
+        assert_eq!(last_reset_ids(&inbox), ["!x", "!d", "!e"]);
+
+        merger
+            .set_space_filter(Some(("acctA".to_owned(), "!s".to_owned())))
+            .await;
+        // Pins: [!a] (pinned wins). Favorites: [!b]. Inbox: [!d] (unread). Archive: [!c].
+        // !e (not in Space) and !x (other account) are gone from every window.
+        assert_eq!(last_reset_ids(&pins_cap), ["!a"]);
+        assert_eq!(last_reset_ids(&favourites), ["!b"]);
+        assert_eq!(last_reset_ids(&inbox), ["!d"]);
+        assert_eq!(last_reset_ids(&archive), ["!c"]);
+        {
+            let batches = inbox.lock().expect("lock");
+            assert_eq!(
+                batches.last().expect("batch").total,
+                Some(1),
+                "inbox total is the filtered count"
+            );
+        }
+
+        // Clearing restores the full unfiltered windows.
+        merger.set_space_filter(None).await;
+        assert_eq!(last_reset_ids(&inbox), ["!x", "!d", "!e"]);
+    }
+
+    #[tokio::test]
+    async fn selected_space_with_no_members_empties_windows() {
+        // A selected Space whose membership is empty yields empty windows.
+        let (merger, inbox, _archive, _pins, _favourites, _spaces) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_flags("!a", Some(100), false, false)],
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        merger
+            .update_spaces(
+                "acctA",
+                vec![space_vm("acctA", "!empty")],
+                membership(&[("!empty", &[])]),
+            )
+            .await;
+        merger
+            .set_space_filter(Some(("acctA".to_owned(), "!empty".to_owned())))
+            .await;
+        assert_eq!(last_reset_ids(&inbox), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn remove_account_clears_a_selection_it_owned() {
+        // Signing out the account that owns the active Space filter clears the
+        // filter, drops its Spaces from the snapshot, and re-emits full windows.
+        let (merger, inbox, _archive, _pins, _favourites, spaces) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger.register_account("acctB", 1).await;
+        merger
+            .apply_account_batch(
+                "acctB",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_flags("!b1", Some(200), false, false)],
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_flags("!a1", Some(100), false, false)],
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        merger
+            .update_spaces(
+                "acctA",
+                vec![space_vm("acctA", "!s")],
+                membership(&[("!s", &["!a1"])]),
+            )
+            .await;
+        merger
+            .set_space_filter(Some(("acctA".to_owned(), "!s".to_owned())))
+            .await;
+        // Filtered to acctA's Space: only !a1.
+        assert_eq!(last_reset_ids(&inbox), ["!a1"]);
+        assert_eq!(last_spaces_ids(&spaces), ["!s"]);
+
+        merger.remove_account("acctA").await;
+        // Filter cleared (its owner is gone); acctB's room is back, acctA gone.
+        assert_eq!(last_reset_ids(&inbox), ["!b1"]);
+        // The Space snapshot no longer lists acctA's Space.
+        assert_eq!(last_spaces_ids(&spaces), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn update_spaces_without_active_filter_skips_window_re_emit() {
+        // With no Space filter active, a Space recompute (which fires on every sync
+        // `RoomUpdates`) must refresh only the spaces snapshot — the four inbox
+        // windows cannot change, so they are NOT re-emitted (avoids doubling inbox
+        // emissions per sync tick).
+        let (merger, inbox, archive, pins_cap, favourites, spaces) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_flags("!a", Some(100), false, false)],
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        let inbox_before = inbox.lock().expect("lock").len();
+        let archive_before = archive.lock().expect("lock").len();
+        let pins_before = pins_cap.lock().expect("lock").len();
+        let fav_before = favourites.lock().expect("lock").len();
+        let spaces_before = spaces.lock().expect("lock").len();
+
+        merger
+            .update_spaces(
+                "acctA",
+                vec![space_vm("acctA", "!s")],
+                membership(&[("!s", &["!a"])]),
+            )
+            .await;
+
+        // Spaces snapshot advanced; the four windows did not.
+        assert_eq!(spaces.lock().expect("lock").len(), spaces_before + 1);
+        assert_eq!(inbox.lock().expect("lock").len(), inbox_before);
+        assert_eq!(archive.lock().expect("lock").len(), archive_before);
+        assert_eq!(pins_cap.lock().expect("lock").len(), pins_before);
+        assert_eq!(favourites.lock().expect("lock").len(), fav_before);
+
+        // Once a filter is active, a subsequent recompute DOES re-emit the windows
+        // (membership changes can move rows in/out of the filtered view).
+        merger
+            .set_space_filter(Some(("acctA".to_owned(), "!s".to_owned())))
+            .await;
+        let inbox_after_filter = inbox.lock().expect("lock").len();
+        merger
+            .update_spaces(
+                "acctA",
+                vec![space_vm("acctA", "!s")],
+                membership(&[("!s", &["!a"])]),
+            )
+            .await;
+        assert_eq!(inbox.lock().expect("lock").len(), inbox_after_filter + 1);
     }
 }

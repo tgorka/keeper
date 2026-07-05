@@ -57,4 +57,12 @@ isArchived: boolean,
  * inbox merge partitions on this to place the room in the Favorites window
  * (removed from Inbox/Archive); the frontend never re-derives it.
  */
-isFavourite: boolean, };
+isFavourite: boolean, 
+/**
+ * Whether the room is itself a Matrix Space (`Room::is_space()`, `m.space`
+ * room type) (Story 4.5, AD-20). Used only to *exclude* Space rooms from the
+ * four inbox chat windows in the merge — Spaces are containers, not chats, and
+ * are surfaced separately as filter views. Not copied to [`InboxRoomVm`]; the
+ * merge drops `is_space` rooms before partitioning.
+ */
+isSpace: boolean, };

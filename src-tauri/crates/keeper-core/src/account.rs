@@ -44,7 +44,7 @@ use crate::bridge;
 use crate::error::{
     AccountError, BackupError, CoreError, InboxError, MediaError, SendError, TimelineError,
 };
-use crate::inbox::InboxMerger;
+use crate::inbox::{InboxMerger, SpacesSink};
 use crate::media::{self, MediaBytes, MediaHandle, MediaVariant};
 use crate::platform::Platform;
 use crate::registry;
@@ -54,7 +54,8 @@ use crate::timeline;
 use crate::verification::{self, VerificationSink};
 use crate::vm::{
     ConnectionStatus, ConnectionStatusBatch, EncryptionStatus, EncryptionStatusBatch, InboxBatch,
-    PaginationStatusBatch, RoomListBatch, RoomListOp, RoomVm, TimelineBatch, TypingBatch, TypistVm,
+    PaginationStatusBatch, RoomListBatch, RoomListOp, RoomVm, SpaceVm, TimelineBatch, TypingBatch,
+    TypistVm,
 };
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
@@ -165,6 +166,10 @@ struct InboxHandle {
     subscription_id: u64,
     merger: InboxMerger,
     producers: HashMap<String, JoinHandle<()>>,
+    /// Per-account Spaces producers (Story 4.5): each recomputes the account's
+    /// joined Spaces + child membership on every sync batch and pokes the merger.
+    /// Tracked separately from `producers` so teardown aborts them too.
+    spaces_producers: HashMap<String, JoinHandle<()>>,
 }
 
 /// Multi-account supervisor (AD-3, AD-19, AD-20). Owns the live per-account
@@ -317,6 +322,7 @@ impl AccountManager {
         archive_sink: InboxSink,
         pins_sink: InboxSink,
         favourites_sink: InboxSink,
+        spaces_sink: SpacesSink,
     ) -> Result<u64, CoreError> {
         // Only one inbox subscription at a time: tear down any prior one so its
         // producers stop feeding a stale merger/channel.
@@ -327,12 +333,21 @@ impl AccountManager {
         // no Matrix representation, so membership + order come from the registry.
         let data_dir = platform.data_dir()?;
         let pins = load_pins(&data_dir)?;
-        let merger = InboxMerger::new(inbox_sink, archive_sink, pins_sink, favourites_sink, pins);
+        let merger = InboxMerger::new(
+            inbox_sink,
+            archive_sink,
+            pins_sink,
+            favourites_sink,
+            pins,
+            spaces_sink,
+        );
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
 
         // Register every account slot up front so the merge reflects the full set
         // even before any batch arrives, then start each account's producer.
         let mut producers: HashMap<String, JoinHandle<()>> = HashMap::with_capacity(accounts.len());
+        let mut spaces_producers: HashMap<String, JoinHandle<()>> =
+            HashMap::with_capacity(accounts.len());
         for account in &accounts {
             merger
                 .register_account(&account.account_id, account.hue_index)
@@ -355,6 +370,14 @@ impl AccountManager {
                     continue;
                 }
             };
+            // The account is now live (acquire_room_list activated it): fetch its
+            // `Client` to drive the Spaces producer (Story 4.5), which enumerates
+            // joined Spaces + child membership locally and pokes the merger on every
+            // sync batch.
+            let client = {
+                let accounts = self.accounts.lock().await;
+                accounts.get(&account_id).map(|h| h.client.clone())
+            };
             let merger_for_task = merger.clone();
             let task = tokio::spawn(
                 async move {
@@ -365,6 +388,19 @@ impl AccountManager {
                 ),
             );
             producers.insert(account.account_id.clone(), task);
+            if let Some(client) = client {
+                let merger_for_spaces = merger.clone();
+                let spaces_account_id = account.account_id.clone();
+                let spaces_task = tokio::spawn(
+                    async move {
+                        run_spaces_producer(client, merger_for_spaces, &spaces_account_id).await;
+                    }
+                    .instrument(
+                        tracing::info_span!("spaces_producer", account_id = %account.account_id),
+                    ),
+                );
+                spaces_producers.insert(account.account_id.clone(), spaces_task);
+            }
         }
 
         {
@@ -373,6 +409,7 @@ impl AccountManager {
                 subscription_id,
                 merger,
                 producers,
+                spaces_producers,
             });
         }
         tracing::info!(subscription_id, "merged inbox subscribed");
@@ -400,6 +437,9 @@ impl AccountManager {
         let handle = self.inbox.lock().await.take();
         if let Some(handle) = handle {
             for (_, task) in handle.producers {
+                task.abort();
+            }
+            for (_, task) in handle.spaces_producers {
                 task.abort();
             }
         }
@@ -1727,6 +1767,18 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Set (or clear) the ephemeral Space filter on the live merger (Story 4.5).
+    /// `selection` is `Some((account_id, space_id))` to narrow every inbox window
+    /// to that Space's joined children, or `None` to restore the full inbox.
+    /// Mirrors [`Self::reorder_pins`]'s poke-the-merger shape: a no-active-inbox
+    /// case is a harmless no-op (the filter is ephemeral, so nothing to persist).
+    pub async fn set_space_filter(&self, selection: Option<(String, String)>) {
+        let inbox = self.inbox.lock().await;
+        if let Some(handle) = inbox.as_ref() {
+            handle.merger.set_space_filter(selection).await;
+        }
+    }
+
     /// Set (or clear) the account's typing notice in the room through the
     /// receipt/typing signals seam (Story 3.9, AD-14). Resolves the account's live
     /// `Room` and delegates to [`signals::set_typing`]. Best-effort: a dispatch
@@ -2032,6 +2084,13 @@ impl AccountManager {
             if let Some(handle) = inbox.as_mut() {
                 handle.merger.remove_account(account_id).await;
                 if let Some(task) = handle.producers.remove(account_id) {
+                    task.abort();
+                    let _ = task.await;
+                }
+                // Abort + await the account's Spaces producer too (Story 4.5): it
+                // holds a `Client` clone, so it must be dropped before `sign_out`
+                // deletes the store dir (same reasoning as the room-list producer).
+                if let Some(task) = handle.spaces_producers.remove(account_id) {
                     task.abort();
                     let _ = task.await;
                 }
@@ -2510,6 +2569,121 @@ async fn run_inbox_producer(room_list: RoomList, merger: InboxMerger, account_id
     }
 }
 
+/// Per-account Spaces producer (Story 4.5). Enumerates the account's joined
+/// Spaces and each Space's joined child rooms **from local state only** — no
+/// `/hierarchy` network fetch — then pokes the live [`InboxMerger`] with the
+/// result, recomputing on every sync batch so the Space list and any active
+/// filter stay live.
+///
+/// It computes once immediately, then loops on
+/// `Client::subscribe_to_all_room_updates()`: on `Ok(_)` it recomputes; on
+/// `Lagged` it forces a full recompute (a missed batch may have changed
+/// membership); on `Closed` it stops (the client is gone). For each
+/// `client.joined_space_rooms()` it builds a [`SpaceVm`] (name via
+/// `room.display_name().await`, avatar via `room.avatar_url()`) and the Space's
+/// child set from `m.space.child` state (`get_state_events_static`), keeping only
+/// children the account has actually joined. A read error on one Space is logged
+/// at `debug!` and that Space skipped — the others still update.
+async fn run_spaces_producer(client: Client, merger: InboxMerger, account_id: &str) {
+    let mut updates = client.subscribe_to_all_room_updates();
+    // Initial compute so the Space list is present before the first sync batch.
+    compute_and_push_spaces(&client, &merger, account_id).await;
+    loop {
+        match updates.recv().await {
+            Ok(_) => compute_and_push_spaces(&client, &merger, account_id).await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::debug!(account_id = %account_id, skipped, "spaces updates lagged; forcing recompute");
+                compute_and_push_spaces(&client, &merger, account_id).await;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tracing::info!(account_id = %account_id, "spaces updates closed, stopping producer");
+                break;
+            }
+        }
+    }
+}
+
+/// Compute the account's joined Spaces + child membership from local state and
+/// push them into the merger (Story 4.5). Factored out of [`run_spaces_producer`]
+/// so the initial compute and each sync-driven recompute share one path.
+async fn compute_and_push_spaces(client: &Client, merger: &InboxMerger, account_id: &str) {
+    use matrix_sdk::deserialized_responses::SyncOrStrippedState;
+    use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
+    use matrix_sdk::ruma::events::SyncStateEvent;
+
+    // The set of rooms this account has actually joined — child links are only
+    // honored when the child room is joined (view-and-filter joined rooms only).
+    let joined: std::collections::HashSet<String> = client
+        .joined_rooms()
+        .iter()
+        .map(|r| r.room_id().to_string())
+        .collect();
+
+    let mut spaces: Vec<SpaceVm> = Vec::new();
+    let mut memberships: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+
+    for space in client.joined_space_rooms() {
+        let space_id = space.room_id().to_string();
+        let name = match space.display_name().await {
+            Ok(name) => name.to_string(),
+            Err(e) => {
+                tracing::debug!(account_id = %account_id, space_id = %space_id, error = %e, "space display name resolve failed, using id");
+                space_id.clone()
+            }
+        };
+        let avatar_url = space.avatar_url().map(|u| u.to_string());
+        // Read the Space's `m.space.child` state from local store only. Keep the
+        // `state_key` (the child room id) of Sync `Original` + Stripped events;
+        // drop Redacted; ignore deserialize errors (mirrors matrix-sdk-ui's
+        // `build_space_state`). Cross-reference against the account's joined rooms.
+        let mut children: std::collections::HashSet<String> = std::collections::HashSet::new();
+        match space
+            .get_state_events_static::<SpaceChildEventContent>()
+            .await
+        {
+            Ok(child_events) => {
+                for raw in child_events {
+                    let child_id = match raw.deserialize() {
+                        Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) => {
+                            Some(e.state_key.to_string())
+                        }
+                        Ok(SyncOrStrippedState::Stripped(e)) => Some(e.state_key.to_string()),
+                        Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) => None,
+                        Err(_) => None,
+                    };
+                    if let Some(child_id) = child_id {
+                        if joined.contains(&child_id) {
+                            children.insert(child_id);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(account_id = %account_id, space_id = %space_id, error = %e, "could not read m.space.child; skipping this space's membership");
+            }
+        }
+
+        spaces.push(SpaceVm {
+            account_id: account_id.to_owned(),
+            space_id: space_id.clone(),
+            name,
+            avatar_url,
+        });
+        memberships.insert(space_id, children);
+    }
+
+    // `joined_space_rooms()` order is unspecified (store-map iteration), so sort
+    // deterministically (by name, then id) to keep the sidebar Space list stable
+    // across recomputes instead of reshuffling on every sync tick.
+    spaces.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.space_id.cmp(&b.space_id))
+    });
+
+    merger.update_spaces(account_id, spaces, memberships).await;
+}
+
 /// Load keeper-local pins from the registry into a merger-shaped map keyed by
 /// `(account_id, room_id)` → `sort_order` (Story 4.3). Pins have no Matrix
 /// representation, so membership + order are registry-authoritative.
@@ -2614,6 +2788,10 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
     // `is_favourite()` reads the cached `m.favourite` notable tag (no await); the
     // merge partitions the inbox on it into the Favorites window (Story 4.4).
     let is_favourite = item.is_favourite();
+    // `is_space()` reads the cached `m.space` room type (no await); the merge
+    // excludes Space rooms from all four chat windows (Story 4.5) — Spaces are
+    // containers, surfaced separately as filter views.
+    let is_space = item.is_space();
 
     RoomVm {
         room_id,
@@ -2625,6 +2803,7 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
         mention_count,
         is_archived,
         is_favourite,
+        is_space,
     }
 }
 
@@ -2808,6 +2987,7 @@ mod tests {
             mention_count: 0,
             is_archived: false,
             is_favourite: false,
+            is_space: false,
         }
     }
 

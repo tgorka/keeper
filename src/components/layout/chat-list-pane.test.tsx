@@ -1,16 +1,19 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountVm, InboxBatch, IpcError } from "@/lib/ipc/client";
+import type { AccountVm, InboxBatch, IpcError, SpacesSnapshot } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 
 // Mock the typed IPC wrapper so the pane never touches Tauri. `subscribeInbox`
-// captures the `onInbox`/`onArchive`/`onPins`/`onFavourites` handlers so the test
-// can drive every window of the merged stream (Story 4.2 + 4.3 + 4.4).
+// captures the `onInbox`/`onArchive`/`onPins`/`onFavourites`/`onSpaces` handlers so
+// the test can drive every window of the merged stream (Story 4.2 + 4.3 + 4.4 + 4.5).
 const subscribeInbox = vi.fn();
 const unsubscribeInbox = vi.fn();
+const setSpaceFilter = vi.fn(
+  async (_accountId: string | null, _spaceId: string | null): Promise<void> => {},
+);
 const getFavoritesCollapsed = vi.fn(async (): Promise<boolean> => false);
 const setFavoritesCollapsed = vi.fn(async (_collapsed: boolean): Promise<void> => {});
 vi.mock("@/lib/ipc/client", () => ({
@@ -19,8 +22,11 @@ vi.mock("@/lib/ipc/client", () => ({
     onArchive: (b: InboxBatch) => void,
     onPins: (b: InboxBatch) => void,
     onFavourites: (b: InboxBatch) => void,
-  ) => subscribeInbox(onInbox, onArchive, onPins, onFavourites),
+    onSpaces: (s: SpacesSnapshot) => void,
+  ) => subscribeInbox(onInbox, onArchive, onPins, onFavourites, onSpaces),
   unsubscribeInbox: (id: number) => unsubscribeInbox(id),
+  setSpaceFilter: (accountId: string | null, spaceId: string | null) =>
+    setSpaceFilter(accountId, spaceId),
   getFavoritesCollapsed: () => getFavoritesCollapsed(),
   setFavoritesCollapsed: (v: boolean) => setFavoritesCollapsed(v),
   // Best-effort mutation wrappers the strip/rows may call; no-ops here.
@@ -39,6 +45,7 @@ import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { favoritesUiStore } from "@/lib/stores/favorites-ui";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
+import { spacesStore } from "@/lib/stores/spaces";
 
 const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -86,9 +93,11 @@ beforeEach(() => {
   pinsRoomsStore.getState().clear();
   favoritesRoomsStore.getState().clear();
   favoritesUiStore.getState().setCollapsed(false);
+  spacesStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
   subscribeInbox.mockReset();
   unsubscribeInbox.mockReset();
+  setSpaceFilter.mockReset();
   getFavoritesCollapsed.mockReset();
   getFavoritesCollapsed.mockResolvedValue(false);
   setFavoritesCollapsed.mockReset();
@@ -103,6 +112,7 @@ afterEach(() => {
   pinsRoomsStore.getState().clear();
   favoritesRoomsStore.getState().clear();
   favoritesUiStore.getState().setCollapsed(false);
+  spacesStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
 });
 
@@ -142,6 +152,7 @@ describe("ChatListPane", () => {
     render(<ChatListPane />);
 
     expect(subscribeInbox).toHaveBeenCalledWith(
+      expect.any(Function),
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
@@ -595,6 +606,249 @@ describe("ChatListPane", () => {
     });
     await waitFor(() => {
       expect(favoritesUiStore.getState().isCollapsed).toBe(true);
+    });
+  });
+
+  it("feeds the fifth channel into the spaces store", async () => {
+    const captured: { onSpaces: ((s: SpacesSnapshot) => void) | null } = { onSpaces: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        _onFavourites: (b: InboxBatch) => void,
+        onSpaces: (s: SpacesSnapshot) => void,
+      ) => {
+        captured.onSpaces = onSpaces;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+
+    captured.onSpaces?.({
+      spaces: [
+        {
+          accountId: account.accountId,
+          spaceId: "!s:example.org",
+          name: "Design",
+          avatarUrl: null,
+        },
+      ],
+    });
+
+    await waitFor(() => {
+      expect(spacesStore.getState().spaces).toHaveLength(1);
+    });
+    expect(spacesStore.getState().spaces[0].name).toBe("Design");
+  });
+
+  it("reconciles a stale Space selection absent from a streamed snapshot", async () => {
+    const captured: { onSpaces: ((s: SpacesSnapshot) => void) | null } = { onSpaces: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        _onFavourites: (b: InboxBatch) => void,
+        onSpaces: (s: SpacesSnapshot) => void,
+      ) => {
+        captured.onSpaces = onSpaces;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    // The active selection points at a Space owned by an account that is about to
+    // vanish from the streamed list (e.g. its owner signed out with others left).
+    spacesStore
+      .getState()
+      .setActiveSpace({ accountId: "gone-account", spaceId: "!gone:example.org" });
+    render(<ChatListPane />);
+    await waitFor(() => {
+      expect(captured.onSpaces).not.toBeNull();
+    });
+    // A snapshot arrives WITHOUT the selected Space.
+    captured.onSpaces?.({
+      spaces: [
+        {
+          accountId: account.accountId,
+          spaceId: "!other:example.org",
+          name: "Design",
+          avatarUrl: null,
+        },
+      ],
+    });
+
+    // The stale selection is dropped and the Rust filter cleared, so the inbox
+    // does not stay filtered on a Space with no members (empty-inbox-forever).
+    await waitFor(() => {
+      expect(setSpaceFilter).toHaveBeenCalledWith(null, null);
+    });
+    expect(spacesStore.getState().activeSpace).toBeNull();
+  });
+
+  it("renders a dismissible Space filter chip that clears the filter", async () => {
+    const captured: { onSpaces: ((s: SpacesSnapshot) => void) | null } = { onSpaces: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        _onFavourites: (b: InboxBatch) => void,
+        onSpaces: (s: SpacesSnapshot) => void,
+      ) => {
+        captured.onSpaces = onSpaces;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    // The selection survives the mount effect; the list arrives via the channel.
+    spacesStore
+      .getState()
+      .setActiveSpace({ accountId: account.accountId, spaceId: "!s:example.org" });
+    render(<ChatListPane />);
+    await waitFor(() => {
+      expect(captured.onSpaces).not.toBeNull();
+    });
+    captured.onSpaces?.({
+      spaces: [
+        {
+          accountId: account.accountId,
+          spaceId: "!s:example.org",
+          name: "Design",
+          avatarUrl: null,
+        },
+      ],
+    });
+
+    // The chip shows the Space name and a clear ✕.
+    const clearBtn = await screen.findByRole("button", { name: "Clear Design filter" });
+    expect(clearBtn).toBeInTheDocument();
+
+    fireEvent.click(clearBtn);
+    // Clearing pokes the Rust filter with null/null and drops the selection.
+    await waitFor(() => {
+      expect(setSpaceFilter).toHaveBeenCalledWith(null, null);
+    });
+    expect(spacesStore.getState().activeSpace).toBeNull();
+  });
+
+  it("clears the Space filter on Esc from the list", async () => {
+    const captured: { onSpaces: ((s: SpacesSnapshot) => void) | null } = { onSpaces: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        _onFavourites: (b: InboxBatch) => void,
+        onSpaces: (s: SpacesSnapshot) => void,
+      ) => {
+        captured.onSpaces = onSpaces;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    spacesStore
+      .getState()
+      .setActiveSpace({ accountId: account.accountId, spaceId: "!s:example.org" });
+    render(<ChatListPane />);
+    await waitFor(() => {
+      expect(captured.onSpaces).not.toBeNull();
+    });
+    captured.onSpaces?.({
+      spaces: [
+        {
+          accountId: account.accountId,
+          spaceId: "!s:example.org",
+          name: "Design",
+          avatarUrl: null,
+        },
+      ],
+    });
+
+    await screen.findByRole("button", { name: "Clear Design filter" });
+    // Esc anywhere in the list container clears the active filter.
+    fireEvent.keyDown(screen.getByLabelText("Clear Design filter"), { key: "Escape" });
+    await waitFor(() => {
+      expect(setSpaceFilter).toHaveBeenCalledWith(null, null);
+    });
+    expect(spacesStore.getState().activeSpace).toBeNull();
+  });
+
+  it("shows the 'No chats in {Space}' empty state when the filtered inbox is empty", async () => {
+    const captured: {
+      onInbox: ((b: InboxBatch) => void) | null;
+      onSpaces: ((s: SpacesSnapshot) => void) | null;
+    } = { onInbox: null, onSpaces: null };
+    subscribeInbox.mockImplementation(
+      (
+        onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        _onFavourites: (b: InboxBatch) => void,
+        onSpaces: (s: SpacesSnapshot) => void,
+      ) => {
+        captured.onInbox = onInbox;
+        captured.onSpaces = onSpaces;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    spacesStore
+      .getState()
+      .setActiveSpace({ accountId: account.accountId, spaceId: "!s:example.org" });
+    render(<ChatListPane />);
+    await waitFor(() => {
+      expect(captured.onSpaces).not.toBeNull();
+    });
+    captured.onSpaces?.({
+      spaces: [
+        {
+          accountId: account.accountId,
+          spaceId: "!s:example.org",
+          name: "Design",
+          avatarUrl: null,
+        },
+      ],
+    });
+
+    // The (filtered) inbox window delivers no rows.
+    captured.onInbox?.({ ops: [{ op: "reset", rooms: [] }], total: 0 });
+
+    await waitFor(() => {
+      // The label is split across text nodes (interpolated Space name); match the
+      // leading text node and the interpolated Space name separately.
+      expect(screen.getByText(/No chats in/)).toBeInTheDocument();
+    });
+    expect(screen.getByText("Design")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear filter" })).toBeInTheDocument();
+    expect(screen.queryByText("No conversations yet.")).not.toBeInTheDocument();
+  });
+
+  it("re-applies the Space filter after an account-set re-subscribe", async () => {
+    subscribeInbox.mockResolvedValue(1);
+    accountsStore.getState().addAccount(account);
+    spacesStore
+      .getState()
+      .setActiveSpace({ accountId: account.accountId, spaceId: "!s:example.org" });
+    render(<ChatListPane />);
+
+    await waitFor(() => {
+      expect(subscribeInbox).toHaveBeenCalledTimes(1);
+    });
+    // The initial subscribe re-applies the carried-over selection.
+    await waitFor(() => {
+      expect(setSpaceFilter).toHaveBeenCalledWith(account.accountId, "!s:example.org");
+    });
+
+    // Adding a second account re-subscribes; the filter is re-applied again.
+    setSpaceFilter.mockClear();
+    accountsStore.getState().addAccount(bob);
+    await waitFor(() => {
+      expect(subscribeInbox).toHaveBeenCalledTimes(2);
+    });
+    await waitFor(() => {
+      expect(setSpaceFilter).toHaveBeenCalledWith(account.accountId, "!s:example.org");
     });
   });
 });

@@ -350,6 +350,51 @@ pub struct RoomVm {
     /// inbox merge partitions on this to place the room in the Favorites window
     /// (removed from Inbox/Archive); the frontend never re-derives it.
     pub is_favourite: bool,
+    /// Whether the room is itself a Matrix Space (`Room::is_space()`, `m.space`
+    /// room type) (Story 4.5, AD-20). Used only to *exclude* Space rooms from the
+    /// four inbox chat windows in the merge — Spaces are containers, not chats, and
+    /// are surfaced separately as filter views. Not copied to [`InboxRoomVm`]; the
+    /// merge drops `is_space` rooms before partitioning.
+    pub is_space: bool,
+}
+
+/// One Matrix Space the user belongs to, surfaced as a filter view (Story 4.5,
+/// FR-22, AD-20).
+///
+/// Carries **only** non-secret render data: the opaque keeper `account_id` that
+/// owns the Space, the opaque Space room id, the SDK-resolved display name, and an
+/// optional avatar `mxc://` URI. Enumerated locally from
+/// `Client::joined_space_rooms()` (no `/hierarchy` network fetch); membership (the
+/// Space's joined children) is computed alongside but stays in the merger — never
+/// on this VM. The frontend renders a SPACES sidebar row per `SpaceVm` and, on
+/// select, pokes the ephemeral Space filter identified by `(account_id, space_id)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpaceVm {
+    /// Opaque keeper account id that owns this Space. Part of the selection key.
+    pub account_id: String,
+    /// Opaque Matrix room id of the Space (passed through verbatim as a string).
+    pub space_id: String,
+    /// The SDK-computed Space display name.
+    pub name: String,
+    /// Optional Space avatar URL (an `mxc://` URI), or `null`.
+    pub avatar_url: Option<String>,
+}
+
+/// The full current Space list, streamed as a whole-snapshot batch on the inbox
+/// subscription's fifth `Channel` (Story 4.5, AD-20).
+///
+/// Spaces are few, so there is no diff protocol: each batch carries the complete
+/// aggregated list across every account (stable account-id order), and the
+/// frontend replaces its list wholesale. Emitted on subscribe, then on every sync
+/// batch that changes the Space list or its membership, and on account removal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SpacesSnapshot {
+    /// Every joined Space across all accounts, in stable account-id order.
+    pub spaces: Vec<SpaceVm>,
 }
 
 /// One index-based room-list operation mirroring an eyeball-im `VectorDiff`
@@ -1370,6 +1415,7 @@ mod tests {
             mention_count: 0,
             is_archived: false,
             is_favourite: false,
+            is_space: false,
         }
     }
 
@@ -1399,12 +1445,46 @@ mod tests {
             mention_count: 0,
             is_archived: false,
             is_favourite: false,
+            is_space: false,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");
         assert!(json.contains("\"timestamp\":null"), "json was: {json}");
         let back: RoomVm = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn space_vm_round_trips_camel_case() {
+        let vm = SpaceVm {
+            account_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            space_id: "!space:example.org".to_owned(),
+            name: "Design Team".to_owned(),
+            avatar_url: Some("mxc://example.org/space".to_owned()),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize space vm");
+        assert!(json.contains("\"accountId\":"), "json was: {json}");
+        assert!(json.contains("\"spaceId\":"), "json was: {json}");
+        assert!(json.contains("\"name\":"), "json was: {json}");
+        assert!(json.contains("\"avatarUrl\":"), "json was: {json}");
+        let back: SpaceVm = serde_json::from_str(&json).expect("deserialize space vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn spaces_snapshot_round_trips() {
+        let snapshot = SpacesSnapshot {
+            spaces: vec![SpaceVm {
+                account_id: "acctA".to_owned(),
+                space_id: "!space:example.org".to_owned(),
+                name: "Space".to_owned(),
+                avatar_url: None,
+            }],
+        };
+        let json = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        assert!(json.contains("\"spaces\":["), "json was: {json}");
+        let back: SpacesSnapshot = serde_json::from_str(&json).expect("deserialize snapshot");
+        assert_eq!(back, snapshot);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { Archive, MessageSquare, Radio, Settings, WifiOff } from "lucide-react";
 import { useState } from "react";
 import { AccountFooter } from "@/components/layout/account-footer";
+import { SpacesGroup } from "@/components/layout/spaces-group";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -107,6 +108,11 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
           );
         })}
       </ul>
+      {/* SPACES group (Story 4.5): a single-select list of the Matrix Spaces the
+          user belongs to, filtering the Unified Inbox. Rendered after the primary
+          views, before the footer. Hidden entirely when there are no Spaces, and
+          suppressed on the collapsed rail (it needs labels + names). */}
+      {!collapsed && <SpacesGroup />}
       {/* Persistent sidebar-footer region (pushed to the bottom with `mt-auto`):
           the offline pill directly ABOVE the account row, both inside the footer
           region. The account row is always mounted while signed in; the pill

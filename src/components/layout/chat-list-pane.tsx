@@ -13,20 +13,27 @@
  * account added or signed out): the effect keys on the account-id set so the
  * merged window always covers exactly the live accounts.
  */
+import { X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { ChatRow } from "@/components/chat/chat-row";
 import { FavoritesSection, hydrateFavoritesCollapsed } from "@/components/layout/favorites-section";
 import { PinsStrip } from "@/components/layout/pins-strip";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { InboxBatch } from "@/lib/ipc/client";
-import { getFavoritesCollapsed, subscribeInbox, unsubscribeInbox } from "@/lib/ipc/client";
+import type { InboxBatch, SpacesSnapshot } from "@/lib/ipc/client";
+import {
+  getFavoritesCollapsed,
+  setSpaceFilter,
+  subscribeInbox,
+  unsubscribeInbox,
+} from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore, useArchiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { favoritesRoomsStore, useFavoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { pinsRoomsStore, usePinsRoomsStore } from "@/lib/stores/pins-rooms";
 import { usePrimaryView } from "@/lib/stores/primary-view";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
+import { spacesStore, useSpacesStore } from "@/lib/stores/spaces";
 
 export function ChatListPane() {
   // Key the subscription on the set of account ids: an add/sign-out re-subscribes
@@ -48,6 +55,19 @@ export function ChatListPane() {
   // merged, Rust-ordered rooms — it hides non-matching rows without touching the
   // merged subscription or the sort. `null` shows every account.
   const filterAccountId = useAccountsStore((s) => s.filterAccountId);
+  // The active Space filter (Story 4.5): a Rust-side inbox filter (unlike the
+  // account switcher, which is a pure TS display filter). The selection is mirrored
+  // here only to render the dismissible chip + empty state and to re-apply the
+  // filter after an account-set re-subscribe. `null` means unfiltered.
+  const activeSpace = useSpacesStore((s) => s.activeSpace);
+  const activeSpaceName = useSpacesStore((s) =>
+    s.activeSpace === null
+      ? null
+      : (s.spaces.find(
+          (sp) =>
+            sp.accountId === s.activeSpace?.accountId && sp.spaceId === s.activeSpace?.spaceId,
+        )?.name ?? null),
+  );
   const [errored, setErrored] = useState(false);
   // Track skeleton-dismissal per window: the Inbox and Archive stream on
   // independent channels, so gating one view's skeleton on the *other* view's
@@ -59,6 +79,9 @@ export function ChatListPane() {
 
   useEffect(() => {
     if (accountKey.length === 0) {
+      // No signed-in accounts: clear the Space list *and* the selection (a full
+      // sign-out has no Space to filter to).
+      spacesStore.getState().clear();
       return;
     }
 
@@ -71,6 +94,13 @@ export function ChatListPane() {
     archiveRoomsStore.getState().clear();
     pinsRoomsStore.getState().clear();
     favoritesRoomsStore.getState().clear();
+    // The Space list is replaced wholesale by each snapshot, so reset only the
+    // list here; the active Space *selection* is preserved across an account-set
+    // re-subscribe so the Rust filter can be re-applied below (survive resubscribe).
+    spacesStore.getState().applySnapshot({ spaces: [] });
+    // Capture the carried-over selection (from before this run) so we can re-apply
+    // the Rust-side filter once the new subscription is live.
+    const carriedSpace = spacesStore.getState().activeSpace;
     let subscriptionId: number | null = null;
     let cancelled = false;
 
@@ -99,7 +129,25 @@ export function ChatListPane() {
         favoritesRoomsStore.getState().applyBatch(b);
       }
     };
-    subscribeInbox(onInbox, onArchive, onPins, onFavourites)
+    const onSpaces = (snapshot: SpacesSnapshot) => {
+      if (!cancelled) {
+        spacesStore.getState().applySnapshot(snapshot);
+        // Reconcile a stale selection: if the active Space is no longer in the
+        // streamed list (its owner account signed out, or the user left the
+        // Space), clear the selection and the Rust filter — otherwise the merger
+        // stays filtered on a `(account, space)` with no members and empties every
+        // window indefinitely while the chip shows a now-nameless Space.
+        const sel = spacesStore.getState().activeSpace;
+        if (
+          sel !== null &&
+          !snapshot.spaces.some((s) => s.accountId === sel.accountId && s.spaceId === sel.spaceId)
+        ) {
+          spacesStore.getState().setActiveSpace(null);
+          void setSpaceFilter(null, null).catch(() => {});
+        }
+      }
+    };
+    subscribeInbox(onInbox, onArchive, onPins, onFavourites, onSpaces)
       .then((id) => {
         if (cancelled) {
           // Unmounted before the id resolved — tear down immediately.
@@ -107,6 +155,12 @@ export function ChatListPane() {
           return;
         }
         subscriptionId = id;
+        // Re-apply the ephemeral Space filter after a (re)subscribe so it survives
+        // an account-set re-subscribe (Story 4.5). The Rust merger starts each new
+        // subscription unfiltered, so a carried-over selection must be re-poked.
+        if (carriedSpace !== null) {
+          void setSpaceFilter(carriedSpace.accountId, carriedSpace.spaceId).catch(() => {});
+        }
       })
       .catch(() => {
         if (!cancelled) {
@@ -116,6 +170,10 @@ export function ChatListPane() {
 
     return () => {
       cancelled = true;
+      // Clear the mirrored Space list on unsubscribe; the selection is kept so a
+      // re-subscribe can re-apply the filter (cleared fully only on full sign-out
+      // via the store's own `clear`, when there are no accounts).
+      spacesStore.getState().applySnapshot({ spaces: [] });
       if (subscriptionId !== null) {
         void unsubscribeInbox(subscriptionId);
       }
@@ -154,20 +212,70 @@ export function ChatListPane() {
       ? favoritesRooms
       : favoritesRooms.filter((room) => room.accountId === filterAccountId);
   const showFavorites = view === "inbox" && visibleFavorites.length > 0;
+  // Clear the active Space filter (chip ✕ / Esc / active-row toggle): drop the
+  // selection and clear the Rust filter so the full inbox is restored (Story 4.5).
+  const clearSpaceFilter = () => {
+    spacesStore.getState().setActiveSpace(null);
+    void setSpaceFilter(null, null).catch(() => {});
+  };
+
   // Per-view empty state (UX-DR13): the Archive uses sentence case with a code-font
-  // `E` and no exclamation; the Inbox keeps its existing copy.
-  const emptyState =
-    view === "archive" ? (
-      <>
-        Nothing archived. <code className="font-mono text-xs">E</code> archives a chat and keeps it
-        searchable.
-      </>
-    ) : (
-      "No conversations yet."
-    );
+  // `E` and no exclamation; the Inbox keeps its existing copy. When a Space filter
+  // is active and the view is empty, show "No chats in {Space name}." with a Clear
+  // action instead (UX-DR13, Story 4.5).
+  const spaceFilterActive = activeSpace !== null;
+  const spaceEmptyLabel = activeSpaceName ?? "this Space";
+  const emptyState = spaceFilterActive ? (
+    <>
+      No chats in {spaceEmptyLabel}.{" "}
+      <button
+        type="button"
+        onClick={clearSpaceFilter}
+        className="text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        Clear filter
+      </button>
+    </>
+  ) : view === "archive" ? (
+    <>
+      Nothing archived. <code className="font-mono text-xs">E</code> archives a chat and keeps it
+      searchable.
+    </>
+  ) : (
+    "No conversations yet."
+  );
 
   return (
-    <div className="flex h-full w-[320px] shrink-0 flex-col border-border border-r bg-background">
+    // biome-ignore lint/a11y/noStaticElementInteractions: container-level Esc handler clears the active Space filter before focus moves (UX-DR); rows stay independently keyboard-operable, so this is additive.
+    <div
+      className="flex h-full w-[320px] shrink-0 flex-col border-border border-r bg-background"
+      onKeyDown={(e) => {
+        // Esc from the list clears an active Space filter before moving focus.
+        if (e.key === "Escape" && spaceFilterActive) {
+          e.preventDefault();
+          clearSpaceFilter();
+        }
+      }}
+    >
+      {/* Dismissible Space filter chip (Story 4.5): shown above the list when a
+          Space filter is active. The ✕ clears the filter and restores the inbox.
+          Built to hold multiple AND-composed chips (Story 4.6 adds the Network
+          chip alongside). */}
+      {spaceFilterActive && (
+        <div className="flex shrink-0 flex-wrap gap-1 border-border border-b px-3 py-2">
+          <span className="inline-flex items-center gap-1 rounded-full bg-accent px-2 py-0.5 text-accent-foreground text-xs">
+            {activeSpaceName ?? "Space"}
+            <button
+              type="button"
+              onClick={clearSpaceFilter}
+              aria-label={`Clear ${activeSpaceName ?? "Space"} filter`}
+              className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <X aria-hidden="true" className="size-3" />
+            </button>
+          </span>
+        </div>
+      )}
       {showPins && (
         <PinsStrip
           pins={visiblePins}

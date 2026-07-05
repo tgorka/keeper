@@ -98,6 +98,7 @@ pub fn run() {
             ipc::pin_room,
             ipc::unpin_room,
             ipc::reorder_pins,
+            ipc::set_space_filter,
             ipc::set_typing,
             ipc::paginate_backwards,
             ipc::typing_subscribe,

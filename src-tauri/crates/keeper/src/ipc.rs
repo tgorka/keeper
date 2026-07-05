@@ -22,8 +22,8 @@ use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, BackupStatus, ConnectionStatusBatch, DemoBatch, EncryptionStatusBatch, InboxBatch,
-    IpcError, IpcErrorCode, PaginationStatusBatch, PingVm, RoomListBatch, TimelineBatch,
-    TypingBatch, VerificationFlowVm,
+    IpcError, IpcErrorCode, PaginationStatusBatch, PingVm, RoomListBatch, SpacesSnapshot,
+    TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -1432,11 +1432,14 @@ pub async fn inbox_subscribe(
     archive: Channel<InboxBatch>,
     pins: Channel<InboxBatch>,
     favourites: Channel<InboxBatch>,
+    spaces: Channel<SpacesSnapshot>,
 ) -> Result<u64, IpcError> {
     let inbox_sink = Box::new(move |batch: InboxBatch| channel.send(batch).is_ok());
     let archive_sink = Box::new(move |batch: InboxBatch| archive.send(batch).is_ok());
     let pins_sink = Box::new(move |batch: InboxBatch| pins.send(batch).is_ok());
     let favourites_sink = Box::new(move |batch: InboxBatch| favourites.send(batch).is_ok());
+    // Fifth channel (Story 4.5): the aggregated Space list as a whole snapshot.
+    let spaces_sink = Box::new(move |snapshot: SpacesSnapshot| spaces.send(snapshot).is_ok());
     state
         .accounts
         .subscribe_inbox(
@@ -1445,9 +1448,29 @@ pub async fn inbox_subscribe(
             archive_sink,
             pins_sink,
             favourites_sink,
+            spaces_sink,
         )
         .await
         .map_err(to_ipc_error)
+}
+
+/// Set (or clear) the ephemeral Space filter on the live merged inbox (Story 4.5,
+/// FR-22). Delegates to the core, which pokes the live merger to re-emit all four
+/// inbox windows narrowed to the selected Space's joined children (mirrors
+/// `reorder_pins`). `account_id`/`space_id` are both present to set a filter, or
+/// both `None` to clear it; the selection is `(account_id, space_id)` (ephemeral,
+/// never persisted). Best-effort — a no-active-inbox case is a harmless no-op.
+#[tauri::command]
+pub async fn set_space_filter(
+    state: State<'_, AppState>,
+    account_id: Option<String>,
+    space_id: Option<String>,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .set_space_filter(account_id.zip(space_id))
+        .await;
+    Ok(())
 }
 
 /// Unsubscribe the merged inbox, aborting every per-account producer feeding it

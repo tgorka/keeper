@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DemoBatch, IpcError } from "./client";
-import { invoke, subscribe } from "./client";
+import type { DemoBatch, IpcError, SpacesSnapshot } from "./client";
+import { invoke, setSpaceFilter, subscribe, subscribeInbox } from "./client";
 
 // `vi.mock` is hoisted above imports, so the mock's dependencies must be created
 // with `vi.hoisted` to be available when the factory runs. `Channel` is mocked
@@ -78,5 +78,59 @@ describe("subscribe", () => {
     channel.onmessage?.({ kind: "diff", added: [], removed: ["1"] });
 
     expect(received.map((b) => b.kind)).toEqual(["snapshot", "diff"]);
+  });
+});
+
+describe("subscribeInbox", () => {
+  it("opens five channels and forwards the spaces snapshot to onSpaces", async () => {
+    invokeMock.mockResolvedValueOnce(3);
+    const spaces: SpacesSnapshot[] = [];
+
+    const id = await subscribeInbox(
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      (s) => {
+        spaces.push(s);
+      },
+    );
+    expect(id).toBe(3);
+
+    // Five channels created; the command receives all five (inbox/archive/pins/
+    // favourites/spaces).
+    expect(channelInstances).toHaveLength(5);
+    const [, args] = invokeMock.mock.calls[0];
+    expect(args).toHaveProperty("spaces");
+
+    // The fifth channel drives the spaces snapshot into onSpaces.
+    const spacesChannel = channelInstances[4] as {
+      onmessage: ((message: SpacesSnapshot) => void) | null;
+    };
+    spacesChannel.onmessage?.({
+      spaces: [{ accountId: "acctA", spaceId: "!s", name: "Design", avatarUrl: null }],
+    });
+    expect(spaces).toHaveLength(1);
+    expect(spaces[0].spaces[0].name).toBe("Design");
+  });
+});
+
+describe("setSpaceFilter", () => {
+  it("invokes set_space_filter with the selection", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await setSpaceFilter("acctA", "!s");
+    expect(invokeMock).toHaveBeenCalledWith("set_space_filter", {
+      accountId: "acctA",
+      spaceId: "!s",
+    });
+  });
+
+  it("invokes set_space_filter with nulls to clear", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await setSpaceFilter(null, null);
+    expect(invokeMock).toHaveBeenCalledWith("set_space_filter", {
+      accountId: null,
+      spaceId: null,
+    });
   });
 });
