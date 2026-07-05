@@ -52,6 +52,7 @@ import {
   editMessage,
   markRoomRead,
   paginateBackwards,
+  resolveTimelineEventKey,
   retrySend,
   sendAttachmentBytes,
   sendAttachmentPath,
@@ -70,7 +71,7 @@ import { useAccountStatus } from "@/lib/stores/account-status";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { attachmentId, attachmentsStore, type PendingAttachment } from "@/lib/stores/attachments";
 import { composerStore, useComposerStore } from "@/lib/stores/composer";
-import { useRoomsStore } from "@/lib/stores/rooms";
+import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { timelineStore, useTimelineStore } from "@/lib/stores/timeline";
 
 /** Trim a body to a short single-line preview for the reply banner/quote. */
@@ -253,6 +254,9 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
   const selected = useRoomsStore((s) => s.selected);
   const accountId = selected?.accountId ?? null;
   const selectedRoomId = selected?.roomId ?? null;
+  // A pending search deep-link focus target (Story 5.4): resolved to a timeline
+  // render key, scrolled to, and tinted once the target room's timeline is loaded.
+  const focusEvent = useRoomsStore((s) => s.focusEvent);
   const items = useTimelineStore((s) => s.items);
   const pending = useComposerStore((s) => s.pending);
   const selectedKey = useComposerStore((s) => s.selectedKey);
@@ -278,7 +282,14 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
   // spinner immediately, before the status stream reports `paginating`, and gates
   // the top-scroll trigger from firing again).
   const [paginationError, setPaginationError] = useState(false);
+  // An honest, non-blocking note shown when a search deep-link target is further
+  // back in history than the loaded window + bounded live paginate can reach
+  // (archive-first seek-to-event is Story 5.6). `null` hides it.
+  const [deepLinkNote, setDeepLinkNote] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // The search deep-link focus target already handled (its `account|room|event`
+  // key), so a re-render never spawns a second concurrent landing attempt (Story 5.4).
+  const handledFocusRef = useRef<string | null>(null);
   // Scroll-preservation bookkeeping (Story 3.9): the scrollHeight captured *before*
   // the last applied batch, and whether the user was near the bottom then. On the
   // next layout after items change we either compensate scrollTop for a prepend
@@ -813,18 +824,159 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
 
   const onCancelPending = useCallback(() => composerStore.getState().cancel(), []);
 
-  const onJumpTo = useCallback((key: string) => {
+  // Scroll a loaded message into view and flash a temporary highlight. `variant`
+  // picks the highlight style: the default reply/jump `ring` (1200 ms), or the
+  // search deep-link `search-highlight` BACKGROUND tint (2000 ms, Story 5.4).
+  // Returns whether the target row was found in the loaded DOM (so the search
+  // deep-link can decide whether to paginate + retry or degrade honestly).
+  const jumpToKey = useCallback((key: string, variant: "ring" | "search" = "ring"): boolean => {
     const el = scrollRef.current?.querySelector<HTMLElement>(`[data-msg-key="${CSS.escape(key)}"]`);
     if (!el) {
-      return;
+      return false;
     }
     el.scrollIntoView({ block: "center", behavior: "smooth" });
-    // Brief highlight so the jump target is obvious.
-    el.classList.add("ring-2", "ring-ring", "ring-offset-1", "ring-offset-background");
+    const classes =
+      variant === "search"
+        ? ["bg-search-highlight", "text-search-highlight-foreground"]
+        : ["ring-2", "ring-ring", "ring-offset-1", "ring-offset-background"];
+    const duration = variant === "search" ? 2000 : 1200;
+    el.classList.add(...classes);
     window.setTimeout(() => {
-      el.classList.remove("ring-2", "ring-ring", "ring-offset-1", "ring-offset-background");
-    }, 1200);
+      el.classList.remove(...classes);
+    }, duration);
+    return true;
   }, []);
+
+  const onJumpTo = useCallback((key: string) => jumpToKey(key, "ring"), [jumpToKey]);
+
+  // Search deep-link landing (Story 5.4, FR-34). When a `focusEvent` is pending for
+  // the open room and its timeline has loaded, resolve the hit's `eventId` to the
+  // opaque render key via the backend (no event id is ever added to a timeline VM),
+  // scroll to it and apply the `search-highlight` tint for 2 s. When the event is
+  // not yet in the loaded window, best-effort `paginateBackwards` in bounded rounds
+  // and retry; if still unreachable, leave the Chat open with an honest note —
+  // never a wrong jump, never a silent no-op. The pending focus is cleared once
+  // handled so it fires exactly once.
+  useEffect(() => {
+    if (
+      focusEvent === null ||
+      accountId === null ||
+      selectedRoomId === null ||
+      focusEvent.accountId !== accountId ||
+      focusEvent.roomId !== selectedRoomId ||
+      !loaded
+    ) {
+      return;
+    }
+    // Start the landing at most once per distinct focus target: a re-render (e.g.
+    // pagination prepends new items) must not spawn a second concurrent attempt.
+    const targetKey = `${focusEvent.accountId}|${focusEvent.roomId}|${focusEvent.eventId}`;
+    if (handledFocusRef.current === targetKey) {
+      return;
+    }
+    handledFocusRef.current = targetKey;
+    const targetAccount = accountId;
+    const targetRoom = selectedRoomId;
+    const targetEvent = focusEvent.eventId;
+    let cancelled = false;
+    // Bounded live paginate rounds (archive-first seek is Story 5.6). Each round
+    // pages a batch of older events, then re-resolves. `hitStart` from the paginate
+    // stops early when the room's homeserver start is reached.
+    const MAX_ROUNDS = 5;
+    const BATCH = 40;
+    setDeepLinkNote(null);
+
+    const tryLand = async () => {
+      for (let round = 0; round <= MAX_ROUNDS; round += 1) {
+        if (cancelled) {
+          return;
+        }
+        let key: string | null;
+        try {
+          key = await resolveTimelineEventKey(targetAccount, targetRoom, targetEvent);
+        } catch {
+          // An unparsable id (should not happen for a real hit) — degrade honestly.
+          key = null;
+          break;
+        }
+        if (cancelled) {
+          return;
+        }
+        if (key !== null) {
+          // The event is loaded (the resolver found it in the timeline). It may
+          // not be painted yet (a just-prepended row); retry the DOM jump a few
+          // times as React commits. Paginating older history cannot help an
+          // already-loaded event, so on a persistent paint-miss degrade honestly
+          // rather than burn pagination rounds.
+          for (let attempt = 0; attempt < 3; attempt += 1) {
+            await Promise.resolve();
+            if (cancelled) {
+              return;
+            }
+            if (jumpToKey(key, "search")) {
+              return;
+            }
+            await new Promise((resolve) => window.setTimeout(resolve, 50));
+            if (cancelled) {
+              return;
+            }
+          }
+          break;
+        }
+        if (round === MAX_ROUNDS) {
+          break;
+        }
+        // Not loaded yet: page older history and retry. Stop early at room start.
+        try {
+          const reachedStart = await paginateBackwards(targetAccount, targetRoom, BATCH);
+          if (reachedStart) {
+            break;
+          }
+        } catch {
+          break;
+        }
+        // Give the prepend ops a frame to apply to the store/DOM before re-resolving.
+        await new Promise((resolve) => window.setTimeout(resolve, 60));
+      }
+      if (!cancelled) {
+        setDeepLinkNote("This message is further back in history than keeper has loaded yet.");
+      }
+    };
+    // Run the landing to completion, then clear the pending focus. Clearing here
+    // (not synchronously) avoids re-triggering/cancelling the in-flight attempt; the
+    // ref guard already prevents a duplicate start before this resolves.
+    void tryLand().finally(() => {
+      // Clear only the focus we actually handled — a newer requestFocus for a
+      // different Chat (even one that coincidentally shares this event id) must
+      // survive, so compare the full account|room|event identity.
+      const current = roomsStore.getState().focusEvent;
+      if (
+        current !== null &&
+        current.accountId === targetAccount &&
+        current.roomId === targetRoom &&
+        current.eventId === targetEvent
+      ) {
+        roomsStore.getState().clearFocus();
+      }
+      // Release the once-guard now the attempt has finished, so re-activating the
+      // *same* hit later re-lands instead of being a silent no-op (spec invariant).
+      // The in-flight window was already protected by the ref for `tryLand`'s
+      // duration; a superseding focus has since overwritten the ref and must not
+      // be released here.
+      if (handledFocusRef.current === targetKey) {
+        handledFocusRef.current = null;
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [focusEvent, accountId, selectedRoomId, loaded, jumpToKey]);
+
+  // Drop the deep-link note whenever the open room changes (a new Chat starts clean).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset keyed on the room pair, not the note value
+  useEffect(() => {
+    setDeepLinkNote(null);
+  }, [accountId, selectedRoomId]);
 
   // Keyboard affordances (epic): ↑/↓ select a message; `r` reply the selected;
   // `e` edit the selected (own only); ⌫/Delete opens the delete-for-everyone
@@ -1004,6 +1156,14 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
       {selectedRoomId !== null && (
         <div className="shrink-0 border-border border-t">
           <div className="mx-auto w-full max-w-[720px] px-4 py-3">
+            {/* Honest, non-blocking search deep-link fallback (Story 5.4): shown when
+                the matched message is further back than the loaded window reaches
+                (archive-first seek-to-event is Story 5.6). Never a wrong jump. */}
+            {deepLinkNote !== null && (
+              <p role="status" className="mb-2 text-xs text-muted-foreground">
+                {deepLinkNote}
+              </p>
+            )}
             {/* Typing indicator (Story 3.9): "<name> is typing…" between the
                 timeline and composer; renders an empty live region when idle. */}
             <TypingIndicator typists={typists} />

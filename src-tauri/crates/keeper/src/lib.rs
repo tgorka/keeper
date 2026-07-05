@@ -85,6 +85,7 @@ pub fn run() {
             ipc::send_reply,
             ipc::edit_message,
             ipc::toggle_reaction,
+            ipc::resolve_timeline_event_key,
             ipc::delete_message,
             ipc::room_network_label,
             ipc::send_retry,

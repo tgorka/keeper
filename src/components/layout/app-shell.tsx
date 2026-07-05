@@ -4,6 +4,7 @@ import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
 import { SidebarPane } from "@/components/layout/sidebar-pane";
 import { VerifyBanner } from "@/components/layout/verify-banner";
+import { SearchOverlay } from "@/components/search/search-overlay";
 import { DeviceVerificationDialog } from "@/components/settings/device-verification-dialog";
 import { KeyBackupDialog } from "@/components/settings/key-backup-dialog";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
@@ -11,6 +12,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAccountStatuses } from "@/hooks/use-account-statuses";
 import { useEncryptionStatuses } from "@/hooks/use-encryption-statuses";
 import { useKeyBackupStatuses } from "@/hooks/use-key-backup-statuses";
+import { useSearchShortcuts } from "@/hooks/use-search-shortcuts";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useVerification } from "@/hooks/use-verification";
 
@@ -29,6 +31,8 @@ export function AppShell() {
   // Stream every account's key-backup status into the key-backup store: the
   // Settings backup row is a pure projection of that map.
   useKeyBackupStatuses();
+  // Wire the search entry points (⌘⇧F global, ⌘F in-chat) to the search surface.
+  useSearchShortcuts();
   const [detailOpen, setDetailOpen] = useState(false);
   const toggleRef = useRef<HTMLButtonElement>(null);
 
@@ -75,6 +79,7 @@ export function AppShell() {
 
       <DeviceVerificationDialog />
       <KeyBackupDialog />
+      <SearchOverlay />
 
       {detailFloating && (
         <Sheet open={detailOpen} onOpenChange={handleSheetOpenChange}>

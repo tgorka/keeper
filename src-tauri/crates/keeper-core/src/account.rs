@@ -33,7 +33,7 @@ use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
 };
-use matrix_sdk::ruma::{OwnedRoomId, RoomId};
+use matrix_sdk::ruma::{EventId, OwnedRoomId, RoomId};
 use matrix_sdk::{Client, Room};
 use matrix_sdk_ui::eyeball_im::VectorDiff;
 use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
@@ -1466,6 +1466,55 @@ impl AccountManager {
         // way — marking never erases. Same gate as `archive::db::retrievable_content`.
         let honor_deletions = archive::get_honor_remote_deletions(&data_dir)?;
         Ok(visible_versions(chain, honor_deletions))
+    }
+
+    /// Resolve a search hit's `event_id` to the opaque timeline render key
+    /// (`unique_id`) so the frontend can deep-link into the timeline at the matched
+    /// message (Story 5.4, FR-34). This is the *inverse* of the reply/edit/reaction
+    /// resolution: those take an opaque `item_key` and find the event id; this takes
+    /// an `event_id` (the sanctioned deep-link handle returned on `SearchHitVm`) and
+    /// finds the loaded item's `unique_id`. Crucially, `event_id` is an **input**
+    /// only — no event id is ever added to a streamed timeline VM, so the
+    /// `TimelineItemVm` no-event-id invariant (NFR-9, AD-1) holds.
+    ///
+    /// Scans the live `Arc<Timeline>` (the same accessor as `submit_reply` /
+    /// `toggle_reaction`) for the event item whose `event_id()` equals the parsed
+    /// input, returning `Some(unique_id)` on a hit or `None` when the event is not in
+    /// the currently-loaded window (the caller then best-effort paginates and
+    /// retries, or degrades honestly). No event id crosses back — only the opaque
+    /// render key.
+    ///
+    /// Errors: an unparsable room id or event id → [`TimelineError::RoomNotFound`]
+    /// (mapped to a retriable `TimelineUnavailable`, never a panic); no open timeline
+    /// for the room → `Ok(None)` (the Chat may still be opening — the caller retries).
+    pub async fn resolve_timeline_event_key(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<String>, CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        // Parse the event id up front so a malformed handle is an honest typed error,
+        // never a silent miss (and never a panic).
+        let event_id = EventId::parse(event_id).map_err(|_| TimelineError::RoomNotFound)?;
+        // The timeline may not be open yet (the Chat is still mounting): that is a
+        // transient "not loaded", so surface `None` rather than an error.
+        let Ok(timeline) = self.open_timeline_for(account_id, &room_id).await else {
+            return Ok(None);
+        };
+        let items = timeline.items().await;
+        // `unique_id()` lives on the outer `TimelineItem`; `event_id()` on its
+        // `EventTimelineItem` view — so match on the event id and return the outer
+        // item's opaque render key (the same key the timeline stream emits).
+        let resolved = items
+            .iter()
+            .find(|item| item.as_event().and_then(|ev| ev.event_id()) == Some(&event_id))
+            .map(|item| item.unique_id().0.clone());
+        if resolved.is_some() {
+            tracing::info!(account_id = %account_id, room_id = %room_id, "search deep-link event resolved to render key");
+        }
+        Ok(resolved)
     }
 
     /// Redact (delete for everyone) the message addressed by `item_key` (its
@@ -3419,6 +3468,50 @@ mod tests {
             .sign_out(&platform, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
             .await
             .expect("second sign_out should succeed");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_timeline_event_key_maps_invalid_ids_to_error_not_panic() {
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!(
+            "keeper-resolve-evt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let manager = AccountManager::new(&data_dir);
+
+        // An unparsable room id is an honest typed error (→ TimelineUnavailable),
+        // never a panic.
+        let bad_room = manager
+            .resolve_timeline_event_key("acct", "not-a-room-id", "$evt:example.org")
+            .await;
+        assert!(matches!(
+            bad_room,
+            Err(CoreError::Timeline(TimelineError::RoomNotFound))
+        ));
+
+        // A well-formed room id but a malformed event id is likewise a typed error,
+        // never a silent miss and never a panic.
+        let bad_event = manager
+            .resolve_timeline_event_key("acct", "!room:example.org", "not-an-event-id")
+            .await;
+        assert!(matches!(
+            bad_event,
+            Err(CoreError::Timeline(TimelineError::RoomNotFound))
+        ));
+
+        // Well-formed ids but no live timeline for the room ⇒ transient "not loaded"
+        // (`Ok(None)`), so the caller retries rather than erroring.
+        let no_timeline = manager
+            .resolve_timeline_event_key("acct", "!room:example.org", "$evt:example.org")
+            .await
+            .expect("well-formed ids with no open timeline resolve to Ok(None)");
+        assert_eq!(no_timeline, None);
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

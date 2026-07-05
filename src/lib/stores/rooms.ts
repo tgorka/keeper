@@ -26,6 +26,18 @@ export interface RoomSelection {
 }
 
 /**
+ * A pending deep-link focus target (Story 5.4): the account/room to open and the
+ * `eventId` (the search hit's sanctioned deep-link handle) the conversation pane
+ * should resolve to a timeline render key, scroll to, and tint. Cleared once the
+ * pane has handled it (jumped, or degraded honestly when unreachable).
+ */
+export interface FocusEvent {
+  accountId: string;
+  roomId: string;
+  eventId: string;
+}
+
+/**
  * Key an optimistic-unread override by its owning account and room. Kept as a flat
  * string so a plain `Map` can carry the overlay without nested lookups.
  */
@@ -53,6 +65,14 @@ export interface RoomsState {
    * conversation pane should stream, on which account.
    */
   selected: RoomSelection | null;
+  /**
+   * A pending deep-link focus target (Story 5.4), or `null` when none is pending.
+   * Set by {@link requestFocus} (typically from a search result activation) and
+   * consumed by the conversation pane, which resolves the `eventId` to a timeline
+   * render key, scrolls to it, and applies the search-highlight tint. Ephemeral UI
+   * state — never a source of truth.
+   */
+  focusEvent: FocusEvent | null;
   /** Apply one streamed batch (its ops in sequence), updating `total`. */
   applyBatch: (batch: InboxBatch) => void;
   /**
@@ -69,6 +89,15 @@ export interface RoomsState {
   clearOptimisticUnread: (accountId: string, roomId: string) => void;
   /** Select a conversation to open (or `null` to close). */
   selectRoom: (selection: RoomSelection | null) => void;
+  /**
+   * Request a deep-link focus (Story 5.4): open the target room (via
+   * {@link selectRoom}) and record the pending {@link FocusEvent} so the
+   * conversation pane resolves + scrolls to the matched message. Selecting the
+   * room here means a search result on a not-yet-open Chat lands correctly.
+   */
+  requestFocus: (focus: FocusEvent) => void;
+  /** Clear the pending deep-link focus once the pane has handled it. */
+  clearFocus: () => void;
   /** Reset to the empty state (on unsubscribe / full sign-out). */
   clear: () => void;
 }
@@ -140,6 +169,7 @@ export const roomsStore = createStore<RoomsState>()((set) => ({
   total: null,
   optimisticUnread: new Map<string, boolean>(),
   selected: null,
+  focusEvent: null,
   applyBatch: (batch) =>
     set((state) => {
       const rooms = batch.ops.reduce(applyOp, state.rooms);
@@ -168,6 +198,9 @@ export const roomsStore = createStore<RoomsState>()((set) => ({
       return { optimisticUnread: next };
     }),
   selectRoom: (selection) => set({ selected: selection }),
+  requestFocus: (focus) =>
+    set({ selected: { accountId: focus.accountId, roomId: focus.roomId }, focusEvent: focus }),
+  clearFocus: () => set({ focusEvent: null }),
   // `selected` is deliberately preserved across an inbox `clear()` so refreshing
   // the streamed window (a Reset) does not close the open conversation.
   // Selection is reset explicitly via `selectRoom(null)` (e.g. on sign-out).

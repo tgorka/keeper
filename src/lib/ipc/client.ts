@@ -694,6 +694,30 @@ export async function toggleReaction(
 }
 
 /**
+ * Resolve a search hit's `eventId` to the open room's opaque timeline render key
+ * so a search result can deep-link to the matched message (FR-34, Story 5.4).
+ * `eventId` is the sanctioned deep-link handle from a {@link SearchHitVm}; the
+ * Rust core parses it and scans the room's live timeline for the loaded item whose
+ * event id matches, returning its opaque `key` (`unique_id`). It is an *input*
+ * only — no event id is ever added to a streamed timeline VM. Resolves with the
+ * render `key` when the event is a currently-loaded timeline item, or `null` when
+ * it is not in the loaded window (the caller best-effort paginates and retries, or
+ * degrades honestly). Rejects with the {@link IpcError} envelope (`code:
+ * "timelineUnavailable"`) on an unparsable room/event id.
+ */
+export async function resolveTimelineEventKey(
+  accountId: string,
+  roomId: string,
+  eventId: string,
+): Promise<string | null> {
+  return await invoke<string | null>("resolve_timeline_event_key", {
+    accountId,
+    roomId,
+    eventId,
+  });
+}
+
+/**
  * Retry a failed outgoing message by re-driving its wedged local echo through the
  * controlled send path (`unwedge`, not a new dispatch). `itemKey` is the timeline
  * item's opaque `key` (`unique_id`). Rejects with the {@link IpcError} envelope

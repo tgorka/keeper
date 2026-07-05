@@ -700,6 +700,32 @@ pub async fn toggle_reaction(
         .map_err(to_ipc_error)
 }
 
+/// Resolve a search hit's `event_id` to the opaque timeline render key so the
+/// frontend can deep-link into a room at the matched message (Story 5.4, FR-34).
+/// `eventId` is the sanctioned deep-link handle returned on `SearchHitVm`; the
+/// Rust core parses it and scans the room's live `Timeline` for the loaded item
+/// whose event id matches, returning its opaque `unique_id` — `event_id` is an
+/// input only, so no event id is ever added to a streamed timeline VM (the
+/// `TimelineItemVm` no-event-id invariant, NFR-9/AD-1, holds). Resolves with the
+/// render key when the event is a currently-loaded timeline item, else `null`
+/// (the caller best-effort paginates + retries, or degrades honestly).
+/// `Option<String>` serializes to `string | null` across IPC. An unparsable
+/// room/event id funnels through [`to_ipc_error`] to `TimelineUnavailable` (never
+/// a panic).
+#[tauri::command]
+pub async fn resolve_timeline_event_key(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    event_id: String,
+) -> Result<Option<String>, IpcError> {
+    state
+        .accounts
+        .resolve_timeline_event_key(&account_id, &room_id, &event_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
 /// Delete an own message for everyone by issuing a Matrix redaction through the
 /// single dispatch gate (FR-15, FR-41, AD-13, Story 3.8). `itemKey` is the
 /// message's opaque render `key` (its `unique_id`); the Rust core resolves it to
