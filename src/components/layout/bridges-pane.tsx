@@ -1,17 +1,25 @@
 /**
- * The Bridges primary view (Story 6.1, FR-42).
+ * The Bridges primary view (Story 6.1 catalog + Story 6.2 discovery).
  *
- * A read-only surface of the data-driven bridge catalog. For each signed-in
- * account it renders a section, and within it a {@link BridgeCard} per catalog
- * Network — cards are keyed Network × Account. With zero accounts it shows an empty
- * state prompting the user to add one. With no accounts there are no cards. The
- * catalog is fetched once over IPC ({@link useBridgeCatalog}); a parse failure
- * shows an honest error state. Health and real provisioning are later stories (6.5
- * / 6.3) — nothing here performs Matrix or network I/O.
+ * Replaces 6.1's static catalog projection with real, per-Account zero-config
+ * discovery. For each signed-in account it runs the three-source discovery pass
+ * ({@link useBridgeDiscovery}) and renders a {@link BridgeCard} per *discovered*
+ * Network — each joined to the 6.1 catalog by `networkId` for glyph/name/tier badge/
+ * ack copy — keyed Network × Account. When an account discovers no catalog bridges it
+ * shows "No bridges found on {homeserver}." with a companion-stack docs link. Loading
+ * and (retriable) error states are honest and per-account. With zero accounts it shows
+ * an add-account prompt. The catalog is fetched once ({@link useBridgeCatalog}) as the
+ * presentation join table; a parse failure shows an error state. Nothing here performs
+ * Matrix I/O directly — the Rust core owns discovery (real login is Story 6.3, live
+ * health Story 6.5).
  */
 import { BridgeCard } from "@/components/bridges/bridge-card";
+import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useBridgeCatalog } from "@/hooks/use-bridge-catalog";
+import { useBridgeDiscovery } from "@/hooks/use-bridge-discovery";
+import { COMPANION_STACK_DOCS_URL } from "@/lib/bridges";
+import type { AccountVm, BridgeNetworkVm } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 
 export function BridgesPane() {
@@ -42,24 +50,83 @@ export function BridgesPane() {
             <p className="text-muted-foreground text-sm">Loading bridges…</p>
           ) : (
             accounts.map((account) => (
-              <div key={account.accountId} className="flex flex-col gap-3">
-                <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-                  {account.userId}
-                </h2>
-                <div className="flex flex-col gap-2">
-                  {catalog.map((network) => (
-                    <BridgeCard
-                      key={`${account.accountId}:${network.networkId}`}
-                      network={network}
-                      accountId={account.accountId}
-                    />
-                  ))}
-                </div>
-              </div>
+              <AccountBridges key={account.accountId} account={account} catalog={catalog} />
             ))
           )}
         </div>
       </ScrollArea>
     </section>
+  );
+}
+
+/** The catalog entry for a network id, or `undefined` when uncatalogued. */
+function catalogFor(catalog: BridgeNetworkVm[], networkId: string): BridgeNetworkVm | undefined {
+  return catalog.find((n) => n.networkId === networkId);
+}
+
+interface AccountBridgesProps {
+  account: AccountVm;
+  catalog: BridgeNetworkVm[];
+}
+
+/**
+ * One account's discovered bridges. Runs discovery for the account and renders a
+ * card per discovered Network (catalog-joined), with per-account loading, retriable
+ * error, and the "No bridges found on {homeserver}." empty state.
+ */
+function AccountBridges({ account, catalog }: AccountBridgesProps) {
+  const { discovery, loading, error, retriable, retry } = useBridgeDiscovery(account.accountId);
+
+  return (
+    <div className="flex flex-col gap-3">
+      <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+        {account.userId}
+      </h2>
+
+      {error !== null ? (
+        <div role="alert" className="flex flex-col items-start gap-2 text-sm">
+          <p className="text-destructive">Could not discover bridges: {error}</p>
+          {retriable && (
+            <Button type="button" size="sm" variant="outline" onClick={retry}>
+              Retry
+            </Button>
+          )}
+        </div>
+      ) : loading || discovery === null ? (
+        <p className="text-muted-foreground text-sm">Discovering bridges…</p>
+      ) : discovery.networks.length === 0 ? (
+        <p className="text-muted-foreground text-sm">
+          No bridges found on {discovery.homeserver}.{" "}
+          <a
+            href={COMPANION_STACK_DOCS_URL}
+            target="_blank"
+            rel="noreferrer"
+            className="underline underline-offset-2"
+          >
+            Set up a companion stack
+          </a>
+          .
+        </p>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {discovery.networks.map((discovered) => {
+            const network = catalogFor(catalog, discovered.networkId);
+            // Catalog-gated in the backend, but guard defensively: skip any
+            // network the frontend catalog can't present.
+            if (network === undefined) {
+              return null;
+            }
+            return (
+              <BridgeCard
+                key={`${account.accountId}:${discovered.networkId}`}
+                network={network}
+                accountId={account.accountId}
+                status={discovered.status}
+              />
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }

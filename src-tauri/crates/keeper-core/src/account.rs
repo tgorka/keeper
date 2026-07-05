@@ -49,7 +49,8 @@ use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
 use crate::bridge;
 use crate::error::{
-    AccountError, BackupError, CoreError, InboxError, MediaError, SendError, TimelineError,
+    AccountError, BackupError, BridgeError, CoreError, InboxError, MediaError, SendError,
+    TimelineError,
 };
 use crate::inbox::{InboxMerger, NetworksSink, SpacesSink};
 use crate::media::{self, MediaBytes, MediaHandle, MediaVariant};
@@ -1204,6 +1205,27 @@ impl AccountManager {
                 )
                 .into()
             })
+    }
+
+    /// Run zero-config bridge discovery for a live account (Story 6.2, FR-25,
+    /// AD-16). Clones the account's `Client` under the manager lock, then runs the
+    /// three-source discovery pass ([`crate::bridges::discover`]) outside the lock
+    /// (it performs Matrix I/O). A missing account surfaces the non-retriable
+    /// [`BridgeError::AccountNotFound`]; a total transport failure surfaces the
+    /// retriable [`BridgeError::Discovery`]. No bot MXID, token, or session
+    /// material crosses back — only non-secret network ids + statuses.
+    pub async fn discover_bridges(
+        &self,
+        account_id: &str,
+    ) -> Result<crate::vm::BridgeDiscoveryVm, CoreError> {
+        let client = {
+            let accounts = self.accounts.lock().await;
+            accounts.get(account_id).map(|h| h.client.clone())
+        };
+        let Some(client) = client else {
+            return Err(BridgeError::AccountNotFound(account_id.to_owned()).into());
+        };
+        Ok(crate::bridges::discover(&client).await?)
     }
 
     /// Resolve the account's live `Client` for a backup action, surfacing a *named*

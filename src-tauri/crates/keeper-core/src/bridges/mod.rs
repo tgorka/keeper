@@ -10,6 +10,9 @@
 //! projection. No risk/badge/ack copy is hardcoded outside the data file.
 
 pub mod data;
+pub mod discovery;
+
+pub use discovery::discover;
 
 use crate::error::BridgeError;
 use crate::vm::BridgeNetworkVm;

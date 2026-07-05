@@ -351,9 +351,25 @@ pub enum ArchiveError {
 pub enum BridgeError {
     /// An embedded bridge data file (`risk-tiers.json`, `coupling-caveats.json`,
     /// or `known-bots.json`) failed to parse or validate. The wrapped string names
-    /// the file and the failure — never secret material.
+    /// the file and the failure — never secret material. Maps to
+    /// `IpcErrorCode::Internal` (non-retriable — the JSON is compiled in).
     #[error("bridge catalog data error: {0}")]
     Data(String),
+
+    /// Bridge discovery (Story 6.2) was asked to run for an account that is not
+    /// live in the [`crate::account::AccountManager`]. Non-retriable — the account
+    /// must be activated first. The wrapped string is the non-secret account id.
+    #[error("no live account for bridge discovery: {0}")]
+    AccountNotFound(String),
+
+    /// Bridge discovery could not complete because a load-bearing Matrix
+    /// transport step failed (e.g. the account has no resolvable user id / server
+    /// name to probe against). Individual per-source failures degrade gracefully
+    /// and never reach here; this is a *total* discovery failure. Retriable — the
+    /// homeserver may be transiently unreachable. The wrapped string is a
+    /// non-secret description — never a token or session material.
+    #[error("bridge discovery failed: {0}")]
+    Discovery(String),
 }
 
 /// The hexagon error root. Every fallible core operation surfaces one of these.

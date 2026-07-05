@@ -427,6 +427,7 @@ mod tests {
     fn err_msg(result: Result<(), BridgeError>) -> String {
         match result {
             Err(BridgeError::Data(msg)) => msg,
+            Err(other) => panic!("expected a Data validation error, got: {other}"),
             Ok(()) => panic!("expected validation to fail, but it passed"),
         }
     }

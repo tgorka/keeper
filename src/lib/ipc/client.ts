@@ -12,11 +12,14 @@ import type { IpcError } from "./gen/IpcError";
 export type { AccountVm } from "./gen/AccountVm";
 export type { BackupStatus } from "./gen/BackupStatus";
 export type { BadgeStyle } from "./gen/BadgeStyle";
+export type { BridgeDiscoveryVm } from "./gen/BridgeDiscoveryVm";
 export type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
+export type { BridgeStatus } from "./gen/BridgeStatus";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
+export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
 export type { EditVersionVm } from "./gen/EditVersionVm";
 export type { EncryptionStatus } from "./gen/EncryptionStatus";
 export type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
@@ -59,6 +62,7 @@ export type { VerificationPhase } from "./gen/VerificationPhase";
 
 import type { AccountVm } from "./gen/AccountVm";
 import type { BackupStatus } from "./gen/BackupStatus";
+import type { BridgeDiscoveryVm } from "./gen/BridgeDiscoveryVm";
 import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { EditVersionVm } from "./gen/EditVersionVm";
@@ -124,6 +128,23 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
  */
 export async function bridgeCatalog(): Promise<BridgeNetworkVm[]> {
   return await invoke<BridgeNetworkVm[]>("bridge_catalog");
+}
+
+/**
+ * Run zero-config, per-Account bridge discovery (FR-25, AD-16, Story 6.2). A
+ * one-shot pass in the Rust core that merges three sources — `thirdparty/protocols`,
+ * a known-bot MXID probe, and a joined-room `m.bridge` portal / bot-DM scan — into a
+ * per-Network status, catalog-gated to the surfaced 6.1 networks. Resolves with a
+ * {@link BridgeDiscoveryVm} (the account's `homeserver` server name + the discovered
+ * networks; an empty `networks` array is the honest "no bridges found" state, not an
+ * error). A homeserver lacking `thirdparty/protocols` degrades to the other sources
+ * rather than erroring. Rejects with the {@link IpcError} envelope: an unknown account
+ * → `code: "internal"` (non-retriable); a total transport failure → `code:
+ * "syncUnavailable"` (`retriable: true`). No bot Matrix ID is ever named by the user or
+ * returned.
+ */
+export async function bridgeDiscover(accountId: string): Promise<BridgeDiscoveryVm> {
+  return await invoke<BridgeDiscoveryVm>("bridge_discover", { accountId });
 }
 
 /**

@@ -1,14 +1,17 @@
 /**
- * A single Bridge card (Story 6.1, FR-42).
+ * A single Bridge card (Story 6.1 catalog join + Story 6.2 discovery status).
  *
- * Renders one connectable Network for one Account: the glyph avatar, the Network
- * name, the data-driven risk-tier {@link Badge}, a placeholder health dot (real
- * health is Story 6.5), and a primary action. All risk/badge/ack copy comes from
- * the backend {@link BridgeNetworkVm} — nothing is hardcoded here. When the tier
- * `requiresAck` (volatile / conditional), the action opens an {@link AlertDialog}
- * showing the tier badge + the backend `ackCopy` and gates on an explicit confirm;
- * otherwise the action proceeds directly. No real login happens this story — the
- * confirm/proceed is a stub that just closes the gate (provisioning is Story 6.3).
+ * Renders one discovered Network for one Account: the glyph avatar, the Network
+ * name, the data-driven risk-tier {@link Badge}, the discovery status word + dot
+ * (Connected / Action needed / Not set up, from the `status` prop), a separate
+ * placeholder live-health dot (real health is Story 6.5), and a primary action. All
+ * risk/badge/ack copy comes from the backend catalog {@link BridgeNetworkVm} — nothing
+ * is hardcoded here; the status word comes from the discovery {@link BridgeStatus} via
+ * the shared {@link BRIDGE_STATUS_LABEL} map. When the tier `requiresAck` (volatile /
+ * conditional), the action opens an {@link AlertDialog} showing the tier badge + the
+ * backend `ackCopy` and gates on an explicit confirm; otherwise it proceeds directly.
+ * No real login happens yet — the confirm/proceed is a stub that just closes the gate
+ * (provisioning is Story 6.3).
  */
 import { useState } from "react";
 import {
@@ -25,7 +28,8 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import type { BadgeStyle, BridgeNetworkVm } from "@/lib/ipc/client";
+import { BRIDGE_STATUS_LABEL } from "@/lib/bridges";
+import type { BadgeStyle, BridgeNetworkVm, BridgeStatus } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
 
 /** The shadcn Badge variant + `--bridge-*` tint for each backend badge style. */
@@ -42,14 +46,23 @@ const BADGE_STYLE: Record<BadgeStyle, { variant: "secondary" | "outline"; classN
   outline: { variant: "outline" },
 };
 
+/** The discovery status dot tint for each {@link BridgeStatus}. */
+const STATUS_DOT_CLASS: Record<BridgeStatus, string> = {
+  loggedIn: "bg-bridge-healthy",
+  notLoggedIn: "bg-bridge-disconnected",
+  configured: "bg-muted-foreground/50",
+};
+
 interface BridgeCardProps {
-  /** The catalog network this card represents. */
+  /** The catalog network this card represents (glyph/name/tier/ack). */
   network: BridgeNetworkVm;
   /** The account id this card is keyed to (Network × Account). */
   accountId: string;
+  /** The discovered setup/login status (Story 6.2). */
+  status: BridgeStatus;
 }
 
-export function BridgeCard({ network, accountId }: BridgeCardProps) {
+export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
   const [ackOpen, setAckOpen] = useState(false);
   const badge = BADGE_STYLE[network.badgeStyle];
 
@@ -92,6 +105,15 @@ export function BridgeCard({ network, accountId }: BridgeCardProps) {
         <div className="flex items-center gap-2">
           <span className="truncate font-medium">{network.name}</span>
           {tierBadge}
+        </div>
+        {/* Discovery status word + dot (Story 6.2) — the setup/login state, distinct
+            from the placeholder live-health dot on the right (Story 6.5). */}
+        <div className="flex items-center gap-1.5" data-slot="bridge-status">
+          <span
+            aria-hidden="true"
+            className={cn("size-1.5 shrink-0 rounded-full", STATUS_DOT_CLASS[status])}
+          />
+          <span className="text-muted-foreground text-xs">{BRIDGE_STATUS_LABEL[status]}</span>
         </div>
       </div>
       {/* Placeholder health dot — neutral until the real state machine (Story 6.5). */}

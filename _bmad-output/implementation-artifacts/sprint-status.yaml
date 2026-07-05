@@ -96,7 +96,7 @@ development_status:
   epic-5-retrospective: optional
   epic-6: backlog
   6-1-bridges-surface-with-data-driven-risk-tiers: done
-  6-2-bridge-discovery: backlog
+  6-2-bridge-discovery: done
   6-3-native-bridge-login-via-provisioning-api: backlog
   6-4-bridge-bot-fallback-driver: backlog
   6-5-bridge-session-health-and-re-login-prompts: backlog

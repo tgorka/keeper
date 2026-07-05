@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { describe, expect, it } from "vitest";
 import { BridgeCard } from "@/components/bridges/bridge-card";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { BadgeStyle, BridgeNetworkVm, RiskTier } from "@/lib/ipc/client";
+import type { BadgeStyle, BridgeNetworkVm, BridgeStatus, RiskTier } from "@/lib/ipc/client";
 
 const ACCOUNT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
@@ -34,10 +34,10 @@ const volatile = network({
   ackCopy: VOLATILE_ACK,
 });
 
-function renderCard(vm: BridgeNetworkVm) {
+function renderCard(vm: BridgeNetworkVm, status: BridgeStatus = "configured") {
   return render(
     <TooltipProvider>
-      <BridgeCard network={vm} accountId={ACCOUNT_ID} />
+      <BridgeCard network={vm} accountId={ACCOUNT_ID} status={status} />
     </TooltipProvider>,
   );
 }
@@ -48,6 +48,25 @@ describe("BridgeCard", () => {
     expect(screen.getByText("Matrix")).toBeInTheDocument();
     expect(screen.getByText("MX")).toBeInTheDocument();
     expect(screen.getByText("Low risk")).toBeInTheDocument();
+  });
+
+  it("renders the discovery status word for each status", () => {
+    const { rerender } = renderCard(network(), "loggedIn");
+    expect(screen.getByText("Connected")).toBeInTheDocument();
+
+    rerender(
+      <TooltipProvider>
+        <BridgeCard network={network()} accountId={ACCOUNT_ID} status="notLoggedIn" />
+      </TooltipProvider>,
+    );
+    expect(screen.getByText("Action needed")).toBeInTheDocument();
+
+    rerender(
+      <TooltipProvider>
+        <BridgeCard network={network()} accountId={ACCOUNT_ID} status="configured" />
+      </TooltipProvider>,
+    );
+    expect(screen.getByText("Not set up")).toBeInTheDocument();
   });
 
   it("renders the maintenance-heavy badge label from the data", () => {

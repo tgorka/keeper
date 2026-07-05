@@ -63,6 +63,67 @@ pub fn parse_bridge_network_name(content: &serde_json::Value) -> Option<String> 
     }
 }
 
+/// Parse the bridged Network's stable `protocol.id` out of an MSC2346 bridge
+/// state event's `content` (pure — the discovery join key, Story 6.2).
+///
+/// Where [`parse_bridge_network_name`] resolves a *display* label, this returns
+/// the machine `content.protocol.id` — the stable network identifier keeper joins
+/// to the catalog `networkId` (mautrix `protocol.id`s reconcile directly, e.g.
+/// `whatsapp`, `telegram`). Trims it and returns it when non-empty; any other
+/// shape (no `protocol`, non-string id, empty/whitespace id, malformed content)
+/// yields `None`. The id is untrusted, server-controlled data used only as a map
+/// key against the compiled-in catalog — a spoofed value can at most fail to
+/// match, never inject.
+pub fn parse_bridge_protocol_id(content: &serde_json::Value) -> Option<String> {
+    let id = content
+        .get("protocol")?
+        .get("id")
+        .and_then(serde_json::Value::as_str)?;
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+/// Read only the opaque `content` JSON from a bridge state event (sync or
+/// stripped variant), reused by the label and protocol-id readers.
+fn bridge_state_content(raw: &RawAnySyncOrStrippedState) -> Option<serde_json::Value> {
+    match raw {
+        RawAnySyncOrStrippedState::Sync(ev) => ev.get_field::<serde_json::Value>("content"),
+        RawAnySyncOrStrippedState::Stripped(ev) => ev.get_field::<serde_json::Value>("content"),
+    }
+    .ok()
+    .flatten()
+}
+
+/// Resolve the bridged-Chat Network's stable `protocol.id` for `room` on demand
+/// (the thin wrapper around [`parse_bridge_protocol_id`], Story 6.2 discovery).
+///
+/// Reads the Room's `m.bridge` then legacy `uk.half-shot.bridge` state events and
+/// returns the first that yields a `protocol.id`. A native Matrix Room, an
+/// unreadable state store, or a bridge event with no protocol id all resolve to
+/// `None`. Never fabricates an id.
+pub async fn room_bridge_protocol_id(room: &Room) -> Option<String> {
+    for event_type in [BRIDGE_EVENT_TYPE, LEGACY_BRIDGE_EVENT_TYPE] {
+        let Ok(states) = room
+            .get_state_events(StateEventType::from(event_type))
+            .await
+        else {
+            continue;
+        };
+        for raw in states {
+            if let Some(content) = bridge_state_content(&raw) {
+                if let Some(id) = parse_bridge_protocol_id(&content) {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the bridged-Chat Network label for `room` on demand (the thin wrapper
 /// around [`parse_bridge_network_name`]).
 ///
@@ -81,15 +142,8 @@ pub async fn room_bridge_network(room: &Room) -> Option<String> {
         };
         for raw in states {
             // Read only the `content` field as opaque JSON — never deserialize the
-            // whole event or read any id (NFR-9). Both the sync and stripped
-            // variants wrap a `Raw`, whose `get_field` extracts one field.
-            let content = match &raw {
-                RawAnySyncOrStrippedState::Sync(ev) => ev.get_field::<serde_json::Value>("content"),
-                RawAnySyncOrStrippedState::Stripped(ev) => {
-                    ev.get_field::<serde_json::Value>("content")
-                }
-            };
-            if let Ok(Some(content)) = content {
+            // whole event or read any id (NFR-9).
+            if let Some(content) = bridge_state_content(&raw) {
                 if let Some(name) = parse_bridge_network_name(&content) {
                     return Some(name);
                 }
@@ -186,5 +240,53 @@ mod tests {
         // just as safely `None`.
         assert_eq!(parse_bridge_network_name(&json!("not-an-object")), None);
         assert_eq!(parse_bridge_network_name(&json!(null)), None);
+    }
+
+    #[test]
+    fn parses_protocol_id_for_discovery() {
+        let content = json!({
+            "bridgebot": "@whatsappbot:beeper.local",
+            "protocol": { "id": "whatsapp", "displayname": "WhatsApp" }
+        });
+        assert_eq!(
+            parse_bridge_protocol_id(&content),
+            Some("whatsapp".to_owned())
+        );
+    }
+
+    #[test]
+    fn protocol_id_ignores_displayname() {
+        // The discovery join key is the machine id, never the display label.
+        let content = json!({ "protocol": { "id": "telegram", "displayname": "Telegram" } });
+        assert_eq!(
+            parse_bridge_protocol_id(&content),
+            Some("telegram".to_owned())
+        );
+    }
+
+    #[test]
+    fn protocol_id_trims_and_rejects_empty_or_missing() {
+        assert_eq!(
+            parse_bridge_protocol_id(&json!({ "protocol": { "id": "  signal  " } })),
+            Some("signal".to_owned())
+        );
+        assert_eq!(
+            parse_bridge_protocol_id(&json!({ "protocol": { "id": "   " } })),
+            None
+        );
+        // Only a displayname, no id → no join key.
+        assert_eq!(
+            parse_bridge_protocol_id(&json!({ "protocol": { "displayname": "Signal" } })),
+            None
+        );
+        assert_eq!(
+            parse_bridge_protocol_id(&json!({ "bridgebot": "@bot:example.org" })),
+            None
+        );
+        assert_eq!(
+            parse_bridge_protocol_id(&json!({ "protocol": { "id": 42 } })),
+            None
+        );
+        assert_eq!(parse_bridge_protocol_id(&json!("not-an-object")), None);
     }
 }

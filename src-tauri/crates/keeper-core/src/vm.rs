@@ -1457,6 +1457,66 @@ pub struct BridgeNetworkVm {
     pub ack_copy: Option<String>,
 }
 
+/// The discovered setup/login status of a bridged Network on an Account's
+/// homeserver (Story 6.2, FR-25, AD-16).
+///
+/// Derived once, per Account, from the merged three-source discovery pass
+/// (`thirdparty/protocols` + known-bot MXID probe + bot-DM/portal room scan) by
+/// the pure `merge_discovery` function. It is the *setup* state, not live
+/// connection health — live health (degraded / disconnected, 60 s surfacing) is
+/// Story 6.5 and stays a separate placeholder. Serializes to its camelCase name —
+/// the frontend wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum BridgeStatus {
+    /// A portal room (`m.bridge` with the Network's `protocol.id`) exists — the
+    /// Network is bridged and logged in.
+    LoggedIn,
+    /// A bot management DM with a known bot exists but no portal room — the bridge
+    /// is present but the user has not logged into the Network yet.
+    NotLoggedIn,
+    /// The Network is present only via the homeserver's `thirdparty/protocols`
+    /// list or a resolving known-bot MXID — configured on the server, no DM/portal
+    /// yet.
+    Configured,
+}
+
+/// One discovered bridged Network for an Account (Story 6.2, FR-25, AD-16).
+///
+/// Carries only the stable `network_id` (joined to the 6.1 [`BridgeNetworkVm`]
+/// catalog on the frontend for glyph/name/tier badge/ack copy) and the derived
+/// [`BridgeStatus`]. Only catalog-gated Networks appear here — a discovered
+/// protocol with no catalog entry is logged and dropped, never surfaced.
+/// Serializes camelCase — the frontend wire contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DiscoveredBridgeVm {
+    /// The stable network identifier (e.g. `"whatsapp"`), joined to the 6.1
+    /// catalog by the frontend for presentation.
+    pub network_id: String,
+    /// The Network's derived setup/login status.
+    pub status: BridgeStatus,
+}
+
+/// The result of a per-Account bridge discovery pass (Story 6.2, FR-25, AD-16).
+///
+/// `homeserver` is the account's server name (e.g. `"example.org"`), used verbatim
+/// in the empty-state copy ("No bridges found on {homeserver}."). `networks` are the
+/// catalog-gated discovered Networks with their derived statuses; an empty list is
+/// the honest "no bridges found" state, not an error. Carries no bot MXID, token, or
+/// session material — only non-secret network ids and statuses cross IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BridgeDiscoveryVm {
+    /// The account's homeserver server name, for the empty-state copy.
+    pub homeserver: String,
+    /// The catalog-gated discovered Networks with their derived statuses.
+    pub networks: Vec<DiscoveredBridgeVm>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1552,6 +1612,58 @@ mod tests {
         let back: BridgeNetworkVm =
             serde_json::from_str(&json).expect("deserialize bridge network vm");
         assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn bridge_discovery_vm_round_trips_camel_case() {
+        let vm = BridgeDiscoveryVm {
+            homeserver: "example.org".to_owned(),
+            networks: vec![
+                DiscoveredBridgeVm {
+                    network_id: "whatsapp".to_owned(),
+                    status: BridgeStatus::LoggedIn,
+                },
+                DiscoveredBridgeVm {
+                    network_id: "signal".to_owned(),
+                    status: BridgeStatus::Configured,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&vm).expect("serialize discovery vm");
+        assert!(
+            json.contains("\"homeserver\":\"example.org\""),
+            "json was: {json}"
+        );
+        assert!(
+            json.contains("\"networkId\":\"whatsapp\""),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"status\":\"loggedIn\""), "json was: {json}");
+        assert!(
+            json.contains("\"status\":\"configured\""),
+            "json was: {json}"
+        );
+        // No bot MXID, token, or session material crosses the wire.
+        assert!(!json.contains("@"), "json leaked an mxid: {json}");
+        let back: BridgeDiscoveryVm =
+            serde_json::from_str(&json).expect("deserialize discovery vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn bridge_status_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&BridgeStatus::NotLoggedIn).expect("serialize status"),
+            "\"notLoggedIn\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BridgeStatus::LoggedIn).expect("serialize status"),
+            "\"loggedIn\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BridgeStatus::Configured).expect("serialize status"),
+            "\"configured\""
+        );
     }
 
     #[test]

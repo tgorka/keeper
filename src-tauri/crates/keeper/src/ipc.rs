@@ -22,10 +22,11 @@ use keeper_core::error::{
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
-    AccountVm, BackupStatus, BridgeNetworkVm, ConnectionStatusBatch, DemoBatch, EditVersionVm,
-    EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IpcError,
-    IpcErrorCode, NetworksSnapshot, PaginationStatusBatch, PingVm, RoomListBatch, SearchFilterVm,
-    SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
+    AccountVm, BackupStatus, BridgeDiscoveryVm, BridgeNetworkVm, ConnectionStatusBatch, DemoBatch,
+    EditVersionVm, EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm,
+    InboxBatch, IpcError, IpcErrorCode, NetworksSnapshot, PaginationStatusBatch, PingVm,
+    RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch,
+    VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -312,6 +313,12 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         // violation, not a user-actionable retry — the JSON is compiled in. The
         // Bridges view shows an error state and there is nothing to retry.
         CoreError::Bridge(BridgeError::Data(_)) => (IpcErrorCode::Internal, false),
+        // Bridge discovery (Story 6.2) against an account that is not live — the
+        // account must be activated first. Not user-actionable as a retry.
+        CoreError::Bridge(BridgeError::AccountNotFound(_)) => (IpcErrorCode::Internal, false),
+        // A total bridge-discovery transport failure (Story 6.2) — the homeserver
+        // may be transiently unreachable. Retriable: the Bridges view can retry.
+        CoreError::Bridge(BridgeError::Discovery(_)) => (IpcErrorCode::SyncUnavailable, true),
     };
     IpcError {
         code,
@@ -390,6 +397,28 @@ pub fn app_ping(state: State<'_, AppState>) -> Result<PingVm, IpcError> {
 #[tauri::command]
 pub fn bridge_catalog() -> Result<Vec<BridgeNetworkVm>, IpcError> {
     keeper_core::bridges::catalog().map_err(|e| to_ipc_error(e.into()))
+}
+
+/// Run zero-config, per-Account bridge discovery (Story 6.2, FR-25, AD-16). A
+/// one-shot pass that merges three sources — `thirdparty/protocols`, a known-bot
+/// MXID probe, and a joined-room `m.bridge` portal / bot-DM scan — into a per-Network
+/// [`BridgeStatus`](keeper_core::vm::BridgeStatus), catalog-gated to the surfaced 6.1
+/// networks. Resolves with a [`BridgeDiscoveryVm`] (the account's `homeserver` server
+/// name + discovered networks; an empty list is the honest "no bridges found" state,
+/// not an error). A homeserver lacking `thirdparty/protocols` degrades to the other
+/// two sources rather than erroring. Failures funnel through [`to_ipc_error`]: an
+/// unknown account → `internal` (non-retriable), a total transport failure →
+/// `syncUnavailable` (retriable). No bot MXID, token, or session material crosses IPC.
+#[tauri::command]
+pub async fn bridge_discover(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<BridgeDiscoveryVm, IpcError> {
+    state
+        .accounts
+        .discover_bridges(&account_id)
+        .await
+        .map_err(to_ipc_error)
 }
 
 /// Open the demo subscription. Emits the snapshot-then-diff batches produced by
