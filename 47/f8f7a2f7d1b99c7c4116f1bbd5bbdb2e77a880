@@ -1,0 +1,39 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_832f25ad6c7466::t_fec0bfb31c3cd4 188-199
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_832f25ad6c7466::t_2016197bba27a1 94
+src-tauri/crates/keeper-core/src/account.rs
+  s_832f25ad6c7466::t_a6d198c3a190d1 2451-2472
+  s_832f25ad6c7466::t_da344a13171174 2440-2450,2473
+src-tauri/crates/keeper-core/src/timeline.rs
+  s_832f25ad6c7466::t_a1c360bfffd752 672-681
+  s_832f25ad6c7466::t_757088d865495a 10-16
+_bmad-output/implementation-artifacts/spec-5-6-archive-first-pagination.md
+  s_832f25ad6c7466::t_56d02fa6757e83 99-116
+  s_832f25ad6c7466::t_f22deb6e011f53 9
+  s_832f25ad6c7466::t_710d27f376df05 54-57
+  s_832f25ad6c7466::t_3e4005d7e8e9f6 5
+  s_832f25ad6c7466::t_48cb07bdfec021 1-4,7-8,10-12,14-53,58-68,81-97
+  s_832f25ad6c7466::t_0dade17252c343 6
+  s_832f25ad6c7466::t_ab1b41e65cfb26 13
+  s_832f25ad6c7466::t_eb0b2688388de6 69-80
+  s_832f25ad6c7466::t_20b50bb3ac201c 98
+src-tauri/crates/keeper-core/tests/event_cache_pagination.rs
+  s_832f25ad6c7466::t_d99ddb8aaf1fc3 1-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "47f8f7a2f7d1b99c7c4116f1bbd5bbdb2e77a880",
+  "prompts": {},
+  "sessions": {
+    "s_832f25ad6c7466": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d7f3678f-5a2d-47a1-925d-e352aa356b28",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
