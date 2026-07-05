@@ -25,7 +25,10 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use matrix_sdk::encryption::VerificationState;
 use matrix_sdk::event_handler::EventHandlerHandle;
-use matrix_sdk::ruma::events::room::message::{MessageType, OriginalSyncRoomMessageEvent};
+use matrix_sdk::ruma::events::room::message::{
+    MessageType, OriginalSyncRoomMessageEvent, Relation,
+};
+use matrix_sdk::ruma::events::room::redaction::OriginalSyncRoomRedactionEvent;
 use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
@@ -41,7 +44,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
-use crate::archive::{ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWriter};
+use crate::archive::{self, ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWriter};
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
 use crate::bridge;
@@ -57,9 +60,9 @@ use crate::signals;
 use crate::timeline;
 use crate::verification::{self, VerificationSink};
 use crate::vm::{
-    ConnectionStatus, ConnectionStatusBatch, EncryptionStatus, EncryptionStatusBatch, InboxBatch,
-    PaginationStatusBatch, RoomListBatch, RoomListOp, RoomVm, SpaceVm, TimelineBatch, TypingBatch,
-    TypistVm,
+    ConnectionStatus, ConnectionStatusBatch, EditVersionVm, EncryptionStatus,
+    EncryptionStatusBatch, InboxBatch, PaginationStatusBatch, RoomListBatch, RoomListOp, RoomVm,
+    SpaceVm, TimelineBatch, TypingBatch, TypistVm,
 };
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
@@ -124,6 +127,7 @@ type ActivatedAccount = (
     JoinHandle<()>,
     JoinHandle<()>,
     EventHandlerHandle,
+    EventHandlerHandle,
 );
 
 /// A live, supervised account: its `Client`, `SyncService`, and the abort
@@ -167,6 +171,11 @@ struct AccountHandle {
     /// Removed from the `Client` in [`AccountManager::shutdown`] so no handler
     /// leaks and no further rows are ingested after the account goes down.
     archive_handler: EventHandlerHandle,
+    /// Account-wide redaction event handler (Story 5.2, FR-36): registered on the
+    /// `Client` in [`activate`], it marks the archived target row's `redacted_ts`
+    /// (marks only, never erases) via the single serialized writer. Removed from
+    /// the `Client` in [`AccountManager::shutdown`] alongside `archive_handler`.
+    redaction_handler: EventHandlerHandle,
 }
 
 /// A live merged-inbox subscription (AD-20): the merger the per-account
@@ -246,8 +255,14 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
-                    activate(platform, account_id, self.archive.clone()).await?;
+                let (
+                    client,
+                    sync,
+                    reconnect_supervisor,
+                    session_persister,
+                    archive_handler,
+                    redaction_handler,
+                ) = activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -258,6 +273,7 @@ impl AccountManager {
                         reconnect_supervisor,
                         session_persister,
                         archive_handler,
+                        redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -500,8 +516,14 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
-                    activate(platform, account_id, self.archive.clone()).await?;
+                let (
+                    client,
+                    sync,
+                    reconnect_supervisor,
+                    session_persister,
+                    archive_handler,
+                    redaction_handler,
+                ) = activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -512,6 +534,7 @@ impl AccountManager {
                         reconnect_supervisor,
                         session_persister,
                         archive_handler,
+                        redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -572,8 +595,14 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
-                    activate(platform, account_id, self.archive.clone()).await?;
+                let (
+                    client,
+                    sync,
+                    reconnect_supervisor,
+                    session_persister,
+                    archive_handler,
+                    redaction_handler,
+                ) = activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -584,6 +613,7 @@ impl AccountManager {
                         reconnect_supervisor,
                         session_persister,
                         archive_handler,
+                        redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -705,8 +735,14 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
-                    activate(platform, account_id, self.archive.clone()).await?;
+                let (
+                    client,
+                    sync,
+                    reconnect_supervisor,
+                    session_persister,
+                    archive_handler,
+                    redaction_handler,
+                ) = activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -717,6 +753,7 @@ impl AccountManager {
                         reconnect_supervisor,
                         session_persister,
                         archive_handler,
+                        redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -805,8 +842,14 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
-                    activate(platform, account_id, self.archive.clone()).await?;
+                let (
+                    client,
+                    sync,
+                    reconnect_supervisor,
+                    session_persister,
+                    archive_handler,
+                    redaction_handler,
+                ) = activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -817,6 +860,7 @@ impl AccountManager {
                         reconnect_supervisor,
                         session_persister,
                         archive_handler,
+                        redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -904,8 +948,14 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
-                    activate(platform, account_id, self.archive.clone()).await?;
+                let (
+                    client,
+                    sync,
+                    reconnect_supervisor,
+                    session_persister,
+                    archive_handler,
+                    redaction_handler,
+                ) = activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -916,6 +966,7 @@ impl AccountManager {
                         reconnect_supervisor,
                         session_persister,
                         archive_handler,
+                        redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -1047,8 +1098,14 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
-                    activate(platform, account_id, self.archive.clone()).await?;
+                let (
+                    client,
+                    sync,
+                    reconnect_supervisor,
+                    session_persister,
+                    archive_handler,
+                    redaction_handler,
+                ) = activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -1059,6 +1116,7 @@ impl AccountManager {
                         reconnect_supervisor,
                         session_persister,
                         archive_handler,
+                        redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -1356,6 +1414,58 @@ impl AccountManager {
         send::submit_edit(&timeline, item_key, body).await?;
         tracing::info!(account_id = %account_id, room_id = %room_id, "message edit dispatched");
         Ok(())
+    }
+
+    /// Read the edit history of the message addressed by `item_key` from the Local
+    /// Archive (Story 5.2, FR-11) — never a fresh homeserver fetch.
+    ///
+    /// Resolves the opaque `item_key` to the message's *original* `event_id` via
+    /// the live `Timeline` (matrix-sdk aggregates edits onto the original item, so
+    /// this is the chain's join key), then reads the version chain from
+    /// `archive.db` and maps each row to an [`EditVersionVm`]: the original's
+    /// display text from its top-level `body`, an edit's from `m.new_content.body`
+    /// (falling back to the top-level `body`). Versions are ordered oldest→newest
+    /// with the last flagged `is_current`. When "honor remote deletions locally"
+    /// is enabled, redacted versions are dropped from the result (FR-36). An
+    /// unresolvable item, a missing room / timeline, or an empty chain yields an
+    /// empty vec — the caller returns `Ok(vec![])` (no history is not an error).
+    pub async fn edit_history(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        room_id: &str,
+        item_key: &str,
+    ) -> Result<Vec<EditVersionVm>, CoreError> {
+        let Ok(room_id) = RoomId::parse(room_id) else {
+            return Ok(Vec::new());
+        };
+        // Resolve item_key → the original event id via the live timeline. A missing
+        // room / timeline / unresolvable item is simply "no history".
+        let event_id = {
+            let Ok(timeline) = self.open_timeline_for(account_id, &room_id).await else {
+                return Ok(Vec::new());
+            };
+            let items = timeline.items().await;
+            let resolved = items
+                .iter()
+                .find(|item| item.unique_id().0 == item_key)
+                .and_then(|item| item.as_event())
+                .and_then(|ev| ev.event_id().map(|id| id.to_string()));
+            match resolved {
+                Some(id) => id,
+                None => return Ok(Vec::new()),
+            }
+        };
+        // Read the archive version chain (read-only, off the writer path).
+        let data_dir = platform.data_dir()?;
+        let conn = archive::db::open_archive_db(&data_dir)?;
+        let chain = archive::db::edit_chain(&conn, account_id, &event_id)?;
+        // Honor the "honor remote deletions locally" policy on this retrieval
+        // surface (FR-36): when enabled, a redacted version is not retrievable, so
+        // it is dropped from the popover. Content stays physically on disk either
+        // way — marking never erases. Same gate as `archive::db::retrievable_content`.
+        let honor_deletions = archive::get_honor_remote_deletions(&data_dir)?;
+        Ok(visible_versions(chain, honor_deletions))
     }
 
     /// Redact (delete for everyone) the message addressed by `item_key` (its
@@ -2159,10 +2269,12 @@ impl AccountManager {
         }
         let mut accounts = self.accounts.lock().await;
         if let Some(handle) = accounts.remove(account_id) {
-            // Remove the account-wide archive event handler (Story 5.1) so no
-            // further events are ingested after the account goes down and no
-            // handler (holding a `Client` clone) leaks past teardown.
+            // Remove the account-wide archive event handlers (Story 5.1/5.2) so no
+            // further events are ingested and no redaction is marked after the
+            // account goes down, and no handler (holding a `Client` clone) leaks
+            // past teardown.
             handle.client.remove_event_handler(handle.archive_handler);
+            handle.client.remove_event_handler(handle.redaction_handler);
             // Stop the SyncService first so no further diffs are produced, then
             // abort the reconnect supervisor and any remaining producer tasks.
             handle.sync.stop().await;
@@ -2269,7 +2381,12 @@ async fn activate(
     // room is open, so message history from the sync flow lands in `archive.db`
     // via the single serialized writer. Mapping never blocks sync (non-blocking
     // `ingest`).
-    let archive_handler = register_archive_handler(&client, account_id, archive);
+    let archive_handler = register_archive_handler(&client, account_id, archive.clone());
+    // Register the account-wide redaction handler (Story 5.2) alongside the
+    // message handler and before sync starts, so a redaction in the first sync
+    // batch is not missed. It marks the archived target row's `redacted_ts` via
+    // the same single writer — marks only, never erases.
+    let redaction_handler = register_redaction_handler(&client, account_id, archive);
 
     // Re-persist the Keychain blob whenever the SDK rotates the session tokens,
     // so the (one-time-use) rotated OAuth refresh token survives a restart. A
@@ -2301,6 +2418,7 @@ async fn activate(
         reconnect_supervisor,
         session_persister,
         archive_handler,
+        redaction_handler,
     ))
 }
 
@@ -2340,6 +2458,47 @@ fn register_archive_handler(
     })
 }
 
+/// Register the account-wide redaction event handler on `client` and return its
+/// [`EventHandlerHandle`] (Story 5.2, FR-36).
+///
+/// The handler fires for every `m.room.redaction` the SDK delivers. It resolves
+/// the redaction's *target* event id in a room-version-safe way — the id lives in
+/// `content.redacts` in room versions ≥ 11 and at the top-level `redacts` field in
+/// earlier versions — and marks the archived target row's `redacted_ts` through
+/// the single serialized writer ([`ArchiveHandle::redact`], non-blocking). Marks
+/// only, never erases; a target not in the archive is a swallowed zero-row update.
+/// When archiving is disabled (`archive` is `None`) the handler is still
+/// registered but does nothing, so activation shape is uniform.
+fn register_redaction_handler(
+    client: &Client,
+    account_id: &str,
+    archive: Option<ArchiveHandle>,
+) -> EventHandlerHandle {
+    let account_id = account_id.to_owned();
+    client.add_event_handler(move |ev: OriginalSyncRoomRedactionEvent| {
+        let account_id = account_id.clone();
+        let archive = archive.clone();
+        async move {
+            let Some(archive) = archive else {
+                return;
+            };
+            // Room-version-safe target resolution: v11+ carries `redacts` inside
+            // `content`, earlier versions at the event top level. Prefer the
+            // content field, fall back to the top-level one.
+            let Some(target) = ev.content.redacts.as_ref().or(ev.redacts.as_ref()) else {
+                tracing::warn!(
+                    account_id = %account_id,
+                    event_id = %ev.event_id,
+                    "archive: redaction has no target event id; skipping mark"
+                );
+                return;
+            };
+            let redacted_ts = i64::from(ev.origin_server_ts.get());
+            archive.redact(&account_id, target.as_str(), redacted_ts);
+        }
+    })
+}
+
 /// Build a normalized [`ArchiveEvent`] from a post-decryption
 /// `m.room.message` event (Story 5.1). Pure over its inputs, so it is
 /// unit-testable without a live `Client`.
@@ -2354,6 +2513,15 @@ fn build_archive_event(
     ev: &OriginalSyncRoomMessageEvent,
 ) -> Result<ArchiveEvent, serde_json::Error> {
     let content_json = serde_json::to_string(&ev.content)?;
+    // Extract an edit relation (Story 5.2): an `m.replace` targets the original
+    // event, stored into queryable columns so the version chain can be read back.
+    // Any other relation (a reply) or none is a plain message — no relation cols.
+    let (relates_to_event_id, rel_type) = match ev.content.relates_to.as_ref() {
+        Some(Relation::Replacement(r)) => {
+            (Some(r.event_id.to_string()), Some("m.replace".to_owned()))
+        }
+        _ => (None, None),
+    };
     Ok(ArchiveEvent {
         account_id: account_id.to_owned(),
         event_id: ev.event_id.to_string(),
@@ -2363,7 +2531,72 @@ fn build_archive_event(
         event_type: "m.room.message".to_owned(),
         content_json,
         media: archive_media(&ev.content.msgtype),
+        relates_to_event_id,
+        rel_type,
     })
+}
+
+/// Map an archive version chain (original first, edits by `origin_ts` ascending)
+/// into the [`EditVersionVm`]s the edit-history popover renders (Story 5.2,
+/// FR-11). Pure over its input, so it is unit-testable without a DB.
+///
+/// The original row's display text is its content's top-level `body`; an edit
+/// row's is `m.new_content.body`, falling back to the top-level `body` when the
+/// edit content lacks `m.new_content`. A row whose JSON cannot be parsed yields an
+/// empty body (honest, never a panic). The version whose `event_id` matches
+/// `current_event_id` is flagged `is_current`; when that version is absent (e.g.
+/// honoring remote deletions dropped the newest one) no version is flagged.
+/// Map a version chain to [`EditVersionVm`]s, applying the honor-remote-deletions
+/// policy (FR-36): when `honor_deletions` is `true`, rows marked redacted
+/// (`redacted_ts` set) are dropped so redacted versions are not retrievable via
+/// the edit-history popover. When `false` (the default), every version is
+/// returned. Content is never erased on disk regardless — this gates retrieval
+/// only, matching [`crate::archive::db::retrievable_content`].
+fn visible_versions(
+    chain: Vec<crate::archive::db::StoredEvent>,
+    honor_deletions: bool,
+) -> Vec<EditVersionVm> {
+    // The current version is the newest row of the *full* chain (`edit_chain`
+    // orders original→newest), captured before filtering. If honoring remote
+    // deletions drops the newest version, no survivor is the current message —
+    // flagging an older survivor `is_current` would contradict the live timeline
+    // and silently suppress that survivor from the popover's prior-versions list.
+    let current_event_id = chain.last().map(|row| row.event_id.clone());
+    let visible: Vec<_> = chain
+        .into_iter()
+        .filter(|row| !(honor_deletions && row.redacted_ts.is_some()))
+        .collect();
+    edit_versions_from_chain(&visible, current_event_id.as_deref())
+}
+
+fn edit_versions_from_chain(
+    chain: &[crate::archive::db::StoredEvent],
+    current_event_id: Option<&str>,
+) -> Vec<EditVersionVm> {
+    chain
+        .iter()
+        .map(|row| EditVersionVm {
+            body: display_body_from_content(&row.content_json),
+            timestamp: row.origin_ts,
+            is_current: current_event_id == Some(row.event_id.as_str()),
+        })
+        .collect()
+}
+
+/// Extract the display text from a stored `m.room.message` content JSON: an edit's
+/// `m.new_content.body` when present, else the top-level `body`, else an empty
+/// string (Story 5.2). Never panics on malformed JSON.
+fn display_body_from_content(content_json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content_json) else {
+        return String::new();
+    };
+    value
+        .get("m.new_content")
+        .and_then(|nc| nc.get("body"))
+        .and_then(|b| b.as_str())
+        .or_else(|| value.get("body").and_then(|b| b.as_str()))
+        .unwrap_or("")
+        .to_owned()
 }
 
 /// Extract archive media *metadata* from a message `msgtype`, or `None` for a
@@ -3528,6 +3761,202 @@ mod tests {
             serde_json::from_str(&archived.content_json).expect("content json parses");
         assert_eq!(content["msgtype"], "m.text");
         assert_eq!(content["body"], "hello");
+        // A plain message carries no relation columns (Story 5.2).
+        assert_eq!(archived.relates_to_event_id, None);
+        assert_eq!(archived.rel_type, None);
+    }
+
+    /// A post-decryption edit (`m.replace`) maps to an `ArchiveEvent` with the
+    /// relation columns populated so it links the version chain (Story 5.2).
+    #[test]
+    fn build_archive_event_extracts_replace_relation() {
+        let ev = parse_message_event(
+            r#"{
+                "type": "m.room.message",
+                "event_id": "$edit:example.org",
+                "sender": "@bob:example.org",
+                "origin_server_ts": 1720000000002,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "* edited body",
+                    "m.new_content": { "msgtype": "m.text", "body": "edited body" },
+                    "m.relates_to": {
+                        "rel_type": "m.replace",
+                        "event_id": "$orig:example.org"
+                    }
+                }
+            }"#,
+        );
+        let archived =
+            build_archive_event("acctA", "!room:example.org", &ev).expect("build archive event");
+        assert_eq!(
+            archived.relates_to_event_id.as_deref(),
+            Some("$orig:example.org")
+        );
+        assert_eq!(archived.rel_type.as_deref(), Some("m.replace"));
+    }
+
+    /// A reply is not an edit — no relation columns (Story 5.2).
+    #[test]
+    fn build_archive_event_reply_has_no_relation_columns() {
+        let ev = parse_message_event(
+            r#"{
+                "type": "m.room.message",
+                "event_id": "$reply:example.org",
+                "sender": "@bob:example.org",
+                "origin_server_ts": 1720000000003,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "a reply",
+                    "m.relates_to": {
+                        "m.in_reply_to": { "event_id": "$orig:example.org" }
+                    }
+                }
+            }"#,
+        );
+        let archived =
+            build_archive_event("acctA", "!room:example.org", &ev).expect("build archive event");
+        assert_eq!(archived.relates_to_event_id, None);
+        assert_eq!(archived.rel_type, None);
+    }
+
+    /// The chain→VM mapping extracts each version's display text (original from
+    /// top-level `body`, edits from `m.new_content.body`), orders them as given,
+    /// and flags the last as current (Story 5.2, FR-11).
+    #[test]
+    fn edit_versions_from_chain_extracts_bodies_and_flags_current() {
+        use crate::archive::db::StoredEvent;
+        let mk = |event_id: &str, origin_ts: i64, content_json: &str| StoredEvent {
+            account_id: "acctA".to_owned(),
+            event_id: event_id.to_owned(),
+            room_id: "!r:e.org".to_owned(),
+            sender: "@u:e.org".to_owned(),
+            origin_ts,
+            event_type: "m.room.message".to_owned(),
+            content_json: content_json.to_owned(),
+            media_json: None,
+            inserted_ts: 0,
+            relates_to_event_id: None,
+            rel_type: None,
+            redacted_ts: None,
+        };
+        let chain = vec![
+            mk("$orig", 100, r#"{"msgtype":"m.text","body":"v1"}"#),
+            mk(
+                "$edit1",
+                200,
+                r#"{"msgtype":"m.text","body":"* v2","m.new_content":{"body":"v2"}}"#,
+            ),
+        ];
+        let versions = edit_versions_from_chain(&chain, Some("$edit1"));
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].body, "v1");
+        assert_eq!(versions[0].timestamp, 100);
+        assert!(!versions[0].is_current);
+        // The edit's display text comes from m.new_content.body, not the "* v2".
+        assert_eq!(versions[1].body, "v2");
+        assert_eq!(versions[1].timestamp, 200);
+        assert!(versions[1].is_current);
+    }
+
+    /// An empty chain maps to an empty vec (Story 5.2).
+    #[test]
+    fn edit_versions_from_chain_empty_is_empty() {
+        assert!(edit_versions_from_chain(&[], None).is_empty());
+    }
+
+    /// The honor-remote-deletions gate drops redacted versions from the popover
+    /// when enabled, and keeps them (the default) when disabled — content is never
+    /// erased on disk either way (Story 5.2, FR-36).
+    #[test]
+    fn visible_versions_honors_remote_deletions_policy() {
+        use crate::archive::db::StoredEvent;
+        let mk =
+            |event_id: &str, origin_ts: i64, body: &str, redacted_ts: Option<i64>| StoredEvent {
+                account_id: "acctA".to_owned(),
+                event_id: event_id.to_owned(),
+                room_id: "!r:e.org".to_owned(),
+                sender: "@u:e.org".to_owned(),
+                origin_ts,
+                event_type: "m.room.message".to_owned(),
+                content_json: format!(r#"{{"msgtype":"m.text","body":"{body}"}}"#),
+                media_json: None,
+                inserted_ts: origin_ts,
+                relates_to_event_id: None,
+                rel_type: None,
+                redacted_ts,
+            };
+        let chain = || {
+            vec![
+                mk("$orig", 100, "v1", Some(150)),
+                mk("$edit1", 200, "v2", None),
+            ]
+        };
+        // Default (off): both versions retrievable, newest flagged current.
+        let kept = visible_versions(chain(), false);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].body, "v1");
+        assert!(kept[1].is_current);
+        // Honor on: the redacted original is dropped; only the live edit remains.
+        let gated = visible_versions(chain(), true);
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].body, "v2");
+        assert!(gated[0].is_current);
+    }
+
+    /// When honoring remote deletions drops the *newest* (current) version, no
+    /// surviving older version is mislabelled `is_current` — the survivors are all
+    /// honest prior versions, matching the live timeline (Story 5.2, FR-36).
+    #[test]
+    fn visible_versions_current_redacted_flags_no_survivor_current() {
+        use crate::archive::db::StoredEvent;
+        let mk =
+            |event_id: &str, origin_ts: i64, body: &str, redacted_ts: Option<i64>| StoredEvent {
+                account_id: "acctA".to_owned(),
+                event_id: event_id.to_owned(),
+                room_id: "!r:e.org".to_owned(),
+                sender: "@u:e.org".to_owned(),
+                origin_ts,
+                event_type: "m.room.message".to_owned(),
+                content_json: format!(r#"{{"msgtype":"m.text","body":"{body}"}}"#),
+                media_json: None,
+                inserted_ts: origin_ts,
+                relates_to_event_id: None,
+                rel_type: None,
+                redacted_ts,
+            };
+        let chain = || {
+            vec![
+                mk("$orig", 100, "v1", None),
+                mk("$edit1", 200, "v2", None),
+                mk("$edit2", 300, "v3", Some(350)),
+            ]
+        };
+        // Honor off: full chain, the true newest ($edit2) is current.
+        let kept = visible_versions(chain(), false);
+        assert_eq!(kept.len(), 3);
+        assert!(kept[2].is_current);
+        // Honor on: the redacted current ($edit2) is dropped. The two survivors are
+        // both prior versions — neither is flagged current (the current message is
+        // redacted and not retrievable here).
+        let gated = visible_versions(chain(), true);
+        assert_eq!(gated.len(), 2);
+        assert_eq!(gated[0].body, "v1");
+        assert_eq!(gated[1].body, "v2");
+        assert!(gated.iter().all(|v| !v.is_current));
+    }
+
+    /// Body extraction falls back to top-level `body` when `m.new_content` is
+    /// absent, and to empty on malformed JSON (never panics).
+    #[test]
+    fn display_body_falls_back_and_never_panics() {
+        assert_eq!(display_body_from_content(r#"{"body":"top"}"#), "top");
+        assert_eq!(
+            display_body_from_content(r#"{"body":"top","m.new_content":{"body":"nc"}}"#),
+            "nc"
+        );
+        assert_eq!(display_body_from_content("not json"), "");
+        assert_eq!(display_body_from_content("{}"), "");
     }
 
     /// A post-decryption image message maps to an `ArchiveEvent` whose `media`

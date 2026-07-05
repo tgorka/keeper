@@ -14,20 +14,42 @@
 use rusqlite::Connection;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use super::ArchiveEvent;
+use super::{db, ArchiveEvent, ArchiveMsg};
 
 /// Run the single archive writer loop until the channel closes.
 ///
 /// Owns `conn` for the whole loop (a single owning task, so holding a rusqlite
 /// [`Connection`] across the `recv().await` is sound — it is never shared). Each
-/// received [`ArchiveEvent`] is inserted with `INSERT OR IGNORE`; any failure is
-/// logged with ids only and swallowed. Ends when every [`super::ArchiveHandle`]
-/// sender is dropped.
-pub(super) async fn run(mut rx: UnboundedReceiver<ArchiveEvent>, conn: Connection) {
-    while let Some(ev) = rx.recv().await {
-        insert_event(&conn, &ev);
+/// received [`ArchiveMsg`] is applied with a synchronous rusqlite call:
+/// `Insert` appends a row with `INSERT OR IGNORE`, `Redact` marks the target
+/// row's `redacted_ts`. Any failure is logged with ids only and swallowed — the
+/// task never dies, so the sync/messaging path is never blocked. Ends when every
+/// [`super::ArchiveHandle`] sender is dropped.
+pub(super) async fn run(mut rx: UnboundedReceiver<ArchiveMsg>, conn: Connection) {
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            ArchiveMsg::Insert(ev) => insert_event(&conn, &ev),
+            ArchiveMsg::Redact {
+                account_id,
+                event_id,
+                redacted_ts,
+            } => mark_redacted(&conn, &account_id, &event_id, redacted_ts),
+        }
     }
     tracing::info!("archive writer task ended (all senders dropped)");
+}
+
+/// Apply one redaction mark, swallowing (and logging with ids only) any failure.
+/// A target not present in the archive is a zero-row `UPDATE`, not an error.
+fn mark_redacted(conn: &Connection, account_id: &str, event_id: &str, redacted_ts: i64) {
+    if let Err(e) = db::mark_redacted(conn, account_id, event_id, redacted_ts) {
+        tracing::warn!(
+            account_id = %account_id,
+            event_id = %event_id,
+            error = %e,
+            "archive redaction mark failed"
+        );
+    }
 }
 
 /// Insert one normalized event, swallowing (and logging with ids only) any
@@ -54,8 +76,8 @@ fn insert_event(conn: &Connection, ev: &ArchiveEvent) {
     if let Err(e) = conn.execute(
         "INSERT OR IGNORE INTO events(\
             account_id, event_id, room_id, sender, origin_ts, event_type, \
-            content_json, media_json, inserted_ts\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            content_json, media_json, inserted_ts, relates_to_event_id, rel_type\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             ev.account_id,
             ev.event_id,
@@ -66,6 +88,8 @@ fn insert_event(conn: &Connection, ev: &ArchiveEvent) {
             ev.content_json,
             media_json,
             inserted_ts,
+            ev.relates_to_event_id,
+            ev.rel_type,
         ],
     ) {
         tracing::warn!(
@@ -90,7 +114,7 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::archive::db::{event_count, get_event, open_archive_db};
-    use crate::archive::{ArchiveEvent, ArchiveMedia};
+    use crate::archive::{ArchiveEvent, ArchiveMedia, ArchiveMsg};
     use std::path::PathBuf;
 
     fn temp_dir() -> PathBuf {
@@ -116,7 +140,26 @@ mod tests {
             event_type: "m.room.message".to_owned(),
             content_json: r#"{"msgtype":"m.text","body":"hi"}"#.to_owned(),
             media: None,
+            relates_to_event_id: None,
+            rel_type: None,
         }
+    }
+
+    #[test]
+    fn insert_edit_persists_relation_columns() {
+        let dir = temp_dir();
+        let conn = open_archive_db(&dir).expect("open");
+        let mut edit = text_event("acctA", "$edit");
+        edit.relates_to_event_id = Some("$orig".to_owned());
+        edit.rel_type = Some("m.replace".to_owned());
+        insert_event(&conn, &edit);
+        let row = get_event(&conn, "acctA", "$edit")
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.relates_to_event_id.as_deref(), Some("$orig"));
+        assert_eq!(row.rel_type.as_deref(), Some("m.replace"));
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -225,6 +268,48 @@ mod tests {
         assert_eq!(event_count(&conn, "acctA").expect("count"), 1);
         assert!(get_event(&conn, "acctA", "$e1").expect("get e1").is_none());
         assert!(get_event(&conn, "acctA", "$e2").expect("get e2").is_some());
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The single writer applies both `Insert` and `Redact` through one channel:
+    /// insert a row, then a redaction marks it (content retained), and a redaction
+    /// for an absent target is a swallowed no-op.
+    #[tokio::test]
+    async fn run_applies_insert_then_redact_through_one_writer() {
+        use tokio::sync::mpsc;
+        let dir = temp_dir();
+        let conn = open_archive_db(&dir).expect("open");
+        let (tx, rx) = mpsc::unbounded_channel::<ArchiveMsg>();
+        let task = tokio::spawn(run(rx, conn));
+        tx.send(ArchiveMsg::Insert(Box::new(text_event("acctA", "$e1"))))
+            .expect("send insert");
+        tx.send(ArchiveMsg::Redact {
+            account_id: "acctA".to_owned(),
+            event_id: "$e1".to_owned(),
+            redacted_ts: 555,
+        })
+        .expect("send redact");
+        // A redaction for a target that was never ingested: a zero-row no-op.
+        tx.send(ArchiveMsg::Redact {
+            account_id: "acctA".to_owned(),
+            event_id: "$ghost".to_owned(),
+            redacted_ts: 777,
+        })
+        .expect("send redact ghost");
+        drop(tx); // close the channel so the writer drains and ends
+        task.await.expect("writer task joins");
+
+        let conn = open_archive_db(&dir).expect("reopen");
+        let row = get_event(&conn, "acctA", "$e1").expect("get").expect("row");
+        assert_eq!(row.redacted_ts, Some(555));
+        assert_eq!(
+            row.content_json, r#"{"msgtype":"m.text","body":"hi"}"#,
+            "content retained through redaction mark"
+        );
+        assert!(get_event(&conn, "acctA", "$ghost")
+            .expect("get ghost")
+            .is_none());
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

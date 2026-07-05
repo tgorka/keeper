@@ -21,9 +21,10 @@ use keeper_core::error::{
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
-    AccountVm, BackupStatus, ConnectionStatusBatch, DemoBatch, EncryptionStatusBatch, InboxBatch,
-    IpcError, IpcErrorCode, NetworksSnapshot, PaginationStatusBatch, PingVm, RoomListBatch,
-    SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
+    AccountVm, BackupStatus, ConnectionStatusBatch, DemoBatch, EditVersionVm,
+    EncryptionStatusBatch, InboxBatch, IpcError, IpcErrorCode, NetworksSnapshot,
+    PaginationStatusBatch, PingVm, RoomListBatch, SpacesSnapshot, TimelineBatch, TypingBatch,
+    VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -458,6 +459,49 @@ pub fn set_encryption_posture(state: State<'_, AppState>, enabled: bool) -> Resu
 #[tauri::command]
 pub fn encryption_posture(state: State<'_, AppState>) -> Result<Option<bool>, IpcError> {
     auth::get_encryption_posture(state.platform.as_ref()).map_err(to_ipc_error)
+}
+
+/// Read the archive-fed edit history for a message from the Local Archive (Story
+/// 5.2, FR-11). `itemKey` is the message's opaque render `key` (its `unique_id`);
+/// the Rust core resolves it to the *original* event id via the live timeline and
+/// reads the version chain from `archive.db` — never a homeserver fetch. Resolves
+/// with an ordered `Vec<EditVersionVm>` (oldest→newest, the last flagged
+/// `isCurrent`), or an empty array when the item is unresolvable or has no local
+/// history. No event id ever crosses IPC. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub async fn edit_history_get(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    item_key: String,
+) -> Result<Vec<EditVersionVm>, IpcError> {
+    state
+        .accounts
+        .edit_history(&state.platform, &account_id, &room_id, &item_key)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Read the app-wide "honor remote deletions locally" policy (Story 5.2, FR-36).
+/// Resolves with `true` only when the setting is explicitly on; absent/off ⇒
+/// `false` (preserve). Read-time policy only — flipping it is never retroactive.
+/// Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn honor_remote_deletions(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::archive::get_honor_remote_deletions(&data_dir).map_err(to_ipc_error)
+}
+
+/// Persist the app-wide "honor remote deletions locally" policy (Story 5.2).
+/// Writes `on`/`off` to the `settings` table in `keeper.db`. Affects subsequent
+/// reads only (not retroactive). Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn set_honor_remote_deletions(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::archive::set_honor_remote_deletions(&data_dir, enabled).map_err(to_ipc_error)
 }
 
 /// Subscribe to an account's sliding-sync room list (FR-8, AD-8/9/19/20).

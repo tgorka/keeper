@@ -11,6 +11,7 @@
  * (Story 3.4); a hover/focus action bar offers Reply and Edit (own).
  */
 
+import { EditHistoryPopover } from "@/components/chat/edit-history-popover";
 import { MediaAttachment } from "@/components/chat/media-attachment";
 import { MessageActions } from "@/components/chat/message-actions";
 import { ReadReceipts } from "@/components/chat/read-receipts";
@@ -26,6 +27,17 @@ export type MessageVm = Extract<TimelineItemVm, { kind: "message" }>;
 interface MessageBubbleProps {
   /** The text message to render. */
   item: MessageVm;
+  /**
+   * The account this message belongs to. Used to fetch the message's edit
+   * history from the Local Archive when the "Edited" caption is clicked (Story
+   * 5.2). When absent, the "Edited" caption renders as static text (not clickable).
+   */
+  accountId?: string;
+  /**
+   * The room this message belongs to. Paired with {@link accountId} to fetch the
+   * edit history from the Local Archive (Story 5.2).
+   */
+  roomId?: string;
   /**
    * Whether this bubble continues a run from the same sender: when `true`, the
    * avatar and sender name are hidden so the run reads as one grouped block.
@@ -110,6 +122,8 @@ function initials(label: string): string {
 
 export function MessageBubble({
   item,
+  accountId,
+  roomId,
   grouped,
   groupTail = true,
   onRetry,
@@ -190,14 +204,12 @@ export function MessageBubble({
             {item.body !== "" && <p className="whitespace-pre-wrap break-words">{item.body}</p>}
             <div className="mt-1 flex items-center justify-end gap-1">
               {item.isEdited && (
-                <span
-                  className={cn(
-                    "text-[10px] leading-none",
-                    isOwn ? "text-primary-foreground/70" : "text-muted-foreground",
-                  )}
-                >
-                  Edited
-                </span>
+                <EditedCaption
+                  accountId={accountId}
+                  roomId={roomId}
+                  messageKey={item.key}
+                  isOwn={isOwn}
+                />
               )}
               {time !== "" && (
                 <time
@@ -249,6 +261,39 @@ export function MessageBubble({
         <ReadReceipts readers={item.readers} isOwn={isOwn} />
       </div>
     </div>
+  );
+}
+
+interface EditedCaptionProps {
+  accountId?: string;
+  roomId?: string;
+  messageKey: string;
+  isOwn: boolean;
+}
+
+/**
+ * The "Edited" caption (Story 3.4 / 5.2, FR-11). When the account and room are
+ * known, it is a clickable button opening the archive-fed edit-history popover;
+ * otherwise it renders as static text (honest — no clickable affordance without a
+ * way to fetch history).
+ */
+function EditedCaption({ accountId, roomId, messageKey, isOwn }: EditedCaptionProps) {
+  const tone = cn(
+    "text-[10px] leading-none",
+    isOwn ? "text-primary-foreground/70" : "text-muted-foreground",
+  );
+  if (accountId == null || roomId == null) {
+    return <span className={tone}>Edited</span>;
+  }
+  return (
+    <EditHistoryPopover accountId={accountId} roomId={roomId} messageKey={messageKey}>
+      <button
+        type="button"
+        className={cn(tone, "cursor-pointer underline-offset-2 hover:underline")}
+      >
+        Edited
+      </button>
+    </EditHistoryPopover>
   );
 }
 

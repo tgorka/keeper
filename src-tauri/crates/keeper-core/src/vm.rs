@@ -547,6 +547,28 @@ pub struct ReplyPreviewVm {
     pub body: String,
 }
 
+/// One version in a message's edit history, fed by the Local Archive (Story 5.2,
+/// FR-11).
+///
+/// The archive-fed edit-history popover lists these newest-first for a message
+/// whose "Edited" caption is clicked. Carries **only** non-secret render data: the
+/// version's display text, its origin timestamp, and whether it is the current
+/// (newest) version. NO event ids or relation logic cross IPC on this VM (AD-1) —
+/// the frontend addresses the message by its opaque render `key` only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct EditVersionVm {
+    /// The decoded plain-text body of this version (the original's top-level
+    /// `body`, or an edit's `m.new_content.body`).
+    pub body: String,
+    /// This version's origin server timestamp: milliseconds since the Unix epoch.
+    #[ts(type = "number")]
+    pub timestamp: i64,
+    /// `true` for the current (newest) version, `false` for a prior version.
+    pub is_current: bool,
+}
+
 /// One aggregated emoji-reaction group on a timeline message (Story 3.5, FR-12,
 /// NFR-9).
 ///

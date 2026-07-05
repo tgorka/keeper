@@ -15,6 +15,7 @@ export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
+export type { EditVersionVm } from "./gen/EditVersionVm";
 export type { EncryptionStatus } from "./gen/EncryptionStatus";
 export type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 export type { InboxBatch } from "./gen/InboxBatch";
@@ -50,6 +51,7 @@ export type { VerificationPhase } from "./gen/VerificationPhase";
 import type { AccountVm } from "./gen/AccountVm";
 import type { BackupStatus } from "./gen/BackupStatus";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
+import type { EditVersionVm } from "./gen/EditVersionVm";
 import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 import type { InboxBatch } from "./gen/InboxBatch";
 import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
@@ -193,6 +195,39 @@ export async function setEncryptionPosture(enabled: boolean): Promise<void> {
  */
 export async function encryptionPosture(): Promise<boolean | null> {
   return await invoke<boolean | null>("encryption_posture");
+}
+
+/**
+ * Read a message's edit history from the Local Archive (FR-11, Story 5.2).
+ * `itemKey` is the message's opaque render `key` (`unique_id`); the Rust core
+ * resolves it to the original event id and reads the version chain from
+ * `archive.db` — never a homeserver fetch. Resolves with an ordered
+ * {@link EditVersionVm}[] (oldest→newest, the last flagged `isCurrent`), or an
+ * empty array when the item is unresolvable or has no local history.
+ */
+export async function getEditHistory(
+  accountId: string,
+  roomId: string,
+  itemKey: string,
+): Promise<EditVersionVm[]> {
+  return await invoke<EditVersionVm[]>("edit_history_get", { accountId, roomId, itemKey });
+}
+
+/**
+ * Read the app-wide "honor remote deletions locally" policy (FR-36, Story 5.2).
+ * Resolves with `true` only when explicitly enabled; absent/off ⇒ `false`
+ * (preserve). Read-time policy only — flipping it is never retroactive.
+ */
+export async function honorRemoteDeletions(): Promise<boolean> {
+  return await invoke<boolean>("honor_remote_deletions");
+}
+
+/**
+ * Persist the app-wide "honor remote deletions locally" policy (FR-36, Story
+ * 5.2). Affects subsequent reads only (not retroactive). Resolves once persisted.
+ */
+export async function setHonorRemoteDeletions(enabled: boolean): Promise<void> {
+  await invoke<void>("set_honor_remote_deletions", { enabled });
 }
 
 /**

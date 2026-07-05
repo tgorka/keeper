@@ -87,7 +87,7 @@ development_status:
   epic-4-retrospective: optional
   epic-5: in-progress
   5-1-archive-ingestion-pipeline: done
-  5-2-durability-against-remote-rewrites-edit-history: backlog
+  5-2-durability-against-remote-rewrites-edit-history: done
   5-3-offline-full-text-search-engine: backlog
   5-4-search-ui-global-and-in-chat: backlog
   5-5-export-to-json-and-markdown: backlog

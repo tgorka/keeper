@@ -980,6 +980,8 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
                 <li key={row.item.key}>
                   <MessageBubble
                     item={row.item}
+                    accountId={accountId ?? undefined}
+                    roomId={selectedRoomId ?? undefined}
                     grouped={row.grouped}
                     groupTail={row.groupTail}
                     onRetry={onRetry}

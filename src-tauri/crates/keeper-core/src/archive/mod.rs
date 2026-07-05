@@ -29,7 +29,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use crate::error::ArchiveError;
+use crate::error::{ArchiveError, CoreError};
+use crate::registry;
+
+/// App-wide setting key for the read-time "honor remote deletions locally" policy
+/// (Story 5.2, FR-36). Stored in `keeper.db`'s `settings` KV as `"on"`/`"off"`;
+/// absent ⇒ off ⇒ preserve (redacted content stays retrievable).
+const HONOR_REMOTE_DELETIONS_SETTING: &str = "honor_remote_deletions";
 
 /// Media *metadata* for an archived media message (Story 5.1). Metadata only —
 /// never the media bytes (those stay in the SDK media cache; the archive records
@@ -86,6 +92,37 @@ pub struct ArchiveEvent {
     /// Media metadata (mxc/mimetype/size/dims/filename), or `None` for a
     /// non-media event. Never holds media bytes.
     pub media: Option<ArchiveMedia>,
+    /// For an edit event (`m.replace`), the target event id being replaced; `None`
+    /// for a plain message or a reply (Story 5.2). The original row is never
+    /// mutated — the edit is stored as its own row and this links the version
+    /// chain.
+    pub relates_to_event_id: Option<String>,
+    /// The relation type (`"m.replace"` for an edit), or `None` for a plain
+    /// message (Story 5.2).
+    pub rel_type: Option<String>,
+}
+
+/// A unit of work for the single serialized archive writer (Story 5.2).
+///
+/// Both variants funnel through the *same* writer task / one `archive.db` — no
+/// second writer, no second connection. `Insert` appends a normalized row
+/// (`INSERT OR IGNORE`); `Redact` marks an existing row's `redacted_ts` without
+/// erasing its content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveMsg {
+    /// Append a normalized event row (idempotent on `(account_id, event_id)`).
+    /// Boxed so the enum's variants stay similarly sized (the redaction variant is
+    /// small); the [`ArchiveEvent`] payload is the same either way.
+    Insert(Box<ArchiveEvent>),
+    /// Mark an archived event as remotely redacted (marks only, never erases).
+    Redact {
+        /// The account whose row is being marked.
+        account_id: String,
+        /// The redaction's *target* event id (the row to mark).
+        event_id: String,
+        /// The redaction timestamp in milliseconds since the Unix epoch.
+        redacted_ts: i64,
+    },
 }
 
 /// The cloneable producer handle for archive ingestion (Story 5.1).
@@ -96,7 +133,7 @@ pub struct ArchiveEvent {
 /// unbounded channel), so it never blocks the sync/messaging path.
 #[derive(Clone)]
 pub struct ArchiveHandle {
-    tx: UnboundedSender<ArchiveEvent>,
+    tx: UnboundedSender<ArchiveMsg>,
 }
 
 impl ArchiveHandle {
@@ -105,17 +142,64 @@ impl ArchiveHandle {
     /// sync/messaging path, and a send onto a closed channel (the writer stopped)
     /// is logged with ids only and dropped — never propagated, never a panic.
     pub fn ingest(&self, ev: ArchiveEvent) {
-        if let Err(e) = self.tx.send(ev) {
-            // The event that failed to enqueue is `e.0`; log ids only, never
+        if let Err(e) = self.tx.send(ArchiveMsg::Insert(Box::new(ev))) {
+            // The message that failed to enqueue is `e.0`; log ids only, never
             // content. A closed channel means the writer task ended.
-            let ev = e.0;
-            tracing::warn!(
-                account_id = %ev.account_id,
-                event_id = %ev.event_id,
-                "archive: writer channel closed; dropping event"
-            );
+            log_dropped(&e.0);
         }
     }
+
+    /// Mark an archived event as remotely redacted through the *same* single
+    /// writer (Story 5.2). Non-blocking and infallible from the caller's view (see
+    /// [`ArchiveHandle::ingest`]); a closed channel is logged with ids only and
+    /// dropped. Marks only — the writer never erases the row's content.
+    pub fn redact(&self, account_id: &str, event_id: &str, redacted_ts: i64) {
+        let msg = ArchiveMsg::Redact {
+            account_id: account_id.to_owned(),
+            event_id: event_id.to_owned(),
+            redacted_ts,
+        };
+        if let Err(e) = self.tx.send(msg) {
+            log_dropped(&e.0);
+        }
+    }
+}
+
+/// Log a dropped writer message with ids only (never content). A closed channel
+/// means the writer task ended.
+fn log_dropped(msg: &ArchiveMsg) {
+    match msg {
+        ArchiveMsg::Insert(ev) => tracing::warn!(
+            account_id = %ev.account_id,
+            event_id = %ev.event_id,
+            "archive: writer channel closed; dropping event"
+        ),
+        ArchiveMsg::Redact {
+            account_id,
+            event_id,
+            ..
+        } => tracing::warn!(
+            account_id = %account_id,
+            event_id = %event_id,
+            "archive: writer channel closed; dropping redaction"
+        ),
+    }
+}
+
+/// Read the app-wide "honor remote deletions locally" policy (Story 5.2, FR-36).
+///
+/// `true` only when the setting is explicitly `"on"`; absent or `"off"` ⇒ `false`
+/// (preserve — redacted content stays retrievable). This is a read-time policy;
+/// flipping it is never retroactive.
+pub fn get_honor_remote_deletions(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(registry::get_setting(data_dir, HONOR_REMOTE_DELETIONS_SETTING)?.as_deref() == Some("on"))
+}
+
+/// Persist the app-wide "honor remote deletions locally" policy (Story 5.2).
+/// Writes `"on"` when enabled, `"off"` otherwise, to `keeper.db`'s `settings`.
+pub fn set_honor_remote_deletions(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    let value = if enabled { "on" } else { "off" };
+    registry::set_setting(data_dir, HONOR_REMOTE_DELETIONS_SETTING, value)
 }
 
 /// Spawns and owns the single serialized archive writer task (Story 5.1).
@@ -133,7 +217,7 @@ impl ArchiveWriter {
     /// inside an async context.
     pub fn spawn(data_dir: &Path) -> Result<ArchiveHandle, ArchiveError> {
         let conn = db::open_archive_db(data_dir)?;
-        let (tx, rx) = mpsc::unbounded_channel::<ArchiveEvent>();
+        let (tx, rx) = mpsc::unbounded_channel::<ArchiveMsg>();
         spawn_writer(rx, conn);
         Ok(ArchiveHandle { tx })
     }
@@ -142,7 +226,7 @@ impl ArchiveWriter {
 /// Spawn the writer future onto whatever runtime is available (see
 /// [`ArchiveWriter::spawn`]). Kept separate so the runtime-selection logic has one
 /// home.
-fn spawn_writer(rx: mpsc::UnboundedReceiver<ArchiveEvent>, conn: rusqlite::Connection) {
+fn spawn_writer(rx: mpsc::UnboundedReceiver<ArchiveMsg>, conn: rusqlite::Connection) {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             handle.spawn(ingest::run(rx, conn));
@@ -209,6 +293,8 @@ mod tests {
             event_type: "m.room.message".to_owned(),
             content_json: r#"{"msgtype":"m.text","body":"hi"}"#.to_owned(),
             media: None,
+            relates_to_event_id: None,
+            rel_type: None,
         }
     }
 
@@ -245,12 +331,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `ingest` onto a closed channel is a swallowed no-op (never panics).
+    /// `ingest`/`redact` onto a closed channel are swallowed no-ops (never panic).
     #[test]
-    fn ingest_after_writer_closed_is_swallowed() {
-        let (tx, rx) = mpsc::unbounded_channel::<ArchiveEvent>();
+    fn writes_after_writer_closed_are_swallowed() {
+        let (tx, rx) = mpsc::unbounded_channel::<ArchiveMsg>();
         drop(rx); // writer gone
         let handle = ArchiveHandle { tx };
         handle.ingest(text_event("acctA", "$e1")); // must not panic
+        handle.redact("acctA", "$e1", 123); // must not panic
     }
 }

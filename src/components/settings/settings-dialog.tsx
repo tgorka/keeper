@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
   SDK_STORE_STATUS_LOADING,
@@ -14,7 +14,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { encryptionPosture } from "@/lib/ipc/client";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { encryptionPosture, honorRemoteDeletions, setHonorRemoteDeletions } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useEncryptionStatus } from "@/lib/stores/encryption-status";
 import { keyBackupStore, useKeyBackupStatus } from "@/lib/stores/key-backup";
@@ -86,10 +88,79 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         <div className="flex flex-col gap-3 text-sm">
           <p>{sdkStatus}</p>
           <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>
+          <HonorRemoteDeletionsRow />
         </div>
         <EncryptionSection />
       </DialogContent>
     </Dialog>
+  );
+}
+
+/**
+ * The plain disclosure for the honor-remote-deletions toggle (Story 5.2, FR-36,
+ * UX-DR17). Sentence case, no exclamation marks (project voice).
+ */
+const HONOR_REMOTE_DELETIONS_SENTENCE =
+  "keeper keeps local copies of remotely edited and deleted messages by default. Turning this on hides remotely deleted messages from history retrieval on this Mac; turning it off makes them retrievable again. The local copies are never erased.";
+
+/**
+ * The "Honor remote deletions locally" toggle in the Archive & Storage section
+ * (Story 5.2, FR-36). Reads its initial state via `honorRemoteDeletions()` and
+ * persists changes via `setHonorRemoteDeletions`. On a persist failure the toggle
+ * reverts to its prior value (honest — never claims a state that was not saved).
+ */
+function HonorRemoteDeletionsRow() {
+  // `undefined` = still loading; otherwise the resolved boolean.
+  const [enabled, setEnabled] = useState<boolean | undefined>(undefined);
+
+  useEffect(() => {
+    let cancelled = false;
+    void honorRemoteDeletions()
+      .then((value) => {
+        if (!cancelled) {
+          setEnabled(value);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setEnabled(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Monotonic token so a failed persist only reverts when no newer toggle has
+  // superseded it — prevents a stale-closure revert clobbering a rapid re-toggle.
+  const writeId = useRef(0);
+
+  const onCheckedChange = (next: boolean) => {
+    writeId.current += 1;
+    const id = writeId.current;
+    const prev = enabled ?? false;
+    setEnabled(next);
+    void setHonorRemoteDeletions(next).catch(() => {
+      // Persist failed — revert, but only if this is still the latest toggle.
+      if (id === writeId.current) {
+        setEnabled(prev);
+      }
+    });
+  };
+
+  return (
+    <div className="mt-1 flex flex-col gap-1.5 border-border border-t pt-3">
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor="honor-remote-deletions">Honor remote deletions locally</Label>
+        <Switch
+          id="honor-remote-deletions"
+          checked={enabled ?? false}
+          disabled={enabled === undefined}
+          onCheckedChange={onCheckedChange}
+        />
+      </div>
+      <p className="text-muted-foreground">{HONOR_REMOTE_DELETIONS_SENTENCE}</p>
+    </div>
   );
 }
 

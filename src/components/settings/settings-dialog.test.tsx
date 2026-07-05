@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
   encryptionPosture: vi.fn(() => Promise.resolve(null)),
+  honorRemoteDeletions: vi.fn(() => Promise.resolve(false)),
+  setHonorRemoteDeletions: vi.fn(() => Promise.resolve()),
   verificationCancel: vi.fn(() => Promise.resolve()),
 }));
 
@@ -13,13 +15,15 @@ import {
 } from "@/components/settings/at-rest-encryption-choice";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import type { AccountVm } from "@/lib/ipc/client";
-import { encryptionPosture } from "@/lib/ipc/client";
+import { encryptionPosture, honorRemoteDeletions, setHonorRemoteDeletions } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
 import { keyBackupStore } from "@/lib/stores/key-backup";
 import { verificationStore } from "@/lib/stores/verification";
 
 const mockPosture = vi.mocked(encryptionPosture);
+const mockHonorGet = vi.mocked(honorRemoteDeletions);
+const mockHonorSet = vi.mocked(setHonorRemoteDeletions);
 
 function account(id: string): AccountVm {
   return {
@@ -34,6 +38,10 @@ function account(id: string): AccountVm {
 describe("SettingsDialog", () => {
   beforeEach(() => {
     mockPosture.mockClear();
+    mockHonorGet.mockClear();
+    mockHonorSet.mockClear();
+    mockHonorGet.mockResolvedValue(false);
+    mockHonorSet.mockResolvedValue(undefined);
     accountsStore.getState().clear();
     encryptionStatusStore.getState().reset();
     keyBackupStore.getState().reset();
@@ -142,5 +150,31 @@ describe("SettingsDialog", () => {
     render(<SettingsDialog open onOpenChange={() => {}} />);
 
     expect(screen.getAllByText("Checking…").length).toBeGreaterThan(0);
+  });
+
+  it("renders the honor-remote-deletions toggle and reads its initial state", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockHonorGet.mockResolvedValue(true);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const toggle = await screen.findByRole("switch", {
+      name: "Honor remote deletions locally",
+    });
+    await waitFor(() => expect(toggle).toBeChecked());
+    expect(mockHonorGet).toHaveBeenCalled();
+  });
+
+  it("persists the honor-remote-deletions toggle on change", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockHonorGet.mockResolvedValue(false);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const toggle = await screen.findByRole("switch", {
+      name: "Honor remote deletions locally",
+    });
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    fireEvent.click(toggle);
+    await waitFor(() => expect(mockHonorSet).toHaveBeenCalledWith(true));
+    expect(toggle).toBeChecked();
   });
 });
