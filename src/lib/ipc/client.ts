@@ -254,27 +254,31 @@ export async function unsubscribeRoomList(accountId: string, id: number): Promis
 
 /**
  * Subscribe to the merged unified inbox across every restorable account (FR-18,
- * AD-20, Story 4.2). Opens **two** `Channel`s over one subscription and forwards
- * the recency-ordered Inbox window to `onInbox` and the Archive window to
- * `onArchive` (each a `Reset` window that updates as accounts sync or as archive
- * state changes). Resolves with the inbox subscription id — one
- * {@link unsubscribeInbox} tears down both. Ordering and the inbox/archive split
- * are computed in Rust — never re-derived here. Rejects with the {@link IpcError}
- * envelope (`code: "syncUnavailable"`) on a stream-start failure.
+ * AD-20, Story 4.2 + 4.3). Opens **three** `Channel`s over one subscription and
+ * forwards the recency-ordered Inbox window to `onInbox`, the Archive window to
+ * `onArchive`, and the Pins window (pinned rooms, user order) to `onPins` (each a
+ * `Reset` window that updates as accounts sync or as archive/pin state changes).
+ * Resolves with the inbox subscription id — one {@link unsubscribeInbox} tears
+ * down all three. Ordering and the three-way split are computed in Rust — never
+ * re-derived here. Rejects with the {@link IpcError} envelope (`code:
+ * "syncUnavailable"`) on a stream-start failure.
  *
- * Both channels arm their `onmessage` before `invoke` (the ordering is
+ * All channels arm their `onmessage` before `invoke` (the ordering is
  * load-bearing per AD-8, so no batch sent by a spawned task is dropped). The Rust
- * command's params are `channel` (inbox) and `archive`.
+ * command's params are `channel` (inbox), `archive`, and `pins`.
  */
 export async function subscribeInbox(
   onInbox: (batch: InboxBatch) => void,
   onArchive: (batch: InboxBatch) => void,
+  onPins: (batch: InboxBatch) => void,
 ): Promise<number> {
   const channel = new Channel<InboxBatch>();
   const archive = new Channel<InboxBatch>();
+  const pins = new Channel<InboxBatch>();
   channel.onmessage = onInbox;
   archive.onmessage = onArchive;
-  return await invoke<number>("inbox_subscribe", { channel, archive });
+  pins.onmessage = onPins;
+  return await invoke<number>("inbox_subscribe", { channel, archive, pins });
 }
 
 /**
@@ -758,6 +762,40 @@ export async function archiveRoom(accountId: string, roomId: string): Promise<vo
  */
 export async function unarchiveRoom(accountId: string, roomId: string): Promise<void> {
   await invoke<void>("unarchive_room", { accountId, roomId });
+}
+
+/**
+ * Pin a room (Story 4.3, FR-22). The Rust core appends the pin at the end of the
+ * keeper-local ordered list, persists it to `keeper.db` (pins have no Matrix
+ * representation), and re-emits the Pins/Inbox/Archive windows so the strip
+ * updates within one frame. Best-effort: callers fire-and-forget and swallow
+ * rejection — the stream is truth. Rejects with the {@link IpcError} envelope
+ * (`code: "internal"`) only on a registry write failure.
+ */
+export async function pinRoom(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("pin_room", { accountId, roomId });
+}
+
+/**
+ * Unpin a room (Story 4.3). The Rust core removes the keeper-local pin ref and
+ * re-emits the windows so the row returns to its chronological Inbox (or Archive)
+ * position. Best-effort: callers fire-and-forget and swallow rejection. Rejects
+ * with the {@link IpcError} envelope only on a registry write failure.
+ */
+export async function unpinRoom(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("unpin_room", { accountId, roomId });
+}
+
+/**
+ * Reorder the pins to the exact `order` given (Story 4.3). Each entry is a
+ * `{ accountId, roomId }` ref; the Rust core rewrites the keeper-local order to
+ * contiguous `0..n` and re-emits the Pins window in that order (authoritative —
+ * no optimistic TS overlay). Best-effort: callers fire-and-forget and swallow
+ * rejection. Rejects with the {@link IpcError} envelope only on a registry write
+ * failure.
+ */
+export async function reorderPins(order: { accountId: string; roomId: string }[]): Promise<void> {
+  await invoke<void>("reorder_pins", { order });
 }
 
 /**

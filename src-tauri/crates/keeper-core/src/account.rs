@@ -301,9 +301,11 @@ impl AccountManager {
     /// Subscribe to the merged unified inbox across every restorable account
     /// (AD-20, Story 4.2). Activates each account whose Keychain session is
     /// present, opens its room-list stream, and feeds each into a shared
-    /// [`InboxMerger`] that partitions the merged window into two recency-ordered
-    /// [`InboxBatch`] streams: the Inbox window into `inbox_sink` and the Archive
-    /// window into `archive_sink`. Returns the inbox subscription id. Replacing an
+    /// [`InboxMerger`] that partitions the merged window into three
+    /// recency/order-authoritative [`InboxBatch`] streams: the Inbox window into
+    /// `inbox_sink`, the Archive window into `archive_sink`, and the Pins window
+    /// into `pins_sink` (seeded from keeper-local [`registry::get_pins`], Story
+    /// 4.3). Returns the inbox subscription id. Replacing an
     /// existing inbox subscription (e.g. the frontend re-subscribes after adding an
     /// account) first tears the old one down. Adding the Nth account is identical
     /// to the 2nd — no count limit.
@@ -312,13 +314,18 @@ impl AccountManager {
         platform: &Arc<dyn Platform>,
         inbox_sink: InboxSink,
         archive_sink: InboxSink,
+        pins_sink: InboxSink,
     ) -> Result<u64, CoreError> {
         // Only one inbox subscription at a time: tear down any prior one so its
         // producers stop feeding a stale merger/channel.
         self.unsubscribe_inbox_inner().await;
 
         let accounts = auth::find_restorable_accounts(platform.as_ref())?;
-        let merger = InboxMerger::new(inbox_sink, archive_sink);
+        // Seed the merger's pin map from keeper-local state (Story 4.3): pins have
+        // no Matrix representation, so membership + order come from the registry.
+        let data_dir = platform.data_dir()?;
+        let pins = load_pins(&data_dir)?;
+        let merger = InboxMerger::new(inbox_sink, archive_sink, pins_sink, pins);
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
 
         // Register every account slot up front so the merge reflects the full set
@@ -1600,6 +1607,78 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Pin the room on `account_id` (Story 4.3, FR-22). Pins are keeper-local: this
+    /// appends the ref at the end of the ordered list (`max(existing)+1`), persists
+    /// it to the registry, then reloads [`registry::get_pins`] and pushes the whole
+    /// map into the live merger via [`InboxMerger::update_pins`] — one code path
+    /// keeps the in-memory map and disk in sync, and re-emits all three windows so
+    /// the strip updates within one frame. Best-effort: a no-active-subscription
+    /// case is a harmless no-op re-emit; a registry write error surfaces.
+    pub async fn pin_room(
+        &self,
+        data_dir: &Path,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<(), CoreError> {
+        // Append at the end of the global order (`max+1`, or 0 when empty).
+        let next_order = registry::get_pins(data_dir)?
+            .iter()
+            .map(|(_, _, o)| *o)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        registry::set_pin(data_dir, account_id, room_id, next_order)?;
+        self.reload_pins(data_dir).await?;
+        tracing::info!(account_id = %account_id, room_id = %room_id, "room pinned");
+        Ok(())
+    }
+
+    /// Unpin the room on `account_id` (Story 4.3). Removes the ref from the registry
+    /// (idempotent), then reloads the pin map into the merger so the row returns to
+    /// its chronological Inbox (or Archive) position. Best-effort re-emit as in
+    /// [`Self::pin_room`].
+    pub async fn unpin_room(
+        &self,
+        data_dir: &Path,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<(), CoreError> {
+        registry::remove_pin(data_dir, account_id, room_id)?;
+        self.reload_pins(data_dir).await?;
+        tracing::info!(account_id = %account_id, room_id = %room_id, "room unpinned");
+        Ok(())
+    }
+
+    /// Reorder the pins to the exact `order` given (Story 4.3): rewrite the full
+    /// ordered ref list to contiguous `0..n` in the registry, then reload the pin
+    /// map into the merger so the Pins window re-emits in the new order. Refs not
+    /// currently pinned are written anyway (upsert) so the frontend's authoritative
+    /// order always wins; the registry is left contiguous and consistent.
+    pub async fn reorder_pins(
+        &self,
+        data_dir: &Path,
+        order: &[(String, String)],
+    ) -> Result<(), CoreError> {
+        for (index, (account_id, room_id)) in order.iter().enumerate() {
+            registry::set_pin(data_dir, account_id, room_id, index as i64)?;
+        }
+        self.reload_pins(data_dir).await?;
+        tracing::debug!(count = order.len(), "pins reordered");
+        Ok(())
+    }
+
+    /// Reload the pin map from the registry and push it into the live merger, if
+    /// any (Story 4.3). A no-op re-emit when no inbox subscription is active — the
+    /// next `subscribe_inbox` seeds from the same registry.
+    async fn reload_pins(&self, data_dir: &Path) -> Result<(), CoreError> {
+        let pins = load_pins(data_dir)?;
+        let inbox = self.inbox.lock().await;
+        if let Some(handle) = inbox.as_ref() {
+            handle.merger.update_pins(pins).await;
+        }
+        Ok(())
+    }
+
     /// Set (or clear) the account's typing notice in the room through the
     /// receipt/typing signals seam (Story 3.9, AD-14). Resolves the account's live
     /// `Room` and delegates to [`signals::set_typing`]. Best-effort: a dispatch
@@ -2381,6 +2460,16 @@ async fn run_inbox_producer(room_list: RoomList, merger: InboxMerger, account_id
             }
         }
     }
+}
+
+/// Load keeper-local pins from the registry into a merger-shaped map keyed by
+/// `(account_id, room_id)` → `sort_order` (Story 4.3). Pins have no Matrix
+/// representation, so membership + order are registry-authoritative.
+fn load_pins(data_dir: &Path) -> Result<HashMap<(String, String), i64>, CoreError> {
+    Ok(registry::get_pins(data_dir)?
+        .into_iter()
+        .map(|(account_id, room_id, order)| ((account_id, room_id), order))
+        .collect())
 }
 
 /// Extract the known room total from a [`RoomListLoadingState`], if loaded.

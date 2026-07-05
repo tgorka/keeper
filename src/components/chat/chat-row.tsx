@@ -22,9 +22,13 @@
  * best-effort with NO optimistic overlay — the row's move between the Inbox and
  * Archive windows is Rust-authoritative filtering (AD-20), so it waits on the tag
  * round-trip; a rejection is swallowed.
+ *
+ * A third context-menu item (Story 4.3) pins / unpins the row: "Pin" when
+ * `!isPinned`, "Unpin" otherwise. Pins are keeper-local; the row's move into the
+ * Pins strip is likewise Rust-authoritative with NO optimistic overlay.
  */
 
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import { Badge } from "@/components/ui/badge";
 import {
   ContextMenu,
@@ -36,7 +40,14 @@ import {
 import { accountHueVar } from "@/lib/account-hue";
 import { formatRoomTimestamp } from "@/lib/format-time";
 import type { InboxRoomVm } from "@/lib/ipc/client";
-import { archiveRoom, markRoomRead, markRoomUnread, unarchiveRoom } from "@/lib/ipc/client";
+import {
+  archiveRoom,
+  markRoomRead,
+  markRoomUnread,
+  pinRoom,
+  unarchiveRoom,
+  unpinRoom,
+} from "@/lib/ipc/client";
 import { effectiveIsUnread, type RoomSelection, useRoomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
 
@@ -48,26 +59,8 @@ interface ChatRowProps {
   selected?: boolean;
 }
 
-/**
- * Derive up-to-two-letter initials from a room display name for the avatar
- * fallback. Falls back to `"#"` for an empty/whitespace name.
- */
-function initials(displayName: string): string {
-  const words = displayName.trim().split(/\s+/).filter(Boolean);
-  if (words.length === 0) {
-    return "#";
-  }
-  if (words.length === 1) {
-    return words[0].slice(0, 2).toUpperCase();
-  }
-  return (words[0][0] + words[words.length - 1][0]).toUpperCase();
-}
-
 export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
   const timestamp = room.timestamp === null ? null : formatRoomTimestamp(room.timestamp) || null;
-  // An `mxc://` URI cannot load in the webview (the media scheme handler is a
-  // later epic); only a browser-loadable http(s) URL is rendered as an image.
-  const httpAvatar = room.avatarUrl && /^https?:\/\//.test(room.avatarUrl) ? room.avatarUrl : null;
 
   // Unread state is authoritative from Rust; the overlay only lets the row lead
   // the stream by a frame after a context-menu action (Story 4.1).
@@ -107,6 +100,15 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
   const onUnarchive = () => {
     void unarchiveRoom(room.accountId, room.roomId).catch(() => {});
   };
+  // Pin/unpin are best-effort with no optimistic overlay (Story 4.3): the row's
+  // move into the Pins strip is Rust-authoritative (AD-20). A rejection is
+  // swallowed — the stream is truth.
+  const onPin = () => {
+    void pinRoom(room.accountId, room.roomId).catch(() => {});
+  };
+  const onUnpin = () => {
+    void unpinRoom(room.accountId, room.roomId).catch(() => {});
+  };
 
   // Accessible unread cue for the row button's name (the visual dot is
   // aria-hidden and the badge sits outside the button's accessible name), gated
@@ -139,10 +141,7 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
             className="absolute inset-y-0 left-0 w-[3px]"
             style={{ backgroundColor: accountHueVar(room.hueIndex) }}
           />
-          <Avatar size="lg">
-            {httpAvatar !== null && <AvatarImage src={httpAvatar} alt="" />}
-            <AvatarFallback>{initials(room.displayName)}</AvatarFallback>
-          </Avatar>
+          <RoomAvatar room={room} size="lg" />
           <div className="flex min-w-0 flex-1 flex-col">
             <div className="flex items-baseline justify-between gap-2">
               <span className={cn("truncate text-sm", isUnread ? "font-semibold" : "font-medium")}>
@@ -184,6 +183,11 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
           <ContextMenuItem onSelect={onUnarchive}>Unarchive</ContextMenuItem>
         ) : (
           <ContextMenuItem onSelect={onArchive}>Archive</ContextMenuItem>
+        )}
+        {room.isPinned ? (
+          <ContextMenuItem onSelect={onUnpin}>Unpin</ContextMenuItem>
+        ) : (
+          <ContextMenuItem onSelect={onPin}>Pin</ContextMenuItem>
         )}
       </ContextMenuContent>
     </ContextMenu>

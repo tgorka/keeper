@@ -1153,6 +1153,70 @@ pub async fn unarchive_room(
         .map_err(to_ipc_error)
 }
 
+/// A pinned-room reference in a reorder request (Story 4.3). Deserialized from the
+/// frontend's `{ accountId, roomId }` (camelCase over IPC).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinRef {
+    account_id: String,
+    room_id: String,
+}
+
+/// Pin a room (Story 4.3, FR-22). Delegates to the core, which appends the pin at
+/// the end of the keeper-local ordered list, persists it to `keeper.db`, and
+/// re-emits the Pins/Inbox/Archive windows so the strip updates within one frame.
+/// Best-effort: callers may fire-and-forget and swallow rejection. A registry
+/// error funnels through [`to_ipc_error`].
+#[tauri::command]
+pub async fn pin_room(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    state
+        .accounts
+        .pin_room(&data_dir, &account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unpin a room (Story 4.3). Delegates to the core, which removes the keeper-local
+/// pin ref and re-emits the windows so the row returns to its chronological Inbox
+/// (or Archive) position. Best-effort; a registry error funnels through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub async fn unpin_room(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    state
+        .accounts
+        .unpin_room(&data_dir, &account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Reorder the pins to the exact `order` given (Story 4.3). Delegates to the core,
+/// which rewrites the keeper-local order to contiguous `0..n` and re-emits the Pins
+/// window in the new order. Best-effort; a registry error funnels through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub async fn reorder_pins(state: State<'_, AppState>, order: Vec<PinRef>) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let refs: Vec<(String, String)> = order
+        .into_iter()
+        .map(|r| (r.account_id, r.room_id))
+        .collect();
+    state
+        .accounts
+        .reorder_pins(&data_dir, &refs)
+        .await
+        .map_err(to_ipc_error)
+}
+
 /// Set (or clear) the account's typing notice in the open room (Story 3.9, typing,
 /// AD-14). Delegates to the core, which emits a normal (non-private) typing
 /// notification through the receipt/typing signals seam. Best-effort: a dispatch
@@ -1293,12 +1357,14 @@ pub async fn inbox_subscribe(
     state: State<'_, AppState>,
     channel: Channel<InboxBatch>,
     archive: Channel<InboxBatch>,
+    pins: Channel<InboxBatch>,
 ) -> Result<u64, IpcError> {
     let inbox_sink = Box::new(move |batch: InboxBatch| channel.send(batch).is_ok());
     let archive_sink = Box::new(move |batch: InboxBatch| archive.send(batch).is_ok());
+    let pins_sink = Box::new(move |batch: InboxBatch| pins.send(batch).is_ok());
     state
         .accounts
-        .subscribe_inbox(&state.platform, inbox_sink, archive_sink)
+        .subscribe_inbox(&state.platform, inbox_sink, archive_sink, pins_sink)
         .await
         .map_err(to_ipc_error)
 }

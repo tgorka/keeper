@@ -19,6 +19,7 @@ function room(
     isUnread: false,
     mentionCount: 0,
     isArchived: false,
+    isPinned: false,
     ...overrides,
   };
 }

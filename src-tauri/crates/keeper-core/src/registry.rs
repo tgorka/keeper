@@ -62,6 +62,19 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
         [],
     )
     .map_err(|e| CoreError::Internal(format!("could not ensure settings schema: {e}")))?;
+    // Local pin membership + user-controlled order (Story 4.3). Pins have no
+    // Matrix representation (no standard *notable* tag), so they persist locally,
+    // keyed by (account, room), ordered by `sort_order` ascending across accounts.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS pins(\
+            account_id TEXT NOT NULL, \
+            room_id TEXT NOT NULL, \
+            sort_order INTEGER NOT NULL, \
+            PRIMARY KEY(account_id, room_id)\
+        )",
+        [],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not ensure pins schema: {e}")))?;
     ensure_hue_index_column(&conn)?;
     ensure_provider_column(&conn)?;
     Ok(conn)
@@ -99,6 +112,62 @@ pub fn set_setting(data_dir: &Path, key: &str, value: &str) -> Result<(), CoreEr
     )
     .map_err(|e| CoreError::Internal(format!("could not write setting: {e}")))?;
     Ok(())
+}
+
+/// Upsert a pin for `(account_id, room_id)` with the given `sort_order` (Story
+/// 4.3). Idempotent per key: a repeated pin overwrites the stored order. Pins are
+/// keeper-local because Matrix has no standard *notable* pin tag.
+pub fn set_pin(
+    data_dir: &Path,
+    account_id: &str,
+    room_id: &str,
+    order: i64,
+) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    conn.execute(
+        "INSERT INTO pins(account_id, room_id, sort_order) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(account_id, room_id) DO UPDATE SET sort_order = excluded.sort_order",
+        rusqlite::params![account_id, room_id, order],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not write pin: {e}")))?;
+    Ok(())
+}
+
+/// Remove the pin for `(account_id, room_id)` if present (Story 4.3). Idempotent —
+/// unpinning an unpinned room is not an error.
+pub fn remove_pin(data_dir: &Path, account_id: &str, room_id: &str) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    conn.execute(
+        "DELETE FROM pins WHERE account_id = ?1 AND room_id = ?2",
+        rusqlite::params![account_id, room_id],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not remove pin: {e}")))?;
+    Ok(())
+}
+
+/// List every pin as `(account_id, room_id, sort_order)`, ordered by `sort_order`
+/// ascending (Story 4.3). Order is global across accounts — the Pins strip merges
+/// pinned rooms from all accounts into one user-controlled sequence. Returns an
+/// empty vector when nothing is pinned.
+pub fn get_pins(data_dir: &Path) -> Result<Vec<(String, String, i64)>, CoreError> {
+    let conn = open(data_dir)?;
+    let mut stmt = conn
+        .prepare("SELECT account_id, room_id, sort_order FROM pins ORDER BY sort_order ASC")
+        .map_err(|e| CoreError::Internal(format!("could not prepare pin list: {e}")))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| CoreError::Internal(format!("could not query pin list: {e}")))?;
+    let mut pins = Vec::new();
+    for row in rows {
+        pins.push(row.map_err(|e| CoreError::Internal(format!("could not read pin row: {e}")))?);
+    }
+    Ok(pins)
 }
 
 /// Add the nullable `hue_index` column to `accounts` if it is not present yet.
@@ -274,6 +343,13 @@ pub fn delete_account(data_dir: &Path, account_id: &str) -> Result<(), CoreError
         rusqlite::params![account_id],
     )
     .map_err(|e| CoreError::Internal(format!("could not delete account row: {e}")))?;
+    // Drop any pins the signed-out account owned (Story 4.3): a pin has no meaning
+    // once its account is gone. Idempotent — an account with no pins deletes zero.
+    conn.execute(
+        "DELETE FROM pins WHERE account_id = ?1",
+        rusqlite::params![account_id],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not delete account pins: {e}")))?;
     Ok(())
 }
 
@@ -621,6 +697,64 @@ mod tests {
         );
         // An unrelated key is independent.
         assert_eq!(get_setting(&dir, "other").expect("get other"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pins_crud_upsert_and_order() {
+        let dir = temp_dir();
+        // Empty registry has no pins.
+        assert!(get_pins(&dir).expect("get empty").is_empty());
+
+        // Insert three pins out of order; get_pins returns them sorted by order asc.
+        set_pin(&dir, "acctA", "!r1", 2).expect("set r1");
+        set_pin(&dir, "acctA", "!r2", 0).expect("set r2");
+        set_pin(&dir, "acctB", "!r3", 1).expect("set r3");
+        let pins = get_pins(&dir).expect("list pins");
+        assert_eq!(
+            pins,
+            vec![
+                ("acctA".to_owned(), "!r2".to_owned(), 0),
+                ("acctB".to_owned(), "!r3".to_owned(), 1),
+                ("acctA".to_owned(), "!r1".to_owned(), 2),
+            ]
+        );
+
+        // Upsert overwrites the stored order for an existing key (no duplicate row).
+        set_pin(&dir, "acctA", "!r2", 5).expect("re-set r2");
+        let pins = get_pins(&dir).expect("list after upsert");
+        assert_eq!(pins.len(), 3, "upsert must not add a row");
+        // r2 now sorts last (order 5).
+        assert_eq!(
+            pins.last().expect("last"),
+            &("acctA".to_owned(), "!r2".to_owned(), 5)
+        );
+
+        // Remove is idempotent. After the upsert the order is r3(1), r2(5), so
+        // removing r1 leaves [r3, r2] in ascending-order sequence.
+        remove_pin(&dir, "acctA", "!r1").expect("remove r1");
+        remove_pin(&dir, "acctA", "!r1").expect("remove missing r1 is ok");
+        let ids: Vec<String> = get_pins(&dir)
+            .expect("list")
+            .into_iter()
+            .map(|(_, r, _)| r)
+            .collect();
+        assert_eq!(ids, vec!["!r3".to_owned(), "!r2".to_owned()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_account_drops_its_pins() {
+        let dir = temp_dir();
+        set_pin(&dir, "acctA", "!r1", 0).expect("pin A r1");
+        set_pin(&dir, "acctA", "!r2", 1).expect("pin A r2");
+        set_pin(&dir, "acctB", "!r3", 2).expect("pin B r3");
+
+        delete_account(&dir, "acctA").expect("delete acctA");
+        let pins = get_pins(&dir).expect("list after account delete");
+        // Only acctB's pin survives.
+        assert_eq!(pins, vec![("acctB".to_owned(), "!r3".to_owned(), 2)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -14,10 +14,19 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     markRoomUnread: vi.fn(async () => {}),
     archiveRoom: vi.fn(async () => {}),
     unarchiveRoom: vi.fn(async () => {}),
+    pinRoom: vi.fn(async () => {}),
+    unpinRoom: vi.fn(async () => {}),
   };
 });
 
-import { archiveRoom, markRoomRead, markRoomUnread, unarchiveRoom } from "@/lib/ipc/client";
+import {
+  archiveRoom,
+  markRoomRead,
+  markRoomUnread,
+  pinRoom,
+  unarchiveRoom,
+  unpinRoom,
+} from "@/lib/ipc/client";
 
 function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
   return {
@@ -31,6 +40,7 @@ function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
     isUnread: false,
     mentionCount: 0,
     isArchived: false,
+    isPinned: false,
     ...overrides,
   };
 }
@@ -295,6 +305,30 @@ describe("ChatRow", () => {
     fireEvent.click(item);
     expect(unarchiveRoom).toHaveBeenCalledWith("acctB", "!xyz:example.org");
     expect(archiveRoom).not.toHaveBeenCalled();
+  });
+
+  it("context menu on an unpinned row shows Pin and invokes pinRoom", async () => {
+    render(
+      <ChatRow room={room({ accountId: "acctB", roomId: "!xyz:example.org", isPinned: false })} />,
+    );
+    fireEvent.contextMenu(screen.getByRole("button"));
+    const item = await screen.findByText("Pin");
+    expect(screen.queryByText("Unpin")).not.toBeInTheDocument();
+    fireEvent.click(item);
+    expect(pinRoom).toHaveBeenCalledWith("acctB", "!xyz:example.org");
+    expect(unpinRoom).not.toHaveBeenCalled();
+  });
+
+  it("context menu on a pinned row shows Unpin and invokes unpinRoom", async () => {
+    render(
+      <ChatRow room={room({ accountId: "acctB", roomId: "!xyz:example.org", isPinned: true })} />,
+    );
+    fireEvent.contextMenu(screen.getByRole("button"));
+    const item = await screen.findByText("Unpin");
+    expect(screen.queryByText("Pin")).not.toBeInTheDocument();
+    fireEvent.click(item);
+    expect(unpinRoom).toHaveBeenCalledWith("acctB", "!xyz:example.org");
+    expect(pinRoom).not.toHaveBeenCalled();
   });
 
   it("reverts the optimistic overlay when the mark command hard-rejects", async () => {

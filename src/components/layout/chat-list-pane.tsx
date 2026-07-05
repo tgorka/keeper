@@ -15,12 +15,14 @@
  */
 import { useEffect, useState } from "react";
 import { ChatRow } from "@/components/chat/chat-row";
+import { PinsStrip } from "@/components/layout/pins-strip";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { InboxBatch } from "@/lib/ipc/client";
 import { subscribeInbox, unsubscribeInbox } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore, useArchiveRoomsStore } from "@/lib/stores/archive-rooms";
+import { pinsRoomsStore, usePinsRoomsStore } from "@/lib/stores/pins-rooms";
 import { usePrimaryView } from "@/lib/stores/primary-view";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 
@@ -36,6 +38,7 @@ export function ChatListPane() {
   const view = usePrimaryView();
   const inboxRooms = useRoomsStore((s) => s.rooms);
   const archiveRooms = useArchiveRoomsStore((s) => s.rooms);
+  const pinsRooms = usePinsRoomsStore((s) => s.rooms);
   const selected = useRoomsStore((s) => s.selected);
   const selectRoom = useRoomsStore((s) => s.selectRoom);
   // Account switcher filter (Story 2.5): a pure display filter over the already-
@@ -63,10 +66,11 @@ export function ChatListPane() {
     // in cleanup instead would race the next mount.
     roomsStore.getState().clear();
     archiveRoomsStore.getState().clear();
+    pinsRoomsStore.getState().clear();
     let subscriptionId: number | null = null;
     let cancelled = false;
 
-    // Gate both sinks so they no-op after cleanup (post-unmount / StrictMode late
+    // Gate all sinks so they no-op after cleanup (post-unmount / StrictMode late
     // batches never mutate the stores). Each window marks itself loaded when its
     // own channel first delivers.
     const onInbox = (b: InboxBatch) => {
@@ -81,7 +85,12 @@ export function ChatListPane() {
         setLoadedArchive(true);
       }
     };
-    subscribeInbox(onInbox, onArchive)
+    const onPins = (b: InboxBatch) => {
+      if (!cancelled) {
+        pinsRoomsStore.getState().applyBatch(b);
+      }
+    };
+    subscribeInbox(onInbox, onArchive, onPins)
       .then((id) => {
         if (cancelled) {
           // Unmounted before the id resolved — tear down immediately.
@@ -113,6 +122,14 @@ export function ChatListPane() {
     filterAccountId === null
       ? activeRooms
       : activeRooms.filter((room) => room.accountId === filterAccountId);
+  // The Pins strip renders only atop the Inbox view; the account switcher filter
+  // applies to it too (same pure display filter, no re-sort). Its order is
+  // Rust-authoritative.
+  const visiblePins =
+    filterAccountId === null
+      ? pinsRooms
+      : pinsRooms.filter((room) => room.accountId === filterAccountId);
+  const showPins = view === "inbox" && visiblePins.length > 0;
   // Per-view empty state (UX-DR13): the Archive uses sentence case with a code-font
   // `E` and no exclamation; the Inbox keeps its existing copy.
   const emptyState =
@@ -127,6 +144,14 @@ export function ChatListPane() {
 
   return (
     <div className="flex h-full w-[320px] shrink-0 flex-col border-border border-r bg-background">
+      {showPins && (
+        <PinsStrip
+          pins={visiblePins}
+          onSelect={selectRoom}
+          selected={selected}
+          reorderable={filterAccountId === null}
+        />
+      )}
       {errored ? (
         <div className="flex flex-1 items-center justify-center p-4">
           <p className="text-center text-muted-foreground text-sm">

@@ -52,27 +52,46 @@ pub struct InboxMerger {
 
 struct MergeState {
     accounts: HashMap<String, AccountSlot>,
-    /// Receives the Inbox window (`!is_archived || is_unread`).
+    /// Receives the Pins window (pinned rooms, `sort_order` ascending) (Story 4.3).
+    pins_sink: InboxSink,
+    /// Receives the Inbox window (`!pinned && (!is_archived || is_unread)`).
     inbox_sink: InboxSink,
-    /// Receives the Archive window (`is_archived && !is_unread`) (Story 4.2).
+    /// Receives the Archive window (`!pinned && is_archived && !is_unread`)
+    /// (Story 4.2).
     archive_sink: InboxSink,
-    /// Set once either sink reports its channel is closed, so later producer
+    /// Keeper-local pin membership + order, keyed by `(account_id, room_id)` →
+    /// `sort_order` (ascending). Reloaded from the registry and pushed in whole via
+    /// [`InboxMerger::update_pins`] on every pin mutation (Story 4.3). A room in
+    /// this map is placed in the Pins window and excluded from Inbox/Archive.
+    pins: HashMap<(String, String), i64>,
+    /// Set once any sink reports its channel is closed, so later producer
     /// updates stop trying to emit.
     closed: bool,
 }
 
 impl InboxMerger {
-    /// Create a merger that partitions each merged window into two recency-ordered
-    /// streams: `inbox_sink` receives the Inbox window and `archive_sink` the
-    /// Archive window (Story 4.2). The partition is `!is_archived || is_unread` for
-    /// the inbox and `is_archived && !is_unread` for the archive, so an
-    /// archived-unread room auto-returns to the inbox as a pure view rule.
-    pub fn new(inbox_sink: InboxSink, archive_sink: InboxSink) -> Self {
+    /// Create a merger that partitions each merged window into three
+    /// recency/order-authoritative streams (Story 4.2 + 4.3): `pins_sink` receives
+    /// the Pins window (pinned rooms sorted by `sort_order` ascending), `inbox_sink`
+    /// the Inbox window (`!pinned && (!is_archived || is_unread)`), and
+    /// `archive_sink` the Archive window (`!pinned && is_archived && !is_unread`).
+    /// Pins win over archive/unread — a pinned room lives only in the Pins window,
+    /// never re-sorting on activity. `pins` seeds the initial pin map (from
+    /// [`crate::registry::get_pins`]); it is replaced whole by [`Self::update_pins`]
+    /// on every mutation.
+    pub fn new(
+        inbox_sink: InboxSink,
+        archive_sink: InboxSink,
+        pins_sink: InboxSink,
+        pins: HashMap<(String, String), i64>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(MergeState {
                 accounts: HashMap::new(),
+                pins_sink,
                 inbox_sink,
                 archive_sink,
+                pins,
                 closed: false,
             })),
         }
@@ -100,6 +119,17 @@ impl InboxMerger {
         }
     }
 
+    /// Replace the whole pin map and re-emit all three windows out-of-band (Story
+    /// 4.3). Called after a pin mutation (`pin_room`/`unpin_room`/`reorder_pins`)
+    /// reloads [`crate::registry::get_pins`], so the strip updates within one frame.
+    /// Mirrors [`Self::remove_account`]'s direct-`emit` poke: it is not driven by an
+    /// account batch, so a no-active-subscription case is a harmless no-op re-emit.
+    pub async fn update_pins(&self, pins: HashMap<(String, String), i64>) {
+        let mut state = self.inner.lock().await;
+        state.pins = pins;
+        emit(&mut state);
+    }
+
     /// Apply one account's per-account [`RoomListBatch`] to its slot, then
     /// re-merge and emit. Returns `false` once the output channel is closed so
     /// the caller's producer can stop.
@@ -115,23 +145,54 @@ impl InboxMerger {
     }
 }
 
-/// Emit the current merged window into both sinks, recording channel closure.
-/// The single recency-ordered merge is partitioned (order preserved) into the
-/// Inbox window (`!is_archived || is_unread`) and the Archive window
-/// (`is_archived && !is_unread`) (Story 4.2). Each partition is emitted as a
-/// `Reset` batch whose `total` is that partition's own length. Returns `false`
-/// if either channel is closed.
+/// Emit the current merged window into all three sinks, recording channel
+/// closure. The single recency-ordered merge is partitioned into three windows
+/// (Story 4.2 + 4.3), each a `Reset` batch whose `total` is that partition's own
+/// length. Returns `false` if any channel is closed.
+///
+/// Pins win over archive/unread: a room in `state.pins` goes only to the **Pins**
+/// window, sorted by `sort_order` ascending (ties broken deterministically by
+/// account/room id, never by recency), and is excluded from the other two. The
+/// remainder splits into the
+/// **Inbox** window (`!pinned && (!is_archived || is_unread)` — an archived-unread
+/// room auto-returns) and the **Archive** window (`!pinned && is_archived &&
+/// !is_unread`).
 fn emit(state: &mut MergeState) -> bool {
     if state.closed {
         return false;
     }
     let merged = merge(&state.accounts);
-    // Partition preserving recency order: inbox keeps every non-archived room
-    // plus any archived-unread room (auto-return); archive keeps only
-    // archived-read rooms.
-    let (inbox_rooms, archive_rooms): (Vec<InboxRoomVm>, Vec<InboxRoomVm>) = merged
+    // Split off pinned rooms first (they win over archive/unread), then partition
+    // the rest. Recency order is preserved within each window.
+    let (mut pinned_rooms, rest): (Vec<InboxRoomVm>, Vec<InboxRoomVm>) = merged
+        .into_iter()
+        .partition(|room| pin_order(&state.pins, room).is_some());
+    // Order the Pins window by `sort_order` ascending, tie-breaking on
+    // (account_id, room_id) so equal orders (e.g. a transient collision from two
+    // near-simultaneous pins) resolve deterministically and identically on every
+    // re-emit — never letting recency flip the strip order under the user. Every
+    // room here is pinned, so `pin_order` is always `Some`; `i64::MAX` is an
+    // unreachable safety default.
+    pinned_rooms.sort_by(|a, b| {
+        let oa = pin_order(&state.pins, a).unwrap_or(i64::MAX);
+        let ob = pin_order(&state.pins, b).unwrap_or(i64::MAX);
+        oa.cmp(&ob)
+            .then_with(|| a.account_id.cmp(&b.account_id))
+            .then_with(|| a.room_id.cmp(&b.room_id))
+    });
+    // Stamp the authoritative pin flag on the Pins window (merger-owned state).
+    for room in &mut pinned_rooms {
+        room.is_pinned = true;
+    }
+    let (inbox_rooms, archive_rooms): (Vec<InboxRoomVm>, Vec<InboxRoomVm>) = rest
         .into_iter()
         .partition(|room| !room.is_archived || room.is_unread);
+    let pins_batch = InboxBatch {
+        total: Some(pinned_rooms.len() as u32),
+        ops: vec![InboxOp::Reset {
+            rooms: pinned_rooms,
+        }],
+    };
     let inbox_batch = InboxBatch {
         total: Some(inbox_rooms.len() as u32),
         ops: vec![InboxOp::Reset { rooms: inbox_rooms }],
@@ -142,15 +203,22 @@ fn emit(state: &mut MergeState) -> bool {
             rooms: archive_rooms,
         }],
     };
-    // Emit both windows; a close on either sink stops all future emissions.
+    // Emit all three windows; a close on any sink stops all future emissions.
+    let pins_ok = (state.pins_sink)(pins_batch);
     let inbox_ok = (state.inbox_sink)(inbox_batch);
     let archive_ok = (state.archive_sink)(archive_batch);
-    if !inbox_ok || !archive_ok {
+    if !pins_ok || !inbox_ok || !archive_ok {
         state.closed = true;
-        tracing::info!("inbox/archive channel closed; stopping merged emissions");
+        tracing::info!("pins/inbox/archive channel closed; stopping merged emissions");
         return false;
     }
     true
+}
+
+/// Look up a room's pin order in the pin map, or `None` if it is not pinned.
+fn pin_order(pins: &HashMap<(String, String), i64>, room: &InboxRoomVm) -> Option<i64> {
+    pins.get(&(room.account_id.clone(), room.room_id.clone()))
+        .copied()
 }
 
 /// Pure recency merge: flatten every account's window into one list of
@@ -197,6 +265,9 @@ fn to_inbox_room(account_id: &str, hue_index: u8, room: &RoomVm) -> InboxRoomVm 
         is_unread: room.is_unread,
         mention_count: room.mention_count,
         is_archived: room.is_archived,
+        // `is_pinned` is set in `emit` from the merger's pin map (the pin state is
+        // merger-owned, not SDK-sourced); a freshly merged row defaults unpinned.
+        is_pinned: false,
     }
 }
 
@@ -333,6 +404,8 @@ mod tests {
         assert!(inbox_room.is_unread);
         assert_eq!(inbox_room.mention_count, 3);
         assert!(inbox_room.is_archived);
+        // `to_inbox_room` defaults unpinned; `emit` stamps the pin flag.
+        assert!(!inbox_room.is_pinned);
         assert_eq!(inbox_room.account_id, "acctA");
         assert_eq!(inbox_room.hue_index, 4);
     }
@@ -409,13 +482,23 @@ mod tests {
         }
     }
 
-    /// Build a merger over two capture vecs (inbox, archive) so partition tests can
-    /// assert each window independently.
-    fn capturing_merger() -> (InboxMerger, Captured, Captured) {
+    /// Build a merger over three capture vecs (inbox, archive, pins) so partition
+    /// tests can assert each window independently. Seeds an empty pin map; tests
+    /// that exercise pins push a map via [`InboxMerger::update_pins`].
+    fn capturing_merger() -> (InboxMerger, Captured, Captured, Captured) {
+        capturing_merger_with_pins(HashMap::new())
+    }
+
+    /// Like [`capturing_merger`] but seeds the merger's pin map.
+    fn capturing_merger_with_pins(
+        pins: HashMap<(String, String), i64>,
+    ) -> (InboxMerger, Captured, Captured, Captured) {
         let inbox: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let archive: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
+        let pins_cap: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let inbox_store = inbox.clone();
         let archive_store = archive.clone();
+        let pins_store = pins_cap.clone();
         let merger = InboxMerger::new(
             Box::new(move |batch: InboxBatch| {
                 inbox_store.lock().expect("lock").push(batch);
@@ -425,13 +508,26 @@ mod tests {
                 archive_store.lock().expect("lock").push(batch);
                 true
             }),
+            Box::new(move |batch: InboxBatch| {
+                pins_store.lock().expect("lock").push(batch);
+                true
+            }),
+            pins,
         );
-        (merger, inbox, archive)
+        (merger, inbox, archive, pins_cap)
+    }
+
+    /// Build a pin map from `(account_id, room_id, order)` triples.
+    fn pin_map(entries: &[(&str, &str, i64)]) -> HashMap<(String, String), i64> {
+        entries
+            .iter()
+            .map(|(a, r, o)| ((a.to_string(), r.to_string()), *o))
+            .collect()
     }
 
     #[tokio::test]
     async fn merger_emits_reset_on_add_batch_and_remove() {
-        let (merger, inbox, _archive) = capturing_merger();
+        let (merger, inbox, _archive, _pins) = capturing_merger();
 
         merger.register_account("acctA", 0).await;
         merger.register_account("acctB", 1).await;
@@ -486,7 +582,7 @@ mod tests {
         //    B archived read (200), A !archived unread (100)]
         // partitions to inbox = [D, C, A] (!is_archived || is_unread) and
         // archive = [B] (is_archived && !is_unread).
-        let (merger, inbox, archive) = capturing_merger();
+        let (merger, inbox, archive, _pins) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -517,5 +613,194 @@ mod tests {
             let batches = archive.lock().expect("lock");
             assert_eq!(batches.last().expect("batch").total, Some(1));
         }
+    }
+
+    /// Read the `is_pinned` flags of the last `Reset` in `store`.
+    fn last_reset_pinned(store: &Captured) -> Vec<bool> {
+        let batches = store.lock().expect("lock");
+        let last = batches.last().expect("a batch");
+        match &last.ops[0] {
+            InboxOp::Reset { rooms } => rooms.iter().map(|r| r.is_pinned).collect(),
+            other => panic!("expected Reset, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_partitions_pins_inbox_and_archive_pins_win() {
+        // Golden three-window case (Story 4.3): recency-desc merged window
+        //   [A pin(ord 1), B pin(ord 0), C archived read, D unread, E read]
+        // → pins = [B, A] (sorted by sort_order asc; removed from below),
+        //   inbox = [D, E], archive = [C]. A pinned room stays in Pins even when
+        //   archived/unread (B is pinned-and-archived here to prove pins win).
+        let pins = pin_map(&[("acctA", "!a", 1), ("acctA", "!b", 0)]);
+        let (merger, inbox, archive, pins_cap) = capturing_merger_with_pins(pins);
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            // ordered by recency desc: a(500), b(400), c(300), d(200), e(100)
+                            room_flags("!a", Some(500), false, false),
+                            room_flags("!b", Some(400), true, false), // pinned + archived
+                            room_flags("!c", Some(300), true, false), // archived read
+                            room_flags("!d", Some(200), false, true), // unread
+                            room_flags("!e", Some(100), false, false), // plain
+                        ],
+                    }],
+                    total: Some(5),
+                },
+            )
+            .await;
+
+        // Pins: [B (ord 0), A (ord 1)], all flagged is_pinned.
+        assert_eq!(last_reset_ids(&pins_cap), ["!b", "!a"]);
+        assert_eq!(last_reset_pinned(&pins_cap), [true, true]);
+        {
+            let batches = pins_cap.lock().expect("lock");
+            assert_eq!(batches.last().expect("batch").total, Some(2));
+        }
+        // Inbox: unpinned, !archived||unread, recency order → [D, E].
+        assert_eq!(last_reset_ids(&inbox), ["!d", "!e"]);
+        assert_eq!(last_reset_pinned(&inbox), [false, false]);
+        // Archive: unpinned archived-read → [C]. B is archived but pinned, so it is
+        // NOT here (pins win, no duplication).
+        assert_eq!(last_reset_ids(&archive), ["!c"]);
+    }
+
+    #[tokio::test]
+    async fn pins_with_equal_order_tie_break_deterministically_not_by_recency() {
+        // Two pins share the same sort_order (a transient collision). They must
+        // order by (account_id, room_id) — never by recency — and stay put when
+        // recency changes, so the strip never flips under the user.
+        let pins = pin_map(&[("acctA", "!m", 5), ("acctA", "!n", 5)]);
+        let (merger, _inbox, _archive, pins_cap) = capturing_merger_with_pins(pins);
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_flags("!n", Some(400), false, false), // newer
+                            room_flags("!m", Some(100), false, false), // older
+                        ],
+                    }],
+                    total: Some(2),
+                },
+            )
+            .await;
+        // room_id ascending wins over recency: !m before !n despite !n being newer.
+        assert_eq!(last_reset_ids(&pins_cap), ["!m", "!n"]);
+
+        // Bump !n to be even newer; the tie-break is unchanged.
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_flags("!n", Some(900), false, false),
+                            room_flags("!m", Some(100), false, false),
+                        ],
+                    }],
+                    total: Some(2),
+                },
+            )
+            .await;
+        assert_eq!(
+            last_reset_ids(&pins_cap),
+            ["!m", "!n"],
+            "order stable across recency"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_room_stays_on_newer_activity_elsewhere() {
+        // A pinned room keeps its Pins-window position when an unpinned chat gets
+        // newer activity (only the Inbox window re-orders).
+        let pins = pin_map(&[("acctA", "!p", 0)]);
+        let (merger, inbox, _archive, pins_cap) = capturing_merger_with_pins(pins);
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_flags("!p", Some(100), false, false), // pinned, oldest
+                            room_flags("!x", Some(200), false, false),
+                            room_flags("!y", Some(300), false, false),
+                        ],
+                    }],
+                    total: Some(3),
+                },
+            )
+            .await;
+        assert_eq!(last_reset_ids(&pins_cap), ["!p"]);
+        assert_eq!(last_reset_ids(&inbox), ["!y", "!x"]);
+
+        // A newer message lands on !x (now the most recent). The Inbox re-orders;
+        // the Pins window is untouched.
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_flags("!p", Some(100), false, false),
+                            room_flags("!x", Some(400), false, false), // bumped
+                            room_flags("!y", Some(300), false, false),
+                        ],
+                    }],
+                    total: Some(3),
+                },
+            )
+            .await;
+        assert_eq!(last_reset_ids(&pins_cap), ["!p"], "pin position unchanged");
+        assert_eq!(last_reset_ids(&inbox), ["!x", "!y"], "inbox re-ordered");
+    }
+
+    #[tokio::test]
+    async fn update_pins_re_emits_all_three_windows() {
+        // Start with no pins: all rooms land in the Inbox window.
+        let (merger, inbox, archive, pins_cap) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_flags("!a", Some(300), false, false),
+                            room_flags("!b", Some(200), false, false),
+                            room_flags("!c", Some(100), false, false),
+                        ],
+                    }],
+                    total: Some(3),
+                },
+            )
+            .await;
+        assert_eq!(last_reset_ids(&pins_cap), Vec::<String>::new());
+        assert_eq!(last_reset_ids(&inbox), ["!a", "!b", "!c"]);
+
+        // Pin b then a (a first at ord 0). update_pins re-emits all three windows
+        // out-of-band with no new account batch.
+        merger
+            .update_pins(pin_map(&[("acctA", "!a", 0), ("acctA", "!b", 1)]))
+            .await;
+        assert_eq!(last_reset_ids(&pins_cap), ["!a", "!b"]);
+        assert_eq!(
+            last_reset_ids(&inbox),
+            ["!c"],
+            "pinned rooms leave the inbox"
+        );
+        assert_eq!(last_reset_ids(&archive), Vec::<String>::new());
+
+        // Unpin all: everything returns to the inbox.
+        merger.update_pins(HashMap::new()).await;
+        assert_eq!(last_reset_ids(&pins_cap), Vec::<String>::new());
+        assert_eq!(last_reset_ids(&inbox), ["!a", "!b", "!c"]);
     }
 }

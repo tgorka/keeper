@@ -12,12 +12,24 @@ import { roomsStore } from "@/lib/stores/rooms";
 const subscribeInbox = vi.fn();
 const unsubscribeInbox = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
-  subscribeInbox: (onInbox: (b: InboxBatch) => void, onArchive: (b: InboxBatch) => void) =>
-    subscribeInbox(onInbox, onArchive),
+  subscribeInbox: (
+    onInbox: (b: InboxBatch) => void,
+    onArchive: (b: InboxBatch) => void,
+    onPins: (b: InboxBatch) => void,
+  ) => subscribeInbox(onInbox, onArchive, onPins),
   unsubscribeInbox: (id: number) => unsubscribeInbox(id),
+  // Best-effort mutation wrappers the strip/rows may call; no-ops here.
+  reorderPins: vi.fn(async () => {}),
+  unpinRoom: vi.fn(async () => {}),
+  pinRoom: vi.fn(async () => {}),
+  markRoomRead: vi.fn(async () => {}),
+  markRoomUnread: vi.fn(async () => {}),
+  archiveRoom: vi.fn(async () => {}),
+  unarchiveRoom: vi.fn(async () => {}),
 }));
 
 import { ChatListPane } from "@/components/layout/chat-list-pane";
+import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
 
 const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -51,6 +63,7 @@ function inboxRoom(roomId: string, accountId: string, displayName: string, lastM
     isUnread: false,
     mentionCount: 0,
     isArchived: false,
+    isPinned: false,
   };
 }
 
@@ -60,6 +73,7 @@ beforeEach(() => {
   roomsStore.getState().clear();
   roomsStore.getState().selectRoom(null);
   archiveRoomsStore.getState().clear();
+  pinsRoomsStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
   subscribeInbox.mockReset();
   unsubscribeInbox.mockReset();
@@ -71,6 +85,7 @@ afterEach(() => {
   roomsStore.getState().clear();
   roomsStore.getState().selectRoom(null);
   archiveRoomsStore.getState().clear();
+  pinsRoomsStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
 });
 
@@ -109,7 +124,11 @@ describe("ChatListPane", () => {
     accountsStore.getState().hydrateAll([account, bob]);
     render(<ChatListPane />);
 
-    expect(subscribeInbox).toHaveBeenCalledWith(expect.any(Function), expect.any(Function));
+    expect(subscribeInbox).toHaveBeenCalledWith(
+      expect.any(Function),
+      expect.any(Function),
+      expect.any(Function),
+    );
 
     captured.onBatch?.({
       ops: [
@@ -372,6 +391,91 @@ describe("ChatListPane", () => {
     captured.onArchive?.({ ops: [{ op: "reset", rooms: [] }], total: 0 });
     await waitFor(() => {
       expect(screen.getByText(/Nothing archived\./)).toBeInTheDocument();
+    });
+  });
+
+  it("feeds the third channel into the pins store and renders the strip in the inbox view", async () => {
+    const captured: { onPins: ((b: InboxBatch) => void) | null } = { onPins: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        onPins: (b: InboxBatch) => void,
+      ) => {
+        captured.onPins = onPins;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+
+    // No pins yet → the strip is hidden entirely.
+    expect(screen.queryByLabelText("Pinned conversations")).not.toBeInTheDocument();
+
+    // The pins channel delivers one pinned room.
+    captured.onPins?.({
+      ops: [
+        {
+          op: "reset",
+          rooms: [
+            {
+              ...inboxRoom("!p:example.org", account.accountId, "Pinned Room", ""),
+              isPinned: true,
+            },
+          ],
+        },
+      ],
+      total: 1,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Pinned conversations")).toBeInTheDocument();
+    });
+    expect(
+      screen.getByRole("button", { name: "Pinned conversation with Pinned Room" }),
+    ).toBeInTheDocument();
+    // The store mirrors the window.
+    expect(pinsRoomsStore.getState().rooms).toHaveLength(1);
+  });
+
+  it("hides the pins strip in the archive view", async () => {
+    const captured: { onPins: ((b: InboxBatch) => void) | null } = { onPins: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        onPins: (b: InboxBatch) => void,
+      ) => {
+        captured.onPins = onPins;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+
+    captured.onPins?.({
+      ops: [
+        {
+          op: "reset",
+          rooms: [
+            {
+              ...inboxRoom("!p:example.org", account.accountId, "Pinned Room", ""),
+              isPinned: true,
+            },
+          ],
+        },
+      ],
+      total: 1,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Pinned conversations")).toBeInTheDocument();
+    });
+
+    // Switch to the archive view: the strip is hidden (it lives atop the inbox only).
+    primaryViewStore.getState().setView("archive");
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Pinned conversations")).not.toBeInTheDocument();
     });
   });
 });

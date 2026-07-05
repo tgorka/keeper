@@ -935,6 +935,12 @@ pub struct InboxRoomVm {
     /// partitions on this to place the row in the Archive window unless it is
     /// unread (auto-return is a pure view rule); the frontend never re-derives it.
     pub is_archived: bool,
+    /// Authoritative pin flag: `true` when the room is pinned in keeper-local
+    /// state (Story 4.3, AD-20). Pins are keeper-local (no Matrix tag), owned by
+    /// the merger, which places a pinned room in the Pins window (removed from
+    /// Inbox/Archive). The frontend renders this directly (Pin/Unpin gating) and
+    /// never re-derives it.
+    pub is_pinned: bool,
 }
 
 /// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
@@ -1168,6 +1174,7 @@ mod tests {
             is_unread: false,
             mention_count: 0,
             is_archived: false,
+            is_pinned: false,
         }
     }
 
