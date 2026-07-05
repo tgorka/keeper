@@ -60,6 +60,17 @@ mentionCount: number,
  */
 isArchived: boolean, 
 /**
+ * Authoritative favourite flag: `true` when the room carries the Matrix
+ * favourite tag (`m.favourite`) (Story 4.4, AD-20). A *notable* tag, so a
+ * change re-emits the room-list stream live and syncs cross-client (SDK-
+ * sourced, copied through like `is_archived` — not merger-owned like
+ * `is_pinned`). The merge partitions on this to place the row in the
+ * Favorites window (removed from Inbox/Archive), behind Pins in precedence;
+ * the frontend renders this directly (Favorite/Unfavorite gating) and never
+ * re-derives it.
+ */
+isFavourite: boolean, 
+/**
  * Authoritative pin flag: `true` when the room is pinned in keeper-local
  * state (Story 4.3, AD-20). Pins are keeper-local (no Matrix tag), owned by
  * the merger, which places a pinned room in the Pins window (removed from

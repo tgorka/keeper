@@ -344,6 +344,12 @@ pub struct RoomVm {
     /// partitions on this to place the room in the Archive window unless it is
     /// unread (auto-return is a pure view rule); the frontend never re-derives it.
     pub is_archived: bool,
+    /// Authoritative favourite flag: `true` when the room carries the Matrix
+    /// favourite tag (`m.favourite`) (Story 4.4, AD-20). This is a *notable* tag,
+    /// so a change re-emits the room-list stream live and syncs cross-client. The
+    /// inbox merge partitions on this to place the room in the Favorites window
+    /// (removed from Inbox/Archive); the frontend never re-derives it.
+    pub is_favourite: bool,
 }
 
 /// One index-based room-list operation mirroring an eyeball-im `VectorDiff`
@@ -935,6 +941,15 @@ pub struct InboxRoomVm {
     /// partitions on this to place the row in the Archive window unless it is
     /// unread (auto-return is a pure view rule); the frontend never re-derives it.
     pub is_archived: bool,
+    /// Authoritative favourite flag: `true` when the room carries the Matrix
+    /// favourite tag (`m.favourite`) (Story 4.4, AD-20). A *notable* tag, so a
+    /// change re-emits the room-list stream live and syncs cross-client (SDK-
+    /// sourced, copied through like `is_archived` — not merger-owned like
+    /// `is_pinned`). The merge partitions on this to place the row in the
+    /// Favorites window (removed from Inbox/Archive), behind Pins in precedence;
+    /// the frontend renders this directly (Favorite/Unfavorite gating) and never
+    /// re-derives it.
+    pub is_favourite: bool,
     /// Authoritative pin flag: `true` when the room is pinned in keeper-local
     /// state (Story 4.3, AD-20). Pins are keeper-local (no Matrix tag), owned by
     /// the merger, which places a pinned room in the Pins window (removed from
@@ -1174,6 +1189,7 @@ mod tests {
             is_unread: false,
             mention_count: 0,
             is_archived: false,
+            is_favourite: false,
             is_pinned: false,
         }
     }
@@ -1353,6 +1369,7 @@ mod tests {
             is_unread: false,
             mention_count: 0,
             is_archived: false,
+            is_favourite: false,
         }
     }
 
@@ -1381,6 +1398,7 @@ mod tests {
             is_unread: false,
             mention_count: 0,
             is_archived: false,
+            is_favourite: false,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");

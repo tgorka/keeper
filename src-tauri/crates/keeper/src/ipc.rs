@@ -1153,6 +1153,78 @@ pub async fn unarchive_room(
         .map_err(to_ipc_error)
 }
 
+/// Favourite a room (Story 4.4, FR-21). Delegates to the core, which sets the
+/// Matrix favourite tag (`m.favourite`) via `Room::set_is_favourite(true, None)`.
+/// `m.favourite` is a *notable* tag, so the row moves into the Favorites window on
+/// the SDK's live re-emit and the tag persists and syncs to the user's other
+/// Matrix clients (no out-of-band merger poke). Best-effort: a dispatch failure is
+/// logged and swallowed in the core (no UI error), so this resolves `Ok` even
+/// then. A room-not-found / inactive account funnels through [`to_ipc_error`] to
+/// `TimelineUnavailable`.
+#[tauri::command]
+pub async fn favourite_room(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .favourite_room(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unfavourite a room (Story 4.4). Delegates to the core, which clears the Matrix
+/// favourite tag (`m.favourite`) via `Room::set_is_favourite(false, None)` so the
+/// row returns to its chronological Inbox position on the SDK's live re-emit.
+/// Best-effort: a dispatch failure is logged and swallowed in the core (no UI
+/// error), so this resolves `Ok` even then. A room-not-found / inactive account
+/// funnels through [`to_ipc_error`] to `TimelineUnavailable`.
+#[tauri::command]
+pub async fn unfavourite_room(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unfavourite_room(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Registry key for the Favorites section's persisted collapse/expand state
+/// (Story 4.4). Stored as `"true"`/`"false"` in the app-level `settings` table;
+/// unset means the section defaults to expanded.
+const FAVORITES_COLLAPSED_KEY: &str = "favorites_collapsed";
+
+/// Read the Favorites section's persisted collapse state (Story 4.4). Pure UI
+/// chrome (not Matrix state), so it lives in the app-level `settings` table in
+/// `keeper.db` (survives restart and re-login). Returns `false` (expanded) when
+/// the setting is unset or not `"true"`. A registry error funnels through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub async fn get_favorites_collapsed(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let value = keeper_core::registry::get_setting(&data_dir, FAVORITES_COLLAPSED_KEY)
+        .map_err(to_ipc_error)?;
+    Ok(value.as_deref() == Some("true"))
+}
+
+/// Persist the Favorites section's collapse state (Story 4.4). Stores
+/// `"true"`/`"false"` in the app-level `settings` table so it survives restart and
+/// re-login. A registry error funnels through [`to_ipc_error`].
+#[tauri::command]
+pub async fn set_favorites_collapsed(
+    state: State<'_, AppState>,
+    collapsed: bool,
+) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let value = if collapsed { "true" } else { "false" };
+    keeper_core::registry::set_setting(&data_dir, FAVORITES_COLLAPSED_KEY, value)
+        .map_err(to_ipc_error)
+}
+
 /// A pinned-room reference in a reorder request (Story 4.3). Deserialized from the
 /// frontend's `{ accountId, roomId }` (camelCase over IPC).
 #[derive(serde::Deserialize)]
@@ -1344,27 +1416,36 @@ pub async fn session_restore(state: State<'_, AppState>) -> Result<Vec<AccountVm
 }
 
 /// Subscribe to the merged unified inbox across every restorable account (FR-18,
-/// AD-20, Story 4.2). Activates each account, opens its room-list stream, and
-/// partitions the recency-ordered merge into two [`InboxBatch`] streams over one
-/// subscription: the Inbox window over `channel` and the Archive window over
-/// `archive` (each a `Reset` window that updates as accounts sync or as archive
-/// state changes). Returns the inbox subscription id — one `inbox_unsubscribe`
-/// tears down both. Ordering and the inbox/archive split are computed in
-/// `keeper-core::inbox`, never in JS. A stream-start failure funnels through
-/// [`to_ipc_error`] to `SyncUnavailable`.
+/// AD-20, Story 4.2 + 4.3 + 4.4). Activates each account, opens its room-list
+/// stream, and partitions the recency-ordered merge into four [`InboxBatch`]
+/// streams over one subscription: the Inbox window over `channel`, the Archive
+/// window over `archive`, the Pins window over `pins`, and the Favorites window
+/// over `favourites` (each a `Reset` window that updates as accounts sync or as
+/// archive/pin/favourite state changes). Returns the inbox subscription id — one
+/// `inbox_unsubscribe` tears down all four. Ordering and the four-way split are
+/// computed in `keeper-core::inbox`, never in JS. A stream-start failure funnels
+/// through [`to_ipc_error`] to `SyncUnavailable`.
 #[tauri::command]
 pub async fn inbox_subscribe(
     state: State<'_, AppState>,
     channel: Channel<InboxBatch>,
     archive: Channel<InboxBatch>,
     pins: Channel<InboxBatch>,
+    favourites: Channel<InboxBatch>,
 ) -> Result<u64, IpcError> {
     let inbox_sink = Box::new(move |batch: InboxBatch| channel.send(batch).is_ok());
     let archive_sink = Box::new(move |batch: InboxBatch| archive.send(batch).is_ok());
     let pins_sink = Box::new(move |batch: InboxBatch| pins.send(batch).is_ok());
+    let favourites_sink = Box::new(move |batch: InboxBatch| favourites.send(batch).is_ok());
     state
         .accounts
-        .subscribe_inbox(&state.platform, inbox_sink, archive_sink, pins_sink)
+        .subscribe_inbox(
+            &state.platform,
+            inbox_sink,
+            archive_sink,
+            pins_sink,
+            favourites_sink,
+        )
         .await
         .map_err(to_ipc_error)
 }

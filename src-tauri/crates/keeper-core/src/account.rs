@@ -301,11 +301,12 @@ impl AccountManager {
     /// Subscribe to the merged unified inbox across every restorable account
     /// (AD-20, Story 4.2). Activates each account whose Keychain session is
     /// present, opens its room-list stream, and feeds each into a shared
-    /// [`InboxMerger`] that partitions the merged window into three
+    /// [`InboxMerger`] that partitions the merged window into four
     /// recency/order-authoritative [`InboxBatch`] streams: the Inbox window into
-    /// `inbox_sink`, the Archive window into `archive_sink`, and the Pins window
-    /// into `pins_sink` (seeded from keeper-local [`registry::get_pins`], Story
-    /// 4.3). Returns the inbox subscription id. Replacing an
+    /// `inbox_sink`, the Archive window into `archive_sink`, the Pins window into
+    /// `pins_sink` (seeded from keeper-local [`registry::get_pins`], Story 4.3),
+    /// and the Favorites window into `favourites_sink` (SDK-sourced `m.favourite`
+    /// tag, Story 4.4). Returns the inbox subscription id. Replacing an
     /// existing inbox subscription (e.g. the frontend re-subscribes after adding an
     /// account) first tears the old one down. Adding the Nth account is identical
     /// to the 2nd — no count limit.
@@ -315,6 +316,7 @@ impl AccountManager {
         inbox_sink: InboxSink,
         archive_sink: InboxSink,
         pins_sink: InboxSink,
+        favourites_sink: InboxSink,
     ) -> Result<u64, CoreError> {
         // Only one inbox subscription at a time: tear down any prior one so its
         // producers stop feeding a stale merger/channel.
@@ -325,7 +327,7 @@ impl AccountManager {
         // no Matrix representation, so membership + order come from the registry.
         let data_dir = platform.data_dir()?;
         let pins = load_pins(&data_dir)?;
-        let merger = InboxMerger::new(inbox_sink, archive_sink, pins_sink, pins);
+        let merger = InboxMerger::new(inbox_sink, archive_sink, pins_sink, favourites_sink, pins);
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
 
         // Register every account slot up front so the merge reflects the full set
@@ -1607,6 +1609,52 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Favourite the room on `account_id` — set the Matrix favourite tag
+    /// (`m.favourite`) via [`matrix_sdk::Room::set_is_favourite`] (Story 4.4).
+    /// Resolves the account's live `Room` via [`Self::room_for`]. `m.favourite` is
+    /// a *notable* tag, so this re-emits the room-list stream live (no out-of-band
+    /// merger poke) and the tag persists across relaunch and syncs to the user's
+    /// other Matrix clients; the merge then moves the row into the Favorites
+    /// window. The SDK makes favourite and low-priority mutually exclusive
+    /// (`set_is_favourite(true)` auto-clears `m.lowpriority`). This is account data
+    /// (a tag), not a receipt API, so it lives here rather than in the signals
+    /// seam. Best-effort: a dispatch failure is logged and swallowed (returns
+    /// `Ok(())`) — never a UI error.
+    ///
+    /// Errors: an unparsable/unknown room id, or an account that isn't live →
+    /// [`TimelineError::RoomNotFound`]. A best-effort tag-dispatch failure is NOT
+    /// an error — it is logged and swallowed.
+    pub async fn favourite_room(&self, account_id: &str, room_id: &str) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+        if let Err(e) = room.set_is_favourite(true, None).await {
+            tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "favourite dispatch failed (best-effort)");
+        }
+        Ok(())
+    }
+
+    /// Unfavourite the room on `account_id` — clear the Matrix favourite tag
+    /// (`m.favourite`) via [`matrix_sdk::Room::set_is_favourite`] (Story 4.4).
+    /// Resolves the account's live `Room` via [`Self::room_for`]. The merge then
+    /// returns the row to its chronological Inbox position. This is account data (a
+    /// tag), not a receipt API, so it lives here rather than in the signals seam.
+    /// Best-effort: a dispatch failure is logged and swallowed (returns `Ok(())`) —
+    /// never a UI error.
+    ///
+    /// Errors: an unparsable/unknown room id, or an account that isn't live →
+    /// [`TimelineError::RoomNotFound`]. A best-effort tag-dispatch failure is NOT
+    /// an error — it is logged and swallowed.
+    pub async fn unfavourite_room(&self, account_id: &str, room_id: &str) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+        if let Err(e) = room.set_is_favourite(false, None).await {
+            tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "unfavourite dispatch failed (best-effort)");
+        }
+        Ok(())
+    }
+
     /// Pin the room on `account_id` (Story 4.3, FR-22). Pins are keeper-local: this
     /// appends the ref at the end of the ordered list (`max(existing)+1`), persists
     /// it to the registry, then reloads [`registry::get_pins`] and pushes the whole
@@ -2563,6 +2611,9 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
     // `is_low_priority()` reads the cached `m.lowpriority` notable tag (no await);
     // the merge partitions the inbox on it into the Archive window (Story 4.2).
     let is_archived = item.is_low_priority();
+    // `is_favourite()` reads the cached `m.favourite` notable tag (no await); the
+    // merge partitions the inbox on it into the Favorites window (Story 4.4).
+    let is_favourite = item.is_favourite();
 
     RoomVm {
         room_id,
@@ -2573,6 +2624,7 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
         is_unread,
         mention_count,
         is_archived,
+        is_favourite,
     }
 }
 
@@ -2755,6 +2807,7 @@ mod tests {
             is_unread: false,
             mention_count: 0,
             is_archived: false,
+            is_favourite: false,
         }
     }
 

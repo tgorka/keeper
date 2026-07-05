@@ -26,6 +26,12 @@
  * A third context-menu item (Story 4.3) pins / unpins the row: "Pin" when
  * `!isPinned`, "Unpin" otherwise. Pins are keeper-local; the row's move into the
  * Pins strip is likewise Rust-authoritative with NO optimistic overlay.
+ *
+ * A fourth context-menu item (Story 4.4) favourites / unfavourites the row:
+ * "Favorite" when `!isFavourite`, "Unfavorite" otherwise, via the `m.favourite`
+ * notable tag (best-effort, no optimistic overlay). While the user has zero
+ * favourites a one-time muted hint (UX-DR13) sits by the Favorite item explaining
+ * the section; it disappears once any favourite exists.
  */
 
 import { RoomAvatar } from "@/components/chat/RoomAvatar";
@@ -34,6 +40,7 @@ import {
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuLabel,
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
@@ -42,12 +49,15 @@ import { formatRoomTimestamp } from "@/lib/format-time";
 import type { InboxRoomVm } from "@/lib/ipc/client";
 import {
   archiveRoom,
+  favoriteRoom,
   markRoomRead,
   markRoomUnread,
   pinRoom,
   unarchiveRoom,
+  unfavoriteRoom,
   unpinRoom,
 } from "@/lib/ipc/client";
+import { useFavoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { effectiveIsUnread, type RoomSelection, useRoomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
 
@@ -109,6 +119,24 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
   const onUnpin = () => {
     void unpinRoom(room.accountId, room.roomId).catch(() => {});
   };
+  // Favorite/unfavorite are best-effort with no optimistic overlay (Story 4.4):
+  // favourite state rides the `m.favourite` notable tag, so the row's move into
+  // the Favorites section is Rust-authoritative (AD-20). A rejection is swallowed.
+  const onFavorite = () => {
+    void favoriteRoom(room.accountId, room.roomId).catch(() => {});
+  };
+  const onUnfavorite = () => {
+    void unfavoriteRoom(room.accountId, room.roomId).catch(() => {});
+  };
+  // One-time discovery hint (UX-DR13): while the user has zero favourites, show a
+  // muted helper line by the Favorite item explaining the section. Once any
+  // favourite exists (`favouritesTotal > 0`) the hint disappears — no persisted
+  // "seen" flag. `total` is the Rust-authoritative Favorites-window length; it is
+  // `null` until the first Favorites batch streams in, so the hint stays hidden
+  // pre-load (only `0` — a known-empty window — shows it), never flashing for a
+  // user who actually has favourites.
+  const favoritesTotal = useFavoritesRoomsStore((s) => s.total);
+  const showFavoritesHint = !room.isFavourite && favoritesTotal === 0;
 
   // Accessible unread cue for the row button's name (the visual dot is
   // aria-hidden and the badge sits outside the button's accessible name), gated
@@ -188,6 +216,16 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
           <ContextMenuItem onSelect={onUnpin}>Unpin</ContextMenuItem>
         ) : (
           <ContextMenuItem onSelect={onPin}>Pin</ContextMenuItem>
+        )}
+        {room.isFavourite ? (
+          <ContextMenuItem onSelect={onUnfavorite}>Unfavorite</ContextMenuItem>
+        ) : (
+          <ContextMenuItem onSelect={onFavorite}>Favorite</ContextMenuItem>
+        )}
+        {showFavoritesHint && (
+          <ContextMenuLabel className="max-w-56 font-normal text-xs">
+            Favorites keeps key chats one interaction away in a section above the inbox.
+          </ContextMenuLabel>
         )}
       </ContextMenuContent>
     </ContextMenu>

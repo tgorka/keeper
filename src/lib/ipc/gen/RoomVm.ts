@@ -49,4 +49,12 @@ mentionCount: number,
  * partitions on this to place the room in the Archive window unless it is
  * unread (auto-return is a pure view rule); the frontend never re-derives it.
  */
-isArchived: boolean, };
+isArchived: boolean, 
+/**
+ * Authoritative favourite flag: `true` when the room carries the Matrix
+ * favourite tag (`m.favourite`) (Story 4.4, AD-20). This is a *notable* tag,
+ * so a change re-emits the room-list stream live and syncs cross-client. The
+ * inbox merge partitions on this to place the room in the Favorites window
+ * (removed from Inbox/Archive); the frontend never re-derives it.
+ */
+isFavourite: boolean, };

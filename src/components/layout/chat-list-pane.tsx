@@ -15,13 +15,15 @@
  */
 import { useEffect, useState } from "react";
 import { ChatRow } from "@/components/chat/chat-row";
+import { FavoritesSection, hydrateFavoritesCollapsed } from "@/components/layout/favorites-section";
 import { PinsStrip } from "@/components/layout/pins-strip";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { InboxBatch } from "@/lib/ipc/client";
-import { subscribeInbox, unsubscribeInbox } from "@/lib/ipc/client";
+import { getFavoritesCollapsed, subscribeInbox, unsubscribeInbox } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore, useArchiveRoomsStore } from "@/lib/stores/archive-rooms";
+import { favoritesRoomsStore, useFavoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { pinsRoomsStore, usePinsRoomsStore } from "@/lib/stores/pins-rooms";
 import { usePrimaryView } from "@/lib/stores/primary-view";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
@@ -39,6 +41,7 @@ export function ChatListPane() {
   const inboxRooms = useRoomsStore((s) => s.rooms);
   const archiveRooms = useArchiveRoomsStore((s) => s.rooms);
   const pinsRooms = usePinsRoomsStore((s) => s.rooms);
+  const favoritesRooms = useFavoritesRoomsStore((s) => s.rooms);
   const selected = useRoomsStore((s) => s.selected);
   const selectRoom = useRoomsStore((s) => s.selectRoom);
   // Account switcher filter (Story 2.5): a pure display filter over the already-
@@ -67,6 +70,7 @@ export function ChatListPane() {
     roomsStore.getState().clear();
     archiveRoomsStore.getState().clear();
     pinsRoomsStore.getState().clear();
+    favoritesRoomsStore.getState().clear();
     let subscriptionId: number | null = null;
     let cancelled = false;
 
@@ -90,7 +94,12 @@ export function ChatListPane() {
         pinsRoomsStore.getState().applyBatch(b);
       }
     };
-    subscribeInbox(onInbox, onArchive, onPins)
+    const onFavourites = (b: InboxBatch) => {
+      if (!cancelled) {
+        favoritesRoomsStore.getState().applyBatch(b);
+      }
+    };
+    subscribeInbox(onInbox, onArchive, onPins, onFavourites)
       .then((id) => {
         if (cancelled) {
           // Unmounted before the id resolved — tear down immediately.
@@ -113,6 +122,13 @@ export function ChatListPane() {
     };
   }, [accountKey]);
 
+  // Hydrate the Favorites section's collapse chrome from the persisted registry
+  // setting once on mount (Story 4.4). Idempotent; a read failure keeps the
+  // expanded default.
+  useEffect(() => {
+    void hydrateFavoritesCollapsed(getFavoritesCollapsed);
+  }, []);
+
   // Pick the active window's rows, then apply the account switcher filter as a
   // pure display filter (no re-sort, no mutation): when a filter is active, hide
   // rows not owned by that account.
@@ -130,6 +146,14 @@ export function ChatListPane() {
       ? pinsRooms
       : pinsRooms.filter((room) => room.accountId === filterAccountId);
   const showPins = view === "inbox" && visiblePins.length > 0;
+  // The Favorites section renders only atop the Inbox view; the account switcher
+  // filter applies to it too (same pure display filter, no re-sort). Its recency
+  // order is Rust-authoritative.
+  const visibleFavorites =
+    filterAccountId === null
+      ? favoritesRooms
+      : favoritesRooms.filter((room) => room.accountId === filterAccountId);
+  const showFavorites = view === "inbox" && visibleFavorites.length > 0;
   // Per-view empty state (UX-DR13): the Archive uses sentence case with a code-font
   // `E` and no exclamation; the Inbox keeps its existing copy.
   const emptyState =
@@ -151,6 +175,9 @@ export function ChatListPane() {
           selected={selected}
           reorderable={filterAccountId === null}
         />
+      )}
+      {showFavorites && (
+        <FavoritesSection favorites={visibleFavorites} onSelect={selectRoom} selected={selected} />
       )}
       {errored ? (
         <div className="flex flex-1 items-center justify-center p-4">

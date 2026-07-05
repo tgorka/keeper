@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { InboxBatch, InboxOp, InboxRoomVm } from "@/lib/ipc/client";
-import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
+import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 
 function room(id: string, overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
   return {
@@ -13,9 +13,9 @@ function room(id: string, overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
     avatarUrl: null,
     isUnread: false,
     mentionCount: 0,
-    isArchived: true,
+    isArchived: false,
     isPinned: false,
-    isFavourite: false,
+    isFavourite: true,
     ...overrides,
   };
 }
@@ -25,40 +25,34 @@ function batch(ops: InboxOp[], total: number | null = null): InboxBatch {
 }
 
 function ids(): string[] {
-  return archiveRoomsStore.getState().rooms.map((r) => r.roomId);
+  return favoritesRoomsStore.getState().rooms.map((r) => r.roomId);
 }
 
 afterEach(() => {
-  archiveRoomsStore.getState().clear();
+  favoritesRoomsStore.getState().clear();
 });
 
-describe("archiveRoomsStore.applyBatch", () => {
+describe("favoritesRoomsStore.applyBatch", () => {
   it("reset replaces contents and sets total", () => {
-    archiveRoomsStore
+    favoritesRoomsStore
       .getState()
       .applyBatch(batch([{ op: "reset", rooms: [room("a"), room("b")] }], 2));
     expect(ids()).toEqual(["a", "b"]);
-    expect(archiveRoomsStore.getState().total).toBe(2);
+    expect(favoritesRoomsStore.getState().total).toBe(2);
   });
 
-  it("set replaces the room at an index in place", () => {
-    archiveRoomsStore
+  it("does not re-sort — mirrors the Rust recency order verbatim", () => {
+    favoritesRoomsStore
       .getState()
       .applyBatch(batch([{ op: "reset", rooms: [room("a"), room("b")] }]));
-    archiveRoomsStore.getState().applyBatch(batch([{ op: "set", index: 1, room: room("b2") }]));
-    expect(ids()).toEqual(["a", "b2"]);
-  });
-
-  it("remove drops the room at an index", () => {
-    archiveRoomsStore
+    favoritesRoomsStore
       .getState()
-      .applyBatch(batch([{ op: "reset", rooms: [room("a"), room("b"), room("c")] }]));
-    archiveRoomsStore.getState().applyBatch(batch([{ op: "remove", index: 1 }]));
-    expect(ids()).toEqual(["a", "c"]);
+      .applyBatch(batch([{ op: "reset", rooms: [room("b"), room("a")] }]));
+    expect(ids()).toEqual(["b", "a"]);
   });
 
   it("folds multiple ops in sequence within one batch", () => {
-    archiveRoomsStore.getState().applyBatch(
+    favoritesRoomsStore.getState().applyBatch(
       batch([
         { op: "reset", rooms: [room("a")] },
         { op: "append", rooms: [room("b"), room("c")] },
@@ -69,19 +63,19 @@ describe("archiveRoomsStore.applyBatch", () => {
   });
 
   it("keeps the prior total when a batch omits it", () => {
-    archiveRoomsStore.getState().applyBatch(batch([{ op: "reset", rooms: [room("a")] }], 5));
-    archiveRoomsStore.getState().applyBatch(batch([{ op: "append", rooms: [room("b")] }], null));
-    expect(archiveRoomsStore.getState().total).toBe(5);
+    favoritesRoomsStore.getState().applyBatch(batch([{ op: "reset", rooms: [room("a")] }], 5));
+    favoritesRoomsStore.getState().applyBatch(batch([{ op: "append", rooms: [room("b")] }], null));
+    expect(favoritesRoomsStore.getState().total).toBe(5);
   });
 });
 
-describe("archiveRoomsStore.clear", () => {
+describe("favoritesRoomsStore.clear", () => {
   it("empties the rooms and resets the total", () => {
-    archiveRoomsStore
+    favoritesRoomsStore
       .getState()
       .applyBatch(batch([{ op: "reset", rooms: [room("a"), room("b")] }], 2));
-    archiveRoomsStore.getState().clear();
+    favoritesRoomsStore.getState().clear();
     expect(ids()).toEqual([]);
-    expect(archiveRoomsStore.getState().total).toBeNull();
+    expect(favoritesRoomsStore.getState().total).toBeNull();
   });
 });

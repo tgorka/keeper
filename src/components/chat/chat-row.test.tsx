@@ -1,7 +1,8 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatRow } from "@/components/chat/chat-row";
-import type { InboxRoomVm } from "@/lib/ipc/client";
+import type { InboxBatch, InboxRoomVm } from "@/lib/ipc/client";
+import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { roomsStore } from "@/lib/stores/rooms";
 
 // The row round-trips read/unread through the typed IPC client wrappers; mock them
@@ -16,17 +17,26 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     unarchiveRoom: vi.fn(async () => {}),
     pinRoom: vi.fn(async () => {}),
     unpinRoom: vi.fn(async () => {}),
+    favoriteRoom: vi.fn(async () => {}),
+    unfavoriteRoom: vi.fn(async () => {}),
   };
 });
 
 import {
   archiveRoom,
+  favoriteRoom,
   markRoomRead,
   markRoomUnread,
   pinRoom,
   unarchiveRoom,
+  unfavoriteRoom,
   unpinRoom,
 } from "@/lib/ipc/client";
+
+/** Seed the Favorites-window mirror's total so the discovery hint hides. */
+function setFavoritesTotal(total: number): void {
+  favoritesRoomsStore.getState().applyBatch({ ops: [], total } as InboxBatch);
+}
 
 function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
   return {
@@ -41,12 +51,20 @@ function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
     mentionCount: 0,
     isArchived: false,
     isPinned: false,
+    isFavourite: false,
     ...overrides,
   };
 }
 
+beforeEach(() => {
+  // Default to a non-empty Favorites window so the one-time discovery hint is
+  // hidden unless a test explicitly asserts it (empty favourites).
+  setFavoritesTotal(1);
+});
+
 afterEach(() => {
   roomsStore.getState().clear();
+  favoritesRoomsStore.getState().clear();
   vi.clearAllMocks();
 });
 
@@ -329,6 +347,62 @@ describe("ChatRow", () => {
     fireEvent.click(item);
     expect(unpinRoom).toHaveBeenCalledWith("acctB", "!xyz:example.org");
     expect(pinRoom).not.toHaveBeenCalled();
+  });
+
+  it("context menu on a non-favourite row shows Favorite and invokes favoriteRoom", async () => {
+    render(
+      <ChatRow
+        room={room({ accountId: "acctB", roomId: "!xyz:example.org", isFavourite: false })}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByRole("button"));
+    const item = await screen.findByText("Favorite");
+    expect(screen.queryByText("Unfavorite")).not.toBeInTheDocument();
+    fireEvent.click(item);
+    expect(favoriteRoom).toHaveBeenCalledWith("acctB", "!xyz:example.org");
+    expect(unfavoriteRoom).not.toHaveBeenCalled();
+  });
+
+  it("context menu on a favourite row shows Unfavorite and invokes unfavoriteRoom", async () => {
+    render(
+      <ChatRow
+        room={room({ accountId: "acctB", roomId: "!xyz:example.org", isFavourite: true })}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByRole("button"));
+    const item = await screen.findByText("Unfavorite");
+    expect(screen.queryByText("Favorite")).not.toBeInTheDocument();
+    fireEvent.click(item);
+    expect(unfavoriteRoom).toHaveBeenCalledWith("acctB", "!xyz:example.org");
+    expect(favoriteRoom).not.toHaveBeenCalled();
+  });
+
+  it("shows the one-time favourites hint only when the favourites window is empty", async () => {
+    // Empty favourites window → the hint shows by the Favorite item (UX-DR13).
+    setFavoritesTotal(0);
+    const { unmount } = render(<ChatRow room={room({ isFavourite: false })} />);
+    fireEvent.contextMenu(screen.getByRole("button"));
+    expect(await screen.findByText(/Favorites keeps key chats/)).toBeInTheDocument();
+    unmount();
+
+    // Once any favourite exists, the hint disappears.
+    setFavoritesTotal(1);
+    render(<ChatRow room={room({ isFavourite: false })} />);
+    fireEvent.contextMenu(screen.getByRole("button"));
+    await screen.findByText("Favorite");
+    expect(screen.queryByText(/Favorites keeps key chats/)).not.toBeInTheDocument();
+  });
+
+  it("hides the favourites hint before the first batch loads (total unknown, not zero)", async () => {
+    // Pre-load the Favorites window `total` is `null`, not `0`. A user who in fact
+    // has favourites must not see the discovery hint flash before the window
+    // streams in, so a `null` total keeps the hint hidden (only a known-empty `0`
+    // shows it).
+    favoritesRoomsStore.getState().clear();
+    render(<ChatRow room={room({ isFavourite: false })} />);
+    fireEvent.contextMenu(screen.getByRole("button"));
+    await screen.findByText("Favorite");
+    expect(screen.queryByText(/Favorites keeps key chats/)).not.toBeInTheDocument();
   });
 
   it("reverts the optimistic overlay when the mark command hard-rejects", async () => {

@@ -7,17 +7,22 @@ import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 
 // Mock the typed IPC wrapper so the pane never touches Tauri. `subscribeInbox`
-// captures the `onInbox`/`onArchive` handlers so the test can drive both windows
-// of the merged stream (Story 4.2).
+// captures the `onInbox`/`onArchive`/`onPins`/`onFavourites` handlers so the test
+// can drive every window of the merged stream (Story 4.2 + 4.3 + 4.4).
 const subscribeInbox = vi.fn();
 const unsubscribeInbox = vi.fn();
+const getFavoritesCollapsed = vi.fn(async (): Promise<boolean> => false);
+const setFavoritesCollapsed = vi.fn(async (_collapsed: boolean): Promise<void> => {});
 vi.mock("@/lib/ipc/client", () => ({
   subscribeInbox: (
     onInbox: (b: InboxBatch) => void,
     onArchive: (b: InboxBatch) => void,
     onPins: (b: InboxBatch) => void,
-  ) => subscribeInbox(onInbox, onArchive, onPins),
+    onFavourites: (b: InboxBatch) => void,
+  ) => subscribeInbox(onInbox, onArchive, onPins, onFavourites),
   unsubscribeInbox: (id: number) => unsubscribeInbox(id),
+  getFavoritesCollapsed: () => getFavoritesCollapsed(),
+  setFavoritesCollapsed: (v: boolean) => setFavoritesCollapsed(v),
   // Best-effort mutation wrappers the strip/rows may call; no-ops here.
   reorderPins: vi.fn(async () => {}),
   unpinRoom: vi.fn(async () => {}),
@@ -26,9 +31,13 @@ vi.mock("@/lib/ipc/client", () => ({
   markRoomUnread: vi.fn(async () => {}),
   archiveRoom: vi.fn(async () => {}),
   unarchiveRoom: vi.fn(async () => {}),
+  favoriteRoom: vi.fn(async () => {}),
+  unfavoriteRoom: vi.fn(async () => {}),
 }));
 
 import { ChatListPane } from "@/components/layout/chat-list-pane";
+import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
+import { favoritesUiStore } from "@/lib/stores/favorites-ui";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
 
 const account: AccountVm = {
@@ -64,6 +73,7 @@ function inboxRoom(roomId: string, accountId: string, displayName: string, lastM
     mentionCount: 0,
     isArchived: false,
     isPinned: false,
+    isFavourite: false,
   };
 }
 
@@ -74,9 +84,14 @@ beforeEach(() => {
   roomsStore.getState().selectRoom(null);
   archiveRoomsStore.getState().clear();
   pinsRoomsStore.getState().clear();
+  favoritesRoomsStore.getState().clear();
+  favoritesUiStore.getState().setCollapsed(false);
   primaryViewStore.getState().setView("inbox");
   subscribeInbox.mockReset();
   unsubscribeInbox.mockReset();
+  getFavoritesCollapsed.mockReset();
+  getFavoritesCollapsed.mockResolvedValue(false);
+  setFavoritesCollapsed.mockReset();
 });
 
 afterEach(() => {
@@ -86,6 +101,8 @@ afterEach(() => {
   roomsStore.getState().selectRoom(null);
   archiveRoomsStore.getState().clear();
   pinsRoomsStore.getState().clear();
+  favoritesRoomsStore.getState().clear();
+  favoritesUiStore.getState().setCollapsed(false);
   primaryViewStore.getState().setView("inbox");
 });
 
@@ -125,6 +142,7 @@ describe("ChatListPane", () => {
     render(<ChatListPane />);
 
     expect(subscribeInbox).toHaveBeenCalledWith(
+      expect.any(Function),
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),
@@ -476,6 +494,107 @@ describe("ChatListPane", () => {
     primaryViewStore.getState().setView("archive");
     await waitFor(() => {
       expect(screen.queryByLabelText("Pinned conversations")).not.toBeInTheDocument();
+    });
+  });
+
+  it("feeds the fourth channel into the favorites store and renders the section (inbox view)", async () => {
+    const captured: { onFavourites: ((b: InboxBatch) => void) | null } = { onFavourites: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        onFavourites: (b: InboxBatch) => void,
+      ) => {
+        captured.onFavourites = onFavourites;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+
+    // No favourites yet → the section is hidden entirely.
+    expect(screen.queryByRole("region", { name: "Favorites" })).not.toBeInTheDocument();
+
+    // The favourites channel delivers one favourited room.
+    captured.onFavourites?.({
+      ops: [
+        {
+          op: "reset",
+          rooms: [
+            {
+              ...inboxRoom("!f:example.org", account.accountId, "Favorite Room", ""),
+              isFavourite: true,
+            },
+          ],
+        },
+      ],
+      total: 1,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("region", { name: "Favorites" })).toBeInTheDocument();
+    });
+    expect(
+      screen.getByRole("button", { name: "Favorite conversation with Favorite Room" }),
+    ).toBeInTheDocument();
+    // The store mirrors the window.
+    expect(favoritesRoomsStore.getState().rooms).toHaveLength(1);
+  });
+
+  it("hides the favorites section in the archive view", async () => {
+    const captured: { onFavourites: ((b: InboxBatch) => void) | null } = { onFavourites: null };
+    subscribeInbox.mockImplementation(
+      (
+        _onInbox: (b: InboxBatch) => void,
+        _onArchive: (b: InboxBatch) => void,
+        _onPins: (b: InboxBatch) => void,
+        onFavourites: (b: InboxBatch) => void,
+      ) => {
+        captured.onFavourites = onFavourites;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+
+    captured.onFavourites?.({
+      ops: [
+        {
+          op: "reset",
+          rooms: [
+            {
+              ...inboxRoom("!f:example.org", account.accountId, "Favorite Room", ""),
+              isFavourite: true,
+            },
+          ],
+        },
+      ],
+      total: 1,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("region", { name: "Favorites" })).toBeInTheDocument();
+    });
+
+    // Switch to the archive view: the section is hidden (it lives atop the inbox only).
+    primaryViewStore.getState().setView("archive");
+    await waitFor(() => {
+      expect(screen.queryByRole("region", { name: "Favorites" })).not.toBeInTheDocument();
+    });
+  });
+
+  it("hydrates the favorites collapse state on mount", async () => {
+    getFavoritesCollapsed.mockResolvedValue(true);
+    subscribeInbox.mockResolvedValue(1);
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+
+    await waitFor(() => {
+      expect(getFavoritesCollapsed).toHaveBeenCalled();
+    });
+    await waitFor(() => {
+      expect(favoritesUiStore.getState().isCollapsed).toBe(true);
     });
   });
 });

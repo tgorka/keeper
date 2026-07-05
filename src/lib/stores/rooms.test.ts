@@ -20,6 +20,7 @@ function room(
     mentionCount: 0,
     isArchived: false,
     isPinned: false,
+    isFavourite: false,
     ...overrides,
   };
 }

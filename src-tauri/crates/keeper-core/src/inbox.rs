@@ -54,10 +54,14 @@ struct MergeState {
     accounts: HashMap<String, AccountSlot>,
     /// Receives the Pins window (pinned rooms, `sort_order` ascending) (Story 4.3).
     pins_sink: InboxSink,
-    /// Receives the Inbox window (`!pinned && (!is_archived || is_unread)`).
+    /// Receives the Favorites window (`!pinned && is_favourite`, recency order)
+    /// (Story 4.4).
+    favourites_sink: InboxSink,
+    /// Receives the Inbox window
+    /// (`!pinned && !is_favourite && (!is_archived || is_unread)`).
     inbox_sink: InboxSink,
-    /// Receives the Archive window (`!pinned && is_archived && !is_unread`)
-    /// (Story 4.2).
+    /// Receives the Archive window
+    /// (`!pinned && !is_favourite && is_archived && !is_unread`) (Story 4.2).
     archive_sink: InboxSink,
     /// Keeper-local pin membership + order, keyed by `(account_id, room_id)` →
     /// `sort_order` (ascending). Reloaded from the registry and pushed in whole via
@@ -70,25 +74,32 @@ struct MergeState {
 }
 
 impl InboxMerger {
-    /// Create a merger that partitions each merged window into three
-    /// recency/order-authoritative streams (Story 4.2 + 4.3): `pins_sink` receives
-    /// the Pins window (pinned rooms sorted by `sort_order` ascending), `inbox_sink`
-    /// the Inbox window (`!pinned && (!is_archived || is_unread)`), and
-    /// `archive_sink` the Archive window (`!pinned && is_archived && !is_unread`).
-    /// Pins win over archive/unread — a pinned room lives only in the Pins window,
-    /// never re-sorting on activity. `pins` seeds the initial pin map (from
+    /// Create a merger that partitions each merged window into four
+    /// recency/order-authoritative streams (Story 4.2 + 4.3 + 4.4): `pins_sink`
+    /// receives the Pins window (pinned rooms sorted by `sort_order` ascending),
+    /// `favourites_sink` the Favorites window (`!pinned && is_favourite`, recency
+    /// order), `inbox_sink` the Inbox window
+    /// (`!pinned && !is_favourite && (!is_archived || is_unread)`), and
+    /// `archive_sink` the Archive window
+    /// (`!pinned && !is_favourite && is_archived && !is_unread`). Precedence is
+    /// Pins > Favorites > Archive/Inbox — a pinned room lives only in the Pins
+    /// window (never re-sorting on activity); a favourited-but-unpinned room lives
+    /// only in the Favorites window. `pins` seeds the initial pin map (from
     /// [`crate::registry::get_pins`]); it is replaced whole by [`Self::update_pins`]
-    /// on every mutation.
+    /// on every mutation. Favourite state is SDK-sourced (the `m.favourite` notable
+    /// tag), so it needs no seed and no out-of-band poke.
     pub fn new(
         inbox_sink: InboxSink,
         archive_sink: InboxSink,
         pins_sink: InboxSink,
+        favourites_sink: InboxSink,
         pins: HashMap<(String, String), i64>,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(MergeState {
                 accounts: HashMap::new(),
                 pins_sink,
+                favourites_sink,
                 inbox_sink,
                 archive_sink,
                 pins,
@@ -145,25 +156,28 @@ impl InboxMerger {
     }
 }
 
-/// Emit the current merged window into all three sinks, recording channel
-/// closure. The single recency-ordered merge is partitioned into three windows
-/// (Story 4.2 + 4.3), each a `Reset` batch whose `total` is that partition's own
-/// length. Returns `false` if any channel is closed.
+/// Emit the current merged window into all four sinks, recording channel
+/// closure. The single recency-ordered merge is partitioned into four windows
+/// (Story 4.2 + 4.3 + 4.4), each a `Reset` batch whose `total` is that
+/// partition's own length. Returns `false` if any channel is closed.
 ///
-/// Pins win over archive/unread: a room in `state.pins` goes only to the **Pins**
-/// window, sorted by `sort_order` ascending (ties broken deterministically by
-/// account/room id, never by recency), and is excluded from the other two. The
-/// remainder splits into the
-/// **Inbox** window (`!pinned && (!is_archived || is_unread)` — an archived-unread
-/// room auto-returns) and the **Archive** window (`!pinned && is_archived &&
-/// !is_unread`).
+/// Precedence is **Pins > Favorites > Archive/Inbox**. A room in `state.pins`
+/// goes only to the **Pins** window, sorted by `sort_order` ascending (ties
+/// broken deterministically by account/room id, never by recency). Of the
+/// remaining unpinned rooms, favourited ones (`is_favourite`) go only to the
+/// **Favorites** window in recency order. The rest splits into the **Inbox**
+/// window (`!is_archived || is_unread` — an archived-unread room auto-returns)
+/// and the **Archive** window (`is_archived && !is_unread`). The four windows are
+/// strictly disjoint: the `!is_favourite` split keeps favourites out of
+/// Inbox/Archive even under a transient sync state where the SDK-mutually-
+/// exclusive favourite/low-priority tags briefly coexist.
 fn emit(state: &mut MergeState) -> bool {
     if state.closed {
         return false;
     }
     let merged = merge(&state.accounts);
-    // Split off pinned rooms first (they win over archive/unread), then partition
-    // the rest. Recency order is preserved within each window.
+    // Split off pinned rooms first (they win over favourites/archive/unread), then
+    // partition the rest. Recency order is preserved within each window.
     let (mut pinned_rooms, rest): (Vec<InboxRoomVm>, Vec<InboxRoomVm>) = merged
         .into_iter()
         .partition(|room| pin_order(&state.pins, room).is_some());
@@ -184,13 +198,24 @@ fn emit(state: &mut MergeState) -> bool {
     for room in &mut pinned_rooms {
         room.is_pinned = true;
     }
-    let (inbox_rooms, archive_rooms): (Vec<InboxRoomVm>, Vec<InboxRoomVm>) = rest
+    // Of the unpinned rooms, favourites win over archive/inbox (recency order,
+    // preserved by the stable partition). Favourite is SDK-sourced, already on the
+    // VM via `to_inbox_room`, so nothing is stamped here.
+    let (favourite_rooms, non_favourite): (Vec<InboxRoomVm>, Vec<InboxRoomVm>) =
+        rest.into_iter().partition(|room| room.is_favourite);
+    let (inbox_rooms, archive_rooms): (Vec<InboxRoomVm>, Vec<InboxRoomVm>) = non_favourite
         .into_iter()
         .partition(|room| !room.is_archived || room.is_unread);
     let pins_batch = InboxBatch {
         total: Some(pinned_rooms.len() as u32),
         ops: vec![InboxOp::Reset {
             rooms: pinned_rooms,
+        }],
+    };
+    let favourites_batch = InboxBatch {
+        total: Some(favourite_rooms.len() as u32),
+        ops: vec![InboxOp::Reset {
+            rooms: favourite_rooms,
         }],
     };
     let inbox_batch = InboxBatch {
@@ -203,13 +228,14 @@ fn emit(state: &mut MergeState) -> bool {
             rooms: archive_rooms,
         }],
     };
-    // Emit all three windows; a close on any sink stops all future emissions.
+    // Emit all four windows; a close on any sink stops all future emissions.
     let pins_ok = (state.pins_sink)(pins_batch);
+    let favourites_ok = (state.favourites_sink)(favourites_batch);
     let inbox_ok = (state.inbox_sink)(inbox_batch);
     let archive_ok = (state.archive_sink)(archive_batch);
-    if !pins_ok || !inbox_ok || !archive_ok {
+    if !pins_ok || !favourites_ok || !inbox_ok || !archive_ok {
         state.closed = true;
-        tracing::info!("pins/inbox/archive channel closed; stopping merged emissions");
+        tracing::info!("pins/favorites/inbox/archive channel closed; stopping merged emissions");
         return false;
     }
     true
@@ -265,6 +291,10 @@ fn to_inbox_room(account_id: &str, hue_index: u8, room: &RoomVm) -> InboxRoomVm 
         is_unread: room.is_unread,
         mention_count: room.mention_count,
         is_archived: room.is_archived,
+        // `is_favourite` is SDK-sourced (the `m.favourite` notable tag), copied
+        // straight through like `is_archived` — the merge partitions on it but
+        // never owns it.
+        is_favourite: room.is_favourite,
         // `is_pinned` is set in `emit` from the merger's pin map (the pin state is
         // merger-owned, not SDK-sourced); a freshly merged row defaults unpinned.
         is_pinned: false,
@@ -337,6 +367,7 @@ mod tests {
             is_unread: false,
             mention_count: 0,
             is_archived: false,
+            is_favourite: false,
         }
     }
 
@@ -346,6 +377,14 @@ mod tests {
             is_archived,
             is_unread,
             ..room(id, ts)
+        }
+    }
+
+    /// A favourited room for Favorites-window partition tests (Story 4.4).
+    fn room_fav(id: &str, ts: Option<i64>, is_archived: bool, is_unread: bool) -> RoomVm {
+        RoomVm {
+            is_favourite: true,
+            ..room_flags(id, ts, is_archived, is_unread)
         }
     }
 
@@ -399,11 +438,14 @@ mod tests {
             is_unread: true,
             mention_count: 3,
             is_archived: true,
+            is_favourite: true,
         };
         let inbox_room = to_inbox_room("acctA", 4, &src);
         assert!(inbox_room.is_unread);
         assert_eq!(inbox_room.mention_count, 3);
         assert!(inbox_room.is_archived);
+        // `is_favourite` is SDK-sourced, copied straight through like `is_archived`.
+        assert!(inbox_room.is_favourite);
         // `to_inbox_room` defaults unpinned; `emit` stamps the pin flag.
         assert!(!inbox_room.is_pinned);
         assert_eq!(inbox_room.account_id, "acctA");
@@ -482,23 +524,26 @@ mod tests {
         }
     }
 
-    /// Build a merger over three capture vecs (inbox, archive, pins) so partition
-    /// tests can assert each window independently. Seeds an empty pin map; tests
-    /// that exercise pins push a map via [`InboxMerger::update_pins`].
-    fn capturing_merger() -> (InboxMerger, Captured, Captured, Captured) {
+    /// Build a merger over four capture vecs (inbox, archive, pins, favourites) so
+    /// partition tests can assert each window independently. Seeds an empty pin
+    /// map; tests that exercise pins push a map via [`InboxMerger::update_pins`].
+    fn capturing_merger() -> (InboxMerger, Captured, Captured, Captured, Captured) {
         capturing_merger_with_pins(HashMap::new())
     }
 
-    /// Like [`capturing_merger`] but seeds the merger's pin map.
+    /// Like [`capturing_merger`] but seeds the merger's pin map. Returns captures
+    /// in `(merger, inbox, archive, pins, favourites)` order.
     fn capturing_merger_with_pins(
         pins: HashMap<(String, String), i64>,
-    ) -> (InboxMerger, Captured, Captured, Captured) {
+    ) -> (InboxMerger, Captured, Captured, Captured, Captured) {
         let inbox: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let archive: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let pins_cap: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
+        let favourites: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let inbox_store = inbox.clone();
         let archive_store = archive.clone();
         let pins_store = pins_cap.clone();
+        let favourites_store = favourites.clone();
         let merger = InboxMerger::new(
             Box::new(move |batch: InboxBatch| {
                 inbox_store.lock().expect("lock").push(batch);
@@ -512,9 +557,13 @@ mod tests {
                 pins_store.lock().expect("lock").push(batch);
                 true
             }),
+            Box::new(move |batch: InboxBatch| {
+                favourites_store.lock().expect("lock").push(batch);
+                true
+            }),
             pins,
         );
-        (merger, inbox, archive, pins_cap)
+        (merger, inbox, archive, pins_cap, favourites)
     }
 
     /// Build a pin map from `(account_id, room_id, order)` triples.
@@ -527,7 +576,7 @@ mod tests {
 
     #[tokio::test]
     async fn merger_emits_reset_on_add_batch_and_remove() {
-        let (merger, inbox, _archive, _pins) = capturing_merger();
+        let (merger, inbox, _archive, _pins, _favourites) = capturing_merger();
 
         merger.register_account("acctA", 0).await;
         merger.register_account("acctB", 1).await;
@@ -582,7 +631,7 @@ mod tests {
         //    B archived read (200), A !archived unread (100)]
         // partitions to inbox = [D, C, A] (!is_archived || is_unread) and
         // archive = [B] (is_archived && !is_unread).
-        let (merger, inbox, archive, _pins) = capturing_merger();
+        let (merger, inbox, archive, _pins, _favourites) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -625,6 +674,146 @@ mod tests {
         }
     }
 
+    /// Read the `is_favourite` flags of the last `Reset` in `store`.
+    fn last_reset_favourite(store: &Captured) -> Vec<bool> {
+        let batches = store.lock().expect("lock");
+        let last = batches.last().expect("a batch");
+        match &last.ops[0] {
+            InboxOp::Reset { rooms } => rooms.iter().map(|r| r.is_favourite).collect(),
+            other => panic!("expected Reset, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_partitions_four_windows_pins_over_favorites() {
+        // Golden four-window case (Story 4.4), precedence Pins > Favorites >
+        // Archive/Inbox. Recency-desc merged window:
+        //   [A pin+fav(ord 0), B fav, C archived-read, D unread, E read, F fav]
+        // → pins       = [A]        (pinned wins over favourite; removed from below)
+        //   favorites  = [B, F]     (!pinned && is_favourite, recency order)
+        //   inbox      = [D, E]     (!pinned && !fav && (!archived || unread))
+        //   archive    = [C]        (!pinned && !fav && archived && !unread)
+        let pins = pin_map(&[("acctA", "!a", 0)]);
+        let (merger, inbox, archive, pins_cap, favourites) = capturing_merger_with_pins(pins);
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            // recency desc: a(600), b(500), c(400), d(300), e(200), f(100)
+                            room_fav("!a", Some(600), false, false), // pinned + favourite
+                            room_fav("!b", Some(500), false, false), // favourite
+                            room_flags("!c", Some(400), true, false), // archived read
+                            room_flags("!d", Some(300), false, true), // unread
+                            room_flags("!e", Some(200), false, false), // plain read
+                            room_fav("!f", Some(100), false, false), // favourite
+                        ],
+                    }],
+                    total: Some(6),
+                },
+            )
+            .await;
+
+        // Pins: [A], pinned flagged. A is favourite too, but pins win — not in favs.
+        assert_eq!(last_reset_ids(&pins_cap), ["!a"]);
+        assert_eq!(last_reset_pinned(&pins_cap), [true]);
+        // Favorites: [B, F] in recency order, all favourite, none pinned.
+        assert_eq!(last_reset_ids(&favourites), ["!b", "!f"]);
+        assert_eq!(last_reset_favourite(&favourites), [true, true]);
+        assert_eq!(last_reset_pinned(&favourites), [false, false]);
+        {
+            let batches = favourites.lock().expect("lock");
+            assert_eq!(batches.last().expect("batch").total, Some(2));
+        }
+        // Inbox: [D, E] — unread auto-return plus plain read, no favourites.
+        assert_eq!(last_reset_ids(&inbox), ["!d", "!e"]);
+        assert_eq!(last_reset_favourite(&inbox), [false, false]);
+        // Archive: [C] — archived-read, not favourite, not pinned.
+        assert_eq!(last_reset_ids(&archive), ["!c"]);
+    }
+
+    #[tokio::test]
+    async fn favourite_and_archived_resolves_to_favorites_not_archive() {
+        // The SDK makes favourite and low-priority mutually exclusive, but even a
+        // transient sync state where a room is both must resolve to Favorites: the
+        // `!is_favourite` guard on the archive/inbox predicates keeps the windows
+        // strictly disjoint (favourite wins over archive here).
+        let (merger, inbox, archive, _pins, favourites) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_fav("!g", Some(200), true, false), // favourite + archived
+                            room_flags("!h", Some(100), true, false), // archived only
+                        ],
+                    }],
+                    total: Some(2),
+                },
+            )
+            .await;
+        // The favourite+archived room lands in Favorites, not Archive.
+        assert_eq!(last_reset_ids(&favourites), ["!g"]);
+        assert_eq!(last_reset_ids(&archive), ["!h"]);
+        assert_eq!(last_reset_ids(&inbox), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn favourite_leaves_inbox_and_returns_on_unfavourite() {
+        // Favouriting removes a room from the chronological Inbox flow; clearing
+        // the favourite tag returns it to its recency position (SDK re-emit).
+        let (merger, inbox, _archive, _pins, favourites) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_flags("!x", Some(300), false, false),
+                            room_fav("!y", Some(200), false, false), // favourite
+                            room_flags("!z", Some(100), false, false),
+                        ],
+                    }],
+                    total: Some(3),
+                },
+            )
+            .await;
+        assert_eq!(last_reset_ids(&favourites), ["!y"]);
+        assert_eq!(
+            last_reset_ids(&inbox),
+            ["!x", "!z"],
+            "favourite left the inbox"
+        );
+
+        // The SDK re-emits with !y no longer favourite; it returns to recency order.
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_flags("!x", Some(300), false, false),
+                            room_flags("!y", Some(200), false, false), // unfavourited
+                            room_flags("!z", Some(100), false, false),
+                        ],
+                    }],
+                    total: Some(3),
+                },
+            )
+            .await;
+        assert_eq!(last_reset_ids(&favourites), Vec::<String>::new());
+        assert_eq!(
+            last_reset_ids(&inbox),
+            ["!x", "!y", "!z"],
+            "unfavourited room back in chronological position"
+        );
+    }
+
     #[tokio::test]
     async fn emit_partitions_pins_inbox_and_archive_pins_win() {
         // Golden three-window case (Story 4.3): recency-desc merged window
@@ -633,7 +822,7 @@ mod tests {
         //   inbox = [D, E], archive = [C]. A pinned room stays in Pins even when
         //   archived/unread (B is pinned-and-archived here to prove pins win).
         let pins = pin_map(&[("acctA", "!a", 1), ("acctA", "!b", 0)]);
-        let (merger, inbox, archive, pins_cap) = capturing_merger_with_pins(pins);
+        let (merger, inbox, archive, pins_cap, _favourites) = capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -675,7 +864,7 @@ mod tests {
         // order by (account_id, room_id) — never by recency — and stay put when
         // recency changes, so the strip never flips under the user.
         let pins = pin_map(&[("acctA", "!m", 5), ("acctA", "!n", 5)]);
-        let (merger, _inbox, _archive, pins_cap) = capturing_merger_with_pins(pins);
+        let (merger, _inbox, _archive, pins_cap, _favourites) = capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -721,7 +910,7 @@ mod tests {
         // A pinned room keeps its Pins-window position when an unpinned chat gets
         // newer activity (only the Inbox window re-orders).
         let pins = pin_map(&[("acctA", "!p", 0)]);
-        let (merger, inbox, _archive, pins_cap) = capturing_merger_with_pins(pins);
+        let (merger, inbox, _archive, pins_cap, _favourites) = capturing_merger_with_pins(pins);
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(
@@ -765,7 +954,7 @@ mod tests {
     #[tokio::test]
     async fn update_pins_re_emits_all_three_windows() {
         // Start with no pins: all rooms land in the Inbox window.
-        let (merger, inbox, archive, pins_cap) = capturing_merger();
+        let (merger, inbox, archive, pins_cap, _favourites) = capturing_merger();
         merger.register_account("acctA", 0).await;
         merger
             .apply_account_batch(

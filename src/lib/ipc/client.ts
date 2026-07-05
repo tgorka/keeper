@@ -254,37 +254,41 @@ export async function unsubscribeRoomList(accountId: string, id: number): Promis
 
 /**
  * Subscribe to the merged unified inbox across every restorable account (FR-18,
- * AD-20, Story 4.2 + 4.3). Opens **three** `Channel`s over one subscription and
- * forwards the recency-ordered Inbox window to `onInbox`, the Archive window to
- * `onArchive`, and the Pins window (pinned rooms, user order) to `onPins` (each a
- * `Reset` window that updates as accounts sync or as archive/pin state changes).
- * Resolves with the inbox subscription id — one {@link unsubscribeInbox} tears
- * down all three. Ordering and the three-way split are computed in Rust — never
- * re-derived here. Rejects with the {@link IpcError} envelope (`code:
- * "syncUnavailable"`) on a stream-start failure.
+ * AD-20, Story 4.2 + 4.3 + 4.4). Opens **four** `Channel`s over one subscription
+ * and forwards the recency-ordered Inbox window to `onInbox`, the Archive window
+ * to `onArchive`, the Pins window (pinned rooms, user order) to `onPins`, and the
+ * Favorites window (favourited rooms, recency order) to `onFavourites` (each a
+ * `Reset` window that updates as accounts sync or as archive/pin/favourite state
+ * changes). Resolves with the inbox subscription id — one
+ * {@link unsubscribeInbox} tears down all four. Ordering and the four-way split
+ * are computed in Rust — never re-derived here. Rejects with the {@link IpcError}
+ * envelope (`code: "syncUnavailable"`) on a stream-start failure.
  *
  * All channels arm their `onmessage` before `invoke` (the ordering is
  * load-bearing per AD-8, so no batch sent by a spawned task is dropped). The Rust
- * command's params are `channel` (inbox), `archive`, and `pins`.
+ * command's params are `channel` (inbox), `archive`, `pins`, and `favourites`.
  */
 export async function subscribeInbox(
   onInbox: (batch: InboxBatch) => void,
   onArchive: (batch: InboxBatch) => void,
   onPins: (batch: InboxBatch) => void,
+  onFavourites: (batch: InboxBatch) => void,
 ): Promise<number> {
   const channel = new Channel<InboxBatch>();
   const archive = new Channel<InboxBatch>();
   const pins = new Channel<InboxBatch>();
+  const favourites = new Channel<InboxBatch>();
   channel.onmessage = onInbox;
   archive.onmessage = onArchive;
   pins.onmessage = onPins;
-  return await invoke<number>("inbox_subscribe", { channel, archive, pins });
+  favourites.onmessage = onFavourites;
+  return await invoke<number>("inbox_subscribe", { channel, archive, pins, favourites });
 }
 
 /**
  * Unsubscribe the merged inbox, aborting every per-account producer feeding it
- * (AD-20). Idempotent — a mismatched/unknown id is a no-op. Covers both the
- * Inbox and Archive channels (Story 4.2).
+ * (AD-20). Idempotent — a mismatched/unknown id is a no-op. Covers the Inbox,
+ * Archive, Pins, and Favorites channels (Story 4.2 + 4.3 + 4.4).
  */
 export async function unsubscribeInbox(id: number): Promise<void> {
   await invoke<void>("inbox_unsubscribe", { subscriptionId: id });
@@ -762,6 +766,53 @@ export async function archiveRoom(accountId: string, roomId: string): Promise<vo
  */
 export async function unarchiveRoom(accountId: string, roomId: string): Promise<void> {
   await invoke<void>("unarchive_room", { accountId, roomId });
+}
+
+/**
+ * Favourite a room (Story 4.4, FR-21). The Rust core sets the Matrix favourite tag
+ * (`m.favourite`) via `Room::set_is_favourite(true, None)`. Because `m.favourite`
+ * is a *notable* tag, the row moves into the Favorites window on the SDK's live
+ * re-emit and the tag persists and syncs to the user's other Matrix clients (no
+ * out-of-band merger poke). Best-effort: a dispatch failure is swallowed in the
+ * core (never a UI error), so this resolves even then. Callers may fire-and-forget
+ * and swallow rejections. Rejects with the {@link IpcError} envelope (`code:
+ * "timelineUnavailable"`) only on an unknown room/inactive account.
+ */
+export async function favoriteRoom(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("favourite_room", { accountId, roomId });
+}
+
+/**
+ * Unfavourite a room (Story 4.4). The Rust core clears the Matrix favourite tag
+ * (`m.favourite`) via `Room::set_is_favourite(false, None)` so the row returns to
+ * its chronological Inbox position on the SDK's live re-emit. Best-effort: a
+ * dispatch failure is swallowed in the core (never a UI error), so this resolves
+ * even then. Callers may fire-and-forget and swallow rejections. Rejects with the
+ * {@link IpcError} envelope (`code: "timelineUnavailable"`) only on an unknown
+ * room/inactive account.
+ */
+export async function unfavoriteRoom(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("unfavourite_room", { accountId, roomId });
+}
+
+/**
+ * Read the Favorites section's persisted collapse state (Story 4.4). Pure UI
+ * chrome, stored in the app-level `settings` table in `keeper.db` (survives
+ * restart and re-login). Resolves `false` (expanded) when unset. Rejects with the
+ * {@link IpcError} envelope only on a registry read failure.
+ */
+export async function getFavoritesCollapsed(): Promise<boolean> {
+  return await invoke<boolean>("get_favorites_collapsed");
+}
+
+/**
+ * Persist the Favorites section's collapse state (Story 4.4). Stores the boolean
+ * in the app-level `settings` table so it survives restart and re-login.
+ * Best-effort: callers may fire-and-forget and swallow rejections. Rejects with
+ * the {@link IpcError} envelope only on a registry write failure.
+ */
+export async function setFavoritesCollapsed(collapsed: boolean): Promise<void> {
+  await invoke<void>("set_favorites_collapsed", { collapsed });
 }
 
 /**
