@@ -16,7 +16,14 @@
  */
 import { open } from "@tauri-apps/plugin-dialog";
 import { Paperclip, X } from "lucide-react";
-import { type ClipboardEvent, type KeyboardEvent, useEffect, useRef, useState } from "react";
+import {
+  type ClipboardEvent,
+  type KeyboardEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -92,7 +99,19 @@ interface ComposerProps {
    * the parent opens edit on the last own message (Story 3.4 / epic affordance).
    */
   onEmptyArrowUp?: () => void;
+  /**
+   * Emit (or clear) the account's typing notice (Story 3.9, typing). Called
+   * `true` when the user is actively typing (throttled here to ≤1/3s) and `false`
+   * on send / clear / blur / ~5 s idle. Best-effort — the parent swallows any
+   * dispatch failure. Absent → no typing is emitted.
+   */
+  onTyping?: (typing: boolean) => void;
 }
+
+/** Minimum interval between `setTyping(true)` emits while typing (≤1/3 s). */
+const TYPING_THROTTLE_MS = 3000;
+/** Idle timeout after the last keystroke before emitting `setTyping(false)`. */
+const TYPING_IDLE_MS = 5000;
 
 export function Composer({
   onSend,
@@ -102,10 +121,57 @@ export function Composer({
   editPrefill = null,
   onCancelPending,
   onEmptyArrowUp,
+  onTyping,
 }: ComposerProps) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState(false);
+
+  // Typing-notice emission (Story 3.9): mirror the callback + local typing state
+  // in refs so the throttle/idle timers don't re-run effects or capture stale
+  // closures. `typingActive` tracks whether we've announced typing (so we emit
+  // `false` exactly once on stop), `lastTypingEmit` throttles the `true` emits.
+  const onTypingRef = useRef(onTyping);
+  onTypingRef.current = onTyping;
+  const typingActive = useRef(false);
+  const lastTypingEmit = useRef(0);
+  const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /** Announce typing (throttled ≤1/3 s) and arm the ~5 s idle-stop timer. */
+  const startTyping = useCallback(() => {
+    const now = Date.now();
+    if (!typingActive.current || now - lastTypingEmit.current >= TYPING_THROTTLE_MS) {
+      typingActive.current = true;
+      lastTypingEmit.current = now;
+      onTypingRef.current?.(true);
+    }
+    if (idleTimer.current !== null) {
+      clearTimeout(idleTimer.current);
+    }
+    idleTimer.current = setTimeout(() => {
+      idleTimer.current = null;
+      if (typingActive.current) {
+        typingActive.current = false;
+        onTypingRef.current?.(false);
+      }
+    }, TYPING_IDLE_MS);
+  }, []);
+
+  /** Stop typing immediately (send / clear / blur), emitting `false` once. */
+  const stopTyping = useCallback(() => {
+    if (idleTimer.current !== null) {
+      clearTimeout(idleTimer.current);
+      idleTimer.current = null;
+    }
+    if (typingActive.current) {
+      typingActive.current = false;
+      onTypingRef.current?.(false);
+    }
+  }, []);
+
+  // Clear typing on unmount / room change (the composer is keyed by room), so a
+  // lingering "typing" is never left announced after the user leaves.
+  useEffect(() => stopTyping, [stopTyping]);
   const attachments = useAttachmentsStore((s) => s.pending);
   // The attach/paste affordances are available only when the parent wires the
   // attachment dispatcher and the composer is enabled.
@@ -156,6 +222,8 @@ export function Composer({
       // Whitespace-only with no attachment / disabled / in-flight: never dispatch.
       return;
     }
+    // Sending stops typing (Story 3.9): clear the notice once as the message goes.
+    stopTyping();
     setSending(true);
     setError(false);
     try {
@@ -367,12 +435,22 @@ export function Composer({
           value={draft}
           disabled={disabled}
           onChange={(e) => {
-            setDraft(e.target.value);
+            const next = e.target.value;
+            setDraft(next);
             if (error) {
               setError(false);
             }
+            // Typing-notice (Story 3.9): a non-empty edit announces typing
+            // (throttled); clearing to empty stops it. An edit-mode composer still
+            // emits typing — the peer sees the user is composing regardless.
+            if (next.trim().length > 0) {
+              startTyping();
+            } else {
+              stopTyping();
+            }
           }}
           onKeyDown={onKeyDown}
+          onBlur={stopTyping}
           onPaste={onPaste}
           rows={1}
           // Autogrow via `field-sizing-content` (from the shadcn base) capped at

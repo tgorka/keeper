@@ -16,13 +16,14 @@ use keeper_core::auth::BeeperFlowRegistry;
 use keeper_core::demo::snapshot_then_diff;
 use keeper_core::error::{
     AccountError, AuthError, BackupError, CoreError, InboxError, MediaError, PlatformError,
-    SendError, TimelineError, VerificationError,
+    SendError, SignalError, TimelineError, VerificationError,
 };
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, BackupStatus, ConnectionStatusBatch, DemoBatch, EncryptionStatusBatch, InboxBatch,
-    IpcError, IpcErrorCode, PingVm, RoomListBatch, TimelineBatch, VerificationFlowVm,
+    IpcError, IpcErrorCode, PaginationStatusBatch, PingVm, RoomListBatch, TimelineBatch,
+    TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -219,6 +220,11 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         CoreError::Backup(
             BackupError::Unavailable(_) | BackupError::RestoreFailed(_) | BackupError::Action(_),
         ) => (IpcErrorCode::BackupFailed, true),
+        // A best-effort receipt/typing signal dispatch failure (Story 3.9, AD-14).
+        // In practice receipts/typing are swallowed in the core (never surfaced),
+        // so this arm keeps the funnel exhaustive; if one ever surfaces it is a
+        // non-retriable, best-effort signal failure.
+        CoreError::Signal(SignalError::Dispatch(_)) => (IpcErrorCode::SignalDispatchFailed, false),
         // Media resolution/fetch errors never reach the IPC command surface —
         // decrypted bytes travel only over the `keeper-media://` protocol, which
         // maps these to HTTP status codes itself (Story 3.6, AD-4). This arm keeps
@@ -1069,6 +1075,140 @@ pub async fn cancel_send(
         .map_err(to_ipc_error)
 }
 
+/// Mark the open room read (Story 3.9, receipts, AD-14). Delegates to the core,
+/// which dispatches a public `m.read` receipt on the room's latest event through
+/// the receipt/typing signals seam — other Matrix clients observe the advance.
+/// Best-effort: a receipt-dispatch failure is logged and swallowed in the core (no
+/// UI error), so this resolves `Ok` even then. A room-not-found / no-open-timeline
+/// funnels through [`to_ipc_error`] to `TimelineUnavailable`.
+#[tauri::command]
+pub async fn mark_room_read(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .mark_room_read(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Set (or clear) the account's typing notice in the open room (Story 3.9, typing,
+/// AD-14). Delegates to the core, which emits a normal (non-private) typing
+/// notification through the receipt/typing signals seam. Best-effort: a dispatch
+/// failure is logged and swallowed in the core (typing is never a UI error), so
+/// this resolves `Ok` even then. A room-not-found / inactive account funnels
+/// through [`to_ipc_error`] to `TimelineUnavailable`.
+#[tauri::command]
+pub async fn set_typing(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    typing: bool,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .set_typing(&account_id, &room_id, typing)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Back-paginate the open room's timeline (Story 3.9, pagination). Delegates to the
+/// core, which fetches up to `numEvents` older events; they arrive back over the
+/// room's existing timeline subscription (no second channel). Resolves with
+/// whether the homeserver start of the room was reached (no more older history). A
+/// room-not-found / no-open-timeline / SDK pagination failure funnels through
+/// [`to_ipc_error`] to the retriable `TimelineUnavailable` so the boundary shows a
+/// retriable inline error, not an infinite spinner.
+#[tauri::command]
+pub async fn paginate_backwards(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    num_events: u16,
+) -> Result<bool, IpcError> {
+    state
+        .accounts
+        .paginate_backwards(&account_id, &room_id, num_events)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Subscribe to the open room's typing notifications (Story 3.9, typing, AD-8,
+/// AD-14). Opens a `Channel`, streams a [`TypingBatch`] (the current set of *other*
+/// members typing, each with a resolved display name) — an initial empty snapshot,
+/// then a batch on every change — and returns the subscription id. The sink
+/// forwards each batch to the channel; a closed channel drops the batch. Only
+/// opaque user ids + display names cross IPC (NFR-9). A room-not-found / inactive
+/// account funnels through [`to_ipc_error`] to `TimelineUnavailable`.
+#[tauri::command]
+pub async fn typing_subscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    channel: Channel<TypingBatch>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |batch: TypingBatch| channel.send(batch).is_ok());
+    state
+        .accounts
+        .subscribe_typing(&account_id, &room_id, sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unsubscribe exactly one typing subscription, aborting its backend producer task
+/// and dropping the SDK typing event handler (AD-19). Idempotent.
+#[tauri::command]
+pub async fn typing_unsubscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_typing(&account_id, subscription_id)
+        .await;
+    Ok(())
+}
+
+/// Subscribe to the open room's live back-pagination status (Story 3.9,
+/// pagination, AD-8). Opens a `Channel`, streams a [`PaginationStatusBatch`] (a
+/// scalar snapshot: `Paginating`/`Idle` + `hitStart`) — an initial snapshot, then
+/// deduped changes — and returns the subscription id. The status drives the honest
+/// history-boundary row; older events themselves arrive over the timeline
+/// subscription, never here. A room-not-found / no-open-timeline funnels through
+/// [`to_ipc_error`] to `TimelineUnavailable`.
+#[tauri::command]
+pub async fn pagination_status_subscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    channel: Channel<PaginationStatusBatch>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |batch: PaginationStatusBatch| channel.send(batch).is_ok());
+    state
+        .accounts
+        .subscribe_pagination_status(&account_id, &room_id, sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unsubscribe exactly one pagination-status subscription, aborting its backend
+/// producer task (AD-19). Idempotent.
+#[tauri::command]
+pub async fn pagination_status_unsubscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_pagination_status(&account_id, subscription_id)
+        .await;
+    Ok(())
+}
+
 /// Report every persisted account that can be restored on launch (FR-8, AD-20).
 /// Identity only — delegates to the core, which lists the registry rows and
 /// returns each whose Keychain session is present as a non-secret [`AccountVm`]
@@ -1433,5 +1573,18 @@ mod tests {
         let ipc = to_ipc_error(CoreError::Backup(BackupError::Action("boom".to_owned())));
         assert_eq!(ipc.code, IpcErrorCode::BackupFailed);
         assert!(ipc.retriable);
+    }
+
+    #[test]
+    fn signal_dispatch_maps_to_non_retriable_signal_code() {
+        // A best-effort receipt/typing dispatch failure (Story 3.9, AD-14) maps to
+        // the named, non-retriable signal code (in practice it is swallowed in the
+        // core, so this only keeps the funnel exhaustive).
+        let ipc = to_ipc_error(CoreError::Signal(SignalError::Dispatch("boom".to_owned())));
+        assert_eq!(ipc.code, IpcErrorCode::SignalDispatchFailed);
+        assert!(
+            !ipc.retriable,
+            "a best-effort signal failure is not retriable"
+        );
     }
 }

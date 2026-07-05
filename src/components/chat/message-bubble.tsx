@@ -13,6 +13,7 @@
 
 import { MediaAttachment } from "@/components/chat/media-attachment";
 import { MessageActions } from "@/components/chat/message-actions";
+import { ReadReceipts } from "@/components/chat/read-receipts";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { formatMessageTime } from "@/lib/format-time";
@@ -241,7 +242,11 @@ export function MessageBubble({
           groupTail={groupTail}
           onRetry={onRetry}
           offline={offline}
+          readCount={item.readers.length}
         />
+        {/* Read-receipt micro-avatar cluster (Story 3.9): the other members whose
+            read receipt sits on this message. Renders nothing when empty. */}
+        <ReadReceipts readers={item.readers} isOwn={isOwn} />
       </div>
     </div>
   );
@@ -341,6 +346,12 @@ interface SendStateCaptionProps {
   groupTail: boolean;
   onRetry?: (key: string) => void;
   offline: boolean;
+  /**
+   * The number of *other* members whose read receipt sits on this message (Story
+   * 3.9). When this own message is sent (`state === null`) and at least one other
+   * member has read it, the caption shows an explicit "Read ✓" tick.
+   */
+  readCount?: number;
 }
 
 /**
@@ -350,7 +361,9 @@ interface SendStateCaptionProps {
  * and only under the last bubble of a same-sender group. While the account is
  * `offline`, a still-`sending` *own* message reads the amber `Queued — sends when
  * you're back online` (a pure projection of the connection status + `isOwn`)
- * instead of `Sending…`. A remote message (`sendState: null`) renders nothing.
+ * instead of `Sending…`. A sent own message that at least one other member has read
+ * shows an explicit `Read ✓` tick instead of `Sent` (Story 3.9). A remote message
+ * (`sendState: null`) with no readers renders nothing.
  */
 function SendStateCaption({
   state,
@@ -359,6 +372,7 @@ function SendStateCaption({
   groupTail,
   onRetry,
   offline,
+  readCount = 0,
 }: SendStateCaptionProps) {
   if (state === "failed") {
     return (
@@ -371,6 +385,16 @@ function SendStateCaption({
           Retry
         </Button>
       </div>
+    );
+  }
+  // A sent own message read by ≥1 other member shows an explicit read tick. This
+  // takes precedence over "Sent" and renders regardless of `groupTail` so the
+  // read state is always visible on the messages others have read.
+  if (state === null && isOwn && readCount > 0) {
+    return (
+      <span className="mt-0.5 text-muted-foreground text-xs">
+        Read <span aria-hidden="true">✓</span>
+      </span>
     );
   }
   if (!groupTail) {

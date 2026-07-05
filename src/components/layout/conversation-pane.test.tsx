@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountVm, IpcError, TimelineBatch } from "@/lib/ipc/client";
+import type { AccountVm, IpcError, TimelineBatch, TimelineItemVm } from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { roomsStore } from "@/lib/stores/rooms";
@@ -19,10 +19,29 @@ const sendAttachmentBytes = vi.fn();
 const cancelSend = vi.fn();
 const deleteMessage = vi.fn();
 const roomNetworkLabel = vi.fn();
+const markRoomRead = vi.fn();
+const setTyping = vi.fn();
+const paginateBackwards = vi.fn();
+const subscribeTyping = vi.fn();
+const unsubscribeTyping = vi.fn();
+const subscribePaginationStatus = vi.fn();
+const unsubscribePaginationStatus = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   subscribeTimeline: (accountId: string, roomId: string, onBatch: (b: TimelineBatch) => void) =>
     subscribeTimeline(accountId, roomId, onBatch),
   unsubscribeTimeline: (accountId: string, id: number) => unsubscribeTimeline(accountId, id),
+  markRoomRead: (accountId: string, roomId: string) => markRoomRead(accountId, roomId),
+  setTyping: (accountId: string, roomId: string, typing: boolean) =>
+    setTyping(accountId, roomId, typing),
+  paginateBackwards: (accountId: string, roomId: string, numEvents: number) =>
+    paginateBackwards(accountId, roomId, numEvents),
+  subscribeTyping: (accountId: string, roomId: string, onBatch: (b: unknown) => void) =>
+    subscribeTyping(accountId, roomId, onBatch),
+  unsubscribeTyping: (accountId: string, id: number) => unsubscribeTyping(accountId, id),
+  subscribePaginationStatus: (accountId: string, roomId: string, onBatch: (b: unknown) => void) =>
+    subscribePaginationStatus(accountId, roomId, onBatch),
+  unsubscribePaginationStatus: (accountId: string, id: number) =>
+    unsubscribePaginationStatus(accountId, id),
   sendText: (accountId: string, roomId: string, body: string) => sendText(accountId, roomId, body),
   sendReply: (accountId: string, roomId: string, inReplyToKey: string, body: string) =>
     sendReply(accountId, roomId, inReplyToKey, body),
@@ -70,24 +89,26 @@ function ipcError(code: IpcError["code"]): IpcError {
   return { code, message: "ignored", accountId: null, retriable: true };
 }
 
-function message(key: string, sender: string, body: string): TimelineBatch["ops"][number] {
+function messageItem(key: string, sender: string, body: string): TimelineItemVm {
   return {
-    op: "pushBack",
-    item: {
-      kind: "message",
-      key,
-      sender,
-      senderDisplayName: null,
-      body,
-      timestamp: 1,
-      isOwn: false,
-      sendState: null,
-      isEdited: false,
-      reply: null,
-      reactions: [],
-      media: null,
-    },
+    kind: "message",
+    key,
+    sender,
+    senderDisplayName: null,
+    body,
+    timestamp: 1,
+    isOwn: false,
+    sendState: null,
+    isEdited: false,
+    reply: null,
+    reactions: [],
+    media: null,
+    readers: [],
   };
+}
+
+function message(key: string, sender: string, body: string): TimelineBatch["ops"][number] {
+  return { op: "pushBack", item: messageItem(key, sender, body) };
 }
 
 function noopProps() {
@@ -120,6 +141,20 @@ beforeEach(() => {
   deleteMessage.mockResolvedValue(undefined);
   roomNetworkLabel.mockReset();
   roomNetworkLabel.mockResolvedValue(null);
+  markRoomRead.mockReset();
+  markRoomRead.mockResolvedValue(undefined);
+  setTyping.mockReset();
+  setTyping.mockResolvedValue(undefined);
+  paginateBackwards.mockReset();
+  paginateBackwards.mockResolvedValue(false);
+  subscribeTyping.mockReset();
+  subscribeTyping.mockResolvedValue(1);
+  unsubscribeTyping.mockReset();
+  unsubscribeTyping.mockResolvedValue(undefined);
+  subscribePaginationStatus.mockReset();
+  subscribePaginationStatus.mockResolvedValue(2);
+  unsubscribePaginationStatus.mockReset();
+  unsubscribePaginationStatus.mockResolvedValue(undefined);
   onDragDropEvent.mockClear();
   onDragDropEvent.mockImplementation(() => Promise.resolve(() => {}));
   composerStore.getState().clear();
@@ -186,6 +221,7 @@ describe("ConversationPane", () => {
               reply: null,
               reactions: [],
               media: null,
+              readers: [],
             },
             { kind: "other", key: "o1" },
           ],
@@ -287,6 +323,7 @@ describe("ConversationPane", () => {
             reply: null,
             reactions: [],
             media: null,
+            readers: [],
           },
         },
       ],
@@ -328,6 +365,7 @@ describe("ConversationPane", () => {
               reply: null,
               reactions: [],
               media: null,
+              readers: [],
             },
             {
               kind: "message",
@@ -342,6 +380,7 @@ describe("ConversationPane", () => {
               reply: null,
               reactions: [],
               media: null,
+              readers: [],
             },
           ],
         },
@@ -590,6 +629,7 @@ describe("ConversationPane", () => {
                 height: 300,
                 caption: null,
               },
+              readers: [],
             },
           ],
         },
@@ -630,6 +670,7 @@ describe("ConversationPane", () => {
               reply: null,
               reactions: [],
               media: null,
+              readers: [],
             },
           ],
         },
@@ -674,6 +715,7 @@ describe("ConversationPane", () => {
               reply: null,
               reactions: [],
               media: null,
+              readers: [],
             },
           ],
         },
@@ -744,6 +786,7 @@ describe("ConversationPane", () => {
               reply: null,
               reactions: [],
               media: null,
+              readers: [],
             },
           ],
         },
@@ -796,6 +839,7 @@ describe("ConversationPane", () => {
               reply: null,
               reactions: [],
               media: null,
+              readers: [],
             },
           ],
         },
@@ -856,6 +900,7 @@ describe("ConversationPane", () => {
               reply: null,
               reactions: [],
               media: null,
+              readers: [],
             },
             {
               kind: "message",
@@ -870,6 +915,7 @@ describe("ConversationPane", () => {
               reply: null,
               reactions: [],
               media: null,
+              readers: [],
             },
           ],
         },
@@ -927,6 +973,7 @@ describe("ConversationPane", () => {
                 height: 600,
                 caption: null,
               },
+              readers: [],
             },
           ],
         },
@@ -1003,6 +1050,7 @@ describe("ConversationPane", () => {
               reply: null,
               reactions: [],
               media: null,
+              readers: [],
             },
             {
               kind: "message",
@@ -1017,6 +1065,7 @@ describe("ConversationPane", () => {
               reply: null,
               reactions: [],
               media: null,
+              readers: [],
             },
           ],
         },
@@ -1048,5 +1097,283 @@ describe("ConversationPane", () => {
         screen.getByRole("alertdialog", { name: "Delete this message for everyone" }),
       ).toBeInTheDocument(),
     );
+  });
+});
+
+/** Configure the scroll container's geometry (jsdom has no layout). */
+function setScrollGeometry(
+  el: HTMLElement,
+  { scrollHeight, clientHeight, scrollTop }: Record<string, number>,
+) {
+  Object.defineProperty(el, "scrollHeight", { value: scrollHeight, configurable: true });
+  Object.defineProperty(el, "clientHeight", { value: clientHeight, configurable: true });
+  Object.defineProperty(el, "scrollTop", {
+    value: scrollTop,
+    writable: true,
+    configurable: true,
+  });
+}
+
+describe("ConversationPane — receipts, typing, pagination (Story 3.9)", () => {
+  /** Render an open room, capturing the timeline/typing/pagination onBatch sinks. */
+  async function renderOpen() {
+    const captured: {
+      timeline: ((b: TimelineBatch) => void) | null;
+      typing: ((b: { typists: unknown[] }) => void) | null;
+      pagination: ((b: { state: string; hitStart: boolean }) => void) | null;
+    } = { timeline: null, typing: null, pagination: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.timeline = onBatch;
+      return Promise.resolve(1);
+    });
+    subscribeTyping.mockImplementation((_a, _r, onBatch: (b: { typists: unknown[] }) => void) => {
+      captured.typing = onBatch;
+      return Promise.resolve(1);
+    });
+    subscribePaginationStatus.mockImplementation(
+      (_a, _r, onBatch: (b: { state: string; hitStart: boolean }) => void) => {
+        captured.pagination = onBatch;
+        return Promise.resolve(2);
+      },
+    );
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    const utils = render(<ConversationPane {...noopProps()} />);
+    // The subscribe effects run after mount; wait for all three sinks to be armed.
+    await waitFor(() => {
+      expect(captured.timeline).not.toBeNull();
+      expect(captured.typing).not.toBeNull();
+      expect(captured.pagination).not.toBeNull();
+    });
+    return { captured, ...utils };
+  }
+
+  it("subscribes to typing + pagination status and marks the room read on view", async () => {
+    await renderOpen();
+    await waitFor(() => {
+      expect(subscribeTyping).toHaveBeenCalledWith(
+        account.accountId,
+        "!room:example.org",
+        expect.any(Function),
+      );
+      expect(subscribePaginationStatus).toHaveBeenCalledWith(
+        account.accountId,
+        "!room:example.org",
+        expect.any(Function),
+      );
+      expect(markRoomRead).toHaveBeenCalledWith(account.accountId, "!room:example.org");
+    });
+  });
+
+  it("renders the typing indicator from the streamed typing set", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({ ops: [{ op: "reset", items: [] }] });
+    await waitFor(() => expect(captured.typing).not.toBeNull());
+    captured.typing?.({ typists: [{ userId: "@bob:example.org", displayName: "Bob" }] });
+    await waitFor(() => expect(screen.getByText("Bob is typing…")).toBeInTheDocument());
+  });
+
+  it("shows the paginating spinner from the pagination status stream", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+    });
+    await waitFor(() => expect(captured.pagination).not.toBeNull());
+    captured.pagination?.({ state: "paginating", hitStart: false });
+    await waitFor(() =>
+      expect(screen.getByText("Older history loads from your homeserver")).toBeInTheDocument(),
+    );
+  });
+
+  it("states the conversation start when the homeserver has no more history", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+    });
+    await waitFor(() => expect(captured.pagination).not.toBeNull());
+    captured.pagination?.({ state: "idle", hitStart: true });
+    await waitFor(() =>
+      expect(screen.getByText("This is the start of the conversation")).toBeInTheDocument(),
+    );
+  });
+
+  it("back-paginates when scrolled near the top (online, not at start)", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+    });
+    await waitFor(() => expect(captured.pagination).not.toBeNull());
+    captured.pagination?.({ state: "idle", hitStart: false });
+
+    const region = await screen.findByLabelText("Messages");
+    const scroll = region.parentElement as HTMLElement;
+    setScrollGeometry(scroll, { scrollHeight: 1000, clientHeight: 400, scrollTop: 10 });
+    fireEvent.scroll(scroll);
+
+    await waitFor(() =>
+      expect(paginateBackwards).toHaveBeenCalledWith(
+        account.accountId,
+        "!room:example.org",
+        expect.any(Number),
+      ),
+    );
+  });
+
+  it("does NOT back-paginate near the top when offline", async () => {
+    accountStatusStore.getState().setStatus(account.accountId, "offline");
+    const { captured } = await renderOpen();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+    });
+    await waitFor(() => expect(captured.pagination).not.toBeNull());
+    captured.pagination?.({ state: "idle", hitStart: false });
+
+    const region = await screen.findByLabelText("Messages");
+    const scroll = region.parentElement as HTMLElement;
+    setScrollGeometry(scroll, { scrollHeight: 1000, clientHeight: 400, scrollTop: 10 });
+    fireEvent.scroll(scroll);
+
+    // Offline: the boundary states offline and no pagination is attempted.
+    expect(
+      screen.getByText("You're offline — older messages will load when you reconnect"),
+    ).toBeInTheDocument();
+    expect(paginateBackwards).not.toHaveBeenCalled();
+  });
+
+  it("does NOT back-paginate once the homeserver start is reached", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+    });
+    await waitFor(() => expect(captured.pagination).not.toBeNull());
+    captured.pagination?.({ state: "idle", hitStart: true });
+
+    const region = await screen.findByLabelText("Messages");
+    const scroll = region.parentElement as HTMLElement;
+    setScrollGeometry(scroll, { scrollHeight: 1000, clientHeight: 400, scrollTop: 10 });
+    fireEvent.scroll(scroll);
+
+    expect(paginateBackwards).not.toHaveBeenCalled();
+  });
+
+  it("preserves scroll position (compensates by height delta) when older history prepends", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "one")] }],
+    });
+    const region = await screen.findByLabelText("Messages");
+    const scroll = region.parentElement as HTMLElement;
+
+    // The user is scrolled up reading older history (not near the bottom). Model the
+    // prepend growing the container: scrollHeight reads 1000 before the batch (the
+    // value captured in onBatch) and 1200 after (once the older item is in the DOM),
+    // via a getter keyed on the rendered message count.
+    let scrollTopValue = 300;
+    Object.defineProperty(scroll, "clientHeight", { value: 400, configurable: true });
+    Object.defineProperty(scroll, "scrollTop", {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (v: number) => {
+        scrollTopValue = v;
+      },
+    });
+    Object.defineProperty(scroll, "scrollHeight", {
+      configurable: true,
+      // 1000 with one message rendered; 1200 once the prepended second message is in.
+      get: () => (scroll.querySelectorAll("[data-msg-key]").length >= 2 ? 1200 : 1000),
+    });
+
+    captured.timeline?.({
+      ops: [{ op: "pushFront", item: messageItem("k0", "@bob:example.org", "older") }],
+    });
+
+    // The layout effect compensated scrollTop by the +200 height delta (300 → 500),
+    // preserving the visual position rather than jumping to the bottom.
+    await waitFor(() => expect(scrollTopValue).toBe(500));
+  });
+
+  it("does NOT move the view when a new message appends at the bottom while scrolled up", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "one")] }],
+    });
+    const region = await screen.findByLabelText("Messages");
+    const scroll = region.parentElement as HTMLElement;
+
+    // The user is scrolled up reading history (not near the bottom). A peer message
+    // arrives at the bottom, growing the container — the view must not jump.
+    let scrollTopValue = 300;
+    Object.defineProperty(scroll, "clientHeight", { value: 400, configurable: true });
+    Object.defineProperty(scroll, "scrollTop", {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (v: number) => {
+        scrollTopValue = v;
+      },
+    });
+    Object.defineProperty(scroll, "scrollHeight", {
+      configurable: true,
+      get: () => (scroll.querySelectorAll("[data-msg-key]").length >= 2 ? 1200 : 1000),
+    });
+
+    captured.timeline?.({
+      ops: [{ op: "pushBack", item: messageItem("k2", "@bob:example.org", "newer") }],
+    });
+
+    // A bottom-append while scrolled up leaves scrollTop untouched (no yank).
+    await new Promise((r) => setTimeout(r, 0));
+    expect(scrollTopValue).toBe(300);
+  });
+
+  it("shows a sticky retriable error on a failed fetch that a status batch cannot clear, and Retry re-fires", async () => {
+    paginateBackwards.mockRejectedValueOnce(new Error("network"));
+    const { captured } = await renderOpen();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+    });
+    await waitFor(() => expect(captured.pagination).not.toBeNull());
+    captured.pagination?.({ state: "idle", hitStart: false });
+
+    const region = await screen.findByLabelText("Messages");
+    const scroll = region.parentElement as HTMLElement;
+    setScrollGeometry(scroll, { scrollHeight: 1000, clientHeight: 400, scrollTop: 10 });
+    fireEvent.scroll(scroll);
+
+    // The failure surfaces the retriable error boundary.
+    await waitFor(() =>
+      expect(screen.getByText("Couldn't load older messages.")).toBeInTheDocument(),
+    );
+
+    // A subsequent status batch must NOT silently clear the error the user needs.
+    captured.pagination?.({ state: "idle", hitStart: false });
+    expect(screen.getByText("Couldn't load older messages.")).toBeInTheDocument();
+
+    // Retry re-fires the fetch (now succeeding) and clears the error.
+    paginateBackwards.mockResolvedValueOnce(false);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(paginateBackwards).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByText("Couldn't load older messages.")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("shows the offline boundary (not a spinner) when the account goes offline mid-pagination", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+    });
+    await waitFor(() => expect(captured.pagination).not.toBeNull());
+    // A pagination is in flight (spinner) ...
+    captured.pagination?.({ state: "paginating", hitStart: false });
+    await waitFor(() =>
+      expect(screen.getByText("Older history loads from your homeserver")).toBeInTheDocument(),
+    );
+    // ... then the account drops offline: offline honesty overrides the spinner.
+    accountStatusStore.getState().setStatus(account.accountId, "offline");
+    await waitFor(() =>
+      expect(
+        screen.getByText("You're offline — older messages will load when you reconnect"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("Older history loads from your homeserver")).not.toBeInTheDocument();
   });
 });

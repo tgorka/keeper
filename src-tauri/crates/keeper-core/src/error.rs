@@ -180,6 +180,23 @@ pub enum SendError {
     Upload(String),
 }
 
+/// Errors originating in the receipt/typing signals seam (Story 3.9, AD-14).
+///
+/// A secret-free taxonomy: no message ever contains a token, event id, session
+/// material, or plaintext — only a non-secret description of a best-effort emit
+/// failure. Read receipts and typing notices are best-effort: a `Dispatch`
+/// failure is logged and swallowed by the caller (no UI error). Maps to
+/// `IpcErrorCode::SignalDispatchFailed` (non-retriable, best-effort) in the
+/// shell's single funnel.
+#[derive(Debug, Error)]
+pub enum SignalError {
+    /// The SDK failed to dispatch a receipt or typing notice. The wrapped string
+    /// is a non-secret description of the failure — never a token, event id, or
+    /// plaintext. Best-effort: the caller logs and swallows it (no UI error).
+    #[error("could not dispatch the signal: {0}")]
+    Dispatch(String),
+}
+
 /// Errors originating in the merged unified-inbox stream (AD-20, AD-21).
 ///
 /// A secret-free taxonomy: no message ever contains a token, session material,
@@ -314,6 +331,10 @@ pub enum CoreError {
     /// An outgoing message could not be enqueued for send.
     #[error(transparent)]
     Send(#[from] SendError),
+
+    /// A best-effort receipt/typing signal dispatch failed (Story 3.9, AD-14).
+    #[error(transparent)]
+    Signal(#[from] SignalError),
 
     /// An interactive device self-verification action failed.
     #[error(transparent)]

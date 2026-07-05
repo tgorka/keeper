@@ -75,7 +75,18 @@ reactions: Array<ReactionGroupVm>,
  * `Box` is serde/ts-rs-transparent, so the wire shape and the generated
  * binding stay `MediaVm | null`.
  */
-media: MediaVm | null, } | { "kind": "utd", 
+media: MediaVm | null, 
+/**
+ * The *other* members whose latest read receipt sits on this item, as
+ * opaque Matrix user ids (Story 3.9, receipts). Populated from
+ * `EventTimelineItem::read_receipts()` keys with the account's own user id
+ * excluded (never render self as a reader), in the SDK's receipt-map
+ * order. Empty when no other member has read up to here. Only opaque ids
+ * cross IPC — no avatars, receipt event ids, or timestamps (NFR-9, AD-1);
+ * the frontend renders deterministic initials micro-avatars. An own
+ * message with a non-empty `readers` additionally shows a read tick.
+ */
+readers: Array<string>, } | { "kind": "utd", 
 /**
  * Stable opaque render key (the item's `unique_id`).
  */

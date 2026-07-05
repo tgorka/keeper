@@ -21,6 +21,7 @@ pub mod oauth;
 pub mod platform;
 pub mod registry;
 pub mod send;
+pub mod signals;
 pub mod timeline;
 pub mod verification;
 pub mod vm;

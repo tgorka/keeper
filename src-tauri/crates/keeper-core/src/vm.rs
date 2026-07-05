@@ -105,6 +105,11 @@ pub enum IpcErrorCode {
     /// ready, network, or another SDK error). Retriable — the user can try again.
     /// Serializes as `"backupFailed"`.
     BackupFailed,
+    /// A best-effort receipt/typing signal dispatch failed (Story 3.9, AD-14).
+    /// Non-retriable and best-effort: in practice receipts/typing are swallowed in
+    /// the core (never surfaced to the UI), so this code exists only to keep the
+    /// error funnel exhaustive. Serializes as `"signalDispatchFailed"`.
+    SignalDispatchFailed,
 }
 
 /// The account's live server-side key-backup posture, mapped from the SDK
@@ -591,6 +596,15 @@ pub enum TimelineItemVm {
         /// `Box` is serde/ts-rs-transparent, so the wire shape and the generated
         /// binding stay `MediaVm | null`.
         media: Option<Box<MediaVm>>,
+        /// The *other* members whose latest read receipt sits on this item, as
+        /// opaque Matrix user ids (Story 3.9, receipts). Populated from
+        /// `EventTimelineItem::read_receipts()` keys with the account's own user id
+        /// excluded (never render self as a reader), in the SDK's receipt-map
+        /// order. Empty when no other member has read up to here. Only opaque ids
+        /// cross IPC — no avatars, receipt event ids, or timestamps (NFR-9, AD-1);
+        /// the frontend renders deterministic initials micro-avatars. An own
+        /// message with a non-empty `readers` additionally shows a read tick.
+        readers: Vec<String>,
     },
     /// An event that could not be decrypted yet (`MsgLikeKind::UnableToDecrypt`).
     /// Renders an explicit honest stub instead of a blank row (Story 3.1). Carries
@@ -717,6 +731,77 @@ pub enum TimelineOp {
 pub struct TimelineBatch {
     /// The ordered ops to apply, in sequence.
     pub ops: Vec<TimelineOp>,
+}
+
+/// One member currently typing in the open room (Story 3.9, typing, AD-14,
+/// NFR-9).
+///
+/// Carries **only** the opaque Matrix `user_id` and a resolved `display_name`
+/// (best-effort, `null` when the member can't be resolved) so the typing row can
+/// render "<name> is typing…" honestly. No presence, avatars, or crypto material
+/// cross IPC on this VM (AD-1). The SDK already filters the account's own user id
+/// out of the typing stream, so a typist is always another member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TypistVm {
+    /// The typing member's Matrix user id (opaque, passed through verbatim).
+    pub user_id: String,
+    /// The member's resolved display name for the "… is typing" copy, or `null`
+    /// when it can't be resolved (the frontend then falls back to the user id).
+    pub display_name: Option<String>,
+}
+
+/// A batch delivered over the typing subscription's `Channel` (Story 3.9, AD-8,
+/// AD-14).
+///
+/// The full current set of *other* members typing in the open room — inherently
+/// idempotent, safe to re-subscribe. An empty `typists` means nobody is typing
+/// (the frontend renders nothing). The stream opens with the current set, then
+/// emits on every change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TypingBatch {
+    /// The members currently typing (other than the account's own user).
+    pub typists: Vec<TypistVm>,
+}
+
+/// Whether back-pagination is currently running (Story 3.9, pagination, AD-8).
+///
+/// A Rust-authoritative projection of the SDK `PaginationStatus`:  `Paginating`
+/// while a back-pagination request is in flight (the boundary shows a spinner),
+/// `Idle` otherwise. Serializes to its camelCase name. The homeserver-start signal
+/// is carried separately on [`PaginationStatusBatch::hit_start`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PaginationState {
+    /// A back-pagination request is in flight — the boundary shows a spinner.
+    Paginating,
+    /// No back-pagination is running.
+    Idle,
+}
+
+/// A batch delivered over the pagination-status subscription's `Channel` (Story
+/// 3.9, AD-8).
+///
+/// A scalar snapshot of the live back-pagination status, mapped from the SDK
+/// `PaginationStatus`: `state` drives the boundary spinner, and `hit_start` is
+/// `true` once the homeserver has no older history (the boundary then states the
+/// conversation start and no further pagination is attempted). Inherently
+/// idempotent — each batch carries the full current status. Older events
+/// themselves arrive over the existing timeline diff stream (`PushFront`/`Insert`),
+/// never here; this channel carries only the status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PaginationStatusBatch {
+    /// Whether back-pagination is currently in flight.
+    pub state: PaginationState,
+    /// Whether the homeserver start of the room has been reached (no more older
+    /// history). `true` only alongside an `Idle` state.
+    pub hit_start: bool,
 }
 
 /// The durable login-mechanism discriminant of an account (Story 2.5, AD-17).
@@ -1586,6 +1671,7 @@ mod tests {
             reply: None,
             reactions: Vec::new(),
             media: None,
+            readers: Vec::new(),
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(
@@ -1609,6 +1695,7 @@ mod tests {
             reply: None,
             reactions: Vec::new(),
             media: None,
+            readers: Vec::new(),
         }
     }
 
@@ -1683,6 +1770,7 @@ mod tests {
                 },
             ],
             media: None,
+            readers: Vec::new(),
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"isEdited\":true"), "json was: {json}");
@@ -1741,6 +1829,7 @@ mod tests {
             reply: None,
             reactions: Vec::new(),
             media: None,
+            readers: Vec::new(),
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(
@@ -1944,6 +2033,7 @@ mod tests {
                 height: Some(720),
                 caption: None,
             })),
+            readers: Vec::new(),
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"media\":{"), "json was: {json}");
@@ -1965,5 +2055,115 @@ mod tests {
         };
         let json = serde_json::to_string(&snap).expect("serialize snapshot");
         assert!(json.contains("\"kind\":\"snapshot\""), "json was: {json}");
+    }
+
+    #[test]
+    fn message_vm_carries_readers_as_opaque_ids() {
+        // The receipts feature (Story 3.9): a message VM carries the *other*
+        // members whose read receipt sits on it as opaque user ids under
+        // `readers` — camelCase, an array of strings, no avatar/receipt-id fields.
+        let vm = TimelineItemVm::Message {
+            key: "unique-1".to_owned(),
+            sender: "@alice:example.org".to_owned(),
+            sender_display_name: Some("Alice".to_owned()),
+            body: "read by others".to_owned(),
+            timestamp: 1_720_000_000_000,
+            is_own: true,
+            send_state: None,
+            is_edited: false,
+            reply: None,
+            reactions: Vec::new(),
+            media: None,
+            readers: vec![
+                "@bob:example.org".to_owned(),
+                "@carol:example.org".to_owned(),
+            ],
+        };
+        let json = serde_json::to_string(&vm).expect("serialize message vm");
+        assert!(
+            json.contains("\"readers\":[\"@bob:example.org\",\"@carol:example.org\"]"),
+            "json was: {json}"
+        );
+        // No receipt event id crosses on a reader.
+        assert!(
+            !json.contains("receiptId"),
+            "json leaked receipt id: {json}"
+        );
+        let back: TimelineItemVm = serde_json::from_str(&json).expect("deserialize message vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn typist_vm_round_trips_camel_case() {
+        let vm = TypistVm {
+            user_id: "@bob:example.org".to_owned(),
+            display_name: Some("Bob".to_owned()),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize typist");
+        assert!(
+            json.contains("\"userId\":\"@bob:example.org\""),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"displayName\":\"Bob\""), "json was: {json}");
+        let back: TypistVm = serde_json::from_str(&json).expect("deserialize typist");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn typing_batch_round_trips_and_empty_serializes() {
+        let batch = TypingBatch {
+            typists: vec![TypistVm {
+                user_id: "@bob:example.org".to_owned(),
+                display_name: None,
+            }],
+        };
+        let json = serde_json::to_string(&batch).expect("serialize typing batch");
+        assert!(json.contains("\"typists\":["), "json was: {json}");
+        assert!(json.contains("\"displayName\":null"), "json was: {json}");
+        let back: TypingBatch = serde_json::from_str(&json).expect("deserialize typing batch");
+        assert_eq!(back, batch);
+
+        let empty = TypingBatch { typists: vec![] };
+        assert_eq!(
+            serde_json::to_string(&empty).expect("serialize empty"),
+            "{\"typists\":[]}"
+        );
+    }
+
+    #[test]
+    fn pagination_state_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&PaginationState::Paginating).expect("serialize paginating"),
+            "\"paginating\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PaginationState::Idle).expect("serialize idle"),
+            "\"idle\""
+        );
+    }
+
+    #[test]
+    fn pagination_status_batch_round_trips_camel_case() {
+        let batch = PaginationStatusBatch {
+            state: PaginationState::Idle,
+            hit_start: true,
+        };
+        let json = serde_json::to_string(&batch).expect("serialize pagination status");
+        assert!(json.contains("\"state\":\"idle\""), "json was: {json}");
+        assert!(json.contains("\"hitStart\":true"), "json was: {json}");
+        let back: PaginationStatusBatch =
+            serde_json::from_str(&json).expect("deserialize pagination status");
+        assert_eq!(back, batch);
+
+        let paginating = PaginationStatusBatch {
+            state: PaginationState::Paginating,
+            hit_start: false,
+        };
+        let json = serde_json::to_string(&paginating).expect("serialize paginating");
+        assert!(
+            json.contains("\"state\":\"paginating\""),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"hitStart\":false"), "json was: {json}");
     }
 }

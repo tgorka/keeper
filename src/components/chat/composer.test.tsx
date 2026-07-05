@@ -314,3 +314,71 @@ describe("Composer", () => {
     expect(attachmentsStore.getState().pending).toHaveLength(1);
   });
 });
+
+describe("Composer typing notices (Story 3.9)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.runOnlyPendingTimers();
+    vi.useRealTimers();
+  });
+
+  it("emits setTyping(true) on non-empty input, throttled to at most once per 3s", () => {
+    const onTyping = vi.fn();
+    render(<Composer onSend={vi.fn()} onTyping={onTyping} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+
+    fireEvent.change(textarea, { target: { value: "h" } });
+    fireEvent.change(textarea, { target: { value: "he" } });
+    fireEvent.change(textarea, { target: { value: "hel" } });
+    // Throttled: only one `true` within the 3s window despite three keystrokes.
+    expect(onTyping.mock.calls.filter(([t]) => t === true)).toHaveLength(1);
+  });
+
+  it("stops typing (setTyping(false)) after ~5s idle", () => {
+    const onTyping = vi.fn();
+    render(<Composer onSend={vi.fn()} onTyping={onTyping} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+
+    fireEvent.change(textarea, { target: { value: "typing" } });
+    expect(onTyping).toHaveBeenLastCalledWith(true);
+    vi.advanceTimersByTime(5000);
+    expect(onTyping).toHaveBeenLastCalledWith(false);
+  });
+
+  it("stops typing immediately when the draft is cleared to empty", () => {
+    const onTyping = vi.fn();
+    render(<Composer onSend={vi.fn()} onTyping={onTyping} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+
+    fireEvent.change(textarea, { target: { value: "hi" } });
+    onTyping.mockClear();
+    fireEvent.change(textarea, { target: { value: "" } });
+    expect(onTyping).toHaveBeenCalledWith(false);
+  });
+
+  it("stops typing on blur", () => {
+    const onTyping = vi.fn();
+    render(<Composer onSend={vi.fn()} onTyping={onTyping} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+
+    fireEvent.change(textarea, { target: { value: "hi" } });
+    onTyping.mockClear();
+    fireEvent.blur(textarea);
+    expect(onTyping).toHaveBeenCalledWith(false);
+  });
+
+  it("stops typing when the message is sent", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    const onTyping = vi.fn();
+    render(<Composer onSend={onSend} onTyping={onTyping} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+
+    fireEvent.change(textarea, { target: { value: "hello" } });
+    onTyping.mockClear();
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    // The stop fires synchronously at the start of send, before the async dispatch.
+    expect(onTyping).toHaveBeenCalledWith(false);
+  });
+});

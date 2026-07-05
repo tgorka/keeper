@@ -16,27 +16,50 @@
  */
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { PanelRight } from "lucide-react";
-import { type KeyboardEvent, type Ref, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type KeyboardEvent,
+  type Ref,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { Composer } from "@/components/chat/composer";
 import { DeleteMessageDialog } from "@/components/chat/delete-message-dialog";
+import { HistoryBoundary, type HistoryBoundaryState } from "@/components/chat/history-boundary";
 import { MediaPreviewOverlay } from "@/components/chat/media-preview-overlay";
 import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble";
 import { RedactedStub } from "@/components/chat/redacted-stub";
+import { TypingIndicator } from "@/components/chat/typing-indicator";
 import { UtdStub } from "@/components/chat/utd-stub";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { TimelineBatch, TimelineItemVm } from "@/lib/ipc/client";
+import type {
+  PaginationStatusBatch,
+  TimelineBatch,
+  TimelineItemVm,
+  TypingBatch,
+  TypistVm,
+} from "@/lib/ipc/client";
 import {
   cancelSend,
   editMessage,
+  markRoomRead,
+  paginateBackwards,
   retrySend,
   sendAttachmentBytes,
   sendAttachmentPath,
   sendReply,
   sendText,
+  setTyping,
+  subscribePaginationStatus,
   subscribeTimeline,
+  subscribeTyping,
   toggleReaction,
+  unsubscribePaginationStatus,
   unsubscribeTimeline,
+  unsubscribeTyping,
 } from "@/lib/ipc/client";
 import { useAccountStatus } from "@/lib/stores/account-status";
 import { attachmentId, attachmentsStore, type PendingAttachment } from "@/lib/stores/attachments";
@@ -48,6 +71,36 @@ import { timelineStore, useTimelineStore } from "@/lib/stores/timeline";
 function previewOf(body: string): string {
   const collapsed = body.replace(/\s+/g, " ").trim();
   return collapsed.length > 120 ? `${collapsed.slice(0, 120)}…` : collapsed;
+}
+
+/** Distance from the bottom (px) still counted as "near the bottom" for auto-scroll. */
+const NEAR_BOTTOM_PX = 80;
+/** Distance from the top (px) that triggers a back-pagination fetch. */
+const NEAR_TOP_PX = 200;
+/** Number of older events to request per back-pagination. */
+const PAGINATE_BATCH = 40;
+/** Debounce before re-marking the room read after new content arrives while open. */
+const MARK_READ_DEBOUNCE_MS = 1000;
+
+/**
+ * Classify a streamed timeline batch so the scroll layout effect can tell an
+ * older-history prepend (preserve the visual position) from a bottom-append (a
+ * new message — never yank the view) from a wholesale reset (anchor to bottom).
+ * Older history arrives as `pushFront`/`insert`-at-index-0; a `reset` replaces
+ * the contents. A single `scrollHeight` delta cannot distinguish these, so we
+ * read the ops directly.
+ */
+function classifyBatch(batch: TimelineBatch): "reset" | "prepend" | "other" {
+  let prepend = false;
+  for (const op of batch.ops) {
+    if (op.op === "reset") {
+      return "reset";
+    }
+    if (op.op === "pushFront" || (op.op === "insert" && op.index === 0)) {
+      prepend = true;
+    }
+  }
+  return prepend ? "prepend" : "other";
 }
 
 interface ConversationPaneProps {
@@ -151,7 +204,34 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
   // The opaque render key of the own message pending a delete-for-everyone
   // confirmation, or `null` when the dialog is closed (Story 3.8).
   const [deleteKey, setDeleteKey] = useState<string | null>(null);
+  // The members currently typing in the open room (Story 3.9), and the live
+  // back-pagination status. Both are pure Rust-streamed mirrors reset on room change.
+  const [typists, setTypists] = useState<TypistVm[]>([]);
+  const [pagination, setPagination] = useState<PaginationStatusBatch>({
+    state: "idle",
+    hitStart: false,
+  });
+  // Whether a pagination request the frontend fired is in flight (drives the
+  // spinner immediately, before the status stream reports `paginating`, and gates
+  // the top-scroll trigger from firing again).
+  const [paginationError, setPaginationError] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Scroll-preservation bookkeeping (Story 3.9): the scrollHeight captured *before*
+  // the last applied batch, and whether the user was near the bottom then. On the
+  // next layout after items change we either compensate scrollTop for a prepend
+  // (older history) or auto-scroll to the bottom for near-bottom bottom-growth.
+  const prevScrollHeight = useRef(0);
+  const wasNearBottom = useRef(true);
+  const prevItemCount = useRef(0);
+  // The kind of the most recently applied batch (reset / prepend / other), so the
+  // scroll layout effect compensates only a genuine older-history prepend and
+  // never yanks the view on a bottom-append.
+  const lastBatchKind = useRef<"reset" | "prepend" | "other">("reset");
+  // Guard so we fire at most one back-pagination at a time from the scroll trigger.
+  const paginatingRef = useRef(false);
+  // The newest item key already marked read, so the read receipt re-advances at
+  // most once per new-content settle (debounced) while the room stays open.
+  const lastMarkedKey = useRef<string | null>(null);
 
   // The body to prefill the composer with when entering edit mode (the target
   // message's current body), or `null` outside edit.
@@ -176,6 +256,9 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
       setLoaded(false);
       setPreviewKey(null);
       setDeleteKey(null);
+      setTypists([]);
+      setPagination({ state: "idle", hitStart: false });
+      setPaginationError(false);
       return;
     }
 
@@ -183,6 +266,15 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     setLoaded(false);
     setPreviewKey(null);
     setDeleteKey(null);
+    setTypists([]);
+    setPagination({ state: "idle", hitStart: false });
+    setPaginationError(false);
+    paginatingRef.current = false;
+    prevScrollHeight.current = 0;
+    wasNearBottom.current = true;
+    prevItemCount.current = 0;
+    lastBatchKind.current = "reset";
+    lastMarkedKey.current = null;
     // Establish clean state at mount so the newest mount always wins; clearing
     // in cleanup instead would race the next room's mount.
     timelineStore.getState().clear();
@@ -198,6 +290,15 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     // batches never mutate the store).
     const onBatch = (b: TimelineBatch) => {
       if (!cancelled) {
+        // Capture pre-mutation scroll metrics so the layout effect can preserve the
+        // user's visual position when older history prepends (Story 3.9): the
+        // height before this batch and whether the user was near the bottom.
+        const el = scrollRef.current;
+        if (el) {
+          prevScrollHeight.current = el.scrollHeight;
+          wasNearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+        }
+        lastBatchKind.current = classifyBatch(b);
         timelineStore.getState().applyBatch(b);
         setLoaded(true);
       }
@@ -225,6 +326,85 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
       timelineStore.getState().clear();
     };
   }, [accountId, selectedRoomId]);
+
+  // Typing + back-pagination status subscriptions (Story 3.9). Both are opened on
+  // room view and torn down on room change / unmount (mirroring the timeline
+  // subscription lifecycle). The typing set and pagination status are pure
+  // Rust-streamed mirrors — the frontend renders them, never derives them. Marking
+  // the room read on view emits a public `m.read` receipt (best-effort).
+  useEffect(() => {
+    if (accountId === null || selectedRoomId === null) {
+      return;
+    }
+    let cancelled = false;
+    let typingSub: number | null = null;
+    let paginationSub: number | null = null;
+
+    subscribeTyping(accountId, selectedRoomId, (b: TypingBatch) => {
+      if (!cancelled) {
+        setTypists(b.typists);
+      }
+    })
+      .then((id) => {
+        if (cancelled) {
+          void unsubscribeTyping(accountId, id);
+          return;
+        }
+        typingSub = id;
+      })
+      .catch(() => {});
+
+    subscribePaginationStatus(accountId, selectedRoomId, (b: PaginationStatusBatch) => {
+      if (!cancelled) {
+        // Mirror the SDK-streamed status verbatim. The in-flight guard and the
+        // inline error are owned by the fetch promise (see `runPaginate`), not the
+        // status stream — an idle/paginating batch must never silently clear a
+        // genuine error boundary the user still needs to see and retry.
+        setPagination(b);
+      }
+    })
+      .then((id) => {
+        if (cancelled) {
+          void unsubscribePaginationStatus(accountId, id);
+          return;
+        }
+        paginationSub = id;
+      })
+      .catch(() => {});
+
+    // Mark the room read on view (best-effort — swallow any rejection).
+    markRoomRead(accountId, selectedRoomId).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (typingSub !== null) {
+        void unsubscribeTyping(accountId, typingSub);
+      }
+      if (paginationSub !== null) {
+        void unsubscribePaginationStatus(accountId, paginationSub);
+      }
+    };
+  }, [accountId, selectedRoomId]);
+
+  // Re-mark the room read when new content settles while it stays open (Story 3.9),
+  // so the user's public `m.read` advances past messages read in place — not only
+  // at room-open. Debounced so a burst of incoming events emits a single receipt on
+  // the newest item; best-effort (swallow rejections). The mark-on-view above still
+  // handles the initial open promptly.
+  useEffect(() => {
+    if (accountId === null || selectedRoomId === null || items.length === 0) {
+      return;
+    }
+    const newestKey = items[items.length - 1]?.key ?? null;
+    if (newestKey === null || newestKey === lastMarkedKey.current) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      lastMarkedKey.current = newestKey;
+      markRoomRead(accountId, selectedRoomId).catch(() => {});
+    }, MARK_READ_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [items, accountId, selectedRoomId]);
 
   // Native drag-drop ingestion (Story 3.7): while a room is open, a file dropped
   // anywhere on the window yields OS **paths** (Rust reads the files — no bytes
@@ -276,19 +456,58 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     };
   }, [accountId, selectedRoomId]);
 
-  // Bottom-anchor the scroll region: keep the newest message in view whenever
-  // the streamed timeline changes (a `Reset` snapshot or a live diff). This is a
-  // plain always-scroll-to-bottom — no auto-follow tuning / jump-to-bottom
-  // (Epic 3 polish). Short lists rest at the bottom via the `mt-auto` content.
-  useEffect(() => {
+  // Scroll management on timeline change (Story 3.9). Preserves the user's visual
+  // position when older history prepends (compensating scrollTop by the height
+  // delta) so a ≥10k-event back-scroll never yanks the view, and only auto-scrolls
+  // to the bottom on bottom-growth when the user was already near the bottom. A
+  // `Reset` snapshot (first load / re-subscribe) always anchors to the bottom.
+  // Runs in a layout effect so the scroll adjust happens before paint (no flicker).
+  useLayoutEffect(() => {
     const el = scrollRef.current;
-    if (el && items.length > 0) {
+    if (!el || items.length === 0) {
+      prevItemCount.current = items.length;
+      return;
+    }
+    const kind = lastBatchKind.current;
+    const heightDelta = el.scrollHeight - prevScrollHeight.current;
+
+    if (kind === "reset" || prevItemCount.current === 0 || items.length < prevItemCount.current) {
+      // A wholesale reset (first load / re-subscribe) or a shrink: anchor to the bottom.
+      el.scrollTop = el.scrollHeight;
+    } else if (kind === "prepend" && !wasNearBottom.current) {
+      // Older history prepended while the user reads up-timeline: preserve the
+      // visual position by compensating scrollTop for the added height (no yank).
+      if (heightDelta > 0) {
+        el.scrollTop += heightDelta;
+      }
+    } else if (wasNearBottom.current) {
+      // Bottom growth (a new message) while the user was near the bottom: follow it.
       el.scrollTop = el.scrollHeight;
     }
+    // A bottom-append while scrolled up (reading history): leave scrollTop untouched
+    // so the newly arrived message below the viewport never jolts the view down.
+    prevItemCount.current = items.length;
   }, [items]);
 
   const rows = toRenderedRows(items);
   const roomLoaded = accountId !== null && selectedRoomId !== null && loaded && !errored;
+
+  // The honest history-boundary state (Story 3.9), in precedence order: the
+  // homeserver start is a definitive truth (no more history), so it wins; offline
+  // is next because when disconnected we genuinely cannot load more — it overrides
+  // a transient in-flight spinner or a stale retriable error so the boundary stops
+  // rather than spins forever (epic UX honesty rule); then a failed fetch shows a
+  // retriable error; then the in-flight spinner; otherwise nothing (idle — more
+  // history may exist, the near-top scroll trigger paginates).
+  const boundaryState: HistoryBoundaryState = pagination.hitStart
+    ? "atStart"
+    : offline
+      ? "offline"
+      : paginationError
+        ? "error"
+        : pagination.state === "paginating"
+          ? "paginating"
+          : "idle";
 
   const onSend = useCallback(
     async (body: string) => {
@@ -318,6 +537,82 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     },
     [accountId, selectedRoomId],
   );
+
+  // Emit the account's typing notice (Story 3.9). Best-effort: swallow rejections so
+  // a typing dispatch is never an unhandled promise or a UI error.
+  const onTyping = useCallback(
+    (typing: boolean) => {
+      if (accountId === null || selectedRoomId === null) {
+        return;
+      }
+      setTyping(accountId, selectedRoomId, typing).catch(() => {});
+    },
+    [accountId, selectedRoomId],
+  );
+
+  // Fire a back-pagination when the user scrolls near the top (Story 3.9), gated so
+  // it never spins forever: skip while a request is in flight, when the homeserver
+  // start is reached, or when offline (the boundary states offline instead). Older
+  // events arrive over the timeline diff stream and prepend in place (the layout
+  // effect preserves scroll). A failure surfaces a retriable inline boundary error.
+  // Single-flight back-pagination fetch. `paginatingRef` is the sole in-flight
+  // guard (cleared unconditionally when the promise settles); the resolved boolean
+  // is authoritative for reaching the homeserver start, so pagination stops even if
+  // the status stream is slow or silent, and a failure sets a sticky retriable error.
+  const runPaginate = useCallback(() => {
+    // `paginatingRef` is the sole in-flight guard: enforce it here so *every*
+    // entry point (the near-top scroll trigger and the boundary Retry button) is
+    // single-flight, not only the scroll path — a rapid Retry can no longer admit
+    // a concurrent fetch.
+    if (accountId === null || selectedRoomId === null || paginatingRef.current) {
+      return;
+    }
+    paginatingRef.current = true;
+    paginateBackwards(accountId, selectedRoomId, PAGINATE_BATCH)
+      .then((hitStart) => {
+        if (hitStart) {
+          setPagination((p) => ({ ...p, state: "idle", hitStart: true }));
+        }
+      })
+      .catch(() => {
+        // A failed pagination surfaces a retriable inline boundary error (and stops
+        // the spinner); it persists until the user retries — the status stream no
+        // longer clears it.
+        setPaginationError(true);
+      })
+      .finally(() => {
+        paginatingRef.current = false;
+      });
+  }, [accountId, selectedRoomId]);
+
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (el === null) {
+      return;
+    }
+    if (
+      el.scrollTop > NEAR_TOP_PX ||
+      paginatingRef.current ||
+      pagination.hitStart ||
+      pagination.state === "paginating" ||
+      offline ||
+      paginationError
+    ) {
+      return;
+    }
+    runPaginate();
+  }, [runPaginate, offline, pagination, paginationError]);
+
+  // Retry a failed pagination from the boundary's Retry button (Story 3.9). Guarded
+  // on offline so a retry that would immediately re-fail is not offered while
+  // disconnected (the boundary shows the offline state instead).
+  const onRetryPagination = useCallback(() => {
+    if (offline) {
+      return;
+    }
+    setPaginationError(false);
+    runPaginate();
+  }, [runPaginate, offline]);
 
   const onRetry = useCallback(
     (key: string) => {
@@ -597,11 +892,17 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
           ref={scrollRef}
           className="flex min-h-0 flex-1 flex-col overflow-y-auto"
           onKeyDown={onKeyDown}
+          onScroll={onScroll}
         >
           <ol
             aria-label="Messages"
             className="mx-auto mt-auto flex w-full max-w-[720px] flex-col px-4 py-4"
           >
+            {/* Top-of-timeline history boundary (Story 3.9): spinner while
+                paginating, offline stop, or "start of the conversation". */}
+            <li aria-hidden={boundaryState === "idle"}>
+              <HistoryBoundary state={boundaryState} onRetry={onRetryPagination} />
+            </li>
             {rows.map((row) =>
               row.kind === "utd" ? (
                 <li key={row.item.key}>
@@ -637,6 +938,9 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
       {selectedRoomId !== null && (
         <div className="shrink-0 border-border border-t">
           <div className="mx-auto w-full max-w-[720px] px-4 py-3">
+            {/* Typing indicator (Story 3.9): "<name> is typing…" between the
+                timeline and composer; renders an empty live region when idle. */}
+            <TypingIndicator typists={typists} />
             <Composer
               key={selectedRoomId}
               onSend={onSend}
@@ -646,6 +950,7 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
               editPrefill={editPrefill}
               onCancelPending={onCancelPending}
               onEmptyArrowUp={onComposerArrowUp}
+              onTyping={onTyping}
             />
           </div>
         </div>

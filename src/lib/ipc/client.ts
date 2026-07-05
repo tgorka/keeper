@@ -24,6 +24,8 @@ export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { MediaKindVm } from "./gen/MediaKindVm";
 export type { MediaVm } from "./gen/MediaVm";
+export type { PaginationState } from "./gen/PaginationState";
+export type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
@@ -36,6 +38,8 @@ export type { SendState } from "./gen/SendState";
 export type { TimelineBatch } from "./gen/TimelineBatch";
 export type { TimelineItemVm } from "./gen/TimelineItemVm";
 export type { TimelineOp } from "./gen/TimelineOp";
+export type { TypingBatch } from "./gen/TypingBatch";
+export type { TypistVm } from "./gen/TypistVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
 
@@ -44,8 +48,10 @@ import type { BackupStatus } from "./gen/BackupStatus";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 import type { InboxBatch } from "./gen/InboxBatch";
+import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { TimelineBatch } from "./gen/TimelineBatch";
+import type { TypingBatch } from "./gen/TypingBatch";
 import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 
 /**
@@ -687,4 +693,99 @@ export async function cancelSend(
   itemKey: string,
 ): Promise<void> {
   await invoke<void>("cancel_send", { accountId, roomId, itemKey });
+}
+
+/**
+ * Mark the open room read (Story 3.9, receipts, AD-14). The Rust core dispatches a
+ * public `m.read` receipt on the room's latest event through the receipt/typing
+ * signals seam — other Matrix clients observe the advance. Best-effort: a
+ * receipt-dispatch failure is swallowed in the core (never a UI error), so this
+ * resolves even then. Callers may fire-and-forget and swallow rejections. Rejects
+ * with the {@link IpcError} envelope (`code: "timelineUnavailable"`) only when the
+ * room isn't open.
+ */
+export async function markRoomRead(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("mark_room_read", { accountId, roomId });
+}
+
+/**
+ * Set (or clear) the account's typing notice in the open room (Story 3.9, typing,
+ * AD-14). The Rust core emits a normal (non-private) typing notification through
+ * the receipt/typing signals seam. Best-effort: a dispatch failure is swallowed in
+ * the core (typing is never a UI error). Callers fire-and-forget and swallow
+ * rejections.
+ */
+export async function setTyping(accountId: string, roomId: string, typing: boolean): Promise<void> {
+  await invoke<void>("set_typing", { accountId, roomId, typing });
+}
+
+/**
+ * Back-paginate the open room's timeline (Story 3.9, pagination). The Rust core
+ * fetches up to `numEvents` older events; they arrive back over the room's existing
+ * timeline subscription (no second channel — the store applies the prepend ops).
+ * Resolves with whether the homeserver start of the room was reached (no more older
+ * history). Rejects with the {@link IpcError} envelope (`code:
+ * "timelineUnavailable"`, `retriable: true`) on a pagination failure so the
+ * boundary can show a retriable inline error, not an infinite spinner.
+ */
+export async function paginateBackwards(
+  accountId: string,
+  roomId: string,
+  numEvents: number,
+): Promise<boolean> {
+  return await invoke<boolean>("paginate_backwards", { accountId, roomId, numEvents });
+}
+
+/**
+ * Subscribe to the open room's typing notifications (Story 3.9, typing, AD-8,
+ * AD-14). Opens a `Channel`, forwards each {@link TypingBatch} (the current set of
+ * *other* members typing, each with a resolved display name) to `onBatch` in
+ * arrival order (an initial empty snapshot before any change), and resolves with
+ * the subscription id. Only opaque user ids + display names cross IPC. Rejects with
+ * the {@link IpcError} envelope (`code: "timelineUnavailable"`) if the room isn't
+ * open.
+ */
+export async function subscribeTyping(
+  accountId: string,
+  roomId: string,
+  onBatch: (batch: TypingBatch) => void,
+): Promise<number> {
+  return await subscribe<TypingBatch>("typing_subscribe", onBatch, { accountId, roomId });
+}
+
+/**
+ * Unsubscribe exactly one typing subscription, aborting its backend producer task
+ * and dropping the SDK typing event handler (AD-19). Idempotent — an unknown id is
+ * a no-op.
+ */
+export async function unsubscribeTyping(accountId: string, id: number): Promise<void> {
+  await invoke<void>("typing_unsubscribe", { accountId, subscriptionId: id });
+}
+
+/**
+ * Subscribe to the open room's live back-pagination status (Story 3.9, pagination,
+ * AD-8). Opens a `Channel`, forwards each {@link PaginationStatusBatch} (a scalar
+ * snapshot: `paginating`/`idle` + `hitStart`) to `onBatch` in arrival order (an
+ * initial snapshot before any change), and resolves with the subscription id. The
+ * status drives the honest history-boundary row; older events themselves arrive
+ * over the timeline subscription, never here. Rejects with the {@link IpcError}
+ * envelope (`code: "timelineUnavailable"`) if the room isn't open.
+ */
+export async function subscribePaginationStatus(
+  accountId: string,
+  roomId: string,
+  onBatch: (batch: PaginationStatusBatch) => void,
+): Promise<number> {
+  return await subscribe<PaginationStatusBatch>("pagination_status_subscribe", onBatch, {
+    accountId,
+    roomId,
+  });
+}
+
+/**
+ * Unsubscribe exactly one pagination-status subscription, aborting its backend
+ * producer task (AD-19). Idempotent — an unknown id is a no-op.
+ */
+export async function unsubscribePaginationStatus(accountId: string, id: number): Promise<void> {
+  await invoke<void>("pagination_status_unsubscribe", { accountId, subscriptionId: id });
 }

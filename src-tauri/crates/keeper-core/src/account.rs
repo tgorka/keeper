@@ -49,11 +49,12 @@ use crate::media::{self, MediaBytes, MediaHandle, MediaVariant};
 use crate::platform::Platform;
 use crate::registry;
 use crate::send::{self, SendTrigger};
+use crate::signals;
 use crate::timeline;
 use crate::verification::{self, VerificationSink};
 use crate::vm::{
     ConnectionStatus, ConnectionStatusBatch, EncryptionStatus, EncryptionStatusBatch, InboxBatch,
-    RoomListBatch, RoomListOp, RoomVm, TimelineBatch,
+    PaginationStatusBatch, RoomListBatch, RoomListOp, RoomVm, TimelineBatch, TypingBatch, TypistVm,
 };
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
@@ -61,6 +62,10 @@ const ROOM_LIST_PAGE_SIZE: usize = 200;
 
 /// Defensive upper bound on a rendered message preview before it crosses IPC.
 const MAX_PREVIEW_CHARS: usize = 256;
+
+/// Defensive upper bound on a single back-pagination request from the webview
+/// (AD-4 trust boundary): the UI pages in batches of 40, so 200 is generous.
+const MAX_PAGINATE_EVENTS: u16 = 200;
 
 /// Sink that receives each produced [`RoomListBatch`]. The shell wraps a Tauri
 /// `Channel::send`; tests capture into a vector. Returns `true` if the batch was
@@ -86,6 +91,17 @@ pub type EncryptionSink = Box<dyn Fn(EncryptionStatusBatch) -> bool + Send + Syn
 /// `Channel::send`; tests capture into a vector. Returns `true` if the batch was
 /// delivered, `false` if the channel is closed (the merger stops emitting).
 pub type InboxSink = Box<dyn Fn(InboxBatch) -> bool + Send + Sync>;
+
+/// Sink that receives each produced [`TypingBatch`] (Story 3.9, AD-14). The shell
+/// wraps a Tauri `Channel::send`; tests capture into a vector. Returns `true` if
+/// the batch was delivered, `false` if the channel is closed (the producer stops).
+pub type TypingSink = Box<dyn Fn(TypingBatch) -> bool + Send + Sync>;
+
+/// Sink that receives each produced [`PaginationStatusBatch`] (Story 3.9). The
+/// shell wraps a Tauri `Channel::send`; tests capture into a vector. Returns
+/// `true` if the batch was delivered, `false` if the channel is closed (the
+/// producer then stops).
+pub type PaginationSink = Box<dyn Fn(PaginationStatusBatch) -> bool + Send + Sync>;
 
 /// Registry of an account's live open room timelines, keyed by the *timeline*
 /// subscription id → its room id and the exact `Arc<Timeline>` that produced the
@@ -1457,6 +1473,254 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Mark the room read on `account_id` — dispatch a public `m.read` receipt on
+    /// the room's latest event through the receipt/typing signals seam (Story 3.9,
+    /// AD-14). Resolves the room's open `Arc<Timeline>` and delegates to
+    /// [`signals::mark_read`]. Best-effort: a dispatch failure is logged and
+    /// swallowed (returns `Ok(())`) so a receipt failure is never a UI error; other
+    /// clients simply don't observe the advance until the next successful mark.
+    ///
+    /// Errors: an unparsable/unknown room id → [`TimelineError::RoomNotFound`]; a
+    /// room with no open timeline → [`TimelineError::RoomNotFound`] (the room must
+    /// be open to mark it read). A best-effort receipt-dispatch failure is NOT an
+    /// error — it is logged and swallowed.
+    pub async fn mark_room_read(&self, account_id: &str, room_id: &str) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let timeline = self
+            .open_timeline_for(account_id, &room_id)
+            .await
+            .map_err(|_| TimelineError::RoomNotFound)?;
+        match signals::mark_read(&timeline).await {
+            Ok(marked) => {
+                if marked {
+                    tracing::debug!(account_id = %account_id, room_id = %room_id, "room marked read");
+                }
+            }
+            // Best-effort (I/O matrix): a receipt-dispatch failure is logged and
+            // swallowed — never surfaced as a UI error.
+            Err(e) => {
+                tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "mark-read dispatch failed (best-effort)");
+            }
+        }
+        Ok(())
+    }
+
+    /// Set (or clear) the account's typing notice in the room through the
+    /// receipt/typing signals seam (Story 3.9, AD-14). Resolves the account's live
+    /// `Room` and delegates to [`signals::set_typing`]. Best-effort: a dispatch
+    /// failure is logged and swallowed (returns `Ok(())`) — typing is never a UI
+    /// error.
+    ///
+    /// Errors: an unparsable/unknown room id, or an account that isn't live →
+    /// [`TimelineError::RoomNotFound`]. A best-effort typing-dispatch failure is NOT
+    /// an error — it is logged and swallowed.
+    pub async fn set_typing(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        typing: bool,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+        if let Err(e) = signals::set_typing(&room, typing).await {
+            tracing::debug!(account_id = %account_id, room_id = %room_id, typing, error = %e, "typing dispatch failed (best-effort)");
+        }
+        Ok(())
+    }
+
+    /// Back-paginate the room's live timeline by up to `num_events` older events
+    /// (Story 3.9, pagination). Resolves the room's open `Arc<Timeline>` and
+    /// delegates to [`timeline::paginate_backwards`]; the older events arrive over
+    /// the room's existing timeline subscription (this synthesizes nothing).
+    /// Returns whether the homeserver start of the room was reached.
+    ///
+    /// Errors: an unparsable/unknown room id, or a room with no open timeline →
+    /// [`TimelineError::RoomNotFound`]; an SDK pagination failure →
+    /// [`TimelineError::Build`] (both funnel to the retriable `TimelineUnavailable`
+    /// code so the boundary shows a retriable inline error, not an infinite spinner).
+    pub async fn paginate_backwards(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        num_events: u16,
+    ) -> Result<bool, CoreError> {
+        // The webview is the trust boundary (AD-4): clamp the caller-provided count
+        // to a sane page size so no renderer call (or future bug) can request an
+        // outsized back-fill. The UI paginates in pages of `PAGINATE_BATCH` (40).
+        let num_events = num_events.clamp(1, MAX_PAGINATE_EVENTS);
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let timeline = self
+            .open_timeline_for(account_id, &room_id)
+            .await
+            .map_err(|_| TimelineError::RoomNotFound)?;
+        let hit_start = timeline::paginate_backwards(&timeline, num_events).await?;
+        tracing::debug!(account_id = %account_id, room_id = %room_id, hit_start, "back-paginated");
+        Ok(hit_start)
+    }
+
+    /// Subscribe to the room's typing notifications (Story 3.9, AD-14, AD-19).
+    /// Resolves the account's live `Room`, spawns a supervised producer over the
+    /// SDK typing broadcast (via [`signals::subscribe_typing`]) that resolves each
+    /// typing member's display name (`room.get_member_no_sync`) and streams a
+    /// [`TypingBatch`] into `sink`, and returns the subscription id.
+    ///
+    /// Mirrors [`subscribe_connection_status`]'s supervised-task + self-reap
+    /// lifecycle: the `JoinHandle` registers in the account's `subscriptions` map
+    /// and is aborted on unsubscribe / shutdown (AD-19). The SDK typing
+    /// event-handler is dropped with the producer (its `EventHandlerDropGuard` is
+    /// held for the producer's lifetime). A room-not-found / inactive account
+    /// funnels to `TimelineUnavailable`.
+    pub async fn subscribe_typing(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        sink: TypingSink,
+    ) -> Result<u64, CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let (room, subs_arc) = {
+            let accounts = self.accounts.lock().await;
+            let handle = accounts
+                .get(account_id)
+                .ok_or(TimelineError::RoomNotFound)?;
+            let room = handle
+                .client
+                .get_room(&room_id)
+                .ok_or(TimelineError::RoomNotFound)?;
+            (room, handle.subscriptions.clone())
+        };
+
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let account_id_owned = account_id.to_owned();
+        let span =
+            tracing::info_span!("typing_producer", account_id = %account_id, room_id = %room_id);
+        let reaper_subs = subs_arc.clone();
+        let task = tokio::spawn(
+            async move {
+                run_typing_producer(room, sink, &account_id_owned).await;
+                reaper_subs.lock().await.remove(&subscription_id);
+            }
+            .instrument(span),
+        );
+
+        {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(_) => {
+                    subs_arc.lock().await.insert(subscription_id, task);
+                }
+                None => {
+                    task.abort();
+                    return Err(TimelineError::RoomNotFound.into());
+                }
+            }
+        }
+        tracing::info!(account_id = %account_id, subscription_id, room_id = %room_id, "typing subscribed");
+        Ok(subscription_id)
+    }
+
+    /// Abort exactly the typing producer task for `subscription_id` (Story 3.9);
+    /// other account state is untouched. Idempotent.
+    pub async fn unsubscribe_typing(&self, account_id: &str, subscription_id: u64) {
+        if self.abort_subscription(account_id, subscription_id).await {
+            tracing::info!(account_id = %account_id, subscription_id, "typing unsubscribed");
+        }
+    }
+
+    /// Subscribe to the room's live back-pagination status (Story 3.9, AD-19).
+    /// Resolves the room's open `Arc<Timeline>` (the exact instance feeding the
+    /// timeline subscription — the room must be open), spawns a supervised
+    /// [`timeline::run_pagination_status_producer`] that streams a
+    /// [`PaginationStatusBatch`] into `sink`, and returns the subscription id.
+    ///
+    /// Mirrors [`subscribe_connection_status`]'s supervised-task + self-reap
+    /// lifecycle: the `JoinHandle` registers in the account's `subscriptions` map
+    /// and is aborted on unsubscribe / shutdown (AD-19). A room-not-found / no-open-
+    /// timeline funnels to `TimelineUnavailable`.
+    pub async fn subscribe_pagination_status(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        sink: PaginationSink,
+    ) -> Result<u64, CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let (timeline, subs_arc) = {
+            let accounts = self.accounts.lock().await;
+            let handle = accounts
+                .get(account_id)
+                .ok_or(TimelineError::RoomNotFound)?;
+            let subs = handle.subscriptions.clone();
+            drop(accounts);
+            // Resolve the newest open `Arc<Timeline>` for the room (mirrors the
+            // send path). The room must be open (its timeline subscribed).
+            let timeline = self
+                .open_timeline_for(account_id, &room_id)
+                .await
+                .map_err(|_| TimelineError::RoomNotFound)?;
+            (timeline, subs)
+        };
+
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let span = tracing::info_span!(
+            "pagination_status_producer",
+            account_id = %account_id,
+            room_id = %room_id
+        );
+        let reaper_subs = subs_arc.clone();
+        let task = tokio::spawn(
+            async move {
+                timeline::run_pagination_status_producer(timeline, sink).await;
+                reaper_subs.lock().await.remove(&subscription_id);
+            }
+            .instrument(span),
+        );
+
+        {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(_) => {
+                    subs_arc.lock().await.insert(subscription_id, task);
+                }
+                None => {
+                    task.abort();
+                    return Err(TimelineError::RoomNotFound.into());
+                }
+            }
+        }
+        tracing::info!(account_id = %account_id, subscription_id, room_id = %room_id, "pagination status subscribed");
+        Ok(subscription_id)
+    }
+
+    /// Abort exactly the pagination-status producer task for `subscription_id`
+    /// (Story 3.9); other account state is untouched. Idempotent.
+    pub async fn unsubscribe_pagination_status(&self, account_id: &str, subscription_id: u64) {
+        if self.abort_subscription(account_id, subscription_id).await {
+            tracing::info!(account_id = %account_id, subscription_id, "pagination status unsubscribed");
+        }
+    }
+
+    /// Resolve the account's live `Room` for `room_id`, or a typed
+    /// [`TimelineError::RoomNotFound`] when the account isn't live or the room is
+    /// unknown. Used by the typing signal (which needs a `Room`, not a `Timeline`).
+    async fn room_for(
+        &self,
+        account_id: &str,
+        room_id: &RoomId,
+    ) -> Result<matrix_sdk::Room, CoreError> {
+        let accounts = self.accounts.lock().await;
+        let handle = accounts
+            .get(account_id)
+            .ok_or(TimelineError::RoomNotFound)?;
+        handle
+            .client
+            .get_room(room_id)
+            .ok_or_else(|| TimelineError::RoomNotFound.into())
+    }
+
     /// Resolve a `keeper-media://` handle to its decrypted bytes for the
     /// custom-protocol handler (Story 3.6, FR-13, AD-4). Resolves the account's
     /// live `Client` and the room's open `Arc<Timeline>`, then delegates to
@@ -1815,6 +2079,62 @@ async fn run_connection_producer(
         }
     }
     tracing::info!(account_id = %account_id, "connection status stream ended");
+}
+
+/// Drive the room's typing stream: emit the current (empty) typing set as an
+/// initial snapshot, then a [`TypingBatch`] on every typing change, resolving each
+/// typing member's display name (Story 3.9, AD-14). Stops when the sink reports the
+/// channel closed or the broadcast sender is dropped (the room/account went away).
+///
+/// The SDK typing broadcast already filters the account's own user id out, so every
+/// id is another member. Display names are resolved via `room.get_member_no_sync`
+/// (no network round-trip on the typing hot path); an unresolvable member carries a
+/// `null` display name (the frontend falls back to the id). The SDK event-handler
+/// drop guard is held for the whole loop so the handler is unregistered on stop.
+/// A `Lagged` broadcast error skips to the newest value rather than ending the
+/// stream (a burst of typing changes never kills the row).
+async fn run_typing_producer(room: matrix_sdk::Room, sink: TypingSink, account_id: &str) {
+    // Hold the drop guard for the producer's lifetime so the SDK typing event
+    // handler is unregistered exactly when this task ends (AD-19).
+    let (_guard, mut receiver) = signals::subscribe_typing(&room);
+
+    // Open with an explicit empty snapshot so the frontend clears any stale row on
+    // (re)subscribe — inherently idempotent.
+    if !(sink)(TypingBatch { typists: vec![] }) {
+        tracing::info!(account_id = %account_id, "typing channel closed before first batch");
+        return;
+    }
+
+    loop {
+        match receiver.recv().await {
+            Ok(user_ids) => {
+                let mut typists = Vec::with_capacity(user_ids.len());
+                for user_id in user_ids {
+                    // Resolve the display name without a network round-trip; a
+                    // missing member yields `None` (the UI falls back to the id).
+                    let display_name = room
+                        .get_member_no_sync(&user_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|m| m.display_name().map(str::to_owned));
+                    typists.push(TypistVm {
+                        user_id: user_id.to_string(),
+                        display_name,
+                    });
+                }
+                if !(sink)(TypingBatch { typists }) {
+                    tracing::info!(account_id = %account_id, "typing channel closed, stopping producer");
+                    break;
+                }
+            }
+            // Lagged: skip to the newest state on the next recv rather than ending.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            // Sender dropped: the room/account was torn down; end the task.
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    tracing::info!(account_id = %account_id, "typing stream ended");
 }
 
 /// Pure mapping of the SDK `SyncService` state to a [`ConnectionStatus`]:

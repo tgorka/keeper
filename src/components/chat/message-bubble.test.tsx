@@ -17,6 +17,7 @@ function msg(overrides: Partial<MessageVm> = {}): MessageVm {
     reply: null,
     reactions: [],
     media: null,
+    readers: [],
     ...overrides,
   };
 }

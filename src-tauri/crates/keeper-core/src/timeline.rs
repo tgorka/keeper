@@ -18,21 +18,23 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt};
+use matrix_sdk::event_cache::PaginationStatus;
 use matrix_sdk::ruma::events::room::message::MessageType;
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use matrix_sdk::Client;
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::timeline::{
-    EventSendState, MsgLikeKind, RoomExt, Timeline, TimelineDetails, TimelineItem,
-    TimelineItemContent, TimelineItemKind,
+    EventSendState, MsgLikeKind, TimelineBuilder, TimelineDetails, TimelineItem,
+    TimelineItemContent, TimelineItemKind, TimelineReadReceiptTracking,
 };
+use matrix_sdk_ui::Timeline;
 
-use crate::account::TimelineSink;
+use crate::account::{PaginationSink, TimelineSink};
 use crate::error::TimelineError;
 use crate::media::{self, MediaVariant};
 use crate::vm::{
-    MediaKindVm, MediaVm, ReactionGroupVm, ReplyPreviewVm, SendState, TimelineBatch,
-    TimelineItemVm, TimelineOp,
+    MediaKindVm, MediaVm, PaginationState, PaginationStatusBatch, ReactionGroupVm, ReplyPreviewVm,
+    SendState, TimelineBatch, TimelineItemVm, TimelineOp,
 };
 
 /// A Rust-side index of `event_id → render key` (unique_id), maintained by the
@@ -308,6 +310,28 @@ fn aggregate_reactions<'a>(
         .collect()
 }
 
+/// Project a message item's per-item read-receipt user ids into the VM `readers`
+/// list, excluding the account's own user id (Story 3.9, receipts, NFR-9, AD-1).
+///
+/// Pure: `receipt_users` is the iterator of `EventTimelineItem::read_receipts()`
+/// keys (the members whose *latest* read receipt sits on this item — the SDK
+/// places each user's receipt on their latest-read item, so this is exactly that
+/// member's read position) and `own_user_id` is the account. Emits each *other*
+/// member's opaque id as a string, in the SDK's receipt-map order; the account's
+/// own id is filtered out (never render self as a reader). No receipt event ids,
+/// timestamps, or crypto material enter the returned list. Split out so the
+/// own-exclusion is unit-testable without an SDK `EventTimelineItem` (whose
+/// receipt map has no public constructor).
+fn readers_of<'a>(
+    receipt_users: impl Iterator<Item = &'a OwnedUserId>,
+    own_user_id: &UserId,
+) -> Vec<String> {
+    receipt_users
+        .filter(|user_id| user_id.as_str() != own_user_id.as_str())
+        .map(|user_id| user_id.to_string())
+        .collect()
+}
+
 /// Map one SDK [`TimelineItem`] to exactly one [`TimelineItemVm`], resolving a
 /// reply's quoted-original key through the producer's `event_id → unique_id`
 /// `index` and aggregating reactions against the account's own `own_user_id`.
@@ -373,6 +397,7 @@ pub fn item_to_vm(
                 reply: reply_preview(ev.content(), index),
                 reactions: reaction_groups(ev.content(), own_user_id),
                 media: media.map(Box::new),
+                readers: readers_of(ev.read_receipts().keys(), own_user_id),
             }
         }
         // An event that cannot be decrypted yet: surface an honest stub. No
@@ -547,8 +572,15 @@ pub async fn open_timeline(
         .user_id()
         .ok_or_else(|| TimelineError::Build("no user id on the live client".to_owned()))?
         .to_owned();
-    let timeline = room
-        .timeline()
+    // Build the timeline with read-receipt tracking enabled (Story 3.9): the
+    // default `room.timeline()` leaves tracking OFF, so per-item `read_receipts()`
+    // would be empty. `MessageLikeEvents` tracks receipts on message-like events —
+    // exactly the items keeper renders — so each member's read position populates
+    // the `readers` field of its latest-read message. Everything else about the
+    // build (subscribe snapshot-then-diff, the shared `Arc<Timeline>`) is preserved.
+    let timeline = TimelineBuilder::new(&room)
+        .track_read_marker_and_receipts(TimelineReadReceiptTracking::MessageLikeEvents)
+        .build()
         .await
         .map_err(|e| TimelineError::Build(e.to_string()))?;
     let (initial, stream) = timeline.subscribe().await;
@@ -626,6 +658,89 @@ pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: Ti
     drop(timeline);
 }
 
+/// Back-paginate the room's live timeline by up to `num_events` older events
+/// (Story 3.9, pagination). Returns whether the *start* of the timeline was hit
+/// (the homeserver has no more older history).
+///
+/// Pagination reads history and is NOT a signal (AD-14), so it stays here, not in
+/// `signals`. The older events themselves arrive over the room's existing
+/// `Timeline::subscribe()` diff stream as `PushFront`/`Insert` ops the frontend
+/// store already applies — this call only triggers the fetch and reports the
+/// start-of-timeline boundary. A failure surfaces as [`TimelineError::Build`]
+/// (funnels to the retriable `TimelineUnavailable` code so the boundary shows a
+/// retriable inline error, not an infinite spinner).
+pub async fn paginate_backwards(
+    timeline: &Timeline,
+    num_events: u16,
+) -> Result<bool, TimelineError> {
+    timeline
+        .paginate_backwards(num_events)
+        .await
+        .map_err(|e| TimelineError::Build(e.to_string()))
+}
+
+/// Map an SDK [`PaginationStatus`] to a [`PaginationStatusBatch`] (Story 3.9).
+///
+/// Pure: `Paginating` → `{ state: Paginating, hit_start: false }` (a request is in
+/// flight, so the start is not asserted); `Idle { hit_timeline_start }` →
+/// `{ state: Idle, hit_start }` (idle, carrying whether the homeserver start was
+/// reached). Split out so the mapping is unit-testable without a live SDK stream.
+fn map_pagination_status(status: PaginationStatus) -> PaginationStatusBatch {
+    match status {
+        PaginationStatus::Paginating => PaginationStatusBatch {
+            state: PaginationState::Paginating,
+            hit_start: false,
+        },
+        PaginationStatus::Idle { hit_timeline_start } => PaginationStatusBatch {
+            state: PaginationState::Idle,
+            hit_start: hit_timeline_start,
+        },
+    }
+}
+
+/// Drive the live back-pagination status stream: emit the current mapped
+/// [`PaginationStatusBatch`] as an initial snapshot, then a batch on every change,
+/// deduping consecutive-equal statuses (the snapshot-then-diff contract, AD-8).
+///
+/// The status drives the frontend's honest history-boundary row (spinner while
+/// `Paginating`, "start of the conversation" once `hit_start`). Older events
+/// themselves arrive over the room's existing timeline diff stream — never here.
+/// The producer holds the shared `Arc<Timeline>` for the whole loop and stops when
+/// the sink reports the channel closed or the status stream ends. When the timeline
+/// is in a focused (non-live) mode `live_back_pagination_status()` yields `None`;
+/// keeper only ever opens live timelines, so this emits an initial `Idle` snapshot
+/// and returns rather than leaving the boundary blank.
+pub async fn run_pagination_status_producer(timeline: Arc<Timeline>, sink: PaginationSink) {
+    let Some((current, stream)) = timeline.live_back_pagination_status().await else {
+        // A focused timeline has no live back-pagination; emit a benign idle
+        // snapshot so the boundary is honest (no spinner, not "at start").
+        let _ = (sink)(PaginationStatusBatch {
+            state: PaginationState::Idle,
+            hit_start: false,
+        });
+        return;
+    };
+    let mut last = map_pagination_status(current);
+    if !(sink)(last) {
+        tracing::info!("pagination status channel closed before first batch");
+        return;
+    }
+    futures_util::pin_mut!(stream);
+    while let Some(status) = stream.next().await {
+        let batch = map_pagination_status(status);
+        if batch == last {
+            continue;
+        }
+        last = batch;
+        if !(sink)(batch) {
+            tracing::info!("pagination status channel closed, stopping producer");
+            break;
+        }
+    }
+    tracing::info!("pagination status stream ended");
+    drop(timeline);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +762,7 @@ mod tests {
             reply: None,
             reactions: Vec::new(),
             media: None,
+            readers: Vec::new(),
         }
     }
 
@@ -904,6 +1020,70 @@ mod tests {
         assert_eq!(vm.in_reply_to_key, Some("unique-orig".to_owned()));
         assert_eq!(vm.sender, "");
         assert_eq!(vm.body, "");
+    }
+
+    #[test]
+    fn readers_of_excludes_own_and_keeps_others_in_order() {
+        use matrix_sdk::ruma::{owned_user_id, user_id};
+        // The receipts feature (Story 3.9): given the read-receipt keys on an item
+        // include the account's own id and two others, `readers_of` drops own and
+        // keeps the others as opaque id strings, in order.
+        let own = user_id!("@alice:example.org");
+        let keys = [
+            owned_user_id!("@bob:example.org"),
+            owned_user_id!("@alice:example.org"),
+            owned_user_id!("@carol:example.org"),
+        ];
+        let readers = readers_of(keys.iter(), own);
+        assert_eq!(
+            readers,
+            vec![
+                "@bob:example.org".to_owned(),
+                "@carol:example.org".to_owned()
+            ]
+        );
+        assert!(
+            !readers.iter().any(|r| r == "@alice:example.org"),
+            "own user must never appear in readers"
+        );
+    }
+
+    #[test]
+    fn readers_of_empty_when_only_own_read() {
+        use matrix_sdk::ruma::{owned_user_id, user_id};
+        // An own-only receipt set (nobody else has read up to here) yields no
+        // readers — the message shows no reader cluster and no read tick.
+        let own = user_id!("@alice:example.org");
+        let keys = [owned_user_id!("@alice:example.org")];
+        assert!(readers_of(keys.iter(), own).is_empty());
+    }
+
+    #[test]
+    fn map_pagination_status_paginating_shows_spinner_not_start() {
+        let batch = map_pagination_status(PaginationStatus::Paginating);
+        assert_eq!(batch.state, PaginationState::Paginating);
+        assert!(
+            !batch.hit_start,
+            "an in-flight pagination never asserts the start"
+        );
+    }
+
+    #[test]
+    fn map_pagination_status_idle_carries_hit_start() {
+        let at_start = map_pagination_status(PaginationStatus::Idle {
+            hit_timeline_start: true,
+        });
+        assert_eq!(at_start.state, PaginationState::Idle);
+        assert!(at_start.hit_start, "idle at start reports hit_start");
+
+        let more = map_pagination_status(PaginationStatus::Idle {
+            hit_timeline_start: false,
+        });
+        assert_eq!(more.state, PaginationState::Idle);
+        assert!(
+            !more.hit_start,
+            "idle with more history reports hit_start=false"
+        );
     }
 
     #[test]

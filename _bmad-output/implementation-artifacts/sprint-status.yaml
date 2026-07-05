@@ -75,7 +75,7 @@ development_status:
   3-6-receive-media-thumbnails-protocol-streaming-preview: done
   3-7-send-media-and-files: done
   3-8-delete-for-everyone-redaction: done
-  3-9-receipts-typing-and-history-pagination: backlog
+  3-9-receipts-typing-and-history-pagination: done
   epic-3-retrospective: optional
   epic-4: backlog
   4-1-unread-management: backlog
