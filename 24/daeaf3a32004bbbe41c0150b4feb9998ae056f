@@ -1,0 +1,131 @@
+src/components/export/export-dialog.test.tsx
+  s_b06ed69ce7d038::t_d1453766499586 32-33
+  s_b06ed69ce7d038::t_09255ebed13a80 133-138
+  s_b06ed69ce7d038::t_cb6b9f4f943ac5 187-208
+  s_b06ed69ce7d038::t_f5826f20b84d5c 1-31,34-132,139-186,209-220
+_bmad-output/implementation-artifacts/spec-5-5-export-to-json-and-markdown.md
+  s_1dc13617debcee::t_893bd1407f064c 138-149
+  s_1dc13617debcee::t_423dbfb29ffd48 173-180
+  s_b06ed69ce7d038::t_88b538fdbfc7e8 7
+  s_b06ed69ce7d038::t_0263e7c3236ae2 68
+  s_b06ed69ce7d038::t_61d9cbea811364 6
+  s_b06ed69ce7d038::t_d0998259c724b4 5
+  s_b06ed69ce7d038::t_50ba65c693408f 1-4,8,10-67,69-83,93-116
+  s_b06ed69ce7d038::t_1339f4ac26fc37 92
+  s_b06ed69ce7d038::t_11d95b057fdef5 117-137,150-172
+  s_b06ed69ce7d038::t_5685dd94489aa7 84-91
+  s_1dc13617debcee::t_5a896bcabd9644 9
+src/lib/stores/export.test.ts
+  s_b06ed69ce7d038::t_09255ebed13a80 5-7,57-61,85-87,94-96
+  s_b06ed69ce7d038::t_8ea804ff82e39c 1-4,8-56,62-84,88-93,97-107
+src/lib/ipc/gen/ExportScopeKind.ts
+  s_b06ed69ce7d038::t_22a1e13de548ba 1-11
+src-tauri/crates/keeper-core/src/archive/export/md.rs
+  s_b06ed69ce7d038::t_329f1bc4c7aa3a 59-69,80-84,93-99
+  s_b06ed69ce7d038::t_42bd87b0165fc7 190
+  s_b06ed69ce7d038::t_d2fd5e15686a70 130,133-155
+  s_b06ed69ce7d038::t_894bdf0bf826e1 70-74
+  s_b06ed69ce7d038::t_366a9661058958 1-58,75-79,85-92,100-129,131-132,156-173,175-189,191-200
+  s_b06ed69ce7d038::t_2a2890014c4c7f 174
+src/lib/ipc/gen/ExportRequestVm.ts
+  s_b06ed69ce7d038::t_22a1e13de548ba 1-45
+src-tauri/crates/keeper/src/lib.rs
+  s_b06ed69ce7d038::t_9ccc5a9663dfec 62-64
+src-tauri/crates/keeper-core/src/error.rs
+  s_b06ed69ce7d038::t_a50fdaa9c033b9 327-334
+src/components/export/export-dialog.tsx
+  s_b06ed69ce7d038::t_3f0291b4e0cde0 222-228,230-237,239-242,245-248,250-255,257-262,264-279,281,283-288,290-338,341,343-348,350,352,354-359,361-365,367-373,375-382
+  s_b06ed69ce7d038::t_ecca179bd5641b 1-15,17-57,127-219,229,238,243-244,249,256,263,280,282,289,339-340,342,349,351,353,360,366,374,383-384
+  s_b06ed69ce7d038::t_02f51226d82ad2 220-221
+  s_b06ed69ce7d038::t_b8e6f1d718620e 16
+  s_b06ed69ce7d038::t_d01a39d10e48bf 58-126
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_b06ed69ce7d038::t_082f2c5dd75dbf 93
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_b06ed69ce7d038::t_16a93e72fd1d78 184-187
+src/components/layout/app-shell.tsx
+  s_b06ed69ce7d038::t_194a3e59881520 84
+  s_b06ed69ce7d038::t_9753291a456328 2
+src/lib/ipc/gen/ExportProgressVm.ts
+  s_b06ed69ce7d038::t_22a1e13de548ba 1-53
+src/components/search/search-overlay.tsx
+  s_b06ed69ce7d038::t_28ea3d4312c327 30
+  s_b06ed69ce7d038::t_06f6c278578636 213-230
+  s_b06ed69ce7d038::t_76ed2b64b650ac 240-254
+src/lib/stores/export.ts
+  s_b06ed69ce7d038::t_ddd6506dfa6452 1-117
+src-tauri/crates/keeper-core/src/archive/export/json.rs
+  s_b06ed69ce7d038::t_b1cb38df2d61ea 1-59,64-129
+  s_b06ed69ce7d038::t_170fa6efb5c136 60-63
+src-tauri/crates/keeper-core/src/archive/db.rs
+  s_b06ed69ce7d038::t_9f6474362a0f23 218-237
+  s_b06ed69ce7d038::t_3df5a42e5c65de 445-521,523-526
+  s_b06ed69ce7d038::t_170fa6efb5c136 522
+src-tauri/crates/keeper-core/src/vm.rs
+  s_b06ed69ce7d038::t_19588c6458a212 648-761
+src/lib/ipc/client.ts
+  s_b06ed69ce7d038::t_9f778351710f76 21-24
+  s_b06ed69ce7d038::t_0d644c733cc489 62-63
+  s_b06ed69ce7d038::t_2cb45f3dd2824c 256-294
+src/lib/ipc/gen/ExportPhase.ts
+  s_b06ed69ce7d038::t_22a1e13de548ba 1-11
+src-tauri/crates/keeper-core/src/archive/export/mod.rs
+  s_b06ed69ce7d038::t_ae244a8a967e89 343-352
+  s_b06ed69ce7d038::t_c52c4b1e64a08e 1-96,104-140,142-154,161-172,187-194,211-232,257-342,353-392,402-404,414-469,473-570,581-594,601,605-606,608-620,622-623,629-630,632-655,657,670-673,678-682,838-854,856-857,869-870,873,878,880-901,903-919,921-929,940-941,943-944,956-957,962-970,981-982,993-1004,1016-1030,1032,1044,1046-1052
+  s_b06ed69ce7d038::t_2a58ccee7583ac 155-160
+  s_1dc13617debcee::t_44f44f9d24c8c6 727-728,793-802,871-872,958-961
+  s_1dc13617debcee::t_16584f9c2fa707 209-210,783
+  s_b06ed69ce7d038::t_170fa6efb5c136 470-472,571-580,595-600,602-604,658-668,674-677,858-868,930-939,945-955,971-980,983-992,1005-1015,1033-1043
+  s_b06ed69ce7d038::t_d27be3d4de6004 607,656,855,902,942,1031
+  s_1dc13617debcee::t_de8f4369ad1d6c 97-103
+  s_1dc13617debcee::t_c3024c7d865330 173-186,195-208
+  s_b06ed69ce7d038::t_a5fce34fd1f948 624-628
+  s_b06ed69ce7d038::t_ebb63e41f2e9ff 874-877
+  s_1dc13617debcee::t_448014115a3351 621,631,669,757,879,920,1045
+  s_b06ed69ce7d038::t_ab62ae782fe20d 233-256
+  s_1dc13617debcee::t_4e87dcacb22e46 784-792,803-836
+  s_b06ed69ce7d038::t_3f0bca66159eee 683-726,729-756,758-782,837
+  s_b06ed69ce7d038::t_2c4b739b488bf3 141
+  s_b06ed69ce7d038::t_568b2e176b3acf 393-401,405-413
+src-tauri/crates/keeper/src/ipc.rs
+  s_b06ed69ce7d038::t_f3e3cd3f82ad2e 122
+  s_b06ed69ce7d038::t_d328d47e8555f8 26-28
+  s_b06ed69ce7d038::t_bb9f03344fbaaf 298-301,305-310
+  s_b06ed69ce7d038::t_c0591ee7001167 8,10-11
+  s_b06ed69ce7d038::t_550a758d98b093 599-630,639-697,699-779,783-785
+  s_b06ed69ce7d038::t_31b375bf8cddf9 698
+  s_b06ed69ce7d038::t_170fa6efb5c136 631-638,780-782
+  s_b06ed69ce7d038::t_19c46493bad8b7 53-100
+src-tauri/crates/keeper-core/src/archive/mod.rs
+  s_b06ed69ce7d038::t_cdcecce48fa122 25
+src/components/layout/conversation-pane.tsx
+  s_b06ed69ce7d038::t_631e1f80d397ac 18
+  s_b06ed69ce7d038::t_6e627fcb216b02 74
+  s_b06ed69ce7d038::t_f7186208e6bfb6 1067-1091
+  s_b06ed69ce7d038::t_83b538d77378dc 1096-1098
+  s_b06ed69ce7d038::t_14bcdd0e70739b 1092-1095
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "24daeaf3a32004bbbe41c0150b4feb9998ae056f",
+  "prompts": {},
+  "sessions": {
+    "s_1dc13617debcee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "970c035d-44ee-4739-9fcb-d19a00560c90",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_b06ed69ce7d038": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4d7b6d8e-2dc8-45e4-808d-192a6c766bb1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
