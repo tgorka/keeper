@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-6-5-bridge-session-health-and-re-login-prompts.md
+  s_443172f62fcb74::t_498a8f3dd0d89c 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4ae9fbb2ed0e8efd6af2a38084b96f1f3c349460",
+  "prompts": {},
+  "sessions": {
+    "s_443172f62fcb74": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24e314f0-edc8-4101-ac04-d75bcce7e2b6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
