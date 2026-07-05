@@ -22,6 +22,7 @@ import { SidebarPane } from "@/components/layout/sidebar-pane";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 
 const OFFLINE_TEXT = "Offline — showing your local archive. Messages queue until you're back.";
 
@@ -52,11 +53,13 @@ function renderSidebar(collapsed = false) {
 beforeEach(() => {
   accountStatusStore.getState().reset();
   accountsStore.getState().clear();
+  primaryViewStore.getState().setView("inbox");
 });
 
 afterEach(() => {
   accountStatusStore.getState().reset();
   accountsStore.getState().clear();
+  primaryViewStore.getState().setView("inbox");
 });
 
 describe("SidebarPane offline pill", () => {
@@ -134,6 +137,30 @@ describe("SidebarPane account footer", () => {
   it("shows no account row when signed out", () => {
     renderSidebar();
     expect(screen.queryByText(account.userId)).not.toBeInTheDocument();
+  });
+});
+
+describe("SidebarPane primary view", () => {
+  it("switches the primary view to archive when Archive is clicked", () => {
+    renderSidebar();
+    expect(primaryViewStore.getState().view).toBe("inbox");
+
+    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+
+    expect(primaryViewStore.getState().view).toBe("archive");
+    // The Archive entry reflects the active view.
+    expect(screen.getByRole("button", { name: "Archive" })).toHaveAttribute("aria-current", "page");
+  });
+
+  it("switches back to the inbox when Chats is clicked", () => {
+    primaryViewStore.getState().setView("archive");
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Chats" }));
+
+    expect(primaryViewStore.getState().view).toBe("inbox");
+    expect(screen.getByRole("button", { name: "Chats" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("button", { name: "Archive" })).not.toHaveAttribute("aria-current");
   });
 });
 

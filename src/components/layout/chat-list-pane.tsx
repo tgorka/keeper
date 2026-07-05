@@ -20,6 +20,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import type { InboxBatch } from "@/lib/ipc/client";
 import { subscribeInbox, unsubscribeInbox } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
+import { archiveRoomsStore, useArchiveRoomsStore } from "@/lib/stores/archive-rooms";
+import { usePrimaryView } from "@/lib/stores/primary-view";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 
 export function ChatListPane() {
@@ -31,7 +33,9 @@ export function ChatListPane() {
       .sort()
       .join(","),
   );
-  const rooms = useRoomsStore((s) => s.rooms);
+  const view = usePrimaryView();
+  const inboxRooms = useRoomsStore((s) => s.rooms);
+  const archiveRooms = useArchiveRoomsStore((s) => s.rooms);
   const selected = useRoomsStore((s) => s.selected);
   const selectRoom = useRoomsStore((s) => s.selectRoom);
   // Account switcher filter (Story 2.5): a pure display filter over the already-
@@ -39,7 +43,13 @@ export function ChatListPane() {
   // merged subscription or the sort. `null` shows every account.
   const filterAccountId = useAccountsStore((s) => s.filterAccountId);
   const [errored, setErrored] = useState(false);
-  const [loaded, setLoaded] = useState(false);
+  // Track skeleton-dismissal per window: the Inbox and Archive stream on
+  // independent channels, so gating one view's skeleton on the *other* view's
+  // arrival would flash a premature empty-state (e.g. "Nothing archived." before
+  // the archive window has actually loaded). Each flag flips only when its own
+  // window delivers a batch.
+  const [loadedInbox, setLoadedInbox] = useState(false);
+  const [loadedArchive, setLoadedArchive] = useState(false);
 
   useEffect(() => {
     if (accountKey.length === 0) {
@@ -47,22 +57,31 @@ export function ChatListPane() {
     }
 
     setErrored(false);
-    setLoaded(false);
+    setLoadedInbox(false);
+    setLoadedArchive(false);
     // Establish clean state at mount so the newest mount always wins; clearing
     // in cleanup instead would race the next mount.
     roomsStore.getState().clear();
+    archiveRoomsStore.getState().clear();
     let subscriptionId: number | null = null;
     let cancelled = false;
 
-    // Gate the sink so it no-ops after cleanup (post-unmount / StrictMode late
-    // batches never mutate the store).
-    const onBatch = (b: InboxBatch) => {
+    // Gate both sinks so they no-op after cleanup (post-unmount / StrictMode late
+    // batches never mutate the stores). Each window marks itself loaded when its
+    // own channel first delivers.
+    const onInbox = (b: InboxBatch) => {
       if (!cancelled) {
         roomsStore.getState().applyBatch(b);
-        setLoaded(true);
+        setLoadedInbox(true);
       }
     };
-    subscribeInbox(onBatch)
+    const onArchive = (b: InboxBatch) => {
+      if (!cancelled) {
+        archiveRoomsStore.getState().applyBatch(b);
+        setLoadedArchive(true);
+      }
+    };
+    subscribeInbox(onInbox, onArchive)
       .then((id) => {
         if (cancelled) {
           // Unmounted before the id resolved — tear down immediately.
@@ -85,10 +104,26 @@ export function ChatListPane() {
     };
   }, [accountKey]);
 
-  // Apply the account switcher filter as a pure display filter (no re-sort, no
-  // mutation): when a filter is active, hide rows not owned by that account.
+  // Pick the active window's rows, then apply the account switcher filter as a
+  // pure display filter (no re-sort, no mutation): when a filter is active, hide
+  // rows not owned by that account.
+  const activeRooms = view === "archive" ? archiveRooms : inboxRooms;
+  const activeLoaded = view === "archive" ? loadedArchive : loadedInbox;
   const visibleRooms =
-    filterAccountId === null ? rooms : rooms.filter((room) => room.accountId === filterAccountId);
+    filterAccountId === null
+      ? activeRooms
+      : activeRooms.filter((room) => room.accountId === filterAccountId);
+  // Per-view empty state (UX-DR13): the Archive uses sentence case with a code-font
+  // `E` and no exclamation; the Inbox keeps its existing copy.
+  const emptyState =
+    view === "archive" ? (
+      <>
+        Nothing archived. <code className="font-mono text-xs">E</code> archives a chat and keeps it
+        searchable.
+      </>
+    ) : (
+      "No conversations yet."
+    );
 
   return (
     <div className="flex h-full w-[320px] shrink-0 flex-col border-border border-r bg-background">
@@ -114,7 +149,7 @@ export function ChatListPane() {
             ))}
           </ul>
         </ScrollArea>
-      ) : !loaded ? (
+      ) : !activeLoaded ? (
         <div role="status" aria-label="Loading conversations" className="flex flex-col gap-1 p-3">
           {[0, 1, 2, 3, 4].map((i) => (
             <div key={i} className="flex h-16 items-center gap-3">
@@ -128,7 +163,7 @@ export function ChatListPane() {
         </div>
       ) : (
         <ul aria-label="Conversations" className="flex flex-1 items-center justify-center p-4">
-          <li className="text-center text-muted-foreground text-sm">No conversations yet.</li>
+          <li className="text-center text-muted-foreground text-sm">{emptyState}</li>
         </ul>
       )}
     </div>

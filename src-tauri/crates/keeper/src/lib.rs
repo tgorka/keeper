@@ -89,6 +89,8 @@ pub fn run() {
             ipc::cancel_send,
             ipc::mark_room_read,
             ipc::mark_room_unread,
+            ipc::archive_room,
+            ipc::unarchive_room,
             ipc::set_typing,
             ipc::paginate_backwards,
             ipc::typing_subscribe,

@@ -7,7 +7,8 @@ import type { InboxOp } from "./InboxOp";
  *
  * The stream always opens with a batch whose first op is an [`InboxOp::Reset`]
  * carrying the current merged window, then further batches as accounts sync or
- * are added/removed. `total` is the sum of the per-account known totals.
+ * are added/removed. The merge is partitioned into an Inbox and an Archive
+ * window (Story 4.2), and `total` is the length of *this* window's partition.
  */
 export type InboxBatch = { 
 /**
@@ -15,7 +16,8 @@ export type InboxBatch = {
  */
 ops: Array<InboxOp>, 
 /**
- * The total number of rooms across all accounts the servers know about,
- * when known.
+ * The number of rooms in this streamed window (the partition's own length),
+ * when known. Since Story 4.2 the merge is split into an Inbox and an
+ * Archive window, so this is per-window, not a cross-account server total.
  */
 total: number | null, };

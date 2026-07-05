@@ -2,14 +2,18 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm, InboxBatch, IpcError } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
+import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 
 // Mock the typed IPC wrapper so the pane never touches Tauri. `subscribeInbox`
-// captures the `onBatch` handler so the test can drive the merged stream.
+// captures the `onInbox`/`onArchive` handlers so the test can drive both windows
+// of the merged stream (Story 4.2).
 const subscribeInbox = vi.fn();
 const unsubscribeInbox = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
-  subscribeInbox: (onBatch: (b: InboxBatch) => void) => subscribeInbox(onBatch),
+  subscribeInbox: (onInbox: (b: InboxBatch) => void, onArchive: (b: InboxBatch) => void) =>
+    subscribeInbox(onInbox, onArchive),
   unsubscribeInbox: (id: number) => unsubscribeInbox(id),
 }));
 
@@ -46,6 +50,7 @@ function inboxRoom(roomId: string, accountId: string, displayName: string, lastM
     avatarUrl: null,
     isUnread: false,
     mentionCount: 0,
+    isArchived: false,
   };
 }
 
@@ -54,6 +59,8 @@ beforeEach(() => {
   accountsStore.setState({ filterAccountId: null });
   roomsStore.getState().clear();
   roomsStore.getState().selectRoom(null);
+  archiveRoomsStore.getState().clear();
+  primaryViewStore.getState().setView("inbox");
   subscribeInbox.mockReset();
   unsubscribeInbox.mockReset();
 });
@@ -63,6 +70,8 @@ afterEach(() => {
   accountsStore.setState({ filterAccountId: null });
   roomsStore.getState().clear();
   roomsStore.getState().selectRoom(null);
+  archiveRoomsStore.getState().clear();
+  primaryViewStore.getState().setView("inbox");
 });
 
 describe("ChatListPane", () => {
@@ -100,7 +109,7 @@ describe("ChatListPane", () => {
     accountsStore.getState().hydrateAll([account, bob]);
     render(<ChatListPane />);
 
-    expect(subscribeInbox).toHaveBeenCalledWith(expect.any(Function));
+    expect(subscribeInbox).toHaveBeenCalledWith(expect.any(Function), expect.any(Function));
 
     captured.onBatch?.({
       ops: [
@@ -253,6 +262,116 @@ describe("ChatListPane", () => {
     accountsStore.getState().toggleFilter(account.accountId);
     await waitFor(() => {
       expect(screen.getByText("Beta Room")).toBeInTheDocument();
+    });
+  });
+
+  it("renders the archive window and empty-state text when the primary view is archive", async () => {
+    const captured: {
+      onInbox: ((b: InboxBatch) => void) | null;
+      onArchive: ((b: InboxBatch) => void) | null;
+    } = { onInbox: null, onArchive: null };
+    subscribeInbox.mockImplementation(
+      (onInbox: (b: InboxBatch) => void, onArchive: (b: InboxBatch) => void) => {
+        captured.onInbox = onInbox;
+        captured.onArchive = onArchive;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+
+    // Feed the inbox window one row and the archive window another.
+    captured.onInbox?.({
+      ops: [
+        { op: "reset", rooms: [inboxRoom("!a:example.org", account.accountId, "Inbox Room", "")] },
+      ],
+      total: 1,
+    });
+    captured.onArchive?.({
+      ops: [
+        {
+          op: "reset",
+          rooms: [inboxRoom("!z:example.org", account.accountId, "Archived Room", "")],
+        },
+      ],
+      total: 1,
+    });
+
+    // Inbox view (default) shows the inbox row, not the archive row.
+    await waitFor(() => {
+      expect(screen.getByText("Inbox Room")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Archived Room")).not.toBeInTheDocument();
+
+    // Switching to the archive view renders the archive row instead.
+    primaryViewStore.getState().setView("archive");
+    await waitFor(() => {
+      expect(screen.getByText("Archived Room")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Inbox Room")).not.toBeInTheDocument();
+  });
+
+  it("shows the archive empty-state text when the archive window is empty", async () => {
+    const captured: {
+      onInbox: ((b: InboxBatch) => void) | null;
+      onArchive: ((b: InboxBatch) => void) | null;
+    } = { onInbox: null, onArchive: null };
+    subscribeInbox.mockImplementation(
+      (onInbox: (b: InboxBatch) => void, onArchive: (b: InboxBatch) => void) => {
+        captured.onInbox = onInbox;
+        captured.onArchive = onArchive;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    primaryViewStore.getState().setView("archive");
+    render(<ChatListPane />);
+
+    captured.onArchive?.({ ops: [{ op: "reset", rooms: [] }], total: 0 });
+
+    await waitFor(() => {
+      expect(screen.getByText(/Nothing archived\./)).toBeInTheDocument();
+    });
+    // The code-font `E` verb (UX-DR13).
+    expect(screen.getByText("E")).toBeInTheDocument();
+    expect(screen.queryByText("No conversations yet.")).not.toBeInTheDocument();
+  });
+
+  it("keeps the archive skeleton (not a premature empty-state) until the archive window itself loads", async () => {
+    const captured: {
+      onInbox: ((b: InboxBatch) => void) | null;
+      onArchive: ((b: InboxBatch) => void) | null;
+    } = { onInbox: null, onArchive: null };
+    subscribeInbox.mockImplementation(
+      (onInbox: (b: InboxBatch) => void, onArchive: (b: InboxBatch) => void) => {
+        captured.onInbox = onInbox;
+        captured.onArchive = onArchive;
+        return Promise.resolve(1);
+      },
+    );
+    accountsStore.getState().addAccount(account);
+    primaryViewStore.getState().setView("archive");
+    render(<ChatListPane />);
+
+    // Only the inbox window has delivered; the archive channel has not emitted
+    // yet. The archive view must still show its loading skeleton, never the
+    // "Nothing archived." empty-state (per-window loaded gating).
+    captured.onInbox?.({
+      ops: [
+        { op: "reset", rooms: [inboxRoom("!a:example.org", account.accountId, "Inbox Room", "")] },
+      ],
+      total: 1,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Nothing archived\./)).not.toBeInTheDocument();
+
+    // Once the archive window delivers (empty), the empty-state replaces the skeleton.
+    captured.onArchive?.({ ops: [{ op: "reset", rooms: [] }], total: 0 });
+    await waitFor(() => {
+      expect(screen.getByText(/Nothing archived\./)).toBeInTheDocument();
     });
   });
 });

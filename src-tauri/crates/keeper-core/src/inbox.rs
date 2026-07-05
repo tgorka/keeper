@@ -31,15 +31,13 @@ use crate::vm::{InboxBatch, InboxOp, InboxRoomVm, RoomListBatch, RoomVm};
 /// delivered, `false` if the channel is closed (the merger then stops emitting).
 pub type InboxSink = Box<dyn Fn(InboxBatch) -> bool + Send + Sync>;
 
-/// One account's contribution to the merged inbox: its opaque id, hue index, the
-/// current room window it is streaming, and its known server-side total.
+/// One account's contribution to the merged inbox: its opaque id, hue index, and
+/// the current room window it is streaming.
 struct AccountSlot {
     hue_index: u8,
     /// The account's current room window, mirrored from its per-account
     /// `RoomListBatch` ops — recency-ordered within the account.
     rooms: Vec<RoomVm>,
-    /// The account's known total, when the server has reported it.
-    total: Option<u32>,
 }
 
 /// Shared per-account merge state feeding one merged-inbox subscription.
@@ -54,19 +52,27 @@ pub struct InboxMerger {
 
 struct MergeState {
     accounts: HashMap<String, AccountSlot>,
-    sink: InboxSink,
-    /// Set once the sink reports the channel is closed, so later producer
+    /// Receives the Inbox window (`!is_archived || is_unread`).
+    inbox_sink: InboxSink,
+    /// Receives the Archive window (`is_archived && !is_unread`) (Story 4.2).
+    archive_sink: InboxSink,
+    /// Set once either sink reports its channel is closed, so later producer
     /// updates stop trying to emit.
     closed: bool,
 }
 
 impl InboxMerger {
-    /// Create a merger that emits merged batches into `sink`.
-    pub fn new(sink: InboxSink) -> Self {
+    /// Create a merger that partitions each merged window into two recency-ordered
+    /// streams: `inbox_sink` receives the Inbox window and `archive_sink` the
+    /// Archive window (Story 4.2). The partition is `!is_archived || is_unread` for
+    /// the inbox and `is_archived && !is_unread` for the archive, so an
+    /// archived-unread room auto-returns to the inbox as a pure view rule.
+    pub fn new(inbox_sink: InboxSink, archive_sink: InboxSink) -> Self {
         Self {
             inner: Arc::new(Mutex::new(MergeState {
                 accounts: HashMap::new(),
-                sink,
+                inbox_sink,
+                archive_sink,
                 closed: false,
             })),
         }
@@ -82,7 +88,6 @@ impl InboxMerger {
             .or_insert_with(|| AccountSlot {
                 hue_index,
                 rooms: Vec::new(),
-                total: None,
             });
     }
 
@@ -105,49 +110,47 @@ impl InboxMerger {
         }
         if let Some(slot) = state.accounts.get_mut(account_id) {
             slot.rooms = apply_room_list_batch(std::mem::take(&mut slot.rooms), &batch);
-            if let Some(total) = batch.total {
-                slot.total = Some(total);
-            }
         }
         emit(&mut state)
     }
 }
 
-/// Emit the current merged window into the sink, recording channel closure.
-/// Returns `false` if the channel is closed.
+/// Emit the current merged window into both sinks, recording channel closure.
+/// The single recency-ordered merge is partitioned (order preserved) into the
+/// Inbox window (`!is_archived || is_unread`) and the Archive window
+/// (`is_archived && !is_unread`) (Story 4.2). Each partition is emitted as a
+/// `Reset` batch whose `total` is that partition's own length. Returns `false`
+/// if either channel is closed.
 fn emit(state: &mut MergeState) -> bool {
     if state.closed {
         return false;
     }
     let merged = merge(&state.accounts);
-    let total = total_across(&state.accounts);
-    let batch = InboxBatch {
-        ops: vec![InboxOp::Reset { rooms: merged }],
-        total,
+    // Partition preserving recency order: inbox keeps every non-archived room
+    // plus any archived-unread room (auto-return); archive keeps only
+    // archived-read rooms.
+    let (inbox_rooms, archive_rooms): (Vec<InboxRoomVm>, Vec<InboxRoomVm>) = merged
+        .into_iter()
+        .partition(|room| !room.is_archived || room.is_unread);
+    let inbox_batch = InboxBatch {
+        total: Some(inbox_rooms.len() as u32),
+        ops: vec![InboxOp::Reset { rooms: inbox_rooms }],
     };
-    if !(state.sink)(batch) {
+    let archive_batch = InboxBatch {
+        total: Some(archive_rooms.len() as u32),
+        ops: vec![InboxOp::Reset {
+            rooms: archive_rooms,
+        }],
+    };
+    // Emit both windows; a close on either sink stops all future emissions.
+    let inbox_ok = (state.inbox_sink)(inbox_batch);
+    let archive_ok = (state.archive_sink)(archive_batch);
+    if !inbox_ok || !archive_ok {
         state.closed = true;
-        tracing::info!("inbox channel closed; stopping merged emissions");
+        tracing::info!("inbox/archive channel closed; stopping merged emissions");
         return false;
     }
     true
-}
-
-/// Sum the per-account known totals. `None` when no account has a known total.
-fn total_across(accounts: &HashMap<String, AccountSlot>) -> Option<u32> {
-    let mut any = false;
-    let mut sum: u32 = 0;
-    for slot in accounts.values() {
-        if let Some(t) = slot.total {
-            any = true;
-            sum = sum.saturating_add(t);
-        }
-    }
-    if any {
-        Some(sum)
-    } else {
-        None
-    }
 }
 
 /// Pure recency merge: flatten every account's window into one list of
@@ -193,6 +196,7 @@ fn to_inbox_room(account_id: &str, hue_index: u8, room: &RoomVm) -> InboxRoomVm 
         avatar_url: room.avatar_url.clone(),
         is_unread: room.is_unread,
         mention_count: room.mention_count,
+        is_archived: room.is_archived,
     }
 }
 
@@ -261,6 +265,16 @@ mod tests {
             avatar_url: None,
             is_unread: false,
             mention_count: 0,
+            is_archived: false,
+        }
+    }
+
+    /// A room with explicit archive/unread flags for partition tests (Story 4.2).
+    fn room_flags(id: &str, ts: Option<i64>, is_archived: bool, is_unread: bool) -> RoomVm {
+        RoomVm {
+            is_archived,
+            is_unread,
+            ..room(id, ts)
         }
     }
 
@@ -268,7 +282,6 @@ mod tests {
         AccountSlot {
             hue_index: hue,
             rooms,
-            total: None,
         }
     }
 
@@ -314,10 +327,12 @@ mod tests {
             avatar_url: None,
             is_unread: true,
             mention_count: 3,
+            is_archived: true,
         };
         let inbox_room = to_inbox_room("acctA", 4, &src);
         assert!(inbox_room.is_unread);
         assert_eq!(inbox_room.mention_count, 3);
+        assert!(inbox_room.is_archived);
         assert_eq!(inbox_room.account_id, "acctA");
         assert_eq!(inbox_room.hue_index, 4);
     }
@@ -381,14 +396,42 @@ mod tests {
         assert_eq!(ids, ["!c", "!a"]);
     }
 
+    /// Shared capture buffer for one sink's emitted batches.
+    type Captured = Arc<StdMutex<Vec<InboxBatch>>>;
+
+    /// Room ids of the last `Reset` batch captured in `store`, or a panic.
+    fn last_reset_ids(store: &Captured) -> Vec<String> {
+        let batches = store.lock().expect("lock");
+        let last = batches.last().expect("a batch");
+        match &last.ops[0] {
+            InboxOp::Reset { rooms } => rooms.iter().map(|r| r.room_id.clone()).collect(),
+            other => panic!("expected Reset, got {other:?}"),
+        }
+    }
+
+    /// Build a merger over two capture vecs (inbox, archive) so partition tests can
+    /// assert each window independently.
+    fn capturing_merger() -> (InboxMerger, Captured, Captured) {
+        let inbox: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
+        let archive: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
+        let inbox_store = inbox.clone();
+        let archive_store = archive.clone();
+        let merger = InboxMerger::new(
+            Box::new(move |batch: InboxBatch| {
+                inbox_store.lock().expect("lock").push(batch);
+                true
+            }),
+            Box::new(move |batch: InboxBatch| {
+                archive_store.lock().expect("lock").push(batch);
+                true
+            }),
+        );
+        (merger, inbox, archive)
+    }
+
     #[tokio::test]
     async fn merger_emits_reset_on_add_batch_and_remove() {
-        let captured: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
-        let sink_store = captured.clone();
-        let merger = InboxMerger::new(Box::new(move |batch: InboxBatch| {
-            sink_store.lock().expect("lock").push(batch);
-            true
-        }));
+        let (merger, inbox, _archive) = capturing_merger();
 
         merger.register_account("acctA", 0).await;
         merger.register_account("acctB", 1).await;
@@ -419,31 +462,60 @@ mod tests {
             .await;
 
         {
-            let batches = captured.lock().expect("lock");
+            let batches = inbox.lock().expect("lock");
             let last = batches.last().expect("a batch");
-            assert_eq!(last.total, Some(3), "totals sum across accounts");
-            match &last.ops[0] {
-                InboxOp::Reset { rooms } => {
-                    let ids: Vec<&str> = rooms.iter().map(|r| r.room_id.as_str()).collect();
-                    // b1 (400), a2 (300), a1 (100) recency desc across accounts.
-                    assert_eq!(ids, ["!b1", "!a2", "!a1"]);
-                }
-                other => panic!("expected Reset, got {other:?}"),
-            }
+            // Each window's total is that partition's own length (Story 4.2).
+            assert_eq!(last.total, Some(3), "inbox total is the partition length");
         }
+        // b1 (400), a2 (300), a1 (100) recency desc across accounts.
+        assert_eq!(last_reset_ids(&inbox), ["!b1", "!a2", "!a1"]);
 
         // Signing account B out removes its rooms from the merged inbox; A stays.
         merger.remove_account("acctB").await;
+        assert_eq!(
+            last_reset_ids(&inbox),
+            ["!a2", "!a1"],
+            "only account A's rooms remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_partitions_inbox_and_archive_preserving_recency() {
+        // Golden case (Story 4.2): recency-desc merged window
+        //   [D !archived read (400), C archived unread (300),
+        //    B archived read (200), A !archived unread (100)]
+        // partitions to inbox = [D, C, A] (!is_archived || is_unread) and
+        // archive = [B] (is_archived && !is_unread).
+        let (merger, inbox, archive) = capturing_merger();
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_flags("!d", Some(400), false, false),
+                            room_flags("!c", Some(300), true, true),
+                            room_flags("!b", Some(200), true, false),
+                            room_flags("!a", Some(100), false, true),
+                        ],
+                    }],
+                    total: Some(4),
+                },
+            )
+            .await;
+
+        // Inbox: non-archived plus the archived-unread auto-return, recency order.
+        assert_eq!(last_reset_ids(&inbox), ["!d", "!c", "!a"]);
         {
-            let batches = captured.lock().expect("lock");
-            let last = batches.last().expect("a batch");
-            match &last.ops[0] {
-                InboxOp::Reset { rooms } => {
-                    let ids: Vec<&str> = rooms.iter().map(|r| r.room_id.as_str()).collect();
-                    assert_eq!(ids, ["!a2", "!a1"], "only account A's rooms remain");
-                }
-                other => panic!("expected Reset, got {other:?}"),
-            }
+            let batches = inbox.lock().expect("lock");
+            assert_eq!(batches.last().expect("batch").total, Some(3));
+        }
+        // Archive: only the archived-read room.
+        assert_eq!(last_reset_ids(&archive), ["!b"]);
+        {
+            let batches = archive.lock().expect("lock");
+            assert_eq!(batches.last().expect("batch").total, Some(1));
         }
     }
 }

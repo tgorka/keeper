@@ -299,23 +299,26 @@ impl AccountManager {
     }
 
     /// Subscribe to the merged unified inbox across every restorable account
-    /// (AD-20). Activates each account whose Keychain session is present, opens
-    /// its room-list stream, and feeds each into a shared [`InboxMerger`] that
-    /// emits one recency-ordered [`InboxBatch`] stream into `sink`. Returns the
-    /// inbox subscription id. Replacing an existing inbox subscription (e.g. the
-    /// frontend re-subscribes after adding an account) first tears the old one
-    /// down. Adding the Nth account is identical to the 2nd — no count limit.
+    /// (AD-20, Story 4.2). Activates each account whose Keychain session is
+    /// present, opens its room-list stream, and feeds each into a shared
+    /// [`InboxMerger`] that partitions the merged window into two recency-ordered
+    /// [`InboxBatch`] streams: the Inbox window into `inbox_sink` and the Archive
+    /// window into `archive_sink`. Returns the inbox subscription id. Replacing an
+    /// existing inbox subscription (e.g. the frontend re-subscribes after adding an
+    /// account) first tears the old one down. Adding the Nth account is identical
+    /// to the 2nd — no count limit.
     pub async fn subscribe_inbox(
         &self,
         platform: &Arc<dyn Platform>,
-        sink: InboxSink,
+        inbox_sink: InboxSink,
+        archive_sink: InboxSink,
     ) -> Result<u64, CoreError> {
         // Only one inbox subscription at a time: tear down any prior one so its
         // producers stop feeding a stale merger/channel.
         self.unsubscribe_inbox_inner().await;
 
         let accounts = auth::find_restorable_accounts(platform.as_ref())?;
-        let merger = InboxMerger::new(sink);
+        let merger = InboxMerger::new(inbox_sink, archive_sink);
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
 
         // Register every account slot up front so the merge reflects the full set
@@ -1554,6 +1557,49 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Archive the room on `account_id` — set the Matrix low-priority tag
+    /// (`m.lowpriority`) via [`matrix_sdk::Room::set_is_low_priority`] (Story 4.2).
+    /// Resolves the account's live `Room` via [`Self::room_for`]. The tag persists
+    /// across relaunch and syncs to the user's other Matrix clients; the merge
+    /// then moves the row into the Archive window (unless it is unread). This is
+    /// account data (a tag), not a receipt API, so it lives here rather than in the
+    /// signals seam. Best-effort: a dispatch failure is logged and swallowed
+    /// (returns `Ok(())`) — never a UI error.
+    ///
+    /// Errors: an unparsable/unknown room id, or an account that isn't live →
+    /// [`TimelineError::RoomNotFound`]. A best-effort tag-dispatch failure is NOT
+    /// an error — it is logged and swallowed.
+    pub async fn archive_room(&self, account_id: &str, room_id: &str) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+        if let Err(e) = room.set_is_low_priority(true, None).await {
+            tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "archive dispatch failed (best-effort)");
+        }
+        Ok(())
+    }
+
+    /// Unarchive the room on `account_id` — clear the Matrix low-priority tag
+    /// (`m.lowpriority`) via [`matrix_sdk::Room::set_is_low_priority`] (Story 4.2).
+    /// Resolves the account's live `Room` via [`Self::room_for`]. The merge then
+    /// returns the row to its chronological Inbox position. This is account data (a
+    /// tag), not a receipt API, so it lives here rather than in the signals seam.
+    /// Best-effort: a dispatch failure is logged and swallowed (returns `Ok(())`) —
+    /// never a UI error.
+    ///
+    /// Errors: an unparsable/unknown room id, or an account that isn't live →
+    /// [`TimelineError::RoomNotFound`]. A best-effort tag-dispatch failure is NOT
+    /// an error — it is logged and swallowed.
+    pub async fn unarchive_room(&self, account_id: &str, room_id: &str) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+        if let Err(e) = room.set_is_low_priority(false, None).await {
+            tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "unarchive dispatch failed (best-effort)");
+        }
+        Ok(())
+    }
+
     /// Set (or clear) the account's typing notice in the room through the
     /// receipt/typing signals seam (Story 3.9, AD-14). Resolves the account's live
     /// `Room` and delegates to [`signals::set_typing`]. Best-effort: a dispatch
@@ -2425,6 +2471,9 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
         item.num_unread_messages(),
         item.num_unread_mentions(),
     );
+    // `is_low_priority()` reads the cached `m.lowpriority` notable tag (no await);
+    // the merge partitions the inbox on it into the Archive window (Story 4.2).
+    let is_archived = item.is_low_priority();
 
     RoomVm {
         room_id,
@@ -2434,6 +2483,7 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
         avatar_url,
         is_unread,
         mention_count,
+        is_archived,
     }
 }
 
@@ -2615,6 +2665,7 @@ mod tests {
             avatar_url: None,
             is_unread: false,
             mention_count: 0,
+            is_archived: false,
         }
     }
 

@@ -12,10 +12,12 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     ...actual,
     markRoomRead: vi.fn(async () => {}),
     markRoomUnread: vi.fn(async () => {}),
+    archiveRoom: vi.fn(async () => {}),
+    unarchiveRoom: vi.fn(async () => {}),
   };
 });
 
-import { markRoomRead, markRoomUnread } from "@/lib/ipc/client";
+import { archiveRoom, markRoomRead, markRoomUnread, unarchiveRoom } from "@/lib/ipc/client";
 
 function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
   return {
@@ -28,6 +30,7 @@ function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
     avatarUrl: null,
     isUnread: false,
     mentionCount: 0,
+    isArchived: false,
     ...overrides,
   };
 }
@@ -266,6 +269,32 @@ describe("ChatRow", () => {
     expect(
       screen.getByRole("button", { name: "Conversation with Alice Smith" }),
     ).toBeInTheDocument();
+  });
+
+  it("context menu on a non-archived row shows Archive and invokes archiveRoom", async () => {
+    render(
+      <ChatRow
+        room={room({ accountId: "acctB", roomId: "!xyz:example.org", isArchived: false })}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByRole("button"));
+    const item = await screen.findByText("Archive");
+    expect(screen.queryByText("Unarchive")).not.toBeInTheDocument();
+    fireEvent.click(item);
+    expect(archiveRoom).toHaveBeenCalledWith("acctB", "!xyz:example.org");
+    expect(unarchiveRoom).not.toHaveBeenCalled();
+  });
+
+  it("context menu on an archived row shows Unarchive and invokes unarchiveRoom", async () => {
+    render(
+      <ChatRow room={room({ accountId: "acctB", roomId: "!xyz:example.org", isArchived: true })} />,
+    );
+    fireEvent.contextMenu(screen.getByRole("button"));
+    const item = await screen.findByText("Unarchive");
+    expect(screen.queryByText("Archive")).not.toBeInTheDocument();
+    fireEvent.click(item);
+    expect(unarchiveRoom).toHaveBeenCalledWith("acctB", "!xyz:example.org");
+    expect(archiveRoom).not.toHaveBeenCalled();
   });
 
   it("reverts the optimistic overlay when the mark command hard-rejects", async () => {

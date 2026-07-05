@@ -42,4 +42,11 @@ isUnread: boolean,
  * filled primary mention badge; a value of 0 shows a plain dot when
  * `is_unread` is otherwise set.
  */
-mentionCount: number, };
+mentionCount: number, 
+/**
+ * Authoritative archive flag: `true` when the room carries the Matrix
+ * low-priority tag (`m.lowpriority`) (Story 4.2, AD-20). The inbox merge
+ * partitions on this to place the room in the Archive window unless it is
+ * unread (auto-return is a pure view rule); the frontend never re-derives it.
+ */
+isArchived: boolean, };

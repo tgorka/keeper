@@ -35,6 +35,7 @@ function room(id: string, accountId: string): InboxRoomVm {
     avatarUrl: null,
     isUnread: false,
     mentionCount: 0,
+    isArchived: false,
   };
 }
 

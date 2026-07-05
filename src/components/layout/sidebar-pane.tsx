@@ -1,10 +1,11 @@
-import { MessageSquare, Radio, Settings, WifiOff } from "lucide-react";
+import { Archive, MessageSquare, Radio, Settings, WifiOff } from "lucide-react";
 import { useState } from "react";
 import { AccountFooter } from "@/components/layout/account-footer";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useShellOffline } from "@/lib/stores/account-status";
+import { primaryViewStore, usePrimaryView } from "@/lib/stores/primary-view";
 import { cn } from "@/lib/utils";
 
 interface SidebarView {
@@ -14,6 +15,7 @@ interface SidebarView {
 
 const VIEWS: SidebarView[] = [
   { label: "Chats", icon: MessageSquare },
+  { label: "Archive", icon: Archive },
   { label: "Bridges", icon: Radio },
   { label: "Settings", icon: Settings },
 ];
@@ -28,8 +30,11 @@ const OFFLINE_PILL_TEXT = "Offline — showing your local archive. Messages queu
 export function SidebarPane({ collapsed }: SidebarPaneProps) {
   const offline = useShellOffline();
   // Controlled state for the Settings dialog (Story 2.6). Only the Settings view
-  // button opens it; Chats/Bridges stay inert.
+  // button opens it; Bridges stays inert.
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // The active primary view (Story 4.2): "Chats" switches to the Unified Inbox,
+  // "Archive" to the Archive window. Reflected as `aria-current` + accent styling.
+  const primaryView = usePrimaryView();
 
   return (
     <nav
@@ -44,9 +49,20 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
       <ul className={cn("flex flex-col gap-1 p-2", collapsed && "items-center")}>
         {VIEWS.map((view) => {
           const Icon = view.icon;
-          // Only the Settings entry is interactive (opens the Settings dialog);
-          // Chats/Bridges remain inert until later stories wire them.
-          const onClick = view.label === "Settings" ? () => setSettingsOpen(true) : undefined;
+          // "Chats" and "Archive" switch the primary view; Settings opens the
+          // dialog; Bridges stays inert until a later story wires it.
+          const onClick =
+            view.label === "Settings"
+              ? () => setSettingsOpen(true)
+              : view.label === "Chats"
+                ? () => primaryViewStore.getState().setView("inbox")
+                : view.label === "Archive"
+                  ? () => primaryViewStore.getState().setView("archive")
+                  : undefined;
+          // Reflect the active primary view on the Chats/Archive entries.
+          const active =
+            (view.label === "Chats" && primaryView === "inbox") ||
+            (view.label === "Archive" && primaryView === "archive");
           if (collapsed) {
             return (
               <li key={view.label}>
@@ -57,7 +73,11 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                       variant="ghost"
                       size="icon"
                       aria-label={view.label}
-                      className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                      aria-current={active ? "page" : undefined}
+                      className={cn(
+                        "focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+                        active && "bg-accent text-accent-foreground",
+                      )}
                       onClick={onClick}
                     >
                       <Icon aria-hidden="true" />
@@ -73,7 +93,11 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
               <Button
                 type="button"
                 variant="ghost"
-                className="w-full justify-start gap-2 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                aria-current={active ? "page" : undefined}
+                className={cn(
+                  "w-full justify-start gap-2 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+                  active && "bg-accent text-accent-foreground",
+                )}
                 onClick={onClick}
               >
                 <Icon aria-hidden="true" />

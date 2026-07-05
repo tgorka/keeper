@@ -16,6 +16,12 @@
  * action, then the streamed VM reconciles it. The right-click context menu offers
  * a single "Mark read" / "Mark unread" item that sets the overlay then round-trips
  * to the server (best-effort — a rejection is swallowed, the stream is truth).
+ *
+ * A second context-menu item (Story 4.2) archives / unarchives the row via the
+ * low-priority tag: "Archive" when `!isArchived`, "Unarchive" otherwise. This is
+ * best-effort with NO optimistic overlay — the row's move between the Inbox and
+ * Archive windows is Rust-authoritative filtering (AD-20), so it waits on the tag
+ * round-trip; a rejection is swallowed.
  */
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -24,12 +30,13 @@ import {
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { accountHueVar } from "@/lib/account-hue";
 import { formatRoomTimestamp } from "@/lib/format-time";
 import type { InboxRoomVm } from "@/lib/ipc/client";
-import { markRoomRead, markRoomUnread } from "@/lib/ipc/client";
+import { archiveRoom, markRoomRead, markRoomUnread, unarchiveRoom } from "@/lib/ipc/client";
 import { effectiveIsUnread, type RoomSelection, useRoomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
 
@@ -89,6 +96,16 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
     void markRoomUnread(room.accountId, room.roomId).catch(() =>
       clearOptimisticUnread(room.accountId, room.roomId),
     );
+  };
+  // Archive/unarchive are best-effort with no optimistic overlay (Story 4.2): row
+  // membership between the Inbox and Archive windows is Rust-authoritative
+  // filtering (AD-20), so the visible move waits on the tag round-trip. A rejection
+  // is swallowed — the stream is truth.
+  const onArchive = () => {
+    void archiveRoom(room.accountId, room.roomId).catch(() => {});
+  };
+  const onUnarchive = () => {
+    void unarchiveRoom(room.accountId, room.roomId).catch(() => {});
   };
 
   // Accessible unread cue for the row button's name (the visual dot is
@@ -161,6 +178,12 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
           <ContextMenuItem onSelect={onMarkRead}>Mark read</ContextMenuItem>
         ) : (
           <ContextMenuItem onSelect={onMarkUnread}>Mark unread</ContextMenuItem>
+        )}
+        <ContextMenuSeparator />
+        {room.isArchived ? (
+          <ContextMenuItem onSelect={onUnarchive}>Unarchive</ContextMenuItem>
+        ) : (
+          <ContextMenuItem onSelect={onArchive}>Archive</ContextMenuItem>
         )}
       </ContextMenuContent>
     </ContextMenu>

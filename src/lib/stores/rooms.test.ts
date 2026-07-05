@@ -18,6 +18,7 @@ function room(
     avatarUrl: null,
     isUnread: false,
     mentionCount: 0,
+    isArchived: false,
     ...overrides,
   };
 }

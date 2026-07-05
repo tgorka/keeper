@@ -1114,6 +1114,45 @@ pub async fn mark_room_unread(
         .map_err(to_ipc_error)
 }
 
+/// Archive a room (Story 4.2). Delegates to the core, which sets the Matrix
+/// low-priority tag (`m.lowpriority`) via `Room::set_is_low_priority(true, None)` so
+/// the row moves into the Archive window (unless it is unread) and the tag persists
+/// and syncs to the user's other Matrix clients. Best-effort: a dispatch failure is
+/// logged and swallowed in the core (no UI error), so this resolves `Ok` even then.
+/// A room-not-found / inactive account funnels through [`to_ipc_error`] to
+/// `TimelineUnavailable`.
+#[tauri::command]
+pub async fn archive_room(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .archive_room(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unarchive a room (Story 4.2). Delegates to the core, which clears the Matrix
+/// low-priority tag (`m.lowpriority`) via `Room::set_is_low_priority(false, None)` so
+/// the row returns to its chronological Inbox position. Best-effort: a dispatch
+/// failure is logged and swallowed in the core (no UI error), so this resolves `Ok`
+/// even then. A room-not-found / inactive account funnels through [`to_ipc_error`] to
+/// `TimelineUnavailable`.
+#[tauri::command]
+pub async fn unarchive_room(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unarchive_room(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
 /// Set (or clear) the account's typing notice in the open room (Story 3.9, typing,
 /// AD-14). Delegates to the core, which emits a normal (non-private) typing
 /// notification through the receipt/typing signals seam. Best-effort: a dispatch
@@ -1241,20 +1280,25 @@ pub async fn session_restore(state: State<'_, AppState>) -> Result<Vec<AccountVm
 }
 
 /// Subscribe to the merged unified inbox across every restorable account (FR-18,
-/// AD-20). Activates each account, opens its room-list stream, and streams one
-/// recency-ordered [`InboxBatch`] over `channel` (a `Reset` window that updates
-/// as accounts sync or are added/removed). Returns the inbox subscription id.
-/// Ordering and filtering are computed in `keeper-core::inbox`, never in JS. A
-/// stream-start failure funnels through [`to_ipc_error`] to `SyncUnavailable`.
+/// AD-20, Story 4.2). Activates each account, opens its room-list stream, and
+/// partitions the recency-ordered merge into two [`InboxBatch`] streams over one
+/// subscription: the Inbox window over `channel` and the Archive window over
+/// `archive` (each a `Reset` window that updates as accounts sync or as archive
+/// state changes). Returns the inbox subscription id — one `inbox_unsubscribe`
+/// tears down both. Ordering and the inbox/archive split are computed in
+/// `keeper-core::inbox`, never in JS. A stream-start failure funnels through
+/// [`to_ipc_error`] to `SyncUnavailable`.
 #[tauri::command]
 pub async fn inbox_subscribe(
     state: State<'_, AppState>,
     channel: Channel<InboxBatch>,
+    archive: Channel<InboxBatch>,
 ) -> Result<u64, IpcError> {
-    let sink = Box::new(move |batch: InboxBatch| channel.send(batch).is_ok());
+    let inbox_sink = Box::new(move |batch: InboxBatch| channel.send(batch).is_ok());
+    let archive_sink = Box::new(move |batch: InboxBatch| archive.send(batch).is_ok());
     state
         .accounts
-        .subscribe_inbox(&state.platform, sink)
+        .subscribe_inbox(&state.platform, inbox_sink, archive_sink)
         .await
         .map_err(to_ipc_error)
 }

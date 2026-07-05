@@ -36,7 +36,7 @@ export function unreadOverrideKey(accountId: string, roomId: string): string {
 export interface RoomsState {
   /** The merged inbox window, exactly as Rust streamed it (recency order). */
   rooms: InboxRoomVm[];
-  /** Total rooms across all accounts the servers know about, or `null`. */
+  /** Number of rooms in the streamed Inbox window (its partition length), or `null`. */
   total: number | null;
   /**
    * Ephemeral optimistic-unread overlay (Story 4.1). Keyed by

@@ -254,19 +254,33 @@ export async function unsubscribeRoomList(accountId: string, id: number): Promis
 
 /**
  * Subscribe to the merged unified inbox across every restorable account (FR-18,
- * AD-20). Opens a `Channel`, forwards each {@link InboxBatch} to `onBatch` in
- * arrival order (a recency-ordered `Reset` window that updates as accounts sync
- * or are added/removed), and resolves with the inbox subscription id. Ordering
- * and filtering are computed in Rust — never re-derived here. Rejects with the
- * {@link IpcError} envelope (`code: "syncUnavailable"`) on a stream-start failure.
+ * AD-20, Story 4.2). Opens **two** `Channel`s over one subscription and forwards
+ * the recency-ordered Inbox window to `onInbox` and the Archive window to
+ * `onArchive` (each a `Reset` window that updates as accounts sync or as archive
+ * state changes). Resolves with the inbox subscription id — one
+ * {@link unsubscribeInbox} tears down both. Ordering and the inbox/archive split
+ * are computed in Rust — never re-derived here. Rejects with the {@link IpcError}
+ * envelope (`code: "syncUnavailable"`) on a stream-start failure.
+ *
+ * Both channels arm their `onmessage` before `invoke` (the ordering is
+ * load-bearing per AD-8, so no batch sent by a spawned task is dropped). The Rust
+ * command's params are `channel` (inbox) and `archive`.
  */
-export async function subscribeInbox(onBatch: (batch: InboxBatch) => void): Promise<number> {
-  return await subscribe<InboxBatch>("inbox_subscribe", onBatch);
+export async function subscribeInbox(
+  onInbox: (batch: InboxBatch) => void,
+  onArchive: (batch: InboxBatch) => void,
+): Promise<number> {
+  const channel = new Channel<InboxBatch>();
+  const archive = new Channel<InboxBatch>();
+  channel.onmessage = onInbox;
+  archive.onmessage = onArchive;
+  return await invoke<number>("inbox_subscribe", { channel, archive });
 }
 
 /**
  * Unsubscribe the merged inbox, aborting every per-account producer feeding it
- * (AD-20). Idempotent — a mismatched/unknown id is a no-op.
+ * (AD-20). Idempotent — a mismatched/unknown id is a no-op. Covers both the
+ * Inbox and Archive channels (Story 4.2).
  */
 export async function unsubscribeInbox(id: number): Promise<void> {
   await invoke<void>("inbox_unsubscribe", { subscriptionId: id });
@@ -719,6 +733,31 @@ export async function markRoomRead(accountId: string, roomId: string): Promise<v
  */
 export async function markRoomUnread(accountId: string, roomId: string): Promise<void> {
   await invoke<void>("mark_room_unread", { accountId, roomId });
+}
+
+/**
+ * Archive a room (Story 4.2). The Rust core sets the Matrix low-priority tag
+ * (`m.lowpriority`) via `Room::set_is_low_priority(true, None)` so the row moves into
+ * the Archive window (unless it is unread) and the tag persists and syncs to the
+ * user's other Matrix clients. Best-effort: a dispatch failure is swallowed in the
+ * core (never a UI error), so this resolves even then. Callers may fire-and-forget
+ * and swallow rejections. Rejects with the {@link IpcError} envelope (`code:
+ * "timelineUnavailable"`) only on an unknown room/inactive account.
+ */
+export async function archiveRoom(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("archive_room", { accountId, roomId });
+}
+
+/**
+ * Unarchive a room (Story 4.2). The Rust core clears the Matrix low-priority tag
+ * (`m.lowpriority`) via `Room::set_is_low_priority(false, None)` so the row returns to
+ * its chronological Inbox position. Best-effort: a dispatch failure is swallowed in
+ * the core (never a UI error), so this resolves even then. Callers may
+ * fire-and-forget and swallow rejections. Rejects with the {@link IpcError} envelope
+ * (`code: "timelineUnavailable"`) only on an unknown room/inactive account.
+ */
+export async function unarchiveRoom(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("unarchive_room", { accountId, roomId });
 }
 
 /**

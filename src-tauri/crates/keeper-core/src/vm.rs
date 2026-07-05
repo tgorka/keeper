@@ -339,6 +339,11 @@ pub struct RoomVm {
     /// `is_unread` is otherwise set.
     #[ts(type = "number")]
     pub mention_count: u32,
+    /// Authoritative archive flag: `true` when the room carries the Matrix
+    /// low-priority tag (`m.lowpriority`) (Story 4.2, AD-20). The inbox merge
+    /// partitions on this to place the room in the Archive window unless it is
+    /// unread (auto-return is a pure view rule); the frontend never re-derives it.
+    pub is_archived: bool,
 }
 
 /// One index-based room-list operation mirroring an eyeball-im `VectorDiff`
@@ -925,6 +930,11 @@ pub struct InboxRoomVm {
     /// `is_unread` is otherwise set.
     #[ts(type = "number")]
     pub mention_count: u32,
+    /// Authoritative archive flag: `true` when the room carries the Matrix
+    /// low-priority tag (`m.lowpriority`) (Story 4.2, AD-20). The merge
+    /// partitions on this to place the row in the Archive window unless it is
+    /// unread (auto-return is a pure view rule); the frontend never re-derives it.
+    pub is_archived: bool,
 }
 
 /// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
@@ -980,15 +990,17 @@ pub enum InboxOp {
 ///
 /// The stream always opens with a batch whose first op is an [`InboxOp::Reset`]
 /// carrying the current merged window, then further batches as accounts sync or
-/// are added/removed. `total` is the sum of the per-account known totals.
+/// are added/removed. The merge is partitioned into an Inbox and an Archive
+/// window (Story 4.2), and `total` is the length of *this* window's partition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct InboxBatch {
     /// The ordered ops to apply, in sequence.
     pub ops: Vec<InboxOp>,
-    /// The total number of rooms across all accounts the servers know about,
-    /// when known.
+    /// The number of rooms in this streamed window (the partition's own length),
+    /// when known. Since Story 4.2 the merge is split into an Inbox and an
+    /// Archive window, so this is per-window, not a cross-account server total.
     #[ts(type = "number | null")]
     pub total: Option<u32>,
 }
@@ -1155,6 +1167,7 @@ mod tests {
             avatar_url: None,
             is_unread: false,
             mention_count: 0,
+            is_archived: false,
         }
     }
 
@@ -1332,6 +1345,7 @@ mod tests {
             avatar_url: Some("mxc://example.org/av".to_owned()),
             is_unread: false,
             mention_count: 0,
+            is_archived: false,
         }
     }
 
@@ -1359,6 +1373,7 @@ mod tests {
             avatar_url: None,
             is_unread: false,
             mention_count: 0,
+            is_archived: false,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");
