@@ -1,0 +1,107 @@
+src-tauri/crates/keeper-core/data/resolve-support.json
+  s_88e814b0c0d63c::t_b6205f797470c8 1-82
+src/lib/ipc/gen/ResolveSupportVm.ts
+  s_88e814b0c0d63c::t_0318cb041d5fe8 1-30
+src-tauri/crates/keeper/src/ipc.rs
+  s_88e814b0c0d63c::t_4d6e8d0908ca81 513-553
+  s_88e814b0c0d63c::t_03cecfbc3ec166 28-30
+src/components/layout/app-shell.tsx
+  s_88e814b0c0d63c::t_ab9dbc29aa47a5 47-48
+  s_88e814b0c0d63c::t_fb01a0e2cfde6b 20
+  s_88e814b0c0d63c::t_ed4f1c8a1fa1d5 2
+  s_88e814b0c0d63c::t_8195caa1dd29cf 108
+src/lib/ipc/client.ts
+  s_88e814b0c0d63c::t_88e3789e632463 47
+  s_88e814b0c0d63c::t_f75a0ae72b2cf2 87
+  s_88e814b0c0d63c::t_f075379606a597 89
+  s_88e814b0c0d63c::t_13937b05d06416 54
+  s_88e814b0c0d63c::t_2a43a00f5677eb 223-259
+src/components/chat/composer.tsx
+  s_88e814b0c0d63c::t_3f39123439b156 449
+  s_88e814b0c0d63c::t_ab359284c633c6 36
+  s_88e814b0c0d63c::t_cd70f555f18611 131,133-134,139,142-145
+  s_88e814b0c0d63c::t_ad585858b4ba11 132,135-138,140-141
+_bmad-output/implementation-artifacts/spec-6-6-start-new-chats-via-bridge.md
+  s_88e814b0c0d63c::t_839f5fe9701150 10
+  s_88e814b0c0d63c::t_855221bf14fcde 133-162
+  s_88e814b0c0d63c::t_3b3b5cd10461a0 5
+  s_88e814b0c0d63c::t_40a7a40bed4f78 78-87
+  s_88e814b0c0d63c::t_206961c008fed7 1-4,6,8-9,11-77,88-94,117-132
+  s_88e814b0c0d63c::t_d8fb3961f2c054 7
+  s_88e814b0c0d63c::t_512c8671293a4c 95-116
+src/components/chat/composer.test.tsx
+  s_88e814b0c0d63c::t_f675a66cdcc677 394,397
+  s_88e814b0c0d63c::t_6f871ddaa565c1 386,388-393,398
+  s_88e814b0c0d63c::t_2b5c0716ea4993 399-408
+  s_88e814b0c0d63c::t_7a8a2dd4b97d69 1
+  s_88e814b0c0d63c::t_f683d63a21c855 5
+  s_88e814b0c0d63c::t_41053f448aa5f2 387,395-396
+  s_88e814b0c0d63c::t_dcfd2113e04da2 16
+src/hooks/use-new-chat-shortcut.ts
+  s_88e814b0c0d63c::t_7a84eb2a6add71 1-19,33-39
+  s_88e814b0c0d63c::t_14b63f82bc17da 20-32
+src/lib/stores/new-chat.ts
+  s_88e814b0c0d63c::t_43256f797313ef 1-47
+src/lib/stores/composer.ts
+  s_88e814b0c0d63c::t_33d3651ab0fd79 102
+  s_88e814b0c0d63c::t_75e49926699cff 119
+  s_88e814b0c0d63c::t_4ab3e0e81af746 62-68
+  s_88e814b0c0d63c::t_147c29c5caa5bd 91-92
+  s_88e814b0c0d63c::t_7aeb1ed84a1f36 61
+src-tauri/crates/keeper-core/src/account.rs
+  s_88e814b0c0d63c::t_5c96438d291b9d 1679-1747,1754-1756,1759-1768
+  s_88e814b0c0d63c::t_955ce702bc5466 1748-1753,1757-1758
+src/components/chat/new-chat-dialog.tsx
+  s_88e814b0c0d63c::t_5ea11159c849d9 62
+  s_88e814b0c0d63c::t_587473f777d65e 227-253
+  s_88e814b0c0d63c::t_fa9fe4996e8b95 1-50,52-61,64-87,97-120,124,132-138,143,146-181,205,221,261-274
+  s_88e814b0c0d63c::t_bf07b85fc56b22 182-204,206-220,222-226
+  s_88e814b0c0d63c::t_70b88153c549cc 63
+  s_88e814b0c0d63c::t_38ec2dba882612 51,144-145
+  s_88e814b0c0d63c::t_7b546d9007652e 88-96
+  s_88e814b0c0d63c::t_5a0cdf76f61f19 254-260
+  s_88e814b0c0d63c::t_55cfbd539b317b 121-123,125-131,139-142
+src-tauri/crates/keeper-core/src/bridges/transport/provisioning.rs
+  s_88e814b0c0d63c::t_512f69ff3e1c42 169-194,201-230,234-245
+  s_88e814b0c0d63c::t_18ece980cc61ea 519-558,563,568-573
+  s_88e814b0c0d63c::t_15c4a9bab60a63 198-200,231-233
+  s_88e814b0c0d63c::t_57f8a9c732f857 195-197
+  s_88e814b0c0d63c::t_fb5862243014b8 327-355,357-366
+  s_88e814b0c0d63c::t_955ce702bc5466 356,559-562,564-567
+src/components/chat/new-chat-dialog.test.tsx
+  s_88e814b0c0d63c::t_88aa8428f5bc35 1-13,17-54,56-153,167-176
+  s_88e814b0c0d63c::t_38ec2dba882612 14-16
+  s_88e814b0c0d63c::t_6dbdc15e5f6cc1 154-166
+  s_88e814b0c0d63c::t_d79521b371da85 55
+src-tauri/crates/keeper-core/src/bridges/data.rs
+  s_88e814b0c0d63c::t_1b32286010753d 303-304
+  s_88e814b0c0d63c::t_a471f71114d297 34-35
+  s_88e814b0c0d63c::t_ee267e08fa85b1 394-460
+  s_88e814b0c0d63c::t_01db37672537f5 768-861
+  s_88e814b0c0d63c::t_aa0ce546f7db53 243-290
+  s_88e814b0c0d63c::t_25a71a1aa91c55 318-319
+src-tauri/crates/keeper/src/lib.rs
+  s_88e814b0c0d63c::t_b3d6d15ab9d679 55-56
+src-tauri/crates/keeper-core/src/vm.rs
+  s_88e814b0c0d63c::t_4c49a796c1629c 1535-1572
+  s_88e814b0c0d63c::t_955ce702bc5466 1933-1936
+  s_88e814b0c0d63c::t_f2c8c0f7fd36e9 1924-1932,1937-1963
+src/lib/ipc/gen/NewChatResolutionVm.ts
+  s_88e814b0c0d63c::t_0318cb041d5fe8 1-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "10966c9a62b506eceb0c908d053ef1cfa78d439f",
+  "prompts": {},
+  "sessions": {
+    "s_88e814b0c0d63c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1bd9248c-65e3-4fd6-bf75-b6b357339211",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
