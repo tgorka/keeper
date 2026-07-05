@@ -324,6 +324,14 @@ pub enum ArchiveError {
     /// wrapped string is a non-secret description — never media bytes.
     #[error("archive serialization error: {0}")]
     Serialization(String),
+
+    /// A filesystem operation during export failed (creating the scope subfolder,
+    /// writing a JSON/Markdown/media file, or cleaning up partial output) (Story
+    /// 5.5). The wrapped string is a non-secret description — never message content
+    /// or media bytes. Surfaces to the export command, which streams it as the
+    /// `Failed` terminal batch after cleaning up partial output.
+    #[error("archive export IO error: {0}")]
+    ExportIo(String),
 }
 
 /// The hexagon error root. Every fallible core operation surfaces one of these.

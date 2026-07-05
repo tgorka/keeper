@@ -15,7 +15,7 @@
  * send-state caption with a persistent `Failed — Retry` (FR-9, AD-13).
  */
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { PanelRight } from "lucide-react";
+import { Download, PanelRight } from "lucide-react";
 import {
   type KeyboardEvent,
   type Ref,
@@ -71,6 +71,7 @@ import { useAccountStatus } from "@/lib/stores/account-status";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { attachmentId, attachmentsStore, type PendingAttachment } from "@/lib/stores/attachments";
 import { composerStore, useComposerStore } from "@/lib/stores/composer";
+import { exportStore } from "@/lib/stores/export";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { timelineStore, useTimelineStore } from "@/lib/stores/timeline";
 
@@ -1063,18 +1064,38 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     <main className="flex h-full min-w-0 flex-1 flex-col bg-background">
       <div className="flex shrink-0 items-center justify-between gap-2 border-border border-b p-2">
         <ConversationHeaderIdentity accountId={accountId} />
-        <Button
-          ref={toggleRef}
-          type="button"
-          variant="ghost"
-          size="icon"
-          aria-label="Toggle detail panel"
-          aria-pressed={detailOpen}
-          onClick={onToggleDetail}
-          className="shrink-0 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-        >
-          <PanelRight aria-hidden="true" />
-        </Button>
+        <div className="flex shrink-0 items-center gap-1">
+          {accountId !== null && selectedRoomId !== null && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Export this chat"
+              onClick={() =>
+                exportStore.getState().open({
+                  scope: "chat",
+                  accountId,
+                  roomId: selectedRoomId,
+                })
+              }
+              className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+            >
+              <Download aria-hidden="true" />
+            </Button>
+          )}
+          <Button
+            ref={toggleRef}
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label="Toggle detail panel"
+            aria-pressed={detailOpen}
+            onClick={onToggleDetail}
+            className="shrink-0 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+          >
+            <PanelRight aria-hidden="true" />
+          </Button>
+        </div>
       </div>
       {selectedRoomId === null ? (
         <div className="flex flex-1 items-center justify-center p-8">

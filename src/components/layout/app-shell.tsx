@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from "react";
+import { ExportDialog } from "@/components/export/export-dialog";
 import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
@@ -80,6 +81,7 @@ export function AppShell() {
       <DeviceVerificationDialog />
       <KeyBackupDialog />
       <SearchOverlay />
+      <ExportDialog />
 
       {detailFloating && (
         <Sheet open={detailOpen} onOpenChange={handleSheetOpenChange}>

@@ -5,9 +5,10 @@
 //! [`Platform`] port is implemented. No business logic lives here — commands
 //! delegate to `keeper-core`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use keeper_core::account::AccountManager;
@@ -22,9 +23,9 @@ use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, BackupStatus, ConnectionStatusBatch, DemoBatch, EditVersionVm,
-    EncryptionStatusBatch, InboxBatch, IpcError, IpcErrorCode, NetworksSnapshot,
-    PaginationStatusBatch, PingVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot,
-    TimelineBatch, TypingBatch, VerificationFlowVm,
+    EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IpcError,
+    IpcErrorCode, NetworksSnapshot, PaginationStatusBatch, PingVm, RoomListBatch, SearchFilterVm,
+    SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -49,6 +50,54 @@ pub struct AppState {
     /// `login_beeper` (keyed by email) so it never crosses IPC; `cancel_beeper`
     /// clears it. All `api.beeper.com` HTTP is confined to `keeper-core`.
     pub beeper_flows: Arc<BeeperFlowRegistry>,
+    /// Live archive-export jobs (Story 5.5). Maps each `exportId` to its shared
+    /// `Arc<AtomicBool>` cancel flag: `export_start` registers a flag before
+    /// spawning the blocking job, `export_cancel` sets it, and the job deregisters
+    /// itself on any terminal phase. The `AtomicU64` mints monotonic ids.
+    pub exports: Arc<ExportRegistry>,
+}
+
+/// The archive-export cancel-flag registry (Story 5.5). Each running job owns an
+/// entry keyed by its `exportId`; setting the flag makes the synchronous export
+/// loop stop at its next between-events check. `rusqlite` is synchronous, so a
+/// drop-based cancel cannot interrupt the loop — this shared flag is how cancel
+/// reaches a blocking job.
+#[derive(Default)]
+pub struct ExportRegistry {
+    /// Monotonic export-id source.
+    next_id: AtomicU64,
+    /// `exportId → cancel flag`. Held under a `Mutex` since it is mutated from the
+    /// command tasks and the blocking job's deregistration.
+    flags: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+}
+
+impl ExportRegistry {
+    /// Register a fresh job: mint an id and store a cleared cancel flag. Returns the
+    /// `(exportId, flag)` the caller passes into the blocking job.
+    fn register(&self) -> (u64, Arc<AtomicBool>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let flag = Arc::new(AtomicBool::new(false));
+        if let Ok(mut flags) = self.flags.lock() {
+            flags.insert(id, flag.clone());
+        }
+        (id, flag)
+    }
+
+    /// Set the cancel flag for a job id (idempotent; a no-op for an unknown/gone id).
+    fn cancel(&self, export_id: u64) {
+        if let Ok(flags) = self.flags.lock() {
+            if let Some(flag) = flags.get(&export_id) {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Deregister a job on any terminal phase (drops its flag). Idempotent.
+    fn deregister(&self, export_id: u64) {
+        if let Ok(mut flags) = self.flags.lock() {
+            flags.remove(&export_id);
+        }
+    }
 }
 
 impl AppState {
@@ -70,6 +119,7 @@ impl AppState {
             accounts: AccountManager::new(&data_dir),
             oauth_flows: Arc::new(OAuthFlowRegistry::new()),
             beeper_flows: Arc::new(BeeperFlowRegistry::new()),
+            exports: Arc::new(ExportRegistry::default()),
         }
     }
 }
@@ -245,13 +295,19 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         CoreError::Media(MediaError::NotFound | MediaError::Fetch(_)) => {
             (IpcErrorCode::Internal, false)
         }
-        // Archive errors (Story 5.1) surface only at archive setup and never cross
-        // the IPC command surface — a runtime write failure is swallowed inside the
-        // writer task. This arm keeps the funnel exhaustive: an internal,
-        // non-retriable IPC error should one ever reach here.
+        // Archive Sqlite/serialization errors (Story 5.1) surface only at archive
+        // setup and never cross the IPC command surface — a runtime write failure is
+        // swallowed inside the writer task. This arm keeps the funnel exhaustive: an
+        // internal, non-retriable IPC error should one ever reach here.
         CoreError::Archive(ArchiveError::Sqlite(_) | ArchiveError::Serialization(_)) => {
             (IpcErrorCode::Internal, false)
         }
+        // An export IO failure (Story 5.5) — e.g. a read-only destination folder — is
+        // surfaced to the export UI's persistent alert. Marked retriable: the user
+        // can pick a writable destination and start the export again. (Terminal
+        // export failures are normally streamed on the `Failed` batch; this arm
+        // covers the `export_start`-time / synchronous-setup path.)
+        CoreError::Archive(ArchiveError::ExportIo(_)) => (IpcErrorCode::Internal, true),
     };
     IpcError {
         code,
@@ -538,6 +594,193 @@ pub fn search_archive(
     keeper_core::archive::search(&conn, &domain_filter, honor_deletions)
         .map_err(CoreError::from)
         .map_err(to_ipc_error)
+}
+
+/// Start a background archive export (Story 5.5, FR-35, AD-11).
+///
+/// Registers a cancel flag, returns the `exportId` immediately, and spawns a
+/// blocking job (rusqlite is synchronous) that reads `archive.db` **only** via a
+/// fresh read-only connection — never the SDK store, live session, or network, so a
+/// signed-out Account is still exportable. The job streams [`ExportProgressVm`]
+/// batches over `channel` (`Running` heartbeats, then exactly one terminal
+/// `Completed`/`Cancelled`/`Failed`), best-effort-copies media via the injected
+/// resolver (currently `None` — session-free media byte inclusion is deferred, so
+/// every media item is skipped-and-counted, honoring AD-11), and on cancel/failure
+/// deletes the partial scope folder before the terminal batch. The job deregisters
+/// its cancel flag on any terminal phase. Setup failures (data dir / missing
+/// archive) funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn export_start(
+    state: State<'_, AppState>,
+    request: ExportRequestVm,
+    channel: Channel<ExportProgressVm>,
+) -> Result<u64, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    // Read the honor-remote-deletions policy once (the same accessor search uses),
+    // so a redacted root renders a stub and never the withheld content.
+    let honor_deletions =
+        keeper_core::archive::get_honor_remote_deletions(&data_dir).map_err(to_ipc_error)?;
+
+    let (export_id, cancel) = state.exports.register();
+    let exports = state.exports.clone();
+
+    // The blocking job owns its own read-only connection and runs off the async
+    // runtime so it never blocks messaging (AD-11). A closed channel simply drops
+    // the batch (the frontend unsubscribed).
+    tokio::task::spawn_blocking(move || {
+        run_export_job(
+            &data_dir,
+            &request,
+            honor_deletions,
+            &cancel,
+            export_id,
+            &channel,
+        );
+        // Terminal phase reached (or the job never started): deregister the flag.
+        exports.deregister(export_id);
+    });
+
+    Ok(export_id)
+}
+
+/// The blocking export body (Story 5.5). Opens a read-only `archive.db`, runs the
+/// tauri-free [`keeper_core::archive::export::run_export`], and sends the terminal
+/// batch. All errors are converted into a terminal `Failed`/`Cancelled` batch — the
+/// caller (`export_start`) already returned the `exportId`, so nothing rejects here.
+fn run_export_job(
+    data_dir: &std::path::Path,
+    request: &ExportRequestVm,
+    honor_deletions: bool,
+    cancel: &AtomicBool,
+    export_id: u64,
+    channel: &Channel<ExportProgressVm>,
+) {
+    use keeper_core::archive::export::{run_export, ExportError};
+
+    // A fresh install / never-synced account has no `archive.db`; treat it as an
+    // empty archive that exports cleanly rather than an error.
+    let dest_root = std::path::PathBuf::from(&request.destination_dir);
+    let conn = if keeper_core::archive::db::db_path(data_dir).exists() {
+        match keeper_core::archive::db::open_readonly_archive_db(data_dir) {
+            Ok(conn) => Some(conn),
+            Err(e) => {
+                send_terminal_failed(channel, export_id, e.to_string());
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    // The progress sink: forward each `Running` batch to the channel (a closed
+    // channel drops it — the frontend unsubscribed).
+    let progress = |vm: ExportProgressVm| channel.send(vm).is_ok();
+
+    // The media resolver is injected here to keep `keeper-core` session-free. Full
+    // session-free media byte inclusion is out of scope for Story 5.5 (deferred), so
+    // pass `None`: every media item is skipped-and-counted, honoring AD-11.
+    let media_resolver = None;
+
+    let result = match &conn {
+        Some(conn) => run_export(
+            conn,
+            request,
+            &dest_root,
+            honor_deletions,
+            &progress,
+            cancel,
+            media_resolver,
+            export_id,
+        ),
+        None => {
+            // No archive on disk: run against a throwaway in-memory DB with the
+            // `events` schema so the export produces valid empty output.
+            match keeper_core::archive::db::open_empty_in_memory_archive_db() {
+                Ok(conn) => run_export(
+                    &conn,
+                    request,
+                    &dest_root,
+                    honor_deletions,
+                    &progress,
+                    cancel,
+                    media_resolver,
+                    export_id,
+                ),
+                Err(e) => {
+                    send_terminal_failed(channel, export_id, e.to_string());
+                    return;
+                }
+            }
+        }
+    };
+
+    match result {
+        Ok(outcome) => {
+            let _ = channel.send(ExportProgressVm {
+                export_id,
+                phase: ExportPhase::Completed,
+                messages_written: outcome.messages_written,
+                total_messages: Some(outcome.messages_written),
+                media_copied: outcome.media_copied,
+                media_skipped: outcome.media_skipped,
+                output_paths: outcome.output_paths,
+                error: None,
+            });
+        }
+        Err(ExportError::Cancelled) => {
+            let _ = channel.send(ExportProgressVm {
+                export_id,
+                phase: ExportPhase::Cancelled,
+                messages_written: 0,
+                total_messages: None,
+                media_copied: 0,
+                media_skipped: 0,
+                output_paths: Vec::new(),
+                error: None,
+            });
+        }
+        Err(ExportError::Failed(e)) => {
+            send_terminal_failed(channel, export_id, e.to_string());
+        }
+    }
+}
+
+/// Send a terminal `Failed` export batch (Story 5.5). The message is a non-secret
+/// description — never message content or media bytes.
+fn send_terminal_failed(channel: &Channel<ExportProgressVm>, export_id: u64, message: String) {
+    let _ = channel.send(ExportProgressVm {
+        export_id,
+        phase: ExportPhase::Failed,
+        messages_written: 0,
+        total_messages: None,
+        media_copied: 0,
+        media_skipped: 0,
+        output_paths: Vec::new(),
+        error: Some(message),
+    });
+}
+
+/// Cancel a running archive export by id (Story 5.5). Sets the job's shared cancel
+/// flag; the synchronous export loop stops at its next between-events check, deletes
+/// partial output, and streams the `Cancelled` terminal batch. Idempotent — a no-op
+/// for an unknown / already-finished id.
+#[tauri::command]
+pub fn export_cancel(state: State<'_, AppState>, export_id: u64) -> Result<(), IpcError> {
+    state.exports.cancel(export_id);
+    Ok(())
+}
+
+/// Reveal an exported file in the OS file manager (Story 5.5, "Reveal in Finder").
+/// Delegates to `tauri_plugin_opener::reveal_item_in_dir` (the `opener:default`
+/// capability grants `allow-reveal-item-in-dir`). An invalid / non-existent path
+/// maps to a non-retriable internal `IpcError` — never a panic.
+#[tauri::command]
+pub fn reveal_path(path: String) -> Result<(), IpcError> {
+    tauri_plugin_opener::reveal_item_in_dir(&path).map_err(|e| {
+        to_ipc_error(CoreError::Internal(format!(
+            "could not reveal the file: {e}"
+        )))
+    })
 }
 
 /// Subscribe to an account's sliding-sync room list (FR-8, AD-8/9/19/20).

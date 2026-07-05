@@ -18,6 +18,10 @@ export type { DemoItem } from "./gen/DemoItem";
 export type { EditVersionVm } from "./gen/EditVersionVm";
 export type { EncryptionStatus } from "./gen/EncryptionStatus";
 export type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
+export type { ExportPhase } from "./gen/ExportPhase";
+export type { ExportProgressVm } from "./gen/ExportProgressVm";
+export type { ExportRequestVm } from "./gen/ExportRequestVm";
+export type { ExportScopeKind } from "./gen/ExportScopeKind";
 export type { InboxBatch } from "./gen/InboxBatch";
 export type { InboxOp } from "./gen/InboxOp";
 export type { InboxRoomVm } from "./gen/InboxRoomVm";
@@ -55,6 +59,8 @@ import type { BackupStatus } from "./gen/BackupStatus";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { EditVersionVm } from "./gen/EditVersionVm";
 import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
+import type { ExportProgressVm } from "./gen/ExportProgressVm";
+import type { ExportRequestVm } from "./gen/ExportRequestVm";
 import type { InboxBatch } from "./gen/InboxBatch";
 import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
@@ -245,6 +251,45 @@ export async function setHonorRemoteDeletions(enabled: boolean): Promise<void> {
  */
 export async function searchArchive(filter: SearchFilterVm): Promise<SearchHitVm[]> {
   return await invoke<SearchHitVm[]>("search_archive", { filter });
+}
+
+/**
+ * Start a background archive export (FR-35, AD-11, Story 5.5). Opens a `Channel`,
+ * forwards each {@link ExportProgressVm} to `onProgress` in arrival order
+ * (`running` heartbeats with live counts, then exactly one terminal
+ * `completed`/`cancelled`/`failed` batch), and resolves with the backend-assigned
+ * `exportId` (the handle {@link cancelExport} sets the cancel flag for). The job
+ * reads `archive.db` only and never blocks messaging; media bytes are best-effort
+ * (unresolvable ones are skipped-and-counted). Rejects with the {@link IpcError}
+ * envelope only on a setup failure (the archive path / a malformed request) — a
+ * runtime export failure arrives as the `failed` batch, not a rejection.
+ */
+export async function startExport(
+  request: ExportRequestVm,
+  onProgress: (batch: ExportProgressVm) => void,
+): Promise<number> {
+  return await subscribe<ExportProgressVm>("export_start", onProgress, { request });
+}
+
+/**
+ * Cancel a running archive export by id (FR-35, Story 5.5). Sets the job's shared
+ * cancel flag; the synchronous export loop stops at its next check, deletes partial
+ * output, and streams the `cancelled` terminal batch over the original progress
+ * channel. Idempotent — a no-op for an unknown / already-finished id. Rejects with
+ * the {@link IpcError} envelope only on an unexpected backend failure.
+ */
+export async function cancelExport(exportId: number): Promise<void> {
+  await invoke<void>("export_cancel", { exportId });
+}
+
+/**
+ * Reveal an exported file in the OS file manager (FR-35, Story 5.5). `path` is one
+ * of the completed export's `outputPaths`; the Rust core delegates to
+ * `reveal_item_in_dir` (Finder on macOS). Rejects with the {@link IpcError}
+ * envelope (`code: "internal"`) on an invalid / non-existent path — never a panic.
+ */
+export async function revealPath(path: string): Promise<void> {
+  await invoke<void>("reveal_path", { path });
 }
 
 /**

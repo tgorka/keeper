@@ -90,7 +90,7 @@ development_status:
   5-2-durability-against-remote-rewrites-edit-history: done
   5-3-offline-full-text-search-engine: done
   5-4-search-ui-global-and-in-chat: done
-  5-5-export-to-json-and-markdown: backlog
+  5-5-export-to-json-and-markdown: done
   5-6-archive-first-pagination: backlog
   5-7-archive-survives-sign-out-and-deletes-only-on-command: backlog
   epic-5-retrospective: optional

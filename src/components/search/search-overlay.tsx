@@ -27,6 +27,7 @@ import type { IpcError, SearchHitVm } from "@/lib/ipc/client";
 import { searchArchive } from "@/lib/ipc/client";
 import { buildSearchFilter, type SearchUiFilter } from "@/lib/search-filter";
 import { useAccountsStore } from "@/lib/stores/accounts";
+import { exportStore } from "@/lib/stores/export";
 import { useNetworksStore } from "@/lib/stores/networks";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { searchStore, useSearchStore } from "@/lib/stores/search";
@@ -209,6 +210,24 @@ export function SearchOverlay() {
     [close],
   );
 
+  // Open the Export dialog preset to the current search scope (Story 5.5): an
+  // in-chat lock → that Chat; a single Account chip → that account; else everything.
+  // Closes the search surface first (the two overlays never stack).
+  const openExport = useCallback(() => {
+    if (chatLock !== null) {
+      exportStore.getState().open({
+        scope: "chat",
+        accountId: chatLock.accountId,
+        roomId: chatLock.roomId,
+      });
+    } else if (accountId !== null) {
+      exportStore.getState().open({ scope: "account", accountId, roomId: null });
+    } else {
+      exportStore.getState().open({ scope: "everything", accountId: null, roomId: null });
+    }
+    close();
+  }, [chatLock, accountId, close]);
+
   const showNoResults = hasSearched && error === null && hits.length === 0 && query.trim() !== "";
 
   return (
@@ -218,11 +237,21 @@ export function SearchOverlay() {
         onKeyDown={onKeyDown}
         aria-label="Search your local archive"
       >
-        <div className="flex flex-col gap-1">
-          <h2 className="text-sm font-semibold text-foreground">Searching your local archive</h2>
-          <p className="text-xs text-muted-foreground">
-            Search works fully offline against your local archive on this Mac.
-          </p>
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex flex-col gap-1">
+            <h2 className="text-sm font-semibold text-foreground">Searching your local archive</h2>
+            <p className="text-xs text-muted-foreground">
+              Search works fully offline against your local archive on this Mac.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={openExport}
+            aria-label="Export this scope"
+            className="h-7 shrink-0 rounded-md border border-input px-2 text-xs text-muted-foreground hover:text-foreground"
+          >
+            Export…
+          </button>
         </div>
 
         <InputGroup>

@@ -22,6 +22,7 @@
 //! no archive-deletion / sign-out path — those are later epic-5 stories.
 
 pub mod db;
+pub mod export;
 pub mod fts;
 mod ingest;
 

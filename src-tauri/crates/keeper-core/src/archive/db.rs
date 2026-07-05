@@ -215,6 +215,26 @@ pub fn open_readonly_archive_db(data_dir: &Path) -> Result<Connection, ArchiveEr
     Ok(conn)
 }
 
+/// Open a throwaway **in-memory** `archive.db` with the full `events` schema
+/// (Story 5.5). Used only by export when a never-synced install has no `archive.db`
+/// file yet: the export then reads an empty archive and produces valid empty output
+/// instead of erroring. Never used for ingestion or reads of real data.
+pub fn open_empty_in_memory_archive_db() -> Result<Connection, ArchiveError> {
+    let conn = Connection::open_in_memory()
+        .map_err(|e| ArchiveError::Sqlite(format!("could not open in-memory archive: {e}")))?;
+    conn.execute(
+        "CREATE TABLE events(\
+            account_id TEXT NOT NULL, event_id TEXT NOT NULL, room_id TEXT NOT NULL, \
+            sender TEXT NOT NULL, origin_ts INTEGER NOT NULL, event_type TEXT NOT NULL, \
+            content_json TEXT NOT NULL, media_json TEXT, inserted_ts INTEGER NOT NULL, \
+            relates_to_event_id TEXT, rel_type TEXT, redacted_ts INTEGER, body TEXT, \
+            PRIMARY KEY(account_id, event_id))",
+        [],
+    )
+    .map_err(|e| ArchiveError::Sqlite(format!("could not create in-memory events: {e}")))?;
+    Ok(conn)
+}
+
 /// The Story 5.2 durability columns, each nullable and each added by the
 /// idempotent migration below when missing from a pre-5.1 `events` table.
 const DURABILITY_COLUMNS: &[(&str, &str)] = &[
@@ -420,6 +440,88 @@ pub fn mark_redacted(
     )
     .map(|_| ())
     .map_err(|e| ArchiveError::Sqlite(format!("could not mark redacted: {e}")))
+}
+
+/// The archive slice an export covers (Story 5.5). A plain keeper-core domain
+/// struct (the IPC `ExportScopeKind` + ids map into this) so the readers stay
+/// tauri-free. `account_id`/`room_id` are `None` for the wider scopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportScope {
+    /// One Chat: both the account and room are pinned.
+    Chat {
+        /// The keeper account id owning the room.
+        account_id: String,
+        /// The Matrix room id.
+        room_id: String,
+    },
+    /// One Account: every room of a single account.
+    Account {
+        /// The keeper account id.
+        account_id: String,
+    },
+    /// Every account and every room in the archive.
+    Everything,
+}
+
+impl ExportScope {
+    /// The `WHERE` predicate + bound params selecting the scope's rows. `Everything`
+    /// selects all rows (`1 = 1`). Kept in one place so the count and the reader
+    /// never drift.
+    fn where_clause(&self) -> (String, Vec<String>) {
+        match self {
+            ExportScope::Chat {
+                account_id,
+                room_id,
+            } => (
+                "account_id = ?1 AND room_id = ?2".to_owned(),
+                vec![account_id.clone(), room_id.clone()],
+            ),
+            ExportScope::Account { account_id } => {
+                ("account_id = ?1".to_owned(), vec![account_id.clone()])
+            }
+            ExportScope::Everything => ("1 = 1".to_owned(), Vec::new()),
+        }
+    }
+}
+
+/// Count the archived rows in an export scope (Story 5.5). This is the provability
+/// denominator: the emitted lossless-JSON event count must equal this. Read-only.
+pub fn scoped_event_count(conn: &Connection, scope: &ExportScope) -> Result<i64, ArchiveError> {
+    let (where_clause, params) = scope.where_clause();
+    let sql = format!("SELECT COUNT(*) FROM events WHERE {where_clause}");
+    let param_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    conn.query_row(&sql, param_refs.as_slice(), |r| r.get::<_, i64>(0))
+        .map_err(|e| ArchiveError::Sqlite(format!("could not count scoped events: {e}")))
+}
+
+/// Read every archived row in an export scope, chronologically ordered for a
+/// transcript (Story 5.5). Ordered `origin_ts ASC` with a deterministic tie-break
+/// (`inserted_ts ASC, event_id ASC`) so the transcript is stable and reproducible.
+/// This returns **all** rows (every edit-chain version + redacted-retained rows) —
+/// the lossless set whose length equals [`scoped_event_count`]. Read-only.
+pub fn scoped_events_chronological(
+    conn: &Connection,
+    scope: &ExportScope,
+) -> Result<Vec<StoredEvent>, ArchiveError> {
+    let (where_clause, params) = scope.where_clause();
+    let sql = format!(
+        "SELECT {STORED_EVENT_COLUMNS} FROM events WHERE {where_clause} \
+         ORDER BY origin_ts ASC, inserted_ts ASC, event_id ASC"
+    );
+    let param_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| ArchiveError::Sqlite(format!("could not prepare scoped read: {e}")))?;
+    let rows = stmt
+        .query_map(param_refs.as_slice(), map_stored_event)
+        .map_err(|e| ArchiveError::Sqlite(format!("could not query scoped events: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| ArchiveError::Sqlite(format!("could not read scoped row: {e}")))?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

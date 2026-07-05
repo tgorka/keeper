@@ -645,6 +645,120 @@ pub struct SearchHitVm {
     pub redacted: bool,
 }
 
+/// Which slice of the archive an export covers (Story 5.5, FR-35, AD-11).
+///
+/// The scope discriminant for [`ExportRequestVm`]: `Chat` restricts to one
+/// `(accountId, roomId)`, `Account` to one account across all its rooms, and
+/// `Everything` to every account. Serializes to its camelCase name — the frontend
+/// wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ExportScopeKind {
+    /// A single Chat: `accountId` + `roomId` both required.
+    Chat,
+    /// A single Account: `accountId` required, all its rooms.
+    Account,
+    /// Every Account and every room in the archive.
+    Everything,
+}
+
+/// The archive-export request crossing IPC into the `export_start` command
+/// (Story 5.5, FR-35, AD-11).
+///
+/// A deserialize-only input VM. `scope` picks the archive slice; `accountId` is
+/// required for `Chat`/`Account` scope and ignored for `Everything`; `roomId` is
+/// required for `Chat` scope only. `json`/`markdown` are the two output formats
+/// (at least one must be true — the dialog enforces it). `includeMedia` governs a
+/// best-effort media byte copy (skipped-and-counted when unresolvable — never
+/// fatal). `destinationDir` is the OS folder the user picked (a scope subfolder is
+/// created under it). No bridge/session state ever crosses here — the export reads
+/// `archive.db` only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ExportRequestVm {
+    /// Which archive slice to export (chat / account / everything).
+    pub scope: ExportScopeKind,
+    /// The keeper account id for `Chat`/`Account` scope, else `null`.
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// The Matrix room id for `Chat` scope, else `null`.
+    #[serde(default)]
+    pub room_id: Option<String>,
+    /// Emit the lossless JSON array (every archived row in scope).
+    pub json: bool,
+    /// Emit the chronological Markdown transcript.
+    pub markdown: bool,
+    /// Best-effort copy of media bytes into `<export>/media/` when resolvable.
+    pub include_media: bool,
+    /// The OS destination folder the user picked (the scope subfolder lands here).
+    pub destination_dir: String,
+}
+
+/// The terminal (or in-flight) phase of a running export job (Story 5.5).
+///
+/// Streamed on [`ExportProgressVm::phase`]: `Running` for every progress batch,
+/// then exactly one terminal batch — `Completed` on success, `Cancelled` when the
+/// user cancelled (partial output cleaned), or `Failed` on an error (partial
+/// output cleaned, `error` set). Serializes to its camelCase name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ExportPhase {
+    /// The job is still writing rows — a progress batch with live counts.
+    Running,
+    /// The job finished successfully; `outputPaths` are the written files.
+    Completed,
+    /// The user cancelled; partial output was deleted before this batch.
+    Cancelled,
+    /// The job failed; partial output was deleted and `error` describes it.
+    Failed,
+}
+
+/// A progress (or terminal) batch streamed over the export subscription's
+/// `Channel` (Story 5.5, FR-35, UX-DR11).
+///
+/// Carries **only** non-secret progress data: the job's `exportId`, its current
+/// [`ExportPhase`], the running message/media counts, the written `outputPaths`
+/// (populated on `Completed`), and a human `error` string on `Failed`. No message
+/// content, media bytes, or session material ever cross IPC on this VM — the
+/// archive stays on disk and only file paths + counts are reported. The stream
+/// emits `Running` batches as rows are written, then exactly one terminal batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ExportProgressVm {
+    /// The job id (also the cancel handle for `export_cancel`).
+    #[ts(type = "number")]
+    pub export_id: u64,
+    /// The current phase (`Running` until exactly one terminal batch).
+    pub phase: ExportPhase,
+    /// How many logical messages (Markdown transcript entries) have been written
+    /// so far — the transcript-progress counter the UI shows.
+    #[ts(type = "number")]
+    pub messages_written: u64,
+    /// The total logical messages in scope when known (the scoped root count), or
+    /// `null` before it has been computed. Drives the progress bar's determinacy.
+    #[ts(type = "number | null")]
+    pub total_messages: Option<u64>,
+    /// How many media items had their bytes copied into `media/` (best-effort).
+    #[ts(type = "number")]
+    pub media_copied: u64,
+    /// How many media items were skipped (unresolvable / uncached / no resolver) —
+    /// counted, never fatal; the link + metadata are still emitted.
+    #[ts(type = "number")]
+    pub media_skipped: u64,
+    /// The written output file paths, populated on the `Completed` batch (the JSON
+    /// and/or Markdown files under the scope subfolder). Empty on non-terminal /
+    /// cleaned-up batches.
+    pub output_paths: Vec<String>,
+    /// A human-readable failure description on `Failed` (never content/secrets), or
+    /// `null` otherwise.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// One aggregated emoji-reaction group on a timeline message (Story 3.5, FR-12,
 /// NFR-9).
 ///
