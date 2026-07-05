@@ -1885,6 +1885,25 @@ pub async fn sign_out(state: State<'_, AppState>, account_id: String) -> Result<
         .map_err(to_ipc_error)
 }
 
+/// Deliberately delete one account's local archive (Story 5.7, FR-6). Delegates
+/// to the core, which routes the purge through the single serialized archive
+/// writer so only the target account's `events` rows and `events_fts` entries are
+/// removed — every other account's history stays intact. This is the destructive
+/// counterpart to the default keep-archive [`sign_out`]; the caller signs out
+/// first, then invokes this. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub async fn delete_account_archive(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<(), IpcError> {
+    tracing::info!(account_id = %account_id, "ipc: delete_account_archive");
+    state
+        .accounts
+        .delete_account_archive(&account_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

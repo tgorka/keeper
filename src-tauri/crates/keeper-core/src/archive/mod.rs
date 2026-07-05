@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::oneshot;
 
 use crate::error::{ArchiveError, CoreError};
 use crate::registry;
@@ -113,11 +114,16 @@ pub struct ArchiveEvent {
 
 /// A unit of work for the single serialized archive writer (Story 5.2).
 ///
-/// Both variants funnel through the *same* writer task / one `archive.db` — no
+/// All variants funnel through the *same* writer task / one `archive.db` — no
 /// second writer, no second connection. `Insert` appends a normalized row
 /// (`INSERT OR IGNORE`); `Redact` marks an existing row's `redacted_ts` without
-/// erasing its content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// erasing its content; `DeleteAccount` purges exactly one account's rows +
+/// FTS entries and reports its outcome back on a `oneshot` completion channel.
+///
+/// Only `Debug` is derived: the `DeleteAccount` completion sender is move-only
+/// (not `Clone`/`Eq`), which is fine — nothing depends on `Clone`/`PartialEq`/`Eq`
+/// for `ArchiveMsg`.
+#[derive(Debug)]
 pub enum ArchiveMsg {
     /// Append a normalized event row (idempotent on `(account_id, event_id)`).
     /// Boxed so the enum's variants stay similarly sized (the redaction variant is
@@ -131,6 +137,16 @@ pub enum ArchiveMsg {
         event_id: String,
         /// The redaction timestamp in milliseconds since the Unix epoch.
         redacted_ts: i64,
+    },
+    /// Deliberately purge one account's archive (Story 5.7): its `events` rows and
+    /// their `events_fts` entries, routed through the single writer so it never
+    /// competes with a second connection. The `done` channel carries the purge's
+    /// `Result` back to the awaiting [`ArchiveHandle::delete_account`] caller.
+    DeleteAccount {
+        /// The keeper account id whose archive is being purged.
+        account_id: String,
+        /// The completion channel the writer sends the purge `Result` on.
+        done: oneshot::Sender<Result<(), ArchiveError>>,
     },
 }
 
@@ -172,6 +188,39 @@ impl ArchiveHandle {
             log_dropped(&e.0);
         }
     }
+
+    /// Deliberately purge one account's archive through the *same* single writer
+    /// (Story 5.7, FR-6) and await its outcome. Unlike `ingest`/`redact`, this is
+    /// a destructive, serialized operation whose result must be reported honestly
+    /// to the IPC command and audit log, so it carries a `oneshot` completion
+    /// channel and awaits it.
+    ///
+    /// A send onto a closed channel means the writer task already stopped, so the
+    /// purge definitely never ran — a definite "not purged" error. A dropped
+    /// completion sender (`RecvError`, e.g. the writer task ended on shutdown after
+    /// committing) is **indeterminate**: the purge may have committed before the
+    /// task ended, so this reports "could not confirm" rather than asserting the
+    /// archive survives.
+    pub async fn delete_account(&self, account_id: &str) -> Result<(), ArchiveError> {
+        let (done, rx) = oneshot::channel();
+        let msg = ArchiveMsg::DeleteAccount {
+            account_id: account_id.to_owned(),
+            done,
+        };
+        if let Err(e) = self.tx.send(msg) {
+            log_dropped(&e.0);
+            return Err(ArchiveError::Sqlite(format!(
+                "archive writer stopped; account {account_id} archive not purged"
+            )));
+        }
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(ArchiveError::Sqlite(format!(
+                "could not confirm account {account_id} archive was deleted \
+                 (writer task ended before acknowledging)"
+            ))),
+        }
+    }
 }
 
 /// Log a dropped writer message with ids only (never content). A closed channel
@@ -191,6 +240,10 @@ fn log_dropped(msg: &ArchiveMsg) {
             account_id = %account_id,
             event_id = %event_id,
             "archive: writer channel closed; dropping redaction"
+        ),
+        ArchiveMsg::DeleteAccount { account_id, .. } => tracing::warn!(
+            account_id = %account_id,
+            "archive: writer channel closed; account archive purge not performed"
         ),
     }
 }

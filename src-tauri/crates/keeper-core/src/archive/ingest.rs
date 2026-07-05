@@ -14,6 +14,10 @@
 use rusqlite::Connection;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use tokio::sync::oneshot;
+
+use crate::error::ArchiveError;
+
 use super::{db, fts, ArchiveEvent, ArchiveMsg};
 
 /// Run the single archive writer loop until the channel closes.
@@ -34,6 +38,9 @@ pub(super) async fn run(mut rx: UnboundedReceiver<ArchiveMsg>, conn: Connection)
                 event_id,
                 redacted_ts,
             } => mark_redacted(&conn, &account_id, &event_id, redacted_ts),
+            ArchiveMsg::DeleteAccount { account_id, done } => {
+                delete_account(&conn, &account_id, done)
+            }
         }
     }
     tracing::info!("archive writer task ended (all senders dropped)");
@@ -50,6 +57,32 @@ fn mark_redacted(conn: &Connection, account_id: &str, event_id: &str, redacted_t
             "archive redaction mark failed"
         );
     }
+}
+
+/// Purge one account's archive through the writer connection (Story 5.7), then
+/// forward the purge `Result` on the `done` channel. Logs a failure with ids only
+/// (never content) and never panics — the writer task keeps running whatever the
+/// outcome, and a closed completion receiver (the awaiting caller went away) is a
+/// swallowed no-op.
+fn delete_account(
+    conn: &Connection,
+    account_id: &str,
+    done: oneshot::Sender<Result<(), ArchiveError>>,
+) {
+    let result = db::delete_account_archive(conn, account_id);
+    if let Err(e) = &result {
+        // Writer-context detail at debug; the single audit warn is emitted one layer
+        // up in `AccountManager::delete_account_archive`. Kept here (at debug) so the
+        // failure is still observable when the awaiting caller was dropped.
+        tracing::debug!(
+            account_id = %account_id,
+            error = %e,
+            "archive: account purge failed (writer)"
+        );
+    }
+    // The awaiting caller may have been dropped; forwarding the outcome is
+    // best-effort (never panic on a closed receiver).
+    let _ = done.send(result);
 }
 
 /// Insert one normalized event, swallowing (and logging with ids only) any
@@ -314,6 +347,37 @@ mod tests {
         assert!(get_event(&conn, "acctA", "$ghost")
             .expect("get ghost")
             .is_none());
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `DeleteAccount` message through the single writer resolves its oneshot with
+    /// `Ok(())` and the account's rows are gone afterward.
+    #[tokio::test]
+    async fn run_delete_account_resolves_ok_and_removes_rows() {
+        use tokio::sync::{mpsc, oneshot};
+        let dir = temp_dir();
+        let conn = open_archive_db(&dir).expect("open");
+        let (tx, rx) = mpsc::unbounded_channel::<ArchiveMsg>();
+        let task = tokio::spawn(run(rx, conn));
+        tx.send(ArchiveMsg::Insert(Box::new(text_event("acctA", "$e1"))))
+            .expect("send insert");
+        tx.send(ArchiveMsg::Insert(Box::new(text_event("acctB", "$e1"))))
+            .expect("send insert B");
+        let (done, ack) = oneshot::channel();
+        tx.send(ArchiveMsg::DeleteAccount {
+            account_id: "acctA".to_owned(),
+            done,
+        })
+        .expect("send delete");
+        let result = ack.await.expect("writer acknowledges");
+        assert!(result.is_ok(), "purge resolves Ok");
+        drop(tx);
+        task.await.expect("writer task joins");
+
+        let conn = open_archive_db(&dir).expect("reopen");
+        assert_eq!(event_count(&conn, "acctA").expect("count A"), 0);
+        assert_eq!(event_count(&conn, "acctB").expect("count B"), 1);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

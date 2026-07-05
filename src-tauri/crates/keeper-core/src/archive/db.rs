@@ -442,6 +442,54 @@ pub fn mark_redacted(
     .map_err(|e| ArchiveError::Sqlite(format!("could not mark redacted: {e}")))
 }
 
+/// Delete exactly one account's archive: its `events` rows and their
+/// `events_fts` entries, in a single `BEGIN IMMEDIATE` transaction (Story 5.7,
+/// FR-6). Touches only the target `account_id`; every other account's rows and
+/// FTS entries stay intact.
+///
+/// `events_fts` is an external-content FTS5 table (`content='events'`), so a
+/// bare `DELETE FROM events` would orphan its trigrams and can trip
+/// `SQLITE_CORRUPT_VTAB` on a later `'rebuild'`/`'integrity-check'`. To purge one
+/// account we issue the FTS5 external-content `'delete'` command for **exactly
+/// the account's rows that are actually in the index** — gated on
+/// `events_fts_docsize` membership, NOT on `body <> ''`. The two index-population
+/// paths disagree on empty bodies: `ensure_fts`'s one-time `'rebuild'` indexes
+/// **every** row incl. empty/NULL bodies, while the incremental `index_body`
+/// **skips** empty bodies. Gating on `events_fts_docsize` deletes exactly what is
+/// indexed regardless of path, and correctly issues no `'delete'` for a
+/// never-indexed row (which would itself corrupt the index). `COALESCE(body, '')`
+/// supplies the indexed content (`body` is never mutated in place). Never
+/// `'rebuild'`s (that would re-index every account). Rolls back on any error.
+pub fn delete_account_archive(conn: &Connection, account_id: &str) -> Result<(), ArchiveError> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| ArchiveError::Sqlite(format!("could not begin account purge: {e}")))?;
+    let purge = (|| {
+        conn.execute(
+            "INSERT INTO events_fts(events_fts, rowid, body) \
+             SELECT 'delete', e.rowid, COALESCE(e.body, '') \
+             FROM events e \
+             WHERE e.account_id = ?1 AND e.rowid IN (SELECT id FROM events_fts_docsize)",
+            rusqlite::params![account_id],
+        )
+        .map_err(|e| ArchiveError::Sqlite(format!("could not purge account fts entries: {e}")))?;
+        conn.execute(
+            "DELETE FROM events WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )
+        .map_err(|e| ArchiveError::Sqlite(format!("could not delete account events: {e}")))?;
+        Ok::<(), ArchiveError>(())
+    })();
+    match purge {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|e| ArchiveError::Sqlite(format!("could not commit account purge: {e}"))),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// The archive slice an export covers (Story 5.5). A plain keeper-core domain
 /// struct (the IPC `ExportScopeKind` + ids map into this) so the readers stay
 /// tauri-free. `account_id`/`room_id` are `None` for the wider scopes.
@@ -722,6 +770,193 @@ mod tests {
         assert!(retrievable_content(&conn, "acctA", "$e1", false)
             .expect("off")
             .is_some());
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A search over `events_fts` MATCH for a term (test helper): how many indexed
+    /// documents match. Uses the trigram FTS path the production search uses.
+    fn fts_match_count(conn: &Connection, term: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM events_fts WHERE events_fts MATCH ?1",
+            rusqlite::params![term],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("fts match count")
+    }
+
+    /// Insert a base row directly WITHOUT touching the FTS index (mirrors a
+    /// pre-index insert). Used so a later `'rebuild'` is what populates the index —
+    /// exercising the empty/NULL-body-gets-indexed path that `index_body` skips.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_base_row(conn: &Connection, account_id: &str, event_id: &str, body: Option<&str>) {
+        conn.execute(
+            "INSERT INTO events(account_id, event_id, room_id, sender, origin_ts, event_type, \
+             content_json, media_json, inserted_ts, relates_to_event_id, rel_type, redacted_ts, body) \
+             VALUES (?1, ?2, '!r:e.org', '@u:e.org', 100, 'm.room.message', '{}', NULL, 0, NULL, NULL, NULL, ?3)",
+            rusqlite::params![account_id, event_id, body],
+        )
+        .expect("insert base row");
+    }
+
+    /// Purge scoping across two accounts, including empty/NULL-body rows populated
+    /// via the `'rebuild'` path (NOT `index_body`), a version-chain row, and a
+    /// surviving account. After `delete_account_archive("acctA")`:
+    /// - acctA has 0 `events` rows; acctB is intact,
+    /// - no orphaned `events_fts_docsize` id remains (every id still maps to a live
+    ///   `events.rowid`),
+    /// - `'integrity-check'` passes,
+    /// - a search for acctA's body returns nothing; acctB's body still hits.
+    #[test]
+    fn delete_account_archive_scopes_and_leaves_no_fts_orphans() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Build the base rows on a RAW connection with NO FTS table yet, so the
+        // first `open_archive_db` below creates `events_fts` and `'rebuild'`s it —
+        // indexing EVERY existing row incl. empty/NULL bodies (the path that
+        // `index_body` would skip, which is exactly what we must exercise).
+        {
+            let conn = Connection::open(db_path(&dir)).expect("open raw");
+            conn.execute(
+                "CREATE TABLE events(\
+                    account_id TEXT NOT NULL, event_id TEXT NOT NULL, room_id TEXT NOT NULL, \
+                    sender TEXT NOT NULL, origin_ts INTEGER NOT NULL, event_type TEXT NOT NULL, \
+                    content_json TEXT NOT NULL, media_json TEXT, inserted_ts INTEGER NOT NULL, \
+                    relates_to_event_id TEXT, rel_type TEXT, redacted_ts INTEGER, body TEXT, \
+                    PRIMARY KEY(account_id, event_id))",
+                [],
+            )
+            .expect("create schema");
+            // acctA: a normal body, an empty-body row, a NULL-body row, and an edit
+            // (version-chain) row.
+            insert_base_row(&conn, "acctA", "$a-normal", Some("alpha unique body"));
+            insert_base_row(&conn, "acctA", "$a-empty", Some(""));
+            insert_base_row(&conn, "acctA", "$a-null", None);
+            conn.execute(
+                "INSERT INTO events(account_id, event_id, room_id, sender, origin_ts, event_type, \
+                 content_json, media_json, inserted_ts, relates_to_event_id, rel_type, redacted_ts, body) \
+                 VALUES ('acctA', '$a-edit', '!r:e.org', '@u:e.org', 200, 'm.room.message', '{}', NULL, 0, '$a-normal', 'm.replace', NULL, 'alpha edited body')",
+                [],
+            )
+            .expect("insert edit row");
+            // acctB: a distinct body that must survive.
+            insert_base_row(&conn, "acctB", "$b-1", Some("bravo survivor body"));
+        }
+        // Open through the migration+FTS path: this creates events_fts and rebuilds
+        // it from the existing rows (empty/NULL bodies included).
+        let conn = open_archive_db(&dir).expect("open + rebuild fts");
+        // Sanity: acctA's normal + edit bodies are searchable pre-purge.
+        assert_eq!(fts_match_count(&conn, "alpha"), 2, "acctA rows indexed");
+        assert_eq!(fts_match_count(&conn, "bravo"), 1, "acctB row indexed");
+
+        delete_account_archive(&conn, "acctA").expect("purge acctA");
+
+        // acctA rows gone; acctB intact.
+        assert_eq!(event_count(&conn, "acctA").expect("count A"), 0);
+        assert_eq!(event_count(&conn, "acctB").expect("count B"), 1);
+
+        // No orphaned docsize id: every remaining `events_fts_docsize.id` still maps
+        // to a live `events.rowid`.
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events_fts_docsize d \
+                 WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.rowid = d.id)",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count orphans");
+        assert_eq!(orphans, 0, "no orphaned docsize rows may remain");
+
+        // The FTS index passes its own integrity check.
+        conn.execute(
+            "INSERT INTO events_fts(events_fts) VALUES('integrity-check')",
+            [],
+        )
+        .expect("integrity-check passes");
+
+        // acctA's body no longer matches; acctB's still does.
+        assert_eq!(
+            fts_match_count(&conn, "alpha"),
+            0,
+            "acctA purged from index"
+        );
+        assert_eq!(
+            fts_match_count(&conn, "bravo"),
+            1,
+            "acctB survives in index"
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Purging an account absent from `events` is a success no-op that touches no
+    /// other account.
+    #[test]
+    fn delete_account_archive_absent_account_is_a_no_op() {
+        let dir = temp_dir();
+        let conn = open_archive_db(&dir).expect("open");
+        insert_row(&conn, "acctB", "$b1", 100, r#"{"body":"kept"}"#, None, None);
+        delete_account_archive(&conn, "acctGhost").expect("purge absent");
+        assert_eq!(event_count(&conn, "acctB").expect("count B"), 1);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An incremental empty-body row (indexed via `index_body`, i.e. skipped and
+    /// NOT in the index) is handled: the purge succeeds and does not error on it,
+    /// leaving no orphan and passing integrity-check.
+    #[test]
+    fn delete_account_archive_handles_incremental_empty_body_row() {
+        let dir = temp_dir();
+        let conn = open_archive_db(&dir).expect("open");
+        // Insert via the writer's exact path: base insert, then index_body (which
+        // skips the empty body — so this row is NEVER in the index).
+        let empty = crate::archive::ArchiveEvent {
+            account_id: "acctA".to_owned(),
+            event_id: "$empty".to_owned(),
+            room_id: "!r:e.org".to_owned(),
+            sender: "@u:e.org".to_owned(),
+            origin_ts: 100,
+            event_type: "m.room.message".to_owned(),
+            content_json: r#"{"msgtype":"m.image"}"#.to_owned(),
+            body: String::new(),
+            media: None,
+            relates_to_event_id: None,
+            rel_type: None,
+        };
+        let rowid = insert_event(&conn, &empty, None, 0)
+            .expect("insert")
+            .expect("inserted");
+        fts::index_body(&conn, rowid, &empty.body).expect("index skips empty");
+        // A normal indexed row for contrast.
+        let full = crate::archive::ArchiveEvent {
+            body: "charlie indexed".to_owned(),
+            event_id: "$full".to_owned(),
+            ..empty.clone()
+        };
+        let full_rowid = insert_event(&conn, &full, None, 0)
+            .expect("insert full")
+            .expect("inserted full");
+        fts::index_body(&conn, full_rowid, &full.body).expect("index full");
+
+        // Purge must succeed even though $empty was never in the index (issuing a
+        // `'delete'` for it would corrupt the index — the docsize gate prevents it).
+        delete_account_archive(&conn, "acctA").expect("purge with never-indexed row");
+        assert_eq!(event_count(&conn, "acctA").expect("count A"), 0);
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events_fts_docsize d \
+                 WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.rowid = d.id)",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count orphans");
+        assert_eq!(orphans, 0, "no orphaned docsize rows");
+        conn.execute(
+            "INSERT INTO events_fts(events_fts) VALUES('integrity-check')",
+            [],
+        )
+        .expect("integrity-check passes");
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

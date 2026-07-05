@@ -2362,6 +2362,39 @@ impl AccountManager {
         crate::auth::sign_out_cleanup(platform.as_ref(), account_id)?;
         Ok(())
     }
+
+    /// Deliberately purge one account's local archive (Story 5.7, FR-6): its
+    /// `events` rows and their `events_fts` entries, routed through the single
+    /// serialized archive writer so it never competes with a second connection.
+    /// Touches only the target account. Logged ids-only.
+    ///
+    /// When archiving is disabled (`archive: None`, e.g. `archive.db` could not be
+    /// opened at startup) there is nothing on disk to purge, so this is `Ok(())`.
+    pub async fn delete_account_archive(&self, account_id: &str) -> Result<(), CoreError> {
+        match self.archive.clone() {
+            Some(handle) => {
+                let result = handle.delete_account(account_id).await;
+                match &result {
+                    Ok(()) => {
+                        tracing::info!(account_id = %account_id, "account archive purged")
+                    }
+                    Err(e) => tracing::warn!(
+                        account_id = %account_id,
+                        error = %e,
+                        "account archive purge failed"
+                    ),
+                }
+                result.map_err(CoreError::from)
+            }
+            None => {
+                tracing::info!(
+                    account_id = %account_id,
+                    "archive disabled; nothing to purge"
+                );
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Keychain key under which an account's saved base58 recovery key is stored

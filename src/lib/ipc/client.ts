@@ -315,6 +315,18 @@ export async function signOut(accountId: string): Promise<void> {
 }
 
 /**
+ * Deliberately delete one account's local archive (Story 5.7, FR-6). The Rust
+ * core routes the purge through the single serialized archive writer so only this
+ * account's `events` rows and `events_fts` entries are removed — every other
+ * account's history stays intact. This is the destructive counterpart to the
+ * keep-archive {@link signOut}; the caller signs out first, then invokes this.
+ * Rejects with the {@link IpcError} envelope on a purge failure.
+ */
+export async function deleteAccountArchive(accountId: string): Promise<void> {
+  await invoke<void>("delete_account_archive", { accountId });
+}
+
+/**
  * Open a streaming subscription. Creates a `Channel`, forwards each delivered
  * batch to `onBatch` in arrival order (snapshot before any diff, per AD-8), and
  * resolves with the backend-assigned subscription id.

@@ -216,6 +216,104 @@ describe("AccountFooter", () => {
     ).not.toBeInTheDocument();
   });
 
+  /** Open the sign-out dialog for an account and return the alertdialog element. */
+  async function openSignOutDialog(userId: string) {
+    const menu = await openRowMenu(userId);
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Sign out…" }));
+    return await screen.findByRole("alertdialog");
+  }
+
+  it("the default dialog states the unsynced-content caveat", async () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter();
+    const dialog = await openSignOutDialog(alice.userId);
+    expect(
+      within(dialog).getByText(
+        /never synced and decrypted before you sign out is not recoverable/i,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("arming the destructive path reveals the identity field and gates confirm on exact trimmed identity", async () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter();
+    const dialog = await openSignOutDialog(alice.userId);
+
+    // The arming control is a secondary (non-destructive) button.
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "…and delete this Account's archive" }),
+    );
+
+    const field = within(dialog).getByLabelText(`Type ${alice.userId} to confirm deletion`);
+    const confirm = within(dialog).getByRole("button", {
+      name: "Sign out and delete archive",
+    });
+    // Disabled until the identity is typed exactly.
+    expect(confirm).toBeDisabled();
+    fireEvent.change(field, { target: { value: "@wrong:example.org" } });
+    expect(confirm).toBeDisabled();
+    // Extra surrounding whitespace still matches (trimmed-equals).
+    fireEvent.change(field, { target: { value: `  ${alice.userId}  ` } });
+    expect(confirm).toBeEnabled();
+  });
+
+  it("the armed dialog uses destructive framing, not the keep-archive copy", async () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter();
+    const dialog = await openSignOutDialog(alice.userId);
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "…and delete this Account's archive" }),
+    );
+
+    expect(
+      within(dialog).getByRole("heading", { name: "Delete this Account's archive" }),
+    ).toBeInTheDocument();
+    // The keep-archive copy must NOT be present once armed.
+    expect(
+      within(dialog).queryByRole("heading", { name: "Sign out, keep local archive" }),
+    ).not.toBeInTheDocument();
+    expect(within(dialog).queryByText(/stays on this Mac/i)).not.toBeInTheDocument();
+  });
+
+  it("arming is reversible without closing the dialog", async () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter();
+    const dialog = await openSignOutDialog(alice.userId);
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "…and delete this Account's archive" }),
+    );
+    expect(
+      within(dialog).getByRole("heading", { name: "Delete this Account's archive" }),
+    ).toBeInTheDocument();
+
+    // A control returns to the keep-archive choice in place (dialog stays open).
+    fireEvent.click(within(dialog).getByRole("button", { name: "Keep archive instead" }));
+    expect(
+      within(dialog).getByRole("heading", { name: "Sign out, keep local archive" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).toBeInTheDocument();
+  });
+
+  it("confirming the armed destructive path runs the delete-archive sign-out", async () => {
+    accountsStore.getState().hydrateAll([alice, bob]);
+    renderFooter();
+    const dialog = await openSignOutDialog(bob.userId);
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "…and delete this Account's archive" }),
+    );
+    fireEvent.change(within(dialog).getByLabelText(`Type ${bob.userId} to confirm deletion`), {
+      target: { value: bob.userId },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Sign out and delete archive" }));
+
+    await waitFor(() => {
+      expect(signOutHandler).toHaveBeenCalledWith(bob.accountId, { deleteArchive: true });
+    });
+  });
+
   it("renders avatar-only rows with a menu when collapsed", () => {
     accountsStore.getState().hydrateAll([alice]);
     renderFooter(true);

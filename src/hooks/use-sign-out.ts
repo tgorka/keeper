@@ -15,14 +15,27 @@
  * shell unmounts once `accounts` is empty).
  */
 import { useCallback } from "react";
-import { signOut } from "@/lib/ipc/client";
+import { toast } from "sonner";
+import { deleteAccountArchive, signOut } from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { roomsStore } from "@/lib/stores/rooms";
 import { timelineStore } from "@/lib/stores/timeline";
 
-export function useSignOut(): (accountId: string) => Promise<void> {
-  return useCallback(async (accountId: string) => {
+/** Options for the sign-out handler. */
+export interface SignOutOptions {
+  /**
+   * Also permanently delete this account's local archive after signing out
+   * (Story 5.7, FR-6). Defaults to `false` — the keep-archive path. The purge
+   * runs *after* the account has been removed (so a purge failure never rolls
+   * back the completed sign-out); a purge rejection is surfaced via a toast that
+   * outlives the unmounting shell/dialog (the last-account case unmounts both).
+   */
+  deleteArchive?: boolean;
+}
+
+export function useSignOut(): (accountId: string, options?: SignOutOptions) => Promise<void> {
+  return useCallback(async (accountId: string, options?: SignOutOptions) => {
     await signOut(accountId);
 
     // If the open conversation belonged to this account, close it and drop its
@@ -48,5 +61,32 @@ export function useSignOut(): (accountId: string) => Promise<void> {
       timelineStore.getState().clear();
     }
     accountsStore.getState().removeAccount(accountId);
+
+    // Delete-archive path: purge AFTER removal so a purge failure never rolls back
+    // the completed sign-out. Removing the last account unmounts the shell + the
+    // sign-out dialog, so a dialog-local error would be invisible — surface a
+    // purge failure via a toast that outlives the unmount, worded as retriable
+    // (the sign-out itself succeeded).
+    if (options?.deleteArchive) {
+      // Purge, and on failure surface a toast with an ACTIONABLE Retry: the purge
+      // is keyed by `accountId` and needs no live session, so it can be retried
+      // even after the account row is gone. Retrying re-offers itself on repeat
+      // failure, so the "retry" promise is always fulfillable.
+      const purge = async (): Promise<void> => {
+        try {
+          await deleteAccountArchive(accountId);
+        } catch {
+          toast.error("Signed out, but this account's archive could not be deleted.", {
+            action: {
+              label: "Retry",
+              onClick: () => {
+                void purge();
+              },
+            },
+          });
+        }
+      };
+      await purge();
+    }
   }, []);
 }

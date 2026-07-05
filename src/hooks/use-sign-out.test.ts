@@ -4,8 +4,16 @@ import type { AccountVm, InboxRoomVm } from "@/lib/ipc/client";
 
 // Mock the typed IPC wrapper so the hook never touches Tauri.
 const signOut = vi.fn();
+const deleteAccountArchive = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   signOut: (accountId: string) => signOut(accountId),
+  deleteAccountArchive: (accountId: string) => deleteAccountArchive(accountId),
+}));
+
+// Mock the toast surface so the last-account purge-failure path is observable.
+const toastError = vi.fn();
+vi.mock("sonner", () => ({
+  toast: { error: (message: string) => toastError(message) },
 }));
 
 import { useSignOut } from "@/hooks/use-sign-out";
@@ -53,6 +61,9 @@ beforeEach(() => {
   accountStatusStore.getState().reset();
   signOut.mockReset();
   signOut.mockResolvedValue(undefined);
+  deleteAccountArchive.mockReset();
+  deleteAccountArchive.mockResolvedValue(undefined);
+  toastError.mockReset();
 });
 
 afterEach(() => {
@@ -127,5 +138,50 @@ describe("useSignOut", () => {
     await result.current(alice.accountId);
 
     expect(accountStatusStore.getState().statuses).toEqual({ [bob.accountId]: "offline" });
+  });
+
+  it("the default (keep-archive) path never calls deleteAccountArchive", async () => {
+    accountsStore.getState().hydrateAll([alice, bob]);
+
+    const { result } = renderHook(() => useSignOut());
+    await result.current(alice.accountId);
+
+    expect(signOut).toHaveBeenCalledWith(alice.accountId);
+    expect(deleteAccountArchive).not.toHaveBeenCalled();
+  });
+
+  it("the delete path signs out then deletes the archive (in order) and removes the account", async () => {
+    accountsStore.getState().hydrateAll([alice, bob]);
+    const order: string[] = [];
+    signOut.mockImplementation(async () => {
+      order.push("signOut");
+    });
+    deleteAccountArchive.mockImplementation(async () => {
+      order.push("deleteArchive");
+    });
+
+    const { result } = renderHook(() => useSignOut());
+    await result.current(alice.accountId, { deleteArchive: true });
+
+    expect(order).toEqual(["signOut", "deleteArchive"]);
+    expect(signOut).toHaveBeenCalledWith(alice.accountId);
+    expect(deleteAccountArchive).toHaveBeenCalledWith(alice.accountId);
+    expect(accountsStore.getState().accounts.map((a) => a.accountId)).toEqual([bob.accountId]);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("a purge failure still removes the account (sign-out not rolled back) and toasts", async () => {
+    accountsStore.getState().hydrateAll([alice]);
+    deleteAccountArchive.mockRejectedValue(new Error("purge failed"));
+
+    const { result } = renderHook(() => useSignOut());
+    // The last account: the delete path must not throw despite the purge failure,
+    // must still remove the account, and must surface the failure via a toast.
+    await result.current(alice.accountId, { deleteArchive: true });
+
+    expect(signOut).toHaveBeenCalledWith(alice.accountId);
+    expect(deleteAccountArchive).toHaveBeenCalledWith(alice.accountId);
+    expect(accountsStore.getState().accounts).toEqual([]);
+    expect(toastError).toHaveBeenCalledTimes(1);
   });
 });

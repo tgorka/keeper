@@ -48,6 +48,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSignOut } from "@/hooks/use-sign-out";
 import { accountHueVar } from "@/lib/account-hue";
@@ -144,7 +145,14 @@ function BeeperCoverageDialog({
   );
 }
 
-/** The keep-local-archive sign-out confirmation for one account (UX-DR20). */
+/**
+ * The sign-out confirmation for one account (UX-DR20, Story 5.7). Defaults to the
+ * keep-local-archive path; a reversible destructive option arms the
+ * "…and delete this Account's archive" path, gated behind typing the account
+ * identity exactly. When armed, the title/description switch to a destructive
+ * framing (never the keep-archive copy) and the arming control is a
+ * secondary/non-destructive button; only the actual confirm is destructive.
+ */
 function SignOutDialog({
   account,
   open,
@@ -156,44 +164,162 @@ function SignOutDialog({
 }) {
   const signOut = useSignOut();
   const [signingOut, setSigningOut] = useState(false);
+  // Whether the destructive delete-archive path is armed (reveals the identity
+  // field and destructive framing). Reversible without closing the dialog.
+  const [armed, setArmed] = useState(false);
+  // The typed identity used to gate the destructive confirm (trimmed-equals).
+  const [typedIdentity, setTypedIdentity] = useState("");
+  // A dialog-local error for a sign-out FAILURE only (which keeps the account, so
+  // the dialog stays mounted). Archive-purge failures are always surfaced via the
+  // hook's toast — the account row unmounts before the purge resolves, so a
+  // dialog-local error would never be seen.
+  const [error, setError] = useState<string | null>(null);
   const userId = account.userId;
+  // Guard against a degenerate empty `userId`: an empty confirm field must never
+  // enable the destructive action.
+  const identityMatches = userId.length > 0 && typedIdentity.trim() === userId;
 
-  async function handleConfirm() {
+  // Reset all destructive-path state whenever the dialog closes, so reopening it
+  // always starts from the keep-archive default.
+  function handleOpenChange(next: boolean) {
+    if (!next) {
+      setArmed(false);
+      setTypedIdentity("");
+      setError(null);
+      setSigningOut(false);
+    }
+    onOpenChange(next);
+  }
+
+  async function handleKeepArchiveConfirm() {
     setSigningOut(true);
+    setError(null);
     try {
       await signOut(account.accountId);
       // On success this row unmounts (account removed); no need to close.
     } catch {
       // A cleanup failure keeps the account signed in; close for a retry.
       setSigningOut(false);
-      onOpenChange(false);
+      handleOpenChange(false);
+    }
+  }
+
+  async function handleDeleteArchiveConfirm() {
+    setSigningOut(true);
+    setError(null);
+    try {
+      await signOut(account.accountId, { deleteArchive: true });
+      // On success this row unmounts (account removed). A purge failure is NOT
+      // thrown here (the hook removes the account first, then surfaces a purge
+      // rejection via toast), so reaching a rejection means the sign-out itself
+      // failed — the account stays; show a dialog-local retry error.
+    } catch {
+      setSigningOut(false);
+      setError("Could not sign out. Please try again.");
     }
   }
 
   return (
-    <AlertDialog open={open} onOpenChange={onOpenChange}>
+    <AlertDialog open={open} onOpenChange={handleOpenChange}>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>Sign out, keep local archive</AlertDialogTitle>
+          <AlertDialogTitle>
+            {armed ? "Delete this Account's archive" : "Sign out, keep local archive"}
+          </AlertDialogTitle>
           <AlertDialogDescription>
-            You'll be signed out of {userId} on this device. Your local archive stays on this Mac
-            and your other accounts keep syncing.
+            {armed ? (
+              <>
+                This permanently deletes {userId}'s entire local archive from this Mac — its
+                messages and search history cannot be recovered. Your other accounts are unaffected.
+                Type <span className="font-medium text-foreground">{userId}</span> to confirm.
+              </>
+            ) : (
+              <>
+                You'll be signed out of {userId} on this device. Your local archive stays on this
+                Mac and your other accounts keep syncing. Content that was never synced and
+                decrypted before you sign out is not recoverable.
+              </>
+            )}
           </AlertDialogDescription>
         </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel className={FOCUS_RING}>Cancel</AlertDialogCancel>
-          <AlertDialogAction
-            variant="destructive"
-            className={FOCUS_RING}
-            disabled={signingOut}
-            onClick={(event) => {
-              // Keep the dialog mounted while the async sign-out runs.
-              event.preventDefault();
-              void handleConfirm();
-            }}
-          >
-            {signingOut ? "Signing out…" : "Sign out, keep local archive"}
-          </AlertDialogAction>
+
+        {armed && (
+          <div className="flex flex-col gap-2">
+            <Input
+              aria-label={`Type ${userId} to confirm deletion`}
+              autoComplete="off"
+              value={typedIdentity}
+              onChange={(event) => setTypedIdentity(event.target.value)}
+              className={FOCUS_RING}
+            />
+            {error && (
+              <p role="alert" className="text-destructive text-sm">
+                {error}
+              </p>
+            )}
+          </div>
+        )}
+
+        <AlertDialogFooter className="sm:flex-col sm:items-stretch sm:gap-2">
+          {armed ? (
+            <>
+              <AlertDialogAction
+                variant="destructive"
+                className={FOCUS_RING}
+                disabled={signingOut || !identityMatches}
+                onClick={(event) => {
+                  event.preventDefault();
+                  void handleDeleteArchiveConfirm();
+                }}
+              >
+                {signingOut ? "Deleting…" : "Sign out and delete archive"}
+              </AlertDialogAction>
+              <div className="flex justify-between gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className={FOCUS_RING}
+                  disabled={signingOut}
+                  onClick={() => {
+                    // Reversible: return to the keep-archive choice in place.
+                    setArmed(false);
+                    setTypedIdentity("");
+                    setError(null);
+                  }}
+                >
+                  Keep archive instead
+                </Button>
+                <AlertDialogCancel className={FOCUS_RING}>Cancel</AlertDialogCancel>
+              </div>
+            </>
+          ) : (
+            <>
+              <AlertDialogAction
+                variant="destructive"
+                className={FOCUS_RING}
+                disabled={signingOut}
+                onClick={(event) => {
+                  // Keep the dialog mounted while the async sign-out runs.
+                  event.preventDefault();
+                  void handleKeepArchiveConfirm();
+                }}
+              >
+                {signingOut ? "Signing out…" : "Sign out, keep local archive"}
+              </AlertDialogAction>
+              <div className="flex justify-between gap-2">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  className={FOCUS_RING}
+                  disabled={signingOut}
+                  onClick={() => setArmed(true)}
+                >
+                  …and delete this Account's archive
+                </Button>
+                <AlertDialogCancel className={FOCUS_RING}>Cancel</AlertDialogCancel>
+              </div>
+            </>
+          )}
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>

@@ -117,7 +117,8 @@ pub fn run() {
             ipc::session_restore,
             ipc::inbox_subscribe,
             ipc::inbox_unsubscribe,
-            ipc::sign_out
+            ipc::sign_out,
+            ipc::delete_account_archive
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
