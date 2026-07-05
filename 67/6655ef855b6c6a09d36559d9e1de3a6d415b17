@@ -1,0 +1,155 @@
+src/lib/bridges.test.ts
+  s_61b02d480f42e6::t_e86f1cfb1e8fdb 24-41
+  s_61b02d480f42e6::t_0f71045d92e5c4 2-7
+src-tauri/crates/keeper-core/data/provisioning.json
+  s_61b02d480f42e6::t_13578e6dba76e0 1-2,4
+  s_61b02d480f42e6::t_e60a6c0c5902a6 3
+src-tauri/crates/keeper-core/src/bridges/mod.rs
+  s_61b02d480f42e6::t_20a196e397db72 14-15
+src/lib/ipc/gen/BridgeLoginInput.ts
+  s_61b02d480f42e6::t_6a6edbfb621847 1-20
+src/components/bridges/bridge-card.test.tsx
+  s_61b02d480f42e6::t_e155a1d793217a 2,7-14
+  s_61b02d480f42e6::t_f597a25a0393fc 15
+  s_61b02d480f42e6::t_2736522d686d82 95,99-100
+  s_61b02d480f42e6::t_d971db1bb2dd16 116,128-129
+src/lib/ipc/gen/BridgeLoginPhase.ts
+  s_61b02d480f42e6::t_6a6edbfb621847 1-14
+src-tauri/crates/keeper-core/src/bridges/transport/provisioning.rs
+  s_61b02d480f42e6::t_35b8c0096b52f6 165-172,176-177,179-182,194,202
+  s_61b02d480f42e6::t_593ead2acbffb4 327-330
+  s_61b02d480f42e6::t_8d1d5aa96ea4a1 63
+  s_61b02d480f42e6::t_db4c36ccb30241 1-62,64-164,178,183-193,195-201,203-326,331-337,354
+  s_61b02d480f42e6::t_61f804161e6d1e 338-346,351-353
+  s_61b02d480f42e6::t_a5bb8b1085d1fd 173-175,347-350
+src-tauri/crates/keeper-core/src/account.rs
+  s_80b4095bddca71::t_ba727bd9d2cca5 1297-1311,1318
+  s_61b02d480f42e6::t_4347ee20bdc609 1270-1296,1312-1317,1323-1325,1330-1332,1335-1336,1341-1346,1356-1383,1390-1397,1410-1416
+  s_61b02d480f42e6::t_d25e031b294b5a 1384-1389,1400-1402,1404-1409
+  s_61b02d480f42e6::t_377ed4796d630f 53
+  s_61b02d480f42e6::t_a5bb8b1085d1fd 1328,1337-1338,1403,2557
+  s_61b02d480f42e6::t_fa8ee11b6ddc81 140-142
+  s_61b02d480f42e6::t_593ead2acbffb4 66,1333-1334
+  s_61b02d480f42e6::t_768d3b20bcc654 1398-1399
+  s_61b02d480f42e6::t_34a788d1a6909e 134-139
+  s_61b02d480f42e6::t_82c1a8d165d1d7 125-133,143-147
+  s_61b02d480f42e6::t_f09ea8c32a4068 1319-1322,1326-1327,1329,1339-1340,1347-1355
+  s_61b02d480f42e6::t_1f4fb1884de93f 51-52
+  s_61b02d480f42e6::t_cb95052583b857 181-185
+  s_61b02d480f42e6::t_9eaf600e7fd93f 2551,2556,2564-2565
+  s_61b02d480f42e6::t_6eecb38023cae6 311,573,653,794,902,1009,1160
+  s_61b02d480f42e6::t_7e70b8138cbe22 2552-2555,2558-2563
+src/components/bridges/bridge-login-sheet.test.tsx
+  s_61b02d480f42e6::t_9c5fc85011cb60 242,245
+  s_61b02d480f42e6::t_cf5572332b1ffd 243-244,246-247
+  s_61b02d480f42e6::t_35dee92a8286a5 1-89,91-134,213-218,220-241,248-262
+  s_61b02d480f42e6::t_82ee29faa47a58 135-212
+  s_61b02d480f42e6::t_dc077027b1432f 90,219
+src-tauri/crates/keeper/src/lib.rs
+  s_61b02d480f42e6::t_7f8364d538fe30 51-53
+src-tauri/crates/keeper-core/src/bridges/transport/mod.rs
+  s_61b02d480f42e6::t_71c30aa52efc7e 1-140,146-214,216-219,224-225,227-278,280-288
+  s_61b02d480f42e6::t_b2c0ae36c50d42 141-145
+  s_61b02d480f42e6::t_607744e0187709 215,220-223,226
+  s_61b02d480f42e6::t_593ead2acbffb4 279
+src/components/bridges/bridge-card.tsx
+  s_61b02d480f42e6::t_6f9a0bd312fa03 68,75-76,79
+  s_61b02d480f42e6::t_50b1d7efe0784a 156-163
+  s_61b02d480f42e6::t_a2c60f3e5da65f 13-14
+  s_61b02d480f42e6::t_dc077027b1432f 17
+src/lib/ipc/client.ts
+  s_61b02d480f42e6::t_9c0254ff789ed2 194-196
+  s_61b02d480f42e6::t_dd8c69a0a69b9c 16-18
+  s_61b02d480f42e6::t_48edb6b3dbc10a 71-72
+  s_61b02d480f42e6::t_ab20b6758dcbac 157-193,197-201
+  s_61b02d480f42e6::t_53348cb6e8a9bc 38-39
+src/lib/bridges.ts
+  s_61b02d480f42e6::t_25a09949fd47fc 10
+  s_61b02d480f42e6::t_4fb495ddac6cad 30-43
+src/lib/ipc/gen/LoginFlowVm.ts
+  s_61b02d480f42e6::t_6a6edbfb621847 1-21
+src/components/bridges/bridge-login-sheet.tsx
+  s_61b02d480f42e6::t_140e5aa760d1d4 145-153,159-167
+  s_61b02d480f42e6::t_8b523fc39ebfd8 1-37,39-144,154-158,168-265,267-369,371-380,384-393
+  s_61b02d480f42e6::t_b64a7a94913fe1 381-383
+  s_61b02d480f42e6::t_dc077027b1432f 38,266,370
+src-tauri/crates/keeper-core/src/vm.rs
+  s_61b02d480f42e6::t_593ead2acbffb4 2491-2494,2530,2533
+  s_61b02d480f42e6::t_f37d73cc3d531a 1520-1664
+  s_61b02d480f42e6::t_f002da89255494 2457-2490,2495-2529,2531-2532,2534-2557
+src/lib/ipc/gen/BridgeLoginVm.ts
+  s_61b02d480f42e6::t_6a6edbfb621847 1-58
+src-tauri/crates/keeper-core/src/error.rs
+  s_61b02d480f42e6::t_6752cfc943945a 373-383
+src-tauri/crates/keeper-core/src/bridges/data.rs
+  s_61b02d480f42e6::t_e74348e813d4f1 112-126
+  s_61b02d480f42e6::t_43d8ed50c60e61 372-411
+  s_61b02d480f42e6::t_ceb078a12a7274 142-143
+  s_61b02d480f42e6::t_3f00819d392016 185-222
+  s_61b02d480f42e6::t_cf0f7ef7073da1 28-29
+  s_61b02d480f42e6::t_b2b089b37a365a 133-134
+src/hooks/use-bridge-login.ts
+  s_61b02d480f42e6::t_eb705229b2095c 1-80,87-89,91-94,96-103,105-119,121-130
+  s_61b02d480f42e6::t_f351bbb62e05b0 81-86,90,95,104,120
+src-tauri/crates/keeper/src/ipc.rs
+  s_61b02d480f42e6::t_a299d729e83f61 472-474
+  s_61b02d480f42e6::t_d8ec5edde5255c 429-471,475-487
+  s_61b02d480f42e6::t_398fb49116e2b1 25-29
+  s_61b02d480f42e6::t_5af1c11b49bce2 322-326
+_bmad-output/implementation-artifacts/spec-6-3-native-bridge-login-via-provisioning-api.md
+  s_61b02d480f42e6::t_90b485af796b99 6
+  s_61b02d480f42e6::t_993ed111fba811 155-187
+  s_80b4095bddca71::t_3c6c68e16cf0a5 188-201
+  s_61b02d480f42e6::t_129952fdb3a4e9 1-4,8,10-81,95-103,138-154
+  s_61b02d480f42e6::t_5ec3c9aa59fb12 7
+  s_80b4095bddca71::t_b6634e35e56817 5
+  s_61b02d480f42e6::t_6b087741106ef9 104-124
+  s_80b4095bddca71::t_970ded57f8a4fa 125-137
+  s_80b4095bddca71::t_550ad1be7a785b 9
+  s_61b02d480f42e6::t_11203f2b474079 82-94
+src/lib/ipc/gen/LoginFieldVm.ts
+  s_61b02d480f42e6::t_6a6edbfb621847 1-40
+src-tauri/crates/keeper-core/src/bridges/login.rs
+  s_61b02d480f42e6::t_709fb4f40508b8 281-287
+  s_61b02d480f42e6::t_877a0c31014ef1 366
+  s_61b02d480f42e6::t_3a831e75b4ac2d 646-647
+  s_61b02d480f42e6::t_35ed7a9aec6b15 10-11
+  s_61b02d480f42e6::t_ee74fe61214afa 527
+  s_61b02d480f42e6::t_2d2f14f8bafea0 154-158,160-164
+  s_61b02d480f42e6::t_be700fd3f1caf5 618-619
+  s_61b02d480f42e6::t_a97e5aaac940a6 77-79
+  s_61b02d480f42e6::t_1ed57e4d811312 371,474
+  s_61b02d480f42e6::t_0e66a922d34a9e 569-578
+  s_61b02d480f42e6::t_35fab2077aa89a 205-209,215
+  s_61b02d480f42e6::t_233756165a739a 357
+  s_61b02d480f42e6::t_e35dc7bb9b7028 29
+  s_61b02d480f42e6::t_a9fc08a54ea01d 395-396
+  s_61b02d480f42e6::t_c30f0547023e79 1-9,12-28,31-76,80-153,159,165-204,210-214,216-280,288-356,358-365,367-370,372-391,397-440,445-473,475-490,494-526,528-568,579-617,620-645,648-657
+  s_61b02d480f42e6::t_593ead2acbffb4 30,392-394,441-444,491-493
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_61b02d480f42e6::t_72be201ead67a2 100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "676655ef855b6c6a09d36559d9e1de3a6d415b17",
+  "prompts": {},
+  "sessions": {
+    "s_61b02d480f42e6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "031857d8-d6c2-487b-8523-a8100cf95a82",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_80b4095bddca71": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b116a5dc-d280-4017-b736-b1a00ee56396",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
