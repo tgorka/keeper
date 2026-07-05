@@ -1,0 +1,4 @@
+{
+  "version": 1,
+  "candidates": ["https://{server}/_matrix/provision", "https://matrix.{server}/_matrix/provision"]
+}

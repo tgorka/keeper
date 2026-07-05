@@ -1,8 +1,17 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { BridgeCard } from "@/components/bridges/bridge-card";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { BadgeStyle, BridgeNetworkVm, BridgeStatus, RiskTier } from "@/lib/ipc/client";
+
+// The login Sheet opened on proceed calls the streaming IPC client on mount; stub
+// it so the card tests never touch a real Tauri channel. A never-resolving start
+// keeps the Sheet in its initial waiting state.
+vi.mock("@/lib/ipc/client", () => ({
+  startBridgeLogin: vi.fn(() => new Promise<number>(() => {})),
+  submitBridgeLogin: vi.fn(() => Promise.resolve()),
+  cancelBridgeLogin: vi.fn(() => Promise.resolve()),
+}));
 
 const ACCOUNT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
@@ -83,10 +92,12 @@ describe("BridgeCard", () => {
     expect(screen.getByText("Maintenance-heavy")).toBeInTheDocument();
   });
 
-  it("a low-risk action proceeds with NO dialog", () => {
+  it("a low-risk Connect proceeds with NO ack dialog and opens the login Sheet", async () => {
     renderCard(network());
     fireEvent.click(screen.getByRole("button", { name: "Connect Matrix" }));
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    // The native login Sheet opens directly (its title names the network).
+    expect(await screen.findByRole("dialog", { name: /Connect Matrix/ })).toBeInTheDocument();
   });
 
   it("a volatile action opens the AlertDialog showing the ack copy and confirm label", async () => {
@@ -102,7 +113,7 @@ describe("BridgeCard", () => {
     ).toBeInTheDocument();
   });
 
-  it("confirming the volatile gate closes the dialog (proceeds)", async () => {
+  it("confirming the volatile gate closes the ack dialog and opens the login Sheet", async () => {
     renderCard(volatile);
     fireEvent.click(screen.getByRole("button", { name: "Set up Instagram" }));
 
@@ -114,6 +125,8 @@ describe("BridgeCard", () => {
     await waitFor(() => {
       expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     });
+    // Proceeding opens the native login Sheet for the connected network.
+    expect(await screen.findByRole("dialog", { name: /Connect Instagram/ })).toBeInTheDocument();
   });
 
   it("cancelling the volatile gate aborts with no side effect (dialog closes)", async () => {

@@ -11,6 +11,8 @@
 
 pub mod data;
 pub mod discovery;
+pub mod login;
+pub mod transport;
 
 pub use discovery::discover;
 

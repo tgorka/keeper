@@ -48,6 +48,9 @@ use crate::archive::{self, ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWri
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
 use crate::bridge;
+use crate::bridges::login::{self, BridgeLoginSink};
+use crate::bridges::transport::provisioning::Provisioning;
+use crate::bridges::transport::BridgeTransport;
 use crate::error::{
     AccountError, BackupError, BridgeError, CoreError, InboxError, MediaError, SendError,
     TimelineError,
@@ -60,6 +63,7 @@ use crate::send::{self, SendTrigger};
 use crate::signals;
 use crate::timeline;
 use crate::verification::{self, VerificationSink};
+use crate::vm::BridgeLoginInput;
 use crate::vm::{
     ConnectionStatus, ConnectionStatusBatch, EditVersionVm, EncryptionStatus,
     EncryptionStatusBatch, InboxBatch, PaginationStatusBatch, RoomListBatch, RoomListOp, RoomVm,
@@ -118,6 +122,29 @@ pub type PaginationSink = Box<dyn Fn(PaginationStatusBatch) -> bool + Send + Syn
 /// entry.
 type OpenTimelines = Arc<Mutex<HashMap<u64, (OwnedRoomId, Arc<Timeline>)>>>;
 
+/// A live native-bridge-login session (Story 6.3, FR-26, AD-16): the driver task
+/// running [`login::drive_login`] and the input sender that `submit_bridge_login`
+/// pushes a [`BridgeLoginInput`] into (a flow choice or field values). Keyed by a
+/// `session_id` from [`NEXT_SUBSCRIPTION_ID`]. Cancelling aborts the task.
+struct LoginSession {
+    /// The running driver task.
+    task: JoinHandle<()>,
+    /// The input sender the driver drains for flow choices / field values.
+    input_tx: mpsc::UnboundedSender<BridgeLoginInput>,
+    /// A clone of the transport, kept so an explicit cancel / graceful-shutdown
+    /// drain can best-effort POST `/login/cancel/{login_id}` before aborting the
+    /// task (the task's own copy is dropped when it is aborted).
+    transport: Provisioning,
+    /// The login id populated by the driver once `login_start` succeeds; `None`
+    /// until then (a cancel before start has no server-side login to cancel).
+    /// A `std::sync::Mutex` (not tokio's) — it is a synchronous, single-writer
+    /// slot the driver sets once and cancel reads.
+    login_id: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// An account's live bridge-login sessions, keyed by `session_id`.
+type LoginSessions = Arc<Mutex<HashMap<u64, LoginSession>>>;
+
 /// The live artifacts produced by [`activate`]: the `Client`, its `SyncService`,
 /// the two lifetime-of-account supervisor task handles (reconnect supervisor and
 /// session persister), and the account-wide archive event-handler handle — all
@@ -151,6 +178,11 @@ struct AccountHandle {
     /// producer picks it up and drives it. Set on subscribe, cleared on
     /// unsubscribe/shutdown.
     verification_flow_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    /// Live native-bridge-login sessions (Story 6.3), keyed by `session_id`. Each
+    /// holds the driver task + the input sender `submit_bridge_login` pushes into.
+    /// Cancelled/aborted on `cancel_bridge_login`, on natural completion (the
+    /// driver self-reaps its entry), and on account shutdown.
+    login_sessions: LoginSessions,
     /// Lifetime-of-account reconnect supervisor task (not tied to any UI
     /// subscription). Observes `sync.state()` and, on every transition into
     /// `Running`, calls `client.send_queue().set_enabled(true)` so a room queue
@@ -276,6 +308,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
+                        login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for room list");
@@ -537,6 +570,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
+                        login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for inbox");
@@ -616,6 +650,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
+                        login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for timeline");
@@ -756,6 +791,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
+                        login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for connection status");
@@ -863,6 +899,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
+                        login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for encryption status");
@@ -969,6 +1006,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
+                        login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for backup status");
@@ -1119,6 +1157,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
+                        login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for verification");
@@ -1226,6 +1265,153 @@ impl AccountManager {
             return Err(BridgeError::AccountNotFound(account_id.to_owned()).into());
         };
         Ok(crate::bridges::discover(&client).await?)
+    }
+
+    /// Start a native bridge login for `network_id` on a live account (Story 6.3,
+    /// FR-26, AD-16). Resolves the account's live `Client`, reads its server name
+    /// and Matrix access token, connects a [`Provisioning`] transport (the
+    /// data-driven base-URL probe), then spawns [`login::drive_login`] to stream a
+    /// [`crate::vm::BridgeLoginVm`] state machine into `sink`. Returns the
+    /// `session_id` used to submit input / cancel.
+    ///
+    /// The access token is read here and handed *only* to the transport as a Bearer
+    /// header — it never crosses IPC (only rendered VM state reaches the frontend).
+    /// A missing account surfaces [`BridgeError::AccountNotFound`]; an unreachable
+    /// provisioning API surfaces [`BridgeError::Provisioning`] (both before the task
+    /// spawns). The driver self-reaps its session entry on natural completion.
+    pub async fn start_bridge_login(
+        &self,
+        account_id: &str,
+        network_id: &str,
+        sink: BridgeLoginSink,
+    ) -> Result<u64, CoreError> {
+        // Resolve the live client + its login-session registry under the lock.
+        let (client, sessions) = {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(handle) => (handle.client.clone(), handle.login_sessions.clone()),
+                None => return Err(BridgeError::AccountNotFound(account_id.to_owned()).into()),
+            }
+        };
+
+        // The provisioning API is served alongside the account's homeserver C-S API,
+        // and the Bearer token is a client-server access token that belongs to that
+        // homeserver. So the probe host is the RESOLVED homeserver host — never the
+        // bare MXID `server_name`, which under `.well-known` delegation can resolve to
+        // a different host operated by another party that must never receive the
+        // token (auth.rs keeps the same resolved-homeserver discipline). Both the host
+        // and token are read here and never leave the transport.
+        let homeserver = client.homeserver();
+        let provisioning_host = homeserver.host_str().ok_or_else(|| {
+            BridgeError::Provisioning("account homeserver has no host".to_owned())
+        })?;
+        let provisioning_host = match homeserver.port() {
+            Some(port) => format!("{provisioning_host}:{port}"),
+            None => provisioning_host.to_owned(),
+        };
+        let token = client.access_token().ok_or_else(|| {
+            BridgeError::Provisioning("account has no live access token".to_owned())
+        })?;
+
+        // Probe the provisioning base URL and connect (before spawning, so an
+        // unreachable API surfaces synchronously as the command's error).
+        let transport = Provisioning::connect(&provisioning_host, &token, network_id).await?;
+        // A clone is kept on the session so an explicit cancel / shutdown drain can
+        // best-effort POST `/login/cancel` after the driver task (which owns the
+        // original) is aborted.
+        let cancel_transport = transport.clone();
+
+        let session_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<BridgeLoginInput>();
+        // The shared slot the driver populates with the login id after start, read
+        // by cancel to know which server-side login to cancel.
+        let login_id: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let driver_login_id = login_id.clone();
+        let network_owned = network_id.to_owned();
+        let account_owned = account_id.to_owned();
+        let reaper_sessions = sessions.clone();
+        let span =
+            tracing::info_span!("bridge_login", account_id = %account_id, network_id = %network_id);
+        let task = tokio::spawn(
+            async move {
+                login::drive_login(transport, &network_owned, sink, input_rx, driver_login_id)
+                    .await;
+                // A naturally-completed login reaps its own session entry. It does
+                // NOT post `/login/cancel` — only an explicit cancel does.
+                reaper_sessions.lock().await.remove(&session_id);
+                tracing::info!(account_id = %account_owned, session_id, "bridge login ended");
+            }
+            .instrument(span),
+        );
+
+        sessions.lock().await.insert(
+            session_id,
+            LoginSession {
+                task,
+                input_tx,
+                transport: cancel_transport,
+                login_id,
+            },
+        );
+        tracing::info!(account_id = %account_id, session_id, "bridge login started");
+        Ok(session_id)
+    }
+
+    /// Push a [`BridgeLoginInput`] (a flow choice or field values) into a running
+    /// bridge-login session (Story 6.3). A stale / unknown `session_id` surfaces
+    /// [`BridgeError::Provisioning`] (the session already ended); a missing account
+    /// surfaces [`BridgeError::AccountNotFound`].
+    pub async fn submit_bridge_login(
+        &self,
+        account_id: &str,
+        session_id: u64,
+        input: BridgeLoginInput,
+    ) -> Result<(), CoreError> {
+        let accounts = self.accounts.lock().await;
+        let handle = accounts
+            .get(account_id)
+            .ok_or_else(|| BridgeError::AccountNotFound(account_id.to_owned()))?;
+        let sessions = handle.login_sessions.lock().await;
+        let session = sessions.get(&session_id).ok_or_else(|| {
+            BridgeError::Provisioning("no active bridge-login session for this id".to_owned())
+        })?;
+        session.input_tx.send(input).map_err(|_| {
+            BridgeError::Provisioning("bridge-login session already ended".to_owned())
+        })?;
+        Ok(())
+    }
+
+    /// Cancel a running bridge-login session (Story 6.3): remove it from the
+    /// registry, best-effort POST `/login/cancel/{login_id}` on the retained
+    /// transport clone (if the login id has resolved), then abort the driver task.
+    /// The server cancel is spawned detached so it never blocks the abort. Only this
+    /// explicit path posts cancel — a naturally-completed login does not. Idempotent
+    /// — a missing session / account is a silent no-op.
+    pub async fn cancel_bridge_login(&self, account_id: &str, session_id: u64) {
+        let sessions = {
+            let accounts = self.accounts.lock().await;
+            accounts.get(account_id).map(|h| h.login_sessions.clone())
+        };
+        let Some(sessions) = sessions else {
+            return;
+        };
+        let removed = sessions.lock().await.remove(&session_id);
+        if let Some(session) = removed {
+            // If the driver got as far as starting the flow, best-effort cancel the
+            // server-side login before aborting the task (detached so it never
+            // blocks the abort; `login_cancel` logs+swallows all errors).
+            let login_id = session.login_id.lock().ok().and_then(|guard| guard.clone());
+            if let Some(id) = login_id {
+                let t = session.transport.clone();
+                tokio::spawn(async move {
+                    t.login_cancel(&id).await;
+                });
+            }
+            // Dropping the input sender closes the driver's input channel; aborting
+            // the task stops any in-flight long-poll immediately.
+            session.task.abort();
+            tracing::info!(account_id = %account_id, session_id, "bridge login cancelled");
+        }
     }
 
     /// Resolve the account's live `Client` for a backup action, surfacing a *named*
@@ -2362,6 +2548,21 @@ impl AccountManager {
             }
             // Drop every stored `Arc<Timeline>` so no room timeline leaks.
             handle.timelines.lock().await.clear();
+            // Abort any in-flight native bridge-login sessions (Story 6.3) so their
+            // driver tasks (holding a `Provisioning` transport) are dropped. For any
+            // session that got as far as starting the flow, best-effort POST
+            // `/login/cancel` first (detached) so sign-out doesn't leak server-side
+            // login sessions.
+            for (_, session) in handle.login_sessions.lock().await.drain() {
+                let login_id = session.login_id.lock().ok().and_then(|guard| guard.clone());
+                if let Some(id) = login_id {
+                    let t = session.transport.clone();
+                    tokio::spawn(async move {
+                        t.login_cancel(&id).await;
+                    });
+                }
+                session.task.abort();
+            }
             tracing::info!(account_id = %account_id, "account shut down");
         }
     }

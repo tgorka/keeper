@@ -1517,6 +1517,151 @@ pub struct BridgeDiscoveryVm {
     pub networks: Vec<DiscoveredBridgeVm>,
 }
 
+/// The phase of a native bridge login flow (Story 6.3, FR-26, AD-16).
+///
+/// A transport-agnostic projection of the bridgev2 provisioning login state
+/// machine, rendered as a distinct native stepper state. The frontend switches on
+/// this phase; the same set must render identically whichever [`BridgeTransport`]
+/// (provisioning today, bot-driver in 6.4) powered the login. Serializes to its
+/// camelCase name — the frontend wire contract.
+///
+/// [`BridgeTransport`]: crate::bridges::transport::BridgeTransport
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum BridgeLoginPhase {
+    /// The bridge exposes more than one login flow — the user must pick one before
+    /// the login can start. `flows` carries the choices.
+    ChoosingMethod,
+    /// The login is in flight and there is nothing yet for the user to do (a step
+    /// is being started or a `display_and_wait` with no visual is long-polling).
+    Waiting,
+    /// A QR code is displayed for the user to scan; `qrSvg` carries the pre-rendered
+    /// SVG. A fresh QR while already in this phase sets `qrRefreshed`.
+    Qr,
+    /// The bridge asked for typed input (a phone number, a 2FA code, a password, …);
+    /// `fields` carries the non-secret field descriptors to render.
+    CodeEntry,
+    /// The login completed — the Network is linked. Terminal.
+    Success,
+    /// The login failed. `error` carries the bridge's own message verbatim (or
+    /// keeper's honest reason for an unsupported step / unreachable API). Terminal
+    /// but retriable — the stepper offers Retry.
+    Failure,
+}
+
+/// One labeled input field the bridge asked for during a code-entry login step
+/// (Story 6.3, FR-26).
+///
+/// A non-secret projection of a bridgev2 `user_input` field descriptor: the field
+/// `id` the submit body is keyed by, its provisioning `field_type` (so the Sheet
+/// can pick an input treatment — a segmented code input, a masked password, …), a
+/// human `name`/`description`, an optional client-side validation `pattern`, and an
+/// optional prefilled `default_value`. NO entered value or secret ever rides on
+/// this VM — values travel only inside a [`BridgeLoginInput::Fields`] submit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct LoginFieldVm {
+    /// The field id the submit body is keyed by (opaque, passed through verbatim).
+    pub id: String,
+    /// The provisioning field type (e.g. `"phone_number"`, `"2fa_code"`,
+    /// `"password"`, `"token"`, `"username"`), driving the input treatment.
+    pub field_type: String,
+    /// The human-readable field label (e.g. `"Phone number"`).
+    pub name: String,
+    /// An optional longer description / helper text, or `null`.
+    pub description: Option<String>,
+    /// An optional regex the entered value must match before submit (client-side
+    /// validated), or `null`.
+    pub pattern: Option<String>,
+    /// An optional prefilled default value (non-secret), or `null`.
+    pub default_value: Option<String>,
+}
+
+/// One selectable login method the bridge offers (Story 6.3, FR-26).
+///
+/// A non-secret projection of a bridgev2 login flow descriptor: the stable `id`
+/// used to start the flow and a human `name`/`description` for the RadioGroup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct LoginFlowVm {
+    /// The stable flow id used to start this login method (opaque, verbatim).
+    pub id: String,
+    /// The flow's human-readable name (e.g. `"QR code"`).
+    pub name: String,
+    /// An optional longer description of the method, or `null`.
+    pub description: Option<String>,
+}
+
+/// A snapshot of a native bridge login flow, streamed over the login `Channel`
+/// (Story 6.3, FR-26, AD-16, NFR secret containment).
+///
+/// The single view model the webview renders for the whole login, mirroring
+/// [`VerificationFlowVm`]'s phase-plus-optional-payload shape. Carries **only**
+/// non-secret render data: the `network_id` being linked, the current
+/// [`BridgeLoginPhase`], a per-phase `instruction` line, a pre-rendered `qr_svg`
+/// (QR phase), the `qr_refreshed` flag (a fresh QR during an active QR phase), the
+/// `fields` to render (code-entry phase), the `flows` to pick from (choosing-method
+/// phase), and the bridge's verbatim `error` (failure phase). The account's Matrix
+/// access token is used only as an HTTP Bearer header inside the transport and
+/// **never** appears here — no token, cookie, or session material crosses IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BridgeLoginVm {
+    /// The stable network id being linked (e.g. `"whatsapp"`), joined to the 6.1
+    /// catalog by the frontend for glyph/name.
+    pub network_id: String,
+    /// The current login phase.
+    pub phase: BridgeLoginPhase,
+    /// A per-phase instruction line (e.g. "Scan this QR with WhatsApp on your
+    /// phone."), or `null`.
+    pub instruction: Option<String>,
+    /// The pre-rendered QR-code SVG string, present in the `Qr` phase, else `null`.
+    pub qr_svg: Option<String>,
+    /// `true` when a fresh QR replaced an earlier one during an active `Qr` phase
+    /// (drives the subtle "QR refreshed" note); `false` otherwise.
+    pub qr_refreshed: bool,
+    /// The non-secret field descriptors to render, populated in the `CodeEntry`
+    /// phase (empty otherwise).
+    pub fields: Vec<LoginFieldVm>,
+    /// The selectable login methods, populated in the `ChoosingMethod` phase (empty
+    /// otherwise).
+    pub flows: Vec<LoginFlowVm>,
+    /// The bridge's verbatim error message (or keeper's honest reason), present in
+    /// the `Failure` phase, else `null`.
+    pub error: Option<String>,
+}
+
+/// User input submitted into a running bridge login (Story 6.3, FR-26).
+///
+/// A deserialize-in input VM pushed into the driver by `bridge_login_submit`: a
+/// flow choice (from the `ChoosingMethod` phase) or a map of field id → entered
+/// value (from the `CodeEntry` phase). Entered values are carried straight into the
+/// transport's submit body and never logged. Serialized as an internally tagged
+/// enum so the frontend can switch on `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum BridgeLoginInput {
+    /// The user picked a login flow in the `ChoosingMethod` phase.
+    ChooseFlow {
+        /// The chosen flow id (matches a [`LoginFlowVm::id`]).
+        flow_id: String,
+    },
+    /// The user submitted the code-entry fields: a map of field id → entered value.
+    Fields {
+        /// The entered values, keyed by [`LoginFieldVm::id`].
+        values: std::collections::BTreeMap<String, String>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2307,6 +2452,107 @@ mod tests {
         );
         let back: VerificationFlowVm = serde_json::from_str(&json).expect("deserialize flow vm");
         assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn bridge_login_phase_round_trips() {
+        for phase in [
+            BridgeLoginPhase::ChoosingMethod,
+            BridgeLoginPhase::Waiting,
+            BridgeLoginPhase::Qr,
+            BridgeLoginPhase::CodeEntry,
+            BridgeLoginPhase::Success,
+            BridgeLoginPhase::Failure,
+        ] {
+            let json = serde_json::to_string(&phase).expect("serialize phase");
+            let back: BridgeLoginPhase = serde_json::from_str(&json).expect("deserialize phase");
+            assert_eq!(back, phase);
+        }
+        // Spot-check the camelCase wire form for a multi-word variant.
+        assert_eq!(
+            serde_json::to_string(&BridgeLoginPhase::ChoosingMethod).expect("serialize"),
+            "\"choosingMethod\""
+        );
+    }
+
+    #[test]
+    fn bridge_login_vm_qr_round_trips_camel_case_and_leaks_no_token() {
+        let vm = BridgeLoginVm {
+            network_id: "whatsapp".to_owned(),
+            phase: BridgeLoginPhase::Qr,
+            instruction: Some("Scan this QR with WhatsApp on your phone.".to_owned()),
+            qr_svg: Some("<svg>…</svg>".to_owned()),
+            qr_refreshed: true,
+            fields: vec![],
+            flows: vec![],
+            error: None,
+        };
+        let json = serde_json::to_string(&vm).expect("serialize login vm");
+        assert!(
+            json.contains("\"networkId\":\"whatsapp\""),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"phase\":\"qr\""), "json was: {json}");
+        assert!(json.contains("\"qrSvg\":\"<svg>"), "json was: {json}");
+        assert!(json.contains("\"qrRefreshed\":true"), "json was: {json}");
+        // No access token / bearer / cookie material may ride on the login VM.
+        assert!(!json.contains("access_token"), "token leaked: {json}");
+        assert!(!json.contains("Bearer"), "bearer leaked: {json}");
+        let back: BridgeLoginVm = serde_json::from_str(&json).expect("deserialize login vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn bridge_login_vm_code_entry_and_flows_round_trip() {
+        let vm = BridgeLoginVm {
+            network_id: "signal".to_owned(),
+            phase: BridgeLoginPhase::CodeEntry,
+            instruction: Some("Enter the code sent to your device.".to_owned()),
+            qr_svg: None,
+            qr_refreshed: false,
+            fields: vec![LoginFieldVm {
+                id: "2fa_code".to_owned(),
+                field_type: "2fa_code".to_owned(),
+                name: "Verification code".to_owned(),
+                description: Some("The 6-digit code".to_owned()),
+                pattern: Some("^[0-9]{6}$".to_owned()),
+                default_value: None,
+            }],
+            flows: vec![LoginFlowVm {
+                id: "qr".to_owned(),
+                name: "QR code".to_owned(),
+                description: None,
+            }],
+            error: None,
+        };
+        let json = serde_json::to_string(&vm).expect("serialize login vm");
+        assert!(
+            json.contains("\"fieldType\":\"2fa_code\""),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"defaultValue\":null"), "json was: {json}");
+        let back: BridgeLoginVm = serde_json::from_str(&json).expect("deserialize login vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn bridge_login_input_tags_and_round_trips() {
+        let choose = BridgeLoginInput::ChooseFlow {
+            flow_id: "qr".to_owned(),
+        };
+        let json = serde_json::to_string(&choose).expect("serialize input");
+        assert!(json.contains("\"kind\":\"chooseFlow\""), "json was: {json}");
+        assert!(json.contains("\"flowId\":\"qr\""), "json was: {json}");
+        let back: BridgeLoginInput = serde_json::from_str(&json).expect("deserialize input");
+        assert_eq!(back, choose);
+
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("phone_number".to_owned(), "+15551234".to_owned());
+        let fields = BridgeLoginInput::Fields { values };
+        let json = serde_json::to_string(&fields).expect("serialize input");
+        assert!(json.contains("\"kind\":\"fields\""), "json was: {json}");
+        let back: BridgeLoginInput = serde_json::from_str(&json).expect("deserialize input");
+        assert_eq!(back, fields);
     }
 
     #[test]

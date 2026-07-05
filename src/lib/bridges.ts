@@ -7,7 +7,7 @@
  * inventing status text. Risk-tier badges and ack copy still come only from the
  * backend catalog data — nothing here duplicates that.
  */
-import type { BridgeStatus } from "@/lib/ipc/client";
+import type { BridgeLoginPhase, BridgeStatus } from "@/lib/ipc/client";
 
 /**
  * The companion-stack docs link surfaced in the "No bridges found" empty state
@@ -26,4 +26,18 @@ export const BRIDGE_STATUS_LABEL: Record<BridgeStatus, string> = {
   loggedIn: "Connected",
   notLoggedIn: "Action needed",
   configured: "Not set up",
+};
+
+/**
+ * The live state word shown in the bridge login Sheet for each
+ * {@link BridgeLoginPhase} (Story 6.3, FR-26). One transport-agnostic word per
+ * phase so the stepper reads identically whichever transport powered the login.
+ */
+export const BRIDGE_LOGIN_PHASE_LABEL: Record<BridgeLoginPhase, string> = {
+  choosingMethod: "Connecting",
+  waiting: "Waiting",
+  qr: "Scan QR",
+  codeEntry: "Enter code",
+  success: "Linked ✓",
+  failure: "Couldn't connect",
 };

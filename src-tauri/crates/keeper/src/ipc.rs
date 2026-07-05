@@ -22,11 +22,11 @@ use keeper_core::error::{
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
-    AccountVm, BackupStatus, BridgeDiscoveryVm, BridgeNetworkVm, ConnectionStatusBatch, DemoBatch,
-    EditVersionVm, EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm,
-    InboxBatch, IpcError, IpcErrorCode, NetworksSnapshot, PaginationStatusBatch, PingVm,
-    RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch,
-    VerificationFlowVm,
+    AccountVm, BackupStatus, BridgeDiscoveryVm, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
+    ConnectionStatusBatch, DemoBatch, EditVersionVm, EncryptionStatusBatch, ExportPhase,
+    ExportProgressVm, ExportRequestVm, InboxBatch, IpcError, IpcErrorCode, NetworksSnapshot,
+    PaginationStatusBatch, PingVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot,
+    TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -319,6 +319,11 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         // A total bridge-discovery transport failure (Story 6.2) — the homeserver
         // may be transiently unreachable. Retriable: the Bridges view can retry.
         CoreError::Bridge(BridgeError::Discovery(_)) => (IpcErrorCode::SyncUnavailable, true),
+        // A native bridge-login provisioning failure (Story 6.3) — the bridge
+        // returned an error, no provisioning API was reachable, or a step failed.
+        // Retriable: the login Sheet offers Retry. The message is the bridge's own
+        // verbatim text.
+        CoreError::Bridge(BridgeError::Provisioning(_)) => (IpcErrorCode::SyncUnavailable, true),
     };
     IpcError {
         code,
@@ -419,6 +424,65 @@ pub async fn bridge_discover(
         .discover_bridges(&account_id)
         .await
         .map_err(to_ipc_error)
+}
+
+/// Start a native bridge login for `network_id` (Story 6.3, FR-26, AD-16).
+///
+/// Connects the [`Provisioning`](keeper_core::bridges::transport::provisioning) transport
+/// (a data-driven base-URL probe authenticated with the account's Matrix access token as
+/// Bearer — the token is read in Rust and never crosses IPC), then streams a
+/// [`BridgeLoginVm`] state machine (choosing method → waiting → QR / code entry →
+/// success / failure) over `channel` and returns the `session_id` used to submit input /
+/// cancel. An unreachable provisioning API or an unknown account funnels through
+/// [`to_ipc_error`] (`syncUnavailable` / `internal`). Only rendered VM state crosses IPC.
+#[tauri::command]
+pub async fn bridge_login_start(
+    state: State<'_, AppState>,
+    account_id: String,
+    network_id: String,
+    channel: Channel<BridgeLoginVm>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |vm: BridgeLoginVm| channel.send(vm).is_ok());
+    state
+        .accounts
+        .start_bridge_login(&account_id, &network_id, sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Submit input into a running bridge login (Story 6.3): a flow choice (from the
+/// choosing-method phase) or the entered field values (from the code-entry phase). A
+/// stale `session_id` funnels through [`to_ipc_error`] (`syncUnavailable`). Entered
+/// values ride only inside the [`BridgeLoginInput`] and are never logged.
+#[tauri::command]
+pub async fn bridge_login_submit(
+    state: State<'_, AppState>,
+    account_id: String,
+    session_id: u64,
+    input: BridgeLoginInput,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .submit_bridge_login(&account_id, session_id, input)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Cancel a running bridge login (Story 6.3) — the user closed the Sheet / pressed Esc.
+/// Drops the session, best-effort POSTs `/login/cancel/{login_id}` on the retained
+/// transport (when the login id has resolved), then aborts the driver task. Idempotent —
+/// cancelling an unknown session is a no-op.
+#[tauri::command]
+pub async fn bridge_login_cancel(
+    state: State<'_, AppState>,
+    account_id: String,
+    session_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .cancel_bridge_login(&account_id, session_id)
+        .await;
+    Ok(())
 }
 
 /// Open the demo subscription. Emits the snapshot-then-diff batches produced by

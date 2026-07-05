@@ -10,10 +10,11 @@
  * the shared {@link BRIDGE_STATUS_LABEL} map. When the tier `requiresAck` (volatile /
  * conditional), the action opens an {@link AlertDialog} showing the tier badge + the
  * backend `ackCopy` and gates on an explicit confirm; otherwise it proceeds directly.
- * No real login happens yet — the confirm/proceed is a stub that just closes the gate
- * (provisioning is Story 6.3).
+ * Proceeding (post-ack) opens the native login {@link BridgeLoginSheet} (Story 6.3),
+ * which drives the provisioning login state machine natively.
  */
 import { useState } from "react";
+import { BridgeLoginSheet } from "@/components/bridges/bridge-login-sheet";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -64,17 +65,18 @@ interface BridgeCardProps {
 
 export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
   const [ackOpen, setAckOpen] = useState(false);
+  const [loginOpen, setLoginOpen] = useState(false);
   const badge = BADGE_STYLE[network.badgeStyle];
 
   // Data-driven action label: an ack-gated (volatile / conditional) Network is
   // "Set up"; a directly-connectable one is "Connect".
   const actionLabel = network.requiresAck ? "Set up" : "Connect";
 
-  // The connect stub. No real login this story (provisioning is Story 6.3) —
-  // proceeding just closes any gate. Keyed per Network × Account so a later story
-  // can dispatch the real bot login from here.
+  // Proceed (post-ack, or directly for a non-gated Network): close any gate and
+  // open the native login Sheet, which drives the provisioning login (Story 6.3).
   const proceed = () => {
     setAckOpen(false);
+    setLoginOpen(true);
   };
 
   const onAction = () => {
@@ -151,6 +153,14 @@ export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
           </AlertDialogContent>
         </AlertDialog>
       )}
+
+      <BridgeLoginSheet
+        accountId={accountId}
+        networkId={network.networkId}
+        networkName={network.name}
+        open={loginOpen}
+        onOpenChange={setLoginOpen}
+      />
     </Card>
   );
 }

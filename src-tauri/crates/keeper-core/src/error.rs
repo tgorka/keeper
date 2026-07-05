@@ -370,6 +370,17 @@ pub enum BridgeError {
     /// non-secret description — never a token or session material.
     #[error("bridge discovery failed: {0}")]
     Discovery(String),
+
+    /// A native bridge login over the mautrix bridgev2 provisioning API (Story
+    /// 6.3, FR-26, AD-16) failed: no candidate base URL authenticated the
+    /// provisioning endpoint, an HTTP/transport error, a JSON (de)serialization
+    /// failure, or a non-2xx response from a login step. The wrapped string is a
+    /// non-secret description — the bridge's own error message rendered verbatim,
+    /// never the account's Matrix access token or any session/cookie material.
+    /// Retriable — the user can retry the login. Maps to
+    /// `IpcErrorCode::SyncUnavailable`.
+    #[error("bridge login failed: {0}")]
+    Provisioning(String),
 }
 
 /// The hexagon error root. Every fallible core operation surfaces one of these.

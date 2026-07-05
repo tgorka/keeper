@@ -13,6 +13,9 @@ export type { AccountVm } from "./gen/AccountVm";
 export type { BackupStatus } from "./gen/BackupStatus";
 export type { BadgeStyle } from "./gen/BadgeStyle";
 export type { BridgeDiscoveryVm } from "./gen/BridgeDiscoveryVm";
+export type { BridgeLoginInput } from "./gen/BridgeLoginInput";
+export type { BridgeLoginPhase } from "./gen/BridgeLoginPhase";
+export type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 export type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 export type { BridgeStatus } from "./gen/BridgeStatus";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
@@ -32,6 +35,8 @@ export type { InboxOp } from "./gen/InboxOp";
 export type { InboxRoomVm } from "./gen/InboxRoomVm";
 export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
+export type { LoginFieldVm } from "./gen/LoginFieldVm";
+export type { LoginFlowVm } from "./gen/LoginFlowVm";
 export type { MediaKindVm } from "./gen/MediaKindVm";
 export type { MediaVm } from "./gen/MediaVm";
 export type { NetworksSnapshot } from "./gen/NetworksSnapshot";
@@ -63,6 +68,8 @@ export type { VerificationPhase } from "./gen/VerificationPhase";
 import type { AccountVm } from "./gen/AccountVm";
 import type { BackupStatus } from "./gen/BackupStatus";
 import type { BridgeDiscoveryVm } from "./gen/BridgeDiscoveryVm";
+import type { BridgeLoginInput } from "./gen/BridgeLoginInput";
+import type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { EditVersionVm } from "./gen/EditVersionVm";
@@ -145,6 +152,51 @@ export async function bridgeCatalog(): Promise<BridgeNetworkVm[]> {
  */
 export async function bridgeDiscover(accountId: string): Promise<BridgeDiscoveryVm> {
   return await invoke<BridgeDiscoveryVm>("bridge_discover", { accountId });
+}
+
+/**
+ * Start a native bridge login for `networkId` (FR-26, AD-16, Story 6.3). Opens a
+ * streaming subscription: the Rust core connects the provisioning transport
+ * (authenticated with the account's Matrix access token as Bearer, read in Rust
+ * and never crossing IPC), drives the bridgev2 login state machine, and forwards
+ * each {@link BridgeLoginVm} snapshot to `onState`. Resolves with the `sessionId`
+ * used to {@link submitBridgeLogin} / {@link cancelBridgeLogin}. Rejects with the
+ * {@link IpcError} envelope: an unreachable provisioning API → `syncUnavailable`
+ * (retriable). Only rendered VM state crosses IPC — never the token or a cookie.
+ */
+export async function startBridgeLogin(
+  accountId: string,
+  networkId: string,
+  onState: (vm: BridgeLoginVm) => void,
+): Promise<number> {
+  return await subscribe<BridgeLoginVm>("bridge_login_start", onState, {
+    accountId,
+    networkId,
+  });
+}
+
+/**
+ * Submit input into a running bridge login (Story 6.3): a flow choice (from the
+ * choosing-method phase) or the entered field values (from the code-entry phase).
+ * Entered values ride only inside the {@link BridgeLoginInput} and are never
+ * logged. Rejects with the {@link IpcError} envelope when the session has ended.
+ */
+export async function submitBridgeLogin(
+  accountId: string,
+  sessionId: number,
+  input: BridgeLoginInput,
+): Promise<void> {
+  await invoke<void>("bridge_login_submit", { accountId, sessionId, input });
+}
+
+/**
+ * Cancel a running bridge login (Story 6.3) — the user closed the Sheet / pressed
+ * Esc. Drops the session, best-effort POSTs `/login/cancel` on the bridge (when the
+ * login id has resolved), then aborts the driver task. Idempotent — cancelling an
+ * unknown session is a no-op.
+ */
+export async function cancelBridgeLogin(accountId: string, sessionId: number): Promise<void> {
+  await invoke<void>("bridge_login_cancel", { accountId, sessionId });
 }
 
 /**

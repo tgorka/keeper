@@ -25,6 +25,8 @@ const RISK_TIERS_VERSION: u32 = 1;
 const COUPLING_CAVEATS_VERSION: u32 = 1;
 /// The schema `version` for `known-bots.json`.
 const KNOWN_BOTS_VERSION: u32 = 1;
+/// The schema `version` for `provisioning.json`.
+const PROVISIONING_VERSION: u32 = 1;
 
 /// The raw `risk-tiers.json` document.
 #[derive(Debug, Deserialize)]
@@ -107,12 +109,29 @@ pub struct KnownBotEntry {
     pub localparts: Vec<String>,
 }
 
+/// The raw `provisioning.json` document (consumed by Story 6.3 native login).
+///
+/// An ordered list of base-URL candidate templates with a `{server}` placeholder,
+/// probed in order by the [`Provisioning`](crate::bridges::transport::provisioning)
+/// transport until one authenticates the provisioning `…/v3/login/flows` endpoint
+/// (AD-16: base-URL resolution is a data-driven probe, an implementation detail
+/// inside the transport). Never hardcoded in the transport code.
+#[derive(Debug, Deserialize)]
+pub struct ProvisioningDoc {
+    /// The data-file schema version (`1`); checked by [`validate_provisioning`].
+    pub version: u32,
+    /// The ordered base-URL candidate templates (each with a `{server}` token).
+    pub candidates: Vec<String>,
+}
+
 /// The compiled-in `risk-tiers.json` bytes.
 const RISK_TIERS_JSON: &str = include_str!("../../data/risk-tiers.json");
 /// The compiled-in `coupling-caveats.json` bytes.
 const COUPLING_CAVEATS_JSON: &str = include_str!("../../data/coupling-caveats.json");
 /// The compiled-in `known-bots.json` bytes.
 const KNOWN_BOTS_JSON: &str = include_str!("../../data/known-bots.json");
+/// The compiled-in `provisioning.json` bytes.
+const PROVISIONING_JSON: &str = include_str!("../../data/provisioning.json");
 
 /// Process-wide cache for the parsed-and-validated risk tiers.
 static RISK_TIERS: OnceLock<Result<RiskTiersDoc, BridgeError>> = OnceLock::new();
@@ -120,6 +139,8 @@ static RISK_TIERS: OnceLock<Result<RiskTiersDoc, BridgeError>> = OnceLock::new()
 static COUPLING_CAVEATS: OnceLock<Result<CouplingCaveatsDoc, BridgeError>> = OnceLock::new();
 /// Process-wide cache for the parsed-and-validated known-bot registry.
 static KNOWN_BOTS: OnceLock<Result<KnownBotsDoc, BridgeError>> = OnceLock::new();
+/// Process-wide cache for the parsed-and-validated provisioning candidates.
+static PROVISIONING: OnceLock<Result<ProvisioningDoc, BridgeError>> = OnceLock::new();
 
 /// Convert a cached `&Result<T, BridgeError>` into a `Result<&T, BridgeError>` so
 /// callers get the shared parsed doc on success and a cloned error on failure.
@@ -159,6 +180,44 @@ pub fn known_bots() -> Result<&'static KnownBotsDoc, BridgeError> {
         Ok(doc)
     });
     as_ref_result(cached)
+}
+
+/// Parse + validate the provisioning candidates once and return the cached doc.
+pub fn provisioning() -> Result<&'static ProvisioningDoc, BridgeError> {
+    let cached = PROVISIONING.get_or_init(|| {
+        let doc: ProvisioningDoc = serde_json::from_str(PROVISIONING_JSON)
+            .map_err(|e| BridgeError::Data(format!("provisioning.json failed to parse: {e}")))?;
+        validate_provisioning(&doc)?;
+        Ok(doc)
+    });
+    as_ref_result(cached)
+}
+
+/// Validate the provisioning candidates: the schema version must match and every
+/// candidate must be a non-empty template carrying the `{server}` placeholder (a
+/// candidate that can't substitute the server would probe a fixed URL, which is a
+/// data authoring error the [`Provisioning`](crate::bridges::transport::provisioning)
+/// probe relies on being caught here).
+fn validate_provisioning(doc: &ProvisioningDoc) -> Result<(), BridgeError> {
+    if doc.version != PROVISIONING_VERSION {
+        return Err(BridgeError::Data(format!(
+            "provisioning.json unsupported version {} (expected {PROVISIONING_VERSION})",
+            doc.version
+        )));
+    }
+    if doc.candidates.is_empty() {
+        return Err(BridgeError::Data(
+            "provisioning.json has no candidates".to_owned(),
+        ));
+    }
+    for candidate in &doc.candidates {
+        if candidate.trim().is_empty() || !candidate.contains("{server}") {
+            return Err(BridgeError::Data(format!(
+                "provisioning.json candidate {candidate:?} is empty or missing the {{server}} placeholder"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Validate the risk-tier document. Enforces the invariants the Bridges surface
@@ -310,6 +369,46 @@ mod tests {
         risk_tiers().expect("risk tiers parse");
         coupling_caveats().expect("coupling caveats parse");
         known_bots().expect("known bots parse");
+        provisioning().expect("provisioning parse");
+    }
+
+    #[test]
+    fn provisioning_candidates_all_carry_server_placeholder() {
+        let doc = provisioning().expect("provisioning parse");
+        assert!(!doc.candidates.is_empty(), "must have candidates");
+        for candidate in &doc.candidates {
+            assert!(
+                candidate.contains("{server}"),
+                "candidate {candidate:?} must carry the {{server}} placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_provisioning_version() {
+        let doc = ProvisioningDoc {
+            version: PROVISIONING_VERSION + 1,
+            candidates: vec!["https://{server}/_matrix/provision".to_owned()],
+        };
+        assert!(err_msg(validate_provisioning(&doc)).contains("unsupported version"));
+    }
+
+    #[test]
+    fn rejects_provisioning_candidate_without_placeholder() {
+        let doc = ProvisioningDoc {
+            version: PROVISIONING_VERSION,
+            candidates: vec!["https://fixed.example.org/_matrix/provision".to_owned()],
+        };
+        assert!(err_msg(validate_provisioning(&doc)).contains("placeholder"));
+    }
+
+    #[test]
+    fn rejects_empty_provisioning_candidates() {
+        let doc = ProvisioningDoc {
+            version: PROVISIONING_VERSION,
+            candidates: vec![],
+        };
+        assert!(err_msg(validate_provisioning(&doc)).contains("no candidates"));
     }
 
     #[test]
