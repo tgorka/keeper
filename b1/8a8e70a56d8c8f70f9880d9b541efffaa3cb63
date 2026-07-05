@@ -1,0 +1,83 @@
+src-tauri/crates/keeper-core/tests/archive_survives_sign_out.rs
+  s_c5431643fbb4f7::t_816ec0d0322bf9 119,183-187
+  s_c5431643fbb4f7::t_23868e3e7a6954 1-118,120-182,188-191
+src/hooks/use-sign-out.test.ts
+  s_c5431643fbb4f7::t_c6735166a4eab1 64-66
+  s_c5431643fbb4f7::t_646d1148080a58 7,10-16
+  s_c5431643fbb4f7::t_f5fff4600f4ee8 142-186
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_c5431643fbb4f7::t_c1cbd5c32bccf4 95
+src/lib/ipc/client.ts
+  s_c5431643fbb4f7::t_acf700c16ad848 317
+  s_c5431643fbb4f7::t_a0c638928001fd 318-328
+src-tauri/crates/keeper-core/src/archive/db.rs
+  s_c5431643fbb4f7::t_816ec0d0322bf9 871-875,878-887,955-959
+  s_c5431643fbb4f7::t_791b213306181b 445-492
+  s_c5431643fbb4f7::t_7f257a6790eb0b 777-870,876-877,888-954,960-963
+_bmad-output/implementation-artifacts/spec-5-7-archive-survives-sign-out-and-deletes-only-on-command.md
+  s_c5431643fbb4f7::t_c913b5ee0e16fa 58
+  s_c5431643fbb4f7::t_6584319a179ad4 118-130
+  s_c5431643fbb4f7::t_47cc8e5bce93c6 5
+  s_c5431643fbb4f7::t_1ac35dd15bbaf2 6
+  s_c5431643fbb4f7::t_253177bf602d45 133,136,138-141,143,146,148,150-152
+  s_c5431643fbb4f7::t_f784ace0f5ce91 90-117
+  s_c5431643fbb4f7::t_9f3aeb760cc348 11
+  s_c5431643fbb4f7::t_34369fa5783d23 166-190
+  s_c5431643fbb4f7::t_c0f822e3e0af99 72-81
+  s_c5431643fbb4f7::t_56caa314f6436d 1-4,9-10,12-57,59-71,82-89,131-132,134-135,137,142,144-145,147,149,153-165
+  s_c5431643fbb4f7::t_431db41f00d0ad 7
+  s_c5431643fbb4f7::t_bfcc69c2982bc2 8
+src/App.tsx
+  s_c5431643fbb4f7::t_42dc26ac45cd30 45-50,52-62,73-95,98-108
+  s_c5431643fbb4f7::t_ccd046b45b9615 5
+src-tauri/crates/keeper/src/ipc.rs
+  s_c5431643fbb4f7::t_6ad89d07c16647 1888-1906
+src/components/layout/account-footer.test.tsx
+  s_c5431643fbb4f7::t_eb105be7fb52d5 219-230,234-306,310-316
+  s_c5431643fbb4f7::t_ae2c5ee92cbb17 231-233,307-309
+src/hooks/use-sign-out.ts
+  s_c5431643fbb4f7::t_ae2c5ee92cbb17 37
+  s_c5431643fbb4f7::t_bdeb0571ca5f99 71-89
+  s_c5431643fbb4f7::t_704a5bac8f1c2b 18-19,25-36,38,64-70,90
+src-tauri/crates/keeper/src/lib.rs
+  s_c5431643fbb4f7::t_556b95a1f39065 120-121
+src-tauri/crates/keeper-core/src/account.rs
+  s_c5431643fbb4f7::t_319a8bd7f84ffe 2365-2397
+src-tauri/crates/keeper-core/src/archive/ingest.rs
+  s_c5431643fbb4f7::t_d8f4591b083292 41-43
+  s_c5431643fbb4f7::t_9d0c1b435adef9 74-77,80
+  s_c5431643fbb4f7::t_56ff60ca1de484 353-383
+  s_c5431643fbb4f7::t_a098657baba70b 62-73,78-79,81-87
+  s_c5431643fbb4f7::t_41397bcf5ac56a 17-20
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_c5431643fbb4f7::t_c8ed25202b0352 200-203
+src/components/layout/account-footer.tsx
+  s_c5431643fbb4f7::t_9ac449760209ae 217
+  s_c5431643fbb4f7::t_05c0f523ba6a65 172-175,178-180
+  s_c5431643fbb4f7::t_0932491faf9d01 181
+  s_c5431643fbb4f7::t_5245c57c8bdd99 148-155,167-171,176,182-192,194,196,203-216,218,223,226-228,230-232,235-242,245-322
+  s_c5431643fbb4f7::t_ae2c5ee92cbb17 233-234
+  s_c5431643fbb4f7::t_05a443b1cd6422 51
+src-tauri/crates/keeper-core/src/archive/mod.rs
+  s_c5431643fbb4f7::t_373de8f876cc75 150
+  s_c5431643fbb4f7::t_5d4b2e4e2b231f 244-247
+  s_c5431643fbb4f7::t_c3924c6ec5847c 117,120-126,141-149
+  s_c5431643fbb4f7::t_ecabd7becefb96 35
+  s_c5431643fbb4f7::t_ae6afe0eb20805 191-223
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b18a8e70a56d8c8f70f9880d9b541efffaa3cb63",
+  "prompts": {},
+  "sessions": {
+    "s_c5431643fbb4f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "15aef718-233a-40fc-925e-e8d007e00a35",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
