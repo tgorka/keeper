@@ -1,0 +1,35 @@
+src-tauri/crates/keeper-core/src/account.rs
+  s_75f9e1d001faa1::t_98f59018fe88b5 1719-1726
+_bmad-output/implementation-artifacts/spec-6-6-start-new-chats-via-bridge.md
+  s_75f9e1d001faa1::t_297d3e0287cecc 7
+  s_75f9e1d001faa1::t_19aaf136971b19 5
+  s_75f9e1d001faa1::t_0252b79cf5dd23 174-191
+  s_75f9e1d001faa1::t_626063dad5e010 102-111
+  s_75f9e1d001faa1::t_3f243c2ce7c72c 11
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_2b7766fddc31e6::t_14b0e7466a0a88 103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f4ce8cb024c83a0d35f8f3d1eae86d66a4af708b",
+  "prompts": {},
+  "sessions": {
+    "s_2b7766fddc31e6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0b436a31-9deb-47b6-b95c-678fafedc91f",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_75f9e1d001faa1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ce39914f-98e7-48ec-bc84-a73e71dba23b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
