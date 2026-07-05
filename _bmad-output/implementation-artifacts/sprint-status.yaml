@@ -85,8 +85,8 @@ development_status:
   4-5-spaces-as-room-group-views: done
   4-6-network-account-attribution-and-network-filter: done
   epic-4-retrospective: optional
-  epic-5: backlog
-  5-1-archive-ingestion-pipeline: backlog
+  epic-5: in-progress
+  5-1-archive-ingestion-pipeline: done
   5-2-durability-against-remote-rewrites-edit-history: backlog
   5-3-offline-full-text-search-engine: backlog
   5-4-search-ui-global-and-in-chat: backlog

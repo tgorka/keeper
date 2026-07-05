@@ -15,8 +15,8 @@ use keeper_core::auth;
 use keeper_core::auth::BeeperFlowRegistry;
 use keeper_core::demo::snapshot_then_diff;
 use keeper_core::error::{
-    AccountError, AuthError, BackupError, CoreError, InboxError, MediaError, PlatformError,
-    SendError, SignalError, TimelineError, VerificationError,
+    AccountError, ArchiveError, AuthError, BackupError, CoreError, InboxError, MediaError,
+    PlatformError, SendError, SignalError, TimelineError, VerificationError,
 };
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
@@ -52,10 +52,21 @@ pub struct AppState {
 
 impl AppState {
     /// Construct the desktop app state with the real platform implementation.
+    ///
+    /// Resolves the platform data dir up front so the [`AccountManager`] can open
+    /// the single app-wide `archive.db` and spawn its serialized writer (Story
+    /// 5.1). If the data dir cannot be resolved (should not happen on a supported
+    /// desktop), fall back to the OS temp dir for the archive path so startup still
+    /// succeeds — archiving degrades rather than aborting the app.
     pub fn new() -> Self {
+        let platform: Arc<dyn Platform> = Arc::new(DesktopPlatform);
+        let data_dir = platform.data_dir().unwrap_or_else(|e| {
+            tracing::error!(error = %e, "could not resolve data dir; archive falls back to temp");
+            std::env::temp_dir().join("dev.tgorka.keeper")
+        });
         Self {
-            platform: Arc::new(DesktopPlatform),
-            accounts: AccountManager::new(),
+            platform,
+            accounts: AccountManager::new(&data_dir),
             oauth_flows: Arc::new(OAuthFlowRegistry::new()),
             beeper_flows: Arc::new(BeeperFlowRegistry::new()),
         }
@@ -231,6 +242,13 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         // the funnel exhaustive; a media failure is an internal, non-retriable IPC
         // error should one ever surface here.
         CoreError::Media(MediaError::NotFound | MediaError::Fetch(_)) => {
+            (IpcErrorCode::Internal, false)
+        }
+        // Archive errors (Story 5.1) surface only at archive setup and never cross
+        // the IPC command surface — a runtime write failure is swallowed inside the
+        // writer task. This arm keeps the funnel exhaustive: an internal,
+        // non-retriable IPC error should one ever reach here.
+        CoreError::Archive(ArchiveError::Sqlite(_) | ArchiveError::Serialization(_)) => {
             (IpcErrorCode::Internal, false)
         }
     };

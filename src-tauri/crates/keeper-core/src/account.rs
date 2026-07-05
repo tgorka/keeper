@@ -24,11 +24,14 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use matrix_sdk::encryption::VerificationState;
+use matrix_sdk::event_handler::EventHandlerHandle;
+use matrix_sdk::ruma::events::room::message::{MessageType, OriginalSyncRoomMessageEvent};
+use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
 };
 use matrix_sdk::ruma::{OwnedRoomId, RoomId};
-use matrix_sdk::Client;
+use matrix_sdk::{Client, Room};
 use matrix_sdk_ui::eyeball_im::VectorDiff;
 use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
 use matrix_sdk_ui::room_list_service::{RoomList, RoomListItem, RoomListLoadingState};
@@ -38,6 +41,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
+use crate::archive::{ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWriter};
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
 use crate::bridge;
@@ -111,13 +115,15 @@ pub type PaginationSink = Box<dyn Fn(PaginationStatusBatch) -> bool + Send + Syn
 type OpenTimelines = Arc<Mutex<HashMap<u64, (OwnedRoomId, Arc<Timeline>)>>>;
 
 /// The live artifacts produced by [`activate`]: the `Client`, its `SyncService`,
-/// and the two lifetime-of-account supervisor task handles (reconnect supervisor
-/// and session persister) that the caller stores on the [`AccountHandle`].
+/// the two lifetime-of-account supervisor task handles (reconnect supervisor and
+/// session persister), and the account-wide archive event-handler handle — all
+/// stored by the caller on the [`AccountHandle`].
 type ActivatedAccount = (
     Client,
     std::sync::Arc<SyncService>,
     JoinHandle<()>,
     JoinHandle<()>,
+    EventHandlerHandle,
 );
 
 /// A live, supervised account: its `Client`, `SyncService`, and the abort
@@ -155,6 +161,12 @@ struct AccountHandle {
     /// open past store-dir deletion and could re-persist the just-deleted
     /// Keychain key on a late token refresh (resurrecting a signed-out secret).
     session_persister: JoinHandle<()>,
+    /// Account-wide post-decryption archive event handler (Story 5.1): registered
+    /// on the `Client` in [`activate`], it maps each message-like room event into
+    /// an [`ArchiveEvent`] and hands it to the single serialized archive writer.
+    /// Removed from the `Client` in [`AccountManager::shutdown`] so no handler
+    /// leaks and no further rows are ingested after the account goes down.
+    archive_handler: EventHandlerHandle,
 }
 
 /// A live merged-inbox subscription (AD-20): the merger the per-account
@@ -176,21 +188,44 @@ struct InboxHandle {
 /// state (each a supervised `Client`/`SyncService`) and the single active
 /// merged-inbox subscription; the shell manages exactly one instance in its
 /// `AppState`. No account-count limit is enforced anywhere.
-#[derive(Default)]
 pub struct AccountManager {
     accounts: Mutex<HashMap<String, AccountHandle>>,
     /// The single active merged-inbox subscription, if any. Sign-out/shutdown
     /// notify it so a removed account's rooms leave the inbox immediately.
     inbox: Mutex<Option<InboxHandle>>,
+    /// The single app-wide archive writer handle (Story 5.1): created ONCE in
+    /// [`AccountManager::new`] from the platform data dir and cloned into every
+    /// account's post-decryption event handler, guaranteeing exactly one
+    /// serialized writer / one `archive.db` for all Accounts. `None` only if the
+    /// archive DB could not be opened at startup — ingestion is then skipped
+    /// (never fatal: the archive path must never block or abort the app).
+    archive: Option<ArchiveHandle>,
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
 impl AccountManager {
-    /// Construct an empty manager with no live accounts.
-    pub fn new() -> Self {
-        Self::default()
+    /// Construct an empty manager with no live accounts, opening the single
+    /// app-wide `archive.db` and spawning its one serialized writer (Story 5.1).
+    ///
+    /// The archive handle is created exactly once here and cloned into each
+    /// account's post-decryption event handler on activation. A failure to open
+    /// `archive.db` is logged and the manager still constructs with archiving
+    /// disabled — the archive path must never block or abort the app.
+    pub fn new(data_dir: &Path) -> Self {
+        let archive = match ArchiveWriter::spawn(data_dir) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::error!(error = %e, "could not open archive.db; archiving disabled");
+                None
+            }
+        };
+        Self {
+            accounts: Mutex::new(HashMap::new()),
+            inbox: Mutex::new(None),
+            archive,
+        }
     }
 
     /// Subscribe to the account's room list, activating the account if it is not
@@ -211,8 +246,8 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister) =
-                    activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
+                    activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -222,6 +257,7 @@ impl AccountManager {
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
                         session_persister,
+                        archive_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -464,8 +500,8 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister) =
-                    activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
+                    activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -475,6 +511,7 @@ impl AccountManager {
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
                         session_persister,
+                        archive_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -535,8 +572,8 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister) =
-                    activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
+                    activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -546,6 +583,7 @@ impl AccountManager {
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
                         session_persister,
+                        archive_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -667,8 +705,8 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister) =
-                    activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
+                    activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -678,6 +716,7 @@ impl AccountManager {
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
                         session_persister,
+                        archive_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -766,8 +805,8 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister) =
-                    activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
+                    activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -777,6 +816,7 @@ impl AccountManager {
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
                         session_persister,
+                        archive_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -864,8 +904,8 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister) =
-                    activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
+                    activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -875,6 +915,7 @@ impl AccountManager {
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
                         session_persister,
+                        archive_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -1006,8 +1047,8 @@ impl AccountManager {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
-                let (client, sync, reconnect_supervisor, session_persister) =
-                    activate(platform, account_id).await?;
+                let (client, sync, reconnect_supervisor, session_persister, archive_handler) =
+                    activate(platform, account_id, self.archive.clone()).await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -1017,6 +1058,7 @@ impl AccountManager {
                         timelines: Arc::new(Mutex::new(HashMap::new())),
                         reconnect_supervisor,
                         session_persister,
+                        archive_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                     },
                 );
@@ -2117,6 +2159,10 @@ impl AccountManager {
         }
         let mut accounts = self.accounts.lock().await;
         if let Some(handle) = accounts.remove(account_id) {
+            // Remove the account-wide archive event handler (Story 5.1) so no
+            // further events are ingested after the account goes down and no
+            // handler (holding a `Client` clone) leaks past teardown.
+            handle.client.remove_event_handler(handle.archive_handler);
             // Stop the SyncService first so no further diffs are produced, then
             // abort the reconnect supervisor and any remaining producer tasks.
             handle.sync.stop().await;
@@ -2175,10 +2221,11 @@ fn recovery_key_keychain_key(account_id: &str) -> String {
 /// lifetime-of-account reconnect supervisor is spawned to re-enable the send
 /// queue on every transition back into `Running`; its `JoinHandle` is returned
 /// for the caller to store on the `AccountHandle`.
-#[tracing::instrument(skip(platform), fields(account_id = %account_id))]
+#[tracing::instrument(skip(platform, archive), fields(account_id = %account_id))]
 async fn activate(
     platform: &Arc<dyn Platform>,
     account_id: &str,
+    archive: Option<ArchiveHandle>,
 ) -> Result<ActivatedAccount, CoreError> {
     let session_json = platform
         .keychain_get(&session_keychain_key(account_id))?
@@ -2214,6 +2261,16 @@ async fn activate(
         .await
         .map_err(|e| AccountError::RestoreFailed(e.to_string()))?;
 
+    // Register the account-wide post-decryption archive handler (Story 5.1)
+    // BEFORE the sync service starts, so no event delivered in the very first
+    // sync batch can slip through a gap between `sync.start()` and handler
+    // registration. It fires for every `m.room.message` the SDK delivers —
+    // including decrypted content for encrypted rooms — regardless of whether a
+    // room is open, so message history from the sync flow lands in `archive.db`
+    // via the single serialized writer. Mapping never blocks sync (non-blocking
+    // `ingest`).
+    let archive_handler = register_archive_handler(&client, account_id, archive);
+
     // Re-persist the Keychain blob whenever the SDK rotates the session tokens,
     // so the (one-time-use) rotated OAuth refresh token survives a restart. A
     // best-effort background task keyed by this account.
@@ -2238,7 +2295,149 @@ async fn activate(
             .instrument(tracing::info_span!("reconnect_supervisor", account_id = %account_id)),
     );
 
-    Ok((client, sync, reconnect_supervisor, session_persister))
+    Ok((
+        client,
+        sync,
+        reconnect_supervisor,
+        session_persister,
+        archive_handler,
+    ))
+}
+
+/// Register the account-wide post-decryption archive event handler on `client`
+/// and return its [`EventHandlerHandle`] (Story 5.1).
+///
+/// The handler fires for every `m.room.message` the SDK delivers post-decryption
+/// (encrypted rooms included). For each original (non-redacted) message it builds
+/// a normalized [`ArchiveEvent`] — event id, room id, sender, `origin_server_ts`
+/// (ms), event type, content JSON, and media *metadata* — and hands it to the
+/// single serialized writer via [`ArchiveHandle::ingest`] (non-blocking). When
+/// archiving is disabled (`archive` is `None`) the handler is still registered but
+/// does nothing, so activation shape is uniform.
+fn register_archive_handler(
+    client: &Client,
+    account_id: &str,
+    archive: Option<ArchiveHandle>,
+) -> EventHandlerHandle {
+    let account_id = account_id.to_owned();
+    client.add_event_handler(move |ev: OriginalSyncRoomMessageEvent, room: Room| {
+        let account_id = account_id.clone();
+        let archive = archive.clone();
+        async move {
+            let Some(archive) = archive else {
+                return;
+            };
+            match build_archive_event(&account_id, room.room_id().as_str(), &ev) {
+                Ok(archive_event) => archive.ingest(archive_event),
+                Err(e) => tracing::warn!(
+                    account_id = %account_id,
+                    event_id = %ev.event_id,
+                    error = %e,
+                    "archive: could not build event; dropping"
+                ),
+            }
+        }
+    })
+}
+
+/// Build a normalized [`ArchiveEvent`] from a post-decryption
+/// `m.room.message` event (Story 5.1). Pure over its inputs, so it is
+/// unit-testable without a live `Client`.
+///
+/// Serializes the event content to JSON for `content_json`, converts
+/// `origin_server_ts` to an i64 ms epoch, and extracts media *metadata* (never
+/// bytes) from the message `msgtype`. Returns an error only if the content cannot
+/// be serialized to JSON (surfaced by the caller as a swallowed, id-only log).
+fn build_archive_event(
+    account_id: &str,
+    room_id: &str,
+    ev: &OriginalSyncRoomMessageEvent,
+) -> Result<ArchiveEvent, serde_json::Error> {
+    let content_json = serde_json::to_string(&ev.content)?;
+    Ok(ArchiveEvent {
+        account_id: account_id.to_owned(),
+        event_id: ev.event_id.to_string(),
+        room_id: room_id.to_owned(),
+        sender: ev.sender.to_string(),
+        origin_ts: i64::from(ev.origin_server_ts.get()),
+        event_type: "m.room.message".to_owned(),
+        content_json,
+        media: archive_media(&ev.content.msgtype),
+    })
+}
+
+/// Extract archive media *metadata* from a message `msgtype`, or `None` for a
+/// non-media message (Story 5.1). Metadata only — never media bytes. Mirrors the
+/// media-info extraction in [`crate::timeline`]/[`crate::media`], reduced to the
+/// fields the archive stores.
+fn archive_media(msgtype: &MessageType) -> Option<ArchiveMedia> {
+    match msgtype {
+        MessageType::Image(c) => {
+            let info = c.info.as_deref();
+            Some(ArchiveMedia {
+                mxc: plain_mxc(&c.source),
+                mimetype: info.and_then(|i| i.mimetype.clone()),
+                size: info.and_then(|i| i.size).map(u64::from),
+                width: info.and_then(|i| i.width).map(u64::from),
+                height: info.and_then(|i| i.height).map(u64::from),
+                filename: Some(c.filename().to_owned()),
+                thumbnail_mxc: info
+                    .and_then(|i| i.thumbnail_source.as_ref())
+                    .and_then(plain_mxc),
+            })
+        }
+        MessageType::Video(c) => {
+            let info = c.info.as_deref();
+            Some(ArchiveMedia {
+                mxc: plain_mxc(&c.source),
+                mimetype: info.and_then(|i| i.mimetype.clone()),
+                size: info.and_then(|i| i.size).map(u64::from),
+                width: info.and_then(|i| i.width).map(u64::from),
+                height: info.and_then(|i| i.height).map(u64::from),
+                filename: Some(c.filename().to_owned()),
+                thumbnail_mxc: info
+                    .and_then(|i| i.thumbnail_source.as_ref())
+                    .and_then(plain_mxc),
+            })
+        }
+        MessageType::Audio(c) => {
+            let info = c.info.as_deref();
+            Some(ArchiveMedia {
+                mxc: plain_mxc(&c.source),
+                mimetype: info.and_then(|i| i.mimetype.clone()),
+                size: info.and_then(|i| i.size).map(u64::from),
+                width: None,
+                height: None,
+                filename: Some(c.filename().to_owned()),
+                thumbnail_mxc: None,
+            })
+        }
+        MessageType::File(c) => {
+            let info = c.info.as_deref();
+            Some(ArchiveMedia {
+                mxc: plain_mxc(&c.source),
+                mimetype: info.and_then(|i| i.mimetype.clone()),
+                size: info.and_then(|i| i.size).map(u64::from),
+                width: None,
+                height: None,
+                filename: Some(c.filename().to_owned()),
+                thumbnail_mxc: info
+                    .and_then(|i| i.thumbnail_source.as_ref())
+                    .and_then(plain_mxc),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The `mxc://` URI of an unencrypted [`MediaSource::Plain`] source, or `None` for
+/// an encrypted source (whose URI stays inside the content JSON, not the metadata
+/// column). Pure.
+fn plain_mxc(source: &MediaSource) -> Option<String> {
+    match source {
+        MediaSource::Plain(uri) => Some(uri.to_string()),
+        MediaSource::Encrypted(_) => None,
+    }
 }
 
 /// Re-persist the account's live session blob to the Keychain (best-effort).
@@ -2986,7 +3185,7 @@ mod tests {
         let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
             data_dir: data_dir.clone(),
         });
-        let manager = AccountManager::new();
+        let manager = AccountManager::new(&data_dir);
 
         // The account was never activated (absent from the manager map): shutdown
         // is a no-op and cleanup touches only already-absent persisted state.
@@ -3291,5 +3490,130 @@ mod tests {
                 .type_(),
             mime::APPLICATION
         );
+    }
+
+    /// Deserialize an `OriginalSyncRoomMessageEvent` from JSON for the archive
+    /// mapping tests (the SDK delivers post-decryption events in this shape).
+    fn parse_message_event(json: &str) -> OriginalSyncRoomMessageEvent {
+        let raw: matrix_sdk::ruma::serde::Raw<OriginalSyncRoomMessageEvent> =
+            serde_json::from_str(json).expect("valid raw message event");
+        raw.deserialize().expect("deserialize message event")
+    }
+
+    /// A post-decryption text message maps to a normalized `ArchiveEvent`:
+    /// event/room/sender ids, ms `origin_ts`, `m.room.message` type, content JSON,
+    /// and no media metadata.
+    #[test]
+    fn build_archive_event_maps_a_text_message() {
+        let ev = parse_message_event(
+            r#"{
+                "type": "m.room.message",
+                "event_id": "$evt:example.org",
+                "sender": "@bob:example.org",
+                "origin_server_ts": 1720000000000,
+                "content": { "msgtype": "m.text", "body": "hello" }
+            }"#,
+        );
+        let archived =
+            build_archive_event("acctA", "!room:example.org", &ev).expect("build archive event");
+        assert_eq!(archived.account_id, "acctA");
+        assert_eq!(archived.event_id, "$evt:example.org");
+        assert_eq!(archived.room_id, "!room:example.org");
+        assert_eq!(archived.sender, "@bob:example.org");
+        assert_eq!(archived.origin_ts, 1_720_000_000_000);
+        assert_eq!(archived.event_type, "m.room.message");
+        assert!(archived.media.is_none());
+        // content_json round-trips the message content.
+        let content: serde_json::Value =
+            serde_json::from_str(&archived.content_json).expect("content json parses");
+        assert_eq!(content["msgtype"], "m.text");
+        assert_eq!(content["body"], "hello");
+    }
+
+    /// A post-decryption image message maps to an `ArchiveEvent` whose `media`
+    /// carries metadata only (mxc/mimetype/size/dims/filename) — never bytes.
+    #[test]
+    fn build_archive_event_extracts_image_media_metadata() {
+        let ev = parse_message_event(
+            r#"{
+                "type": "m.room.message",
+                "event_id": "$img:example.org",
+                "sender": "@bob:example.org",
+                "origin_server_ts": 1720000000001,
+                "content": {
+                    "msgtype": "m.image",
+                    "body": "cat.png",
+                    "url": "mxc://example.org/abc123",
+                    "info": {
+                        "mimetype": "image/png",
+                        "size": 2048,
+                        "w": 640,
+                        "h": 480,
+                        "thumbnail_url": "mxc://example.org/thumb456"
+                    }
+                }
+            }"#,
+        );
+        let archived =
+            build_archive_event("acctA", "!room:example.org", &ev).expect("build archive event");
+        let media = archived.media.expect("media metadata present");
+        assert_eq!(media.mxc.as_deref(), Some("mxc://example.org/abc123"));
+        assert_eq!(media.mimetype.as_deref(), Some("image/png"));
+        assert_eq!(media.size, Some(2048));
+        assert_eq!(media.width, Some(640));
+        assert_eq!(media.height, Some(480));
+        assert_eq!(media.filename.as_deref(), Some("cat.png"));
+        assert_eq!(
+            media.thumbnail_mxc.as_deref(),
+            Some("mxc://example.org/thumb456")
+        );
+        // No media bytes anywhere in the archived row.
+        assert!(!archived.content_json.contains("\"bytes\""));
+    }
+
+    /// A non-media msgtype yields no archive media metadata.
+    #[test]
+    fn archive_media_is_none_for_text() {
+        use matrix_sdk::ruma::events::room::message::TextMessageEventContent;
+        let mt = MessageType::Text(TextMessageEventContent::plain("hi"));
+        assert!(archive_media(&mt).is_none());
+    }
+
+    /// An encrypted media source contributes no plain `mxc` (its URI stays inside
+    /// the content JSON, not the metadata column), but other metadata is captured.
+    #[test]
+    fn build_archive_event_encrypted_image_has_no_plain_mxc() {
+        let ev = parse_message_event(
+            r#"{
+                "type": "m.room.message",
+                "event_id": "$enc:example.org",
+                "sender": "@bob:example.org",
+                "origin_server_ts": 1720000000002,
+                "content": {
+                    "msgtype": "m.image",
+                    "body": "secret.png",
+                    "file": {
+                        "url": "mxc://example.org/enc789",
+                        "key": {
+                            "kty": "oct",
+                            "key_ops": ["encrypt", "decrypt"],
+                            "alg": "A256CTR",
+                            "k": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                            "ext": true
+                        },
+                        "iv": "AAECAwQFBgcICQoLDA0ODw",
+                        "hashes": { "sha256": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8" },
+                        "v": "v2"
+                    },
+                    "info": { "mimetype": "image/png", "size": 999 }
+                }
+            }"#,
+        );
+        let archived =
+            build_archive_event("acctA", "!room:example.org", &ev).expect("build archive event");
+        let media = archived.media.expect("media metadata present");
+        assert_eq!(media.mxc, None, "encrypted source contributes no plain mxc");
+        assert_eq!(media.mimetype.as_deref(), Some("image/png"));
+        assert_eq!(media.size, Some(999));
     }
 }

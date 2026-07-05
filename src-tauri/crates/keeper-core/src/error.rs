@@ -305,6 +305,27 @@ pub enum MediaError {
     Fetch(String),
 }
 
+/// Errors originating in local archive ingestion (Story 5.1, epic 5, AD-21).
+///
+/// A secret-free taxonomy: no message ever contains message plaintext, media
+/// bytes, or session material — only a non-secret description of a SQLite or
+/// serialization failure. These surface at the [`crate::archive`] boundary only
+/// during setup (`ArchiveWriter::spawn` opening `archive.db`); a *runtime* write
+/// failure inside the writer task is logged with ids only and swallowed, never
+/// propagated (the archive path must never block or abort sync/messaging).
+#[derive(Debug, Error)]
+pub enum ArchiveError {
+    /// A SQLite operation on `archive.db` failed (open, PRAGMA, schema, or a
+    /// read). The wrapped string is a non-secret description — never content.
+    #[error("archive database error: {0}")]
+    Sqlite(String),
+
+    /// Serializing media metadata to JSON for the `media_json` column failed. The
+    /// wrapped string is a non-secret description — never media bytes.
+    #[error("archive serialization error: {0}")]
+    Serialization(String),
+}
+
 /// The hexagon error root. Every fallible core operation surfaces one of these.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -349,6 +370,12 @@ pub enum CoreError {
     /// funnel.
     #[error(transparent)]
     Media(#[from] MediaError),
+
+    /// Local archive setup failed (Story 5.1) — opening `archive.db`. Runtime
+    /// archive write failures are swallowed inside the writer task and never reach
+    /// here.
+    #[error(transparent)]
+    Archive(#[from] ArchiveError),
 
     /// A requested capability is not supported on this platform/build. Honest,
     /// non-panicking signal used by not-yet-wired [`crate::platform::Platform`]

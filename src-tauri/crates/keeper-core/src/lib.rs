@@ -10,6 +10,7 @@
 #![recursion_limit = "256"]
 
 pub mod account;
+pub mod archive;
 pub mod auth;
 pub mod backup;
 pub mod bridge;
