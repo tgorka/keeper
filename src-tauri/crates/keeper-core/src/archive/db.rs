@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+use super::fts;
 use crate::error::ArchiveError;
 
 /// Resolve the `archive.db` path under a data directory. The single canonical
@@ -35,8 +36,10 @@ const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 ///
 /// The row captures the normalized event: `account_id`, `event_id`, `room_id`,
 /// `sender`, `origin_ts` (ms epoch), `event_type`, `content_json`, an optional
-/// `media_json` (media *metadata* only — never bytes), and `inserted_ts`. The
-/// primary key `(account_id, event_id)` is what makes ingestion idempotent.
+/// `media_json` (media *metadata* only — never bytes), `inserted_ts`, the edit
+/// linkage `relates_to_event_id`/`rel_type`, a `redacted_ts` retention marker, and
+/// the indexed `body` text backing full-text search (Story 5.3). The primary key
+/// `(account_id, event_id)` is what makes ingestion idempotent.
 pub fn open_archive_db(data_dir: &Path) -> Result<Connection, ArchiveError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| ArchiveError::Sqlite(format!("could not create data dir: {e}")))?;
@@ -64,15 +67,16 @@ pub fn open_archive_db(data_dir: &Path) -> Result<Connection, ArchiveError> {
             relates_to_event_id TEXT, \
             rel_type TEXT, \
             redacted_ts INTEGER, \
+            body TEXT, \
             PRIMARY KEY(account_id, event_id)\
         )",
         [],
     )
     .map_err(|e| ArchiveError::Sqlite(format!("could not ensure events schema: {e}")))?;
-    // Story 5.2 durability columns: idempotently add them to a pre-5.1
-    // `archive.db` that predates the extended schema above (`CREATE TABLE IF NOT
-    // EXISTS` never alters an existing table). Every column is nullable, so no
-    // existing row needs rewriting; re-running is a no-op.
+    // Story 5.2 durability columns + Story 5.3 `body`: idempotently add them to a
+    // pre-5.1/5.2 `archive.db` that predates the extended schema above (`CREATE
+    // TABLE IF NOT EXISTS` never alters an existing table). Every column is
+    // nullable, so no existing row needs rewriting; re-running is a no-op.
     migrate_durability_columns(&conn)?;
     // Index the replace-relation join key so the version-chain lookup
     // (`edit_chain`) does not scan the account's rows.
@@ -82,6 +86,132 @@ pub fn open_archive_db(data_dir: &Path) -> Result<Connection, ArchiveError> {
         [],
     )
     .map_err(|e| ArchiveError::Sqlite(format!("could not ensure replace index: {e}")))?;
+    // Story 5.3: backfill the `body` of any row inserted before the column existed
+    // (a pre-5.1/5.2 archive, or a 5.1/5.2 row inserted before this migration), then
+    // ensure the FTS index exists (creating + `'rebuild'`-ing it once on fresh
+    // creation). Both are idempotent no-ops on re-open.
+    backfill_missing_bodies(&conn)?;
+    fts::ensure_fts(&conn)?;
+    Ok(conn)
+}
+
+/// Backfill the `body` column for every row where it is still `NULL` (Story 5.3).
+///
+/// `NULL` marks "not yet backfilled" (a row inserted before the `body` column
+/// existed); a genuinely text-less row is stored as the empty string, never
+/// `NULL`. Reads each such row's `content_json` and writes the shared
+/// [`crate::archive::display_body_from_content`] extraction back, so the backfill
+/// uses the exact same body fidelity as ingest. Idempotent: once every row has a
+/// non-`NULL` `body`, this selects zero rows and is a no-op.
+fn backfill_missing_bodies(conn: &Connection) -> Result<(), ArchiveError> {
+    // Collect the (rowid, content_json) of unbackfilled rows first so we are not
+    // iterating a live statement while issuing UPDATEs on the same connection.
+    let pending: Vec<(i64, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT rowid, content_json FROM events WHERE body IS NULL")
+            .map_err(|e| ArchiveError::Sqlite(format!("could not prepare backfill scan: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| ArchiveError::Sqlite(format!("could not scan for backfill: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(
+                row.map_err(|e| ArchiveError::Sqlite(format!("could not read backfill row: {e}")))?,
+            );
+        }
+        out
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+    // One transaction for the whole backfill: on a large pre-5.3 archive this turns
+    // up to N per-row WAL commits (which could hang startup for minutes) into a
+    // single commit, and makes the backfill all-or-nothing so a crash can't leave a
+    // half-populated `body` that the paired `ensure_fts` 'rebuild' would index
+    // incompletely.
+    conn.execute_batch("BEGIN")
+        .map_err(|e| ArchiveError::Sqlite(format!("could not begin backfill: {e}")))?;
+    let result = (|| {
+        for (rowid, content_json) in &pending {
+            let body = crate::archive::display_body_from_content(content_json);
+            conn.execute(
+                "UPDATE events SET body = ?2 WHERE rowid = ?1",
+                rusqlite::params![rowid, body],
+            )
+            .map_err(|e| ArchiveError::Sqlite(format!("could not backfill body: {e}")))?;
+        }
+        Ok::<(), ArchiveError>(())
+    })();
+    match result {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|e| ArchiveError::Sqlite(format!("could not commit backfill: {e}"))),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Insert one normalized event row through the writer connection (Story 5.1/5.3).
+///
+/// Idempotent on the `(account_id, event_id)` primary key (`INSERT OR IGNORE`).
+/// Returns `Some(rowid)` when a row was actually inserted (rows-affected == 1) so
+/// the caller can index it into `events_fts`, or `None` when the insert was a
+/// no-op on a re-synced duplicate (rows-affected == 0) — the caller must never
+/// double-index in that case. `media_json` is the pre-serialized media metadata (or
+/// `None`); `body` is the shared body extraction (`""` for a text-less event).
+pub fn insert_event(
+    conn: &Connection,
+    ev: &crate::archive::ArchiveEvent,
+    media_json: Option<&str>,
+    inserted_ts: i64,
+) -> Result<Option<i64>, ArchiveError> {
+    let affected = conn
+        .execute(
+            "INSERT OR IGNORE INTO events(\
+                account_id, event_id, room_id, sender, origin_ts, event_type, \
+                content_json, media_json, inserted_ts, relates_to_event_id, rel_type, body\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                ev.account_id,
+                ev.event_id,
+                ev.room_id,
+                ev.sender,
+                ev.origin_ts,
+                ev.event_type,
+                ev.content_json,
+                media_json,
+                inserted_ts,
+                ev.relates_to_event_id,
+                ev.rel_type,
+                ev.body,
+            ],
+        )
+        .map_err(|e| ArchiveError::Sqlite(format!("could not insert event: {e}")))?;
+    Ok(if affected == 1 {
+        Some(conn.last_insert_rowid())
+    } else {
+        None
+    })
+}
+
+/// Open `archive.db` as a **read-only** connection for concurrent reads (Story
+/// 5.3 search, and later read-only surfaces). WAL permits any number of readers
+/// alongside the single writer, so this never blocks or races the writer task.
+///
+/// Unlike [`open_archive_db`] this performs no schema creation or migration — a
+/// reader must never write. It assumes the file exists and has already been opened
+/// (and migrated) at least once by the writer path. `SQLITE_OPEN_READ_ONLY` makes
+/// any accidental write attempt fail fast rather than corrupt the file.
+pub fn open_readonly_archive_db(data_dir: &Path) -> Result<Connection, ArchiveError> {
+    let conn = Connection::open_with_flags(
+        db_path(data_dir),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| ArchiveError::Sqlite(format!("could not open archive.db read-only: {e}")))?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|e| ArchiveError::Sqlite(format!("could not set busy timeout: {e}")))?;
     Ok(conn)
 }
 
@@ -91,6 +221,9 @@ const DURABILITY_COLUMNS: &[(&str, &str)] = &[
     ("relates_to_event_id", "TEXT"),
     ("rel_type", "TEXT"),
     ("redacted_ts", "INTEGER"),
+    // Story 5.3: the nullable indexed display body. `NULL` on a freshly-added
+    // column marks "not yet backfilled"; `backfill_missing_bodies` then fills it.
+    ("body", "TEXT"),
 ];
 
 /// Idempotently add the Story 5.2 durability columns to an existing `events`

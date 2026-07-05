@@ -58,6 +58,7 @@ pub fn run() {
             ipc::edit_history_get,
             ipc::honor_remote_deletions,
             ipc::set_honor_remote_deletions,
+            ipc::search_archive,
             ipc::room_list_subscribe,
             ipc::room_list_unsubscribe,
             ipc::timeline_subscribe,

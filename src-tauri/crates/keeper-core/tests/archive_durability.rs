@@ -43,6 +43,7 @@ fn text_event(account_id: &str, event_id: &str, origin_ts: i64, body: &str) -> A
         origin_ts,
         event_type: "m.room.message".to_owned(),
         content_json: format!(r#"{{"msgtype":"m.text","body":"{body}"}}"#),
+        body: body.to_owned(),
         media: None,
         relates_to_event_id: None,
         rel_type: None,
@@ -67,6 +68,7 @@ fn edit_event(
         content_json: format!(
             r#"{{"msgtype":"m.text","body":"* {new_body}","m.new_content":{{"msgtype":"m.text","body":"{new_body}"}}}}"#
         ),
+        body: new_body.to_owned(),
         media: None,
         relates_to_event_id: Some(target.to_owned()),
         rel_type: Some("m.replace".to_owned()),

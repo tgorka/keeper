@@ -37,6 +37,8 @@ export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
 export type { SasEmojiVm } from "./gen/SasEmojiVm";
+export type { SearchFilterVm } from "./gen/SearchFilterVm";
+export type { SearchHitVm } from "./gen/SearchHitVm";
 export type { SendState } from "./gen/SendState";
 export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 export type { SpaceVm } from "./gen/SpaceVm";
@@ -57,6 +59,8 @@ import type { InboxBatch } from "./gen/InboxBatch";
 import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { RoomListBatch } from "./gen/RoomListBatch";
+import type { SearchFilterVm } from "./gen/SearchFilterVm";
+import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
@@ -228,6 +232,19 @@ export async function honorRemoteDeletions(): Promise<boolean> {
  */
 export async function setHonorRemoteDeletions(enabled: boolean): Promise<void> {
   await invoke<void>("set_honor_remote_deletions", { enabled });
+}
+
+/**
+ * Search the Local Archive with full-text search (FR-34, AD-12, Story 5.3).
+ * Runs fully offline against `archive.db` — never a homeserver fetch, no live
+ * session required. Queries of 3+ characters use the trigram FTS index; shorter
+ * queries fall back to an accelerated `LIKE` scan. All {@link SearchFilterVm}
+ * filters are optional (empty `accountIds`/`roomIds` mean unrestricted). Resolves
+ * with at most one {@link SearchHitVm} per logical message (chain-root `eventId`
+ * for deep-linking), ordered newest-first, or an empty array when nothing matches.
+ */
+export async function searchArchive(filter: SearchFilterVm): Promise<SearchHitVm[]> {
+  return await invoke<SearchHitVm[]>("search_archive", { filter });
 }
 
 /**

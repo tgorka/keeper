@@ -2522,6 +2522,9 @@ fn build_archive_event(
         }
         _ => (None, None),
     };
+    // Extract the display body once, via the shared archive extractor (Story 5.3),
+    // so ingest, edit-history, and the migration backfill never drift.
+    let body = archive::display_body_from_content(&content_json);
     Ok(ArchiveEvent {
         account_id: account_id.to_owned(),
         event_id: ev.event_id.to_string(),
@@ -2530,6 +2533,7 @@ fn build_archive_event(
         origin_ts: i64::from(ev.origin_server_ts.get()),
         event_type: "m.room.message".to_owned(),
         content_json,
+        body,
         media: archive_media(&ev.content.msgtype),
         relates_to_event_id,
         rel_type,
@@ -2576,27 +2580,11 @@ fn edit_versions_from_chain(
     chain
         .iter()
         .map(|row| EditVersionVm {
-            body: display_body_from_content(&row.content_json),
+            body: archive::display_body_from_content(&row.content_json),
             timestamp: row.origin_ts,
             is_current: current_event_id == Some(row.event_id.as_str()),
         })
         .collect()
-}
-
-/// Extract the display text from a stored `m.room.message` content JSON: an edit's
-/// `m.new_content.body` when present, else the top-level `body`, else an empty
-/// string (Story 5.2). Never panics on malformed JSON.
-fn display_body_from_content(content_json: &str) -> String {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(content_json) else {
-        return String::new();
-    };
-    value
-        .get("m.new_content")
-        .and_then(|nc| nc.get("body"))
-        .and_then(|b| b.as_str())
-        .or_else(|| value.get("body").and_then(|b| b.as_str()))
-        .unwrap_or("")
-        .to_owned()
 }
 
 /// Extract archive media *metadata* from a message `msgtype`, or `None` for a
@@ -3761,6 +3749,8 @@ mod tests {
             serde_json::from_str(&archived.content_json).expect("content json parses");
         assert_eq!(content["msgtype"], "m.text");
         assert_eq!(content["body"], "hello");
+        // The indexed body is the top-level body for a plain message (Story 5.3).
+        assert_eq!(archived.body, "hello");
         // A plain message carries no relation columns (Story 5.2).
         assert_eq!(archived.relates_to_event_id, None);
         assert_eq!(archived.rel_type, None);
@@ -3794,6 +3784,9 @@ mod tests {
             Some("$orig:example.org")
         );
         assert_eq!(archived.rel_type.as_deref(), Some("m.replace"));
+        // The indexed body for an edit is the `m.new_content.body` (Story 5.3), so
+        // the edited-away text stays searchable on its own version row.
+        assert_eq!(archived.body, "edited body");
     }
 
     /// A reply is not an edit — no relation columns (Story 5.2).
@@ -3950,6 +3943,7 @@ mod tests {
     /// absent, and to empty on malformed JSON (never panics).
     #[test]
     fn display_body_falls_back_and_never_panics() {
+        use crate::archive::display_body_from_content;
         assert_eq!(display_body_from_content(r#"{"body":"top"}"#), "top");
         assert_eq!(
             display_body_from_content(r#"{"body":"top","m.new_content":{"body":"nc"}}"#),

@@ -22,7 +22,10 @@
 //! no archive-deletion / sign-out path — those are later epic-5 stories.
 
 pub mod db;
+pub mod fts;
 mod ingest;
+
+pub use fts::{search, SearchFilter};
 
 use std::path::{Path, PathBuf};
 
@@ -89,6 +92,11 @@ pub struct ArchiveEvent {
     pub event_type: String,
     /// The event content, serialized as JSON.
     pub content_json: String,
+    /// The extracted display body for full-text indexing (Story 5.3): an edit's
+    /// `m.new_content.body` when present, else the top-level `body`, else the empty
+    /// string for a text-less event. Computed once via [`display_body_from_content`]
+    /// so ingest, edit-history, and the migration backfill share one extractor.
+    pub body: String,
     /// Media metadata (mxc/mimetype/size/dims/filename), or `None` for a
     /// non-media event. Never holds media bytes.
     pub media: Option<ArchiveMedia>,
@@ -264,6 +272,27 @@ pub fn archive_db_path(data_dir: &Path) -> PathBuf {
     db::db_path(data_dir)
 }
 
+/// Extract the display text from a stored `m.room.message` content JSON: an edit's
+/// `m.new_content.body` when present, else the top-level `body`, else the empty
+/// string (Story 5.2/5.3). Never panics on malformed JSON.
+///
+/// The single body extractor shared by [`crate::account::build_archive_event`] at
+/// ingest, the edit-history version mapping, and the Story 5.3 migration backfill —
+/// one implementation, no drift. The empty string marks a genuinely text-less row
+/// (never indexed); `NULL` in the `body` column means "not yet backfilled".
+pub(crate) fn display_body_from_content(content_json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content_json) else {
+        return String::new();
+    };
+    value
+        .get("m.new_content")
+        .and_then(|nc| nc.get("body"))
+        .and_then(|b| b.as_str())
+        .or_else(|| value.get("body").and_then(|b| b.as_str()))
+        .unwrap_or("")
+        .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +321,7 @@ mod tests {
             origin_ts: 1_720_000_000_000,
             event_type: "m.room.message".to_owned(),
             content_json: r#"{"msgtype":"m.text","body":"hi"}"#.to_owned(),
+            body: "hi".to_owned(),
             media: None,
             relates_to_event_id: None,
             rel_type: None,

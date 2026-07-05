@@ -23,8 +23,8 @@ use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, BackupStatus, ConnectionStatusBatch, DemoBatch, EditVersionVm,
     EncryptionStatusBatch, InboxBatch, IpcError, IpcErrorCode, NetworksSnapshot,
-    PaginationStatusBatch, PingVm, RoomListBatch, SpacesSnapshot, TimelineBatch, TypingBatch,
-    VerificationFlowVm,
+    PaginationStatusBatch, PingVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot,
+    TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -502,6 +502,42 @@ pub fn set_honor_remote_deletions(
 ) -> Result<(), IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     keeper_core::archive::set_honor_remote_deletions(&data_dir, enabled).map_err(to_ipc_error)
+}
+
+/// Search the Local Archive with full-text search (Story 5.3, FR-34, AD-12).
+///
+/// Opens a fresh read-only `archive.db` connection (WAL permits concurrent readers,
+/// so search never touches the writer or a live Matrix session — it works fully
+/// offline), reads the app-wide honor-remote-deletions setting, and runs the
+/// tauri-free [`keeper_core::archive::search`] engine: trigram MATCH for queries of
+/// ≥3 Unicode scalar values, an accelerated `LIKE` scan below that, applying the
+/// account / room / sender / date-range filters, honoring deletions when enabled,
+/// and deduplicating to one [`SearchHitVm`] per logical message (chain-root
+/// `eventId`). Resolves with the hits (an empty array on no match — never an
+/// error). Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn search_archive(
+    state: State<'_, AppState>,
+    filter: SearchFilterVm,
+) -> Result<Vec<SearchHitVm>, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    // A fresh install (or an account that has never synced) has no `archive.db` yet;
+    // an empty archive means empty results, not an error dialog. Opening a missing
+    // file read-only would otherwise fail with `SQLITE_CANTOPEN`.
+    if !keeper_core::archive::db::db_path(&data_dir).exists() {
+        return Ok(Vec::new());
+    }
+    let honor_deletions =
+        keeper_core::archive::get_honor_remote_deletions(&data_dir).map_err(to_ipc_error)?;
+    // A fresh read-only connection: WAL readers never block the single writer, and
+    // search must not require a live session (works offline / after sign-out).
+    let conn = keeper_core::archive::db::open_readonly_archive_db(&data_dir)
+        .map_err(CoreError::from)
+        .map_err(to_ipc_error)?;
+    let domain_filter = keeper_core::archive::SearchFilter::from(filter);
+    keeper_core::archive::search(&conn, &domain_filter, honor_deletions)
+        .map_err(CoreError::from)
+        .map_err(to_ipc_error)
 }
 
 /// Subscribe to an account's sliding-sync room list (FR-8, AD-8/9/19/20).

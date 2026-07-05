@@ -35,6 +35,7 @@ fn text_event(account_id: &str, event_id: &str, body: &str) -> ArchiveEvent {
         origin_ts: 1_720_000_000_000,
         event_type: "m.room.message".to_owned(),
         content_json: format!(r#"{{"msgtype":"m.text","body":"{body}"}}"#),
+        body: body.to_owned(),
         media: None,
         relates_to_event_id: None,
         rel_type: None,

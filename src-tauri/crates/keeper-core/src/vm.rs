@@ -569,6 +569,82 @@ pub struct EditVersionVm {
     pub is_current: bool,
 }
 
+/// The archive search request crossing IPC into the `search_archive` command
+/// (Story 5.3, FR-34).
+///
+/// A deserialize-only input VM: every filter is optional. Empty `account_ids` /
+/// `room_ids` lists mean unrestricted (the boundary for both the "Chat" and
+/// "Network" UI filters — Story 5.4 resolves a Network selection to its `room_ids`
+/// set before calling). `sender` is a Matrix user id; `startTs`/`endTs` bound
+/// `origin_ts` in ms since the Unix epoch; `limit` caps the hit count (the engine
+/// clamps it to a sane maximum). The core maps this to its tauri-free
+/// `SearchFilter` domain struct — no bridge/session state ever crosses here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SearchFilterVm {
+    /// The user's query text (dispatched to trigram MATCH at ≥3 Unicode scalar
+    /// values, else an accelerated `LIKE` scan).
+    pub query: String,
+    /// Restrict to these keeper account ids; empty ⇒ all accounts.
+    #[serde(default)]
+    pub account_ids: Vec<String>,
+    /// Restrict to these room ids; empty ⇒ all rooms.
+    #[serde(default)]
+    pub room_ids: Vec<String>,
+    /// Restrict to this sender (Matrix user id), or `null` for any sender.
+    #[serde(default)]
+    pub sender: Option<String>,
+    /// Inclusive lower bound on `origin_ts` (ms since the Unix epoch), or `null`.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub start_ts: Option<i64>,
+    /// Inclusive upper bound on `origin_ts` (ms since the Unix epoch), or `null`.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub end_ts: Option<i64>,
+    /// Cap on the number of hits, or `null` for the engine's default. The engine
+    /// clamps this to `[1, max]`.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub limit: Option<i64>,
+}
+
+/// One archive search result crossing IPC out of the `search_archive` command
+/// (Story 5.3, FR-34).
+///
+/// Carries the `(account_id, room_id, event_id)` deep-link identifiers the epic AC
+/// mandates for jumping into a timeline at the matched message, plus render data:
+/// sender, the matched display body, its timestamp, and whether the row is
+/// redacted. `eventId` is the chain root (the edit target when the match was on a
+/// prior version, else the row's own event id), so every version deep-links to the
+/// same timeline item. This `eventId` is the epic-authorized search-scoped
+/// exception to the no-ids rule (see the Story 5.3 design notes) — no tokens,
+/// session material, or full event content beyond the display body crosses here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SearchHitVm {
+    /// Opaque keeper account id the matched message belongs to.
+    pub account_id: String,
+    /// Matrix room id the matched message was sent to.
+    pub room_id: String,
+    /// The chain-root Matrix event id — the sanctioned deep-link handle.
+    pub event_id: String,
+    /// Matrix user id of the sender.
+    pub sender: String,
+    /// The matched display body (an edit's `m.new_content.body`, else the
+    /// original's top-level `body`).
+    pub body: String,
+    /// The matched row's origin server timestamp: ms since the Unix epoch (UTC).
+    #[ts(type = "number")]
+    pub timestamp: i64,
+    /// `true` when the matched row has been marked remotely redacted. Only ever
+    /// `true` in results when the honor-deletions setting is off (when on, redacted
+    /// rows are excluded entirely).
+    pub redacted: bool,
+}
+
 /// One aggregated emoji-reaction group on a timeline message (Story 3.5, FR-12,
 /// NFR-9).
 ///

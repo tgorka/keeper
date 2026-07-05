@@ -14,7 +14,7 @@
 use rusqlite::Connection;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use super::{db, ArchiveEvent, ArchiveMsg};
+use super::{db, fts, ArchiveEvent, ArchiveMsg};
 
 /// Run the single archive writer loop until the channel closes.
 ///
@@ -58,7 +58,12 @@ fn mark_redacted(conn: &Connection, account_id: &str, event_id: &str, redacted_t
 /// Serializes the optional [`super::ArchiveMedia`] to `media_json` first; a
 /// serialization failure is logged and the row is dropped for this attempt (the
 /// writer keeps running). The `INSERT OR IGNORE` makes a duplicate
-/// `(account_id, event_id)` a silent no-op.
+/// `(account_id, event_id)` a silent no-op. When the base insert actually added a
+/// row (rows-affected == 1) and the body is non-empty, the row is indexed into
+/// `events_fts` on this *same* writer connection (Story 5.3) — re-synced duplicates
+/// (rows-affected == 0) never reach the indexing step, so a row is never
+/// double-indexed. An indexing failure is logged with ids only and swallowed; the
+/// base row is already committed and the writer keeps running.
 fn insert_event(conn: &Connection, ev: &ArchiveEvent) {
     let media_json = match ev.media.as_ref().map(serde_json::to_string).transpose() {
         Ok(json) => json,
@@ -73,31 +78,29 @@ fn insert_event(conn: &Connection, ev: &ArchiveEvent) {
         }
     };
     let inserted_ts = now_ms();
-    if let Err(e) = conn.execute(
-        "INSERT OR IGNORE INTO events(\
-            account_id, event_id, room_id, sender, origin_ts, event_type, \
-            content_json, media_json, inserted_ts, relates_to_event_id, rel_type\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        rusqlite::params![
-            ev.account_id,
-            ev.event_id,
-            ev.room_id,
-            ev.sender,
-            ev.origin_ts,
-            ev.event_type,
-            ev.content_json,
-            media_json,
-            inserted_ts,
-            ev.relates_to_event_id,
-            ev.rel_type,
-        ],
-    ) {
-        tracing::warn!(
-            account_id = %ev.account_id,
-            event_id = %ev.event_id,
-            error = %e,
-            "archive write failed"
-        );
+    match db::insert_event(conn, ev, media_json.as_deref(), inserted_ts) {
+        Ok(Some(rowid)) => {
+            // A row was actually inserted: index its body incrementally through the
+            // same writer connection (empty bodies are skipped inside `index_body`).
+            if let Err(e) = fts::index_body(conn, rowid, &ev.body) {
+                tracing::warn!(
+                    account_id = %ev.account_id,
+                    event_id = %ev.event_id,
+                    error = %e,
+                    "archive: could not index body"
+                );
+            }
+        }
+        // Re-synced duplicate: no row added, so no indexing (never double-index).
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                account_id = %ev.account_id,
+                event_id = %ev.event_id,
+                error = %e,
+                "archive write failed"
+            );
+        }
     }
 }
 
@@ -139,6 +142,7 @@ mod tests {
             origin_ts: 1_720_000_000_000,
             event_type: "m.room.message".to_owned(),
             content_json: r#"{"msgtype":"m.text","body":"hi"}"#.to_owned(),
+            body: "hi".to_owned(),
             media: None,
             relates_to_event_id: None,
             rel_type: None,
