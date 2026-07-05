@@ -1,0 +1,98 @@
+src-tauri/crates/keeper-core/src/bridges/discovery.rs
+  s_6bd56c5e4a3300::t_8f6a422da55c15 177-180
+  s_6bd56c5e4a3300::t_3c855ac7dbf014 1-35,37-41,43-103,108-109,111-169,183,192-206,222-223,225-242,244-276,279-295,298-300,302-454,466-479
+  s_6bd56c5e4a3300::t_cf1d795b993351 104-107,110
+  s_6bd56c5e4a3300::t_e78a4e233a2e1f 36
+  s_6bd56c5e4a3300::t_8ac9668174bd01 207
+  s_6bd56c5e4a3300::t_3578ad37877a2c 42
+  s_6bd56c5e4a3300::t_ce92cfbca8bd87 277-278
+  s_6bd56c5e4a3300::t_1d1bec64abbe33 455-465
+  s_6bd56c5e4a3300::t_253f05a65c3120 170-176,181-182,184-191,208-221,224
+  s_6bd56c5e4a3300::t_625fd2491901eb 243
+  s_6bd56c5e4a3300::t_3eb99a3300c9c4 296-297,301
+src/lib/ipc/client.ts
+  s_6bd56c5e4a3300::t_d4f15f8837513a 134-149
+  s_6bd56c5e4a3300::t_0b904f18131969 15,17
+  s_6bd56c5e4a3300::t_30dfaaa0307bf6 22
+  s_6bd56c5e4a3300::t_60a91f45cf2aa2 65
+  s_6bd56c5e4a3300::t_ef5cc53a652279 133
+src/components/bridges/bridge-card.tsx
+  s_6bd56c5e4a3300::t_919d43c355322b 51
+  s_6bd56c5e4a3300::t_b84e8dd9401c87 109-117
+  s_6bd56c5e4a3300::t_700c846e46f472 49-50,52-55,57,61-62,65
+  s_6bd56c5e4a3300::t_fd3cb2cccea076 31-32
+  s_6bd56c5e4a3300::t_4d97efaa7cd19c 2,4-14
+src-tauri/crates/keeper-core/src/bridge.rs
+  s_6bd56c5e4a3300::t_c2c77f0ce41504 145-146
+  s_6bd56c5e4a3300::t_f98501c63ef44d 244-291
+  s_6bd56c5e4a3300::t_ec871fc24867e5 66-126
+src-tauri/crates/keeper-core/src/bridges/mod.rs
+  s_6bd56c5e4a3300::t_26202aa411afcf 13-15
+src-tauri/crates/keeper/src/lib.rs
+  s_6bd56c5e4a3300::t_ba3184d1534da3 50
+src/lib/ipc/gen/BridgeStatus.ts
+  s_6bd56c5e4a3300::t_40b4467d7bd2be 1-14
+src/lib/ipc/gen/DiscoveredBridgeVm.ts
+  s_6bd56c5e4a3300::t_40b4467d7bd2be 1-22
+src/components/layout/bridges-pane.test.tsx
+  s_6bd56c5e4a3300::t_64595e6e9bef21 5-6,31-41,47,80-81,95-96,100-101,107-110,116-120,122-166
+  s_6bd56c5e4a3300::t_d01accdefff2b3 3,121
+  s_6bd56c5e4a3300::t_32c3a52386fdc9 167
+src/components/layout/bridges-pane.tsx
+  s_6bd56c5e4a3300::t_82394f0c9712f5 2,4-14,17,20-22,53,61-130,132
+  s_6bd56c5e4a3300::t_35d24f3d8165dd 131
+src-tauri/crates/keeper-core/src/bridges/data.rs
+  s_6bd56c5e4a3300::t_13924037cb7190 430
+src/lib/ipc/gen/BridgeDiscoveryVm.ts
+  s_6bd56c5e4a3300::t_40b4467d7bd2be 1-21
+src-tauri/crates/keeper/src/ipc.rs
+  s_6bd56c5e4a3300::t_f1ebae40f8c92e 316-321
+  s_6bd56c5e4a3300::t_73172c57ade151 25
+  s_6bd56c5e4a3300::t_3578ad37877a2c 26-29
+  s_6bd56c5e4a3300::t_4da7a04f185b82 402-423
+src/lib/bridges.ts
+  s_6bd56c5e4a3300::t_85c726c716f295 1-29
+src-tauri/crates/keeper-core/src/vm.rs
+  s_6bd56c5e4a3300::t_4be5f7a49c808d 1617-1632,1641,1646-1668
+  s_6bd56c5e4a3300::t_82bfcbe1c6ea57 1460-1519
+  s_6bd56c5e4a3300::t_3578ad37877a2c 1633-1640,1642-1645
+_bmad-output/implementation-artifacts/spec-6-2-bridge-discovery.md
+  s_6bd56c5e4a3300::t_a64b2171233575 5,8
+  s_6bd56c5e4a3300::t_1d1b27afbf2d54 1-4,7,9-80,92-99,117-130
+  s_6bd56c5e4a3300::t_1deb8cd2812992 6
+  s_6bd56c5e4a3300::t_60064d66d1f451 81-91
+  s_6bd56c5e4a3300::t_05b3fc8179e0b7 100-116
+  s_6bd56c5e4a3300::t_73c865f9e8b373 131-160
+src-tauri/crates/keeper-core/src/account.rs
+  s_6bd56c5e4a3300::t_2f685c5d14d907 52-53
+  s_6bd56c5e4a3300::t_e3af7f8d871b5c 1210-1230
+src/lib/bridges.test.ts
+  s_6bd56c5e4a3300::t_1bcaad0c223432 1-20
+src-tauri/crates/keeper-core/src/error.rs
+  s_6bd56c5e4a3300::t_ceb02922528e19 354-355,358-372
+src/components/bridges/bridge-card.test.tsx
+  s_6bd56c5e4a3300::t_f7b05c956784ab 5
+  s_6bd56c5e4a3300::t_1590f5116dc8ea 53-71
+  s_6bd56c5e4a3300::t_002ae3127b32ff 37,40
+src/hooks/use-bridge-discovery.ts
+  s_6bd56c5e4a3300::t_d01accdefff2b3 72-78
+  s_6bd56c5e4a3300::t_eeb6bec1413016 1-10,12-28,38-39,42-43,45-48,50,61,67-71,79-82,85-88,90-96,104
+  s_6bd56c5e4a3300::t_d1c114b5ed49d1 11,29-37,40-41,44,49,51-60,65,83-84,89,97-103
+  s_6bd56c5e4a3300::t_8fa42710b31bc4 62-64,66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5579756f51f780f505b117a4f27701129358185b",
+  "prompts": {},
+  "sessions": {
+    "s_6bd56c5e4a3300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b6844e2-ccee-495d-928d-728eb93a734a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
