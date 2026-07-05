@@ -1,0 +1,43 @@
+src-tauri/crates/keeper-core/src/bridge.rs
+  s_8908f1bd62ea9b::t_5525a5afd4a406 169-180
+  s_8908f1bd62ea9b::t_4ad0385c4f05e8 55-62
+_bmad-output/implementation-artifacts/spec-3-8-delete-for-everyone-redaction.md
+  s_8908f1bd62ea9b::t_1f54de4e9540f4 148-174
+  s_8908f1bd62ea9b::t_1429a636e74182 7
+  s_8908f1bd62ea9b::t_64448d03fcab35 9
+  s_8908f1bd62ea9b::t_2f5d0e37a0b5ae 5
+  s_8908f1bd62ea9b::t_404edbe6aa4a26 98-108
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_4c8c8a1f5ccd95::t_78db61396b9813 77
+src/components/chat/delete-message-dialog.tsx
+  s_8908f1bd62ea9b::t_384c4942011c5e 101,107-118
+  s_8908f1bd62ea9b::t_8fb6b58f33f248 167-170
+  s_8908f1bd62ea9b::t_fdb3ef0e8d088f 58-64
+  s_8908f1bd62ea9b::t_bcbf2149578ac2 76
+src/components/chat/delete-message-dialog.test.tsx
+  s_8908f1bd62ea9b::t_b5d8415428eb15 100-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8ef6207e2d6bc109d2d2b5c42984d6d0ccacae55",
+  "prompts": {},
+  "sessions": {
+    "s_4c8c8a1f5ccd95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f619e6d8-a849-42dd-94e4-58a7ed7b1ea5",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_8908f1bd62ea9b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a4eed85-4da2-40cb-a64a-e46651dd904c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
