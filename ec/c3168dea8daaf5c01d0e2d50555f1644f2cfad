@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-6-6-start-new-chats-via-bridge.md
+  s_75f9e1d001faa1::t_c37c9db8f405dc 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ecc3168dea8daaf5c01d0e2d50555f1644f2cfad",
+  "prompts": {},
+  "sessions": {
+    "s_75f9e1d001faa1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ce39914f-98e7-48ec-bc84-a73e71dba23b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
