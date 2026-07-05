@@ -1,0 +1,96 @@
+_bmad-output/implementation-artifacts/spec-4-1-unread-management.md
+  s_2cdad09bb616a7::t_1b9b0d501725fe 72-81
+  s_2cdad09bb616a7::t_15505f857d4bb4 6
+  s_2cdad09bb616a7::t_04a13023587b26 28-30,34
+  s_2cdad09bb616a7::t_e06faebf8e1a6d 117-139
+  s_2cdad09bb616a7::t_8b0d1e6182d0e9 13
+  s_2cdad09bb616a7::t_5c0ae17570ac1c 5,7
+  s_2cdad09bb616a7::t_26a75aba2faed9 1-4,8-12,14-27,31-33,35-71,82-89,91,93,95-102
+  s_2cdad09bb616a7::t_41c077b26b362b 103-116
+  s_2cdad09bb616a7::t_0d58c01956a49a 90,92,94
+src-tauri/crates/keeper-core/src/vm.rs
+  s_2cdad09bb616a7::t_3fe851201b85b1 332-341
+  s_2cdad09bb616a7::t_beb4e4c6b27cfa 1360-1361
+  s_2cdad09bb616a7::t_20b2c84ae32423 1333-1334
+  s_2cdad09bb616a7::t_caea252532886c 918-927
+  s_2cdad09bb616a7::t_3a2a676b8e32e2 1156-1157
+src/components/chat/chat-row.tsx
+  s_2cdad09bb616a7::t_a3f7cf56f2bb50 109
+  s_2cdad09bb616a7::t_c671421f88d9af 144
+  s_2cdad09bb616a7::t_88f365a6b433be 145
+  s_2cdad09bb616a7::t_9c8a574199906c 20,22,32
+  s_2cdad09bb616a7::t_b851c435a2189e 2,11-18,23-28,33,65-68,70,75-77,82,86-88,92,104-108,110-114,116-143,146-166
+  s_2cdad09bb616a7::t_89149c390cf117 69,71-74,78-81,83-85,89-91,93-101
+  s_2cdad09bb616a7::t_f74f441d10518f 102
+src/lib/ipc/client.ts
+  s_2cdad09bb616a7::t_c0e0a317e03efa 699-706,712-721
+  s_2cdad09bb616a7::t_488b8a76840c5b 722-723
+src/hooks/use-sign-out.test.ts
+  s_2cdad09bb616a7::t_c3aa3091e34953 36-37
+src/components/chat/chat-row.test.tsx
+  s_2cdad09bb616a7::t_1ea7a9bf3c8b51 160-195,197-209,211-223,225-228
+  s_2cdad09bb616a7::t_8a4354439190e7 2,5-18,29-30,35-38
+  s_2cdad09bb616a7::t_9c8a574199906c 196,210,224
+  s_2cdad09bb616a7::t_daf59cc9eaec93 229-283
+  s_2cdad09bb616a7::t_ce6b4323f19a96 39
+_bmad-output/implementation-artifacts/epic-4-context.md
+  s_2cdad09bb616a7::t_43f1eaadf2456f 1-53
+src-tauri/crates/keeper-core/src/inbox.rs
+  s_2cdad09bb616a7::t_6c2eb084c25dcc 308-324
+  s_2cdad09bb616a7::t_cf4a03b547fa0c 194-195
+  s_2cdad09bb616a7::t_f7e514a8e0fc44 262-263
+  s_2cdad09bb616a7::t_554a851ce8916b 307
+src/lib/stores/rooms.ts
+  s_2cdad09bb616a7::t_148a7c6bb5c6db 28-35,41-49,58-63,76-89,97-104,106,115-122
+  s_2cdad09bb616a7::t_8e19572e66096d 160-169
+  s_2cdad09bb616a7::t_a9f8a8a6cf83b9 141,144-159,174
+  s_2cdad09bb616a7::t_74c697b3e9dc74 90-96,105,107-114
+  s_2cdad09bb616a7::t_0e1c1f0f0b484f 64-69
+  s_2cdad09bb616a7::t_19d554b987230c 123
+src-tauri/crates/keeper-core/src/account.rs
+  s_2cdad09bb616a7::t_6cb50933470a95 2621-2652
+  s_2cdad09bb616a7::t_86702d5bbf2008 1525-1531
+  s_2cdad09bb616a7::t_1f8584958e5532 36
+  s_2cdad09bb616a7::t_1b86385d4f35b5 1478-1481,1483-1487,1489-1491,1495-1498,1500-1520,1524,1532-1553
+  s_2cdad09bb616a7::t_0e4f1bf085fef3 1499
+  s_2cdad09bb616a7::t_ba9cf9f22c4d1c 1482
+  s_2cdad09bb616a7::t_4554255220d353 2616-2617
+  s_2cdad09bb616a7::t_686613ab87f5d2 2420-2427,2435-2436,2440-2449
+  s_2cdad09bb616a7::t_262d23aedaff50 2450-2451
+src-tauri/crates/keeper/src/lib.rs
+  s_2cdad09bb616a7::t_25d407306729cd 91
+src/lib/ipc/gen/InboxRoomVm.ts
+  s_2cdad09bb616a7::t_4cc151c3441461 41-54
+src/components/layout/chat-list-pane.test.tsx
+  s_2cdad09bb616a7::t_f50cb5a4e8091c 47-48
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_2cdad09bb616a7::t_b8e1a35eb1f65c 120-122
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_2cdad09bb616a7::t_c5a15f708e1a97 81
+src-tauri/crates/keeper/src/ipc.rs
+  s_2cdad09bb616a7::t_824fe43af509b5 1078,1080-1084,1098-1112
+  s_2cdad09bb616a7::t_907412dc4c3d01 1113-1116
+src/lib/ipc/gen/RoomVm.ts
+  s_2cdad09bb616a7::t_4cc151c3441461 32-45
+src/lib/stores/rooms.test.ts
+  s_2cdad09bb616a7::t_f70358a462d0d0 182-210
+  s_2cdad09bb616a7::t_813fdd8acdc558 112-144,148-152,156-166,170-171,175-181,211-212
+  s_2cdad09bb616a7::t_9c8a574199906c 145-147,153-155,167-169,172-174
+  s_2cdad09bb616a7::t_49d14f83c3dd97 3-10,19-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f0bd2b2f6f3c9a3572fc7b7b26ceef0bf88d43b8",
+  "prompts": {},
+  "sessions": {
+    "s_2cdad09bb616a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4c84e93e-ffc3-4744-bada-9736f0693a59",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
