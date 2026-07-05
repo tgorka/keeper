@@ -1,0 +1,115 @@
+src-tauri/crates/keeper/src/lib.rs
+  s_94f6c54bf471e2::t_4327d813420524 21-23
+  s_94f6c54bf471e2::t_f969a170b9800b 85-87
+src/lib/stores/attachments.ts
+  s_94f6c54bf471e2::t_6bf5474ec3c08f 1-91
+src-tauri/Cargo.toml
+  s_94f6c54bf471e2::t_a23c2166779fbc 26
+  s_94f6c54bf471e2::t_3190de887f0ea2 52-58
+src/components/chat/composer.test.tsx
+  s_94f6c54bf471e2::t_af134d22b098cb 204-315
+  s_94f6c54bf471e2::t_e1449aca80851d 2,4-19
+src/lib/ipc/client.ts
+  s_94f6c54bf471e2::t_f8bac743daadd7 572-651,657-658
+  s_94f6c54bf471e2::t_8608aaca3eee41 652-656
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_94f6c54bf471e2::t_eb54bd04407367 111-116
+src-tauri/crates/keeper/src/ipc.rs
+  s_94f6c54bf471e2::t_ea1b7b6be87165 192-193
+  s_94f6c54bf471e2::t_db2d7d09de6b75 239-265
+  s_94f6c54bf471e2::t_7c7d157dd0c5dc 993-994,1296-1299
+  s_94f6c54bf471e2::t_82248c5a07083d 1266-1295,1300-1309
+  s_94f6c54bf471e2::t_83518d5e1b86c8 940-992,995-1029
+src-tauri/crates/keeper/capabilities/default.json
+  s_94f6c54bf471e2::t_4d91a8e341a014 6
+src/components/chat/message-bubble.tsx
+  s_94f6c54bf471e2::t_25c9d90c4964a6 117
+  s_94f6c54bf471e2::t_9ca1dab1f2a977 168-173
+  s_94f6c54bf471e2::t_e7c08ea2ef9866 82-87
+src-tauri/crates/keeper-core/src/error.rs
+  s_94f6c54bf471e2::t_e41b9ebe63bfe0 173-180
+bun.lock
+  s_94f6c54bf471e2::t_0da71416306996 11,474-475
+src/components/chat/composer.tsx
+  s_94f6c54bf471e2::t_7d94c7a1816fcf 56,252
+  s_94f6c54bf471e2::t_8608aaca3eee41 225
+  s_94f6c54bf471e2::t_914f7a8f284f1b 322-350,352-363,376
+  s_94f6c54bf471e2::t_4f1d13d3b7d8f6 17-19,22-27,31-55
+  s_94f6c54bf471e2::t_ee8251da0ba052 65-73
+  s_94f6c54bf471e2::t_cd9e1ba6c2d18f 141-148,152-156,162-179,182-183,191-224,226-251
+  s_94f6c54bf471e2::t_9a7cfe62d65cfc 99,109-112
+package.json
+  s_94f6c54bf471e2::t_a18dafdec81a31 31
+src/components/layout/conversation-pane.test.tsx
+  s_94f6c54bf471e2::t_1fe4526fd9ab1d 486-492,495-512,547-596
+  s_94f6c54bf471e2::t_4dcc47aad5ae4b 513-546
+  s_94f6c54bf471e2::t_10e72fa2671605 47
+  s_94f6c54bf471e2::t_dc6b34972ce5ad 53
+  s_94f6c54bf471e2::t_cc31669de03eb4 493-494
+  s_94f6c54bf471e2::t_9c8250fb232c0b 108-115,118,129
+  s_94f6c54bf471e2::t_c351613d009d5e 17-19,31-46,48-49
+src-tauri/crates/keeper-core/src/send.rs
+  s_94f6c54bf471e2::t_377fae7f6ed8e6 211-234,244-278
+  s_94f6c54bf471e2::t_e3d4f4a0e77e1b 331-336
+  s_94f6c54bf471e2::t_881b97c3bd40e5 20
+  s_94f6c54bf471e2::t_e571624a3dfef2 235-243
+  s_94f6c54bf471e2::t_d82f69ca36db51 396-414
+  s_94f6c54bf471e2::t_a21632d84e668a 16,21
+src/components/layout/conversation-pane.tsx
+  s_94f6c54bf471e2::t_7c14b614e59482 316-338,345-363
+  s_94f6c54bf471e2::t_72ddeb6703c0a8 17,28,31-32
+  s_94f6c54bf471e2::t_1135f01c96f996 339-344
+  s_94f6c54bf471e2::t_e430e89b8f50c8 157
+  s_94f6c54bf471e2::t_6780ff73743cb2 170-171,174
+  s_94f6c54bf471e2::t_cd143c9fb71f31 568
+  s_94f6c54bf471e2::t_8608aaca3eee41 40
+  s_94f6c54bf471e2::t_b6f9da974f5ead 582
+  s_94f6c54bf471e2::t_69c8ecd9a7d4f4 210-259
+_bmad-output/implementation-artifacts/spec-3-7-send-media-and-files.md
+  s_94f6c54bf471e2::t_efbe614ca593ab 139-172
+  s_94f6c54bf471e2::t_8f831e0ccb8a24 1-4,6-7,10-80,93-105,116-138
+  s_94f6c54bf471e2::t_106178d2ac9d70 9
+  s_94f6c54bf471e2::t_717090a554bfc8 5
+  s_94f6c54bf471e2::t_32d49160db4c2c 81-92
+  s_94f6c54bf471e2::t_a4f2c4c54f9d73 8
+  s_94f6c54bf471e2::t_f3f37ff5d9df6c 106-115
+src-tauri/crates/keeper/Cargo.toml
+  s_94f6c54bf471e2::t_2b5ad109bab891 37-42
+src/components/chat/media-attachment.tsx
+  s_94f6c54bf471e2::t_bd848bc0034d5c 77-83
+  s_94f6c54bf471e2::t_03ab5ee1722cfb 228
+  s_94f6c54bf471e2::t_14da89fea4e7b3 16,33-46
+  s_94f6c54bf471e2::t_8608aaca3eee41 123-136,138,146-165,167-202,204-227
+  s_94f6c54bf471e2::t_46968b5dbe805e 115-120,122
+  s_94f6c54bf471e2::t_228c418e1554a8 229-237,239,244-247,249-264,269
+src-tauri/crates/keeper-core/src/account.rs
+  s_94f6c54bf471e2::t_4ef5e03fc6d7d1 2370-2412
+  s_94f6c54bf471e2::t_7a924c68c6d73d 1362-1370
+  s_94f6c54bf471e2::t_0bd0089d86b3bc 20-21
+  s_94f6c54bf471e2::t_b8e12785534c5d 1290-1361,1371-1402
+src/components/chat/message-bubble.test.tsx
+  s_94f6c54bf471e2::t_f5260ba935d088 36-39
+  s_94f6c54bf471e2::t_6858432c8603ec 406-410,418-453
+  s_94f6c54bf471e2::t_bda1acf9223c44 411-417
+  s_94f6c54bf471e2::t_f1570504c4fd10 4,24-35
+src-tauri/crates/keeper-core/Cargo.toml
+  s_94f6c54bf471e2::t_1a24c3fa6a8833 33-35
+src-tauri/Cargo.lock
+  s_94f6c54bf471e2::t_cd4a323e72ebe4 2837,2843,2858-2859,3506-3515,3796,4587-4610,5761-5802,6494-6499,7152-7160,7194,7201-7217,7248-7253,7266-7271,7284-7289,7296-7301,7314-7319,7332-7337,7350-7355,7368-7373
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "003f471ede2d5f73fb5cc5e6212315499b740ee6",
+  "prompts": {},
+  "sessions": {
+    "s_94f6c54bf471e2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "80711616-83a4-473f-8342-3dd6e086c732",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
