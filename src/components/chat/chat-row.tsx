@@ -45,6 +45,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { accountHueVar } from "@/lib/account-hue";
+import { BRIDGE_HEALTH_DOT_CLASS } from "@/lib/bridges";
 import { formatRoomTimestamp } from "@/lib/format-time";
 import type { InboxRoomVm } from "@/lib/ipc/client";
 import {
@@ -57,6 +58,7 @@ import {
   unfavoriteRoom,
   unpinRoom,
 } from "@/lib/ipc/client";
+import { useBridgeHealth } from "@/lib/stores/bridge-health";
 import { useFavoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { effectiveIsUnread, type RoomSelection, useRoomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
@@ -138,6 +140,14 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
   const favoritesTotal = useFavoritesRoomsStore((s) => s.total);
   const showFavoritesHint = !room.isFavourite && favoritesTotal === 0;
 
+  // Affected-row health dot (Story 6.5, UX-DR8): a row is "affected" iff it matches an
+  // unhealthy bridge session on BOTH `accountId` AND the room's stable machine
+  // `networkId` (the `protocol.id`, never the display label). A native room (no
+  // networkId) or a healthy/unmonitored session shows no dot. Rust owns the state.
+  const sessionHealth = useBridgeHealth(room.accountId, room.networkId ?? "");
+  const affectedHealth =
+    sessionHealth !== undefined && sessionHealth.health !== "healthy" ? sessionHealth.health : null;
+
   // Accessible unread cue for the row button's name (the visual dot is
   // aria-hidden and the badge sits outside the button's accessible name), gated
   // on the same effective-unread state the visuals use.
@@ -172,8 +182,25 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
           <RoomAvatar room={room} size="lg" />
           <div className="flex min-w-0 flex-1 flex-col">
             <div className="flex items-baseline justify-between gap-2">
-              <span className={cn("truncate text-sm", isUnread ? "font-semibold" : "font-medium")}>
-                {room.displayName}
+              <span className="flex min-w-0 items-center gap-1.5">
+                {/* Affected-row health dot (Story 6.5): shown iff this room's
+                    (accountId, networkId) session is unhealthy — a persistent,
+                    Rust-authoritative indicator, never re-derived here. */}
+                {affectedHealth !== null && (
+                  <span
+                    aria-hidden="true"
+                    data-testid="bridge-health-dot"
+                    className={cn(
+                      "size-2 shrink-0 rounded-full",
+                      BRIDGE_HEALTH_DOT_CLASS[affectedHealth],
+                    )}
+                  />
+                )}
+                <span
+                  className={cn("truncate text-sm", isUnread ? "font-semibold" : "font-medium")}
+                >
+                  {room.displayName}
+                </span>
               </span>
               {timestamp !== null && (
                 <span className="shrink-0 text-muted-foreground text-xs">{timestamp}</span>

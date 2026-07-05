@@ -2,7 +2,14 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { BridgeCard } from "@/components/bridges/bridge-card";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { BadgeStyle, BridgeNetworkVm, BridgeStatus, RiskTier } from "@/lib/ipc/client";
+import type {
+  BadgeStyle,
+  BridgeHealth,
+  BridgeNetworkVm,
+  BridgeStatus,
+  RiskTier,
+} from "@/lib/ipc/client";
+import { bridgeHealthStore } from "@/lib/stores/bridge-health";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 
@@ -64,7 +71,24 @@ describe("BridgeCard", () => {
     // Reset the shared navigation stores so each assertion starts from a known state.
     primaryViewStore.getState().setView("bridges");
     roomsStore.getState().selectRoom(null);
+    bridgeHealthStore.getState().reset();
   });
+
+  /** Seed one session's live health into the store for `(ACCOUNT_ID, networkId)`. */
+  function seedHealth(networkId: string, health: BridgeHealth) {
+    bridgeHealthStore.getState().applySnapshot({
+      sessions: [
+        {
+          accountId: ACCOUNT_ID,
+          networkId,
+          networkName: networkId,
+          health,
+          lastCheckedMs: 1_720_000_000_000,
+          detail: null,
+        },
+      ],
+    });
+  }
 
   it("renders the network name, glyph, and its data-driven risk-tier badge", () => {
     renderCard(network());
@@ -177,5 +201,40 @@ describe("BridgeCard", () => {
         roomId: "!bot:example.org",
       });
     });
+  });
+
+  // --- Live health (Story 6.5) ---------------------------------------------
+
+  it("shows no live-health block when the session is not monitored", () => {
+    renderCard(network(), "loggedIn");
+    expect(screen.queryByTestId("bridge-health-word")).not.toBeInTheDocument();
+    // The neutral placeholder dot is still present.
+    expect(document.querySelector('[data-slot="bridge-health-dot"]')).toBeInTheDocument();
+  });
+
+  it("binds the live-health state word + dot from the store", () => {
+    seedHealth("matrix", "healthy");
+    renderCard(network(), "loggedIn");
+    const word = screen.getByTestId("bridge-health-word");
+    expect(word).toHaveTextContent("Connected");
+    expect(screen.getByTestId("bridge-health-checked")).toHaveTextContent(/Checked/);
+  });
+
+  it("shows the disconnected-red left edge and a Re-link action when disconnected", async () => {
+    seedHealth("matrix", "disconnected");
+    renderCard(network(), "loggedIn");
+    expect(screen.getByTestId("bridge-health-word")).toHaveTextContent("Disconnected");
+    expect(document.querySelector('[data-slot="bridge-health-edge"]')).toBeInTheDocument();
+    // The action re-links straight into the login stepper (no ack re-gate).
+    fireEvent.click(screen.getByRole("button", { name: "Re-link Matrix" }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(await screen.findByRole("dialog", { name: /Connect Matrix/ })).toBeInTheDocument();
+  });
+
+  it("shows a degraded state word without the red edge", () => {
+    seedHealth("matrix", "degraded");
+    renderCard(network(), "loggedIn");
+    expect(screen.getByTestId("bridge-health-word")).toHaveTextContent("Action needed");
+    expect(document.querySelector('[data-slot="bridge-health-edge"]')).not.toBeInTheDocument();
   });
 });

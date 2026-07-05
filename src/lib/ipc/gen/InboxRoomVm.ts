@@ -84,4 +84,13 @@ isPinned: boolean,
  * Drives the avatar Network badge and the ephemeral Network filter's retain;
  * the frontend renders the badge directly and never re-derives or re-filters it.
  */
-network: string | null, };
+network: string | null, 
+/**
+ * The room's stable bridge `network_id` — the machine `protocol.id` (Story 6.5,
+ * FR-28), copied straight through from [`RoomVm::network_id`]. Distinct from the
+ * display `network` label: this is the join key the frontend matches against an
+ * unhealthy bridge session on `(account_id, network_id)` to show the affected-row
+ * health dot and the in-conversation re-link banner. `None` for a native Matrix
+ * room. Never re-derived on the frontend — it mirrors the Rust stream.
+ */
+networkId: string | null, };

@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "default": {
+    "disconnectedMarkers": [
+      "you have been logged out",
+      "you're logged out",
+      "logged out of",
+      "session expired",
+      "your session has expired",
+      "device was unlinked",
+      "device has been unlinked",
+      "you were logged out",
+      "connection lost",
+      "not logged in",
+      "reconnection failed",
+      "not connected",
+      "no longer connected",
+      "no longer online",
+      "went offline",
+      "is offline",
+      "unable to connect",
+      "could not connect",
+      "couldn't connect",
+      "connection failed",
+      "disconnected"
+    ],
+    "degradedMarkers": [
+      "reconnecting",
+      "connecting",
+      "your phone was last seen",
+      "trying to reconnect",
+      "temporary disconnection",
+      "syncing"
+    ],
+    "healthyMarkers": [
+      "connected",
+      "you're logged in",
+      "you are logged in",
+      "successfully connected",
+      "back online",
+      "online",
+      "session is healthy",
+      "sync complete"
+    ],
+    "pingCommand": "ping",
+    "tickIntervalSecs": 60,
+    "enablePing": false
+  },
+  "overrides": [
+    {
+      "networkId": "whatsapp",
+      "disconnectedMarkers": [
+        "you have been logged out",
+        "you were logged out",
+        "your whatsapp is not connected",
+        "logged out of whatsapp",
+        "session expired",
+        "device was unlinked",
+        "device has been unlinked",
+        "phone not connected",
+        "not connected",
+        "no longer connected",
+        "no longer online",
+        "went offline",
+        "is offline",
+        "connection lost",
+        "unable to connect",
+        "could not connect",
+        "couldn't connect",
+        "connection failed",
+        "reconnection failed",
+        "not logged in",
+        "disconnected"
+      ],
+      "degradedMarkers": ["reconnecting", "your phone was last seen", "connecting"],
+      "healthyMarkers": ["connected", "you're logged in", "successfully connected", "back online"],
+      "pingCommand": "ping",
+      "tickIntervalSecs": 60,
+      "enablePing": false
+    }
+  ]
+}

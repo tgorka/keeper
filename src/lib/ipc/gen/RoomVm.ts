@@ -75,4 +75,14 @@ isSpace: boolean,
  * [`InboxRoomVm`] and used both for the avatar Network badge and the ephemeral
  * Network filter. Never fabricated — it is untrusted, length-capped state.
  */
-network: string | null, };
+network: string | null, 
+/**
+ * The room's stable bridge `network_id` — the machine `protocol.id` (Story 6.5,
+ * FR-28), resolved from the room's MSC2346 `m.bridge` state via
+ * [`crate::bridge::room_bridge_protocol_id`] (e.g. `"whatsapp"`, `"telegram"`).
+ * Distinct from the display `network` label: this is the join key that matches a
+ * room to an unhealthy bridge session on `(account_id, network_id)`. `None` for a
+ * native Matrix room (no bridge state). Copied through to [`InboxRoomVm`]. Never
+ * fabricated — it is untrusted, server-controlled state used only as a map key.
+ */
+networkId: string | null, };

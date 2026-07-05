@@ -29,6 +29,8 @@ const KNOWN_BOTS_VERSION: u32 = 1;
 const PROVISIONING_VERSION: u32 = 1;
 /// The schema `version` for `bot-commands.json`.
 const BOT_COMMANDS_VERSION: u32 = 1;
+/// The schema `version` for `health-signals.json`.
+const HEALTH_SIGNALS_VERSION: u32 = 1;
 
 /// The raw `risk-tiers.json` document.
 #[derive(Debug, Deserialize)]
@@ -171,6 +173,71 @@ pub struct BotProtocol {
     pub cancel_command: String,
 }
 
+/// The raw `health-signals.json` document (consumed by Story 6.5's health monitor).
+///
+/// The data-driven bridge-session health grammar: a `default` [`BridgeHealthGrammar`]
+/// (disconnected/degraded/healthy markers, the liveness ping command + cadence) every
+/// bridgev2 management-room bot works with, plus optional per-network overrides keyed
+/// by `networkId`. Grammar knowledge lives in versioned data (never hardcoded in the
+/// health monitor), so tuning a bot's health markers or the tick cadence needs no code
+/// change.
+#[derive(Debug, Deserialize)]
+pub struct HealthSignalsDoc {
+    /// The data-file schema version (`1`); checked by [`validate_health_signals`].
+    pub version: u32,
+    /// The fallback grammar every bridgev2 management-room bot works with.
+    pub default: BridgeHealthGrammar,
+    /// Optional per-network grammar overrides (empty when every bot uses the
+    /// default). Absent in the JSON → an empty list.
+    #[serde(default)]
+    pub overrides: Vec<BridgeHealthGrammarOverride>,
+}
+
+/// One per-network override row in `health-signals.json`: the `networkId` it applies
+/// to plus its health [`BridgeHealthGrammar`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeHealthGrammarOverride {
+    /// The network id this grammar applies to.
+    pub network_id: String,
+    /// The health grammar for this network.
+    #[serde(flatten)]
+    pub grammar: BridgeHealthGrammar,
+}
+
+/// The bridge-session health grammar for one network (or the default). The markers
+/// are matched case-insensitively as substrings against a management-room notice's
+/// body (never regex — the data carries plain phrases). `ping_command` is sent
+/// verbatim as a bot chat message by the liveness tick when `enable_ping` is set;
+/// `tick_interval_secs` bounds the fallback cadence (≤ 60 s to meet the detect-in-60s
+/// target).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeHealthGrammar {
+    /// Phrases that flip a session to `Disconnected` (e.g. "you have been logged out").
+    pub disconnected_markers: Vec<String>,
+    /// Phrases that flip a session to `Degraded` (e.g. "reconnecting").
+    pub degraded_markers: Vec<String>,
+    /// Phrases that recover a session to `Healthy` (e.g. "connected").
+    pub healthy_markers: Vec<String>,
+    /// The command the liveness tick sends to ping the bot (e.g. `ping`).
+    pub ping_command: String,
+    /// The bounded liveness-tick cadence in seconds (must be ≥ 1 and ≤ 60).
+    #[serde(default = "default_tick_interval_secs")]
+    pub tick_interval_secs: u64,
+    /// Whether the liveness tick actively pings the bot (vs. only re-checking the
+    /// last observed state). Off by default — a passive re-check never spams the
+    /// management room.
+    #[serde(default)]
+    pub enable_ping: bool,
+}
+
+/// The default liveness-tick cadence (seconds) when a grammar omits it — the 60 s
+/// detect-within budget.
+fn default_tick_interval_secs() -> u64 {
+    60
+}
+
 /// The compiled-in `risk-tiers.json` bytes.
 const RISK_TIERS_JSON: &str = include_str!("../../data/risk-tiers.json");
 /// The compiled-in `coupling-caveats.json` bytes.
@@ -181,6 +248,8 @@ const KNOWN_BOTS_JSON: &str = include_str!("../../data/known-bots.json");
 const PROVISIONING_JSON: &str = include_str!("../../data/provisioning.json");
 /// The compiled-in `bot-commands.json` bytes.
 const BOT_COMMANDS_JSON: &str = include_str!("../../data/bot-commands.json");
+/// The compiled-in `health-signals.json` bytes.
+const HEALTH_SIGNALS_JSON: &str = include_str!("../../data/health-signals.json");
 
 /// Process-wide cache for the parsed-and-validated risk tiers.
 static RISK_TIERS: OnceLock<Result<RiskTiersDoc, BridgeError>> = OnceLock::new();
@@ -192,6 +261,8 @@ static KNOWN_BOTS: OnceLock<Result<KnownBotsDoc, BridgeError>> = OnceLock::new()
 static PROVISIONING: OnceLock<Result<ProvisioningDoc, BridgeError>> = OnceLock::new();
 /// Process-wide cache for the parsed-and-validated bot-command protocol.
 static BOT_COMMANDS: OnceLock<Result<BotCommandsDoc, BridgeError>> = OnceLock::new();
+/// Process-wide cache for the parsed-and-validated health-signal grammar.
+static HEALTH_SIGNALS: OnceLock<Result<HealthSignalsDoc, BridgeError>> = OnceLock::new();
 
 /// Convert a cached `&Result<T, BridgeError>` into a `Result<&T, BridgeError>` so
 /// callers get the shared parsed doc on success and a cloned error on failure.
@@ -253,6 +324,90 @@ pub fn bot_commands() -> Result<&'static BotCommandsDoc, BridgeError> {
         Ok(doc)
     });
     as_ref_result(cached)
+}
+
+/// Parse + validate the health-signal grammar once and return the cached doc.
+pub fn health_signals() -> Result<&'static HealthSignalsDoc, BridgeError> {
+    let cached = HEALTH_SIGNALS.get_or_init(|| {
+        let doc: HealthSignalsDoc = serde_json::from_str(HEALTH_SIGNALS_JSON)
+            .map_err(|e| BridgeError::Data(format!("health-signals.json failed to parse: {e}")))?;
+        validate_health_signals(&doc)?;
+        Ok(doc)
+    });
+    as_ref_result(cached)
+}
+
+impl HealthSignalsDoc {
+    /// The health [`BridgeHealthGrammar`] for `network_id`: the matching override if
+    /// one exists, else the `default` grammar (so every bridgev2 bot has a grammar
+    /// without a per-network row). Returns a clone so the caller owns a `Send` value
+    /// it can hold in a `Clone` monitor.
+    pub fn grammar_for(&self, network_id: &str) -> BridgeHealthGrammar {
+        self.overrides
+            .iter()
+            .find(|o| o.network_id == network_id)
+            .map(|o| o.grammar.clone())
+            .unwrap_or_else(|| self.default.clone())
+    }
+}
+
+/// Validate the health-signal grammar: the schema version must match, the default
+/// grammar must be valid, every override must name a non-empty network id with a
+/// valid grammar, and no override network id may repeat (a duplicate would make
+/// [`HealthSignalsDoc::grammar_for`] order-dependent).
+fn validate_health_signals(doc: &HealthSignalsDoc) -> Result<(), BridgeError> {
+    if doc.version != HEALTH_SIGNALS_VERSION {
+        return Err(BridgeError::Data(format!(
+            "health-signals.json unsupported version {} (expected {HEALTH_SIGNALS_VERSION})",
+            doc.version
+        )));
+    }
+    validate_health_grammar(&doc.default, "default")?;
+    let mut network_ids: HashSet<&str> = HashSet::new();
+    for over in &doc.overrides {
+        if over.network_id.trim().is_empty() {
+            return Err(BridgeError::Data(
+                "health-signals.json has an override with an empty networkId".to_owned(),
+            ));
+        }
+        validate_health_grammar(&over.grammar, &over.network_id)?;
+        if !network_ids.insert(over.network_id.as_str()) {
+            return Err(BridgeError::Data(format!(
+                "health-signals.json has a duplicate override networkId {:?}",
+                over.network_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A [`BridgeHealthGrammar`] must carry a non-empty ping command, a tick cadence in
+/// `[1, 60]` (the detect-within-60s budget), and no empty marker phrase — `who`
+/// names the offending row (`default` or a network id) for the error copy.
+fn validate_health_grammar(grammar: &BridgeHealthGrammar, who: &str) -> Result<(), BridgeError> {
+    if grammar.ping_command.trim().is_empty() {
+        return Err(BridgeError::Data(format!(
+            "health-signals.json grammar {who:?} has an empty pingCommand"
+        )));
+    }
+    if grammar.tick_interval_secs == 0 || grammar.tick_interval_secs > 60 {
+        return Err(BridgeError::Data(format!(
+            "health-signals.json grammar {who:?} has tickIntervalSecs {} outside [1, 60]",
+            grammar.tick_interval_secs
+        )));
+    }
+    for markers in [
+        &grammar.disconnected_markers,
+        &grammar.degraded_markers,
+        &grammar.healthy_markers,
+    ] {
+        if markers.iter().any(|m| m.trim().is_empty()) {
+            return Err(BridgeError::Data(format!(
+                "health-signals.json grammar {who:?} has an empty marker phrase"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl BotCommandsDoc {
@@ -488,6 +643,133 @@ mod tests {
         known_bots().expect("known bots parse");
         provisioning().expect("provisioning parse");
         bot_commands().expect("bot commands parse");
+        health_signals().expect("health signals parse");
+    }
+
+    fn health_grammar() -> BridgeHealthGrammar {
+        BridgeHealthGrammar {
+            disconnected_markers: vec!["logged out".to_owned()],
+            degraded_markers: vec!["reconnecting".to_owned()],
+            healthy_markers: vec!["connected".to_owned()],
+            ping_command: "ping".to_owned(),
+            tick_interval_secs: 60,
+            enable_ping: false,
+        }
+    }
+
+    #[test]
+    fn health_signals_default_has_all_marker_classes() {
+        let doc = health_signals().expect("health signals parse");
+        assert!(
+            !doc.default.disconnected_markers.is_empty(),
+            "default disconnected markers must be non-empty"
+        );
+        assert!(
+            !doc.default.degraded_markers.is_empty(),
+            "default degraded markers must be non-empty"
+        );
+        assert!(
+            !doc.default.healthy_markers.is_empty(),
+            "default healthy markers must be non-empty"
+        );
+        assert!(
+            doc.default.tick_interval_secs >= 1 && doc.default.tick_interval_secs <= 60,
+            "default tick cadence must be within the 60s budget"
+        );
+    }
+
+    #[test]
+    fn health_grammar_for_falls_back_to_default() {
+        let doc = health_signals().expect("health signals parse");
+        // An unknown network with no override resolves to the default grammar.
+        let grammar = doc.grammar_for("no-such-network");
+        assert_eq!(grammar.ping_command, doc.default.ping_command);
+    }
+
+    #[test]
+    fn health_grammar_for_prefers_an_override() {
+        let doc = HealthSignalsDoc {
+            version: HEALTH_SIGNALS_VERSION,
+            default: health_grammar(),
+            overrides: vec![BridgeHealthGrammarOverride {
+                network_id: "whatsapp".to_owned(),
+                grammar: BridgeHealthGrammar {
+                    healthy_markers: vec!["whatsapp connected".to_owned()],
+                    ..health_grammar()
+                },
+            }],
+        };
+        assert_eq!(
+            doc.grammar_for("whatsapp").healthy_markers,
+            vec!["whatsapp connected".to_owned()]
+        );
+        assert_eq!(
+            doc.grammar_for("signal").healthy_markers,
+            vec!["connected".to_owned()]
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_health_signals_version() {
+        let doc = HealthSignalsDoc {
+            version: HEALTH_SIGNALS_VERSION + 1,
+            default: health_grammar(),
+            overrides: vec![],
+        };
+        assert!(err_msg(validate_health_signals(&doc)).contains("unsupported version"));
+    }
+
+    #[test]
+    fn rejects_health_grammar_with_empty_ping_command() {
+        let doc = HealthSignalsDoc {
+            version: HEALTH_SIGNALS_VERSION,
+            default: BridgeHealthGrammar {
+                ping_command: "   ".to_owned(),
+                ..health_grammar()
+            },
+            overrides: vec![],
+        };
+        assert!(err_msg(validate_health_signals(&doc)).contains("empty pingCommand"));
+    }
+
+    #[test]
+    fn rejects_health_grammar_with_out_of_range_tick() {
+        let doc = HealthSignalsDoc {
+            version: HEALTH_SIGNALS_VERSION,
+            default: BridgeHealthGrammar {
+                tick_interval_secs: 120,
+                ..health_grammar()
+            },
+            overrides: vec![],
+        };
+        assert!(err_msg(validate_health_signals(&doc)).contains("outside [1, 60]"));
+    }
+
+    #[test]
+    fn rejects_health_grammar_with_empty_marker() {
+        let doc = HealthSignalsDoc {
+            version: HEALTH_SIGNALS_VERSION,
+            default: BridgeHealthGrammar {
+                healthy_markers: vec!["   ".to_owned()],
+                ..health_grammar()
+            },
+            overrides: vec![],
+        };
+        assert!(err_msg(validate_health_signals(&doc)).contains("empty marker phrase"));
+    }
+
+    #[test]
+    fn rejects_duplicate_health_override_network_id() {
+        let over = |id: &str| BridgeHealthGrammarOverride {
+            network_id: id.to_owned(),
+            grammar: health_grammar(),
+        };
+        let doc = HealthSignalsDoc {
+            version: HEALTH_SIGNALS_VERSION,
+            default: health_grammar(),
+            overrides: vec![over("whatsapp"), over("whatsapp")],
+        };
+        assert!(err_msg(validate_health_signals(&doc)).contains("duplicate override networkId"));
     }
 
     #[test]

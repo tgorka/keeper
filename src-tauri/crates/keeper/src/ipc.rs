@@ -22,11 +22,11 @@ use keeper_core::error::{
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
-    AccountVm, BackupStatus, BridgeDiscoveryVm, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
-    ConnectionStatusBatch, DemoBatch, EditVersionVm, EncryptionStatusBatch, ExportPhase,
-    ExportProgressVm, ExportRequestVm, InboxBatch, IpcError, IpcErrorCode, NetworksSnapshot,
-    PaginationStatusBatch, PingVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot,
-    TimelineBatch, TypingBatch, VerificationFlowVm,
+    AccountVm, BackupStatus, BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput,
+    BridgeLoginVm, BridgeNetworkVm, ConnectionStatusBatch, DemoBatch, EditVersionVm,
+    EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IpcError,
+    IpcErrorCode, NetworksSnapshot, PaginationStatusBatch, PingVm, RoomListBatch, SearchFilterVm,
+    SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -507,6 +507,42 @@ pub async fn bridge_bot_room(
         .bridge_bot_room(&account_id, &network_id)
         .await
         .map_err(to_ipc_error)
+}
+
+/// Subscribe to live bridge-session health across every active account (Story 6.5,
+/// FR-28, NFR-6, AD-16, UX-DR8/UX-DR11).
+///
+/// Bootstraps the monitored (logged-in) sessions from each account's discovery pass,
+/// spawns a per-account health monitor (management-room notice classifier + a bounded
+/// liveness tick), and streams a whole-set [`BridgeHealthSnapshot`] over `channel` —
+/// the bootstrap snapshot on subscribe, then only on a per-session state change
+/// (diffed). Returns the subscription id; [`bridge_unsubscribe_health`] tears it down.
+/// Health is computed entirely in Rust — the frontend mirrors the stream and never
+/// re-derives it. No bot MXID, token, or session material crosses IPC — only non-secret
+/// render data. Best-effort: a per-account discovery/monitor failure is skipped, so
+/// subscription never rejects.
+#[tauri::command]
+pub async fn bridge_subscribe_health(
+    state: State<'_, AppState>,
+    channel: Channel<BridgeHealthSnapshot>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |snapshot: BridgeHealthSnapshot| channel.send(snapshot).is_ok());
+    Ok(state.accounts.subscribe_bridge_health(sink).await)
+}
+
+/// Unsubscribe the bridge-health subscription (Story 6.5), draining every per-account
+/// monitor (aborting its tick + removing its management-room handlers). Idempotent — a
+/// mismatched/unknown id is a no-op.
+#[tauri::command]
+pub async fn bridge_unsubscribe_health(
+    state: State<'_, AppState>,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_bridge_health(subscription_id)
+        .await;
+    Ok(())
 }
 
 /// Open the demo subscription. Emits the snapshot-then-diff batches produced by

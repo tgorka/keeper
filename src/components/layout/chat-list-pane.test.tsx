@@ -92,6 +92,7 @@ function inboxRoom(roomId: string, accountId: string, displayName: string, lastM
     isPinned: false,
     isFavourite: false,
     network: null,
+    networkId: null,
   };
 }
 

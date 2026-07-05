@@ -12,6 +12,7 @@ import { KeyBackupDialog } from "@/components/settings/key-backup-dialog";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAccountStatuses } from "@/hooks/use-account-statuses";
+import { useBridgeHealthSubscription } from "@/hooks/use-bridge-health";
 import { useBridgesShortcut } from "@/hooks/use-bridges-shortcut";
 import { useEncryptionStatuses } from "@/hooks/use-encryption-statuses";
 import { useKeyBackupStatuses } from "@/hooks/use-key-backup-statuses";
@@ -35,6 +36,10 @@ export function AppShell() {
   // Stream every account's key-backup status into the key-backup store: the
   // Settings backup row is a pure projection of that map.
   useKeyBackupStatuses();
+  // Stream live bridge-session health across every account into the bridge-health
+  // store: the card dot + state word, the sidebar roll-up, the affected chat-row dot,
+  // and the in-conversation re-link banner are pure projections of that map (Story 6.5).
+  useBridgeHealthSubscription();
   // Wire the search entry points (⌘⇧F global, ⌘F in-chat) to the search surface.
   useSearchShortcuts();
   // Wire ⌘4 to the Bridges surface (Story 6.1).

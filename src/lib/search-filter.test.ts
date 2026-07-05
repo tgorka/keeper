@@ -19,6 +19,7 @@ function room(
     isFavourite: false,
     isPinned: false,
     network: partial.network ?? null,
+    networkId: partial.networkId ?? null,
   };
 }
 

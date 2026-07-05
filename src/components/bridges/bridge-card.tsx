@@ -13,7 +13,7 @@
  * Proceeding (post-ack) opens the native login {@link BridgeLoginSheet} (Story 6.3),
  * which drives the provisioning login state machine natively.
  */
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { BridgeLoginSheet } from "@/components/bridges/bridge-login-sheet";
 import {
@@ -36,9 +36,11 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { BRIDGE_STATUS_LABEL } from "@/lib/bridges";
-import type { BadgeStyle, BridgeNetworkVm, BridgeStatus } from "@/lib/ipc/client";
+import { BRIDGE_HEALTH_DOT_CLASS, BRIDGE_HEALTH_LABEL, BRIDGE_STATUS_LABEL } from "@/lib/bridges";
+import { formatRoomTimestamp } from "@/lib/format-time";
+import type { BadgeStyle, BridgeHealth, BridgeNetworkVm, BridgeStatus } from "@/lib/ipc/client";
 import { bridgeBotRoom } from "@/lib/ipc/client";
+import { useBridgeHealth } from "@/lib/stores/bridge-health";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
@@ -73,10 +75,43 @@ interface BridgeCardProps {
   status: BridgeStatus;
 }
 
+/** Whether a live health is an unhealthy (surfaced) state. */
+function isUnhealthy(health: BridgeHealth): boolean {
+  return health === "degraded" || health === "disconnected";
+}
+
 export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
   const [ackOpen, setAckOpen] = useState(false);
   const [loginOpen, setLoginOpen] = useState(false);
   const badge = BADGE_STYLE[network.badgeStyle];
+
+  // The live health for this exact (accountId, networkId) session, from the
+  // Rust-authoritative store (Story 6.5). `undefined` when the session is not
+  // monitored (not logged in) — the card then shows no live-health dot/word/edge.
+  const health = useBridgeHealth(accountId, network.networkId);
+  const liveHealth = health?.health;
+
+  // Pulse-twice-then-steady on a transition INTO an unhealthy state (UX-DR8): the dot
+  // pulses only when the health newly becomes unhealthy, then settles to a steady tint
+  // — a persistent (never dismissible) indicator. Tracked against the previous health
+  // so a re-render on unrelated state never re-triggers the pulse.
+  const prevHealthRef = useRef<BridgeHealth | undefined>(undefined);
+  const [pulsing, setPulsing] = useState(false);
+  useEffect(() => {
+    const prev = prevHealthRef.current;
+    prevHealthRef.current = liveHealth;
+    if (liveHealth !== undefined && isUnhealthy(liveHealth) && prev !== liveHealth) {
+      setPulsing(true);
+      // Two pulses (~0.6 s each) then steady.
+      const timer = setTimeout(() => setPulsing(false), 1200);
+      return () => clearTimeout(timer);
+    }
+    if (liveHealth === undefined || !isUnhealthy(liveHealth)) {
+      setPulsing(false);
+    }
+  }, [liveHealth]);
+
+  const showRedEdge = liveHealth === "disconnected";
 
   // Data-driven action label: an ack-gated (volatile / conditional) Network is
   // "Set up"; a directly-connectable one is "Connect".
@@ -90,6 +125,13 @@ export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
   };
 
   const onAction = () => {
+    // A disconnected session re-links straight into the existing login stepper
+    // (Story 6.5, AD-16) — the session was already acknowledged at first login, so the
+    // volatile/conditional ack gate is not re-shown on a re-link.
+    if (liveHealth === "disconnected") {
+      proceed();
+      return;
+    }
     if (network.requiresAck) {
       setAckOpen(true);
       return;
@@ -123,8 +165,20 @@ export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
       size="sm"
       data-account-id={accountId}
       data-network-id={network.networkId}
-      className="flex-row items-center gap-3 px-4"
+      className={cn(
+        "relative flex-row items-center gap-3 px-4",
+        // A 3 px disconnected-red left edge on a dead session (UX-DR11) — a
+        // persistent, unmissable indicator.
+        showRedEdge && "pl-[19px]",
+      )}
     >
+      {showRedEdge && (
+        <span
+          aria-hidden="true"
+          data-slot="bridge-health-edge"
+          className="absolute inset-y-0 left-0 w-[3px] rounded-l bg-bridge-disconnected"
+        />
+      )}
       <Avatar size="sm">
         <AvatarFallback aria-hidden="true">{network.glyph}</AvatarFallback>
       </Avatar>
@@ -143,20 +197,53 @@ export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
           <span className="text-muted-foreground text-xs">{BRIDGE_STATUS_LABEL[status]}</span>
         </div>
       </div>
-      {/* Placeholder health dot — neutral until the real state machine (Story 6.5). */}
-      <span
-        aria-hidden="true"
-        data-slot="bridge-health-dot"
-        className="size-2 shrink-0 rounded-full bg-muted-foreground/30"
-      />
+      {/* Live-health block (Story 6.5): the state word + a dot that pulses twice on a
+          transition into an unhealthy state then goes steady, plus the last-checked
+          time. Shown only for a monitored (logged-in) session; a neutral placeholder
+          dot otherwise. Rust owns the state — this is a pure projection. */}
+      {health !== undefined ? (
+        <div className="flex shrink-0 flex-col items-end gap-0.5" data-slot="bridge-health">
+          <div className="flex items-center gap-1.5">
+            <span
+              className="text-muted-foreground text-xs"
+              data-slot="bridge-health-word"
+              data-testid="bridge-health-word"
+            >
+              {BRIDGE_HEALTH_LABEL[health.health]}
+            </span>
+            <span
+              aria-hidden="true"
+              data-slot="bridge-health-dot"
+              className={cn(
+                "size-2 rounded-full",
+                BRIDGE_HEALTH_DOT_CLASS[health.health],
+                pulsing && "animate-pulse",
+              )}
+            />
+          </div>
+          <span
+            className="text-[10px] text-muted-foreground/70"
+            data-slot="bridge-health-checked"
+            data-testid="bridge-health-checked"
+          >
+            Checked {formatRoomTimestamp(health.lastCheckedMs)}
+          </span>
+        </div>
+      ) : (
+        <span
+          aria-hidden="true"
+          data-slot="bridge-health-dot"
+          className="size-2 shrink-0 rounded-full bg-muted-foreground/30"
+        />
+      )}
       <Button
         type="button"
         size="sm"
-        variant="outline"
+        variant={showRedEdge ? "default" : "outline"}
         onClick={onAction}
-        aria-label={`${actionLabel} ${network.name}`}
+        aria-label={`${liveHealth === "disconnected" ? "Re-link" : actionLabel} ${network.name}`}
       >
-        {actionLabel}
+        {liveHealth === "disconnected" ? "Re-link" : actionLabel}
       </Button>
 
       {/* Manage menu (UX-DR19): for now its only item is the manual escape hatch to

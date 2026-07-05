@@ -6,7 +6,9 @@ import { SpacesGroup } from "@/components/layout/spaces-group";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import type { BridgeHealth } from "@/lib/ipc/client";
 import { useShellOffline } from "@/lib/stores/account-status";
+import { useWorstBridgeHealth } from "@/lib/stores/bridge-health";
 import { primaryViewStore, usePrimaryView } from "@/lib/stores/primary-view";
 import { cn } from "@/lib/utils";
 
@@ -22,33 +24,7 @@ const VIEWS: SidebarView[] = [
   { label: "Settings", icon: Settings },
 ];
 
-/**
- * A configured bridge's health, for the sidebar worst-state roll-up (Story 6.1).
- * The real state machine is Story 6.5; here health is a placeholder and nothing is
- * configured yet, so the roll-up resolves to `null` (no dot).
- */
-type BridgeHealth = "healthy" | "degraded" | "disconnected";
-
-/** Worst-state precedence: disconnected beats degraded beats healthy. */
-const HEALTH_RANK: Record<BridgeHealth, number> = {
-  healthy: 0,
-  degraded: 1,
-  disconnected: 2,
-};
-
-/**
- * Roll the set of configured bridge healths up to the single worst state for the
- * sidebar dot, or `null` when nothing is configured (Story 6.1 placeholder — no
- * dot). Ready for Story 6.5 to feed real per-bridge health in.
- */
-function worstBridgeHealth(healths: readonly BridgeHealth[]): BridgeHealth | null {
-  if (healths.length === 0) {
-    return null;
-  }
-  return healths.reduce((worst, h) => (HEALTH_RANK[h] > HEALTH_RANK[worst] ? h : worst));
-}
-
-/** The `--bridge-*` tint class for a rolled-up worst health. */
+/** The `--bridge-*` tint class for a rolled-up worst health (Story 6.5). */
 const HEALTH_DOT_CLASS: Record<BridgeHealth, string> = {
   healthy: "bg-bridge-healthy",
   degraded: "bg-bridge-degraded",
@@ -71,10 +47,10 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
   // Inbox, "Archive" to the Archive window, "Bridges" to the Bridges surface.
   // Reflected as `aria-current` + accent styling.
   const primaryView = usePrimaryView();
-  // The sidebar Bridges health roll-up (Story 6.1): the single worst state across
-  // configured bridges. Health is a placeholder here (real state machine is Story
-  // 6.5) and nothing is configured yet, so this resolves to `null` (no dot).
-  const bridgeHealth = worstBridgeHealth([]);
+  // The sidebar Bridges health roll-up (Story 6.5): the single worst state across
+  // every monitored bridge session, rolled up from the Rust-authoritative
+  // bridge-health store. `null` when nothing is monitored (no dot).
+  const bridgeHealth = useWorstBridgeHealth();
 
   return (
     <nav

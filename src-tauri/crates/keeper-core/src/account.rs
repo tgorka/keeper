@@ -16,7 +16,7 @@
 //! plaintext beyond the rendered preview crosses IPC or reaches a `tracing` log
 //! (NFR-9).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +48,9 @@ use crate::archive::{self, ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWri
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
 use crate::bridge;
+use crate::bridges::health::{
+    BridgeHealthSink, HealthAggregator, HealthMonitor, HealthState, MonitoredSession, SessionKey,
+};
 use crate::bridges::login::{self, BridgeLoginSink};
 use crate::bridges::transport::bot::BotDriver;
 use crate::bridges::transport::provisioning::Provisioning;
@@ -269,6 +272,16 @@ struct InboxHandle {
     spaces_producers: HashMap<String, JoinHandle<()>>,
 }
 
+/// A live bridge-session-health subscription (Story 6.5, FR-28, AD-16): the shared
+/// cross-account [`HealthAggregator`] its per-account [`HealthMonitor`]s feed, keyed by
+/// account id (so one account's monitor drains on that account's sign-out, not only on
+/// a whole-subscription unsubscribe). There is at most one at a time.
+struct BridgeHealthHandle {
+    subscription_id: u64,
+    aggregator: HealthAggregator,
+    monitors: HashMap<String, HealthMonitor>,
+}
+
 /// Multi-account supervisor (AD-3, AD-19, AD-20). Owns the live per-account
 /// state (each a supervised `Client`/`SyncService`) and the single active
 /// merged-inbox subscription; the shell manages exactly one instance in its
@@ -278,6 +291,16 @@ pub struct AccountManager {
     /// The single active merged-inbox subscription, if any. Sign-out/shutdown
     /// notify it so a removed account's rooms leave the inbox immediately.
     inbox: Mutex<Option<InboxHandle>>,
+    /// The single active bridge-session-health subscription, if any (Story 6.5).
+    /// Sign-out/shutdown drain the removed account's monitor so its sessions leave
+    /// the health snapshot immediately.
+    bridge_health: Mutex<Option<BridgeHealthHandle>>,
+    /// Serializes [`AccountManager::subscribe_bridge_health`] against itself. The
+    /// subscribe body does slow Matrix I/O (discovery + monitor spawn) between draining
+    /// the prior subscription and storing the new handle; without this guard two
+    /// concurrent subscribes (e.g. a StrictMode double-mount) could both build monitors
+    /// and the loser's would leak (never drained). Held for the whole subscribe body.
+    bridge_health_subscribe: Mutex<()>,
     /// The single app-wide archive writer handle (Story 5.1): created ONCE in
     /// [`AccountManager::new`] from the platform data dir and cloned into every
     /// account's post-decryption event handler, guaranteeing exactly one
@@ -309,6 +332,8 @@ impl AccountManager {
         Self {
             accounts: Mutex::new(HashMap::new()),
             inbox: Mutex::new(None),
+            bridge_health: Mutex::new(None),
+            bridge_health_subscribe: Mutex::new(()),
             archive,
         }
     }
@@ -1308,6 +1333,152 @@ impl AccountManager {
             return Err(BridgeError::AccountNotFound(account_id.to_owned()).into());
         };
         Ok(crate::bridges::discover(&client).await?)
+    }
+
+    /// Subscribe to live bridge-session health across every active account (Story 6.5,
+    /// FR-28, NFR-6, AD-16). Bootstraps the monitored (logged-in) sessions from each
+    /// live account's discovery pass, spawns a per-account [`HealthMonitor`] (mgmt-room
+    /// notice handler + bounded liveness tick) feeding one shared [`HealthAggregator`],
+    /// emits the initial snapshot, and returns the subscription id. The stream then
+    /// emits **only on a per-session state change** (diffed). Tears down any prior
+    /// subscription first. A per-account discovery / monitor failure is logged and
+    /// skipped (others keep monitoring) — never fatal to the whole subscription.
+    pub async fn subscribe_bridge_health(&self, sink: BridgeHealthSink) -> u64 {
+        // Serialize the whole subscribe body against any concurrent subscribe so the
+        // drain→build→store sequence is atomic — otherwise two overlapping subscribes
+        // both spawn monitors and the loser's leak (never drained). Held to return.
+        let _subscribe_guard = self.bridge_health_subscribe.lock().await;
+
+        // Only one health subscription at a time: drain any prior one.
+        self.unsubscribe_bridge_health_inner().await;
+
+        // Resolve the live clients under the lock (cheap handle clones), then run
+        // discovery + monitor spawn outside it (Matrix I/O).
+        let clients: Vec<(String, Client)> = {
+            let accounts = self.accounts.lock().await;
+            accounts
+                .iter()
+                .map(|(id, handle)| (id.clone(), handle.client.clone()))
+                .collect()
+        };
+
+        // Bootstrap the monitored (logged-in) sessions across accounts, resolving each
+        // Network's display name from the catalog. Only `LoggedIn` sessions have health
+        // (a `NotLoggedIn`/`Configured` bridge is not monitored).
+        let catalog = crate::bridges::catalog().unwrap_or_default();
+        let name_for = |network_id: &str| -> String {
+            catalog
+                .iter()
+                .find(|n| n.network_id == network_id)
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| network_id.to_owned())
+        };
+
+        let mut sessions_by_account: HashMap<String, Vec<MonitoredSession>> = HashMap::new();
+        let mut all_sessions: BTreeMap<SessionKey, MonitoredSession> = BTreeMap::new();
+        for (account_id, client) in &clients {
+            let discovery = match crate::bridges::discover(client).await {
+                Ok(discovery) => discovery,
+                Err(e) => {
+                    tracing::warn!(
+                        account_id = %account_id,
+                        error = %e,
+                        "health: discovery failed for account; skipping (others keep monitoring)"
+                    );
+                    continue;
+                }
+            };
+            let mut sessions = Vec::new();
+            for discovered in &discovery.networks {
+                if discovered.status != crate::vm::BridgeStatus::LoggedIn {
+                    continue;
+                }
+                let session = MonitoredSession {
+                    account_id: account_id.clone(),
+                    network_id: discovered.network_id.clone(),
+                    network_name: name_for(&discovered.network_id),
+                    state: HealthState::new_healthy(),
+                };
+                all_sessions.insert(
+                    (account_id.clone(), discovered.network_id.clone()),
+                    session.clone(),
+                );
+                sessions.push(session);
+            }
+            sessions_by_account.insert(account_id.clone(), sessions);
+        }
+
+        let aggregator = HealthAggregator::new(sink, all_sessions);
+        // Emit the bootstrap snapshot (the stream always opens with the current set).
+        aggregator.emit_initial();
+
+        // Spawn a per-account monitor over each account's sessions.
+        let mut monitors: HashMap<String, HealthMonitor> = HashMap::new();
+        for (account_id, client) in clients {
+            let sessions = sessions_by_account.remove(&account_id).unwrap_or_default();
+            if sessions.is_empty() {
+                continue;
+            }
+            let monitor =
+                HealthMonitor::spawn(client, account_id.clone(), &sessions, aggregator.clone())
+                    .await;
+            monitors.insert(account_id, monitor);
+        }
+
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut health = self.bridge_health.lock().await;
+            *health = Some(BridgeHealthHandle {
+                subscription_id,
+                aggregator,
+                monitors,
+            });
+        }
+        tracing::info!(subscription_id, "bridge health subscribed");
+        subscription_id
+    }
+
+    /// Unsubscribe the bridge-health subscription for `subscription_id`, draining every
+    /// per-account monitor. Idempotent — a mismatched/unknown id is a no-op.
+    pub async fn unsubscribe_bridge_health(&self, subscription_id: u64) {
+        let matches = {
+            let health = self.bridge_health.lock().await;
+            health
+                .as_ref()
+                .is_some_and(|h| h.subscription_id == subscription_id)
+        };
+        if matches {
+            self.unsubscribe_bridge_health_inner().await;
+            tracing::info!(subscription_id, "bridge health unsubscribed");
+        }
+    }
+
+    /// Tear down any active bridge-health subscription: drain every monitor (abort its
+    /// tick + drop its handlers) and drop the handle. Idempotent.
+    async fn unsubscribe_bridge_health_inner(&self) {
+        let handle = {
+            let mut health = self.bridge_health.lock().await;
+            health.take()
+        };
+        if let Some(handle) = handle {
+            for (_, monitor) in handle.monitors {
+                monitor.drain();
+            }
+        }
+    }
+
+    /// Drain one account's health monitor and drop its sessions from the shared
+    /// aggregator (called from `shutdown` so a signed-out account's sessions leave the
+    /// health snapshot immediately). Best-effort — a no-active-subscription case is a
+    /// harmless no-op.
+    async fn drain_account_health(&self, account_id: &str) {
+        let mut health = self.bridge_health.lock().await;
+        if let Some(handle) = health.as_mut() {
+            if let Some(monitor) = handle.monitors.remove(account_id) {
+                monitor.drain();
+            }
+            handle.aggregator.remove_account(account_id);
+        }
     }
 
     /// Start a native bridge login for `network_id` on a live account (Story 6.3,
@@ -2591,6 +2762,11 @@ impl AccountManager {
     /// leave immediately while other accounts keep syncing), abort every
     /// subscription, and drop the live `Client`/`SyncService`.
     pub async fn shutdown(&self, account_id: &str) {
+        // Drain the account's bridge-health monitor first (Story 6.5): abort its tick,
+        // remove its mgmt-room handlers (which hold `Client` clones), and drop its
+        // sessions from the shared health snapshot — so a signed-out account's health
+        // leaves the UI immediately and no handler leaks past teardown.
+        self.drain_account_health(account_id).await;
         // Remove the account from the active merged inbox first, so its rows are
         // dropped from the emitted window, then abort *its* inbox producer and
         // wait for it to finish. This releases the producer's `RoomList` (and the
@@ -3667,6 +3843,12 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
     // state only (no `/hierarchy` or network fetch); a native room resolves to
     // `None` and shows no badge / is excluded from the Networks list.
     let network = bridge::room_bridge_network(item).await;
+    // Resolve the room's stable bridge `network_id` — the machine `protocol.id`
+    // (Story 6.5, FR-28) — from the same local `m.bridge` state via the pure
+    // `parse_bridge_protocol_id` wrapper. This is the join key that matches a room to
+    // an unhealthy bridge session on `(account_id, network_id)`, distinct from the
+    // display `network` label above. A native room resolves to `None`.
+    let network_id = bridge::room_bridge_protocol_id(item).await;
 
     RoomVm {
         room_id,
@@ -3680,6 +3862,7 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
         is_favourite,
         is_space,
         network,
+        network_id,
     }
 }
 
@@ -3909,6 +4092,7 @@ mod tests {
             is_favourite: false,
             is_space: false,
             network: None,
+            network_id: None,
         }
     }
 

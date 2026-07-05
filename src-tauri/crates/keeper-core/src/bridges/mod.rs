@@ -11,6 +11,7 @@
 
 pub mod data;
 pub mod discovery;
+pub mod health;
 pub mod login;
 pub mod transport;
 
@@ -75,6 +76,17 @@ pub async fn resolve_bot_room(
         .await
         .map_err(|e| BridgeError::Bot(format!("could not open a chat with the Bridge Bot: {e}")))?;
     Ok((room, bot_mxid))
+}
+
+/// Resolve the bot management DM for `network_id` **only if it already exists** — never
+/// creating one. This is the passive counterpart of [`resolve_bot_room`], used by the
+/// health monitor, which must observe existing conversations without provoking any
+/// server-side room creation on a background/launch code path. Returns `None` when the
+/// bot MXID can't be resolved or the account has no existing DM with it.
+pub async fn find_bot_room(client: &Client, network_id: &str) -> Option<(Room, OwnedUserId)> {
+    let bot_mxid = resolve_bot_mxid(client, network_id).ok()?;
+    let room = find_bot_dm(client, &bot_mxid).await?;
+    Some((room, bot_mxid))
 }
 
 /// Find an existing direct room whose target is `bot_mxid` among the account's

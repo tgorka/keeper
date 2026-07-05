@@ -20,8 +20,10 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
 
 import { SidebarPane } from "@/components/layout/sidebar-pane";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { BridgeHealth } from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
+import { bridgeHealthStore } from "@/lib/stores/bridge-health";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 
 const OFFLINE_TEXT = "Offline — showing your local archive. Messages queue until you're back.";
@@ -54,13 +56,33 @@ beforeEach(() => {
   accountStatusStore.getState().reset();
   accountsStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
+  bridgeHealthStore.getState().reset();
 });
 
 afterEach(() => {
   accountStatusStore.getState().reset();
   accountsStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
+  bridgeHealthStore.getState().reset();
 });
+
+/** Seed one session's live health into the store. */
+function seedSession(networkId: string, health: BridgeHealth) {
+  const current = bridgeHealthStore.getState().sessions;
+  bridgeHealthStore.getState().applySnapshot({
+    sessions: [
+      ...Object.values(current),
+      {
+        accountId: account.accountId,
+        networkId,
+        networkName: networkId,
+        health,
+        lastCheckedMs: 1,
+        detail: null,
+      },
+    ],
+  });
+}
 
 describe("SidebarPane offline pill", () => {
   it("hides the pill while online (the default)", () => {
@@ -161,6 +183,32 @@ describe("SidebarPane primary view", () => {
     expect(primaryViewStore.getState().view).toBe("inbox");
     expect(screen.getByRole("button", { name: "Chats" })).toHaveAttribute("aria-current", "page");
     expect(screen.getByRole("button", { name: "Archive" })).not.toHaveAttribute("aria-current");
+  });
+});
+
+describe("SidebarPane bridge-health roll-up", () => {
+  it("shows no roll-up dot when nothing is monitored", () => {
+    renderSidebar();
+    expect(document.querySelector('[data-slot="bridge-health-rollup"]')).not.toBeInTheDocument();
+  });
+
+  it("rolls the worst state up to the Bridges dot (disconnected beats degraded)", () => {
+    seedSession("telegram", "degraded");
+    seedSession("whatsapp", "disconnected");
+    seedSession("signal", "healthy");
+    renderSidebar();
+    const dot = document.querySelector('[data-slot="bridge-health-rollup"]');
+    expect(dot).toBeInTheDocument();
+    // Worst state is disconnected → the disconnected tint.
+    expect(dot).toHaveClass("bg-bridge-disconnected");
+  });
+
+  it("shows the degraded tint when the worst monitored state is degraded", () => {
+    seedSession("telegram", "degraded");
+    seedSession("signal", "healthy");
+    renderSidebar();
+    const dot = document.querySelector('[data-slot="bridge-health-rollup"]');
+    expect(dot).toHaveClass("bg-bridge-degraded");
   });
 });
 

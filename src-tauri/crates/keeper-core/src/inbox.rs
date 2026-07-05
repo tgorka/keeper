@@ -550,6 +550,9 @@ fn to_inbox_room(account_id: &str, hue_index: u8, room: &RoomVm) -> InboxRoomVm 
         // The bridged-Network label is SDK/bridge-sourced (from local `m.bridge`
         // state, resolved on the `RoomVm`), copied straight through (Story 4.6).
         network: room.network.clone(),
+        // The stable bridge `network_id` (machine `protocol.id`) is likewise resolved
+        // on the `RoomVm`, copied straight through (Story 6.5) — the health join key.
+        network_id: room.network_id.clone(),
     }
 }
 
@@ -622,6 +625,7 @@ mod tests {
             is_favourite: false,
             is_space: false,
             network: None,
+            network_id: None,
         }
     }
 
@@ -711,6 +715,7 @@ mod tests {
             is_favourite: true,
             is_space: false,
             network: Some("Telegram".to_owned()),
+            network_id: Some("telegram".to_owned()),
         };
         let inbox_room = to_inbox_room("acctA", 4, &src);
         assert!(inbox_room.is_unread);
@@ -722,6 +727,8 @@ mod tests {
         assert!(!inbox_room.is_pinned);
         // The bridged-Network label is copied straight through (Story 4.6).
         assert_eq!(inbox_room.network.as_deref(), Some("Telegram"));
+        // The stable bridge network_id is copied straight through (Story 6.5).
+        assert_eq!(inbox_room.network_id.as_deref(), Some("telegram"));
         assert_eq!(inbox_room.account_id, "acctA");
         assert_eq!(inbox_room.hue_index, 4);
     }

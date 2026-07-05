@@ -29,6 +29,7 @@ function room(p: Pick<InboxRoomVm, "accountId" | "roomId"> & Partial<InboxRoomVm
     isFavourite: false,
     isPinned: false,
     network: p.network ?? null,
+    networkId: p.networkId ?? null,
   };
 }
 

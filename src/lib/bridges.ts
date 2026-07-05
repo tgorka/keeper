@@ -7,7 +7,7 @@
  * inventing status text. Risk-tier badges and ack copy still come only from the
  * backend catalog data — nothing here duplicates that.
  */
-import type { BridgeLoginPhase, BridgeStatus } from "@/lib/ipc/client";
+import type { BridgeHealth, BridgeLoginPhase, BridgeStatus } from "@/lib/ipc/client";
 
 /**
  * The companion-stack docs link surfaced in the "No bridges found" empty state
@@ -40,4 +40,22 @@ export const BRIDGE_LOGIN_PHASE_LABEL: Record<BridgeLoginPhase, string> = {
   codeEntry: "Enter code",
   success: "Linked ✓",
   failure: "Couldn't connect",
+};
+
+/**
+ * The live-health state word shown on a bridge card for each {@link BridgeHealth}
+ * (Story 6.5, FR-28). Live connection health — distinct from the setup/login
+ * {@link BRIDGE_STATUS_LABEL}. Rust owns the state; this only names it.
+ */
+export const BRIDGE_HEALTH_LABEL: Record<BridgeHealth, string> = {
+  healthy: "Connected",
+  degraded: "Action needed",
+  disconnected: "Disconnected",
+};
+
+/** The `--bridge-*` dot tint for each live {@link BridgeHealth} (Story 6.5). */
+export const BRIDGE_HEALTH_DOT_CLASS: Record<BridgeHealth, string> = {
+  healthy: "bg-bridge-healthy",
+  degraded: "bg-bridge-degraded",
+  disconnected: "bg-bridge-disconnected",
 };

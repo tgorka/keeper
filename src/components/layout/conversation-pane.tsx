@@ -25,6 +25,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { BridgeLoginSheet } from "@/components/bridges/bridge-login-sheet";
 import { Composer } from "@/components/chat/composer";
 import { DeleteMessageDialog } from "@/components/chat/delete-message-dialog";
 import { HistoryBoundary, type HistoryBoundaryState } from "@/components/chat/history-boundary";
@@ -34,6 +35,7 @@ import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import { RedactedStub } from "@/components/chat/redacted-stub";
 import { TypingIndicator } from "@/components/chat/typing-indicator";
 import { UtdStub } from "@/components/chat/utd-stub";
+import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -70,6 +72,7 @@ import {
 import { useAccountStatus } from "@/lib/stores/account-status";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { attachmentId, attachmentsStore, type PendingAttachment } from "@/lib/stores/attachments";
+import { useBridgeHealth } from "@/lib/stores/bridge-health";
 import { composerStore, useComposerStore } from "@/lib/stores/composer";
 import { exportStore } from "@/lib/stores/export";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
@@ -251,10 +254,67 @@ function ConversationHeaderIdentity({ accountId }: { accountId: string | null })
   return null;
 }
 
+/**
+ * The non-dismissible in-conversation re-link banner (Story 6.5, FR-28, UX-DR11).
+ *
+ * Shown iff the open room's `(accountId, networkId)` matches an *unhealthy* bridge
+ * session (both keys must match — the machine `networkId`, never the display label).
+ * The banner is persistent until the session recovers — never a dismissible toast.
+ * Its single "Re-link" action opens the shipped {@link BridgeLoginSheet} for that exact
+ * `(accountId, networkId)` (the same `start_bridge_login` entry the card uses — no new
+ * login flow). Renders nothing for a native room, a healthy/unmonitored session, or no
+ * open room. The health state is Rust-authoritative — this is a pure projection.
+ */
+export function ConversationHealthBanner({
+  accountId,
+  networkId,
+}: {
+  accountId: string | null;
+  networkId: string | null;
+}) {
+  const [relinkOpen, setRelinkOpen] = useState(false);
+  const health = useBridgeHealth(accountId ?? "", networkId ?? "");
+
+  if (accountId === null || networkId === null || health === undefined) {
+    return null;
+  }
+  if (health.health === "healthy") {
+    return null;
+  }
+
+  return (
+    <div className="shrink-0 px-3 pt-2">
+      {/* role="alert" (not "status") — an unhealthy session is a persistent, actionable
+          problem the user must see. No dismiss control: it clears only on recovery. */}
+      <Alert role="alert" variant="destructive" className="pr-28">
+        <AlertDescription>
+          {health.networkName} disconnected — messages may not arrive.
+        </AlertDescription>
+        <AlertAction>
+          <Button type="button" variant="outline" size="xs" onClick={() => setRelinkOpen(true)}>
+            Re-link
+          </Button>
+        </AlertAction>
+      </Alert>
+      <BridgeLoginSheet
+        accountId={accountId}
+        networkId={networkId}
+        networkName={health.networkName}
+        open={relinkOpen}
+        onOpenChange={setRelinkOpen}
+      />
+    </div>
+  );
+}
+
 export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: ConversationPaneProps) {
   const selected = useRoomsStore((s) => s.selected);
   const accountId = selected?.accountId ?? null;
   const selectedRoomId = selected?.roomId ?? null;
+  // The open room's stable machine `networkId` (Story 6.5) — the health join key.
+  // `null` for a native room or when the room's VM isn't in any streamed window.
+  const selectedRoom = useSelectedRoomVm();
+  const selectedNetworkId = selectedRoom?.networkId ?? null;
   // A pending search deep-link focus target (Story 5.4): resolved to a timeline
   // render key, scrolled to, and tinted once the target room's timeline is loaded.
   const focusEvent = useRoomsStore((s) => s.focusEvent);
@@ -1097,6 +1157,10 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
           </Button>
         </div>
       </div>
+      {/* Non-dismissible in-conversation re-link banner (Story 6.5, UX-DR11): shown iff
+          the open room's (accountId, networkId) session is unhealthy → opens the login
+          stepper for that exact bridge. Persistent until the session recovers. */}
+      <ConversationHealthBanner accountId={accountId} networkId={selectedNetworkId} />
       {selectedRoomId === null ? (
         <div className="flex flex-1 items-center justify-center p-8">
           <p className="max-w-sm text-center text-muted-foreground text-sm">

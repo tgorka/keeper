@@ -1,7 +1,8 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatRow } from "@/components/chat/chat-row";
-import type { InboxBatch, InboxRoomVm } from "@/lib/ipc/client";
+import type { BridgeHealth, InboxBatch, InboxRoomVm } from "@/lib/ipc/client";
+import { bridgeHealthStore } from "@/lib/stores/bridge-health";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { roomsStore } from "@/lib/stores/rooms";
 
@@ -53,6 +54,7 @@ function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
     isPinned: false,
     isFavourite: false,
     network: null,
+    networkId: null,
     ...overrides,
   };
 }
@@ -66,8 +68,18 @@ beforeEach(() => {
 afterEach(() => {
   roomsStore.getState().clear();
   favoritesRoomsStore.getState().clear();
+  bridgeHealthStore.getState().reset();
   vi.clearAllMocks();
 });
+
+/** Seed one session's live health into the store for the given account/network. */
+function seedHealth(accountId: string, networkId: string, health: BridgeHealth) {
+  bridgeHealthStore.getState().applySnapshot({
+    sessions: [
+      { accountId, networkId, networkName: networkId, health, lastCheckedMs: 1, detail: null },
+    ],
+  });
+}
 
 describe("ChatRow", () => {
   it("renders display name and preview", () => {
@@ -428,5 +440,38 @@ describe("ChatRow", () => {
   it("renders no Network badge on a native row", () => {
     render(<ChatRow room={room({ network: null })} />);
     expect(screen.queryByLabelText(/network$/)).not.toBeInTheDocument();
+  });
+
+  // --- Affected-row health dot (Story 6.5) ---------------------------------
+
+  it("shows a health dot when the row's (accountId, networkId) session is unhealthy", () => {
+    const accountId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    seedHealth(accountId, "whatsapp", "disconnected");
+    render(<ChatRow room={room({ accountId, network: "WhatsApp", networkId: "whatsapp" })} />);
+    const dot = screen.getByTestId("bridge-health-dot");
+    expect(dot).toBeInTheDocument();
+    expect(dot).toHaveClass("bg-bridge-disconnected");
+  });
+
+  it("shows no health dot when the session is healthy", () => {
+    const accountId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    seedHealth(accountId, "whatsapp", "healthy");
+    render(<ChatRow room={room({ accountId, network: "WhatsApp", networkId: "whatsapp" })} />);
+    expect(screen.queryByTestId("bridge-health-dot")).not.toBeInTheDocument();
+  });
+
+  it("shows no health dot when the networkId does not match (only the label matches)", () => {
+    const accountId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    // An unhealthy telegram session must not light up a whatsapp row.
+    seedHealth(accountId, "telegram", "disconnected");
+    render(<ChatRow room={room({ accountId, network: "WhatsApp", networkId: "whatsapp" })} />);
+    expect(screen.queryByTestId("bridge-health-dot")).not.toBeInTheDocument();
+  });
+
+  it("shows no health dot on a native row (no networkId)", () => {
+    const accountId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    seedHealth(accountId, "whatsapp", "disconnected");
+    render(<ChatRow room={room({ accountId, network: null, networkId: null })} />);
+    expect(screen.queryByTestId("bridge-health-dot")).not.toBeInTheDocument();
   });
 });

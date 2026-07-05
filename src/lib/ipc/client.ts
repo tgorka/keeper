@@ -13,10 +13,13 @@ export type { AccountVm } from "./gen/AccountVm";
 export type { BackupStatus } from "./gen/BackupStatus";
 export type { BadgeStyle } from "./gen/BadgeStyle";
 export type { BridgeDiscoveryVm } from "./gen/BridgeDiscoveryVm";
+export type { BridgeHealth } from "./gen/BridgeHealth";
+export type { BridgeHealthSnapshot } from "./gen/BridgeHealthSnapshot";
 export type { BridgeLoginInput } from "./gen/BridgeLoginInput";
 export type { BridgeLoginPhase } from "./gen/BridgeLoginPhase";
 export type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 export type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
+export type { BridgeSessionHealthVm } from "./gen/BridgeSessionHealthVm";
 export type { BridgeStatus } from "./gen/BridgeStatus";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
@@ -68,6 +71,7 @@ export type { VerificationPhase } from "./gen/VerificationPhase";
 import type { AccountVm } from "./gen/AccountVm";
 import type { BackupStatus } from "./gen/BackupStatus";
 import type { BridgeDiscoveryVm } from "./gen/BridgeDiscoveryVm";
+import type { BridgeHealthSnapshot } from "./gen/BridgeHealthSnapshot";
 import type { BridgeLoginInput } from "./gen/BridgeLoginInput";
 import type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
@@ -557,6 +561,29 @@ export async function setNetworkFilter(network: string | null): Promise<void> {
  */
 export async function unsubscribeInbox(id: number): Promise<void> {
   await invoke<void>("inbox_unsubscribe", { subscriptionId: id });
+}
+
+/**
+ * Subscribe to live bridge-session health across every active account (Story 6.5,
+ * FR-28, NFR-6, AD-16). Opens a `Channel` and forwards each whole-set
+ * {@link BridgeHealthSnapshot} to `onSnapshot` — the bootstrap snapshot on subscribe,
+ * then only on a per-session state change (diffed in Rust). Resolves with the
+ * subscription id; {@link unsubscribeBridgeHealth} tears it down. Health is computed
+ * entirely in Rust — the frontend mirrors the stream and never re-derives it. Never
+ * rejects (a per-account discovery/monitor failure is skipped in the core).
+ */
+export async function subscribeBridgeHealth(
+  onSnapshot: (snapshot: BridgeHealthSnapshot) => void,
+): Promise<number> {
+  return await subscribe<BridgeHealthSnapshot>("bridge_subscribe_health", onSnapshot);
+}
+
+/**
+ * Unsubscribe the bridge-health subscription (Story 6.5), draining every per-account
+ * monitor. Idempotent — a mismatched/unknown id is a no-op.
+ */
+export async function unsubscribeBridgeHealth(id: number): Promise<void> {
+  await invoke<void>("bridge_unsubscribe_health", { subscriptionId: id });
 }
 
 /**

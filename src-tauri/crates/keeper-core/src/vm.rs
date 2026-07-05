@@ -364,6 +364,14 @@ pub struct RoomVm {
     /// [`InboxRoomVm`] and used both for the avatar Network badge and the ephemeral
     /// Network filter. Never fabricated — it is untrusted, length-capped state.
     pub network: Option<String>,
+    /// The room's stable bridge `network_id` — the machine `protocol.id` (Story 6.5,
+    /// FR-28), resolved from the room's MSC2346 `m.bridge` state via
+    /// [`crate::bridge::room_bridge_protocol_id`] (e.g. `"whatsapp"`, `"telegram"`).
+    /// Distinct from the display `network` label: this is the join key that matches a
+    /// room to an unhealthy bridge session on `(account_id, network_id)`. `None` for a
+    /// native Matrix room (no bridge state). Copied through to [`InboxRoomVm`]. Never
+    /// fabricated — it is untrusted, server-controlled state used only as a map key.
+    pub network_id: Option<String>,
 }
 
 /// One Matrix Space the user belongs to, surfaced as a filter view (Story 4.5,
@@ -1258,6 +1266,13 @@ pub struct InboxRoomVm {
     /// Drives the avatar Network badge and the ephemeral Network filter's retain;
     /// the frontend renders the badge directly and never re-derives or re-filters it.
     pub network: Option<String>,
+    /// The room's stable bridge `network_id` — the machine `protocol.id` (Story 6.5,
+    /// FR-28), copied straight through from [`RoomVm::network_id`]. Distinct from the
+    /// display `network` label: this is the join key the frontend matches against an
+    /// unhealthy bridge session on `(account_id, network_id)` to show the affected-row
+    /// health dot and the in-conversation re-link banner. `None` for a native Matrix
+    /// room. Never re-derived on the frontend — it mirrors the Rust stream.
+    pub network_id: Option<String>,
 }
 
 /// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
@@ -1515,6 +1530,79 @@ pub struct BridgeDiscoveryVm {
     pub homeserver: String,
     /// The catalog-gated discovered Networks with their derived statuses.
     pub networks: Vec<DiscoveredBridgeVm>,
+}
+
+/// The live connection health of a bridged session (Story 6.5, FR-28, NFR-6,
+/// UX-DR8/UX-DR11).
+///
+/// A pure, per-session state — keyed by `(account_id, network_id)` — driven by the
+/// bridge's management-room notices (real-time via the running sync) with a bounded
+/// bot-ping liveness fallback. Distinct from the *setup* [`BridgeStatus`] (which is a
+/// one-shot discovery result): this is the live signal that a logged-in session went
+/// silent (device unlinked, token expired) or recovered. Serializes to its camelCase
+/// name — the frontend wire contract. The frontend renders the dot / state-word / red
+/// edge / roll-up / banner as pure projections of this one enum and never re-derives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum BridgeHealth {
+    /// The session is connected — the bridge is delivering. Renders "Connected" + a
+    /// healthy dot; no banner.
+    Healthy,
+    /// The session is impaired but not dead — the bridge reported a transient
+    /// reconnect. Renders "Action needed" + an amber dot.
+    Degraded,
+    /// The session is dead — the bridge posted a logged-out notice or the liveness
+    /// tick timed out past the debounce threshold. Renders "Disconnected" + a red dot,
+    /// a red left edge, an affected-row dot, and the non-dismissible re-link banner.
+    Disconnected,
+}
+
+/// One bridged session's live health, keyed by `(account_id, network_id)` (Story
+/// 6.5, FR-28).
+///
+/// Carries **only** non-secret render data: the opaque keeper `account_id`, the stable
+/// machine `network_id` (the `protocol.id`, the row/conversation join key — never the
+/// display label), the resolved display `network_name` for banner/card copy, the live
+/// [`BridgeHealth`], the `last_checked_ms` timestamp (ms since the Unix epoch), and an
+/// optional `detail` carrying the bot's verbatim reason (trimmed, length-capped, no
+/// tokens or session material). Never a bot MXID, token, or session material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BridgeSessionHealthVm {
+    /// Opaque keeper account id this session belongs to (part of the join key).
+    pub account_id: String,
+    /// The stable machine `network_id` (`protocol.id`), the room/conversation join
+    /// key — never the display label.
+    pub network_id: String,
+    /// The Network's display name for the card / banner copy (e.g. `"WhatsApp"`).
+    pub network_name: String,
+    /// The live connection health.
+    pub health: BridgeHealth,
+    /// When the session was last checked: ms since the Unix epoch (UTC).
+    #[ts(type = "number")]
+    pub last_checked_ms: i64,
+    /// The bot's verbatim reason (trimmed, length-capped, no tokens/session material),
+    /// or `null` — populated on a disconnected/degraded notice, cleared on recovery.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// The full current bridge-session health snapshot, streamed as a whole-snapshot
+/// batch over the health subscription's `Channel` (Story 6.5, FR-28, AD-8).
+///
+/// Sessions are few, so there is no diff protocol: each batch carries the complete
+/// set of monitored (logged-in) sessions across every account, and the frontend
+/// replaces its keyed map wholesale. Emitted on subscribe (the bootstrap snapshot),
+/// then **only on a real per-session state change** (diffed) — no periodic re-emit
+/// noise, matching the `NetworksSnapshot` cadence contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BridgeHealthSnapshot {
+    /// Every monitored (logged-in) session's live health, across all accounts.
+    pub sessions: Vec<BridgeSessionHealthVm>,
 }
 
 /// The phase of a native bridge login flow (Story 6.3, FR-26, AD-16).
@@ -1871,6 +1959,7 @@ mod tests {
             is_favourite: false,
             is_pinned: false,
             network: None,
+            network_id: None,
         }
     }
 
@@ -2052,6 +2141,7 @@ mod tests {
             is_favourite: false,
             is_space: false,
             network: None,
+            network_id: None,
         }
     }
 
@@ -2083,6 +2173,7 @@ mod tests {
             is_favourite: false,
             is_space: false,
             network: None,
+            network_id: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");
@@ -2178,6 +2269,97 @@ mod tests {
         assert!(json.contains("\"network\":\"Signal\""), "json was: {json}");
         let back: InboxRoomVm = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn room_vm_network_id_round_trips() {
+        let vm = RoomVm {
+            network: Some("WhatsApp".to_owned()),
+            network_id: Some("whatsapp".to_owned()),
+            ..sample_room()
+        };
+        let json = serde_json::to_string(&vm).expect("serialize");
+        assert!(
+            json.contains("\"networkId\":\"whatsapp\""),
+            "json was: {json}"
+        );
+        let back: RoomVm = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn inbox_room_vm_network_id_round_trips() {
+        let vm = InboxRoomVm {
+            network: Some("WhatsApp".to_owned()),
+            network_id: Some("whatsapp".to_owned()),
+            ..sample_inbox_room()
+        };
+        let json = serde_json::to_string(&vm).expect("serialize");
+        assert!(
+            json.contains("\"networkId\":\"whatsapp\""),
+            "json was: {json}"
+        );
+        let back: InboxRoomVm = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn bridge_health_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&BridgeHealth::Healthy).expect("serialize health"),
+            "\"healthy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BridgeHealth::Degraded).expect("serialize health"),
+            "\"degraded\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BridgeHealth::Disconnected).expect("serialize health"),
+            "\"disconnected\""
+        );
+    }
+
+    #[test]
+    fn bridge_health_snapshot_round_trips_camel_case() {
+        let snapshot = BridgeHealthSnapshot {
+            sessions: vec![
+                BridgeSessionHealthVm {
+                    account_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    network_id: "whatsapp".to_owned(),
+                    network_name: "WhatsApp".to_owned(),
+                    health: BridgeHealth::Disconnected,
+                    last_checked_ms: 1_720_000_000_000,
+                    detail: Some("you have been logged out".to_owned()),
+                },
+                BridgeSessionHealthVm {
+                    account_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    network_id: "telegram".to_owned(),
+                    network_name: "Telegram".to_owned(),
+                    health: BridgeHealth::Healthy,
+                    last_checked_ms: 1_720_000_000_000,
+                    detail: None,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        assert!(
+            json.contains("\"networkId\":\"whatsapp\""),
+            "json was: {json}"
+        );
+        assert!(
+            json.contains("\"networkName\":\"WhatsApp\""),
+            "json was: {json}"
+        );
+        assert!(
+            json.contains("\"health\":\"disconnected\""),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"lastCheckedMs\":"), "json was: {json}");
+        // No bot MXID, token, or session material crosses the wire.
+        assert!(!json.contains("@"), "json leaked an mxid: {json}");
+        assert!(!json.contains("token"), "json leaked a token field: {json}");
+        let back: BridgeHealthSnapshot = serde_json::from_str(&json).expect("deserialize snapshot");
+        assert_eq!(back, snapshot);
     }
 
     #[test]
