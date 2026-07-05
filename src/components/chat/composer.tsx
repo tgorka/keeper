@@ -33,6 +33,7 @@ import {
   useAttachmentsStore,
 } from "@/lib/stores/attachments";
 import type { PendingContext } from "@/lib/stores/composer";
+import { useComposerStore } from "@/lib/stores/composer";
 import { cn } from "@/lib/utils";
 
 /** Derive a chip display name for a pending attachment (its filename). */
@@ -126,6 +127,21 @@ export function Composer({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState(false);
+
+  // The textarea handle, focused programmatically when the composer store's focus
+  // nonce is *bumped* (Story 6.6 — e.g. after a new chat is resolved and opened).
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const focusNonce = useComposerStore((s) => s.focusNonce);
+  // Seed to the current nonce so a fresh Composer mount (every room switch clears &
+  // remounts the pane) does NOT self-focus off a stale, already-bumped nonce — only a
+  // genuine change after mount steals focus into the composer.
+  const seenFocusNonce = useRef(focusNonce);
+  useEffect(() => {
+    if (focusNonce !== seenFocusNonce.current) {
+      seenFocusNonce.current = focusNonce;
+      textareaRef.current?.focus();
+    }
+  }, [focusNonce]);
 
   // Typing-notice emission (Story 3.9): mirror the callback + local typing state
   // in refs so the throttle/idle timers don't re-run effects or capture stale
@@ -430,6 +446,7 @@ export function Composer({
           </Button>
         )}
         <Textarea
+          ref={textareaRef}
           aria-label="Message"
           placeholder="Write a message…"
           value={draft}

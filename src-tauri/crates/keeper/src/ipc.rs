@@ -25,8 +25,9 @@ use keeper_core::vm::{
     AccountVm, BackupStatus, BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput,
     BridgeLoginVm, BridgeNetworkVm, ConnectionStatusBatch, DemoBatch, EditVersionVm,
     EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IpcError,
-    IpcErrorCode, NetworksSnapshot, PaginationStatusBatch, PingVm, RoomListBatch, SearchFilterVm,
-    SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
+    IpcErrorCode, NetworksSnapshot, NewChatResolutionVm, PaginationStatusBatch, PingVm,
+    ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch,
+    TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -505,6 +506,47 @@ pub async fn bridge_bot_room(
     state
         .accounts
         .bridge_bot_room(&account_id, &network_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Return the data-driven new-chat resolve capability for `network_id` (Story 6.6,
+/// FR-32). A pure, I/O-free projection of the embedded `resolve-support.json`
+/// (override-or-default) into a [`ResolveSupportVm`] — the frontend disables the
+/// identifier field and shows "not supported on {Network}" upfront when `supported`
+/// is `false`, before any resolve call. A malformed embedded data file funnels
+/// through [`to_ipc_error`] to `internal`.
+#[tauri::command]
+pub fn bridge_resolve_support(
+    state: State<'_, AppState>,
+    network_id: String,
+) -> Result<ResolveSupportVm, IpcError> {
+    state
+        .accounts
+        .bridge_resolve_support(&network_id)
+        .map_err(to_ipc_error)
+}
+
+/// Resolve a new-chat `identifier` on `network_id` through the bridge's provisioning
+/// API (Story 6.6, FR-32) and return the portal room id to open. The Rust core
+/// connects the provisioning transport (Matrix access token as Bearer, read in Rust
+/// and never crossing IPC), calls `resolve_identifier` then `create_dm` only if no DM
+/// exists yet, and returns a [`NewChatResolutionVm`] carrying only the non-secret
+/// room id (opened verbatim via `roomsStore.selectRoom`). Failures funnel through
+/// [`to_ipc_error`]: an unknown account → `internal`; a bot-only account or an
+/// unresolvable identifier → `syncUnavailable` (retriable) with the bridge's own
+/// verbatim message, so the dialog can render "Not found on {Network}" and retain the
+/// input.
+#[tauri::command]
+pub async fn resolve_bridge_identifier(
+    state: State<'_, AppState>,
+    account_id: String,
+    network_id: String,
+    identifier: String,
+) -> Result<NewChatResolutionVm, IpcError> {
+    state
+        .accounts
+        .resolve_bridge_identifier(&account_id, &network_id, &identifier)
         .await
         .map_err(to_ipc_error)
 }

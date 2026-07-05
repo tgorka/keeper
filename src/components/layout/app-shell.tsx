@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from "react";
+import { NewChatDialog } from "@/components/chat/new-chat-dialog";
 import { ExportDialog } from "@/components/export/export-dialog";
 import { BridgesPane } from "@/components/layout/bridges-pane";
 import { ChatListPane } from "@/components/layout/chat-list-pane";
@@ -16,6 +17,7 @@ import { useBridgeHealthSubscription } from "@/hooks/use-bridge-health";
 import { useBridgesShortcut } from "@/hooks/use-bridges-shortcut";
 import { useEncryptionStatuses } from "@/hooks/use-encryption-statuses";
 import { useKeyBackupStatuses } from "@/hooks/use-key-backup-statuses";
+import { useNewChatShortcut } from "@/hooks/use-new-chat-shortcut";
 import { useSearchShortcuts } from "@/hooks/use-search-shortcuts";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useVerification } from "@/hooks/use-verification";
@@ -42,6 +44,8 @@ export function AppShell() {
   useBridgeHealthSubscription();
   // Wire the search entry points (⌘⇧F global, ⌘F in-chat) to the search surface.
   useSearchShortcuts();
+  // Wire ⌘N to the new-chat dialog (Story 6.6).
+  useNewChatShortcut();
   // Wire ⌘4 to the Bridges surface (Story 6.1).
   useBridgesShortcut();
   // Which primary view the shell renders. "bridges" replaces the chat-list +
@@ -101,6 +105,7 @@ export function AppShell() {
       <KeyBackupDialog />
       <SearchOverlay />
       <ExportDialog />
+      <NewChatDialog />
 
       {detailFloating && (
         <Sheet open={detailOpen} onOpenChange={handleSheetOpenChange}>

@@ -59,6 +59,14 @@ export interface ComposerState {
   /** The keyboard-selected message key, or `null`. */
   selectedKey: string | null;
   /**
+   * A monotonically-increasing focus nonce (Story 6.6). Bumped by
+   * {@link ComposerState.requestFocus} to programmatically focus the composer's
+   * textarea for the currently-open room — e.g. after a new chat is resolved and
+   * opened. Ephemeral UI signal, not a source of truth (mirrors the rooms store's
+   * `focusEvent` deep-link pattern).
+   */
+  focusNonce: number;
+  /**
    * Enter reply mode for `target`. The typed draft is left untouched (reply keeps
    * the user's text), so nothing is stashed.
    */
@@ -80,6 +88,8 @@ export interface ComposerState {
   select: (key: string) => void;
   /** Clear the keyboard selection. */
   clearSelection: () => void;
+  /** Request programmatic composer focus by bumping {@link ComposerState.focusNonce}. */
+  requestFocus: () => void;
 }
 
 /**
@@ -89,6 +99,7 @@ export const composerStore = createStore<ComposerState>()((set, get) => ({
   pending: null,
   stashedDraft: null,
   selectedKey: null,
+  focusNonce: 0,
   startReply: ({ targetKey, sender, bodyPreview }) =>
     // Reply leaves the typed draft alone: no stash, clear any prior edit stash.
     set({ pending: { mode: "reply", targetKey, sender, bodyPreview }, stashedDraft: null }),
@@ -105,6 +116,7 @@ export const composerStore = createStore<ComposerState>()((set, get) => ({
   clear: () => set({ pending: null, stashedDraft: null }),
   select: (key) => set({ selectedKey: key }),
   clearSelection: () => set({ selectedKey: null }),
+  requestFocus: () => set((state) => ({ focusNonce: state.focusNonce + 1 })),
 }));
 
 /**

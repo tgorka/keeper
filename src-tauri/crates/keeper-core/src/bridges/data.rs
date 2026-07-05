@@ -31,6 +31,8 @@ const PROVISIONING_VERSION: u32 = 1;
 const BOT_COMMANDS_VERSION: u32 = 1;
 /// The schema `version` for `health-signals.json`.
 const HEALTH_SIGNALS_VERSION: u32 = 1;
+/// The schema `version` for `resolve-support.json`.
+const RESOLVE_SUPPORT_VERSION: u32 = 1;
 
 /// The raw `risk-tiers.json` document.
 #[derive(Debug, Deserialize)]
@@ -238,6 +240,54 @@ fn default_tick_interval_secs() -> u64 {
     60
 }
 
+/// The raw `resolve-support.json` document (consumed by Story 6.6's new-chat surface).
+///
+/// The data-driven new-chat resolve-capability grammar: a `default`
+/// [`ResolveSupport`] (whether the bridge can resolve an identifier, the input hint,
+/// and the placeholder) every bridgev2 network works with, plus optional per-network
+/// overrides keyed by `networkId`. A network marked `supported: false` disables the
+/// identifier field upfront (before any I/O). Capability knowledge lives in versioned
+/// data (never hardcoded in Rust or TS), so tuning a network's hint or marking it
+/// unsupported needs no code change.
+#[derive(Debug, Deserialize)]
+pub struct ResolveSupportDoc {
+    /// The data-file schema version (`1`); checked by [`validate_resolve_support`].
+    pub version: u32,
+    /// The fallback resolve capability every bridgev2 network works with.
+    pub default: ResolveSupport,
+    /// Optional per-network capability overrides (empty when every network uses the
+    /// default). Absent in the JSON → an empty list.
+    #[serde(default)]
+    pub overrides: Vec<ResolveSupportOverride>,
+}
+
+/// One per-network override row in `resolve-support.json`: the `networkId` it applies
+/// to plus its [`ResolveSupport`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveSupportOverride {
+    /// The network id this capability applies to.
+    pub network_id: String,
+    /// The resolve capability for this network.
+    #[serde(flatten)]
+    pub support: ResolveSupport,
+}
+
+/// The new-chat resolve capability for one network (or the default). `supported`
+/// gates the identifier field before any network I/O; `identifier_hint` and
+/// `placeholder` drive the input's label/placeholder copy (data, never hardcoded).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveSupport {
+    /// Whether starting a new chat by resolving an identifier is supported here.
+    pub supported: bool,
+    /// The identifier-field hint copy (e.g. "Phone number, username, or Matrix ID").
+    pub identifier_hint: String,
+    /// The identifier-field placeholder copy (e.g. "+1 555 123 4567 or @username").
+    #[serde(default)]
+    pub placeholder: String,
+}
+
 /// The compiled-in `risk-tiers.json` bytes.
 const RISK_TIERS_JSON: &str = include_str!("../../data/risk-tiers.json");
 /// The compiled-in `coupling-caveats.json` bytes.
@@ -250,6 +300,8 @@ const PROVISIONING_JSON: &str = include_str!("../../data/provisioning.json");
 const BOT_COMMANDS_JSON: &str = include_str!("../../data/bot-commands.json");
 /// The compiled-in `health-signals.json` bytes.
 const HEALTH_SIGNALS_JSON: &str = include_str!("../../data/health-signals.json");
+/// The compiled-in `resolve-support.json` bytes.
+const RESOLVE_SUPPORT_JSON: &str = include_str!("../../data/resolve-support.json");
 
 /// Process-wide cache for the parsed-and-validated risk tiers.
 static RISK_TIERS: OnceLock<Result<RiskTiersDoc, BridgeError>> = OnceLock::new();
@@ -263,6 +315,8 @@ static PROVISIONING: OnceLock<Result<ProvisioningDoc, BridgeError>> = OnceLock::
 static BOT_COMMANDS: OnceLock<Result<BotCommandsDoc, BridgeError>> = OnceLock::new();
 /// Process-wide cache for the parsed-and-validated health-signal grammar.
 static HEALTH_SIGNALS: OnceLock<Result<HealthSignalsDoc, BridgeError>> = OnceLock::new();
+/// Process-wide cache for the parsed-and-validated resolve-support capability.
+static RESOLVE_SUPPORT: OnceLock<Result<ResolveSupportDoc, BridgeError>> = OnceLock::new();
 
 /// Convert a cached `&Result<T, BridgeError>` into a `Result<&T, BridgeError>` so
 /// callers get the shared parsed doc on success and a cloned error on failure.
@@ -335,6 +389,73 @@ pub fn health_signals() -> Result<&'static HealthSignalsDoc, BridgeError> {
         Ok(doc)
     });
     as_ref_result(cached)
+}
+
+/// Parse + validate the resolve-support capability once and return the cached doc.
+pub fn resolve_support() -> Result<&'static ResolveSupportDoc, BridgeError> {
+    let cached = RESOLVE_SUPPORT.get_or_init(|| {
+        let doc: ResolveSupportDoc = serde_json::from_str(RESOLVE_SUPPORT_JSON)
+            .map_err(|e| BridgeError::Data(format!("resolve-support.json failed to parse: {e}")))?;
+        validate_resolve_support(&doc)?;
+        Ok(doc)
+    });
+    as_ref_result(cached)
+}
+
+impl ResolveSupportDoc {
+    /// The [`ResolveSupport`] for `network_id`: the matching override if one exists,
+    /// else the `default` capability (so every bridgev2 network has a capability
+    /// without a per-network row). Returns a clone so the caller owns a `Send` value.
+    pub fn support_for(&self, network_id: &str) -> ResolveSupport {
+        self.overrides
+            .iter()
+            .find(|o| o.network_id == network_id)
+            .map(|o| o.support.clone())
+            .unwrap_or_else(|| self.default.clone())
+    }
+}
+
+/// Validate the resolve-support capability: the schema version must match, the
+/// default capability must be valid, every override must name a non-empty network id
+/// with a valid capability, and no override network id may repeat (a duplicate would
+/// make [`ResolveSupportDoc::support_for`] order-dependent).
+fn validate_resolve_support(doc: &ResolveSupportDoc) -> Result<(), BridgeError> {
+    if doc.version != RESOLVE_SUPPORT_VERSION {
+        return Err(BridgeError::Data(format!(
+            "resolve-support.json unsupported version {} (expected {RESOLVE_SUPPORT_VERSION})",
+            doc.version
+        )));
+    }
+    validate_resolve_capability(&doc.default, "default")?;
+    let mut network_ids: HashSet<&str> = HashSet::new();
+    for over in &doc.overrides {
+        if over.network_id.trim().is_empty() {
+            return Err(BridgeError::Data(
+                "resolve-support.json has an override with an empty networkId".to_owned(),
+            ));
+        }
+        validate_resolve_capability(&over.support, &over.network_id)?;
+        if !network_ids.insert(over.network_id.as_str()) {
+            return Err(BridgeError::Data(format!(
+                "resolve-support.json has a duplicate override networkId {:?}",
+                over.network_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A [`ResolveSupport`] that is `supported` must carry a non-empty identifier hint (a
+/// supported network with no hint would render an empty label). An unsupported
+/// network's hint is the "not supported" copy and is likewise required — `who` names
+/// the offending row (`default` or a network id) for the error copy.
+fn validate_resolve_capability(support: &ResolveSupport, who: &str) -> Result<(), BridgeError> {
+    if support.identifier_hint.trim().is_empty() {
+        return Err(BridgeError::Data(format!(
+            "resolve-support.json capability {who:?} has an empty identifierHint"
+        )));
+    }
+    Ok(())
 }
 
 impl HealthSignalsDoc {
@@ -644,6 +765,100 @@ mod tests {
         provisioning().expect("provisioning parse");
         bot_commands().expect("bot commands parse");
         health_signals().expect("health signals parse");
+        resolve_support().expect("resolve support parse");
+    }
+
+    fn resolve_capability() -> ResolveSupport {
+        ResolveSupport {
+            supported: true,
+            identifier_hint: "Phone number or username".to_owned(),
+            placeholder: "+1 555 123 4567".to_owned(),
+        }
+    }
+
+    #[test]
+    fn resolve_support_default_is_supported_with_a_hint() {
+        let doc = resolve_support().expect("resolve support parse");
+        assert!(doc.default.supported, "default must be supported");
+        assert!(
+            !doc.default.identifier_hint.trim().is_empty(),
+            "default identifier hint must be non-empty"
+        );
+    }
+
+    #[test]
+    fn resolve_support_for_falls_back_to_default() {
+        let doc = resolve_support().expect("resolve support parse");
+        // An unknown network with no override resolves to the default capability.
+        let support = doc.support_for("no-such-network");
+        assert_eq!(support.supported, doc.default.supported);
+        assert_eq!(support.identifier_hint, doc.default.identifier_hint);
+    }
+
+    #[test]
+    fn resolve_support_for_prefers_an_override() {
+        let doc = ResolveSupportDoc {
+            version: RESOLVE_SUPPORT_VERSION,
+            default: resolve_capability(),
+            overrides: vec![ResolveSupportOverride {
+                network_id: "slack".to_owned(),
+                support: ResolveSupport {
+                    supported: false,
+                    identifier_hint: "not supported on Slack".to_owned(),
+                    placeholder: String::new(),
+                },
+            }],
+        };
+        assert!(!doc.support_for("slack").supported);
+        assert!(doc.support_for("whatsapp").supported);
+    }
+
+    #[test]
+    fn resolve_support_marks_an_unsupported_network() {
+        // At least one genuinely-unsupported network must be declared upfront so the
+        // dialog's "not supported" gate has data to drive it.
+        let doc = resolve_support().expect("resolve support parse");
+        assert!(
+            doc.overrides.iter().any(|o| !o.support.supported),
+            "at least one network must be marked unsupported"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_resolve_support_version() {
+        let doc = ResolveSupportDoc {
+            version: RESOLVE_SUPPORT_VERSION + 1,
+            default: resolve_capability(),
+            overrides: vec![],
+        };
+        assert!(err_msg(validate_resolve_support(&doc)).contains("unsupported version"));
+    }
+
+    #[test]
+    fn rejects_resolve_capability_with_empty_hint() {
+        let doc = ResolveSupportDoc {
+            version: RESOLVE_SUPPORT_VERSION,
+            default: ResolveSupport {
+                identifier_hint: "   ".to_owned(),
+                ..resolve_capability()
+            },
+            overrides: vec![],
+        };
+        assert!(err_msg(validate_resolve_support(&doc)).contains("empty identifierHint"));
+    }
+
+    #[test]
+    fn rejects_duplicate_resolve_support_override_network_id() {
+        let over = |id: &str| ResolveSupportOverride {
+            network_id: id.to_owned(),
+            support: resolve_capability(),
+        };
+        let doc = ResolveSupportDoc {
+            version: RESOLVE_SUPPORT_VERSION,
+            default: resolve_capability(),
+            overrides: vec![over("whatsapp"), over("whatsapp")],
+        };
+        assert!(err_msg(validate_resolve_support(&doc)).contains("duplicate override networkId"));
     }
 
     fn health_grammar() -> BridgeHealthGrammar {

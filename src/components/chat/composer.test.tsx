@@ -1,7 +1,8 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Composer } from "@/components/chat/composer";
 import { attachmentsStore } from "@/lib/stores/attachments";
+import { composerStore } from "@/lib/stores/composer";
 
 // Mock the native file picker; each test sets its return value.
 const open = vi.fn();
@@ -12,6 +13,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 /** Reset the shared pending-attachment tray between tests. */
 beforeEach(() => {
   attachmentsStore.getState().clear();
+  composerStore.setState({ focusNonce: 0 });
   open.mockReset();
 });
 afterEach(() => {
@@ -380,5 +382,28 @@ describe("Composer typing notices (Story 3.9)", () => {
     fireEvent.keyDown(textarea, { key: "Enter" });
     // The stop fires synchronously at the start of send, before the async dispatch.
     expect(onTyping).toHaveBeenCalledWith(false);
+  });
+
+  it("focuses the textarea when the composer store's focus nonce is bumped", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    render(<Composer onSend={onSend} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+
+    // The textarea is not focused until a focus is requested (Story 6.6).
+    expect(document.activeElement).not.toBe(textarea);
+    await act(async () => {
+      composerStore.getState().requestFocus();
+    });
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  it("does not steal focus when it mounts onto an already-bumped focus nonce", () => {
+    // Simulate a prior new-chat: the persisted nonce is already > 0 when a fresh
+    // Composer mounts (every room switch remounts the pane). It must NOT self-focus.
+    composerStore.setState({ focusNonce: 5 });
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    render(<Composer onSend={onSend} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    expect(document.activeElement).not.toBe(textarea);
   });
 });

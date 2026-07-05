@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "default": {
+    "supported": true,
+    "identifierHint": "Phone number, username, or Matrix ID",
+    "placeholder": "+1 555 123 4567 or @username"
+  },
+  "overrides": [
+    {
+      "networkId": "whatsapp",
+      "supported": true,
+      "identifierHint": "Phone number in international format",
+      "placeholder": "+1 555 123 4567"
+    },
+    {
+      "networkId": "signal",
+      "supported": true,
+      "identifierHint": "Phone number in international format",
+      "placeholder": "+1 555 123 4567"
+    },
+    {
+      "networkId": "telegram",
+      "supported": true,
+      "identifierHint": "Username or phone number",
+      "placeholder": "@username or +1 555 123 4567"
+    },
+    {
+      "networkId": "instagram",
+      "supported": true,
+      "identifierHint": "Instagram username",
+      "placeholder": "@username"
+    },
+    {
+      "networkId": "messenger",
+      "supported": true,
+      "identifierHint": "Username or profile handle",
+      "placeholder": "@username"
+    },
+    {
+      "networkId": "linkedin",
+      "supported": true,
+      "identifierHint": "LinkedIn profile handle",
+      "placeholder": "@username"
+    },
+    {
+      "networkId": "discord",
+      "supported": true,
+      "identifierHint": "Discord username",
+      "placeholder": "@username"
+    },
+    {
+      "networkId": "slack",
+      "supported": false,
+      "identifierHint": "Starting new chats isn't supported on Slack from keeper",
+      "placeholder": ""
+    },
+    {
+      "networkId": "google",
+      "supported": true,
+      "identifierHint": "Phone number or email address",
+      "placeholder": "+1 555 123 4567"
+    },
+    {
+      "networkId": "matrix",
+      "supported": true,
+      "identifierHint": "Matrix ID",
+      "placeholder": "@user:example.org"
+    },
+    {
+      "networkId": "imessage",
+      "supported": false,
+      "identifierHint": "Starting new chats isn't supported on iMessage from keeper",
+      "placeholder": ""
+    },
+    {
+      "networkId": "xchat",
+      "supported": false,
+      "identifierHint": "Starting new chats isn't supported on X Chat from keeper",
+      "placeholder": ""
+    }
+  ]
+}

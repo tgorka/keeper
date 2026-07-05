@@ -166,6 +166,83 @@ impl Provisioning {
         }
     }
 
+    /// Resolve an identifier through the provisioning API (Story 6.6, FR-32):
+    /// `GET …/v3/resolve_identifier/{identifier}`. On 2xx, returns the response's
+    /// `dm_room_mxid` if a DM already exists (`Some`), or `None` when the identifier
+    /// is valid but no portal room exists yet (the caller then calls [`create_dm`]).
+    /// A non-2xx surfaces the bridge's own error body verbatim (capped) as
+    /// [`BridgeError::Provisioning`] — the "Not found on {network}" path.
+    ///
+    /// [`create_dm`]: Provisioning::create_dm
+    pub async fn resolve_identifier(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<String>, BridgeError> {
+        let url = format!(
+            "{}/v3/resolve_identifier/{}",
+            self.base_url,
+            encode_identifier_segment(identifier)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(SHORT_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| BridgeError::Provisioning(format!("provisioning request failed: {e}")))?;
+        let status = resp.status();
+        // Read the body with an honest error rather than defaulting to `""`: a
+        // truncated/failed 2xx read must NOT be misread as "valid identifier, no DM
+        // yet" and silently fall through to `create_dm` (which would create a portal).
+        let text = resp.text().await.map_err(|e| {
+            BridgeError::Provisioning(format!("provisioning response unreadable: {e}"))
+        })?;
+        if !status.is_success() {
+            let message = extract_error_message(&text)
+                .unwrap_or_else(|| format!("could not resolve the identifier ({status})"));
+            return Err(BridgeError::Provisioning(message));
+        }
+        // A 2xx with a present `dm_room_mxid` means a DM already exists; its absence
+        // is the honest "valid identifier, no portal yet" signal (→ `create_dm`).
+        Ok(parse_resolved_room(&text))
+    }
+
+    /// Create a portal DM through the provisioning API (Story 6.6, FR-32):
+    /// `POST …/v3/create_dm/{identifier}`. The `dm_room_mxid` is REQUIRED on success
+    /// — an absent/empty one is a bridge protocol violation surfaced as
+    /// [`BridgeError::Provisioning`] (never open a blank room). A non-2xx surfaces the
+    /// bridge's own error body verbatim (capped).
+    pub async fn create_dm(&self, identifier: &str) -> Result<String, BridgeError> {
+        let url = format!(
+            "{}/v3/create_dm/{}",
+            self.base_url,
+            encode_identifier_segment(identifier)
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .timeout(SHORT_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| BridgeError::Provisioning(format!("provisioning request failed: {e}")))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| {
+            BridgeError::Provisioning(format!("provisioning response unreadable: {e}"))
+        })?;
+        if !status.is_success() {
+            let message = extract_error_message(&text)
+                .unwrap_or_else(|| format!("could not start the chat ({status})"));
+            return Err(BridgeError::Provisioning(message));
+        }
+        parse_resolved_room(&text).ok_or_else(|| {
+            BridgeError::Provisioning(
+                "the bridge created the chat but returned no room id".to_owned(),
+            )
+        })
+    }
+
     /// POST a login-step body and parse the next [`LoginStepResponse`]. A non-2xx
     /// surfaces the response body verbatim as [`BridgeError::Provisioning`].
     async fn post_step(
@@ -245,6 +322,46 @@ pub fn extract_error_message(body: &str) -> Option<String> {
     } else {
         Some(cap_message(trimmed))
     }
+}
+
+/// Project a provisioning `resolve_identifier` / `create_dm` response body to its
+/// portal room id (Story 6.6). Pure and unit-tested: extracts a non-empty
+/// `dm_room_mxid` from the JSON body, returning `None` when the field is absent,
+/// null, or empty (a valid identifier with no DM yet, or a `create_dm` protocol
+/// violation the caller treats as an error). keeper never guesses a room id from any
+/// other field — only the bridge's declared `dm_room_mxid` opens a chat.
+pub fn parse_resolved_room(body: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Resolved {
+        #[serde(default)]
+        dm_room_mxid: Option<String>,
+    }
+    let parsed = serde_json::from_str::<Resolved>(body).ok()?;
+    let room = parsed.dm_room_mxid?;
+    if room.trim().is_empty() {
+        None
+    } else {
+        Some(room)
+    }
+}
+
+/// Percent-encode an identifier into a single URL path segment (Story 6.6). Pure and
+/// unit-tested. A phone number's `+`, a username's `@`, and any reserved / non-ASCII
+/// character are encoded so the identifier can never break out of its path segment or
+/// be misread as a query. Uses the RFC 3986 unreserved set as the safe alphabet;
+/// everything else (including `/`, `+`, `@`, `:`, spaces) is `%`-escaped.
+pub fn encode_identifier_segment(identifier: &str) -> String {
+    let mut out = String::with_capacity(identifier.len());
+    for byte in identifier.bytes() {
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+        if unreserved {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
 }
 
 impl BridgeTransport for Provisioning {
@@ -397,6 +514,61 @@ mod tests {
     fn extract_error_message_is_none_for_empty_body() {
         assert_eq!(extract_error_message(""), None);
         assert_eq!(extract_error_message("   "), None);
+    }
+
+    #[test]
+    fn parse_resolved_room_extracts_present_dm_room() {
+        // An existing DM: `dm_room_mxid` present → open that room verbatim.
+        let body = r#"{"id":"x","name":"Alice","dm_room_mxid":"!portal:example.org"}"#;
+        assert_eq!(
+            parse_resolved_room(body).as_deref(),
+            Some("!portal:example.org")
+        );
+    }
+
+    #[test]
+    fn parse_resolved_room_is_none_when_no_dm_yet() {
+        // A valid identifier with no portal yet: `dm_room_mxid` null / absent → None
+        // (the caller then calls `create_dm`).
+        let null_body = r#"{"id":"x","name":"Alice","dm_room_mxid":null}"#;
+        assert_eq!(parse_resolved_room(null_body), None);
+        let absent_body = r#"{"id":"x","name":"Alice"}"#;
+        assert_eq!(parse_resolved_room(absent_body), None);
+    }
+
+    #[test]
+    fn parse_resolved_room_is_none_for_empty_room_id() {
+        // `create_dm` returning an empty room id is a protocol violation the caller
+        // maps to an error (never open a blank room).
+        let empty_body = r#"{"dm_room_mxid":""}"#;
+        assert_eq!(parse_resolved_room(empty_body), None);
+        let blank_body = r#"{"dm_room_mxid":"   "}"#;
+        assert_eq!(parse_resolved_room(blank_body), None);
+    }
+
+    #[test]
+    fn parse_resolved_room_is_none_for_unparseable_body() {
+        assert_eq!(parse_resolved_room("{ not json"), None);
+    }
+
+    #[test]
+    fn encode_identifier_segment_escapes_reserved_and_leaves_unreserved() {
+        // A phone number's `+` and a username's `@` must be percent-encoded so they
+        // stay inside the single path segment.
+        assert_eq!(encode_identifier_segment("+15551234567"), "%2B15551234567");
+        assert_eq!(
+            encode_identifier_segment("@user:example.org"),
+            "%40user%3Aexample.org"
+        );
+        // Unreserved chars (alphanumerics + `-._~`) pass through unescaped.
+        assert_eq!(
+            encode_identifier_segment("alice-bob_1.0~"),
+            "alice-bob_1.0~"
+        );
+        // A slash can never split the segment.
+        assert_eq!(encode_identifier_segment("a/b"), "a%2Fb");
+        // Spaces and non-ASCII are escaped.
+        assert_eq!(encode_identifier_segment("a b"), "a%20b");
     }
 
     #[test]

@@ -1676,6 +1676,104 @@ impl AccountManager {
         Ok(room.room_id().to_string())
     }
 
+    /// The data-driven new-chat resolve capability for `network_id` (Story 6.6,
+    /// FR-32): a pure projection of `resolve-support.json` (override-or-default) into
+    /// a [`crate::vm::ResolveSupportVm`]. Account-agnostic and I/O-free — the frontend
+    /// disables the identifier field upfront when `supported` is `false`, before any
+    /// resolve call. A malformed embedded data file surfaces [`BridgeError::Data`].
+    pub fn bridge_resolve_support(
+        &self,
+        network_id: &str,
+    ) -> Result<crate::vm::ResolveSupportVm, CoreError> {
+        let support = crate::bridges::data::resolve_support()?.support_for(network_id);
+        Ok(crate::vm::ResolveSupportVm {
+            network_id: network_id.to_owned(),
+            supported: support.supported,
+            identifier_hint: support.identifier_hint,
+            placeholder: support.placeholder,
+        })
+    }
+
+    /// Resolve a new-chat `identifier` on `network_id` through the bridge's
+    /// provisioning API (Story 6.6, FR-32) and return the portal room id to open.
+    ///
+    /// Reuses the [`start_bridge_login`](Self::start_bridge_login) host/token
+    /// derivation (resolved-homeserver host + port + the account's Matrix access
+    /// token as Bearer — read here, never crossing IPC) and [`Provisioning::connect`].
+    /// Then: `resolve_identifier` first (validates cheaply, may return an existing
+    /// DM); only if no DM exists yet does it `create_dm` (avoids creating a portal for
+    /// a typo'd identifier). The returned room id is opened verbatim — keeper never
+    /// scans joined rooms.
+    ///
+    /// A missing account surfaces [`BridgeError::AccountNotFound`]. A bot-only account
+    /// (`Provisioning::connect` → `Ok(None)`) surfaces an honest
+    /// [`BridgeError::Provisioning`] naming the Bridge Bot chat (no fabricated resolve
+    /// from a bot's prose). A resolve/create error surfaces the bridge's own message
+    /// verbatim so the dialog renders "Not found on {Network}" with the input retained.
+    pub async fn resolve_bridge_identifier(
+        &self,
+        account_id: &str,
+        network_id: &str,
+        identifier: &str,
+    ) -> Result<crate::vm::NewChatResolutionVm, CoreError> {
+        // Defense-in-depth at the IPC boundary: the dialog disables Start on an empty
+        // identifier (Story 6.6 I/O matrix, frontend pure validation), but guard here
+        // too so an empty path segment never reaches the bridge's `resolve_identifier`
+        // route (undefined behavior there) — honest failure over a late/undefined one.
+        if identifier.trim().is_empty() {
+            return Err(BridgeError::Provisioning("identifier is empty".to_owned()).into());
+        }
+
+        // Resolve the live client under the accounts lock (AccountNotFound on miss).
+        let client = {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(handle) => handle.client.clone(),
+                None => return Err(BridgeError::AccountNotFound(account_id.to_owned()).into()),
+            }
+        };
+
+        // Same resolved-homeserver-host + Bearer-token discipline as start_bridge_login:
+        // the provisioning API is served alongside the account's homeserver C-S API, so
+        // the probe host is the RESOLVED homeserver host (never the bare MXID
+        // server_name), and the Bearer token belongs to that homeserver. Both are read
+        // here and never leave the transport.
+        let homeserver = client.homeserver();
+        let provisioning_host = homeserver.host_str().ok_or_else(|| {
+            BridgeError::Provisioning("account homeserver has no host".to_owned())
+        })?;
+        let provisioning_host = match homeserver.port() {
+            Some(port) => format!("{provisioning_host}:{port}"),
+            None => provisioning_host.to_owned(),
+        };
+        let token = client.access_token().ok_or_else(|| {
+            BridgeError::Provisioning("account has no live access token".to_owned())
+        })?;
+
+        // Bot-only accounts have no honest structured resolve (a bot reply is prose, no
+        // room id) — surface the honest "use the Bridge Bot chat" error rather than
+        // fabricate a resolve. `Err` is a genuine transport error, surfaced verbatim.
+        let provisioning = match Provisioning::connect(&provisioning_host, &token, network_id)
+            .await?
+        {
+            Some(provisioning) => provisioning,
+            None => {
+                return Err(BridgeError::Provisioning(format!(
+                        "Starting a chat from keeper needs the provisioning API for {network_id}; open the Bridge Bot chat"
+                    ))
+                    .into());
+            }
+        };
+
+        // Two structured calls, no guessing: resolve first (may return an existing DM),
+        // create only when no DM exists yet.
+        let room_id = match provisioning.resolve_identifier(identifier).await? {
+            Some(room_id) => room_id,
+            None => provisioning.create_dm(identifier).await?,
+        };
+        Ok(crate::vm::NewChatResolutionVm { room_id })
+    }
+
     /// Resolve the account's live `Client` for a backup action, surfacing a *named*
     /// [`BackupError::Unavailable`] (→ `backupFailed`) when the account is not live
     /// — never a verification error code. Backup status is subscribed at app-shell

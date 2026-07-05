@@ -44,12 +44,14 @@ export type { MediaKindVm } from "./gen/MediaKindVm";
 export type { MediaVm } from "./gen/MediaVm";
 export type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 export type { NetworkVm } from "./gen/NetworkVm";
+export type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
 export type { PaginationState } from "./gen/PaginationState";
 export type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { ReplyPreviewVm } from "./gen/ReplyPreviewVm";
+export type { ResolveSupportVm } from "./gen/ResolveSupportVm";
 export type { RiskTier } from "./gen/RiskTier";
 export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
@@ -82,7 +84,9 @@ import type { ExportProgressVm } from "./gen/ExportProgressVm";
 import type { ExportRequestVm } from "./gen/ExportRequestVm";
 import type { InboxBatch } from "./gen/InboxBatch";
 import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
+import type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
+import type { ResolveSupportVm } from "./gen/ResolveSupportVm";
 import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { SearchFilterVm } from "./gen/SearchFilterVm";
 import type { SearchHitVm } from "./gen/SearchHitVm";
@@ -214,6 +218,43 @@ export async function cancelBridgeLogin(accountId: string, sessionId: number): P
  */
 export async function bridgeBotRoom(accountId: string, networkId: string): Promise<string> {
   return await invoke<string>("bridge_bot_room", { accountId, networkId });
+}
+
+/**
+ * Fetch the data-driven new-chat resolve capability for `networkId` (FR-32, Story
+ * 6.6). A one-shot, I/O-free read of the embedded `resolve-support.json`
+ * (override-or-default), projected into a {@link ResolveSupportVm}. The new-chat
+ * dialog disables the identifier field and shows "not supported on {Network}" upfront
+ * when `supported` is `false`, before any resolve call. The `identifierHint` /
+ * `placeholder` copy is authored in the backend data file — never hardcoded here.
+ * Rejects with the {@link IpcError} envelope (`code: "internal"`) only if the embedded
+ * data fails to parse or validate.
+ */
+export async function bridgeResolveSupport(networkId: string): Promise<ResolveSupportVm> {
+  return await invoke<ResolveSupportVm>("bridge_resolve_support", { networkId });
+}
+
+/**
+ * Resolve a new-chat `identifier` on `networkId` through the bridge's provisioning
+ * API (FR-32, Story 6.6) and resolve with the portal {@link NewChatResolutionVm} to
+ * open. The Rust core connects the provisioning transport (Matrix access token as
+ * Bearer, read in Rust and never crossing IPC), calls `resolve_identifier` then
+ * `create_dm` only if no DM exists yet, and returns only the non-secret room id —
+ * opened verbatim via `roomsStore.selectRoom`. Rejects with the {@link IpcError}
+ * envelope: an unknown account → `internal`; a bot-only account or an unresolvable
+ * identifier → `syncUnavailable` (retriable) carrying the bridge's own verbatim
+ * message, so the dialog can render "Not found on {Network}" and retain the input.
+ */
+export async function resolveBridgeIdentifier(
+  accountId: string,
+  networkId: string,
+  identifier: string,
+): Promise<NewChatResolutionVm> {
+  return await invoke<NewChatResolutionVm>("resolve_bridge_identifier", {
+    accountId,
+    networkId,
+    identifier,
+  });
 }
 
 /**

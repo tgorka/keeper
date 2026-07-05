@@ -1532,6 +1532,44 @@ pub struct BridgeDiscoveryVm {
     pub networks: Vec<DiscoveredBridgeVm>,
 }
 
+/// The data-driven new-chat resolve capability for one Network (Story 6.6, FR-32).
+///
+/// A pure projection of `resolve-support.json` (override-or-default) for a selected
+/// network: whether starting a chat by resolving an identifier is `supported`, the
+/// identifier-field `identifier_hint`, and its `placeholder`. `supported: false`
+/// disables the identifier field and shows the "not supported on {Network}" copy
+/// **before** any network I/O. All capability/hint copy is data, never hardcoded in
+/// TypeScript or Rust. Carries no session material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ResolveSupportVm {
+    /// The stable network identifier this capability was resolved for.
+    pub network_id: String,
+    /// Whether resolving an identifier to start a chat is supported here.
+    pub supported: bool,
+    /// The identifier-field hint copy (also carries the "not supported" copy when
+    /// `supported` is `false`).
+    pub identifier_hint: String,
+    /// The identifier-field placeholder copy (empty for an unsupported network).
+    pub placeholder: String,
+}
+
+/// The result of resolving a new-chat identifier through the bridge (Story 6.6,
+/// FR-32).
+///
+/// Carries only the non-secret portal `room_id` the frontend opens verbatim via
+/// `roomsStore.selectRoom`. The account's Matrix access token is used only as an HTTP
+/// Bearer header inside the provisioning transport and **never** appears here — no
+/// token, cookie, or session material crosses IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NewChatResolutionVm {
+    /// The resolved portal room id to open (opened verbatim, never inferred).
+    pub room_id: String,
+}
+
 /// The live connection health of a bridged session (Story 6.5, FR-28, NFR-6,
 /// UX-DR8/UX-DR11).
 ///
@@ -1880,6 +1918,46 @@ mod tests {
         assert!(!json.contains("@"), "json leaked an mxid: {json}");
         let back: BridgeDiscoveryVm =
             serde_json::from_str(&json).expect("deserialize discovery vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn resolve_support_vm_round_trips_camel_case() {
+        let vm = ResolveSupportVm {
+            network_id: "whatsapp".to_owned(),
+            supported: true,
+            identifier_hint: "Phone number in international format".to_owned(),
+            placeholder: "+1 555 123 4567".to_owned(),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize resolve support vm");
+        assert!(
+            json.contains("\"networkId\":\"whatsapp\""),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"supported\":true"), "json was: {json}");
+        assert!(json.contains("\"identifierHint\":"), "json was: {json}");
+        assert!(json.contains("\"placeholder\":"), "json was: {json}");
+        // No token/session material is present on the VM.
+        assert!(!json.contains("token"), "json leaked a token field: {json}");
+        let back: ResolveSupportVm =
+            serde_json::from_str(&json).expect("deserialize resolve support vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn new_chat_resolution_vm_round_trips_camel_case() {
+        let vm = NewChatResolutionVm {
+            room_id: "!portal:example.org".to_owned(),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize new chat resolution vm");
+        assert!(
+            json.contains("\"roomId\":\"!portal:example.org\""),
+            "json was: {json}"
+        );
+        // Only the room id crosses the wire — no token/session material.
+        assert!(!json.contains("token"), "json leaked a token field: {json}");
+        let back: NewChatResolutionVm =
+            serde_json::from_str(&json).expect("deserialize new chat resolution vm");
         assert_eq!(back, vm);
     }
 
