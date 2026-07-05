@@ -1,16 +1,23 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { BridgeCard } from "@/components/bridges/bridge-card";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { BadgeStyle, BridgeNetworkVm, BridgeStatus, RiskTier } from "@/lib/ipc/client";
+import { primaryViewStore } from "@/lib/stores/primary-view";
+import { roomsStore } from "@/lib/stores/rooms";
 
 // The login Sheet opened on proceed calls the streaming IPC client on mount; stub
 // it so the card tests never touch a real Tauri channel. A never-resolving start
-// keeps the Sheet in its initial waiting state.
+// keeps the Sheet in its initial waiting state. `bridgeBotRoom` is mocked so the
+// Manage → Open Bridge Bot chat action resolves a room id without a real Tauri call.
+const bridgeBotRoomMock = vi.fn((_accountId: string, _networkId: string) =>
+  Promise.resolve("!bot:example.org"),
+);
 vi.mock("@/lib/ipc/client", () => ({
   startBridgeLogin: vi.fn(() => new Promise<number>(() => {})),
   submitBridgeLogin: vi.fn(() => Promise.resolve()),
   cancelBridgeLogin: vi.fn(() => Promise.resolve()),
+  bridgeBotRoom: (...args: [string, string]) => bridgeBotRoomMock(...args),
 }));
 
 const ACCOUNT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -52,6 +59,13 @@ function renderCard(vm: BridgeNetworkVm, status: BridgeStatus = "configured") {
 }
 
 describe("BridgeCard", () => {
+  beforeEach(() => {
+    bridgeBotRoomMock.mockClear();
+    // Reset the shared navigation stores so each assertion starts from a known state.
+    primaryViewStore.getState().setView("bridges");
+    roomsStore.getState().selectRoom(null);
+  });
+
   it("renders the network name, glyph, and its data-driven risk-tier badge", () => {
     renderCard(network());
     expect(screen.getByText("Matrix")).toBeInTheDocument();
@@ -138,6 +152,30 @@ describe("BridgeCard", () => {
 
     await waitFor(() => {
       expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    });
+  });
+
+  it("Manage → Open Bridge Bot chat resolves the room and navigates to it", async () => {
+    renderCard(network());
+    // Radix DropdownMenu opens on pointer-down (not `click`) in jsdom.
+    const trigger = screen.getByRole("button", { name: "Manage Matrix" });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    fireEvent.pointerUp(trigger, { button: 0 });
+
+    const menu = await screen.findByRole("menu");
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Open Bridge Bot chat" }));
+
+    // The escape hatch resolves the bot DM for this account × network …
+    await waitFor(() => {
+      expect(bridgeBotRoomMock).toHaveBeenCalledWith(ACCOUNT_ID, "matrix");
+    });
+    // … then navigates: primary view → Inbox and the resolved room selected.
+    await waitFor(() => {
+      expect(primaryViewStore.getState().view).toBe("inbox");
+      expect(roomsStore.getState().selected).toEqual({
+        accountId: ACCOUNT_ID,
+        roomId: "!bot:example.org",
+      });
     });
   });
 });

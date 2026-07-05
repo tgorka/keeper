@@ -381,6 +381,18 @@ pub enum BridgeError {
     /// `IpcErrorCode::SyncUnavailable`.
     #[error("bridge login failed: {0}")]
     Provisioning(String),
+
+    /// A bridge login driven over the raw Bridge Bot chat (Story 6.4, FR-27,
+    /// AD-16) failed: the bot MXID/room could not be resolved or created, a
+    /// command send failed, the bot did not reply within the timeout, or the
+    /// bot's reply could not be classified into a known login step. The wrapped
+    /// string is a non-secret description — the bot's own reply rendered
+    /// verbatim (length-capped, like the provisioning cap), never the account's
+    /// Matrix access token or any session/cookie material. Retriable — the user
+    /// can retry the login. Maps to `IpcErrorCode::SyncUnavailable`, mirroring
+    /// [`BridgeError::Provisioning`].
+    #[error("bridge login failed: {0}")]
+    Bot(String),
 }
 
 /// The hexagon error root. Every fallible core operation surfaces one of these.

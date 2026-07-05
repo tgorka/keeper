@@ -52,6 +52,23 @@ pub fn resolve_candidates(server: &str, doc: &data::ProvisioningDoc) -> Vec<Stri
         .collect()
 }
 
+/// Classify the "no candidate connected" outcome of the base-URL probe (pure,
+/// unit-tested): if any resolved candidate answered with a genuine server error
+/// (`saw_transport_error`), that is a real transport failure surfaced as
+/// [`BridgeError::Provisioning`] (`Err`); otherwise every candidate was simply
+/// absent / unauthenticated, so there is no provisioning API here — `Ok(())` (the
+/// caller maps this to `Ok(None)` and falls back to the Bridge Bot driver). The
+/// `network` name is woven into the honest error copy.
+fn classify_no_connection(saw_transport_error: bool, network: &str) -> Result<(), BridgeError> {
+    if saw_transport_error {
+        Err(BridgeError::Provisioning(format!(
+            "Couldn't reach a provisioning API for {network}."
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 /// The bridgev2 `GET /v3/login/flows` response shape.
 #[derive(Debug, Deserialize)]
 struct FlowsResponse {
@@ -78,16 +95,31 @@ impl Provisioning {
     /// Probe the ordered candidate base URLs for `server` and connect to the first
     /// whose `…/v3/login/flows` authenticates with `token`.
     ///
-    /// Returns [`BridgeError::Provisioning`] if no candidate authenticates (the
-    /// bridge exposes no provisioning API keeper can reach). The `network` name is
-    /// woven into that message so the failure copy is honest per-network.
-    pub async fn connect(server: &str, token: &str, network: &str) -> Result<Self, BridgeError> {
+    /// Three outcomes (Story 6.4): `Ok(Some(_))` = a candidate authenticated and
+    /// this transport is bound to it; `Ok(None)` = no candidate resolved a
+    /// provisioning base URL at all (the bridge exposes no provisioning API keeper
+    /// can reach), which the caller treats as the signal to fall back to the Bridge
+    /// Bot driver; `Err(_)` = a genuine transport error on a resolved candidate (a
+    /// reachable endpoint that failed for a real reason), which the caller surfaces
+    /// rather than silently falling back. The `network` name is woven into any
+    /// message so the copy is honest per-network.
+    pub async fn connect(
+        server: &str,
+        token: &str,
+        network: &str,
+    ) -> Result<Option<Self>, BridgeError> {
         let doc = data::provisioning()?;
         let candidates = resolve_candidates(server, doc);
         let http = reqwest::Client::builder()
             .timeout(SHORT_TIMEOUT)
             .build()
             .map_err(|e| BridgeError::Provisioning(format!("could not build HTTP client: {e}")))?;
+
+        // Track the strongest signal seen so probe outcomes classify honestly: a
+        // reachable-but-failing candidate (e.g. a 5xx from the provisioning app) is a
+        // real error, whereas every candidate being merely absent/unauthenticated is
+        // "no provisioning API" → bot fallback (`Ok(None)`).
+        let mut saw_transport_error = false;
 
         for base in &candidates {
             let url = format!("{base}/v3/login/flows");
@@ -101,25 +133,37 @@ impl Provisioning {
                         }
                     };
                     tracing::info!(base = %base, network = %network, "provisioning base URL resolved");
-                    return Ok(Self {
+                    return Ok(Some(Self {
                         http,
                         base_url: base.clone(),
                         token: token.to_owned(),
                         flows,
-                    });
+                    }));
                 }
                 Ok(resp) => {
+                    // A resolved endpoint that answered with a server error (5xx) is a
+                    // genuine transport failure, not an "endpoint absent" — distinguish
+                    // it so it never masquerades as bot-fallback. An auth/4xx answer is
+                    // the ordinary "not a provisioning API here" case that degrades.
+                    if resp.status().is_server_error() {
+                        saw_transport_error = true;
+                    }
                     tracing::debug!(base = %base, status = %resp.status(), "provisioning candidate did not authenticate; trying next");
                 }
                 Err(e) => {
+                    // A per-candidate transport error (connect/DNS/TLS/timeout) is
+                    // expected when a candidate host simply doesn't exist under this
+                    // deployment; it degrades to the next candidate and, if nothing
+                    // resolves, to the bot fallback (`Ok(None)`).
                     tracing::debug!(base = %base, error = %e, "provisioning candidate unreachable; trying next");
                 }
             }
         }
 
-        Err(BridgeError::Provisioning(format!(
-            "Couldn't reach a provisioning API for {network}."
-        )))
+        match classify_no_connection(saw_transport_error, network) {
+            Ok(()) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// POST a login-step body and parse the next [`LoginStepResponse`]. A non-2xx
@@ -304,6 +348,25 @@ mod tests {
                 .any(|c| c == "https://keeper.test/_matrix/provision"),
             "resolved candidates were: {resolved:?}"
         );
+    }
+
+    #[test]
+    fn no_connection_without_transport_error_degrades_to_bot_fallback() {
+        // Every candidate merely absent / unauthenticated → no provisioning API here,
+        // so the caller should fall back to the bot driver (`Ok(())` → `Ok(None)`).
+        assert!(classify_no_connection(false, "whatsapp").is_ok());
+    }
+
+    #[test]
+    fn no_connection_with_transport_error_is_a_real_failure() {
+        // A resolved candidate answered with a server error — a genuine transport
+        // failure that must surface, never a silent bot fallback.
+        match classify_no_connection(true, "whatsapp") {
+            Err(BridgeError::Provisioning(msg)) => {
+                assert!(msg.contains("whatsapp"), "message names the network: {msg}");
+            }
+            other => panic!("expected a Provisioning error, got: {other:?}"),
+        }
     }
 
     #[test]

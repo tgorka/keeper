@@ -2,6 +2,8 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BridgeLoginSheet } from "@/components/bridges/bridge-login-sheet";
 import type { BridgeLoginVm } from "@/lib/ipc/client";
+import { primaryViewStore } from "@/lib/stores/primary-view";
+import { roomsStore } from "@/lib/stores/rooms";
 
 // Drive the Sheet through the hook seam: the mock lets each test hand the Sheet a
 // specific phase VM and capture the start/submit/cancel calls the Sheet makes.
@@ -14,6 +16,15 @@ const hookState = {
 
 vi.mock("@/hooks/use-bridge-login", () => ({
   useBridgeLogin: () => hookState,
+}));
+
+// The failure-state escape hatch calls `bridgeBotRoom`; mock it so the test resolves
+// a room id without a real Tauri call.
+const bridgeBotRoomMock = vi.fn((_accountId: string, _networkId: string) =>
+  Promise.resolve("!bot:example.org"),
+);
+vi.mock("@/lib/ipc/client", () => ({
+  bridgeBotRoom: (...args: [string, string]) => bridgeBotRoomMock(...args),
 }));
 
 const ACCOUNT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -49,6 +60,9 @@ beforeEach(() => {
   hookState.start.mockClear();
   hookState.submit.mockClear();
   hookState.cancel.mockClear();
+  bridgeBotRoomMock.mockClear();
+  primaryViewStore.getState().setView("bridges");
+  roomsStore.getState().selectRoom(null);
 });
 
 afterEach(() => {
@@ -223,6 +237,28 @@ describe("BridgeLoginSheet", () => {
     expect(hookState.start.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("failure offers the Bridge Bot escape hatch that navigates and closes the Sheet", async () => {
+    const onOpenChange = vi.fn();
+    hookState.vm = baseVm({ phase: "failure", error: "M_FORBIDDEN: already linked" });
+    renderSheet(onOpenChange);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Bridge Bot chat" }));
+
+    // Resolves the bot DM for this account × network …
+    await waitFor(() => {
+      expect(bridgeBotRoomMock).toHaveBeenCalledWith(ACCOUNT_ID, "whatsapp");
+    });
+    // … then navigates (Inbox + selected room) and closes the Sheet.
+    await waitFor(() => {
+      expect(primaryViewStore.getState().view).toBe("inbox");
+      expect(roomsStore.getState().selected).toEqual({
+        accountId: ACCOUNT_ID,
+        roomId: "!bot:example.org",
+      });
+      expect(onOpenChange).toHaveBeenCalledWith(false);
+    });
+  });
+
   it("the unsupported-method failure names the Bridge Bot chat honestly (no webview)", () => {
     hookState.vm = baseVm({
       phase: "failure",
@@ -230,7 +266,10 @@ describe("BridgeLoginSheet", () => {
         "This network needs browser sign-in, which keeper can't do natively yet. You can still log in from the Bridge Bot chat.",
     });
     renderSheet();
-    expect(screen.getByText(/Bridge Bot chat/)).toBeInTheDocument();
+    // The verbatim error copy itself names the Bridge Bot chat (scoped to the error
+    // slot so it isn't confused with the "Open Bridge Bot chat" escape-hatch button).
+    const errorText = document.querySelector('[data-slot="bridge-login-error"]');
+    expect(errorText).toHaveTextContent(/Bridge Bot chat/);
     // No embedded webview / iframe is ever rendered for an unsupported method.
     expect(document.querySelector("iframe")).toBeNull();
   });

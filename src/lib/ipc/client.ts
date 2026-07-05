@@ -200,6 +200,19 @@ export async function cancelBridgeLogin(accountId: string, sessionId: number): P
 }
 
 /**
+ * Resolve-or-create the Bridge Bot DM room for `networkId` (FR-27, UX-DR19, Story
+ * 6.4) and resolve with its room id — the manual escape hatch to the raw Bridge Bot
+ * chat, offered from the card Manage menu and a login failure. The frontend
+ * navigates to it via `primaryViewStore.setView("inbox")` + `roomsStore.selectRoom`.
+ * Rejects with the {@link IpcError} envelope: an unknown account → `internal`; an
+ * unresolvable / uncreatable bot DM → `syncUnavailable` (retriable). No bot Matrix ID
+ * or session material crosses IPC — only the room id.
+ */
+export async function bridgeBotRoom(accountId: string, networkId: string): Promise<string> {
+  return await invoke<string>("bridge_bot_room", { accountId, networkId });
+}
+
+/**
  * Password login (FR-1, FR-5). Sends the homeserver, username, and password to
  * the Rust core, which runs the store-less SSS probe, logs in, persists the
  * session to the Keychain, and writes the account registry row. Resolves with

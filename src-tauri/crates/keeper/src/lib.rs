@@ -51,6 +51,7 @@ pub fn run() {
             ipc::bridge_login_start,
             ipc::bridge_login_submit,
             ipc::bridge_login_cancel,
+            ipc::bridge_bot_room,
             ipc::demo_subscribe,
             ipc::login_password,
             ipc::login_oidc,

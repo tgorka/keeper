@@ -324,6 +324,11 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         // Retriable: the login Sheet offers Retry. The message is the bridge's own
         // verbatim text.
         CoreError::Bridge(BridgeError::Provisioning(_)) => (IpcErrorCode::SyncUnavailable, true),
+        // A Bridge Bot fallback-login failure (Story 6.4) — the bot didn't respond,
+        // its reply couldn't be classified, or the bot DM couldn't be resolved.
+        // Retriable, mirroring the provisioning arm: the login Sheet offers Retry and
+        // the message is the bot's own verbatim text.
+        CoreError::Bridge(BridgeError::Bot(_)) => (IpcErrorCode::SyncUnavailable, true),
     };
     IpcError {
         code,
@@ -483,6 +488,25 @@ pub async fn bridge_login_cancel(
         .cancel_bridge_login(&account_id, session_id)
         .await;
     Ok(())
+}
+
+/// Resolve-or-create the Bridge Bot DM room for `network_id` (Story 6.4, FR-27,
+/// UX-DR19) and return its room id, so the frontend can navigate straight to the raw
+/// Bridge Bot chat — the manual escape hatch offered from the card Manage menu and a
+/// login failure. An unknown account funnels through [`to_ipc_error`] (`internal`); an
+/// unresolvable / uncreatable bot DM funnels to `syncUnavailable` (retriable). No bot
+/// MXID or session material crosses IPC — only the non-secret room id.
+#[tauri::command]
+pub async fn bridge_bot_room(
+    state: State<'_, AppState>,
+    account_id: String,
+    network_id: String,
+) -> Result<String, IpcError> {
+    state
+        .accounts
+        .bridge_bot_room(&account_id, &network_id)
+        .await
+        .map_err(to_ipc_error)
 }
 
 /// Open the demo subscription. Emits the snapshot-then-diff batches produced by

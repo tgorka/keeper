@@ -27,6 +27,7 @@ use serde::Deserialize;
 
 use crate::error::BridgeError;
 
+pub mod bot;
 pub mod provisioning;
 
 /// One login method the bridge offers (a bridgev2 login flow descriptor).

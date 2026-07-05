@@ -14,6 +14,7 @@
  * which drives the provisioning login state machine natively.
  */
 import { useState } from "react";
+import { toast } from "sonner";
 import { BridgeLoginSheet } from "@/components/bridges/bridge-login-sheet";
 import {
   AlertDialog,
@@ -29,8 +30,17 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { BRIDGE_STATUS_LABEL } from "@/lib/bridges";
 import type { BadgeStyle, BridgeNetworkVm, BridgeStatus } from "@/lib/ipc/client";
+import { bridgeBotRoom } from "@/lib/ipc/client";
+import { primaryViewStore } from "@/lib/stores/primary-view";
+import { roomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
 
 /** The shadcn Badge variant + `--bridge-*` tint for each backend badge style. */
@@ -87,6 +97,21 @@ export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
     proceed();
   };
 
+  // The manual escape hatch (UX-DR19): resolve-or-create the raw Bridge Bot DM room
+  // and navigate straight to it (Inbox + select the room), keeping the bot reachable
+  // even when native login isn't possible. A resolve failure is logged, not thrown —
+  // the menu action is best-effort and must never crash the card.
+  const openBotChat = async () => {
+    try {
+      const roomId = await bridgeBotRoom(accountId, network.networkId);
+      primaryViewStore.getState().setView("inbox");
+      roomsStore.getState().selectRoom({ accountId, roomId });
+    } catch (error) {
+      console.error("could not open the Bridge Bot chat", error);
+      toast.error("Couldn't open the Bridge Bot chat. Try again.");
+    }
+  };
+
   const tierBadge = (
     <Badge variant={badge.variant} className={badge.className}>
       {network.tierLabel}
@@ -133,6 +158,22 @@ export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
       >
         {actionLabel}
       </Button>
+
+      {/* Manage menu (UX-DR19): for now its only item is the manual escape hatch to
+          the raw Bridge Bot chat; Re-link / Log out / View sessions arrive with
+          Stories 6.5/6.6. */}
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button type="button" size="sm" variant="ghost" aria-label={`Manage ${network.name}`}>
+            Manage
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem onSelect={() => void openBotChat()}>
+            Open Bridge Bot chat
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
 
       {network.requiresAck && (
         <AlertDialog open={ackOpen} onOpenChange={setAckOpen}>

@@ -98,7 +98,7 @@ development_status:
   6-1-bridges-surface-with-data-driven-risk-tiers: done
   6-2-bridge-discovery: done
   6-3-native-bridge-login-via-provisioning-api: done
-  6-4-bridge-bot-fallback-driver: backlog
+  6-4-bridge-bot-fallback-driver: done
   6-5-bridge-session-health-and-re-login-prompts: backlog
   6-6-start-new-chats-via-bridge: backlog
   6-7-bbctl-integration-for-beeper-self-hosted-bridges: backlog

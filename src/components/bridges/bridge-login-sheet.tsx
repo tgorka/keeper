@@ -23,6 +23,7 @@
  * Rust core produced — never a JS QR lib, never `dangerouslySetInnerHTML`.
  */
 import { useEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
@@ -38,6 +39,9 @@ import {
 import { useBridgeLogin } from "@/hooks/use-bridge-login";
 import { BRIDGE_LOGIN_PHASE_LABEL } from "@/lib/bridges";
 import type { BridgeLoginVm, LoginFieldVm } from "@/lib/ipc/client";
+import { bridgeBotRoom } from "@/lib/ipc/client";
+import { primaryViewStore } from "@/lib/stores/primary-view";
+import { roomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
 
 /** How long "Linked ✓" shows before the Sheet auto-advances (ms). */
@@ -110,10 +114,13 @@ export function BridgeLoginSheet({
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
           <BridgeLoginBody
             vm={vm}
+            accountId={accountId}
+            networkId={networkId}
             networkName={networkName}
             onChooseFlow={(flowId) => submit({ kind: "chooseFlow", flowId })}
             onSubmitFields={(values) => submit({ kind: "fields", values })}
             onRetry={start}
+            onClose={() => onOpenChange(false)}
           />
         </div>
       </SheetContent>
@@ -123,18 +130,24 @@ export function BridgeLoginSheet({
 
 interface BridgeLoginBodyProps {
   vm: BridgeLoginVm | null;
+  accountId: string;
+  networkId: string;
   networkName: string;
   onChooseFlow: (flowId: string) => void;
   onSubmitFields: (values: Record<string, string>) => void;
   onRetry: () => void;
+  onClose: () => void;
 }
 
 function BridgeLoginBody({
   vm,
+  accountId,
+  networkId,
   networkName,
   onChooseFlow,
   onSubmitFields,
   onRetry,
+  onClose,
 }: BridgeLoginBodyProps) {
   if (vm === null) {
     return <WaitingPanel instruction="Connecting…" />;
@@ -168,7 +181,15 @@ function BridgeLoginBody({
     case "success":
       return <SuccessPanel networkName={networkName} />;
     case "failure":
-      return <FailurePanel vm={vm} onRetry={onRetry} />;
+      return (
+        <FailurePanel
+          vm={vm}
+          accountId={accountId}
+          networkId={networkId}
+          onRetry={onRetry}
+          onClose={onClose}
+        />
+      );
     default:
       return null;
   }
@@ -348,7 +369,34 @@ function SuccessPanel({ networkName }: { networkName: string }) {
   );
 }
 
-function FailurePanel({ vm, onRetry }: { vm: BridgeLoginVm; onRetry: () => void }) {
+function FailurePanel({
+  vm,
+  accountId,
+  networkId,
+  onRetry,
+  onClose,
+}: {
+  vm: BridgeLoginVm;
+  accountId: string;
+  networkId: string;
+  onRetry: () => void;
+  onClose: () => void;
+}) {
+  // The manual escape hatch (UX-DR19): resolve-or-create the raw Bridge Bot DM room,
+  // navigate to it (Inbox + select the room), and close the Sheet. A resolve failure
+  // is logged, not thrown — the button is best-effort and must never crash the Sheet.
+  const openBotChat = async () => {
+    try {
+      const roomId = await bridgeBotRoom(accountId, networkId);
+      primaryViewStore.getState().setView("inbox");
+      roomsStore.getState().selectRoom({ accountId, roomId });
+      onClose();
+    } catch (error) {
+      console.error("could not open the Bridge Bot chat", error);
+      toast.error("Couldn't open the Bridge Bot chat. Try again.");
+    }
+  };
+
   return (
     <div className="flex flex-col gap-4" data-slot="bridge-login-failure">
       {/* The bridge's own error message, verbatim — keeper never rewrites it. */}
@@ -357,6 +405,10 @@ function FailurePanel({ vm, onRetry }: { vm: BridgeLoginVm; onRetry: () => void 
       </p>
       <Button type="button" variant="outline" onClick={onRetry}>
         Retry
+      </Button>
+      {/* The raw Bridge Bot chat stays reachable as the manual escape hatch. */}
+      <Button type="button" variant="ghost" onClick={() => void openBotChat()}>
+        Open Bridge Bot chat
       </Button>
     </div>
   );

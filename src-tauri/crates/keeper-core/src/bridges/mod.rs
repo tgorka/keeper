@@ -16,8 +16,91 @@ pub mod transport;
 
 pub use discovery::discover;
 
+use matrix_sdk::ruma::{OwnedUserId, UserId};
+use matrix_sdk::{Client, Room};
+
 use crate::error::BridgeError;
 use crate::vm::BridgeNetworkVm;
+
+/// Resolve the Bridge Bot MXID for `network_id` on the account's own server (Story
+/// 6.4, FR-27). Builds `@{localpart}:{server_name}` from the first `known-bots.json`
+/// localpart for the network, using the account's Matrix `server_name` (a Matrix
+/// user id — `server_name` is correct here, unlike 6.3's resolved HTTP host).
+///
+/// Returns [`BridgeError::Bot`] when the account has no user id, the network has no
+/// known-bot entry, or the composed MXID is malformed — the caller surfaces it
+/// (no silent bot fallback to an unknown bot).
+pub fn resolve_bot_mxid(client: &Client, network_id: &str) -> Result<OwnedUserId, BridgeError> {
+    let own_user = client.user_id().ok_or_else(|| {
+        BridgeError::Bot("account has no resolved user id (not logged in?)".to_owned())
+    })?;
+    let server_name = own_user.server_name();
+    let known = data::known_bots()?;
+    let entry = known
+        .bots
+        .iter()
+        .find(|b| b.network_id == network_id)
+        .ok_or_else(|| {
+            BridgeError::Bot(format!(
+                "no known Bridge Bot for {network_id} to fall back to"
+            ))
+        })?;
+    // The registry guarantees ≥1 non-empty localpart (validated on load).
+    let localpart = entry.localparts.first().ok_or_else(|| {
+        BridgeError::Bot(format!("no known Bridge Bot localpart for {network_id}"))
+    })?;
+    let mxid = format!("@{localpart}:{server_name}");
+    OwnedUserId::try_from(mxid.as_str())
+        .map_err(|e| BridgeError::Bot(format!("could not build the Bridge Bot MXID: {e}")))
+}
+
+/// Resolve-or-create the Bridge Bot DM `Room` for `network_id` on the account's
+/// `client` (Story 6.4, FR-27, UX-DR19), returning the room and the bot's MXID.
+///
+/// Reuses the discovery DM-scan pattern: find an existing direct room among
+/// `client.joined_rooms()` whose target is the bot MXID; otherwise create one via
+/// `client.create_dm`. Shared by `BotDriver` construction and the `bridge_bot_room`
+/// command. Returns [`BridgeError::Bot`] when the bot is unresolvable or the DM can't
+/// be created.
+pub async fn resolve_bot_room(
+    client: &Client,
+    network_id: &str,
+) -> Result<(Room, OwnedUserId), BridgeError> {
+    let bot_mxid = resolve_bot_mxid(client, network_id)?;
+    if let Some(room) = find_bot_dm(client, &bot_mxid).await {
+        return Ok((room, bot_mxid));
+    }
+    let room = client
+        .create_dm(&bot_mxid)
+        .await
+        .map_err(|e| BridgeError::Bot(format!("could not open a chat with the Bridge Bot: {e}")))?;
+    Ok((room, bot_mxid))
+}
+
+/// Find an existing direct room whose target is `bot_mxid` among the account's
+/// joined rooms (best-effort — a store error reading directness is logged and the
+/// room skipped, mirroring discovery's DM scan).
+async fn find_bot_dm(client: &Client, bot_mxid: &UserId) -> Option<Room> {
+    for room in client.joined_rooms() {
+        match room.is_direct().await {
+            Ok(true) => {
+                if room
+                    .direct_targets()
+                    .iter()
+                    .filter_map(|t| t.as_user_id())
+                    .any(|user_id| user_id == bot_mxid)
+                {
+                    return Some(room);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, "bot-room resolve: could not read room directness; skipping");
+            }
+        }
+    }
+    None
+}
 
 /// Build the flat bridge catalog from the embedded risk-tier data.
 ///

@@ -27,6 +27,8 @@ const COUPLING_CAVEATS_VERSION: u32 = 1;
 const KNOWN_BOTS_VERSION: u32 = 1;
 /// The schema `version` for `provisioning.json`.
 const PROVISIONING_VERSION: u32 = 1;
+/// The schema `version` for `bot-commands.json`.
+const BOT_COMMANDS_VERSION: u32 = 1;
 
 /// The raw `risk-tiers.json` document.
 #[derive(Debug, Deserialize)]
@@ -124,6 +126,51 @@ pub struct ProvisioningDoc {
     pub candidates: Vec<String>,
 }
 
+/// The raw `bot-commands.json` document (consumed by Story 6.4's `BotDriver`).
+///
+/// The data-driven Bridge Bot login protocol: a `default` [`BotProtocol`]
+/// (login/cancel command strings) every bridgev2 bot works with, plus optional
+/// per-network overrides keyed by `networkId`. The command knowledge lives in
+/// versioned data (never hardcoded in the transport), so tuning a bot's grammar
+/// needs no code change. The schema MAY later carry list-logins / logout / relay
+/// command strings as *data* (no code) when Stories 6.5/6.6 add those trait
+/// methods — this build reads only login/cancel.
+#[derive(Debug, Deserialize)]
+pub struct BotCommandsDoc {
+    /// The data-file schema version (`1`); checked by [`validate_bot_commands`].
+    pub version: u32,
+    /// The fallback command protocol every bridgev2 bot works with.
+    pub default: BotProtocol,
+    /// Optional per-network command overrides (empty when every bot uses the
+    /// default). Absent in the JSON → an empty list.
+    #[serde(default)]
+    pub overrides: Vec<BotProtocolOverride>,
+}
+
+/// One per-network override row in `bot-commands.json`: the `networkId` it
+/// applies to plus its command [`BotProtocol`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BotProtocolOverride {
+    /// The network id these commands apply to.
+    pub network_id: String,
+    /// The command protocol for this network.
+    #[serde(flatten)]
+    pub protocol: BotProtocol,
+}
+
+/// The Bridge Bot command strings for one network (or the default). The commands
+/// are sent verbatim as bot chat messages by the `BotDriver`; a leading `!` (the
+/// mautrix bot prefix) is NOT assumed here — the data carries the exact string.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BotProtocol {
+    /// The command that starts a login (e.g. `login`).
+    pub login_command: String,
+    /// The command that cancels an in-progress login (e.g. `cancel`).
+    pub cancel_command: String,
+}
+
 /// The compiled-in `risk-tiers.json` bytes.
 const RISK_TIERS_JSON: &str = include_str!("../../data/risk-tiers.json");
 /// The compiled-in `coupling-caveats.json` bytes.
@@ -132,6 +179,8 @@ const COUPLING_CAVEATS_JSON: &str = include_str!("../../data/coupling-caveats.js
 const KNOWN_BOTS_JSON: &str = include_str!("../../data/known-bots.json");
 /// The compiled-in `provisioning.json` bytes.
 const PROVISIONING_JSON: &str = include_str!("../../data/provisioning.json");
+/// The compiled-in `bot-commands.json` bytes.
+const BOT_COMMANDS_JSON: &str = include_str!("../../data/bot-commands.json");
 
 /// Process-wide cache for the parsed-and-validated risk tiers.
 static RISK_TIERS: OnceLock<Result<RiskTiersDoc, BridgeError>> = OnceLock::new();
@@ -141,6 +190,8 @@ static COUPLING_CAVEATS: OnceLock<Result<CouplingCaveatsDoc, BridgeError>> = Onc
 static KNOWN_BOTS: OnceLock<Result<KnownBotsDoc, BridgeError>> = OnceLock::new();
 /// Process-wide cache for the parsed-and-validated provisioning candidates.
 static PROVISIONING: OnceLock<Result<ProvisioningDoc, BridgeError>> = OnceLock::new();
+/// Process-wide cache for the parsed-and-validated bot-command protocol.
+static BOT_COMMANDS: OnceLock<Result<BotCommandsDoc, BridgeError>> = OnceLock::new();
 
 /// Convert a cached `&Result<T, BridgeError>` into a `Result<&T, BridgeError>` so
 /// callers get the shared parsed doc on success and a cloned error on failure.
@@ -191,6 +242,72 @@ pub fn provisioning() -> Result<&'static ProvisioningDoc, BridgeError> {
         Ok(doc)
     });
     as_ref_result(cached)
+}
+
+/// Parse + validate the bot-command protocol once and return the cached doc.
+pub fn bot_commands() -> Result<&'static BotCommandsDoc, BridgeError> {
+    let cached = BOT_COMMANDS.get_or_init(|| {
+        let doc: BotCommandsDoc = serde_json::from_str(BOT_COMMANDS_JSON)
+            .map_err(|e| BridgeError::Data(format!("bot-commands.json failed to parse: {e}")))?;
+        validate_bot_commands(&doc)?;
+        Ok(doc)
+    });
+    as_ref_result(cached)
+}
+
+impl BotCommandsDoc {
+    /// The command [`BotProtocol`] for `network_id`: the matching override if one
+    /// exists, else the `default` protocol (so every bridgev2 bot works without a
+    /// per-network row). Returns a clone so the caller owns a `Send` value it can
+    /// hold in a `Clone` transport.
+    pub fn protocol_for(&self, network_id: &str) -> BotProtocol {
+        self.overrides
+            .iter()
+            .find(|o| o.network_id == network_id)
+            .map(|o| o.protocol.clone())
+            .unwrap_or_else(|| self.default.clone())
+    }
+}
+
+/// Validate the bot-command protocol: the schema version must match, the default
+/// protocol must carry non-empty login/cancel commands, every override must name a
+/// non-empty network id with non-empty commands, and no override network id may
+/// repeat (a duplicate would make [`BotCommandsDoc::protocol_for`] order-dependent).
+fn validate_bot_commands(doc: &BotCommandsDoc) -> Result<(), BridgeError> {
+    if doc.version != BOT_COMMANDS_VERSION {
+        return Err(BridgeError::Data(format!(
+            "bot-commands.json unsupported version {} (expected {BOT_COMMANDS_VERSION})",
+            doc.version
+        )));
+    }
+    validate_bot_protocol(&doc.default, "default")?;
+    let mut network_ids: HashSet<&str> = HashSet::new();
+    for over in &doc.overrides {
+        if over.network_id.trim().is_empty() {
+            return Err(BridgeError::Data(
+                "bot-commands.json has an override with an empty networkId".to_owned(),
+            ));
+        }
+        validate_bot_protocol(&over.protocol, &over.network_id)?;
+        if !network_ids.insert(over.network_id.as_str()) {
+            return Err(BridgeError::Data(format!(
+                "bot-commands.json has a duplicate override networkId {:?}",
+                over.network_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A [`BotProtocol`] must carry non-empty login and cancel command strings —
+/// `who` names the offending row (`default` or a network id) for the error copy.
+fn validate_bot_protocol(protocol: &BotProtocol, who: &str) -> Result<(), BridgeError> {
+    if protocol.login_command.trim().is_empty() || protocol.cancel_command.trim().is_empty() {
+        return Err(BridgeError::Data(format!(
+            "bot-commands.json protocol {who:?} has an empty login/cancel command"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate the provisioning candidates: the schema version must match and every
@@ -370,6 +487,95 @@ mod tests {
         coupling_caveats().expect("coupling caveats parse");
         known_bots().expect("known bots parse");
         provisioning().expect("provisioning parse");
+        bot_commands().expect("bot commands parse");
+    }
+
+    #[test]
+    fn bot_commands_default_has_login_and_cancel() {
+        let doc = bot_commands().expect("bot commands parse");
+        assert!(
+            !doc.default.login_command.trim().is_empty(),
+            "default login command must be non-empty"
+        );
+        assert!(
+            !doc.default.cancel_command.trim().is_empty(),
+            "default cancel command must be non-empty"
+        );
+    }
+
+    #[test]
+    fn bot_commands_protocol_for_falls_back_to_default() {
+        let doc = bot_commands().expect("bot commands parse");
+        // An unknown network with no override resolves to the default protocol.
+        let proto = doc.protocol_for("no-such-network");
+        assert_eq!(proto.login_command, doc.default.login_command);
+        assert_eq!(proto.cancel_command, doc.default.cancel_command);
+    }
+
+    #[test]
+    fn bot_commands_protocol_for_prefers_an_override() {
+        let doc = BotCommandsDoc {
+            version: BOT_COMMANDS_VERSION,
+            default: BotProtocol {
+                login_command: "login".to_owned(),
+                cancel_command: "cancel".to_owned(),
+            },
+            overrides: vec![BotProtocolOverride {
+                network_id: "whatsapp".to_owned(),
+                protocol: BotProtocol {
+                    login_command: "login qr".to_owned(),
+                    cancel_command: "cancel".to_owned(),
+                },
+            }],
+        };
+        assert_eq!(doc.protocol_for("whatsapp").login_command, "login qr");
+        assert_eq!(doc.protocol_for("signal").login_command, "login");
+    }
+
+    #[test]
+    fn rejects_unsupported_bot_commands_version() {
+        let doc = BotCommandsDoc {
+            version: BOT_COMMANDS_VERSION + 1,
+            default: BotProtocol {
+                login_command: "login".to_owned(),
+                cancel_command: "cancel".to_owned(),
+            },
+            overrides: vec![],
+        };
+        assert!(err_msg(validate_bot_commands(&doc)).contains("unsupported version"));
+    }
+
+    #[test]
+    fn rejects_bot_commands_default_with_empty_command() {
+        let doc = BotCommandsDoc {
+            version: BOT_COMMANDS_VERSION,
+            default: BotProtocol {
+                login_command: "   ".to_owned(),
+                cancel_command: "cancel".to_owned(),
+            },
+            overrides: vec![],
+        };
+        assert!(err_msg(validate_bot_commands(&doc)).contains("empty login/cancel"));
+    }
+
+    #[test]
+    fn rejects_duplicate_bot_commands_override_network_id() {
+        let over = |id: &str| BotProtocolOverride {
+            network_id: id.to_owned(),
+            protocol: BotProtocol {
+                login_command: "login".to_owned(),
+                cancel_command: "cancel".to_owned(),
+            },
+        };
+        let doc = BotCommandsDoc {
+            version: BOT_COMMANDS_VERSION,
+            default: BotProtocol {
+                login_command: "login".to_owned(),
+                cancel_command: "cancel".to_owned(),
+            },
+            overrides: vec![over("whatsapp"), over("whatsapp")],
+        };
+        assert!(err_msg(validate_bot_commands(&doc)).contains("duplicate override networkId"));
     }
 
     #[test]

@@ -49,6 +49,7 @@ use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
 use crate::bridge;
 use crate::bridges::login::{self, BridgeLoginSink};
+use crate::bridges::transport::bot::BotDriver;
 use crate::bridges::transport::provisioning::Provisioning;
 use crate::bridges::transport::BridgeTransport;
 use crate::error::{
@@ -131,15 +132,57 @@ struct LoginSession {
     task: JoinHandle<()>,
     /// The input sender the driver drains for flow choices / field values.
     input_tx: mpsc::UnboundedSender<BridgeLoginInput>,
-    /// A clone of the transport, kept so an explicit cancel / graceful-shutdown
-    /// drain can best-effort POST `/login/cancel/{login_id}` before aborting the
-    /// task (the task's own copy is dropped when it is aborted).
-    transport: Provisioning,
+    /// A clone of the transport that powered this session, kept so an explicit
+    /// cancel / graceful-shutdown drain can best-effort cancel the server-side login
+    /// (POST `/login/cancel/{login_id}` for provisioning, or send the bot's cancel
+    /// command) before aborting the task (the task's own copy is dropped when it is
+    /// aborted).
+    transport: LoginTransport,
     /// The login id populated by the driver once `login_start` succeeds; `None`
     /// until then (a cancel before start has no server-side login to cancel).
     /// A `std::sync::Mutex` (not tokio's) — it is a synchronous, single-writer
     /// slot the driver sets once and cancel reads.
     login_id: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// The transport that powered a bridge-login session (Story 6.4, AD-16): either the
+/// mautrix bridgev2 [`Provisioning`] API or the [`BotDriver`] Bridge Bot chat
+/// fallback. Held on the [`LoginSession`] (both are `Clone`) so an explicit cancel /
+/// graceful-shutdown drain can best-effort cancel the server-side login on whichever
+/// transport drove it.
+#[derive(Clone)]
+enum LoginTransport {
+    /// A login driven over the bridgev2 provisioning API (Story 6.3).
+    Provisioning(Provisioning),
+    /// A login driven over the raw Bridge Bot chat (Story 6.4).
+    Bot(BotDriver),
+}
+
+impl LoginTransport {
+    /// Best-effort cancel the login recorded in `login_id`, dispatching to the arm
+    /// that powered the session. A failure is logged and swallowed inside each
+    /// transport's `login_cancel`.
+    ///
+    /// The `None` case matters for the bot: `drive_login` only records the login id
+    /// *after* `login_start` succeeds, but `BotDriver::login_start` sends the login
+    /// command to the bot chat before awaiting the reply — so a reply timeout leaves
+    /// the slot `None` even though a login was already initiated on the bot. The
+    /// bot's cancel command ignores the id and is idempotent, so fire it regardless
+    /// to avoid orphaning that pending bot login. Provisioning needs a real login id
+    /// (`None` = no `/login/start` succeeded = nothing server-side to cancel).
+    async fn cancel_recorded(&self, login_id: Option<String>) {
+        match self {
+            LoginTransport::Provisioning(t) => {
+                if let Some(id) = login_id {
+                    t.login_cancel(&id).await;
+                }
+            }
+            LoginTransport::Bot(t) => {
+                t.login_cancel(login_id.as_deref().unwrap_or_default())
+                    .await
+            }
+        }
+    }
 }
 
 /// An account's live bridge-login sessions, keyed by `session_id`.
@@ -1313,12 +1356,27 @@ impl AccountManager {
             BridgeError::Provisioning("account has no live access token".to_owned())
         })?;
 
-        // Probe the provisioning base URL and connect (before spawning, so an
-        // unreachable API surfaces synchronously as the command's error).
-        let transport = Provisioning::connect(&provisioning_host, &token, network_id).await?;
+        // Select the transport, provisioning-first with a Bridge Bot fallback (Story
+        // 6.4, AD-16). Probe the provisioning base URL before spawning so a genuine
+        // provisioning error surfaces synchronously as the command's error (never a
+        // silent bot fallback): `Ok(Some)` = drive with Provisioning; `Ok(None)` = no
+        // provisioning API here, build the BotDriver fallback; `Err` = a real
+        // transport error, surfaced.
+        let transport = match Provisioning::connect(&provisioning_host, &token, network_id).await? {
+            Some(provisioning) => LoginTransport::Provisioning(provisioning),
+            None => {
+                // No provisioning API — resolve/create the Bridge Bot DM and drive
+                // over chat. An unresolvable bot surfaces `BridgeError::Bot` here,
+                // before the task spawns (no silent fallback to an unknown bot).
+                let (room, bot_mxid) =
+                    crate::bridges::resolve_bot_room(&client, network_id).await?;
+                let protocol = crate::bridges::data::bot_commands()?.protocol_for(network_id);
+                LoginTransport::Bot(BotDriver::new(client.clone(), room, bot_mxid, protocol))
+            }
+        };
         // A clone is kept on the session so an explicit cancel / shutdown drain can
-        // best-effort POST `/login/cancel` after the driver task (which owns the
-        // original) is aborted.
+        // best-effort cancel the server-side login (POST `/login/cancel` or the bot's
+        // cancel command) after the driver task (which owns the original) is aborted.
         let cancel_transport = transport.clone();
 
         let session_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
@@ -1332,12 +1390,23 @@ impl AccountManager {
         let reaper_sessions = sessions.clone();
         let span =
             tracing::info_span!("bridge_login", account_id = %account_id, network_id = %network_id);
+        // Branch the spawn on the transport arm: `drive_login` is generic and
+        // statically dispatched, so each arm monomorphizes a distinct instantiation —
+        // the driver, `step_to_vm`, and the VM are identical either way.
         let task = tokio::spawn(
             async move {
-                login::drive_login(transport, &network_owned, sink, input_rx, driver_login_id)
-                    .await;
+                match transport {
+                    LoginTransport::Provisioning(t) => {
+                        login::drive_login(t, &network_owned, sink, input_rx, driver_login_id)
+                            .await;
+                    }
+                    LoginTransport::Bot(t) => {
+                        login::drive_login(t, &network_owned, sink, input_rx, driver_login_id)
+                            .await;
+                    }
+                }
                 // A naturally-completed login reaps its own session entry. It does
-                // NOT post `/login/cancel` — only an explicit cancel does.
+                // NOT cancel the server-side login — only an explicit cancel does.
                 reaper_sessions.lock().await.remove(&session_id);
                 tracing::info!(account_id = %account_owned, session_id, "bridge login ended");
             }
@@ -1397,21 +1466,43 @@ impl AccountManager {
         };
         let removed = sessions.lock().await.remove(&session_id);
         if let Some(session) = removed {
-            // If the driver got as far as starting the flow, best-effort cancel the
-            // server-side login before aborting the task (detached so it never
-            // blocks the abort; `login_cancel` logs+swallows all errors).
+            // Best-effort cancel the login before aborting the task (detached so it
+            // never blocks the abort; `login_cancel` logs+swallows all errors). The
+            // bot arm cancels even with no recorded id (its login command was already
+            // sent), so a Sheet-close during a slow first reply still cancels.
             let login_id = session.login_id.lock().ok().and_then(|guard| guard.clone());
-            if let Some(id) = login_id {
-                let t = session.transport.clone();
-                tokio::spawn(async move {
-                    t.login_cancel(&id).await;
-                });
-            }
+            let t = session.transport.clone();
+            tokio::spawn(async move {
+                t.cancel_recorded(login_id).await;
+            });
             // Dropping the input sender closes the driver's input channel; aborting
             // the task stops any in-flight long-poll immediately.
             session.task.abort();
             tracing::info!(account_id = %account_id, session_id, "bridge login cancelled");
         }
+    }
+
+    /// Resolve-or-create the Bridge Bot DM room for `network_id` on a live account
+    /// (Story 6.4, FR-27, UX-DR19) and return its room id, so the frontend can
+    /// navigate straight to the raw Bridge Bot chat (the manual escape hatch from the
+    /// card Manage menu / a login failure). A missing account surfaces
+    /// [`BridgeError::AccountNotFound`]; an unresolvable / uncreatable bot DM surfaces
+    /// [`BridgeError::Bot`]. No bot MXID or session material crosses back — only the
+    /// non-secret room id.
+    pub async fn bridge_bot_room(
+        &self,
+        account_id: &str,
+        network_id: &str,
+    ) -> Result<String, CoreError> {
+        let client = {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(handle) => handle.client.clone(),
+                None => return Err(BridgeError::AccountNotFound(account_id.to_owned()).into()),
+            }
+        };
+        let (room, _bot_mxid) = crate::bridges::resolve_bot_room(&client, network_id).await?;
+        Ok(room.room_id().to_string())
     }
 
     /// Resolve the account's live `Client` for a backup action, surfacing a *named*
@@ -2548,19 +2639,18 @@ impl AccountManager {
             }
             // Drop every stored `Arc<Timeline>` so no room timeline leaks.
             handle.timelines.lock().await.clear();
-            // Abort any in-flight native bridge-login sessions (Story 6.3) so their
-            // driver tasks (holding a `Provisioning` transport) are dropped. For any
-            // session that got as far as starting the flow, best-effort POST
-            // `/login/cancel` first (detached) so sign-out doesn't leak server-side
-            // login sessions.
+            // Abort any in-flight native bridge-login sessions (Stories 6.3/6.4) so
+            // their driver tasks (holding a `Provisioning` or `BotDriver` transport)
+            // are dropped. Best-effort cancel first (detached) so sign-out doesn't
+            // leak a login: the provisioning arm POSTs `/login/cancel` when a login id
+            // was recorded, the bot arm sends its cancel command even without one
+            // (its login command may already be pending on the bot).
             for (_, session) in handle.login_sessions.lock().await.drain() {
                 let login_id = session.login_id.lock().ok().and_then(|guard| guard.clone());
-                if let Some(id) = login_id {
-                    let t = session.transport.clone();
-                    tokio::spawn(async move {
-                        t.login_cancel(&id).await;
-                    });
-                }
+                let t = session.transport.clone();
+                tokio::spawn(async move {
+                    t.cancel_recorded(login_id).await;
+                });
                 session.task.abort();
             }
             tracing::info!(account_id = %account_id, "account shut down");
