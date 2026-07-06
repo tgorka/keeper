@@ -71,9 +71,9 @@ use crate::verification::{self, VerificationSink};
 use crate::vm::BridgeLoginInput;
 use crate::vm::{
     ApprovalDraftVm, ConnectionStatus, ConnectionStatusBatch, DraftMirrorBatch, EditVersionVm,
-    EncryptionStatus, EncryptionStatusBatch, InboxBatch, IncognitoVm, PaginationStatusBatch,
-    RemoteDraftVm, RoomListBatch, RoomListOp, RoomVm, SpaceVm, TimelineBatch, TypingBatch,
-    TypistVm,
+    EncryptionStatus, EncryptionStatusBatch, HeldSendVm, InboxBatch, IncognitoVm, OutboxVm,
+    PaginationStatusBatch, RemoteDraftVm, RoomListBatch, RoomListOp, RoomVm, SpaceVm,
+    TimelineBatch, TypingBatch, TypistVm,
 };
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
@@ -127,6 +127,11 @@ pub type PaginationSink = Box<dyn Fn(PaginationStatusBatch) -> bool + Send + Syn
 /// `true` if the batch was delivered, `false` if the channel is closed (the
 /// relay then stops).
 pub type DraftMirrorSink = Box<dyn Fn(DraftMirrorBatch) -> bool + Send + Sync>;
+
+/// Sink that receives each produced [`OutboxVm`] snapshot (Story 8.3). The shell wraps
+/// a Tauri `Channel::send`; tests capture into a vector. Returns `true` if the snapshot
+/// was delivered, `false` if the channel is closed (the producer then stops).
+pub type OutboxSink = Box<dyn Fn(OutboxVm) -> bool + Send + Sync>;
 
 /// Registry of an account's live open room timelines, keyed by the *timeline*
 /// subscription id → its room id and the exact `Arc<Timeline>` that produced the
@@ -211,6 +216,8 @@ type ActivatedAccount = (
     EventHandlerHandle,
     EventHandlerHandle,
     EventHandlerHandle,
+    JoinHandle<()>,
+    tokio::sync::broadcast::Sender<OutboxChange>,
 );
 
 /// A live, supervised account: its `Client`, `SyncService`, and the abort
@@ -271,6 +278,208 @@ struct AccountHandle {
     /// Removed from the `Client` in [`AccountManager::shutdown`] alongside the
     /// archive/redaction handlers so no handler leaks past teardown.
     draft_handler: EventHandlerHandle,
+    /// Lifetime-of-account Undo-Send outbox scheduler task (Story 8.3): a tokio
+    /// interval (~250 ms) that dispatches held sends whose `dispatch_at_ts` has
+    /// elapsed (oldest-first) through the single [`send::dispatch`] gate, then
+    /// deletes the row (dispatch-then-delete: never lose a held message) and
+    /// notifies the outbox broadcast so subscribers re-snapshot. Aborted in
+    /// [`AccountManager::shutdown`] and on partial activation teardown.
+    outbox_scheduler: JoinHandle<()>,
+    /// Per-account outbox change broadcast (Story 8.3): every mutation of this
+    /// account's `outbox` rows (hold, cancel, scheduler dispatch) signals here so
+    /// each live [`AccountManager::subscribe_outbox`] producer re-reads its room's
+    /// rows and emits a fresh snapshot. Cloned into the scheduler on activation and
+    /// into every outbox producer on subscribe.
+    outbox_tx: tokio::sync::broadcast::Sender<OutboxChange>,
+    /// Live per-room outbox subscriptions, keyed by subscription id → the producer
+    /// task. Aborted on `unsubscribe_outbox` and on shutdown; a producer whose sink
+    /// closes ends on its own.
+    outbox_subs: Arc<Mutex<HashMap<u64, JoinHandle<()>>>>,
+}
+
+/// A change signal broadcast on an account's outbox (Story 8.3). Carries no payload:
+/// each subscriber re-reads the authoritative rows from `keeper.db` on receipt, so a
+/// missed/lagged signal only means a redundant re-read, never a lost update. `Copy` so
+/// the broadcast ring is trivially cloneable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboxChange;
+
+/// Current wall-clock time in milliseconds since the Unix epoch (UTC), saturating to
+/// `i64::MAX` on an out-of-range duration and `0` if the clock is before the epoch.
+/// Used for outbox `held_at_ts` / `dispatch_at_ts` and the restored-draft timestamp
+/// (Story 8.3), mirroring `drafts::now_ms`.
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+/// Build the [`OutboxVm`] snapshot of held sends for one `(account_id, room_id)` from
+/// the authoritative `outbox` rows (Story 8.3), oldest-first. A read failure yields an
+/// empty snapshot (logged) rather than propagating — the outbox surface must never
+/// crash the producer. Bodies cross IPC (the composer needs them to restore on cancel)
+/// but are never logged here.
+fn outbox_snapshot(data_dir: &Path, account_id: &str, room_id: &str) -> OutboxVm {
+    let rows = match registry::list_outbox_rows_for_account(data_dir, account_id) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(account_id = %account_id, error = %e, "could not read outbox rows; emitting empty snapshot");
+            Vec::new()
+        }
+    };
+    let rows = rows
+        .into_iter()
+        .filter(|r| r.room_id == room_id)
+        .map(|r| HeldSendVm {
+            id: r.id,
+            account_id: r.account_id,
+            room_id: r.room_id,
+            body: r.body,
+            held_at_ms: r.held_at_ts,
+            dispatch_at_ms: r.dispatch_at_ts,
+        })
+        .collect();
+    OutboxVm { rows }
+}
+
+/// Emit one outbox snapshot for `(account_id, room_id)` into `sink`. Returns `false`
+/// when the sink is closed so the producer stops (Story 8.3).
+fn emit_outbox_snapshot(
+    data_dir: &Path,
+    account_id: &str,
+    room_id: &str,
+    sink: &OutboxSink,
+) -> bool {
+    sink(outbox_snapshot(data_dir, account_id, room_id))
+}
+
+/// The interval between Undo-Send scheduler ticks (Story 8.3). Small enough that a
+/// dispatch fires within a fraction of a second of its window elapsing, large enough
+/// that an idle account's scheduler is negligible.
+const OUTBOX_SCHEDULER_TICK_MS: u64 = 250;
+
+/// The lifetime-of-account Undo-Send outbox scheduler (Story 8.3, NFR-8).
+///
+/// Ticks every [`OUTBOX_SCHEDULER_TICK_MS`]; on each tick it reads this account's held
+/// rows (oldest-first) and, for every row whose `dispatch_at_ts <= now`, dispatches the
+/// body through the single [`send::dispatch`] gate via a reuse-or-transient `Timeline`
+/// (the same pattern `send_approval` uses), then deletes the row. **Dispatch-then-
+/// delete**: a crash in the microsecond gap re-dispatches on restart (a rare duplicate)
+/// rather than dropping a held message — at-least-once is the epic's chosen trade-off.
+/// A dispatch error is logged and swallowed (best-effort) and the row is left for a
+/// later tick to retry — it is never lost. On startup, rows already elapsed while the
+/// app was down dispatch on the first tick (crash/offline durability). Each dispatch
+/// notifies the outbox broadcast so subscribers re-snapshot (the held bubble/pill
+/// disappears and the SDK echo takes over). Aborted on account shutdown. The body is
+/// never logged.
+async fn run_outbox_scheduler(
+    client: Client,
+    account_id: String,
+    platform: Arc<dyn Platform>,
+    outbox_tx: tokio::sync::broadcast::Sender<OutboxChange>,
+) {
+    let data_dir = match platform.data_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::error!(account_id = %account_id, error = %e, "outbox scheduler: no data dir; not starting");
+            return;
+        }
+    };
+    let mut ticker =
+        tokio::time::interval(std::time::Duration::from_millis(OUTBOX_SCHEDULER_TICK_MS));
+    // A slow tick must not trigger a catch-up burst of back-to-back ticks; delay the
+    // next tick a full interval instead (this loop is already sequential, so bursts
+    // would only add contention).
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Ids handed to the SDK send queue whose `outbox` row delete has not yet succeeded.
+    // A row here is already durable in the SDK queue, so it must be re-*deleted*, never
+    // re-*dispatched* — otherwise a transient delete failure (e.g. `SQLITE_BUSY` under
+    // WAL contention) would re-send the same body every tick. This in-memory set bounds
+    // duplicates to a genuine crash/abort (which clears it), preserving at-least-once.
+    let mut awaiting_delete: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        ticker.tick().await;
+        let rows = match registry::list_outbox_rows_for_account(&data_dir, &account_id) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(account_id = %account_id, error = %e, "outbox scheduler: could not read rows; retrying next tick");
+                continue;
+            }
+        };
+        let now = now_ms();
+        // Oldest-first (the query orders by held_at_ts asc): dispatch every elapsed row.
+        let mut changed = false;
+        for row in rows.into_iter().filter(|r| r.dispatch_at_ts <= now) {
+            // Already dispatched to the SDK queue on a prior tick; only its delete is
+            // pending. Retry the delete — never re-dispatch.
+            if awaiting_delete.contains(&row.id) {
+                if registry::delete_outbox(&data_dir, &row.id).is_ok() {
+                    awaiting_delete.remove(&row.id);
+                    changed = true;
+                }
+                continue;
+            }
+            let Ok(parsed_room) = RoomId::parse(&row.room_id) else {
+                // An unparsable room id can never dispatch; drop the row so it does not
+                // wedge the scheduler forever.
+                tracing::warn!(account_id = %account_id, "outbox scheduler: dropping row with unparsable room id");
+                let _ = registry::delete_outbox(&data_dir, &row.id);
+                changed = true;
+                continue;
+            };
+            let timeline = match build_dispatch_timeline(&client, &parsed_room).await {
+                Ok(timeline) => timeline,
+                Err(e) => {
+                    // The room isn't resolvable yet (still syncing / offline): leave the
+                    // row for a later tick. Never lost.
+                    tracing::warn!(account_id = %account_id, error = %e, "outbox scheduler: no timeline yet; will retry");
+                    continue;
+                }
+            };
+            // Dispatch-then-delete: hand to the SDK send queue (which persists it),
+            // then remove the row. A dispatch error is best-effort — leave the row to
+            // retry next tick rather than deleting an undispatched message.
+            match send::dispatch(&timeline, &row.body).await {
+                Ok(()) => {
+                    if let Err(e) = registry::delete_outbox(&data_dir, &row.id) {
+                        // Handed off but not yet deleted: remember it so the next tick
+                        // retries the delete instead of re-dispatching a duplicate.
+                        awaiting_delete.insert(row.id.clone());
+                        tracing::warn!(account_id = %account_id, error = %e, "outbox scheduler: dispatched but could not delete row; will retry delete");
+                    }
+                    changed = true;
+                    tracing::info!(account_id = %account_id, room_id = %parsed_room, "held send dispatched after window elapsed");
+                }
+                Err(e) => {
+                    tracing::warn!(account_id = %account_id, error = %e, "outbox scheduler: dispatch failed; will retry next tick");
+                }
+            }
+        }
+        if changed {
+            // Notify subscribers to re-snapshot (held bubble/pill removed; SDK echo
+            // takes over). No live subscriber → swallowed no-op.
+            let _ = outbox_tx.send(OutboxChange);
+        }
+    }
+}
+
+/// Acquire a `Timeline` for dispatching a held send (Story 8.3): build a transient
+/// `TimelineBuilder::new(&room).build()` from the account's live `Room`. The scheduler
+/// runs independently of any open Chat, so — unlike `send_text` — it cannot rely on an
+/// open-conversation timeline; a transient timeline is the same off-open-subscription
+/// path `send_approval` / `mark_room_read` use, so no new dispatch path is introduced
+/// (the single-gate boundary holds). Errors if the room is not resolvable on the live
+/// `Client` (still syncing / offline) so the caller can retry on a later tick.
+async fn build_dispatch_timeline(client: &Client, room_id: &RoomId) -> Result<Timeline, CoreError> {
+    let room = client
+        .get_room(room_id)
+        .ok_or(TimelineError::RoomNotFound)?;
+    TimelineBuilder::new(&room)
+        .build()
+        .await
+        .map_err(|e| TimelineError::Build(e.to_string()).into())
 }
 
 /// A live merged-inbox subscription (AD-20): the merger the per-account
@@ -398,6 +607,8 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    outbox_scheduler,
+                    outbox_tx,
                 ) = activate(
                     platform,
                     account_id,
@@ -419,6 +630,9 @@ impl AccountManager {
                         draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
+                        outbox_scheduler,
+                        outbox_tx,
+                        outbox_subs: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for room list");
@@ -452,6 +666,7 @@ impl AccountManager {
                         if let Some(dead) = accounts.remove(account_id) {
                             dead.reconnect_supervisor.abort();
                             dead.session_persister.abort();
+                            dead.outbox_scheduler.abort();
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -668,6 +883,8 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    outbox_scheduler,
+                    outbox_tx,
                 ) = activate(
                     platform,
                     account_id,
@@ -689,6 +906,9 @@ impl AccountManager {
                         draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
+                        outbox_scheduler,
+                        outbox_tx,
+                        outbox_subs: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for inbox");
@@ -712,6 +932,7 @@ impl AccountManager {
                         if let Some(dead) = accounts.remove(account_id) {
                             dead.reconnect_supervisor.abort();
                             dead.session_persister.abort();
+                            dead.outbox_scheduler.abort();
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -756,6 +977,8 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    outbox_scheduler,
+                    outbox_tx,
                 ) = activate(
                     platform,
                     account_id,
@@ -777,6 +1000,9 @@ impl AccountManager {
                         draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
+                        outbox_scheduler,
+                        outbox_tx,
+                        outbox_subs: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for timeline");
@@ -814,6 +1040,7 @@ impl AccountManager {
                         if let Some(dead) = accounts.remove(account_id) {
                             dead.reconnect_supervisor.abort();
                             dead.session_persister.abort();
+                            dead.outbox_scheduler.abort();
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -905,6 +1132,8 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    outbox_scheduler,
+                    outbox_tx,
                 ) = activate(
                     platform,
                     account_id,
@@ -926,6 +1155,9 @@ impl AccountManager {
                         draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
+                        outbox_scheduler,
+                        outbox_tx,
+                        outbox_subs: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for connection status");
@@ -1021,6 +1253,8 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    outbox_scheduler,
+                    outbox_tx,
                 ) = activate(
                     platform,
                     account_id,
@@ -1042,6 +1276,9 @@ impl AccountManager {
                         draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
+                        outbox_scheduler,
+                        outbox_tx,
+                        outbox_subs: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for encryption status");
@@ -1136,6 +1373,8 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    outbox_scheduler,
+                    outbox_tx,
                 ) = activate(
                     platform,
                     account_id,
@@ -1157,6 +1396,9 @@ impl AccountManager {
                         draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
+                        outbox_scheduler,
+                        outbox_tx,
+                        outbox_subs: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for backup status");
@@ -1295,6 +1537,8 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    outbox_scheduler,
+                    outbox_tx,
                 ) = activate(
                     platform,
                     account_id,
@@ -1316,6 +1560,9 @@ impl AccountManager {
                         draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
+                        outbox_scheduler,
+                        outbox_tx,
+                        outbox_subs: Arc::new(Mutex::new(HashMap::new())),
                     },
                 );
                 tracing::info!(account_id = %account_id, "account activated for verification");
@@ -2099,15 +2346,276 @@ impl AccountManager {
     /// enqueue failure → [`SendError::Dispatch`].
     pub async fn send_text(
         &self,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         room_id: &str,
         body: &str,
     ) -> Result<(), CoreError> {
         let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        // Undo-Send window (Story 8.3): a positive window holds the approved send in
+        // the durable `outbox` instead of enqueuing it now; the per-account scheduler
+        // completes it once the window elapses. A zero window preserves the immediate
+        // path exactly. A trim-empty body is a no-op either way (the composer guards
+        // it, but never hold or dispatch an empty body).
+        if body.trim().is_empty() {
+            return Ok(());
+        }
+        let data_dir = platform.data_dir()?;
+        let window = registry::get_undo_send_window(&data_dir)?;
+        if window > 0 {
+            self.hold_send(&data_dir, account_id, room_id.as_str(), body, window)
+                .await?;
+            return Ok(());
+        }
         let timeline = self.open_timeline_for(account_id, &room_id).await?;
         send::submit(&timeline, body, SendTrigger::ComposerSend).await?;
         tracing::info!(account_id = %account_id, room_id = %room_id, "message dispatched");
         Ok(())
+    }
+
+    /// Hold an approved send in the durable `outbox` (Story 8.3): insert a row with
+    /// `dispatch_at_ts = now + window*1000`, then notify the account's outbox
+    /// broadcast so every live subscriber re-snapshots. Called by `send_text` /
+    /// `send_approval` when the Undo-Send window is positive; the row is completed by
+    /// the scheduler when its window elapses, or deleted by `cancel_held_send`. The
+    /// row id is a fresh `TransactionId` so many holds may coexist in one room. The
+    /// body is never logged. An insert failure surfaces to the caller as a send error
+    /// (the held message is never silently dropped).
+    async fn hold_send(
+        &self,
+        data_dir: &Path,
+        account_id: &str,
+        room_id: &str,
+        body: &str,
+        window_secs: u16,
+    ) -> Result<(), CoreError> {
+        let id = matrix_sdk::ruma::TransactionId::new().to_string();
+        let held_at = now_ms();
+        let dispatch_at = held_at.saturating_add(i64::from(window_secs) * 1000);
+        registry::insert_outbox(
+            data_dir,
+            &id,
+            account_id,
+            room_id,
+            body,
+            held_at,
+            dispatch_at,
+        )?;
+        self.notify_outbox(account_id).await;
+        tracing::info!(account_id = %account_id, room_id = %room_id, "send held in undo-send window");
+        Ok(())
+    }
+
+    /// Signal the account's outbox broadcast (Story 8.3) so every live
+    /// `subscribe_outbox` producer re-reads its room's rows and emits a fresh
+    /// snapshot. A closed channel (no live subscribers) is a swallowed no-op — the
+    /// authoritative rows are already durable in `keeper.db`. The account not being
+    /// live (e.g. a cancel just after sign-out) is likewise a no-op.
+    async fn notify_outbox(&self, account_id: &str) {
+        let tx = {
+            let accounts = self.accounts.lock().await;
+            accounts.get(account_id).map(|h| h.outbox_tx.clone())
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(OutboxChange);
+        }
+    }
+
+    /// Cancel a held send by its `id` (Story 8.3): delete the `outbox` row, persist its
+    /// body as the Chat's Draft ([`registry::set_draft`]) so the composer can restore
+    /// it, notify the outbox broadcast, and return the restored body. Performs **zero**
+    /// network dispatch. Cancel of an already-dispatched or absent row is an idempotent
+    /// no-op that returns an empty body. The body is never logged.
+    pub async fn cancel_held_send(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        room_id: &str,
+        id: &str,
+    ) -> Result<String, CoreError> {
+        let data_dir = platform.data_dir()?;
+        // Find the row so we can restore its body; a missing row is an idempotent
+        // no-op (the scheduler may have just dispatched it).
+        let row = registry::list_outbox_rows_for_account(&data_dir, account_id)?
+            .into_iter()
+            .find(|r| r.id == id);
+        let Some(row) = row else {
+            return Ok(String::new());
+        };
+        // Delete first (zero network), then persist the body as the room Draft so the
+        // composer restores it. Deleting before the draft write means a crash in the
+        // gap loses the row but the text is the user's own most recent intent to
+        // re-type — never a silently sent message.
+        registry::delete_outbox(&data_dir, id)?;
+        // The frontend always cancels a hold from its own open Chat, so the caller's
+        // `room_id` normally equals the row's stored room; if they ever diverge, trust the
+        // row (the message was held for *its* room) and surface the mismatch rather than
+        // restoring the body into the wrong room.
+        if room_id != row.room_id {
+            tracing::warn!(account_id = %account_id, caller_room = %room_id, row_room = %row.room_id, "cancel: caller room differs from held row's room; restoring into the row's own room");
+        }
+        // Persist the body as the room Draft best-effort: even if this write fails the
+        // body is still returned below so the composer restores it live — the held text
+        // is never lost to a draft-write error after the row is already gone. Restore into
+        // the row's *own* room (`row.room_id`, the canonical room recorded at hold time),
+        // not the caller-supplied `room_id`, so the draft can never land in the wrong room.
+        if let Err(e) =
+            registry::set_draft(&data_dir, account_id, &row.room_id, &row.body, now_ms())
+        {
+            tracing::warn!(account_id = %account_id, error = %e, "cancel: could not persist restored draft; returning body for live restore");
+        }
+        self.notify_outbox(account_id).await;
+        tracing::info!(account_id = %account_id, room_id = %row.room_id, "held send cancelled; body restored as draft");
+        Ok(row.body)
+    }
+
+    /// Subscribe to the held sends for one open Chat (Story 8.3). Emits an initial
+    /// snapshot immediately, then a fresh full snapshot (oldest-first, filtered to this
+    /// room) on every outbox change (hold, cancel, scheduler dispatch), into `sink`.
+    /// Returns the subscription id.
+    ///
+    /// Mirrors the timeline subscription lifecycle: the account is activated lazily if
+    /// needed (never a second `Client`/`SyncService`); the producer `JoinHandle`
+    /// registers in the account's `outbox_subs` and is aborted on `unsubscribe_outbox`
+    /// / shutdown. The producer drains the account's outbox change broadcast and
+    /// re-reads authoritative rows from `keeper.db` on each signal — the store is never
+    /// the source of truth. A `Lagged` signal only forces a redundant re-read.
+    pub async fn subscribe_outbox(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        room_id: &str,
+        sink: OutboxSink,
+    ) -> Result<u64, CoreError> {
+        // Parse up front so a malformed room id is an honest error, not a silent empty
+        // stream. (The value is compared as a string below.)
+        RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+
+        // Activate the account if needed, reusing the live handle, then take a receiver
+        // on its outbox broadcast and a clone of its subs map — all under the manager
+        // lock so a concurrent subscribe cannot build a second Client/SyncService.
+        let (mut receiver, subs_arc) = {
+            let mut accounts = self.accounts.lock().await;
+            if !accounts.contains_key(account_id) {
+                let (
+                    client,
+                    sync,
+                    reconnect_supervisor,
+                    session_persister,
+                    archive_handler,
+                    redaction_handler,
+                    draft_handler,
+                    outbox_scheduler,
+                    outbox_tx,
+                ) = activate(
+                    platform,
+                    account_id,
+                    self.archive.clone(),
+                    self.draft_mirror_tx.clone(),
+                )
+                .await?;
+                accounts.insert(
+                    account_id.to_owned(),
+                    AccountHandle {
+                        client,
+                        sync,
+                        subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                        timelines: Arc::new(Mutex::new(HashMap::new())),
+                        reconnect_supervisor,
+                        session_persister,
+                        archive_handler,
+                        redaction_handler,
+                        draft_handler,
+                        verification_flow_tx: Arc::new(Mutex::new(None)),
+                        login_sessions: Arc::new(Mutex::new(HashMap::new())),
+                        outbox_scheduler,
+                        outbox_tx,
+                        outbox_subs: Arc::new(Mutex::new(HashMap::new())),
+                    },
+                );
+                tracing::info!(account_id = %account_id, "account activated for outbox");
+            }
+            let handle = accounts.get(account_id).ok_or_else(|| {
+                CoreError::Internal("account handle vanished after activation".to_owned())
+            })?;
+            (handle.outbox_tx.subscribe(), handle.outbox_subs.clone())
+        };
+
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let data_dir = platform.data_dir()?;
+        let account_id_task = account_id.to_owned();
+        let room_id_task = room_id.to_owned();
+        let reaper_subs = subs_arc.clone();
+        let span =
+            tracing::info_span!("outbox_producer", account_id = %account_id, room_id = %room_id);
+        let task = tokio::spawn(
+            async move {
+                // Initial snapshot, then re-snapshot on every broadcast signal.
+                if !emit_outbox_snapshot(&data_dir, &account_id_task, &room_id_task, &sink) {
+                    reaper_subs.lock().await.remove(&subscription_id);
+                    return;
+                }
+                loop {
+                    match receiver.recv().await {
+                        Ok(OutboxChange) => {
+                            if !emit_outbox_snapshot(
+                                &data_dir,
+                                &account_id_task,
+                                &room_id_task,
+                                &sink,
+                            ) {
+                                break;
+                            }
+                        }
+                        // A lagged receiver just re-snapshots from authoritative rows.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            if !emit_outbox_snapshot(
+                                &data_dir,
+                                &account_id_task,
+                                &room_id_task,
+                                &sink,
+                            ) {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                // A naturally-completed producer reaps its own subscription entry.
+                reaper_subs.lock().await.remove(&subscription_id);
+            }
+            .instrument(span),
+        );
+
+        {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(_) => {
+                    subs_arc.lock().await.insert(subscription_id, task);
+                }
+                None => {
+                    task.abort();
+                    return Err(TimelineError::Build(
+                        "account removed during outbox subscribe".to_owned(),
+                    )
+                    .into());
+                }
+            }
+        }
+        tracing::info!(account_id = %account_id, subscription_id, "outbox subscribed");
+        Ok(subscription_id)
+    }
+
+    /// Abort exactly the outbox producer for `subscription_id` on `account_id` (Story
+    /// 8.3). Idempotent — an unknown account/id is a no-op.
+    pub async fn unsubscribe_outbox(&self, account_id: &str, subscription_id: u64) {
+        let accounts = self.accounts.lock().await;
+        if let Some(handle) = accounts.get(account_id) {
+            if let Some(task) = handle.outbox_subs.lock().await.remove(&subscription_id) {
+                task.abort();
+                tracing::info!(account_id = %account_id, subscription_id, "outbox unsubscribed");
+            }
+        }
     }
 
     /// List every pending draft across all accounts for the approval pane (Story
@@ -2191,6 +2699,7 @@ impl AccountManager {
     /// send never loses unsent text).
     pub async fn send_approval(
         &self,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         room_id: &str,
         body: &str,
@@ -2203,7 +2712,24 @@ impl AccountManager {
         if body.trim().is_empty() {
             return Err(SendError::EmptyBody.into());
         }
+        // Parse the room id up front — *before* the hold branch — so a malformed id is
+        // an honest error the caller's catch retains the draft for, never a row the
+        // scheduler later drops as unparsable (which would silently lose an approved,
+        // held message). `send_text` parses first for the same reason; keep them
+        // symmetric so `hold_send` only ever stores a canonical room id.
         let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        // Undo-Send window (Story 8.3): a positive window holds the approved draft in
+        // the durable `outbox` (the scheduler completes it when the window elapses)
+        // instead of enqueuing it now; a zero window preserves the immediate path
+        // exactly. The approval trigger was already the user pressing approve — the
+        // scheduler mints no new trigger (AD-13).
+        let data_dir = platform.data_dir()?;
+        let window = registry::get_undo_send_window(&data_dir)?;
+        if window > 0 {
+            self.hold_send(&data_dir, account_id, room_id.as_str(), body, window)
+                .await?;
+            return Ok(());
+        }
         let room = self.room_for(account_id, &room_id).await?;
 
         // Acquire the dispatch `Timeline`. Reuse an already-open conversation timeline
@@ -3491,6 +4017,13 @@ impl AccountManager {
             // abort the reconnect supervisor and any remaining producer tasks.
             handle.sync.stop().await;
             handle.reconnect_supervisor.abort();
+            // Abort the Undo-Send outbox scheduler (Story 8.3) so no held send is
+            // dispatched after the account goes down, and abort every live outbox
+            // producer so no subscriber task leaks past teardown.
+            handle.outbox_scheduler.abort();
+            for (_, task) in handle.outbox_subs.lock().await.drain() {
+                task.abort();
+            }
             // Abort and await the session-persister so its `Client` clone (and
             // the store's SQLite handles it keeps alive) is dropped before
             // `sign_out_cleanup` deletes the store dir, and so it can never
@@ -3713,6 +4246,24 @@ async fn activate(
             .instrument(tracing::info_span!("reconnect_supervisor", account_id = %account_id)),
     );
 
+    // Spawn the lifetime-of-account Undo-Send outbox scheduler (Story 8.3). It ticks a
+    // ~250 ms interval, dispatching held sends whose window has elapsed (oldest-first)
+    // through the single `send::dispatch` gate, then deleting the row and notifying the
+    // outbox broadcast. On startup it also picks up rows already elapsed while the app
+    // was down (crash/offline durability, NFR-8). A modest broadcast ring: outbox
+    // mutations are low-frequency and every subscriber re-reads authoritative rows, so
+    // a `Lagged` receiver only re-snapshots.
+    let (outbox_tx, _) = tokio::sync::broadcast::channel::<OutboxChange>(64);
+    let outbox_scheduler = tokio::spawn(
+        run_outbox_scheduler(
+            client.clone(),
+            account_id.to_owned(),
+            platform.clone(),
+            outbox_tx.clone(),
+        )
+        .instrument(tracing::info_span!("outbox_scheduler", account_id = %account_id)),
+    );
+
     Ok((
         client,
         sync,
@@ -3721,6 +4272,8 @@ async fn activate(
         archive_handler,
         redaction_handler,
         draft_handler,
+        outbox_scheduler,
+        outbox_tx,
     ))
 }
 
@@ -4936,11 +5489,17 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
+            data_dir: data_dir.clone(),
+        });
+        // Window 0 exercises the immediate-dispatch path (Story 8.3): with a positive
+        // window the approve would be held in the outbox instead of reaching the gate.
+        registry::set_undo_send_window(&data_dir, 0).expect("disable undo-send window");
         let manager = AccountManager::new(&data_dir);
 
         // An unparsable room id is an honest typed error, never a panic.
         let bad_room = manager
-            .send_approval("acctA", "not-a-room-id", "approve me")
+            .send_approval(&platform, "acctA", "not-a-room-id", "approve me")
             .await;
         assert!(matches!(
             bad_room,
@@ -4953,7 +5512,7 @@ mod tests {
         // defect): the pane never has an open conversation, so short-circuiting there
         // would make approve non-functional for every draft.
         let not_live = manager
-            .send_approval("acctA", "!room:example.org", "approve me")
+            .send_approval(&platform, "acctA", "!room:example.org", "approve me")
             .await;
         assert!(matches!(
             not_live,
@@ -4983,18 +5542,22 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
+            data_dir: data_dir.clone(),
+        });
         let manager = AccountManager::new(&data_dir);
 
-        // An empty body → EmptyBody, not a dispatched no-op.
+        // An empty body → EmptyBody, not a dispatched no-op. The empty-body guard runs
+        // ahead of the Undo-Send window check, so this holds at any window (Story 8.3).
         let empty = manager
-            .send_approval("acctA", "!room:example.org", "")
+            .send_approval(&platform, "acctA", "!room:example.org", "")
             .await;
         assert!(matches!(empty, Err(CoreError::Send(SendError::EmptyBody))));
 
         // A whitespace-only body → EmptyBody as well (the guard trims). The room id
         // is well-formed, proving the guard runs before the timeline is opened.
         let blank = manager
-            .send_approval("acctA", "!room:example.org", "   \n\t ")
+            .send_approval(&platform, "acctA", "!room:example.org", "   \n\t ")
             .await;
         assert!(matches!(blank, Err(CoreError::Send(SendError::EmptyBody))));
 
@@ -5019,10 +5582,18 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
+            data_dir: data_dir.clone(),
+        });
+        // Window 0 exercises the immediate-dispatch path (Story 8.3): a positive window
+        // would hold the send in the outbox instead of reaching the gate.
+        registry::set_undo_send_window(&data_dir, 0).expect("disable undo-send window");
         let manager = AccountManager::new(&data_dir);
 
         // An unparsable room id is an honest typed error, never a panic.
-        let bad_room = manager.send_text("acctA", "not-a-room-id", "hi").await;
+        let bad_room = manager
+            .send_text(&platform, "acctA", "not-a-room-id", "hi")
+            .await;
         assert!(matches!(
             bad_room,
             Err(CoreError::Send(SendError::RoomNotFound))
@@ -5031,11 +5602,169 @@ mod tests {
         // Well-formed room id but a non-live account: no open timeline, so the
         // composer path reaches the gate boundary and returns the typed
         // `NoOpenTimeline` — never `Ok`, never a panic.
-        let not_live = manager.send_text("acctA", "!room:example.org", "hi").await;
+        let not_live = manager
+            .send_text(&platform, "acctA", "!room:example.org", "hi")
+            .await;
         assert!(matches!(
             not_live,
             Err(CoreError::Send(SendError::NoOpenTimeline))
         ));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    fn outbox_test_dir(tag: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "keeper-outbox-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        dir
+    }
+
+    /// Story 8.3: with a positive Undo-Send window, `send_text` HOLDS the message in
+    /// the durable `outbox` rather than reaching the send gate — a row is inserted with
+    /// `dispatch_at_ts ≈ now + window*1000` and NO dispatch occurs (proven by the
+    /// non-live account NOT returning `NoOpenTimeline`: the code never touched the
+    /// gate). The body is preserved verbatim for later dispatch/undo.
+    #[tokio::test]
+    async fn send_text_with_positive_window_holds_instead_of_dispatching() {
+        let data_dir = outbox_test_dir("hold");
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
+            data_dir: data_dir.clone(),
+        });
+        registry::set_undo_send_window(&data_dir, 10).expect("set window 10");
+        let manager = AccountManager::new(&data_dir);
+
+        let before = now_ms();
+        // A non-live account: with window 0 this would be `NoOpenTimeline`; with a
+        // positive window it returns Ok because the send is held, never dispatched.
+        manager
+            .send_text(&platform, "acctA", "!room:example.org", "held message")
+            .await
+            .expect("held send returns Ok without dispatching");
+
+        let rows = registry::list_outbox_rows_for_account(&data_dir, "acctA").expect("list outbox");
+        assert_eq!(rows.len(), 1, "exactly one held row inserted");
+        assert_eq!(rows[0].room_id, "!room:example.org");
+        assert_eq!(rows[0].body, "held message");
+        // dispatch_at is ~now + 10s; allow slack for the clock read.
+        assert!(
+            rows[0].dispatch_at_ts >= before + 10_000
+                && rows[0].dispatch_at_ts <= now_ms() + 10_500,
+            "dispatch_at_ts is held_at + window"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 8.3: `cancel_held_send` deletes the row, writes the body as the room
+    /// Draft, and returns it — with ZERO network dispatch. Cancel of a missing/
+    /// already-dispatched row is an idempotent no-op that returns an empty body.
+    #[tokio::test]
+    async fn cancel_held_send_deletes_row_and_writes_draft() {
+        let data_dir = outbox_test_dir("cancel");
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
+            data_dir: data_dir.clone(),
+        });
+        registry::set_undo_send_window(&data_dir, 30).expect("set window 30");
+        let manager = AccountManager::new(&data_dir);
+
+        manager
+            .send_text(&platform, "acctA", "!room:example.org", "undo me")
+            .await
+            .expect("hold send");
+        let rows = registry::list_outbox_rows_for_account(&data_dir, "acctA").expect("list outbox");
+        assert_eq!(rows.len(), 1);
+        let id = rows[0].id.clone();
+
+        let restored = manager
+            .cancel_held_send(&platform, "acctA", "!room:example.org", &id)
+            .await
+            .expect("cancel");
+        assert_eq!(restored, "undo me", "cancel returns the held body");
+        assert!(
+            registry::list_outbox_rows_for_account(&data_dir, "acctA")
+                .expect("list after cancel")
+                .is_empty(),
+            "row deleted on cancel"
+        );
+        assert_eq!(
+            registry::get_draft(&data_dir, "acctA", "!room:example.org").expect("get draft"),
+            Some("undo me".to_owned()),
+            "body persisted as the room draft for composer restore"
+        );
+
+        // Cancelling again (row gone) is an idempotent no-op returning an empty body.
+        let again = manager
+            .cancel_held_send(&platform, "acctA", "!room:example.org", &id)
+            .await
+            .expect("idempotent cancel");
+        assert_eq!(again, "", "cancel of an absent row returns empty");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 8.3: `send_approval` with a positive window holds the approved draft in
+    /// the outbox (the scheduler completes it later) rather than reaching the gate —
+    /// even though the approval trigger already fired, the scheduler mints no new
+    /// trigger (AD-13). The empty-body guard still runs ahead of the window branch.
+    #[tokio::test]
+    async fn send_approval_with_positive_window_holds() {
+        let data_dir = outbox_test_dir("approval-hold");
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
+            data_dir: data_dir.clone(),
+        });
+        registry::set_undo_send_window(&data_dir, 5).expect("set window 5");
+        let manager = AccountManager::new(&data_dir);
+
+        // A whitespace-only body is still rejected before the window branch.
+        let empty = manager
+            .send_approval(&platform, "acctA", "!room:example.org", "   ")
+            .await;
+        assert!(matches!(empty, Err(CoreError::Send(SendError::EmptyBody))));
+
+        manager
+            .send_approval(&platform, "acctA", "!room:example.org", "approved + held")
+            .await
+            .expect("held approval returns Ok without dispatching");
+        let rows = registry::list_outbox_rows_for_account(&data_dir, "acctA").expect("list outbox");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body, "approved + held");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn send_approval_with_malformed_room_id_errors_and_holds_nothing() {
+        // Regression (Story 8.3 review): the window branch must run *after* RoomId::parse
+        // so a malformed room id is a caller-visible error — never a held row the
+        // scheduler later silently drops as unparsable (an approved message lost).
+        let data_dir = outbox_test_dir("approval-badroom");
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
+            data_dir: data_dir.clone(),
+        });
+        registry::set_undo_send_window(&data_dir, 5).expect("set window 5");
+        let manager = AccountManager::new(&data_dir);
+
+        let result = manager
+            .send_approval(
+                &platform,
+                "acctA",
+                "not-a-valid-room-id",
+                "must not be held",
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(CoreError::Send(SendError::RoomNotFound))
+        ));
+        let rows = registry::list_outbox_rows_for_account(&data_dir, "acctA").expect("list outbox");
+        assert!(rows.is_empty(), "a malformed room id must hold nothing");
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

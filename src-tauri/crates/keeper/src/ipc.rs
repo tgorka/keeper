@@ -26,9 +26,9 @@ use keeper_core::vm::{
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
     ConnectionStatusBatch, CouplingCaveatVm, DemoBatch, DraftMirrorBatch, EditVersionVm,
     EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IncognitoVm,
-    IpcError, IpcErrorCode, NetworksSnapshot, NewChatResolutionVm, PaginationStatusBatch, PingVm,
-    RemoteDraftVm, ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot,
-    TimelineBatch, TypingBatch, VerificationFlowVm,
+    IpcError, IpcErrorCode, NetworksSnapshot, NewChatResolutionVm, OutboxVm, PaginationStatusBatch,
+    PingVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm,
+    SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -1278,7 +1278,7 @@ pub async fn approve_draft(
 ) -> Result<(), IpcError> {
     state
         .accounts
-        .send_approval(&account_id, &room_id, &body)
+        .send_approval(&state.platform, &account_id, &room_id, &body)
         .await
         .map_err(to_ipc_error)
 }
@@ -1593,9 +1593,81 @@ pub async fn send_text(
 ) -> Result<(), IpcError> {
     state
         .accounts
-        .send_text(&account_id, &room_id, &body)
+        .send_text(&state.platform, &account_id, &room_id, &body)
         .await
         .map_err(to_ipc_error)
+}
+
+/// Read the Undo-Send window in whole seconds (Story 8.3). Absent / unparsable ⇒ the
+/// default of 10; a stored value is clamped to `0..=60`. Sync — a small keeper-local
+/// read. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn undo_send_window(state: State<'_, AppState>) -> Result<u16, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::get_undo_send_window(&data_dir).map_err(to_ipc_error)
+}
+
+/// Set the Undo-Send window in whole seconds (Story 8.3), clamped to `0..=60` before
+/// persisting (0 disables holding). Sync — a small keeper-local write. Failures funnel
+/// through [`to_ipc_error`].
+#[tauri::command]
+pub fn set_undo_send_window(state: State<'_, AppState>, seconds: u16) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::set_undo_send_window(&data_dir, seconds).map_err(to_ipc_error)
+}
+
+/// Cancel a held send by its `id` (Story 8.3): delete the `outbox` row, persist its
+/// body as the Chat's Draft, and return the restored body so the composer can restore
+/// it. Performs **zero** network dispatch. Cancel of an already-dispatched/absent row
+/// is an idempotent no-op that resolves with an empty string. Failures funnel through
+/// [`to_ipc_error`]. The body is never logged.
+#[tauri::command]
+pub async fn cancel_held_send(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    id: String,
+) -> Result<String, IpcError> {
+    state
+        .accounts
+        .cancel_held_send(&state.platform, &account_id, &room_id, &id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Subscribe to the held sends for one open Chat (Story 8.3). Reuses the account's live
+/// session (activating it lazily) and streams [`OutboxVm`] snapshots over `channel` — an
+/// initial snapshot first, then a fresh full snapshot on every outbox change — returning
+/// the subscription id. The sink forwards each snapshot to the channel; a closed channel
+/// simply stops the producer. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub async fn subscribe_outbox(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    channel: Channel<OutboxVm>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |snapshot: OutboxVm| channel.send(snapshot).is_ok());
+    state
+        .accounts
+        .subscribe_outbox(&state.platform, &account_id, &room_id, sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Unsubscribe exactly one outbox subscription, aborting its producer task (Story 8.3).
+/// Other account state is untouched. Idempotent.
+#[tauri::command]
+pub async fn unsubscribe_outbox(
+    state: State<'_, AppState>,
+    account_id: String,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_outbox(&account_id, subscription_id)
+        .await;
+    Ok(())
 }
 
 /// Send a plain-text reply to a message through the single dispatch gate (FR-10,

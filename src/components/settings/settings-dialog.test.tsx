@@ -7,6 +7,8 @@ vi.mock("@/lib/ipc/client", () => ({
   setHonorRemoteDeletions: vi.fn(() => Promise.resolve()),
   incognitoGetGlobal: vi.fn(() => Promise.resolve(false)),
   incognitoSetGlobal: vi.fn(() => Promise.resolve()),
+  undoSendWindow: vi.fn(() => Promise.resolve(10)),
+  setUndoSendWindow: vi.fn(() => Promise.resolve()),
   verificationCancel: vi.fn(() => Promise.resolve()),
 }));
 
@@ -17,7 +19,13 @@ import {
 } from "@/components/settings/at-rest-encryption-choice";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import type { AccountVm } from "@/lib/ipc/client";
-import { encryptionPosture, honorRemoteDeletions, setHonorRemoteDeletions } from "@/lib/ipc/client";
+import {
+  encryptionPosture,
+  honorRemoteDeletions,
+  setHonorRemoteDeletions,
+  setUndoSendWindow,
+  undoSendWindow,
+} from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
 import { keyBackupStore } from "@/lib/stores/key-backup";
@@ -27,6 +35,8 @@ import { wizardStore } from "@/lib/stores/wizard";
 const mockPosture = vi.mocked(encryptionPosture);
 const mockHonorGet = vi.mocked(honorRemoteDeletions);
 const mockHonorSet = vi.mocked(setHonorRemoteDeletions);
+const mockUndoGet = vi.mocked(undoSendWindow);
+const mockUndoSet = vi.mocked(setUndoSendWindow);
 
 function account(id: string): AccountVm {
   return {
@@ -45,6 +55,10 @@ describe("SettingsDialog", () => {
     mockHonorSet.mockClear();
     mockHonorGet.mockResolvedValue(false);
     mockHonorSet.mockResolvedValue(undefined);
+    mockUndoGet.mockClear();
+    mockUndoSet.mockClear();
+    mockUndoGet.mockResolvedValue(10);
+    mockUndoSet.mockResolvedValue(undefined);
     accountsStore.getState().clear();
     encryptionStatusStore.getState().reset();
     keyBackupStore.getState().reset();
@@ -180,6 +194,32 @@ describe("SettingsDialog", () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(mockHonorSet).toHaveBeenCalledWith(true));
     expect(toggle).toBeChecked();
+  });
+
+  it("renders the Undo-Send window control and reads its initial value", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockUndoGet.mockResolvedValue(15);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const input = await screen.findByLabelText("Undo-Send window (seconds)");
+    await waitFor(() => expect(input).toHaveValue(15));
+    expect(mockUndoGet).toHaveBeenCalled();
+  });
+
+  it("persists a changed Undo-Send window (clamping out-of-range input)", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockUndoGet.mockResolvedValue(10);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const input = await screen.findByLabelText("Undo-Send window (seconds)");
+    await waitFor(() => expect(input).toHaveValue(10));
+    // An in-range value persists verbatim.
+    fireEvent.change(input, { target: { value: "5" } });
+    await waitFor(() => expect(mockUndoSet).toHaveBeenCalledWith(5));
+    // An out-of-range value clamps to 60 before persisting.
+    fireEvent.change(input, { target: { value: "99" } });
+    await waitFor(() => expect(mockUndoSet).toHaveBeenCalledWith(60));
+    expect(input).toHaveValue(60);
   });
 
   it("'Run setup again' starts the wizard and closes Settings", async () => {

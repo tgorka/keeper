@@ -41,6 +41,7 @@ export type { ExportPhase } from "./gen/ExportPhase";
 export type { ExportProgressVm } from "./gen/ExportProgressVm";
 export type { ExportRequestVm } from "./gen/ExportRequestVm";
 export type { ExportScopeKind } from "./gen/ExportScopeKind";
+export type { HeldSendVm } from "./gen/HeldSendVm";
 export type { InboxBatch } from "./gen/InboxBatch";
 export type { InboxOp } from "./gen/InboxOp";
 export type { InboxRoomVm } from "./gen/InboxRoomVm";
@@ -55,6 +56,7 @@ export type { MediaVm } from "./gen/MediaVm";
 export type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 export type { NetworkVm } from "./gen/NetworkVm";
 export type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
+export type { OutboxVm } from "./gen/OutboxVm";
 export type { PaginationState } from "./gen/PaginationState";
 export type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 export type { PingVm } from "./gen/PingVm";
@@ -102,6 +104,7 @@ import type { InboxBatch } from "./gen/InboxBatch";
 import type { IncognitoVm } from "./gen/IncognitoVm";
 import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 import type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
+import type { OutboxVm } from "./gen/OutboxVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 import type { ResolveSupportVm } from "./gen/ResolveSupportVm";
@@ -1045,6 +1048,59 @@ export async function backupSavedRecoveryKey(accountId: string): Promise<string 
  */
 export async function sendText(accountId: string, roomId: string, body: string): Promise<void> {
   await invoke<void>("send_text", { accountId, roomId, body });
+}
+
+/**
+ * Read the Undo-Send window in whole seconds (Story 8.3, FR-46). Absent/unparsable =
+ * the default of 10; a stored value is clamped to `0..=60` (0 disables holding).
+ * Rejects with the {@link IpcError} envelope on a registry failure.
+ */
+export async function undoSendWindow(): Promise<number> {
+  return await invoke<number>("undo_send_window");
+}
+
+/**
+ * Set the Undo-Send window in whole seconds (Story 8.3, FR-46). Clamped to `0..=60`
+ * before persisting (0 disables holding). Resolves once persisted.
+ */
+export async function setUndoSendWindow(seconds: number): Promise<void> {
+  await invoke<void>("set_undo_send_window", { seconds });
+}
+
+/**
+ * Cancel a held send by its `id` (Story 8.3, FR-46): deletes the durable `outbox`
+ * row, persists its body as the Chat's Draft, and resolves with the restored body so
+ * the composer can restore it. Performs **zero** network dispatch. Cancel of an
+ * already-dispatched/absent row is an idempotent no-op resolving with an empty string.
+ */
+export async function cancelHeldSend(
+  accountId: string,
+  roomId: string,
+  id: string,
+): Promise<string> {
+  return await invoke<string>("cancel_held_send", { accountId, roomId, id });
+}
+
+/**
+ * Subscribe to the held sends for one open Chat (Story 8.3, FR-46). Opens a `Channel`,
+ * forwards each {@link OutboxVm} snapshot to `onBatch` in arrival order (an initial
+ * snapshot before any change; each snapshot is the full, oldest-first set that
+ * REPLACES the room's mirrored rows), and resolves with the subscription id.
+ */
+export async function subscribeOutbox(
+  accountId: string,
+  roomId: string,
+  onBatch: (batch: OutboxVm) => void,
+): Promise<number> {
+  return await subscribe<OutboxVm>("subscribe_outbox", onBatch, { accountId, roomId });
+}
+
+/**
+ * Unsubscribe exactly one outbox subscription, aborting its backend producer task
+ * (Story 8.3). Idempotent — unsubscribing an unknown id is a no-op.
+ */
+export async function unsubscribeOutbox(accountId: string, id: number): Promise<void> {
+  await invoke<void>("unsubscribe_outbox", { accountId, subscriptionId: id });
 }
 
 /**

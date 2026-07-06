@@ -14,6 +14,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -22,6 +23,8 @@ import {
   incognitoGetGlobal,
   incognitoSetGlobal,
   setHonorRemoteDeletions,
+  setUndoSendWindow,
+  undoSendWindow,
 } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useEncryptionStatus } from "@/lib/stores/encryption-status";
@@ -181,6 +184,14 @@ function HonorRemoteDeletionsRow() {
 const INCOGNITO_GLOBAL_SENTENCE =
   "Reading a chat sends a private read receipt: your read position still syncs across your own devices, but the other person keeps seeing the message as unread. This is the default for every chat; you can override it per account or per chat.";
 
+/** The default Undo-Send window in seconds (mirrors the Rust registry default). */
+const UNDO_SEND_WINDOW_DEFAULT = 10;
+/** The maximum Undo-Send window in seconds (values clamp to 0..=60). */
+const UNDO_SEND_WINDOW_MAX = 60;
+/** The honest copy explaining the Undo-Send window (Story 8.3). */
+const UNDO_SEND_SENTENCE =
+  "Each message you send waits this many seconds before it leaves, so you can undo it. Set to 0 to send immediately.";
+
 /**
  * Privacy section (Story 8.1): the global Incognito default `Switch`, bound to
  * `incognitoSetGlobal`. Reads its initial state via `incognitoGetGlobal()` on open and
@@ -238,6 +249,55 @@ function PrivacySection({ open }: { open: boolean }) {
       });
   };
 
+  // Undo-Send window in seconds (Story 8.3): `undefined` = still loading; otherwise the
+  // resolved 0..=60 value (0 disables holding). Load-on-open + optimistic write with
+  // revert, mirroring the Incognito toggle above.
+  // Named `undoWindow` (not `window`) so it does not shadow the browser global in this
+  // component's scope.
+  const [undoWindow, setUndoWindow] = useState<number | undefined>(undefined);
+  const windowWriteId = useRef(0);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    setUndoWindow(undefined);
+    let cancelled = false;
+    void undoSendWindow()
+      .then((value) => {
+        if (!cancelled) {
+          setUndoWindow(value);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setUndoWindow(UNDO_SEND_WINDOW_DEFAULT);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  const onWindowChange = (raw: string) => {
+    // Parse + clamp to 0..=60 locally so the field never shows an out-of-range value;
+    // Rust clamps again defensively. A non-numeric entry is ignored (keeps the prior).
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isNaN(parsed)) {
+      return;
+    }
+    const clamped = Math.min(UNDO_SEND_WINDOW_MAX, Math.max(0, parsed));
+    windowWriteId.current += 1;
+    const id = windowWriteId.current;
+    const prev = undoWindow ?? UNDO_SEND_WINDOW_DEFAULT;
+    setUndoWindow(clamped);
+    void setUndoSendWindow(clamped).catch(() => {
+      if (id === windowWriteId.current) {
+        setUndoWindow(prev);
+      }
+    });
+  };
+
   return (
     <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
       <p className="font-medium">Privacy</p>
@@ -251,6 +311,20 @@ function PrivacySection({ open }: { open: boolean }) {
         />
       </div>
       <p className="text-muted-foreground">{INCOGNITO_GLOBAL_SENTENCE}</p>
+      <div className="mt-1 flex items-center justify-between gap-2">
+        <Label htmlFor="undo-send-window">Undo-Send window (seconds)</Label>
+        <Input
+          id="undo-send-window"
+          type="number"
+          min={0}
+          max={UNDO_SEND_WINDOW_MAX}
+          className="w-20"
+          value={undoWindow ?? ""}
+          disabled={undoWindow === undefined}
+          onChange={(e) => onWindowChange(e.target.value)}
+        />
+      </div>
+      <p className="text-muted-foreground">{UNDO_SEND_SENTENCE}</p>
     </div>
   );
 }

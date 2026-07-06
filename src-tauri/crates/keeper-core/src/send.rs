@@ -1,8 +1,12 @@
 //! The single outgoing-send dispatch gate (FR-41, AD-13).
 //!
-//! [`submit`] is the *only* function in the whole crate that feeds new content to
-//! the SDK send queue — the sole call site of `Timeline::send(..)`. A
-//! `#[cfg(test)]` source scan asserts this invariant holds. [`retry`] re-drives an
+//! [`dispatch`] is the *only* function in the whole crate that feeds new content to
+//! the SDK send queue — the sole call site of `Timeline::send(..)`. [`submit`] (the
+//! immediate user path, window == 0) and the outbox scheduler (the deferred
+//! completion of an already-approved hold once its Undo-Send window elapses,
+//! Story 8.3) both funnel through it; the scheduler is the only non-[`submit`]
+//! caller of [`dispatch`]. A `#[cfg(test)]` source scan asserts this invariant
+//! holds. [`retry`] re-drives an
 //! *already-dispatched* wedged local echo via its `SendHandle::unwedge()` (same
 //! `unique_id`, no duplicate bubble); it feeds no new content, so it does not
 //! violate the single-gate rule.
@@ -122,6 +126,23 @@ pub async fn submit(
         trigger = trigger.as_label(),
         "dispatching content through send gate"
     );
+    dispatch(timeline, text).await
+}
+
+/// The sole SDK-enqueue primitive (FR-41, AD-13): enqueue `text` as a plain-text
+/// `m.room.message` on `timeline`'s send queue. **This is the only place in the crate
+/// that calls `Timeline::send(..)`.**
+///
+/// Both legal completion paths funnel through here: the *immediate* user path
+/// ([`submit`], window == 0) and the *deferred* completion path (the outbox scheduler,
+/// which finishes a hold already approved under one of the two [`SendTrigger`]s once its
+/// Undo-Send window elapses — Story 8.3). The scheduler is the only non-[`submit`]
+/// caller of `dispatch`; it mints no new [`SendTrigger`] because completing an
+/// already-approved hold is not a new dispatch decision (AD-13). The resulting
+/// `SendHandle` is intentionally dropped — the local echo and every send-state
+/// transition arrive through the room's existing `Timeline::subscribe()` diff stream, so
+/// keeper never synthesizes echo.
+pub(crate) async fn dispatch(timeline: &Timeline, text: &str) -> Result<(), SendError> {
     let content =
         AnyMessageLikeEventContent::RoomMessage(RoomMessageEventContent::text_plain(text));
     // SOLE-SEND-GATE: the one and only `Timeline::send` call site (FR-41 guard).
@@ -484,6 +505,22 @@ mod tests {
             approval_calls, 1,
             "AD-13: exactly one `ApprovalPaneApprove` dispatch call site expected; found {approval_calls}."
         );
+
+        // AD-13 (Story 8.3): the deferred completion path. `send::dispatch(` is the
+        // SDK-enqueue primitive; besides `submit` (which lives in send.rs, not
+        // account.rs) its ONLY caller is the outbox scheduler in account.rs. Exactly
+        // one `send::dispatch(` call site may appear in production `account.rs` — the
+        // scheduler. A second one (a new background/bulk drainer) changes this count
+        // and fails the guard, surfacing it as an invariant breach needing a planning
+        // decision. The rustdoc references in this file are `[`send::dispatch`]`
+        // (no `(`), so they don't match.
+        let dispatch_calls = normalized.matches("send::dispatch(").count();
+        assert_eq!(
+            dispatch_calls, 1,
+            "AD-13: `send::dispatch(` must have exactly one non-`submit` production \
+             caller in account.rs (the outbox scheduler); found {dispatch_calls}. A \
+             second caller is an invariant breach requiring a planning decision."
+        );
     }
 
     /// FR-41 / AD-13 single-dispatch-gate guard: the SDK content-send call
@@ -521,9 +558,6 @@ mod tests {
             call_sites.len()
         );
 
-        let submit_start = source
-            .find("pub async fn submit")
-            .expect("submit fn must exist");
         let submit_reply_start = source
             .find("pub async fn submit_reply")
             .expect("submit_reply fn must exist");
@@ -545,12 +579,17 @@ mod tests {
         let cancel_start = source
             .find("pub async fn cancel")
             .expect("cancel fn must exist");
+        let dispatch_start = source
+            .find("pub(crate) async fn dispatch")
+            .expect("dispatch fn must exist");
         let call = call_sites[0];
-        // The single `.send(content)` must live in `submit` — before `submit_reply`
-        // (the first fn following `submit`).
+        // The single `.send(content)` must live in `dispatch` — after `submit`,
+        // before `submit_reply` (the first fn following `dispatch` in source order).
+        // `submit` delegates to `dispatch`; both funnel here, preserving the single
+        // SDK-enqueue call site across the Story 8.3 refactor (AD-13).
         assert!(
-            call > submit_start && call < submit_reply_start,
-            "the sole `timeline.send(` call must be inside `submit` (offset {call} not within {submit_start}..{submit_reply_start})"
+            call > dispatch_start && call < submit_reply_start,
+            "the sole `timeline.send(` call must be inside `dispatch` (offset {call} not within {dispatch_start}..{submit_reply_start})"
         );
 
         // The single reply-dispatch call site: `.send_reply(`. Doc references say

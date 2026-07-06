@@ -104,6 +104,24 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
         [],
     )
     .map_err(|e| CoreError::Internal(format!("could not ensure chat_incognito schema: {e}")))?;
+    // Persistent held-send outbox (Story 8.3, Undo-Send Window). An approved send with
+    // a positive Undo-Send window is written here instead of the SDK send queue, then
+    // dispatched by the per-account scheduler once `dispatch_at_ts` elapses. Durable in
+    // WAL so a crash/restart never silently loses a held message (NFR-8). Unlike drafts
+    // there can be MANY rows per (account, room), so the primary key is a unique `id`
+    // (a fresh `TransactionId`), not `(account, room)`. Bodies are never logged.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS outbox(\
+            id TEXT PRIMARY KEY, \
+            account_id TEXT NOT NULL, \
+            room_id TEXT NOT NULL, \
+            body TEXT NOT NULL, \
+            held_at_ts INTEGER NOT NULL, \
+            dispatch_at_ts INTEGER NOT NULL\
+        )",
+        [],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not ensure outbox schema: {e}")))?;
     ensure_hue_index_column(&conn)?;
     ensure_provider_column(&conn)?;
     ensure_incognito_column(&conn)?;
@@ -514,6 +532,139 @@ pub fn incognito_scopes(
     Ok((chat, account, global))
 }
 
+/// The `settings` key holding the Undo-Send window in whole seconds (Story 8.3).
+/// Stored as a decimal string; absent / unparsable ⇒ the default of 10 s.
+const UNDO_SEND_WINDOW_KEY: &str = "undo_send.window";
+
+/// The default Undo-Send window in seconds when the setting is absent or unparsable.
+pub const UNDO_SEND_WINDOW_DEFAULT: u16 = 10;
+
+/// The maximum Undo-Send window in seconds; values are clamped to `0..=60`.
+pub const UNDO_SEND_WINDOW_MAX: u16 = 60;
+
+/// Read the Undo-Send window in seconds (Story 8.3). Absent / unparsable ⇒ the
+/// default of 10 s; a stored value is clamped to `0..=60` defensively. Stored in the
+/// `settings` k/v table under `undo_send.window`.
+pub fn get_undo_send_window(data_dir: &Path) -> Result<u16, CoreError> {
+    let raw = get_setting(data_dir, UNDO_SEND_WINDOW_KEY)?;
+    let secs = raw
+        .as_deref()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(UNDO_SEND_WINDOW_DEFAULT);
+    Ok(secs.min(UNDO_SEND_WINDOW_MAX))
+}
+
+/// Write the Undo-Send window in seconds (Story 8.3), clamping to `0..=60` before
+/// persisting. Persists a decimal string into the `settings` k/v table under
+/// `undo_send.window`.
+pub fn set_undo_send_window(data_dir: &Path, secs: u16) -> Result<(), CoreError> {
+    let clamped = secs.min(UNDO_SEND_WINDOW_MAX);
+    set_setting(data_dir, UNDO_SEND_WINDOW_KEY, &clamped.to_string())
+}
+
+/// A single held-send row from the `outbox` table (Story 8.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxRow {
+    /// Opaque unique row id (a fresh `TransactionId`).
+    pub id: String,
+    /// Owning keeper account id.
+    pub account_id: String,
+    /// Target room id.
+    pub room_id: String,
+    /// The held message body (never logged).
+    pub body: String,
+    /// When the send was held, in milliseconds since the Unix epoch (UTC).
+    pub held_at_ts: i64,
+    /// When the hold elapses and the row must dispatch, in ms since the Unix epoch.
+    pub dispatch_at_ts: i64,
+}
+
+/// Insert a held-send row into the `outbox` (Story 8.3). Keyed by the unique `id`, so
+/// many rows may coexist for one `(account_id, room_id)`. The body is never logged.
+pub fn insert_outbox(
+    data_dir: &Path,
+    id: &str,
+    account_id: &str,
+    room_id: &str,
+    body: &str,
+    held_at_ts: i64,
+    dispatch_at_ts: i64,
+) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    conn.execute(
+        "INSERT INTO outbox(id, account_id, room_id, body, held_at_ts, dispatch_at_ts) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![id, account_id, room_id, body, held_at_ts, dispatch_at_ts],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not insert outbox row: {e}")))?;
+    Ok(())
+}
+
+/// Remove a held-send row by its unique `id` (Story 8.3). Idempotent — deleting an
+/// already-dispatched or absent row is not an error (cancel and scheduler both rely on
+/// this).
+pub fn delete_outbox(data_dir: &Path, id: &str) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    conn.execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])
+        .map_err(|e| CoreError::Internal(format!("could not delete outbox row: {e}")))?;
+    Ok(())
+}
+
+/// List every held-send row for `account_id`, oldest first (ordered by `held_at_ts`
+/// ascending), so the scheduler dispatches and the UI stacks oldest-first (Story 8.3).
+pub fn list_outbox_rows_for_account(
+    data_dir: &Path,
+    account_id: &str,
+) -> Result<Vec<OutboxRow>, CoreError> {
+    let conn = open(data_dir)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts FROM outbox \
+             WHERE account_id = ?1 ORDER BY held_at_ts ASC",
+        )
+        .map_err(|e| CoreError::Internal(format!("could not prepare outbox list: {e}")))?;
+    let rows = stmt
+        .query_map(rusqlite::params![account_id], map_outbox_row)
+        .map_err(|e| CoreError::Internal(format!("could not query outbox list: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| CoreError::Internal(format!("could not read outbox row: {e}")))?);
+    }
+    Ok(out)
+}
+
+/// List every held-send row across all accounts, oldest first (Story 8.3).
+pub fn list_outbox_rows(data_dir: &Path) -> Result<Vec<OutboxRow>, CoreError> {
+    let conn = open(data_dir)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts FROM outbox \
+             ORDER BY held_at_ts ASC",
+        )
+        .map_err(|e| CoreError::Internal(format!("could not prepare outbox list: {e}")))?;
+    let rows = stmt
+        .query_map([], map_outbox_row)
+        .map_err(|e| CoreError::Internal(format!("could not query outbox list: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| CoreError::Internal(format!("could not read outbox row: {e}")))?);
+    }
+    Ok(out)
+}
+
+/// Map a `SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts` row into
+/// an [`OutboxRow`]. Shared by the two outbox list queries.
+fn map_outbox_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
+    Ok(OutboxRow {
+        id: r.get(0)?,
+        account_id: r.get(1)?,
+        room_id: r.get(2)?,
+        body: r.get(3)?,
+        held_at_ts: r.get(4)?,
+        dispatch_at_ts: r.get(5)?,
+    })
+}
+
 /// A single non-secret account row from the registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRow {
@@ -655,6 +806,14 @@ pub fn delete_account(data_dir: &Path, account_id: &str) -> Result<(), CoreError
         rusqlite::params![account_id],
     )
     .map_err(|e| CoreError::Internal(format!("could not delete account drafts: {e}")))?;
+    // Drop any held-send outbox rows the signed-out account owned (Story 8.3): a held
+    // send has no meaning once its account is gone. Idempotent — an account with no
+    // held sends deletes zero.
+    conn.execute(
+        "DELETE FROM outbox WHERE account_id = ?1",
+        rusqlite::params![account_id],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not delete account outbox rows: {e}")))?;
     Ok(())
 }
 
@@ -1312,6 +1471,112 @@ mod tests {
         // Only acctB's draft survives.
         assert_eq!(keys, vec![("acctB".to_owned(), "!r3".to_owned())]);
         assert_eq!(get_draft(&dir, "acctA", "!r1").expect("get gone"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_send_window_defaults_and_clamps() {
+        let dir = temp_dir();
+        // Absent setting reads the default of 10.
+        assert_eq!(
+            get_undo_send_window(&dir).expect("get default"),
+            UNDO_SEND_WINDOW_DEFAULT
+        );
+        // Round-trip an in-range value.
+        set_undo_send_window(&dir, 25).expect("set 25");
+        assert_eq!(get_undo_send_window(&dir).expect("get 25"), 25);
+        // 0 disables and round-trips.
+        set_undo_send_window(&dir, 0).expect("set 0");
+        assert_eq!(get_undo_send_window(&dir).expect("get 0"), 0);
+        // Out-of-range clamps to 60 on write.
+        set_undo_send_window(&dir, 99).expect("set 99");
+        assert_eq!(get_undo_send_window(&dir).expect("get clamped"), 60);
+        // A stored garbage value falls back to the default on read.
+        set_setting(&dir, UNDO_SEND_WINDOW_KEY, "not-a-number").expect("set garbage");
+        assert_eq!(
+            get_undo_send_window(&dir).expect("get garbage"),
+            UNDO_SEND_WINDOW_DEFAULT
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outbox_crud_insert_list_for_account_and_delete() {
+        let dir = temp_dir();
+        // Empty outbox lists nothing.
+        assert!(
+            list_outbox_rows(&dir).expect("list empty").is_empty(),
+            "fresh outbox lists no rows"
+        );
+        assert!(list_outbox_rows_for_account(&dir, "acctA")
+            .expect("list empty for account")
+            .is_empty());
+
+        // Insert three rows out of held-at order; list returns oldest-first.
+        insert_outbox(&dir, "id2", "acctA", "!r1", "second", 200, 210_000).expect("ins id2");
+        insert_outbox(&dir, "id1", "acctA", "!r1", "first", 100, 110_000).expect("ins id1");
+        insert_outbox(&dir, "id3", "acctB", "!r9", "other", 150, 160_000).expect("ins id3");
+
+        let a = list_outbox_rows_for_account(&dir, "acctA").expect("list acctA");
+        assert_eq!(a.len(), 2, "acctA has two held rows");
+        assert_eq!(a[0].id, "id1", "oldest (held_at 100) first");
+        assert_eq!(a[1].id, "id2");
+        assert_eq!(a[0].body, "first");
+        assert_eq!(a[0].dispatch_at_ts, 110_000);
+
+        // The cross-account list spans accounts, still oldest-first.
+        let all = list_outbox_rows(&dir).expect("list all");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id, "id1", "held_at 100");
+        assert_eq!(all[1].id, "id3", "held_at 150");
+        assert_eq!(all[2].id, "id2", "held_at 200");
+
+        // Idempotent delete removes one row; deleting again is a no-op.
+        delete_outbox(&dir, "id1").expect("delete id1");
+        delete_outbox(&dir, "id1").expect("delete missing id1 is ok");
+        let a = list_outbox_rows_for_account(&dir, "acctA").expect("list after delete");
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].id, "id2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unelapsed_outbox_row_survives_restart_read() {
+        // Simulate crash/restart: a row written now with a future dispatch_at_ts must
+        // be readable back from a freshly opened db (WAL durability), preserving its
+        // countdown target so the scheduler waits and the UI resumes.
+        let dir = temp_dir();
+        insert_outbox(
+            &dir,
+            "held1",
+            "acctA",
+            "!r1",
+            "surviving",
+            1_000,
+            9_999_999_999,
+        )
+        .expect("insert held");
+        // A second `open` (implicit in every registry call) reads the same durable row.
+        let rows = list_outbox_rows_for_account(&dir, "acctA").expect("re-read after restart");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "held1");
+        assert_eq!(rows[0].body, "surviving");
+        assert_eq!(rows[0].dispatch_at_ts, 9_999_999_999);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_account_drops_its_outbox_rows() {
+        let dir = temp_dir();
+        insert_outbox(&dir, "o1", "acctA", "!r1", "a1", 1, 2).expect("outbox A o1");
+        insert_outbox(&dir, "o2", "acctA", "!r2", "a2", 3, 4).expect("outbox A o2");
+        insert_outbox(&dir, "o3", "acctB", "!r3", "b3", 5, 6).expect("outbox B o3");
+
+        delete_account(&dir, "acctA").expect("delete acctA");
+        let all = list_outbox_rows(&dir).expect("list after account delete");
+        assert_eq!(all.len(), 1, "only acctB's held row survives");
+        assert_eq!(all[0].id, "o3");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

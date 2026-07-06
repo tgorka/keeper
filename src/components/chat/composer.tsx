@@ -48,7 +48,7 @@ import {
   useAttachmentsStore,
 } from "@/lib/stores/attachments";
 import type { PendingContext } from "@/lib/stores/composer";
-import { useComposerStore } from "@/lib/stores/composer";
+import { composerStore, useComposerStore } from "@/lib/stores/composer";
 import { draftsStore, useRemoteDraft } from "@/lib/stores/drafts";
 import { useIncognito } from "@/lib/stores/incognito";
 import { cn } from "@/lib/utils";
@@ -433,6 +433,39 @@ export function Composer({
     },
     [scheduleDraftSave],
   );
+
+  // Undo-Send restore (Story 8.3): when a held send is cancelled, `cancelHeldSend`
+  // returns the held body and the pill calls `composerStore.restore(accountId, roomId,
+  // body)`, bumping `restoreNonce`. Apply it here, establishing the composer text
+  // (latching `restoreConsumed` so a late mount-restore can't clobber it) and persisting
+  // it as the durable draft — replacing current composer content per the documented
+  // "restored text is the user's most recent intent" trade-off. Seeded to the current
+  // nonce so a fresh mount does not self-apply a stale, already-consumed restore. The
+  // restore only applies when its target matches this composer's chat, so a restore that
+  // resolves after the user switched rooms never lands in the wrong room's composer.
+  const restoreNonce = useComposerStore((s) => s.restoreNonce);
+  const seenRestoreNonce = useRef(restoreNonce);
+  useEffect(() => {
+    if (restoreNonce === seenRestoreNonce.current) {
+      return;
+    }
+    seenRestoreNonce.current = restoreNonce;
+    const { restoreBody: body, restoreTarget: target } = composerStore.getState();
+    if (body === null || pendingModeRef.current === "edit") {
+      return;
+    }
+    if (
+      target === null ||
+      target.accountId !== accountIdRef.current ||
+      target.roomId !== roomIdRef.current
+    ) {
+      return;
+    }
+    restoreConsumed.current = true;
+    setDraft(body);
+    setError(false);
+    scheduleDraftSave(body);
+  }, [restoreNonce, scheduleDraftSave]);
 
   // Restore the persisted draft and reconcile the remote mirror once on mount (Story
   // 7.1 + 7.2). The composer remounts per (account, room) in the parent, so this runs

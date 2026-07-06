@@ -59,6 +59,25 @@ export interface ComposerState {
   /** The keyboard-selected message key, or `null`. */
   selectedKey: string | null;
   /**
+   * A pending composer-text restore (Story 8.3, Undo-Send). Set by `restore` when a
+   * held send is undone: the composer watches `restoreNonce` and, when it changes,
+   * replaces its textarea content with `restoreBody`. `null` means nothing is
+   * pending. Ephemeral UI signal (the durable draft is already persisted in Rust by
+   * `cancelHeldSend`); this only drives the in-place composer update without a remount.
+   */
+  restoreBody: string | null;
+  /**
+   * The `(accountId, roomId)` the pending restore belongs to, or `null`. The composer
+   * applies a restore only when this matches its own chat, so a restore never lands in
+   * the wrong room's composer if the user switches chats during the async cancel.
+   */
+  restoreTarget: { accountId: string; roomId: string } | null;
+  /**
+   * A monotonically-increasing nonce bumped by {@link ComposerState.restore} so the
+   * composer applies a restore even when the same body is restored twice in a row.
+   */
+  restoreNonce: number;
+  /**
    * A monotonically-increasing focus nonce (Story 6.6). Bumped by
    * {@link ComposerState.requestFocus} to programmatically focus the composer's
    * textarea for the currently-open room — e.g. after a new chat is resolved and
@@ -90,6 +109,15 @@ export interface ComposerState {
   clearSelection: () => void;
   /** Request programmatic composer focus by bumping {@link ComposerState.focusNonce}. */
   requestFocus: () => void;
+  /**
+   * Restore `body` into the `(accountId, roomId)` composer (Story 8.3): set
+   * {@link ComposerState.restoreBody}/{@link ComposerState.restoreTarget} and bump
+   * {@link ComposerState.restoreNonce} so that chat's open composer replaces its text.
+   * Used after an Undo-Send cancel returns the held body. Also bumps `focusNonce` so
+   * focus lands back in the composer. The target scoping keeps the body out of any
+   * other room's composer if the user switched chats during the cancel.
+   */
+  restore: (accountId: string, roomId: string, body: string) => void;
 }
 
 /**
@@ -99,6 +127,9 @@ export const composerStore = createStore<ComposerState>()((set, get) => ({
   pending: null,
   stashedDraft: null,
   selectedKey: null,
+  restoreBody: null,
+  restoreTarget: null,
+  restoreNonce: 0,
   focusNonce: 0,
   startReply: ({ targetKey, sender, bodyPreview }) =>
     // Reply leaves the typed draft alone: no stash, clear any prior edit stash.
@@ -117,6 +148,13 @@ export const composerStore = createStore<ComposerState>()((set, get) => ({
   select: (key) => set({ selectedKey: key }),
   clearSelection: () => set({ selectedKey: null }),
   requestFocus: () => set((state) => ({ focusNonce: state.focusNonce + 1 })),
+  restore: (accountId, roomId, body) =>
+    set((state) => ({
+      restoreBody: body,
+      restoreTarget: { accountId, roomId },
+      restoreNonce: state.restoreNonce + 1,
+      focusNonce: state.focusNonce + 1,
+    })),
 }));
 
 /**

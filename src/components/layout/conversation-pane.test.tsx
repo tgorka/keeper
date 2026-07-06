@@ -71,6 +71,11 @@ vi.mock("@/lib/ipc/client", () => ({
   deleteMessage: (accountId: string, roomId: string, itemKey: string) =>
     deleteMessage(accountId, roomId, itemKey),
   roomNetworkLabel: (accountId: string, roomId: string) => roomNetworkLabel(accountId, roomId),
+  // Undo-Send held-send subscription (Story 8.3): no held sends; subscribe returns a
+  // stub id and never emits, unsubscribe is a no-op.
+  subscribeOutbox: vi.fn(async (): Promise<number> => 1),
+  unsubscribeOutbox: vi.fn(async (): Promise<void> => {}),
+  cancelHeldSend: vi.fn(async (): Promise<string> => ""),
   // Composer persistent drafts (Story 7.1): no stored draft; persist/clear are no-ops.
   loadDraft: vi.fn(async (): Promise<string | null> => null),
   saveDraft: vi.fn(async (): Promise<void> => {}),

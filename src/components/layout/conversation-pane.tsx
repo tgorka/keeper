@@ -34,6 +34,7 @@ import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble"
 import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import { RedactedStub } from "@/components/chat/redacted-stub";
 import { TypingIndicator } from "@/components/chat/typing-indicator";
+import { UndoSendPill } from "@/components/chat/undo-send-pill";
 import { UtdStub } from "@/components/chat/utd-stub";
 import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -67,10 +68,12 @@ import {
   sendReply,
   sendText,
   setTyping,
+  subscribeOutbox,
   subscribePaginationStatus,
   subscribeTimeline,
   subscribeTyping,
   toggleReaction,
+  unsubscribeOutbox,
   unsubscribePaginationStatus,
   unsubscribeTimeline,
   unsubscribeTyping,
@@ -82,6 +85,7 @@ import { useBridgeHealth } from "@/lib/stores/bridge-health";
 import { composerStore, useComposerStore } from "@/lib/stores/composer";
 import { exportStore } from "@/lib/stores/export";
 import { refreshIncognito, useIncognito, useIncognitoPolicyVersion } from "@/lib/stores/incognito";
+import { outboxStore, useHeldSends } from "@/lib/stores/outbox";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { timelineStore, useTimelineStore } from "@/lib/stores/timeline";
 import { cn } from "@/lib/utils";
@@ -612,6 +616,45 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     };
   }, [accountId, selectedRoomId]);
 
+  // Undo-Send held-send subscription (Story 8.3): opened on room view and torn down on
+  // room change / unmount (mirroring the timeline subscription lifecycle). Each snapshot
+  // is a full, oldest-first set that REPLACES this room's mirrored held rows. The
+  // `outbox` table in `keeper.db` is the source of truth — the store is a pure mirror.
+  useEffect(() => {
+    if (accountId === null || selectedRoomId === null) {
+      outboxStore.getState().clear();
+      return;
+    }
+    const roomAccount = accountId;
+    const room = selectedRoomId;
+    let subscriptionId: number | null = null;
+    let cancelled = false;
+    outboxStore.getState().applySnapshot(roomAccount, room, []);
+    subscribeOutbox(roomAccount, room, (batch) => {
+      if (!cancelled) {
+        outboxStore.getState().applySnapshot(roomAccount, room, batch.rows);
+      }
+    })
+      .then((id) => {
+        if (cancelled) {
+          void unsubscribeOutbox(roomAccount, id);
+          return;
+        }
+        subscriptionId = id;
+      })
+      .catch(() => {
+        // A held-send subscription failure is non-fatal: the Chat still works, just
+        // without live held-send surfaces (they re-appear on the next successful open).
+      });
+    return () => {
+      cancelled = true;
+      if (subscriptionId !== null) {
+        void unsubscribeOutbox(roomAccount, subscriptionId);
+      }
+      outboxStore.getState().clear();
+    };
+  }, [accountId, selectedRoomId]);
+
   // Typing + back-pagination status subscriptions (Story 3.9). Both are opened on
   // room view and torn down on room change / unmount (mirroring the timeline
   // subscription lifecycle). The typing set and pagination status are pure
@@ -799,6 +842,12 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
 
   const rows = toRenderedRows(items);
   const roomLoaded = accountId !== null && selectedRoomId !== null && loaded && !errored;
+
+  // Held sends for this Chat (Story 8.3), oldest-first — a pure mirror of the Rust
+  // `outbox` stream. Rendered as amber "Held" bubbles at the timeline tail, distinct
+  // from SDK local echoes; a row disappears when the scheduler dispatches it (the SDK
+  // "Sending…" echo then takes over) or the user undoes it.
+  const heldSends = useHeldSends(accountId ?? "", selectedRoomId ?? "");
 
   // The honest history-boundary state (Story 3.9), in precedence order: the
   // homeserver start is a definitive truth (no more history), so it wins; offline
@@ -1418,6 +1467,19 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
                 </li>
               ),
             )}
+            {/* Held sends (Story 8.3): amber "Held" bubbles at the timeline tail, one
+                per held send, oldest-first. Rendered from the outbox VM (never SDK
+                timeline items) so the SDK send-state mapping stays honest. */}
+            {heldSends.map((row) => (
+              <li key={`held:${row.id}`} data-testid="held-bubble">
+                <div className="flex justify-end px-3 py-0.5">
+                  <div className="max-w-[75%] rounded-[14px] border border-held/40 bg-held/10 px-3 py-2">
+                    <p className="whitespace-pre-wrap break-words text-sm">{row.body}</p>
+                    <span className="mt-0.5 block text-held text-xs">Held</span>
+                  </div>
+                </div>
+              </li>
+            ))}
           </ol>
         </div>
       )}
@@ -1432,6 +1494,10 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
                 {deepLinkNote}
               </p>
             )}
+            {/* Undo-Send pill(s) (Story 8.3): floating above the composer, one per
+                held send in this Chat, stacked oldest-first with a countdown ring.
+                Renders nothing when there are no held sends. */}
+            {accountId !== null && <UndoSendPill accountId={accountId} roomId={selectedRoomId} />}
             {/* Typing indicator (Story 3.9): "<name> is typing…" between the
                 timeline and composer; renders an empty live region when idle. */}
             <TypingIndicator typists={typists} />

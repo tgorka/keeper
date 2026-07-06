@@ -2009,6 +2009,50 @@ pub struct BbctlProgressVm {
     pub error: Option<String>,
 }
 
+/// One held send awaiting the elapse of its Undo-Send window (Story 8.3).
+///
+/// A held send is a message the user approved (composer or Approval Pane) while the
+/// Undo-Send window was positive: it has NOT been enqueued to the SDK send queue and
+/// is durable in the `outbox` table until either its window elapses (the scheduler
+/// dispatches it) or the user undoes it (the row is deleted, its body restored to the
+/// composer). It is deliberately NOT an SDK timeline item — the frontend renders it
+/// from this VM at the timeline tail, distinct from a real local echo. The body is
+/// authoritative in Rust and never logged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HeldSendVm {
+    /// The opaque unique row id (a `TransactionId`), used to address the row for
+    /// cancel / dispatch.
+    pub id: String,
+    /// The owning account id.
+    pub account_id: String,
+    /// The target room id.
+    pub room_id: String,
+    /// The held message body (authoritative, from Rust; never logged).
+    pub body: String,
+    /// When the send was held, in milliseconds since the Unix epoch (UTC).
+    #[ts(type = "number")]
+    pub held_at_ms: i64,
+    /// When the hold elapses and the row dispatches, in ms since the Unix epoch —
+    /// the frontend computes its countdown from this so a resumed Chat picks up the
+    /// correct remaining time after a restart.
+    #[ts(type = "number")]
+    pub dispatch_at_ms: i64,
+}
+
+/// A full snapshot of the held sends streamed to the frontend for one open Chat
+/// (Story 8.3). The outbox stream is low-churn, so each change emits a fresh, complete
+/// snapshot (oldest-first) that REPLACES the room's mirrored rows — the frontend store
+/// never folds ops. Empty `rows` means the Chat currently has no held sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct OutboxVm {
+    /// The held sends for the subscribed Chat, oldest-first.
+    pub rows: Vec<HeldSendVm>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
