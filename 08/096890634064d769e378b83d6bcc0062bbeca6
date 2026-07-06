@@ -1,0 +1,30 @@
+_bmad-output/implementation-artifacts/spec-9-4-global-hotkey.md
+  s_e6a43f1918e769::t_4d48148f728963 158-171
+  s_e6a43f1918e769::t_ba9a9c87f573bb 7
+  s_e6a43f1918e769::t_16a49bd047f945 9
+  s_e6a43f1918e769::t_a684b76c083bf4 108-119
+src/lib/hotkey.ts
+  s_e6a43f1918e769::t_9a251b286510b4 120-123,125-126
+  s_e6a43f1918e769::t_2a9c24af83a379 133-139
+src/lib/hotkey.test.ts
+  s_e6a43f1918e769::t_c947c73eb66037 67-80
+src-tauri/crates/keeper/src/ipc.rs
+  s_e6a43f1918e769::t_eba601a0bf205e 1654-1656
+  s_e6a43f1918e769::t_b643b08e40c18d 1707-1727
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "08096890634064d769e378b83d6bcc0062bbeca6",
+  "prompts": {},
+  "sessions": {
+    "s_e6a43f1918e769": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2cb1ad3a-c388-45ca-8111-389ed38a84eb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
