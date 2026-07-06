@@ -35,6 +35,31 @@ pub struct IncognitoVm {
     pub chat: Option<bool>,
 }
 
+/// The OS-global summon hotkey binding, projected to the Settings → Shortcuts
+/// section (Story 9.4, FR-50).
+///
+/// `accelerator` is the current opaque binding (e.g. `"Control+Alt+Space"`);
+/// `isDefault` is whether it equals the shipped default; `active` is whether that
+/// binding is currently registered with the OS (`false` ⇒ the section explains what to
+/// enable rather than showing nothing); `conflict` carries a *soft* warning when the
+/// accelerator matches a curated common macOS system shortcut (assignment still
+/// proceeds), else `null`. The frontend renders this VM only — it never derives
+/// conflict or registration state itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HotkeyVm {
+    /// The current accelerator string (opaque to the frontend; the shell parses it).
+    pub accelerator: String,
+    /// Whether the current accelerator equals the shipped default (`⌃⌥Space`).
+    pub is_default: bool,
+    /// Whether the accelerator is currently registered with the OS.
+    pub active: bool,
+    /// A soft conflict warning when the accelerator matches a curated macOS system
+    /// shortcut; `None` for a novel combo.
+    pub conflict: Option<String>,
+}
+
 /// Response of the `app_ping` liveness command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

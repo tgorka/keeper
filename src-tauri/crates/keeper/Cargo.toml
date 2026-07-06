@@ -37,6 +37,9 @@ keyring = { workspace = true }
 # Native file-picker dialog for the composer attach button (Story 3.7). Yields OS
 # file paths (never bytes over IPC). MIT/Apache — passes `cargo deny check`.
 tauri-plugin-dialog = { workspace = true }
+# OS-level global summon/hide hotkey (Story 9.4, FR-50). Registration/toggle live in
+# `hotkey.rs`; the accelerator string persists via `keeper-core::registry`.
+tauri-plugin-global-shortcut = { workspace = true }
 # Percent-decoding raw-body IPC headers (filename/caption) for the pasted-image
 # send path (Story 3.7). Already in the tree via url/matrix-sdk.
 percent-encoding = { workspace = true }

@@ -15,11 +15,16 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Kbd } from "@/components/ui/kbd";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { acceleratorFromEvent, DEFAULT_GLOBAL_HOTKEY, formatAccelerator } from "@/lib/hotkey";
 import {
   encryptionPosture,
+  type HotkeyVm,
   honorRemoteDeletions,
+  hotkeyGet,
+  hotkeySet,
   incognitoGetGlobal,
   incognitoSetGlobal,
   setHonorRemoteDeletions,
@@ -102,6 +107,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           <HonorRemoteDeletionsRow />
         </div>
         <PrivacySection open={open} />
+        <ShortcutsSection open={open} />
         <EncryptionSection />
         <SetupSection onOpenChange={onOpenChange} />
       </DialogContent>
@@ -385,6 +391,159 @@ function SetupSection({ onOpenChange }: { onOpenChange: (open: boolean) => void 
           Run setup again
         </Button>
       </div>
+    </div>
+  );
+}
+
+/** The honest copy explaining what to enable when the OS-global hotkey is not
+ * currently registered (`active === false`) — Story 9.4, FR-50. macOS
+ * `RegisterEventHotKey` does not require a specific permission API, so the copy points
+ * at the general place to check rather than over-claiming a single toggle. */
+const HOTKEY_PERMISSION_SENTENCE =
+  "The summon hotkey isn't registered with macOS right now. Another app may already own this shortcut, or keeper may need permission — check System Settings → Privacy & Security (Accessibility) and Keyboard shortcuts, then reassign it below.";
+
+/**
+ * Settings → Shortcuts section (Story 9.4, FR-50). Shows the OS-global summon hotkey as
+ * `Kbd` glyph chips, a "Change…" capture control that records the next chord
+ * ({@link acceleratorFromEvent}) and reassigns via {@link hotkeySet}, a soft conflict
+ * warning when the binding collides with a known macOS system shortcut, an honest
+ * explanation when the binding is not registered with the OS (`active === false`), and a
+ * "Reset to default" button. The VM is rendered as-is — conflict/registration state is
+ * never derived in TS.
+ */
+function ShortcutsSection({ open }: { open: boolean }) {
+  // `undefined` = still loading; otherwise the resolved binding VM.
+  const [hotkey, setHotkey] = useState<HotkeyVm | undefined>(undefined);
+  // Whether the capture control is armed and listening for the next chord.
+  const [capturing, setCapturing] = useState(false);
+  // The last reassignment error (OS refused / malformed), or `null`.
+  const [error, setError] = useState<string | null>(null);
+  const writeId = useRef(0);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    setHotkey(undefined);
+    setCapturing(false);
+    setError(null);
+    let cancelled = false;
+    void hotkeyGet()
+      .then((vm) => {
+        if (!cancelled) {
+          setHotkey(vm);
+        }
+      })
+      .catch(() => {
+        // On a read failure leave the section in its loading state rather than
+        // asserting a (possibly wrong) binding.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  // Persist a reassignment (from capture or reset), replacing the shown binding on
+  // success and surfacing the error on a hard failure without losing the old binding.
+  const assign = (accelerator: string) => {
+    writeId.current += 1;
+    const id = writeId.current;
+    setError(null);
+    void hotkeySet(accelerator)
+      .then((vm) => {
+        if (id === writeId.current) {
+          setHotkey(vm);
+        }
+      })
+      .catch((raw: unknown) => {
+        if (id !== writeId.current) {
+          return;
+        }
+        const message =
+          typeof raw === "object" && raw !== null && "message" in raw
+            ? String((raw as { message: unknown }).message)
+            : "Could not set that shortcut.";
+        setError(message);
+      });
+  };
+
+  // While capturing, translate the next complete chord into an accelerator and assign
+  // it. A bare modifier press yields `null` and keeps capturing; Escape cancels.
+  const onCaptureKeyDown = (event: React.KeyboardEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === "Escape") {
+      setCapturing(false);
+      return;
+    }
+    const accelerator = acceleratorFromEvent(event.nativeEvent);
+    if (accelerator === null) {
+      return;
+    }
+    setCapturing(false);
+    assign(accelerator);
+  };
+
+  return (
+    <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
+      <p className="font-medium">Shortcuts</p>
+      <div className="flex items-center justify-between gap-2">
+        <Label>Summon keeper</Label>
+        <div className="flex items-center gap-2">
+          {capturing ? (
+            <button
+              type="button"
+              // biome-ignore lint/a11y/noAutofocus: capture is an explicit user action; the field must receive the next keystroke immediately.
+              autoFocus
+              onKeyDown={onCaptureKeyDown}
+              onBlur={() => setCapturing(false)}
+              className="rounded-sm border border-ring px-2 py-0.5 text-muted-foreground text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Press a shortcut… (Esc to cancel)
+            </button>
+          ) : (
+            <Kbd aria-label={hotkey === undefined ? "Loading shortcut" : hotkey.accelerator}>
+              {hotkey === undefined ? "…" : formatAccelerator(hotkey.accelerator)}
+            </Kbd>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={hotkey === undefined || capturing}
+            onClick={() => {
+              setError(null);
+              setCapturing(true);
+            }}
+          >
+            Change…
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={hotkey === undefined || hotkey.isDefault}
+            onClick={() => assign(DEFAULT_GLOBAL_HOTKEY)}
+          >
+            Reset to default
+          </Button>
+        </div>
+      </div>
+      {hotkey?.conflict != null && (
+        <p className="text-held text-xs" role="status">
+          {hotkey.conflict}
+        </p>
+      )}
+      {hotkey !== undefined && !hotkey.active && (
+        <p className="text-held text-xs" role="status">
+          {HOTKEY_PERMISSION_SENTENCE}
+        </p>
+      )}
+      {error !== null && (
+        <p className="text-held text-xs" role="alert">
+          {error}
+        </p>
+      )}
     </div>
   );
 }

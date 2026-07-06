@@ -9,6 +9,22 @@ vi.mock("@/lib/ipc/client", () => ({
   incognitoSetGlobal: vi.fn(() => Promise.resolve()),
   undoSendWindow: vi.fn(() => Promise.resolve(10)),
   setUndoSendWindow: vi.fn(() => Promise.resolve()),
+  hotkeyGet: vi.fn(() =>
+    Promise.resolve({
+      accelerator: "Control+Alt+Space",
+      isDefault: true,
+      active: true,
+      conflict: null,
+    }),
+  ),
+  hotkeySet: vi.fn(() =>
+    Promise.resolve({
+      accelerator: "Control+Alt+Space",
+      isDefault: true,
+      active: true,
+      conflict: null,
+    }),
+  ),
   verificationCancel: vi.fn(() => Promise.resolve()),
 }));
 
@@ -21,7 +37,10 @@ import { SettingsDialog } from "@/components/settings/settings-dialog";
 import type { AccountVm } from "@/lib/ipc/client";
 import {
   encryptionPosture,
+  type HotkeyVm,
   honorRemoteDeletions,
+  hotkeyGet,
+  hotkeySet,
   setHonorRemoteDeletions,
   setUndoSendWindow,
   undoSendWindow,
@@ -37,6 +56,15 @@ const mockHonorGet = vi.mocked(honorRemoteDeletions);
 const mockHonorSet = vi.mocked(setHonorRemoteDeletions);
 const mockUndoGet = vi.mocked(undoSendWindow);
 const mockUndoSet = vi.mocked(setUndoSendWindow);
+const mockHotkeyGet = vi.mocked(hotkeyGet);
+const mockHotkeySet = vi.mocked(hotkeySet);
+
+const DEFAULT_HOTKEY_VM: HotkeyVm = {
+  accelerator: "Control+Alt+Space",
+  isDefault: true,
+  active: true,
+  conflict: null,
+};
 
 function account(id: string): AccountVm {
   return {
@@ -59,6 +87,10 @@ describe("SettingsDialog", () => {
     mockUndoSet.mockClear();
     mockUndoGet.mockResolvedValue(10);
     mockUndoSet.mockResolvedValue(undefined);
+    mockHotkeyGet.mockClear();
+    mockHotkeySet.mockClear();
+    mockHotkeyGet.mockResolvedValue(DEFAULT_HOTKEY_VM);
+    mockHotkeySet.mockResolvedValue(DEFAULT_HOTKEY_VM);
     accountsStore.getState().clear();
     encryptionStatusStore.getState().reset();
     keyBackupStore.getState().reset();
@@ -233,5 +265,84 @@ describe("SettingsDialog", () => {
     expect(wizardStore.getState().active).toBe(true);
     expect(wizardStore.getState().step).toBe("welcome");
     expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  // ── Shortcuts section (Story 9.4) ──────────────────────────────────────────
+  it("renders the current summon hotkey binding as glyph chips", async () => {
+    mockPosture.mockResolvedValue(false);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText("Shortcuts")).toBeInTheDocument();
+    // The default Control+Alt+Space renders as the macOS glyph string ⌃⌥Space.
+    expect(await screen.findByText("⌃⌥Space")).toBeInTheDocument();
+    expect(mockHotkeyGet).toHaveBeenCalled();
+  });
+
+  it("captures a new chord and reassigns via hotkeySet", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockHotkeySet.mockResolvedValue({
+      accelerator: "Control+Shift+K",
+      isDefault: false,
+      active: true,
+      conflict: null,
+    });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const change = await screen.findByRole("button", { name: "Change…" });
+    fireEvent.click(change);
+    const capture = await screen.findByText(/Press a shortcut/);
+    // Fire the captured chord ⌃⇧K.
+    fireEvent.keyDown(capture, { code: "KeyK", key: "k", ctrlKey: true, shiftKey: true });
+
+    await waitFor(() => {
+      expect(mockHotkeySet).toHaveBeenCalledWith("Control+Shift+K");
+    });
+    // The new binding renders.
+    expect(await screen.findByText("⌃⇧K")).toBeInTheDocument();
+  });
+
+  it("shows the soft conflict warning returned by the backend", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockHotkeyGet.mockResolvedValue({
+      accelerator: "Super+Space",
+      isDefault: false,
+      active: true,
+      conflict: "May conflict with Spotlight (⌘Space).",
+    });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(/May conflict with Spotlight/)).toBeInTheDocument();
+  });
+
+  it("explains what to enable when the hotkey is not registered (active=false)", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockHotkeyGet.mockResolvedValue({
+      accelerator: "Control+Alt+Space",
+      isDefault: true,
+      active: false,
+      conflict: null,
+    });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(/Privacy & Security/)).toBeInTheDocument();
+  });
+
+  it("resets to the default via hotkeySet", async () => {
+    mockPosture.mockResolvedValue(false);
+    // Start on a non-default binding so the Reset button is enabled.
+    mockHotkeyGet.mockResolvedValue({
+      accelerator: "Control+Shift+K",
+      isDefault: false,
+      active: true,
+      conflict: null,
+    });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const reset = await screen.findByRole("button", { name: "Reset to default" });
+    fireEvent.click(reset);
+
+    await waitFor(() => {
+      expect(mockHotkeySet).toHaveBeenCalledWith("Control+Alt+Space");
+    });
   });
 });

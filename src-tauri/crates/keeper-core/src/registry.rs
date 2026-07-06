@@ -532,6 +532,31 @@ pub fn incognito_scopes(
     Ok((chat, account, global))
 }
 
+/// The `settings` key holding the OS-global summon hotkey accelerator (Story 9.4).
+/// Stored as an opaque accelerator string (e.g. `"Control+Alt+Space"`); absent ⇒
+/// [`DEFAULT_GLOBAL_HOTKEY`]. `keeper-core` never parses this string — accelerator
+/// parsing/registration lives only in the `keeper` shell crate (core stays Tauri-free).
+const HOTKEY_GLOBAL_KEY: &str = "hotkey.global";
+
+/// The default OS-global summon hotkey accelerator when the setting is absent
+/// (Story 9.4). `⌃⌥Space`. An opaque string to `keeper-core` — the shell parses it.
+pub const DEFAULT_GLOBAL_HOTKEY: &str = "Control+Alt+Space";
+
+/// Read the OS-global summon hotkey accelerator (Story 9.4). Absent ⇒ the default
+/// [`DEFAULT_GLOBAL_HOTKEY`]. Stored in the `settings` k/v table under `hotkey.global`.
+/// The value is an opaque accelerator string; `keeper-core` never parses it.
+pub fn get_global_hotkey(data_dir: &Path) -> Result<String, CoreError> {
+    Ok(get_setting(data_dir, HOTKEY_GLOBAL_KEY)?
+        .unwrap_or_else(|| DEFAULT_GLOBAL_HOTKEY.to_owned()))
+}
+
+/// Write the OS-global summon hotkey accelerator (Story 9.4). Persists the opaque
+/// accelerator string into the `settings` k/v table under `hotkey.global`. The shell
+/// crate validates + registers with the OS *before* calling this; core only stores it.
+pub fn set_global_hotkey(data_dir: &Path, accelerator: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, HOTKEY_GLOBAL_KEY, accelerator)
+}
+
 /// The `settings` key holding the Undo-Send window in whole seconds (Story 8.3).
 /// Stored as a decimal string; absent / unparsable ⇒ the default of 10 s.
 const UNDO_SEND_WINDOW_KEY: &str = "undo_send.window";
@@ -1288,6 +1313,29 @@ mod tests {
         assert!(get_incognito_global(&dir).expect("get global on"));
         set_incognito_global(&dir, false).expect("set global off");
         assert!(!get_incognito_global(&dir).expect("get global off"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_hotkey_defaults_and_round_trips() {
+        let dir = temp_dir();
+        // Absent setting reads the default accelerator (Story 9.4).
+        assert_eq!(
+            get_global_hotkey(&dir).expect("get absent hotkey"),
+            DEFAULT_GLOBAL_HOTKEY
+        );
+        // Set then read back an opaque accelerator string (core never parses it).
+        set_global_hotkey(&dir, "Control+Shift+K").expect("set hotkey");
+        assert_eq!(
+            get_global_hotkey(&dir).expect("get set hotkey"),
+            "Control+Shift+K"
+        );
+        // Overwrite replaces the stored accelerator.
+        set_global_hotkey(&dir, DEFAULT_GLOBAL_HOTKEY).expect("reset hotkey");
+        assert_eq!(
+            get_global_hotkey(&dir).expect("get reset hotkey"),
+            DEFAULT_GLOBAL_HOTKEY
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

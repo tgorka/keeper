@@ -25,11 +25,11 @@ use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
     ConnectionStatusBatch, CouplingCaveatVm, DemoBatch, DraftMirrorBatch, EditVersionVm,
-    EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IncognitoVm,
-    IpcError, IpcErrorCode, MenuSectionVm, NetworksSnapshot, NewChatResolutionVm, OutboxVm,
-    PaginationStatusBatch, PaletteMode, PaletteResultsVm, PingVm, RemoteDraftVm, ResolveSupportVm,
-    RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch,
-    VerificationFlowVm,
+    EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch,
+    IncognitoVm, IpcError, IpcErrorCode, MenuSectionVm, NetworksSnapshot, NewChatResolutionVm,
+    OutboxVm, PaginationStatusBatch, PaletteMode, PaletteResultsVm, PingVm, RemoteDraftVm,
+    ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch,
+    TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -1615,6 +1615,117 @@ pub fn undo_send_window(state: State<'_, AppState>) -> Result<u16, IpcError> {
 pub fn set_undo_send_window(state: State<'_, AppState>, seconds: u16) -> Result<(), IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     keeper_core::registry::set_undo_send_window(&data_dir, seconds).map_err(to_ipc_error)
+}
+
+/// Build the [`HotkeyVm`] for `accelerator`: `isDefault` vs the shipped default, `active`
+/// = whether it is currently registered with the OS, and the soft `conflict` warning.
+/// Pure over the app's global-shortcut state and the accelerator string.
+fn hotkey_vm(app: &tauri::AppHandle, accelerator: String) -> HotkeyVm {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let is_default = accelerator == crate::hotkey::DEFAULT_HOTKEY;
+    // `active` is honest: the parsed accelerator must both parse AND be registered.
+    let active = crate::hotkey::parse(&accelerator)
+        .map(|shortcut| app.global_shortcut().is_registered(shortcut))
+        .unwrap_or(false);
+    let conflict = crate::hotkey::known_conflict(&accelerator);
+    HotkeyVm {
+        accelerator,
+        is_default,
+        active,
+        conflict,
+    }
+}
+
+/// Read the OS-global summon hotkey binding (Story 9.4, FR-50). Returns the persisted
+/// accelerator (absent ⇒ the default `⌃⌥Space`), whether it equals the default, whether
+/// it is currently registered with the OS (`active`), and any soft conflict warning.
+/// Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn hotkey_get(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<HotkeyVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let accelerator = keeper_core::registry::get_global_hotkey(&data_dir).map_err(to_ipc_error)?;
+    Ok(hotkey_vm(&app, accelerator))
+}
+
+/// Reassign the OS-global summon hotkey (Story 9.4, FR-50). Validates the accelerator,
+/// computes the soft `known_conflict` warning, then unregisters the old binding and
+/// registers the new one with the OS; on success persists it and returns the new VM. A
+/// malformed accelerator is rejected before touching registration; if the OS *refuses*
+/// the new registration — or the OS accepts it but persisting the value fails — the old
+/// binding is restored (re-registered) and nothing is persisted, and the command returns
+/// `Err`. Logs carry accelerator strings only.
+#[tauri::command]
+pub fn hotkey_set(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    accelerator: String,
+) -> Result<HotkeyVm, IpcError> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+
+    // Validate before touching registration (malformed → reject, matrix row 8).
+    let Some(new_shortcut) = crate::hotkey::parse(&accelerator) else {
+        return Err(to_ipc_error(CoreError::Internal(format!(
+            "invalid accelerator: {accelerator}"
+        ))));
+    };
+
+    let previous = keeper_core::registry::get_global_hotkey(&data_dir).map_err(to_ipc_error)?;
+    let gs = app.global_shortcut();
+
+    // Unregister the currently-bound accelerator (best-effort — it may already be gone
+    // if startup registration failed). Only the single summon hotkey is ever bound.
+    if let Some(prev_shortcut) = crate::hotkey::parse(&previous) {
+        if gs.is_registered(prev_shortcut) {
+            if let Err(error) = gs.unregister(prev_shortcut) {
+                tracing::warn!(%error, accelerator = %previous, "hotkey: could not unregister old binding");
+            }
+        }
+    }
+
+    // Register the new accelerator with the shared toggle handler. A hard failure keeps
+    // the OLD binding (re-register it) and returns Err — nothing is persisted.
+    if let Err(error) = gs.on_shortcut(new_shortcut, crate::hotkey::on_shortcut_event) {
+        tracing::warn!(%error, accelerator, "hotkey: OS refused to register new binding; restoring previous");
+        // Restore the previous binding so the user is not left with no hotkey. If the
+        // restore ALSO fails (e.g. the previous accelerator was never registered), log
+        // it — the user is then left with no active hotkey, which `hotkey_get().active`
+        // will report as `false` so the Settings section shows the permission
+        // explanation rather than failing silently.
+        if let Some(prev_shortcut) = crate::hotkey::parse(&previous) {
+            if let Err(restore_error) =
+                gs.on_shortcut(prev_shortcut, crate::hotkey::on_shortcut_event)
+            {
+                tracing::warn!(%restore_error, accelerator = %previous, "hotkey: could not restore previous binding after a failed reassignment");
+            }
+        }
+        return Err(to_ipc_error(CoreError::Internal(format!(
+            "the system refused to register {accelerator}: {error}"
+        ))));
+    }
+
+    // Only persist an accelerator the OS accepted (Block-If / never-persist-refused). If
+    // the OS accepted the new binding but the persist fails (e.g. a disk error), roll the
+    // registration back to `previous` so the live global shortcut and the stored value
+    // never diverge — otherwise the new hotkey would be live this session while startup
+    // and `hotkey_get` would report the old one, leaving `active=false` for a working key.
+    if let Err(error) = keeper_core::registry::set_global_hotkey(&data_dir, &accelerator) {
+        tracing::warn!(%error, accelerator, "hotkey: could not persist new binding; rolling back to previous");
+        if gs.is_registered(new_shortcut) {
+            if let Err(unreg_error) = gs.unregister(new_shortcut) {
+                tracing::warn!(%unreg_error, accelerator, "hotkey: could not unregister new binding during rollback");
+            }
+        }
+        if let Some(prev_shortcut) = crate::hotkey::parse(&previous) {
+            if let Err(restore_error) =
+                gs.on_shortcut(prev_shortcut, crate::hotkey::on_shortcut_event)
+            {
+                tracing::warn!(%restore_error, accelerator = %previous, "hotkey: could not restore previous binding after a failed persist");
+            }
+        }
+        return Err(to_ipc_error(error));
+    }
+    Ok(hotkey_vm(&app, accelerator))
 }
 
 /// Cancel a held send by its `id` (Story 8.3): delete the `outbox` row, persist its

@@ -41,6 +41,7 @@ import {
 } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore, useArchiveRoomsStore } from "@/lib/stores/archive-rooms";
+import { useChatListFocusNonce } from "@/lib/stores/chat-list-focus";
 import { composerStore } from "@/lib/stores/composer";
 import { draftsStore } from "@/lib/stores/drafts";
 import { favoritesRoomsStore, useFavoritesRoomsStore } from "@/lib/stores/favorites-rooms";
@@ -110,6 +111,18 @@ export function ChatListPane() {
   // move `.focus()` as the roving index changes. Rebuilt each render from the
   // current `visibleRooms` length.
   const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  // The chat-list container element, so a focus request can fall back to focusing it
+  // when the Inbox list is empty (no row to focus). See the focus-request effect below.
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  // A focus request that landed on an empty/not-yet-loaded Inbox and is still pending:
+  // the container was focused as a fallback and the request should complete (jump to the
+  // first row) once the Inbox rows arrive — the cold-start raise path, where the hotkey
+  // fires before the first inbox batch has streamed in (Story 9.4).
+  const pendingFocusRef = useRef(false);
+  // The global summon hotkey's focus-request nonce (Story 9.4): each bump asks this
+  // pane to move keyboard focus to the first visible Inbox row (or the container when
+  // empty), reusing the Story 9.2 roving-focus state without lifting it out.
+  const focusNonce = useChatListFocusNonce();
 
   useEffect(() => {
     if (accountKey.length === 0) {
@@ -344,6 +357,55 @@ export function ChatListPane() {
     clearNetworkFilter();
   };
 
+  // Global summon-hotkey focus request (Story 9.4): when the hotkey raises the window
+  // it bumps `focusNonce`; move the roving cursor to the first visible Inbox row and
+  // focus it, or — when the Inbox list is empty (or another view is active) — fall back
+  // to focusing the list container so keyboard focus still lands here (matrix: empty
+  // inbox). The initial mount (nonce 0) is skipped so the list is not auto-focused on
+  // load. Reuses the Story 9.2 roving state (`focusedKey`/`rowRefs`) — never re-orders.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally keyed on `focusNonce` only — each bump is one focus request; re-running on every `visibleRooms`/`view` change would steal focus spuriously.
+  useEffect(() => {
+    if (focusNonce === 0) {
+      return;
+    }
+    if (view === "inbox" && visibleRooms.length > 0) {
+      const first = visibleRooms[0];
+      setFocusedKey(`${first.accountId}:${first.roomId}`);
+      rowRefs.current[0]?.focus();
+      pendingFocusRef.current = false;
+      return;
+    }
+    // Empty/not-yet-loaded Inbox (or a non-inbox view): focus the container so keyboard
+    // focus still lands here. When the target is the Inbox, remember the request so it
+    // completes once rows stream in (cold-start raise); the completion effect below
+    // only acts while focus is still parked on the container.
+    pendingFocusRef.current = view === "inbox";
+    containerRef.current?.focus();
+  }, [focusNonce]);
+
+  // Complete a pending cold-start focus request (Story 9.4): once the Inbox rows arrive
+  // after the container fallback, move focus to the first row — but only while focus is
+  // still on the container, so a request is never allowed to steal focus the user has
+  // since moved elsewhere. Runs on Inbox-list changes; the pending flag makes it a
+  // cheap no-op in the common case.
+  useEffect(() => {
+    if (!pendingFocusRef.current) {
+      return;
+    }
+    if (view !== "inbox" || visibleRooms.length === 0) {
+      return;
+    }
+    if (document.activeElement !== containerRef.current) {
+      // Focus already moved on (user or another surface) — abandon the request.
+      pendingFocusRef.current = false;
+      return;
+    }
+    const first = visibleRooms[0];
+    setFocusedKey(`${first.accountId}:${first.roomId}`);
+    rowRefs.current[0]?.focus();
+    pendingFocusRef.current = false;
+  }, [visibleRooms, view]);
+
   // ── Chat-list keyboard navigation (Story 9.2) ──────────────────────────────
   // Bare-key list verbs on the focused row, mirroring the `ChatRow` context menu:
   // the command direction is chosen from the row's current flag, and `u` mirrors
@@ -499,7 +561,12 @@ export function ChatListPane() {
   return (
     // biome-ignore lint/a11y/noStaticElementInteractions: container-level Esc handler clears all active filters before focus moves (UX-DR); rows stay independently keyboard-operable, so this is additive.
     <div
-      className="flex h-full w-[320px] shrink-0 flex-col border-border border-r bg-background"
+      ref={containerRef}
+      // `tabIndex={-1}` makes the container programmatically focusable so the global
+      // summon-hotkey fallback (empty inbox) can land focus here (Story 9.4). It is not
+      // a tab stop for normal keyboard nav — the roving rows own that.
+      tabIndex={-1}
+      className="flex h-full w-[320px] shrink-0 flex-col border-border border-r bg-background outline-none"
       onKeyDown={onListKeyDown}
     >
       {/* Dismissible filter chips (Story 4.5 + 4.6): shown above the list when a

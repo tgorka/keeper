@@ -120,7 +120,7 @@ development_status:
   9-1-command-palette: done
   9-2-keyboard-navigation-and-quick-switcher: done
   9-3-cheat-sheet-and-native-menu-bar-from-the-action-registry: done
-  9-4-global-hotkey: backlog
+  9-4-global-hotkey: done
   epic-9-retrospective: optional
   epic-10: backlog
   10-1-native-notifications-from-the-sync-loop: backlog

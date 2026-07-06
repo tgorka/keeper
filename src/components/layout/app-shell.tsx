@@ -22,6 +22,7 @@ import { useBridgesShortcut } from "@/hooks/use-bridges-shortcut";
 import { useCheatSheetShortcut } from "@/hooks/use-cheat-sheet-shortcut";
 import { useCommandPaletteShortcut } from "@/hooks/use-command-palette-shortcut";
 import { useEncryptionStatuses } from "@/hooks/use-encryption-statuses";
+import { useGlobalHotkey } from "@/hooks/use-global-hotkey";
 import { useKeyBackupStatuses } from "@/hooks/use-key-backup-statuses";
 import { useMenuActions } from "@/hooks/use-menu-actions";
 import { useNewChatShortcut } from "@/hooks/use-new-chat-shortcut";
@@ -72,6 +73,9 @@ export function AppShell() {
   useQuickSwitcher();
   // Wire ⌥⌘↓/⌥⌘↑ to jump next/previous-unread in the rendered window (Story 9.2).
   useUnreadJump();
+  // Listen for the OS-global summon hotkey (Story 9.4): a raise switches to Inbox and
+  // moves keyboard focus into the chat list via the focus-request nonce store.
+  useGlobalHotkey();
   // Which primary view the shell renders. "bridges" and "approval" each replace the
   // chat-list + conversation cluster with a full-surface pane (Story 6.1 / 7.3).
   const primaryView = usePrimaryView();

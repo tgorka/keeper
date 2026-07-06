@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   AccountVm,
@@ -9,6 +9,7 @@ import type {
 } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
+import { chatListFocusStore } from "@/lib/stores/chat-list-focus";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 
@@ -149,6 +150,7 @@ beforeEach(() => {
   markRoomReadMock.mockClear();
   markRoomUnreadMock.mockClear();
   composerStore.setState({ focusNonce: 0 });
+  chatListFocusStore.setState({ focusNonce: 0 });
 });
 
 afterEach(() => {
@@ -1487,5 +1489,86 @@ describe("ChatListPane keyboard navigation (Story 9.2)", () => {
     fireEvent.keyDown(sibling, { key: "e" });
     expect(archiveRoomMock).not.toHaveBeenCalled();
     sibling.remove();
+  });
+
+  // ── Global summon-hotkey focus request (Story 9.4) ─────────────────────────
+  it("moves keyboard focus to the first Inbox row when a focus request is made", async () => {
+    await renderWithRooms([
+      { roomId: "!a", displayName: "Alpha", isArchived: false },
+      { roomId: "!b", displayName: "Beta", isArchived: false },
+    ]);
+    // No row focused initially.
+    expect(rowButton("Alpha")).not.toHaveFocus();
+
+    // A focus request (the global hotkey raise) lands focus on the first row.
+    act(() => {
+      chatListFocusStore.getState().requestFocus();
+    });
+    await waitFor(() => {
+      expect(rowButton("Alpha")).toHaveFocus();
+    });
+  });
+
+  it("falls back to the list container when the Inbox is empty on a focus request", async () => {
+    const captured: { onInbox: ((b: InboxBatch) => void) | null } = { onInbox: null };
+    subscribeInbox.mockImplementation((onInbox: (b: InboxBatch) => void) => {
+      captured.onInbox = onInbox;
+      return Promise.resolve(1);
+    });
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+    captured.onInbox?.({ ops: [{ op: "reset", rooms: [] }], total: 0 });
+    await waitFor(() => {
+      expect(screen.getByText("No conversations yet.")).toBeInTheDocument();
+    });
+
+    act(() => {
+      chatListFocusStore.getState().requestFocus();
+    });
+    // With no row to focus, the focusable list container receives focus so keyboard
+    // focus still lands in the pane (matrix: empty inbox).
+    await waitFor(() => {
+      expect(document.activeElement).not.toBe(document.body);
+      expect((document.activeElement as HTMLElement)?.tabIndex).toBe(-1);
+    });
+  });
+
+  it("completes a pending focus request on the first row once cold-start rooms arrive", async () => {
+    // Cold-start raise: the hotkey fires before the first inbox batch has streamed in.
+    const captured: { onInbox: ((b: InboxBatch) => void) | null } = { onInbox: null };
+    subscribeInbox.mockImplementation((onInbox: (b: InboxBatch) => void) => {
+      captured.onInbox = onInbox;
+      return Promise.resolve(1);
+    });
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+    captured.onInbox?.({ ops: [{ op: "reset", rooms: [] }], total: 0 });
+    await waitFor(() => {
+      expect(screen.getByText("No conversations yet.")).toBeInTheDocument();
+    });
+
+    // Request focus while the list is still empty → container fallback, request pending.
+    act(() => {
+      chatListFocusStore.getState().requestFocus();
+    });
+    await waitFor(() => {
+      expect((document.activeElement as HTMLElement)?.tabIndex).toBe(-1);
+    });
+
+    // Rooms stream in a moment later; the pending request completes onto the first row.
+    act(() => {
+      captured.onInbox?.({
+        ops: [
+          {
+            op: "reset",
+            rooms: [inboxRoom("!a:example.org", account.accountId, "Alpha", "")],
+          },
+        ],
+        total: 1,
+      });
+    });
+    await waitFor(() => {
+      expect(rowButton("Alpha")).toHaveFocus();
+    });
   });
 });

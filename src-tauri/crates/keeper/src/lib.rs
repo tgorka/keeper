@@ -5,6 +5,7 @@
 // default type-layout recursion depth; raise it as matrix-sdk recommends.
 #![recursion_limit = "256"]
 
+mod hotkey;
 mod ipc;
 mod media_protocol;
 mod menu;
@@ -22,6 +23,10 @@ pub fn run() {
         // Native file-picker for the composer attach button (Story 3.7). Returns
         // OS file paths; Rust reads the file — no media bytes cross IPC.
         .plugin(tauri_plugin_dialog::init())
+        // OS-level global summon/hide hotkey (Story 9.4, FR-50). The single accelerator
+        // is registered in `setup()` via `hotkey::install`; its press handler toggles
+        // the main window on focus.
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(ipc::AppState::new())
         // The exclusive decrypted-media transport (Story 3.6, AD-4): decrypted
         // bytes reach the webview only over this Range-capable `keeper-media://`
@@ -55,6 +60,12 @@ pub fn run() {
             app.on_menu_event(|app, event| {
                 menu::handle_menu_event(app, event.id().as_ref());
             });
+
+            // Register the OS-global summon/hide hotkey (Story 9.4): the persisted-or-
+            // default accelerator, whose press handler toggles the main window on focus
+            // and emits `keeper://global-hotkey-activated`. Best-effort — a registration
+            // failure leaves the app running with `hotkey_get().active = false`.
+            hotkey::install(app.handle());
 
             Ok(())
         })
@@ -125,6 +136,8 @@ pub fn run() {
             ipc::send_text,
             ipc::undo_send_window,
             ipc::set_undo_send_window,
+            ipc::hotkey_get,
+            ipc::hotkey_set,
             ipc::cancel_held_send,
             ipc::subscribe_outbox,
             ipc::unsubscribe_outbox,

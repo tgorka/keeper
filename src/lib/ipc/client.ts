@@ -42,6 +42,7 @@ export type { ExportProgressVm } from "./gen/ExportProgressVm";
 export type { ExportRequestVm } from "./gen/ExportRequestVm";
 export type { ExportScopeKind } from "./gen/ExportScopeKind";
 export type { HeldSendVm } from "./gen/HeldSendVm";
+export type { HotkeyVm } from "./gen/HotkeyVm";
 export type { InboxBatch } from "./gen/InboxBatch";
 export type { InboxOp } from "./gen/InboxOp";
 export type { InboxRoomVm } from "./gen/InboxRoomVm";
@@ -106,6 +107,7 @@ import type { EditVersionVm } from "./gen/EditVersionVm";
 import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 import type { ExportProgressVm } from "./gen/ExportProgressVm";
 import type { ExportRequestVm } from "./gen/ExportRequestVm";
+import type { HotkeyVm } from "./gen/HotkeyVm";
 import type { InboxBatch } from "./gen/InboxBatch";
 import type { IncognitoVm } from "./gen/IncognitoVm";
 import type { MenuSectionVm } from "./gen/MenuSectionVm";
@@ -1103,6 +1105,27 @@ export async function undoSendWindow(): Promise<number> {
  */
 export async function setUndoSendWindow(seconds: number): Promise<void> {
   await invoke<void>("set_undo_send_window", { seconds });
+}
+
+/**
+ * Read the OS-global summon hotkey binding (Story 9.4, FR-50). Returns the persisted
+ * accelerator (absent = the default `⌃⌥Space`), whether it equals the default, whether
+ * it is currently registered with the OS (`active`), and any soft conflict warning.
+ * Rejects with the {@link IpcError} envelope on a registry failure.
+ */
+export async function hotkeyGet(): Promise<HotkeyVm> {
+  return await invoke<HotkeyVm>("hotkey_get");
+}
+
+/**
+ * Reassign the OS-global summon hotkey (Story 9.4, FR-50). Validates the accelerator,
+ * unregisters the old binding, registers the new one with the OS, and persists it on
+ * success — resolving with the new {@link HotkeyVm} (including any soft `conflict`
+ * warning). A malformed accelerator or an OS refusal keeps the previous binding and
+ * rejects with the {@link IpcError} envelope (nothing is persisted).
+ */
+export async function hotkeySet(accelerator: string): Promise<HotkeyVm> {
+  return await invoke<HotkeyVm>("hotkey_set", { accelerator });
 }
 
 /**
