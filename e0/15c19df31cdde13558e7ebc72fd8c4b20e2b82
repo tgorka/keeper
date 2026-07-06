@@ -1,0 +1,52 @@
+src/components/chat/composer.tsx
+  s_9f9cfd011f23ca::t_7d888e768d1156 335-337,342
+  s_9f9cfd011f23ca::t_ac263c00919f3e 227-233
+  s_9f9cfd011f23ca::t_cd73e5d2ab67fa 623-625
+  s_9f9cfd011f23ca::t_99f53dc8883bdd 317-319
+  s_9f9cfd011f23ca::t_520ddc972225c6 381-383
+  s_9f9cfd011f23ca::t_a35235a1f2ec7f 327-330
+src-tauri/crates/keeper/src/ipc.rs
+  s_9f9cfd011f23ca::t_63bb2c10810fba 1130-1133
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_9f9cfd011f23ca::t_9f7ec311ba2740 248-259
+_bmad-output/implementation-artifacts/spec-7-1-persistent-per-chat-drafts.md
+  s_1fe351bbf27d76::t_05ddde4723c349 5
+  s_9f9cfd011f23ca::t_e3acaeaa82635e 99-110
+  s_9f9cfd011f23ca::t_3078c02ff62f03 153-155,157,159
+src/components/layout/conversation-pane.tsx
+  s_9f9cfd011f23ca::t_c6243e70accbe2 1256-1262
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_5f1cb7113585b0::t_b17055f398a5c9 108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e015c19df31cdde13558e7ebc72fd8c4b20e2b82",
+  "prompts": {},
+  "sessions": {
+    "s_1fe351bbf27d76": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d54f1ca5-b58a-45f2-9877-d80c267ece24",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_5f1cb7113585b0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "76554204-7375-4175-9617-fa0d26f788c7",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_9f9cfd011f23ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "da791745-7a84-46d0-aa28-4eda5ce473fe",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
