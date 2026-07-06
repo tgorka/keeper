@@ -120,3 +120,9 @@ Keeper is an open-source, Beeper-style Matrix messenger client (Apache-2.0). It 
 - Review periodically for outdated rules and remove rules that become obvious.
 
 Last Updated: 2026-07-03
+
+## Git workflow (automation sessions)
+
+- Commit on the branch that is checked out when the session starts. Do NOT create new
+  branches, switch branches, push, or rewrite history — the bmad-loop orchestrator and the
+  human coordinator own branch topology and pushing.
