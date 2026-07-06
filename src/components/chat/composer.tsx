@@ -50,6 +50,7 @@ import {
 import type { PendingContext } from "@/lib/stores/composer";
 import { useComposerStore } from "@/lib/stores/composer";
 import { draftsStore, useRemoteDraft } from "@/lib/stores/drafts";
+import { useIncognito } from "@/lib/stores/incognito";
 import { cn } from "@/lib/utils";
 
 /** Derive a chip display name for a pending attachment (its filename). */
@@ -171,6 +172,10 @@ export function Composer({
   // differing. Local text is never overwritten without the user tapping "Use that
   // version".
   const [remoteOffer, setRemoteOffer] = useState<string | null>(null);
+
+  // Whether Incognito is effective for this chat (Story 8.1). Mirrored from the
+  // Rust-resolved VM; drives the violet composer focus ring while it applies.
+  const incognitoEffective = useIncognito(accountId, roomId)?.effective ?? false;
 
   // The textarea handle, focused programmatically when the composer store's focus
   // nonce is *bumped* (Story 6.6 — e.g. after a new chat is resolved and opened).
@@ -839,8 +844,14 @@ export function Composer({
           onPaste={onPaste}
           rows={1}
           // Autogrow via `field-sizing-content` (from the shadcn base) capped at
-          // eight lines, then scroll.
-          className={cn("max-h-[calc(8*1.5rem+1rem)] min-h-9 resize-none")}
+          // eight lines, then scroll. While Incognito is effective for this chat
+          // (Story 8.1), tint the focus ring violet with the reserved `--incognito`
+          // token, overriding the base ring/border color.
+          className={cn(
+            "max-h-[calc(8*1.5rem+1rem)] min-h-9 resize-none",
+            incognitoEffective && "focus-visible:border-incognito focus-visible:ring-incognito/50",
+          )}
+          data-incognito={incognitoEffective ? "true" : undefined}
         />
         <Button
           type="button"

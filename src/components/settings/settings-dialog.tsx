@@ -16,9 +16,16 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { encryptionPosture, honorRemoteDeletions, setHonorRemoteDeletions } from "@/lib/ipc/client";
+import {
+  encryptionPosture,
+  honorRemoteDeletions,
+  incognitoGetGlobal,
+  incognitoSetGlobal,
+  setHonorRemoteDeletions,
+} from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useEncryptionStatus } from "@/lib/stores/encryption-status";
+import { incognitoStore } from "@/lib/stores/incognito";
 import { keyBackupStore, useKeyBackupStatus } from "@/lib/stores/key-backup";
 import { verificationStore } from "@/lib/stores/verification";
 import { wizardStore } from "@/lib/stores/wizard";
@@ -91,6 +98,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>
           <HonorRemoteDeletionsRow />
         </div>
+        <PrivacySection open={open} />
         <EncryptionSection />
         <SetupSection onOpenChange={onOpenChange} />
       </DialogContent>
@@ -162,6 +170,87 @@ function HonorRemoteDeletionsRow() {
         />
       </div>
       <p className="text-muted-foreground">{HONOR_REMOTE_DELETIONS_SENTENCE}</p>
+    </div>
+  );
+}
+
+/**
+ * The plain disclosure for the global Incognito default (Story 8.1). Sentence case,
+ * no exclamation marks, honest consequence-naming (project voice).
+ */
+const INCOGNITO_GLOBAL_SENTENCE =
+  "Reading a chat sends a private read receipt: your read position still syncs across your own devices, but the other person keeps seeing the message as unread. This is the default for every chat; you can override it per account or per chat.";
+
+/**
+ * Privacy section (Story 8.1): the global Incognito default `Switch`, bound to
+ * `incognitoSetGlobal`. Reads its initial state via `incognitoGetGlobal()` on open and
+ * mirrors the new value into the incognito store so open chats reflect it. On a persist
+ * failure the toggle reverts (honest — never claims a state that was not saved).
+ */
+function PrivacySection({ open }: { open: boolean }) {
+  // `undefined` = still loading; otherwise the resolved global default.
+  const [enabled, setEnabled] = useState<boolean | undefined>(undefined);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    setEnabled(undefined);
+    let cancelled = false;
+    void incognitoGetGlobal()
+      .then((value) => {
+        if (!cancelled) {
+          setEnabled(value);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setEnabled(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  // Monotonic token so a failed persist only reverts when no newer toggle superseded it.
+  const writeId = useRef(0);
+
+  const onCheckedChange = (next: boolean) => {
+    writeId.current += 1;
+    const id = writeId.current;
+    const prev = enabled ?? false;
+    setEnabled(next);
+    // Mirror the new global into the store immediately for the global selector, then
+    // bump the policy version once the write lands so any open chat re-reads its fully
+    // resolved effective state (the chip/ring reconcile without a room reopen).
+    incognitoStore.getState().applyGlobal(next);
+    void incognitoSetGlobal(next)
+      .then(() => {
+        incognitoStore.getState().bumpPolicyVersion();
+      })
+      .catch(() => {
+        if (id === writeId.current) {
+          setEnabled(prev);
+          incognitoStore.getState().applyGlobal(prev);
+          incognitoStore.getState().bumpPolicyVersion();
+        }
+      });
+  };
+
+  return (
+    <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
+      <p className="font-medium">Privacy</p>
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor="incognito-global">Incognito by default</Label>
+        <Switch
+          id="incognito-global"
+          checked={enabled ?? false}
+          disabled={enabled === undefined}
+          onCheckedChange={onCheckedChange}
+        />
+      </div>
+      <p className="text-muted-foreground">{INCOGNITO_GLOBAL_SENTENCE}</p>
     </div>
   );
 }

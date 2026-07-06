@@ -43,6 +43,8 @@ export type { ExportScopeKind } from "./gen/ExportScopeKind";
 export type { InboxBatch } from "./gen/InboxBatch";
 export type { InboxOp } from "./gen/InboxOp";
 export type { InboxRoomVm } from "./gen/InboxRoomVm";
+export type { IncognitoScope } from "./gen/IncognitoScope";
+export type { IncognitoVm } from "./gen/IncognitoVm";
 export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { LoginFieldVm } from "./gen/LoginFieldVm";
@@ -95,6 +97,7 @@ import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 import type { ExportProgressVm } from "./gen/ExportProgressVm";
 import type { ExportRequestVm } from "./gen/ExportRequestVm";
 import type { InboxBatch } from "./gen/InboxBatch";
+import type { IncognitoVm } from "./gen/IncognitoVm";
 import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 import type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
@@ -1265,6 +1268,65 @@ export async function cancelSend(
  */
 export async function markRoomRead(accountId: string, roomId: string): Promise<void> {
   await invoke<void>("mark_room_read", { accountId, roomId });
+}
+
+/**
+ * Read the resolved Incognito state for `(accountId, roomId)` (Story 8.1). The Rust
+ * core reads the three registry scopes and applies the Chat > Account > Global
+ * resolver inside the `signals` seam, returning an {@link IncognitoVm} the frontend
+ * renders directly — precedence is never resolved on the frontend. Rejects with the
+ * {@link IpcError} envelope on a registry failure.
+ */
+export async function incognitoGet(accountId: string, roomId: string): Promise<IncognitoVm> {
+  return await invoke<IncognitoVm>("incognito_get", { accountId, roomId });
+}
+
+/**
+ * Read the global Incognito default (Story 8.1). Absent = off (Incognito off by
+ * default). Rejects with the {@link IpcError} envelope on a registry failure.
+ */
+export async function incognitoGetGlobal(): Promise<boolean> {
+  return await invoke<boolean>("incognito_get_global");
+}
+
+/**
+ * Set the global Incognito default (Story 8.1). Persists into the `settings` k/v
+ * table in `keeper.db`; off by default. Resolves once persisted.
+ */
+export async function incognitoSetGlobal(enabled: boolean): Promise<void> {
+  await invoke<void>("incognito_set_global", { enabled });
+}
+
+/**
+ * Read the per-Account Incognito override (Story 8.1). Tri-state: `true`/`false` = an
+ * explicit override, `null` = inherit the global scope (the Rust `Option<bool>`
+ * serializes to `boolean | null`). Rejects with the {@link IpcError} envelope on a
+ * registry failure.
+ */
+export async function incognitoGetAccount(accountId: string): Promise<boolean | null> {
+  return await invoke<boolean | null>("incognito_get_account", { accountId });
+}
+
+/**
+ * Set (or clear) the per-Account Incognito override (Story 8.1). `value` is tri-state:
+ * `true`/`false` sets an explicit override; `null` clears it back to inherit the global
+ * scope. Resolves once persisted.
+ */
+export async function incognitoSetAccount(accountId: string, value: boolean | null): Promise<void> {
+  await invoke<void>("incognito_set_account", { accountId, value });
+}
+
+/**
+ * Set (or clear) the per-Chat Incognito override for `(accountId, roomId)` (Story
+ * 8.1). `enabled` is tri-state: `true`/`false` upserts an explicit override; `null`
+ * clears it back to inherit the account/global scope. Resolves once persisted.
+ */
+export async function incognitoSetChat(
+  accountId: string,
+  roomId: string,
+  enabled: boolean | null,
+): Promise<void> {
+  await invoke<void>("incognito_set_chat", { accountId, roomId, enabled });
 }
 
 /**

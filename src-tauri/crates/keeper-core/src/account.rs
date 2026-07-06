@@ -71,8 +71,9 @@ use crate::verification::{self, VerificationSink};
 use crate::vm::BridgeLoginInput;
 use crate::vm::{
     ApprovalDraftVm, ConnectionStatus, ConnectionStatusBatch, DraftMirrorBatch, EditVersionVm,
-    EncryptionStatus, EncryptionStatusBatch, InboxBatch, PaginationStatusBatch, RemoteDraftVm,
-    RoomListBatch, RoomListOp, RoomVm, SpaceVm, TimelineBatch, TypingBatch, TypistVm,
+    EncryptionStatus, EncryptionStatusBatch, InboxBatch, IncognitoVm, PaginationStatusBatch,
+    RemoteDraftVm, RoomListBatch, RoomListOp, RoomVm, SpaceVm, TimelineBatch, TypingBatch,
+    TypistVm,
 };
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
@@ -2586,9 +2587,12 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Mark the room read on `account_id` — dispatch a public `m.read` receipt on
-    /// the room's latest event through the receipt/typing signals seam (Story 3.9,
-    /// 4.1, AD-14) and clear any manual `m.marked_unread` flag. Works for any inbox
+    /// Mark the room read on `account_id` — dispatch a read receipt on the room's
+    /// latest event through the receipt/typing signals seam (Story 3.9, 4.1, AD-14)
+    /// and clear any manual `m.marked_unread` flag. The receipt is public (`m.read`)
+    /// or private (`m.read.private`) per the effective Incognito policy resolved at
+    /// emission time from the registry scopes (Story 8.1); a scope-read failure falls
+    /// back to the public path (best-effort). Works for any inbox
     /// row whether or not its timeline is open (Story 4.1): reuses an already-open
     /// `Arc<Timeline>` when present, else builds a transient
     /// `TimelineBuilder::new(&room).build()` purely to advance the receipt through
@@ -2602,10 +2606,34 @@ impl AccountManager {
     /// Errors: an unparsable/unknown room id, or an account that isn't live →
     /// [`TimelineError::RoomNotFound`]. A best-effort receipt- or flag-dispatch
     /// failure is NOT an error — it is logged and swallowed.
-    pub async fn mark_room_read(&self, account_id: &str, room_id: &str) -> Result<(), CoreError> {
+    pub async fn mark_room_read(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<(), CoreError> {
         let room_id: OwnedRoomId =
             RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
         let room = self.room_for(account_id, &room_id).await?;
+
+        // Resolve the effective Incognito policy at emission time (Story 8.1, AD-14):
+        // read the three scope values from the registry and let the `signals` resolver
+        // apply Chat > Account > Global. If the registry read fails we cannot know the
+        // policy — fail CLOSED: skip the receipt entirely rather than risk leaking a
+        // PUBLIC `m.read` for a chat the user meant to keep private. The read position
+        // simply doesn't advance to the remote until the next successful mark; this is
+        // best-effort and never a UI error. Logged at `warn` because a silent privacy
+        // downgrade would be the worse failure for a privacy feature.
+        let policy = match platform
+            .data_dir()
+            .and_then(|dir| registry::incognito_scopes(&dir, account_id, room_id.as_str()))
+        {
+            Ok((chat, account, global)) => Some(signals::resolve_incognito(chat, account, global)),
+            Err(e) => {
+                tracing::warn!(account_id = %account_id, room_id = %room_id, error = %e, "incognito scope read failed; skipping receipt to avoid a public leak (fail-closed)");
+                None
+            }
+        };
 
         // Advance the read receipt through the signals seam (AD-14). Reuse an
         // already-open timeline when present; otherwise build a transient one just
@@ -2620,8 +2648,10 @@ impl AccountManager {
                 }
             },
         };
-        if let Some(timeline) = timeline {
-            match signals::mark_read(&timeline).await {
+        // Only dispatch when the policy is known (fail-closed above). A `None` policy
+        // means the scope read failed, so we deliberately emit nothing this pass.
+        if let (Some(timeline), Some(policy)) = (timeline, policy) {
+            match signals::mark_read(&timeline, policy).await {
                 Ok(marked) => {
                     if marked {
                         tracing::debug!(account_id = %account_id, room_id = %room_id, "room marked read");
@@ -2644,6 +2674,87 @@ impl AccountManager {
             tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "clear marked-unread flag failed (best-effort)");
         }
         Ok(())
+    }
+
+    /// Read the resolved Incognito state for `(account_id, room_id)` (Story 8.1).
+    ///
+    /// Reads the three registry scope values and applies the `signals` resolver
+    /// (Chat over Account over Global), projecting the resolved effective on/off, the
+    /// deciding `source`, and the raw scope values into an [`IncognitoVm`] the frontend
+    /// renders directly (never re-resolving precedence on the frontend).
+    pub fn incognito_get(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<IncognitoVm, CoreError> {
+        let data_dir = platform.data_dir()?;
+        let (chat, account, global) = registry::incognito_scopes(&data_dir, account_id, room_id)?;
+        let policy = signals::resolve_incognito(chat, account, global);
+        Ok(IncognitoVm {
+            effective: policy.enabled,
+            source: policy.source,
+            global,
+            account,
+            chat,
+        })
+    }
+
+    /// Read the global Incognito default (Story 8.1). Absent = off (Incognito off by
+    /// default). Reads the `settings` k/v table key `incognito.global`.
+    pub fn incognito_get_global(&self, platform: &Arc<dyn Platform>) -> Result<bool, CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::get_incognito_global(&data_dir)
+    }
+
+    /// Set the global Incognito default (Story 8.1). Persists into the `settings`
+    /// k/v table under `incognito.global`; off by default.
+    pub fn incognito_set_global(
+        &self,
+        platform: &Arc<dyn Platform>,
+        enabled: bool,
+    ) -> Result<(), CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::set_incognito_global(&data_dir, enabled)
+    }
+
+    /// Read the per-Account Incognito override for `account_id` (Story 8.1). `None` =
+    /// inherit the global scope; `Some(bool)` = an explicit per-Account override. Reads
+    /// the nullable `accounts.incognito` column.
+    pub fn incognito_get_account(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+    ) -> Result<Option<bool>, CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::get_incognito_account(&data_dir, account_id)
+    }
+
+    /// Set (or clear) the per-Account Incognito override for `account_id` (Story
+    /// 8.1). `Some(bool)` sets an explicit override; `None` clears it back to inherit
+    /// the global scope. Writes the `accounts.incognito` column.
+    pub fn incognito_set_account(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        value: Option<bool>,
+    ) -> Result<(), CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::set_incognito_account(&data_dir, account_id, value)
+    }
+
+    /// Set (or clear) the per-Chat Incognito override for `(account_id, room_id)`
+    /// (Story 8.1). `Some(bool)` upserts an explicit override; `None` clears it back
+    /// to inherit the account/global scope. Writes the `chat_incognito` table.
+    pub fn incognito_set_chat(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        room_id: &str,
+        enabled: Option<bool>,
+    ) -> Result<(), CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::set_incognito_chat(&data_dir, account_id, room_id, enabled)
     }
 
     /// Manually mark the room unread on `account_id` — set the `m.marked_unread`

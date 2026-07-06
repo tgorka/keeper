@@ -111,7 +111,7 @@ development_status:
   7-4-explicit-approval-invariant-enforced-and-tested: done
   epic-7-retrospective: optional
   epic-8: backlog
-  8-1-incognito-read-receipts-with-scoped-policy: backlog
+  8-1-incognito-read-receipts-with-scoped-policy: done
   8-2-typing-presence-suppression-coupling-caveats-and-manual-release: backlog
   8-3-undo-send-window: backlog
   8-4-post-dispatch-delete-for-everyone: backlog

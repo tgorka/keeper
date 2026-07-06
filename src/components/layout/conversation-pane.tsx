@@ -37,12 +37,14 @@ import { TypingIndicator } from "@/components/chat/typing-indicator";
 import { UtdStub } from "@/components/chat/utd-stub";
 import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useSelectedRoomVm } from "@/hooks/use-selected-room-vm";
 import { accountHueVar } from "@/lib/account-hue";
 import { initials } from "@/lib/account-initials";
 import type {
+  IncognitoVm,
   PaginationStatusBatch,
   TimelineBatch,
   TimelineItemVm,
@@ -52,6 +54,7 @@ import type {
 import {
   cancelSend,
   editMessage,
+  incognitoSetChat,
   markRoomRead,
   paginateBackwards,
   resolveTimelineEventKey,
@@ -75,8 +78,10 @@ import { attachmentId, attachmentsStore, type PendingAttachment } from "@/lib/st
 import { useBridgeHealth } from "@/lib/stores/bridge-health";
 import { composerStore, useComposerStore } from "@/lib/stores/composer";
 import { exportStore } from "@/lib/stores/export";
+import { refreshIncognito, useIncognito, useIncognitoPolicyVersion } from "@/lib/stores/incognito";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { timelineStore, useTimelineStore } from "@/lib/stores/timeline";
+import { cn } from "@/lib/utils";
 
 /** Trim a body to a short single-line preview for the reply banner/quote. */
 function previewOf(body: string): string {
@@ -252,6 +257,68 @@ function ConversationHeaderIdentity({ accountId }: { accountId: string | null })
     );
   }
   return null;
+}
+
+/** The effective-scope label carried by the header Incognito chip (Story 8.1). The
+ * label always reflects *which* scope decided (Chat > Account > Global), not value
+ * equality — a per-Chat override reads "this chat overrides account" even when its
+ * value matches the account's. */
+export function incognitoChipLabel(source: IncognitoVm["source"]): string {
+  switch (source) {
+    case "chat":
+      return "Incognito — this chat overrides account";
+    case "account":
+      return "Incognito — account";
+    default:
+      return "Incognito — global";
+  }
+}
+
+/**
+ * The violet Incognito chip in the Chat header (Story 8.1). Renders only when
+ * Incognito is *effective* for the open chat (resolved in Rust, mirrored via
+ * {@link useIncognito}); it carries the effective-scope label and, on click, toggles
+ * the per-Chat scope (turning the effective state off by writing a per-Chat override),
+ * then re-reads the authoritative VM. Uses the reserved `--incognito` violet token.
+ */
+function ConversationIncognitoChip({
+  accountId,
+  roomId,
+}: {
+  accountId: string | null;
+  roomId: string | null;
+}) {
+  const vm = useIncognito(accountId, roomId);
+  if (accountId === null || roomId === null || vm === undefined || !vm.effective) {
+    return null;
+  }
+  const label = incognitoChipLabel(vm.source);
+  return (
+    <Badge
+      asChild
+      className={cn(
+        "bg-incognito text-incognito-foreground focus-visible:ring-incognito/50",
+        "cursor-pointer",
+      )}
+    >
+      <button
+        type="button"
+        aria-label={label}
+        title={label}
+        onClick={() => {
+          // The chip only shows while effective is on, so a click writes a per-Chat
+          // override turning it off, then refreshes the mirror from the resolved VM.
+          // Best-effort: a write failure is swallowed (never an unhandled rejection);
+          // the mirror keeps its last-observed state and the next read reconciles.
+          void incognitoSetChat(accountId, roomId, !vm.effective)
+            .then(() => refreshIncognito(accountId, roomId))
+            .catch(() => {});
+        }}
+      >
+        {label}
+      </button>
+    </Badge>
+  );
 }
 
 /**
@@ -466,7 +533,9 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
   // room view and torn down on room change / unmount (mirroring the timeline
   // subscription lifecycle). The typing set and pagination status are pure
   // Rust-streamed mirrors — the frontend renders them, never derives them. Marking
-  // the room read on view emits a public `m.read` receipt (best-effort).
+  // the room read on view emits a read receipt (best-effort) whose type — public
+  // `m.read` or private `m.read.private` — the Rust core picks from the effective
+  // Incognito policy (Story 8.1); the frontend never decides it.
   useEffect(() => {
     if (accountId === null || selectedRoomId === null) {
       return;
@@ -521,9 +590,30 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     };
   }, [accountId, selectedRoomId]);
 
+  // Refresh the effective Incognito VM into the mirror store on room open (Story 8.1),
+  // so the header chip and composer ring reflect the resolved state for this chat.
+  // Also re-runs on `incognitoPolicyVersion` bumps, so a global (Settings) or
+  // per-account (menu) toggle reconciles the open chat without a room reopen.
+  // Best-effort — a read failure leaves the last-observed state; a read that resolves
+  // after a room switch is dropped via the `cancelled` guard.
+  const incognitoPolicyVersion = useIncognitoPolicyVersion();
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `incognitoPolicyVersion` is a deliberate re-run trigger — a broad-scope (global/per-account) toggle bumps it to force this open chat to re-read its effective VM; it is not read in the body.
+  useEffect(() => {
+    if (accountId === null || selectedRoomId === null) {
+      return;
+    }
+    let cancelled = false;
+    void refreshIncognito(accountId, selectedRoomId, () => cancelled);
+    return () => {
+      cancelled = true;
+    };
+  }, [accountId, selectedRoomId, incognitoPolicyVersion]);
+
   // Re-mark the room read when new content settles while it stays open (Story 3.9),
-  // so the user's public `m.read` advances past messages read in place — not only
-  // at room-open. Debounced so a burst of incoming events emits a single receipt on
+  // so the user's read receipt advances past messages read in place — not only
+  // at room-open. The receipt type (public `m.read` vs private `m.read.private`)
+  // stays a Rust-side decision from the effective Incognito policy (Story 8.1).
+  // Debounced so a burst of incoming events emits a single receipt on
   // the newest item; best-effort (swallow rejections). The mark-on-view above still
   // handles the initial open promptly.
   useEffect(() => {
@@ -1123,7 +1213,10 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col bg-background">
       <div className="flex shrink-0 items-center justify-between gap-2 border-border border-b p-2">
-        <ConversationHeaderIdentity accountId={accountId} />
+        <div className="flex min-w-0 items-center gap-2">
+          <ConversationHeaderIdentity accountId={accountId} />
+          <ConversationIncognitoChip accountId={accountId} roomId={selectedRoomId} />
+        </div>
         <div className="flex shrink-0 items-center gap-1">
           {accountId !== null && selectedRoomId !== null && (
             <Button

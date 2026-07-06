@@ -9,6 +9,32 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::signals::IncognitoScope;
+
+/// The resolved Incognito state for a chat, projected to the frontend (Story 8.1).
+///
+/// The frontend renders this VM only — it never resolves precedence itself. `effective`
+/// is the resolved on/off; `source` names *which* scope decided it (Chat > Account >
+/// Global) so the header chip can read "this chat overrides account" even when the
+/// per-Chat value equals the account's. `global`/`account`/`chat` echo the raw scope
+/// values so the toggles reflect their own tri-state (`account`/`chat` are
+/// `bool | null`, `null` = inherit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct IncognitoVm {
+    /// The resolved effective on/off — drives the private-vs-public receipt path.
+    pub effective: bool,
+    /// The scope that decided the effective value (Chat > Account > Global).
+    pub source: IncognitoScope,
+    /// The global default (plain bool, off by default).
+    pub global: bool,
+    /// The per-Account override, or `None` to inherit the global scope.
+    pub account: Option<bool>,
+    /// The per-Chat override, or `None` to inherit the account/global scope.
+    pub chat: Option<bool>,
+}
+
 /// Response of the `app_ping` liveness command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

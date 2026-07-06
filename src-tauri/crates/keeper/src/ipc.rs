@@ -25,10 +25,10 @@ use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
     ConnectionStatusBatch, DemoBatch, DraftMirrorBatch, EditVersionVm, EncryptionStatusBatch,
-    ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IpcError, IpcErrorCode,
-    NetworksSnapshot, NewChatResolutionVm, PaginationStatusBatch, PingVm, RemoteDraftVm,
-    ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch,
-    TypingBatch, VerificationFlowVm,
+    ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IncognitoVm, IpcError,
+    IpcErrorCode, NetworksSnapshot, NewChatResolutionVm, PaginationStatusBatch, PingVm,
+    RemoteDraftVm, ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot,
+    TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -2211,8 +2211,91 @@ pub async fn mark_room_read(
 ) -> Result<(), IpcError> {
     state
         .accounts
-        .mark_room_read(&account_id, &room_id)
+        .mark_room_read(&state.platform, &account_id, &room_id)
         .await
+        .map_err(to_ipc_error)
+}
+
+/// Read the resolved Incognito state for `(accountId, roomId)` (Story 8.1). Delegates
+/// to the core, which reads the three registry scopes and applies the `signals`
+/// Chat > Account > Global resolver, returning an [`IncognitoVm`] the frontend renders
+/// directly — precedence is never resolved on the frontend. Errors funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub fn incognito_get(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<IncognitoVm, IpcError> {
+    state
+        .accounts
+        .incognito_get(&state.platform, &account_id, &room_id)
+        .map_err(to_ipc_error)
+}
+
+/// Read the global Incognito default (Story 8.1). Absent = off (Incognito off by
+/// default). Errors funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn incognito_get_global(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    state
+        .accounts
+        .incognito_get_global(&state.platform)
+        .map_err(to_ipc_error)
+}
+
+/// Set the global Incognito default (Story 8.1). Persists into the `settings` k/v
+/// table; off by default. Errors funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn incognito_set_global(state: State<'_, AppState>, enabled: bool) -> Result<(), IpcError> {
+    state
+        .accounts
+        .incognito_set_global(&state.platform, enabled)
+        .map_err(to_ipc_error)
+}
+
+/// Read the per-Account Incognito override (Story 8.1). Tri-state: `Some(bool)` = an
+/// explicit override, `None` = inherit the global scope. Errors funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub fn incognito_get_account(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Option<bool>, IpcError> {
+    state
+        .accounts
+        .incognito_get_account(&state.platform, &account_id)
+        .map_err(to_ipc_error)
+}
+
+/// Set (or clear) the per-Account Incognito override (Story 8.1). `value` is
+/// tri-state: `Some(bool)` sets an explicit override, `None` clears it back to inherit
+/// the global scope. Errors funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn incognito_set_account(
+    state: State<'_, AppState>,
+    account_id: String,
+    value: Option<bool>,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .incognito_set_account(&state.platform, &account_id, value)
+        .map_err(to_ipc_error)
+}
+
+/// Set (or clear) the per-Chat Incognito override for `(accountId, roomId)` (Story
+/// 8.1). `enabled` is tri-state: `Some(bool)` upserts an explicit override, `None`
+/// clears it back to inherit the account/global scope. Errors funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub fn incognito_set_chat(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    enabled: Option<bool>,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .incognito_set_chat(&state.platform, &account_id, &room_id, enabled)
         .map_err(to_ipc_error)
 }
 

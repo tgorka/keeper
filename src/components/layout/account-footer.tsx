@@ -15,8 +15,17 @@
  *
  * Renders only the Add Account button when there are no accounts.
  */
-import { Check, CloudOff, Loader2, LogOut, MoreVertical, Plus, Settings } from "lucide-react";
-import { useState } from "react";
+import {
+  Check,
+  CloudOff,
+  Loader2,
+  LogOut,
+  MoreVertical,
+  Plus,
+  Settings,
+  VenetianMask,
+} from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { BeeperCoverageDisclosure } from "@/components/auth/beeper-coverage-disclosure";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import {
@@ -45,7 +54,12 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
@@ -54,11 +68,17 @@ import { useSignOut } from "@/hooks/use-sign-out";
 import { accountHueVar } from "@/lib/account-hue";
 import { initials } from "@/lib/account-initials";
 import { isBeeperAccount } from "@/lib/beeper";
-import type { AccountVm, ConnectionStatus } from "@/lib/ipc/client";
+import {
+  type AccountVm,
+  type ConnectionStatus,
+  incognitoGetAccount,
+  incognitoSetAccount,
+} from "@/lib/ipc/client";
 import { useAccountStatus } from "@/lib/stores/account-status";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useAddAccountStore } from "@/lib/stores/add-account";
 import { useShowVerifyBadgeForAccount } from "@/lib/stores/encryption-status";
+import { incognitoStore } from "@/lib/stores/incognito";
 import { settingsUiStore, useSettingsOpen } from "@/lib/stores/settings-ui";
 import { cn } from "@/lib/utils";
 
@@ -328,6 +348,83 @@ function SignOutDialog({
 
 /** The per-row menu (Settings / Beeper coverage / Sign out…) plus the dialogs it
  * opens. Rendered in both collapsed and expanded rows. */
+/**
+ * Per-Account Incognito tri-state submenu (Story 8.1). Reads the account's override
+ * via `incognitoGetAccount` on menu open and writes the chosen scope via
+ * `incognitoSetAccount`. Tri-state: "Inherit global" (`null`), "On" (`true`), "Off"
+ * (`false`). The radio group's value encodes the tri-state as `"inherit" | "on" |
+ * "off"`. Precedence still resolves in Rust — this only sets the account scope.
+ */
+function AccountIncognitoSubmenu({ accountId }: { accountId: string }) {
+  // `undefined` = still loading; otherwise the tri-state override.
+  const [value, setValue] = useState<boolean | null | undefined>(undefined);
+  // Monotonic write id: only the newest write may revert on failure, so a slow
+  // failed write can't clobber a newer successful selection (mirrors PrivacySection).
+  const writeId = useRef(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    void incognitoGetAccount(accountId)
+      .then((v) => {
+        if (!cancelled) {
+          setValue(v);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setValue(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accountId]);
+
+  const radio = value === undefined ? "inherit" : value === null ? "inherit" : value ? "on" : "off";
+
+  const onSelect = (next: boolean | null) => {
+    writeId.current += 1;
+    const id = writeId.current;
+    const prev = value ?? null;
+    setValue(next);
+    void incognitoSetAccount(accountId, next)
+      .then(() => {
+        // Nudge any open chat for this account to re-read its effective state so the
+        // header chip and composer ring reconcile without a room reopen (Story 8.1).
+        incognitoStore.getState().bumpPolicyVersion();
+      })
+      .catch(() => {
+        // Revert on a persist failure — but only if no newer write superseded this
+        // one, so a stale failed write never clobbers a newer successful selection.
+        if (id === writeId.current) {
+          setValue(prev);
+        }
+      });
+  };
+
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger>
+        <VenetianMask aria-hidden="true" />
+        Incognito
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent>
+        <DropdownMenuRadioGroup value={radio}>
+          <DropdownMenuRadioItem value="inherit" onSelect={() => onSelect(null)}>
+            Inherit global
+          </DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="on" onSelect={() => onSelect(true)}>
+            On
+          </DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="off" onSelect={() => onSelect(false)}>
+            Off
+          </DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
+}
+
 function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed: boolean }) {
   // The Settings dialog open-state is shared (Story 3.1) so the verify banner and
   // the UTD stub can open it too; the per-row menu drives the same store. The
@@ -387,6 +484,7 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
               Beeper coverage
             </DropdownMenuItem>
           )}
+          <AccountIncognitoSubmenu accountId={account.accountId} />
           <DropdownMenuSeparator />
           <DropdownMenuItem variant="destructive" onSelect={() => setSignOutOpen(true)}>
             <LogOut aria-hidden="true" />

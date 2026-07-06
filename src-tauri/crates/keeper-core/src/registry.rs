@@ -90,8 +90,23 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
         [],
     )
     .map_err(|e| CoreError::Internal(format!("could not ensure drafts schema: {e}")))?;
+    // Per-chat Incognito override (Story 8.1). Tri-state: a present row's `enabled`
+    // (0/1) overrides the account/global scopes for `(account, room)`; an absent row
+    // means "inherit the next-broader scope". Mirrors the `drafts`/`pins` precedent
+    // for per-(account, room) keeper-local state. Never any secret material.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS chat_incognito(\
+            account_id TEXT NOT NULL, \
+            room_id TEXT NOT NULL, \
+            enabled INTEGER NOT NULL, \
+            PRIMARY KEY(account_id, room_id)\
+        )",
+        [],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not ensure chat_incognito schema: {e}")))?;
     ensure_hue_index_column(&conn)?;
     ensure_provider_column(&conn)?;
+    ensure_incognito_column(&conn)?;
     Ok(conn)
 }
 
@@ -343,6 +358,160 @@ fn ensure_provider_column(conn: &Connection) -> Result<(), CoreError> {
             .map_err(|e| CoreError::Internal(format!("could not add provider column: {e}")))?;
     }
     Ok(())
+}
+
+/// Add the nullable `incognito` column to `accounts` if it is not present yet
+/// (Story 8.1).
+///
+/// Idempotent and non-destructive, exactly like [`ensure_hue_index_column`]:
+/// reads the table's column list and only runs `ALTER TABLE ... ADD COLUMN` when
+/// `incognito` is missing, so an install that predates the column upgrades in place
+/// without dropping any account row. The column is tri-state: `NULL` = inherit the
+/// global scope, `0`/`1` = a per-Account override.
+fn ensure_incognito_column(conn: &Connection) -> Result<(), CoreError> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(accounts)")
+        .map_err(|e| CoreError::Internal(format!("could not inspect accounts schema: {e}")))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| CoreError::Internal(format!("could not read accounts columns: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| CoreError::Internal(format!("could not read accounts columns: {e}")))?;
+    drop(stmt);
+    if !existing.iter().any(|c| c == "incognito") {
+        conn.execute("ALTER TABLE accounts ADD COLUMN incognito INTEGER", [])
+            .map_err(|e| CoreError::Internal(format!("could not add incognito column: {e}")))?;
+    }
+    Ok(())
+}
+
+/// The `settings` key holding the global Incognito default (Story 8.1). Stored as
+/// `"1"`/`"0"`; absent = off (Incognito off by default).
+const INCOGNITO_GLOBAL_KEY: &str = "incognito.global";
+
+/// Read the global Incognito default (Story 8.1). Absent / unparsable ⇒ `false`
+/// (off by default). Stored in the `settings` k/v table under `incognito.global`.
+pub fn get_incognito_global(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, INCOGNITO_GLOBAL_KEY)?.as_deref() == Some("1"))
+}
+
+/// Write the global Incognito default (Story 8.1). Persists `"1"`/`"0"` into the
+/// `settings` k/v table under `incognito.global`.
+pub fn set_incognito_global(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        INCOGNITO_GLOBAL_KEY,
+        if enabled { "1" } else { "0" },
+    )
+}
+
+/// Read the per-Account Incognito override for `account_id` (Story 8.1). `None` =
+/// inherit the global scope; `Some(bool)` = an explicit per-Account override. Reads
+/// the nullable `accounts.incognito` column; a missing account row also reads `None`.
+pub fn get_incognito_account(data_dir: &Path, account_id: &str) -> Result<Option<bool>, CoreError> {
+    let conn = open(data_dir)?;
+    let value = conn
+        .query_row(
+            "SELECT incognito FROM accounts WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(CoreError::Internal(format!(
+                "could not read account incognito: {other}"
+            ))),
+        })?;
+    Ok(value.map(|v| v != 0))
+}
+
+/// Write the per-Account Incognito override for `account_id` (Story 8.1). `Some(bool)`
+/// sets an explicit override; `None` clears it back to inherit (writes `NULL`).
+/// Updates the `accounts.incognito` column; a no-op when the account row is absent.
+pub fn set_incognito_account(
+    data_dir: &Path,
+    account_id: &str,
+    value: Option<bool>,
+) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    let stored: Option<i64> = value.map(|b| if b { 1 } else { 0 });
+    conn.execute(
+        "UPDATE accounts SET incognito = ?2 WHERE account_id = ?1",
+        rusqlite::params![account_id, stored],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not write account incognito: {e}")))?;
+    Ok(())
+}
+
+/// Read the per-Chat Incognito override for `(account_id, room_id)` (Story 8.1).
+/// `None` = inherit the account/global scope (no row); `Some(bool)` = an explicit
+/// per-Chat override. Reads the `chat_incognito` table.
+pub fn get_incognito_chat(
+    data_dir: &Path,
+    account_id: &str,
+    room_id: &str,
+) -> Result<Option<bool>, CoreError> {
+    let conn = open(data_dir)?;
+    let value = conn
+        .query_row(
+            "SELECT enabled FROM chat_incognito WHERE account_id = ?1 AND room_id = ?2",
+            rusqlite::params![account_id, room_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|v| Some(v != 0))
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(CoreError::Internal(format!(
+                "could not read chat incognito: {other}"
+            ))),
+        })?;
+    Ok(value)
+}
+
+/// Write the per-Chat Incognito override for `(account_id, room_id)` (Story 8.1).
+/// `Some(bool)` upserts an explicit override; `None` clears it back to inherit
+/// (deletes the row). Keyed by `(account_id, room_id)` in `chat_incognito`.
+pub fn set_incognito_chat(
+    data_dir: &Path,
+    account_id: &str,
+    room_id: &str,
+    value: Option<bool>,
+) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    match value {
+        Some(enabled) => {
+            conn.execute(
+                "INSERT INTO chat_incognito(account_id, room_id, enabled) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(account_id, room_id) DO UPDATE SET enabled = excluded.enabled",
+                rusqlite::params![account_id, room_id, i64::from(enabled)],
+            )
+            .map_err(|e| CoreError::Internal(format!("could not write chat incognito: {e}")))?;
+        }
+        None => {
+            conn.execute(
+                "DELETE FROM chat_incognito WHERE account_id = ?1 AND room_id = ?2",
+                rusqlite::params![account_id, room_id],
+            )
+            .map_err(|e| CoreError::Internal(format!("could not clear chat incognito: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// Read all three Incognito scope values for `(account_id, room_id)` in one call
+/// (Story 8.1), returning `(chat, account, global)` ready to feed
+/// `signals::resolve_incognito`. `chat`/`account` are tri-state (`None` = inherit);
+/// `global` is the plain default. Read at receipt-emission time so the effective
+/// policy is resolved from live state.
+pub fn incognito_scopes(
+    data_dir: &Path,
+    account_id: &str,
+    room_id: &str,
+) -> Result<(Option<bool>, Option<bool>, bool), CoreError> {
+    let chat = get_incognito_chat(data_dir, account_id, room_id)?;
+    let account = get_incognito_account(data_dir, account_id)?;
+    let global = get_incognito_global(data_dir)?;
+    Ok((chat, account, global))
 }
 
 /// A single non-secret account row from the registry.
@@ -947,6 +1116,118 @@ mod tests {
                 ("acctA".to_owned(), "!r2".to_owned()),
                 ("acctB".to_owned(), "!r3".to_owned()),
             ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incognito_global_round_trips_and_defaults_off() {
+        let dir = temp_dir();
+        // Absent global setting defaults off (Incognito off by default).
+        assert!(!get_incognito_global(&dir).expect("get absent global"));
+        set_incognito_global(&dir, true).expect("set global on");
+        assert!(get_incognito_global(&dir).expect("get global on"));
+        set_incognito_global(&dir, false).expect("set global off");
+        assert!(!get_incognito_global(&dir).expect("get global off"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incognito_account_round_trips_tristate() {
+        let dir = temp_dir();
+        insert_account(
+            &dir,
+            "acctA",
+            "@a:e.org",
+            "https://e.org/",
+            "D",
+            1,
+            0,
+            "password",
+        )
+        .expect("insert acctA");
+        // A fresh account inherits (NULL column) — absent account also reads None.
+        assert_eq!(
+            get_incognito_account(&dir, "acctA").expect("get inherit"),
+            None
+        );
+        assert_eq!(
+            get_incognito_account(&dir, "nope").expect("get missing"),
+            None
+        );
+        // Set explicit true, then false, then clear back to inherit.
+        set_incognito_account(&dir, "acctA", Some(true)).expect("set true");
+        assert_eq!(
+            get_incognito_account(&dir, "acctA").expect("get true"),
+            Some(true)
+        );
+        set_incognito_account(&dir, "acctA", Some(false)).expect("set false");
+        assert_eq!(
+            get_incognito_account(&dir, "acctA").expect("get false"),
+            Some(false)
+        );
+        set_incognito_account(&dir, "acctA", None).expect("clear");
+        assert_eq!(
+            get_incognito_account(&dir, "acctA").expect("get cleared"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incognito_chat_round_trips_and_clears() {
+        let dir = temp_dir();
+        // Absent row = inherit.
+        assert_eq!(
+            get_incognito_chat(&dir, "acctA", "!r1").expect("get absent"),
+            None
+        );
+        set_incognito_chat(&dir, "acctA", "!r1", Some(true)).expect("set true");
+        assert_eq!(
+            get_incognito_chat(&dir, "acctA", "!r1").expect("get true"),
+            Some(true)
+        );
+        // Upsert overwrites (no duplicate row).
+        set_incognito_chat(&dir, "acctA", "!r1", Some(false)).expect("set false");
+        assert_eq!(
+            get_incognito_chat(&dir, "acctA", "!r1").expect("get false"),
+            Some(false)
+        );
+        // None deletes the row back to inherit; idempotent.
+        set_incognito_chat(&dir, "acctA", "!r1", None).expect("clear");
+        set_incognito_chat(&dir, "acctA", "!r1", None).expect("clear again is ok");
+        assert_eq!(
+            get_incognito_chat(&dir, "acctA", "!r1").expect("get cleared"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incognito_scopes_reads_all_three() {
+        let dir = temp_dir();
+        insert_account(
+            &dir,
+            "acctA",
+            "@a:e.org",
+            "https://e.org/",
+            "D",
+            1,
+            0,
+            "password",
+        )
+        .expect("insert acctA");
+        // Defaults: chat inherit, account inherit, global off.
+        assert_eq!(
+            incognito_scopes(&dir, "acctA", "!r1").expect("scopes default"),
+            (None, None, false)
+        );
+        set_incognito_global(&dir, true).expect("global on");
+        set_incognito_account(&dir, "acctA", Some(false)).expect("account off");
+        set_incognito_chat(&dir, "acctA", "!r1", Some(true)).expect("chat on");
+        assert_eq!(
+            incognito_scopes(&dir, "acctA", "!r1").expect("scopes set"),
+            (Some(true), Some(false), true)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

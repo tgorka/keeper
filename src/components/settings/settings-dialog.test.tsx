@@ -5,6 +5,8 @@ vi.mock("@/lib/ipc/client", () => ({
   encryptionPosture: vi.fn(() => Promise.resolve(null)),
   honorRemoteDeletions: vi.fn(() => Promise.resolve(false)),
   setHonorRemoteDeletions: vi.fn(() => Promise.resolve()),
+  incognitoGetGlobal: vi.fn(() => Promise.resolve(false)),
+  incognitoSetGlobal: vi.fn(() => Promise.resolve()),
   verificationCancel: vi.fn(() => Promise.resolve()),
 }));
 
