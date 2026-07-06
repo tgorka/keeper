@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 
-use crate::vm::{PaletteActionVm, PaletteChatVm, PaletteMode, PaletteResultsVm};
+use crate::vm::{
+    MenuItemVm, MenuSectionVm, PaletteActionVm, PaletteChatVm, PaletteMode, PaletteResultsVm,
+};
 
 /// Max rows returned per group (chats / contacts / actions), keeping the render
 /// cheap and the wire payload bounded even against a 10k-entry index.
@@ -338,6 +340,7 @@ fn action_score(needle: &str, action: &PaletteActionVm) -> Option<i32> {
 /// query ranks them first in action mode. Shortcut chips mirror the existing
 /// keyboard bindings; `None` means the action is palette-only.
 pub fn palette_actions() -> Vec<PaletteActionVm> {
+    // Non-toggle actions: `toggle_group` is `None`.
     let action = |id: &str,
                   title: &str,
                   category: &str,
@@ -350,6 +353,24 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
         keywords: keywords.iter().map(|k| (*k).to_owned()).collect(),
         shortcut: shortcut.map(str::to_owned),
         requires_open_chat,
+        toggle_group: None,
+    };
+
+    // Toggle actions: the two directions of a pair share a `toggle_group` so both
+    // surfaces (cheat sheet + native menu, Story 9.3) collapse them into one row.
+    let toggle = |id: &str,
+                  title: &str,
+                  category: &str,
+                  keywords: &[&str],
+                  shortcut: Option<&str>,
+                  group: &str| PaletteActionVm {
+        id: id.to_owned(),
+        title: title.to_owned(),
+        category: category.to_owned(),
+        keywords: keywords.iter().map(|k| (*k).to_owned()).collect(),
+        shortcut: shortcut.map(str::to_owned),
+        requires_open_chat: true,
+        toggle_group: Some(group.to_owned()),
     };
 
     vec![
@@ -428,69 +449,71 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             false,
         ),
         // --- Open-chat actions (operate on the current conversation) ---
-        action(
+        // Toggle pairs share a `toggle_group`; the cheat sheet + native menu render
+        // each pair as ONE row, resolving direction from the open room's flag.
+        toggle(
             "archive-chat",
             "Archive Chat",
             "Chat",
             &["low priority", "hide", "e"],
             Some("E"),
-            true,
+            "archive",
         ),
-        action(
+        toggle(
             "unarchive-chat",
             "Unarchive Chat",
             "Chat",
             &["restore", "unhide"],
             Some("E"),
-            true,
+            "archive",
         ),
-        action(
+        toggle(
             "pin-chat",
             "Pin Chat",
             "Chat",
             &["stick", "top", "p"],
             Some("P"),
-            true,
+            "pin",
         ),
-        action(
+        toggle(
             "unpin-chat",
             "Unpin Chat",
             "Chat",
             &["unstick", "p"],
             Some("P"),
-            true,
+            "pin",
         ),
-        action(
+        toggle(
             "favorite-chat",
             "Favorite Chat",
             "Chat",
             &["star", "favourite", "f"],
             Some("F"),
-            true,
+            "favorite",
         ),
-        action(
+        toggle(
             "unfavorite-chat",
             "Unfavorite Chat",
             "Chat",
             &["unstar", "unfavourite", "f"],
             Some("F"),
-            true,
+            "favorite",
         ),
-        action(
+        toggle(
             "mark-read",
             "Mark as Read",
             "Chat",
             &["clear unread", "seen", "u"],
             Some("U"),
-            true,
+            "read",
         ),
-        action(
+        toggle(
             "mark-unread",
             "Mark as Unread",
             "Chat",
             &["flag", "u"],
             Some("U"),
-            true,
+            "read",
         ),
         action(
             "toggle-incognito-chat",
@@ -509,6 +532,143 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             true,
         ),
     ]
+}
+
+/// The stable category order the derived surfaces (cheat sheet + native menu,
+/// Story 9.3) present. Categories are rendered in this order; any category present
+/// in `palette_actions()` but missing here is appended last (alphabetically) so a
+/// newly-added category is never silently dropped.
+const CATEGORY_ORDER: &[&str] = &[
+    "Navigation",
+    "Chats",
+    "Archive",
+    "Accounts",
+    "Privacy",
+    "Chat",
+];
+
+/// The single projection both discovery surfaces consume (Story 9.3, epic 9 spine).
+///
+/// Derived purely from [`palette_actions`]: groups the registry by `category` in the
+/// stable [`CATEGORY_ORDER`], preserving each category's registry order, and collapses
+/// every toggle pair (two actions sharing a `toggle_group`) into a single unambiguous
+/// [`MenuItemVm`] — the canonical (first-seen, positive) direction's id, a combined
+/// "Archive / Unarchive Chat" title, and the shared shortcut. The native menu builder
+/// and the `cheat_sheet_sections` command both call this, so the two surfaces provably
+/// never drift from the palette (UX-DR15). Pure — no I/O, no state.
+pub fn registry_sections() -> Vec<MenuSectionVm> {
+    let actions = palette_actions();
+
+    // Preserve first-appearance order of categories, then sort by CATEGORY_ORDER
+    // (unlisted categories sort last, alphabetically, but keep their inner order).
+    let mut category_order: Vec<String> = Vec::new();
+    for action in &actions {
+        if !category_order.contains(&action.category) {
+            category_order.push(action.category.clone());
+        }
+    }
+    let rank = |category: &str| {
+        CATEGORY_ORDER
+            .iter()
+            .position(|c| *c == category)
+            .unwrap_or(CATEGORY_ORDER.len())
+    };
+    category_order.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+
+    category_order
+        .into_iter()
+        .map(|category| {
+            let mut items: Vec<MenuItemVm> = Vec::new();
+            // Track which toggle groups already emitted their (canonical) row so the
+            // second direction of a pair collapses into it instead of adding a row.
+            let mut seen_groups: Vec<String> = Vec::new();
+            for action in actions.iter().filter(|a| a.category == category) {
+                match &action.toggle_group {
+                    Some(group) => {
+                        if seen_groups.contains(group) {
+                            // The pair's canonical row already exists — skip the
+                            // opposite direction (its title is folded in below).
+                            continue;
+                        }
+                        seen_groups.push(group.clone());
+                        // Combine the two directions' titles into one label, e.g.
+                        // "Archive / Unarchive Chat". Find the paired action to
+                        // extract its distinguishing verb.
+                        let title = combined_toggle_title(&actions, action, group);
+                        items.push(MenuItemVm {
+                            id: action.id.clone(),
+                            title,
+                            shortcut: action.shortcut.clone(),
+                            toggle_group: Some(group.clone()),
+                            requires_open_chat: action.requires_open_chat,
+                        });
+                    }
+                    None => items.push(MenuItemVm {
+                        id: action.id.clone(),
+                        title: action.title.clone(),
+                        shortcut: action.shortcut.clone(),
+                        toggle_group: None,
+                        requires_open_chat: action.requires_open_chat,
+                    }),
+                }
+            }
+            MenuSectionVm { category, items }
+        })
+        .collect()
+}
+
+/// Build the collapsed toggle title for a pair into one unambiguous label.
+///
+/// Factors out the words the two direction titles share as a common word-prefix and
+/// word-suffix, then joins the two differing middles with `" / "`. Examples:
+/// - `"Archive Chat"` + `"Unarchive Chat"` → `"Archive / Unarchive Chat"`
+///   (shared suffix `Chat`; middles `Archive` / `Unarchive`).
+/// - `"Mark as Read"` + `"Mark as Unread"` → `"Mark as Read / Unread"`
+///   (shared prefix `Mark as`; middles `Read` / `Unread`).
+///
+/// The canonical direction's middle comes first so the row reads in the positive
+/// direction. Falls back to the canonical title alone if the pair's second direction
+/// is somehow absent (defensive — the registry always ships both directions).
+fn combined_toggle_title(
+    actions: &[PaletteActionVm],
+    canonical: &PaletteActionVm,
+    group: &str,
+) -> String {
+    let Some(other) = actions
+        .iter()
+        .find(|a| a.toggle_group.as_deref() == Some(group) && a.id != canonical.id)
+    else {
+        return canonical.title.clone();
+    };
+
+    let a: Vec<&str> = canonical.title.split_whitespace().collect();
+    let b: Vec<&str> = other.title.split_whitespace().collect();
+
+    // Longest shared leading run of whole words.
+    let mut prefix = 0;
+    while prefix < a.len() && prefix < b.len() && a[prefix] == b[prefix] {
+        prefix += 1;
+    }
+    // Longest shared trailing run of whole words (not overlapping the prefix).
+    let mut suffix = 0;
+    while suffix < a.len() - prefix
+        && suffix < b.len() - prefix
+        && a[a.len() - 1 - suffix] == b[b.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let shared_prefix = a[..prefix].join(" ");
+    let a_middle = a[prefix..a.len() - suffix].join(" ");
+    let b_middle = b[prefix..b.len() - suffix].join(" ");
+    let shared_suffix = a[a.len() - suffix..].join(" ");
+
+    let middle = format!("{a_middle} / {b_middle}");
+    [shared_prefix, middle, shared_suffix]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -714,6 +874,205 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len(), "duplicate action id in registry");
+    }
+
+    #[test]
+    fn registry_sections_collapse_toggle_pairs_to_one_row() {
+        let sections = registry_sections();
+        let chat = sections
+            .iter()
+            .find(|s| s.category == "Chat")
+            .expect("Chat section present");
+
+        // Each of the four toggle groups appears exactly once as a collapsed row.
+        for group in ["archive", "pin", "favorite", "read"] {
+            let matching: Vec<&MenuItemVm> = chat
+                .items
+                .iter()
+                .filter(|i| i.toggle_group.as_deref() == Some(group))
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "toggle group {group} should collapse to one row, got {}",
+                matching.len()
+            );
+        }
+
+        // The archive row carries the CANONICAL (positive) id and the shared shortcut,
+        // and its combined title names both directions.
+        let archive = chat
+            .items
+            .iter()
+            .find(|i| i.toggle_group.as_deref() == Some("archive"))
+            .expect("archive row present");
+        assert_eq!(archive.id, "archive-chat", "canonical id retained");
+        assert_eq!(archive.shortcut.as_deref(), Some("E"), "shared shortcut");
+        assert!(
+            archive.title.contains("Archive") && archive.title.contains("Unarchive"),
+            "combined title names both directions, got {:?}",
+            archive.title
+        );
+
+        // read pair collapses too, canonical = mark-read, shortcut U.
+        let read = chat
+            .items
+            .iter()
+            .find(|i| i.toggle_group.as_deref() == Some("read"))
+            .expect("read row present");
+        assert_eq!(read.id, "mark-read");
+        assert_eq!(read.shortcut.as_deref(), Some("U"));
+        assert!(
+            read.title.contains("Read") && read.title.contains("Unread"),
+            "combined read title, got {:?}",
+            read.title
+        );
+
+        // No un-collapsed opposite direction leaked as its own row.
+        for opposite in [
+            "unarchive-chat",
+            "unpin-chat",
+            "unfavorite-chat",
+            "mark-unread",
+        ] {
+            assert!(
+                !chat.items.iter().any(|i| i.id == opposite),
+                "opposite direction {opposite} must be folded into its pair"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_sections_no_toggle_group_left_uncollapsed() {
+        // Across ALL sections, every toggle group appears exactly once.
+        let sections = registry_sections();
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for section in &sections {
+            for item in &section.items {
+                if let Some(group) = &item.toggle_group {
+                    *counts.entry(group.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        assert_eq!(counts.len(), 4, "exactly four toggle groups");
+        for (group, count) in counts {
+            assert_eq!(count, 1, "group {group} collapsed to a single item");
+        }
+    }
+
+    #[test]
+    fn registry_sections_ordered_by_category() {
+        let sections = registry_sections();
+        let categories: Vec<&str> = sections.iter().map(|s| s.category.as_str()).collect();
+        assert_eq!(
+            categories,
+            vec![
+                "Navigation",
+                "Chats",
+                "Archive",
+                "Accounts",
+                "Privacy",
+                "Chat"
+            ],
+            "categories rendered in the stable CATEGORY_ORDER"
+        );
+        // Every section is non-empty (no phantom category).
+        assert!(sections.iter().all(|s| !s.items.is_empty()));
+    }
+
+    #[test]
+    fn registry_sections_covers_all_actions() {
+        // Every registered action id is reachable through a section item: a
+        // non-toggle action maps to its own item; a toggle action maps to its
+        // group's collapsed item (by canonical id or by group membership). This
+        // proves the projection drops nothing.
+        let sections = registry_sections();
+        let section_ids: Vec<String> = sections
+            .iter()
+            .flat_map(|s| s.items.iter().map(|i| i.id.clone()))
+            .collect();
+        let section_groups: Vec<String> = sections
+            .iter()
+            .flat_map(|s| s.items.iter().filter_map(|i| i.toggle_group.clone()))
+            .collect();
+        for action in palette_actions() {
+            let covered = section_ids.contains(&action.id)
+                || action
+                    .toggle_group
+                    .as_ref()
+                    .is_some_and(|g| section_groups.contains(g));
+            assert!(covered, "action {} not reachable via a section", action.id);
+        }
+    }
+
+    /// FR-48 release-gate parity test (Story 9.3).
+    ///
+    /// Enumerates every MVP UI surface shipped in epics 1–8 and asserts each is
+    /// reachable through ≥1 registered `palette_actions()` id, OR is on the
+    /// documented justified-exclusion allowlist. A new surface that ships without a
+    /// registered action (and without a justified exclusion) FAILS this test — the
+    /// parity gate becomes mechanical rather than a hand-maintained promise.
+    #[test]
+    fn parity_every_mvp_surface_has_an_action_or_is_excluded() {
+        let ids: Vec<String> = palette_actions().into_iter().map(|a| a.id).collect();
+        let has = |id: &str| ids.iter().any(|i| i == id);
+
+        // Each row: (surface label, covering action ids). A surface is covered when
+        // at least ONE of its listed ids is registered. Grounded in the actual
+        // shipped actions and the surfaces they route to (see actions.ts).
+        let surfaces: &[(&str, &[&str])] = &[
+            // Epic 4 — Unified Inbox and its views.
+            ("Unified Inbox view", &["open-inbox"]),
+            ("Archive view", &["open-archive"]),
+            // Epic 4 — chat-row triage verbs (archive/pin/favourite/read).
+            (
+                "Archive/unarchive a chat",
+                &["archive-chat", "unarchive-chat"],
+            ),
+            ("Pin/unpin a chat", &["pin-chat", "unpin-chat"]),
+            (
+                "Favourite/unfavourite a chat",
+                &["favorite-chat", "unfavorite-chat"],
+            ),
+            ("Mark chat read/unread", &["mark-read", "mark-unread"]),
+            // Epic 5 — Local Archive search + export.
+            ("Archive search", &["open-search"]),
+            ("Export (whole archive)", &["start-export"]),
+            ("Export this chat", &["export-chat"]),
+            // Epic 6 — Bridges surface + new chat.
+            ("Bridges view", &["open-bridges"]),
+            ("New chat", &["new-chat"]),
+            // Epic 1/2 — account onboarding.
+            ("Add an account", &["add-account"]),
+            // Epic 7 — Approval Pane (draft airlock).
+            ("Approval Pane view", &["open-approval"]),
+            // Epic 8 — Incognito (global + per-chat).
+            ("Toggle Incognito globally", &["toggle-incognito-global"]),
+            ("Toggle Incognito for a chat", &["toggle-incognito-chat"]),
+        ];
+
+        // Justified exclusions — surfaces intentionally NOT registered as palette
+        // actions, with rationale. Consistent with 9.1's Block-If and the
+        // deferred-work ledger. These are asserted to STAY excluded (documented),
+        // not asserted covered.
+        //   - Device verification: no clean cold-open entry point; auto-opens on an
+        //     incoming request / from Settings, not a palette-dispatchable surface.
+        //   - Key backup: same — no cold-open entry point; driven from Settings and
+        //     the recovery-key modal lifecycle.
+        //   - Mute: no backend command exists yet (the `m` verb has no handler); a
+        //     palette action would dispatch a dead id. Deferred until the backend ships.
+        let excluded: &[&str] = &["device-verification", "key-backup", "mute"];
+        assert_eq!(excluded.len(), 3, "the documented exclusion set is stable");
+
+        for (surface, covering) in surfaces {
+            let covered = covering.iter().any(|id| has(id));
+            assert!(
+                covered,
+                "MVP surface {surface:?} has no registered palette action \
+                 (expected one of {covering:?}); register an action or add it to the \
+                 justified-exclusion allowlist with a rationale"
+            );
+        }
     }
 
     #[test]

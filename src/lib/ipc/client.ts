@@ -53,6 +53,8 @@ export type { LoginFieldVm } from "./gen/LoginFieldVm";
 export type { LoginFlowVm } from "./gen/LoginFlowVm";
 export type { MediaKindVm } from "./gen/MediaKindVm";
 export type { MediaVm } from "./gen/MediaVm";
+export type { MenuItemVm } from "./gen/MenuItemVm";
+export type { MenuSectionVm } from "./gen/MenuSectionVm";
 export type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 export type { NetworkVm } from "./gen/NetworkVm";
 export type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
@@ -106,6 +108,7 @@ import type { ExportProgressVm } from "./gen/ExportProgressVm";
 import type { ExportRequestVm } from "./gen/ExportRequestVm";
 import type { InboxBatch } from "./gen/InboxBatch";
 import type { IncognitoVm } from "./gen/IncognitoVm";
+import type { MenuSectionVm } from "./gen/MenuSectionVm";
 import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 import type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
 import type { OutboxVm } from "./gen/OutboxVm";
@@ -661,6 +664,18 @@ export async function paletteQuery(
   openChat: boolean,
 ): Promise<PaletteResultsVm> {
   return await invoke<PaletteResultsVm>("palette_query", { query, mode, openChat });
+}
+
+/**
+ * Fetch the category-grouped, toggle-collapsed shortcut reference for the ⌘? cheat
+ * sheet (Story 9.3). A pure projection of the same `palette_actions()` registry the
+ * palette consumes (`registry_sections()` in Rust), grouped by category with each
+ * toggle pair (archive/unarchive, …) collapsed to one unambiguous row — no
+ * hand-maintained list, so it never drifts from the palette or the native menu bar
+ * (UX-DR15). Stateless and never fails. Resolves with the {@link MenuSectionVm}[].
+ */
+export async function cheatSheetSections(): Promise<MenuSectionVm[]> {
+  return await invoke<MenuSectionVm[]>("cheat_sheet_sections");
 }
 
 /**

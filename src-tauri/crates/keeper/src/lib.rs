@@ -7,6 +7,7 @@
 
 mod ipc;
 mod media_protocol;
+mod menu;
 
 use tauri::Manager;
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -42,6 +43,19 @@ pub fn run() {
                     tracing::debug!(handled, "deep-link: received keeper:// URL");
                 }
             });
+
+            // Build + install the native menu bar from the action registry (Story
+            // 9.3): standard macOS App/Edit/Window submenus plus one generated
+            // submenu per registry category, derived from the same
+            // `registry_sections()` the ⌘? cheat sheet renders. No accelerators are
+            // bound (the JS hooks own every binding); the shortcut is display-only
+            // label text. A menu click routes through `on_menu_event` below.
+            let native_menu = menu::build_menu(app.handle())?;
+            app.set_menu(native_menu)?;
+            app.on_menu_event(|app, event| {
+                menu::handle_menu_event(app, event.id().as_ref());
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -126,6 +140,7 @@ pub fn run() {
             ipc::cancel_send,
             ipc::mark_room_read,
             ipc::palette_query,
+            ipc::cheat_sheet_sections,
             ipc::release_receipt,
             ipc::coupling_caveats,
             ipc::mark_room_unread,

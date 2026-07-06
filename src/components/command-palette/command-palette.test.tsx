@@ -57,6 +57,7 @@ function action(
     keywords: p.keywords ?? [],
     shortcut: p.shortcut ?? null,
     requiresOpenChat: p.requiresOpenChat ?? false,
+    toggleGroup: p.toggleGroup ?? null,
   };
 }
 

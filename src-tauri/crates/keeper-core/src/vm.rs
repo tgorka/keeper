@@ -2128,6 +2128,53 @@ pub struct PaletteActionVm {
     pub shortcut: Option<String>,
     /// `true` when the action operates on the currently open chat.
     pub requires_open_chat: bool,
+    /// The toggle-pair group this action belongs to (Story 9.3), e.g. `"archive"`
+    /// for both `archive-chat` and `unarchive-chat`. `None` for a non-toggle action.
+    /// The palette ignores this (backward-safe); the cheat sheet + native menu
+    /// collapse each group's two actions into a single unambiguous entry.
+    pub toggle_group: Option<String>,
+}
+
+/// One category submenu in the derived menu/cheat-sheet projection (Story 9.3).
+///
+/// A projection of the action registry (`keeper_core::palette::registry_sections`),
+/// grouping `palette_actions` by `category` in a stable order and collapsing each
+/// toggle pair (archive/unarchive, pin/unpin, …) into a single [`MenuItemVm`]. Both
+/// the native macOS menu bar and the ⌘? cheat sheet render this same projection — no
+/// hand-maintained shortcut list, so adding/removing a registry action changes both
+/// surfaces automatically (UX-DR15). Static, non-secret render data only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MenuSectionVm {
+    /// The category / group label (e.g. `"Navigation"`, `"Chat"`).
+    pub category: String,
+    /// The category's items, in registry order, toggle pairs collapsed.
+    pub items: Vec<MenuItemVm>,
+}
+
+/// One item in a derived menu/cheat-sheet section (Story 9.3).
+///
+/// The stable `id` is the canonical dispatch key the frontend `actions.ts` map
+/// resolves — for a collapsed toggle pair it is the canonical (positive) direction
+/// (e.g. `archive-chat`), which `use-menu-actions` flips to the opposite direction
+/// from the open room's current flag at click time. `title` is the display label (a
+/// combined "Archive / Unarchive Chat" for a collapsed pair), `shortcut` the shared
+/// chip string, and `requires_open_chat` gates it to an open conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MenuItemVm {
+    /// Canonical dispatch id (the positive direction for a collapsed toggle pair).
+    pub id: String,
+    /// The display label (combined for a collapsed toggle pair).
+    pub title: String,
+    /// The shared shortcut-chip string (e.g. `"⌘1"`, `"E"`), or `None` when unbound.
+    pub shortcut: Option<String>,
+    /// The toggle-pair group (e.g. `"archive"`) for a collapsed item, else `None`.
+    pub toggle_group: Option<String>,
+    /// `true` when the item operates on the currently open chat.
+    pub requires_open_chat: bool,
 }
 
 /// The grouped, ranked, bounded result of one `palette_query` (Story 9.1).

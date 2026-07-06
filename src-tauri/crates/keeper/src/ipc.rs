@@ -26,9 +26,10 @@ use keeper_core::vm::{
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
     ConnectionStatusBatch, CouplingCaveatVm, DemoBatch, DraftMirrorBatch, EditVersionVm,
     EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IncognitoVm,
-    IpcError, IpcErrorCode, NetworksSnapshot, NewChatResolutionVm, OutboxVm, PaginationStatusBatch,
-    PaletteMode, PaletteResultsVm, PingVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
-    SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
+    IpcError, IpcErrorCode, MenuSectionVm, NetworksSnapshot, NewChatResolutionVm, OutboxVm,
+    PaginationStatusBatch, PaletteMode, PaletteResultsVm, PingVm, RemoteDraftVm, ResolveSupportVm,
+    RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch,
+    VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -2307,6 +2308,19 @@ pub async fn palette_query(
     open_chat: bool,
 ) -> Result<PaletteResultsVm, IpcError> {
     Ok(state.accounts.palette_query(&query, mode, open_chat).await)
+}
+
+/// Return the category-grouped, toggle-collapsed registry projection (Story 9.3).
+///
+/// The data source for the ⌘? cheat sheet: a pure projection of the same
+/// `palette_actions()` registry the palette consumes, grouped by category and with
+/// each toggle pair collapsed to one row (`keeper_core::palette::registry_sections`).
+/// The native macOS menu bar is built from this same projection in Rust, so the two
+/// discovery surfaces provably never drift (UX-DR15). Pure and stateless — never
+/// fails.
+#[tauri::command]
+pub fn cheat_sheet_sections() -> Result<Vec<MenuSectionVm>, IpcError> {
+    Ok(keeper_core::palette::registry_sections())
 }
 
 /// Read the resolved Incognito state for `(accountId, roomId)` (Story 8.1). Delegates

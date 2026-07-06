@@ -37,4 +37,11 @@ shortcut: string | null,
 /**
  * `true` when the action operates on the currently open chat.
  */
-requiresOpenChat: boolean, };
+requiresOpenChat: boolean, 
+/**
+ * The toggle-pair group this action belongs to (Story 9.3), e.g. `"archive"`
+ * for both `archive-chat` and `unarchive-chat`. `None` for a non-toggle action.
+ * The palette ignores this (backward-safe); the cheat sheet + native menu
+ * collapse each group's two actions into a single unambiguous entry.
+ */
+toggleGroup: string | null, };

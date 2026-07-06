@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import { ApprovalPane } from "@/components/approval/approval-pane";
 import { NewChatDialog } from "@/components/chat/new-chat-dialog";
+import { CheatSheetOverlay } from "@/components/cheat-sheet/cheat-sheet-overlay";
 import { CommandPalette } from "@/components/command-palette/command-palette";
 import { ExportDialog } from "@/components/export/export-dialog";
 import { BridgesPane } from "@/components/layout/bridges-pane";
@@ -18,9 +19,11 @@ import { useAccountStatuses } from "@/hooks/use-account-statuses";
 import { useApprovalShortcut } from "@/hooks/use-approval-shortcut";
 import { useBridgeHealthSubscription } from "@/hooks/use-bridge-health";
 import { useBridgesShortcut } from "@/hooks/use-bridges-shortcut";
+import { useCheatSheetShortcut } from "@/hooks/use-cheat-sheet-shortcut";
 import { useCommandPaletteShortcut } from "@/hooks/use-command-palette-shortcut";
 import { useEncryptionStatuses } from "@/hooks/use-encryption-statuses";
 import { useKeyBackupStatuses } from "@/hooks/use-key-backup-statuses";
+import { useMenuActions } from "@/hooks/use-menu-actions";
 import { useNewChatShortcut } from "@/hooks/use-new-chat-shortcut";
 import { useQuickSwitcher } from "@/hooks/use-quick-switcher";
 import { useSearchShortcuts } from "@/hooks/use-search-shortcuts";
@@ -59,6 +62,10 @@ export function AppShell() {
   useApprovalShortcut();
   // Wire ⌘K to toggle the command palette (Story 9.1).
   useCommandPaletteShortcut();
+  // Wire ⌘? to toggle the shortcut cheat sheet (Story 9.3).
+  useCheatSheetShortcut();
+  // Route native-menu clicks through the shared palette dispatch (Story 9.3).
+  useMenuActions();
   // Wire ⌘1/⌘2 to Inbox/Archive (Story 9.2), completing the ⌘1–4 view set.
   useViewShortcuts();
   // Wire ⌃Tab/⌃⇧Tab to cycle the open chat over the rendered window (Story 9.2).
@@ -126,6 +133,7 @@ export function AppShell() {
       <ExportDialog />
       <NewChatDialog />
       <CommandPalette />
+      <CheatSheetOverlay />
 
       {detailFloating && (
         <Sheet open={detailOpen} onOpenChange={handleSheetOpenChange}>
