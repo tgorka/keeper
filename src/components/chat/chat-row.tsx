@@ -35,6 +35,7 @@
  */
 
 import { Pencil } from "lucide-react";
+import { forwardRef } from "react";
 import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -71,9 +72,23 @@ interface ChatRowProps {
   onSelect?: (selection: RoomSelection) => void;
   /** Whether this row is the currently open conversation. */
   selected?: boolean;
+  /**
+   * Roving tabindex driven by the chat-list pane's keyboard navigation
+   * (Story 9.2): the keyboard-focused row is `0`, every other row `-1`, so a
+   * single Tab lands on the active row and `↑`/`↓`/`j`/`k` move the ring. Omitted
+   * on surfaces that don't drive roving focus (the row stays natively focusable).
+   */
+  tabIndex?: number;
 }
 
-export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
+/**
+ * The row `<button>` forwards its ref so the chat-list pane can imperatively
+ * `.focus()` the roving-tabindex row as the keyboard selection moves (Story 9.2).
+ */
+export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function ChatRow(
+  { room, onSelect, selected = false, tabIndex },
+  ref,
+) {
   const timestamp = room.timestamp === null ? null : formatRoomTimestamp(room.timestamp) || null;
 
   // Unread state is authoritative from Rust; the overlay only lets the row lead
@@ -168,7 +183,9 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <button
+          ref={ref}
           type="button"
+          tabIndex={tabIndex}
           onClick={() => onSelect?.({ accountId: room.accountId, roomId: room.roomId })}
           aria-label={`Conversation with ${room.displayName}${unreadLabel}`}
           aria-current={selected ? "true" : undefined}
@@ -273,4 +290,4 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
       </ContextMenuContent>
     </ContextMenu>
   );
-}
+});

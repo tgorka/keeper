@@ -27,6 +27,16 @@ const setFavoritesCollapsed = vi.fn(async (_collapsed: boolean): Promise<void> =
 // a live remote edit, and record the subscribe/unsubscribe lifecycle.
 const subscribeDraftMirror = vi.fn();
 const unsubscribeDraftMirror = vi.fn();
+// Verb command wrappers the keyboard navigation (Story 9.2) invokes on the focused
+// row. Hoisted so the nav tests can assert the correct command + direction fired.
+const archiveRoomMock = vi.fn(async (_accountId: string, _roomId: string): Promise<void> => {});
+const unarchiveRoomMock = vi.fn(async (_accountId: string, _roomId: string): Promise<void> => {});
+const pinRoomMock = vi.fn(async (_accountId: string, _roomId: string): Promise<void> => {});
+const unpinRoomMock = vi.fn(async (_accountId: string, _roomId: string): Promise<void> => {});
+const favoriteRoomMock = vi.fn(async (_accountId: string, _roomId: string): Promise<void> => {});
+const unfavoriteRoomMock = vi.fn(async (_accountId: string, _roomId: string): Promise<void> => {});
+const markRoomReadMock = vi.fn(async (_accountId: string, _roomId: string): Promise<void> => {});
+const markRoomUnreadMock = vi.fn(async (_accountId: string, _roomId: string): Promise<void> => {});
 vi.mock("@/lib/ipc/client", () => ({
   subscribeInbox: (
     onInbox: (b: InboxBatch) => void,
@@ -47,19 +57,20 @@ vi.mock("@/lib/ipc/client", () => ({
   // Draft-mirror subscription (Story 7.2): app-lifetime remote-edit stream.
   subscribeDraftMirror: (onBatch: (b: unknown) => void) => subscribeDraftMirror(onBatch),
   unsubscribeDraftMirror: (id: number) => unsubscribeDraftMirror(id),
-  // Best-effort mutation wrappers the strip/rows may call; no-ops here.
+  // Best-effort mutation wrappers the strip/rows/keyboard verbs may call.
   reorderPins: vi.fn(async () => {}),
-  unpinRoom: vi.fn(async () => {}),
-  pinRoom: vi.fn(async () => {}),
-  markRoomRead: vi.fn(async () => {}),
-  markRoomUnread: vi.fn(async () => {}),
-  archiveRoom: vi.fn(async () => {}),
-  unarchiveRoom: vi.fn(async () => {}),
-  favoriteRoom: vi.fn(async () => {}),
-  unfavoriteRoom: vi.fn(async () => {}),
+  unpinRoom: (accountId: string, roomId: string) => unpinRoomMock(accountId, roomId),
+  pinRoom: (accountId: string, roomId: string) => pinRoomMock(accountId, roomId),
+  markRoomRead: (accountId: string, roomId: string) => markRoomReadMock(accountId, roomId),
+  markRoomUnread: (accountId: string, roomId: string) => markRoomUnreadMock(accountId, roomId),
+  archiveRoom: (accountId: string, roomId: string) => archiveRoomMock(accountId, roomId),
+  unarchiveRoom: (accountId: string, roomId: string) => unarchiveRoomMock(accountId, roomId),
+  favoriteRoom: (accountId: string, roomId: string) => favoriteRoomMock(accountId, roomId),
+  unfavoriteRoom: (accountId: string, roomId: string) => unfavoriteRoomMock(accountId, roomId),
 }));
 
 import { ChatListPane } from "@/components/layout/chat-list-pane";
+import { composerStore } from "@/lib/stores/composer";
 import { draftsStore } from "@/lib/stores/drafts";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { favoritesUiStore } from "@/lib/stores/favorites-ui";
@@ -129,6 +140,15 @@ beforeEach(() => {
   getFavoritesCollapsed.mockReset();
   getFavoritesCollapsed.mockResolvedValue(false);
   setFavoritesCollapsed.mockReset();
+  archiveRoomMock.mockClear();
+  unarchiveRoomMock.mockClear();
+  pinRoomMock.mockClear();
+  unpinRoomMock.mockClear();
+  favoriteRoomMock.mockClear();
+  unfavoriteRoomMock.mockClear();
+  markRoomReadMock.mockClear();
+  markRoomUnreadMock.mockClear();
+  composerStore.setState({ focusNonce: 0 });
 });
 
 afterEach(() => {
@@ -1225,5 +1245,247 @@ describe("ChatListPane draft-mirror subscription (Story 7.2)", () => {
     await waitFor(() => {
       expect(unsubscribeDraftMirror).toHaveBeenCalledWith(11);
     });
+  });
+});
+
+describe("ChatListPane keyboard navigation (Story 9.2)", () => {
+  // Render the pane and stream a set of inbox rows, returning the row buttons in
+  // Rust order. Each row overrides come from the passed VM patches.
+  async function renderWithRooms(
+    rooms: Array<Partial<ReturnType<typeof inboxRoom>> & { roomId: string; displayName: string }>,
+  ) {
+    const captured: { onInbox: ((b: InboxBatch) => void) | null } = { onInbox: null };
+    subscribeInbox.mockImplementation((onInbox: (b: InboxBatch) => void) => {
+      captured.onInbox = onInbox;
+      return Promise.resolve(1);
+    });
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+    captured.onInbox?.({
+      ops: [
+        {
+          op: "reset",
+          rooms: rooms.map((r) => ({
+            ...inboxRoom(r.roomId, account.accountId, r.displayName, ""),
+            ...r,
+          })),
+        },
+      ],
+      total: rooms.length,
+    });
+    await waitFor(() => {
+      expect(screen.getByText(rooms[0].displayName)).toBeInTheDocument();
+    });
+    // Return the captured inbox emitter so a test can stream a later batch (e.g. a
+    // recency re-order) and assert the roving cursor tracks identity, not position.
+    return (
+      rooms: Array<Partial<ReturnType<typeof inboxRoom>> & { roomId: string; displayName: string }>,
+    ) =>
+      captured.onInbox?.({
+        ops: [
+          {
+            op: "reset",
+            rooms: rooms.map((r) => ({
+              ...inboxRoom(r.roomId, account.accountId, r.displayName, ""),
+              ...r,
+            })),
+          },
+        ],
+        total: rooms.length,
+      });
+  }
+
+  function rowButton(displayName: string): HTMLElement {
+    return screen.getByRole("button", { name: `Conversation with ${displayName}` });
+  }
+
+  it("moves the roving focus ring through rows in Rust order on ArrowDown / j", async () => {
+    await renderWithRooms([
+      { roomId: "!a", displayName: "Alpha" },
+      { roomId: "!b", displayName: "Beta" },
+      { roomId: "!c", displayName: "Gamma" },
+    ]);
+    const container = screen.getByLabelText("Conversations");
+
+    fireEvent.keyDown(container, { key: "ArrowDown" });
+    expect(rowButton("Alpha")).toHaveFocus();
+    expect(rowButton("Alpha")).toHaveAttribute("tabindex", "0");
+
+    fireEvent.keyDown(container, { key: "j" });
+    expect(rowButton("Beta")).toHaveFocus();
+    expect(rowButton("Alpha")).toHaveAttribute("tabindex", "-1");
+  });
+
+  it("clamps at the ends deterministically and moves back up with ArrowUp / k", async () => {
+    await renderWithRooms([
+      { roomId: "!a", displayName: "Alpha" },
+      { roomId: "!b", displayName: "Beta" },
+    ]);
+    const container = screen.getByLabelText("Conversations");
+
+    fireEvent.keyDown(container, { key: "ArrowDown" });
+    fireEvent.keyDown(container, { key: "ArrowDown" });
+    fireEvent.keyDown(container, { key: "ArrowDown" }); // clamps at the last row
+    expect(rowButton("Beta")).toHaveFocus();
+
+    fireEvent.keyDown(container, { key: "k" });
+    expect(rowButton("Alpha")).toHaveFocus();
+    fireEvent.keyDown(container, { key: "ArrowUp" }); // clamps at the first row
+    expect(rowButton("Alpha")).toHaveFocus();
+  });
+
+  it("Enter selects the focused row and requests composer focus", async () => {
+    await renderWithRooms([
+      { roomId: "!a", displayName: "Alpha" },
+      { roomId: "!b", displayName: "Beta" },
+    ]);
+    const container = screen.getByLabelText("Conversations");
+    fireEvent.keyDown(container, { key: "ArrowDown" });
+    fireEvent.keyDown(container, { key: "ArrowDown" });
+
+    fireEvent.keyDown(container, { key: "Enter" });
+    expect(roomsStore.getState().selected).toEqual({
+      accountId: account.accountId,
+      roomId: "!b",
+    });
+    expect(composerStore.getState().focusNonce).toBe(1);
+  });
+
+  it("`e` archives an inbox row and unarchives an archived one", async () => {
+    await renderWithRooms([
+      { roomId: "!a", displayName: "Alpha", isArchived: false },
+      { roomId: "!b", displayName: "Beta", isArchived: true },
+    ]);
+    const container = screen.getByLabelText("Conversations");
+
+    fireEvent.keyDown(container, { key: "ArrowDown" }); // focus Alpha
+    fireEvent.keyDown(container, { key: "e" });
+    expect(archiveRoomMock).toHaveBeenCalledWith(account.accountId, "!a");
+    expect(unarchiveRoomMock).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(container, { key: "ArrowDown" }); // focus Beta (archived)
+    fireEvent.keyDown(container, { key: "e" });
+    expect(unarchiveRoomMock).toHaveBeenCalledWith(account.accountId, "!b");
+  });
+
+  it("`p` pins / unpins and `f` favorites / unfavorites per current flag", async () => {
+    await renderWithRooms([
+      { roomId: "!a", displayName: "Alpha", isPinned: false, isFavourite: true },
+    ]);
+    const container = screen.getByLabelText("Conversations");
+    fireEvent.keyDown(container, { key: "ArrowDown" });
+
+    fireEvent.keyDown(container, { key: "p" });
+    expect(pinRoomMock).toHaveBeenCalledWith(account.accountId, "!a");
+
+    fireEvent.keyDown(container, { key: "f" });
+    expect(unfavoriteRoomMock).toHaveBeenCalledWith(account.accountId, "!a");
+  });
+
+  it("`u` sets the optimistic overlay and marks read for an unread row", async () => {
+    await renderWithRooms([{ roomId: "!a", displayName: "Alpha", isUnread: true }]);
+    const container = screen.getByLabelText("Conversations");
+    fireEvent.keyDown(container, { key: "ArrowDown" });
+
+    fireEvent.keyDown(container, { key: "u" });
+    // Optimistic overlay flips the row to read within the frame; the command fires.
+    expect(roomsStore.getState().optimisticUnread.get(`${account.accountId}|!a`)).toBe(false);
+    expect(markRoomReadMock).toHaveBeenCalledWith(account.accountId, "!a");
+  });
+
+  it("`u` reverts the optimistic overlay when the mark command hard-rejects", async () => {
+    markRoomUnreadMock.mockRejectedValueOnce(new Error("nope"));
+    await renderWithRooms([{ roomId: "!a", displayName: "Alpha", isUnread: false }]);
+    const container = screen.getByLabelText("Conversations");
+    fireEvent.keyDown(container, { key: "ArrowDown" });
+
+    fireEvent.keyDown(container, { key: "u" });
+    expect(markRoomUnreadMock).toHaveBeenCalledWith(account.accountId, "!a");
+    // The overlay was set optimistically, then reverted on the rejection.
+    await waitFor(() => {
+      expect(roomsStore.getState().optimisticUnread.has(`${account.accountId}|!a`)).toBe(false);
+    });
+  });
+
+  it("passes modifier chords through (no bare-verb hijack while a modifier is held)", async () => {
+    await renderWithRooms([{ roomId: "!a", displayName: "Alpha", isArchived: false }]);
+    const container = screen.getByLabelText("Conversations");
+    fireEvent.keyDown(container, { key: "ArrowDown" });
+
+    // ⌘F (search) must not archive; the list handler ignores modifier chords.
+    fireEvent.keyDown(container, { key: "e", metaKey: true });
+    expect(archiveRoomMock).not.toHaveBeenCalled();
+  });
+
+  it("Esc clears the focused-row ring when no filter is active", async () => {
+    await renderWithRooms([{ roomId: "!a", displayName: "Alpha" }]);
+    const container = screen.getByLabelText("Conversations");
+    fireEvent.keyDown(container, { key: "ArrowDown" });
+    expect(rowButton("Alpha")).toHaveAttribute("tabindex", "0");
+
+    fireEvent.keyDown(container, { key: "Escape" });
+    // Ring cleared: the first row falls back to the default tab stop (0) but no row
+    // is keyboard-focused; a subsequent verb no-ops. Assert the verb no-ops.
+    fireEvent.keyDown(container, { key: "e" });
+    expect(archiveRoomMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the roving cursor on the same room after a recency re-order (verb targets by identity)", async () => {
+    const restream = await renderWithRooms([
+      { roomId: "!a", displayName: "Alpha", isArchived: false },
+      { roomId: "!b", displayName: "Beta", isArchived: false },
+    ]);
+    const container = screen.getByLabelText("Conversations");
+    fireEvent.keyDown(container, { key: "ArrowDown" }); // focus Alpha (index 0)
+
+    // A recency bump re-orders the window so Beta is now index 0 and Alpha index 1.
+    restream([
+      { roomId: "!b", displayName: "Beta", isArchived: false },
+      { roomId: "!a", displayName: "Alpha", isArchived: false },
+    ]);
+    await waitFor(() => {
+      // The tab stop follows Alpha to its new position — it is not stranded on index 0.
+      expect(rowButton("Alpha")).toHaveAttribute("tabindex", "0");
+      expect(rowButton("Beta")).toHaveAttribute("tabindex", "-1");
+    });
+
+    // `e` archives Alpha (the keyed row), NOT whatever row now sits at the old index.
+    fireEvent.keyDown(container, { key: "e" });
+    expect(archiveRoomMock).toHaveBeenCalledWith(account.accountId, "!a");
+  });
+
+  it("no-ops a verb when the focused row has left the window", async () => {
+    const restream = await renderWithRooms([
+      { roomId: "!a", displayName: "Alpha", isArchived: false },
+      { roomId: "!b", displayName: "Beta", isArchived: false },
+    ]);
+    const container = screen.getByLabelText("Conversations");
+    fireEvent.keyDown(container, { key: "ArrowDown" }); // focus Alpha
+
+    // Alpha leaves the inbox window (e.g. archived elsewhere); only Beta remains.
+    restream([{ roomId: "!b", displayName: "Beta", isArchived: false }]);
+    await waitFor(() => {
+      // The list keeps exactly one tab stop — the surviving first row.
+      expect(rowButton("Beta")).toHaveAttribute("tabindex", "0");
+    });
+
+    // The gone row is not acted on, and the cursor did not silently jump to Beta.
+    fireEvent.keyDown(container, { key: "e" });
+    expect(archiveRoomMock).not.toHaveBeenCalled();
+  });
+
+  it("ignores list keys bubbling from outside the conversations list (pins/favorites/chips)", async () => {
+    await renderWithRooms([{ roomId: "!a", displayName: "Alpha", isArchived: false }]);
+    const list = screen.getByLabelText("Conversations");
+    fireEvent.keyDown(list, { key: "ArrowDown" }); // focus Alpha in the main list
+
+    // A bare `e` whose target is a sibling of the <ul> (a Pins/Favorites/chip button
+    // lives in the same keydown container but outside the conversations list) must
+    // bubble to the container handler and be ignored — no main-list archive verb.
+    const sibling = document.createElement("button");
+    list.parentElement?.appendChild(sibling);
+    fireEvent.keyDown(sibling, { key: "e" });
+    expect(archiveRoomMock).not.toHaveBeenCalled();
+    sibling.remove();
   });
 });

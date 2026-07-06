@@ -14,31 +14,40 @@
  * merged window always covers exactly the live accounts.
  */
 import { X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChatRow } from "@/components/chat/chat-row";
 import { FavoritesSection, hydrateFavoritesCollapsed } from "@/components/layout/favorites-section";
 import { PinsStrip } from "@/components/layout/pins-strip";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { InboxBatch, NetworksSnapshot, SpacesSnapshot } from "@/lib/ipc/client";
+import type { InboxBatch, InboxRoomVm, NetworksSnapshot, SpacesSnapshot } from "@/lib/ipc/client";
 import {
+  archiveRoom,
+  favoriteRoom,
   getFavoritesCollapsed,
   listDrafts,
+  markRoomRead,
+  markRoomUnread,
+  pinRoom,
   setNetworkFilter,
   setSpaceFilter,
   subscribeDraftMirror,
   subscribeInbox,
+  unarchiveRoom,
+  unfavoriteRoom,
+  unpinRoom,
   unsubscribeDraftMirror,
   unsubscribeInbox,
 } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore, useArchiveRoomsStore } from "@/lib/stores/archive-rooms";
+import { composerStore } from "@/lib/stores/composer";
 import { draftsStore } from "@/lib/stores/drafts";
 import { favoritesRoomsStore, useFavoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { networksStore, useNetworksStore } from "@/lib/stores/networks";
 import { pinsRoomsStore, usePinsRoomsStore } from "@/lib/stores/pins-rooms";
 import { usePrimaryView } from "@/lib/stores/primary-view";
-import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
+import { effectiveIsUnread, roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { spacesStore, useSpacesStore } from "@/lib/stores/spaces";
 
 export function ChatListPane() {
@@ -87,6 +96,20 @@ export function ChatListPane() {
   // window delivers a batch.
   const [loadedInbox, setLoadedInbox] = useState(false);
   const [loadedArchive, setLoadedArchive] = useState(false);
+  // Roving keyboard focus over the main list (Story 9.2): the stable
+  // `${accountId}:${roomId}` key of the row that carries the visible focus ring +
+  // `tabIndex={0}`, or `null` when no row is keyboard-focused (the ring is cleared,
+  // e.g. after Esc). Keyed by identity, NOT position, so that when the Rust stream
+  // re-orders `visibleRooms` (a routine recency bump) or the focused row leaves the
+  // window (its own `e`-archive), the cursor still points at the same room — or at
+  // nothing if that room is gone — never at whatever row now sits at a stale index.
+  // Pure UI cursor over the Rust-ordered list — never a source of truth, never
+  // re-orders.
+  const [focusedKey, setFocusedKey] = useState<string | null>(null);
+  // Live refs to each rendered row button so the container handler can imperatively
+  // move `.focus()` as the roving index changes. Rebuilt each render from the
+  // current `visibleRooms` length.
+  const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
   useEffect(() => {
     if (accountKey.length === 0) {
@@ -321,6 +344,122 @@ export function ChatListPane() {
     clearNetworkFilter();
   };
 
+  // ── Chat-list keyboard navigation (Story 9.2) ──────────────────────────────
+  // Bare-key list verbs on the focused row, mirroring the `ChatRow` context menu:
+  // the command direction is chosen from the row's current flag, and `u` mirrors
+  // the optimistic-unread pattern (`setOptimisticUnread` then round-trip; revert on
+  // a hard reject). These reuse the shipped commands — nothing new is wired.
+  const runVerb = (room: InboxRoomVm, verb: "e" | "u" | "p" | "f") => {
+    if (verb === "e") {
+      const fn = room.isArchived ? unarchiveRoom : archiveRoom;
+      void fn(room.accountId, room.roomId).catch(() => {});
+      return;
+    }
+    if (verb === "p") {
+      const fn = room.isPinned ? unpinRoom : pinRoom;
+      void fn(room.accountId, room.roomId).catch(() => {});
+      return;
+    }
+    if (verb === "f") {
+      const fn = room.isFavourite ? unfavoriteRoom : favoriteRoom;
+      void fn(room.accountId, room.roomId).catch(() => {});
+      return;
+    }
+    // `u`: toggle read/unread with the optimistic overlay, reverting on hard reject.
+    const store = roomsStore.getState();
+    const intendedRead = effectiveIsUnread(room, store.optimisticUnread);
+    store.setOptimisticUnread(room.accountId, room.roomId, !intendedRead);
+    const mark = intendedRead ? markRoomRead : markRoomUnread;
+    void mark(room.accountId, room.roomId).catch(() =>
+      roomsStore.getState().clearOptimisticUnread(room.accountId, room.roomId),
+    );
+  };
+
+  // Resolve the roving cursor's key to a position in the CURRENT `visibleRooms`
+  // each render: `-1` when nothing is keyboard-focused or the focused room has left
+  // the window (re-ordered away / archived). The tab stop falls back to the first
+  // row in that case, so the list never loses its single keyboard entry point.
+  const resolvedFocusIdx =
+    focusedKey === null
+      ? -1
+      : visibleRooms.findIndex((r) => `${r.accountId}:${r.roomId}` === focusedKey);
+
+  // The chat-list container's keyboard handler. Fires the list-focused keys only
+  // when focus is within the main conversations list (not the Pins strip, Favorites
+  // section, or filter chips — all focusable siblings in this container) AND no
+  // ⌘/⌥/⌃ modifier is held — so those chords fall through to the global hooks and
+  // typing/other surfaces are never hijacked — driving the roving focus ring over
+  // `visibleRooms` (Rust order; never re-sorted). Extends the existing Esc
+  // filter-clearing handler with a second Esc clearing the focused-row ring.
+  const onListKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // Esc: clear any active filter first, else clear the focused-row ring. Handled
+    // container-wide (independent of the main-list scope check below) so Esc from a
+    // filter chip still clears the filter.
+    if (e.key === "Escape") {
+      if (anyFilterActive) {
+        e.preventDefault();
+        clearFilters();
+      } else if (resolvedFocusIdx >= 0) {
+        e.preventDefault();
+        // Blur the still-focused row so its `focus-visible` ring actually clears
+        // (dropping the cursor alone leaves DOM focus — and its ring — on the row).
+        rowRefs.current[resolvedFocusIdx]?.blur();
+        setFocusedKey(null);
+      }
+      return;
+    }
+    // Only the main conversations list owns the movement/verb keys: ignore keydowns
+    // bubbling up from a Pins/Favorites/chip button so they keep their native
+    // activation (the spec scopes those surfaces out of keyboard nav).
+    const target = e.target as HTMLElement | null;
+    if (target === null || target.closest('ul[aria-label="Conversations"]') === null) {
+      return;
+    }
+    // Let ⌘/⌥/⌃ chords pass through to the global window hooks; only bare keys are
+    // list-owned. (Shift alone is fine — it is not a chord modifier here.)
+    if (e.metaKey || e.altKey || e.ctrlKey) {
+      return;
+    }
+    if (visibleRooms.length === 0) {
+      return;
+    }
+    const moveTo = (index: number) => {
+      e.preventDefault();
+      const row = visibleRooms[index];
+      setFocusedKey(`${row.accountId}:${row.roomId}`);
+      rowRefs.current[index]?.focus();
+    };
+    // ↑/↓ and j/k move the ring, clamping at the ends deterministically.
+    if (e.key === "ArrowDown" || e.key === "j") {
+      moveTo(Math.min(resolvedFocusIdx + 1, visibleRooms.length - 1));
+      return;
+    }
+    if (e.key === "ArrowUp" || e.key === "k") {
+      const base = resolvedFocusIdx < 0 ? visibleRooms.length : resolvedFocusIdx;
+      moveTo(Math.max(base - 1, 0));
+      return;
+    }
+    // The remaining keys act on the focused row (resolved by identity); no-op when
+    // nothing is focused or the focused room has left the window.
+    if (resolvedFocusIdx < 0) {
+      return;
+    }
+    const room = visibleRooms[resolvedFocusIdx];
+    if (room === undefined) {
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      selectRoom({ accountId: room.accountId, roomId: room.roomId });
+      composerStore.getState().requestFocus();
+      return;
+    }
+    if (e.key === "e" || e.key === "u" || e.key === "p" || e.key === "f") {
+      e.preventDefault();
+      runVerb(room, e.key);
+    }
+  };
+
   // Per-view empty state (UX-DR13): the Archive uses sentence case with a code-font
   // `E` and no exclamation; the Inbox keeps its existing copy. When any filter is
   // active and the view is empty, show "No chats in {filter names}." (Space · Network
@@ -361,14 +500,7 @@ export function ChatListPane() {
     // biome-ignore lint/a11y/noStaticElementInteractions: container-level Esc handler clears all active filters before focus moves (UX-DR); rows stay independently keyboard-operable, so this is additive.
     <div
       className="flex h-full w-[320px] shrink-0 flex-col border-border border-r bg-background"
-      onKeyDown={(e) => {
-        // Esc from the list clears ALL active filters (Space + Network) before
-        // moving focus (Story 4.5 + 4.6).
-        if (e.key === "Escape" && anyFilterActive) {
-          e.preventDefault();
-          clearFilters();
-        }
-      }}
+      onKeyDown={onListKeyDown}
     >
       {/* Dismissible filter chips (Story 4.5 + 4.6): shown above the list when a
           Space and/or Network filter is active (AND composition — both chips
@@ -424,14 +556,22 @@ export function ChatListPane() {
       ) : visibleRooms.length > 0 ? (
         <ScrollArea className="flex-1">
           <ul aria-label="Conversations" className="flex flex-col">
-            {visibleRooms.map((room) => (
+            {visibleRooms.map((room, index) => (
               <li key={`${room.accountId}:${room.roomId}`}>
                 <ChatRow
+                  ref={(el) => {
+                    rowRefs.current[index] = el;
+                  }}
                   room={room}
                   onSelect={selectRoom}
                   selected={
                     selected?.roomId === room.roomId && selected?.accountId === room.accountId
                   }
+                  // Roving tabindex (Story 9.2): the keyboard-focused row is `0` so a
+                  // single Tab lands on it; every other row is `-1`. Before any row is
+                  // keyboard-focused — or when the focused row has left the window — the
+                  // first row is the tab stop, so the list always has exactly one.
+                  tabIndex={(resolvedFocusIdx >= 0 ? resolvedFocusIdx : 0) === index ? 0 : -1}
                 />
               </li>
             ))}

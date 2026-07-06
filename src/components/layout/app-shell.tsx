@@ -22,9 +22,12 @@ import { useCommandPaletteShortcut } from "@/hooks/use-command-palette-shortcut"
 import { useEncryptionStatuses } from "@/hooks/use-encryption-statuses";
 import { useKeyBackupStatuses } from "@/hooks/use-key-backup-statuses";
 import { useNewChatShortcut } from "@/hooks/use-new-chat-shortcut";
+import { useQuickSwitcher } from "@/hooks/use-quick-switcher";
 import { useSearchShortcuts } from "@/hooks/use-search-shortcuts";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { useUnreadJump } from "@/hooks/use-unread-jump";
 import { useVerification } from "@/hooks/use-verification";
+import { useViewShortcuts } from "@/hooks/use-view-shortcuts";
 import { usePrimaryView } from "@/lib/stores/primary-view";
 
 export function AppShell() {
@@ -56,6 +59,12 @@ export function AppShell() {
   useApprovalShortcut();
   // Wire ⌘K to toggle the command palette (Story 9.1).
   useCommandPaletteShortcut();
+  // Wire ⌘1/⌘2 to Inbox/Archive (Story 9.2), completing the ⌘1–4 view set.
+  useViewShortcuts();
+  // Wire ⌃Tab/⌃⇧Tab to cycle the open chat over the rendered window (Story 9.2).
+  useQuickSwitcher();
+  // Wire ⌥⌘↓/⌥⌘↑ to jump next/previous-unread in the rendered window (Story 9.2).
+  useUnreadJump();
   // Which primary view the shell renders. "bridges" and "approval" each replace the
   // chat-list + conversation cluster with a full-surface pane (Story 6.1 / 7.3).
   const primaryView = usePrimaryView();
