@@ -194,6 +194,47 @@ pub struct ConnectionStatusBatch {
     pub status: ConnectionStatus,
 }
 
+/// The remote (cross-device) draft read back from the account-data mirror for a
+/// `(account, room)` (Story 7.2, AD-15). Returned by `load_remote_draft` and
+/// carried in a [`DraftMirrorBatch`] on a live remote edit.
+///
+/// **Local always wins**: this is only ever read to *offer* adoption. `body` is
+/// always non-empty here — an empty body reads back as "no remote draft"
+/// (`None`), so a tombstone never surfaces as an adoptable draft. `updated_ts` is
+/// informational/forward-scaffolding only; the winner rule is purely local-wins
+/// and never consults a timestamp. The body is never logged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RemoteDraftVm {
+    /// The remote draft body (always non-empty; empty maps to `None`).
+    pub body: String,
+    /// Write time in milliseconds since the Unix epoch (UTC). Informational only.
+    #[ts(type = "number")]
+    pub updated_ts: i64,
+}
+
+/// A batch delivered over the app-wide draft-mirror subscription's `Channel`
+/// (Story 7.2, AD-15). Each batch carries one account/room's live remote-draft
+/// change observed via the `dev.keeper.draft` room-account-data event handler.
+///
+/// A tombstone (empty body) arrives with `body: None` so the frontend clears any
+/// offered remote draft for that key. The body is never logged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DraftMirrorBatch {
+    /// The owning account id.
+    pub account_id: String,
+    /// The room id the remote draft belongs to.
+    pub room_id: String,
+    /// The remote draft body, or `None` for a tombstone (cleared remote draft).
+    pub body: Option<String>,
+    /// Write time in milliseconds since the Unix epoch (UTC). Informational only.
+    #[ts(type = "number")]
+    pub updated_ts: i64,
+}
+
 /// The account's live device-verification (encryption) posture, mapped from the
 /// SDK `client.encryption().verification_state()` (Story 3.1, FR, AD-8).
 ///

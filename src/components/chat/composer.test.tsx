@@ -21,10 +21,22 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     loadDraft: vi.fn(async () => null),
     saveDraft: vi.fn(async () => {}),
     clearDraft: vi.fn(async () => {}),
+    // Cross-device mirror (Story 7.2): default to no remote draft; individual tests
+    // override `loadRemoteDraft`. The write/clear mirror calls are best-effort no-ops.
+    loadRemoteDraft: vi.fn(async () => null),
+    mirrorDraft: vi.fn(async () => {}),
+    clearDraftMirror: vi.fn(async () => {}),
   };
 });
 
-import { clearDraft, loadDraft, saveDraft } from "@/lib/ipc/client";
+import {
+  clearDraft,
+  clearDraftMirror,
+  loadDraft,
+  loadRemoteDraft,
+  mirrorDraft,
+  saveDraft,
+} from "@/lib/ipc/client";
 
 /** Reset the shared pending-attachment tray between tests. */
 beforeEach(() => {
@@ -35,6 +47,9 @@ beforeEach(() => {
   vi.mocked(loadDraft).mockResolvedValue(null);
   vi.mocked(saveDraft).mockClear();
   vi.mocked(clearDraft).mockClear();
+  vi.mocked(loadRemoteDraft).mockResolvedValue(null);
+  vi.mocked(mirrorDraft).mockClear();
+  vi.mocked(clearDraftMirror).mockClear();
 });
 afterEach(() => {
   attachmentsStore.getState().clear();
@@ -707,5 +722,144 @@ describe("Composer persistent drafts (Story 7.1)", () => {
     // After the edit sends, the pre-edit real draft returns to the composer.
     await waitFor(() => expect(textarea.value).toBe("real draft"));
     expect(draftsStore.getState().keys.has(`${ACCT} ${ROOM}`)).toBe(true);
+  });
+});
+
+describe("Composer cross-device mirror (Story 7.2)", () => {
+  const ACCT = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const ROOM = "!r1:example.org";
+
+  it("adopts the remote draft into an empty, untouched composer on open", async () => {
+    // No local draft; a remote draft is present → it follows the user.
+    vi.mocked(loadDraft).mockResolvedValue(null);
+    vi.mocked(loadRemoteDraft).mockResolvedValue({ body: "from device B", updatedTs: 100 });
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    await waitFor(() => expect(textarea.value).toBe("from device B"));
+    // No conflict chip when the composer was empty — adoption is silent.
+    expect(screen.queryByText(/edited on another device/i)).toBeNull();
+  });
+
+  it("keeps local text and offers a conflict chip when the remote differs (local wins)", async () => {
+    // A stored local draft loads; a differing remote draft is present.
+    vi.mocked(loadDraft).mockResolvedValue("my local text");
+    vi.mocked(loadRemoteDraft).mockResolvedValue({ body: "remote version", updatedTs: 200 });
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    // Local text stays put — never overwritten by the remote.
+    await waitFor(() => expect(textarea.value).toBe("my local text"));
+    const chip = await screen.findByText(/edited on another device/i);
+    expect(chip).toBeInTheDocument();
+    // Tapping "Use that version" adopts the remote body into the composer.
+    fireEvent.click(screen.getByRole("button", { name: /use that version/i }));
+    await waitFor(() => expect(textarea.value).toBe("remote version"));
+    // The chip is dismissed after adoption.
+    expect(screen.queryByText(/edited on another device/i)).toBeNull();
+  });
+
+  it("shows no chip when the remote equals the local draft", async () => {
+    vi.mocked(loadDraft).mockResolvedValue("same text");
+    vi.mocked(loadRemoteDraft).mockResolvedValue({ body: "same text", updatedTs: 300 });
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    await waitFor(() => expect(textarea.value).toBe("same text"));
+    // Equal bodies → nothing to reconcile, no chip.
+    expect(screen.queryByText(/edited on another device/i)).toBeNull();
+  });
+
+  it("raises the conflict chip on a live remote edit while composing (local untouched)", async () => {
+    vi.mocked(loadDraft).mockResolvedValue(null);
+    vi.mocked(loadRemoteDraft).mockResolvedValue(null);
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    // The user types local text (touches the composer).
+    fireEvent.change(textarea, { target: { value: "typed locally" } });
+    // A live remote edit arrives via the app-wide mirror subscription.
+    act(() => {
+      draftsStore.getState().applyRemote(ACCT, ROOM, "live remote edit", 400);
+    });
+    // Local text is untouched; the chip offers the remote for one-tap adoption.
+    expect(textarea.value).toBe("typed locally");
+    expect(await screen.findByText(/edited on another device/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /use that version/i }));
+    await waitFor(() => expect(textarea.value).toBe("live remote edit"));
+  });
+
+  it("mirrors a draft cross-device on the looser debounce, off the keystroke path", () => {
+    vi.useFakeTimers();
+    try {
+      render(<Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} />);
+      const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+      fireEvent.change(textarea, { target: { value: "mirror me" } });
+      // The local save fires first (200 ms) — the mirror has NOT yet fired.
+      vi.advanceTimersByTime(200);
+      expect(mirrorDraft).not.toHaveBeenCalled();
+      // The looser mirror debounce (1000 ms total) then writes the mirror.
+      vi.advanceTimersByTime(800);
+      expect(mirrorDraft).toHaveBeenCalledWith(ACCT, ROOM, "mirror me");
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("tombstones the mirror on a successful send", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={onSend} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    fireEvent.change(textarea, { target: { value: "send and clear mirror" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(onSend).toHaveBeenCalled());
+    // The cross-device mirror is tombstoned so other devices stop showing the draft.
+    await waitFor(() => expect(clearDraftMirror).toHaveBeenCalledWith(ACCT, ROOM));
+  });
+
+  it("never raises the conflict chip while editing an existing message", async () => {
+    // Edit mode owns the composer (the edit body); a remote draft must not offer a
+    // chip over it, and adopting one would corrupt the edit + persistent draft.
+    vi.mocked(loadDraft).mockResolvedValue(null);
+    vi.mocked(loadRemoteDraft).mockResolvedValue(null);
+    render(
+      <Composer
+        accountId={ACCT}
+        roomId={ROOM}
+        onSend={vi.fn()}
+        pending={{ mode: "edit", targetKey: "k2" }}
+        editPrefill="the edit body"
+      />,
+    );
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    await waitFor(() => expect(textarea.value).toBe("the edit body"));
+    // A live remote draft arrives mid-edit — it must NOT surface the chip.
+    act(() => {
+      draftsStore.getState().applyRemote(ACCT, ROOM, "remote draft body", 500);
+    });
+    expect(screen.queryByText(/edited on another device/i)).toBeNull();
+    // The edit body is untouched.
+    expect(textarea.value).toBe("the edit body");
+  });
+
+  it("cancels a queued mirror on send so it cannot resurrect the sent draft", async () => {
+    vi.useFakeTimers();
+    try {
+      const onSend = vi.fn().mockResolvedValue(undefined);
+      render(<Composer accountId={ACCT} roomId={ROOM} onSend={onSend} />);
+      const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+      // Type, then send within the looser mirror debounce window (before it fires).
+      fireEvent.change(textarea, { target: { value: "racy body" } });
+      vi.advanceTimersByTime(200); // local save fired; the mirror is still queued
+      expect(mirrorDraft).not.toHaveBeenCalled();
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      // Flush the async send chain and any surviving timers.
+      await vi.runAllTimersAsync();
+      // The queued mirror was cancelled before the send — it never writes the body,
+      // so it cannot land after and reorder past the post-send tombstone.
+      expect(mirrorDraft).not.toHaveBeenCalled();
+      // The mirror is tombstoned instead.
+      expect(clearDraftMirror).toHaveBeenCalledWith(ACCT, ROOM);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
   });
 });

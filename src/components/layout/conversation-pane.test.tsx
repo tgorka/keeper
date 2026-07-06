@@ -68,6 +68,10 @@ vi.mock("@/lib/ipc/client", () => ({
   loadDraft: vi.fn(async (): Promise<string | null> => null),
   saveDraft: vi.fn(async (): Promise<void> => {}),
   clearDraft: vi.fn(async (): Promise<void> => {}),
+  // Cross-device draft mirror (Story 7.2): no remote draft; mirror writes are no-ops.
+  loadRemoteDraft: vi.fn(async (): Promise<null> => null),
+  mirrorDraft: vi.fn(async (): Promise<void> => {}),
+  clearDraftMirror: vi.fn(async (): Promise<void> => {}),
 }));
 
 // The conversation pane subscribes to native drag-drop via `getCurrentWebview()`.

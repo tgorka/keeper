@@ -24,10 +24,11 @@ use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm, BridgeDiscoveryVm,
     BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm, ConnectionStatusBatch,
-    DemoBatch, EditVersionVm, EncryptionStatusBatch, ExportPhase, ExportProgressVm,
-    ExportRequestVm, InboxBatch, IpcError, IpcErrorCode, NetworksSnapshot, NewChatResolutionVm,
-    PaginationStatusBatch, PingVm, ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm,
-    SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
+    DemoBatch, DraftMirrorBatch, EditVersionVm, EncryptionStatusBatch, ExportPhase,
+    ExportProgressVm, ExportRequestVm, InboxBatch, IpcError, IpcErrorCode, NetworksSnapshot,
+    NewChatResolutionVm, PaginationStatusBatch, PingVm, RemoteDraftVm, ResolveSupportVm,
+    RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch,
+    VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -1181,6 +1182,66 @@ pub fn list_drafts(state: State<'_, AppState>) -> Result<Vec<(String, String)>, 
     keeper_core::registry::list_drafts(&data_dir).map_err(to_ipc_error)
 }
 
+/// Mirror the composer draft for `(account_id, room_id)` to the account (Story 7.2,
+/// AD-15): the synced `dev.keeper.draft` account-data event plus a best-effort
+/// `save_composer_draft` (Element interop). Async — resolves the live `Room` via
+/// `state.accounts`. Deduped by last-mirrored body; the `updated_ts` is generated in
+/// Rust at write time (a stale caller timestamp is never trusted).
+///
+/// Best-effort: the frontend fires this off the debounced keystroke path and swallows
+/// any rejection — a mirror failure must never block or fail local persistence, so the
+/// only symptom is the absent cross-device echo. The body is never logged.
+#[tauri::command]
+pub async fn mirror_draft(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    body: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .mirror_draft(&account_id, &room_id, &body)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Clear the draft mirror for `(account_id, room_id)` (Story 7.2): tombstone the
+/// `dev.keeper.draft` account-data event plus `clear_composer_draft`, so other devices
+/// stop showing the draft. Async — resolves via `state.accounts`. Best-effort: fired
+/// fire-and-forget on the clear path; a failure never blocks the send/clear and can at
+/// worst transiently re-present a cleared draft cross-device (never destroys text).
+#[tauri::command]
+pub async fn clear_draft_mirror(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .clear_draft_mirror(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Read the remote (cross-device) draft for `(account_id, room_id)` from the
+/// account-data mirror (Story 7.2), or `None` when there is no draft (an empty-body
+/// tombstone maps to `None`). Async — resolves via `state.accounts`. Read only to
+/// *offer* adoption — local always wins; the composer never auto-replaces non-empty
+/// local text. A failure funnels through [`to_ipc_error`]; the composer falls back to
+/// local. The body is never logged.
+#[tauri::command]
+pub async fn load_remote_draft(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<Option<RemoteDraftVm>, IpcError> {
+    state
+        .accounts
+        .load_remote_draft(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
 /// Search the Local Archive with full-text search (Story 5.3, FR-34, AD-12).
 ///
 /// Opens a fresh read-only `archive.db` connection (WAL permits concurrent readers,
@@ -1665,6 +1726,37 @@ pub async fn connection_status_unsubscribe(
     state
         .accounts
         .unsubscribe_connection_status(&account_id, subscription_id)
+        .await;
+    Ok(())
+}
+
+/// Subscribe to live remote draft edits across every account (Story 7.2, AD-15).
+///
+/// App-wide (not per account): streams a [`DraftMirrorBatch`] over `channel` for each
+/// `dev.keeper.draft` room-account-data edit observed by any account's handler, and
+/// returns the subscription id. The frontend pumps these into the drafts store's
+/// `remote` map for local-wins conflict detection. The sink forwards each batch to the
+/// channel; a closed channel drops the batch (the relay then stops). Never fails — the
+/// relay is spawned unconditionally.
+#[tauri::command]
+pub async fn draft_mirror_subscribe(
+    state: State<'_, AppState>,
+    channel: Channel<DraftMirrorBatch>,
+) -> Result<u64, IpcError> {
+    let sink = Box::new(move |batch: DraftMirrorBatch| channel.send(batch).is_ok());
+    Ok(state.accounts.subscribe_draft_mirror(sink).await)
+}
+
+/// Unsubscribe exactly one draft-mirror subscription, aborting its relay task (Story
+/// 7.2). Idempotent — unsubscribing an unknown id is a no-op.
+#[tauri::command]
+pub async fn draft_mirror_unsubscribe(
+    state: State<'_, AppState>,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_draft_mirror(subscription_id)
         .await;
     Ok(())
 }

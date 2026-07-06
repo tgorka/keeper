@@ -23,6 +23,10 @@ const setSpaceFilter = vi.fn(
 const setNetworkFilter = vi.fn(async (_network: string | null): Promise<void> => {});
 const getFavoritesCollapsed = vi.fn(async (): Promise<boolean> => false);
 const setFavoritesCollapsed = vi.fn(async (_collapsed: boolean): Promise<void> => {});
+// Draft-mirror subscription (Story 7.2): capture the batch handler so a test can drive
+// a live remote edit, and record the subscribe/unsubscribe lifecycle.
+const subscribeDraftMirror = vi.fn();
+const unsubscribeDraftMirror = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   subscribeInbox: (
     onInbox: (b: InboxBatch) => void,
@@ -40,6 +44,9 @@ vi.mock("@/lib/ipc/client", () => ({
   setFavoritesCollapsed: (v: boolean) => setFavoritesCollapsed(v),
   // Draft-marker seed on mount (Story 7.1): no drafts by default.
   listDrafts: vi.fn(async (): Promise<Array<[string, string]>> => []),
+  // Draft-mirror subscription (Story 7.2): app-lifetime remote-edit stream.
+  subscribeDraftMirror: (onBatch: (b: unknown) => void) => subscribeDraftMirror(onBatch),
+  unsubscribeDraftMirror: (id: number) => unsubscribeDraftMirror(id),
   // Best-effort mutation wrappers the strip/rows may call; no-ops here.
   reorderPins: vi.fn(async () => {}),
   unpinRoom: vi.fn(async () => {}),
@@ -53,6 +60,7 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import { ChatListPane } from "@/components/layout/chat-list-pane";
+import { draftsStore } from "@/lib/stores/drafts";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { favoritesUiStore } from "@/lib/stores/favorites-ui";
 import { networksStore } from "@/lib/stores/networks";
@@ -112,6 +120,10 @@ beforeEach(() => {
   primaryViewStore.getState().setView("inbox");
   subscribeInbox.mockReset();
   unsubscribeInbox.mockReset();
+  subscribeDraftMirror.mockReset();
+  subscribeDraftMirror.mockResolvedValue(1);
+  unsubscribeDraftMirror.mockReset();
+  unsubscribeDraftMirror.mockResolvedValue(undefined);
   setSpaceFilter.mockReset();
   setNetworkFilter.mockReset();
   getFavoritesCollapsed.mockReset();
@@ -130,6 +142,7 @@ afterEach(() => {
   favoritesUiStore.getState().setCollapsed(false);
   spacesStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
+  draftsStore.getState().clear();
 });
 
 describe("ChatListPane", () => {
@@ -1156,6 +1169,61 @@ describe("ChatListPane — Network filter (Story 4.6)", () => {
     await waitFor(() => {
       expect(networksStore.getState().activeNetwork).toBeNull();
       expect(setNetworkFilter).toHaveBeenCalledWith(null);
+    });
+  });
+});
+
+describe("ChatListPane draft-mirror subscription (Story 7.2)", () => {
+  it("starts the app-lifetime mirror subscription and pumps edits into the drafts store", async () => {
+    subscribeInbox.mockResolvedValue(1);
+    const captured: { onBatch: ((b: unknown) => void) | null } = { onBatch: null };
+    subscribeDraftMirror.mockImplementation((onBatch: (b: unknown) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(9);
+    });
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+
+    await waitFor(() => {
+      expect(captured.onBatch).not.toBeNull();
+    });
+    // A live remote edit is fed into the drafts store's remote map.
+    captured.onBatch?.({
+      accountId: account.accountId,
+      roomId: "!r1:example.org",
+      body: "remote draft",
+      updatedTs: 100,
+    });
+    await waitFor(() => {
+      expect(draftsStore.getState().remote.get(`${account.accountId} !r1:example.org`)).toEqual({
+        body: "remote draft",
+        updatedTs: 100,
+      });
+    });
+    // A tombstone (null body) removes the remote entry.
+    captured.onBatch?.({
+      accountId: account.accountId,
+      roomId: "!r1:example.org",
+      body: null,
+      updatedTs: 101,
+    });
+    await waitFor(() => {
+      expect(draftsStore.getState().remote.has(`${account.accountId} !r1:example.org`)).toBe(false);
+    });
+  });
+
+  it("unsubscribes the mirror on unmount", async () => {
+    subscribeInbox.mockResolvedValue(1);
+    subscribeDraftMirror.mockResolvedValue(11);
+    accountsStore.getState().addAccount(account);
+    const { unmount } = render(<ChatListPane />);
+
+    await waitFor(() => {
+      expect(subscribeDraftMirror).toHaveBeenCalled();
+    });
+    unmount();
+    await waitFor(() => {
+      expect(unsubscribeDraftMirror).toHaveBeenCalledWith(11);
     });
   });
 });

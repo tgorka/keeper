@@ -33,7 +33,14 @@ import {
 } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { clearDraft, loadDraft, saveDraft } from "@/lib/ipc/client";
+import {
+  clearDraft,
+  clearDraftMirror,
+  loadDraft,
+  loadRemoteDraft,
+  mirrorDraft,
+  saveDraft,
+} from "@/lib/ipc/client";
 import {
   attachmentId,
   attachmentsStore,
@@ -42,7 +49,7 @@ import {
 } from "@/lib/stores/attachments";
 import type { PendingContext } from "@/lib/stores/composer";
 import { useComposerStore } from "@/lib/stores/composer";
-import { draftsStore } from "@/lib/stores/drafts";
+import { draftsStore, useRemoteDraft } from "@/lib/stores/drafts";
 import { cn } from "@/lib/utils";
 
 /** Derive a chip display name for a pending attachment (its filename). */
@@ -136,6 +143,13 @@ const TYPING_IDLE_MS = 5000;
 /** Debounce before a keystroke persists the draft (fire-and-forget, Story 7.1). */
 const DRAFT_SAVE_DEBOUNCE_MS = 200;
 
+/**
+ * Debounce before a draft is mirrored cross-device (Story 7.2, AD-15). Deliberately
+ * looser than the local save so bursts of typing coalesce into few homeserver writes;
+ * mirroring runs off the keystroke path and is best-effort.
+ */
+const DRAFT_MIRROR_DEBOUNCE_MS = 1000;
+
 export function Composer({
   accountId,
   roomId,
@@ -151,6 +165,12 @@ export function Composer({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState(false);
+  // The remote (cross-device) draft body currently offered as a local-wins conflict
+  // chip (Story 7.2), or `null` when nothing is offered. Set when a differing remote
+  // draft arrives against non-empty local text; cleared on adopt / when it stops
+  // differing. Local text is never overwritten without the user tapping "Use that
+  // version".
+  const [remoteOffer, setRemoteOffer] = useState<string | null>(null);
 
   // The textarea handle, focused programmatically when the composer store's focus
   // nonce is *bumped* (Story 6.6 — e.g. after a new chat is resolved and opened).
@@ -224,6 +244,11 @@ export function Composer({
   roomIdRef.current = roomId;
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingDraft = useRef<string | null>(null);
+  // Cross-device mirror (Story 7.2, AD-15) runs on its own looser debounce, off the
+  // keystroke path. `pendingMirror` holds the body a debounced mirror will write;
+  // `null` means nothing is queued. Best-effort — never blocks or fails local persistence.
+  const draftMirrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingMirror = useRef<string | null>(null);
   // The mount restore (below) runs after an async `loadDraft`. If anything establishes
   // the composer's content during that window — the user types, sends, or enters edit
   // (prefill) — a late restore must not clobber it. This latch is set by those paths so
@@ -231,6 +256,51 @@ export function Composer({
   // momentarily-empty draft (both of which miss the type-then-clear / send-during-load
   // races). (Story 7.1)
   const restoreConsumed = useRef(false);
+
+  /** Mirror the queued draft now (trimmed-empty tombstones). Best-effort, fire-and-forget. */
+  const flushMirror = useCallback(() => {
+    if (draftMirrorTimer.current !== null) {
+      clearTimeout(draftMirrorTimer.current);
+      draftMirrorTimer.current = null;
+    }
+    const body = pendingMirror.current;
+    if (body === null) {
+      return;
+    }
+    pendingMirror.current = null;
+    const a = accountIdRef.current;
+    const r = roomIdRef.current;
+    const trimmed = body.trim();
+    // Best-effort: a mirror failure must never block or fail local persistence — the
+    // only symptom is the absent cross-device echo. The Rust core dedupes by body.
+    if (trimmed.length > 0) {
+      void mirrorDraft(a, r, trimmed).catch(() => {});
+    } else {
+      void clearDraftMirror(a, r).catch(() => {});
+    }
+  }, []);
+
+  /** Cross-device clear: tombstone the mirror (best-effort) and drop any queued mirror. */
+  const clearMirror = useCallback(() => {
+    if (draftMirrorTimer.current !== null) {
+      clearTimeout(draftMirrorTimer.current);
+      draftMirrorTimer.current = null;
+    }
+    pendingMirror.current = null;
+    void clearDraftMirror(accountIdRef.current, roomIdRef.current).catch(() => {});
+  }, []);
+
+  /** Queue `body` for a debounced cross-device mirror write (Story 7.2). */
+  const scheduleMirror = useCallback(
+    (body: string) => {
+      pendingMirror.current = body;
+      if (draftMirrorTimer.current !== null) {
+        clearTimeout(draftMirrorTimer.current);
+      }
+      draftMirrorTimer.current = setTimeout(flushMirror, DRAFT_MIRROR_DEBOUNCE_MS);
+    },
+    [flushMirror],
+  );
 
   /** Persist the queued draft now (trimmed-empty deletes the row). Fire-and-forget. */
   const flushDraft = useCallback(() => {
@@ -271,7 +341,10 @@ export function Composer({
     const r = roomIdRef.current;
     void clearDraft(a, r).catch(() => {});
     draftsStore.getState().mark(a, r, false);
-  }, []);
+    // Tombstone the cross-device mirror too (Story 7.2) so other devices stop showing
+    // the sent/cleared draft. Best-effort — never blocks the send/clear path.
+    clearMirror();
+  }, [clearMirror]);
 
   /** Queue `body` for a ~200 ms debounced persist, updating the marker immediately. */
   const scheduleDraftSave = useCallback(
@@ -284,8 +357,11 @@ export function Composer({
         clearTimeout(draftSaveTimer.current);
       }
       draftSaveTimer.current = setTimeout(flushDraft, DRAFT_SAVE_DEBOUNCE_MS);
+      // Also mirror cross-device (Story 7.2) on a looser, separate debounce off the
+      // keystroke path — best-effort, never blocks typing or local persistence.
+      scheduleMirror(body);
     },
-    [flushDraft],
+    [flushDraft, scheduleMirror],
   );
 
   const attachments = useAttachmentsStore((s) => s.pending);
@@ -297,6 +373,10 @@ export function Composer({
   // taking `draft` as a dependency (which would re-run the effect every keystroke).
   const draftRef = useRef(draft);
   draftRef.current = draft;
+  // Mirror the pending mode in a ref so the remote-reconcile adopt callback can check
+  // "am I editing?" without taking `pending` as a dependency (Story 7.2).
+  const pendingModeRef = useRef(pending?.mode);
+  pendingModeRef.current = pending?.mode;
   // The draft that was in the composer just before entering the current edit,
   // restored verbatim on Esc/cancel so an edit "cancels without losing composer
   // text" (Story 3.4, FR-11). Owned here because the draft lives in local state.
@@ -323,38 +403,118 @@ export function Composer({
     }
   }, [editTargetKey, editPrefill]);
 
-  // Restore the persisted draft once on mount (Story 7.1). The composer remounts per
-  // (account, room) in the parent, so this runs on each chat open. The restore only
-  // reads refs, so `[]` deps are exhaustive; it never overwrites content the user has
-  // already established (see `restoreConsumed`). A load failure is swallowed (no
-  // restore, never a crash).
+  /**
+   * Adopt a remote draft body into the composer (Story 7.2). The single path by which
+   * remote text enters the composer — auto (empty untouched composer) or user-tapped
+   * (conflict chip). Establishes the content (latches `restoreConsumed`), persists it
+   * locally, and dismisses any offered chip; the mirror is deduped so the adopt→save
+   * echo does not storm. A no-op for an empty body.
+   */
+  const adoptRemote = useCallback(
+    (body: string) => {
+      // Edit mode owns the composer (the edit body, not this room's persistent draft),
+      // so a remote draft must never be adopted into it — that would overwrite the edit
+      // and persist/mirror it as the draft (Story 7.2/3.4). Defensive: callers already
+      // gate on edit mode.
+      if (body.length === 0 || pendingModeRef.current === "edit") {
+        return;
+      }
+      restoreConsumed.current = true;
+      setDraft(body);
+      setRemoteOffer(null);
+      // Persist the adopted body locally so the draft is durable and the marker shows;
+      // this also schedules a mirror (deduped by body, so it is effectively a no-op).
+      scheduleDraftSave(body);
+    },
+    [scheduleDraftSave],
+  );
+
+  // Restore the persisted draft and reconcile the remote mirror once on mount (Story
+  // 7.1 + 7.2). The composer remounts per (account, room) in the parent, so this runs
+  // on each chat open. Local always wins: a differing remote draft is only ever *offered*
+  // via the conflict chip; it replaces the composer only into an empty, untouched one
+  // (drafts follow the user). Reads refs only, so `[]` deps are exhaustive; it never
+  // overwrites content the user has already established (see `restoreConsumed`). A load
+  // failure is swallowed (fall back to local / no chip, never a crash).
   useEffect(() => {
     let cancelled = false;
-    void loadDraft(accountIdRef.current, roomIdRef.current)
-      .then((body) => {
-        // Skip when: unmounted, no stored body, or the composer's content was already
-        // established during the async load — the user typed, sent, or entered edit
-        // (`restoreConsumed`), any of which must not be clobbered by a late restore.
-        if (
-          cancelled ||
-          body === null ||
-          body.length === 0 ||
-          restoreConsumed.current ||
-          draftRef.current.length > 0
-        ) {
-          return;
+    const a = accountIdRef.current;
+    const r = roomIdRef.current;
+    void Promise.all([
+      loadDraft(a, r).catch(() => null),
+      loadRemoteDraft(a, r).catch(() => null),
+    ]).then(([local, remote]) => {
+      // Bail if unmounted or the composer's content was already established during the
+      // async load — the user typed, sent, or entered edit (`restoreConsumed`), any of
+      // which local-wins must not clobber.
+      if (cancelled || restoreConsumed.current || draftRef.current.length > 0) {
+        return;
+      }
+      const localBody = local ?? "";
+      const remoteBody = remote?.body ?? null;
+      if (localBody.length > 0) {
+        // Restore the local draft (7.1). If a differing remote exists, offer it — local
+        // wins, remote is only surfaced for one-tap adoption.
+        setDraft(localBody);
+        if (remoteBody !== null && remoteBody !== localBody) {
+          setRemoteOffer(remoteBody);
         }
-        setDraft(body);
-      })
-      .catch(() => {});
+      } else if (remoteBody !== null) {
+        // Empty, untouched composer with a present remote draft: adopt it (drafts follow
+        // the user across devices).
+        adoptRemote(remoteBody);
+      }
+    });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [adoptRemote]);
 
-  // Flush the pending debounced save on unmount (room switch / composer close) so the
-  // latest keystroke is durable even if it fell inside the debounce window (Story 7.1).
-  useEffect(() => () => flushDraft(), [flushDraft]);
+  // Live remote reconcile (Story 7.2): react to a remote draft arriving/updating via the
+  // app-wide mirror subscription while this composer is open. Local always wins — an
+  // empty, untouched composer auto-adopts (drafts follow the user); otherwise a differing
+  // remote raises the conflict chip for one-tap adoption. A remote that equals the local
+  // text (or a tombstone) dismisses the chip. Never overwrites non-empty local text.
+  const remoteDraft = useRemoteDraft(accountId, roomId);
+  const inEdit = pending?.mode === "edit";
+  useEffect(() => {
+    if (inEdit) {
+      // Edit mode owns the composer (the edit body, not this room's draft): never
+      // reconcile a remote draft against it or raise the chip. Withdraw any offer
+      // shown before the edit began; it re-reconciles on leaving edit (Story 7.2/3.4).
+      setRemoteOffer(null);
+      return;
+    }
+    const remoteBody = remoteDraft?.body ?? null;
+    if (remoteBody === null) {
+      // Remote cleared / tombstoned: withdraw any offer.
+      setRemoteOffer(null);
+      return;
+    }
+    if (!restoreConsumed.current && draftRef.current.length === 0) {
+      // Empty and untouched: adopt (auto-follow).
+      adoptRemote(remoteBody);
+      return;
+    }
+    if (remoteBody === draftRef.current) {
+      // Remote now equals local text: nothing to offer.
+      setRemoteOffer(null);
+      return;
+    }
+    setRemoteOffer(remoteBody);
+  }, [remoteDraft, adoptRemote, inEdit]);
+
+  // Flush the pending debounced save AND the pending cross-device mirror on unmount
+  // (room switch / composer close) so the latest keystroke is durable and mirrored even
+  // if it fell inside a debounce window (Story 7.1 + 7.2). The mirror flush is
+  // best-effort — it never blocks the room switch.
+  useEffect(
+    () => () => {
+      flushDraft();
+      flushMirror();
+    },
+    [flushDraft, flushMirror],
+  );
 
   const hasAttachments = attachments.length > 0;
   // Send is enabled when there is a trimmed body OR at least one pending
@@ -390,6 +550,16 @@ export function Composer({
       draftSaveTimer.current = null;
     }
     pendingDraft.current = null;
+    // Same hazard for the cross-device mirror (Story 7.2): a queued debounced mirror
+    // landing during a slow `onSend` would write the draft to account data, and then
+    // reorder after the post-send tombstone (`clearPersistedDraft → clearMirror`),
+    // resurrecting the sent draft on other devices. Cancel it before the send; a
+    // failed non-edit send re-schedules the mirror in the catch below.
+    if (draftMirrorTimer.current !== null) {
+      clearTimeout(draftMirrorTimer.current);
+      draftMirrorTimer.current = null;
+    }
+    pendingMirror.current = null;
     // Sending stops typing (Story 3.9): clear the notice once as the message goes.
     stopTyping();
     setSending(true);
@@ -572,6 +742,20 @@ export function Composer({
           </Button>
         </div>
       )}
+      {/* Local-wins conflict chip (Story 7.2, AD-15): a differing remote draft is
+          offered for one-tap adoption. Local text stays put until the user taps —
+          adoption is the only way remote text enters a non-empty composer. Never
+          shown while editing an existing message (the composer is then the edit body). */}
+      {remoteOffer !== null && pending?.mode !== "edit" && (
+        <div className="flex items-center gap-2 rounded-md border border-border bg-muted/50 px-3 py-1.5">
+          <span className="min-w-0 flex-1 truncate text-muted-foreground text-xs">
+            Edited on another device
+          </span>
+          <Button type="button" variant="ghost" size="xs" onClick={() => adoptRemote(remoteOffer)}>
+            Use that version
+          </Button>
+        </div>
+      )}
       {/* Pending-attachment tray (Story 3.7): removable chips above the textarea,
           each showing the filename (+ size for pasted bytes). Removing a chip is a
           pre-upload cancel. */}
@@ -628,6 +812,11 @@ export function Composer({
             restoreConsumed.current = true;
             if (error) {
               setError(false);
+            }
+            // Reconcile the conflict chip against the typed text (Story 7.2): dismiss it
+            // once the local text matches the offered remote (nothing to adopt).
+            if (remoteOffer !== null && remoteOffer === next) {
+              setRemoteOffer(null);
             }
             // Persist the draft (Story 7.1): debounced, fire-and-forget so the keystroke
             // path never blocks on IPC; also updates the inbox marker at once. NOT while

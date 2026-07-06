@@ -55,6 +55,7 @@ use crate::bridges::login::{self, BridgeLoginSink};
 use crate::bridges::transport::bot::BotDriver;
 use crate::bridges::transport::provisioning::Provisioning;
 use crate::bridges::transport::BridgeTransport;
+use crate::drafts;
 use crate::error::{
     AccountError, BackupError, BridgeError, CoreError, InboxError, MediaError, SendError,
     TimelineError,
@@ -69,9 +70,9 @@ use crate::timeline;
 use crate::verification::{self, VerificationSink};
 use crate::vm::BridgeLoginInput;
 use crate::vm::{
-    ConnectionStatus, ConnectionStatusBatch, EditVersionVm, EncryptionStatus,
-    EncryptionStatusBatch, InboxBatch, PaginationStatusBatch, RoomListBatch, RoomListOp, RoomVm,
-    SpaceVm, TimelineBatch, TypingBatch, TypistVm,
+    ConnectionStatus, ConnectionStatusBatch, DraftMirrorBatch, EditVersionVm, EncryptionStatus,
+    EncryptionStatusBatch, InboxBatch, PaginationStatusBatch, RemoteDraftVm, RoomListBatch,
+    RoomListOp, RoomVm, SpaceVm, TimelineBatch, TypingBatch, TypistVm,
 };
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
@@ -119,6 +120,12 @@ pub type TypingSink = Box<dyn Fn(TypingBatch) -> bool + Send + Sync>;
 /// `true` if the batch was delivered, `false` if the channel is closed (the
 /// producer then stops).
 pub type PaginationSink = Box<dyn Fn(PaginationStatusBatch) -> bool + Send + Sync>;
+
+/// Sink that receives each produced [`DraftMirrorBatch`] (Story 7.2, AD-15). The
+/// shell wraps a Tauri `Channel::send`; tests capture into a vector. Returns
+/// `true` if the batch was delivered, `false` if the channel is closed (the
+/// relay then stops).
+pub type DraftMirrorSink = Box<dyn Fn(DraftMirrorBatch) -> bool + Send + Sync>;
 
 /// Registry of an account's live open room timelines, keyed by the *timeline*
 /// subscription id → its room id and the exact `Arc<Timeline>` that produced the
@@ -202,6 +209,7 @@ type ActivatedAccount = (
     JoinHandle<()>,
     EventHandlerHandle,
     EventHandlerHandle,
+    EventHandlerHandle,
 );
 
 /// A live, supervised account: its `Client`, `SyncService`, and the abort
@@ -255,6 +263,13 @@ struct AccountHandle {
     /// (marks only, never erases) via the single serialized writer. Removed from
     /// the `Client` in [`AccountManager::shutdown`] alongside `archive_handler`.
     redaction_handler: EventHandlerHandle,
+    /// Account-wide `dev.keeper.draft` room-account-data handler (Story 7.2,
+    /// AD-15): registered on the `Client` in [`activate`], it observes live remote
+    /// draft edits and forwards each into the manager's draft-mirror broadcast so
+    /// the app-wide `subscribe_draft_mirror` relay can stream them to the UI.
+    /// Removed from the `Client` in [`AccountManager::shutdown`] alongside the
+    /// archive/redaction handlers so no handler leaks past teardown.
+    draft_handler: EventHandlerHandle,
 }
 
 /// A live merged-inbox subscription (AD-20): the merger the per-account
@@ -308,6 +323,18 @@ pub struct AccountManager {
     /// archive DB could not be opened at startup — ingestion is then skipped
     /// (never fatal: the archive path must never block or abort the app).
     archive: Option<ArchiveHandle>,
+    /// Process broadcast of live remote draft edits (Story 7.2, AD-15): each
+    /// account's `dev.keeper.draft` handler (registered in [`activate`]) forwards
+    /// observed edits here, and the single app-wide `subscribe_draft_mirror` relay
+    /// fans them out to the UI. Created once in [`AccountManager::new`] and cloned
+    /// into every account's handler on activation.
+    draft_mirror_tx: tokio::sync::broadcast::Sender<DraftMirrorBatch>,
+    /// Live app-wide draft-mirror relay subscriptions, keyed by subscription id →
+    /// the relay task. Aborted on `draft_mirror_unsubscribe`; a relay whose broadcast
+    /// sender is dropped (all accounts torn down) ends on its own and its finished
+    /// handle is cleared by the eventual `draft_mirror_unsubscribe`. Not tied to any
+    /// one account — there is at most one in the shell, so the map is bounded.
+    draft_mirror_subs: Mutex<HashMap<u64, JoinHandle<()>>>,
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
@@ -329,12 +356,18 @@ impl AccountManager {
                 None
             }
         };
+        // A modest buffer: draft edits are low-frequency (debounced in the UI) and
+        // the relay skips to the newest on lag, so a small ring never loses the
+        // convergent final state.
+        let (draft_mirror_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
             accounts: Mutex::new(HashMap::new()),
             inbox: Mutex::new(None),
             bridge_health: Mutex::new(None),
             bridge_health_subscribe: Mutex::new(()),
             archive,
+            draft_mirror_tx,
+            draft_mirror_subs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -363,7 +396,14 @@ impl AccountManager {
                     session_persister,
                     archive_handler,
                     redaction_handler,
-                ) = activate(platform, account_id, self.archive.clone()).await?;
+                    draft_handler,
+                ) = activate(
+                    platform,
+                    account_id,
+                    self.archive.clone(),
+                    self.draft_mirror_tx.clone(),
+                )
+                .await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -375,6 +415,7 @@ impl AccountManager {
                         session_persister,
                         archive_handler,
                         redaction_handler,
+                        draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
@@ -625,7 +666,14 @@ impl AccountManager {
                     session_persister,
                     archive_handler,
                     redaction_handler,
-                ) = activate(platform, account_id, self.archive.clone()).await?;
+                    draft_handler,
+                ) = activate(
+                    platform,
+                    account_id,
+                    self.archive.clone(),
+                    self.draft_mirror_tx.clone(),
+                )
+                .await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -637,6 +685,7 @@ impl AccountManager {
                         session_persister,
                         archive_handler,
                         redaction_handler,
+                        draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
@@ -705,7 +754,14 @@ impl AccountManager {
                     session_persister,
                     archive_handler,
                     redaction_handler,
-                ) = activate(platform, account_id, self.archive.clone()).await?;
+                    draft_handler,
+                ) = activate(
+                    platform,
+                    account_id,
+                    self.archive.clone(),
+                    self.draft_mirror_tx.clone(),
+                )
+                .await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -717,6 +773,7 @@ impl AccountManager {
                         session_persister,
                         archive_handler,
                         redaction_handler,
+                        draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
@@ -846,7 +903,14 @@ impl AccountManager {
                     session_persister,
                     archive_handler,
                     redaction_handler,
-                ) = activate(platform, account_id, self.archive.clone()).await?;
+                    draft_handler,
+                ) = activate(
+                    platform,
+                    account_id,
+                    self.archive.clone(),
+                    self.draft_mirror_tx.clone(),
+                )
+                .await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -858,6 +922,7 @@ impl AccountManager {
                         session_persister,
                         archive_handler,
                         redaction_handler,
+                        draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
@@ -954,7 +1019,14 @@ impl AccountManager {
                     session_persister,
                     archive_handler,
                     redaction_handler,
-                ) = activate(platform, account_id, self.archive.clone()).await?;
+                    draft_handler,
+                ) = activate(
+                    platform,
+                    account_id,
+                    self.archive.clone(),
+                    self.draft_mirror_tx.clone(),
+                )
+                .await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -966,6 +1038,7 @@ impl AccountManager {
                         session_persister,
                         archive_handler,
                         redaction_handler,
+                        draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
@@ -1061,7 +1134,14 @@ impl AccountManager {
                     session_persister,
                     archive_handler,
                     redaction_handler,
-                ) = activate(platform, account_id, self.archive.clone()).await?;
+                    draft_handler,
+                ) = activate(
+                    platform,
+                    account_id,
+                    self.archive.clone(),
+                    self.draft_mirror_tx.clone(),
+                )
+                .await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -1073,6 +1153,7 @@ impl AccountManager {
                         session_persister,
                         archive_handler,
                         redaction_handler,
+                        draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
@@ -1212,7 +1293,14 @@ impl AccountManager {
                     session_persister,
                     archive_handler,
                     redaction_handler,
-                ) = activate(platform, account_id, self.archive.clone()).await?;
+                    draft_handler,
+                ) = activate(
+                    platform,
+                    account_id,
+                    self.archive.clone(),
+                    self.draft_mirror_tx.clone(),
+                )
+                .await?;
                 accounts.insert(
                     account_id.to_owned(),
                     AccountHandle {
@@ -1224,6 +1312,7 @@ impl AccountManager {
                         session_persister,
                         archive_handler,
                         redaction_handler,
+                        draft_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     },
@@ -2866,6 +2955,123 @@ impl AccountManager {
             .ok_or_else(|| TimelineError::RoomNotFound.into())
     }
 
+    /// Mirror `body` for `(account_id, room_id)` to the account (Story 7.2,
+    /// AD-15): the synced `dev.keeper.draft` account-data event plus a best-effort
+    /// `save_composer_draft` (Element interop). Resolves the live `Room` via
+    /// [`room_for`] and delegates to [`drafts::mirror_draft`], which dedupes by
+    /// last-mirrored body and generates the `updated_ts` at write time.
+    ///
+    /// Best-effort: every error (an inactive account, an unknown room, a rejecting
+    /// server) is returned for the caller to swallow and log — it must never block
+    /// or fail local persistence. The body is never logged.
+    pub async fn mirror_draft(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        body: &str,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+        drafts::mirror_draft(account_id, &room, body)
+            .await
+            .map_err(|e| CoreError::Internal(e.to_string()))
+    }
+
+    /// Clear `(account_id, room_id)`'s draft mirror (Story 7.2): tombstone the
+    /// `dev.keeper.draft` account-data event plus `clear_composer_draft`. Resolves
+    /// the live `Room` via [`room_for`] and delegates to
+    /// [`drafts::clear_draft_mirror`].
+    ///
+    /// Best-effort: every error is returned for the caller to swallow and log; a
+    /// failed clear can transiently re-present a cleared draft cross-device, which
+    /// re-*shows* recoverable text and never destroys it. The body is never logged.
+    pub async fn clear_draft_mirror(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+        drafts::clear_draft_mirror(account_id, &room)
+            .await
+            .map_err(|e| CoreError::Internal(e.to_string()))
+    }
+
+    /// Read `(account_id, room_id)`'s remote draft from the account-data mirror
+    /// (Story 7.2), or `None` when there is no draft (an empty-body tombstone maps
+    /// to `None`). Resolves the live `Room` via [`room_for`] and delegates to
+    /// [`drafts::load_remote_draft`].
+    ///
+    /// Read only to *offer* adoption — local always wins. A load failure is
+    /// returned for the caller to swallow (the composer falls back to local). The
+    /// body is never logged.
+    pub async fn load_remote_draft(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<Option<RemoteDraftVm>, CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+        drafts::load_remote_draft(&room)
+            .await
+            .map_err(|e| CoreError::Internal(e.to_string()))
+    }
+
+    /// Subscribe to live remote draft edits across every account (Story 7.2,
+    /// AD-15). Spawns a supervised relay over the manager's draft-mirror broadcast
+    /// that forwards each observed [`DraftMirrorBatch`] into `sink`, and returns
+    /// the subscription id.
+    ///
+    /// App-wide (not per account): the single relay drains the broadcast every
+    /// account's `dev.keeper.draft` handler feeds. The `JoinHandle` registers in
+    /// `draft_mirror_subs` and is aborted on `draft_mirror_unsubscribe`; a `Lagged`
+    /// broadcast error skips to the newest value (drafts converge on bodies), and the
+    /// relay task ends on its own when the sink closes or the broadcast sender is
+    /// dropped (its finished handle is cleared by the eventual unsubscribe).
+    pub async fn subscribe_draft_mirror(&self, sink: DraftMirrorSink) -> u64 {
+        let mut receiver = self.draft_mirror_tx.subscribe();
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let span = tracing::info_span!("draft_mirror_relay");
+        let task = tokio::spawn(
+            async move {
+                loop {
+                    match receiver.recv().await {
+                        Ok(batch) => {
+                            if !(sink)(batch) {
+                                tracing::info!("draft mirror channel closed, stopping relay");
+                                break;
+                            }
+                        }
+                        // Lagged: skip to the newest edit on the next recv. Drafts
+                        // converge on bodies, so a dropped intermediate is harmless.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        // Sender dropped: no live accounts remain; end the relay.
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+            .instrument(span),
+        );
+        self.draft_mirror_subs
+            .lock()
+            .await
+            .insert(subscription_id, task);
+        tracing::info!(subscription_id, "draft mirror subscribed");
+        subscription_id
+    }
+
+    /// Abort exactly the draft-mirror relay for `subscription_id` (Story 7.2).
+    /// Idempotent — an unknown id is a no-op.
+    pub async fn unsubscribe_draft_mirror(&self, subscription_id: u64) {
+        if let Some(task) = self.draft_mirror_subs.lock().await.remove(&subscription_id) {
+            task.abort();
+            tracing::info!(subscription_id, "draft mirror unsubscribed");
+        }
+    }
+
     /// Resolve a `keeper-media://` handle to its decrypted bytes for the
     /// custom-protocol handler (Story 3.6, FR-13, AD-4). Resolves the account's
     /// live `Client` and the room's open `Arc<Timeline>`, then delegates to
@@ -2981,6 +3187,10 @@ impl AccountManager {
             // past teardown.
             handle.client.remove_event_handler(handle.archive_handler);
             handle.client.remove_event_handler(handle.redaction_handler);
+            // Remove the `dev.keeper.draft` handler (Story 7.2) so no further remote
+            // draft edits are observed after the account goes down and no handler
+            // (holding a `Client` clone) leaks past teardown.
+            handle.client.remove_event_handler(handle.draft_handler);
             // Stop the SyncService first so no further diffs are produced, then
             // abort the reconnect supervisor and any remaining producer tasks.
             handle.sync.stop().await;
@@ -3091,6 +3301,7 @@ async fn activate(
     platform: &Arc<dyn Platform>,
     account_id: &str,
     archive: Option<ArchiveHandle>,
+    draft_mirror_tx: tokio::sync::broadcast::Sender<DraftMirrorBatch>,
 ) -> Result<ActivatedAccount, CoreError> {
     let session_json = platform
         .keychain_get(&session_keychain_key(account_id))?
@@ -3140,6 +3351,13 @@ async fn activate(
     // batch is not missed. It marks the archived target row's `redacted_ts` via
     // the same single writer — marks only, never erases.
     let redaction_handler = register_redaction_handler(&client, account_id, archive);
+    // Register the account-wide `dev.keeper.draft` room-account-data handler
+    // (Story 7.2, AD-15) alongside the archive/redaction handlers and before sync
+    // starts, so a remote draft edit in the first sync batch is observed. It maps
+    // each observed edit to a `DraftMirrorBatch` and forwards it into the manager's
+    // process broadcast for the app-wide `subscribe_draft_mirror` relay. The body
+    // is never logged.
+    let draft_handler = register_draft_handler(&client, account_id, draft_mirror_tx);
 
     // Archive-first back-pagination enablement (Story 5.6, FR-17). Subscribe the
     // SDK event cache once here — alongside the archive/redaction handlers and
@@ -3206,6 +3424,7 @@ async fn activate(
         session_persister,
         archive_handler,
         redaction_handler,
+        draft_handler,
     ))
 }
 
@@ -3282,6 +3501,52 @@ fn register_redaction_handler(
             };
             let redacted_ts = i64::from(ev.origin_server_ts.get());
             archive.redact(&account_id, target.as_str(), redacted_ts);
+        }
+    })
+}
+
+/// Register the account-wide `dev.keeper.draft` room-account-data handler on
+/// `client` and return its [`EventHandlerHandle`] (Story 7.2, AD-15).
+///
+/// The handler fires for every `dev.keeper.draft` room-account-data event the SDK
+/// delivers — **including this device's own echo**, which is dropped by matching the
+/// event's `origin` device id against this client's own (room account data is
+/// account-level and the SDK echoes a device's own write back to it, so without this
+/// the user would be offered their own just-mirrored text as a bogus conflict). Every
+/// other (genuinely remote) edit is forwarded into the manager's process broadcast as
+/// a [`DraftMirrorBatch`] (empty body → tombstone). The frontend reconciles local-wins:
+/// local text is never overwritten without a user tap. A closed broadcast (no live
+/// relay) is a swallowed no-op. The body is never logged.
+fn register_draft_handler(
+    client: &Client,
+    account_id: &str,
+    draft_mirror_tx: tokio::sync::broadcast::Sender<DraftMirrorBatch>,
+) -> EventHandlerHandle {
+    let account_id = account_id.to_owned();
+    let own_device = client
+        .device_id()
+        .map(|d| d.as_str().to_owned())
+        .unwrap_or_default();
+    client.add_event_handler(move |ev: drafts::KeeperDraftEvent, room: Room| {
+        let account_id = account_id.clone();
+        let draft_mirror_tx = draft_mirror_tx.clone();
+        let own_device = own_device.clone();
+        async move {
+            // Drop this device's own echo: a non-empty origin equal to our device id
+            // is a write we made, not a cross-device edit — never offer it back.
+            if !own_device.is_empty() && ev.content.origin == own_device {
+                return;
+            }
+            let batch = drafts::draft_mirror_batch(
+                &account_id,
+                room.room_id().as_str(),
+                ev.content.body,
+                ev.content.updated_ts,
+            );
+            // Best-effort: no live relay simply drops the batch (the next chat open
+            // re-reconciles from account data). Never logs the body.
+            let _ = draft_mirror_tx.send(batch);
+            tracing::debug!(account_id = %account_id, room_id = %room.room_id(), "observed remote draft edit");
         }
     })
 }

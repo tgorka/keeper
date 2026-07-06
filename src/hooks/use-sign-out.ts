@@ -19,6 +19,7 @@ import { toast } from "sonner";
 import { deleteAccountArchive, signOut } from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
+import { draftsStore } from "@/lib/stores/drafts";
 import { roomsStore } from "@/lib/stores/rooms";
 import { timelineStore } from "@/lib/stores/timeline";
 
@@ -51,6 +52,11 @@ export function useSignOut(): (accountId: string, options?: SignOutOptions) => P
     // status subscriber's teardown also removes it, but do it here so it is gone
     // immediately regardless of subscriber timing.)
     accountStatusStore.getState().removeAccount(accountId);
+
+    // Drop this account's draft markers and any mirrored remote draft bodies (Story
+    // 7.2): the cross-device `remote` map holds actual unsent text, so a signed-out
+    // account's drafts must not linger in memory or leave a stale inbox marker.
+    draftsStore.getState().clearAccount(accountId);
 
     const remaining = accountsStore.getState().accounts.filter((a) => a.accountId !== accountId);
     if (remaining.length === 0) {

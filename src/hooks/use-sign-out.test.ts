@@ -19,6 +19,7 @@ vi.mock("sonner", () => ({
 import { useSignOut } from "@/hooks/use-sign-out";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
+import { draftsStore } from "@/lib/stores/drafts";
 import { roomsStore } from "@/lib/stores/rooms";
 import { timelineStore } from "@/lib/stores/timeline";
 
@@ -60,6 +61,7 @@ beforeEach(() => {
   roomsStore.getState().selectRoom(null);
   timelineStore.getState().clear();
   accountStatusStore.getState().reset();
+  draftsStore.getState().clear();
   signOut.mockReset();
   signOut.mockResolvedValue(undefined);
   deleteAccountArchive.mockReset();
@@ -128,6 +130,24 @@ describe("useSignOut", () => {
     // The signed-out account's per-account status entry is removed.
     expect(accountStatusStore.getState().statuses).toEqual({});
     expect(accountsStore.getState().accounts).toEqual([]);
+  });
+
+  it("prunes the signed-out account's draft markers and mirrored bodies, keeping the others", async () => {
+    accountsStore.getState().hydrateAll([alice, bob]);
+    draftsStore.getState().mark(alice.accountId, "!a:example.org", true);
+    draftsStore.getState().applyRemote(alice.accountId, "!a:example.org", "alice unsent text", 1);
+    draftsStore.getState().mark(bob.accountId, "!b:example.org", true);
+    draftsStore.getState().applyRemote(bob.accountId, "!b:example.org", "bob unsent text", 2);
+
+    const { result } = renderHook(() => useSignOut());
+    await result.current(alice.accountId);
+
+    // Alice's marker and mirrored body no longer linger in memory.
+    expect(draftsStore.getState().keys.has(`${alice.accountId} !a:example.org`)).toBe(false);
+    expect(draftsStore.getState().remote.has(`${alice.accountId} !a:example.org`)).toBe(false);
+    // Bob (still signed in) is untouched.
+    expect(draftsStore.getState().keys.has(`${bob.accountId} !b:example.org`)).toBe(true);
+    expect(draftsStore.getState().remote.has(`${bob.accountId} !b:example.org`)).toBe(true);
   });
 
   it("removes the signed-out account's status entry, keeping the others", async () => {

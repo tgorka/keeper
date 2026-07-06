@@ -31,6 +31,7 @@ export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
 export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
+export type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
 export type { EditVersionVm } from "./gen/EditVersionVm";
 export type { EncryptionStatus } from "./gen/EncryptionStatus";
 export type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
@@ -55,6 +56,7 @@ export type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
+export type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 export type { ReplyPreviewVm } from "./gen/ReplyPreviewVm";
 export type { ResolveSupportVm } from "./gen/ResolveSupportVm";
 export type { RiskTier } from "./gen/RiskTier";
@@ -85,6 +87,7 @@ import type { BridgeLoginInput } from "./gen/BridgeLoginInput";
 import type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
+import type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
 import type { EditVersionVm } from "./gen/EditVersionVm";
 import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 import type { ExportProgressVm } from "./gen/ExportProgressVm";
@@ -93,6 +96,7 @@ import type { InboxBatch } from "./gen/InboxBatch";
 import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 import type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
+import type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 import type { ResolveSupportVm } from "./gen/ResolveSupportVm";
 import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { SearchFilterVm } from "./gen/SearchFilterVm";
@@ -479,6 +483,44 @@ export async function listDrafts(): Promise<Array<[string, string]>> {
 }
 
 /**
+ * Mirror the composer draft for `(accountId, roomId)` to the account (Story 7.2,
+ * AD-15): the synced `dev.keeper.draft` account data plus a best-effort
+ * `save_composer_draft` (Element interop). The Rust core dedupes by last-mirrored
+ * body and generates the `updatedTs` at write time. Called fire-and-forget on a
+ * looser debounce than the local save, so callers `void` it and never await — a
+ * mirror failure must never block typing or local persistence. The body is never
+ * logged.
+ */
+export async function mirrorDraft(accountId: string, roomId: string, body: string): Promise<void> {
+  await invoke<void>("mirror_draft", { accountId, roomId, body });
+}
+
+/**
+ * Clear the draft mirror for `(accountId, roomId)` (Story 7.2): tombstone the
+ * `dev.keeper.draft` account data plus `clear_composer_draft`, so other devices stop
+ * showing the draft. Fired fire-and-forget on the send/clear path; callers `void` it.
+ * A failure never blocks the clear and can at worst transiently re-present a cleared
+ * draft cross-device (never destroys text).
+ */
+export async function clearDraftMirror(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("clear_draft_mirror", { accountId, roomId });
+}
+
+/**
+ * Read the remote (cross-device) draft for `(accountId, roomId)` from the account-data
+ * mirror (Story 7.2), or `null` when there is no draft (an empty-body tombstone reads
+ * back as `null`). Read only to *offer* adoption — local always wins; the composer
+ * never auto-replaces non-empty local text. A failure rejects with the {@link IpcError}
+ * envelope; the composer falls back to local.
+ */
+export async function loadRemoteDraft(
+  accountId: string,
+  roomId: string,
+): Promise<RemoteDraftVm | null> {
+  return await invoke<RemoteDraftVm | null>("load_remote_draft", { accountId, roomId });
+}
+
+/**
  * Search the Local Archive with full-text search (FR-34, AD-12, Story 5.3).
  * Runs fully offline against `archive.db` — never a homeserver fetch, no live
  * session required. Queries of 3+ characters use the trigram FTS index; shorter
@@ -763,6 +805,27 @@ export async function subscribeConnectionStatus(
  */
 export async function unsubscribeConnectionStatus(accountId: string, id: number): Promise<void> {
   await invoke<void>("connection_status_unsubscribe", { accountId, subscriptionId: id });
+}
+
+/**
+ * Subscribe to live remote draft edits across every account (Story 7.2, AD-15).
+ * App-wide (not per account): opens a `Channel`, forwards each {@link DraftMirrorBatch}
+ * to `onBatch` in arrival order, and resolves with the subscription id. The frontend
+ * pumps these into the drafts store's `remote` map for local-wins conflict detection.
+ * There is exactly one such subscription for the app's lifetime.
+ */
+export async function subscribeDraftMirror(
+  onBatch: (batch: DraftMirrorBatch) => void,
+): Promise<number> {
+  return await subscribe<DraftMirrorBatch>("draft_mirror_subscribe", onBatch);
+}
+
+/**
+ * Unsubscribe exactly one draft-mirror subscription, aborting its backend relay task
+ * (Story 7.2). Idempotent — unsubscribing an unknown id is a no-op.
+ */
+export async function unsubscribeDraftMirror(id: number): Promise<void> {
+  await invoke<void>("draft_mirror_unsubscribe", { subscriptionId: id });
 }
 
 /**

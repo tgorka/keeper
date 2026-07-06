@@ -106,7 +106,7 @@ development_status:
   epic-6-retrospective: optional
   epic-7: backlog
   7-1-persistent-per-chat-drafts: done
-  7-2-cross-device-draft-mirroring-with-local-wins-conflicts: backlog
+  7-2-cross-device-draft-mirroring-with-local-wins-conflicts: done
   7-3-approval-pane: backlog
   7-4-explicit-approval-invariant-enforced-and-tested: backlog
   epic-7-retrospective: optional

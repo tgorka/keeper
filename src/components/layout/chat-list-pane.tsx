@@ -26,7 +26,9 @@ import {
   listDrafts,
   setNetworkFilter,
   setSpaceFilter,
+  subscribeDraftMirror,
   subscribeInbox,
+  unsubscribeDraftMirror,
   unsubscribeInbox,
 } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
@@ -242,6 +244,36 @@ export function ChatListPane() {
       cancelled = true;
     };
   }, [accountKey]);
+
+  // Start the single app-lifetime remote draft-mirror subscription (Story 7.2, AD-15):
+  // pump each observed `dev.keeper.draft` edit into the drafts store's `remote` map so
+  // an open composer can offer local-wins adoption. Mounted once (not keyed on the
+  // account set — the backend relay spans every account); torn down on unmount. A
+  // subscribe failure is swallowed — no live remote stream, no crash; the next chat
+  // open still reconciles via `loadRemoteDraft`.
+  useEffect(() => {
+    let cancelled = false;
+    let subId: number | null = null;
+    void subscribeDraftMirror((batch) => {
+      draftsStore
+        .getState()
+        .applyRemote(batch.accountId, batch.roomId, batch.body, batch.updatedTs);
+    })
+      .then((id) => {
+        if (cancelled) {
+          void unsubscribeDraftMirror(id).catch(() => {});
+        } else {
+          subId = id;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (subId !== null) {
+        void unsubscribeDraftMirror(subId).catch(() => {});
+      }
+    };
+  }, []);
 
   // Pick the active window's rows, then apply the account switcher filter as a
   // pure display filter (no re-sort, no mutation): when a filter is active, hide
