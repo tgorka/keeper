@@ -1,0 +1,163 @@
+src/lib/ipc/gen/BbctlPhase.ts
+  s_ece6028af0fc92::t_bcc2f5c5075bdc 1-3,5,13-14
+  s_d0449708b303e9::t_c53fbcc063a7fc 4,6-12
+src-tauri/crates/keeper-core/src/bridges/data.rs
+  s_d0449708b303e9::t_c80afe692f768b 1001-1004
+  s_d0449708b303e9::t_2ab363ade80e26 371-372
+  s_d0449708b303e9::t_a46311c4e7979e 36-37
+  s_d0449708b303e9::t_b1862040e0185c 354-355
+  s_d0449708b303e9::t_fe9ade5083781d 890-1000,1005-1006
+  s_d0449708b303e9::t_25a196b6e877c8 293-339
+  s_d0449708b303e9::t_310efeeadfde9a 458-525
+src/lib/ipc/gen/BbctlNetworkVm.ts
+  s_ece6028af0fc92::t_bcc2f5c5075bdc 1-3,5,9-11,13-15,17-19,21-22
+  s_ece6028af0fc92::t_77447199c2f2e5 16
+  s_d0449708b303e9::t_c53fbcc063a7fc 4,6-8,12,20
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_d0449708b303e9::t_6a0e2cbebf0a51 236-243
+src/lib/stores/bbctl.ts
+  s_d0449708b303e9::t_c7225f0f9a7a9f 1-32,34-43
+  s_d0449708b303e9::t_c4cc2e86203019 33
+src-tauri/Cargo.toml
+  s_d0449708b303e9::t_94ea60a10a9370 32
+src/components/bridges/bbctl-run-sheet.test.tsx
+  s_d0449708b303e9::t_3495dc3d6d52b7 2-62,67-68,72-73,77-123,125-126,133-134
+  s_d0449708b303e9::t_710e5ea335436b 69-71,74-76
+  s_d0449708b303e9::t_09717437df5c93 63-66
+  s_d0449708b303e9::t_a7c77a387f0821 1
+  s_d0449708b303e9::t_62c49238512d01 124,127-132
+src-tauri/crates/keeper-core/src/error.rs
+  s_d0449708b303e9::t_590232ac5890cb 396-407
+src/components/bridges/bbctl-panel.tsx
+  s_d0449708b303e9::t_4e3d0fdebe90cb 1-219
+src-tauri/crates/keeper/src/lib.rs
+  s_d0449708b303e9::t_a9d4c019983ec7 55-57
+src/hooks/use-bbctl-run.ts
+  s_d0449708b303e9::t_c4cc2e86203019 35
+  s_d0449708b303e9::t_0e242dcb0d34e7 1-34,36-112
+_bmad-output/implementation-artifacts/spec-6-7-bbctl-integration-for-beeper-self-hosted-bridges.md
+  s_ece6028af0fc92::t_85de8a7f260cc7 64
+  s_d0449708b303e9::t_96a2e97c6a0d55 165-208
+  s_ece6028af0fc92::t_76d19ab56c9cb5 10
+  s_9439d87b890278::t_4c141caf380d27 7
+  s_ece6028af0fc92::t_cb6193ea801545 1-4,8-9,12-63,65-68,70-73,77-81,94-103,111-112,147-152,155-164
+  s_ece6028af0fc92::t_4e2d64dcc89cd4 113-125
+  s_9439d87b890278::t_2226510aca6db3 209-216
+  s_ece6028af0fc92::t_a5043b91523dd9 104-110
+  s_9439d87b890278::t_0aa349e64157b9 11
+  s_d0449708b303e9::t_40be757604a595 82-93
+  s_d0449708b303e9::t_cb64c1418ce240 5
+  s_ece6028af0fc92::t_d047a1ce9cbca0 153-154
+  s_ece6028af0fc92::t_8bb7846da87848 74-76
+  s_ece6028af0fc92::t_88791312fe2ef8 69
+  s_aaffbdf3cfba6a::t_80fb182749c7f1 6
+  s_d0449708b303e9::t_ac1b5ebd1d9416 126-136
+  s_9439d87b890278::t_f900bb14f73763 137-146
+src/lib/ipc/gen/BbctlInstallVm.ts
+  s_d0449708b303e9::t_c53fbcc063a7fc 4-5,9-10,14
+  s_ece6028af0fc92::t_bcc2f5c5075bdc 1-3,6-8,11-13,15-16
+src-tauri/crates/keeper-core/data/bbctl.json
+  s_d0449708b303e9::t_13aa844e5ae800 1-19
+src/lib/ipc/gen/BbctlProgressVm.ts
+  s_ece6028af0fc92::t_bcc2f5c5075bdc 1-4,7,13-15,17-19,21-23,25-27,30-31
+  s_d0449708b303e9::t_c53fbcc063a7fc 5-6,8-12,16,20,24,28-29
+src-tauri/crates/keeper-core/src/account.rs
+  s_d0449708b303e9::t_e67066f44bc187 1338-1421
+src/components/bridges/bbctl-run-sheet.tsx
+  s_d0449708b303e9::t_fa28873d2b3e0a 1-103,105-131,134-149,154-159,161-172
+  s_d0449708b303e9::t_c4cc2e86203019 104,150-153,160
+  s_d0449708b303e9::t_61f6ce0b0df4bb 132-133
+src/components/layout/bridges-pane.tsx
+  s_d0449708b303e9::t_2ab4cf7544c957 80
+  s_d0449708b303e9::t_958112a207820a 132-136
+  s_d0449708b303e9::t_fbbd197909b352 16
+src-tauri/Cargo.lock
+  s_d0449708b303e9::t_650d5065efbc00 6080
+src/components/bridges/bbctl-panel.test.tsx
+  s_d0449708b303e9::t_a4b7a96eb0d2f2 64,86,104
+  s_d0449708b303e9::t_f4b8864b6312eb 15
+  s_d0449708b303e9::t_761dbef7158855 11
+  s_d0449708b303e9::t_ff05d7849461f8 1-10,12-14,16-63,65-85,87-103,105-106
+src/lib/ipc/gen/BbctlAvailabilityVm.ts
+  s_d0449708b303e9::t_c53fbcc063a7fc 6-7,9-13,17-18,22,26
+  s_ece6028af0fc92::t_bcc2f5c5075bdc 1-5,8,14-16,19-21,23-25,27-28
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_aaffbdf3cfba6a::t_a61365ec738df0 104
+src-tauri/crates/keeper/src/ipc.rs
+  s_9439d87b890278::t_89fb03861133cd 63-65
+  s_d0449708b303e9::t_62080a8bd70bde 600-604
+  s_d0449708b303e9::t_c3934ed81061b4 295-336,350-386,395-400,404-419,422-435,437-455,460-468
+  s_d0449708b303e9::t_e0dd09c97733df 401-403,420-421,436
+  s_d0449708b303e9::t_679fc629c673ad 766-817,829,834-849
+  s_d0449708b303e9::t_84b1437d009fa9 221
+  s_d0449708b303e9::t_2aef51322c3b35 25
+  s_d0449708b303e9::t_61835059051be1 337-349
+  s_9439d87b890278::t_0612b3f0773c71 69-78,87-89,93,98-118,120-124,127-128,134-142,148-151,154
+  s_d0449708b303e9::t_441dbb7d29a258 60-62,66-68,79-86,90-92,94-97,119,125-126,129-133,143-147,152-153,155
+  s_d0449708b303e9::t_5762898a42ea1a 456-459
+  s_9439d87b890278::t_b9acef0160256e 818-828,830-833
+  s_d0449708b303e9::t_c80afe692f768b 26-30,387-394
+src-tauri/crates/keeper-core/src/bridges/mod.rs
+  s_d0449708b303e9::t_d27d552f61d068 12
+src-tauri/crates/keeper-core/src/vm.rs
+  s_d0449708b303e9::t_c80afe692f768b 2958-2961,2976-2979
+  s_d0449708b303e9::t_41fde559371d05 1791-1894
+  s_d0449708b303e9::t_55249a58798bce 2922-2957,2962-2975,2980-2990
+src/lib/bridges.ts
+  s_d0449708b303e9::t_c4cc2e86203019 10
+  s_d0449708b303e9::t_8673e38c6b5073 45
+  s_d0449708b303e9::t_027dc7410e9c41 46-58
+src/lib/ipc/client.ts
+  s_d0449708b303e9::t_70c8a6f81303fd 15-19
+  s_d0449708b303e9::t_0e290e1f9494b6 80-81
+  s_d0449708b303e9::t_87861dc83a3267 230-275
+src-tauri/crates/keeper-core/src/bridges/bbctl.rs
+  s_d0449708b303e9::t_0f99d210df60b9 1-195,199-216,218-227,231-274,276-286,289-292,295-527,532-574,576-585
+  s_d0449708b303e9::t_bd82d61e7bfc47 196-198
+  s_d0449708b303e9::t_4e31ab6a8e91ad 275
+  s_d0449708b303e9::t_4b399bc758202d 217
+  s_d0449708b303e9::t_c80afe692f768b 528-531,575
+  s_d0449708b303e9::t_8edf4074ea26a4 293-294
+  s_d0449708b303e9::t_bbcdf850d10a2d 287-288
+  s_d0449708b303e9::t_604cc36bf2371a 228-230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c69904b3e571c329732c655f42fdd0a5f230b9aa",
+  "prompts": {},
+  "sessions": {
+    "s_9439d87b890278": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2c44ed97-5ac5-4815-a85b-7eeb681d5bf4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    },
+    "s_aaffbdf3cfba6a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ff0a041d-6a4f-4df3-8f01-582e80bd7186",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_d0449708b303e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d889b50e-42f8-474c-a327-306d0cd55eae",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_ece6028af0fc92": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7fd1e74d-be56-4f00-bb96-5bd80e156efe",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
