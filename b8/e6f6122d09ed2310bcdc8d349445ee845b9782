@@ -1,0 +1,38 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_0c048476c47153::t_348d824fed6370 301-308
+_bmad-output/implementation-artifacts/spec-8-3-undo-send-window.md
+  s_9efa5fcc001fb3::t_8871fc63bfa7fd 5
+  s_0c048476c47153::t_9bb1427e273a18 125-134
+  s_0c048476c47153::t_b0c2926036ed2e 160-167
+  s_0c048476c47153::t_5b78067689ad23 7
+src-tauri/crates/keeper-core/src/account.rs
+  s_0c048476c47153::t_d2e733ad296d0e 2459-2461,2464,2468
+  s_0c048476c47153::t_5406bf250308c3 2462-2463
+  s_0c048476c47153::t_8f7e96ffd0fe34 2450-2456
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_9efa5fcc001fb3::t_1914b40e08be41 116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b8e6f6122d09ed2310bcdc8d349445ee845b9782",
+  "prompts": {},
+  "sessions": {
+    "s_0c048476c47153": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ff8790fd-6be4-4bbf-b196-ea0a36845643",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_9efa5fcc001fb3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9298dc7c-4767-412f-8b1b-9e57f2b4c202",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
