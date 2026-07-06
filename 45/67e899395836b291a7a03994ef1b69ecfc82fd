@@ -1,0 +1,95 @@
+src/hooks/use-quick-switcher.ts
+  s_d166f6bcf1ecb4::t_c87e630ba088bd 1-65
+src/hooks/use-unread-jump.ts
+  s_d166f6bcf1ecb4::t_2a6866f23e7326 32
+  s_d166f6bcf1ecb4::t_074e271c5b3679 1-28,31,33-44,48-78
+  s_d166f6bcf1ecb4::t_530303018227ae 45-47
+  s_d166f6bcf1ecb4::t_0a2612afc28198 29-30
+src/components/chat/chat-row.tsx
+  s_d166f6bcf1ecb4::t_e4443f69cc7347 75-81,84-91
+  s_d166f6bcf1ecb4::t_7a05ae5f436d1b 293
+  s_d166f6bcf1ecb4::t_134ed353191bff 186,188
+  s_d166f6bcf1ecb4::t_05e6de29ecee0a 38
+src/components/layout/chat-list-pane.test.tsx
+  s_d166f6bcf1ecb4::t_260ca83c02424a 32-39
+  s_d166f6bcf1ecb4::t_ce30cf95bc214f 1479-1480,1482-1487,1489
+  s_d166f6bcf1ecb4::t_0487e16fb328b7 60,62-69
+  s_d166f6bcf1ecb4::t_d42d0bd0afdbdd 1432-1441,1446-1465,1467-1478,1481,1488,1490
+  s_d166f6bcf1ecb4::t_19c8cde5494708 1442-1445
+  s_d166f6bcf1ecb4::t_9dd79c950c2335 1250-1278,1296-1431,1491
+  s_d166f6bcf1ecb4::t_607940c12d744e 1466
+  s_d166f6bcf1ecb4::t_04b706336dba83 30-31
+  s_d166f6bcf1ecb4::t_6073c2e01e7e57 1279-1295
+  s_d166f6bcf1ecb4::t_b8cb4707fd2ed1 143-151
+  s_d166f6bcf1ecb4::t_99cd9999014cde 73
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_24df70ab9762df::t_624dbac537bb5a 329-332
+src/components/layout/chat-list-pane.tsx
+  s_d166f6bcf1ecb4::t_245b2d1d2e6e40 503
+  s_d166f6bcf1ecb4::t_c4d6f2fdeae8dd 99-108
+  s_d166f6bcf1ecb4::t_537bb909bcf97d 17
+  s_d166f6bcf1ecb4::t_85594e52623199 559,562-564,570-571
+  s_d166f6bcf1ecb4::t_28759a8651a4e8 378-386,388-393,395-397,402,404-407,411-417,428-429,434,438,442-444,447
+  s_d166f6bcf1ecb4::t_f69e76523118f8 23,25-26,29-31,36-38,44,50
+  s_d166f6bcf1ecb4::t_c61934bbd5f4cb 109-112
+  s_d166f6bcf1ecb4::t_2c0b4236e981ef 572-574
+  s_d166f6bcf1ecb4::t_e228dc082e4684 347-377,387,394,398-401,403,408-410,418-427,430-433,435-437,439-441,445-446,448-462
+src/hooks/use-view-shortcuts.test.ts
+  s_d166f6bcf1ecb4::t_a8a29cf1d3a90f 1-86
+src/hooks/use-view-shortcuts.ts
+  s_d166f6bcf1ecb4::t_320ccbf1c6b73a 1-48
+src/hooks/use-unread-jump.test.ts
+  s_d166f6bcf1ecb4::t_c5d60271aa665b 1-145
+src/lib/rendered-window.ts
+  s_d166f6bcf1ecb4::t_2b11c626ac3777 1-36
+src/hooks/use-quick-switcher.test.ts
+  s_d166f6bcf1ecb4::t_d60cb9c87e913d 1-161
+_bmad-output/implementation-artifacts/spec-9-2-keyboard-navigation-and-quick-switcher.md
+  s_24df70ab9762df::t_56bad1fcc113c3 164-180
+  s_d166f6bcf1ecb4::t_b107a3848c7e26 1-4,8,10-76,87-95,126-140
+  s_d166f6bcf1ecb4::t_712024d6b9bac3 6
+  s_d166f6bcf1ecb4::t_38a0ff4324a106 96-101,113-125
+  s_24df70ab9762df::t_a64817563d13a7 7
+  s_24df70ab9762df::t_8cf816c933e329 9
+  s_d166f6bcf1ecb4::t_e1e30b89d119f1 141-163
+  s_d166f6bcf1ecb4::t_7d18f6e17c6cee 5
+  s_d166f6bcf1ecb4::t_435290a30f08bb 77-86
+  s_24df70ab9762df::t_7097f682627133 102-112
+src/components/layout/app-shell.tsx
+  s_d166f6bcf1ecb4::t_bbe046947b7246 62-67
+  s_d166f6bcf1ecb4::t_4e16965ec642f6 25,28,30
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_790c3e38167e25::t_73f05abc0e5d2e 121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4567e899395836b291a7a03994ef1b69ecfc82fd",
+  "prompts": {},
+  "sessions": {
+    "s_24df70ab9762df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "043e7541-dff8-4d31-b547-c47a175a39e6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    },
+    "s_790c3e38167e25": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1b0d16ae-8f0d-4edd-9102-e9e52211393a",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_d166f6bcf1ecb4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "364090d7-17c5-433a-b5ed-76abdba991be",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
