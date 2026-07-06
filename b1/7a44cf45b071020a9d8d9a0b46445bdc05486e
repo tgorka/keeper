@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-6-7-bbctl-integration-for-beeper-self-hosted-bridges.md
+  s_9439d87b890278::t_0aa349e64157b9 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b17a44cf45b071020a9d8d9a0b46445bdc05486e",
+  "prompts": {},
+  "sessions": {
+    "s_9439d87b890278": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2c44ed97-5ac5-4815-a85b-7eeb681d5bf4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
