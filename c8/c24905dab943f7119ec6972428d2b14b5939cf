@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-10-4-click-through-and-bridge-health-alerts.md
+  s_7fc3db3fcc05a3::t_3dc90e6cf34361 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c8c24905dab943f7119ec6972428d2b14b5939cf",
+  "prompts": {},
+  "sessions": {
+    "s_7fc3db3fcc05a3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57baf1e0-01fd-432e-9eac-e681df6948a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
