@@ -59,6 +59,10 @@ export type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
 export type { OutboxVm } from "./gen/OutboxVm";
 export type { PaginationState } from "./gen/PaginationState";
 export type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
+export type { PaletteActionVm } from "./gen/PaletteActionVm";
+export type { PaletteChatVm } from "./gen/PaletteChatVm";
+export type { PaletteMode } from "./gen/PaletteMode";
+export type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
@@ -106,6 +110,8 @@ import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 import type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
 import type { OutboxVm } from "./gen/OutboxVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
+import type { PaletteMode } from "./gen/PaletteMode";
+import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 import type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 import type { ResolveSupportVm } from "./gen/ResolveSupportVm";
 import type { RoomListBatch } from "./gen/RoomListBatch";
@@ -638,6 +644,23 @@ export async function signOut(accountId: string): Promise<void> {
  */
 export async function deleteAccountArchive(accountId: string): Promise<void> {
   await invoke<void>("delete_account_archive", { accountId });
+}
+
+/**
+ * Query the command palette (Story 9.1). Serves grouped, ranked, bounded results
+ * from the in-memory Rust index over every room across all accounts (chats + DM
+ * contacts) plus the static action registry — the frontend only renders and
+ * dispatches by id, never filters or re-orders (AD-20). `mode` is `"default"`
+ * (chats + contacts at ≥2 chars + actions) or `"action"` (the `>` prefix: actions
+ * only, open-chat actions first when `openChat` is set). Never rejects on an empty
+ * index — global actions always come back. Resolves with the {@link PaletteResultsVm}.
+ */
+export async function paletteQuery(
+  query: string,
+  mode: PaletteMode,
+  openChat: boolean,
+): Promise<PaletteResultsVm> {
+  return await invoke<PaletteResultsVm>("palette_query", { query, mode, openChat });
 }
 
 /**

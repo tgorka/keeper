@@ -62,6 +62,7 @@ use crate::error::{
 };
 use crate::inbox::{InboxMerger, NetworksSink, SpacesSink};
 use crate::media::{self, MediaBytes, MediaHandle, MediaVariant};
+use crate::palette::{PaletteEntry, PaletteIndex};
 use crate::platform::Platform;
 use crate::registry;
 use crate::send::{self, SendTrigger};
@@ -72,8 +73,8 @@ use crate::vm::BridgeLoginInput;
 use crate::vm::{
     ApprovalDraftVm, ConnectionStatus, ConnectionStatusBatch, DraftMirrorBatch, EditVersionVm,
     EncryptionStatus, EncryptionStatusBatch, HeldSendVm, InboxBatch, IncognitoVm, OutboxVm,
-    PaginationStatusBatch, RemoteDraftVm, RoomListBatch, RoomListOp, RoomVm, SpaceVm,
-    TimelineBatch, TypingBatch, TypistVm,
+    PaginationStatusBatch, PaletteMode, PaletteResultsVm, RemoteDraftVm, RoomListBatch, RoomListOp,
+    RoomVm, SpaceVm, TimelineBatch, TypingBatch, TypistVm,
 };
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
@@ -495,6 +496,11 @@ struct InboxHandle {
     /// joined Spaces + child membership on every sync batch and pokes the merger.
     /// Tracked separately from `producers` so teardown aborts them too.
     spaces_producers: HashMap<String, JoinHandle<()>>,
+    /// Per-account palette producers (Story 9.1): each refreshes that account's
+    /// **full** room set into the shared [`PaletteIndex`] on every sync batch (the
+    /// palette must find any of ~10k rooms, not just the recency window). Tracked
+    /// so teardown aborts them too.
+    palette_producers: HashMap<String, JoinHandle<()>>,
 }
 
 /// A live bridge-session-health subscription (Story 6.5, FR-28, AD-16): the shared
@@ -545,6 +551,11 @@ pub struct AccountManager {
     /// handle is cleared by the eventual `draft_mirror_unsubscribe`. Not tied to any
     /// one account — there is at most one in the shell, so the map is bounded.
     draft_mirror_subs: Mutex<HashMap<u64, JoinHandle<()>>>,
+    /// The in-memory command-palette index (Story 9.1): every room across all
+    /// accounts, projected into lightweight entries and refreshed by the per-account
+    /// palette producers spawned in [`AccountManager::subscribe_inbox`]. Read by
+    /// [`AccountManager::palette_query`]; never a source of truth for room state.
+    palette: Arc<Mutex<PaletteIndex>>,
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
@@ -578,7 +589,24 @@ impl AccountManager {
             archive,
             draft_mirror_tx,
             draft_mirror_subs: Mutex::new(HashMap::new()),
+            palette: Arc::new(Mutex::new(PaletteIndex::new())),
         }
+    }
+
+    /// Answer one command-palette query against the in-memory index (Story 9.1).
+    ///
+    /// Pure over the current index snapshot: acquires the lock, runs the fuzzy
+    /// filter + ranking, and returns the grouped, bounded [`PaletteResultsVm`]. All
+    /// ranking lives in `keeper_core::palette` — the frontend only renders and
+    /// dispatches. Never fails (an empty index simply yields the global actions).
+    pub async fn palette_query(
+        &self,
+        query: &str,
+        mode: PaletteMode,
+        open_chat: bool,
+    ) -> PaletteResultsVm {
+        let index = self.palette.lock().await;
+        index.query(query, mode, open_chat)
     }
 
     /// Subscribe to the account's room list, activating the account if it is not
@@ -765,6 +793,15 @@ impl AccountManager {
         let mut producers: HashMap<String, JoinHandle<()>> = HashMap::with_capacity(accounts.len());
         let mut spaces_producers: HashMap<String, JoinHandle<()>> =
             HashMap::with_capacity(accounts.len());
+        let mut palette_producers: HashMap<String, JoinHandle<()>> =
+            HashMap::with_capacity(accounts.len());
+        // Rebuild the palette index from scratch for this subscription: drop any
+        // stale entries so a re-subscribe (StrictMode remount, account add/remove)
+        // never leaves a departed account's rooms behind.
+        {
+            let mut index = self.palette.lock().await;
+            *index = PaletteIndex::new();
+        }
         for account in &accounts {
             merger
                 .register_account(&account.account_id, account.hue_index)
@@ -806,6 +843,9 @@ impl AccountManager {
             );
             producers.insert(account.account_id.clone(), task);
             if let Some(client) = client {
+                // Reuse the one client handle for both producers: clone once for the
+                // palette producer before moving the original into the Spaces closure.
+                let client_for_palette = client.clone();
                 let merger_for_spaces = merger.clone();
                 let spaces_account_id = account.account_id.clone();
                 let spaces_task = tokio::spawn(
@@ -817,6 +857,29 @@ impl AccountManager {
                     ),
                 );
                 spaces_producers.insert(account.account_id.clone(), spaces_task);
+
+                // Palette producer (Story 9.1): refresh this account's FULL room set
+                // into the shared index on every sync batch. It enumerates
+                // `Client::rooms()`, not the recency window, so the palette can find
+                // any of ~10k rooms.
+                let palette = self.palette.clone();
+                let palette_account_id = account.account_id.clone();
+                let hue_index = account.hue_index;
+                let palette_task = tokio::spawn(
+                    async move {
+                        run_palette_producer(
+                            client_for_palette,
+                            palette,
+                            &palette_account_id,
+                            hue_index,
+                        )
+                        .await;
+                    }
+                    .instrument(
+                        tracing::info_span!("palette_producer", account_id = %account.account_id),
+                    ),
+                );
+                palette_producers.insert(account.account_id.clone(), palette_task);
             }
         }
 
@@ -827,6 +890,7 @@ impl AccountManager {
                 merger,
                 producers,
                 spaces_producers,
+                palette_producers,
             });
         }
         tracing::info!(subscription_id, "merged inbox subscribed");
@@ -859,6 +923,14 @@ impl AccountManager {
             for (_, task) in handle.spaces_producers {
                 task.abort();
             }
+            for (_, task) in handle.palette_producers {
+                task.abort();
+            }
+        }
+        // Clear the palette index too — a torn-down inbox has no live rooms to find.
+        {
+            let mut index = self.palette.lock().await;
+            *index = PaletteIndex::new();
         }
     }
 
@@ -3999,8 +4071,20 @@ impl AccountManager {
                     task.abort();
                     let _ = task.await;
                 }
+                // Abort + await the account's palette producer too (Story 9.1): it
+                // holds a `Client` clone and keeps feeding this account's full room
+                // set into the shared `PaletteIndex`, so it must be dropped before
+                // `sign_out` deletes the store dir (same reasoning as above).
+                if let Some(task) = handle.palette_producers.remove(account_id) {
+                    task.abort();
+                    let _ = task.await;
+                }
             }
         }
+        // Prune this account's slice from the shared palette index so a signed-out
+        // account's rooms stop being queryable (the whole index is only rebuilt on a
+        // full inbox re-subscribe; single-account sign-out must prune here). Idempotent.
+        self.palette.lock().await.remove_account(account_id);
         let mut accounts = self.accounts.lock().await;
         if let Some(handle) = accounts.remove(account_id) {
             // Remove the account-wide archive event handlers (Story 5.1/5.2) so no
@@ -5022,6 +5106,79 @@ async fn compute_and_push_spaces(client: &Client, merger: &InboxMerger, account_
     });
 
     merger.update_spaces(account_id, spaces, memberships).await;
+}
+
+/// Per-account palette producer (Story 9.1). Projects the account's **full**
+/// matrix-sdk room set into the shared [`PaletteIndex`], seeding it immediately and
+/// refreshing it on every sync batch so the palette can find any room (not just the
+/// recency-windowed inbox `MergeState`).
+///
+/// Mirrors [`run_spaces_producer`]: it computes once, then loops on
+/// `Client::subscribe_to_all_room_updates()` — recomputing on each batch, forcing a
+/// full recompute on `Lagged`, and stopping on `Closed`.
+async fn run_palette_producer(
+    client: Client,
+    palette: Arc<Mutex<PaletteIndex>>,
+    account_id: &str,
+    hue_index: u8,
+) {
+    let mut updates = client.subscribe_to_all_room_updates();
+    compute_and_push_palette(&client, &palette, account_id, hue_index).await;
+    loop {
+        match updates.recv().await {
+            Ok(_) => compute_and_push_palette(&client, &palette, account_id, hue_index).await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::debug!(account_id = %account_id, skipped, "palette updates lagged; forcing recompute");
+                compute_and_push_palette(&client, &palette, account_id, hue_index).await;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tracing::info!(account_id = %account_id, "palette updates closed, stopping producer");
+                break;
+            }
+        }
+    }
+}
+
+/// Project the account's full room set into palette entries and replace that
+/// account's slice of the shared index (Story 9.1). Excludes Space rooms (Spaces
+/// are containers, not chats — surfaced separately). A room's DM status classifies
+/// it as chat vs contact; a resolve error on `is_direct` degrades to `false`
+/// (treated as a chat) rather than dropping the room. Reads local state only — no
+/// network fetch. Factored out so the seed and each refresh share one path.
+async fn compute_and_push_palette(
+    client: &Client,
+    palette: &Arc<Mutex<PaletteIndex>>,
+    account_id: &str,
+    hue_index: u8,
+) {
+    let rooms = client.rooms();
+    let mut entries: Vec<PaletteEntry> = Vec::with_capacity(rooms.len());
+    for room in rooms {
+        if room.is_space() {
+            continue;
+        }
+        let room_id = room.room_id().to_string();
+        let display_name = resolved_room_name(&room, &room_id).await;
+        // `is_direct` reads the local m.direct account data; on error treat the room
+        // as a non-DM chat so it still appears (never drop a room from the palette).
+        let is_direct = room.is_direct().await.unwrap_or(false);
+        let network = bridge::room_bridge_network(&room).await;
+        let last_activity_ms = room
+            .latest_event_timestamp()
+            .map(|ts| ts.get().into())
+            .unwrap_or(0);
+        entries.push(PaletteEntry::new(
+            account_id.to_owned(),
+            hue_index,
+            room_id,
+            display_name,
+            is_direct,
+            network,
+            last_activity_ms,
+        ));
+    }
+    let mut index = palette.lock().await;
+    index.set_account_rooms(account_id, entries);
 }
 
 /// Load keeper-local pins from the registry into a merger-shaped map keyed by

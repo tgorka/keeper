@@ -2053,6 +2053,103 @@ pub struct OutboxVm {
     pub rows: Vec<HeldSendVm>,
 }
 
+/// Which palette query mode the frontend requested (Story 9.1).
+///
+/// `Default` filters chats + contacts (at ≥2 chars) plus matching actions;
+/// `Action` (the `>`-prefix mode) returns only actions with open-chat-context
+/// ranking. Serializes to its camelCase name — the `mode` argument of
+/// `palette_query`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PaletteMode {
+    /// The default finder: chats + contacts + actions.
+    Default,
+    /// Action mode (the `>` prefix): actions only, context-ranked.
+    Action,
+}
+
+/// One chat- or contact-kind result row from the command palette (Story 9.1).
+///
+/// Projected from the in-memory `keeper_core::palette::PaletteIndex` for a query,
+/// carrying **only** non-secret render data: the `(accountId, roomId)` selection
+/// key, the resolved display name, the owning account's `hueIndex` (0–7) for the
+/// hue dot, the bridged-`network` label (`None` for a native room, no badge), and
+/// the `isDirect` DM flag. A DM room is surfaced under **Contacts** and excluded
+/// from **Chats** so a person is never listed twice — the frontend groups on
+/// `isDirect` alone and never re-classifies. No tokens, message bodies, or event
+/// ids cross IPC on this VM. The `id` is a stable `"accountId|roomId"` composite
+/// so the frontend can key rows without deriving it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PaletteChatVm {
+    /// Stable composite key `"accountId|roomId"` for the frontend row key.
+    pub id: String,
+    /// Opaque keeper account id this room belongs to. Drives select/peek.
+    pub account_id: String,
+    /// Opaque Matrix room id (passed through verbatim as a string).
+    pub room_id: String,
+    /// The resolved room display name.
+    pub display_name: String,
+    /// The owning account's hue index (0–7) for the hue dot.
+    #[ts(type = "number")]
+    pub hue_index: u8,
+    /// The bridged-Network label, or `None` for a native Matrix room (no badge).
+    pub network: Option<String>,
+    /// `true` when the room is a direct/DM room — surfaced under Contacts.
+    pub is_direct: bool,
+}
+
+/// One action-kind result row from the command palette (Story 9.1).
+///
+/// A projection of a single entry in the Rust action registry
+/// (`keeper_core::palette::palette_actions`) — the sole source of palette actions,
+/// reused by the cheat sheet + native menu bar (Story 9.3). Carries the stable
+/// `id` (dispatched by the frontend `actions.ts` map), the human `title`, its
+/// `category` group label, the `keywords` it also matches on, an optional
+/// `shortcut` chip string (e.g. `"⌘K"`), and `requiresOpenChat` — `true` for an
+/// action that operates on the currently open chat (Archive, Pin, …), which the
+/// frontend disables when no chat is open and which ranks first in action mode
+/// when a chat is open. Static, non-secret render data only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PaletteActionVm {
+    /// Stable action id — the dispatch key the frontend maps to a handler.
+    pub id: String,
+    /// The human-readable action title (the row label).
+    pub title: String,
+    /// The action's category / group label (e.g. `"Navigation"`, `"Chat"`).
+    pub category: String,
+    /// Extra keywords the action also matches on (never rendered directly).
+    pub keywords: Vec<String>,
+    /// An optional shortcut-chip string (e.g. `"⌘K"`), or `None` when unbound.
+    pub shortcut: Option<String>,
+    /// `true` when the action operates on the currently open chat.
+    pub requires_open_chat: bool,
+}
+
+/// The grouped, ranked, bounded result of one `palette_query` (Story 9.1).
+///
+/// The single view model the palette renders. `contacts` holds matched direct/DM
+/// rooms, `chats` holds matched non-DM rooms (a person is never in both), and
+/// `actions` holds matched (or, on an empty/short/no-match query, top) registered
+/// actions. All filtering, fuzzy scoring, and ranking happen in Rust — the
+/// frontend only renders these three lists and dispatches by id; it never filters
+/// or re-orders. Each list is capped to a bounded top-N so the render stays cheap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PaletteResultsVm {
+    /// Matched direct/DM contact rows (empty for a short/no-match query).
+    pub contacts: Vec<PaletteChatVm>,
+    /// Matched non-DM chat rows (empty for a short/no-match query).
+    pub chats: Vec<PaletteChatVm>,
+    /// Matched actions, or the top registered actions on a short/no-match query.
+    pub actions: Vec<PaletteActionVm>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

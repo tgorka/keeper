@@ -125,6 +125,7 @@ pub fn run() {
             ipc::send_attachment_bytes,
             ipc::cancel_send,
             ipc::mark_room_read,
+            ipc::palette_query,
             ipc::release_receipt,
             ipc::coupling_caveats,
             ipc::mark_room_unread,

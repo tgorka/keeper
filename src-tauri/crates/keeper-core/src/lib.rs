@@ -21,6 +21,7 @@ pub mod error;
 pub mod inbox;
 pub mod media;
 pub mod oauth;
+pub mod palette;
 pub mod platform;
 pub mod registry;
 pub mod send;

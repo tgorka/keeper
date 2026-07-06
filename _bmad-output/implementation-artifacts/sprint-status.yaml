@@ -117,7 +117,7 @@ development_status:
   8-4-post-dispatch-delete-for-everyone: done
   epic-8-retrospective: optional
   epic-9: backlog
-  9-1-command-palette: backlog
+  9-1-command-palette: done
   9-2-keyboard-navigation-and-quick-switcher: backlog
   9-3-cheat-sheet-and-native-menu-bar-from-the-action-registry: backlog
   9-4-global-hotkey: backlog

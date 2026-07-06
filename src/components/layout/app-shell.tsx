@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import { ApprovalPane } from "@/components/approval/approval-pane";
 import { NewChatDialog } from "@/components/chat/new-chat-dialog";
+import { CommandPalette } from "@/components/command-palette/command-palette";
 import { ExportDialog } from "@/components/export/export-dialog";
 import { BridgesPane } from "@/components/layout/bridges-pane";
 import { ChatListPane } from "@/components/layout/chat-list-pane";
@@ -17,6 +18,7 @@ import { useAccountStatuses } from "@/hooks/use-account-statuses";
 import { useApprovalShortcut } from "@/hooks/use-approval-shortcut";
 import { useBridgeHealthSubscription } from "@/hooks/use-bridge-health";
 import { useBridgesShortcut } from "@/hooks/use-bridges-shortcut";
+import { useCommandPaletteShortcut } from "@/hooks/use-command-palette-shortcut";
 import { useEncryptionStatuses } from "@/hooks/use-encryption-statuses";
 import { useKeyBackupStatuses } from "@/hooks/use-key-backup-statuses";
 import { useNewChatShortcut } from "@/hooks/use-new-chat-shortcut";
@@ -52,6 +54,8 @@ export function AppShell() {
   useBridgesShortcut();
   // Wire ⌘3 to the Approval Pane (Story 7.3).
   useApprovalShortcut();
+  // Wire ⌘K to toggle the command palette (Story 9.1).
+  useCommandPaletteShortcut();
   // Which primary view the shell renders. "bridges" and "approval" each replace the
   // chat-list + conversation cluster with a full-surface pane (Story 6.1 / 7.3).
   const primaryView = usePrimaryView();
@@ -112,6 +116,7 @@ export function AppShell() {
       <SearchOverlay />
       <ExportDialog />
       <NewChatDialog />
+      <CommandPalette />
 
       {detailFloating && (
         <Sheet open={detailOpen} onOpenChange={handleSheetOpenChange}>

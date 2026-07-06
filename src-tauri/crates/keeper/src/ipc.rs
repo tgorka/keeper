@@ -27,8 +27,8 @@ use keeper_core::vm::{
     ConnectionStatusBatch, CouplingCaveatVm, DemoBatch, DraftMirrorBatch, EditVersionVm,
     EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IncognitoVm,
     IpcError, IpcErrorCode, NetworksSnapshot, NewChatResolutionVm, OutboxVm, PaginationStatusBatch,
-    PingVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm,
-    SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
+    PaletteMode, PaletteResultsVm, PingVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
+    SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -2286,6 +2286,27 @@ pub async fn mark_room_read(
         .mark_room_read(&state.platform, &account_id, &room_id)
         .await
         .map_err(to_ipc_error)
+}
+
+/// Query the command palette (Story 9.1, epic 9 spine). Serves grouped, ranked,
+/// bounded results from the in-memory Rust index over **every** room across all
+/// accounts (chats + DM contacts) plus the static action registry — the frontend
+/// only renders and dispatches by id, never filters or re-orders (AD-20).
+///
+/// `mode` picks the query mode: `default` filters chats + contacts (≥2 chars) plus
+/// matching actions; `action` (the `>` prefix) returns only actions with open-chat
+/// actions ranked first when `openChat` is set. On an empty/short/no-match query
+/// the top registered actions are returned so the frontend can show them plus a `>`
+/// hint. Never fails (an empty index simply yields the global actions); the < 100 ms
+/// budget at 10k chats is met by the pure linear scan in `keeper_core::palette`.
+#[tauri::command]
+pub async fn palette_query(
+    state: State<'_, AppState>,
+    query: String,
+    mode: PaletteMode,
+    open_chat: bool,
+) -> Result<PaletteResultsVm, IpcError> {
+    Ok(state.accounts.palette_query(&query, mode, open_chat).await)
 }
 
 /// Read the resolved Incognito state for `(accountId, roomId)` (Story 8.1). Delegates
