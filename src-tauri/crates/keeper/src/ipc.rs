@@ -24,9 +24,9 @@ use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
-    ConnectionStatusBatch, DemoBatch, DraftMirrorBatch, EditVersionVm, EncryptionStatusBatch,
-    ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IncognitoVm, IpcError,
-    IpcErrorCode, NetworksSnapshot, NewChatResolutionVm, PaginationStatusBatch, PingVm,
+    ConnectionStatusBatch, CouplingCaveatVm, DemoBatch, DraftMirrorBatch, EditVersionVm,
+    EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IncognitoVm,
+    IpcError, IpcErrorCode, NetworksSnapshot, NewChatResolutionVm, PaginationStatusBatch, PingVm,
     RemoteDraftVm, ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot,
     TimelineBatch, TypingBatch, VerificationFlowVm,
 };
@@ -2493,12 +2493,14 @@ pub async fn reorder_pins(state: State<'_, AppState>, order: Vec<PinRef>) -> Res
         .map_err(to_ipc_error)
 }
 
-/// Set (or clear) the account's typing notice in the open room (Story 3.9, typing,
-/// AD-14). Delegates to the core, which emits a normal (non-private) typing
-/// notification through the receipt/typing signals seam. Best-effort: a dispatch
-/// failure is logged and swallowed in the core (typing is never a UI error), so
-/// this resolves `Ok` even then. A room-not-found / inactive account funnels
-/// through [`to_ipc_error`] to `TimelineUnavailable`.
+/// Set (or clear) the account's typing notice in the open room (Story 3.9, 8.2,
+/// typing, AD-14, FR-43). Delegates to the core, which resolves the effective
+/// Incognito policy and gates the emission through the receipt/typing signals seam —
+/// while Incognito applies, zero `m.typing` events leave the machine. Best-effort: a
+/// dispatch failure (or a fail-closed scope-read skip) is logged and swallowed in the
+/// core (typing is never a UI error), so this resolves `Ok` even then. A
+/// room-not-found / inactive account funnels through [`to_ipc_error`] to
+/// `TimelineUnavailable`.
 #[tauri::command]
 pub async fn set_typing(
     state: State<'_, AppState>,
@@ -2508,9 +2510,40 @@ pub async fn set_typing(
 ) -> Result<(), IpcError> {
     state
         .accounts
-        .set_typing(&account_id, &room_id, typing)
+        .set_typing(&state.platform, &account_id, &room_id, typing)
         .await
         .map_err(to_ipc_error)
+}
+
+/// Release a PUBLIC read receipt on the open room — the explicit "Mark read publicly"
+/// action (Story 8.2, AD-14, FR-45). Delegates to the core, which dispatches exactly
+/// one public `m.read` on the room's latest event through the signals seam regardless
+/// of the effective Incognito policy (the user chose to acknowledge). Best-effort: a
+/// dispatch failure is logged and swallowed in the core (never a UI error), so this
+/// resolves `Ok` even then. A room-not-found / inactive account funnels through
+/// [`to_ipc_error`] to `TimelineUnavailable`.
+#[tauri::command]
+pub async fn release_receipt(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .release_receipt(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// The data-driven per-Network coupling caveats (Story 8.2, FR-44). Projects the
+/// embedded `coupling-caveats.json` into a [`Vec<CouplingCaveatVm>`] the frontend
+/// joins to the open room's Network by `networkId` to surface the caveat inline at the
+/// Incognito toggle. Read-only, account-agnostic static data; a parse/validation
+/// failure in the embedded data file funnels the `BridgeError` through
+/// [`to_ipc_error`] to `internal`.
+#[tauri::command]
+pub fn coupling_caveats() -> Result<Vec<CouplingCaveatVm>, IpcError> {
+    keeper_core::bridges::coupling_caveats_catalog().map_err(|e| to_ipc_error(e.into()))
 }
 
 /// Back-paginate the open room's timeline (Story 3.9, pagination). Delegates to the

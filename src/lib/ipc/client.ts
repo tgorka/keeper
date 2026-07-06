@@ -29,6 +29,7 @@ export type { BridgeSessionHealthVm } from "./gen/BridgeSessionHealthVm";
 export type { BridgeStatus } from "./gen/BridgeStatus";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
+export type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
 export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
@@ -91,6 +92,7 @@ import type { BridgeLoginInput } from "./gen/BridgeLoginInput";
 import type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
+import type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
 import type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
 import type { EditVersionVm } from "./gen/EditVersionVm";
 import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
@@ -1268,6 +1270,31 @@ export async function cancelSend(
  */
 export async function markRoomRead(accountId: string, roomId: string): Promise<void> {
   await invoke<void>("mark_room_read", { accountId, roomId });
+}
+
+/**
+ * Release a PUBLIC read receipt on a room — the explicit "Mark read publicly" action
+ * (Story 8.2, AD-14, FR-45). The Rust core dispatches exactly one public `m.read` on
+ * the room's latest event through the signals seam regardless of the effective
+ * Incognito policy (the user chose to acknowledge), so own + remote clients see it
+ * read. Best-effort: a dispatch failure is swallowed in the core (never a UI error),
+ * so this resolves even then. Callers may fire-and-forget and swallow rejections.
+ * Rejects with the {@link IpcError} envelope (`code: "timelineUnavailable"`) only on
+ * an unknown room/inactive account.
+ */
+export async function releaseReceipt(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("release_receipt", { accountId, roomId });
+}
+
+/**
+ * Read the data-driven per-Network coupling caveats (Story 8.2, FR-44). The Rust core
+ * projects the embedded `coupling-caveats.json` into {@link CouplingCaveatVm}s the
+ * frontend joins to the open room's Network by `networkId` to surface the caveat
+ * inline at the Incognito toggle — no caveat copy is authored in TypeScript. Rejects
+ * with the {@link IpcError} envelope on an embedded-data parse failure.
+ */
+export async function couplingCaveats(): Promise<CouplingCaveatVm[]> {
+  return await invoke<CouplingCaveatVm[]>("coupling_caveats");
 }
 
 /**

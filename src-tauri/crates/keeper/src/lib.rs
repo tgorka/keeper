@@ -120,6 +120,8 @@ pub fn run() {
             ipc::send_attachment_bytes,
             ipc::cancel_send,
             ipc::mark_room_read,
+            ipc::release_receipt,
+            ipc::coupling_caveats,
             ipc::mark_room_unread,
             ipc::incognito_get,
             ipc::incognito_get_global,

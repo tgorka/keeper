@@ -2965,16 +2965,23 @@ impl AccountManager {
     }
 
     /// Set (or clear) the account's typing notice in the room through the
-    /// receipt/typing signals seam (Story 3.9, AD-14). Resolves the account's live
-    /// `Room` and delegates to [`signals::set_typing`]. Best-effort: a dispatch
-    /// failure is logged and swallowed (returns `Ok(())`) — typing is never a UI
-    /// error.
+    /// receipt/typing signals seam, gated on the effective Incognito policy (Story 3.9,
+    /// 8.2, AD-14, FR-43). Resolves the account's live `Room`, reads the three registry
+    /// scope values, and lets the `signals` resolver apply Chat > Account > Global, then
+    /// passes the resolved policy to [`signals::set_typing`] — which emits nothing (start
+    /// or stop) while Incognito applies, so zero `m.typing` events leave the machine.
+    ///
+    /// Scope read is **fail-closed** (mirroring [`Self::mark_room_read`]): a registry read
+    /// error skips emission entirely rather than risk leaking a typing notice for a chat
+    /// the user meant to keep private (logged at `warn`). Best-effort: a dispatch failure
+    /// is logged and swallowed (returns `Ok(())`) — typing is never a UI error.
     ///
     /// Errors: an unparsable/unknown room id, or an account that isn't live →
     /// [`TimelineError::RoomNotFound`]. A best-effort typing-dispatch failure is NOT
     /// an error — it is logged and swallowed.
     pub async fn set_typing(
         &self,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         room_id: &str,
         typing: bool,
@@ -2982,8 +2989,73 @@ impl AccountManager {
         let room_id: OwnedRoomId =
             RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
         let room = self.room_for(account_id, &room_id).await?;
-        if let Err(e) = signals::set_typing(&room, typing).await {
-            tracing::debug!(account_id = %account_id, room_id = %room_id, typing, error = %e, "typing dispatch failed (best-effort)");
+
+        // Resolve the effective Incognito policy at emission time (Story 8.1/8.2, AD-14),
+        // fail-closed like `mark_room_read`: if the registry read fails we cannot know the
+        // policy, so we SKIP emission rather than risk leaking a typing notice for a chat
+        // the user meant to keep private. Logged at `warn` because a silent privacy
+        // downgrade would be the worse failure for a privacy feature.
+        let policy = match platform
+            .data_dir()
+            .and_then(|dir| registry::incognito_scopes(&dir, account_id, room_id.as_str()))
+        {
+            Ok((chat, account, global)) => Some(signals::resolve_incognito(chat, account, global)),
+            Err(e) => {
+                tracing::warn!(account_id = %account_id, room_id = %room_id, error = %e, "incognito scope read failed; skipping typing to avoid a leak (fail-closed)");
+                None
+            }
+        };
+
+        // Only dispatch when the policy is known (fail-closed above). `signals::set_typing`
+        // itself suppresses emission when Incognito is effective.
+        if let Some(policy) = policy {
+            if let Err(e) = signals::set_typing(&room, typing, policy).await {
+                tracing::debug!(account_id = %account_id, room_id = %room_id, typing, error = %e, "typing dispatch failed (best-effort)");
+            }
+        }
+        Ok(())
+    }
+
+    /// Release a PUBLIC read receipt on the room's latest event — the explicit,
+    /// user-triggered "Mark read publicly" action (Story 8.2, AD-14, FR-45). A
+    /// best-effort sibling of [`Self::mark_room_read`]: it reuses the same timeline
+    /// open / transient-build pattern, then dispatches exactly one public `m.read`
+    /// through [`signals::release_receipt`] — regardless of the effective Incognito
+    /// policy, because the user chose to acknowledge. Best-effort: every dispatch
+    /// failure is logged and swallowed (returns `Ok(())`) so a failure is never a UI
+    /// error.
+    ///
+    /// Errors: an unparsable/unknown room id, or an account that isn't live →
+    /// [`TimelineError::RoomNotFound`]. A best-effort receipt-dispatch failure is NOT
+    /// an error — it is logged and swallowed.
+    pub async fn release_receipt(&self, account_id: &str, room_id: &str) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+
+        // Reuse an already-open timeline when present; otherwise build a transient one
+        // just to dispatch the receipt — the mark-as-read call stays inside signals.rs.
+        let timeline = match self.open_timeline_for(account_id, &room_id).await {
+            Ok(timeline) => Some(timeline),
+            Err(_) => match TimelineBuilder::new(&room).build().await {
+                Ok(timeline) => Some(Arc::new(timeline)),
+                Err(e) => {
+                    tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "transient timeline build for release-receipt failed (best-effort)");
+                    None
+                }
+            },
+        };
+        if let Some(timeline) = timeline {
+            match signals::release_receipt(&timeline).await {
+                Ok(released) => {
+                    if released {
+                        tracing::debug!(account_id = %account_id, room_id = %room_id, "public read receipt released");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(account_id = %account_id, room_id = %room_id, error = %e, "release-receipt dispatch failed (best-effort)");
+                }
+            }
         }
         Ok(())
     }

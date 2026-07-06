@@ -1570,6 +1570,25 @@ pub struct BridgeNetworkVm {
     pub ack_copy: Option<String>,
 }
 
+/// One per-Network coupling caveat — a behavior that connecting a Network couples
+/// in (Story 8.2, FR-44). A pure read-only projection of `coupling-caveats.json`:
+/// the stable `network_id` this caveat applies to, the human-readable `text` shown
+/// inline at the per-Chat Incognito toggle, and `applies_to`, a machine tag naming
+/// the coupled surface (e.g. `"read-receipts"`). All caveat copy is data — none is
+/// authored in TypeScript. Joined to the open room's Network by `network_id` on the
+/// frontend; an uncoupled or native (null-network) room shows no caveat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CouplingCaveatVm {
+    /// The stable network identifier this caveat applies to (e.g. `"whatsapp"`).
+    pub network_id: String,
+    /// The human-readable caveat text, from the data file.
+    pub text: String,
+    /// A machine tag naming the coupled surface (e.g. `"read-receipts"`).
+    pub applies_to: String,
+}
+
 /// The discovered setup/login status of a bridged Network on an Account's
 /// homeserver (Story 6.2, FR-25, AD-16).
 ///

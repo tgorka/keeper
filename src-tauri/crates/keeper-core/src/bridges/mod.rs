@@ -22,7 +22,7 @@ use matrix_sdk::ruma::{OwnedUserId, UserId};
 use matrix_sdk::{Client, Room};
 
 use crate::error::BridgeError;
-use crate::vm::BridgeNetworkVm;
+use crate::vm::{BridgeNetworkVm, CouplingCaveatVm};
 
 /// Resolve the Bridge Bot MXID for `network_id` on the account's own server (Story
 /// 6.4, FR-27). Builds `@{localpart}:{server_name}` from the first `known-bots.json`
@@ -158,6 +158,28 @@ pub fn catalog() -> Result<Vec<BridgeNetworkVm>, BridgeError> {
     Ok(out)
 }
 
+/// Build the flat coupling-caveats catalog from the embedded data file (Story 8.2,
+/// FR-44).
+///
+/// Projects every caveat in `coupling-caveats.json` into a [`CouplingCaveatVm`] in
+/// file order — the stable `network_id`, the human-readable `text`, and the
+/// `applies_to` machine tag. Read-only and account-agnostic: the frontend joins a
+/// caveat to the open room's Network by `network_id`. Returns a [`BridgeError`] only
+/// if the embedded data fails to parse or validate (never a panic). Mirrors
+/// [`catalog()`].
+pub fn coupling_caveats_catalog() -> Result<Vec<CouplingCaveatVm>, BridgeError> {
+    let doc = data::coupling_caveats()?;
+    Ok(doc
+        .caveats
+        .iter()
+        .map(|caveat| CouplingCaveatVm {
+            network_id: caveat.network_id.clone(),
+            text: caveat.text.clone(),
+            applies_to: caveat.applies_to.clone(),
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +303,37 @@ mod tests {
                 caveat.network_id
             );
         }
+    }
+
+    #[test]
+    fn coupling_caveats_catalog_projects_seeded_caveats() {
+        let caveats = coupling_caveats_catalog().expect("coupling caveats catalog builds");
+        assert!(
+            !caveats.is_empty(),
+            "coupling caveats catalog must not be empty"
+        );
+        // Every projected caveat must carry non-empty text and a real networkId — a
+        // caveat with blank copy would render an empty inline hint (FR-44).
+        for caveat in &caveats {
+            assert!(
+                !caveat.text.trim().is_empty(),
+                "caveat text must be non-empty for {}",
+                caveat.network_id
+            );
+            assert!(
+                !caveat.network_id.trim().is_empty(),
+                "caveat networkId must be non-empty"
+            );
+        }
+        // The WhatsApp read-receipt coupling seed (Story 6.1) is the one FR-44 surfaces
+        // inline; pin that it projects with non-empty text.
+        let whatsapp = caveats
+            .iter()
+            .find(|c| c.network_id == "whatsapp")
+            .expect("whatsapp coupling caveat present");
+        assert!(
+            !whatsapp.text.trim().is_empty(),
+            "whatsapp caveat text must be non-empty"
+        );
     }
 }

@@ -20,6 +20,9 @@ const cancelSend = vi.fn();
 const deleteMessage = vi.fn();
 const roomNetworkLabel = vi.fn();
 const markRoomRead = vi.fn();
+const releaseReceipt = vi.fn();
+const couplingCaveats = vi.fn();
+const incognitoSetChat = vi.fn();
 const setTyping = vi.fn();
 const paginateBackwards = vi.fn();
 const subscribeTyping = vi.fn();
@@ -31,6 +34,10 @@ vi.mock("@/lib/ipc/client", () => ({
     subscribeTimeline(accountId, roomId, onBatch),
   unsubscribeTimeline: (accountId: string, id: number) => unsubscribeTimeline(accountId, id),
   markRoomRead: (accountId: string, roomId: string) => markRoomRead(accountId, roomId),
+  releaseReceipt: (accountId: string, roomId: string) => releaseReceipt(accountId, roomId),
+  couplingCaveats: () => couplingCaveats(),
+  incognitoSetChat: (accountId: string, roomId: string, enabled: boolean | null) =>
+    incognitoSetChat(accountId, roomId, enabled),
   setTyping: (accountId: string, roomId: string, typing: boolean) =>
     setTyping(accountId, roomId, typing),
   paginateBackwards: (accountId: string, roomId: string, numEvents: number) =>
@@ -82,11 +89,12 @@ vi.mock("@tauri-apps/api/webview", () => ({
 }));
 
 import { ConversationPane } from "@/components/layout/conversation-pane";
-import type { InboxRoomVm } from "@/lib/ipc/client";
+import type { CouplingCaveatVm, InboxRoomVm, IncognitoVm } from "@/lib/ipc/client";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { attachmentsStore } from "@/lib/stores/attachments";
 import { composerStore } from "@/lib/stores/composer";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
+import { incognitoStore } from "@/lib/stores/incognito";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
 
 const account: AccountVm = {
@@ -155,6 +163,12 @@ beforeEach(() => {
   roomNetworkLabel.mockResolvedValue(null);
   markRoomRead.mockReset();
   markRoomRead.mockResolvedValue(undefined);
+  releaseReceipt.mockReset();
+  releaseReceipt.mockResolvedValue(undefined);
+  couplingCaveats.mockReset();
+  couplingCaveats.mockResolvedValue([]);
+  incognitoSetChat.mockReset();
+  incognitoSetChat.mockResolvedValue(undefined);
   setTyping.mockReset();
   setTyping.mockResolvedValue(undefined);
   paginateBackwards.mockReset();
@@ -1455,5 +1469,167 @@ describe("ConversationPane — header attribution (Story 4.6)", () => {
     expect(screen.queryByLabelText(/network$/)).not.toBeInTheDocument();
     // ... but the account-initial chip still renders (never a crash).
     expect(screen.getByTestId("account-initial-chip")).toHaveTextContent("A");
+  });
+});
+
+const whatsappCaveat: CouplingCaveatVm = {
+  networkId: "whatsapp",
+  text: "you may also stop seeing others' read receipts",
+  appliesTo: "read-receipts",
+};
+
+const whatsappCaveatTyping: CouplingCaveatVm = {
+  networkId: "whatsapp",
+  text: "typing indicators may also be affected on this network",
+  appliesTo: "typing",
+};
+
+function incognitoVm(overrides: Partial<IncognitoVm> = {}): IncognitoVm {
+  return {
+    effective: true,
+    source: "chat",
+    global: false,
+    account: null,
+    chat: true,
+    ...overrides,
+  };
+}
+
+describe("ConversationPane — Incognito control (Story 8.2)", () => {
+  beforeEach(() => {
+    pinsRoomsStore.getState().clear();
+    favoritesRoomsStore.getState().clear();
+    archiveRoomsStore.getState().clear();
+    incognitoStore.getState().clear();
+    subscribeTimeline.mockResolvedValue(1);
+  });
+
+  afterEach(() => {
+    pinsRoomsStore.getState().clear();
+    favoritesRoomsStore.getState().clear();
+    archiveRoomsStore.getState().clear();
+    incognitoStore.getState().clear();
+  });
+
+  /** Render the pane with an open room whose `networkId` is `network`, mirroring an
+   * effective (or not) Incognito VM into the store first. */
+  function renderWithRoom(networkId: string | null, vm: IncognitoVm) {
+    accountsStore.getState().hydrateAll([account]);
+    incognitoStore.getState().applyVm(account.accountId, "!room:example.org", vm);
+    roomsStore.getState().applyBatch({
+      ops: [{ op: "reset", rooms: [headerRoom({ networkId })] }],
+      total: 1,
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    return render(<ConversationPane {...noopProps()} />);
+  }
+
+  it("shows the effective-scope chip label (chat > account > global)", async () => {
+    couplingCaveats.mockResolvedValue([]);
+    renderWithRoom(null, incognitoVm({ source: "chat" }));
+    expect(
+      await screen.findByRole("button", { name: "Incognito — this chat overrides account" }),
+    ).toBeInTheDocument();
+  });
+
+  it("renders the account and global scope labels too", () => {
+    couplingCaveats.mockResolvedValue([]);
+    const { rerender } = renderWithRoom(null, incognitoVm({ source: "account" }));
+    expect(screen.getByRole("button", { name: "Incognito — account" })).toBeInTheDocument();
+
+    incognitoStore
+      .getState()
+      .applyVm(account.accountId, "!room:example.org", incognitoVm({ source: "global" }));
+    rerender(<ConversationPane {...noopProps()} />);
+    expect(screen.getByRole("button", { name: "Incognito — global" })).toBeInTheDocument();
+  });
+
+  it("surfaces the coupling caveat inline for a WhatsApp room", async () => {
+    couplingCaveats.mockResolvedValue([whatsappCaveat]);
+    renderWithRoom("whatsapp", incognitoVm());
+    // Open the popover, then assert the resolved caveat text is shown.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Incognito — this chat overrides account" }),
+    );
+    expect(await screen.findByText(whatsappCaveat.text)).toBeInTheDocument();
+  });
+
+  it("shows no caveat for a native (null networkId) room", async () => {
+    couplingCaveats.mockResolvedValue([whatsappCaveat]);
+    renderWithRoom(null, incognitoVm());
+    fireEvent.click(
+      screen.getByRole("button", { name: "Incognito — this chat overrides account" }),
+    );
+    // The release action opens, proving the popover rendered — but no caveat text.
+    expect(await screen.findByRole("button", { name: "Mark read publicly" })).toBeInTheDocument();
+    expect(screen.queryByText(whatsappCaveat.text)).not.toBeInTheDocument();
+  });
+
+  it("invokes releaseReceipt exactly once when the user marks read publicly, then closes the popover", async () => {
+    couplingCaveats.mockResolvedValue([]);
+    renderWithRoom(null, incognitoVm());
+    fireEvent.click(
+      screen.getByRole("button", { name: "Incognito — this chat overrides account" }),
+    );
+    const release = await screen.findByRole("button", { name: "Mark read publicly" });
+    fireEvent.click(release);
+    await waitFor(() =>
+      expect(releaseReceipt).toHaveBeenCalledWith(account.accountId, "!room:example.org"),
+    );
+    // Fired exactly once — the release action closes the popover so a stale re-click
+    // can't double-fire.
+    expect(releaseReceipt).toHaveBeenCalledTimes(1);
+    // The popover closed after the action (the release button is no longer mounted).
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Mark read publicly" })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("turns Incognito off for the chat and closes the popover (effective → off)", async () => {
+    couplingCaveats.mockResolvedValue([]);
+    renderWithRoom(null, incognitoVm());
+    fireEvent.click(
+      screen.getByRole("button", { name: "Incognito — this chat overrides account" }),
+    );
+    const turnOff = await screen.findByRole("button", {
+      name: "Turn Incognito off for this chat",
+    });
+    fireEvent.click(turnOff);
+    await waitFor(() =>
+      expect(incognitoSetChat).toHaveBeenCalledWith(account.accountId, "!room:example.org", false),
+    );
+    // The turn-off handler closes the popover after firing.
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Turn Incognito off for this chat" }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("renders every coupling caveat a network has, not just the first", async () => {
+    couplingCaveats.mockResolvedValue([whatsappCaveat, whatsappCaveatTyping]);
+    renderWithRoom("whatsapp", incognitoVm());
+    fireEvent.click(
+      screen.getByRole("button", { name: "Incognito — this chat overrides account" }),
+    );
+    // Both matched caveats render, each on its own line.
+    expect(await screen.findByText(whatsappCaveat.text)).toBeInTheDocument();
+    expect(screen.getByText(whatsappCaveatTyping.text)).toBeInTheDocument();
+  });
+
+  it("offers an enable affordance (with caveat) when Incognito is off", async () => {
+    couplingCaveats.mockResolvedValue([whatsappCaveat]);
+    renderWithRoom("whatsapp", incognitoVm({ effective: false, source: "global", chat: null }));
+    fireEvent.click(screen.getByRole("button", { name: "Incognito — off for this chat" }));
+    const enable = await screen.findByRole("button", {
+      name: "Turn Incognito on for this chat",
+    });
+    expect(enable).toBeInTheDocument();
+    // FR-44: the coupling caveat surfaces at toggle time for a coupled network.
+    expect(screen.getByText(whatsappCaveat.text)).toBeInTheDocument();
+    fireEvent.click(enable);
+    await waitFor(() =>
+      expect(incognitoSetChat).toHaveBeenCalledWith(account.accountId, "!room:example.org", true),
+    );
   });
 });

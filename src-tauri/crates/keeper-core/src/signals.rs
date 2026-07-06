@@ -17,8 +17,14 @@
 //! depending on the effective Incognito policy resolved *here* at emission time
 //! ([`resolve_incognito`], Story 8.1): the pure Chat > Account > Global resolver and
 //! the receipt-type branch both live in this seam, so privacy is decided at the one
-//! gate — never faked by suppressing the receipt. Typing is emitted normally (typing
-//! suppression is Story 8.2).
+//! gate — never faked by suppressing the receipt. Typing is gated on the SAME policy
+//! (Story 8.2): while Incognito applies, [`set_typing`] emits nothing at all — neither
+//! a start nor a stop — so zero `m.typing` events leave the machine.
+//! [`release_receipt`] is the explicit user-triggered exception: it dispatches exactly
+//! one PUBLIC `m.read` on demand, regardless of policy, reusing the already-gated
+//! `mark_as_read(ReceiptType::Read)` call (so it adds no new SDK surface). Presence is
+//! never emitted anywhere — keeper has no `set_presence` path (a guardrail test pins
+//! that it stays withheld across keeper-core and the keeper IPC crate).
 //! Best-effort: an emit failure is a non-fatal [`SignalError::Dispatch`] the
 //! caller swallows for the UI. Secret containment (NFR-9): no token, event id, or
 //! plaintext ever crosses here — only opaque user ids flow out of the typing
@@ -131,16 +137,58 @@ fn receipt_type_for(policy: &EffectivePolicy) -> ReceiptType {
     }
 }
 
-/// Set (or clear) the account's typing notice in the room, emitted as a normal
-/// (non-private) typing notification (AD-14).
+/// Whether a typing notice may be emitted under the resolved Incognito `policy`
+/// (Story 8.2). Pure and side-effect-free so the suppression gate is unit-testable
+/// without a live `Room`: typing leaves the machine only when Incognito is *off*
+/// (`!policy.enabled`). When Incognito applies, both start and stop are suppressed —
+/// a stop is itself an `m.typing` event on the wire, so honoring "zero typing events"
+/// means dropping both (any indicator shown before Incognito was enabled expires via
+/// the server's typing timeout).
+pub fn should_emit_typing(policy: &EffectivePolicy) -> bool {
+    !policy.enabled
+}
+
+/// Set (or clear) the account's typing notice in the room, gated on the resolved
+/// Incognito `policy` (AD-14, Story 8.2).
 ///
-/// The sole call site of `Room::typing_notice`. `true` announces typing (the SDK
-/// throttles the on-wire re-sends and auto-expires it); `false` stops it. A
-/// failure is best-effort — it surfaces as [`SignalError::Dispatch`] for the
-/// caller to log and swallow.
-pub async fn set_typing(room: &Room, typing: bool) -> Result<(), SignalError> {
+/// The sole call site of `Room::typing_notice`. When Incognito is effective the
+/// notice is suppressed entirely — neither `true` (start) nor `false` (stop) is
+/// emitted, so no `m.typing` event leaves the machine (see [`should_emit_typing`]).
+/// Otherwise `true` announces typing (the SDK throttles the on-wire re-sends and
+/// auto-expires it) and `false` stops it. A failure is best-effort — it surfaces as
+/// [`SignalError::Dispatch`] for the caller to log and swallow.
+pub async fn set_typing(
+    room: &Room,
+    typing: bool,
+    policy: EffectivePolicy,
+) -> Result<(), SignalError> {
+    // Incognito effective ⇒ emit nothing (suppress start AND stop), so zero typing
+    // events leave the machine.
+    if !should_emit_typing(&policy) {
+        return Ok(());
+    }
     // SOLE-TYPING-EMIT-GATE: the one and only `.typing_notice(` call site (AD-14).
     room.typing_notice(typing)
+        .await
+        .map_err(|e| SignalError::Dispatch(e.to_string()))
+}
+
+/// Dispatch exactly one PUBLIC `m.read` receipt on the timeline's latest event —
+/// the explicit, user-triggered read release (AD-14, Story 8.2, FR-45).
+///
+/// The deliberate exception to the private-by-default path: it *always* emits a
+/// public `ReceiptType::Read` regardless of the effective Incognito policy, because
+/// the user chose to acknowledge. It reuses the already-gated `mark_as_read`
+/// (`ReceiptType::Read`) call — the same PUBLIC branch [`mark_read`] uses when
+/// Incognito is off — so it adds no new SDK surface to the sole gate. Returns `true`
+/// when a receipt was actually dispatched, or `false` for a benign no-op (empty
+/// timeline / receipt already at the latest event). A dispatch failure is best-effort:
+/// it surfaces as [`SignalError::Dispatch`] for the caller to log and swallow.
+pub async fn release_receipt(timeline: &Timeline) -> Result<bool, SignalError> {
+    // SOLE-RECEIPT-GATE: reuses the one and only `.mark_as_read(` call site (AD-14),
+    // forcing the PUBLIC receipt type — the user's explicit release is never private.
+    timeline
+        .mark_as_read(ReceiptType::Read)
         .await
         .map_err(|e| SignalError::Dispatch(e.to_string()))
 }
@@ -165,7 +213,8 @@ pub fn subscribe_typing(
 #[cfg(test)]
 mod tests {
     use super::{
-        receipt_type_for, resolve_incognito, EffectivePolicy, IncognitoScope, ReceiptType,
+        receipt_type_for, resolve_incognito, should_emit_typing, EffectivePolicy, IncognitoScope,
+        ReceiptType,
     };
 
     /// The privacy-critical branch: an enabled policy dispatches the PRIVATE
@@ -190,6 +239,115 @@ mod tests {
             matches!(public, ReceiptType::Read),
             "disabled policy must dispatch public m.read, got {public:?}"
         );
+    }
+
+    /// The pure typing-suppression gate (Story 8.2). `should_emit_typing` takes no
+    /// `typing` argument — it is `typing`-independent *by construction*, a function of
+    /// the effective policy alone: it returns `false` when Incognito is enabled and
+    /// `true` when it is disabled. The four typing I/O-matrix rows (suppress both start
+    /// and stop while on; emit both while off) follow from this single decision plus
+    /// [`set_typing`] early-returning whenever this gate is `false` — so both the
+    /// `true` (start) and `false` (stop) calls are dropped without the gate ever seeing
+    /// the `typing` bool. Pinning the enabled-vs-disabled outcome here is the whole
+    /// contract; no duplicated identical assertion is needed to "cover" a bool the gate
+    /// does not take.
+    #[test]
+    fn should_emit_typing_follows_effective_policy() {
+        // Incognito effective ⇒ no typing leaves the machine (start AND stop suppressed,
+        // since the gate is checked before either is emitted). Spot-checked once per
+        // source variant.
+        assert!(
+            !should_emit_typing(&EffectivePolicy {
+                enabled: true,
+                source: IncognitoScope::Chat,
+            }),
+            "Incognito effective (chat) must gate typing off"
+        );
+        assert!(
+            !should_emit_typing(&EffectivePolicy {
+                enabled: true,
+                source: IncognitoScope::Account,
+            }),
+            "Incognito effective (account) must gate typing off"
+        );
+        // Incognito off ⇒ typing may be emitted (unchanged behavior — both start and
+        // stop pass the gate).
+        assert!(
+            should_emit_typing(&EffectivePolicy {
+                enabled: false,
+                source: IncognitoScope::Global,
+            }),
+            "Incognito off must allow typing to be emitted"
+        );
+    }
+
+    /// Presence-withheld guardrail (Story 8.2, FR-43): keeper emits NO presence
+    /// anywhere. Matrix presence is a per-user (account-global) signal that per-Chat
+    /// Incognito cannot scope, so "withheld where the protocol allows" is satisfied by
+    /// having no presence-emit path at all. This walks every `.rs` source under BOTH
+    /// `keeper-core/src/` (this crate) AND the sibling `keeper/src/` (the IPC crate,
+    /// where a `set_presence` Tauri command would otherwise slip past a keeper-core-only
+    /// scan) and asserts neither the presence emit-call form nor the presence enum type
+    /// name appears in any of them — so a future change that silently adds a presence
+    /// emission in either crate is caught automatically, fail-closed. The two guarded
+    /// tokens are spelled split (built by concatenation below) so this file does not trip
+    /// its own scan. The sibling `keeper/src` directory must resolve at runtime — a
+    /// missing dir fails the scan loudly rather than silently skipping the IPC crate.
+    #[test]
+    fn presence_is_withheld_everywhere() {
+        use std::path::{Path, PathBuf};
+
+        // Build the forbidden tokens by concatenation so the literals do NOT appear as
+        // contiguous substrings *in this very file* — the scan below covers signals.rs
+        // too, and spelling them out here would false-positive against itself.
+        let set_presence = format!(".set_{}(", "presence");
+        let presence_state = format!("Presence{}", "State");
+        let forbidden = [set_presence.as_str(), presence_state.as_str()];
+
+        fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read crate src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    collect_rs(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // This crate (keeper-core/src) AND the sibling IPC crate (keeper/src). Both must
+        // stay presence-clean; the crate-wide guarantee spans keeper-core and keeper.
+        let core_src = manifest.join("src");
+        let ipc_src = manifest.join("../keeper/src");
+        assert!(
+            ipc_src.is_dir(),
+            "sibling IPC crate src dir did not resolve at {} — the presence guard must scan it, not silently skip it",
+            ipc_src.display()
+        );
+        let mut sources = Vec::new();
+        collect_rs(&core_src, &mut sources);
+        collect_rs(&ipc_src, &mut sources);
+        assert!(
+            !sources.is_empty(),
+            "guard scanned no sources — src dir resolution failed"
+        );
+
+        for path in &sources {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for pattern in forbidden {
+                assert!(
+                    !source.contains(pattern),
+                    "`{pattern}` must appear nowhere under keeper-core/src or keeper/src (presence stays withheld), but was found in {name}"
+                );
+            }
+        }
     }
 
     /// The eight deterministic resolver rows from the spec I/O matrix (2 global ×

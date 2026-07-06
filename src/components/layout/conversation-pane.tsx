@@ -39,7 +39,9 @@ import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useCouplingCaveats } from "@/hooks/use-coupling-caveats";
 import { useSelectedRoomVm } from "@/hooks/use-selected-room-vm";
 import { accountHueVar } from "@/lib/account-hue";
 import { initials } from "@/lib/account-initials";
@@ -57,6 +59,7 @@ import {
   incognitoSetChat,
   markRoomRead,
   paginateBackwards,
+  releaseReceipt,
   resolveTimelineEventKey,
   retrySend,
   sendAttachmentBytes,
@@ -275,49 +278,129 @@ export function incognitoChipLabel(source: IncognitoVm["source"]): string {
 }
 
 /**
- * The violet Incognito chip in the Chat header (Story 8.1). Renders only when
- * Incognito is *effective* for the open chat (resolved in Rust, mirrored via
- * {@link useIncognito}); it carries the effective-scope label and, on click, toggles
- * the per-Chat scope (turning the effective state off by writing a per-Chat override),
- * then re-reads the authoritative VM. Uses the reserved `--incognito` violet token.
+ * The per-Chat Incognito control in the Chat header (Story 8.1 chip + Story 8.2
+ * Popover, FR-44/FR-45). Resolved in Rust and mirrored via {@link useIncognito}.
+ *
+ * When Incognito is *effective* for the open chat, the violet chip
+ * ({@link incognitoChipLabel} + the `--incognito` token) is the Popover trigger; the
+ * body carries a "Mark read publicly" release action ({@link releaseReceipt}), a
+ * control turning Incognito off for this chat, and — when the room's Network couples —
+ * the inline coupling caveat. When it is *not* effective, a subtle ghost trigger lets
+ * the user enable per-Chat Incognito; the coupling caveat surfaces inline in that
+ * enable affordance too (FR-44: the caveat at toggle time). All caveat copy comes from
+ * Rust ({@link useCouplingCaveats}); precedence is never re-resolved on the frontend.
  */
 function ConversationIncognitoChip({
   accountId,
   roomId,
+  networkId,
 }: {
   accountId: string | null;
   roomId: string | null;
+  networkId: string | null;
 }) {
   const vm = useIncognito(accountId, roomId);
-  if (accountId === null || roomId === null || vm === undefined || !vm.effective) {
+  const caveats = useCouplingCaveats(networkId);
+  // Controlled Popover open state, so an action can close it after firing (and a
+  // stale/rapid re-click can't double-fire while it's already dismissing).
+  const [open, setOpen] = useState(false);
+  if (accountId === null || roomId === null || vm === undefined) {
     return null;
   }
+
+  const effective = vm.effective;
   const label = incognitoChipLabel(vm.source);
+
+  // Enable/disable the per-Chat scope, then re-read the authoritative VM. Best-effort:
+  // a write failure is swallowed (never an unhandled rejection); the mirror keeps its
+  // last-observed state and the next read reconciles.
+  const setChat = (enabled: boolean) => {
+    void incognitoSetChat(accountId, roomId, enabled)
+      .then(() => refreshIncognito(accountId, roomId))
+      .catch(() => {});
+  };
+
   return (
-    <Badge
-      asChild
-      className={cn(
-        "bg-incognito text-incognito-foreground focus-visible:ring-incognito/50",
-        "cursor-pointer",
-      )}
-    >
-      <button
-        type="button"
-        aria-label={label}
-        title={label}
-        onClick={() => {
-          // The chip only shows while effective is on, so a click writes a per-Chat
-          // override turning it off, then refreshes the mirror from the resolved VM.
-          // Best-effort: a write failure is swallowed (never an unhandled rejection);
-          // the mirror keeps its last-observed state and the next read reconciles.
-          void incognitoSetChat(accountId, roomId, !vm.effective)
-            .then(() => refreshIncognito(accountId, roomId))
-            .catch(() => {});
-        }}
-      >
-        {label}
-      </button>
-    </Badge>
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        {effective ? (
+          <Badge
+            asChild
+            className={cn(
+              "bg-incognito text-incognito-foreground focus-visible:ring-incognito/50",
+              "cursor-pointer",
+            )}
+          >
+            <button type="button" aria-label={label} title={label}>
+              {label}
+            </button>
+          </Badge>
+        ) : (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            aria-label="Incognito — off for this chat"
+            title="Incognito — off for this chat"
+            className="h-6 text-muted-foreground text-xs"
+          >
+            Incognito off
+          </Button>
+        )}
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-72 gap-3">
+        {effective ? (
+          <>
+            <p className="font-medium text-sm">{label}</p>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                // Explicit user release: dispatch exactly one public m.read. Best-effort
+                // — a failure is swallowed (never a UI error). Close the popover so a
+                // stale/rapid re-click can't double-fire the release.
+                void releaseReceipt(accountId, roomId).catch(() => {});
+                setOpen(false);
+              }}
+            >
+              Mark read publicly
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setChat(false);
+                setOpen(false);
+              }}
+            >
+              Turn Incognito off for this chat
+            </Button>
+            {/* Every coupling caveat for the open room's Network — each rendered
+                verbatim from Rust on its own line ({@link useCouplingCaveats} returns
+                all matches, not just the first). */}
+            {caveats.map((caveat) => (
+              <p key={caveat.text} className="text-muted-foreground text-xs">
+                {caveat.text}
+              </p>
+            ))}
+          </>
+        ) : (
+          <>
+            <p className="font-medium text-sm">Incognito is off for this chat</p>
+            <Button type="button" variant="secondary" size="sm" onClick={() => setChat(true)}>
+              Turn Incognito on for this chat
+            </Button>
+            {caveats.map((caveat) => (
+              <p key={caveat.text} className="text-muted-foreground text-xs">
+                {caveat.text}
+              </p>
+            ))}
+          </>
+        )}
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -1215,7 +1298,14 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
       <div className="flex shrink-0 items-center justify-between gap-2 border-border border-b p-2">
         <div className="flex min-w-0 items-center gap-2">
           <ConversationHeaderIdentity accountId={accountId} />
-          <ConversationIncognitoChip accountId={accountId} roomId={selectedRoomId} />
+          <ConversationIncognitoChip
+            // Key by roomId so a room switch remounts the chip: it can never leave a
+            // Popover bound (open) to the previously selected chat.
+            key={selectedRoomId ?? ""}
+            accountId={accountId}
+            roomId={selectedRoomId}
+            networkId={selectedNetworkId}
+          />
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {accountId !== null && selectedRoomId !== null && (
