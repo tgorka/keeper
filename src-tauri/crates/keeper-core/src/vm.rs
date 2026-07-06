@@ -1788,6 +1788,110 @@ pub enum BridgeLoginInput {
     },
 }
 
+/// The phase of a `bbctl` self-hosted-bridge run (Story 6.7, FR-29).
+///
+/// A log-free projection of the `bbctl register`/`run` progression, rendered as a
+/// distinct stepper state. The frontend switches on this phase; only recognized
+/// prose markers ever produce a phase (unrecognized `bbctl` output is dropped —
+/// there is no path from a raw log line to the UI). `run` is launch-and-leave: on
+/// the started marker the run resolves at [`BbctlPhase::Success`] leaving the
+/// daemon alive and unsupervised (v1.x — no restart policy, no log viewer).
+/// Serializes to its camelCase name — the frontend wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum BbctlPhase {
+    /// keeper is checking whether the `bbctl` sidecar is available.
+    Checking,
+    /// `bbctl register` is running (registering the self-hosted bridge appservice).
+    Registering,
+    /// `bbctl run` is starting the bridge daemon.
+    Starting,
+    /// The bridge daemon is coming up (post-start, pre-ready markers).
+    Running,
+    /// The bridge started successfully — it now surfaces through the existing
+    /// discovery + health machinery. Terminal.
+    Success,
+    /// The run failed. `error` carries `bbctl`'s own message verbatim (or keeper's
+    /// honest reason for an absent sidecar / non-Beeper gate). Terminal but
+    /// retriable — the stepper offers Retry.
+    Failure,
+}
+
+/// The `bbctl` self-host capability for the "Run your own bridge" surface (Story
+/// 6.7, FR-29).
+///
+/// A one-shot projection of the embedded `bbctl.json` plus the live sidecar
+/// availability probe: whether the `bbctl` binary can be resolved (`available`), the
+/// guided-install instructions to render when it cannot, and the self-hostable
+/// networks offered in the picker. Carries **only** non-secret static data — no
+/// token, session, or process material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BbctlAvailabilityVm {
+    /// Whether the `bbctl` sidecar resolved on this host/build. `false` renders the
+    /// guided-install branch and everything else in keeper keeps working.
+    pub available: bool,
+    /// The guided-install instructions (rendered when `available` is `false`).
+    pub install: BbctlInstallVm,
+    /// The self-hostable networks offered in the run picker (supported only).
+    pub networks: Vec<BbctlNetworkVm>,
+}
+
+/// The guided-install block of the bbctl availability VM (Story 6.7): ordered human
+/// `steps` and a `docs_url` to the Beeper self-host documentation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BbctlInstallVm {
+    /// The ordered install steps (rendered as a numbered list — may repeat prose,
+    /// so the frontend keys them by index).
+    pub steps: Vec<String>,
+    /// The Beeper self-host docs URL.
+    pub docs_url: String,
+}
+
+/// One self-hostable network offered in the run-your-own-bridge picker (Story 6.7).
+///
+/// A non-secret projection of a supported `bbctl.json` network: the keeper
+/// `network_id` (joined to the 6.1 catalog for glyph/badge), a display `name`, and
+/// the `bbctl_name` the run uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BbctlNetworkVm {
+    /// The keeper network id (e.g. `"signal"`).
+    pub network_id: String,
+    /// The network's display name (e.g. `"Signal"`), joined from the 6.1 catalog.
+    pub name: String,
+    /// The name `bbctl` uses for this self-hosted bridge (e.g. `"sh-signal"`).
+    pub bbctl_name: String,
+}
+
+/// A snapshot of a `bbctl` self-hosted-bridge run, streamed over the run `Channel`
+/// (Story 6.7, FR-29, NFR secret containment).
+///
+/// The single view model the webview renders for the whole run: the `network_id`
+/// being run, the current [`BbctlPhase`], an optional per-phase `message`, and the
+/// verbatim `error` (failure phase). Carries **only** non-secret render data — the
+/// account's Beeper token is never read into a VM, and no raw `bbctl` log line
+/// reaches the UI (only recognized phase markers project a snapshot).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BbctlProgressVm {
+    /// The stable network id being run (e.g. `"signal"`).
+    pub network_id: String,
+    /// The current run phase.
+    pub phase: BbctlPhase,
+    /// An optional per-phase message line, or `null`.
+    pub message: Option<String>,
+    /// `bbctl`'s verbatim error message (capped, non-secret), present in the
+    /// `Failure` phase, else `null`.
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2813,6 +2917,75 @@ mod tests {
         assert!(json.contains("\"kind\":\"fields\""), "json was: {json}");
         let back: BridgeLoginInput = serde_json::from_str(&json).expect("deserialize input");
         assert_eq!(back, fields);
+    }
+
+    #[test]
+    fn bbctl_phase_serializes_camel_case_and_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&BbctlPhase::Checking).expect("serialize"),
+            "\"checking\""
+        );
+        for phase in [
+            BbctlPhase::Checking,
+            BbctlPhase::Registering,
+            BbctlPhase::Starting,
+            BbctlPhase::Running,
+            BbctlPhase::Success,
+            BbctlPhase::Failure,
+        ] {
+            let json = serde_json::to_string(&phase).expect("serialize phase");
+            let back: BbctlPhase = serde_json::from_str(&json).expect("deserialize phase");
+            assert_eq!(back, phase);
+        }
+    }
+
+    #[test]
+    fn bbctl_availability_vm_round_trips_camel_case() {
+        let vm = BbctlAvailabilityVm {
+            available: false,
+            install: BbctlInstallVm {
+                steps: vec!["install bbctl".to_owned(), "run bbctl login".to_owned()],
+                docs_url: "https://example.org/docs".to_owned(),
+            },
+            networks: vec![BbctlNetworkVm {
+                network_id: "signal".to_owned(),
+                name: "Signal".to_owned(),
+                bbctl_name: "sh-signal".to_owned(),
+            }],
+        };
+        let json = serde_json::to_string(&vm).expect("serialize availability vm");
+        assert!(json.contains("\"docsUrl\":"), "json was: {json}");
+        assert!(
+            json.contains("\"bbctlName\":\"sh-signal\""),
+            "json was: {json}"
+        );
+        let back: BbctlAvailabilityVm =
+            serde_json::from_str(&json).expect("deserialize availability vm");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn bbctl_progress_vm_round_trips_and_leaks_no_token() {
+        let vm = BbctlProgressVm {
+            network_id: "signal".to_owned(),
+            phase: BbctlPhase::Failure,
+            message: None,
+            error: Some("bbctl: could not reach the appservice".to_owned()),
+        };
+        let json = serde_json::to_string(&vm).expect("serialize progress vm");
+        assert!(
+            json.contains("\"networkId\":\"signal\""),
+            "json was: {json}"
+        );
+        // No token / bearer / session material is ever carried on the VM.
+        assert!(
+            !json.to_lowercase().contains("token")
+                && !json.to_lowercase().contains("bearer")
+                && !json.to_lowercase().contains("access_token"),
+            "progress VM must carry no token material: {json}"
+        );
+        let back: BbctlProgressVm = serde_json::from_str(&json).expect("deserialize progress vm");
+        assert_eq!(back, vm);
     }
 
     #[test]

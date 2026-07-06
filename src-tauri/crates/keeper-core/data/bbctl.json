@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "install": {
+    "docsUrl": "https://github.com/beeper/bridge-manager#installation",
+    "steps": [
+      "Install bbctl from the Beeper bridge-manager releases (or `brew install beeper/bridge-manager/bbctl`).",
+      "Run `bbctl login` once in a terminal and sign in with your Beeper account.",
+      "Restart keeper so it can find bbctl next to the app, then come back here to run a self-hosted bridge."
+    ]
+  },
+  "networks": [
+    { "networkId": "signal", "bbctlName": "sh-signal", "supported": true },
+    { "networkId": "whatsapp", "bbctlName": "sh-whatsapp", "supported": true },
+    { "networkId": "telegram", "bbctlName": "sh-telegram", "supported": true },
+    { "networkId": "discord", "bbctlName": "sh-discord", "supported": true },
+    { "networkId": "slack", "bbctlName": "sh-slack", "supported": false },
+    { "networkId": "imessage", "bbctlName": "sh-imessage", "supported": false }
+  ]
+}

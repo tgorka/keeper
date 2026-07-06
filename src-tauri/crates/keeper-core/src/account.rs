@@ -1335,6 +1335,90 @@ impl AccountManager {
         Ok(crate::bridges::discover(&client).await?)
     }
 
+    /// Project the `bbctl` self-host capability for the "Run your own bridge" surface
+    /// (Story 6.7, FR-29). A pure map over the embedded `bbctl.json` (guided-install
+    /// steps + the supported self-hostable networks, catalog-joined for display name)
+    /// plus the live `runner.is_available()` probe. No I/O beyond the availability
+    /// probe; carries only non-secret static data. A malformed embedded data file
+    /// funnels through [`BridgeError`].
+    pub fn bbctl_availability<R: crate::bridges::bbctl::BbctlRunner>(
+        &self,
+        runner: &R,
+    ) -> Result<crate::vm::BbctlAvailabilityVm, CoreError> {
+        let doc = crate::bridges::data::bbctl_doc()?;
+        let catalog = crate::bridges::catalog().unwrap_or_default();
+        let name_for = |network_id: &str| -> String {
+            catalog
+                .iter()
+                .find(|n| n.network_id == network_id)
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| network_id.to_owned())
+        };
+        let networks = doc
+            .networks()
+            .into_iter()
+            .map(|n| crate::vm::BbctlNetworkVm {
+                network_id: n.network_id.clone(),
+                name: name_for(&n.network_id),
+                bbctl_name: n.bbctl_name.clone(),
+            })
+            .collect();
+        Ok(crate::vm::BbctlAvailabilityVm {
+            available: runner.is_available(),
+            install: crate::vm::BbctlInstallVm {
+                steps: doc.install.steps.clone(),
+                docs_url: doc.install.docs_url.clone(),
+            },
+            networks,
+        })
+    }
+
+    /// Gate a `bbctl` self-hosted-bridge run and resolve the target network (Story
+    /// 6.7, FR-29, AD-16) — defense in depth for the frontend's Beeper-only gate.
+    ///
+    /// Reads the account's **durable, non-secret** [`Provider`](crate::vm::Provider)
+    /// from the registry (never a token) via `platform`; a non-Beeper account is
+    /// refused with an honest [`BridgeError::Bbctl`]. Then support-gates `network_id`
+    /// against the embedded `bbctl.json` supported set. On success returns the
+    /// resolved [`BbctlNetwork`](crate::bridges::data::BbctlNetwork) — the IPC command
+    /// owns the actual `run_self_hosted` spawn (so the streaming task is `'static` and
+    /// cancelable), and this gate always runs before any spawn.
+    pub fn bbctl_run_start(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        network_id: &str,
+    ) -> Result<crate::bridges::data::BbctlNetwork, CoreError> {
+        let data_dir = platform.data_dir()?;
+        let row = registry::get_account(&data_dir, account_id)?.ok_or_else(|| {
+            BridgeError::Bbctl(
+                "Running your own bridge is available for Beeper accounts only".to_owned(),
+            )
+        })?;
+        let is_beeper = row
+            .provider
+            .as_deref()
+            .and_then(crate::vm::Provider::from_registry_str)
+            == Some(crate::vm::Provider::Beeper);
+        if !is_beeper {
+            return Err(BridgeError::Bbctl(
+                "Running your own bridge is available for Beeper accounts only".to_owned(),
+            )
+            .into());
+        }
+
+        let doc = crate::bridges::data::bbctl_doc()?;
+        let network = doc
+            .support_for(network_id)
+            .filter(|n| n.supported)
+            .ok_or_else(|| {
+                BridgeError::Bbctl(format!(
+                    "{network_id} can't be self-hosted from keeper right now"
+                ))
+            })?;
+        Ok(network)
+    }
+
     /// Subscribe to live bridge-session health across every active account (Story 6.5,
     /// FR-28, NFR-6, AD-16). Bootstraps the monitored (logged-in) sessions from each
     /// live account's discovery pass, spawns a per-account [`HealthMonitor`] (mgmt-room

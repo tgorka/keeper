@@ -12,6 +12,11 @@ import type { IpcError } from "./gen/IpcError";
 export type { AccountVm } from "./gen/AccountVm";
 export type { BackupStatus } from "./gen/BackupStatus";
 export type { BadgeStyle } from "./gen/BadgeStyle";
+export type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
+export type { BbctlInstallVm } from "./gen/BbctlInstallVm";
+export type { BbctlNetworkVm } from "./gen/BbctlNetworkVm";
+export type { BbctlPhase } from "./gen/BbctlPhase";
+export type { BbctlProgressVm } from "./gen/BbctlProgressVm";
 export type { BridgeDiscoveryVm } from "./gen/BridgeDiscoveryVm";
 export type { BridgeHealth } from "./gen/BridgeHealth";
 export type { BridgeHealthSnapshot } from "./gen/BridgeHealthSnapshot";
@@ -72,6 +77,8 @@ export type { VerificationPhase } from "./gen/VerificationPhase";
 
 import type { AccountVm } from "./gen/AccountVm";
 import type { BackupStatus } from "./gen/BackupStatus";
+import type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
+import type { BbctlProgressVm } from "./gen/BbctlProgressVm";
 import type { BridgeDiscoveryVm } from "./gen/BridgeDiscoveryVm";
 import type { BridgeHealthSnapshot } from "./gen/BridgeHealthSnapshot";
 import type { BridgeLoginInput } from "./gen/BridgeLoginInput";
@@ -218,6 +225,52 @@ export async function cancelBridgeLogin(accountId: string, sessionId: number): P
  */
 export async function bridgeBotRoom(accountId: string, networkId: string): Promise<string> {
   return await invoke<string>("bridge_bot_room", { accountId, networkId });
+}
+
+/**
+ * Fetch the `bbctl` self-host capability for the "Run your own bridge" surface
+ * (FR-29, Story 6.7). A one-shot read of the embedded `bbctl.json` (guided-install
+ * steps + the supported self-hostable networks) plus the live sidecar availability
+ * probe, projected into a {@link BbctlAvailabilityVm}. `available: false` renders the
+ * guided-install branch and everything else in keeper keeps working. Rejects with the
+ * {@link IpcError} envelope (`code: "internal"`) only if the embedded data fails to
+ * parse/validate. No token or process material crosses IPC.
+ */
+export async function bbctlAvailability(): Promise<BbctlAvailabilityVm> {
+  return await invoke<BbctlAvailabilityVm>("bbctl_availability");
+}
+
+/**
+ * Start a `bbctl` self-hosted-bridge run for `networkId` (FR-29, AD-16, Story 6.7).
+ * Opens a streaming subscription: the Rust core gates the account (Beeper-only, read
+ * from the durable registry `provider` — never a token) and the network, then drives
+ * `bbctl register`/`run` as a launch-on-demand sidecar and forwards each
+ * {@link BbctlProgressVm} snapshot (checking → registering → starting → running →
+ * success/failure) to `onState`. Resolves with the `sessionId` used to
+ * {@link bbctlRunCancel}. Rejects with the {@link IpcError} envelope: a non-Beeper
+ * gate / unsupported network / absent sidecar → `syncUnavailable` (retriable). Only
+ * rendered VM state crosses IPC — never the token or a raw `bbctl` log line.
+ */
+export async function bbctlRunStart(
+  accountId: string,
+  networkId: string,
+  onState: (vm: BbctlProgressVm) => void,
+): Promise<number> {
+  return await subscribe<BbctlProgressVm>("bbctl_run_start", onState, {
+    accountId,
+    networkId,
+  });
+}
+
+/**
+ * Cancel a running `bbctl` self-hosted-bridge run (Story 6.7) — the user closed the
+ * run Sheet. Aborts keeper's streaming driver task and removes it from the runs
+ * registry. Idempotent — cancelling an unknown session is a no-op. (The launched
+ * `bbctl run` daemon is launch-and-leave, so this tears down only keeper's streaming
+ * task, not the already-detached bridge process — supervision is out of scope, v1.x.)
+ */
+export async function bbctlRunCancel(sessionId: number): Promise<void> {
+  await invoke<void>("bbctl_run_cancel", { sessionId });
 }
 
 /**

@@ -393,6 +393,18 @@ pub enum BridgeError {
     /// [`BridgeError::Provisioning`].
     #[error("bridge login failed: {0}")]
     Bot(String),
+
+    /// A `bbctl` self-hosted-bridge run (Story 6.7, FR-29) failed or was refused:
+    /// the surface was invoked for a non-Beeper account, the requested network is
+    /// not self-hostable, the `bbctl` sidecar could not be resolved (the guided
+    /// install path), or the `bbctl register`/`run` process errored / exited
+    /// non-zero. The wrapped string is a non-secret description — `bbctl`'s own
+    /// output rendered verbatim (length-capped, like the provisioning/bot caps),
+    /// never the account's Beeper token or any session/cookie material. Retriable —
+    /// the user can retry the run. Maps to `IpcErrorCode::SyncUnavailable`,
+    /// mirroring [`BridgeError::Provisioning`]/[`BridgeError::Bot`].
+    #[error("bbctl run failed: {0}")]
+    Bbctl(String),
 }
 
 /// The hexagon error root. Every fallible core operation surfaces one of these.

@@ -9,6 +9,7 @@
 //! stories (6.2 discovery, 6.5 health) layer live status on top of this static
 //! projection. No risk/badge/ack copy is hardcoded outside the data file.
 
+pub mod bbctl;
 pub mod data;
 pub mod discovery;
 pub mod health;

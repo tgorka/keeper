@@ -13,6 +13,7 @@
  * Matrix I/O directly — the Rust core owns discovery (real login is Story 6.3, live
  * health Story 6.5).
  */
+import { BbctlPanel } from "@/components/bridges/bbctl-panel";
 import { BridgeCard } from "@/components/bridges/bridge-card";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -76,6 +77,7 @@ interface AccountBridgesProps {
  */
 function AccountBridges({ account, catalog }: AccountBridgesProps) {
   const { discovery, loading, error, retriable, retry } = useBridgeDiscovery(account.accountId);
+  const isBeeper = account.provider === "beeper";
 
   return (
     <div className="flex flex-col gap-3">
@@ -127,6 +129,11 @@ function AccountBridges({ account, catalog }: AccountBridgesProps) {
           })}
         </div>
       )}
+
+      {/* Beeper-only: run your own bridge via bbctl (Story 6.7). Non-Beeper accounts
+          never render this section; the backend gate is defense-in-depth. On a
+          successful run we re-run discovery so the new bridge card appears. */}
+      {isBeeper && <BbctlPanel accountId={account.accountId} onBridgeAdded={retry} />}
     </div>
   );
 }

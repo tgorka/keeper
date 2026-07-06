@@ -33,6 +33,8 @@ const BOT_COMMANDS_VERSION: u32 = 1;
 const HEALTH_SIGNALS_VERSION: u32 = 1;
 /// The schema `version` for `resolve-support.json`.
 const RESOLVE_SUPPORT_VERSION: u32 = 1;
+/// The schema `version` for `bbctl.json`.
+const BBCTL_VERSION: u32 = 1;
 
 /// The raw `risk-tiers.json` document.
 #[derive(Debug, Deserialize)]
@@ -288,6 +290,53 @@ pub struct ResolveSupport {
     pub placeholder: String,
 }
 
+/// The raw `bbctl.json` document (consumed by Story 6.7's run-your-own-bridge surface).
+///
+/// The data-driven `bbctl` self-host capability: a versioned document carrying the
+/// guided-`install` steps + docs URL (rendered when the `bbctl` sidecar can't be
+/// resolved) and the `networks` that can be self-hosted (each mapping a keeper
+/// `networkId` to its `bbctlName` and whether it is `supported`). A network absent
+/// from the supported set is never offered. Capability knowledge lives in versioned
+/// data (never hardcoded in Rust or TS), so tuning the supported set or the install
+/// copy needs no code change — loaded/validated/cached exactly like the other data
+/// files.
+#[derive(Debug, Deserialize)]
+pub struct BbctlDoc {
+    /// The data-file schema version (`1`); checked by [`validate_bbctl`].
+    pub version: u32,
+    /// The guided-install instructions rendered when the sidecar is absent.
+    pub install: BbctlInstall,
+    /// The self-hostable networks (each mapping a keeper network id to its
+    /// `bbctl` name + supported flag).
+    pub networks: Vec<BbctlNetwork>,
+}
+
+/// The guided-install block of `bbctl.json`: ordered human `steps` and a `docsUrl`
+/// pointing at the Beeper self-host documentation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BbctlInstall {
+    /// The ordered install steps (at least one; may repeat prose).
+    pub steps: Vec<String>,
+    /// The Beeper self-host docs URL.
+    pub docs_url: String,
+}
+
+/// One self-hostable network row in `bbctl.json`: the keeper `networkId`, its
+/// `bbctlName` (the name `bbctl register`/`run` uses), and whether keeper offers
+/// running it (`supported`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BbctlNetwork {
+    /// The keeper network id (e.g. `"signal"`), joined to the 6.1 catalog for
+    /// display name/glyph.
+    pub network_id: String,
+    /// The name `bbctl` uses for this self-hosted bridge (e.g. `"sh-signal"`).
+    pub bbctl_name: String,
+    /// Whether keeper offers running this network as a self-hosted bridge.
+    pub supported: bool,
+}
+
 /// The compiled-in `risk-tiers.json` bytes.
 const RISK_TIERS_JSON: &str = include_str!("../../data/risk-tiers.json");
 /// The compiled-in `coupling-caveats.json` bytes.
@@ -302,6 +351,8 @@ const BOT_COMMANDS_JSON: &str = include_str!("../../data/bot-commands.json");
 const HEALTH_SIGNALS_JSON: &str = include_str!("../../data/health-signals.json");
 /// The compiled-in `resolve-support.json` bytes.
 const RESOLVE_SUPPORT_JSON: &str = include_str!("../../data/resolve-support.json");
+/// The compiled-in `bbctl.json` bytes.
+const BBCTL_JSON: &str = include_str!("../../data/bbctl.json");
 
 /// Process-wide cache for the parsed-and-validated risk tiers.
 static RISK_TIERS: OnceLock<Result<RiskTiersDoc, BridgeError>> = OnceLock::new();
@@ -317,6 +368,8 @@ static BOT_COMMANDS: OnceLock<Result<BotCommandsDoc, BridgeError>> = OnceLock::n
 static HEALTH_SIGNALS: OnceLock<Result<HealthSignalsDoc, BridgeError>> = OnceLock::new();
 /// Process-wide cache for the parsed-and-validated resolve-support capability.
 static RESOLVE_SUPPORT: OnceLock<Result<ResolveSupportDoc, BridgeError>> = OnceLock::new();
+/// Process-wide cache for the parsed-and-validated bbctl self-host capability.
+static BBCTL: OnceLock<Result<BbctlDoc, BridgeError>> = OnceLock::new();
 
 /// Convert a cached `&Result<T, BridgeError>` into a `Result<&T, BridgeError>` so
 /// callers get the shared parsed doc on success and a cloned error on failure.
@@ -400,6 +453,74 @@ pub fn resolve_support() -> Result<&'static ResolveSupportDoc, BridgeError> {
         Ok(doc)
     });
     as_ref_result(cached)
+}
+
+/// Parse + validate the bbctl self-host capability once and return the cached doc.
+pub fn bbctl_doc() -> Result<&'static BbctlDoc, BridgeError> {
+    let cached = BBCTL.get_or_init(|| {
+        let doc: BbctlDoc = serde_json::from_str(BBCTL_JSON)
+            .map_err(|e| BridgeError::Data(format!("bbctl.json failed to parse: {e}")))?;
+        validate_bbctl(&doc)?;
+        Ok(doc)
+    });
+    as_ref_result(cached)
+}
+
+impl BbctlDoc {
+    /// The [`BbctlNetwork`] for `network_id` if it is a known self-hostable network,
+    /// else `None` (a network absent from the set is never offered). Returns a clone
+    /// so the caller owns a `Send` value.
+    pub fn support_for(&self, network_id: &str) -> Option<BbctlNetwork> {
+        self.networks
+            .iter()
+            .find(|n| n.network_id == network_id)
+            .cloned()
+    }
+
+    /// The self-hostable networks marked `supported`, in file order. A network absent
+    /// from this set is not offered in the run-your-own-bridge picker.
+    pub fn networks(&self) -> Vec<&BbctlNetwork> {
+        self.networks.iter().filter(|n| n.supported).collect()
+    }
+}
+
+/// Validate the bbctl self-host capability: the schema version must match, the
+/// install block must carry at least one non-empty step and a non-empty docs URL,
+/// and every network must name a non-empty keeper `networkId` + `bbctlName` with no
+/// duplicate `networkId` (a duplicate would make [`BbctlDoc::support_for`]
+/// order-dependent).
+fn validate_bbctl(doc: &BbctlDoc) -> Result<(), BridgeError> {
+    if doc.version != BBCTL_VERSION {
+        return Err(BridgeError::Data(format!(
+            "bbctl.json unsupported version {} (expected {BBCTL_VERSION})",
+            doc.version
+        )));
+    }
+    if doc.install.docs_url.trim().is_empty() {
+        return Err(BridgeError::Data(
+            "bbctl.json install has an empty docsUrl".to_owned(),
+        ));
+    }
+    if doc.install.steps.is_empty() || doc.install.steps.iter().any(|s| s.trim().is_empty()) {
+        return Err(BridgeError::Data(
+            "bbctl.json install has no valid steps".to_owned(),
+        ));
+    }
+    let mut network_ids: HashSet<&str> = HashSet::new();
+    for network in &doc.networks {
+        if network.network_id.trim().is_empty() || network.bbctl_name.trim().is_empty() {
+            return Err(BridgeError::Data(
+                "bbctl.json has a network with an empty networkId/bbctlName".to_owned(),
+            ));
+        }
+        if !network_ids.insert(network.network_id.as_str()) {
+            return Err(BridgeError::Data(format!(
+                "bbctl.json has a duplicate networkId {:?}",
+                network.network_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl ResolveSupportDoc {
@@ -766,6 +887,123 @@ mod tests {
         bot_commands().expect("bot commands parse");
         health_signals().expect("health signals parse");
         resolve_support().expect("resolve support parse");
+        bbctl_doc().expect("bbctl parse");
+    }
+
+    fn bbctl_network(id: &str, supported: bool) -> BbctlNetwork {
+        BbctlNetwork {
+            network_id: id.to_owned(),
+            bbctl_name: format!("sh-{id}"),
+            supported,
+        }
+    }
+
+    fn bbctl_install() -> BbctlInstall {
+        BbctlInstall {
+            steps: vec!["install bbctl".to_owned()],
+            docs_url: "https://example.org/docs".to_owned(),
+        }
+    }
+
+    #[test]
+    fn bbctl_doc_has_supported_and_unsupported_networks() {
+        let doc = bbctl_doc().expect("bbctl parse");
+        assert!(
+            !doc.networks().is_empty(),
+            "at least one supported self-host network must be declared"
+        );
+        assert!(
+            doc.networks.iter().any(|n| !n.supported),
+            "at least one network must be marked unsupported"
+        );
+    }
+
+    #[test]
+    fn bbctl_support_for_returns_only_known_networks() {
+        let doc = bbctl_doc().expect("bbctl parse");
+        assert!(
+            doc.support_for("no-such-network").is_none(),
+            "an unknown network must not resolve"
+        );
+        // Every declared network resolves to itself.
+        for network in &doc.networks {
+            let resolved = doc
+                .support_for(&network.network_id)
+                .expect("declared network resolves");
+            assert_eq!(resolved.bbctl_name, network.bbctl_name);
+        }
+    }
+
+    #[test]
+    fn bbctl_networks_excludes_unsupported() {
+        let doc = bbctl_doc().expect("bbctl parse");
+        assert!(
+            doc.networks().iter().all(|n| n.supported),
+            "networks() must only include supported entries"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_bbctl_version() {
+        let doc = BbctlDoc {
+            version: BBCTL_VERSION + 1,
+            install: bbctl_install(),
+            networks: vec![bbctl_network("signal", true)],
+        };
+        assert!(err_msg(validate_bbctl(&doc)).contains("unsupported version"));
+    }
+
+    #[test]
+    fn rejects_bbctl_empty_docs_url() {
+        let doc = BbctlDoc {
+            version: BBCTL_VERSION,
+            install: BbctlInstall {
+                docs_url: "   ".to_owned(),
+                ..bbctl_install()
+            },
+            networks: vec![bbctl_network("signal", true)],
+        };
+        assert!(err_msg(validate_bbctl(&doc)).contains("empty docsUrl"));
+    }
+
+    #[test]
+    fn rejects_bbctl_empty_steps() {
+        let doc = BbctlDoc {
+            version: BBCTL_VERSION,
+            install: BbctlInstall {
+                steps: vec![],
+                ..bbctl_install()
+            },
+            networks: vec![bbctl_network("signal", true)],
+        };
+        assert!(err_msg(validate_bbctl(&doc)).contains("no valid steps"));
+    }
+
+    #[test]
+    fn rejects_bbctl_network_with_empty_field() {
+        let doc = BbctlDoc {
+            version: BBCTL_VERSION,
+            install: bbctl_install(),
+            networks: vec![BbctlNetwork {
+                network_id: "signal".to_owned(),
+                bbctl_name: "  ".to_owned(),
+                supported: true,
+            }],
+        };
+        assert!(err_msg(validate_bbctl(&doc)).contains("empty networkId/bbctlName"));
+    }
+
+    #[test]
+    fn rejects_duplicate_bbctl_network_id() {
+        let doc = BbctlDoc {
+            version: BBCTL_VERSION,
+            install: bbctl_install(),
+            networks: vec![
+                bbctl_network("signal", true),
+                bbctl_network("signal", false),
+            ],
+        };
+        assert!(err_msg(validate_bbctl(&doc)).contains("duplicate networkId"));
     }
 
     fn resolve_capability() -> ResolveSupport {

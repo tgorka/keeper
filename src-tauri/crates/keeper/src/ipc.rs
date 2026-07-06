@@ -22,12 +22,12 @@ use keeper_core::error::{
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
-    AccountVm, BackupStatus, BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput,
-    BridgeLoginVm, BridgeNetworkVm, ConnectionStatusBatch, DemoBatch, EditVersionVm,
-    EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IpcError,
-    IpcErrorCode, NetworksSnapshot, NewChatResolutionVm, PaginationStatusBatch, PingVm,
-    ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch,
-    TypingBatch, VerificationFlowVm,
+    AccountVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm, BridgeDiscoveryVm,
+    BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm, ConnectionStatusBatch,
+    DemoBatch, EditVersionVm, EncryptionStatusBatch, ExportPhase, ExportProgressVm,
+    ExportRequestVm, InboxBatch, IpcError, IpcErrorCode, NetworksSnapshot, NewChatResolutionVm,
+    PaginationStatusBatch, PingVm, ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm,
+    SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -57,6 +57,102 @@ pub struct AppState {
     /// spawning the blocking job, `export_cancel` sets it, and the job deregisters
     /// itself on any terminal phase. The `AtomicU64` mints monotonic ids.
     pub exports: Arc<ExportRegistry>,
+    /// Live `bbctl` self-hosted-bridge runs (Story 6.7). Maps each `sessionId` to
+    /// its driver-task abort handle, keyed also by `(accountId, networkId)` so a
+    /// second run for the same target replaces the first rather than spawning a
+    /// second unsupervised `bbctl run` daemon. `bbctl_run_start` reserves the target,
+    /// spawns, and registers the handle atomically under one lock (so a fast-terminating
+    /// task can never leave a resident handle); `bbctl_run_cancel` aborts and removes.
+    pub bbctl_runs: Arc<BbctlRunRegistry>,
+}
+
+/// The two registry maps, held under a single lock so target-reservation and
+/// handle-insertion are one indivisible step (see [`BbctlRunRegistry::start`]).
+#[derive(Default)]
+struct BbctlRunInner {
+    /// `sessionId → driver-task abort handle`.
+    tasks: HashMap<u64, tokio::task::AbortHandle>,
+    /// `(accountId, networkId) → sessionId` for in-flight dedupe.
+    by_target: HashMap<(String, String), u64>,
+}
+
+/// The `bbctl` run registry (Story 6.7). Each in-flight run owns an entry keyed by
+/// its `sessionId`, plus a `(accountId, networkId) → sessionId` index used to dedupe
+/// an already-in-flight run for the same target. The `AtomicU64` mints monotonic
+/// session ids.
+#[derive(Default)]
+pub struct BbctlRunRegistry {
+    /// Monotonic session-id source.
+    next_id: AtomicU64,
+    /// Both maps under **one** lock so [`Self::start`] reserves the target, aborts any
+    /// prior run for it, spawns, and inserts the new handle atomically.
+    inner: Mutex<BbctlRunInner>,
+}
+
+impl BbctlRunRegistry {
+    /// Mint a fresh session id (does not register anything — [`Self::start`] does).
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Reserve the `(accountId, networkId)` target for `session_id`, abort any run
+    /// already in flight for it, invoke `spawn` (which spawns the driver task and
+    /// returns its abort handle), and register that handle — **all under one lock**.
+    ///
+    /// Holding the lock across reserve + spawn + insert makes those three steps
+    /// indivisible, closing two races the earlier reserve-then-spawn-then-insert
+    /// shape left open: (a) a racing second start for the same target always observes
+    /// this run's handle in `tasks` and aborts it (true dedupe — never two daemons),
+    /// and (b) a fast-terminating driver can never run [`Self::finish`] before its
+    /// handle is inserted (no resident stale handle leaks). `spawn` must only
+    /// `tokio::spawn` and return the handle — it must not block or await.
+    fn start(
+        &self,
+        account_id: &str,
+        network_id: &str,
+        session_id: u64,
+        spawn: impl FnOnce() -> tokio::task::AbortHandle,
+    ) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let key = (account_id.to_owned(), network_id.to_owned());
+        // Abort any prior in-flight run for the same target (replace, never a second
+        // unsupervised daemon).
+        if let Some(prior_id) = inner.by_target.insert(key, session_id) {
+            if let Some(handle) = inner.tasks.remove(&prior_id) {
+                handle.abort();
+            }
+        }
+        let handle = spawn();
+        inner.tasks.insert(session_id, handle);
+    }
+
+    /// Deregister a run on natural completion (drops its handle + target index).
+    /// Idempotent — a mismatched/unknown id is a no-op.
+    fn finish(&self, account_id: &str, network_id: &str, session_id: u64) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.tasks.remove(&session_id);
+        let key = (account_id.to_owned(), network_id.to_owned());
+        // Only clear the index if it still points at THIS session (a newer run for
+        // the same target may have replaced it).
+        if inner.by_target.get(&key) == Some(&session_id) {
+            inner.by_target.remove(&key);
+        }
+    }
+
+    /// Cancel a run by `sessionId`: abort its driver task and remove it. Idempotent.
+    fn cancel(&self, session_id: u64) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if let Some(handle) = inner.tasks.remove(&session_id) {
+            handle.abort();
+        }
+        inner.by_target.retain(|_, id| *id != session_id);
+    }
 }
 
 /// The archive-export cancel-flag registry (Story 5.5). Each running job owns an
@@ -122,6 +218,7 @@ impl AppState {
             oauth_flows: Arc::new(OAuthFlowRegistry::new()),
             beeper_flows: Arc::new(BeeperFlowRegistry::new()),
             exports: Arc::new(ExportRegistry::default()),
+            bbctl_runs: Arc::new(BbctlRunRegistry::default()),
         }
     }
 }
@@ -195,10 +292,180 @@ impl Platform for DesktopPlatform {
         ))
     }
 
-    fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
-        Err(CoreError::Unsupported(
-            "sidecar_path not wired until a later story".to_owned(),
-        ))
+    fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError> {
+        // Tauri lays per-arch sidecars next to the running executable, suffixed with
+        // the target triple (e.g. `bbctl-aarch64-apple-darwin`). Resolve there via
+        // `current_exe()` — `DesktopPlatform` is a unit struct with no `AppHandle`.
+        // In dev/CI (no bundled binary) the file is absent → an honest `Unsupported`,
+        // which is the guided-install path (Story 6.7, AC-2), never a panic.
+        let exe = std::env::current_exe().map_err(|e| {
+            CoreError::Unsupported(format!("could not resolve the running executable: {e}"))
+        })?;
+        let dir = exe.parent().ok_or_else(|| {
+            CoreError::Unsupported("running executable has no parent directory".to_owned())
+        })?;
+        let triple = tauri::utils::platform::target_triple()
+            .map_err(|e| CoreError::Unsupported(format!("could not resolve target triple: {e}")))?;
+        let mut candidate = dir.join(format!("{name}-{triple}"));
+        if cfg!(target_os = "windows") {
+            candidate.set_extension("exe");
+        }
+        if candidate.is_file() {
+            Ok(candidate)
+        } else {
+            Err(CoreError::Unsupported(format!(
+                "sidecar {name:?} not found next to the executable"
+            )))
+        }
+    }
+}
+
+/// The logical sidecar name for the Beeper `bbctl` CLI (Story 6.7). Resolved per-arch
+/// next to the executable via [`Platform::sidecar_path`].
+const BBCTL_SIDECAR_NAME: &str = "bbctl";
+
+/// The desktop [`BbctlRunner`] (Story 6.7, FR-29). `is_available` is simply whether
+/// the `bbctl` sidecar resolves; `run` spawns it via `tokio::process` on the resolved
+/// path — no `tauri-plugin-shell`, no `externalBin`, no new capability.
+///
+/// The runner **pipes AND reads BOTH stdout and stderr** (bbctl is a Go CLI that logs
+/// progress/markers to stderr), merging their lines through `on_line`. It honors an
+/// `on_line` `Stop` by ending the read promptly and returning
+/// [`BbctlRunExit::StoppedEarly`] — it does NOT `child.wait()` and does NOT kill the
+/// child (a `bbctl run` daemon keeps running, launch-and-leave). A single non-UTF-8
+/// line is skipped (NOT treated as clean EOF), and the reader keeps going.
+/// Aborts the wrapped task when dropped. Wraps the `bbctl` stdout/stderr reader
+/// tasks so they are torn down whenever the `run` future is dropped — including a
+/// `bbctl_run_cancel` that aborts the driver task mid-stream — leaving no reader
+/// task or pipe fd leaked. The launched `bbctl run` daemon itself is untouched
+/// (launch-and-leave); only keeper's readers stop.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+pub struct DesktopBbctlRunner {
+    platform: Arc<dyn Platform>,
+}
+
+impl DesktopBbctlRunner {
+    /// Construct a runner sharing the app's platform port (for sidecar resolution).
+    pub fn new(platform: Arc<dyn Platform>) -> Self {
+        Self { platform }
+    }
+}
+
+impl keeper_core::bridges::bbctl::BbctlRunner for DesktopBbctlRunner {
+    fn is_available(&self) -> bool {
+        self.platform.sidecar_path(BBCTL_SIDECAR_NAME).is_ok()
+    }
+
+    async fn run(
+        &self,
+        args: Vec<String>,
+        mut on_line: Box<dyn FnMut(&str) -> keeper_core::bridges::bbctl::LineControl + Send>,
+    ) -> Result<keeper_core::bridges::bbctl::BbctlRunExit, BridgeError> {
+        use keeper_core::bridges::bbctl::{BbctlRunExit, LineControl};
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let path = self
+            .platform
+            .sidecar_path(BBCTL_SIDECAR_NAME)
+            .map_err(|e| BridgeError::Bbctl(format!("bbctl is unavailable: {e}")))?;
+
+        let mut child = tokio::process::Command::new(&path)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| BridgeError::Bbctl(format!("could not launch bbctl: {e}")))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| BridgeError::Bbctl("could not capture bbctl stdout".to_owned()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| BridgeError::Bbctl("could not capture bbctl stderr".to_owned()))?;
+
+        // Merge stdout + stderr lines onto one channel so a single `on_line` loop
+        // sees both streams in arrival order. Each reader task streams `Vec<u8>`
+        // lines (byte-level so a non-UTF-8 line is skipped, never a false EOF).
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let out_tx = tx.clone();
+        // Wrapped in `AbortOnDrop` so the readers are torn down whenever this `run`
+        // future is dropped (early stop OR a driver-cancel), never leaking.
+        let _out_reader = AbortOnDrop(tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if out_tx.send(buf.clone()).is_err() {
+                            break;
+                        }
+                    }
+                    // A read error ends this stream only — never treated as the
+                    // whole run's clean EOF.
+                    Err(_) => break,
+                }
+            }
+        }));
+        let _err_reader = AbortOnDrop(tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send(buf.clone()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }));
+
+        // Consume merged lines. A `Stop` resolves `StoppedEarly` immediately —
+        // WITHOUT `child.wait()` and WITHOUT killing the child (launch-and-leave).
+        let mut early_stop = false;
+        while let Some(raw) = rx.recv().await {
+            // Decode lossily; a non-UTF-8 line is not an EOF — we still get a line
+            // (replacement chars) and keep reading.
+            let line = String::from_utf8_lossy(&raw);
+            let trimmed = line.trim_end_matches(['\n', '\r']);
+            if trimmed.is_empty() {
+                continue;
+            }
+            if on_line(trimmed) == LineControl::Stop {
+                early_stop = true;
+                break;
+            }
+        }
+
+        if early_stop {
+            // Leave the child running; the reader tasks are aborted when their
+            // `AbortOnDrop` guards drop at scope exit. A `bbctl_run_cancel` that
+            // aborts the driver task mid-stream drops this whole future — and with
+            // it the guards — so the readers never leak either.
+            return Ok(BbctlRunExit::StoppedEarly);
+        }
+
+        // Both streams reached EOF (the process is exiting) — reap the status.
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| BridgeError::Bbctl(format!("bbctl did not exit cleanly: {e}")))?;
+        Ok(BbctlRunExit::Exited(status.code().unwrap_or(-1)))
     }
 }
 
@@ -330,6 +597,11 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         // Retriable, mirroring the provisioning arm: the login Sheet offers Retry and
         // the message is the bot's own verbatim text.
         CoreError::Bridge(BridgeError::Bot(_)) => (IpcErrorCode::SyncUnavailable, true),
+        // A bbctl self-hosted-bridge run failure or refusal (Story 6.7) — a
+        // non-Beeper gate, an unsupported network, an absent sidecar, or a bbctl
+        // process error. Retriable: the run Sheet offers Retry. The message is
+        // bbctl's own verbatim text (or keeper's honest gate/install reason).
+        CoreError::Bridge(BridgeError::Bbctl(_)) => (IpcErrorCode::SyncUnavailable, true),
     };
     IpcError {
         code,
@@ -488,6 +760,90 @@ pub async fn bridge_login_cancel(
         .accounts
         .cancel_bridge_login(&account_id, session_id)
         .await;
+    Ok(())
+}
+
+/// Return the `bbctl` self-host capability for the "Run your own bridge" surface
+/// (Story 6.7, FR-29). A one-shot read of the embedded `bbctl.json` (guided-install
+/// steps + the supported self-hostable networks) plus the live sidecar availability
+/// probe, projected into a [`BbctlAvailabilityVm`]. `available: false` renders the
+/// guided-install branch and everything else in keeper keeps working. No token,
+/// session, or process material crosses IPC. A malformed embedded data file funnels
+/// through [`to_ipc_error`] (`internal`).
+#[tauri::command]
+pub fn bbctl_availability(state: State<'_, AppState>) -> Result<BbctlAvailabilityVm, IpcError> {
+    let runner = DesktopBbctlRunner::new(state.platform.clone());
+    state
+        .accounts
+        .bbctl_availability(&runner)
+        .map_err(to_ipc_error)
+}
+
+/// Start a `bbctl` self-hosted-bridge run for `network_id` (Story 6.7, FR-29, AD-16).
+///
+/// Gates the request in the core FIRST (defense in depth): the account must be Beeper
+/// (read from the durable, non-secret registry `provider` — never a token) and the
+/// network must be self-hostable, else an honest [`BridgeError::Bbctl`] funnels
+/// through [`to_ipc_error`] before anything spawns. Then registers the run session in
+/// the runs registry **before** spawning the driver task (insert-then-spawn), dedupes
+/// an already-in-flight run for the same `(account, network)` (replacing it rather
+/// than spawning a second unsupervised daemon), and streams a [`BbctlProgressVm`]
+/// stepper (checking → registering → starting → running → success/failure) over
+/// `channel`, returning the `sessionId` used to cancel. Only rendered VM state
+/// crosses IPC — no token, no raw `bbctl` log line.
+#[tauri::command]
+pub async fn bbctl_run_start(
+    state: State<'_, AppState>,
+    account_id: String,
+    network_id: String,
+    channel: Channel<BbctlProgressVm>,
+) -> Result<u64, IpcError> {
+    // Gate + resolve the network in the core before any spawn.
+    let network = state
+        .accounts
+        .bbctl_run_start(&state.platform, &account_id, &network_id)
+        .map_err(to_ipc_error)?;
+
+    let runner = DesktopBbctlRunner::new(state.platform.clone());
+    let sink: keeper_core::bridges::bbctl::BbctlSink =
+        Box::new(move |vm: BbctlProgressVm| channel.send(vm).is_ok());
+
+    let registry = state.bbctl_runs.clone();
+    let session_id = registry.next_id();
+
+    let bbctl_name = network.bbctl_name.clone();
+    let network_owned = network_id.clone();
+    let account_owned = account_id.clone();
+    let reaper = registry.clone();
+    // Reserve the target (aborting any prior in-flight run for it), spawn the driver,
+    // and register its abort handle — atomically under one lock, so a racing second
+    // start always dedupes and a fast-terminating task cannot leak a resident handle.
+    registry.start(&account_id, &network_id, session_id, move || {
+        tokio::spawn(async move {
+            keeper_core::bridges::bbctl::run_self_hosted(
+                &runner,
+                &network_owned,
+                &bbctl_name,
+                sink,
+            )
+            .await;
+            // A naturally-completed run reaps its own registry entry.
+            reaper.finish(&account_owned, &network_owned, session_id);
+        })
+        .abort_handle()
+    });
+
+    Ok(session_id)
+}
+
+/// Cancel a running `bbctl` self-hosted-bridge run (Story 6.7) — the user closed the
+/// run Sheet. Aborts the driver task and removes it from the runs registry.
+/// Idempotent — cancelling an unknown session is a no-op. (The launched `bbctl run`
+/// daemon is launch-and-leave, so this only tears down keeper's streaming task, not
+/// the already-detached bridge process — supervision is out of scope, v1.x.)
+#[tauri::command]
+pub fn bbctl_run_cancel(state: State<'_, AppState>, session_id: u64) -> Result<(), IpcError> {
+    state.bbctl_runs.cancel(session_id);
     Ok(())
 }
 

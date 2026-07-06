@@ -7,7 +7,7 @@
  * inventing status text. Risk-tier badges and ack copy still come only from the
  * backend catalog data — nothing here duplicates that.
  */
-import type { BridgeHealth, BridgeLoginPhase, BridgeStatus } from "@/lib/ipc/client";
+import type { BbctlPhase, BridgeHealth, BridgeLoginPhase, BridgeStatus } from "@/lib/ipc/client";
 
 /**
  * The companion-stack docs link surfaced in the "No bridges found" empty state
@@ -40,6 +40,20 @@ export const BRIDGE_LOGIN_PHASE_LABEL: Record<BridgeLoginPhase, string> = {
   codeEntry: "Enter code",
   success: "Linked ✓",
   failure: "Couldn't connect",
+};
+
+/**
+ * The log-free step word shown in the "Run your own bridge" run Sheet for each
+ * {@link BbctlPhase} (Story 6.7, FR-29). Recognized phase transitions only — no raw
+ * `bbctl` log line ever reaches the UI (there is no log viewer, v1.x).
+ */
+export const BBCTL_PHASE_LABEL: Record<BbctlPhase, string> = {
+  checking: "Checking for bbctl",
+  registering: "Registering bridge",
+  starting: "Starting bridge",
+  running: "Bringing it up",
+  success: "Running ✓",
+  failure: "Couldn't start",
 };
 
 /**
