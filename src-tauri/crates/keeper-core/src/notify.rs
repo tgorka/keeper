@@ -34,6 +34,7 @@ use matrix_sdk::event_handler::{EventHandlerHandle, RawEvent};
 
 use crate::bridge;
 use crate::platform::Platform;
+use crate::vm::NotifyTarget;
 
 /// The app-wide "message previews" toggle (Story 10.1). Holds the single
 /// [`AtomicBool`] the desktop shell reads/writes through the two Settings commands
@@ -146,6 +147,10 @@ impl NotifyConfig {
 /// from the message event by [`register_notify_handler`] so the rules never touch the
 /// SDK types directly.
 pub struct NotifyContext {
+    /// The message's Matrix event id, carried into the [`NotifyTarget::Message`]
+    /// click-through payload (Story 10.4). Never rendered — only the coarse landing
+    /// seam and (in Epic 11) exact-message routing consume it.
+    pub event_id: String,
     /// The rendered Chat name (room display name, or the room id as a fallback).
     pub chat: String,
     /// The rendered sender name (member display name, or the localpart fallback).
@@ -310,7 +315,15 @@ pub fn dispatch(
         &ctx.preview,
         config.previews_enabled(),
     );
-    if let Err(e) = platform.notify(&title, &body) {
+    // Attach the typed click-through target: the exact `(account_id, room_id, event_id)`
+    // this notification was raised for (Story 10.4). Under Option B the shell records it
+    // as the "last notification target" and lands coarsely on the Inbox — never exact.
+    let target = NotifyTarget::Message {
+        account_id: account_id.to_owned(),
+        room_id: room_id.to_owned(),
+        event_id: ctx.event_id.clone(),
+    };
+    if let Err(e) = platform.notify(&title, &body, &target) {
         // Best-effort: a notifier failure never blocks sync. Log ids only — never the
         // title/body (they carry message content).
         tracing::warn!(
@@ -318,6 +331,48 @@ pub fn dispatch(
             room_id = %room_id,
             error = %e,
             "notify: could not post native notification; swallowing"
+        );
+    }
+}
+
+/// Post the FR-28 bridge-disconnected native notification (Story 10.4).
+///
+/// The single entry point the bridge-health machine calls on a per-session transition
+/// **into** `Disconnected`. The body copy is exactly
+/// `"{network_name} disconnected — re-link to keep receiving messages."` (Network-named),
+/// and the click-through target is [`NotifyTarget::Bridge`] carrying `(account_id,
+/// network_id)` — coarse landing routes to the Bridges view.
+///
+/// Suppression policy differs from message notifications: this respects **only** global
+/// Do-Not-Disturb (`NotifyConfig::dnd_enabled`); per-Chat and per-Network mute do NOT
+/// apply (bridge integrity is not chat noise). The persistent Story 6.5 in-app surfaces
+/// stand regardless of whether this native toast fires. A notifier failure (or an unset
+/// port on a headless build) is logged at `warn` and swallowed — it must never block the
+/// health machine or panic.
+pub fn notify_bridge_disconnected(
+    platform: &dyn Platform,
+    config: &NotifyConfig,
+    account_id: &str,
+    network_id: &str,
+    network_name: &str,
+) {
+    // Global DND silences the bridge alert too; per-Network / per-Chat mute never does.
+    if config.dnd_enabled() {
+        return;
+    }
+    let title = "Bridge disconnected".to_owned();
+    let body = format!("{network_name} disconnected — re-link to keep receiving messages.");
+    let target = NotifyTarget::Bridge {
+        account_id: account_id.to_owned(),
+        network_id: network_id.to_owned(),
+    };
+    if let Err(e) = platform.notify(&title, &body, &target) {
+        // Best-effort: a notifier failure never blocks the health machine. Log ids only.
+        tracing::warn!(
+            account_id = %account_id,
+            network_id = %network_id,
+            error = %e,
+            "notify: could not post bridge-disconnected notification; swallowing"
         );
     }
 }
@@ -432,6 +487,7 @@ pub fn register_notify_handler(
                 };
 
                 let ctx = NotifyContext {
+                    event_id: ev.event_id.to_string(),
                     chat,
                     sender: sender_name,
                     preview,
@@ -509,11 +565,11 @@ mod tests {
 
     use crate::error::CoreError;
 
-    /// A capturing [`Platform`] double recording every `(title, body)` posted through
-    /// `notify`, so the dispatch matrix is covered without a homeserver. `notify` can be
-    /// made to fail to exercise the swallow path.
+    /// A capturing [`Platform`] double recording every `(title, body, target)` posted
+    /// through `notify`, so the dispatch matrix is covered without a homeserver. `notify`
+    /// can be made to fail to exercise the swallow path.
     struct CapturingPlatform {
-        calls: Mutex<Vec<(String, String)>>,
+        calls: Mutex<Vec<(String, String, NotifyTarget)>>,
         fail: bool,
     }
 
@@ -530,8 +586,24 @@ mod tests {
                 fail: true,
             }
         }
+        /// The `(title, body)` of every posted notification (the target is asserted
+        /// separately via [`CapturingPlatform::targets`]).
         fn calls(&self) -> Vec<(String, String)> {
-            self.calls.lock().expect("lock calls").clone()
+            self.calls
+                .lock()
+                .expect("lock calls")
+                .iter()
+                .map(|(title, body, _)| (title.clone(), body.clone()))
+                .collect()
+        }
+        /// The click-through [`NotifyTarget`] of every posted notification.
+        fn targets(&self) -> Vec<NotifyTarget> {
+            self.calls
+                .lock()
+                .expect("lock calls")
+                .iter()
+                .map(|(_, _, target)| target.clone())
+                .collect()
         }
     }
 
@@ -551,14 +623,15 @@ mod tests {
         fn open_url(&self, _url: &str) -> Result<(), CoreError> {
             Ok(())
         }
-        fn notify(&self, title: &str, body: &str) -> Result<(), CoreError> {
+        fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
             if self.fail {
                 return Err(CoreError::Unsupported("notify failed in test".to_owned()));
             }
-            self.calls
-                .lock()
-                .expect("lock calls")
-                .push((title.to_owned(), body.to_owned()));
+            self.calls.lock().expect("lock calls").push((
+                title.to_owned(),
+                body.to_owned(),
+                target.clone(),
+            ));
             Ok(())
         }
         fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
@@ -586,6 +659,7 @@ mod tests {
         notifies: bool,
     ) -> NotifyContext {
         NotifyContext {
+            event_id: "$ev:example.org".to_owned(),
             chat: chat.to_owned(),
             sender: sender.to_owned(),
             preview: preview.to_owned(),
@@ -601,6 +675,7 @@ mod tests {
     /// network-muted dispatch matrix.
     fn ctx_gated(ts: u64, room_push_notifies: bool, network_muted: bool) -> NotifyContext {
         NotifyContext {
+            event_id: "$ev:example.org".to_owned(),
             chat: "Weekend plans".to_owned(),
             sender: "Alice".to_owned(),
             preview: "who's in?".to_owned(),
@@ -988,6 +1063,105 @@ mod tests {
             &ctx_gated(100, true, false),
         );
         assert_eq!(platform.calls().len(), 1);
+    }
+
+    // ── Story 10.4: message click-through target attach at dispatch ─────────────
+    #[test]
+    fn dispatch_attaches_message_target_with_exact_ids() {
+        // The posted notification carries the exact (account_id, room_id, event_id) as a
+        // NotifyTarget::Message — the click-through payload ships even though MVP landing
+        // is coarse.
+        let platform = CapturingPlatform::new();
+        let config = NotifyConfig::new(true);
+        let mut context = ctx("Weekend plans", "Alice", "who's in?", false, 100, true);
+        context.event_id = "$evt-42:example.org".to_owned();
+        dispatch(
+            &platform,
+            &config,
+            "acct-7",
+            "!room:example.org",
+            50,
+            &context,
+        );
+        assert_eq!(
+            platform.targets(),
+            vec![NotifyTarget::Message {
+                account_id: "acct-7".to_owned(),
+                room_id: "!room:example.org".to_owned(),
+                event_id: "$evt-42:example.org".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn dispatch_suppressed_message_attaches_no_target() {
+        // A suppressed message (own echo) never posts, so no target is recorded either.
+        let platform = CapturingPlatform::new();
+        let config = NotifyConfig::new(true);
+        dispatch(
+            &platform,
+            &config,
+            "acct",
+            "!room:example.org",
+            50,
+            &ctx("Alice", "Alice", "hi me", true, 100, true),
+        );
+        assert!(platform.targets().is_empty());
+    }
+
+    // ── Story 10.4: bridge-disconnected notify entry point ──────────────────────
+    #[test]
+    fn bridge_notify_posts_exact_copy_and_bridge_target() {
+        let platform = CapturingPlatform::new();
+        let config = NotifyConfig::new(true);
+        notify_bridge_disconnected(&platform, &config, "acct-1", "signal", "Signal");
+        assert_eq!(
+            platform.calls(),
+            vec![(
+                "Bridge disconnected".to_owned(),
+                "Signal disconnected — re-link to keep receiving messages.".to_owned(),
+            )]
+        );
+        assert_eq!(
+            platform.targets(),
+            vec![NotifyTarget::Bridge {
+                account_id: "acct-1".to_owned(),
+                network_id: "signal".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn bridge_notify_suppressed_by_global_dnd() {
+        // Global DND silences the bridge alert (the in-app 6.5 surfaces still update —
+        // not exercised here). Per-Network mute would NOT suppress it (asserted below).
+        let platform = CapturingPlatform::new();
+        let config = NotifyConfig::new(true);
+        config.set_dnd_enabled(true);
+        notify_bridge_disconnected(&platform, &config, "acct-1", "signal", "Signal");
+        assert!(platform.calls().is_empty());
+    }
+
+    #[test]
+    fn bridge_notify_ignores_per_network_mute() {
+        // Per-Network mute is chat noise, not bridge integrity: a muted Network must
+        // STILL raise the bridge-disconnected alert.
+        let platform = CapturingPlatform::new();
+        let mut seed = HashSet::new();
+        seed.insert("Signal".to_owned());
+        let config = NotifyConfig::with_state(true, false, seed);
+        assert!(config.is_network_muted("Signal"));
+        notify_bridge_disconnected(&platform, &config, "acct-1", "signal", "Signal");
+        assert_eq!(platform.calls().len(), 1);
+    }
+
+    #[test]
+    fn bridge_notify_swallows_notifier_failure() {
+        // A notifier failure (or an unset port) never panics or blocks the health machine.
+        let platform = CapturingPlatform::failing();
+        let config = NotifyConfig::new(true);
+        notify_bridge_disconnected(&platform, &config, "acct-1", "signal", "Signal");
+        assert!(platform.calls().is_empty());
     }
 
     #[test]

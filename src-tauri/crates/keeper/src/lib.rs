@@ -296,8 +296,16 @@ pub fn run() {
                 }
             }
             // macOS dock-icon click while the window is hidden re-shows + focuses it.
+            // Following a notification click (which activates the app), this is the
+            // coarse click-through seam (Story 10.4, Option B): summon+focus, then emit a
+            // navigate event derived from the KIND of the last recorded notification
+            // target so the webview lands on the Inbox (Message) or Bridges (Bridge)
+            // view. The kept notification backend has NO per-notification click callback,
+            // so this is deliberately coarse — never exact-message routing (deferred to
+            // Epic 11).
             tauri::RunEvent::Reopen { .. } => {
                 tray::show_main_window(app_handle);
+                ipc::emit_notify_navigate(app_handle);
             }
             _ => {}
         });

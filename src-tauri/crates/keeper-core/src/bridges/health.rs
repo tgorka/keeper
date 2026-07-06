@@ -38,6 +38,8 @@ use matrix_sdk::{Client, Room};
 use tokio::task::JoinHandle;
 
 use crate::bridges::data::{self, BridgeHealthGrammar};
+use crate::notify::{self, NotifyConfig};
+use crate::platform::Platform;
 use crate::vm::{BridgeHealth, BridgeHealthSnapshot, BridgeSessionHealthVm};
 
 /// The debounce threshold: consecutive liveness-tick timeouts from `Healthy` needed
@@ -318,6 +320,19 @@ struct AggregatorState {
     last_emitted: BTreeMap<SessionKey, BridgeSessionHealthVm>,
     /// The sink; set `None` once it reports its channel closed so we stop emitting.
     sink: Option<BridgeHealthSink>,
+    /// The optional FR-28 native-notify leg (Story 10.4): the shared `Platform` port +
+    /// `NotifyConfig`. `None` on a headless build / in the pure diff tests. When set, a
+    /// per-session transition **into** `Disconnected` posts exactly one native
+    /// notification (gated on global DND inside [`notify::notify_bridge_disconnected`]).
+    notify: Option<NotifyHook>,
+}
+
+/// The bound notify leg carried by the aggregator (Story 10.4): the shared `Platform`
+/// port and the app-wide `NotifyConfig`, threaded from `subscribe_bridge_health`.
+#[derive(Clone)]
+struct NotifyHook {
+    platform: Arc<dyn Platform>,
+    config: Arc<NotifyConfig>,
 }
 
 /// A monotonically-increasing wall clock in ms (UTC), used for `last_checked_ms`. A
@@ -340,8 +355,23 @@ impl HealthAggregator {
                 sessions,
                 last_emitted: BTreeMap::new(),
                 sink: Some(sink),
+                notify: None,
             })),
         }
+    }
+
+    /// Bind the FR-28 native-notify leg (Story 10.4): a per-session transition **into**
+    /// `Disconnected` posts exactly one native notification through `platform` (gated on
+    /// global DND). Called once by `subscribe_bridge_health` after construction; on a
+    /// headless build it is simply never bound and the leg is inert.
+    pub fn set_notify(&self, platform: Arc<dyn Platform>, config: Arc<NotifyConfig>) {
+        let Ok(mut state) = self.inner.lock() else {
+            // A poisoned lock here would silently drop the FR-28 notify leg for the whole
+            // subscription lifetime; surface it rather than fail silent (Story 10.4 review).
+            tracing::warn!("bridge health: notify leg not bound (aggregator lock poisoned)");
+            return;
+        };
+        state.notify = Some(NotifyHook { platform, config });
     }
 
     /// Emit the bootstrap snapshot unconditionally (the stream always opens with the
@@ -364,16 +394,48 @@ impl HealthAggregator {
             return;
         };
         let key = (account_id.to_owned(), network_id.to_owned());
-        let changed = match state.sessions.get_mut(&key) {
-            Some(session) => session.state.apply(obs),
+        // Capture the health BEFORE applying so we can detect the transition **into**
+        // `Disconnected` (Story 10.4): only a real transition notifies — a session that
+        // stays `Disconnected` never re-notifies, and `apply` already reports no change
+        // for a redundant same-state observation. `Degraded` never satisfies the
+        // now-Disconnected check, so it never toasts.
+        let (changed, transition_name) = match state.sessions.get_mut(&key) {
+            Some(session) => {
+                let was_disconnected = session.state.health() == BridgeHealth::Disconnected;
+                let changed = session.state.apply(obs);
+                let now_disconnected = session.state.health() == BridgeHealth::Disconnected;
+                let transition_name = (changed && now_disconnected && !was_disconnected)
+                    .then(|| session.network_name.clone());
+                (changed, transition_name)
+            }
             None => return,
         };
         if !changed {
             return;
         }
+        // Capture the FR-28 native-notify leg for the transition into Disconnected (fires
+        // exactly once, using the session's `network_name`) — but defer the post until
+        // AFTER the aggregator lock is released below. `Platform::notify` is an arbitrary
+        // trait impl (an OS post); it must never run while this `std::sync::Mutex` is held,
+        // or a blocking backend would serialize every concurrent `observe` behind a
+        // synchronous OS round-trip (Story 10.4 review — the click-capable backend lands in
+        // Epic 11). Both fields are cheap `Arc`/`String` clones.
+        let pending_notify = transition_name
+            .zip(state.notify.clone())
+            .map(|(name, hook)| (hook, name));
         let map = snapshot_map(&state.sessions, now_ms());
         if diff_sessions(&state.last_emitted, &map) {
             Self::send(&mut state, &map);
+        }
+        drop(state);
+        if let Some((hook, name)) = pending_notify {
+            notify::notify_bridge_disconnected(
+                hook.platform.as_ref(),
+                &hook.config,
+                account_id,
+                network_id,
+                &name,
+            );
         }
     }
 
@@ -684,7 +746,179 @@ async fn ping_once(wiring: &SessionWiring) -> HealthObservation {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Mutex as StdMutex;
+
     use super::*;
+    use crate::error::CoreError;
+    use crate::vm::NotifyTarget;
+
+    /// A capturing [`Platform`] double recording every notification the aggregator's
+    /// FR-28 notify leg posts, so the bridge transition/DND/dedup matrix is covered
+    /// without a homeserver or an OS notifier.
+    struct CapturingNotifier {
+        calls: StdMutex<Vec<(String, NotifyTarget)>>,
+    }
+
+    impl CapturingNotifier {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: StdMutex::new(Vec::new()),
+            })
+        }
+        fn bodies(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|(body, _)| body.clone())
+                .collect()
+        }
+        fn targets(&self) -> Vec<NotifyTarget> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|(_, target)| target.clone())
+                .collect()
+        }
+    }
+
+    impl Platform for CapturingNotifier {
+        fn data_dir(&self) -> Result<PathBuf, CoreError> {
+            Ok(PathBuf::from("/tmp/keeper-health-test"))
+        }
+        fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn keychain_get(&self, _key: &str) -> Result<Option<String>, CoreError> {
+            Ok(None)
+        }
+        fn keychain_delete(&self, _key: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn open_url(&self, _url: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn notify(&self, _title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push((body.to_owned(), target.clone()));
+            Ok(())
+        }
+        fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
+            Err(CoreError::Unsupported("unused".to_owned()))
+        }
+        fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    /// A one-session aggregator wired with a capturing notifier and the given
+    /// [`NotifyConfig`], for the FR-28 notify-leg tests. The sink swallows snapshots (the
+    /// pure diff/emit path is covered elsewhere).
+    fn notify_aggregator(
+        notifier: Arc<CapturingNotifier>,
+        config: Arc<NotifyConfig>,
+    ) -> HealthAggregator {
+        let sessions = map_of(vec![session("acctA", "signal", BridgeHealth::Healthy)]);
+        // Give the session a Network display name for the copy.
+        let mut sessions = sessions;
+        if let Some(s) = sessions.get_mut(&("acctA".to_owned(), "signal".to_owned())) {
+            s.network_name = "Signal".to_owned();
+        }
+        let aggregator = HealthAggregator::new(Box::new(|_snapshot| true), sessions);
+        aggregator.set_notify(notifier, config);
+        aggregator
+    }
+
+    fn disconnect_notice() -> HealthObservation {
+        HealthObservation::Notice {
+            health: BridgeHealth::Disconnected,
+            reason: "you have been logged out".to_owned(),
+        }
+    }
+
+    #[test]
+    fn aggregator_notifies_once_on_transition_into_disconnected() {
+        let notifier = CapturingNotifier::new();
+        let config = Arc::new(NotifyConfig::new(true));
+        let aggregator = notify_aggregator(notifier.clone(), config);
+        aggregator.observe("acctA", "signal", &disconnect_notice());
+        assert_eq!(
+            notifier.bodies(),
+            vec!["Signal disconnected — re-link to keep receiving messages.".to_owned()]
+        );
+        assert_eq!(
+            notifier.targets(),
+            vec![NotifyTarget::Bridge {
+                account_id: "acctA".to_owned(),
+                network_id: "signal".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn aggregator_does_not_renotify_while_still_disconnected() {
+        // Only the transition notifies: a second disconnect observation on an already-
+        // Disconnected session (redundant — no state change) must NOT re-toast.
+        let notifier = CapturingNotifier::new();
+        let config = Arc::new(NotifyConfig::new(true));
+        let aggregator = notify_aggregator(notifier.clone(), config);
+        aggregator.observe("acctA", "signal", &disconnect_notice());
+        aggregator.observe("acctA", "signal", &disconnect_notice());
+        // A sustained-silence ping timeout on an already-Disconnected session also no-ops.
+        aggregator.observe("acctA", "signal", &HealthObservation::PingTimeout);
+        assert_eq!(notifier.bodies().len(), 1, "one alert per drop");
+    }
+
+    #[test]
+    fn aggregator_renotifies_on_a_fresh_drop_after_recovery() {
+        // Recover, then drop again → the SECOND drop is a fresh transition and notifies.
+        let notifier = CapturingNotifier::new();
+        let config = Arc::new(NotifyConfig::new(true));
+        let aggregator = notify_aggregator(notifier.clone(), config);
+        aggregator.observe("acctA", "signal", &disconnect_notice());
+        aggregator.observe(
+            "acctA",
+            "signal",
+            &HealthObservation::PingReply {
+                health: BridgeHealth::Healthy,
+            },
+        );
+        aggregator.observe("acctA", "signal", &disconnect_notice());
+        assert_eq!(notifier.bodies().len(), 2, "each fresh drop notifies");
+    }
+
+    #[test]
+    fn aggregator_does_not_toast_on_degraded() {
+        // A Degraded transition changes state (emits a snapshot) but must NEVER toast.
+        let notifier = CapturingNotifier::new();
+        let config = Arc::new(NotifyConfig::new(true));
+        let aggregator = notify_aggregator(notifier.clone(), config);
+        aggregator.observe(
+            "acctA",
+            "signal",
+            &HealthObservation::Notice {
+                health: BridgeHealth::Degraded,
+                reason: "reconnecting".to_owned(),
+            },
+        );
+        assert!(notifier.bodies().is_empty(), "Degraded must not toast");
+    }
+
+    #[test]
+    fn aggregator_bridge_notify_suppressed_by_global_dnd() {
+        // Global DND suppresses the native bridge notification; the session still flips
+        // (the in-app 6.5 surfaces update via the emitted snapshot, not asserted here).
+        let notifier = CapturingNotifier::new();
+        let config = Arc::new(NotifyConfig::new(true));
+        config.set_dnd_enabled(true);
+        let aggregator = notify_aggregator(notifier.clone(), config);
+        aggregator.observe("acctA", "signal", &disconnect_notice());
+        assert!(notifier.bodies().is_empty(), "DND suppresses the toast");
+    }
 
     /// A grammar with distinct, unambiguous markers for the classifier I/O matrix.
     fn grammar() -> BridgeHealthGrammar {

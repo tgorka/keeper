@@ -1387,6 +1387,53 @@ impl DockBadgeMode {
     }
 }
 
+/// The click-through target carried by every native notification (Story 10.4, FR-51).
+///
+/// Attached at the notification dispatch site so a click can land the user in the
+/// right place. Under the **Option B** MVP scope (coordinator decision 2026-07-06) the
+/// kept `tauri-plugin-notification` desktop backend has no per-notification click
+/// callback, so the payload is recorded app-side as the "last notification target" at
+/// dispatch and drives only a **coarse** view landing on app activation — Message
+/// targets land on the Inbox, Bridge targets on the Bridges view. The full
+/// `(account_id, room_id, event_id)` payload ships now even though MVP click handling is
+/// coarse; exact-message / exact-re-login deep landing via a click-capable backend is
+/// deferred to Epic 11 (see `deferred-work.md`). This is NEVER exact-message routing.
+///
+/// Serialized as an internally tagged enum so the frontend can switch on `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum NotifyTarget {
+    /// A message notification: the exact `(account_id, room_id, event_id)` that raised it.
+    /// Coarse landing routes to the Inbox view; exact Chat/Account/message landing is
+    /// deferred to Epic 11.
+    Message {
+        /// The opaque keeper account id the message belongs to.
+        account_id: String,
+        /// The Matrix room id the message was sent in.
+        room_id: String,
+        /// The message's Matrix event id.
+        event_id: String,
+    },
+    /// A bridge-health notification: the `(account_id, network_id)` of the disconnected
+    /// session. Coarse landing routes to the Bridges view; the persistent Story 6.5
+    /// surfaces route the user into the exact re-login. Exact re-login deep-landing is
+    /// deferred to Epic 11.
+    Bridge {
+        /// The opaque keeper account id owning the bridge session.
+        account_id: String,
+        /// The stable machine `network_id` (the `protocol.id`) of the bridge.
+        network_id: String,
+    },
+    /// No specific target (a notification with nothing to land on). Coarse landing is a
+    /// no-op — the window is still summoned+focused by the OS default activation.
+    None,
+}
+
 /// Non-secret account registry projection returned to the frontend on a
 /// successful login (FR-1, NFR-9).
 ///

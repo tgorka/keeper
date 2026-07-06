@@ -98,7 +98,12 @@ impl Platform for LocalPlatform {
     fn open_url(&self, _url: &str) -> Result<(), CoreError> {
         Ok(())
     }
-    fn notify(&self, _title: &str, _body: &str) -> Result<(), CoreError> {
+    fn notify(
+        &self,
+        _title: &str,
+        _body: &str,
+        _target: &keeper_core::vm::NotifyTarget,
+    ) -> Result<(), CoreError> {
         Ok(())
     }
     fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {

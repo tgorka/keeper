@@ -698,7 +698,12 @@ mod tests {
         fn open_url(&self, _url: &str) -> Result<(), CoreError> {
             Err(CoreError::Unsupported("open_url".to_owned()))
         }
-        fn notify(&self, _title: &str, _body: &str) -> Result<(), CoreError> {
+        fn notify(
+            &self,
+            _title: &str,
+            _body: &str,
+            _target: &crate::vm::NotifyTarget,
+        ) -> Result<(), CoreError> {
             Err(CoreError::Unsupported("notify".to_owned()))
         }
         fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {

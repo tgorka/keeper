@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use crate::error::CoreError;
+use crate::vm::NotifyTarget;
 
 /// Injected platform capabilities the core depends on.
 ///
@@ -40,9 +41,13 @@ pub trait Platform: Send + Sync {
     /// concrete browser-open lives in the `keeper` shell.
     fn open_url(&self, url: &str) -> Result<(), CoreError>;
 
-    /// Post a desktop notification (title + body).
-    /// Not wired in Story 1.1 — returns [`CoreError::Unsupported`].
-    fn notify(&self, title: &str, body: &str) -> Result<(), CoreError>;
+    /// Post a desktop notification (title + body) carrying a typed click-through
+    /// [`NotifyTarget`] (Story 10.4, FR-51). The kept desktop backend has no
+    /// per-notification click callback, so the shell records `target` as the "last
+    /// notification target" at dispatch and drives a coarse view landing on app
+    /// activation (Message → Inbox, Bridge → Bridges); it must NEVER be presented as
+    /// exact-message routing. Not wired in Story 1.1 — returns [`CoreError::Unsupported`].
+    fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError>;
 
     /// Resolve the path to a bundled sidecar binary by logical `name`.
     /// Not wired in Story 1.1 — returns [`CoreError::Unsupported`].

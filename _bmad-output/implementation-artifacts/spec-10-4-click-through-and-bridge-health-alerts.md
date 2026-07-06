@@ -2,7 +2,9 @@
 title: 'Click-Through and Bridge-Health Alerts'
 type: 'feature'
 created: '2026-07-06'
-status: 'draft'
+status: done
+baseline_revision: 007afa96f6ea4f1b5971e64cdd7cd82a126c8b1a
+final_revision: 05b026fb58111df1fd88ad8a4b5eb92d30002fff
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
@@ -80,12 +82,12 @@ signed .app bundle exists to validate it; record that deferral in deferred-work.
 as specified below. AC amendments per this decision are marked [AMENDED-B].
 
 **Execution:**
-- [ ] `src-tauri/crates/keeper-core/src/vm.rs` + `platform.rs` -- add `NotifyTarget` (ts-rs) and extend the `Platform::notify` port to carry it; update all impls/mocks -- typed click-through payload across the port.
-- [ ] `src-tauri/crates/keeper-core/src/notify.rs` -- attach `NotifyTarget::Message` at dispatch; add a bridge-health notify entry that posts the exact copy + `NotifyTarget::Bridge`, gated on global DND -- both notification kinds carry a target.
-- [ ] `src-tauri/crates/keeper-core/src/bridges/health.rs` + `account.rs` -- notify once on the transition into `Disconnected` using `network_name`; wire the consumer under `subscribe_bridge_health` -- FR-28 native leg within the existing 60 s machine.
-- [ ] `src-tauri/crates/keeper/src/ipc.rs` + `lib.rs` -- [AMENDED-B] on app activation following a notification (kept backend, no click callback): `show_main_window` + emit a coarse navigate event from the "last notification target" kind recorded at dispatch -- the coarse click seam.
-- [ ] `src/lib/ipc/gen/NotifyTarget.ts` + `client.ts` + `bridge-relink.ts` + `App.tsx` -- regenerated binding + navigate listener routing Message→inbox view, Bridge→bridges view (coarse; no `requestFocus` deep landing in MVP) -- frontend landing.
-- [ ] Unit-test the I/O matrix edges: transition-only bridge dedup, DND suppression, Degraded→no-toast, target attach mapping at dispatch.
+- [x] `src-tauri/crates/keeper-core/src/vm.rs` + `platform.rs` -- add `NotifyTarget` (ts-rs) and extend the `Platform::notify` port to carry it; update all impls/mocks -- typed click-through payload across the port.
+- [x] `src-tauri/crates/keeper-core/src/notify.rs` -- attach `NotifyTarget::Message` at dispatch; add a bridge-health notify entry that posts the exact copy + `NotifyTarget::Bridge`, gated on global DND -- both notification kinds carry a target.
+- [x] `src-tauri/crates/keeper-core/src/bridges/health.rs` + `account.rs` -- notify once on the transition into `Disconnected` using `network_name`; wire the consumer under `subscribe_bridge_health` -- FR-28 native leg within the existing 60 s machine.
+- [x] `src-tauri/crates/keeper/src/ipc.rs` + `lib.rs` -- [AMENDED-B] on app activation following a notification (kept backend, no click callback): `show_main_window` + emit a coarse navigate event from the "last notification target" kind recorded at dispatch -- the coarse click seam.
+- [x] `src/lib/ipc/gen/NotifyTarget.ts` + `client.ts` + `bridge-relink.ts` + `App.tsx` -- regenerated binding + navigate listener routing Message→inbox view, Bridge→bridges view (coarse; no `requestFocus` deep landing in MVP) -- frontend landing.
+- [x] Unit-test the I/O matrix edges: transition-only bridge dedup, DND suppression, Degraded→no-toast, target attach mapping at dispatch.
 
 **Acceptance Criteria:**
 - [AMENDED-B] Given a hidden window and a message notification, when the user clicks it, then the window is summoned+focused (macOS default activation) and the app shows the Inbox; exact Chat/Account/message landing is deferred to Epic 11 (deferred-work entry required).
@@ -113,7 +115,19 @@ as specified below. AC amendments per this decision are marked [AMENDED-B].
 
 ## Review Triage Log
 
-_No review pass — blocked at planning (step-02) before implementation._
+_Planning-phase note superseded: the story was implemented after the Option B unblock; the review pass below is the first post-implementation pass._
+
+### 2026-07-06 — Review pass
+- intent_gap: 0
+- bad_spec: 0
+- patch: 2: (high 0, medium 0, low 2)
+- defer: 3: (high 0, medium 2, low 1)
+- reject: 4: (high 0, medium 0, low 4)
+- addressed_findings:
+  - `[low]` `[patch]` Notify posted while holding the aggregator `std::sync::Mutex` (`bridges/health.rs::observe`): deferred the `Platform::notify` OS post until after the guard is dropped (capture `(hook, name)` under the lock, `drop(state)`, then notify), so a future blocking click-capable backend cannot serialize concurrent `observe` behind a synchronous OS round-trip. Verified safe with the current fire-and-forget backend; this hardens the Epic 11 swap.
+  - `[low]` `[patch]` Silent poisoned-lock in `HealthAggregator::set_notify`: added a `tracing::warn!` on the poisoned-lock branch so a permanently-dropped FR-28 notify leg is observable instead of failing silent.
+- deferred (single consolidated deferred-work entry): the Option-B coarse single-slot "last notification target" mechanism's three edge behaviors — (a) stale-target over-navigation on any plain dock activation, (b) a Bridge target clobbered by later Message notifications, (c) a rare emit-before-subscribe navigate loss — all inherent to the accepted coarse scope and structurally resolved by Epic 11's click-capable, payload-carrying backend.
+- rejected: `bridgeRelinkStore` write-only (intended Epic-11 seam mandated by the Code Map; `check` passes); cold-launch already-dead bridge toasts on first discovery (spec-consistent and user-beneficial — the user should learn a Bridge is down); `NotifyTarget::None` sentinel doc nit; frontend `assertNever` default (ts-rs/serde tag contract verified exactly consistent Rust↔TS).
 
 ## Design Notes
 
@@ -144,11 +158,57 @@ The rest of the design (payload shape, DND/mute policy, transition-only bridge d
 - Click a message notification while the window is hidden → app summons and lands on the exact Chat/Account/message.
 - Drop a bridge session → one native "‹Network› disconnected — re-link…" notification; clicking opens that bridge's re-login.
 
+
 ## Auto Run Result
 
-Status: resolved-pending-redrive
+Status: done
 
-Prior blocked result superseded by the coordinator's Option B resolution (2026-07-06):
-backend kept, summon+focus + coarse view landing in MVP, exact landing deferred to
-Epic 11. The frozen intent-contract above now encodes the decision; re-drive per the
-amended Tasks & Acceptance.
+**Implemented change.** Story 10.4 (Option B) — a typed click-through `NotifyTarget` now
+rides every native notification, and the existing bridge `HealthAggregator` disconnect
+transition feeds the same `notify` pipeline to complete FR-28's native leg. Message
+notifications carry `NotifyTarget::Message{account_id, room_id, event_id}`; a per-session
+transition **into** `Disconnected` posts exactly one native toast with the exact copy
+`"{network_name} disconnected — re-link to keep receiving messages."` (DND-gated; per-Chat/
+per-Network mute deliberately does not apply; `Degraded` never toasts; no re-notify while
+still disconnected). Per the settled Option-B descope, click behavior is **summon+focus +
+coarse view landing** — the kept `tauri-plugin-notification` backend has no per-notification
+click callback, so on `RunEvent::Reopen` the shell emits `notify://navigate` from the KIND
+of the "last notification target" recorded at dispatch (Message → Inbox, Bridge → Bridges).
+Exact-message / exact-re-login deep landing is deferred to Epic 11 (payload + `bridgeRelink`
+store already ship, so no new contract is needed there).
+
+**Files changed.**
+- `src-tauri/crates/keeper-core/src/vm.rs` — new ts-rs `NotifyTarget` enum (Message/Bridge/None).
+- `src-tauri/crates/keeper-core/src/platform.rs` — `Platform::notify(title, body, target)` port extension.
+- `src-tauri/crates/keeper-core/src/notify.rs` — attach `NotifyTarget::Message` at dispatch; `notify_bridge_disconnected` entry (exact copy + `NotifyTarget::Bridge`, DND-gated).
+- `src-tauri/crates/keeper-core/src/bridges/health.rs` — `NotifyHook`/`set_notify`; transition-into-`Disconnected` notify in `observe`; **review patches**: notify now posted after the aggregator lock is dropped, and a poisoned-lock `set_notify` warns instead of failing silent.
+- `src-tauri/crates/keeper-core/src/account.rs` — bind the notify leg under `subscribe_bridge_health(platform, sink)`.
+- `src-tauri/crates/keeper-core/src/{auth.rs, inbox.rs}` + `tests/archive_survives_sign_out.rs` — mock `notify` signature updates.
+- `src-tauri/crates/keeper/src/ipc.rs` — `LAST_NOTIFY_TARGET` slot + `record_last_notify_target`/`last_notify_target`/`emit_notify_navigate` + `NOTIFY_NAVIGATE_EVENT`; `DesktopPlatform::notify` records the target.
+- `src-tauri/crates/keeper/src/lib.rs` — `RunEvent::Reopen` → `show_main_window` + coarse `emit_notify_navigate`.
+- `src/lib/ipc/gen/NotifyTarget.ts` (new, generated) + `src/lib/ipc/client.ts` — `listenNotifyNavigate` + event constant.
+- `src/lib/stores/bridge-relink.ts` (new) — signal store carrying the bridge re-link target for Epic 11.
+- `src/hooks/use-notify-navigate.ts` (+ `.test.ts`, new) — one-shot navigate listener (Message→inbox, Bridge→bridges, coarse); subscribed once in `src/App.tsx`.
+- `_bmad-output/implementation-artifacts/deferred-work.md` — Epic-11 exact-landing entry (dev) + coarse-mechanism edge-behaviors entry (review).
+
+**Review findings breakdown.** 2 patches applied (both low, Rust hardening: notify-outside-lock;
+poisoned-lock warn). 3 findings deferred to Epic 11 in one consolidated entry (coarse single-slot
+edge behaviors: stale-target over-navigation on plain dock activation, Bridge-target clobbered by
+later Message notifications, rare emit-before-subscribe navigate loss). 4 rejected (relink store is
+an intended Code-Map seam; cold-launch already-dead bridge toast is spec-consistent/useful;
+`NotifyTarget::None` doc nit; `assertNever` default — ts-rs/serde contract verified exactly
+consistent). 0 intent_gap, 0 bad_spec.
+
+**Follow-up review recommendation:** false — the only review-driven changes were two localized,
+low-consequence Rust hardening patches; the substantive implementation was accepted unchanged.
+
+**Verification performed.**
+- `bun run check:rust` — rustfmt clean + clippy `--all-targets -D warnings` clean (re-run after patches).
+- `bun run test:rust` — cargo-nextest: 741 passed, 0 skipped (incl. bridge transition-dedup, DND suppression, Degraded→no-toast, target-mapping tests; re-run after patches).
+- `bun run check` — biome + tsc + vitest: 915 passed (incl. the regenerated `NotifyTarget` binding and the `use-notify-navigate` routing tests) + `keeper-core` tauri-free guard.
+
+**Residual risks.** All coarse-landing imperfections are captured in deferred-work and are
+structurally resolved by Epic 11's click-capable backend; none are load-bearing for the MVP ACs.
+The load-bearing shell RunEvents (`Reopen`/notify emit) remain validated by manual inspection
+only, consistent with the project's existing untested-shell-glue boundary (a signed-build manual
+pass is the intended check per the spec's Verification section).

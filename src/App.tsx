@@ -4,6 +4,7 @@ import { AppShell } from "@/components/layout/app-shell";
 import { AtRestEncryptionChoice } from "@/components/settings/at-rest-encryption-choice";
 import { Toaster } from "@/components/ui/sonner";
 import { FirstRunWizard } from "@/components/wizard/first-run-wizard";
+import { useNotifyNavigate } from "@/hooks/use-notify-navigate";
 import { useSessionRestore } from "@/hooks/use-session-restore";
 import { encryptionPosture } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
@@ -13,6 +14,10 @@ import { useWizardStore, wizardStore } from "@/lib/stores/wizard";
 function App() {
   // Attempt a one-shot boot session-restore before deciding what to render.
   useSessionRestore();
+  // Subscribe once to the coarse notification-navigate seam (Story 10.4, Option B):
+  // a notification click summons the app and lands it on the Inbox (message) or the
+  // Bridges view (bridge alert). Coarse only — no exact-message deep landing in MVP.
+  useNotifyNavigate();
   const hydrated = useAccountsStore((s) => s.hydrated);
   const hasAccount = useAccountsStore((s) => s.accounts.length > 0);
   const addAccountOpen = useAddAccountStore((s) => s.open);

@@ -27,9 +27,9 @@ use keeper_core::vm::{
     ChatNotifyMode, ConnectionStatusBatch, CouplingCaveatVm, DemoBatch, DockBadgeMode,
     DraftMirrorBatch, EditVersionVm, EncryptionStatusBatch, ExportPhase, ExportProgressVm,
     ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError, IpcErrorCode, MenuSectionVm,
-    NetworksSnapshot, NewChatResolutionVm, OutboxVm, PaginationStatusBatch, PaletteMode,
-    PaletteResultsVm, PingVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch, SearchFilterVm,
-    SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
+    NetworksSnapshot, NewChatResolutionVm, NotifyTarget, OutboxVm, PaginationStatusBatch,
+    PaletteMode, PaletteResultsVm, PingVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
+    SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -251,6 +251,73 @@ pub fn set_notify_app_handle(handle: tauri::AppHandle) {
     let _ = NOTIFY_APP.set(handle);
 }
 
+/// The "last notification target" recorded at dispatch time (Story 10.4, Option B).
+///
+/// The kept `tauri-plugin-notification` desktop backend has NO per-notification click
+/// callback, so exact per-notification routing is impossible on this backend (deferred to
+/// Epic 11). Instead `Platform::notify` records the target of the most recently posted
+/// notification here, and on the next app activation the shell emits a **coarse** navigate
+/// event derived from its KIND (Message → Inbox, Bridge → Bridges). This is deliberately
+/// coarse — it is NEVER exact-message routing. Guarded by a `Mutex`; the honest default is
+/// [`NotifyTarget::None`] (a plain summon+focus with no view switch).
+static LAST_NOTIFY_TARGET: OnceLock<Mutex<NotifyTarget>> = OnceLock::new();
+
+fn last_notify_target_slot() -> &'static Mutex<NotifyTarget> {
+    LAST_NOTIFY_TARGET.get_or_init(|| Mutex::new(NotifyTarget::None))
+}
+
+/// Record the target of the notification just posted (Story 10.4). A poisoned lock is
+/// recovered rather than propagated — recording a coarse landing target must never panic.
+fn record_last_notify_target(target: &NotifyTarget) {
+    let mut slot = match last_notify_target_slot().lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = target.clone();
+}
+
+/// Read the "last notification target" recorded at dispatch (Story 10.4), for the coarse
+/// navigate emit on app activation. A poisoned lock recovers to the stored value.
+pub fn last_notify_target() -> NotifyTarget {
+    match last_notify_target_slot().lock() {
+        Ok(slot) => slot.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// The Tauri event the shell emits to the webview on app activation following a
+/// notification (Story 10.4). Carries the recorded [`NotifyTarget`]; the frontend routes
+/// its KIND to a coarse view (Message → Inbox, Bridge → Bridges). Once consumed the
+/// target is reset to [`NotifyTarget::None`] so a later plain dock-click does not re-emit
+/// a stale landing.
+pub const NOTIFY_NAVIGATE_EVENT: &str = "notify://navigate";
+
+/// Emit the coarse navigate event to the main window from the last recorded notification
+/// target (Story 10.4, Option B), then reset the target so it fires once per notification.
+///
+/// A [`NotifyTarget::None`] (no notification since the last activation, e.g. a plain
+/// dock-click) is a no-op — only Message/Bridge targets emit. Best-effort: a missing
+/// window or an emit failure is logged at `warn`, never a panic.
+pub fn emit_notify_navigate(app: &tauri::AppHandle) {
+    use tauri::{Emitter, Manager};
+
+    let target = last_notify_target();
+    if matches!(target, NotifyTarget::None) {
+        // No pending notification landing — a plain activation. Nothing to navigate to.
+        return;
+    }
+    // Reset so the same target is not re-emitted on a subsequent plain activation.
+    record_last_notify_target(&NotifyTarget::None);
+
+    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        tracing::warn!("notify: main window not found; cannot emit navigate event");
+        return;
+    };
+    if let Err(error) = window.emit(NOTIFY_NAVIGATE_EVENT, &target) {
+        tracing::warn!(%error, "notify: could not emit coarse navigate event");
+    }
+}
+
 /// The label of the main window (matches `tauri.conf.json` / the default capability),
 /// whose dock badge the desktop `Platform::set_badge_count` port drives (Story 10.3).
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -319,8 +386,15 @@ impl Platform for DesktopPlatform {
             .map_err(|e| CoreError::Internal(format!("could not open the system browser: {e}")))
     }
 
-    fn notify(&self, title: &str, body: &str) -> Result<(), CoreError> {
+    fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
         use tauri_plugin_notification::NotificationExt;
+
+        // Record the click-through target as the "last notification target" (Story 10.4,
+        // Option B): the kept backend has no per-notification click callback, so on the
+        // next app activation the shell emits a coarse navigate event derived from this
+        // target's KIND (Message → Inbox, Bridge → Bridges). Recorded before the post so
+        // the target is set even if the OS notifier itself errors.
+        record_last_notify_target(target);
 
         // The app handle is set once in `setup()`; when it is unset (headless / CI)
         // this is an honest `Unsupported`, never a panic. `DesktopPlatform` stays a
@@ -990,7 +1064,13 @@ pub async fn bridge_subscribe_health(
     channel: Channel<BridgeHealthSnapshot>,
 ) -> Result<u64, IpcError> {
     let sink = Box::new(move |snapshot: BridgeHealthSnapshot| channel.send(snapshot).is_ok());
-    Ok(state.accounts.subscribe_bridge_health(sink).await)
+    // Thread the shared `Platform` port so the health machine's FR-28 leg can post the
+    // native bridge-disconnected notification (Story 10.4). The notify config lives on the
+    // AccountManager and is bound to the aggregator inside `subscribe_bridge_health`.
+    Ok(state
+        .accounts
+        .subscribe_bridge_health(state.platform.clone(), sink)
+        .await)
 }
 
 /// Unsubscribe the bridge-health subscription (Story 6.5), draining every per-account

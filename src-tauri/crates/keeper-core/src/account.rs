@@ -1932,7 +1932,11 @@ impl AccountManager {
     /// emits **only on a per-session state change** (diffed). Tears down any prior
     /// subscription first. A per-account discovery / monitor failure is logged and
     /// skipped (others keep monitoring) — never fatal to the whole subscription.
-    pub async fn subscribe_bridge_health(&self, sink: BridgeHealthSink) -> u64 {
+    pub async fn subscribe_bridge_health(
+        &self,
+        platform: Arc<dyn Platform>,
+        sink: BridgeHealthSink,
+    ) -> u64 {
         // Serialize the whole subscribe body against any concurrent subscribe so the
         // drain→build→store sequence is atomic — otherwise two overlapping subscribes
         // both spawn monitors and the loser's leak (never drained). Held to return.
@@ -1998,6 +2002,11 @@ impl AccountManager {
         }
 
         let aggregator = HealthAggregator::new(sink, all_sessions);
+        // Bind the FR-28 native-notify leg (Story 10.4): a per-session transition into
+        // `Disconnected` posts exactly one native notification through the shared
+        // `Platform` port, gated on global DND (the same app-wide `NotifyConfig` the
+        // message notify handler consults). Per-Chat/per-Network mute does NOT apply.
+        aggregator.set_notify(platform, self.notify.clone());
         // Emit the bootstrap snapshot (the stream always opens with the current set).
         aggregator.emit_initial();
 
@@ -5845,7 +5854,12 @@ mod tests {
         fn open_url(&self, _url: &str) -> Result<(), CoreError> {
             Ok(())
         }
-        fn notify(&self, _title: &str, _body: &str) -> Result<(), CoreError> {
+        fn notify(
+            &self,
+            _title: &str,
+            _body: &str,
+            _target: &crate::vm::NotifyTarget,
+        ) -> Result<(), CoreError> {
             Ok(())
         }
         fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {

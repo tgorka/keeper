@@ -7,9 +7,11 @@
  * generated into `./gen/` by the Rust ts-rs export step — never hand-edited.
  */
 import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { IpcError } from "./gen/IpcError";
+import type { NotifyTarget } from "./gen/NotifyTarget";
 
 export type { AccountVm } from "./gen/AccountVm";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
@@ -64,6 +66,7 @@ export type { MuteState } from "./gen/MuteState";
 export type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 export type { NetworkVm } from "./gen/NetworkVm";
 export type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
+export type { NotifyTarget } from "./gen/NotifyTarget";
 export type { OutboxVm } from "./gen/OutboxVm";
 export type { PaginationState } from "./gen/PaginationState";
 export type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
@@ -1810,4 +1813,30 @@ export async function subscribePaginationStatus(
  */
 export async function unsubscribePaginationStatus(accountId: string, id: number): Promise<void> {
   await invoke<void>("pagination_status_unsubscribe", { accountId, subscriptionId: id });
+}
+
+/**
+ * The Tauri event the Rust shell emits on app activation following a notification
+ * (Story 10.4, Option B). Must match `NOTIFY_NAVIGATE_EVENT` in `keeper/src/ipc.rs`.
+ */
+export const NOTIFY_NAVIGATE_EVENT = "notify://navigate";
+
+/**
+ * Subscribe to the coarse notification-navigate event (Story 10.4, Option B). The kept
+ * `tauri-plugin-notification` desktop backend has NO per-notification click callback, so
+ * on app activation following a notification the Rust shell summons+focuses the window and
+ * emits this event carrying the {@link NotifyTarget} recorded at dispatch. The frontend
+ * routes its KIND to a **coarse** view (Message → Inbox, Bridge → Bridges) — this is NEVER
+ * exact-message routing (deferred to Epic 11).
+ *
+ * Resolves with an unlisten function; registering is best-effort and graceful outside a
+ * Tauri webview (jsdom in tests / a future non-desktop port) — a failure just leaves the
+ * bridge inert and never crashes the shell.
+ */
+export async function listenNotifyNavigate(
+  onNavigate: (target: NotifyTarget) => void,
+): Promise<() => void> {
+  return await listen<NotifyTarget>(NOTIFY_NAVIGATE_EVENT, (event) => {
+    onNavigate(event.payload);
+  });
 }
