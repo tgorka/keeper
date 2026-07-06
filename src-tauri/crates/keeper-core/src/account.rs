@@ -4818,6 +4818,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    /// AD-13 reachability (mirrors `send_approval_routes_through_the_single_gate`):
+    /// the `ComposerSend` trigger path is reachable and reaches the gate-acquisition
+    /// boundary with a typed error — never `Ok`, never a panic — with no live
+    /// homeserver. An unparsable room id is `RoomNotFound`; a well-formed room id on a
+    /// non-live account has no open timeline (the composer legitimately requires an
+    /// open conversation — there is no transient-build fallback), so it is
+    /// `NoOpenTimeline`.
+    #[tokio::test]
+    async fn send_text_composer_trigger_routes_through_the_gate() {
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!(
+            "keeper-composer-send-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let manager = AccountManager::new(&data_dir);
+
+        // An unparsable room id is an honest typed error, never a panic.
+        let bad_room = manager.send_text("acctA", "not-a-room-id", "hi").await;
+        assert!(matches!(
+            bad_room,
+            Err(CoreError::Send(SendError::RoomNotFound))
+        ));
+
+        // Well-formed room id but a non-live account: no open timeline, so the
+        // composer path reaches the gate boundary and returns the typed
+        // `NoOpenTimeline` — never `Ok`, never a panic.
+        let not_live = manager.send_text("acctA", "!room:example.org", "hi").await;
+        assert!(matches!(
+            not_live,
+            Err(CoreError::Send(SendError::NoOpenTimeline))
+        ));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     fn room(id: &str) -> RoomVm {
         RoomVm {
             room_id: id.to_owned(),

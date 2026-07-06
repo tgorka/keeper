@@ -108,7 +108,7 @@ development_status:
   7-1-persistent-per-chat-drafts: done
   7-2-cross-device-draft-mirroring-with-local-wins-conflicts: done
   7-3-approval-pane: done
-  7-4-explicit-approval-invariant-enforced-and-tested: backlog
+  7-4-explicit-approval-invariant-enforced-and-tested: done
   epic-7-retrospective: optional
   epic-8: backlog
   8-1-incognito-read-receipts-with-scoped-policy: backlog

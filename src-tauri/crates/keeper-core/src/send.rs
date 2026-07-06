@@ -7,6 +7,51 @@
 //! `unique_id`, no duplicate bubble); it feeds no new content, so it does not
 //! violate the single-gate rule.
 //!
+//! # The explicit-approval airlock invariant (AD-13) — a binding contract
+//!
+//! This is the contract that the future agent-proposal features are built on;
+//! treat it as binding, not advisory.
+//!
+//! - **Exactly two user-initiated dispatch triggers exist:**
+//!   [`SendTrigger::ComposerSend`] (the user sends from the composer) and
+//!   [`SendTrigger::ApprovalPaneApprove`] (the user approves a pending draft in the
+//!   approval pane, Story 7.3). Both — and only these two — flow through the single
+//!   [`submit`] gate. [`SendTrigger`] is a **closed set** of exactly these two.
+//! - **No background, scheduled, automated, or bulk dispatch path exists or may be
+//!   added.** There is no timer, no queue drainer, no `approve-all`, and no
+//!   *unattended*, scheduled, or bulk send API. Every new plain-text message that
+//!   goes through [`submit`] is the direct, per-message result of a user action.
+//!   ([`submit`] is `pub` so the two triggers can call it — the guard is that every
+//!   dispatch carries a caller-supplied user-initiated trigger, not that the function
+//!   is private.)
+//! - **Agents may *propose*; only the *user* approves.** A future agent contributes
+//!   by *writing a draft* (`dev.keeper.draft` account data) — a proposal is a stored
+//!   draft, never a dispatch. Turning a proposal into a sent message always passes
+//!   through the user pressing approve in the pane ([`SendTrigger::ApprovalPaneApprove`]).
+//!   Writing a draft never reaches this gate.
+//! - **Adding a trigger or any unattended send path is a new planning-level
+//!   decision, not merely a code change.** A third [`SendTrigger`] variant, a third
+//!   [`submit`] caller, or any background/scheduled/automated/bulk send path is an
+//!   invariant breach: it must be raised as a planning decision, not slipped in as
+//!   an edit. Never add a `_ =>` wildcard arm to a [`SendTrigger`] match — it would
+//!   silently absorb a new variant and defeat the exhaustiveness gate.
+//!
+//! **Scope.** This two-trigger airlock governs *new plain-text message origination*
+//! through [`submit`]. The sibling gates [`submit_reply`], [`submit_edit`],
+//! [`toggle_reaction`], [`redact`], and [`submit_attachment`] dispatch replies,
+//! edits, reactions, redactions, and media — each locked to a single call site by
+//! `submit_is_the_sole_send_dispatch_gate` and carrying no [`SendTrigger`]; read
+//! receipts and typing are AD-14 signals; draft mirroring writes account data. Those
+//! sit outside the [`SendTrigger`] accounting by design: the airlock is about the
+//! compose-vs-send separation for new messages, not every outbound verb.
+//!
+//! Enforcing guard tests (all in this module's `#[cfg(test)]` block plus the sibling
+//! `account.rs` scan they read): `submit_is_the_sole_send_dispatch_gate` (the SDK
+//! send verbs each stay one call site), `exactly_two_legal_dispatch_triggers` (the
+//! wildcard-free exhaustiveness gate — a third variant fails to compile), and
+//! `submit_has_exactly_the_two_user_initiated_callers` (a source scan of production
+//! `account.rs` — a third or background [`submit`] caller fails the count).
+//!
 //! Secret containment (NFR-9): neither the message body, a txn id, an event id,
 //! nor a token ever reaches `tracing` — logs carry the opaque room id only, via
 //! the caller. This module itself logs nothing secret.
@@ -24,10 +69,15 @@ use crate::error::SendError;
 
 /// What caused a content dispatch through the single send gate (AD-13).
 ///
-/// Seeds the two triggers the send-gate contract names: [`SendTrigger::ComposerSend`]
-/// (a composer send) and [`SendTrigger::ApprovalPaneApprove`] (approving a pending
-/// draft in the approval pane, Story 7.3). These are the only two legal dispatch
-/// triggers; both flow through the single [`submit`] gate.
+/// This is a **closed set** of exactly two user-initiated triggers, the only two the
+/// send-gate contract names: [`SendTrigger::ComposerSend`] (a composer send) and
+/// [`SendTrigger::ApprovalPaneApprove`] (approving a pending draft in the approval
+/// pane, Story 7.3). These are the only two legal dispatch triggers; both flow
+/// through the single [`submit`] gate. Adding a third variant is an AD-13 invariant
+/// breach requiring a new planning-level decision (see the module-level airlock
+/// contract), and it will fail the wildcard-free exhaustiveness gate
+/// (`exactly_two_legal_dispatch_triggers`) at compile time. No match over this enum
+/// may use a `_ =>` wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendTrigger {
     /// A message the user composed and sent from the composer.
@@ -337,6 +387,105 @@ pub async fn cancel(timeline: &Timeline, item_key: &str) -> Result<(), SendError
 
 #[cfg(test)]
 mod tests {
+    use super::SendTrigger;
+
+    /// AD-13 exhaustiveness gate: `SendTrigger` is the closed set of exactly the two
+    /// user-initiated dispatch triggers. This test is the **planning gate** — if a
+    /// future change adds a third variant, the wildcard-free `match` below fails to
+    /// COMPILE here (and the length assert fails), forcing the change to be raised as
+    /// a planning-level decision rather than slipped in as an edit.
+    ///
+    /// Do NOT add a `_ =>` arm to the match: a wildcard would silently absorb a new
+    /// variant and defeat this gate.
+    #[test]
+    fn exactly_two_legal_dispatch_triggers() {
+        const ALL_TRIGGERS: &[SendTrigger] =
+            &[SendTrigger::ComposerSend, SendTrigger::ApprovalPaneApprove];
+
+        // Wildcard-free exhaustive match: a new `SendTrigger` variant makes this
+        // non-exhaustive and the crate fails to compile HERE. NO `_ =>` arm.
+        for trigger in ALL_TRIGGERS {
+            match trigger {
+                SendTrigger::ComposerSend => {}
+                SendTrigger::ApprovalPaneApprove => {}
+            }
+        }
+
+        assert_eq!(
+            ALL_TRIGGERS.len(),
+            2,
+            "AD-13: exactly two legal dispatch triggers must exist; found {}. \
+             A third trigger is an invariant breach requiring a planning decision.",
+            ALL_TRIGGERS.len()
+        );
+    }
+
+    /// AD-13 caller gate: `send::submit` has exactly the two user-initiated callers —
+    /// `send_text` (`ComposerSend`) and `send_approval` (`ApprovalPaneApprove`) — and
+    /// no third, background, scheduled, or bulk caller, and no other public API
+    /// dispatches. Scans the PRODUCTION slice of `account.rs` (everything before its
+    /// sole `#[cfg(test)]` marker) so this guard's own literals never self-match.
+    ///
+    /// A future third `send::submit(` call site (or a background/bulk dispatcher)
+    /// changes the count and fails this test, surfacing the change as an invariant
+    /// breach needing a planning decision.
+    #[test]
+    fn submit_has_exactly_the_two_user_initiated_callers() {
+        let full = include_str!("account.rs");
+
+        // The scan splits production off the test module on the sole `#[cfg(test)]`
+        // marker; assert there is exactly one, so a future second `#[cfg(test)]`
+        // block (which would make `.split(..).next()` silently truncate the scanned
+        // slice and could hide a `send::submit` caller after it) fails loudly here
+        // instead of passing on a partial scan.
+        let markers = full.matches("#[cfg(test)]").count();
+        assert_eq!(
+            markers, 1,
+            "AD-13 caller scan assumes a single `#[cfg(test)]` boundary in account.rs; \
+             found {markers}. A second one would truncate the scanned production slice \
+             and could hide a `send::submit` caller — the scan must be updated before \
+             it can be trusted."
+        );
+        let source = full
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes the test module");
+
+        // Whitespace-normalize before counting so a rustfmt-reformatted or multi-line
+        // call site (`send::submit(\n    &tl, ..)`, `SendTrigger::ComposerSend)\n .await`)
+        // still counts — the guard must not be defeated by mere reformatting. A
+        // `crate::send::submit(` prefix still matches `send::submit(` as a substring.
+        let normalized: String = source.split_whitespace().collect();
+
+        // The gate must have exactly two call sites. The prose reference in rustdoc
+        // is `[`send::submit`]` (no `(`), so it does not match.
+        let submit_calls = normalized.matches("send::submit(").count();
+        assert_eq!(
+            submit_calls, 2,
+            "AD-13: `send::submit(` must have exactly two production callers \
+             (composer + approval); found {submit_calls}. A third or background \
+             caller is an invariant breach requiring a planning decision."
+        );
+
+        // Call forms (with `).await`) dodge the bracketed `[`SendTrigger::…`]` rustdoc
+        // reference at account.rs:2172. Each user-initiated trigger appears exactly
+        // once at a real call site.
+        let composer_calls = normalized
+            .matches("SendTrigger::ComposerSend).await")
+            .count();
+        assert_eq!(
+            composer_calls, 1,
+            "AD-13: exactly one `ComposerSend` dispatch call site expected; found {composer_calls}."
+        );
+        let approval_calls = normalized
+            .matches("SendTrigger::ApprovalPaneApprove).await")
+            .count();
+        assert_eq!(
+            approval_calls, 1,
+            "AD-13: exactly one `ApprovalPaneApprove` dispatch call site expected; found {approval_calls}."
+        );
+    }
+
     /// FR-41 / AD-13 single-dispatch-gate guard: the SDK content-send call
     /// (`.send(content)` on a `Timeline`) appears exactly once in this module,
     /// and that one call site is inside `submit`.
