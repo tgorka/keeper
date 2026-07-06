@@ -21,6 +21,7 @@ import { useAccountsStore } from "@/lib/stores/accounts";
 import { useEncryptionStatus } from "@/lib/stores/encryption-status";
 import { keyBackupStore, useKeyBackupStatus } from "@/lib/stores/key-backup";
 import { verificationStore } from "@/lib/stores/verification";
+import { wizardStore } from "@/lib/stores/wizard";
 
 interface SettingsDialogProps {
   /** Whether the dialog is open (controlled by the caller). */
@@ -91,6 +92,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           <HonorRemoteDeletionsRow />
         </div>
         <EncryptionSection />
+        <SetupSection onOpenChange={onOpenChange} />
       </DialogContent>
     </Dialog>
   );
@@ -193,6 +195,33 @@ function EncryptionSection() {
         </ul>
       )}
       <p className="text-muted-foreground">{ENCRYPTION_HONESTY_SENTENCE}</p>
+    </div>
+  );
+}
+
+/**
+ * Setup section (Story 6.8): a "Run setup again" entry that re-opens the
+ * session-scoped first-run wizard over the shell and closes Settings. The wizard
+ * is fully re-runnable; `accountId` defaults to the first account on re-entry.
+ */
+function SetupSection({ onOpenChange }: { onOpenChange: (open: boolean) => void }) {
+  return (
+    <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
+      <p className="font-medium">Setup</p>
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-muted-foreground">Walk through the first-run setup again.</p>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            wizardStore.getState().start();
+            onOpenChange(false);
+          }}
+        >
+          Run setup again
+        </Button>
+      </div>
     </div>
   );
 }

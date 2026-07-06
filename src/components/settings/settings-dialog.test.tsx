@@ -20,6 +20,7 @@ import { accountsStore } from "@/lib/stores/accounts";
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
 import { keyBackupStore } from "@/lib/stores/key-backup";
 import { verificationStore } from "@/lib/stores/verification";
+import { wizardStore } from "@/lib/stores/wizard";
 
 const mockPosture = vi.mocked(encryptionPosture);
 const mockHonorGet = vi.mocked(honorRemoteDeletions);
@@ -46,6 +47,7 @@ describe("SettingsDialog", () => {
     encryptionStatusStore.getState().reset();
     keyBackupStore.getState().reset();
     verificationStore.setState({ flow: null, modalOpen: false, activeAccountId: null });
+    wizardStore.setState({ active: false, dismissed: false, step: "welcome", accountId: null });
   });
 
   afterEach(() => {
@@ -176,5 +178,18 @@ describe("SettingsDialog", () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(mockHonorSet).toHaveBeenCalledWith(true));
     expect(toggle).toBeChecked();
+  });
+
+  it("'Run setup again' starts the wizard and closes Settings", async () => {
+    mockPosture.mockResolvedValue(false);
+    const onOpenChange = vi.fn();
+    render(<SettingsDialog open onOpenChange={onOpenChange} />);
+
+    const runAgain = await screen.findByRole("button", { name: "Run setup again" });
+    fireEvent.click(runAgain);
+
+    expect(wizardStore.getState().active).toBe(true);
+    expect(wizardStore.getState().step).toBe("welcome");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 });

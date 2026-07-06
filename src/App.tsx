@@ -1,12 +1,14 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { LoginScreen } from "@/components/auth/login-screen";
 import { AppShell } from "@/components/layout/app-shell";
 import { AtRestEncryptionChoice } from "@/components/settings/at-rest-encryption-choice";
 import { Toaster } from "@/components/ui/sonner";
+import { FirstRunWizard } from "@/components/wizard/first-run-wizard";
 import { useSessionRestore } from "@/hooks/use-session-restore";
 import { encryptionPosture } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useAddAccountStore } from "@/lib/stores/add-account";
+import { useWizardStore, wizardStore } from "@/lib/stores/wizard";
 
 function App() {
   // Attempt a one-shot boot session-restore before deciding what to render.
@@ -15,6 +17,12 @@ function App() {
   const hasAccount = useAccountsStore((s) => s.accounts.length > 0);
   const addAccountOpen = useAddAccountStore((s) => s.open);
   const closeAddAccount = useAddAccountStore((s) => s.closeAddAccount);
+  // First-run wizard (Story 6.8). `active` takes precedence over the `hasAccount`
+  // gate below so adding an account mid-flow does not unmount the wizard;
+  // `dismissed` lands a skipped fresh install in an empty inbox (not the login
+  // screen). Both are session-scoped and never persisted.
+  const wizardActive = useWizardStore((s) => s.active);
+  const wizardDismissed = useWizardStore((s) => s.dismissed);
 
   // First-run at-rest-encryption gate (Story 2.6). Loaded once for a fresh
   // install (`!hasAccount`). `undefined` = still loading (hold the splash);
@@ -41,6 +49,33 @@ function App() {
       cancelled = true;
     };
   }, []);
+
+  // One-shot first-run auto-start of the wizard (Story 6.8). Fires at most once
+  // (guarded by a ref) when the app has finished restoring, there are no accounts,
+  // and the at-rest-encryption posture has resolved (not still loading / unchosen).
+  // Deliberately NOT triggered by a later sign-out-of-last-account: the ref keeps
+  // it a genuine first-run boot event only.
+  const bootDecidedRef = useRef(false);
+  useEffect(() => {
+    // Only evaluate the first-run decision once the boot state is fully resolved
+    // (hydrated + a resolved posture). This is a one-shot boot decision: the first
+    // time we reach a resolved boot state we either auto-start (fresh install with
+    // zero accounts) or lock the decision out forever. A later sign-out-of-last-
+    // account therefore never auto-starts the wizard — the decision was already made
+    // at boot, when an account was present.
+    if (
+      bootDecidedRef.current ||
+      !hydrated ||
+      postureChosen === undefined ||
+      postureChosen === null
+    ) {
+      return;
+    }
+    bootDecidedRef.current = true;
+    if (!hasAccount) {
+      wizardStore.getState().start();
+    }
+  }, [hydrated, hasAccount, postureChosen]);
 
   // Decide the shell/login/splash content, then render it alongside a single
   // always-mounted <Toaster />. The Toaster lives ABOVE the hasAccount gate so a
@@ -71,6 +106,13 @@ function App() {
       );
     }
 
+    // The first-run wizard's `active` flag takes precedence over the `hasAccount`
+    // gate: adding an account mid-flow flips `hasAccount` true, but the wizard must
+    // stay mounted through its discovery/login steps (Story 6.8, Design Notes).
+    if (wizardActive) {
+      return <FirstRunWizard />;
+    }
+
     // No accounts yet → gate first sign-in behind the first-run encryption choice
     // when the posture is unchosen. Otherwise mount the shell, and layer the
     // add-account login overlay on top when the footer requests it (subsequent adds
@@ -92,7 +134,17 @@ function App() {
       if (postureChosen === null) {
         return <AtRestEncryptionChoice onResolved={() => setPostureChosen(false)} />;
       }
-      return <LoginScreen />;
+      // A resolved posture with the wizard dismissed (skipped/finished with zero
+      // accounts) lands the user in an empty inbox — the shell (with its "Add an
+      // account" footer) rather than the bare login screen. `dismissed` is set only
+      // by the wizard's own finish(), so a sign-out-of-last-account still shows the
+      // login screen here (it never sets `dismissed`). All other zero-account states
+      // render the login screen unchanged.
+      if (!wizardDismissed) {
+        return <LoginScreen />;
+      }
+      // Fall through to the shell path below (empty inbox + reachable add-account
+      // overlay).
     }
 
     return (

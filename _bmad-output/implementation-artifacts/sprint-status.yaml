@@ -102,7 +102,7 @@ development_status:
   6-5-bridge-session-health-and-re-login-prompts: done
   6-6-start-new-chats-via-bridge: done
   6-7-bbctl-integration-for-beeper-self-hosted-bridges: done
-  6-8-first-run-wizard: backlog
+  6-8-first-run-wizard: done
   epic-6-retrospective: optional
   epic-7: backlog
   7-1-persistent-per-chat-drafts: backlog
