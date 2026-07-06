@@ -27,6 +27,7 @@ function room(
     isFavourite: false,
     network: null,
     networkId: null,
+    muteState: "none",
     ...overrides,
   };
 }

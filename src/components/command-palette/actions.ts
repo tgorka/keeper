@@ -16,6 +16,7 @@
  */
 import {
   archiveRoom,
+  chatNotifyModeSet,
   favoriteRoom,
   incognitoGet,
   incognitoGetGlobal,
@@ -85,6 +86,12 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
     const vm = await incognitoGet(ctx.accountId, ctx.roomId);
     await incognitoSetChat(ctx.accountId, ctx.roomId, !vm.effective);
   },
+  // Per-Chat notification mode (Story 10.2): set a synced Matrix push rule. `unmute`
+  // resolves to `all` (clears any per-Chat rule). Rust owns persistence + the row glyph.
+  "mute-chat": (ctx) => (ctx ? chatNotifyModeSet(ctx.accountId, ctx.roomId, "mute") : undefined),
+  "mention-only-chat": (ctx) =>
+    ctx ? chatNotifyModeSet(ctx.accountId, ctx.roomId, "mention_only") : undefined,
+  "unmute-chat": (ctx) => (ctx ? chatNotifyModeSet(ctx.accountId, ctx.roomId, "all") : undefined),
   "export-chat": (ctx) =>
     ctx
       ? exportStore.getState().open({ scope: "chat", accountId: ctx.accountId, roomId: ctx.roomId })

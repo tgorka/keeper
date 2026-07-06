@@ -72,10 +72,10 @@ use crate::timeline;
 use crate::verification::{self, VerificationSink};
 use crate::vm::BridgeLoginInput;
 use crate::vm::{
-    ApprovalDraftVm, ConnectionStatus, ConnectionStatusBatch, DraftMirrorBatch, EditVersionVm,
-    EncryptionStatus, EncryptionStatusBatch, HeldSendVm, InboxBatch, IncognitoVm, OutboxVm,
-    PaginationStatusBatch, PaletteMode, PaletteResultsVm, RemoteDraftVm, RoomListBatch, RoomListOp,
-    RoomVm, SpaceVm, TimelineBatch, TypingBatch, TypistVm,
+    ApprovalDraftVm, ChatNotifyMode, ConnectionStatus, ConnectionStatusBatch, DraftMirrorBatch,
+    EditVersionVm, EncryptionStatus, EncryptionStatusBatch, HeldSendVm, InboxBatch, IncognitoVm,
+    MuteState, OutboxVm, PaginationStatusBatch, PaletteMode, PaletteResultsVm, RemoteDraftVm,
+    RoomListBatch, RoomListOp, RoomVm, SpaceVm, TimelineBatch, TypingBatch, TypistVm,
 };
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
@@ -604,7 +604,26 @@ impl AccountManager {
             tracing::warn!(error = %e, "could not read notify previews setting; defaulting on");
             true
         });
-        let notify = Arc::new(NotifyConfig::new(previews_enabled));
+        // Seed the global DND switch + muted-Network set from the persisted registry
+        // (Story 10.2). A read failure defaults off / empty — suppression must never
+        // block startup, and its honest default is "notify normally".
+        let dnd_enabled = registry::get_dnd_global(data_dir).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not read DND setting; defaulting off");
+            false
+        });
+        let muted_networks: std::collections::HashSet<String> =
+            registry::get_muted_networks(data_dir)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "could not read muted networks; defaulting empty");
+                    Vec::new()
+                })
+                .into_iter()
+                .collect();
+        let notify = Arc::new(NotifyConfig::with_state(
+            previews_enabled,
+            dnd_enabled,
+            muted_networks,
+        ));
         Self {
             accounts: Mutex::new(HashMap::new()),
             inbox: Mutex::new(None),
@@ -737,6 +756,11 @@ impl AccountManager {
 
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
         let account_id_owned = account_id.to_owned();
+        // The in-memory `NotifyConfig` muted-Network set threads into each row's
+        // `MuteState` resolution (Story 10.2) — the same live source the notify handler
+        // reads, so the glyph and notification suppression never diverge, and no
+        // per-row SQLite open happens on the inbox hot path.
+        let notify = self.notify.clone();
         let span = tracing::info_span!("room_list_producer", account_id = %account_id);
         let reaper_subs = subs_arc.clone();
         let task = tokio::spawn(
@@ -744,7 +768,7 @@ impl AccountManager {
                 // `client` is captured to keep the account alive for the task's
                 // lifetime; the producer reads from the room list only.
                 let _keep_alive = client;
-                run_producer(room_list, sink, &account_id_owned).await;
+                run_producer(room_list, sink, &account_id_owned, &notify).await;
                 // A naturally-completed producer reaps its own subscription entry.
                 reaper_subs.lock().await.remove(&subscription_id);
             }
@@ -861,9 +885,14 @@ impl AccountManager {
                 accounts.get(&account_id).map(|h| h.client.clone())
             };
             let merger_for_task = merger.clone();
+            // Thread the in-memory `NotifyConfig` into the producer so each row's
+            // `MuteState` consults the same live muted-Network set the notify handler
+            // reads (Story 10.2) — no per-row SQLite open on the inbox hot path.
+            let notify_for_task = self.notify.clone();
             let task = tokio::spawn(
                 async move {
-                    run_inbox_producer(room_list, merger_for_task, &account_id).await;
+                    run_inbox_producer(room_list, merger_for_task, &account_id, &notify_for_task)
+                        .await;
                 }
                 .instrument(
                     tracing::info_span!("inbox_producer", account_id = %account.account_id),
@@ -3369,6 +3398,120 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Read the global Do-Not-Disturb switch (Story 10.2, AD-18). Returns the in-memory
+    /// [`NotifyConfig`] value (seeded from the persisted registry at construction).
+    pub fn dnd_get(&self) -> bool {
+        self.notify.dnd_enabled()
+    }
+
+    /// Set the global Do-Not-Disturb switch (Story 10.2, AD-18). Persists the new value
+    /// to the `settings` k/v table under `notify.dnd_global` **and** updates the
+    /// in-memory [`NotifyConfig`] so every account's live notify handler sees the change
+    /// immediately. Persists first: an in-memory change is applied only once it is durable.
+    pub fn dnd_set(&self, platform: &Arc<dyn Platform>, enabled: bool) -> Result<(), CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::set_dnd_global(&data_dir, enabled)?;
+        self.notify.set_dnd_enabled(enabled);
+        Ok(())
+    }
+
+    /// Whether a Network label is currently muted (Story 10.2, AD-18). Reads the
+    /// persisted `muted_networks` table (authoritative across restart).
+    pub fn network_mute_get(
+        &self,
+        platform: &Arc<dyn Platform>,
+        network_id: &str,
+    ) -> Result<bool, CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::is_network_muted(&data_dir, network_id)
+    }
+
+    /// Set (or clear) the muted state for a Network label (Story 10.2, AD-18). Persists
+    /// the change to the `muted_networks` table **and** updates the in-memory
+    /// [`NotifyConfig`] muted set so every account's live notify handler suppresses (or
+    /// resumes) immediately. Persists first (durable-before-applied). The inbox row
+    /// glyph reads the same in-memory set but is recomputed only at the next inbox
+    /// emit for a room, so an idle room's glyph refreshes when it next produces a diff
+    /// (a live re-emit poke is deferred — see deferred-work).
+    pub fn network_mute_set(
+        &self,
+        platform: &Arc<dyn Platform>,
+        network_id: &str,
+        muted: bool,
+    ) -> Result<(), CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::set_network_muted(&data_dir, network_id, muted)?;
+        self.notify.set_network_muted(network_id, muted);
+        Ok(())
+    }
+
+    /// Read the per-Chat notification mode for `(account_id, room_id)` (Story 10.2,
+    /// AD-18). Resolves the account's live `Client` and reads the synced Matrix push-rule
+    /// mode via `notification_settings().get_user_defined_room_notification_mode(...)`:
+    /// `Mute` → [`ChatNotifyMode::Mute`], `MentionsAndKeywordsOnly` →
+    /// [`ChatNotifyMode::MentionOnly`], `AllMessages`/absent → [`ChatNotifyMode::All`].
+    ///
+    /// Errors: an unparsable/unknown room id, or an account that isn't live →
+    /// [`TimelineError::RoomNotFound`].
+    pub async fn chat_notify_mode_get(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<ChatNotifyMode, CoreError> {
+        use matrix_sdk::notification_settings::RoomNotificationMode;
+
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+        let mode = room
+            .client()
+            .notification_settings()
+            .await
+            .get_user_defined_room_notification_mode(&room_id)
+            .await;
+        Ok(match mode {
+            Some(RoomNotificationMode::Mute) => ChatNotifyMode::Mute,
+            Some(RoomNotificationMode::MentionsAndKeywordsOnly) => ChatNotifyMode::MentionOnly,
+            Some(RoomNotificationMode::AllMessages) | None => ChatNotifyMode::All,
+        })
+    }
+
+    /// Set the per-Chat notification mode for `(account_id, room_id)` (Story 10.2,
+    /// AD-18). Writes a synced Matrix push rule via
+    /// `notification_settings().set_room_notification_mode(...)`, so the mode survives
+    /// restart and syncs across the user's devices: [`ChatNotifyMode::All`] →
+    /// `AllMessages` (the "unmute" target), [`ChatNotifyMode::MentionOnly`] →
+    /// `MentionsAndKeywordsOnly`, [`ChatNotifyMode::Mute`] → `Mute`. The notify handler
+    /// then reads the verdict back per event via `event_push_actions`; unread is untouched.
+    ///
+    /// Errors: an unparsable/unknown room id, or an account that isn't live →
+    /// [`TimelineError::RoomNotFound`]. A push-rule dispatch failure surfaces as
+    /// [`SignalError::Dispatch`](crate::error::SignalError::Dispatch).
+    pub async fn chat_notify_mode_set(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        mode: ChatNotifyMode,
+    ) -> Result<(), CoreError> {
+        use matrix_sdk::notification_settings::RoomNotificationMode;
+
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+        let target = match mode {
+            ChatNotifyMode::All => RoomNotificationMode::AllMessages,
+            ChatNotifyMode::MentionOnly => RoomNotificationMode::MentionsAndKeywordsOnly,
+            ChatNotifyMode::Mute => RoomNotificationMode::Mute,
+        };
+        room.client()
+            .notification_settings()
+            .await
+            .set_room_notification_mode(&room_id, target)
+            .await
+            .map_err(|e| crate::error::SignalError::Dispatch(e.to_string()))?;
+        Ok(())
+    }
+
     /// Read the global Incognito default (Story 8.1). Absent = off (Incognito off by
     /// default). Reads the `settings` k/v table key `incognito.global`.
     pub fn incognito_get_global(&self, platform: &Arc<dyn Platform>) -> Result<bool, CoreError> {
@@ -4982,7 +5125,12 @@ fn map_encryption_status(state: &VerificationState) -> EncryptionStatus {
 /// Drive the recency-sorted entries stream, converting each `VectorDiff` batch
 /// into a [`RoomListBatch`] and forwarding it to `sink`. The stream yields
 /// nothing until the filter is set, then a `Reset` and live diffs.
-async fn run_producer(room_list: RoomList, sink: BatchSink, account_id: &str) {
+async fn run_producer(
+    room_list: RoomList,
+    sink: BatchSink,
+    account_id: &str,
+    notify: &NotifyConfig,
+) {
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
     if !controller.set_filter(Box::new(new_filter_non_left())) {
@@ -5006,7 +5154,7 @@ async fn run_producer(room_list: RoomList, sink: BatchSink, account_id: &str) {
                     Some(diffs) => {
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
-                            ops.push(diff_to_op(diff).await);
+                            ops.push(diff_to_op(diff, notify).await);
                         }
                         if !(sink)(RoomListBatch { ops, total }) {
                             tracing::info!(account_id = %account_id, "room list channel closed, stopping producer");
@@ -5035,7 +5183,12 @@ async fn run_producer(room_list: RoomList, sink: BatchSink, account_id: &str) {
 /// [`InboxMerger`], which folds it into that account's slot and re-emits the
 /// merged window. Stops when the merger reports the output channel is closed or
 /// the entries stream ends.
-async fn run_inbox_producer(room_list: RoomList, merger: InboxMerger, account_id: &str) {
+async fn run_inbox_producer(
+    room_list: RoomList,
+    merger: InboxMerger,
+    account_id: &str,
+    notify: &NotifyConfig,
+) {
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
     if !controller.set_filter(Box::new(new_filter_non_left())) {
@@ -5055,7 +5208,7 @@ async fn run_inbox_producer(room_list: RoomList, merger: InboxMerger, account_id
                     Some(diffs) => {
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
-                            ops.push(diff_to_op(diff).await);
+                            ops.push(diff_to_op(diff, notify).await);
                         }
                         if !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await {
                             tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
@@ -5289,47 +5442,52 @@ fn loaded_total(state: &RoomListLoadingState) -> Option<u32> {
 /// Convert a `VectorDiff<RoomListItem>` into a [`RoomListOp`], resolving each
 /// carried item to a [`RoomVm`] (async) before delegating to the pure
 /// [`vector_diff_to_op`] seam.
-async fn diff_to_op(diff: VectorDiff<RoomListItem>) -> RoomListOp {
-    let mapped = map_vector_diff(diff).await;
+async fn diff_to_op(diff: VectorDiff<RoomListItem>, notify: &NotifyConfig) -> RoomListOp {
+    let mapped = map_vector_diff(diff, notify).await;
     vector_diff_to_op(mapped)
 }
 
 /// Map every `RoomListItem` in a diff to a [`RoomVm`], preserving the variant.
 ///
 /// Kept separate from [`vector_diff_to_op`] because item→VM conversion is async
-/// (display name / latest event) while the diff→op conversion is pure.
-async fn map_vector_diff(diff: VectorDiff<RoomListItem>) -> VectorDiff<RoomVm> {
+/// (display name / latest event / mute state) while the diff→op conversion is pure.
+/// `notify` threads the in-memory muted-Network set into the per-room [`MuteState`]
+/// resolution (Story 10.2) — the same live source the notify handler reads.
+async fn map_vector_diff(
+    diff: VectorDiff<RoomListItem>,
+    notify: &NotifyConfig,
+) -> VectorDiff<RoomVm> {
     match diff {
         VectorDiff::Append { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(room_item_to_vm(&item).await);
+                vms.push(room_item_to_vm(&item, notify).await);
             }
             VectorDiff::Append { values: vms.into() }
         }
         VectorDiff::Clear => VectorDiff::Clear,
         VectorDiff::PushFront { value } => VectorDiff::PushFront {
-            value: room_item_to_vm(&value).await,
+            value: room_item_to_vm(&value, notify).await,
         },
         VectorDiff::PushBack { value } => VectorDiff::PushBack {
-            value: room_item_to_vm(&value).await,
+            value: room_item_to_vm(&value, notify).await,
         },
         VectorDiff::PopFront => VectorDiff::PopFront,
         VectorDiff::PopBack => VectorDiff::PopBack,
         VectorDiff::Insert { index, value } => VectorDiff::Insert {
             index,
-            value: room_item_to_vm(&value).await,
+            value: room_item_to_vm(&value, notify).await,
         },
         VectorDiff::Set { index, value } => VectorDiff::Set {
             index,
-            value: room_item_to_vm(&value).await,
+            value: room_item_to_vm(&value, notify).await,
         },
         VectorDiff::Remove { index } => VectorDiff::Remove { index },
         VectorDiff::Truncate { length } => VectorDiff::Truncate { length },
         VectorDiff::Reset { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(room_item_to_vm(&item).await);
+                vms.push(room_item_to_vm(&item, notify).await);
             }
             VectorDiff::Reset { values: vms.into() }
         }
@@ -5354,9 +5512,50 @@ async fn resolved_room_name(room: &matrix_sdk::Room, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_owned())
 }
 
+/// Resolve the durable per-Chat / per-Network [`MuteState`] for a room at inbox
+/// projection time (Story 10.2, FR-52, AD-18).
+///
+/// Combines the room's synced Matrix push-rule mode
+/// (`get_user_defined_room_notification_mode`) with the keeper-local muted-Network
+/// set: `Mute` → `Muted`, `MentionsAndKeywordsOnly` → `MentionOnly`; otherwise, if
+/// the room's bridged Network label is in the muted set → `Muted`, else `None`.
+/// Fail-open: any read error (push-rule lookup, registry) resolves to `None` and is
+/// logged at `debug` — the glyph is a comfort indicator and must never block the
+/// inbox stream. The global DND switch is intentionally *not* consulted here (DND is
+/// surfaced once in the footer, never stamped per row).
+async fn resolve_mute_state(
+    room: &matrix_sdk::Room,
+    network: Option<&str>,
+    notify: &NotifyConfig,
+) -> MuteState {
+    use matrix_sdk::notification_settings::RoomNotificationMode;
+
+    let mode = room
+        .client()
+        .notification_settings()
+        .await
+        .get_user_defined_room_notification_mode(room.room_id())
+        .await;
+    match mode {
+        Some(RoomNotificationMode::Mute) => return MuteState::Muted,
+        Some(RoomNotificationMode::MentionsAndKeywordsOnly) => return MuteState::MentionOnly,
+        Some(RoomNotificationMode::AllMessages) | None => {}
+    }
+    // No per-Chat rule (or an explicit "all"): fall back to the per-Network mute set.
+    // Read the in-memory `NotifyConfig` (seeded from the persisted `muted_networks`
+    // table, kept current by `network_mute_set`) — the same live source the notify
+    // handler consults, so the glyph and suppression agree, with no SQLite open here.
+    if let Some(net) = network {
+        if notify.is_network_muted(net) {
+            return MuteState::Muted;
+        }
+    }
+    MuteState::None
+}
+
 /// Resolve a [`RoomListItem`] to a non-secret [`RoomVm`]: display name plus a
 /// latest-event text preview and timestamp.
-async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
+async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig) -> RoomVm {
     let room_id = item.room_id().to_string();
     let resolved = item.display_name().await;
     if resolved.is_err() {
@@ -5406,6 +5605,12 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
     // display `network` label above. A native room resolves to `None`.
     let network_id = bridge::room_bridge_protocol_id(item).await;
 
+    // Resolve the durable per-Chat / per-Network mute intent for the row glyph
+    // (Story 10.2). `RoomListItem` derefs to `matrix_sdk::Room`; fail-open `None` on
+    // any read error so a transient push-rule failure never blocks the inbox stream
+    // and never touches the unread computation above.
+    let mute_state = resolve_mute_state(item, network.as_deref(), notify).await;
+
     RoomVm {
         room_id,
         display_name,
@@ -5419,6 +5624,7 @@ async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
         is_space,
         network,
         network_id,
+        mute_state,
     }
 }
 
@@ -6025,6 +6231,7 @@ mod tests {
             is_space: false,
             network: None,
             network_id: None,
+            mute_state: MuteState::None,
         }
     }
 

@@ -26,6 +26,7 @@ function room(roomId: string, isUnread = false, accountId = ACC): InboxRoomVm {
     isFavourite: false,
     network: null,
     networkId: null,
+    muteState: "none",
   };
 }
 

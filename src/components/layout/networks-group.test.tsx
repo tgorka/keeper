@@ -9,11 +9,14 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   return {
     ...actual,
     setNetworkFilter: vi.fn(async () => {}),
+    // Per-Network mute (Story 10.2): default not-muted, capture the set call.
+    networkMuteGet: vi.fn(async () => false),
+    networkMuteSet: vi.fn(async () => {}),
   };
 });
 
 import { NetworksGroup } from "@/components/layout/networks-group";
-import { setNetworkFilter } from "@/lib/ipc/client";
+import { networkMuteGet, networkMuteSet, setNetworkFilter } from "@/lib/ipc/client";
 import { networksStore } from "@/lib/stores/networks";
 
 function network(name: string): NetworkVm {
@@ -66,6 +69,40 @@ describe("NetworksGroup", () => {
     expect(networksStore.getState().activeNetwork).toBeNull();
     await waitFor(() => {
       expect(setNetworkFilter).toHaveBeenCalledWith(null);
+    });
+  });
+
+  // ── Per-Network mute (Story 10.2) ──────────────────────────────────────────
+  it("reads the muted state for each network on render", async () => {
+    networksStore.getState().applySnapshot({ networks: [network("Telegram")] });
+    render(<NetworksGroup />);
+    await waitFor(() => {
+      expect(networkMuteGet).toHaveBeenCalledWith("Telegram");
+    });
+  });
+
+  it("the context menu mutes an unmuted network via networkMuteSet", async () => {
+    networksStore.getState().applySnapshot({ networks: [network("Telegram")] });
+    render(<NetworksGroup />);
+    // Default not-muted → the menu offers "Mute Network".
+    fireEvent.contextMenu(screen.getByRole("button", { name: /Telegram/ }));
+    fireEvent.click(await screen.findByText("Mute Network"));
+    await waitFor(() => {
+      expect(networkMuteSet).toHaveBeenCalledWith("Telegram", true);
+    });
+  });
+
+  it("shows the mute glyph and offers Unmute when a network is muted", async () => {
+    (networkMuteGet as ReturnType<typeof vi.fn>).mockResolvedValueOnce(true);
+    networksStore.getState().applySnapshot({ networks: [network("Telegram")] });
+    render(<NetworksGroup />);
+    await waitFor(() => {
+      expect(screen.getByTestId("network-mute-glyph")).toBeInTheDocument();
+    });
+    fireEvent.contextMenu(screen.getByRole("button", { name: /Telegram/ }));
+    fireEvent.click(await screen.findByText("Unmute Network"));
+    await waitFor(() => {
+      expect(networkMuteSet).toHaveBeenCalledWith("Telegram", false);
     });
   });
 });

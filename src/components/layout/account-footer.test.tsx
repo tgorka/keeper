@@ -16,11 +16,15 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   return {
     ...actual,
     encryptionPosture: vi.fn(() => Promise.resolve(false)),
+    // Global DND toggle (Story 10.2): default off, capture the set call.
+    dndGetGlobal: vi.fn(() => Promise.resolve(false)),
+    dndSetGlobal: vi.fn(() => Promise.resolve()),
   };
 });
 
 import { AccountFooter } from "@/components/layout/account-footer";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { dndGetGlobal, dndSetGlobal } from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { addAccountStore } from "@/lib/stores/add-account";
@@ -325,5 +329,31 @@ describe("AccountFooter", () => {
       screen.getByRole("button", { name: `Account menu for ${alice.userId}` }),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add account" })).toBeInTheDocument();
+  });
+
+  // ── Global Do-Not-Disturb toggle (Story 10.2) ──────────────────────────────
+  it("shows a Do not disturb row and reads the global DND state on open", async () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter();
+    await openRowMenu(alice.userId);
+    expect(await screen.findByText("Do not disturb")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(dndGetGlobal).toHaveBeenCalled();
+    });
+  });
+
+  it("toggling Do not disturb writes the new global state via dndSetGlobal", async () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter();
+    await openRowMenu(alice.userId);
+    const item = await screen.findByText("Do not disturb");
+    // Initial read resolved to false; the toggle flips it on.
+    await waitFor(() => {
+      expect(dndGetGlobal).toHaveBeenCalled();
+    });
+    fireEvent.click(item);
+    await waitFor(() => {
+      expect(dndSetGlobal).toHaveBeenCalledWith(true);
+    });
   });
 });

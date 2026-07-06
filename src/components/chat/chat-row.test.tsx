@@ -21,11 +21,13 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     unpinRoom: vi.fn(async () => {}),
     favoriteRoom: vi.fn(async () => {}),
     unfavoriteRoom: vi.fn(async () => {}),
+    chatNotifyModeSet: vi.fn(async () => {}),
   };
 });
 
 import {
   archiveRoom,
+  chatNotifyModeSet,
   favoriteRoom,
   markRoomRead,
   markRoomUnread,
@@ -56,6 +58,7 @@ function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
     isFavourite: false,
     network: null,
     networkId: null,
+    muteState: "none",
     ...overrides,
   };
 }
@@ -500,5 +503,51 @@ describe("ChatRow", () => {
     draftsStore.getState().mark("01ARZ3NDEKTSV4RRFFQ69G5FAV", "!other:example.org", true);
     render(<ChatRow room={room()} />);
     expect(screen.queryByTestId("draft-marker")).not.toBeInTheDocument();
+  });
+
+  // ── Mute glyph + Notifications submenu (Story 10.2) ────────────────────────
+  it("shows the bell-off glyph when the room is muted", () => {
+    render(<ChatRow room={room({ muteState: "muted" })} />);
+    expect(screen.getByTestId("mute-glyph")).toBeInTheDocument();
+    expect(screen.queryByTestId("mention-only-glyph")).not.toBeInTheDocument();
+  });
+
+  it("shows the at-sign glyph when the room is mention-only", () => {
+    render(<ChatRow room={room({ muteState: "mention_only" })} />);
+    expect(screen.getByTestId("mention-only-glyph")).toBeInTheDocument();
+    expect(screen.queryByTestId("mute-glyph")).not.toBeInTheDocument();
+  });
+
+  it("shows no mute glyph when the room is not muted", () => {
+    render(<ChatRow room={room({ muteState: "none" })} />);
+    expect(screen.queryByTestId("mute-glyph")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("mention-only-glyph")).not.toBeInTheDocument();
+  });
+
+  it("Notifications submenu → Mute sets the mute mode via chatNotifyModeSet", async () => {
+    render(<ChatRow room={room({ accountId: "acctZ", roomId: "!z:example.org" })} />);
+    fireEvent.contextMenu(screen.getByRole("button"));
+    // Open the Notifications submenu, then pick Mute.
+    fireEvent.click(await screen.findByText("Notifications"));
+    fireEvent.click(await screen.findByText("Mute"));
+    expect(chatNotifyModeSet).toHaveBeenCalledWith("acctZ", "!z:example.org", "mute");
+  });
+
+  it("Notifications submenu → Mentions only sets mention_only", async () => {
+    render(<ChatRow room={room({ accountId: "acctZ", roomId: "!z:example.org" })} />);
+    fireEvent.contextMenu(screen.getByRole("button"));
+    fireEvent.click(await screen.findByText("Notifications"));
+    fireEvent.click(await screen.findByText("Mentions only"));
+    expect(chatNotifyModeSet).toHaveBeenCalledWith("acctZ", "!z:example.org", "mention_only");
+  });
+
+  it("Notifications submenu → All clears the rule (unmute target)", async () => {
+    render(
+      <ChatRow room={room({ accountId: "acctZ", roomId: "!z:example.org", muteState: "muted" })} />,
+    );
+    fireEvent.contextMenu(screen.getByRole("button"));
+    fireEvent.click(await screen.findByText("Notifications"));
+    fireEvent.click(await screen.findByText("All"));
+    expect(chatNotifyModeSet).toHaveBeenCalledWith("acctZ", "!z:example.org", "all");
   });
 });

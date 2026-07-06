@@ -20,6 +20,7 @@ function room(
     isPinned: false,
     network: partial.network ?? null,
     networkId: partial.networkId ?? null,
+    muteState: partial.muteState ?? "none",
   };
 }
 

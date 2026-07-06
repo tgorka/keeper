@@ -20,6 +20,7 @@ import {
   CloudOff,
   Loader2,
   LogOut,
+  MoonStar,
   MoreVertical,
   Plus,
   Settings,
@@ -71,6 +72,8 @@ import { isBeeperAccount } from "@/lib/beeper";
 import {
   type AccountVm,
   type ConnectionStatus,
+  dndGetGlobal,
+  dndSetGlobal,
   incognitoGetAccount,
   incognitoSetAccount,
 } from "@/lib/ipc/client";
@@ -425,6 +428,65 @@ function AccountIncognitoSubmenu({ accountId }: { accountId: string }) {
   );
 }
 
+/**
+ * Global Do-Not-Disturb toggle row (Story 10.2, FR-52). A single app-wide on/off
+ * switch: when on, no notification posts on any account/Chat while unread still accrues
+ * everywhere. Reads the global state via `dndGetGlobal` on mount and writes it via
+ * `dndSetGlobal`; a monotonic `writeId` reverts only the newest failed write so a slow
+ * failure never clobbers a newer successful toggle (mirrors the Incognito pattern).
+ * `onSelect` returns `false` so picking it does not close the menu — the trailing check
+ * updates in place, matching a durable toggle.
+ */
+function GlobalDndToggle() {
+  const [enabled, setEnabled] = useState<boolean | undefined>(undefined);
+  const writeId = useRef(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    void dndGetGlobal()
+      .then((v) => {
+        if (!cancelled) {
+          setEnabled(v);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setEnabled(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const onToggle = () => {
+    writeId.current += 1;
+    const id = writeId.current;
+    const prev = enabled ?? false;
+    const next = !prev;
+    setEnabled(next);
+    void dndSetGlobal(next).catch(() => {
+      if (id === writeId.current) {
+        setEnabled(prev);
+      }
+    });
+  };
+
+  return (
+    <DropdownMenuItem
+      onSelect={(e) => {
+        // Keep the menu open so the trailing check reflects the new state in place.
+        e.preventDefault();
+        onToggle();
+      }}
+    >
+      <MoonStar aria-hidden="true" />
+      Do not disturb
+      {enabled === true && <Check aria-hidden="true" className="ml-auto" />}
+    </DropdownMenuItem>
+  );
+}
+
 function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed: boolean }) {
   // The Settings dialog open-state is shared (Story 3.1) so the verify banner and
   // the UTD stub can open it too; the per-row menu drives the same store. The
@@ -485,6 +547,7 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
             </DropdownMenuItem>
           )}
           <AccountIncognitoSubmenu accountId={account.accountId} />
+          <GlobalDndToggle />
           <DropdownMenuSeparator />
           <DropdownMenuItem variant="destructive" onSelect={() => setSignOutOpen(true)}>
             <LogOut aria-hidden="true" />

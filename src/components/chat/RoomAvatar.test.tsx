@@ -19,6 +19,7 @@ function room(overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
     isFavourite: false,
     network: null,
     networkId: null,
+    muteState: "none",
     ...overrides,
   };
 }

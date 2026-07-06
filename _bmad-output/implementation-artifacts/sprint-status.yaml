@@ -124,7 +124,7 @@ development_status:
   epic-9-retrospective: optional
   epic-10: backlog
   10-1-native-notifications-from-the-sync-loop: done
-  10-2-mutes-mention-only-and-do-not-disturb: backlog
+  10-2-mutes-mention-only-and-do-not-disturb: done
   10-3-background-operation-and-honest-quit: backlog
   10-4-click-through-and-bridge-health-alerts: backlog
   epic-10-retrospective: optional

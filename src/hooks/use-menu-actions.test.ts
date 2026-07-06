@@ -41,6 +41,7 @@ function room(roomId: string, flags: Partial<InboxRoomVm> = {}): InboxRoomVm {
     isFavourite: false,
     network: null,
     networkId: null,
+    muteState: "none",
     ...flags,
   };
 }

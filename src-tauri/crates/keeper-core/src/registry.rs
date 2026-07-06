@@ -122,6 +122,18 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
         [],
     )
     .map_err(|e| CoreError::Internal(format!("could not ensure outbox schema: {e}")))?;
+    // Per-Network mute set (Story 10.2, FR-52). A present row mutes every Chat bridged
+    // to that Network's label across all accounts; an absent row means "not muted".
+    // Matrix has no "network" concept, so this is keeper-local (evaluated in the notify
+    // decision and at inbox emit). Keyed by the Network's display label — the same
+    // cross-account identifier the Networks sidebar selects on. Never any secret material.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS muted_networks(\
+            network_id TEXT PRIMARY KEY\
+        )",
+        [],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not ensure muted_networks schema: {e}")))?;
     ensure_hue_index_column(&conn)?;
     ensure_provider_column(&conn)?;
     ensure_incognito_column(&conn)?;
@@ -442,6 +454,78 @@ pub fn set_notify_previews(data_dir: &Path, enabled: bool) -> Result<(), CoreErr
         NOTIFY_PREVIEWS_KEY,
         if enabled { "1" } else { "0" },
     )
+}
+
+/// The `settings` key holding the global Do-Not-Disturb switch (Story 10.2). Stored
+/// as `"1"`/`"0"`; absent = off (DND off by default, so notifications post normally).
+const NOTIFY_DND_GLOBAL_KEY: &str = "notify.dnd_global";
+
+/// Read the global Do-Not-Disturb switch (Story 10.2). Absent / anything-but-`"1"` ⇒
+/// `false` (off by default). Stored in the `settings` k/v table under
+/// `notify.dnd_global`. When on, the notify decision silences every account/Chat while
+/// unread still accrues everywhere.
+pub fn get_dnd_global(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, NOTIFY_DND_GLOBAL_KEY)?.as_deref() == Some("1"))
+}
+
+/// Write the global Do-Not-Disturb switch (Story 10.2). Persists `"1"`/`"0"` into the
+/// `settings` k/v table under `notify.dnd_global`.
+pub fn set_dnd_global(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        NOTIFY_DND_GLOBAL_KEY,
+        if enabled { "1" } else { "0" },
+    )
+}
+
+/// List every muted Network label (Story 10.2, FR-52). Returns the `network_id`
+/// (display-label) of each present row; an empty vector means no Network is muted.
+/// Sorted ascending for determinism. Keeper-local — Matrix has no Network concept.
+pub fn get_muted_networks(data_dir: &Path) -> Result<Vec<String>, CoreError> {
+    let conn = open(data_dir)?;
+    let mut stmt = conn
+        .prepare("SELECT network_id FROM muted_networks ORDER BY network_id ASC")
+        .map_err(|e| CoreError::Internal(format!("could not prepare muted-networks list: {e}")))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| CoreError::Internal(format!("could not query muted-networks list: {e}")))?;
+    let mut networks = Vec::new();
+    for row in rows {
+        networks.push(
+            row.map_err(|e| CoreError::Internal(format!("could not read muted-network row: {e}")))?,
+        );
+    }
+    Ok(networks)
+}
+
+/// Set (or clear) the muted state for a Network label (Story 10.2, FR-52). `true`
+/// inserts the row (idempotent — re-muting is a no-op via `OR IGNORE`); `false`
+/// deletes it (idempotent — unmuting an unmuted Network is not an error). Keyed by the
+/// Network's display label in `muted_networks`.
+pub fn set_network_muted(data_dir: &Path, network_id: &str, muted: bool) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    if muted {
+        conn.execute(
+            "INSERT OR IGNORE INTO muted_networks(network_id) VALUES (?1)",
+            rusqlite::params![network_id],
+        )
+        .map_err(|e| CoreError::Internal(format!("could not mute network: {e}")))?;
+    } else {
+        conn.execute(
+            "DELETE FROM muted_networks WHERE network_id = ?1",
+            rusqlite::params![network_id],
+        )
+        .map_err(|e| CoreError::Internal(format!("could not unmute network: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Whether a single Network label is currently muted (Story 10.2). A thin
+/// convenience over [`get_muted_networks`] for the per-Network IPC getter.
+pub fn is_network_muted(data_dir: &Path, network_id: &str) -> Result<bool, CoreError> {
+    Ok(get_muted_networks(data_dir)?
+        .iter()
+        .any(|n| n == network_id))
 }
 
 /// Read the per-Account Incognito override for `account_id` (Story 8.1). `None` =
@@ -1207,6 +1291,47 @@ mod tests {
         );
         // An unrelated key is independent.
         assert_eq!(get_setting(&dir, "other").expect("get other"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dnd_global_defaults_off_and_round_trips() {
+        let dir = temp_dir();
+        // Absent = off (DND off by default; notifications post normally).
+        assert!(!get_dnd_global(&dir).expect("get default"));
+        set_dnd_global(&dir, true).expect("set on");
+        assert!(get_dnd_global(&dir).expect("get on"));
+        set_dnd_global(&dir, false).expect("set off");
+        assert!(!get_dnd_global(&dir).expect("get off"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn muted_networks_crud_and_idempotent() {
+        let dir = temp_dir();
+        // Fresh registry mutes nothing.
+        assert!(get_muted_networks(&dir).expect("get empty").is_empty());
+        assert!(!is_network_muted(&dir, "Telegram").expect("is_muted empty"));
+
+        // Mute two Networks; list is sorted ascending and deduped.
+        set_network_muted(&dir, "Telegram", true).expect("mute telegram");
+        set_network_muted(&dir, "Signal", true).expect("mute signal");
+        // Re-muting is idempotent (no duplicate row via OR IGNORE).
+        set_network_muted(&dir, "Telegram", true).expect("re-mute telegram");
+        assert_eq!(
+            get_muted_networks(&dir).expect("list"),
+            vec!["Signal".to_owned(), "Telegram".to_owned()]
+        );
+        assert!(is_network_muted(&dir, "Telegram").expect("is_muted telegram"));
+        assert!(!is_network_muted(&dir, "WhatsApp").expect("is_muted whatsapp"));
+
+        // Unmute is idempotent — clearing an unmuted Network is not an error.
+        set_network_muted(&dir, "Telegram", false).expect("unmute telegram");
+        set_network_muted(&dir, "Telegram", false).expect("unmute again ok");
+        assert_eq!(
+            get_muted_networks(&dir).expect("list after unmute"),
+            vec!["Signal".to_owned()]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

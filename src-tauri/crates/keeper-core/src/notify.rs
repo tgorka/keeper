@@ -18,16 +18,21 @@
 //!
 //! [`register_archive_handler`]: crate::account
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use matrix_sdk::ruma::events::room::message::{
     MessageType, OriginalSyncRoomMessageEvent, Relation,
 };
+use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+use matrix_sdk::ruma::push::Action;
+use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::{Client, Room};
 
-use matrix_sdk::event_handler::EventHandlerHandle;
+use matrix_sdk::event_handler::{EventHandlerHandle, RawEvent};
 
+use crate::bridge;
 use crate::platform::Platform;
 
 /// The app-wide "message previews" toggle (Story 10.1). Holds the single
@@ -40,14 +45,38 @@ use crate::platform::Platform;
 #[derive(Debug)]
 pub struct NotifyConfig {
     previews_enabled: AtomicBool,
+    /// The global Do-Not-Disturb switch (Story 10.2). When `true`, the notify decision
+    /// silences every account/Chat while unread still accrues everywhere. Seeded from
+    /// the persisted registry value; a lock-free atomic so the handler reads it per event.
+    dnd_enabled: AtomicBool,
+    /// The keeper-local muted-Network set (Story 10.2), keyed by the Network's display
+    /// label. A message whose room's bridged Network is in this set does not notify.
+    /// Seeded from the registry and replaced wholesale on each per-Network toggle;
+    /// read under a short `RwLock` in the notify decision.
+    muted_networks: RwLock<HashSet<String>>,
 }
 
 impl NotifyConfig {
     /// Construct with the given initial "message previews" state (seeded from the
     /// persisted registry value in [`AccountManager::new`](crate::account::AccountManager)).
+    /// DND defaults off and the muted-Network set defaults empty; both are seeded from
+    /// the registry via the fuller [`NotifyConfig::with_state`] in `AccountManager::new`.
     pub fn new(previews_enabled: bool) -> Self {
+        Self::with_state(previews_enabled, false, HashSet::new())
+    }
+
+    /// Construct with the full persisted notification state (Story 10.2): previews,
+    /// global DND, and the muted-Network set. Seeded once in
+    /// [`AccountManager::new`](crate::account::AccountManager) from the registry.
+    pub fn with_state(
+        previews_enabled: bool,
+        dnd_enabled: bool,
+        muted_networks: HashSet<String>,
+    ) -> Self {
         Self {
             previews_enabled: AtomicBool::new(previews_enabled),
+            dnd_enabled: AtomicBool::new(dnd_enabled),
+            muted_networks: RwLock::new(muted_networks),
         }
     }
 
@@ -60,6 +89,56 @@ impl NotifyConfig {
     /// [`registry::set_notify_previews`](crate::registry::set_notify_previews)).
     pub fn set_previews_enabled(&self, enabled: bool) {
         self.previews_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether global Do-Not-Disturb is currently on (Story 10.2).
+    pub fn dnd_enabled(&self) -> bool {
+        self.dnd_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Update the in-memory global DND state (the caller also persists it via
+    /// [`registry::set_dnd_global`](crate::registry::set_dnd_global)).
+    pub fn set_dnd_enabled(&self, enabled: bool) {
+        self.dnd_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the given Network label is currently muted (Story 10.2). A poisoned lock
+    /// fails open (treated as "not muted") rather than panicking — mute is a comfort
+    /// feature and must never abort the notify path.
+    pub fn is_network_muted(&self, network: &str) -> bool {
+        match self.muted_networks.read() {
+            Ok(set) => set.contains(network),
+            Err(poisoned) => {
+                tracing::warn!("muted-networks lock poisoned; failing open (not muted)");
+                poisoned.into_inner().contains(network)
+            }
+        }
+    }
+
+    /// Add or remove a single Network label from the in-memory muted set (Story 10.2).
+    /// The caller also persists it via
+    /// [`registry::set_network_muted`](crate::registry::set_network_muted). A poisoned
+    /// lock is recovered rather than propagated.
+    pub fn set_network_muted(&self, network: &str, muted: bool) {
+        let mut set = match self.muted_networks.write() {
+            Ok(set) => set,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if muted {
+            set.insert(network.to_owned());
+        } else {
+            set.remove(network);
+        }
+    }
+
+    /// Replace the whole in-memory muted-Network set (Story 10.2), e.g. to re-seed from
+    /// the registry. A poisoned lock is recovered rather than propagated.
+    pub fn replace_muted_networks(&self, networks: HashSet<String>) {
+        let mut set = match self.muted_networks.write() {
+            Ok(set) => set,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *set = networks;
     }
 }
 
@@ -81,16 +160,51 @@ pub struct NotifyContext {
     /// Whether this message type notifies at all (text/notice/emote/media yes;
     /// verification-request / server-notice / unknown no).
     pub notifies: bool,
+    /// Whether the room's synced Matrix push rules elected to notify *this* event
+    /// (Story 10.2): the room's `event_push_actions` contained an `Action::Notify`.
+    /// This folds per-Chat mute and mention-only (and mention/reply detection) into the
+    /// standard ruleset. Fail-open `true` when the push-rule lookup errors — never drop
+    /// a genuine notification because a rule read failed.
+    pub room_push_notifies: bool,
+    /// Whether the room's bridged Network is in the keeper-local muted set (Story 10.2).
+    /// Fail-open `false` (not muted) when the Network cannot be resolved.
+    pub network_muted: bool,
 }
 
 /// Whether a message should raise a notification (pure rule).
 ///
-/// A notification is raised only when the message is **not** our own echo, is **not**
-/// pre-session backlog (`event_ts_ms >= baseline_ms`), and is a notifying message type.
-/// Backlog suppression drops cold-launch history (the inbox already shows it) while
-/// still notifying messages that arrive during a live background session.
-pub fn should_notify(is_self: bool, event_ts_ms: u64, baseline_ms: u64, notifies: bool) -> bool {
-    !is_self && notifies && event_ts_ms >= baseline_ms
+/// The golden decision (Story 10.1 + 10.2). A notification is raised only when **all**
+/// of these hold:
+/// - not our own echo (`!is_self`),
+/// - a notifying message type (`notifies`),
+/// - not pre-session backlog (`event_ts_ms >= baseline_ms`),
+/// - the room's synced push rules elected to notify this event (`room_push_notifies`) —
+///   this ANDs in per-Chat mute and mention-only,
+/// - global Do-Not-Disturb is off (`!dnd_enabled`),
+/// - the room's Network is not muted (`!network_muted`).
+///
+/// The first three gates are the unchanged Story 10.1 rules; the last three are the
+/// Story 10.2 suppression layer. Backlog suppression drops cold-launch history (the
+/// inbox already shows it) while still notifying messages that arrive during a live
+/// background session. `room_push_notifies` / `network_muted` are computed fail-open by
+/// the handler, so a transient rule/network read error over-notifies rather than
+/// dropping a genuine notification.
+#[allow(clippy::too_many_arguments)]
+pub fn should_notify(
+    is_self: bool,
+    event_ts_ms: u64,
+    baseline_ms: u64,
+    notifies: bool,
+    room_push_notifies: bool,
+    dnd_enabled: bool,
+    network_muted: bool,
+) -> bool {
+    !is_self
+        && notifies
+        && event_ts_ms >= baseline_ms
+        && room_push_notifies
+        && !dnd_enabled
+        && !network_muted
 }
 
 /// Derive the preview string for a message type (pure rule).
@@ -177,7 +291,17 @@ pub fn dispatch(
     baseline_ms: u64,
     ctx: &NotifyContext,
 ) {
-    if !should_notify(ctx.is_self, ctx.event_ts_ms, baseline_ms, ctx.notifies) {
+    // Read global DND from the shared config at decision time; the per-Chat push verdict
+    // and per-Network mute are already resolved into the context by the handler.
+    if !should_notify(
+        ctx.is_self,
+        ctx.event_ts_ms,
+        baseline_ms,
+        ctx.notifies,
+        ctx.room_push_notifies,
+        config.dnd_enabled(),
+        ctx.network_muted,
+    ) {
         return;
     }
     let (title, body) = format_notification(
@@ -220,6 +344,15 @@ fn now_ms() -> u64 {
 /// Chat, own-id via `client.user_id()` for the self check — then hands a pure
 /// [`NotifyContext`] to [`dispatch`]. Extraction and decision never block sync and never
 /// log the body (NFR-9).
+///
+/// Story 10.2 threads three suppression gates through the same pipeline: the room's
+/// synced push-rule verdict for this event (`room.event_push_actions` over the raw JSON
+/// supplied by the [`RawEvent`] context arg → contains [`Action::Notify`]), the global
+/// DND switch (read from `config` in [`dispatch`]), and the per-Network mute set
+/// (resolved via [`bridge::room_bridge_network`] against `config`). Every new read is
+/// fail-open: a push-rule/network error is logged at `warn` and treated as
+/// "would notify" / "not muted", so a transient failure over-notifies rather than
+/// silently dropping a genuine notification.
 pub fn register_notify_handler(
     client: &Client,
     account_id: &str,
@@ -232,69 +365,121 @@ pub fn register_notify_handler(
     let baseline_ms = now_ms();
     // Resolve our own user id once so the self-echo check needs no per-event lookup.
     let own_user_id = client.user_id().map(|u| u.as_str().to_owned());
-    client.add_event_handler(move |ev: OriginalSyncRoomMessageEvent, room: Room| {
-        let account_id = account_id.clone();
-        let platform = platform.clone();
-        let config = config.clone();
-        let own_user_id = own_user_id.clone();
-        async move {
-            let room_id = room.room_id().to_owned();
-            let sender = ev.sender.clone();
-            let is_self = own_user_id
-                .as_deref()
-                .is_some_and(|own| own == sender.as_str());
+    client.add_event_handler(
+        move |ev: OriginalSyncRoomMessageEvent, room: Room, raw: RawEvent| {
+            let account_id = account_id.clone();
+            let platform = platform.clone();
+            let config = config.clone();
+            let own_user_id = own_user_id.clone();
+            async move {
+                let room_id = room.room_id().to_owned();
+                let sender = ev.sender.clone();
+                let is_self = own_user_id
+                    .as_deref()
+                    .is_some_and(|own| own == sender.as_str());
 
-            // An edit (`m.replace`) is delivered as a fresh `m.room.message`; it is not a
-            // new incoming message, so it must not notify (the previewed body would be the
-            // `* edited text` fallback). Mirrors the archive handler's Replacement guard.
-            if matches!(ev.content.relates_to, Some(Relation::Replacement(_))) {
-                return;
+                // An edit (`m.replace`) is delivered as a fresh `m.room.message`; it is not a
+                // new incoming message, so it must not notify (the previewed body would be the
+                // `* edited text` fallback). Mirrors the archive handler's Replacement guard.
+                if matches!(ev.content.relates_to, Some(Relation::Replacement(_))) {
+                    return;
+                }
+
+                let (preview, notifies) = preview_for(&ev.content.msgtype);
+                let event_ts_ms = u64::from(ev.origin_server_ts.get());
+
+                // Cheap, I/O-free gates first: drop our own echo, pre-session backlog,
+                // non-notifying types, and global DND before touching the push ruleset,
+                // the Network resolution, or any display-name lookup. This keeps the
+                // common suppressed-message path (self-echoes, backlog) as light as the
+                // 10.1 handler — the per-event push-rule evaluation and bridge state read
+                // below run only for messages that survive these gates.
+                if is_self || !notifies || event_ts_ms < baseline_ms || config.dnd_enabled() {
+                    return;
+                }
+
+                // Resolve the room's synced push-rule verdict for THIS event from the raw
+                // JSON the `RawEvent` context arg supplies (Story 10.2). Fail-open `true`:
+                // never drop a genuine notification because a rule lookup failed.
+                let room_push_notifies = room_push_notifies(&room, &raw).await;
+                // Resolve the room's bridged Network and check the keeper-local muted set.
+                // Fail-open `false` (not muted) when no Network resolves.
+                let network_muted = match bridge::room_bridge_network(&room).await {
+                    Some(net) => config.is_network_muted(&net),
+                    None => false,
+                };
+
+                // Per-Chat mute / mention-only (synced push rules) and per-Network mute.
+                if !room_push_notifies || network_muted {
+                    return;
+                }
+
+                // Sender display name → localpart fallback (no network round-trip). An empty
+                // display name falls back too, so the sender is never blank.
+                let sender_name = room
+                    .get_member_no_sync(&sender)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.display_name().map(str::to_owned))
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| localpart_fallback(sender.as_str()));
+
+                // Chat display name → room id fallback (an empty name falls back too).
+                let chat = match room.display_name().await {
+                    Ok(name) if !name.to_string().trim().is_empty() => name.to_string(),
+                    _ => room_id.as_str().to_owned(),
+                };
+
+                let ctx = NotifyContext {
+                    chat,
+                    sender: sender_name,
+                    preview,
+                    is_self,
+                    event_ts_ms,
+                    notifies,
+                    room_push_notifies,
+                    network_muted,
+                };
+                dispatch(
+                    platform.as_ref(),
+                    &config,
+                    &account_id,
+                    room_id.as_str(),
+                    baseline_ms,
+                    &ctx,
+                );
             }
+        },
+    )
+}
 
-            let (preview, notifies) = preview_for(&ev.content.msgtype);
-            let event_ts_ms = u64::from(ev.origin_server_ts.get());
-
-            // Cheap early-out on the pure gates before any display-name resolution
-            // (avoids a member/room lookup for our own echo or suppressed backlog).
-            if !should_notify(is_self, event_ts_ms, baseline_ms, notifies) {
-                return;
-            }
-
-            // Sender display name → localpart fallback (no network round-trip). An empty
-            // display name falls back too, so the sender is never blank.
-            let sender_name = room
-                .get_member_no_sync(&sender)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|m| m.display_name().map(str::to_owned))
-                .filter(|n| !n.trim().is_empty())
-                .unwrap_or_else(|| localpart_fallback(sender.as_str()));
-
-            // Chat display name → room id fallback (an empty name falls back too).
-            let chat = match room.display_name().await {
-                Ok(name) if !name.to_string().trim().is_empty() => name.to_string(),
-                _ => room_id.as_str().to_owned(),
-            };
-
-            let ctx = NotifyContext {
-                chat,
-                sender: sender_name,
-                preview,
-                is_self,
-                event_ts_ms,
-                notifies,
-            };
-            dispatch(
-                platform.as_ref(),
-                &config,
-                &account_id,
-                room_id.as_str(),
-                baseline_ms,
-                &ctx,
+/// Resolve the room's synced push-rule verdict for one raw event (Story 10.2).
+///
+/// Runs the room's server-synced push ruleset over the event's raw JSON via
+/// [`matrix_sdk::Room::event_push_actions`] and returns whether the resulting actions
+/// contain [`Action::Notify`] — i.e. whether per-Chat mute / mention-only elected to
+/// notify this event. Fail-open `true` on any error (a raw-JSON reparse failure or a
+/// push-actions error): a comfort feature must never silently drop a genuine
+/// notification. The event id / body is never logged (NFR-9).
+async fn room_push_notifies(room: &Room, raw: &RawEvent) -> bool {
+    // Rebuild a typed `Raw<AnySyncTimelineEvent>` from the handler-supplied raw JSON;
+    // `event_push_actions` runs the room's synced ruleset over it.
+    let raw_event: Raw<AnySyncTimelineEvent> = Raw::from_json(raw.0.clone());
+    match room.event_push_actions(&raw_event).await {
+        Ok(actions) => actions
+            .unwrap_or_default()
+            .iter()
+            .any(|a| matches!(a, Action::Notify)),
+        Err(e) => {
+            tracing::warn!(
+                room_id = %room.room_id(),
+                error = %e,
+                "notify: push-actions lookup failed; failing open (would notify)"
             );
+            true
         }
-    })
+    }
 }
 
 /// The localpart of a Matrix user id (`@alice:example.org` → `alice`), used as the
@@ -385,6 +570,10 @@ mod tests {
         MessageType::Text(TextMessageEventContent::plain(body))
     }
 
+    /// A default-notifying context (Story 10.1 shape): the new 10.2 gates default to
+    /// "would notify" (`room_push_notifies = true`, `network_muted = false`), so the
+    /// existing dispatch tests exercise exactly the 10.1 behavior. The mute-specific
+    /// tests build their contexts with [`ctx_gated`].
     fn ctx(
         chat: &str,
         sender: &str,
@@ -400,34 +589,91 @@ mod tests {
             is_self,
             event_ts_ms: ts,
             notifies,
+            room_push_notifies: true,
+            network_muted: false,
+        }
+    }
+
+    /// A context with explicit 10.2 suppression gates, for the mute / mention-only /
+    /// network-muted dispatch matrix.
+    fn ctx_gated(ts: u64, room_push_notifies: bool, network_muted: bool) -> NotifyContext {
+        NotifyContext {
+            chat: "Weekend plans".to_owned(),
+            sender: "Alice".to_owned(),
+            preview: "who's in?".to_owned(),
+            is_self: false,
+            event_ts_ms: ts,
+            notifies: true,
+            room_push_notifies,
+            network_muted,
         }
     }
 
     // ── should_notify ──────────────────────────────────────────────────────────
+    // The last three args are the Story 10.2 gates: room_push_notifies, dnd_enabled,
+    // network_muted. The default "would notify" tuple is (…, true, false, false).
     #[test]
     fn should_notify_true_for_live_other_message() {
-        assert!(should_notify(false, 100, 50, true));
+        assert!(should_notify(false, 100, 50, true, true, false, false));
     }
 
     #[test]
     fn should_notify_false_for_own_echo() {
-        assert!(!should_notify(true, 100, 50, true));
+        assert!(!should_notify(true, 100, 50, true, true, false, false));
     }
 
     #[test]
     fn should_notify_false_for_backlog() {
         // origin_ts strictly before the baseline is suppressed backlog.
-        assert!(!should_notify(false, 40, 50, true));
+        assert!(!should_notify(false, 40, 50, true, true, false, false));
     }
 
     #[test]
     fn should_notify_true_at_exact_baseline() {
-        assert!(should_notify(false, 50, 50, true));
+        assert!(should_notify(false, 50, 50, true, true, false, false));
     }
 
     #[test]
     fn should_notify_false_for_non_notifying_type() {
-        assert!(!should_notify(false, 100, 50, false));
+        assert!(!should_notify(false, 100, 50, false, true, false, false));
+    }
+
+    // ── should_notify: Story 10.2 suppression gates ─────────────────────────────
+    #[test]
+    fn should_notify_false_when_room_push_rules_suppress() {
+        // Chat muted / mention-only non-mention: the synced ruleset did NOT elect to
+        // notify this event → no notification, even though every 10.1 gate passes.
+        assert!(!should_notify(false, 100, 50, true, false, false, false));
+    }
+
+    #[test]
+    fn should_notify_true_when_room_push_rules_notify() {
+        // Mention-only with a mention/reply (ruleset yielded Action::Notify) → notifies.
+        assert!(should_notify(false, 100, 50, true, true, false, false));
+    }
+
+    #[test]
+    fn should_notify_false_when_dnd_enabled() {
+        // Global DND silences every account/Chat regardless of the other gates.
+        assert!(!should_notify(false, 100, 50, true, true, true, false));
+    }
+
+    #[test]
+    fn should_notify_false_when_network_muted() {
+        // The room's Network is in the muted set → no notification.
+        assert!(!should_notify(false, 100, 50, true, true, false, true));
+    }
+
+    #[test]
+    fn should_notify_requires_all_gates_together() {
+        // Every gate must hold; flipping any one to its suppressing value drops it.
+        assert!(should_notify(false, 100, 50, true, true, false, false));
+        assert!(!should_notify(true, 100, 50, true, true, false, false)); // self
+        assert!(!should_notify(false, 100, 50, false, true, false, false)); // type
+        assert!(!should_notify(false, 40, 50, true, true, false, false)); // backlog
+        assert!(!should_notify(false, 100, 50, true, false, false, false)); // push-rule
+        assert!(!should_notify(false, 100, 50, true, true, true, false)); // dnd
+        assert!(!should_notify(false, 100, 50, true, true, false, true)); // network
     }
 
     // ── preview_for ────────────────────────────────────────────────────────────
@@ -640,6 +886,107 @@ mod tests {
         assert!(platform.calls().is_empty());
     }
 
+    // ── dispatch: Story 10.2 suppression gates (capturing Platform double) ───────
+    #[test]
+    fn dispatch_skips_when_room_push_rules_suppress() {
+        // Chat muted / mention-only non-mention: the room's synced ruleset elected NOT
+        // to notify (`room_push_notifies = false`) → no notification posts.
+        let platform = CapturingPlatform::new();
+        let config = NotifyConfig::new(true);
+        dispatch(
+            &platform,
+            &config,
+            "acct",
+            "!room:example.org",
+            50,
+            &ctx_gated(100, false, false),
+        );
+        assert!(platform.calls().is_empty());
+    }
+
+    #[test]
+    fn dispatch_notifies_when_mention_reply_yields_notify_action() {
+        // Mention-only with a mention/reply: the ruleset yielded Action::Notify
+        // (`room_push_notifies = true`) → one notification.
+        let platform = CapturingPlatform::new();
+        let config = NotifyConfig::new(true);
+        dispatch(
+            &platform,
+            &config,
+            "acct",
+            "!room:example.org",
+            50,
+            &ctx_gated(100, true, false),
+        );
+        assert_eq!(
+            platform.calls(),
+            vec![("Weekend plans".to_owned(), "Alice: who's in?".to_owned())]
+        );
+    }
+
+    #[test]
+    fn dispatch_skips_when_network_muted() {
+        // The room's Network is in the muted set → no notification (unread still accrues
+        // elsewhere; that is the inbox path, not exercised here).
+        let platform = CapturingPlatform::new();
+        let config = NotifyConfig::new(true);
+        dispatch(
+            &platform,
+            &config,
+            "acct",
+            "!room:example.org",
+            50,
+            &ctx_gated(100, true, true),
+        );
+        assert!(platform.calls().is_empty());
+    }
+
+    #[test]
+    fn dispatch_skips_every_chat_when_dnd_enabled() {
+        // Global DND (read from config in dispatch) silences a would-notify message.
+        let platform = CapturingPlatform::new();
+        let config = NotifyConfig::new(true);
+        config.set_dnd_enabled(true);
+        dispatch(
+            &platform,
+            &config,
+            "acct",
+            "!room:example.org",
+            50,
+            &ctx_gated(100, true, false),
+        );
+        assert!(platform.calls().is_empty());
+        // Turning DND back off restores notifications for the same context.
+        config.set_dnd_enabled(false);
+        dispatch(
+            &platform,
+            &config,
+            "acct",
+            "!room:example.org",
+            50,
+            &ctx_gated(100, true, false),
+        );
+        assert_eq!(platform.calls().len(), 1);
+    }
+
+    #[test]
+    fn dispatch_fail_open_over_notifies_on_push_rule_error() {
+        // The handler resolves `room_push_notifies` fail-open to `true` on a rule-read
+        // error; `dispatch` then behaves exactly like the 10.1 path — one notification.
+        let platform = CapturingPlatform::new();
+        let config = NotifyConfig::new(true);
+        dispatch(
+            &platform,
+            &config,
+            "acct",
+            "!room:example.org",
+            50,
+            // room_push_notifies = true models the fail-open verdict.
+            &ctx_gated(100, true, false),
+        );
+        assert_eq!(platform.calls().len(), 1);
+    }
+
     #[test]
     fn notify_config_round_trips() {
         let config = NotifyConfig::new(true);
@@ -648,6 +995,34 @@ mod tests {
         assert!(!config.previews_enabled());
         config.set_previews_enabled(true);
         assert!(config.previews_enabled());
+    }
+
+    #[test]
+    fn notify_config_dnd_and_muted_networks_round_trip() {
+        let mut seed = HashSet::new();
+        seed.insert("Telegram".to_owned());
+        let config = NotifyConfig::with_state(true, true, seed);
+        // Seeded state is readable.
+        assert!(config.dnd_enabled());
+        assert!(config.is_network_muted("Telegram"));
+        assert!(!config.is_network_muted("Signal"));
+
+        // DND toggles independently.
+        config.set_dnd_enabled(false);
+        assert!(!config.dnd_enabled());
+
+        // Per-Network mute add/remove.
+        config.set_network_muted("Signal", true);
+        assert!(config.is_network_muted("Signal"));
+        config.set_network_muted("Telegram", false);
+        assert!(!config.is_network_muted("Telegram"));
+
+        // Wholesale replace re-seeds the set.
+        let mut next = HashSet::new();
+        next.insert("WhatsApp".to_owned());
+        config.replace_muted_networks(next);
+        assert!(config.is_network_muted("WhatsApp"));
+        assert!(!config.is_network_muted("Signal"));
     }
 
     #[test]

@@ -7,6 +7,7 @@
  * generated into `./gen/` by the Rust ts-rs export step — never hand-edited.
  */
 import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
+import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 import type { IpcError } from "./gen/IpcError";
 
 export type { AccountVm } from "./gen/AccountVm";
@@ -27,6 +28,7 @@ export type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 export type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 export type { BridgeSessionHealthVm } from "./gen/BridgeSessionHealthVm";
 export type { BridgeStatus } from "./gen/BridgeStatus";
+export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 export type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
@@ -56,6 +58,7 @@ export type { MediaKindVm } from "./gen/MediaKindVm";
 export type { MediaVm } from "./gen/MediaVm";
 export type { MenuItemVm } from "./gen/MenuItemVm";
 export type { MenuSectionVm } from "./gen/MenuSectionVm";
+export type { MuteState } from "./gen/MuteState";
 export type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 export type { NetworkVm } from "./gen/NetworkVm";
 export type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
@@ -1441,6 +1444,67 @@ export async function notifyGetPreviewEnabled(): Promise<boolean> {
  */
 export async function notifySetPreviewEnabled(enabled: boolean): Promise<void> {
   await invoke<void>("notify_set_preview_enabled", { enabled });
+}
+
+/**
+ * Read the global Do-Not-Disturb switch (Story 10.2). Absent = off (DND off by default,
+ * so notifications post normally). Resolves with the current in-memory config value.
+ */
+export async function dndGetGlobal(): Promise<boolean> {
+  return await invoke<boolean>("dnd_get_global");
+}
+
+/**
+ * Set the global Do-Not-Disturb switch (Story 10.2). Persists into the `settings` k/v
+ * table under `notify.dnd_global` and updates the in-memory config so every live notify
+ * handler sees the change immediately. Resolves once persisted.
+ */
+export async function dndSetGlobal(enabled: boolean): Promise<void> {
+  await invoke<void>("dnd_set_global", { enabled });
+}
+
+/**
+ * Read whether a Network label is currently muted (Story 10.2). Reads the persisted
+ * `muted_networks` table. Rejects with the {@link IpcError} envelope on failure.
+ */
+export async function networkMuteGet(networkId: string): Promise<boolean> {
+  return await invoke<boolean>("network_mute_get", { networkId });
+}
+
+/**
+ * Set (or clear) the muted state for a Network label (Story 10.2). Persists into the
+ * `muted_networks` table and updates the in-memory config so every live notify handler
+ * and the inbox glyph see the change immediately. Resolves once persisted.
+ */
+export async function networkMuteSet(networkId: string, muted: boolean): Promise<void> {
+  await invoke<void>("network_mute_set", { networkId, muted });
+}
+
+/**
+ * Read the per-Chat notification mode for `(accountId, roomId)` (Story 10.2). Resolves
+ * the account's live client and reads the synced Matrix push-rule mode
+ * (`"all" | "mention_only" | "mute"`). Rejects with the {@link IpcError} envelope
+ * (`timelineUnavailable`) for an unknown room / inactive account.
+ */
+export async function chatNotifyModeGet(
+  accountId: string,
+  roomId: string,
+): Promise<ChatNotifyMode> {
+  return await invoke<ChatNotifyMode>("chat_notify_mode_get", { accountId, roomId });
+}
+
+/**
+ * Set the per-Chat notification mode for `(accountId, roomId)` (Story 10.2). Writes a
+ * synced Matrix push rule so the mode survives restart and syncs across devices; `"all"`
+ * clears any per-Chat rule (the "unmute" target). Rejects with the {@link IpcError}
+ * envelope for an unknown room / inactive account or a push-rule dispatch failure.
+ */
+export async function chatNotifyModeSet(
+  accountId: string,
+  roomId: string,
+  mode: ChatNotifyMode,
+): Promise<void> {
+  await invoke<void>("chat_notify_mode_set", { accountId, roomId, mode });
 }
 
 /**

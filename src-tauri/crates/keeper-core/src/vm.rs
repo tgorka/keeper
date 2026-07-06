@@ -495,6 +495,11 @@ pub struct RoomVm {
     /// native Matrix room (no bridge state). Copied through to [`InboxRoomVm`]. Never
     /// fabricated — it is untrusted, server-controlled state used only as a map key.
     pub network_id: Option<String>,
+    /// The durable per-Chat / per-Network mute intent for this room (Story 10.2,
+    /// FR-52), resolved at projection time from the room's synced push-rule mode plus
+    /// the keeper-local muted-Network set. Copied through to [`InboxRoomVm`] to render
+    /// the mute glyph; never gates unread. Fail-open `None` on any read error.
+    pub mute_state: MuteState,
 }
 
 /// One Matrix Space the user belongs to, surfaced as a filter view (Story 4.5,
@@ -1296,6 +1301,50 @@ impl Provider {
     }
 }
 
+/// The durable per-Chat / per-Network mute intent stamped on a room row (Story
+/// 10.2, FR-52, AD-18).
+///
+/// A pure render signal computed at inbox emit time from the room's synced Matrix
+/// push-rule mode plus the keeper-local muted-Network set: `Muted` when the room
+/// mode is `RoomNotificationMode::Mute` **or** the room's bridged Network is in the
+/// muted set; `MentionOnly` when the mode is `MentionsAndKeywordsOnly`; otherwise
+/// `None`. It reflects *durable* mute intent only — it deliberately does **not**
+/// reflect the global Do-Not-Disturb switch (shown once in the footer, never stamped
+/// per row) and never gates unread. Fail-open: any read error resolves to `None`.
+/// Serializes to `"none" | "muted" | "mention_only"` (the frontend wire contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum MuteState {
+    /// No durable mute intent — the row notifies per the 10.1 pipeline.
+    None,
+    /// Muted: the room's push-rule mode is `Mute`, or its Network is muted.
+    Muted,
+    /// Mention-only: the room's push-rule mode is `MentionsAndKeywordsOnly`.
+    MentionOnly,
+}
+
+/// The per-Chat notification mode the IPC boundary sets/reads (Story 10.2, AD-18),
+/// a one-to-one mirror of matrix-sdk `RoomNotificationMode` mapped onto keeper's
+/// wire vocabulary.
+///
+/// `All` clears any per-Chat rule back to "notify for all messages" (the effective
+/// "unmute"); `MentionOnly` notifies only for mentions/keywords/replies; `Mute`
+/// silences the Chat entirely. Persisted as a synced Matrix push rule via
+/// `client.notification_settings().set_room_notification_mode(...)`, so it survives
+/// restart and syncs across devices. Serializes to `"all" | "mention_only" | "mute"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ChatNotifyMode {
+    /// Notify for every message (clears any per-Chat rule — the "unmute" target).
+    All,
+    /// Notify for mentions / keywords / replies only.
+    MentionOnly,
+    /// Silence the Chat entirely.
+    Mute,
+}
+
 /// Non-secret account registry projection returned to the frontend on a
 /// successful login (FR-1, NFR-9).
 ///
@@ -1396,6 +1445,11 @@ pub struct InboxRoomVm {
     /// health dot and the in-conversation re-link banner. `None` for a native Matrix
     /// room. Never re-derived on the frontend — it mirrors the Rust stream.
     pub network_id: Option<String>,
+    /// The durable per-Chat / per-Network mute intent (Story 10.2, FR-52), copied
+    /// straight through from [`RoomVm::mute_state`]. Drives the row's mute glyph
+    /// (`Muted` → bell-off, `MentionOnly` → at-sign); `None` shows no glyph. Reflects
+    /// durable mute only — never the global DND switch — and never gates unread.
+    pub mute_state: MuteState,
 }
 
 /// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
@@ -2472,6 +2526,7 @@ mod tests {
             is_pinned: false,
             network: None,
             network_id: None,
+            mute_state: MuteState::None,
         }
     }
 
@@ -2654,6 +2709,7 @@ mod tests {
             is_space: false,
             network: None,
             network_id: None,
+            mute_state: MuteState::None,
         }
     }
 
@@ -2686,6 +2742,7 @@ mod tests {
             is_space: false,
             network: None,
             network_id: None,
+            mute_state: MuteState::None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");
@@ -2813,6 +2870,58 @@ mod tests {
         );
         let back: InboxRoomVm = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn mute_state_serializes_snake_case_wire_contract() {
+        // The frontend union is `"none" | "muted" | "mention_only"` — assert the exact
+        // wire tags so the ts-rs binding and the TS renderer never drift (Story 10.2).
+        assert_eq!(
+            serde_json::to_string(&MuteState::None).expect("serialize none"),
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MuteState::Muted).expect("serialize muted"),
+            "\"muted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MuteState::MentionOnly).expect("serialize mention"),
+            "\"mention_only\""
+        );
+        let back: MuteState =
+            serde_json::from_str("\"mention_only\"").expect("deserialize mention_only");
+        assert_eq!(back, MuteState::MentionOnly);
+    }
+
+    #[test]
+    fn inbox_room_vm_carries_mute_state() {
+        let vm = InboxRoomVm {
+            mute_state: MuteState::Muted,
+            ..sample_inbox_room()
+        };
+        let json = serde_json::to_string(&vm).expect("serialize");
+        assert!(json.contains("\"muteState\":\"muted\""), "json was: {json}");
+        let back: InboxRoomVm = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, vm);
+    }
+
+    #[test]
+    fn chat_notify_mode_serializes_snake_case_wire_contract() {
+        // The IPC command vocabulary is `"all" | "mention_only" | "mute"` (Story 10.2).
+        assert_eq!(
+            serde_json::to_string(&ChatNotifyMode::All).expect("serialize all"),
+            "\"all\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ChatNotifyMode::MentionOnly).expect("serialize mention"),
+            "\"mention_only\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ChatNotifyMode::Mute).expect("serialize mute"),
+            "\"mute\""
+        );
+        let back: ChatNotifyMode = serde_json::from_str("\"mute\"").expect("deserialize mute");
+        assert_eq!(back, ChatNotifyMode::Mute);
     }
 
     #[test]

@@ -24,12 +24,12 @@ use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
-    ConnectionStatusBatch, CouplingCaveatVm, DemoBatch, DraftMirrorBatch, EditVersionVm,
-    EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch,
-    IncognitoVm, IpcError, IpcErrorCode, MenuSectionVm, NetworksSnapshot, NewChatResolutionVm,
-    OutboxVm, PaginationStatusBatch, PaletteMode, PaletteResultsVm, PingVm, RemoteDraftVm,
-    ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch,
-    TypingBatch, VerificationFlowVm,
+    ChatNotifyMode, ConnectionStatusBatch, CouplingCaveatVm, DemoBatch, DraftMirrorBatch,
+    EditVersionVm, EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm,
+    InboxBatch, IncognitoVm, IpcError, IpcErrorCode, MenuSectionVm, NetworksSnapshot,
+    NewChatResolutionVm, OutboxVm, PaginationStatusBatch, PaletteMode, PaletteResultsVm, PingVm,
+    RemoteDraftVm, ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot,
+    TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -2495,6 +2495,85 @@ pub fn notify_set_preview_enabled(
     state
         .accounts
         .notify_previews_set(&state.platform, enabled)
+        .map_err(to_ipc_error)
+}
+
+/// Read the global Do-Not-Disturb switch (Story 10.2). Returns the in-memory
+/// [`NotifyConfig`](keeper_core::notify::NotifyConfig) value (seeded from the persisted
+/// registry at startup; default off). Infallible — reads process state, never fails.
+#[tauri::command]
+pub fn dnd_get_global(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    Ok(state.accounts.dnd_get())
+}
+
+/// Set the global Do-Not-Disturb switch (Story 10.2). Persists into the `settings` k/v
+/// table under `notify.dnd_global` and updates the in-memory config so every live notify
+/// handler sees the change immediately. Errors funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn dnd_set_global(state: State<'_, AppState>, enabled: bool) -> Result<(), IpcError> {
+    state
+        .accounts
+        .dnd_set(&state.platform, enabled)
+        .map_err(to_ipc_error)
+}
+
+/// Read whether a Network label is currently muted (Story 10.2). Reads the persisted
+/// `muted_networks` table. Errors funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn network_mute_get(state: State<'_, AppState>, network_id: String) -> Result<bool, IpcError> {
+    state
+        .accounts
+        .network_mute_get(&state.platform, &network_id)
+        .map_err(to_ipc_error)
+}
+
+/// Set (or clear) the muted state for a Network label (Story 10.2). Persists into the
+/// `muted_networks` table and updates the in-memory config so every live notify handler
+/// and the inbox glyph see the change immediately. Errors funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn network_mute_set(
+    state: State<'_, AppState>,
+    network_id: String,
+    muted: bool,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .network_mute_set(&state.platform, &network_id, muted)
+        .map_err(to_ipc_error)
+}
+
+/// Read the per-Chat notification mode for `(accountId, roomId)` (Story 10.2). Resolves
+/// the account's live `Client` and reads the synced Matrix push-rule mode. A room-not-
+/// found / inactive account funnels through [`to_ipc_error`] to `TimelineUnavailable`.
+#[tauri::command]
+pub async fn chat_notify_mode_get(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<ChatNotifyMode, IpcError> {
+    state
+        .accounts
+        .chat_notify_mode_get(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Set the per-Chat notification mode for `(accountId, roomId)` (Story 10.2). Writes a
+/// synced Matrix push rule so the mode survives restart and syncs across devices; the
+/// notify handler reads the verdict back per event. `All` clears any per-Chat rule (the
+/// "unmute" target). A room-not-found / inactive account, or a push-rule dispatch
+/// failure, funnels through [`to_ipc_error`].
+#[tauri::command]
+pub async fn chat_notify_mode_set(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    mode: ChatNotifyMode,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .chat_notify_mode_set(&account_id, &room_id, mode)
+        .await
         .map_err(to_ipc_error)
 }
 

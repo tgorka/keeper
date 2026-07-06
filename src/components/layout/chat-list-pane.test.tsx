@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   AccountVm,
   InboxBatch,
+  InboxRoomVm,
   IpcError,
   NetworksSnapshot,
   SpacesSnapshot,
@@ -99,7 +100,12 @@ function ipcError(code: IpcError["code"]): IpcError {
   return { code, message: "ignored", accountId: null, retriable: true };
 }
 
-function inboxRoom(roomId: string, accountId: string, displayName: string, lastMessage: string) {
+function inboxRoom(
+  roomId: string,
+  accountId: string,
+  displayName: string,
+  lastMessage: string,
+): InboxRoomVm {
   return {
     accountId,
     hueIndex: 0,
@@ -115,6 +121,7 @@ function inboxRoom(roomId: string, accountId: string, displayName: string, lastM
     isFavourite: false,
     network: null,
     networkId: null,
+    muteState: "none",
   };
 }
 

@@ -30,6 +30,7 @@ function room(p: Pick<InboxRoomVm, "accountId" | "roomId"> & Partial<InboxRoomVm
     isPinned: false,
     network: p.network ?? null,
     networkId: p.networkId ?? null,
+    muteState: p.muteState ?? "none",
   };
 }
 

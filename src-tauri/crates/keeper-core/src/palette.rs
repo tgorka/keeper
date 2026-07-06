@@ -523,6 +523,34 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             None,
             true,
         ),
+        // Per-Chat notification mode (Story 10.2). Three discrete targets rather than a
+        // two-direction toggle pair, so each is a plain `action` (not a `toggle_group`)
+        // — the single-key `m` verb + the chat context menu cover direction. They share
+        // the `m` shortcut chip so the cheat sheet surfaces the verb once per target.
+        action(
+            "mute-chat",
+            "Mute Chat",
+            "Chat",
+            &["silence", "notifications off", "m"],
+            Some("M"),
+            true,
+        ),
+        action(
+            "mention-only-chat",
+            "Mentions Only (This Chat)",
+            "Chat",
+            &["mention only", "keywords", "m"],
+            Some("M"),
+            true,
+        ),
+        action(
+            "unmute-chat",
+            "Unmute Chat",
+            "Chat",
+            &["notifications on", "all messages", "m"],
+            Some("M"),
+            true,
+        ),
         action(
             "export-chat",
             "Export This Chat",
@@ -863,6 +891,9 @@ mod tests {
             "mark-read",
             "mark-unread",
             "toggle-incognito-chat",
+            "mute-chat",
+            "mention-only-chat",
+            "unmute-chat",
         ] {
             assert!(
                 ids.contains(&expected.to_owned()),
@@ -1049,6 +1080,11 @@ mod tests {
             // Epic 8 — Incognito (global + per-chat).
             ("Toggle Incognito globally", &["toggle-incognito-global"]),
             ("Toggle Incognito for a chat", &["toggle-incognito-chat"]),
+            // Epic 10 — per-Chat mute / mention-only / unmute (Story 10.2).
+            (
+                "Mute / mention-only / unmute a chat",
+                &["mute-chat", "mention-only-chat", "unmute-chat"],
+            ),
         ];
 
         // Justified exclusions — surfaces intentionally NOT registered as palette
@@ -1059,10 +1095,11 @@ mod tests {
         //     incoming request / from Settings, not a palette-dispatchable surface.
         //   - Key backup: same — no cold-open entry point; driven from Settings and
         //     the recovery-key modal lifecycle.
-        //   - Mute: no backend command exists yet (the `m` verb has no handler); a
-        //     palette action would dispatch a dead id. Deferred until the backend ships.
-        let excluded: &[&str] = &["device-verification", "key-backup", "mute"];
-        assert_eq!(excluded.len(), 3, "the documented exclusion set is stable");
+        //   (Mute shipped in Story 10.2: the `mute-chat` / `mention-only-chat` /
+        //   `unmute-chat` actions dispatch `chat_notify_mode_set`, so it is now a covered
+        //   surface above rather than a justified exclusion.)
+        let excluded: &[&str] = &["device-verification", "key-backup"];
+        assert_eq!(excluded.len(), 2, "the documented exclusion set is stable");
 
         for (surface, covering) in surfaces {
             let covered = covering.iter().any(|id| has(id));

@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DemoBatch, IpcError, NetworksSnapshot, SpacesSnapshot } from "./client";
 import {
+  chatNotifyModeGet,
+  chatNotifyModeSet,
+  dndGetGlobal,
+  dndSetGlobal,
   invoke,
+  networkMuteGet,
+  networkMuteSet,
   notifyGetPreviewEnabled,
   notifySetPreviewEnabled,
   setNetworkFilter,
@@ -183,5 +189,57 @@ describe("notifySetPreviewEnabled", () => {
     invokeMock.mockResolvedValueOnce(undefined);
     await notifySetPreviewEnabled(false);
     expect(invokeMock).toHaveBeenCalledWith("notify_set_preview_enabled", { enabled: false });
+  });
+});
+
+describe("dndGetGlobal / dndSetGlobal (Story 10.2)", () => {
+  it("dndGetGlobal invokes dnd_get_global and resolves with the boolean", async () => {
+    invokeMock.mockResolvedValueOnce(true);
+    await expect(dndGetGlobal()).resolves.toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("dnd_get_global", undefined);
+  });
+
+  it("dndSetGlobal invokes dnd_set_global with the enabled flag", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await dndSetGlobal(true);
+    expect(invokeMock).toHaveBeenCalledWith("dnd_set_global", { enabled: true });
+  });
+});
+
+describe("networkMuteGet / networkMuteSet (Story 10.2)", () => {
+  it("networkMuteGet invokes network_mute_get with the networkId", async () => {
+    invokeMock.mockResolvedValueOnce(false);
+    await expect(networkMuteGet("Telegram")).resolves.toBe(false);
+    expect(invokeMock).toHaveBeenCalledWith("network_mute_get", { networkId: "Telegram" });
+  });
+
+  it("networkMuteSet invokes network_mute_set with networkId + muted", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await networkMuteSet("Telegram", true);
+    expect(invokeMock).toHaveBeenCalledWith("network_mute_set", {
+      networkId: "Telegram",
+      muted: true,
+    });
+  });
+});
+
+describe("chatNotifyModeGet / chatNotifyModeSet (Story 10.2)", () => {
+  it("chatNotifyModeGet invokes chat_notify_mode_get with ids and resolves the mode", async () => {
+    invokeMock.mockResolvedValueOnce("mention_only");
+    await expect(chatNotifyModeGet("acctA", "!r:example.org")).resolves.toBe("mention_only");
+    expect(invokeMock).toHaveBeenCalledWith("chat_notify_mode_get", {
+      accountId: "acctA",
+      roomId: "!r:example.org",
+    });
+  });
+
+  it("chatNotifyModeSet invokes chat_notify_mode_set with ids + mode", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await chatNotifyModeSet("acctA", "!r:example.org", "mute");
+    expect(invokeMock).toHaveBeenCalledWith("chat_notify_mode_set", {
+      accountId: "acctA",
+      roomId: "!r:example.org",
+      mode: "mute",
+    });
   });
 });

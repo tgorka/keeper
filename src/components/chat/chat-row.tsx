@@ -34,7 +34,7 @@
  * the section; it disappears once any favourite exists.
  */
 
-import { Pencil } from "lucide-react";
+import { AtSign, BellOff, Pencil } from "lucide-react";
 import { forwardRef } from "react";
 import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import { Badge } from "@/components/ui/badge";
@@ -43,15 +43,21 @@ import {
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuLabel,
+  ContextMenuRadioGroup,
+  ContextMenuRadioItem,
   ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { accountHueVar } from "@/lib/account-hue";
 import { BRIDGE_HEALTH_DOT_CLASS } from "@/lib/bridges";
 import { formatRoomTimestamp } from "@/lib/format-time";
-import type { InboxRoomVm } from "@/lib/ipc/client";
+import type { ChatNotifyMode, InboxRoomVm } from "@/lib/ipc/client";
 import {
   archiveRoom,
+  chatNotifyModeSet,
   favoriteRoom,
   markRoomRead,
   markRoomUnread,
@@ -147,6 +153,22 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
   const onUnfavorite = () => {
     void unfavoriteRoom(room.accountId, room.roomId).catch(() => {});
   };
+  // Per-Chat notification mode (Story 10.2): a synced Matrix push rule. Best-effort
+  // with NO optimistic overlay — the row's mute glyph is Rust-authoritative (resolved
+  // at inbox emit from the synced rule + muted-Network set), so it waits on the
+  // round-trip; a rejection is swallowed and the stream stays truth.
+  const setNotifyMode = (mode: ChatNotifyMode) => {
+    void chatNotifyModeSet(room.accountId, room.roomId, mode).catch(() => {});
+  };
+  // The Notifications radio reflects the durable per-Chat rule. `mention_only` maps to
+  // the mention-only radio; both `muted` (a Chat rule OR a muted Network) and `none`
+  // otherwise resolve to mute/all — the radio shows "Mute" for `muted`, else "All".
+  const notifyRadioValue =
+    room.muteState === "mention_only"
+      ? "mention_only"
+      : room.muteState === "muted"
+        ? "mute"
+        : "all";
   // One-time discovery hint (UX-DR13): while the user has zero favourites, show a
   // muted helper line by the Favorite item explaining the section. Once any
   // favourite exists (`favouritesTotal > 0`) the hint disappears — no persisted
@@ -225,6 +247,22 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
                 >
                   {room.displayName}
                 </span>
+                {/* Durable mute glyph (Story 10.2, FR-52): a bell-off for a muted Chat
+                    or muted Network, an at-sign for mention-only. Rust-authoritative
+                    (`room.muteState`), never re-derived; DND is NOT stamped here. */}
+                {room.muteState === "muted" ? (
+                  <BellOff
+                    aria-label="Muted"
+                    data-testid="mute-glyph"
+                    className="size-3 shrink-0 text-muted-foreground"
+                  />
+                ) : room.muteState === "mention_only" ? (
+                  <AtSign
+                    aria-label="Mentions only"
+                    data-testid="mention-only-glyph"
+                    className="size-3 shrink-0 text-muted-foreground"
+                  />
+                ) : null}
               </span>
               {timestamp !== null && (
                 <span className="shrink-0 text-muted-foreground text-xs">{timestamp}</span>
@@ -282,6 +320,26 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
         ) : (
           <ContextMenuItem onSelect={onFavorite}>Favorite</ContextMenuItem>
         )}
+        <ContextMenuSeparator />
+        <ContextMenuSub>
+          <ContextMenuSubTrigger>Notifications</ContextMenuSubTrigger>
+          <ContextMenuSubContent>
+            <ContextMenuRadioGroup value={notifyRadioValue}>
+              <ContextMenuRadioItem value="all" onSelect={() => setNotifyMode("all")}>
+                All
+              </ContextMenuRadioItem>
+              <ContextMenuRadioItem
+                value="mention_only"
+                onSelect={() => setNotifyMode("mention_only")}
+              >
+                Mentions only
+              </ContextMenuRadioItem>
+              <ContextMenuRadioItem value="mute" onSelect={() => setNotifyMode("mute")}>
+                Mute
+              </ContextMenuRadioItem>
+            </ContextMenuRadioGroup>
+          </ContextMenuSubContent>
+        </ContextMenuSub>
         {showFavoritesHint && (
           <ContextMenuLabel className="max-w-56 font-normal text-xs">
             Favorites keeps key chats one interaction away in a section above the inbox.

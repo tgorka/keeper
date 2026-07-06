@@ -23,6 +23,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import type { InboxBatch, InboxRoomVm, NetworksSnapshot, SpacesSnapshot } from "@/lib/ipc/client";
 import {
   archiveRoom,
+  chatNotifyModeSet,
   favoriteRoom,
   getFavoritesCollapsed,
   listDrafts,
@@ -411,7 +412,7 @@ export function ChatListPane() {
   // the command direction is chosen from the row's current flag, and `u` mirrors
   // the optimistic-unread pattern (`setOptimisticUnread` then round-trip; revert on
   // a hard reject). These reuse the shipped commands — nothing new is wired.
-  const runVerb = (room: InboxRoomVm, verb: "e" | "u" | "p" | "f") => {
+  const runVerb = (room: InboxRoomVm, verb: "e" | "u" | "p" | "f" | "m") => {
     if (verb === "e") {
       const fn = room.isArchived ? unarchiveRoom : archiveRoom;
       void fn(room.accountId, room.roomId).catch(() => {});
@@ -425,6 +426,18 @@ export function ChatListPane() {
     if (verb === "f") {
       const fn = room.isFavourite ? unfavoriteRoom : favoriteRoom;
       void fn(room.accountId, room.roomId).catch(() => {});
+      return;
+    }
+    if (verb === "m") {
+      // Cycle the per-Chat notification mode: All → Mentions only → Mute → All.
+      // Rust owns the synced rule + the row glyph (no optimistic overlay).
+      const next =
+        room.muteState === "none"
+          ? "mention_only"
+          : room.muteState === "mention_only"
+            ? "mute"
+            : "all";
+      void chatNotifyModeSet(room.accountId, room.roomId, next).catch(() => {});
       return;
     }
     // `u`: toggle read/unread with the optimistic overlay, reverting on hard reject.
@@ -516,7 +529,7 @@ export function ChatListPane() {
       composerStore.getState().requestFocus();
       return;
     }
-    if (e.key === "e" || e.key === "u" || e.key === "p" || e.key === "f") {
+    if (e.key === "e" || e.key === "u" || e.key === "p" || e.key === "f" || e.key === "m") {
       e.preventDefault();
       runVerb(room, e.key);
     }

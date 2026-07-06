@@ -553,6 +553,10 @@ fn to_inbox_room(account_id: &str, hue_index: u8, room: &RoomVm) -> InboxRoomVm 
         // The stable bridge `network_id` (machine `protocol.id`) is likewise resolved
         // on the `RoomVm`, copied straight through (Story 6.5) — the health join key.
         network_id: room.network_id.clone(),
+        // The durable per-Chat / per-Network mute intent is resolved on the `RoomVm`
+        // at projection time (Story 10.2), copied straight through — it drives the row
+        // mute glyph and never gates the unread computation above.
+        mute_state: room.mute_state,
     }
 }
 
@@ -626,6 +630,7 @@ mod tests {
             is_space: false,
             network: None,
             network_id: None,
+            mute_state: crate::vm::MuteState::None,
         }
     }
 
@@ -716,9 +721,12 @@ mod tests {
             is_space: false,
             network: Some("Telegram".to_owned()),
             network_id: Some("telegram".to_owned()),
+            mute_state: crate::vm::MuteState::Muted,
         };
         let inbox_room = to_inbox_room("acctA", 4, &src);
         assert!(inbox_room.is_unread);
+        // The durable mute intent is copied straight through (Story 10.2).
+        assert_eq!(inbox_room.mute_state, crate::vm::MuteState::Muted);
         assert_eq!(inbox_room.mention_count, 3);
         assert!(inbox_room.is_archived);
         // `is_favourite` is SDK-sourced, copied straight through like `is_archived`.
