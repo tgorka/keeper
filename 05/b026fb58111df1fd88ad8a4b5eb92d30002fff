@@ -1,0 +1,89 @@
+src/App.tsx
+  s_7fc3db3fcc05a3::t_5ef9ab2e0afa0f 17-20
+  s_7fc3db3fcc05a3::t_542bbe4ccfe3a5 7
+src-tauri/crates/keeper-core/tests/archive_survives_sign_out.rs
+  s_7fc3db3fcc05a3::t_f26feb757793a6 101-106
+src/hooks/use-notify-navigate.ts
+  s_7fc3db3fcc05a3::t_8219781b8ffb81 1-75
+src-tauri/crates/keeper-core/src/vm.rs
+  s_7fc3db3fcc05a3::t_f26feb757793a6 1404-1408
+  s_7fc3db3fcc05a3::t_81ae82f5621959 1390-1403,1409-1436
+src-tauri/crates/keeper-core/src/account.rs
+  s_7fc3db3fcc05a3::t_376700ca147c66 2005-2009
+  s_7fc3db3fcc05a3::t_8e6c9912202332 1935-1939
+  s_7fc3db3fcc05a3::t_f26feb757793a6 5857-5862
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_7fc3db3fcc05a3::t_98bd4de271f709 373-376
+  s_7fc3db3fcc05a3::t_57ead5e777709b 377-380
+src-tauri/crates/keeper-core/src/auth.rs
+  s_7fc3db3fcc05a3::t_f26feb757793a6 921-926,1031-1036
+src-tauri/crates/keeper-core/src/notify.rs
+  s_7fc3db3fcc05a3::t_5463621c4b05fd 1068-1166
+  s_7fc3db3fcc05a3::t_76a7e0c839a76a 318-326
+  s_7fc3db3fcc05a3::t_e4893048f466d5 626
+  s_7fc3db3fcc05a3::t_7d0c211befcc86 150-153
+  s_7fc3db3fcc05a3::t_3f07129e475445 37
+  s_7fc3db3fcc05a3::t_912745070bca7f 338-379
+  s_7fc3db3fcc05a3::t_1d2e3b37f3a31a 490
+  s_7fc3db3fcc05a3::t_2880839aeeda5c 568-570,572
+  s_7fc3db3fcc05a3::t_f14738db4d5a0c 589-590,592-606
+  s_7fc3db3fcc05a3::t_f26feb757793a6 630-634
+  s_7fc3db3fcc05a3::t_55aca8dde292d8 678
+  s_7fc3db3fcc05a3::t_d0d4144b1c33d4 662
+src-tauri/crates/keeper/src/lib.rs
+  s_7fc3db3fcc05a3::t_a60e2b44684fc2 299-305,308
+src-tauri/crates/keeper-core/src/platform.rs
+  s_7fc3db3fcc05a3::t_f48281671443cd 13
+  s_7fc3db3fcc05a3::t_dd4268244a8c8d 44-50
+src/hooks/use-notify-navigate.test.ts
+  s_7fc3db3fcc05a3::t_92c9229e277320 1-102
+src/lib/ipc/client.ts
+  s_7fc3db3fcc05a3::t_bb4ffcf06e618f 69
+  s_7fc3db3fcc05a3::t_41b6a50fac082f 1817-1842
+  s_7fc3db3fcc05a3::t_49b281ba78cbf2 10,14
+_bmad-output/implementation-artifacts/spec-10-4-click-through-and-bridge-health-alerts.md
+  s_7fc3db3fcc05a3::t_512d6853703d5c 118-130
+  s_7fc3db3fcc05a3::t_7d0d8b00692fb8 5,7
+  s_7fc3db3fcc05a3::t_38a1cdc53617b0 85-90
+  s_7fc3db3fcc05a3::t_b2b2d92a4dcada 162,164-214
+  s_7fc3db3fcc05a3::t_10e582bbaabbfc 6
+src/lib/stores/bridge-relink.ts
+  s_7fc3db3fcc05a3::t_1f0b502a600dca 1-46
+src-tauri/crates/keeper-core/src/inbox.rs
+  s_7fc3db3fcc05a3::t_f26feb757793a6 701-706
+src/lib/ipc/gen/NotifyTarget.ts
+  s_7fc3db3fcc05a3::t_5894b5e8ccd60a 1-38
+src-tauri/crates/keeper/src/ipc.rs
+  s_7fc3db3fcc05a3::t_c477d2697666f7 288-320
+  s_7fc3db3fcc05a3::t_0e4ebb5d4132a4 30-32
+  s_7fc3db3fcc05a3::t_1d51841e7e6c42 254-287
+  s_7fc3db3fcc05a3::t_91359bcf36ec8f 389,392-397
+  s_7fc3db3fcc05a3::t_d5b423a1934fde 1067-1073
+  s_7fc3db3fcc05a3::t_99610baada1e63 398
+src-tauri/crates/keeper-core/src/bridges/health.rs
+  s_7fc3db3fcc05a3::t_dfb175ce64c224 358,363-368,372-374
+  s_7fc3db3fcc05a3::t_17e09f857ce142 369-371
+  s_7fc3db3fcc05a3::t_ba379be504f66b 323-335
+  s_7fc3db3fcc05a3::t_c1604c1d8e61e2 400-402,407-409,432-438
+  s_7fc3db3fcc05a3::t_aa8d0c48807f00 416-425,430-431
+  s_7fc3db3fcc05a3::t_e269351f4df791 397-399,403-406,410
+  s_7fc3db3fcc05a3::t_5c58c403ea80f5 41-42
+  s_7fc3db3fcc05a3::t_7f1a44047272f0 375,439,749-751,753-921
+  s_7fc3db3fcc05a3::t_4c3668b9f72004 376
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "05b026fb58111df1fd88ad8a4b5eb92d30002fff",
+  "prompts": {},
+  "sessions": {
+    "s_7fc3db3fcc05a3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57baf1e0-01fd-432e-9eac-e681df6948a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
