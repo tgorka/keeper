@@ -40,6 +40,9 @@ tauri-plugin-dialog = { workspace = true }
 # OS-level global summon/hide hotkey (Story 9.4, FR-50). Registration/toggle live in
 # `hotkey.rs`; the accelerator string persists via `keeper-core::registry`.
 tauri-plugin-global-shortcut = { workspace = true }
+# Native OS notifications from the sync loop (Story 10.1, FR-51). Wires the desktop
+# `Platform::notify` port to the OS notifier; the plugin is registered in `lib.rs`.
+tauri-plugin-notification = { workspace = true }
 # Percent-decoding raw-body IPC headers (filename/caption) for the pasted-image
 # send path (Story 3.7). Already in the tree via url/matrix-sdk.
 percent-encoding = { workspace = true }

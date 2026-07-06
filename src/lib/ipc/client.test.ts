@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DemoBatch, IpcError, NetworksSnapshot, SpacesSnapshot } from "./client";
-import { invoke, setNetworkFilter, setSpaceFilter, subscribe, subscribeInbox } from "./client";
+import {
+  invoke,
+  notifyGetPreviewEnabled,
+  notifySetPreviewEnabled,
+  setNetworkFilter,
+  setSpaceFilter,
+  subscribe,
+  subscribeInbox,
+} from "./client";
 
 // `vi.mock` is hoisted above imports, so the mock's dependencies must be created
 // with `vi.hoisted` to be available when the factory runs. `Channel` is mocked
@@ -159,5 +167,21 @@ describe("setNetworkFilter", () => {
     invokeMock.mockResolvedValueOnce(undefined);
     await setNetworkFilter(null);
     expect(invokeMock).toHaveBeenCalledWith("set_network_filter", { network: null });
+  });
+});
+
+describe("notifyGetPreviewEnabled", () => {
+  it("invokes notify_get_preview_enabled and resolves with the boolean", async () => {
+    invokeMock.mockResolvedValueOnce(true);
+    await expect(notifyGetPreviewEnabled()).resolves.toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("notify_get_preview_enabled", undefined);
+  });
+});
+
+describe("notifySetPreviewEnabled", () => {
+  it("invokes notify_set_preview_enabled with the enabled flag", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await notifySetPreviewEnabled(false);
+    expect(invokeMock).toHaveBeenCalledWith("notify_set_preview_enabled", { enabled: false });
   });
 });

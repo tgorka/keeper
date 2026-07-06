@@ -20,6 +20,7 @@ pub mod drafts;
 pub mod error;
 pub mod inbox;
 pub mod media;
+pub mod notify;
 pub mod oauth;
 pub mod palette;
 pub mod platform;

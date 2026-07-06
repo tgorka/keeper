@@ -7,6 +7,8 @@ vi.mock("@/lib/ipc/client", () => ({
   setHonorRemoteDeletions: vi.fn(() => Promise.resolve()),
   incognitoGetGlobal: vi.fn(() => Promise.resolve(false)),
   incognitoSetGlobal: vi.fn(() => Promise.resolve()),
+  notifyGetPreviewEnabled: vi.fn(() => Promise.resolve(true)),
+  notifySetPreviewEnabled: vi.fn(() => Promise.resolve()),
   undoSendWindow: vi.fn(() => Promise.resolve(10)),
   setUndoSendWindow: vi.fn(() => Promise.resolve()),
   hotkeyGet: vi.fn(() =>
@@ -41,6 +43,8 @@ import {
   honorRemoteDeletions,
   hotkeyGet,
   hotkeySet,
+  notifyGetPreviewEnabled,
+  notifySetPreviewEnabled,
   setHonorRemoteDeletions,
   setUndoSendWindow,
   undoSendWindow,
@@ -58,6 +62,8 @@ const mockUndoGet = vi.mocked(undoSendWindow);
 const mockUndoSet = vi.mocked(setUndoSendWindow);
 const mockHotkeyGet = vi.mocked(hotkeyGet);
 const mockHotkeySet = vi.mocked(hotkeySet);
+const mockNotifyGet = vi.mocked(notifyGetPreviewEnabled);
+const mockNotifySet = vi.mocked(notifySetPreviewEnabled);
 
 const DEFAULT_HOTKEY_VM: HotkeyVm = {
   accelerator: "Control+Alt+Space",
@@ -91,6 +97,10 @@ describe("SettingsDialog", () => {
     mockHotkeySet.mockClear();
     mockHotkeyGet.mockResolvedValue(DEFAULT_HOTKEY_VM);
     mockHotkeySet.mockResolvedValue(DEFAULT_HOTKEY_VM);
+    mockNotifyGet.mockClear();
+    mockNotifySet.mockClear();
+    mockNotifyGet.mockResolvedValue(true);
+    mockNotifySet.mockResolvedValue(undefined);
     accountsStore.getState().clear();
     encryptionStatusStore.getState().reset();
     keyBackupStore.getState().reset();
@@ -226,6 +236,57 @@ describe("SettingsDialog", () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(mockHonorSet).toHaveBeenCalledWith(true));
     expect(toggle).toBeChecked();
+  });
+
+  // ── Notifications section (Story 10.1) ─────────────────────────────────────
+  it("renders the message-previews toggle and reads its initial state", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockNotifyGet.mockResolvedValue(true);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const toggle = await screen.findByRole("switch", { name: "Show message previews" });
+    await waitFor(() => expect(toggle).toBeChecked());
+    expect(mockNotifyGet).toHaveBeenCalled();
+  });
+
+  it("reflects previews-off in the toggle", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockNotifyGet.mockResolvedValue(false);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const toggle = await screen.findByRole("switch", { name: "Show message previews" });
+    await waitFor(() => expect(toggle).not.toBeChecked());
+  });
+
+  it("persists the message-previews toggle on change", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockNotifyGet.mockResolvedValue(true);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const toggle = await screen.findByRole("switch", { name: "Show message previews" });
+    await waitFor(() => expect(toggle).toBeChecked());
+    fireEvent.click(toggle);
+    await waitFor(() => expect(mockNotifySet).toHaveBeenCalledWith(false));
+    expect(toggle).not.toBeChecked();
+  });
+
+  it("reverts the message-previews toggle when the persist fails", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockNotifyGet.mockResolvedValue(true);
+    mockNotifySet.mockRejectedValue({
+      code: "internal",
+      message: "boom",
+      accountId: null,
+      retriable: false,
+    });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const toggle = await screen.findByRole("switch", { name: "Show message previews" });
+    await waitFor(() => expect(toggle).toBeChecked());
+    fireEvent.click(toggle);
+    // Optimistic flip, then revert on the failed persist.
+    await waitFor(() => expect(mockNotifySet).toHaveBeenCalledWith(false));
+    await waitFor(() => expect(toggle).toBeChecked());
   });
 
   it("renders the Undo-Send window control and reads its initial value", async () => {

@@ -62,6 +62,7 @@ use crate::error::{
 };
 use crate::inbox::{InboxMerger, NetworksSink, SpacesSink};
 use crate::media::{self, MediaBytes, MediaHandle, MediaVariant};
+use crate::notify::{self, NotifyConfig};
 use crate::palette::{PaletteEntry, PaletteIndex};
 use crate::platform::Platform;
 use crate::registry;
@@ -217,6 +218,7 @@ type ActivatedAccount = (
     EventHandlerHandle,
     EventHandlerHandle,
     EventHandlerHandle,
+    EventHandlerHandle,
     JoinHandle<()>,
     tokio::sync::broadcast::Sender<OutboxChange>,
 );
@@ -279,6 +281,13 @@ struct AccountHandle {
     /// Removed from the `Client` in [`AccountManager::shutdown`] alongside the
     /// archive/redaction handlers so no handler leaks past teardown.
     draft_handler: EventHandlerHandle,
+    /// Account-wide post-decryption notify event handler (Story 10.1, AD-18):
+    /// registered on the `Client` in [`activate`], it taps each `m.room.message`,
+    /// applies the notify rules (skip own/backlog/non-notifying), and posts a native
+    /// notification through the `Platform::notify` port. Removed from the `Client` in
+    /// [`AccountManager::shutdown`] so a signed-out account produces no further
+    /// notifications and no handler (holding a `Client` clone) leaks past teardown.
+    notify_handler: EventHandlerHandle,
     /// Lifetime-of-account Undo-Send outbox scheduler task (Story 8.3): a tokio
     /// interval (~250 ms) that dispatches held sends whose `dispatch_at_ts` has
     /// elapsed (oldest-first) through the single [`send::dispatch`] gate, then
@@ -556,6 +565,13 @@ pub struct AccountManager {
     /// palette producers spawned in [`AccountManager::subscribe_inbox`]. Read by
     /// [`AccountManager::palette_query`]; never a source of truth for room state.
     palette: Arc<Mutex<PaletteIndex>>,
+    /// The app-wide "message previews" toggle (Story 10.1, AD-18): the single
+    /// [`NotifyConfig`] seeded once in [`AccountManager::new`] from the persisted
+    /// registry value (default on) and cloned into every account's notify handler on
+    /// activation. Lives here (not a `static`) so there is no new global mutable state;
+    /// the Settings commands read/set it via [`AccountManager::notify_previews_get`] /
+    /// [`AccountManager::notify_previews_set`].
+    notify: Arc<NotifyConfig>,
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
@@ -581,6 +597,14 @@ impl AccountManager {
         // the relay skips to the newest on lag, so a small ring never loses the
         // convergent final state.
         let (draft_mirror_tx, _) = tokio::sync::broadcast::channel(64);
+        // Seed the app-wide "message previews" toggle from the persisted registry value
+        // (Story 10.1). A read failure defaults on (previews enabled) — the toggle must
+        // never block startup and its honest default is on.
+        let previews_enabled = registry::get_notify_previews(data_dir).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not read notify previews setting; defaulting on");
+            true
+        });
+        let notify = Arc::new(NotifyConfig::new(previews_enabled));
         Self {
             accounts: Mutex::new(HashMap::new()),
             inbox: Mutex::new(None),
@@ -590,6 +614,7 @@ impl AccountManager {
             draft_mirror_tx,
             draft_mirror_subs: Mutex::new(HashMap::new()),
             palette: Arc::new(Mutex::new(PaletteIndex::new())),
+            notify,
         }
     }
 
@@ -635,6 +660,7 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    notify_handler,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -642,6 +668,7 @@ impl AccountManager {
                     account_id,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
+                    self.notify.clone(),
                 )
                 .await?;
                 accounts.insert(
@@ -656,6 +683,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         draft_handler,
+                        notify_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -955,6 +983,7 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    notify_handler,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -962,6 +991,7 @@ impl AccountManager {
                     account_id,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
+                    self.notify.clone(),
                 )
                 .await?;
                 accounts.insert(
@@ -976,6 +1006,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         draft_handler,
+                        notify_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1049,6 +1080,7 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    notify_handler,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1056,6 +1088,7 @@ impl AccountManager {
                     account_id,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
+                    self.notify.clone(),
                 )
                 .await?;
                 accounts.insert(
@@ -1070,6 +1103,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         draft_handler,
+                        notify_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1204,6 +1238,7 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    notify_handler,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1211,6 +1246,7 @@ impl AccountManager {
                     account_id,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
+                    self.notify.clone(),
                 )
                 .await?;
                 accounts.insert(
@@ -1225,6 +1261,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         draft_handler,
+                        notify_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1325,6 +1362,7 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    notify_handler,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1332,6 +1370,7 @@ impl AccountManager {
                     account_id,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
+                    self.notify.clone(),
                 )
                 .await?;
                 accounts.insert(
@@ -1346,6 +1385,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         draft_handler,
+                        notify_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1445,6 +1485,7 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    notify_handler,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1452,6 +1493,7 @@ impl AccountManager {
                     account_id,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
+                    self.notify.clone(),
                 )
                 .await?;
                 accounts.insert(
@@ -1466,6 +1508,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         draft_handler,
+                        notify_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1609,6 +1652,7 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    notify_handler,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1616,6 +1660,7 @@ impl AccountManager {
                     account_id,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
+                    self.notify.clone(),
                 )
                 .await?;
                 accounts.insert(
@@ -1630,6 +1675,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         draft_handler,
+                        notify_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -2577,6 +2623,7 @@ impl AccountManager {
                     archive_handler,
                     redaction_handler,
                     draft_handler,
+                    notify_handler,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -2584,6 +2631,7 @@ impl AccountManager {
                     account_id,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
+                    self.notify.clone(),
                 )
                 .await?;
                 accounts.insert(
@@ -2598,6 +2646,7 @@ impl AccountManager {
                         archive_handler,
                         redaction_handler,
                         draft_handler,
+                        notify_handler,
                         verification_flow_tx: Arc::new(Mutex::new(None)),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -3296,6 +3345,28 @@ impl AccountManager {
             account,
             chat,
         })
+    }
+
+    /// Read the "message previews" toggle (Story 10.1, AD-18). Returns the in-memory
+    /// [`NotifyConfig`] value (seeded from the persisted registry at construction).
+    pub fn notify_previews_get(&self) -> bool {
+        self.notify.previews_enabled()
+    }
+
+    /// Set the "message previews" toggle (Story 10.1, AD-18). Persists the new value to
+    /// the `settings` k/v table under `notify.previews_enabled` **and** updates the
+    /// in-memory [`NotifyConfig`] so every account's live notify handler sees the change
+    /// immediately. Persists first: an in-memory change is applied only once it is
+    /// durable.
+    pub fn notify_previews_set(
+        &self,
+        platform: &Arc<dyn Platform>,
+        enabled: bool,
+    ) -> Result<(), CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::set_notify_previews(&data_dir, enabled)?;
+        self.notify.set_previews_enabled(enabled);
+        Ok(())
     }
 
     /// Read the global Incognito default (Story 8.1). Absent = off (Incognito off by
@@ -4097,6 +4168,10 @@ impl AccountManager {
             // draft edits are observed after the account goes down and no handler
             // (holding a `Client` clone) leaks past teardown.
             handle.client.remove_event_handler(handle.draft_handler);
+            // Remove the account-wide notify handler (Story 10.1) so a signed-out
+            // account produces no further native notifications and no handler (holding
+            // a `Client` clone) leaks past teardown.
+            handle.client.remove_event_handler(handle.notify_handler);
             // Stop the SyncService first so no further diffs are produced, then
             // abort the reconnect supervisor and any remaining producer tasks.
             handle.sync.stop().await;
@@ -4215,6 +4290,7 @@ async fn activate(
     account_id: &str,
     archive: Option<ArchiveHandle>,
     draft_mirror_tx: tokio::sync::broadcast::Sender<DraftMirrorBatch>,
+    notify_config: Arc<NotifyConfig>,
 ) -> Result<ActivatedAccount, CoreError> {
     let session_json = platform
         .keychain_get(&session_keychain_key(account_id))?
@@ -4271,6 +4347,14 @@ async fn activate(
     // process broadcast for the app-wide `subscribe_draft_mirror` relay. The body
     // is never logged.
     let draft_handler = register_draft_handler(&client, account_id, draft_mirror_tx);
+    // Register the account-wide post-decryption notify handler (Story 10.1, AD-18)
+    // alongside the archive/redaction/draft handlers and before sync starts, so a
+    // message in the first live batch is not missed. It captures its backlog baseline
+    // at registration (cold-launch history is suppressed) and posts a native
+    // notification through the `Platform::notify` port for each qualifying message. The
+    // body is never logged; a notifier failure is swallowed and never blocks sync.
+    let notify_handler =
+        notify::register_notify_handler(&client, account_id, platform.clone(), notify_config);
 
     // Archive-first back-pagination enablement (Story 5.6, FR-17). Subscribe the
     // SDK event cache once here — alongside the archive/redaction handlers and
@@ -4356,6 +4440,7 @@ async fn activate(
         archive_handler,
         redaction_handler,
         draft_handler,
+        notify_handler,
         outbox_scheduler,
         outbox_tx,
     ))

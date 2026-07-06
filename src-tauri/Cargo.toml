@@ -27,6 +27,10 @@ tauri-plugin-dialog = "2"
 # OS-level global summon/hide hotkey (Story 9.4, FR-50). Desktop-only platform port;
 # registration/unregistration happen only in Rust. MIT/Apache — passes `cargo deny check`.
 tauri-plugin-global-shortcut = "2"
+# Native OS notifications from the sync loop (Story 10.1, FR-51). The desktop
+# `Platform::notify` port posts through this; content originates only from the local
+# decrypting loop, never a push gateway. MIT/Apache — passes `cargo deny check`.
+tauri-plugin-notification = "2"
 # Serialization + IPC bindings
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

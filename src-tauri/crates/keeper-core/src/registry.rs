@@ -423,6 +423,27 @@ pub fn set_incognito_global(data_dir: &Path, enabled: bool) -> Result<(), CoreEr
     )
 }
 
+/// The `settings` key holding the "message previews" toggle (Story 10.1). Stored as
+/// `"1"`/`"0"`; absent = on (previews enabled by default).
+const NOTIFY_PREVIEWS_KEY: &str = "notify.previews_enabled";
+
+/// Read the "message previews" toggle (Story 10.1). Absent ⇒ `true` (previews enabled
+/// by default). Stored in the `settings` k/v table under `notify.previews_enabled`.
+pub fn get_notify_previews(data_dir: &Path) -> Result<bool, CoreError> {
+    // Default-on: only an explicit `"0"` disables previews; absent/anything-else is on.
+    Ok(get_setting(data_dir, NOTIFY_PREVIEWS_KEY)?.as_deref() != Some("0"))
+}
+
+/// Write the "message previews" toggle (Story 10.1). Persists `"1"`/`"0"` into the
+/// `settings` k/v table under `notify.previews_enabled`.
+pub fn set_notify_previews(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        NOTIFY_PREVIEWS_KEY,
+        if enabled { "1" } else { "0" },
+    )
+}
+
 /// Read the per-Account Incognito override for `account_id` (Story 8.1). `None` =
 /// inherit the global scope; `Some(bool)` = an explicit per-Account override. Reads
 /// the nullable `accounts.incognito` column; a missing account row also reads `None`.
@@ -1313,6 +1334,18 @@ mod tests {
         assert!(get_incognito_global(&dir).expect("get global on"));
         set_incognito_global(&dir, false).expect("set global off");
         assert!(!get_incognito_global(&dir).expect("get global off"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notify_previews_round_trips_and_defaults_on() {
+        let dir = temp_dir();
+        // Absent setting defaults ON (previews enabled by default, Story 10.1).
+        assert!(get_notify_previews(&dir).expect("get absent previews"));
+        set_notify_previews(&dir, false).expect("set previews off");
+        assert!(!get_notify_previews(&dir).expect("get previews off"));
+        set_notify_previews(&dir, true).expect("set previews on");
+        assert!(get_notify_previews(&dir).expect("get previews on"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

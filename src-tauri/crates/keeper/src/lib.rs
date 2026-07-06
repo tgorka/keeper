@@ -27,6 +27,10 @@ pub fn run() {
         // is registered in `setup()` via `hotkey::install`; its press handler toggles
         // the main window on focus.
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        // Native OS notifications from the sync loop (Story 10.1, FR-51). The desktop
+        // `Platform::notify` port posts through this plugin; the app handle is stored in
+        // `setup()` and notification permission is requested best-effort there.
+        .plugin(tauri_plugin_notification::init())
         .manage(ipc::AppState::new())
         // The exclusive decrypted-media transport (Story 3.6, AD-4): decrypted
         // bytes reach the webview only over this Range-capable `keeper-media://`
@@ -66,6 +70,27 @@ pub fn run() {
             // and emits `keeper://global-hotkey-activated`. Best-effort — a registration
             // failure leaves the app running with `hotkey_get().active = false`.
             hotkey::install(app.handle());
+
+            // Store the app handle for the desktop notifier port (Story 10.1) so
+            // `Platform::notify` can post native notifications from the sync loop, and
+            // request notification permission best-effort. A permission failure only
+            // means the OS will drop notifications — it never blocks startup.
+            ipc::set_notify_app_handle(app.handle().clone());
+            {
+                use tauri_plugin_notification::NotificationExt;
+                let notifier = app.notification();
+                match notifier.permission_state() {
+                    Ok(tauri_plugin_notification::PermissionState::Granted) => {}
+                    Ok(_) => {
+                        if let Err(e) = notifier.request_permission() {
+                            tracing::warn!(error = %e, "could not request notification permission");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not read notification permission state");
+                    }
+                }
+            }
 
             Ok(())
         })
@@ -157,6 +182,8 @@ pub fn run() {
             ipc::release_receipt,
             ipc::coupling_caveats,
             ipc::mark_room_unread,
+            ipc::notify_get_preview_enabled,
+            ipc::notify_set_preview_enabled,
             ipc::incognito_get,
             ipc::incognito_get_global,
             ipc::incognito_set_global,

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use keeper_core::account::AccountManager;
@@ -237,6 +237,20 @@ static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 /// macOS Keychain service name under which all keeper secrets are stored (AD-3).
 const KEYCHAIN_SERVICE: &str = "dev.tgorka.keeper";
 
+/// The Tauri app handle used by the desktop `Platform::notify` port to post native
+/// notifications (Story 10.1). Set exactly once in `lib.rs` `setup()` via
+/// [`set_notify_app_handle`]; the write-once `OnceLock` is the one permitted global
+/// (mirroring how `sidecar_path` reaches process state — `DesktopPlatform` stays a
+/// unit struct). When unset (headless / CI), `notify` returns an honest `Unsupported`
+/// rather than panicking.
+static NOTIFY_APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+/// Store the app handle for the desktop notifier port (Story 10.1). Called once from
+/// `lib.rs` `setup()`. Idempotent — a second call is ignored (the handle is write-once).
+pub fn set_notify_app_handle(handle: tauri::AppHandle) {
+    let _ = NOTIFY_APP.set(handle);
+}
+
 /// Concrete [`Platform`] implementation for the desktop shell.
 ///
 /// The data-dir port is fully wired via `dirs`; the remaining ports return
@@ -288,10 +302,21 @@ impl Platform for DesktopPlatform {
             .map_err(|e| CoreError::Internal(format!("could not open the system browser: {e}")))
     }
 
-    fn notify(&self, _title: &str, _body: &str) -> Result<(), CoreError> {
-        Err(CoreError::Unsupported(
-            "notify not wired until a later story".to_owned(),
-        ))
+    fn notify(&self, title: &str, body: &str) -> Result<(), CoreError> {
+        use tauri_plugin_notification::NotificationExt;
+
+        // The app handle is set once in `setup()`; when it is unset (headless / CI)
+        // this is an honest `Unsupported`, never a panic. `DesktopPlatform` stays a
+        // unit struct — it reaches the handle through the write-once global.
+        let app = NOTIFY_APP.get().ok_or_else(|| {
+            CoreError::Unsupported("notification app handle is not set (headless)".to_owned())
+        })?;
+        app.notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show()
+            .map_err(|e| CoreError::Internal(format!("could not post notification: {e}")))
     }
 
     fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError> {
@@ -2448,6 +2473,28 @@ pub fn incognito_get(
     state
         .accounts
         .incognito_get(&state.platform, &account_id, &room_id)
+        .map_err(to_ipc_error)
+}
+
+/// Read the "message previews" toggle (Story 10.1). Returns the in-memory
+/// [`NotifyConfig`](keeper_core::notify::NotifyConfig) value (seeded from the persisted
+/// registry at startup; default on). Infallible — reads process state, never fails.
+#[tauri::command]
+pub fn notify_get_preview_enabled(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    Ok(state.accounts.notify_previews_get())
+}
+
+/// Set the "message previews" toggle (Story 10.1). Persists into the `settings` k/v
+/// table under `notify.previews_enabled` and updates the in-memory config so every live
+/// notify handler sees the change immediately. Errors funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn notify_set_preview_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .notify_previews_set(&state.platform, enabled)
         .map_err(to_ipc_error)
 }
 

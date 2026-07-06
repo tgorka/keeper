@@ -1426,6 +1426,24 @@ export async function incognitoGet(accountId: string, roomId: string): Promise<I
 }
 
 /**
+ * Read the "message previews" toggle (Story 10.1). Absent = on (previews enabled by
+ * default). Resolves with the current in-memory config value. Rejects with the
+ * {@link IpcError} envelope only on an unexpected failure.
+ */
+export async function notifyGetPreviewEnabled(): Promise<boolean> {
+  return await invoke<boolean>("notify_get_preview_enabled");
+}
+
+/**
+ * Set the "message previews" toggle (Story 10.1). Persists into the `settings` k/v
+ * table in `keeper.db` and updates the in-memory config so every live notify handler
+ * sees the change immediately. Resolves once persisted.
+ */
+export async function notifySetPreviewEnabled(enabled: boolean): Promise<void> {
+  await invoke<void>("notify_set_preview_enabled", { enabled });
+}
+
+/**
  * Read the global Incognito default (Story 8.1). Absent = off (Incognito off by
  * default). Rejects with the {@link IpcError} envelope on a registry failure.
  */

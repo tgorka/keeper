@@ -27,6 +27,8 @@ import {
   hotkeySet,
   incognitoGetGlobal,
   incognitoSetGlobal,
+  notifyGetPreviewEnabled,
+  notifySetPreviewEnabled,
   setHonorRemoteDeletions,
   setUndoSendWindow,
   undoSendWindow,
@@ -106,6 +108,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>
           <HonorRemoteDeletionsRow />
         </div>
+        <NotificationsSection open={open} />
         <PrivacySection open={open} />
         <ShortcutsSection open={open} />
         <EncryptionSection />
@@ -197,6 +200,78 @@ const UNDO_SEND_WINDOW_MAX = 60;
 /** The honest copy explaining the Undo-Send window (Story 8.3). */
 const UNDO_SEND_SENTENCE =
   "Each message you send waits this many seconds before it leaves, so you can undo it. Set to 0 to send immediately.";
+
+/**
+ * The plain disclosure for the message-previews toggle (Story 10.1). Sentence case,
+ * no exclamation marks, honest consequence-naming (project voice).
+ */
+const NOTIFY_PREVIEWS_SENTENCE =
+  "Native notifications for new messages show the sender and chat, plus a short preview of the message. Turn this off to hide the message content: notifications then show only the sender and chat, never the text. Notifications are always on-device and never leave this Mac.";
+
+/**
+ * Notifications section (Story 10.1): the "Show message previews" `Switch`, bound to
+ * `notifySetPreviewEnabled`. Reads its initial state via `notifyGetPreviewEnabled()` on
+ * open. On a persist failure the toggle reverts (honest — never claims a state that was
+ * not saved).
+ */
+function NotificationsSection({ open }: { open: boolean }) {
+  // `undefined` = still loading; otherwise the resolved previews state.
+  const [enabled, setEnabled] = useState<boolean | undefined>(undefined);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    setEnabled(undefined);
+    let cancelled = false;
+    void notifyGetPreviewEnabled()
+      .then((value) => {
+        if (!cancelled) {
+          setEnabled(value);
+        }
+      })
+      .catch(() => {
+        // On a read failure, fall back to the honest default (previews on).
+        if (!cancelled) {
+          setEnabled(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  // Monotonic token so a failed persist only reverts when no newer toggle superseded it.
+  const writeId = useRef(0);
+
+  const onCheckedChange = (next: boolean) => {
+    writeId.current += 1;
+    const id = writeId.current;
+    const prev = enabled ?? true;
+    setEnabled(next);
+    void notifySetPreviewEnabled(next).catch(() => {
+      if (id === writeId.current) {
+        setEnabled(prev);
+      }
+    });
+  };
+
+  return (
+    <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
+      <p className="font-medium">Notifications</p>
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor="notify-previews">Show message previews</Label>
+        <Switch
+          id="notify-previews"
+          checked={enabled ?? false}
+          disabled={enabled === undefined}
+          onCheckedChange={onCheckedChange}
+        />
+      </div>
+      <p className="text-muted-foreground">{NOTIFY_PREVIEWS_SENTENCE}</p>
+    </div>
+  );
+}
 
 /**
  * Privacy section (Story 8.1): the global Incognito default `Switch`, bound to
