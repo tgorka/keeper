@@ -186,6 +186,75 @@ fn redaction_marks_and_retrievable_content_honors_policy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An own message row (sender is the local account's own user) — mirrors what the
+/// archive stores for a message the user themselves sent, whose delete-for-everyone
+/// redaction (Story 3.8 `send::redact`) is echoed back through the same sync path.
+fn own_text_event(account_id: &str, event_id: &str, origin_ts: i64, body: &str) -> ArchiveEvent {
+    ArchiveEvent {
+        account_id: account_id.to_owned(),
+        event_id: event_id.to_owned(),
+        room_id: "!room:example.org".to_owned(),
+        sender: "@alice:example.org".to_owned(),
+        origin_ts,
+        event_type: "m.room.message".to_owned(),
+        content_json: format!(r#"{{"msgtype":"m.text","body":"{body}"}}"#),
+        body: body.to_owned(),
+        media: None,
+        relates_to_event_id: None,
+        rel_type: None,
+    }
+}
+
+/// FR-36 for an OWN post-dispatch deletion (Story 8.4). A user's own
+/// delete-for-everyone dispatches `send::redact`; the server echoes the redaction back
+/// via sync, and it arrives at the SAME source-agnostic redaction handler as a remote
+/// redaction — `handle.redact(...)` → `mark_redacted`. This pins that an own redaction
+/// marks the archive row (`redacted_ts` set, `content_json` retained, never erased) and
+/// that `retrievable_content` still gates read-time visibility on the "honor remote
+/// deletions locally" setting, exactly like a remote deletion. No origin/`is_own` branch
+/// exists in the handler, so own and remote are treated identically.
+#[test]
+fn own_post_dispatch_redaction_marks_archive_and_honors_policy() {
+    let dir = temp_dir("own-redact");
+    let handle: ArchiveHandle = ArchiveWriter::spawn(&dir).expect("spawn writer");
+    // The user's own message lands in the archive via the normal sync ingest path.
+    handle.ingest(own_text_event("acctA", "$own", 100, "my secret"));
+    wait_until(&dir, |conn| {
+        get_event(conn, "acctA", "$own").ok().flatten().is_some()
+    });
+    // The own delete-for-everyone redaction, echoed back through sync, reaches the same
+    // handler as any remote redaction — no is_own branch.
+    handle.redact("acctA", "$own", 777);
+    drop(handle);
+
+    wait_until(&dir, |conn| {
+        get_event(conn, "acctA", "$own")
+            .ok()
+            .flatten()
+            .and_then(|r| r.redacted_ts)
+            .is_some()
+    });
+    let conn = open_archive_db(&dir).expect("reopen");
+    let row = get_event(&conn, "acctA", "$own")
+        .expect("get")
+        .expect("row");
+    // The row is MARKED, never erased — content is retained on disk.
+    assert_eq!(row.redacted_ts, Some(777));
+    assert_eq!(
+        row.content_json, r#"{"msgtype":"m.text","body":"my secret"}"#,
+        "own-redaction retains content_json (mark-never-erase, FR-36)"
+    );
+    // honor OFF → the pre-redaction content is still retrievable locally; honor ON → the
+    // content is withheld at read time (the row stays on disk). Identical to remote.
+    assert!(retrievable_content(&conn, "acctA", "$own", false)
+        .expect("off")
+        .is_some());
+    assert!(retrievable_content(&conn, "acctA", "$own", true)
+        .expect("on")
+        .is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The app-wide honor-deletions setting round-trips through `keeper.db`: absent ⇒
 /// false, then on/off persist.
 #[test]

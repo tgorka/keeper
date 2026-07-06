@@ -19,9 +19,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { HeldSendVm } from "@/lib/ipc/client";
-import { cancelHeldSend } from "@/lib/ipc/client";
-import { composerStore } from "@/lib/stores/composer";
-import { useHeldSends } from "@/lib/stores/outbox";
+import { undoHeldSend, useHeldSends } from "@/lib/stores/outbox";
 import { cn } from "@/lib/utils";
 
 /** Whole seconds remaining until `dispatchAtMs`, clamped at 0 (never negative). */
@@ -51,14 +49,11 @@ export function UndoSendPill({ accountId, roomId }: UndoSendPillProps) {
   }, [held.length]);
 
   const undo = useCallback(
-    async (id: string) => {
-      // Cancel is idempotent in Rust (an already-dispatched row returns ""); only
-      // restore when a non-empty body actually came back.
-      const body = await cancelHeldSend(accountId, roomId, id).catch(() => "");
-      if (body.length > 0) {
-        composerStore.getState().restore(accountId, roomId, body);
-      }
-    },
+    // The shared undo effect (Story 8.4): cancel is idempotent in Rust (an
+    // already-dispatched row returns ""); it only restores on a non-empty body. This is
+    // the same helper the timeline Delete affordance on a held bubble calls, so the two
+    // cannot drift.
+    (id: string) => void undoHeldSend(accountId, roomId, id),
     [accountId, roomId],
   );
 

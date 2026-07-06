@@ -85,7 +85,7 @@ import { useBridgeHealth } from "@/lib/stores/bridge-health";
 import { composerStore, useComposerStore } from "@/lib/stores/composer";
 import { exportStore } from "@/lib/stores/export";
 import { refreshIncognito, useIncognito, useIncognitoPolicyVersion } from "@/lib/stores/incognito";
-import { outboxStore, useHeldSends } from "@/lib/stores/outbox";
+import { outboxStore, undoHeldSend, useHeldSends } from "@/lib/stores/outbox";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { timelineStore, useTimelineStore } from "@/lib/stores/timeline";
 import { cn } from "@/lib/utils";
@@ -1059,12 +1059,44 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
     [items],
   );
 
+  // Resolve a Delete intent on a HELD (still-in-window) bubble as an UNDO, never a
+  // redaction (Story 8.4). Held render keys are `held:<id>`. Returns whether the key was
+  // a held key — a `held:` key is ALWAYS consumed so callers return before any redaction
+  // path (a held id must never reach `deleteMessage`). The effect is the shared
+  // `undoHeldSend`, byte-identical to the undo-send pill's Undo.
+  const tryUndoHeld = useCallback(
+    (key: string): boolean => {
+      // Not a held bubble: let the caller fall through to the redaction path.
+      if (!key.startsWith("held:")) {
+        return false;
+      }
+      // The undo only fires when the row is still live in the snapshot and the room
+      // context is resolved; a stale held selection (its window already elapsed and the
+      // row dispatched) cleanly no-ops here instead of leaking to the redaction path or
+      // to the browser's native key handling. Either way a `held:` key is consumed.
+      if (accountId !== null && selectedRoomId !== null) {
+        const id = key.slice("held:".length);
+        if (heldSends.some((h) => h.id === id)) {
+          void undoHeldSend(accountId, selectedRoomId, id);
+        }
+      }
+      return true;
+    },
+    [heldSends, accountId, selectedRoomId],
+  );
+
   // Open the delete-for-everyone confirmation for an own message (Story 3.8,
-  // FR-15). Fired by the action-bar Delete button and the ⌫/Delete key. Only own
-  // messages are deletable (Rust also gates redaction dispatch); a non-own or
-  // missing target is a no-op. The actual redaction runs from the dialog's confirm.
+  // FR-15). Fired by the action-bar Delete button and the ⌫/Delete key. A held-row
+  // key (`held:<id>`, Story 8.4) resolves as an undo BEFORE any redaction path — a held
+  // id can never reach the redaction dialog. Otherwise only own messages are deletable
+  // (Rust also gates redaction dispatch); a non-own or missing target is a no-op. The
+  // actual redaction runs from the dialog's confirm.
   const onDelete = useCallback(
     (key: string) => {
+      // A held bubble's Delete is an undo, not a redaction — branch first and return.
+      if (tryUndoHeld(key)) {
+        return;
+      }
       const target = items.find((it) => it.kind === "message" && it.key === key);
       // Delete-for-everyone is scoped to an own message that has actually been sent;
       // an unsent/failed echo (`sendState !== null`) has no remote event to redact.
@@ -1073,7 +1105,7 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
       }
       setDeleteKey(key);
     },
-    [items],
+    [items, tryUndoHeld],
   );
 
   // Toggle an emoji reaction on a message (Story 3.5, FR-12). Fired by both the
@@ -1317,6 +1349,12 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
         !e.altKey &&
         sel !== null
       ) {
+        // A held bubble (`held:<id>`, Story 8.4) selected: ⌫ resolves as an UNDO, never a
+        // redaction — branch first so a held id never reaches the redaction dialog.
+        if (tryUndoHeld(sel)) {
+          e.preventDefault();
+          return;
+        }
         // Delete-for-everyone only applies to the user's OWN, already-sent selected
         // message (Story 3.8, FR-15). Only intercept the key when the target is
         // actually deletable — a bare ⌫ on someone else's (or an unsent) message
@@ -1329,7 +1367,7 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
         }
       }
     },
-    [items, onReply, onEdit, onDelete],
+    [items, onReply, onEdit, onDelete, tryUndoHeld],
   );
 
   // `↑` in an empty composer edits the last own text message (epic affordance).
@@ -1469,17 +1507,47 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
             )}
             {/* Held sends (Story 8.3): amber "Held" bubbles at the timeline tail, one
                 per held send, oldest-first. Rendered from the outbox VM (never SDK
-                timeline items) so the SDK send-state mapping stays honest. */}
-            {heldSends.map((row) => (
-              <li key={`held:${row.id}`} data-testid="held-bubble">
-                <div className="flex justify-end px-3 py-0.5">
-                  <div className="max-w-[75%] rounded-[14px] border border-held/40 bg-held/10 px-3 py-2">
-                    <p className="whitespace-pre-wrap break-words text-sm">{row.body}</p>
-                    <span className="mt-0.5 block text-held text-xs">Held</span>
+                timeline items) so the SDK send-state mapping stays honest. Each bubble is
+                selectable (selected key `held:<id>`) so `⌫` can target it, and carries a
+                Delete affordance (Story 8.4) — both resolve as an UNDO (`undoHeldSend`),
+                never a redaction, because a held message has no remote event to redact. */}
+            {heldSends.map((row) => {
+              const heldKey = `held:${row.id}`;
+              return (
+                <li key={heldKey} data-testid="held-bubble">
+                  <div className="group flex items-center justify-end gap-2 px-3 py-0.5">
+                    <button
+                      type="button"
+                      className="rounded-full border border-held/40 px-2 py-0.5 text-held text-xs opacity-0 transition-opacity focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-held group-hover:opacity-100"
+                      onClick={() => onDelete(heldKey)}
+                      data-testid="held-delete-button"
+                      // Honest naming: this Delete undoes an unsent hold (text returns to
+                      // the composer), unlike the destructive redaction Delete on a sent
+                      // message.
+                      aria-label="Discard held message and return it to the composer"
+                    >
+                      Delete
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => composerStore.getState().select(heldKey)}
+                      className={cn(
+                        "max-w-[75%] rounded-[14px] border border-held/40 bg-held/10 px-3 py-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-held",
+                        selectedKey === heldKey && "ring-2 ring-held",
+                      )}
+                      aria-pressed={selectedKey === heldKey}
+                    >
+                      {/* Block <span> (not <p>) so the bubble stays valid phrasing
+                          content inside a <button>. */}
+                      <span className="block whitespace-pre-wrap break-words text-sm">
+                        {row.body}
+                      </span>
+                      <span className="mt-0.5 block text-held text-xs">Held</span>
+                    </button>
                   </div>
-                </div>
-              </li>
-            ))}
+                </li>
+              );
+            })}
           </ol>
         </div>
       )}

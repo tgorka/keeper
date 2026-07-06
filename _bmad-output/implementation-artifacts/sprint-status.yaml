@@ -114,7 +114,7 @@ development_status:
   8-1-incognito-read-receipts-with-scoped-policy: done
   8-2-typing-presence-suppression-coupling-caveats-and-manual-release: done
   8-3-undo-send-window: done
-  8-4-post-dispatch-delete-for-everyone: backlog
+  8-4-post-dispatch-delete-for-everyone: done
   epic-8-retrospective: optional
   epic-9: backlog
   9-1-command-palette: backlog

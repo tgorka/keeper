@@ -14,6 +14,8 @@
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import type { HeldSendVm } from "@/lib/ipc/client";
+import { cancelHeldSend } from "@/lib/ipc/client";
+import { composerStore } from "@/lib/stores/composer";
 
 /** The composite key for a chat: `` `${accountId} ${roomId}` ``. */
 function roomKey(accountId: string, roomId: string): string {
@@ -63,6 +65,25 @@ export const outboxStore = createStore<OutboxState>()((set) => ({
     }),
   clear: () => set({ rooms: new Map<string, readonly HeldSendVm[]>() }),
 }));
+
+/**
+ * Undo a held send (Story 8.3/8.4): the single shared effect behind BOTH the
+ * undo-send pill's Undo and the timeline Delete affordance on a held bubble. Cancels
+ * the durable `outbox` row via {@link cancelHeldSend} (zero network activity) and, only
+ * when a non-empty body comes back, restores it into the `(accountId, roomId)` composer
+ * as a Draft via `composerStore.restore`.
+ *
+ * `cancelHeldSend` is idempotent in Rust — an already-dispatched (window-elapsed) row
+ * returns `""`, so nothing is restored. Errors are swallowed (mirrors the pill): a
+ * failed cancel never crashes the affordance and never restores stale text. Keeping this
+ * in one place stops the pill-undo and delete-undo from drifting apart.
+ */
+export async function undoHeldSend(accountId: string, roomId: string, id: string): Promise<void> {
+  const body = await cancelHeldSend(accountId, roomId, id).catch(() => "");
+  if (body.length > 0) {
+    composerStore.getState().restore(accountId, roomId, body);
+  }
+}
 
 /**
  * React selector hook: the held sends for `(accountId, roomId)`, oldest-first, or a

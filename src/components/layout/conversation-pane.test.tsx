@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm, IpcError, TimelineBatch, TimelineItemVm } from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
@@ -29,6 +29,7 @@ const subscribeTyping = vi.fn();
 const unsubscribeTyping = vi.fn();
 const subscribePaginationStatus = vi.fn();
 const unsubscribePaginationStatus = vi.fn();
+const cancelHeldSend = vi.fn(async (_a: string, _r: string, _id: string): Promise<string> => "");
 vi.mock("@/lib/ipc/client", () => ({
   subscribeTimeline: (accountId: string, roomId: string, onBatch: (b: TimelineBatch) => void) =>
     subscribeTimeline(accountId, roomId, onBatch),
@@ -75,7 +76,8 @@ vi.mock("@/lib/ipc/client", () => ({
   // stub id and never emits, unsubscribe is a no-op.
   subscribeOutbox: vi.fn(async (): Promise<number> => 1),
   unsubscribeOutbox: vi.fn(async (): Promise<void> => {}),
-  cancelHeldSend: vi.fn(async (): Promise<string> => ""),
+  cancelHeldSend: (accountId: string, roomId: string, id: string) =>
+    cancelHeldSend(accountId, roomId, id),
   // Composer persistent drafts (Story 7.1): no stored draft; persist/clear are no-ops.
   loadDraft: vi.fn(async (): Promise<string | null> => null),
   saveDraft: vi.fn(async (): Promise<void> => {}),
@@ -100,6 +102,7 @@ import { attachmentsStore } from "@/lib/stores/attachments";
 import { composerStore } from "@/lib/stores/composer";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { incognitoStore } from "@/lib/stores/incognito";
+import { outboxStore } from "@/lib/stores/outbox";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
 
 const account: AccountVm = {
@@ -190,7 +193,11 @@ beforeEach(() => {
   onDragDropEvent.mockImplementation(() => Promise.resolve(() => {}));
   composerStore.getState().clear();
   composerStore.getState().clearSelection();
+  composerStore.setState({ restoreBody: null, restoreTarget: null });
   attachmentsStore.getState().clear();
+  outboxStore.getState().clear();
+  cancelHeldSend.mockReset();
+  cancelHeldSend.mockResolvedValue("");
 });
 
 afterEach(() => {
@@ -202,6 +209,7 @@ afterEach(() => {
   composerStore.getState().clear();
   composerStore.getState().clearSelection();
   attachmentsStore.getState().clear();
+  outboxStore.getState().clear();
 });
 
 describe("ConversationPane", () => {
@@ -1128,6 +1136,156 @@ describe("ConversationPane", () => {
         screen.getByRole("alertdialog", { name: "Delete this message for everyone" }),
       ).toBeInTheDocument(),
     );
+  });
+});
+
+describe("ConversationPane — held-aware Delete (Story 8.4)", () => {
+  /** Render an open room with one dispatched own message, capturing nothing extra. */
+  async function renderWithOwnMessage() {
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      onBatch({
+        ops: [
+          {
+            op: "reset",
+            items: [
+              {
+                kind: "message",
+                key: "mine-1",
+                sender: account.userId,
+                senderDisplayName: null,
+                body: "mine",
+                timestamp: 2,
+                isOwn: true,
+                sendState: null,
+                isEdited: false,
+                reply: null,
+                reactions: [],
+                media: null,
+                readers: [],
+              },
+            ],
+          },
+        ],
+      });
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    const utils = render(<ConversationPane {...noopProps()} />);
+    await screen.findByText("mine");
+    return utils;
+  }
+
+  /** Seed one held send for the open room. */
+  function seedHeld(id = "held-1", body = "held body") {
+    const now = Date.now();
+    outboxStore.getState().applySnapshot(account.accountId, "!room:example.org", [
+      {
+        id,
+        accountId: account.accountId,
+        roomId: "!room:example.org",
+        body,
+        heldAtMs: now,
+        dispatchAtMs: now + 10_000,
+      },
+    ]);
+  }
+
+  it("held-bubble Delete resolves as an undo (cancelHeldSend) and never opens the delete dialog", async () => {
+    cancelHeldSend.mockResolvedValue("held body");
+    await renderWithOwnMessage();
+    act(() => {
+      seedHeld();
+    });
+
+    const deleteBtn = await screen.findByTestId("held-delete-button");
+    fireEvent.click(deleteBtn);
+
+    await waitFor(() =>
+      expect(cancelHeldSend).toHaveBeenCalledWith(account.accountId, "!room:example.org", "held-1"),
+    );
+    // The held id must NEVER reach the redaction path.
+    expect(deleteMessage).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("alertdialog", { name: "Delete this message for everyone" }),
+    ).not.toBeInTheDocument();
+    // A non-empty returned body is restored to the composer as a Draft.
+    await waitFor(() => expect(composerStore.getState().restoreBody).toBe("held body"));
+  });
+
+  it("`⌫` on a selected held bubble resolves as an undo and never opens the delete dialog", async () => {
+    cancelHeldSend.mockResolvedValue("held body");
+    await renderWithOwnMessage();
+    act(() => {
+      seedHeld();
+    });
+    await screen.findByTestId("held-bubble");
+
+    // Select the held bubble (selected key is `held:<id>`) and press ⌫.
+    composerStore.getState().select("held:held-1");
+    const list = screen.getByLabelText("Messages");
+    fireEvent.keyDown(list, { key: "Backspace" });
+
+    await waitFor(() =>
+      expect(cancelHeldSend).toHaveBeenCalledWith(account.accountId, "!room:example.org", "held-1"),
+    );
+    expect(deleteMessage).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("alertdialog", { name: "Delete this message for everyone" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("Delete/`⌫` on a dispatched own message still opens the Story 3.8 redaction dialog", async () => {
+    await renderWithOwnMessage();
+    const list = screen.getByLabelText("Messages");
+
+    composerStore.getState().select("mine-1");
+    fireEvent.keyDown(list, { key: "Backspace" });
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("alertdialog", { name: "Delete this message for everyone" }),
+      ).toBeInTheDocument(),
+    );
+    // The dispatched path never invokes the held-undo cancel.
+    expect(cancelHeldSend).not.toHaveBeenCalled();
+  });
+
+  it("keeps opening the redaction dialog for a dispatched own message while a held row is present", async () => {
+    // The branch ordering is load-bearing: `tryUndoHeld` must consume only `held:` keys,
+    // so a selected dispatched message still redacts even when held rows coexist.
+    await renderWithOwnMessage();
+    act(() => {
+      seedHeld();
+    });
+    await screen.findByTestId("held-bubble");
+    const list = screen.getByLabelText("Messages");
+
+    composerStore.getState().select("mine-1");
+    fireEvent.keyDown(list, { key: "Backspace" });
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("alertdialog", { name: "Delete this message for everyone" }),
+      ).toBeInTheDocument(),
+    );
+    expect(cancelHeldSend).not.toHaveBeenCalled();
+  });
+
+  it("consumes `⌫` on a stale held selection without a redaction or a cancel", async () => {
+    // The window elapsed and the row dispatched, but `selectedKey` still points at the
+    // vanished `held:<id>`. The key must be consumed (no redaction, no cancel) rather
+    // than leaking to the redaction path or the browser's native Backspace.
+    await renderWithOwnMessage();
+    composerStore.getState().select("held:gone-1");
+    const list = screen.getByLabelText("Messages");
+
+    fireEvent.keyDown(list, { key: "Backspace" });
+
+    expect(cancelHeldSend).not.toHaveBeenCalled();
+    expect(deleteMessage).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("alertdialog", { name: "Delete this message for everyone" }),
+    ).not.toBeInTheDocument();
   });
 });
 
