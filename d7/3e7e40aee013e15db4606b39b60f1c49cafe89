@@ -1,0 +1,33 @@
+_bmad-output/implementation-artifacts/spec-9-2-keyboard-navigation-and-quick-switcher.md
+  s_24df70ab9762df::t_8cf816c933e329 9
+  s_24df70ab9762df::t_7097f682627133 102-112
+  s_24df70ab9762df::t_56bad1fcc113c3 164-180
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_24df70ab9762df::t_624dbac537bb5a 329-332
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_790c3e38167e25::t_73f05abc0e5d2e 121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d73e7e40aee013e15db4606b39b60f1c49cafe89",
+  "prompts": {},
+  "sessions": {
+    "s_24df70ab9762df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "043e7541-dff8-4d31-b547-c47a175a39e6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_790c3e38167e25": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1b0d16ae-8f0d-4edd-9102-e9e52211393a",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
