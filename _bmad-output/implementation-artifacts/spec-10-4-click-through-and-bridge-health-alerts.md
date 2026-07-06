@@ -2,7 +2,7 @@
 title: 'Click-Through and Bridge-Health Alerts'
 type: 'feature'
 created: '2026-07-06'
-status: 'blocked'
+status: 'draft'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
@@ -17,36 +17,36 @@ warnings: ['oversized']
 
 **Problem:** keeper posts native notifications (Story 10.1) but a click does nothing useful — it cannot land the user in the exact Chat/Account/message, and a Bridge Session drop is never natively notified (only the in-app surfaces from Story 6.5 exist). Story 10.4 must (a) make a notification click restore/summon the window and switch to the exact Chat + Account with the message in view via the `(account_id, room_id, event_id)` payload, and (b) complete FR-28 by notifying "‹Network› disconnected — re-link to keep receiving messages." within 60 s of a Bridge Session drop, with the click landing directly in that Bridge's re-login flow.
 
-**Approach:** Carry a typed click-through target with every notification, route a click through the shell to the frontend's existing deep-link infra (`primaryViewStore.setView` + `roomsStore.requestFocus`) for message targets and to the bridge re-login flow for bridge targets, and feed the existing `HealthAggregator` disconnect transition into the same `notify` pipeline. **This is BLOCKED (see Block If): the notification backend pinned by the epic (`tauri-plugin-notification` 2.3.3) delivers NO desktop notification-click/action callback, so click-through cannot be built on it — resolving this requires a human architecture + scope decision.**
+**Approach:** Carry a typed click-through target with every notification, and feed the existing `HealthAggregator` disconnect transition into the same `notify` pipeline. **RESOLVED (coordinator decision 2026-07-06, Option B):** keep `tauri-plugin-notification` as the backend. MVP click behavior is **summon + focus the app window** (macOS default activation — no per-notification click callback exists on desktop) plus **coarse view landing** driven by app-side "last notification target" state recorded at dispatch time: Message targets land on the Inbox, Bridge targets land on the Bridges view. Exact-message / exact-re-login deep landing via a click-capable backend (mac-notification-sys or UNUserNotificationCenter) is deferred to Epic 11 (signed .app exists there to validate it) — record that deferral in deferred-work.md.
 
 ## Boundaries & Constraints
 
 **Always:**
 - Notifications originate only from the local decrypting sync loop / local health machine; never any push infrastructure (egress-honesty). Reuse the `Platform::notify` port; keep mute/DND rules in `keeper-core`, never duplicated in JS.
-- Message click-through payload is exactly `(account_id, room_id, event_id)`. A click restores/summons + focuses the main window (`show_main_window`, `tray.rs:39`) and lands on the exact Chat + Account with the message in view — routed via `primaryViewStore.setView("inbox")` + `roomsStore.requestFocus({accountId, roomId, eventId})` (the Story 5.4 focus pattern, `rooms.ts:34-38,98`). Chat-switch target ~150 ms.
-- Each posted notification must map back to *its own* target (not "the most recent notification"); clicking an old notification lands on that old notification's message.
-- Bridge-health: post exactly ONE native notification on the transition **into** `Disconnected` per session; body copy is exactly `"{network_name} disconnected — re-link to keep receiving messages."` (Network-named). A click opens the re-login flow for that `(account_id, network_id)` (`primaryViewStore.setView("bridges")` + open `BridgeLoginSheet`/`bridge_login_start`).
+- Message click-through payload is exactly `(account_id, room_id, event_id)` and is attached to every posted notification (`NotifyTarget::Message`) — the payload ships now even though MVP click handling is coarse. [AMENDED-B] A click restores/summons + focuses the main window (`show_main_window`, `tray.rs:39`, macOS default activation) and lands on the **Inbox view** (`primaryViewStore.setView("inbox")`). Exact Chat+Account+message landing (`roomsStore.requestFocus`) is deferred to Epic 11.
+- [AMENDED-B] Per-notification exact click routing is deferred to Epic 11 (no desktop click callback in the kept backend). Coarse landing MAY use a "last notification target" recorded at dispatch to choose the view (Inbox vs Bridges); it must NEVER be presented or tested as exact-message routing.
+- Bridge-health: post exactly ONE native notification on the transition **into** `Disconnected` per session; body copy is exactly `"{network_name} disconnected — re-link to keep receiving messages."` (Network-named). [AMENDED-B] A click summons+focuses the window and lands on the **Bridges view** (`primaryViewStore.setView("bridges")`); the persistent Story 6.5 surfaces route the user into the exact re-login. Exact re-login deep-landing deferred to Epic 11.
 - The 60 s bar is satisfied by the existing health machine (`run_liveness_tick` ≤60 s + real-time mgmt-room notices, `bridges/health.rs:586,531`); the notify leg only reacts to transitions — do not add new polling.
 - Bridge-health notifications respect global DND (consistent with Story 10.2's `NotifyConfig.dnd_enabled`); per-Chat/per-Network mute does NOT apply (bridge integrity ≠ chat noise). The persistent in-app surfaces from Story 6.5 (banner, dots, card state) stand regardless of the native notification.
 - `keeper-core` stays platform-free: the OS notification, its click callback, window show/focus, and the Rust→frontend navigate event are shell (`keeper` crate) concerns reached through the `Platform` port. Commit on the current branch only.
 
 **Block If:**
-- **[FIRED — see Design Notes/Auto Run Result]** The pinned notification backend cannot deliver a per-notification desktop click/action callback that lets the app route to *that* notification's target. `tauri-plugin-notification` 2.3.3 desktop `show()` is fire-and-forget (`notify-rust`); `action_type_id`/`register_action_types`/`onAction` are mobile-only. The only local mechanism is `mac-notification-sys` `wait_for_click(true)`, which (1) blocks the calling thread per notification, (2) shares the global ObjC delegate + `set_application` identity with `notify-rust` so mixing it with the plugin is fragile → implies replacing the shipped Story 10.1 notification backend, (3) carries no structured payload, and (4) needs a signed bundle identity for reliable click delivery. HALT — blocking condition `notification click-through backend decision required`.
-- Enabling reliable click delivery requires code-signing / bundle-identity / entitlement changes that couple to and collide with the Epic 11 signing & notarization pipeline, and the ≥99% click-delivery reliability bar cannot be validated in the unsigned `tauri dev` build (notifications are attributed to `com.apple.Terminal` in dev). HALT — blocking condition `notification click delivery needs Epic 11 signing decision`.
+- ~~[RESOLVED 2026-07-06 — Option B]~~ The two prior blockers (no desktop click callback in the pinned backend; signed-bundle coupling to Epic 11) are resolved by scope decision: MVP ships summon+focus + coarse view landing on the kept backend, exact landing deferred to Epic 11. Do NOT re-raise these two conditions; they are settled.
+- A genuinely new contradiction outside this decision (e.g. the kept backend cannot even post the bridge notification, or coarse landing conflicts with another frozen spec) still HALTs as usual.
 
 **Never:**
 - Never route notifications or health/badge state through any push service (egress + honest-quit invariant). No inline notification quick-reply (v1.x, MVP is click-through only).
-- Never remember only the last notification's target and misroute older clicks. Never emit a native toast for the `Degraded` state — only the `Disconnected` transition notifies; Degraded keeps its persistent in-app surfaces only.
+- [AMENDED-B] Never present coarse view landing as exact-message routing (no fake "lands on the exact message" claims in UI/docs/tests). Never emit a native toast for the `Degraded` state — only the `Disconnected` transition notifies; Degraded keeps its persistent in-app surfaces only.
 - Never re-notify while a session stays `Disconnected` (one alert per drop). Never create branches, push, or rewrite history.
 
 ## I/O & Edge-Case Matrix
 
 | Scenario | Input / State | Expected Output / Behavior | Error Handling |
 |----------|--------------|---------------------------|----------------|
-| Message click | Notification for `(acct, room, event)` clicked, window hidden | Window shown+focused; view→inbox; Chat+Account selected; message scrolled into view within ~150 ms | Room/event missing from view models → select room, best-effort scroll; log warn, no panic |
-| Old notification click | An earlier notification (not the newest) clicked | Lands on *that* notification's `(acct, room, event)`, not the newest | as above |
+| Message click [AMENDED-B] | Notification clicked, window hidden | Window shown+focused (macOS activation); view→inbox (coarse landing) | — |
+| Old notification click [AMENDED-B] | An earlier notification (not the newest) clicked | Same coarse behavior (summon+focus, view by last-target kind); exact per-notification routing deferred to Epic 11 | — |
 | Bridge drop | Session transitions Healthy/Degraded → `Disconnected` | One native notification, body `"{network_name} disconnected — re-link to keep receiving messages."`; in-app surfaces already updated by 6.5 | notify port unset (headless) → honest no-op |
-| Bridge alert click | Disconnected notification clicked | Window shown+focused; view→bridges; re-login flow for `(acct, network_id)` opens | login start error → surfaced in the sheet, no panic |
+| Bridge alert click [AMENDED-B] | Disconnected notification clicked | Window shown+focused; view→bridges; Story 6.5 surfaces route into re-login | — |
 | Still disconnected | Session stays `Disconnected` across further observations | No additional native notification (dedup on transition) | — |
 | Degraded | Session → `Degraded` | No native toast; persistent in-app surfaces only | — |
 | DND on | Global DND enabled, bridge drops | Native bridge notification suppressed; in-app surfaces still update | — |
@@ -83,9 +83,9 @@ as specified below. AC amendments per this decision are marked [AMENDED-B].
 - [ ] `src-tauri/crates/keeper-core/src/vm.rs` + `platform.rs` -- add `NotifyTarget` (ts-rs) and extend the `Platform::notify` port to carry it; update all impls/mocks -- typed click-through payload across the port.
 - [ ] `src-tauri/crates/keeper-core/src/notify.rs` -- attach `NotifyTarget::Message` at dispatch; add a bridge-health notify entry that posts the exact copy + `NotifyTarget::Bridge`, gated on global DND -- both notification kinds carry a target.
 - [ ] `src-tauri/crates/keeper-core/src/bridges/health.rs` + `account.rs` -- notify once on the transition into `Disconnected` using `network_name`; wire the consumer under `subscribe_bridge_health` -- FR-28 native leg within the existing 60 s machine.
-- [ ] `src-tauri/crates/keeper/src/ipc.rs` + `lib.rs` -- **[blocked]** click-capable notification backend; on click `show_main_window` + emit the typed navigate event -- the click seam.
-- [ ] `src/lib/ipc/gen/NotifyTarget.ts` + `client.ts` + `bridge-relink.ts` + `App.tsx` -- regenerated binding + navigate listener routing Message→inbox+`requestFocus`, Bridge→bridges+re-login -- frontend landing.
-- [ ] Unit-test the I/O matrix edges: transition-only bridge dedup, DND suppression, Degraded→no-toast, per-notification target mapping.
+- [ ] `src-tauri/crates/keeper/src/ipc.rs` + `lib.rs` -- [AMENDED-B] on app activation following a notification (kept backend, no click callback): `show_main_window` + emit a coarse navigate event from the "last notification target" kind recorded at dispatch -- the coarse click seam.
+- [ ] `src/lib/ipc/gen/NotifyTarget.ts` + `client.ts` + `bridge-relink.ts` + `App.tsx` -- regenerated binding + navigate listener routing Message→inbox view, Bridge→bridges view (coarse; no `requestFocus` deep landing in MVP) -- frontend landing.
+- [ ] Unit-test the I/O matrix edges: transition-only bridge dedup, DND suppression, Degraded→no-toast, target attach mapping at dispatch.
 
 **Acceptance Criteria:**
 - [AMENDED-B] Given a hidden window and a message notification, when the user clicks it, then the window is summoned+focused (macOS default activation) and the app shows the Inbox; exact Chat/Account/message landing is deferred to Epic 11 (deferred-work entry required).
@@ -96,6 +96,14 @@ as specified below. AC amendments per this decision are marked [AMENDED-B].
 
 ## Spec Change Log
 
+- 2026-07-06 (dev-auto re-arm): Escalation resolution (Option B) was recorded in the
+  spec body + committed (`9377cba`), but the frozen-spec resolution flow intentionally
+  leaves `status:` untouched (the orchestrator re-arms it on resume). This run was
+  invoked standalone, so no orchestrator re-arm happened and `status:` was stale at
+  `blocked`. Re-armed `status: blocked → draft` to route the now-unblocked plan back
+  through step-02 for a coherence/readiness pass — the Option-B descope left a residual
+  contradiction (the click-seam execution item still tagged `[blocked]`) and the
+  `oversized` warning unresolved. No scope change; the Option B decision stands.
 - 2026-07-06 (coordinator, escalation resolution): **Option B chosen** from the three
   escalation options. Backend stays `tauri-plugin-notification`; MVP click behavior is
   summon+focus with coarse landing (Inbox / Bridges view); exact-target landing and the
@@ -138,16 +146,9 @@ The rest of the design (payload shape, DND/mute policy, transition-only bridge d
 
 ## Auto Run Result
 
-Status: blocked
+Status: resolved-pending-redrive
 
-**Blocking condition:** `notification click-through backend decision required`.
-
-Story 10.4's two legs both require a per-notification **desktop notification-click callback** (message click → exact Chat/Account/message; bridge-disconnect click → that Bridge's re-login flow). The notification backend pinned by the epic and shipped in Story 10.1 — `tauri-plugin-notification` 2.3.3 — provides **no desktop click/action callback** (desktop `show()` is fire-and-forget via `notify-rust`; `action_type_id`/`onAction` are mobile-only). The only local alternative, `mac-notification-sys` `wait_for_click(true)`, blocks per notification, carries no payload, shares the global ObjC delegate/`set_application` identity with `notify-rust` (so it means replacing the shipped notification backend), and needs a signed bundle identity for reliable click delivery — which also makes the epic's ≥99% reliability bar unverifiable in the unsigned dev build and couples to the Epic 11 signing pipeline.
-
-This is an architecture + scope decision that cannot be made unattended and contradicts the epic's explicit "posts via `tauri-plugin-notification`" Technical Decision. Halting rather than silently replacing a shipped foundation or silently under-delivering the acceptance criteria.
-
-**What is settled (survives the decision):** the `NotifyTarget::{Message,Bridge}` payload shape and `Platform::notify` extension; the frontend routing via the existing `primaryViewStore.setView` + `roomsStore.requestFocus` deep-link infra (Story 5.4) and a small bridge-relink signal store; the bridge-health leg feeding the existing `HealthAggregator` disconnect transition into the same `notify` pipeline with copy `"{network_name} disconnected — re-link to keep receiving messages."`, notifying once per drop, respecting global DND, leaving Degraded and the persistent Story 6.5 surfaces untouched, and satisfying the 60 s bar via the existing health machine (no new polling).
-
-**Decision required — one of:** (A) replace the desktop notification backend with `mac-notification-sys` (accept thread-lifetime + signed-bundle caveats); (B) descope MVP click-through to app-summon-only, deferring exact landing to Epic 11; or (C) split the story to ship bridge-health notification generation now and defer both click-through clauses. See Design Notes for details. Re-run `/bmad-dev-auto 10-4-click-through-and-bridge-health-alerts` after the decision (and any AC amendment) is recorded.
-
-**Evidence:** `tauri-plugin-notification-2.3.3/src/desktop.rs:26,150-210` (fire-and-forget), `src/mobile.rs`/`src/models.rs:159` (actions mobile-only), `ipc.rs:322-337` (current post path), `mac-notification-sys-0.6.15/src/lib.rs:66-91` + `notification.rs:232-334` (blocking `wait_for_click`, `NotificationResponse`), `bridges/health.rs:209,362,586` (health machine + 60 s cadence), `rooms.ts:34-38,98` + `primary-view.ts:24` (frontend deep-link infra).
+Prior blocked result superseded by the coordinator's Option B resolution (2026-07-06):
+backend kept, summon+focus + coarse view landing in MVP, exact landing deferred to
+Epic 11. The frozen intent-contract above now encodes the decision; re-drive per the
+amended Tasks & Acceptance.
