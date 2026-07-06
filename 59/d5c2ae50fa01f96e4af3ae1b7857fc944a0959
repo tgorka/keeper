@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-7-2-cross-device-draft-mirroring-with-local-wins-conflicts.md
+  s_f0a52ddd60a9ff::t_0cc238785f329a 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "59d5c2ae50fa01f96e4af3ae1b7857fc944a0959",
+  "prompts": {},
+  "sessions": {
+    "s_f0a52ddd60a9ff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08f1fbff-8704-471c-8b5e-16fc6d48ed95",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
