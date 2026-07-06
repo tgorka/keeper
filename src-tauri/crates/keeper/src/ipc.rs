@@ -1126,6 +1126,61 @@ pub fn set_honor_remote_deletions(
     keeper_core::archive::set_honor_remote_deletions(&data_dir, enabled).map_err(to_ipc_error)
 }
 
+/// Persist the composer draft for `(account_id, room_id)` (Story 7.1, AD-15). Upserts
+/// `body` verbatim into the `drafts` table in `keeper.db` with the current wall clock
+/// as `updated_ts`. The frontend trims before calling and deletes (not saves) an empty
+/// body, so a stored row is always non-empty. Sync — a small keeper-local write, never
+/// a secret. Failures funnel
+/// through [`to_ipc_error`]; the frontend fires this fire-and-forget so a failure never
+/// blocks typing. The body is never logged.
+#[tauri::command]
+pub fn set_draft(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    body: String,
+) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::set_draft(&data_dir, &account_id, &room_id, &body, now_ms())
+        .map_err(to_ipc_error)
+}
+
+/// Read the composer draft for `(account_id, room_id)` (Story 7.1). Resolves with the
+/// stored body or `None` when no draft exists; `Option<String>` serializes to
+/// `string | null`. The composer seeds its local state from this on mount. Failures
+/// funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn get_draft(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<Option<String>, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::get_draft(&data_dir, &account_id, &room_id).map_err(to_ipc_error)
+}
+
+/// Delete the composer draft for `(account_id, room_id)` (Story 7.1). Idempotent —
+/// clearing an absent draft (send succeeded, or the body trimmed to empty) is a no-op.
+/// Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn delete_draft(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::delete_draft(&data_dir, &account_id, &room_id).map_err(to_ipc_error)
+}
+
+/// List every draft's `(account_id, room_id)` key (Story 7.1). Presence only — the
+/// body is not returned. Seeds the inbox draft markers at startup, cross-account.
+/// Serializes to `[accountId, roomId][]`. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn list_drafts(state: State<'_, AppState>) -> Result<Vec<(String, String)>, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::list_drafts(&data_dir).map_err(to_ipc_error)
+}
+
 /// Search the Local Archive with full-text search (Story 5.3, FR-34, AD-12).
 ///
 /// Opens a fresh read-only `archive.db` connection (WAL permits concurrent readers,

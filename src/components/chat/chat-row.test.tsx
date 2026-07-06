@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatRow } from "@/components/chat/chat-row";
 import type { BridgeHealth, InboxBatch, InboxRoomVm } from "@/lib/ipc/client";
 import { bridgeHealthStore } from "@/lib/stores/bridge-health";
+import { draftsStore } from "@/lib/stores/drafts";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { roomsStore } from "@/lib/stores/rooms";
 
@@ -69,6 +70,7 @@ afterEach(() => {
   roomsStore.getState().clear();
   favoritesRoomsStore.getState().clear();
   bridgeHealthStore.getState().reset();
+  draftsStore.getState().clear();
   vi.clearAllMocks();
 });
 
@@ -473,5 +475,30 @@ describe("ChatRow", () => {
     seedHealth(accountId, "whatsapp", "disconnected");
     render(<ChatRow room={room({ accountId, network: null, networkId: null })} />);
     expect(screen.queryByTestId("bridge-health-dot")).not.toBeInTheDocument();
+  });
+
+  // --- Pending-draft marker (Story 7.1) ------------------------------------
+
+  it("shows an amber pencil + Draft prefix when the chat has a pending draft", () => {
+    draftsStore.getState().mark("01ARZ3NDEKTSV4RRFFQ69G5FAV", "!abc:example.org", true);
+    render(<ChatRow room={room()} />);
+    const marker = screen.getByTestId("draft-marker");
+    expect(marker).toBeInTheDocument();
+    expect(marker).toHaveTextContent("Draft");
+    expect(marker).toHaveClass("text-held");
+    // The last-message preview is still rendered alongside the marker.
+    expect(screen.getByText("hey there")).toBeInTheDocument();
+  });
+
+  it("shows no draft marker when the chat has no pending draft", () => {
+    render(<ChatRow room={room()} />);
+    expect(screen.queryByTestId("draft-marker")).not.toBeInTheDocument();
+  });
+
+  it("scopes the draft marker to the matching (accountId, roomId)", () => {
+    // A draft on a different room must not light up this row.
+    draftsStore.getState().mark("01ARZ3NDEKTSV4RRFFQ69G5FAV", "!other:example.org", true);
+    render(<ChatRow room={room()} />);
+    expect(screen.queryByTestId("draft-marker")).not.toBeInTheDocument();
   });
 });

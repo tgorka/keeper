@@ -38,6 +38,8 @@ vi.mock("@/lib/ipc/client", () => ({
   setNetworkFilter: (network: string | null) => setNetworkFilter(network),
   getFavoritesCollapsed: () => getFavoritesCollapsed(),
   setFavoritesCollapsed: (v: boolean) => setFavoritesCollapsed(v),
+  // Draft-marker seed on mount (Story 7.1): no drafts by default.
+  listDrafts: vi.fn(async (): Promise<Array<[string, string]>> => []),
   // Best-effort mutation wrappers the strip/rows may call; no-ops here.
   reorderPins: vi.fn(async () => {}),
   unpinRoom: vi.fn(async () => {}),

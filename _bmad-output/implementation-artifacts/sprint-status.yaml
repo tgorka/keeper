@@ -105,7 +105,7 @@ development_status:
   6-8-first-run-wizard: done
   epic-6-retrospective: optional
   epic-7: backlog
-  7-1-persistent-per-chat-drafts: backlog
+  7-1-persistent-per-chat-drafts: done
   7-2-cross-device-draft-mirroring-with-local-wins-conflicts: backlog
   7-3-approval-pane: backlog
   7-4-explicit-approval-invariant-enforced-and-tested: backlog

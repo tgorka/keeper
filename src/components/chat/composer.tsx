@@ -5,8 +5,15 @@
  * a send {@link Button}. Enter sends; ⇧Enter inserts a newline; a whitespace-only
  * body never dispatches. The draft lives in local `useState` (no IPC round-trip
  * on keystroke, so input stays under one frame) and is cleared on a successful
- * send. This component owns no IPC knowledge — the parent wires `onSend` (which
- * routes to reply / edit / text based on `pending`).
+ * send. This component owns no IPC knowledge for the send path — the parent wires
+ * `onSend` (which routes to reply / edit / text based on `pending`).
+ *
+ * The draft is **durable** per `(accountId, roomId)` (Story 7.1, AD-15): on mount it
+ * is restored from `keeper.db` (unless entering edit mode, whose prefill wins), and
+ * each keystroke schedules a ~200 ms debounced, fire-and-forget `saveDraft`
+ * (trimmed-empty → `clearDraft`) plus a `draftsStore` marker update — never a
+ * synchronous IPC write on the keystroke path. The pending save is flushed on unmount
+ * (room switch), and the row + marker are cleared on a successful send.
  *
  * When `pending` is set, a context banner renders above the textarea (the quoted
  * sender/preview for a reply, "Editing your message" for an edit) with a cancel
@@ -26,6 +33,7 @@ import {
 } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { clearDraft, loadDraft, saveDraft } from "@/lib/ipc/client";
 import {
   attachmentId,
   attachmentsStore,
@@ -34,6 +42,7 @@ import {
 } from "@/lib/stores/attachments";
 import type { PendingContext } from "@/lib/stores/composer";
 import { useComposerStore } from "@/lib/stores/composer";
+import { draftsStore } from "@/lib/stores/drafts";
 import { cn } from "@/lib/utils";
 
 /** Derive a chip display name for a pending attachment (its filename). */
@@ -63,6 +72,16 @@ function basename(path: string): string {
 }
 
 interface ComposerProps {
+  /**
+   * The open conversation's owning account id (Story 7.1). Keys the persistent
+   * per-chat draft together with {@link roomId}.
+   */
+  accountId: string;
+  /**
+   * The open conversation's room id (Story 7.1). Keys the persistent per-chat draft
+   * together with {@link accountId}.
+   */
+  roomId: string;
   /**
    * Dispatch the trimmed body. Resolves on success (the draft then clears);
    * rejects if the send could not be enqueued (the draft is kept so the user can
@@ -114,7 +133,12 @@ const TYPING_THROTTLE_MS = 3000;
 /** Idle timeout after the last keystroke before emitting `setTyping(false)`. */
 const TYPING_IDLE_MS = 5000;
 
+/** Debounce before a keystroke persists the draft (fire-and-forget, Story 7.1). */
+const DRAFT_SAVE_DEBOUNCE_MS = 200;
+
 export function Composer({
+  accountId,
+  roomId,
   onSend,
   onSendAttachments,
   disabled = false,
@@ -188,6 +212,82 @@ export function Composer({
   // Clear typing on unmount / room change (the composer is keyed by room), so a
   // lingering "typing" is never left announced after the user leaves.
   useEffect(() => stopTyping, [stopTyping]);
+
+  // Persistent per-chat draft (Story 7.1, AD-15). The composer is keyed by room in the
+  // parent, so mount == open-a-chat and unmount == leave-it. The account/room ids are
+  // mirrored in refs so the debounce timer and unmount flush read the latest without
+  // re-arming per keystroke. `pendingDraft` holds the body a debounced save will
+  // persist; `null` means nothing is queued.
+  const accountIdRef = useRef(accountId);
+  accountIdRef.current = accountId;
+  const roomIdRef = useRef(roomId);
+  roomIdRef.current = roomId;
+  const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingDraft = useRef<string | null>(null);
+  // The mount restore (below) runs after an async `loadDraft`. If anything establishes
+  // the composer's content during that window — the user types, sends, or enters edit
+  // (prefill) — a late restore must not clobber it. This latch is set by those paths so
+  // the restore bails, instead of relying on a mount-time `pending` snapshot or a
+  // momentarily-empty draft (both of which miss the type-then-clear / send-during-load
+  // races). (Story 7.1)
+  const restoreConsumed = useRef(false);
+
+  /** Persist the queued draft now (trimmed-empty deletes the row). Fire-and-forget. */
+  const flushDraft = useCallback(() => {
+    if (draftSaveTimer.current !== null) {
+      clearTimeout(draftSaveTimer.current);
+      draftSaveTimer.current = null;
+    }
+    const body = pendingDraft.current;
+    if (body === null) {
+      return;
+    }
+    pendingDraft.current = null;
+    const a = accountIdRef.current;
+    const r = roomIdRef.current;
+    const trimmed = body.trim();
+    // Fire-and-forget: a persist failure must never block or surface on the keystroke
+    // path — the composer's local state stays the visible truth.
+    if (trimmed.length > 0) {
+      void saveDraft(a, r, trimmed).catch(() => {});
+    } else {
+      void clearDraft(a, r).catch(() => {});
+    }
+    draftsStore.getState().mark(a, r, trimmed.length > 0);
+  }, []);
+
+  /**
+   * Delete the persisted draft + its marker after a successful send / composer clear
+   * (Story 7.1). Cancels any queued debounced save so it can't re-write a row we just
+   * deleted. Fire-and-forget — a delete failure never blocks the send path.
+   */
+  const clearPersistedDraft = useCallback(() => {
+    if (draftSaveTimer.current !== null) {
+      clearTimeout(draftSaveTimer.current);
+      draftSaveTimer.current = null;
+    }
+    pendingDraft.current = null;
+    const a = accountIdRef.current;
+    const r = roomIdRef.current;
+    void clearDraft(a, r).catch(() => {});
+    draftsStore.getState().mark(a, r, false);
+  }, []);
+
+  /** Queue `body` for a ~200 ms debounced persist, updating the marker immediately. */
+  const scheduleDraftSave = useCallback(
+    (body: string) => {
+      pendingDraft.current = body;
+      // The inbox marker reflects the live composer state at once (not after the debounce)
+      // so the amber pencil never lags a keystroke; the DB write is what is debounced.
+      draftsStore.getState().mark(accountIdRef.current, roomIdRef.current, body.trim().length > 0);
+      if (draftSaveTimer.current !== null) {
+        clearTimeout(draftSaveTimer.current);
+      }
+      draftSaveTimer.current = setTimeout(flushDraft, DRAFT_SAVE_DEBOUNCE_MS);
+    },
+    [flushDraft],
+  );
+
   const attachments = useAttachmentsStore((s) => s.pending);
   // The attach/paste affordances are available only when the parent wires the
   // attachment dispatcher and the composer is enabled.
@@ -214,11 +314,47 @@ export function Composer({
       preEditDraft.current = draftRef.current;
       setDraft(editPrefill ?? "");
       setError(false);
+      // Entering edit establishes the composer text (the edit body); a late draft
+      // restore must not overwrite it, even if the prefill body is empty. (Story 7.1)
+      restoreConsumed.current = true;
     }
     if (editTargetKey === null) {
       prefilledFor.current = null;
     }
   }, [editTargetKey, editPrefill]);
+
+  // Restore the persisted draft once on mount (Story 7.1). The composer remounts per
+  // (account, room) in the parent, so this runs on each chat open. The restore only
+  // reads refs, so `[]` deps are exhaustive; it never overwrites content the user has
+  // already established (see `restoreConsumed`). A load failure is swallowed (no
+  // restore, never a crash).
+  useEffect(() => {
+    let cancelled = false;
+    void loadDraft(accountIdRef.current, roomIdRef.current)
+      .then((body) => {
+        // Skip when: unmounted, no stored body, or the composer's content was already
+        // established during the async load — the user typed, sent, or entered edit
+        // (`restoreConsumed`), any of which must not be clobbered by a late restore.
+        if (
+          cancelled ||
+          body === null ||
+          body.length === 0 ||
+          restoreConsumed.current ||
+          draftRef.current.length > 0
+        ) {
+          return;
+        }
+        setDraft(body);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Flush the pending debounced save on unmount (room switch / composer close) so the
+  // latest keystroke is durable even if it fell inside the debounce window (Story 7.1).
+  useEffect(() => () => flushDraft(), [flushDraft]);
 
   const hasAttachments = attachments.length > 0;
   // Send is enabled when there is a trimmed body OR at least one pending
@@ -230,6 +366,10 @@ export function Composer({
     !sending;
 
   async function send() {
+    // Capture the mode before awaiting: an edit sends onto an existing message and
+    // must not touch this room's persistent draft, so it restores the pre-edit text
+    // instead of clearing (Story 7.1). A reply/text send owns the draft and clears it.
+    const wasEdit = pending?.mode === "edit";
     const body = draft.trim();
     const trayAttachments = attachmentsStore.getState().pending;
     const dispatchAttachments =
@@ -238,6 +378,18 @@ export function Composer({
       // Whitespace-only with no attachment / disabled / in-flight: never dispatch.
       return;
     }
+    // A dispatch consumes/replaces the composer content; a late mount restore must not
+    // resurrect a just-sent draft into the emptied composer. (Story 7.1)
+    restoreConsumed.current = true;
+    // Cancel any queued debounced persist before the (possibly slow) send: otherwise
+    // a flush landing mid-send could re-`saveDraft` a row we then `clearDraft`, and the
+    // two fire-and-forget writes could reorder — leaving an orphan draft + amber marker
+    // on an already-sent chat that survives relaunch (Story 7.1).
+    if (draftSaveTimer.current !== null) {
+      clearTimeout(draftSaveTimer.current);
+      draftSaveTimer.current = null;
+    }
+    pendingDraft.current = null;
     // Sending stops typing (Story 3.9): clear the notice once as the message goes.
     stopTyping();
     setSending(true);
@@ -253,20 +405,37 @@ export function Composer({
         if (caption === undefined && body.length > 0) {
           await onSend(body);
         }
-        // Clear only on success so a failed enqueue keeps the tray + text.
+        // Clear only on success so a failed enqueue keeps the tray + text. Attachments
+        // never ride an edit (guarded above), so the draft is always cleared here.
         attachmentsStore.getState().clear();
         setDraft("");
+        clearPersistedDraft();
       } else {
         await onSend(body);
         // Clear only on success so a failed enqueue keeps the user's text.
-        setDraft("");
+        if (wasEdit) {
+          // Editing an existing message leaves the persistent draft untouched: restore
+          // the pre-edit composer text (the real draft) and keep the stored row/marker.
+          setDraft(preEditDraft.current);
+        } else {
+          setDraft("");
+          clearPersistedDraft();
+        }
       }
     } catch {
       // Enqueue-time failure produces no timeline echo to fall back on, so
       // surface an honest inline error (AD-21) and keep the draft/tray so the
       // user can resend. Async delivery failures instead show as the message's
-      // Failed send-state caption.
+      // Failed send-state caption. Re-persist the retained draft (the queued save was
+      // cancelled above) so a failed non-edit send stays durable across relaunch. An
+      // edit never touched the stored draft, so there is nothing to re-persist.
+      // Read the live draft via `draftRef` (not the `draft` closure captured at send
+      // time): if the user retyped during the in-flight send, the composer now shows
+      // that newer text, and persisting the stale pre-send body would diverge from it.
       setError(true);
+      if (!wasEdit) {
+        scheduleDraftSave(draftRef.current);
+      }
     } finally {
       setSending(false);
     }
@@ -454,8 +623,18 @@ export function Composer({
           onChange={(e) => {
             const next = e.target.value;
             setDraft(next);
+            // The user has typed into this composer; a late mount restore must not
+            // clobber their input (even after they clear it back to empty). (Story 7.1)
+            restoreConsumed.current = true;
             if (error) {
               setError(false);
+            }
+            // Persist the draft (Story 7.1): debounced, fire-and-forget so the keystroke
+            // path never blocks on IPC; also updates the inbox marker at once. NOT while
+            // editing an existing message — the composer text is then the edit body, not
+            // this room's persistent draft, so it must never overwrite the stored draft.
+            if (pending?.mode !== "edit") {
+              scheduleDraftSave(next);
             }
             // Typing-notice (Story 3.9): a non-empty edit announces typing
             // (throttled); clearing to empty stops it. An edit-mode composer still

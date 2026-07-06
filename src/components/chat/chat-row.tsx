@@ -34,6 +34,7 @@
  * the section; it disappears once any favourite exists.
  */
 
+import { Pencil } from "lucide-react";
 import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -59,6 +60,7 @@ import {
   unpinRoom,
 } from "@/lib/ipc/client";
 import { useBridgeHealth } from "@/lib/stores/bridge-health";
+import { useHasDraft } from "@/lib/stores/drafts";
 import { useFavoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { effectiveIsUnread, type RoomSelection, useRoomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
@@ -148,6 +150,11 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
   const affectedHealth =
     sessionHealth !== undefined && sessionHealth.health !== "healthy" ? sessionHealth.health : null;
 
+  // Pending-draft marker (Story 7.1, AD-15): when this chat carries unsent composer
+  // text, the preview line leads with an amber (`held`) pencil + "Draft" prefix. Draft
+  // presence is Rust-authoritative (the `drafts` table), mirrored in `draftsStore`.
+  const hasDraft = useHasDraft(room.accountId, room.roomId);
+
   // Accessible unread cue for the row button's name (the visual dot is
   // aria-hidden and the badge sits outside the button's accessible name), gated
   // on the same effective-unread state the visuals use.
@@ -207,8 +214,17 @@ export function ChatRow({ room, onSelect, selected = false }: ChatRowProps) {
               )}
             </div>
             <div className="flex items-center justify-between gap-2">
-              <span className="truncate text-muted-foreground text-sm">
-                {room.lastMessage ?? ""}
+              <span className="flex min-w-0 items-center gap-1 truncate text-muted-foreground text-sm">
+                {hasDraft && (
+                  <span
+                    data-testid="draft-marker"
+                    className="inline-flex shrink-0 items-center gap-1 text-held"
+                  >
+                    <Pencil aria-hidden="true" className="size-3" />
+                    Draft
+                  </span>
+                )}
+                <span className="truncate">{room.lastMessage ?? ""}</span>
               </span>
               {/* Unread affordance (UX-DR3): a filled primary mention badge with
                   the count, else a neutral dot for any other unread, else nothing. */}

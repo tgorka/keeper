@@ -64,6 +64,10 @@ vi.mock("@/lib/ipc/client", () => ({
   deleteMessage: (accountId: string, roomId: string, itemKey: string) =>
     deleteMessage(accountId, roomId, itemKey),
   roomNetworkLabel: (accountId: string, roomId: string) => roomNetworkLabel(accountId, roomId),
+  // Composer persistent drafts (Story 7.1): no stored draft; persist/clear are no-ops.
+  loadDraft: vi.fn(async (): Promise<string | null> => null),
+  saveDraft: vi.fn(async (): Promise<void> => {}),
+  clearDraft: vi.fn(async (): Promise<void> => {}),
 }));
 
 // The conversation pane subscribes to native drag-drop via `getCurrentWebview()`.

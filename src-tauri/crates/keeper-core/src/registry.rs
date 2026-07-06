@@ -75,6 +75,21 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
         [],
     )
     .map_err(|e| CoreError::Internal(format!("could not ensure pins schema: {e}")))?;
+    // Persistent per-chat composer drafts (Story 7.1, AD-15). Unsent text is durable,
+    // keyed by (account, room), so switching chats / force-quitting / crashing never
+    // loses a half-written message. Never any secret material; draft bodies are never
+    // logged. Mirrors the `pins` precedent for per-(account, room) keeper-local state.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS drafts(\
+            account_id TEXT NOT NULL, \
+            room_id TEXT NOT NULL, \
+            body TEXT NOT NULL, \
+            updated_ts INTEGER NOT NULL, \
+            PRIMARY KEY(account_id, room_id)\
+        )",
+        [],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not ensure drafts schema: {e}")))?;
     ensure_hue_index_column(&conn)?;
     ensure_provider_column(&conn)?;
     Ok(conn)
@@ -168,6 +183,84 @@ pub fn get_pins(data_dir: &Path) -> Result<Vec<(String, String, i64)>, CoreError
         pins.push(row.map_err(|e| CoreError::Internal(format!("could not read pin row: {e}")))?);
     }
     Ok(pins)
+}
+
+/// Upsert the composer draft for `(account_id, room_id)` with the given `body` and
+/// `updated_ts` (Story 7.1). Idempotent per key: a repeated save overwrites the stored
+/// body. Drafts are keeper-local pre-send state (no Matrix representation, no
+/// cross-device mirror). The body is never logged.
+pub fn set_draft(
+    data_dir: &Path,
+    account_id: &str,
+    room_id: &str,
+    body: &str,
+    updated_ts: i64,
+) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    conn.execute(
+        "INSERT INTO drafts(account_id, room_id, body, updated_ts) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(account_id, room_id) DO UPDATE SET \
+            body = excluded.body, updated_ts = excluded.updated_ts",
+        rusqlite::params![account_id, room_id, body, updated_ts],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not write draft: {e}")))?;
+    Ok(())
+}
+
+/// Read the composer draft body for `(account_id, room_id)`, or `None` when no draft
+/// is stored (Story 7.1). The composer seeds its local state from this on mount.
+pub fn get_draft(
+    data_dir: &Path,
+    account_id: &str,
+    room_id: &str,
+) -> Result<Option<String>, CoreError> {
+    let conn = open(data_dir)?;
+    let body = conn
+        .query_row(
+            "SELECT body FROM drafts WHERE account_id = ?1 AND room_id = ?2",
+            rusqlite::params![account_id, room_id],
+            |r| r.get::<_, String>(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(CoreError::Internal(format!(
+                "could not read draft: {other}"
+            ))),
+        })?;
+    Ok(body)
+}
+
+/// Remove the composer draft for `(account_id, room_id)` if present (Story 7.1).
+/// Idempotent — deleting an absent draft (send succeeded, or the body trimmed to
+/// empty) is not an error.
+pub fn delete_draft(data_dir: &Path, account_id: &str, room_id: &str) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    conn.execute(
+        "DELETE FROM drafts WHERE account_id = ?1 AND room_id = ?2",
+        rusqlite::params![account_id, room_id],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not delete draft: {e}")))?;
+    Ok(())
+}
+
+/// List every draft's `(account_id, room_id)` key (Story 7.1). Presence only — the
+/// body is not returned, so the startup marker seed stays small. Cross-account, over
+/// the whole table. Returns an empty vector when nothing is drafted.
+pub fn list_drafts(data_dir: &Path) -> Result<Vec<(String, String)>, CoreError> {
+    let conn = open(data_dir)?;
+    let mut stmt = conn
+        .prepare("SELECT account_id, room_id FROM drafts")
+        .map_err(|e| CoreError::Internal(format!("could not prepare draft list: {e}")))?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| CoreError::Internal(format!("could not query draft list: {e}")))?;
+    let mut drafts = Vec::new();
+    for row in rows {
+        drafts
+            .push(row.map_err(|e| CoreError::Internal(format!("could not read draft row: {e}")))?);
+    }
+    Ok(drafts)
 }
 
 /// Add the nullable `hue_index` column to `accounts` if it is not present yet.
@@ -350,6 +443,14 @@ pub fn delete_account(data_dir: &Path, account_id: &str) -> Result<(), CoreError
         rusqlite::params![account_id],
     )
     .map_err(|e| CoreError::Internal(format!("could not delete account pins: {e}")))?;
+    // Drop any composer drafts the signed-out account owned (Story 7.1): a draft has
+    // no meaning once its account is gone, leaving no orphaned draft or inbox marker.
+    // Idempotent — an account with no drafts deletes zero.
+    conn.execute(
+        "DELETE FROM drafts WHERE account_id = ?1",
+        rusqlite::params![account_id],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not delete account drafts: {e}")))?;
     Ok(())
 }
 
@@ -755,6 +856,78 @@ mod tests {
         let pins = get_pins(&dir).expect("list after account delete");
         // Only acctB's pin survives.
         assert_eq!(pins, vec![("acctB".to_owned(), "!r3".to_owned(), 2)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drafts_crud_roundtrip_and_upsert() {
+        let dir = temp_dir();
+        // Absent draft reads as None; list is empty.
+        assert_eq!(get_draft(&dir, "acctA", "!r1").expect("get absent"), None);
+        assert!(list_drafts(&dir).expect("list empty").is_empty());
+
+        // Write then read back.
+        set_draft(&dir, "acctA", "!r1", "half a message", 100).expect("set r1");
+        assert_eq!(
+            get_draft(&dir, "acctA", "!r1").expect("get r1"),
+            Some("half a message".to_owned())
+        );
+
+        // Upsert overwrites the stored body (no duplicate row).
+        set_draft(&dir, "acctA", "!r1", "revised message", 200).expect("re-set r1");
+        assert_eq!(
+            get_draft(&dir, "acctA", "!r1").expect("get r1 after upsert"),
+            Some("revised message".to_owned())
+        );
+        assert_eq!(
+            list_drafts(&dir).expect("list after upsert").len(),
+            1,
+            "upsert must not add a row"
+        );
+
+        // Idempotent delete: removing twice is not an error, and the draft is gone.
+        delete_draft(&dir, "acctA", "!r1").expect("delete r1");
+        delete_draft(&dir, "acctA", "!r1").expect("delete missing r1 is ok");
+        assert_eq!(
+            get_draft(&dir, "acctA", "!r1").expect("get after delete"),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_drafts_spans_accounts() {
+        let dir = temp_dir();
+        set_draft(&dir, "acctA", "!r1", "a1", 1).expect("set A r1");
+        set_draft(&dir, "acctA", "!r2", "a2", 2).expect("set A r2");
+        set_draft(&dir, "acctB", "!r3", "b3", 3).expect("set B r3");
+
+        let mut keys = list_drafts(&dir).expect("list across accounts");
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                ("acctA".to_owned(), "!r1".to_owned()),
+                ("acctA".to_owned(), "!r2".to_owned()),
+                ("acctB".to_owned(), "!r3".to_owned()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_account_drops_its_drafts() {
+        let dir = temp_dir();
+        set_draft(&dir, "acctA", "!r1", "a1", 1).expect("draft A r1");
+        set_draft(&dir, "acctA", "!r2", "a2", 2).expect("draft A r2");
+        set_draft(&dir, "acctB", "!r3", "b3", 3).expect("draft B r3");
+
+        delete_account(&dir, "acctA").expect("delete acctA");
+        let keys = list_drafts(&dir).expect("list after account delete");
+        // Only acctB's draft survives.
+        assert_eq!(keys, vec![("acctB".to_owned(), "!r3".to_owned())]);
+        assert_eq!(get_draft(&dir, "acctA", "!r1").expect("get gone"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -442,6 +442,43 @@ export async function setHonorRemoteDeletions(enabled: boolean): Promise<void> {
 }
 
 /**
+ * Persist the composer draft for `(accountId, roomId)` (Story 7.1, AD-15). Upserts
+ * the trimmed `body` into the `drafts` table in `keeper.db`. Called fire-and-forget
+ * on the debounced keystroke path, so callers `void` it and never await — a failure
+ * must never block typing. Resolves once persisted. The body is never logged.
+ */
+export async function saveDraft(accountId: string, roomId: string, body: string): Promise<void> {
+  await invoke<void>("set_draft", { accountId, roomId, body });
+}
+
+/**
+ * Read the composer draft for `(accountId, roomId)` (Story 7.1). Resolves with the
+ * stored body, or `null` when no draft exists (the Rust `Option<String>` serializes
+ * to `string | null`). The composer seeds its local state from this on mount.
+ */
+export async function loadDraft(accountId: string, roomId: string): Promise<string | null> {
+  return await invoke<string | null>("get_draft", { accountId, roomId });
+}
+
+/**
+ * Delete the composer draft for `(accountId, roomId)` (Story 7.1). Idempotent — a
+ * no-op when no draft exists (a successful send, or the body trimmed to empty).
+ * Fired fire-and-forget alongside the keystroke path; callers `void` it.
+ */
+export async function clearDraft(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("delete_draft", { accountId, roomId });
+}
+
+/**
+ * List every draft's `(accountId, roomId)` key (Story 7.1). Presence only — the body
+ * is not returned. Seeds the inbox draft markers at startup, cross-account. The Rust
+ * `Vec<(String, String)>` serializes to `[accountId, roomId][]`.
+ */
+export async function listDrafts(): Promise<Array<[string, string]>> {
+  return await invoke<Array<[string, string]>>("list_drafts");
+}
+
+/**
  * Search the Local Archive with full-text search (FR-34, AD-12, Story 5.3).
  * Runs fully offline against `archive.db` — never a homeserver fetch, no live
  * session required. Queries of 3+ characters use the trigram FTS index; shorter

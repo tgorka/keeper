@@ -1253,7 +1253,15 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
                 timeline and composer; renders an empty live region when idle. */}
             <TypingIndicator typists={typists} />
             <Composer
-              key={selectedRoomId}
+              // Key on the full (account, room) identity, not roomId alone: a draft is
+              // keyed by (accountId, roomId) and roomId is not unique across accounts
+              // (rooms come from different accounts — see rooms.ts). Keying on roomId
+              // only would keep the same Composer instance mounted when switching to a
+              // same-roomId chat under another account, leaking one account's draft into
+              // the other. The composite key forces a remount + fresh restore (Story 7.1).
+              key={`${accountId ?? ""}:${selectedRoomId}`}
+              accountId={accountId ?? ""}
+              roomId={selectedRoomId}
               onSend={onSend}
               onSendAttachments={onSendAttachments}
               disabled={!roomLoaded}

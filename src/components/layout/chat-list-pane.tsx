@@ -23,6 +23,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import type { InboxBatch, NetworksSnapshot, SpacesSnapshot } from "@/lib/ipc/client";
 import {
   getFavoritesCollapsed,
+  listDrafts,
   setNetworkFilter,
   setSpaceFilter,
   subscribeInbox,
@@ -30,6 +31,7 @@ import {
 } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore, useArchiveRoomsStore } from "@/lib/stores/archive-rooms";
+import { draftsStore } from "@/lib/stores/drafts";
 import { favoritesRoomsStore, useFavoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { networksStore, useNetworksStore } from "@/lib/stores/networks";
 import { pinsRoomsStore, usePinsRoomsStore } from "@/lib/stores/pins-rooms";
@@ -221,6 +223,25 @@ export function ChatListPane() {
   useEffect(() => {
     void hydrateFavoritesCollapsed(getFavoritesCollapsed);
   }, []);
+
+  // Seed the inbox draft markers from `keeper.db` (Story 7.1, AD-15) so a chat with a
+  // pending draft shows its amber pencil after relaunch, cross-account. Re-seeded
+  // whenever the signed-in account set changes (an add/sign-out) so the markers cover
+  // exactly the live accounts. A read failure is swallowed — no markers, no crash.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: re-seed keyed on the account-id set so an add/sign-out refreshes markers; `accountKey` is intentionally the trigger, not read in the body.
+  useEffect(() => {
+    let cancelled = false;
+    void listDrafts()
+      .then((keys) => {
+        if (!cancelled) {
+          draftsStore.getState().applyKeys(keys);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [accountKey]);
 
   // Pick the active window's rows, then apply the account switcher filter as a
   // pure display filter (no re-sort, no mutation): when a filter is active, hide
