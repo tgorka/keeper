@@ -10,6 +10,7 @@ import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type { IpcError } from "./gen/IpcError";
 
 export type { AccountVm } from "./gen/AccountVm";
+export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 export type { BackupStatus } from "./gen/BackupStatus";
 export type { BadgeStyle } from "./gen/BadgeStyle";
 export type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
@@ -78,6 +79,7 @@ export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
 
 import type { AccountVm } from "./gen/AccountVm";
+import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 import type { BackupStatus } from "./gen/BackupStatus";
 import type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
 import type { BbctlProgressVm } from "./gen/BbctlProgressVm";
@@ -518,6 +520,30 @@ export async function loadRemoteDraft(
   roomId: string,
 ): Promise<RemoteDraftVm | null> {
   return await invoke<RemoteDraftVm | null>("load_remote_draft", { accountId, roomId });
+}
+
+/**
+ * List every pending draft across all accounts for the approval pane (Story 7.3).
+ * Resolves with one {@link ApprovalDraftVm} per pending draft, enriched with the
+ * owning account's identity/hue and the room's display name + bridge network. A
+ * draft whose room/account cannot be resolved (account offline) is STILL listed
+ * (`displayName = roomId`, `network = null`) — the airlock never hides held text.
+ * Bodies stay authoritative in Rust. Rejects with the {@link IpcError} envelope on
+ * a backend failure.
+ */
+export async function listPendingDrafts(): Promise<ApprovalDraftVm[]> {
+  return await invoke<ApprovalDraftVm[]>("list_pending_drafts");
+}
+
+/**
+ * Approve (send) a pending draft's `body` to `(accountId, roomId)` through the
+ * single dispatch gate with the `ApprovalPaneApprove` trigger (FR-41, AD-13, Story
+ * 7.3). Resolves once enqueued; the local echo arrives over the existing timeline
+ * subscription. Rejects with the {@link IpcError} envelope on an enqueue failure —
+ * callers MUST retain the draft on rejection so a failed send never loses text.
+ */
+export async function approveDraft(accountId: string, roomId: string, body: string): Promise<void> {
+  await invoke<void>("approve_draft", { accountId, roomId, body });
 }
 
 /**

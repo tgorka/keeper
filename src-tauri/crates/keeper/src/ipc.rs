@@ -22,13 +22,13 @@ use keeper_core::error::{
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{
-    AccountVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm, BridgeDiscoveryVm,
-    BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm, ConnectionStatusBatch,
-    DemoBatch, DraftMirrorBatch, EditVersionVm, EncryptionStatusBatch, ExportPhase,
-    ExportProgressVm, ExportRequestVm, InboxBatch, IpcError, IpcErrorCode, NetworksSnapshot,
-    NewChatResolutionVm, PaginationStatusBatch, PingVm, RemoteDraftVm, ResolveSupportVm,
-    RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch,
-    VerificationFlowVm,
+    AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
+    BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
+    ConnectionStatusBatch, DemoBatch, DraftMirrorBatch, EditVersionVm, EncryptionStatusBatch,
+    ExportPhase, ExportProgressVm, ExportRequestVm, InboxBatch, IpcError, IpcErrorCode,
+    NetworksSnapshot, NewChatResolutionVm, PaginationStatusBatch, PingVm, RemoteDraftVm,
+    ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch,
+    TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -525,12 +525,14 @@ fn to_ipc_error(err: CoreError) -> IpcError {
             | SendError::Dispatch(_)
             | SendError::Upload(_),
         ) => (IpcErrorCode::SendFailed, true),
-        // A reply/edit target that isn't in the live timeline, or an edit of a
-        // non-own/non-text message, is *not* retriable — re-issuing the same
-        // request won't help (Story 3.4). Same `SendFailed` code, `false`.
-        CoreError::Send(SendError::TargetNotFound | SendError::NotEditable) => {
-            (IpcErrorCode::SendFailed, false)
-        }
+        // A reply/edit target that isn't in the live timeline, an edit of a
+        // non-own/non-text message, or an approve of an empty draft is *not*
+        // retriable — re-issuing the same request won't help (Story 3.4, 7.3).
+        // Same `SendFailed` code, `false`. The empty-body guard exists so the
+        // frontend's catch retains the draft rather than clearing unsent text.
+        CoreError::Send(
+            SendError::TargetNotFound | SendError::NotEditable | SendError::EmptyBody,
+        ) => (IpcErrorCode::SendFailed, false),
         // Any verification failure (crypto not ready / flow not found / SDK action
         // failure) is retriable: the user can restart verification.
         CoreError::Verification(
@@ -1238,6 +1240,45 @@ pub async fn load_remote_draft(
     state
         .accounts
         .load_remote_draft(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// List every pending draft across all accounts for the approval pane (Story 7.3).
+/// Async — reads the full draft rows from `keeper.db` and enriches each with the
+/// owning account's identity/hue (registry) plus the room's display name + bridge
+/// network (best-effort via the live `Room`). A draft whose room/account cannot be
+/// resolved is STILL listed (`display_name = room_id`, `network = None`) — the
+/// airlock never hides held text. Bodies stay authoritative in Rust; never logged.
+/// Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub async fn list_pending_drafts(
+    state: State<'_, AppState>,
+) -> Result<Vec<ApprovalDraftVm>, IpcError> {
+    state
+        .accounts
+        .list_pending_drafts(&state.platform)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Approve (send) a pending draft's `body` to `(account_id, room_id)` through the
+/// single dispatch gate with the `ApprovalPaneApprove` trigger (FR-41, AD-13, Story
+/// 7.3). Async — delegates to the core, which enqueues the message on the room's
+/// open `Timeline`; the local echo and every send-state transition arrive back over
+/// the existing timeline subscription (no echo is synthesized). An enqueue-time
+/// failure funnels through [`to_ipc_error`] to `SendFailed`; the frontend retains
+/// the draft on error so a failed send never loses unsent text.
+#[tauri::command]
+pub async fn approve_draft(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    body: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .send_approval(&account_id, &room_id, &body)
         .await
         .map_err(to_ipc_error)
 }
@@ -2857,6 +2898,16 @@ mod tests {
         let ipc = to_ipc_error(CoreError::Send(SendError::NotEditable));
         assert_eq!(ipc.code, IpcErrorCode::SendFailed);
         assert!(!ipc.retriable, "a non-editable message is not retriable");
+    }
+
+    #[test]
+    fn send_empty_body_maps_to_non_retriable_send_failed() {
+        let ipc = to_ipc_error(CoreError::Send(SendError::EmptyBody));
+        assert_eq!(ipc.code, IpcErrorCode::SendFailed);
+        assert!(
+            !ipc.retriable,
+            "an empty-draft approve is not retriable (re-issuing empty won't help)"
+        );
     }
 
     #[test]

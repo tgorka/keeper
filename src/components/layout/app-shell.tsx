@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from "react";
+import { ApprovalPane } from "@/components/approval/approval-pane";
 import { NewChatDialog } from "@/components/chat/new-chat-dialog";
 import { ExportDialog } from "@/components/export/export-dialog";
 import { BridgesPane } from "@/components/layout/bridges-pane";
@@ -13,6 +14,7 @@ import { KeyBackupDialog } from "@/components/settings/key-backup-dialog";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAccountStatuses } from "@/hooks/use-account-statuses";
+import { useApprovalShortcut } from "@/hooks/use-approval-shortcut";
 import { useBridgeHealthSubscription } from "@/hooks/use-bridge-health";
 import { useBridgesShortcut } from "@/hooks/use-bridges-shortcut";
 import { useEncryptionStatuses } from "@/hooks/use-encryption-statuses";
@@ -48,8 +50,10 @@ export function AppShell() {
   useNewChatShortcut();
   // Wire ⌘4 to the Bridges surface (Story 6.1).
   useBridgesShortcut();
-  // Which primary view the shell renders. "bridges" replaces the chat-list +
-  // conversation cluster with the Bridges surface (Story 6.1).
+  // Wire ⌘3 to the Approval Pane (Story 7.3).
+  useApprovalShortcut();
+  // Which primary view the shell renders. "bridges" and "approval" each replace the
+  // chat-list + conversation cluster with a full-surface pane (Story 6.1 / 7.3).
   const primaryView = usePrimaryView();
   const [detailOpen, setDetailOpen] = useState(false);
   const toggleRef = useRef<HTMLButtonElement>(null);
@@ -87,6 +91,8 @@ export function AppShell() {
           <SidebarPane collapsed={sidebarCollapsed} />
           {primaryView === "bridges" ? (
             <BridgesPane />
+          ) : primaryView === "approval" ? (
+            <ApprovalPane />
           ) : (
             <>
               <ChatListPane />

@@ -24,15 +24,28 @@ use crate::error::SendError;
 
 /// What caused a content dispatch through the single send gate (AD-13).
 ///
-/// Seeds the two triggers the send-gate contract names; only [`SendTrigger::ComposerSend`]
-/// is used this story. [`SendTrigger::ApprovalPaneApprove`] is reserved for the
-/// later approval-pane epic and is intentionally unused here.
+/// Seeds the two triggers the send-gate contract names: [`SendTrigger::ComposerSend`]
+/// (a composer send) and [`SendTrigger::ApprovalPaneApprove`] (approving a pending
+/// draft in the approval pane, Story 7.3). These are the only two legal dispatch
+/// triggers; both flow through the single [`submit`] gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendTrigger {
     /// A message the user composed and sent from the composer.
     ComposerSend,
-    /// A message dispatched by approving it in the approval pane (later epic).
+    /// A message dispatched by approving a pending draft in the approval pane
+    /// (Story 7.3).
     ApprovalPaneApprove,
+}
+
+impl SendTrigger {
+    /// A non-secret label for this trigger, safe to log (NFR-9): it carries no
+    /// body, no txn/event id, and no token.
+    fn as_label(self) -> &'static str {
+        match self {
+            SendTrigger::ComposerSend => "composer_send",
+            SendTrigger::ApprovalPaneApprove => "approval_pane_approve",
+        }
+    }
 }
 
 /// The sole content-dispatch gate (FR-41, AD-13): enqueue `text` as a plain-text
@@ -54,7 +67,11 @@ pub async fn submit(
         // body to the queue.
         return Ok(());
     }
-    let _ = trigger;
+    // Record only the non-secret trigger label (never the body / ids / tokens).
+    tracing::debug!(
+        trigger = trigger.as_label(),
+        "dispatching content through send gate"
+    );
     let content =
         AnyMessageLikeEventContent::RoomMessage(RoomMessageEventContent::text_plain(text));
     // SOLE-SEND-GATE: the one and only `Timeline::send` call site (FR-41 guard).

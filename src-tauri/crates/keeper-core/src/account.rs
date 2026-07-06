@@ -70,9 +70,9 @@ use crate::timeline;
 use crate::verification::{self, VerificationSink};
 use crate::vm::BridgeLoginInput;
 use crate::vm::{
-    ConnectionStatus, ConnectionStatusBatch, DraftMirrorBatch, EditVersionVm, EncryptionStatus,
-    EncryptionStatusBatch, InboxBatch, PaginationStatusBatch, RemoteDraftVm, RoomListBatch,
-    RoomListOp, RoomVm, SpaceVm, TimelineBatch, TypingBatch, TypistVm,
+    ApprovalDraftVm, ConnectionStatus, ConnectionStatusBatch, DraftMirrorBatch, EditVersionVm,
+    EncryptionStatus, EncryptionStatusBatch, InboxBatch, PaginationStatusBatch, RemoteDraftVm,
+    RoomListBatch, RoomListOp, RoomVm, SpaceVm, TimelineBatch, TypingBatch, TypistVm,
 };
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
@@ -2106,6 +2106,119 @@ impl AccountManager {
         let timeline = self.open_timeline_for(account_id, &room_id).await?;
         send::submit(&timeline, body, SendTrigger::ComposerSend).await?;
         tracing::info!(account_id = %account_id, room_id = %room_id, "message dispatched");
+        Ok(())
+    }
+
+    /// List every pending draft across all accounts for the approval pane (Story
+    /// 7.3). Reads the full draft rows from `keeper.db` ([`registry::list_draft_rows`])
+    /// and enriches each with the owning account's `user_id`/`hue_index` (from the
+    /// registry) and the room's `display_name` + bridge `network` (best-effort via
+    /// the live `Room`).
+    ///
+    /// **Never hide a draft** (the airlock invariant): metadata resolution is
+    /// best-effort. When a row's account is offline or its room is not resolvable,
+    /// the row is still emitted with `display_name = room_id` and `network = None`.
+    /// A draft whose account is missing from the registry falls back to `user_id =
+    /// account_id` and `hue_index = 0`. Bodies stay authoritative in Rust and are
+    /// never logged.
+    pub async fn list_pending_drafts(
+        &self,
+        platform: &Arc<dyn Platform>,
+    ) -> Result<Vec<ApprovalDraftVm>, CoreError> {
+        let data_dir = platform.data_dir()?;
+        let rows = registry::list_draft_rows(&data_dir)?;
+        // Index the registry accounts by id for the identity/hue join.
+        let accounts: HashMap<String, registry::AccountRow> = registry::list_accounts(&data_dir)?
+            .into_iter()
+            .map(|row| (row.account_id.clone(), row))
+            .collect();
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (account_id, room_id, body, updated_ts) in rows {
+            let (account_user_id, hue_index) = match accounts.get(&account_id) {
+                Some(row) => (row.user_id.clone(), row.hue_index.unwrap_or(0)),
+                None => (account_id.clone(), 0),
+            };
+            // Best-effort room metadata: parse + resolve the live room. Any failure
+            // (offline account, unknown room) falls back to room_id / no network —
+            // the row is still emitted.
+            let (display_name, network) = match RoomId::parse(&room_id) {
+                Ok(parsed) => match self.room_for(&account_id, &parsed).await {
+                    Ok(room) => {
+                        let name = resolved_room_name(&room, &room_id).await;
+                        let network = bridge::room_bridge_network(&room).await;
+                        (name, network)
+                    }
+                    Err(_) => (room_id.clone(), None),
+                },
+                Err(_) => (room_id.clone(), None),
+            };
+            out.push(ApprovalDraftVm {
+                account_id,
+                account_user_id,
+                hue_index,
+                room_id,
+                display_name,
+                network,
+                body,
+                updated_ts,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Approve (send) a pending draft's `body` to `room_id`/`account_id` through the
+    /// single dispatch gate (FR-41, AD-13, Story 7.3) with the
+    /// [`SendTrigger::ApprovalPaneApprove`] trigger — the second and last legal
+    /// dispatch trigger. Delegates to [`send::submit`] with the approval trigger; no
+    /// new dispatch path or public send API is introduced.
+    ///
+    /// The Approval Pane is a standalone primary view where the target room's
+    /// conversation is NOT open, so [`open_timeline_for`] (open-conversation-only)
+    /// alone would return [`SendError::NoOpenTimeline`] for essentially every draft.
+    /// This therefore acquires the `Timeline` with the same "reuse-open-else-transient
+    /// -build" pattern [`mark_room_read`] (Story 4.1) uses: reuse an already-open
+    /// timeline when present, otherwise build a transient
+    /// `TimelineBuilder::new(&room).build()` from [`room_for`] — obtaining a
+    /// `Timeline` off the open-subscription path without introducing a new dispatch
+    /// path (the single-gate boundary holds).
+    ///
+    /// Errors: an unparsable room id, or an account/room that isn't live (via
+    /// [`room_for`]) → [`SendError::RoomNotFound`]/[`TimelineError::RoomNotFound`]; a
+    /// transient-build failure → [`TimelineError::Build`]; an SDK enqueue failure →
+    /// [`SendError::Dispatch`]. On any error the caller retains the draft (a failed
+    /// send never loses unsent text).
+    pub async fn send_approval(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        body: &str,
+    ) -> Result<(), CoreError> {
+        // Guard whitespace-only bodies before any timeline work: `send::submit`
+        // treats a trim-empty body as a silent no-op `Ok(())`, which would let the
+        // frontend clear the draft — destroying unsent text. Surface a typed error
+        // instead so the caller's catch retains the draft (the airlock never
+        // destroys held text).
+        if body.trim().is_empty() {
+            return Err(SendError::EmptyBody.into());
+        }
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let room = self.room_for(account_id, &room_id).await?;
+
+        // Acquire the dispatch `Timeline`. Reuse an already-open conversation timeline
+        // when present; otherwise build a transient one — the Approval Pane opens no
+        // conversation, so this is the normal path (mirrors `mark_room_read`).
+        let timeline = match self.open_timeline_for(account_id, &room_id).await {
+            Ok(timeline) => timeline,
+            Err(_) => Arc::new(
+                TimelineBuilder::new(&room)
+                    .build()
+                    .await
+                    .map_err(|e| TimelineError::Build(e.to_string()))?,
+            ),
+        };
+        send::submit(&timeline, body, SendTrigger::ApprovalPaneApprove).await?;
+        tracing::info!(account_id = %account_id, room_id = %room_id, "draft approved and dispatched");
         Ok(())
     }
 
@@ -4245,6 +4358,24 @@ async fn map_vector_diff(diff: VectorDiff<RoomListItem>) -> VectorDiff<RoomVm> {
     }
 }
 
+/// Resolve a live [`matrix_sdk::Room`]'s display name, falling back to the cached
+/// name and finally to `fallback` (the room id) when nothing usable resolves
+/// (Story 7.3). Mirrors the name-resolution ladder in [`room_item_to_vm`] so an
+/// approval-pane row never shows an empty name.
+async fn resolved_room_name(room: &matrix_sdk::Room, fallback: &str) -> String {
+    room.display_name()
+        .await
+        .ok()
+        .map(|n| n.to_string())
+        .filter(|n| !n.trim().is_empty())
+        .or_else(|| {
+            room.cached_display_name()
+                .map(|n| n.to_string())
+                .filter(|n| !n.trim().is_empty())
+        })
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
 /// Resolve a [`RoomListItem`] to a non-secret [`RoomVm`]: display name plus a
 /// latest-event text preview and timestamp.
 async fn room_item_to_vm(item: &RoomListItem) -> RoomVm {
@@ -4522,6 +4653,167 @@ mod tests {
             .await
             .expect("well-formed ids with no open timeline resolve to Ok(None)");
         assert_eq!(no_timeline, None);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 7.3 airlock invariant: a pending draft whose room/account cannot be
+    /// resolved (no live account) is STILL listed, with `display_name = room_id`
+    /// and `network = None`. The identity/hue join reads from the registry.
+    #[tokio::test]
+    async fn list_pending_drafts_emits_unresolved_rows_with_fallback() {
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!(
+            "keeper-approval-list-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
+            data_dir: data_dir.clone(),
+        });
+        let manager = AccountManager::new(&data_dir);
+
+        // Seed one account with a known user_id + hue, plus a draft whose account is
+        // registered but not live (no room can be resolved).
+        registry::insert_account(
+            &data_dir,
+            "acctA",
+            "@alice:example.org",
+            "https://example.org",
+            "DEV1",
+            10,
+            3,
+            "password",
+        )
+        .expect("insert account");
+        registry::set_draft(&data_dir, "acctA", "!room1:example.org", "held text", 42)
+            .expect("set draft with account");
+        // A draft whose account is absent from the registry → identity/hue fallback.
+        registry::set_draft(
+            &data_dir,
+            "acctGhost",
+            "!room2:example.org",
+            "orphan text",
+            7,
+        )
+        .expect("set draft without account");
+
+        let mut rows = manager
+            .list_pending_drafts(&platform)
+            .await
+            .expect("list pending drafts");
+        rows.sort_by(|a, b| a.room_id.cmp(&b.room_id));
+
+        assert_eq!(rows.len(), 2, "both drafts are listed, none dropped");
+
+        let with_account = rows
+            .iter()
+            .find(|r| r.account_id == "acctA")
+            .expect("acctA row present");
+        assert_eq!(with_account.account_user_id, "@alice:example.org");
+        assert_eq!(with_account.hue_index, 3);
+        // Room is unresolvable (no live account) → fallback to room_id, no network.
+        assert_eq!(with_account.display_name, "!room1:example.org");
+        assert_eq!(with_account.network, None);
+        assert_eq!(with_account.body, "held text");
+        assert_eq!(with_account.updated_ts, 42);
+
+        let orphan = rows
+            .iter()
+            .find(|r| r.account_id == "acctGhost")
+            .expect("orphan row present");
+        // Missing registry account → user_id falls back to account_id, hue 0.
+        assert_eq!(orphan.account_user_id, "acctGhost");
+        assert_eq!(orphan.hue_index, 0);
+        assert_eq!(orphan.display_name, "!room2:example.org");
+        assert_eq!(orphan.network, None);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 7.3: `send_approval` dispatches through the single gate with the
+    /// approval trigger, acquiring its `Timeline` via the reuse-open-else-transient
+    /// -build pattern (like `mark_room_read`) so it works from the pane where NO
+    /// conversation is open. Crucially it must NOT short-circuit on `NoOpenTimeline`:
+    /// with a resolvable-but-not-live account the code path proceeds past
+    /// `open_timeline_for` and `room_for` yields `RoomNotFound` (there is no live
+    /// homeserver in a unit test to build a transient timeline against) — never the
+    /// old `NoOpenTimeline` that baked in the defect.
+    #[tokio::test]
+    async fn send_approval_routes_through_the_single_gate() {
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!(
+            "keeper-approval-send-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let manager = AccountManager::new(&data_dir);
+
+        // An unparsable room id is an honest typed error, never a panic.
+        let bad_room = manager
+            .send_approval("acctA", "not-a-room-id", "approve me")
+            .await;
+        assert!(matches!(
+            bad_room,
+            Err(CoreError::Send(SendError::RoomNotFound))
+        ));
+
+        // Well-formed room id but a non-live account: the conversation is not open, so
+        // the code takes the transient-build path — `room_for` resolves no live room
+        // and yields `RoomNotFound`. It must NOT return `NoOpenTimeline` (the prior
+        // defect): the pane never has an open conversation, so short-circuiting there
+        // would make approve non-functional for every draft.
+        let not_live = manager
+            .send_approval("acctA", "!room:example.org", "approve me")
+            .await;
+        assert!(matches!(
+            not_live,
+            Err(CoreError::Timeline(TimelineError::RoomNotFound))
+        ));
+        assert!(!matches!(
+            not_live,
+            Err(CoreError::Send(SendError::NoOpenTimeline))
+        ));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 7.3 (P7): a whitespace-only approve body is guarded as `EmptyBody`
+    /// *before* the timeline opens — never a silent `Ok(())` no-op. The guard runs
+    /// ahead of room parsing, so even a well-formed room id returns the typed error
+    /// (the frontend's catch then retains the draft — the airlock never destroys
+    /// held text). A truly empty and a whitespace-only body both surface it.
+    #[tokio::test]
+    async fn send_approval_rejects_a_whitespace_only_body() {
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!(
+            "keeper-approval-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let manager = AccountManager::new(&data_dir);
+
+        // An empty body → EmptyBody, not a dispatched no-op.
+        let empty = manager
+            .send_approval("acctA", "!room:example.org", "")
+            .await;
+        assert!(matches!(empty, Err(CoreError::Send(SendError::EmptyBody))));
+
+        // A whitespace-only body → EmptyBody as well (the guard trims). The room id
+        // is well-formed, proving the guard runs before the timeline is opened.
+        let blank = manager
+            .send_approval("acctA", "!room:example.org", "   \n\t ")
+            .await;
+        assert!(matches!(blank, Err(CoreError::Send(SendError::EmptyBody))));
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

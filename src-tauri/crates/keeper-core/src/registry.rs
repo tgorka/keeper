@@ -263,6 +263,41 @@ pub fn list_drafts(data_dir: &Path) -> Result<Vec<(String, String)>, CoreError> 
     Ok(drafts)
 }
 
+/// List every draft as a full row `(account_id, room_id, body, updated_ts)` across
+/// all accounts (Story 7.3, approval pane). Unlike [`list_drafts`] (keys only), this
+/// carries the authoritative body and timestamp so the approval pane can render each
+/// pending draft. Cross-account, over the whole table. Returns an empty vector when
+/// nothing is drafted. The body is never logged.
+///
+/// A deterministic `ORDER BY account_id, updated_ts, room_id` is applied so the
+/// grouped pane and its single roving tab-stop keep a stable order across re-queries
+/// (a bare `SELECT` has unspecified SQLite row order).
+pub fn list_draft_rows(data_dir: &Path) -> Result<Vec<(String, String, String, i64)>, CoreError> {
+    let conn = open(data_dir)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT account_id, room_id, body, updated_ts FROM drafts \
+             ORDER BY account_id, updated_ts, room_id",
+        )
+        .map_err(|e| CoreError::Internal(format!("could not prepare draft-row list: {e}")))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|e| CoreError::Internal(format!("could not query draft-row list: {e}")))?;
+    let mut drafts = Vec::new();
+    for row in rows {
+        drafts
+            .push(row.map_err(|e| CoreError::Internal(format!("could not read draft-row: {e}")))?);
+    }
+    Ok(drafts)
+}
+
 /// Add the nullable `hue_index` column to `accounts` if it is not present yet.
 ///
 /// Idempotent and non-destructive: reads the table's column list and only runs
@@ -913,6 +948,74 @@ mod tests {
                 ("acctB".to_owned(), "!r3".to_owned()),
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_draft_rows_round_trips_full_rows() {
+        let dir = temp_dir();
+        assert!(
+            list_draft_rows(&dir).expect("list empty rows").is_empty(),
+            "empty registry yields no draft rows"
+        );
+
+        // Insert deliberately out of the ORDER BY key (account_id, updated_ts,
+        // room_id) so a passing assertion proves the query orders, not insertion luck.
+        set_draft(&dir, "acctB", "!r3", "b3 body", 300).expect("set B r3");
+        set_draft(&dir, "acctA", "!r2", "a2 body", 200).expect("set A r2");
+        set_draft(&dir, "acctA", "!r1", "a1 body", 100).expect("set A r1");
+        // Same account + same timestamp → room_id breaks the tie deterministically.
+        set_draft(&dir, "acctA", "!r0", "a0 body", 100).expect("set A r0");
+
+        // The query returns a deterministic ORDER BY account_id, updated_ts, room_id —
+        // no local sort. This keeps the grouped pane + single roving tab-stop stable
+        // across re-queries.
+        let rows = list_draft_rows(&dir).expect("list draft rows");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "acctA".to_owned(),
+                    "!r0".to_owned(),
+                    "a0 body".to_owned(),
+                    100
+                ),
+                (
+                    "acctA".to_owned(),
+                    "!r1".to_owned(),
+                    "a1 body".to_owned(),
+                    100
+                ),
+                (
+                    "acctA".to_owned(),
+                    "!r2".to_owned(),
+                    "a2 body".to_owned(),
+                    200
+                ),
+                (
+                    "acctB".to_owned(),
+                    "!r3".to_owned(),
+                    "b3 body".to_owned(),
+                    300
+                ),
+            ],
+            "rows must come back in the deterministic ORDER BY order"
+        );
+
+        // Ordering is stable across a re-query (identical vector, no reshuffle).
+        let rows_again = list_draft_rows(&dir).expect("re-list draft rows");
+        assert_eq!(rows, rows_again, "row order is stable across re-queries");
+
+        // Upsert is reflected in the projected body + timestamp (no duplicate row).
+        set_draft(&dir, "acctA", "!r1", "a1 revised", 150).expect("re-set A r1");
+        let rows = list_draft_rows(&dir).expect("list draft rows after upsert");
+        assert_eq!(rows.len(), 4, "upsert must not add a row");
+        let a1 = rows
+            .iter()
+            .find(|r| r.0 == "acctA" && r.1 == "!r1")
+            .expect("acctA r1 present");
+        assert_eq!(a1.2, "a1 revised");
+        assert_eq!(a1.3, 150);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

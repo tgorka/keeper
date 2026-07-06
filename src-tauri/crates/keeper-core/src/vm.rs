@@ -235,6 +235,37 @@ pub struct DraftMirrorBatch {
     pub updated_ts: i64,
 }
 
+/// One pending draft row for the cross-account approval pane (Story 7.3), sourced
+/// from a cross-account query over the `drafts` table enriched with the owning
+/// account's identity/hue and the room's display name + bridge network.
+///
+/// Metadata resolution is best-effort: an offline account whose room cannot be
+/// resolved still yields a row — `display_name` falls back to `room_id` and
+/// `network` to `None`. A pending draft is never hidden. The body is authoritative
+/// in Rust and never logged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ApprovalDraftVm {
+    /// The owning account id.
+    pub account_id: String,
+    /// The owning account's Matrix user id (section header identity).
+    pub account_user_id: String,
+    /// The owning account's hue index (0..8) for the account-hue edge.
+    pub hue_index: u8,
+    /// The room the draft belongs to.
+    pub room_id: String,
+    /// The room's display name, or `room_id` when the room cannot be resolved.
+    pub display_name: String,
+    /// The bridge network the room belongs to, or `None` when unresolved / native.
+    pub network: Option<String>,
+    /// The authoritative draft body (from Rust).
+    pub body: String,
+    /// Last write time in milliseconds since the Unix epoch (UTC).
+    #[ts(type = "number")]
+    pub updated_ts: i64,
+}
+
 /// The account's live device-verification (encryption) posture, mapped from the
 /// SDK `client.encryption().verification_state()` (Story 3.1, FR, AD-8).
 ///

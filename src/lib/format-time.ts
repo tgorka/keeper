@@ -65,3 +65,40 @@ export function formatMessageTime(ms: number): string {
     minute: "2-digit",
   }).format(new Date(ms));
 }
+
+/**
+ * Format a draft's age (its `updatedTs`, ms since the Unix epoch) as a short,
+ * localized relative string for the approval pane (Story 7.3).
+ *
+ * - < 1 min → `"just now"`.
+ * - < 1 h → whole minutes (e.g. `"5 min ago"`) via `Intl.RelativeTimeFormat`.
+ * - < 24 h → whole hours (e.g. `"2 hr ago"`).
+ * - Older → a localized short date (`formatRoomTimestamp`'s date branch).
+ *
+ * A future or clock-skewed timestamp (ms > now) clamps to `"just now"`. An
+ * invalid / non-positive / out-of-range input yields `""`.
+ *
+ * @param ms - The draft's `updatedTs` in ms since the Unix epoch (UTC).
+ * @param now - Reference "now" in ms; defaults to `Date.now()` (injectable for tests).
+ */
+export function formatDraftAge(ms: number, now: number = Date.now()): string {
+  if (!Number.isFinite(ms) || ms <= 0 || ms > MAX_DATE_MS) {
+    return "";
+  }
+  const elapsedMs = now - ms;
+  // Future / clock-skewed timestamps clamp to "just now" rather than "in 5 min".
+  if (elapsedMs < 60_000) {
+    return "just now";
+  }
+  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "always", style: "short" });
+  const minutes = Math.floor(elapsedMs / 60_000);
+  if (minutes < 60) {
+    return rtf.format(-minutes, "minute");
+  }
+  const hours = Math.floor(elapsedMs / 3_600_000);
+  if (hours < 24) {
+    return rtf.format(-hours, "hour");
+  }
+  // Older than a day → a short absolute date, reusing the chat-row date branch.
+  return formatRoomTimestamp(ms, now);
+}

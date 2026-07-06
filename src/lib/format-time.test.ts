@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatMessageTime, formatRoomTimestamp } from "@/lib/format-time";
+import { formatDraftAge, formatMessageTime, formatRoomTimestamp } from "@/lib/format-time";
 
 describe("formatRoomTimestamp", () => {
   it("shows a clock time (HH:MM) for a same-day timestamp", () => {
@@ -56,5 +56,46 @@ describe("formatMessageTime", () => {
     expect(formatMessageTime(0)).toBe("");
     expect(formatMessageTime(-1)).toBe("");
     expect(formatMessageTime(Number.POSITIVE_INFINITY)).toBe("");
+  });
+});
+
+describe("formatDraftAge", () => {
+  const now = new Date(2026, 6, 4, 18, 0, 0).getTime();
+
+  it('shows "just now" for a draft under a minute old', () => {
+    expect(formatDraftAge(now - 30_000, now)).toBe("just now");
+    expect(formatDraftAge(now, now)).toBe("just now");
+  });
+
+  it("shows whole minutes for a draft under an hour old", () => {
+    const out = formatDraftAge(now - 5 * 60_000, now);
+    // Relative-time string mentions "5" and a minute unit; never a clock or date.
+    expect(out).toMatch(/5/);
+    expect(out.toLowerCase()).toMatch(/min/);
+  });
+
+  it("shows whole hours for a draft under a day old", () => {
+    const out = formatDraftAge(now - 2 * 3_600_000, now);
+    expect(out).toMatch(/2/);
+    expect(out.toLowerCase()).toMatch(/h/);
+  });
+
+  it("falls back to a short date for a draft older than a day", () => {
+    const twoDaysAgo = new Date(2026, 6, 2, 9, 0, 0).getTime();
+    const out = formatDraftAge(twoDaysAgo, now);
+    // The date fallback carries no relative "ago"/"in" phrasing.
+    expect(out.length).toBeGreaterThan(0);
+    expect(out.toLowerCase()).not.toMatch(/ago|in /);
+  });
+
+  it('clamps a future / clock-skewed timestamp to "just now"', () => {
+    expect(formatDraftAge(now + 60_000, now)).toBe("just now");
+  });
+
+  it("returns an empty string for non-finite or non-positive timestamps", () => {
+    expect(formatDraftAge(Number.NaN, now)).toBe("");
+    expect(formatDraftAge(0, now)).toBe("");
+    expect(formatDraftAge(-1, now)).toBe("");
+    expect(formatDraftAge(Number.POSITIVE_INFINITY, now)).toBe("");
   });
 });

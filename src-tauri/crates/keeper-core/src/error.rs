@@ -166,6 +166,13 @@ pub enum SendError {
     #[error("message can't be edited")]
     NotEditable,
 
+    /// An approval was requested for a draft whose body is empty or
+    /// whitespace-only (Story 7.3). Guarded in [`send_approval`] so the frontend
+    /// retains the draft rather than silently discarding unsent text — the
+    /// airlock never destroys held text. Non-retriable as-is.
+    #[error("cannot approve an empty draft")]
+    EmptyBody,
+
     /// The SDK failed to enqueue (or re-drive) the send. The wrapped string is a
     /// non-secret description of the failure — never message plaintext.
     #[error("could not send the message: {0}")]

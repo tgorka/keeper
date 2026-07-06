@@ -78,6 +78,8 @@ pub fn run() {
             ipc::mirror_draft,
             ipc::clear_draft_mirror,
             ipc::load_remote_draft,
+            ipc::list_pending_drafts,
+            ipc::approve_draft,
             ipc::draft_mirror_subscribe,
             ipc::draft_mirror_unsubscribe,
             ipc::search_archive,

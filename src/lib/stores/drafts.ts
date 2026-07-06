@@ -138,3 +138,28 @@ export function useHasDraft(accountId: string, roomId: string): boolean {
 export function useRemoteDraft(accountId: string, roomId: string): RemoteDraft | undefined {
   return useStore(draftsStore, (state) => state.remote.get(draftKey(accountId, roomId)));
 }
+
+/**
+ * React selector hook: the count of chats with a pending draft across all accounts
+ * (Story 7.3). Equals `keys.size` — the presence set already tracks every pending
+ * draft cross-account (seeded at startup, maintained by the composer), so the
+ * approval-pane count badge is free (no extra query). Subscribes to just the set
+ * size so an unrelated body edit never re-renders the badge.
+ */
+export function usePendingDraftCount(): number {
+  return useStore(draftsStore, (state) => state.keys.size);
+}
+
+/**
+ * React selector hook: a stable, order-independent serialization of the pending-draft
+ * presence keys (Story 7.3). Unlike {@link usePendingDraftCount} (just `keys.size`),
+ * this changes on *contents*, so a simultaneous add+remove that leaves the size
+ * unchanged still triggers a re-query in the approval pane (the size-only signal would
+ * miss it and go stale). The keys are sorted so ordering never matters, and joined with
+ * a newline (account ids and room ids carry no newline); `Object.is` compares two equal
+ * strings as equal, so an unchanged set yields a referentially-equal value and no render
+ * loop.
+ */
+export function usePendingDraftKeys(): string {
+  return useStore(draftsStore, (state) => Array.from(state.keys).sort().join("\n"));
+}

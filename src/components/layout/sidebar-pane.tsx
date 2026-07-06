@@ -1,4 +1,4 @@
-import { Archive, MessageSquare, Radio, Settings, WifiOff } from "lucide-react";
+import { Archive, Inbox, MessageSquare, Radio, Settings, WifiOff } from "lucide-react";
 import { useState } from "react";
 import { AccountFooter } from "@/components/layout/account-footer";
 import { NetworksGroup } from "@/components/layout/networks-group";
@@ -9,6 +9,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { BridgeHealth } from "@/lib/ipc/client";
 import { useShellOffline } from "@/lib/stores/account-status";
 import { useWorstBridgeHealth } from "@/lib/stores/bridge-health";
+import { usePendingDraftCount } from "@/lib/stores/drafts";
 import { primaryViewStore, usePrimaryView } from "@/lib/stores/primary-view";
 import { cn } from "@/lib/utils";
 
@@ -20,6 +21,7 @@ interface SidebarView {
 const VIEWS: SidebarView[] = [
   { label: "Chats", icon: MessageSquare },
   { label: "Archive", icon: Archive },
+  { label: "Approvals", icon: Inbox },
   { label: "Bridges", icon: Radio },
   { label: "Settings", icon: Settings },
 ];
@@ -51,6 +53,9 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
   // every monitored bridge session, rolled up from the Rust-authoritative
   // bridge-health store. `null` when nothing is monitored (no dot).
   const bridgeHealth = useWorstBridgeHealth();
+  // The count of chats with a pending draft across all accounts (Story 7.3). Drives
+  // the amber "Approvals" count badge — shown only when at least one draft is held.
+  const pendingDraftCount = usePendingDraftCount();
 
   return (
     <nav
@@ -74,13 +79,17 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                 ? () => primaryViewStore.getState().setView("inbox")
                 : view.label === "Archive"
                   ? () => primaryViewStore.getState().setView("archive")
-                  : view.label === "Bridges"
-                    ? () => primaryViewStore.getState().setView("bridges")
-                    : undefined;
-          // Reflect the active primary view on the Chats/Archive/Bridges entries.
+                  : view.label === "Approvals"
+                    ? () => primaryViewStore.getState().setView("approval")
+                    : view.label === "Bridges"
+                      ? () => primaryViewStore.getState().setView("bridges")
+                      : undefined;
+          // Reflect the active primary view on the Chats/Archive/Approvals/Bridges
+          // entries.
           const active =
             (view.label === "Chats" && primaryView === "inbox") ||
             (view.label === "Archive" && primaryView === "archive") ||
+            (view.label === "Approvals" && primaryView === "approval") ||
             (view.label === "Bridges" && primaryView === "bridges");
           // The Bridges entry carries the worst-state health roll-up dot (Story
           // 6.1): shown only when at least one bridge reports non-null health.
@@ -95,6 +104,19 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                 )}
               />
             ) : null;
+          // The "Approvals" entry carries an amber count badge (Story 7.3): the
+          // number of chats with a pending draft, shown only when > 0 ("written,
+          // not sent"). Amber (`--held`) marks the badge — nothing else.
+          const showApprovalBadge = view.label === "Approvals" && pendingDraftCount > 0;
+          const approvalBadge = showApprovalBadge ? (
+            <span
+              data-slot="approval-count"
+              aria-hidden="true"
+              className="ml-auto inline-flex min-w-5 shrink-0 items-center justify-center rounded-full bg-held px-1.5 py-0.5 font-medium text-[11px] text-held-foreground leading-none"
+            >
+              {pendingDraftCount}
+            </span>
+          ) : null;
           if (collapsed) {
             return (
               <li key={view.label}>
@@ -104,7 +126,11 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                       type="button"
                       variant="ghost"
                       size="icon"
-                      aria-label={view.label}
+                      aria-label={
+                        showApprovalBadge
+                          ? `${view.label}, ${pendingDraftCount} pending`
+                          : view.label
+                      }
                       aria-current={active ? "page" : undefined}
                       className={cn(
                         "relative focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
@@ -123,9 +149,18 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                           )}
                         />
                       )}
+                      {showApprovalBadge && (
+                        <span
+                          aria-hidden="true"
+                          data-slot="approval-count"
+                          className="absolute top-1 right-1 size-2 rounded-full bg-held"
+                        />
+                      )}
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent side="right">{view.label}</TooltipContent>
+                  <TooltipContent side="right">
+                    {showApprovalBadge ? `${view.label} (${pendingDraftCount})` : view.label}
+                  </TooltipContent>
                 </Tooltip>
               </li>
             );
@@ -145,6 +180,7 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                 <Icon aria-hidden="true" />
                 {view.label}
                 {healthDot}
+                {approvalBadge}
               </Button>
             </li>
           );

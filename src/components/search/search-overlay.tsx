@@ -29,6 +29,7 @@ import { buildSearchFilter, type SearchUiFilter } from "@/lib/search-filter";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { exportStore } from "@/lib/stores/export";
 import { useNetworksStore } from "@/lib/stores/networks";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { searchStore, useSearchStore } from "@/lib/stores/search";
 
@@ -228,6 +229,13 @@ export function SearchOverlay() {
     close();
   }, [chatLock, accountId, close]);
 
+  // Navigate to the Approval Pane from the ⌘K surface (Story 7.3), closing the
+  // overlay first (the two surfaces never stack).
+  const goToApprovals = useCallback(() => {
+    primaryViewStore.getState().setView("approval");
+    close();
+  }, [close]);
+
   const showNoResults = hasSearched && error === null && hits.length === 0 && query.trim() !== "";
 
   return (
@@ -244,14 +252,24 @@ export function SearchOverlay() {
               Search works fully offline against your local archive on this Mac.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={openExport}
-            aria-label="Export this scope"
-            className="h-7 shrink-0 rounded-md border border-input px-2 text-xs text-muted-foreground hover:text-foreground"
-          >
-            Export…
-          </button>
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              onClick={goToApprovals}
+              aria-label="Go to Approval Pane"
+              className="h-7 shrink-0 rounded-md border border-input px-2 text-xs text-muted-foreground hover:text-foreground"
+            >
+              Go to Approval Pane
+            </button>
+            <button
+              type="button"
+              onClick={openExport}
+              aria-label="Export this scope"
+              className="h-7 shrink-0 rounded-md border border-input px-2 text-xs text-muted-foreground hover:text-foreground"
+            >
+              Export…
+            </button>
+          </div>
         </div>
 
         <InputGroup>

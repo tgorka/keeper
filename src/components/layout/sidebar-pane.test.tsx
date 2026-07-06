@@ -24,6 +24,7 @@ import type { BridgeHealth } from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { bridgeHealthStore } from "@/lib/stores/bridge-health";
+import { draftsStore } from "@/lib/stores/drafts";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 
 const OFFLINE_TEXT = "Offline — showing your local archive. Messages queue until you're back.";
@@ -57,6 +58,7 @@ beforeEach(() => {
   accountsStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
   bridgeHealthStore.getState().reset();
+  draftsStore.getState().clear();
 });
 
 afterEach(() => {
@@ -64,6 +66,7 @@ afterEach(() => {
   accountsStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
   bridgeHealthStore.getState().reset();
+  draftsStore.getState().clear();
 });
 
 /** Seed one session's live health into the store. */
@@ -209,6 +212,51 @@ describe("SidebarPane bridge-health roll-up", () => {
     renderSidebar();
     const dot = document.querySelector('[data-slot="bridge-health-rollup"]');
     expect(dot).toHaveClass("bg-bridge-degraded");
+  });
+});
+
+describe("SidebarPane approvals", () => {
+  it("navigates to the approval pane when Approvals is clicked", () => {
+    renderSidebar();
+    expect(primaryViewStore.getState().view).toBe("inbox");
+
+    fireEvent.click(screen.getByRole("button", { name: "Approvals" }));
+
+    expect(primaryViewStore.getState().view).toBe("approval");
+    expect(screen.getByRole("button", { name: "Approvals" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+  });
+
+  it("shows no count badge when there are no pending drafts", () => {
+    renderSidebar();
+    expect(document.querySelector('[data-slot="approval-count"]')).not.toBeInTheDocument();
+  });
+
+  it("shows the amber count badge with the pending-draft count", () => {
+    draftsStore.getState().mark("a1", "!r1:x", true);
+    draftsStore.getState().mark("a1", "!r2:x", true);
+    draftsStore.getState().mark("a2", "!r3:x", true);
+    renderSidebar();
+    const badge = document.querySelector('[data-slot="approval-count"]');
+    expect(badge).toBeInTheDocument();
+    expect(badge).toHaveClass("bg-held");
+    expect(badge).toHaveTextContent("3");
+  });
+
+  it("hides the badge again when the last draft clears", () => {
+    draftsStore.getState().mark("a1", "!r1:x", true);
+    const { rerender } = renderSidebar();
+    expect(document.querySelector('[data-slot="approval-count"]')).toBeInTheDocument();
+
+    draftsStore.getState().mark("a1", "!r1:x", false);
+    rerender(
+      <TooltipProvider>
+        <SidebarPane collapsed={false} />
+      </TooltipProvider>,
+    );
+    expect(document.querySelector('[data-slot="approval-count"]')).not.toBeInTheDocument();
   });
 });
 
