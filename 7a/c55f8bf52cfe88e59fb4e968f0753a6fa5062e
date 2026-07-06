@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-8-1-incognito-read-receipts-with-scoped-policy.md
+  s_5ebb9e873e3626::t_0baf6511284738 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7ac55f8bf52cfe88e59fb4e968f0753a6fa5062e",
+  "prompts": {},
+  "sessions": {
+    "s_5ebb9e873e3626": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "93cd7f82-e5c7-4d05-bb65-49f9b45ca87e",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
