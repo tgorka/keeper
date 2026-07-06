@@ -36,3 +36,4 @@ coverage
 *.keychain
 .bmad-loop/runs/
 .bmad-loop/cache/
+.bmad-loop/archive/
