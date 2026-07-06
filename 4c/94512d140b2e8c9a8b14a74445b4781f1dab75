@@ -1,0 +1,130 @@
+src-tauri/crates/keeper-core/src/send.rs
+  s_d48a13690bfdc4::t_b22f9a2e227f51 508-523
+  s_d48a13690bfdc4::t_d4872598250681 129-145
+  s_d48a13690bfdc4::t_1a607413b88eec 3-9
+  s_d48a13690bfdc4::t_e03c7d6a5269f9 582-584,586-589,591-592
+src-tauri/crates/keeper/src/lib.rs
+  s_d48a13690bfdc4::t_6206a4f641a6a6 112-116
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_d48a13690bfdc4::t_825ac192842243 297-300
+src/lib/stores/outbox.test.ts
+  s_d48a13690bfdc4::t_0d389b922ddeaa 1-89
+src/lib/ipc/gen/HeldSendVm.ts
+  s_d48a13690bfdc4::t_b8a6f53e954312 1-41
+src-tauri/crates/keeper/src/ipc.rs
+  s_d48a13690bfdc4::t_ce4f82e08e489d 29-31
+  s_d48a13690bfdc4::t_3dd295b877c55d 1281
+  s_d48a13690bfdc4::t_2f3d1b7f896df3 1596
+  s_d48a13690bfdc4::t_a030ca4bf73dff 1601-1672
+src-tauri/crates/keeper-core/src/vm.rs
+  s_d48a13690bfdc4::t_f05a1a1c3a9e8b 2012-2055
+src/components/chat/undo-send-pill.test.tsx
+  s_d48a13690bfdc4::t_b3c6f9ffc92ac1 1-49,53-79,83-99,103-119
+  s_d48a13690bfdc4::t_c66618351c62ae 50-52,100-102
+  s_d48a13690bfdc4::t_4bf90830d345cb 80-82
+_bmad-output/implementation-artifacts/spec-8-3-undo-send-window.md
+  s_d48a13690bfdc4::t_97065cccb17587 1-4,6,8-9,12-72,83-106
+  s_d48a13690bfdc4::t_6e31b514a30dc2 10
+  s_d48a13690bfdc4::t_5d32b841ca9ce7 5,7,11
+  s_d48a13690bfdc4::t_2305c553ab4c5d 124-160
+  s_d48a13690bfdc4::t_ec3250952846f1 73-82
+  s_d48a13690bfdc4::t_dda6a35f302b3d 107-123
+src/lib/ipc/gen/OutboxVm.ts
+  s_d48a13690bfdc4::t_b8a6f53e954312 1-14
+src/components/settings/settings-dialog.tsx
+  s_d48a13690bfdc4::t_f85dce003e77d1 17
+  s_d48a13690bfdc4::t_6da374ec5509fe 255-257,264,269,274,292-293,296
+  s_d48a13690bfdc4::t_b562823bd23f05 187-194
+  s_d48a13690bfdc4::t_7275746b752d27 322-323
+  s_d48a13690bfdc4::t_347f9dbb725a49 26-27
+  s_d48a13690bfdc4::t_339351308056ce 252-254,258-263,265-268,270-273,275-291,294-295,297-300,314-321,324-327
+src/components/layout/conversation-pane.test.tsx
+  s_d48a13690bfdc4::t_2bf830fbdae0f9 74-78
+src/components/settings/settings-dialog.test.tsx
+  s_d48a13690bfdc4::t_b5b6e31cf18204 10-11
+  s_d48a13690bfdc4::t_223fb627fdfd79 22-28
+  s_d48a13690bfdc4::t_29f34928ba4ae5 38-39
+  s_d48a13690bfdc4::t_357a6a2229fdb9 58-61
+  s_d48a13690bfdc4::t_a6f91807b9e408 199-224
+src-tauri/crates/keeper-core/src/account.rs
+  s_d48a13690bfdc4::t_a273a5ee82218f 5534-5536,5539-5540,5542,5549
+  s_d48a13690bfdc4::t_931a17b6d3f11a 2450-2455
+  s_d48a13690bfdc4::t_81b528f910847f 319-391,402-414,424-446,451-474,476-482
+  s_d48a13690bfdc4::t_e0d1b79f89eca0 2704-2708,2718
+  s_d48a13690bfdc4::t_5c20349e532149 281-305
+  s_d48a13690bfdc4::t_ff671733c3c8a0 131-135
+  s_d48a13690bfdc4::t_57d721210a0d90 610-611,886-887,980-981,1135-1136,1256-1257,1376-1377,1540-1541
+  s_d48a13690bfdc4::t_e899fec8a95fbb 5481-5486,5491,5504
+  s_d48a13690bfdc4::t_7db0c7038bff8d 5731-5743,5750-5757
+  s_d48a13690bfdc4::t_01e13db9bdf8a1 219-220
+  s_d48a13690bfdc4::t_1809ccb4541c02 2691,2710-2717,2719-2720
+  s_d48a13690bfdc4::t_ea2972ca41bea2 4238-4255,4264-4265
+  s_d48a13690bfdc4::t_2e42588f2baef4 5744-5749
+  s_d48a13690bfdc4::t_651bd652ae2292 669,935,1043
+  s_d48a13690bfdc4::t_39a46623c313ed 2459,5602-5603,5605-5639,5641-5669,5671-5723,5725-5730
+  s_d48a13690bfdc4::t_b02e972335254a 392-401,415-423,447-450
+  s_d48a13690bfdc4::t_fc1464354d071c 475,2395-2403,5640,5670,5724
+  s_d48a13690bfdc4::t_632cbff13b7369 2461-2609,2721
+  s_d48a13690bfdc4::t_f3e051e742337a 74-76
+  s_d48a13690bfdc4::t_b06a546df65424 5574-5579,5583-5585,5594-5596
+  s_d48a13690bfdc4::t_82d35fa0b449fa 307-318
+  s_d48a13690bfdc4::t_9c13d1923cafea 633-635,909-911,1003-1005,1158-1160,1279-1281,1399-1401,1563-1565
+  s_d48a13690bfdc4::t_5f28693974b346 2349,2355-2369,2376-2394,2404-2449,2456-2458
+  s_d48a13690bfdc4::t_8196bb2791e81e 4009-4015
+  s_d48a13690bfdc4::t_324d6ca4cf91b4 306,2460,5604
+src/lib/ipc/client.ts
+  s_d48a13690bfdc4::t_9fb8f0bc85901b 107
+  s_d48a13690bfdc4::t_e66f7cd4760de5 1053-1105
+  s_d48a13690bfdc4::t_32f11cf41bc202 44
+  s_d48a13690bfdc4::t_0217285568965f 59
+src/components/chat/undo-send-pill.tsx
+  s_d48a13690bfdc4::t_32f11cf41bc202 22,95,137
+  s_d48a13690bfdc4::t_d537e5612dfb85 59,65-68,75-78
+  s_d48a13690bfdc4::t_94cfdf20f50c39 1-21,23-58,60-64,69-74,79-94,96-136,138-178
+src/lib/stores/composer.ts
+  s_d48a13690bfdc4::t_133b74d382fd2f 113-115,117-118,120
+  s_d48a13690bfdc4::t_4e5afd150f6fa1 131
+  s_d48a13690bfdc4::t_8f3e463794d80a 151,154
+  s_d48a13690bfdc4::t_a856706d7ba3b0 70-75
+  s_d48a13690bfdc4::t_5a7b859c984c92 130,132
+  s_d48a13690bfdc4::t_1e3f2bdab706c7 62-69,76-79
+  s_d48a13690bfdc4::t_fb57171539b26a 61,112,116,119
+  s_d48a13690bfdc4::t_4240149d9b58e7 152-153,155-157
+src/components/layout/conversation-pane.tsx
+  s_d48a13690bfdc4::t_1e96b874dece07 619-657
+  s_d48a13690bfdc4::t_a4447eb1abfe6d 88
+  s_d48a13690bfdc4::t_766bfbcb5a02a5 1497-1499
+  s_d48a13690bfdc4::t_32f11cf41bc202 1500
+  s_d48a13690bfdc4::t_29efc395b1b562 37
+  s_d48a13690bfdc4::t_57f59c4f2ecb9d 1470-1482
+  s_d48a13690bfdc4::t_86db8801cd04f6 71,76
+  s_d48a13690bfdc4::t_adeaaec0df4e03 846-851
+src/lib/stores/outbox.ts
+  s_d48a13690bfdc4::t_21b2850acf9353 1-74
+src/components/chat/composer.tsx
+  s_d48a13690bfdc4::t_8e624ad0376138 438-441,443-445,453,455-461
+  s_d48a13690bfdc4::t_ee51cd891d30e2 51
+  s_d48a13690bfdc4::t_9cf85c6dabe403 437,442,446-452,454,462-469
+src-tauri/crates/keeper-core/src/registry.rs
+  s_d48a13690bfdc4::t_fc1464354d071c 608-609,1511-1513,1550-1559
+  s_d48a13690bfdc4::t_1f7273d4728ada 1477-1510,1514-1549,1560-1582
+  s_d48a13690bfdc4::t_934d682e2ab222 107-124
+  s_d48a13690bfdc4::t_32da1a333ea125 535-607,610-667
+  s_d48a13690bfdc4::t_7ce6c8f1be9aa5 809-816
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4c94512d140b2e8c9a8b14a74445b4781f1dab75",
+  "prompts": {},
+  "sessions": {
+    "s_d48a13690bfdc4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "75d79103-9e0b-4d12-a111-c7a2f2da63d3",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
