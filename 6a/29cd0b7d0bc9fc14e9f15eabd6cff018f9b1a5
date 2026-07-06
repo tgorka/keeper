@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-8-3-undo-send-window.md
+  s_0c048476c47153::t_06a039116e7995 5,11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6a29cd0b7d0bc9fc14e9f15eabd6cff018f9b1a5",
+  "prompts": {},
+  "sessions": {
+    "s_0c048476c47153": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ff8790fd-6be4-4bbf-b196-ea0a36845643",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
