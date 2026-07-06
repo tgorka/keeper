@@ -43,6 +43,9 @@ tauri-plugin-global-shortcut = { workspace = true }
 # Native OS notifications from the sync loop (Story 10.1, FR-51). Wires the desktop
 # `Platform::notify` port to the OS notifier; the plugin is registered in `lib.rs`.
 tauri-plugin-notification = { workspace = true }
+# Opt-in launch-at-login (Story 10.3, FR-53, AD-25). Registered in `lib.rs`; toggled
+# through the `launch_at_login_set` command via `ManagerExt::autolaunch()`.
+tauri-plugin-autostart = { workspace = true }
 # Percent-decoding raw-body IPC headers (filename/caption) for the pasted-image
 # send path (Story 3.7). Already in the tree via url/matrix-sdk.
 percent-encoding = { workspace = true }

@@ -47,6 +47,7 @@ use tracing::Instrument;
 use crate::archive::{self, ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWriter};
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
+use crate::badge::BadgeConfig;
 use crate::bridge;
 use crate::bridges::health::{
     BridgeHealthSink, HealthAggregator, HealthMonitor, HealthState, MonitoredSession, SessionKey,
@@ -572,6 +573,13 @@ pub struct AccountManager {
     /// the Settings commands read/set it via [`AccountManager::notify_previews_get`] /
     /// [`AccountManager::notify_previews_set`].
     notify: Arc<NotifyConfig>,
+    /// The app-wide dock-badge mode (Story 10.3, FR-53): the single [`BadgeConfig`]
+    /// seeded once in [`AccountManager::new`] from the persisted registry value (default
+    /// [`DockBadgeMode::All`](crate::vm::DockBadgeMode)) and cloned into the inbox merger
+    /// so it recomputes the badge on every merged-state change. Lives here (not a
+    /// `static`) so there is no new global mutable state; the Settings command reads/sets
+    /// it via [`AccountManager::dock_badge_mode_get`] / [`AccountManager::dock_badge_mode_set`].
+    badge: Arc<BadgeConfig>,
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
@@ -624,6 +632,14 @@ impl AccountManager {
             dnd_enabled,
             muted_networks,
         ));
+        // Seed the dock-badge mode from the persisted registry value (Story 10.3). A read
+        // failure defaults to `All` (badge all unreads) — the badge must never block
+        // startup and its honest default is to show unread counts.
+        let badge_mode = registry::get_dock_badge_mode(data_dir).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not read dock-badge mode; defaulting to all");
+            crate::vm::DockBadgeMode::All
+        });
+        let badge = Arc::new(BadgeConfig::new(badge_mode));
         Self {
             accounts: Mutex::new(HashMap::new()),
             inbox: Mutex::new(None),
@@ -634,6 +650,7 @@ impl AccountManager {
             draft_mirror_subs: Mutex::new(HashMap::new()),
             palette: Arc::new(Mutex::new(PaletteIndex::new())),
             notify,
+            badge,
         }
     }
 
@@ -837,6 +854,10 @@ impl AccountManager {
             pins,
             spaces_sink,
             networks_sink,
+            // Thread the shared platform port + dock-badge config into the merger so it
+            // pushes the cross-account badge on every merged-state change (Story 10.3).
+            platform.clone(),
+            self.badge.clone(),
         );
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -3445,6 +3466,72 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Read the dock-badge mode (Story 10.3, FR-53). Returns the in-memory
+    /// [`BadgeConfig`] value (seeded from the persisted registry at construction; default
+    /// [`DockBadgeMode::All`](crate::vm::DockBadgeMode)). Infallible — reads process state.
+    pub fn dock_badge_mode_get(&self) -> crate::vm::DockBadgeMode {
+        self.badge.mode()
+    }
+
+    /// Set the dock-badge mode (Story 10.3, FR-53). Persists the new mode to the
+    /// `settings` k/v table under `notify.dock_badge_mode`, updates the in-memory
+    /// [`BadgeConfig`], then re-pokes the live inbox merger so the badge is recomputed and
+    /// reapplied immediately (even with no room activity flowing). Persists first: the
+    /// in-memory change is applied only once it is durable.
+    pub async fn dock_badge_mode_set(
+        &self,
+        platform: &Arc<dyn Platform>,
+        mode: crate::vm::DockBadgeMode,
+    ) -> Result<(), CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::set_dock_badge_mode(&data_dir, mode)?;
+        self.badge.set_mode(mode);
+        // Reapply against the current merged state so the badge reflects the new mode now.
+        if let Some(handle) = self.inbox.lock().await.as_ref() {
+            handle.merger.reapply_badge().await;
+        }
+        Ok(())
+    }
+
+    /// Read the menu-bar (tray) presence toggle (Story 10.3, FR-53). Reads the persisted
+    /// `system.menu_bar_presence` setting (authoritative across restart; default off).
+    pub fn menu_bar_presence_get(&self, platform: &Arc<dyn Platform>) -> Result<bool, CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::get_menu_bar_presence(&data_dir)
+    }
+
+    /// Set the menu-bar (tray) presence toggle (Story 10.3, FR-53). Persists the new value
+    /// to the `settings` k/v table under `system.menu_bar_presence`. The shell creates or
+    /// destroys the tray icon live off this value; the setting is authoritative across
+    /// restart.
+    pub fn menu_bar_presence_set(
+        &self,
+        platform: &Arc<dyn Platform>,
+        enabled: bool,
+    ) -> Result<(), CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::set_menu_bar_presence(&data_dir, enabled)
+    }
+
+    /// Gracefully shut down **every** active account (Story 10.3, FR-53 — honest quit).
+    /// Snapshots the current active account ids under the manager lock, then awaits
+    /// [`Self::shutdown`] for each so every account's `SyncService` is stopped and all its
+    /// tasks/handlers are torn down before the process exits. Idempotent — a second call
+    /// (or a call with no active accounts) is a harmless no-op. The caller (the shell's
+    /// `ExitRequested` handler) runs this under a bounded `block_on`; if it exceeds the
+    /// bound the process still exits (no hidden background process survives a quit).
+    pub async fn shutdown_all(&self) {
+        // Snapshot the ids first, then release the lock: `shutdown` re-locks `accounts`
+        // internally, so holding the lock across the loop would deadlock.
+        let account_ids: Vec<String> = {
+            let accounts = self.accounts.lock().await;
+            accounts.keys().cloned().collect()
+        };
+        for account_id in account_ids {
+            self.shutdown(&account_id).await;
+        }
+    }
+
     /// Read the per-Chat notification mode for `(account_id, room_id)` (Story 10.2,
     /// AD-18). Resolves the account's live `Client` and reads the synced Matrix push-rule
     /// mode via `notification_settings().get_user_defined_room_notification_mode(...)`:
@@ -5763,6 +5850,9 @@ mod tests {
         }
         fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
             Err(CoreError::Unsupported("sidecar unused in tests".to_owned()))
+        }
+        fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
+            Ok(())
         }
     }
 

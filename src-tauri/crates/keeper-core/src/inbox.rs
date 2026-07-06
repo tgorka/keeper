@@ -24,6 +24,8 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use crate::badge::{self, BadgeConfig};
+use crate::platform::Platform;
 use crate::vm::{
     InboxBatch, InboxOp, InboxRoomVm, NetworkVm, NetworksSnapshot, RoomListBatch, RoomVm, SpaceVm,
     SpacesSnapshot,
@@ -114,6 +116,17 @@ struct MergeState {
     /// persistence). Set/cleared out-of-band by [`InboxMerger::set_network_filter`].
     /// Composes AND with `selected_space` (Network retain runs after the Space retain).
     selected_network: Option<String>,
+    /// The OS dock-badge sink (Story 10.3, FR-53). On every merged-state change the
+    /// merger computes the cross-account `(unread_rooms, mention_total)` aggregate over
+    /// the *full* unfiltered room set and pushes the badge through this port so it stays
+    /// correct while the window is hidden (never computed in the webview). Shared with
+    /// the shell as the same `Arc<dyn Platform>` the account producers use.
+    platform: Arc<dyn Platform>,
+    /// The app-wide dock-badge mode (Story 10.3): read on every merged-state change to
+    /// decide what the aggregate badges (all unreads / mentions / off). Shared with the
+    /// [`AccountManager`](crate::account::AccountManager); the Settings command mutates it
+    /// live and can re-poke the merger to reapply.
+    badge: Arc<BadgeConfig>,
     /// Set once any sink reports its channel is closed, so later producer
     /// updates stop trying to emit.
     closed: bool,
@@ -134,6 +147,10 @@ impl InboxMerger {
     /// [`crate::registry::get_pins`]); it is replaced whole by [`Self::update_pins`]
     /// on every mutation. Favourite state is SDK-sourced (the `m.favourite` notable
     /// tag), so it needs no seed and no out-of-band poke.
+    // The four inbox windows, the spaces/networks snapshots, the pin seed, and the
+    // platform + badge config each cross a distinct concern; grouping them into a struct
+    // would only obscure the one-to-one wiring the shell threads through.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         inbox_sink: InboxSink,
         archive_sink: InboxSink,
@@ -142,6 +159,8 @@ impl InboxMerger {
         pins: HashMap<(String, String), i64>,
         spaces_sink: SpacesSink,
         networks_sink: NetworksSink,
+        platform: Arc<dyn Platform>,
+        badge: Arc<BadgeConfig>,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(MergeState {
@@ -157,6 +176,8 @@ impl InboxMerger {
                 selected_space: None,
                 networks_sink,
                 selected_network: None,
+                platform,
+                badge,
                 closed: false,
             })),
         }
@@ -277,6 +298,24 @@ impl InboxMerger {
         emit(&mut state);
     }
 
+    /// Recompute and reapply the dock badge from the current full merged state (Story
+    /// 10.3), without re-emitting the inbox windows. Called out-of-band after the
+    /// dock-badge *mode* changes so the badge reflects the new mode immediately even when
+    /// no room activity is flowing. Best-effort — a closed subscription or unset platform
+    /// handle is a harmless no-op.
+    pub async fn reapply_badge(&self) {
+        let state = self.inner.lock().await;
+        let merged = merge(&state.accounts);
+        let unread_rooms = merged.iter().filter(|room| room.is_unread).count() as u32;
+        let mention_total: u32 = merged.iter().map(|room| room.mention_count).sum();
+        badge::apply(
+            &*state.platform,
+            state.badge.mode(),
+            unread_rooms,
+            mention_total,
+        );
+    }
+
     /// Apply one account's per-account [`RoomListBatch`] to its slot, then
     /// re-merge and emit. Returns `false` once the output channel is closed so
     /// the caller's producer can stop.
@@ -321,6 +360,21 @@ fn emit(state: &mut MergeState) -> bool {
     // deduped by name, name-sorted; native rooms (`None`) excluded. Snapshot is
     // pushed LAST (see end of `emit`).
     let network_names = distinct_network_names(&merged);
+    // Compute the dock-badge aggregate from the *full* unfiltered merged set (Story
+    // 10.3, FR-53), BEFORE any Space/Network retain, so the badge reflects every account
+    // and every room regardless of the active view filter and stays correct while the
+    // window is hidden. `unread_rooms` counts rooms with `is_unread`; `mention_total`
+    // sums `mention_count`. This reads the same `is_unread`/`mention_count` the windows
+    // render — it never alters the unread computation. The badge is pushed through the
+    // `Platform` port, which is an honest no-op when the app handle is unset (tests).
+    let unread_rooms = merged.iter().filter(|room| room.is_unread).count() as u32;
+    let mention_total: u32 = merged.iter().map(|room| room.mention_count).sum();
+    badge::apply(
+        &*state.platform,
+        state.badge.mode(),
+        unread_rooms,
+        mention_total,
+    );
     // Self-heal the ephemeral Network selection: if the selected Network is no
     // longer present anywhere in the merged set (its last bridged room left, or an
     // owner account signed out), clear it. This keeps filter validity
@@ -613,8 +667,59 @@ fn apply_room_list_batch(mut rooms: Vec<RoomVm>, batch: &RoomListBatch) -> Vec<R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::RoomListOp;
+    use crate::error::CoreError;
+    use crate::vm::{DockBadgeMode, RoomListOp};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
     use std::sync::Mutex as StdMutex;
+
+    /// A no-op [`Platform`] that records the last dock-badge count set, so badge
+    /// assertions run without a live `AppHandle` (Story 10.3). All other ports are
+    /// honest `Unsupported` — the merger only uses `set_badge_count`.
+    #[derive(Default)]
+    struct BadgeRecordingPlatform {
+        // -1 encodes "cleared" (`None`); a non-negative value is `Some(n)`.
+        last: AtomicI64,
+    }
+
+    impl Platform for BadgeRecordingPlatform {
+        fn data_dir(&self) -> Result<PathBuf, CoreError> {
+            Err(CoreError::Unsupported("no data dir in test".to_owned()))
+        }
+        fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
+            Err(CoreError::Unsupported("keychain".to_owned()))
+        }
+        fn keychain_get(&self, _key: &str) -> Result<Option<String>, CoreError> {
+            Err(CoreError::Unsupported("keychain".to_owned()))
+        }
+        fn keychain_delete(&self, _key: &str) -> Result<(), CoreError> {
+            Err(CoreError::Unsupported("keychain".to_owned()))
+        }
+        fn open_url(&self, _url: &str) -> Result<(), CoreError> {
+            Err(CoreError::Unsupported("open_url".to_owned()))
+        }
+        fn notify(&self, _title: &str, _body: &str) -> Result<(), CoreError> {
+            Err(CoreError::Unsupported("notify".to_owned()))
+        }
+        fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
+            Err(CoreError::Unsupported("sidecar".to_owned()))
+        }
+        fn set_badge_count(&self, count: Option<u32>) -> Result<(), CoreError> {
+            self.last
+                .store(count.map(i64::from).unwrap_or(-1), AtomicOrdering::Relaxed);
+            Ok(())
+        }
+    }
+
+    impl BadgeRecordingPlatform {
+        /// The last badge count set, decoding `-1` back to `None`.
+        fn last_badge(&self) -> Option<u32> {
+            match self.last.load(AtomicOrdering::Relaxed) {
+                -1 => None,
+                n => Some(n as u32),
+            }
+        }
+    }
 
     fn room(id: &str, ts: Option<i64>) -> RoomVm {
         RoomVm {
@@ -841,7 +946,45 @@ mod tests {
 
     /// Like [`capturing_merger`] but seeds the merger's pin map. Returns captures
     /// in `(merger, inbox, archive, pins, favourites, spaces, networks)` order.
+    /// The dock badge is wired to a discarded no-op platform in mode `All`; badge-
+    /// asserting tests use [`badge_merger`] instead to hold the recording handle.
     fn capturing_merger_with_pins(pins: HashMap<(String, String), i64>) -> CapturingMerger {
+        let (merger, inbox, archive, pins_cap, favourites, spaces, networks, _platform) =
+            capturing_merger_with_pins_and_badge(pins, DockBadgeMode::All);
+        (
+            merger, inbox, archive, pins_cap, favourites, spaces, networks,
+        )
+    }
+
+    /// Build a merger plus a [`BadgeRecordingPlatform`] in the given badge `mode`, so a
+    /// test can assert the OS dock badge the merger pushes on each merged-state change
+    /// (Story 10.3). Returns `(merger, recording_platform)`.
+    fn badge_merger(mode: DockBadgeMode) -> (InboxMerger, Arc<BadgeRecordingPlatform>) {
+        let (merger, _inbox, _archive, _pins, _favourites, _spaces, _networks, platform) =
+            capturing_merger_with_pins_and_badge(HashMap::new(), mode);
+        (merger, platform)
+    }
+
+    /// The [`CapturingMerger`] captures plus the [`BadgeRecordingPlatform`] the merger
+    /// pushes dock badges through.
+    type CapturingMergerWithBadge = (
+        InboxMerger,
+        Captured,
+        Captured,
+        Captured,
+        Captured,
+        CapturedSpaces,
+        CapturedNetworks,
+        Arc<BadgeRecordingPlatform>,
+    );
+
+    /// The shared builder behind [`capturing_merger_with_pins`] and [`badge_merger`]:
+    /// seeds the pin map and the dock-badge `mode`, returning every capture handle plus
+    /// the recording platform.
+    fn capturing_merger_with_pins_and_badge(
+        pins: HashMap<(String, String), i64>,
+        mode: DockBadgeMode,
+    ) -> CapturingMergerWithBadge {
         let inbox: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let archive: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let pins_cap: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
@@ -854,6 +997,9 @@ mod tests {
         let favourites_store = favourites.clone();
         let spaces_store = spaces.clone();
         let networks_store = networks.clone();
+        let platform = Arc::new(BadgeRecordingPlatform::default());
+        let platform_port: Arc<dyn Platform> = platform.clone();
+        let badge = Arc::new(BadgeConfig::new(mode));
         let merger = InboxMerger::new(
             Box::new(move |batch: InboxBatch| {
                 inbox_store.lock().expect("lock").push(batch);
@@ -880,9 +1026,11 @@ mod tests {
                 networks_store.lock().expect("lock").push(snapshot);
                 true
             }),
+            platform_port,
+            badge,
         );
         (
-            merger, inbox, archive, pins_cap, favourites, spaces, networks,
+            merger, inbox, archive, pins_cap, favourites, spaces, networks, platform,
         )
     }
 
@@ -1869,5 +2017,120 @@ mod tests {
         // Signal room is shown (not empty windows).
         merger.remove_account("acctB").await;
         assert_eq!(last_reset_ids(&inbox), ["!a"]);
+    }
+
+    /// A room with an explicit unread flag + mention count for badge-aggregate tests.
+    fn room_unread(id: &str, ts: Option<i64>, is_unread: bool, mentions: u32) -> RoomVm {
+        RoomVm {
+            is_unread,
+            mention_count: mentions,
+            ..room(id, ts)
+        }
+    }
+
+    #[tokio::test]
+    async fn badge_all_mode_counts_unread_rooms_across_accounts() {
+        // `All` badges the count of unread rooms over the FULL cross-account set, not the
+        // filtered/windowed view (Story 10.3).
+        let (merger, platform) = badge_merger(DockBadgeMode::All);
+        merger.register_account("acctA", 0).await;
+        merger.register_account("acctB", 1).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_unread("!a1", Some(300), true, 2),
+                            room_unread("!a2", Some(200), false, 0),
+                        ],
+                    }],
+                    total: Some(2),
+                },
+            )
+            .await;
+        merger
+            .apply_account_batch(
+                "acctB",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_unread("!b1", Some(400), true, 5)],
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        // Two unread rooms across both accounts → badge shows 2.
+        assert_eq!(platform.last_badge(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn badge_mentions_mode_sums_mention_counts() {
+        let (merger, platform) = badge_merger(DockBadgeMode::Mentions);
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_unread("!a1", Some(300), true, 3),
+                            room_unread("!a2", Some(200), true, 4),
+                        ],
+                    }],
+                    total: Some(2),
+                },
+            )
+            .await;
+        // 3 + 4 = 7 mentions → badge shows 7 (unread-room count ignored in this mode).
+        assert_eq!(platform.last_badge(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn badge_off_mode_clears_and_zero_clears() {
+        // `Off` never badges even with unread state present.
+        let (merger, platform) = badge_merger(DockBadgeMode::Off);
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_unread("!a1", Some(300), true, 9)],
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        assert_eq!(platform.last_badge(), None);
+
+        // In `All` mode, clearing the last unread clears the badge (never Some(0)).
+        let (merger, platform) = badge_merger(DockBadgeMode::All);
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_unread("!a1", Some(300), true, 0)],
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        assert_eq!(platform.last_badge(), Some(1));
+        // The room is read → the badge clears.
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![room_unread("!a1", Some(300), false, 0)],
+                    }],
+                    total: Some(1),
+                },
+            )
+            .await;
+        assert_eq!(platform.last_badge(), None);
     }
 }

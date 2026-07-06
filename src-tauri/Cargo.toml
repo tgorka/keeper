@@ -18,8 +18,9 @@ all = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 
 [workspace.dependencies]
-# Tauri shell
-tauri = { version = "2", features = [] }
+# Tauri shell. The `tray-icon` feature backs the opt-in menu-bar presence (Story 10.3,
+# FR-53); the dock-badge port uses the in-core `set_badge_count` API (no extra feature).
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-deep-link = "2"
@@ -31,6 +32,9 @@ tauri-plugin-global-shortcut = "2"
 # `Platform::notify` port posts through this; content originates only from the local
 # decrypting loop, never a push gateway. MIT/Apache — passes `cargo deny check`.
 tauri-plugin-notification = "2"
+# Opt-in launch-at-login via a macOS LaunchAgent (Story 10.3, FR-53, AD-25). The plugin
+# owns the enabled state authoritatively; off by default. Apache/MIT — passes `cargo deny`.
+tauri-plugin-autostart = "2"
 # Serialization + IPC bindings
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

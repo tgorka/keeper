@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::error::{CoreError, PlatformError};
+use crate::vm::DockBadgeMode;
 
 /// Resolve the `keeper.db` path under a data directory.
 fn db_path(data_dir: &Path) -> PathBuf {
@@ -474,6 +475,48 @@ pub fn set_dnd_global(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
     set_setting(
         data_dir,
         NOTIFY_DND_GLOBAL_KEY,
+        if enabled { "1" } else { "0" },
+    )
+}
+
+/// The `settings` key holding the dock-badge mode (Story 10.3). Stored as the mode's
+/// registry string (`"all"`/`"mentions"`/`"off"`); absent = `all` (badge all unreads
+/// by default).
+const NOTIFY_DOCK_BADGE_MODE_KEY: &str = "notify.dock_badge_mode";
+
+/// Read the dock-badge mode (Story 10.3, FR-53). Absent / unparsable ⇒
+/// [`DockBadgeMode::All`] (badge all unreads by default). Stored in the `settings` k/v
+/// table under `notify.dock_badge_mode`.
+pub fn get_dock_badge_mode(data_dir: &Path) -> Result<DockBadgeMode, CoreError> {
+    match get_setting(data_dir, NOTIFY_DOCK_BADGE_MODE_KEY)? {
+        Some(value) => Ok(DockBadgeMode::from_registry_str(&value)),
+        None => Ok(DockBadgeMode::All),
+    }
+}
+
+/// Write the dock-badge mode (Story 10.3, FR-53). Persists the mode's registry string
+/// into the `settings` k/v table under `notify.dock_badge_mode`.
+pub fn set_dock_badge_mode(data_dir: &Path, mode: DockBadgeMode) -> Result<(), CoreError> {
+    set_setting(data_dir, NOTIFY_DOCK_BADGE_MODE_KEY, mode.as_registry_str())
+}
+
+/// The `settings` key holding the opt-in menu-bar (tray) presence toggle (Story 10.3).
+/// Stored as `"1"`/`"0"`; absent = off (no tray by default).
+const SYSTEM_MENU_BAR_PRESENCE_KEY: &str = "system.menu_bar_presence";
+
+/// Read the menu-bar presence toggle (Story 10.3, FR-53). Absent / anything-but-`"1"` ⇒
+/// `false` (off by default — the tray is opt-in). Stored in the `settings` k/v table
+/// under `system.menu_bar_presence`.
+pub fn get_menu_bar_presence(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, SYSTEM_MENU_BAR_PRESENCE_KEY)?.as_deref() == Some("1"))
+}
+
+/// Write the menu-bar presence toggle (Story 10.3, FR-53). Persists `"1"`/`"0"` into the
+/// `settings` k/v table under `system.menu_bar_presence`.
+pub fn set_menu_bar_presence(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        SYSTEM_MENU_BAR_PRESENCE_KEY,
         if enabled { "1" } else { "0" },
     )
 }
@@ -1807,6 +1850,38 @@ mod tests {
             .expect("read journal_mode");
         assert_eq!(mode.to_lowercase(), "wal");
         drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dock_badge_mode_defaults_all_and_round_trips() {
+        let dir = temp_dir();
+        // Absent ⇒ the honest default (badge all unreads).
+        assert_eq!(
+            get_dock_badge_mode(&dir).expect("read default"),
+            DockBadgeMode::All
+        );
+        // Every mode persists and reads back identically.
+        for mode in [
+            DockBadgeMode::All,
+            DockBadgeMode::Mentions,
+            DockBadgeMode::Off,
+        ] {
+            set_dock_badge_mode(&dir, mode).expect("persist mode");
+            assert_eq!(get_dock_badge_mode(&dir).expect("read back"), mode);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn menu_bar_presence_defaults_off_and_round_trips() {
+        let dir = temp_dir();
+        // Absent ⇒ off (the tray is opt-in).
+        assert!(!get_menu_bar_presence(&dir).expect("read default"));
+        set_menu_bar_presence(&dir, true).expect("enable");
+        assert!(get_menu_bar_presence(&dir).expect("read back on"));
+        set_menu_bar_presence(&dir, false).expect("disable");
+        assert!(!get_menu_bar_presence(&dir).expect("read back off"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

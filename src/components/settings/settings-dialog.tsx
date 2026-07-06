@@ -17,9 +17,13 @@ import {
 import { Input } from "@/components/ui/input";
 import { Kbd } from "@/components/ui/kbd";
 import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
 import { acceleratorFromEvent, DEFAULT_GLOBAL_HOTKEY, formatAccelerator } from "@/lib/hotkey";
 import {
+  type DockBadgeMode,
+  dockBadgeModeGet,
+  dockBadgeModeSet,
   encryptionPosture,
   type HotkeyVm,
   honorRemoteDeletions,
@@ -27,6 +31,10 @@ import {
   hotkeySet,
   incognitoGetGlobal,
   incognitoSetGlobal,
+  launchAtLoginGet,
+  launchAtLoginSet,
+  menuBarPresenceGet,
+  menuBarPresenceSet,
   notifyGetPreviewEnabled,
   notifySetPreviewEnabled,
   setHonorRemoteDeletions,
@@ -109,6 +117,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           <HonorRemoteDeletionsRow />
         </div>
         <NotificationsSection open={open} />
+        <BackgroundSection open={open} />
         <PrivacySection open={open} />
         <ShortcutsSection open={open} />
         <EncryptionSection />
@@ -269,6 +278,167 @@ function NotificationsSection({ open }: { open: boolean }) {
         />
       </div>
       <p className="text-muted-foreground">{NOTIFY_PREVIEWS_SENTENCE}</p>
+    </div>
+  );
+}
+
+/** Honest disclosure of what ⌘W (background) and ⌘Q (quit) do (Story 10.3, UX-DR17).
+ * Sentence case, no exclamation marks; never promises push or notifications while quit. */
+const BACKGROUND_QUIT_SENTENCE =
+  "Closing the window with ⌘W keeps keeper running in the background: it stays signed in, keeps syncing, and still shows notifications. Quitting with ⌘Q stops syncing and notifications until you open keeper again. keeper never runs a background push service, so it cannot notify you while it is quit.";
+
+/** The dock-badge mode options and their honest labels (Story 10.3). */
+const DOCK_BADGE_OPTIONS: ReadonlyArray<{ value: DockBadgeMode; label: string }> = [
+  { value: "all", label: "All unreads" },
+  { value: "mentions", label: "Mentions only" },
+  { value: "off", label: "Off" },
+];
+
+/**
+ * Background & dock section (Story 10.3, FR-53): a dock-badge-mode `RadioGroup` (all
+ * unreads / mentions only / off), a "Launch at login" `Switch` (off by default, backed by
+ * the autostart plugin), a "Keep in menu bar" `Switch` (off by default), and honest
+ * quit-vs-background copy. Each control loads its state on open and reverts on a persist
+ * failure (honest — never claims a state that was not saved).
+ */
+function BackgroundSection({ open }: { open: boolean }) {
+  // `undefined` = still loading; otherwise the resolved dock-badge mode.
+  const [mode, setMode] = useState<DockBadgeMode | undefined>(undefined);
+  const modeWriteId = useRef(0);
+  // Launch-at-login + menu-bar presence: `undefined` = loading; otherwise the boolean.
+  const [launch, setLaunch] = useState<boolean | undefined>(undefined);
+  const launchWriteId = useRef(0);
+  const [menuBar, setMenuBar] = useState<boolean | undefined>(undefined);
+  const menuBarWriteId = useRef(0);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    setMode(undefined);
+    setLaunch(undefined);
+    setMenuBar(undefined);
+    let cancelled = false;
+    void dockBadgeModeGet()
+      .then((value) => {
+        if (!cancelled) {
+          setMode(value);
+        }
+      })
+      .catch(() => {
+        // On a read failure, fall back to the honest default (badge all unreads).
+        if (!cancelled) {
+          setMode("all");
+        }
+      });
+    void launchAtLoginGet()
+      .then((value) => {
+        if (!cancelled) {
+          setLaunch(value);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setLaunch(false);
+        }
+      });
+    void menuBarPresenceGet()
+      .then((value) => {
+        if (!cancelled) {
+          setMenuBar(value);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setMenuBar(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  const onModeChange = (next: string) => {
+    const value = next as DockBadgeMode;
+    modeWriteId.current += 1;
+    const id = modeWriteId.current;
+    const prev = mode ?? "all";
+    setMode(value);
+    void dockBadgeModeSet(value).catch(() => {
+      if (id === modeWriteId.current) {
+        setMode(prev);
+      }
+    });
+  };
+
+  const onLaunchChange = (next: boolean) => {
+    launchWriteId.current += 1;
+    const id = launchWriteId.current;
+    const prev = launch ?? false;
+    setLaunch(next);
+    void launchAtLoginSet(next).catch(() => {
+      if (id === launchWriteId.current) {
+        setLaunch(prev);
+      }
+    });
+  };
+
+  const onMenuBarChange = (next: boolean) => {
+    menuBarWriteId.current += 1;
+    const id = menuBarWriteId.current;
+    const prev = menuBar ?? false;
+    setMenuBar(next);
+    void menuBarPresenceSet(next).catch(() => {
+      if (id === menuBarWriteId.current) {
+        setMenuBar(prev);
+      }
+    });
+  };
+
+  return (
+    <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
+      <p className="font-medium">Background &amp; dock</p>
+      <div className="flex flex-col gap-2">
+        <Label>Dock badge</Label>
+        <RadioGroup
+          value={mode ?? ""}
+          onValueChange={onModeChange}
+          aria-label="Dock badge mode"
+          className="gap-2"
+        >
+          {DOCK_BADGE_OPTIONS.map((option) => (
+            <div key={option.value} className="flex items-center gap-2">
+              <RadioGroupItem
+                id={`dock-badge-${option.value}`}
+                value={option.value}
+                disabled={mode === undefined}
+              />
+              <Label htmlFor={`dock-badge-${option.value}`} className="font-normal">
+                {option.label}
+              </Label>
+            </div>
+          ))}
+        </RadioGroup>
+      </div>
+      <div className="mt-1 flex items-center justify-between gap-2">
+        <Label htmlFor="launch-at-login">Launch at login</Label>
+        <Switch
+          id="launch-at-login"
+          checked={launch ?? false}
+          disabled={launch === undefined}
+          onCheckedChange={onLaunchChange}
+        />
+      </div>
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor="menu-bar-presence">Keep in menu bar</Label>
+        <Switch
+          id="menu-bar-presence"
+          checked={menuBar ?? false}
+          disabled={menuBar === undefined}
+          onCheckedChange={onMenuBarChange}
+        />
+      </div>
+      <p className="text-muted-foreground">{BACKGROUND_QUIT_SENTENCE}</p>
     </div>
   );
 }

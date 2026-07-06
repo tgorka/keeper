@@ -24,12 +24,12 @@ use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
-    ChatNotifyMode, ConnectionStatusBatch, CouplingCaveatVm, DemoBatch, DraftMirrorBatch,
-    EditVersionVm, EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm,
-    InboxBatch, IncognitoVm, IpcError, IpcErrorCode, MenuSectionVm, NetworksSnapshot,
-    NewChatResolutionVm, OutboxVm, PaginationStatusBatch, PaletteMode, PaletteResultsVm, PingVm,
-    RemoteDraftVm, ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot,
-    TimelineBatch, TypingBatch, VerificationFlowVm,
+    ChatNotifyMode, ConnectionStatusBatch, CouplingCaveatVm, DemoBatch, DockBadgeMode,
+    DraftMirrorBatch, EditVersionVm, EncryptionStatusBatch, ExportPhase, ExportProgressVm,
+    ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError, IpcErrorCode, MenuSectionVm,
+    NetworksSnapshot, NewChatResolutionVm, OutboxVm, PaginationStatusBatch, PaletteMode,
+    PaletteResultsVm, PingVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch, SearchFilterVm,
+    SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -251,6 +251,23 @@ pub fn set_notify_app_handle(handle: tauri::AppHandle) {
     let _ = NOTIFY_APP.set(handle);
 }
 
+/// The label of the main window (matches `tauri.conf.json` / the default capability),
+/// whose dock badge the desktop `Platform::set_badge_count` port drives (Story 10.3).
+const MAIN_WINDOW_LABEL: &str = "main";
+
+/// The Tauri app handle used by the desktop `Platform::set_badge_count` port to set the
+/// OS dock badge on the main window (Story 10.3). Set once in `lib.rs` `setup()` via
+/// [`set_badge_app_handle`]; the write-once `OnceLock` mirrors [`NOTIFY_APP`]. When unset
+/// (headless / CI / before setup), `set_badge_count` is an honest no-op rather than a
+/// panic — the badge computation still runs in core, it simply reaches no OS dock.
+static BADGE_APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+/// Store the app handle for the desktop dock-badge port (Story 10.3). Called once from
+/// `lib.rs` `setup()`. Idempotent — a second call is ignored (the handle is write-once).
+pub fn set_badge_app_handle(handle: tauri::AppHandle) {
+    let _ = BADGE_APP.set(handle);
+}
+
 /// Concrete [`Platform`] implementation for the desktop shell.
 ///
 /// The data-dir port is fully wired via `dirs`; the remaining ports return
@@ -317,6 +334,25 @@ impl Platform for DesktopPlatform {
             .body(body)
             .show()
             .map_err(|e| CoreError::Internal(format!("could not post notification: {e}")))
+    }
+
+    fn set_badge_count(&self, count: Option<u32>) -> Result<(), CoreError> {
+        use tauri::Manager;
+
+        // The badge app handle is set once in `setup()`; when it is unset (headless /
+        // CI / pre-setup) this is an honest no-op — the badge is a comfort signal and
+        // must never block or abort the inbox merge. `DesktopPlatform` stays a unit
+        // struct, reaching the handle through the write-once global.
+        let Some(app) = BADGE_APP.get() else {
+            return Ok(());
+        };
+        let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+            // No main window yet (very early startup) — nothing to badge; honest no-op.
+            return Ok(());
+        };
+        window
+            .set_badge_count(count.map(i64::from))
+            .map_err(|e| CoreError::Internal(format!("could not set dock badge count: {e}")))
     }
 
     fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError> {
@@ -2540,6 +2576,90 @@ pub fn network_mute_set(
         .accounts
         .network_mute_set(&state.platform, &network_id, muted)
         .map_err(to_ipc_error)
+}
+
+/// Read the dock-badge mode (Story 10.3, FR-53). Returns the in-memory
+/// [`BadgeConfig`](keeper_core::badge::BadgeConfig) value (seeded from the persisted
+/// registry at startup; default `all`). Infallible — reads process state, never fails.
+#[tauri::command]
+pub fn dock_badge_mode_get(state: State<'_, AppState>) -> Result<DockBadgeMode, IpcError> {
+    Ok(state.accounts.dock_badge_mode_get())
+}
+
+/// Set the dock-badge mode (Story 10.3, FR-53). Persists into the `settings` k/v table
+/// under `notify.dock_badge_mode`, updates the in-memory config, and re-pokes the live
+/// inbox merger so the badge is recomputed and reapplied immediately. Errors funnel
+/// through [`to_ipc_error`].
+#[tauri::command]
+pub async fn dock_badge_mode_set(
+    state: State<'_, AppState>,
+    mode: DockBadgeMode,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .dock_badge_mode_set(&state.platform, mode)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Read whether launch-at-login is enabled (Story 10.3, FR-53, AD-25). The autostart
+/// plugin is the single source of truth (its LaunchAgent state), so this reads
+/// `autolaunch().is_enabled()` rather than a shadow setting. Default off on a fresh
+/// install. Errors funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn launch_at_login_get(app: tauri::AppHandle) -> Result<bool, IpcError> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| {
+        to_ipc_error(CoreError::Internal(format!(
+            "could not read autostart: {e}"
+        )))
+    })
+}
+
+/// Set launch-at-login (Story 10.3, FR-53, AD-25). Enables/disables the LaunchAgent
+/// through the autostart plugin (authoritative — no shadow source of truth). Off by
+/// default; only ever toggled by an explicit user action. Errors funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub fn launch_at_login_set(app: tauri::AppHandle, enabled: bool) -> Result<(), IpcError> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    result.map_err(|e| to_ipc_error(CoreError::Internal(format!("could not set autostart: {e}"))))
+}
+
+/// Read the menu-bar (tray) presence toggle (Story 10.3, FR-53). Reads the persisted
+/// `system.menu_bar_presence` setting (default off). Errors funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub fn menu_bar_presence_get(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    state
+        .accounts
+        .menu_bar_presence_get(&state.platform)
+        .map_err(to_ipc_error)
+}
+
+/// Set the menu-bar (tray) presence toggle (Story 10.3, FR-53). Persists into the
+/// `settings` k/v table under `system.menu_bar_presence`, then creates or destroys the
+/// tray icon live through the app handle. Off by default; only ever toggled by an
+/// explicit user action. Errors funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn menu_bar_presence_set(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), IpcError> {
+    // Persist first (durable-before-applied), then reflect the tray live.
+    state
+        .accounts
+        .menu_bar_presence_set(&state.platform, enabled)
+        .map_err(to_ipc_error)?;
+    crate::tray::set_tray_presence(&app, enabled);
+    Ok(())
 }
 
 /// Read the per-Chat notification mode for `(accountId, roomId)` (Story 10.2). Resolves

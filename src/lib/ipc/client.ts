@@ -8,6 +8,7 @@
  */
 import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
+import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { IpcError } from "./gen/IpcError";
 
 export type { AccountVm } from "./gen/AccountVm";
@@ -35,6 +36,7 @@ export type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
 export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
+export type { DockBadgeMode } from "./gen/DockBadgeMode";
 export type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
 export type { EditVersionVm } from "./gen/EditVersionVm";
 export type { EncryptionStatus } from "./gen/EncryptionStatus";
@@ -1461,6 +1463,61 @@ export async function dndGetGlobal(): Promise<boolean> {
  */
 export async function dndSetGlobal(enabled: boolean): Promise<void> {
   await invoke<void>("dnd_set_global", { enabled });
+}
+
+/**
+ * Read the dock-badge mode (Story 10.3, FR-53). Absent = `"all"` (badge all unreads by
+ * default). The badge count itself is computed in Rust from the full cross-account
+ * unread/mention state; this only reads the mode. Resolves with the current mode.
+ */
+export async function dockBadgeModeGet(): Promise<DockBadgeMode> {
+  return await invoke<DockBadgeMode>("dock_badge_mode_get");
+}
+
+/**
+ * Set the dock-badge mode (Story 10.3, FR-53). Persists into the `settings` k/v table
+ * under `notify.dock_badge_mode` and re-pokes the Rust inbox merger so the dock badge is
+ * recomputed and reapplied immediately. Resolves once persisted.
+ */
+export async function dockBadgeModeSet(mode: DockBadgeMode): Promise<void> {
+  await invoke<void>("dock_badge_mode_set", { mode });
+}
+
+/**
+ * Read whether launch-at-login is enabled (Story 10.3, FR-53, AD-25). The autostart
+ * plugin's LaunchAgent state is authoritative; off by default on a fresh install.
+ * Rejects with the {@link IpcError} envelope on a plugin failure.
+ */
+export async function launchAtLoginGet(): Promise<boolean> {
+  return await invoke<boolean>("launch_at_login_get");
+}
+
+/**
+ * Set launch-at-login (Story 10.3, FR-53, AD-25). Enables or disables the macOS
+ * LaunchAgent through the autostart plugin (the single source of truth). Only ever
+ * called from an explicit user toggle. Rejects with the {@link IpcError} envelope on a
+ * plugin failure.
+ */
+export async function launchAtLoginSet(enabled: boolean): Promise<void> {
+  await invoke<void>("launch_at_login_set", { enabled });
+}
+
+/**
+ * Read the menu-bar (tray) presence toggle (Story 10.3, FR-53). Reads the persisted
+ * `system.menu_bar_presence` setting; off by default. Rejects with the {@link IpcError}
+ * envelope on a registry failure.
+ */
+export async function menuBarPresenceGet(): Promise<boolean> {
+  return await invoke<boolean>("menu_bar_presence_get");
+}
+
+/**
+ * Set the menu-bar (tray) presence toggle (Story 10.3, FR-53). Persists the choice and
+ * creates or destroys the tray icon live. Only ever called from an explicit user toggle.
+ * Rejects with the {@link IpcError} envelope on a registry failure.
+ */
+export async function menuBarPresenceSet(enabled: boolean): Promise<void> {
+  await invoke<void>("menu_bar_presence_set", { enabled });
 }
 
 /**

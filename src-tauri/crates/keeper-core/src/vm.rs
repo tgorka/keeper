@@ -1345,6 +1345,48 @@ pub enum ChatNotifyMode {
     Mute,
 }
 
+/// The dock-badge mode the IPC boundary sets/reads (Story 10.3, FR-53, AD-18).
+///
+/// Drives the Rust-computed dock badge from the full cross-account unread/mention
+/// state so the count stays correct while the window is hidden (the badge is never
+/// computed in the webview). `All` shows the count of unread rooms; `Mentions` shows
+/// the total unread-mention count; `Off` shows no badge. A zero total clears the
+/// badge in every mode. Persisted in `keeper.db` `settings` under
+/// `notify.dock_badge_mode`; default `All`. Serializes to `"all" | "mentions" | "off"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DockBadgeMode {
+    /// Badge the count of unread rooms across all accounts.
+    All,
+    /// Badge the total unread-mention count across all accounts.
+    Mentions,
+    /// No dock badge.
+    Off,
+}
+
+impl DockBadgeMode {
+    /// The stable registry string this mode persists as under `notify.dock_badge_mode`.
+    pub fn as_registry_str(self) -> &'static str {
+        match self {
+            DockBadgeMode::All => "all",
+            DockBadgeMode::Mentions => "mentions",
+            DockBadgeMode::Off => "off",
+        }
+    }
+
+    /// Parse a persisted registry string back into a mode; an unknown/absent value
+    /// resolves to the default [`DockBadgeMode::All`] (honest default, never fails).
+    pub fn from_registry_str(value: &str) -> Self {
+        match value {
+            "mentions" => DockBadgeMode::Mentions,
+            "off" => DockBadgeMode::Off,
+            // "all" and any unrecognized value default to All.
+            _ => DockBadgeMode::All,
+        }
+    }
+}
+
 /// Non-secret account registry projection returned to the frontend on a
 /// successful login (FR-1, NFR-9).
 ///

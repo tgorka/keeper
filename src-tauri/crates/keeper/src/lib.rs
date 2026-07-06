@@ -9,8 +9,9 @@ mod hotkey;
 mod ipc;
 mod media_protocol;
 mod menu;
+mod tray;
 
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 use tauri_plugin_deep_link::DeepLinkExt;
 
 /// Application entry point. Registers the plugin set and the typed IPC command
@@ -31,6 +32,13 @@ pub fn run() {
         // `Platform::notify` port posts through this plugin; the app handle is stored in
         // `setup()` and notification permission is requested best-effort there.
         .plugin(tauri_plugin_notification::init())
+        // Opt-in launch-at-login (Story 10.3, FR-53, AD-25). The autostart plugin owns
+        // the LaunchAgent state authoritatively; it is off by default and only ever
+        // toggled by an explicit user action via the `launch_at_login_set` command.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(ipc::AppState::new())
         // The exclusive decrypted-media transport (Story 3.6, AD-4): decrypted
         // bytes reach the webview only over this Range-capable `keeper-media://`
@@ -76,6 +84,31 @@ pub fn run() {
             // request notification permission best-effort. A permission failure only
             // means the OS will drop notifications — it never blocks startup.
             ipc::set_notify_app_handle(app.handle().clone());
+
+            // Store the app handle for the desktop dock-badge port (Story 10.3) so
+            // `Platform::set_badge_count` can drive the main window's OS dock badge from
+            // the Rust-computed cross-account unread/mention aggregate while the window is
+            // hidden. Unset before this point → an honest no-op (never a panic).
+            ipc::set_badge_app_handle(app.handle().clone());
+
+            // Build the menu-bar (tray) icon at startup only when the persisted opt-in
+            // toggle is on (Story 10.3, FR-53). Off by default → no tray. A read failure
+            // defaults off (the tray is a convenience, never load-bearing).
+            {
+                let state = app.state::<ipc::AppState>();
+                let present = state
+                    .platform
+                    .data_dir()
+                    .and_then(|dir| keeper_core::registry::get_menu_bar_presence(&dir))
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "tray: could not read menu-bar presence; defaulting off");
+                        false
+                    });
+                if present {
+                    tray::set_tray_presence(app.handle(), true);
+                }
+            }
+
             {
                 use tauri_plugin_notification::NotificationExt;
                 let notifier = app.notification();
@@ -217,8 +250,55 @@ pub fn run() {
             ipc::inbox_subscribe,
             ipc::inbox_unsubscribe,
             ipc::sign_out,
-            ipc::delete_account_archive
+            ipc::delete_account_archive,
+            ipc::dock_badge_mode_get,
+            ipc::dock_badge_mode_set,
+            ipc::launch_at_login_get,
+            ipc::launch_at_login_set,
+            ipc::menu_bar_presence_get,
+            ipc::menu_bar_presence_set
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // Window-close (⌘W / red button) hides the main window instead of destroying it
+        // (Story 10.3, FR-53): the process keeps every account's `SyncService` and the
+        // notification pipeline alive so background behavior is byte-for-byte identical to
+        // foreground. A real quit goes through `RunEvent::ExitRequested` (below), not here.
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    if let Err(error) = window.hide() {
+                        tracing::warn!(%error, "could not hide main window on close; leaving it open");
+                    }
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| match event {
+            // App-quit (⌘Q / native Quit): gracefully stop every account's sync with a
+            // bounded wait, then let the process exit (never `prevent_exit`). This is the
+            // honest-quit guarantee made mechanical — no hidden background process
+            // survives a quit. If shutdown exceeds the bound, still exit (log at warn).
+            tauri::RunEvent::ExitRequested { .. } => {
+                let state = app_handle.state::<ipc::AppState>();
+                // A short, bounded graceful shutdown: `shutdown_all` awaits each
+                // account's `sync.stop()`. Bounding it keeps quit responsive even if a
+                // network teardown hangs.
+                let shutdown = async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        state.accounts.shutdown_all(),
+                    )
+                    .await
+                };
+                if tauri::async_runtime::block_on(shutdown).is_err() {
+                    tracing::warn!("shutdown_all exceeded the quit bound; exiting anyway");
+                }
+            }
+            // macOS dock-icon click while the window is hidden re-shows + focuses it.
+            tauri::RunEvent::Reopen { .. } => {
+                tray::show_main_window(app_handle);
+            }
+            _ => {}
+        });
 }

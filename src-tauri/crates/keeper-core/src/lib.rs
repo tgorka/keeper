@@ -13,6 +13,7 @@ pub mod account;
 pub mod archive;
 pub mod auth;
 pub mod backup;
+pub mod badge;
 pub mod bridge;
 pub mod bridges;
 pub mod demo;

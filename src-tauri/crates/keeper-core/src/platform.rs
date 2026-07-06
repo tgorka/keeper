@@ -47,4 +47,12 @@ pub trait Platform: Send + Sync {
     /// Resolve the path to a bundled sidecar binary by logical `name`.
     /// Not wired in Story 1.1 — returns [`CoreError::Unsupported`].
     fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError>;
+
+    /// Set (or clear) the OS dock badge (Story 10.3, FR-53). `Some(n)` shows the
+    /// count `n`; `None` clears the badge. Driven from the Rust-computed
+    /// cross-account unread/mention aggregate so it stays correct while the window
+    /// is hidden — the count is never derived in the webview. The desktop shell
+    /// wires this to the main window's badge; when no app handle is available
+    /// (headless / tests) it is an honest no-op, never a panic.
+    fn set_badge_count(&self, count: Option<u32>) -> Result<(), CoreError>;
 }
