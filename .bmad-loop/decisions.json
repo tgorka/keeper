@@ -62,6 +62,15 @@
     "label": "Scope later per-concern",
     "resolution": ""
   },
+  "DW-52": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Audit every Client clone in shutdown() and guarantee the last one is dropped before sign_out_cleanup, so EventCacheDropHandles fire and release SQLite handles before dir removal.",
+    "key": "1",
+    "label": "Guarantee last-Client-drop",
+    "resolution": ""
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",
