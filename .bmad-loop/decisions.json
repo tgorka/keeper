@@ -1,0 +1,11 @@
+{
+  "DW-8": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "On sign-out of a StoredSession::Oauth account, best-effort call client.oauth() logout/revocation before local teardown, tolerating failure so offline sign-out still converges. Leave AD-10's local-only path unchanged for password sessions.",
+    "key": "1",
+    "label": "Carve out OAuth revocation",
+    "resolution": ""
+  }
+}
