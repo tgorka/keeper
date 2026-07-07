@@ -664,6 +664,7 @@ origin: migrated from legacy ledger (spec-10-1-native-notifications-from-the-syn
 location: keeper-core/src/notify.rs (should_notify)
 reason: `keeper-core/src/notify.rs` captures `baseline_ms = now_ms()` once at handler registration and gates on `event_ts_ms >= baseline_ms` (`should_notify`); the handler is registered once per account lifetime (not per reconnect), so when the SyncService catches up after a long gap every missed event has `origin_server_ts >= baseline` and notifies. Two independent reviewers (Blind Hunter, Edge Case Hunter) flagged the clock-model + wake-storm. Story 10.1 documents the timestamp baseline as an accepted MVP tradeoff; a robust fix (read-marker/high-water-mark awareness, or gating on first-live-sync rather than a cross-clock timestamp compare) is design-level work that fits the notification-rules stories (10.2+).
 status: open
+decision: 2026-07-06 Read-marker awareness — Implement read-marker / high-water-mark awareness (or gate on first-live-sync rather than a cross-clock timestamp compare) so a long gap doesn't replay notifications for already-read messages.
 
 ### DW-92: Notifications fire even when the app is foreground-focused and the user is actively viewing the room the message arrived in, with no focus/active-room suppression.
 

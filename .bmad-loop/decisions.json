@@ -151,5 +151,14 @@
     "key": "1",
     "label": "Route through shared coordinator",
     "resolution": ""
+  },
+  "DW-91": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Implement read-marker / high-water-mark awareness (or gate on first-live-sync rather than a cross-clock timestamp compare) so a long gap doesn't replay notifications for already-read messages.",
+    "key": "1",
+    "label": "Read-marker awareness",
+    "resolution": ""
   }
 }
