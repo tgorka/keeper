@@ -8,6 +8,15 @@
     "label": "Add encrypted flag + honest state",
     "resolution": ""
   },
+  "DW-19": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "keep-open",
+    "intent": "",
+    "key": "2",
+    "label": "Leave honest waiting screen",
+    "resolution": "Keep the current honest-but-mislabeled QR waiting screen until a live QR validation session is available."
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",
