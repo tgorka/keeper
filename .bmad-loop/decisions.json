@@ -124,5 +124,14 @@
     "key": "1",
     "label": "Carve out OAuth revocation",
     "resolution": ""
+  },
+  "DW-86": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Add a shared dialog-precedence coordinator: on palette (and cheat-sheet) open, close the user-utility dialogs (search/export/new-chat/add-account) but DEFER to auto-opened security ceremonies (device verification / key backup), so modal depth is provably <= 1 without interrupting a security flow. Resolves DW-90 too.",
+    "key": "1",
+    "label": "Coordinator, defer to ceremonies",
+    "resolution": ""
   }
 }
