@@ -39,6 +39,14 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        // Signed auto-updates (Story 11.2, NFR-12). The updater checks the
+        // GitHub-releases `latest.json` endpoint (config in `tauri.conf.json`
+        // `plugins.updater`) and verifies every downloaded artifact against the
+        // committed minisign public key before installing; `tauri-plugin-process`
+        // supplies `relaunch()` for the in-app update flow to restart into the new
+        // build. The in-app "check for updates" control drives both from the webview.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(ipc::AppState::new())
         // The exclusive decrypted-media transport (Story 3.6, AD-4): decrypted
         // bytes reach the webview only over this Range-capable `keeper-media://`
@@ -143,6 +151,7 @@ pub fn run() {
             ipc::bridge_subscribe_health,
             ipc::bridge_unsubscribe_health,
             ipc::demo_subscribe,
+            ipc::egress_list,
             ipc::login_password,
             ipc::login_oidc,
             ipc::cancel_oidc,

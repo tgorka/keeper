@@ -33,7 +33,17 @@ vi.mock("@/lib/ipc/client", () => ({
       conflict: null,
     }),
   ),
+  egressList: vi.fn(() => Promise.resolve([])),
   verificationCancel: vi.fn(() => Promise.resolve()),
+}));
+
+// The About section (mounted by the dialog) imports the updater/process plugins;
+// mock them so the dialog renders in jsdom without a Tauri runtime.
+vi.mock("@tauri-apps/plugin-updater", () => ({
+  check: vi.fn(() => Promise.resolve(null)),
+}));
+vi.mock("@tauri-apps/plugin-process", () => ({
+  relaunch: vi.fn(() => Promise.resolve()),
 }));
 
 import {

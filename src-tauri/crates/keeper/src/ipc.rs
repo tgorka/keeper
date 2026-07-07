@@ -15,6 +15,7 @@ use keeper_core::account::AccountManager;
 use keeper_core::auth;
 use keeper_core::auth::BeeperFlowRegistry;
 use keeper_core::demo::snapshot_then_diff;
+use keeper_core::egress::{compute_egress, EGRESS_UPDATE_ENDPOINT};
 use keeper_core::error::{
     AccountError, ArchiveError, AuthError, BackupError, BridgeError, CoreError, InboxError,
     MediaError, PlatformError, SendError, SignalError, TimelineError, VerificationError,
@@ -25,11 +26,12 @@ use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
     ChatNotifyMode, ConnectionStatusBatch, CouplingCaveatVm, DemoBatch, DockBadgeMode,
-    DraftMirrorBatch, EditVersionVm, EncryptionStatusBatch, ExportPhase, ExportProgressVm,
-    ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError, IpcErrorCode, MenuSectionVm,
-    NetworksSnapshot, NewChatResolutionVm, NotifyTarget, OutboxVm, PaginationStatusBatch,
-    PaletteMode, PaletteResultsVm, PingVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
-    SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
+    DraftMirrorBatch, EditVersionVm, EgressEndpointVm, EncryptionStatusBatch, ExportPhase,
+    ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError, IpcErrorCode,
+    MenuSectionVm, NetworksSnapshot, NewChatResolutionVm, NotifyTarget, OutboxVm,
+    PaginationStatusBatch, PaletteMode, PaletteResultsVm, PingVm, Provider, RemoteDraftVm,
+    ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch,
+    TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -3196,6 +3198,38 @@ pub async fn session_restore(state: State<'_, AppState>) -> Result<Vec<AccountVm
     auth::find_restorable_accounts(state.platform.as_ref()).map_err(to_ipc_error)
 }
 
+/// Report the live set of network destinations keeper contacts (Story 11.2,
+/// NFR-11, UX-DR17). Reads the accounts registry from the same path
+/// [`session_restore`] uses — `registry::list_accounts` — projects each row to its
+/// `(homeserver_url, Provider)`, and feeds them plus the shared
+/// [`EGRESS_UPDATE_ENDPOINT`] into the pure `compute_egress`. The result is
+/// rendered as UI under Settings → About so keeper's egress claim is verifiable,
+/// never asserted: each homeserver (deduped), `api.beeper.com` exactly when a
+/// Beeper account exists, and the update endpoint. A legacy row with no/unknown
+/// `provider` tag maps to [`Provider::Password`] — Beeper detection still catches
+/// it by host. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub async fn egress_list(state: State<'_, AppState>) -> Result<Vec<EgressEndpointVm>, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let rows = keeper_core::registry::list_accounts(&data_dir).map_err(to_ipc_error)?;
+    let accounts: Vec<(String, Provider)> = rows
+        .into_iter()
+        .map(|row| {
+            // A row created after Story 2.5 carries a durable provider tag; a legacy
+            // NULL / unrecognized tag falls back to Password. Beeper-by-host detection
+            // inside `compute_egress` still surfaces `api.beeper.com` for a legacy
+            // Beeper row, so the fallback never omits a real destination.
+            let provider = row
+                .provider
+                .as_deref()
+                .and_then(Provider::from_registry_str)
+                .unwrap_or(Provider::Password);
+            (row.homeserver_url, provider)
+        })
+        .collect();
+    Ok(compute_egress(&accounts, EGRESS_UPDATE_ENDPOINT))
+}
+
 /// Subscribe to the merged unified inbox across every restorable account (FR-18,
 /// AD-20, Story 4.2 + 4.3 + 4.4). Activates each account, opens its room-list
 /// stream, and partitions the recency-ordered merge into four [`InboxBatch`]
@@ -3325,6 +3359,28 @@ mod tests {
     #[test]
     fn now_ms_is_positive() {
         assert!(now_ms() > 0);
+    }
+
+    /// Egress honesty guard (Story 11.2, NFR-11): the About surface shows
+    /// `EGRESS_UPDATE_ENDPOINT`, but the updater actually checks the URL in
+    /// `tauri.conf.json` `plugins.updater.endpoints`. If these two literals drift, the
+    /// egress list would disclose a destination the app no longer contacts — the exact
+    /// dishonesty this story prevents. Fail the build the moment they diverge.
+    #[test]
+    fn egress_update_endpoint_matches_tauri_conf() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri.conf.json parses as JSON");
+        let endpoints = conf["plugins"]["updater"]["endpoints"]
+            .as_array()
+            .expect("plugins.updater.endpoints is an array");
+        assert!(
+            endpoints
+                .iter()
+                .any(|e| e.as_str() == Some(EGRESS_UPDATE_ENDPOINT)),
+            "EGRESS_UPDATE_ENDPOINT ({EGRESS_UPDATE_ENDPOINT}) must appear in \
+             tauri.conf.json plugins.updater.endpoints ({endpoints:?}) — keep the egress \
+             list and the updater config in sync"
+        );
     }
 
     #[test]

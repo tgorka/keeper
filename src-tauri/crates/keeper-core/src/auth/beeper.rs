@@ -41,8 +41,11 @@ use super::AuthProvider;
 /// — the Beeper tab never asks for a homeserver.
 pub const BEEPER_HOMESERVER: &str = "https://matrix.beeper.com";
 
-/// Base URL of Beeper's unofficial login API.
-const BEEPER_API_BASE: &str = "https://api.beeper.com";
+/// Base URL of Beeper's unofficial login API. This is the single source of truth for
+/// the `api.beeper.com` origin — the egress list (Story 11.2) reuses it so the
+/// disclosed Beeper destination can never drift from where the login flow actually
+/// connects.
+pub const BEEPER_API_BASE: &str = "https://api.beeper.com";
 
 /// The public bearer token every Beeper client sends on the unofficial login
 /// API. This is NOT a secret — it is a well-known constant shared by all Beeper

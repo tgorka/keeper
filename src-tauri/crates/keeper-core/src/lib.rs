@@ -18,6 +18,7 @@ pub mod bridge;
 pub mod bridges;
 pub mod demo;
 pub mod drafts;
+pub mod egress;
 pub mod error;
 pub mod inbox;
 pub mod media;

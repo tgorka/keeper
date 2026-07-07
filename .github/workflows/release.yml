@@ -17,7 +17,11 @@ jobs:
     name: Signed, notarized macOS release (aarch64)
     runs-on: macos-latest
     steps:
+      # fetch-depth: 0 pulls full history + tags so the "Egress diff note" step can
+      # diff docs/egress.md against the previous tag (Story 11.2, NFR-11, AD-23).
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -58,9 +62,60 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/api_key.p8
+          # Signed auto-updates (Story 11.2, NFR-12). Tauri signs the updater artifacts
+          # with this minisign private key; the app verifies each download against the
+          # committed `plugins.updater.pubkey` before installing. Both come only from
+          # GitHub secrets — the private key is never in the repo. If either secret is
+          # empty (e.g. before a maintainer provisions their keypair per docs/release.md)
+          # the updater artifacts are simply not signed.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "keeper ${{ github.ref_name }}"
           releaseDraft: true
           prerelease: false
           args: --config src-tauri/crates/keeper/tauri.conf.json --target aarch64-apple-darwin
+
+      # Per-release egress diff note (Story 11.2, NFR-11, AD-23): docs/egress.md is the
+      # canonical, diffable egress surface. Diff it against the previous tag into the job
+      # summary so any change to where keeper sends traffic is visible per release. On the
+      # first tag (no previous tag) publish the file itself as the baseline. Requires the
+      # full-history checkout (fetch-depth: 0) above.
+      - name: Egress diff note
+        if: always()
+        # REF comes in as an env var, never interpolated into the script body, so a
+        # crafted ref can't inject shell (GitHub-Actions script-injection guard).
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Egress diff (docs/egress.md)"
+            echo
+            if [ ! -f docs/egress.md ]; then
+              echo "> docs/egress.md is missing at \`$REF\` — the egress surface is undocumented for this release."
+            elif prev="$(git describe --tags --abbrev=0 "$REF^" 2>/dev/null)" && [ -n "$prev" ]; then
+              # Capture the diff so we can distinguish "no change" from a diff failure
+              # instead of blindly swallowing both with `|| true`.
+              if diff="$(git diff "$prev" "$REF" -- docs/egress.md)"; then
+                if [ -z "$diff" ]; then
+                  echo "No change to docs/egress.md since \`$prev\`."
+                else
+                  echo "Changes since \`$prev\`:"
+                  echo
+                  echo '```diff'
+                  echo "$diff"
+                  echo '```'
+                fi
+              else
+                echo "> Could not diff docs/egress.md against \`$prev\` (history incomplete) — review the file manually."
+              fi
+            else
+              echo "No previous tag — publishing the current egress surface as the baseline:"
+              echo
+              echo '```markdown'
+              cat docs/egress.md
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1301,6 +1301,48 @@ impl Provider {
     }
 }
 
+/// The kind of a network egress destination (Story 11.2, NFR-11).
+///
+/// Classifies each entry in the [`EgressEndpointVm`] list the Settings → About
+/// surface renders so the frontend can label it honestly without re-deriving the
+/// classification. `Homeserver` is an account's Matrix homeserver; `Beeper` is the
+/// `api.beeper.com` login/service endpoint present exactly when a Beeper account
+/// exists; `Update` is the signed-update endpoint the app checks. Serializes to
+/// `"homeserver" | "beeper" | "update"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum EgressKind {
+    /// A Matrix homeserver an account is signed into.
+    Homeserver,
+    /// Beeper's `api.beeper.com` service endpoint (present iff a Beeper account exists).
+    Beeper,
+    /// The signed auto-update endpoint (`plugins.updater.endpoints`).
+    Update,
+}
+
+/// One network destination keeper contacts, derived from live app state (Story
+/// 11.2, NFR-11, UX-DR17).
+///
+/// The Settings → About surface renders the full set of these — computed by
+/// `egress::compute_egress` from the accounts registry (each homeserver, plus
+/// `api.beeper.com` when a Beeper account exists) and the shared update endpoint —
+/// so keeper's egress claim is verifiable rather than asserted. Never fabricated,
+/// never stale-cached: it is read from the same registry the session-restore path
+/// uses on each open. `url` is the destination shown; `label` is a short honest
+/// caption; `kind` classifies it for rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct EgressEndpointVm {
+    /// The destination URL (or the raw stored homeserver string when unparseable).
+    pub url: String,
+    /// The classification of this destination.
+    pub kind: EgressKind,
+    /// A short, honest human-readable caption for the destination.
+    pub label: String,
+}
+
 /// The durable per-Chat / per-Network mute intent stamped on a room row (Story
 /// 10.2, FR-52, AD-18).
 ///

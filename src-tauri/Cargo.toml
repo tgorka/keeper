@@ -35,6 +35,12 @@ tauri-plugin-notification = "2"
 # Opt-in launch-at-login via a macOS LaunchAgent (Story 10.3, FR-53, AD-25). The plugin
 # owns the enabled state authoritatively; off by default. Apache/MIT — passes `cargo deny`.
 tauri-plugin-autostart = "2"
+# Signed auto-updates (Story 11.2, NFR-12). The updater checks the GitHub-releases
+# `latest.json` endpoint and verifies each artifact against the committed minisign public
+# key before installing; `tauri-plugin-process` supplies `relaunch()` after an update.
+# Both are MIT/Apache — pass `cargo deny check`.
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 # Serialization + IPC bindings
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

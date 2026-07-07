@@ -21,7 +21,7 @@ use std::time::Duration;
 /// `keeper_core::auth::{BeeperFlowRegistry, …}` alongside the other providers.
 pub mod beeper;
 
-pub use beeper::{BeeperAuthProvider, BeeperFlowRegistry, BEEPER_HOMESERVER};
+pub use beeper::{BeeperAuthProvider, BeeperFlowRegistry, BEEPER_API_BASE, BEEPER_HOMESERVER};
 
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::authentication::oauth::{ClientId, OAuthSession, UserSession};
@@ -692,7 +692,12 @@ fn infer_legacy_provider(session_json: &str, homeserver_url: &str) -> Provider {
 /// Whether `homeserver_url` resolves to Beeper's homeserver host
 /// (`matrix.beeper.com`), matched exactly on the host component. A malformed URL
 /// is not Beeper. Reuses [`BEEPER_HOMESERVER`]'s host as the single source.
-fn is_beeper_homeserver(homeserver_url: &str) -> bool {
+///
+/// This is the single source of truth for Beeper host detection, reused by the
+/// egress computation (Story 11.2) so `api.beeper.com` appears exactly when an
+/// account is Beeper (by host); the provider-tag path (`Provider::Beeper`) is the
+/// other half of the same "is Beeper" test.
+pub fn is_beeper_homeserver(homeserver_url: &str) -> bool {
     let beeper_host = url::Url::parse(BEEPER_HOMESERVER)
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned));

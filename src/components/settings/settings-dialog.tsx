@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
+import { AboutSection } from "@/components/settings/about-section";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
   SDK_STORE_STATUS_LOADING,
@@ -122,6 +123,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         <ShortcutsSection open={open} />
         <EncryptionSection />
         <SetupSection onOpenChange={onOpenChange} />
+        <AboutSection open={open} />
       </DialogContent>
     </Dialog>
   );

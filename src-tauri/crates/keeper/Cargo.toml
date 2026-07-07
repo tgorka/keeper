@@ -46,6 +46,11 @@ tauri-plugin-notification = { workspace = true }
 # Opt-in launch-at-login (Story 10.3, FR-53, AD-25). Registered in `lib.rs`; toggled
 # through the `launch_at_login_set` command via `ManagerExt::autolaunch()`.
 tauri-plugin-autostart = { workspace = true }
+# Signed auto-updates (Story 11.2, NFR-12). Registered in `lib.rs`; the in-app
+# "check for updates" flow drives it from the frontend via `@tauri-apps/plugin-updater`.
+# `tauri-plugin-process` supplies `relaunch()` after applying an update.
+tauri-plugin-updater = { workspace = true }
+tauri-plugin-process = { workspace = true }
 # Percent-decoding raw-body IPC headers (filename/caption) for the pasted-image
 # send path (Story 3.7). Already in the tree via url/matrix-sdk.
 percent-encoding = { workspace = true }

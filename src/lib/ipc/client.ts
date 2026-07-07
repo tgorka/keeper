@@ -10,6 +10,7 @@ import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
+import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
 import type { IpcError } from "./gen/IpcError";
 import type { NotifyTarget } from "./gen/NotifyTarget";
 
@@ -41,6 +42,8 @@ export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
 export type { DockBadgeMode } from "./gen/DockBadgeMode";
 export type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
 export type { EditVersionVm } from "./gen/EditVersionVm";
+export type { EgressEndpointVm } from "./gen/EgressEndpointVm";
+export type { EgressKind } from "./gen/EgressKind";
 export type { EncryptionStatus } from "./gen/EncryptionStatus";
 export type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 export type { ExportPhase } from "./gen/ExportPhase";
@@ -634,6 +637,20 @@ export async function revealPath(path: string): Promise<void> {
  */
 export async function sessionRestore(): Promise<AccountVm[]> {
   return await invoke<AccountVm[]>("session_restore");
+}
+
+/**
+ * Report the live set of network destinations keeper contacts (Story 11.2, NFR-11,
+ * UX-DR17). The Rust core reads the accounts registry (the same path
+ * {@link sessionRestore} uses) and computes, from live state, each homeserver
+ * (deduplicated), `api.beeper.com` exactly when a Beeper account exists, and the
+ * signed-update endpoint. The Settings → About surface renders the returned
+ * {@link EgressEndpointVm} list directly so keeper's egress claim is verifiable
+ * rather than asserted — never hardcoded, never stale. Rejects with the
+ * {@link IpcError} envelope on a registry read failure.
+ */
+export async function egressList(): Promise<EgressEndpointVm[]> {
+  return await invoke<EgressEndpointVm[]>("egress_list");
 }
 
 /**
