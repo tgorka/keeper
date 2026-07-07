@@ -44,6 +44,15 @@
     "label": "Ceiling honoring m.upload.size",
     "resolution": ""
   },
+  "DW-38": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Add the 4.1 unread/mention treatment to compact Favorites rows and emit the needed unread/mention state for favourited rooms.",
+    "key": "1",
+    "label": "Add unread/mention cue",
+    "resolution": ""
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",

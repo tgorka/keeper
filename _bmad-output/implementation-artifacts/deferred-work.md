@@ -275,6 +275,7 @@ origin: migrated from legacy ledger (spec-4-4-favorites.md), 2026-07-06
 location: src/components/.../favorites-section.tsx + keeper-core inbox.rs (emit)
 reason: `favorites-section.tsx` compact rows render only `RoomAvatar` + `displayName` (per the spec's "avatar + single-line name"); `inbox.rs::emit` routes `!pinned && is_favourite` rooms exclusively to the Favorites window (excluded from Inbox/Archive), so the epic-wide "chat name weight 600 = unread, neutral dot / filled mention badge" cue (Story 4.1) never appears for them. This matches the spec-as-written and the Pins-strip precedent (4.3 hoisted rows are avatar-only), so it is not a defect in this story, but it is a real information-loss surprise: favouriting a chat hides its unread state from the whole inbox surface. Deferred as a UX-design decision — whether compact Favorites rows should carry the 4.1 unread/mention treatment — rather than inventing the visual treatment unattended in this story.
 status: open
+decision: 2026-07-06 Add unread/mention cue — Add the 4.1 unread/mention treatment to compact Favorites rows and emit the needed unread/mention state for favourited rooms.
 
 ### DW-39: Two Spaces with the same display name owned by different accounts render as indistinguishable SPACES sidebar rows (avatar + name only), so a user cannot tell which account's Space they are selecting.
 
