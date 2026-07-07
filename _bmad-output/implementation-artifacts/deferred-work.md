@@ -528,7 +528,9 @@ status: open
 origin: migrated from legacy ledger (spec-7-1-persistent-per-chat-drafts.md), 2026-07-06
 location: keeper-core registry.rs (drafts schema)
 reason: `registry.rs` `drafts` schema stores `body` as cleartext; the intent contract's "keeper.db conventions" clause was framed against `pins` (room membership metadata), not message content. A stolen-laptop / leaked-backup threat model exposes half-written private messages verbatim. Worth an explicit ADR note confirming plaintext-at-rest is acceptable for draft content, or an encryption pass aligning drafts with the app's other at-rest sensitivity boundaries.
-status: open
+status: done 2026-07-06
+resolution: closed by human decision: Record an ADR explicitly confirming plaintext-at-rest is acceptable for draft content (the minimal conscious decision); note encryption is the stronger posture if revisited.
+decision: 2026-07-06 ADR accepting plaintext — Record an ADR explicitly confirming plaintext-at-rest is acceptable for draft content (the minimal conscious decision); note encryption is the stronger posture if revisited.
 
 ### DW-74: The cross-device mirror dedupe map `LAST_MIRRORED` (drafts.rs) is a process-wide static that grows one entry per `(account, room)` ever mirrored and is never pruned on account sign-out or teardown, so it accumulates unboundedly over a very long session.
 
