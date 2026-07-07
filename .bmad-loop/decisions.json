@@ -98,6 +98,15 @@
     "label": "Probe bridge domains",
     "resolution": ""
   },
+  "DW-59": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Enable ping for a chosen conservative set of networks and cadence in health-signals.json, balancing silent-death detection against the spam constraint.",
+    "key": "1",
+    "label": "Ship ping (chosen cadence)",
+    "resolution": ""
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",

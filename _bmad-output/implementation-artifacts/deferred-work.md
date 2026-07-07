@@ -429,6 +429,7 @@ origin: migrated from legacy ledger (spec-6-5-bridge-session-health-and-re-login
 location: health-signals.json + keeper-core bridges/health.rs (run_liveness_tick)
 reason: `run_liveness_tick` (bridges/health.rs) early-returns when no wiring enables ping (a prior-pass patch), so `ping_once`/`PingTimeout`/the debounce path is dead code in production; health only changes when the bot voluntarily posts a notice. The mechanism is fully implemented and unit-tested and enabling it is a data-only change, but doing so trades against the intent's "Never: continuous/aggressive bot-pinging that spams the management room" constraint — a product decision on whether (and per which networks) to ship ping enabled, with the spam-cadence tradeoff, is owed. Related consequence: a session stuck `Degraded` ("reconnecting") with ping off and no further notice never escalates to `Disconnected`.
 status: open
+decision: 2026-07-06 Ship ping (chosen cadence) — Enable ping for a chosen conservative set of networks and cadence in health-signals.json, balancing silent-death detection against the spam constraint.
 
 ### DW-60: The non-dismissible in-conversation health banner's visibility is coupled to window membership — it resolves `networkId` from `useSelectedRoomVm()`, which returns `null` when the open room is not in any streamed window, which would silently hide the story's primary in-conversation safety surface.
 
