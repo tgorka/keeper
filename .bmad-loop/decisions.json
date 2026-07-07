@@ -53,6 +53,15 @@
     "label": "Add unread/mention cue",
     "resolution": ""
   },
+  "DW-45": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "keep-open",
+    "intent": "",
+    "key": "3",
+    "label": "Scope later per-concern",
+    "resolution": ""
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",

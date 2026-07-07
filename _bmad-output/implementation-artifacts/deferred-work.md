@@ -325,6 +325,7 @@ origin: migrated from legacy ledger (spec-5-1-archive-ingestion-pipeline.md), 20
 location: keeper-core account.rs (register_archive_handler)
 reason: `account.rs::register_archive_handler` registers an `add_event_handler` typed `OriginalSyncRoomMessageEvent`, which fires only for non-redacted `m.room.message` delivered forward through sync. This matches the story's ACs (text/media message history through the sync flow) and the epic's sequencing — redaction/edit durability is Story 5.2, archive-first pagination is Story 5.6 — so it is not a defect in 5.1, but the archive is intentionally not a total capture of everything a server holds. Deferred: decide which additional event classes (reactions, UTD-then-redecrypted events, paginated history) the archive should ingest, in the stories that own those concerns.
 status: open
+decision: 2026-07-06 Scope later per-concern
 
 ### DW-46: If `Platform::data_dir()` fails, `AppState::new` points `archive.db` at the OS temp dir, so the archive would silently land in a wipe-on-reboot location instead of disabling archiving.
 
