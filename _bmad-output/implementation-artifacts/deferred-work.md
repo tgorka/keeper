@@ -29,7 +29,14 @@ resolution: already resolved: account.rs:4464 sign_out() now calls self.shutdown
 origin: migrated from legacy ledger (spec-1-5-timeline-view-receive-text.md), 2026-07-06
 location: src/lib/ipc/client.ts
 reason: On a rejected subscribe (e.g. `timelineUnavailable`/`syncUnavailable`), the promise rejects and the caller shows the inline error, but the `Channel` created inside `subscribe()` keeps its `onmessage` handler and its Tauri callback registration — nothing nulls it or drops the channel. Repeated retries of a failing room accumulate dangling handlers. Pre-existing: the helper predates this story (added for the room-list stream in Story 1.4) and is unchanged here; Story 1.5 only exercises the failure path more readily via `RoomNotFound`/`Build`. No functional bug on the happy path (no backend task is spawned on failure, so no stale batch is delivered), so deferred rather than patched in this story. Fix: in `subscribe()`, clear `channel.onmessage` (and drop the channel) in a `catch`/`finally` around `invoke`.
-status: open
+status: closed
+resolution: wont-fix (coordinator, 2026-07-06). The prescribed `onmessage = null` fix is a
+no-op — `@tauri-apps/api` Channel registers its callback in the constructor and frees it
+only via the non-public `cleanupCallback()`; both sweep reviewers confirmed. The two real
+fixes (undocumented internal API; backend unsubscribe Rust change) violate the conservative
+dependency posture / bundle scope. Impact is a single dangling callback registration per
+FAILED subscribe (error path only, no producer spawned, no stale data) — a bounded,
+theoretical memory leak. Revisit only if a public Channel teardown API lands in Tauri.
 
 ### DW-5: The FR-41 single-dispatch-gate guard test (`keeper-core/src/send.rs`) is module-scoped and string-literal-based — it `include_str!`s only `send.rs` and scans for the exact substring `.send(content)`, so it cannot see a `Timeline::send` added in another file and is defeated by a variable rename, inlining, or line-splitting of the call.
 
