@@ -71,6 +71,15 @@
     "label": "Guarantee last-Client-drop",
     "resolution": ""
   },
+  "DW-54": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "keep-open",
+    "intent": "",
+    "key": "2",
+    "label": "Measure first",
+    "resolution": "Measure real disk-growth expectations before committing to a retention policy."
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",

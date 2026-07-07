@@ -391,6 +391,7 @@ origin: migrated from legacy ledger (spec-5-6-archive-first-pagination.md), 2026
 location: keeper-core account.rs (activate — SqliteEventCacheStore)
 reason: The change broadens on-disk persistence from opened-rooms-only to all-synced-rooms. The SDK's `auto_shrink_linked_chunk_task` bounds in-memory linked chunks but the persisted event-cache store still grows, and `archive.db` already persists message content independently — so keeper now holds two overlapping on-disk copies of synced history. For a long-lived archival client this is a capacity question (eviction/retention policy, disk-growth expectations) worth a deliberate assessment; it is a spine-sanctioned trade-off today (SPINE places the persisted event cache in the sdk dir), not a defect.
 status: open
+decision: 2026-07-06 Measure first — Measure real disk-growth expectations before committing to a retention policy.
 
 ### DW-55: There is no UI entry point to purge a leftover local archive for an account that is already signed out (a failed or app-killed-mid-flow archive deletion leaves that account's rows on disk with no later retry surface).
 
