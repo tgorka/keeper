@@ -13,7 +13,8 @@ resolution: resolved by sweep bundle dw-login-error-open-in-browser
 origin: migrated from legacy ledger (spec-1-3-password-login-with-sliding-sync-verification.md), 2026-07-06
 location: keeper-core auth::map_login_error
 reason: `matrix_auth().login_username()` does not pre-fetch the `/login` flow list, and Synapse returns `M_FORBIDDEN` for a password-login-disabled server (same errcode as a wrong password). The spec's error-kind mapping (`Forbidden`→`InvalidCredentials`, `Unrecognized`/`InvalidParam`→`UnsupportedLoginType`) therefore cannot reliably satisfy the I/O-matrix row for "unsupported login type." A robust fix is a pre-login `matrix_auth().login_types()` / supported-flows check to detect `m.login.password` before attempting login. Low user impact (uncommon scenario, both outcomes are non-retriable password-login failures); deferred rather than re-deriving the flow — the spec consciously chose error-kind mapping and did not mandate a flow pre-check.
-status: open
+status: done 2026-07-06
+resolution: resolved by sweep bundle dw-login-unsupported-type-detection
 
 ### DW-3: An activated account's `Client`/`SyncService` runs for the process lifetime — `AccountManager::shutdown` (which now stops sync and aborts tasks) exists but is never called from any sign-out or account-change path, so sync is not torn down on sign-out.
 

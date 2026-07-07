@@ -26,6 +26,7 @@ pub use beeper::{BeeperAuthProvider, BeeperFlowRegistry, BEEPER_API_BASE, BEEPER
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::authentication::oauth::{ClientId, OAuthSession, UserSession};
 use matrix_sdk::authentication::AuthSession;
+use matrix_sdk::ruma::api::client::session::get_login_types::v3::LoginType;
 use matrix_sdk::ruma::api::FeatureFlag;
 use matrix_sdk::store::RoomLoadSettings;
 use matrix_sdk::Client;
@@ -98,9 +99,31 @@ impl AuthProvider for PasswordAuthProvider<'_> {
         client: &Client,
         _platform: &dyn Platform,
     ) -> Result<(), CoreError> {
-        client
-            .matrix_auth()
-            .login_username(self.username, self.password)
+        let auth = client.matrix_auth();
+
+        // Pre-login supported-flows probe (DW-2): a homeserver with password
+        // login disabled returns M_FORBIDDEN on login_username — the same errcode
+        // as a wrong password — so `map_login_error` alone cannot tell the two
+        // apart. Query GET /login up front and, only when the probe *definitively*
+        // shows the homeserver does not advertise `m.login.password`, classify it
+        // as UnsupportedLoginType before wasting a login attempt. A probe
+        // transport/HTTP failure is non-fatal: log and fall through to the real
+        // login, whose own error (via `map_login_error`) stays authoritative — so
+        // the probe never turns a would-succeed login into a spurious failure.
+        match auth.get_login_types().await {
+            Ok(types) if !flows_include_password(&types.flows) => {
+                return Err(AuthError::UnsupportedLoginType(
+                    "homeserver does not offer m.login.password".to_owned(),
+                )
+                .into());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::info!(error = %e, "login-types probe failed; proceeding to login attempt")
+            }
+        }
+
+        auth.login_username(self.username, self.password)
             .initial_device_display_name("keeper")
             .send()
             .await
@@ -375,6 +398,16 @@ fn generate_store_passphrase() -> String {
         .take(32)
         .map(char::from)
         .collect()
+}
+
+/// Whether the homeserver's advertised login flows include `m.login.password`.
+///
+/// Keyed off the SDK's [`LoginType::login_type()`] discriminant string rather than
+/// the `Password(_)` variant, so it stays correct across ruma's `#[non_exhaustive]`
+/// enum without depending on the variant shape. Pure and network-free so the
+/// pre-login classification is unit-testable.
+fn flows_include_password(flows: &[LoginType]) -> bool {
+    flows.iter().any(|f| f.login_type() == "m.login.password")
 }
 
 /// Map a matrix-sdk login error to the secret-free [`AuthError`] taxonomy.
@@ -806,6 +839,51 @@ mod tests {
             "passphrase must be alphanumeric"
         );
         assert_ne!(a, b, "two generated passphrases must differ");
+    }
+
+    /// Construct a `LoginType` for a given discriminant string, with empty flow
+    /// data, so `flows_include_password` can be exercised without a network.
+    fn login_type(type_str: &str) -> LoginType {
+        use matrix_sdk::ruma::serde::JsonObject;
+        LoginType::new(type_str, JsonObject::default()).expect("valid login type")
+    }
+
+    #[test]
+    fn flows_include_password_true_when_present_among_mixed_flows() {
+        let flows = [login_type("m.login.sso"), login_type("m.login.password")];
+        assert!(
+            flows_include_password(&flows),
+            "password among mixed flows must be detected"
+        );
+    }
+
+    #[test]
+    fn flows_include_password_false_for_sso_only() {
+        let flows = [login_type("m.login.sso")];
+        assert!(
+            !flows_include_password(&flows),
+            "sso-only flows omit password"
+        );
+    }
+
+    #[test]
+    fn flows_include_password_false_for_empty_flows() {
+        assert!(
+            !flows_include_password(&[]),
+            "no advertised flows means no password support"
+        );
+    }
+
+    #[test]
+    fn flows_include_password_false_for_custom_or_unknown_only() {
+        let flows = [
+            login_type("m.login.token"),
+            login_type("com.example.custom"),
+        ];
+        assert!(
+            !flows_include_password(&flows),
+            "token/custom-only flows omit password"
+        );
     }
 
     /// Build a `MatrixSession` from its flattened JSON shape (user_id, device_id,
