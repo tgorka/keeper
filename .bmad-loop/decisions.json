@@ -89,6 +89,15 @@
     "label": "Broaden detection",
     "resolution": ""
   },
+  "DW-57": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Probe/accept configured appservice/bridge domain(s) in addition to the account's own server when building probe MXIDs and matching DM targets.",
+    "key": "1",
+    "label": "Probe bridge domains",
+    "resolution": ""
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",

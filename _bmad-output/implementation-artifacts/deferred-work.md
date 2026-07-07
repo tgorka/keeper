@@ -414,6 +414,7 @@ origin: migrated from legacy ledger (spec-6-2-bridge-discovery.md), 2026-07-06
 location: keeper-core bridges/discovery.rs (bot_network_for)
 reason: `bridges/discovery.rs` builds the probe MXID as `@{localpart}:{server_name}` from `own_user.server_name()`, and `bot_network_for` rejects any DM target whose `server_name() != own_server`. Under the common self-hosted topology (user `@me:example.org`, bot `@whatsappbot:bridge.example.org`) sources (b) and (c-bot-DM) both produce nothing and only source (a)/(c-portal) can find the network. The single-domain (Beeper-style) assumption is documented in code docstrings but is not called out in the spec's Boundaries as an accepted limitation, so on a standard mautrix deployment discovery will under-report. A later story should either probe/accept the appservice/bridge domain(s) or record this as an explicit, product-blessed topology constraint. See [[DW-56]].
 status: open
+decision: 2026-07-06 Probe bridge domains — Probe/accept configured appservice/bridge domain(s) in addition to the account's own server when building probe MXIDs and matching DM targets.
 
 ### DW-58: The impure discovery shell (`fetch_protocol_ids` wiring, `scan_rooms` portal/DM detection, `bot_network_for` server matching, `probe_network_bots` error-kind handling) has zero test coverage — only the pure `merge_discovery`/`merge_catalog`/`protocols_error_degrades` functions are unit-tested.
 
