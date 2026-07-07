@@ -169,5 +169,14 @@
     "key": "1",
     "label": "Add focus/active-room suppression",
     "resolution": ""
+  },
+  "DW-99": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Swap the desktop notifier to a click-capable backend (mac-notification-sys wait_for_click(true) with a shell-side id->target map, or UNUserNotificationCenter) and route NotifyTarget::Message to exact Chat/Account/message focus and NotifyTarget::Bridge to the specific network's re-login sheet.",
+    "key": "1",
+    "label": "Swap to click-capable backend",
+    "resolution": ""
   }
 }
