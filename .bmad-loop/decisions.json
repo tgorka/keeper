@@ -107,6 +107,15 @@
     "label": "Ship ping (chosen cadence)",
     "resolution": ""
   },
+  "DW-70": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Serialize per-(account,room) draft writes through a promise chain in client.ts (or add a Rust-side stale-write guard), with attended review of the frozen send-ordering invariant.",
+    "key": "1",
+    "label": "Serialize writes (attended)",
+    "resolution": ""
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",
