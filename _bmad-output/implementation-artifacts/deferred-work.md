@@ -19,7 +19,8 @@ status: open
 origin: migrated from legacy ledger (spec-1-4-sliding-sync-room-list.md), 2026-07-06
 location: keeper-core AccountManager::shutdown (never called from sign-out)
 reason: Story 1.4 lazily activates the account on room-list subscribe and never deactivates it; `room_list_unsubscribe` only aborts the per-subscription producer, leaving `SyncService` running (network/battery/crypto) with no subscriber. This is out of 1.4's scope (its `Never` excludes sign-out) and is explicitly Story 1.8's acceptance criterion ("deletes exactly `accounts/<ulid>/sdk/` and Keychain entries, stops the account's supervision tasks, returns to login"). 1.8 must wire a sign-out command to `AccountManager::shutdown(account_id)`. In Epic 1's single-account slice with the room list always mounted while signed in, there is no trigger for the leak, so it is deferred rather than fixed here.
-status: open
+status: done 2026-07-06
+resolution: already resolved: account.rs:4464 sign_out() now calls self.shutdown(account_id).await first (shutdown at :4356 stops sync via handle.sync.stop() and aborts all producer/subscription tasks); wired to the frontend via keeper/src/ipc.rs:3328 sign_out command. Story 1.8 wired sign-out->shutdown as promised.
 
 ### DW-4: The shared `subscribe()` IPC helper (`src/lib/ipc/client.ts`) arms `channel.onmessage` before awaiting `invoke`, but never clears it when `invoke` rejects, so every failed subscribe leaves a live `Channel` handler registered.
 
@@ -40,7 +41,8 @@ status: open
 origin: migrated from legacy ledger (spec-2-1-account-manager-unlimited-concurrent-accounts.md), 2026-07-06
 location: src/hooks/use-connection-status.ts
 reason: Story 2.1's `Never` boundary explicitly defers the per-account sync-state glyph to Story 2.5, so a single positional pill is a deliberate placeholder, not a regression — but it is genuinely wrong for a multi-account setup today. Story 2.5 ("Account Switcher and Per-Account State") builds the per-account sync-state glyph driven by each account's status stream, which is the correct home for this. Fix there: render connectivity per account in the switcher rather than one positional shell pill.
-status: open
+status: done 2026-07-06
+resolution: already resolved: src/hooks/use-connection-status.ts deleted in Story 2.5 (commit 6a0fb04). The shell offline pill is now derived by src/lib/stores/account-status.ts:70 useShellOffline() which ranges over ALL signed-in accounts, not accounts[0].
 
 ### DW-7: Adding or signing out an account tears the entire merged inbox down and rebuilds it — `chat-list-pane.tsx` re-keys its subscribe effect on the sorted account-id set, so every account-set change calls `unsubscribe_inbox` (aborting all producers) then `subscribe_inbox` (reactivating already-live accounts' room lists), briefly clearing the list to the loading state.
 
@@ -68,14 +70,16 @@ status: open
 origin: migrated from legacy ledger (spec-2-4-beeper-coverage-disclosure.md), 2026-07-06
 location: isBeeperAccount (frontend) / StoredSession (keeper-core)
 reason: `AccountVm.homeserverUrl` is the SDK-resolved homeserver after `.well-known/matrix/client` discovery, and a Beeper login persists as a plain `StoredSession::Password` (no provider/kind field), so host match is the only available signal — the spec consciously chose it and forbade adding a provider/kind field in this story ("Never"). It works today (Beeper's well-known resolves back to `matrix.beeper.com`), so there is no live defect. It becomes wrong if Beeper ever redirects its well-known to a different host: every existing and new Beeper account would silently stop being recognized, the footer coverage control would vanish, and the pre-completion disclosure gate would stop firing — with no type/test protection. Fix: persist a durable account-kind tag at add time (extend `StoredSession`/`AccountVm` with a `provider`/`kind` discriminant set by `BeeperAuthProvider`) and key `isBeeperAccount` off that instead of the homeserver host; deferred because the fix touches Rust persistence + IPC shape, which this frontend-only story explicitly excluded.
-status: open
+status: done 2026-07-06
+resolution: already resolved: src/lib/beeper.ts:13 isBeeperAccount returns account.provider === 'beeper' (no host match). Durable provider tag added end-to-end: vm.rs:1272 Provider enum + AccountVm.provider; registry.rs:369 ensure_provider_column + backfill_provider migration; auth.rs:649 resolves provider on restore. Story 2.5.
 
 ### DW-11: The first account is subscribed to its `connection_status` channel twice — once by the pre-existing `use-connection-status` hook (driving the shell offline pill from `accounts[0]`) and once by the new `use-account-statuses` hook (driving every account's switcher glyph) — a redundant subscription that should be consolidated.
 
 origin: migrated from legacy ledger (spec-2-5-account-switcher-and-per-account-state.md), 2026-07-06
 location: src/hooks/use-connection-status.ts + src/hooks/use-account-statuses.ts
 reason: Story 2.5 deliberately left `src/hooks/use-connection-status.ts` untouched (it feeds the Story 1.7 shell offline pill / queued-send caption via the global `connectionStore`) and added a separate `src/hooks/use-account-statuses.ts` + `account-status` store for the per-account switcher glyphs, to keep the story's blast radius small. The backend multiplexes independent subscriptions per id, so the double subscription on `accounts[0]` is harmless (no correctness bug), but it is wasteful and slightly confusing. This also relates to the still-open 2.1 deferred item about the positional shell offline pill (`accounts[0]`-driven): the per-account glyph now exists, so the shell pill could be re-derived from the per-account `account-status` store (e.g. "offline if any/primary account offline") and the redundant hook removed. Fix: make `use-account-statuses` the single connection-status subscriber and derive both the switcher glyphs and the shell pill from `account-status`, retiring `use-connection-status`/`connectionStore` (or reducing `connectionStore` to a selector over the per-account map). Deferred because it touches Story 1.7's offline-pill code and tests, out of 2.5's scope. See [[DW-6]].
-status: open
+status: done 2026-07-06
+resolution: already resolved: use-connection-status.ts deleted (commit 6a0fb04); the single connection-status subscriber is now use-account-statuses.ts:55 (account-status.ts header documents it as 'the SINGLE connection-status subscriber'). The redundant accounts[0] double-subscribe is gone.
 
 ### DW-12: A passphrase-encrypted account whose Keychain passphrase entry is lost (Keychain reset/corruption, manual removal, or a crash between `keychain_set` and the registry-row insert) restores with a generic matrix-sdk-sqlite open/decrypt failure and no honest, actionable "encryption key missing" state — it even boots into the shell as a normal account that silently never syncs.
 
@@ -334,7 +338,8 @@ status: open
 origin: migrated from legacy ledger (spec-5-3-offline-full-text-search-engine.md), 2026-07-06
 location: keeper-core archive/fts.rs
 reason: `archive/fts.rs` only ever runs `INSERT INTO events_fts(rowid, body)` (`index_body`); there is no `INSERT INTO events_fts(events_fts, rowid, body) VALUES('delete', …)` anywhere and `mark_redacted` deliberately does not touch the index (redaction is retrieval-gated at query time via the root-redaction `NOT EXISTS` clause, which is correct for 5.3's mark-not-erase scope). This is by-design for Story 5.3 (its `Never` forbids FTS deletion, reserved for 5.7), but is a real trap the instant a real delete/erase lands: Story 5.7 (and any GDPR/erase work) must add the FTS5 external-content `'delete'` command — or install `AFTER DELETE`/`AFTER UPDATE` sync triggers at table creation — so the index can never drift from `events`.
-status: open
+status: done 2026-07-06
+resolution: already resolved: archive/db.rs:463-491 delete_account_archive issues INSERT INTO events_fts(events_fts,rowid,body) SELECT 'delete',... before DELETE FROM events in one BEGIN IMMEDIATE txn. Story 5.7 (the named actionable trigger) added the FTS5 external-content delete maintenance path exactly as required; no other indexed-row delete/mutate path exists today.
 
 ### DW-49: `events_fts` uses `content_rowid='rowid'`, but `events` has no `INTEGER PRIMARY KEY` (its PK is the composite `(account_id, event_id)`), so its implicit `rowid` is not stable across `VACUUM`; if `archive.db` ever gains an explicit `VACUUM` or `PRAGMA auto_vacuum`, rowids renumber while the FTS shadow tables keep the old numbers and search silently returns wrong-message deep-links.
 
@@ -586,14 +591,16 @@ status: open
 origin: migrated from legacy ledger (spec-9-1-command-palette.md), 2026-07-06
 location: keeper-core palette.rs (palette_actions)
 reason: `palette.rs` `palette_actions()` declares the paired actions with duplicated `shortcut` values and no pairing field. This is fine for the 9-1 palette itself (context/state picks the relevant verb), but the epic-spine data model lacks the metadata 9.3 needs to collapse toggle pairs into one cheat-sheet row. Deferred to story 9.3, which owns the cheat-sheet/menu-bar generation and should add toggle-pairing metadata to the registry. See [[DW-87]], [[DW-89]].
-status: open
+status: done 2026-07-06
+resolution: already resolved: palette.rs:356-373 PaletteActionVm.toggle_group field + toggle() helper set the group on both directions; :582-646 the derived cheat-sheet/native-menu builder collapses each toggle_group pair into one row via combined_toggle_title. Story 9.3 added the pairing metadata the entry required.
 
 ### DW-85: The registry ships 19 actions covering the primary MVP surfaces, but has no action for some secondary shipped surfaces (device verification, key backup, mute), and the "every shipped MVP surface has ≥1 action" acceptance is currently self-certified by a hand-picked id list in a test rather than derived from an actual surface inventory.
 
 origin: migrated from legacy ledger (spec-9-1-command-palette.md), 2026-07-06
 location: keeper-core palette.rs (action catalog + coverage test)
 reason: `palette.rs` action catalog and its coverage test enumerate a fixed id set; epic-3 encryption surfaces (device verification, key backup) and the mute menu have no registered palette action, and their cold-open entry points are uncertain (opening a verification/backup flow out of context may not be well-defined — hence not force-added here, per the spec's Block-If caution against wiring actions to surfaces lacking a clean entry point). Story 9.3 owns the palette-parity release audit (FR-48 release gate); deferred there to enforce completeness via a derived parity test with proper entry points for the remaining surfaces.
-status: open
+status: done 2026-07-06
+resolution: already resolved: palette.rs:531-548 mute-chat/mention-only-chat/unmute-chat actions added; :1047-1112 parity_every_mvp_surface_has_an_action_or_is_excluded test is now a derived surface-inventory gate (not a hand-picked id list). Device-verification/key-backup remain intentionally excluded with documented rationale, which the entry endorsed. Story 9.3 + 10.2.
 
 ### DW-86: The "modal depth ≤ 1 — opening ⌘K closes anything below it" invariant (Boundaries & Constraints + the fifth AC) is asserted in comments but never enforced — pressing ⌘K while a Search/Export/New-Chat/Add-Account/device-verification/key-backup dialog is open stacks the palette on top, mounting two modal overlays (two focus traps).
 
