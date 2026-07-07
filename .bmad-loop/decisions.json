@@ -133,5 +133,14 @@
     "key": "1",
     "label": "Coordinator, defer to ceremonies",
     "resolution": ""
+  },
+  "DW-88": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Use capture-phase stopPropagation in the new unread-jump window hook so the modified-arrow keystroke never reaches the focused React handlers, leaving the epic-3 timeline/composer handlers untouched (respects the Never constraint).",
+    "key": "1",
+    "label": "Capture-phase stopPropagation in hook",
+    "resolution": ""
   }
 }
