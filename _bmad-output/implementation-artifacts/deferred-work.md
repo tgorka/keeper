@@ -406,6 +406,7 @@ origin: migrated from legacy ledger (spec-6-2-bridge-discovery.md), 2026-07-06
 location: keeper-core bridges/discovery.rs (scan_rooms)
 reason: `bridges/discovery.rs::scan_rooms` only inspects `direct_targets()` when `room.is_direct().await == Ok(true)`; the appservice-created management room often carries no `m.direct` account-data entry, so `direct_targets()` yields nothing and a genuinely-present-but-not-logged-in bridge degrades to `Configured` (via source b) or drops entirely. The spec's I/O-matrix "Bot DM, no portal → not logged in" row prescribes exactly `is_direct()`/`direct_targets()` (intent contract), and the impure shell has no mock-`Client` test asserting `is_direct()` fires for a mautrix management room, so this completeness gap ships untested. A later story should broaden management-room detection (e.g. also treat a joined room whose only other member is a known bot MXID as a management DM) rather than trust the `m.direct` flag alone. See [[DW-57]], [[DW-58]].
 status: open
+decision: 2026-07-06 Broaden detection — Broaden management-room detection to also treat a joined room whose only other member is a known bot MXID as a management DM, rather than trusting the m.direct flag alone.
 
 ### DW-57: The known-bot MXID probe (source b) and bot-DM matching (source c) both hard-code the account's OWN server name, so bridge bots living on a separate appservice/bridge domain are invisible to discovery on standard self-hosted mautrix stacks.
 

@@ -80,6 +80,15 @@
     "label": "Measure first",
     "resolution": "Measure real disk-growth expectations before committing to a retention policy."
   },
+  "DW-56": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Broaden management-room detection to also treat a joined room whose only other member is a known bot MXID as a management DM, rather than trusting the m.direct flag alone.",
+    "key": "1",
+    "label": "Broaden detection",
+    "resolution": ""
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",
