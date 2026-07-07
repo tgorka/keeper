@@ -225,6 +225,7 @@ origin: migrated from legacy ledger (spec-3-7-send-media-and-files.md), 2026-07-
 location: keeper-core account.rs (send_attachment_path / send_attachment_bytes)
 reason: `account.rs::send_attachment_path` does `tokio::fs::read(path)` with no cap and `send_attachment_bytes` takes an unbounded `Vec<u8>`; the spec explicitly deferred a size cap to avoid regressing the 25 MB video bar, and 3.6 already logged the symmetric receive-side unbounded-RAM concern. Needs a product-level upload ceiling honoring the homeserver `m.upload.size` limit with a friendly pre-send error. See [[DW-29]].
 status: open
+decision: 2026-07-06 Ceiling honoring m.upload.size — Enforce a pre-send upload ceiling honoring the homeserver m.upload.size limit with a friendly pre-send error, coordinated with the receive-side cap in DW-29.
 
 ### DW-32: Attaching media while a reply context is pending sends the attachment without any reply linkage — media-as-reply silently drops the reply relation.
 

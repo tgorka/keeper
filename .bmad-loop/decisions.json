@@ -35,6 +35,15 @@
     "label": "Cap honoring 25 MB bar",
     "resolution": ""
   },
+  "DW-31": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Enforce a pre-send upload ceiling honoring the homeserver m.upload.size limit with a friendly pre-send error, coordinated with the receive-side cap in DW-29.",
+    "key": "1",
+    "label": "Ceiling honoring m.upload.size",
+    "resolution": ""
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",
