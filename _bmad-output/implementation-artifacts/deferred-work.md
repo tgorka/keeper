@@ -202,6 +202,7 @@ origin: migrated from legacy ledger (spec-3-6-receive-media-thumbnails-protocol-
 location: src/components/chat/media-attachment.tsx
 reason: `src/components/chat/media-attachment.tsx` audio branch wires only `onError`/`onLoadedMetadata`; a webview stall (unsupported codec) is distinct from an error and never fires either. Deferred rather than patched because an honest fix needs stall detection (a load timeout heuristic) plus a fallback surface (download/open-externally), and Matrix voice notes are commonly Opus — a product decision on the fallback UX (and possibly transcoding, out of scope here) is warranted. Not caused by a code defect; it is a platform codec-support limitation surfaced by this story.
 status: open
+decision: 2026-07-06 Stall timeout + download fallback — Add a load-timeout stall heuristic and a fallback surface (download / open-externally button) when the audio element neither loads nor errors.
 
 ### DW-29: The `keeper-media://` protocol handler places no ceiling on media size: `client.media().get_media_content(..., true)` is atomic (whole file downloaded+decrypted into a `Vec<u8>` in RAM), and each Range request re-materializes the full buffer, so a malicious/oversized attachment (e.g. multi-GB video) can spike memory / amplify on repeated seeks with no 413/reject guard.
 

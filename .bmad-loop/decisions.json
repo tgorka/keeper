@@ -17,6 +17,15 @@
     "label": "Leave honest waiting screen",
     "resolution": "Keep the current honest-but-mislabeled QR waiting screen until a live QR validation session is available."
   },
+  "DW-28": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Add a load-timeout stall heuristic and a fallback surface (download / open-externally button) when the audio element neither loads nor errors.",
+    "key": "1",
+    "label": "Stall timeout + download fallback",
+    "resolution": ""
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",
