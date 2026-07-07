@@ -1,0 +1,60 @@
+scripts/check-js-licenses.ts
+  s_c2e74b28a44582::t_2895ba3aea0a2a 208-210
+  s_c2e74b28a44582::t_6ff3811e0131ce 1-4,7,16-21,23-24,26-47,51-52,57-58,60,62-69,73-81,83-84,86-96,98-100,110,119-133,139-140,153,155,174-176,178-180,190-206,212-227,229-231,241
+  s_c2e74b28a44582::t_b5cfe174d34a60 5-6,8-15,22,25,48-50,53-56,59,61,70-72,82,85,97,101-109,111-118,134-138,141-142,144-152,154,163,173,177,181-189,207,211,228,232-240
+  s_c2e74b28a44582::t_4dbaa40cc89c6a 143,156-162,164-172
+package.json
+  s_c2e74b28a44582::t_01f9d424f5480e 22,25
+scripts/check-js-licenses.test.ts
+  s_c2e74b28a44582::t_06546e51597523 2-19,25-33,46-56,77-78
+  s_c2e74b28a44582::t_03e45c34196c6f 1,20-24,34-45,57-76
+docs/release.md
+  s_c2e74b28a44582::t_d7bde2df01a3dd 1-8,13-30,33-42,49-87,89-93
+  s_c2e74b28a44582::t_cf399d56a6dc4e 31-32
+  s_c2e74b28a44582::t_5b6102294752e4 43-48
+  s_c2e74b28a44582::t_079fdf6502287a 9-12
+  s_c2e74b28a44582::t_acaab0fc930836 88,94-103
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_c2e74b28a44582::t_fafbc348b7e1cd 381-388
+.github/workflows/release.yml
+  s_c2e74b28a44582::t_ca767cd572daa7 1-36,40-41,44-45,47-66
+  s_c2e74b28a44582::t_279d1a52190290 37-39,42-43,46
+.github/pull_request_template.md
+  s_c2e74b28a44582::t_a54e22dde57421 1-11
+_bmad-output/implementation-artifacts/spec-11-1-signed-notarized-release-pipeline.md
+  s_c2e74b28a44582::t_fbf4eca43867d2 8
+  s_c2e74b28a44582::t_97e15fba7cf964 11
+  s_c2e74b28a44582::t_a461ff5dbadcc9 83-89
+  s_c2e74b28a44582::t_66a21fc3098d72 5
+  s_c2e74b28a44582::t_1fb8cdbcb8a6cc 7
+  s_c2e74b28a44582::t_9f14714f190566 90-108
+  s_c2e74b28a44582::t_b1b93bcbfc3308 132
+  s_c2e74b28a44582::t_850fb24bbeda54 139-170
+  s_c2e74b28a44582::t_cf52fa747eb17c 1-4,6,9-10,12-67,76-82,109-131,133-138
+  s_c2e74b28a44582::t_745cca736603a4 68-75
+.github/workflows/ci.yml
+  s_c2e74b28a44582::t_bb739110b29124 59-63
+  s_c2e74b28a44582::t_a521d944325b17 47-58,64-67
+_bmad-output/implementation-artifacts/epic-11-context.md
+  s_c2e74b28a44582::t_40d46e89766950 1-53
+vitest.config.ts
+  s_c2e74b28a44582::t_9f61730ad31709 16
+src-tauri/crates/keeper/tauri.conf.json
+  s_c2e74b28a44582::t_7793fddd632315 50-53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "27bc258b90d299e567f56fddcf1453fa603a7fde",
+  "prompts": {},
+  "sessions": {
+    "s_c2e74b28a44582": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4480dc88-2218-49f2-888a-f0676d0879e2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
