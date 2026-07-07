@@ -26,6 +26,15 @@
     "label": "Stall timeout + download fallback",
     "resolution": ""
   },
+  "DW-29": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Enforce a max-size guard at or above the epic's 25 MB video bar, rejecting oversized media (413) before the whole-file load, coordinated with the send-side cap in DW-31.",
+    "key": "1",
+    "label": "Cap honoring 25 MB bar",
+    "resolution": ""
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",

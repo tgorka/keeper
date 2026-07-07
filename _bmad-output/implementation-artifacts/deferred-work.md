@@ -210,6 +210,7 @@ origin: migrated from legacy ledger (spec-3-6-receive-media-thumbnails-protocol-
 location: src-tauri/crates/keeper/src/media_protocol.rs + keeper-core/src/media.rs
 reason: `src-tauri/crates/keeper/src/media_protocol.rs` (`partial_or_full`) + `src-tauri/crates/keeper-core/src/media.rs` (`fetch_media`, sole `get_media_content` gate). The full-in-memory load is inherent to matrix-sdk 0.18's atomic media API (documented in the spec's Design Notes), so this is an architectural constraint surfaced by the story rather than a code defect. A max-size guard needs a product decision on the limit (must not break legitimate large media such as the epic's 25 MB video bar) — hence deferred, not patched. See [[DW-31]].
 status: open
+decision: 2026-07-06 Cap honoring 25 MB bar — Enforce a max-size guard at or above the epic's 25 MB video bar, rejecting oversized media (413) before the whole-file load, coordinated with the send-side cap in DW-31.
 
 ### DW-30: The `keeper-media://` handle is unauthenticated/forgeable — its three path segments (`account_id`, `room_id`, item `unique_id`) are all data the webview already holds, so a compromised webview (e.g. via a future XSS foothold) could name coordinates to fetch decrypted bytes for any currently-open room on the same account; the handle is not HMAC-signed and the trust boundary is undocumented.
 
