@@ -160,5 +160,14 @@
     "key": "1",
     "label": "Read-marker awareness",
     "resolution": ""
+  },
+  "DW-92": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Wire a shell window-focus + active-room signal into dispatch and suppress notifications for the room the user is actively viewing while the app is focused.",
+    "key": "1",
+    "label": "Add focus/active-room suppression",
+    "resolution": ""
   }
 }

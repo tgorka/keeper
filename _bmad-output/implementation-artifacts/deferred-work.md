@@ -672,6 +672,7 @@ origin: migrated from legacy ledger (spec-10-1-native-notifications-from-the-syn
 location: keeper-core/src/notify.rs (register_notify_handler / dispatch)
 reason: `keeper-core/src/notify.rs` `register_notify_handler`/`dispatch` have no window-focus or active-room check; a user typing in a Chat gets an OS notification for the message that just appeared on screen. Not required by Story 10.1's ACs (which only require posting sender/Chat/preview, honoring the previews toggle, and no push egress), so it was not in scope, but it is standard notification behavior worth an explicit later decision alongside the mute/mention-only/DND rules (Story 10.2) or background/foreground semantics (Story 10.3).
 status: open
+decision: 2026-07-06 Add focus/active-room suppression — Wire a shell window-focus + active-room signal into dispatch and suppress notifications for the room the user is actively viewing while the app is focused.
 
 ### DW-93: Muting/unmuting a whole Network does not live-refresh the inbox row mute glyph — an idle room's glyph flips only when that room next produces a VectorDiff, so the bell-off glyph can lag the actual (immediately-applied) notification suppression for an arbitrary time.
 
