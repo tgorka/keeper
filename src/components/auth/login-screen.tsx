@@ -1,4 +1,5 @@
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { type FormEvent, type MouseEvent, useEffect, useRef, useState } from "react";
 import { BeeperCoverageDisclosure } from "@/components/auth/beeper-coverage-disclosure";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -57,6 +58,22 @@ function errorCopy(code: FormErrorCode): string {
     default:
       return "Something went wrong signing in. Please try again.";
   }
+}
+
+/**
+ * Route an external link through the bundled opener plugin instead of letting
+ * the Tauri WKWebView follow the anchor (where `target="_blank"` is unreliable).
+ * The anchors keep `href` + `target="_blank"` as a safe fallback: any activation
+ * that bypasses this handler (middle-click, aux-click) then attempts a new window
+ * — a harmless no-op in the webview — rather than navigating the login SPA away
+ * in-place. Fire-and-forget: any rejection is swallowed (best-effort, mirrors the
+ * existing `void cancelOidc().catch(() => {})` pattern in this file).
+ */
+function openExternal(event: MouseEvent<HTMLAnchorElement>, url: string) {
+  event.preventDefault();
+  void openUrl(url).catch(() => {
+    // Best-effort: nothing actionable if the system opener fails.
+  });
 }
 
 /** Narrowing guard for the {@link IpcError} envelope thrown by the IPC client. */
@@ -291,7 +308,12 @@ function PasswordTab({ addMode, addAccount, onDone }: TabProps) {
             {errorCode === "slidingSyncUnsupported" && (
               <>
                 {" "}
-                <a href={SSS_DOC_URL} target="_blank" rel="noreferrer">
+                <a
+                  href={SSS_DOC_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={(e) => openExternal(e, SSS_DOC_URL)}
+                >
                   Learn more about Simplified Sliding Sync
                 </a>
                 .
@@ -439,7 +461,12 @@ function BeeperTab({ addMode, addAccount, onDone }: TabProps) {
           <AlertTitle>Beeper login unavailable</AlertTitle>
           <AlertDescription>
             {BEEPER_FAILURE}{" "}
-            <a href={BEEPER_STATUS_URL} target="_blank" rel="noreferrer">
+            <a
+              href={BEEPER_STATUS_URL}
+              target="_blank"
+              rel="noreferrer"
+              onClick={(e) => openExternal(e, BEEPER_STATUS_URL)}
+            >
               Check Beeper status
             </a>
             .

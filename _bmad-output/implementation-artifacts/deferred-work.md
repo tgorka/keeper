@@ -5,7 +5,8 @@
 origin: migrated from legacy ledger (spec-1-3-password-login-with-sliding-sync-verification.md), 2026-07-06
 location: src/components (login error "Learn more about Simplified Sliding Sync" link)
 reason: In a Tauri WKWebView, `target="_blank"` often does nothing or navigates the webview rather than opening the default browser; the app bundles `tauri_plugin_opener` but the link does not route through it. The component test only asserts the `href` attribute exists, not that activation opens the browser. Needs a manual `tauri dev` check and, if broken, wiring the link through the opener plugin.
-status: open
+status: done 2026-07-06
+resolution: resolved by sweep bundle dw-login-error-open-in-browser
 
 ### DW-2: The `unsupportedLoginType` classification is unreliable — a homeserver with password login disabled typically returns `M_FORBIDDEN`, which `auth::map_login_error` maps to `InvalidCredentials`, so the user sees "Wrong username or password" instead of "password login not supported."
 

@@ -19,6 +19,12 @@ vi.mock("@/lib/ipc/client", () => ({
   cancelBeeper: (...args: []) => cancelBeeper(...args),
 }));
 
+// Mock the opener plugin so external links route through a spy instead of Tauri.
+const openUrl = vi.fn();
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: (...args: [string]) => openUrl(...args),
+}));
+
 // Import after the mock is registered.
 import { LoginScreen } from "@/components/auth/login-screen";
 
@@ -61,6 +67,8 @@ describe("LoginScreen", () => {
     loginBeeper.mockReset();
     cancelBeeper.mockReset();
     cancelBeeper.mockResolvedValue(undefined);
+    openUrl.mockReset();
+    openUrl.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -174,6 +182,20 @@ describe("LoginScreen", () => {
     ).toBeInTheDocument();
     const link = screen.getByRole("link", { name: /Simplified Sliding Sync/ });
     expect(link).toHaveAttribute("href");
+  });
+
+  it("opens the SSS doc link through the opener and prevents default navigation", async () => {
+    loginPassword.mockRejectedValue(ipcError("slidingSyncUnsupported"));
+    render(<LoginScreen />);
+    fillAndSubmit();
+    const link = await screen.findByRole("link", { name: /Simplified Sliding Sync/ });
+    // fireEvent.click returns false when a listener called preventDefault().
+    const notPrevented = fireEvent.click(link);
+    expect(notPrevented).toBe(false);
+    expect(openUrl).toHaveBeenCalledTimes(1);
+    expect(openUrl).toHaveBeenCalledWith(
+      "https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/4186-simplified-sliding-sync.md",
+    );
   });
 
   it("guards blank/whitespace input without calling the backend", async () => {
@@ -408,6 +430,20 @@ describe("LoginScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(await screen.findByLabelText("Email")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Send code" })).toBeInTheDocument();
+  });
+
+  it("opens the Beeper status link through the opener and prevents default navigation", async () => {
+    beeperRequestCode.mockRejectedValue(ipcError("beeperUnavailable"));
+    render(<LoginScreen />);
+    await openBeeperTab();
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "alice@beeper.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send code" }));
+    const link = await screen.findByRole("link", { name: /Beeper status/ });
+    // fireEvent.click returns false when a listener called preventDefault().
+    const notPrevented = fireEvent.click(link);
+    expect(notPrevented).toBe(false);
+    expect(openUrl).toHaveBeenCalledTimes(1);
+    expect(openUrl).toHaveBeenCalledWith("https://status.beeper.com");
   });
 
   it("renders the named failure when verification fails", async () => {
