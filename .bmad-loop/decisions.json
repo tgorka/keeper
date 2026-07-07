@@ -1,4 +1,13 @@
 {
+  "DW-100": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Adopt DW-99's click-capable notifier backend, which structurally resolves all three edge behaviors: navigation fires only on a real click, each click routes its own target (no single-slot clobber), and the target is delivered directly (no emit-before-subscribe race).",
+    "key": "1",
+    "label": "Adopt click-capable backend",
+    "resolution": ""
+  },
   "DW-12": {
     "answered_at": "2026-07-06",
     "bundle_name": "",
