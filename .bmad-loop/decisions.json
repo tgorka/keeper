@@ -142,5 +142,14 @@
     "key": "1",
     "label": "Capture-phase stopPropagation in hook",
     "resolution": ""
+  },
+  "DW-90": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Route the cheat sheet through the shared dialog-precedence coordinator decided for DW-86 (close user-utility dialogs, resolve security-ceremony precedence) so opening Cmd-? keeps modal depth <= 1.",
+    "key": "1",
+    "label": "Route through shared coordinator",
+    "resolution": ""
   }
 }

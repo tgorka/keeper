@@ -656,6 +656,7 @@ origin: migrated from legacy ledger (spec-9-3-cheat-sheet-and-native-menu-bar-fr
 location: src/hooks/use-cheat-sheet-shortcut.ts + src/components/layout/app-shell.tsx
 reason: `use-cheat-sheet-shortcut.ts` only toggles its own store and `src/components/layout/app-shell.tsx` mounts `<CheatSheetOverlay/>` as an uncoordinated sibling of `<CommandPalette/>`/`SearchOverlay`/`ExportDialog`/etc., so opening the cheat sheet closes nothing below it. This is the same uncoordinated-dialog architecture already flagged for ⌘K (the pre-existing "modal depth <= 1 unenforced" deferral from spec-9-1); the cheat sheet adds one more sibling. A correct fix is the shared dialog-precedence coordinator that deferral calls for (including auto-opened security ceremonies), not a per-hook close — out of scope here. See [[DW-86]].
 status: open
+decision: 2026-07-06 Route through shared coordinator — Route the cheat sheet through the shared dialog-precedence coordinator decided for DW-86 (close user-utility dialogs, resolve security-ceremony precedence) so opening Cmd-? keeps modal depth <= 1.
 
 ### DW-91: Notification new-vs-backlog classification uses a client-clock baseline against the server's origin_server_ts and tracks no read markers, so a long offline/sleep gap can replay a burst of notifications for messages already read on another device.
 
