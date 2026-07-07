@@ -572,7 +572,9 @@ status: open
 origin: migrated from legacy ledger (spec-8-1-incognito-read-receipts-with-scoped-policy.md), 2026-07-06
 location: keeper-core signals.rs (mark_read)
 reason: The SDK stores implicit read receipts as public (matrix-sdk-ui timeline controller comment "Implicit read receipts are saved as public read receipts") and emits one on message send — a path that never flows through `keeper-core::signals::mark_read`, so neither the AD-14 sole-gate nor the effective-policy branch can intercept it. Story 8.1's scope is read-receipts-on-viewing (the `mark_room_read` path), and sending a message already reveals engagement to the remote, so the marginal privacy loss is small and this was not caused by the change — it is pre-existing SDK behavior surfaced incidentally. Worth a conscious decision: either wire a client-level suppression of implicit/public send receipts to the effective Incognito policy, or scope the `signals.rs` module-doc privacy claim to explicitly exclude the send path so the guarantee is not overstated.
-status: open
+status: done 2026-07-06
+resolution: closed by human decision: Narrow the signals.rs module-doc privacy claim to explicitly exclude the send path, so the guarantee is not overstated (sending already reveals engagement).
+decision: 2026-07-06 Scope the privacy claim — Narrow the signals.rs module-doc privacy claim to explicitly exclude the send path, so the guarantee is not overstated (sending already reveals engagement).
 
 ### DW-80: The Undo-Send outbox scheduler retries a held row whose room id parses but never resolves on the live Client (e.g. the user left the room, or it never syncs) on every 250ms tick forever, with no age bound or terminal "failed" surfacing — the held bubble/pill lingers indefinitely.
 
