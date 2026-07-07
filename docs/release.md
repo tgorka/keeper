@@ -136,6 +136,29 @@ spctl -a -t open --context context:primary-signature keeper.dmg
 xcrun stapler validate keeper.app
 ```
 
+## Perf and reliability sign-off (SM-3)
+
+Most performance and reliability gates are enforced automatically in CI (see
+[`docs/performance.md`](performance.md) for the full gate table). Three of them cannot run
+unattended — they need the built app, the webview, or a live bridge session — so measure and
+record them **at release time on reference Apple Silicon hardware** with a realistically seeded
+install (a 100k+-event archive; 1 and 5 configured accounts).
+
+- [ ] **Full cold-start-to-interactive < 2 s (NFR-1).** With a seeded 100k+-event archive, cold-launch
+  the app and measure the time from launch to an interactive inbox. Record the figure and confirm it
+  is under 2 s. (CI only guards the offline local-init *subset*; this is the full figure — see
+  [`docs/performance.md`](performance.md) → "Cold-start honesty".)
+- [ ] **Idle memory — measure & flag (NFR-3).** Let the app settle to idle and record idle RSS with
+  **1** account and with **5** accounts. Flag if over the assumed budgets (~300 MB / 1 account,
+  ~500 MB / 5 accounts). These budgets are **ASSUMPTIONS awaiting owner confirmation**, so this is a
+  measure-and-flag step, never a hard fail — see [`docs/performance.md`](performance.md) →
+  "Idle-memory budgets".
+- [ ] **Live induced bridge-drop reflected + notified ≤ 60 s (NFR-6).** Induce a real bridge-session
+  drop (e.g. disconnect a bridged network's session) and confirm keeper reflects the disconnected
+  state **and** surfaces one notification within 60 s. The CI logic tests cover the immediate
+  disconnect-notice path; this live end-to-end check is what confirms the ≤ 60 s bar on real
+  bridge grammars.
+
 ## Required status checks (branch protection)
 
 Required checks are enforced via repository **branch-protection settings**, not YAML. A repo
