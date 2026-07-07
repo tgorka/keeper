@@ -44,6 +44,27 @@ jobs:
       - run: cargo nextest run --no-tests=pass
         working-directory: src-tauri
 
+  licenses:
+    name: License firewall (cargo-deny, JS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # Licensing/supply-chain firewall only (Story 11.1). Advisory/vulnerability
+      # gating is intentionally out of scope here: the crate graph carries pre-existing
+      # `unmaintained` RUSTSEC advisories for Linux-only gtk-rs GTK3 bindings, which are
+      # irrelevant to this macOS-first app and would make the required check perma-red.
+      - run: cargo deny check licenses bans sources
+        working-directory: src-tauri
+      - run: bun install --frozen-lockfile
+      - run: bun run check:licenses
+
   build:
     name: Tauri build (macOS)
     runs-on: macos-latest

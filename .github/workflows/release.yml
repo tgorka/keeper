@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Signed, notarized macOS release (aarch64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: bun install --frozen-lockfile
+
+      # App Store Connect notarization needs the API key on disk. The secret holds
+      # the base64-encoded .p8; decode it to a file that tauri-action can read. Note
+      # the secret is named APPLE_API_KEY_P8_BASE64 (not APPLE_API_KEY) so it never
+      # collides with the APPLE_API_KEY env var below, which is the Key ID string.
+      - name: Decode App Store Connect API key
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_API_KEY_BASE64" || { echo "APPLE_API_KEY_P8_BASE64 secret is empty"; exit 1; }
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/api_key.p8"
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+
+      - name: Build, sign, notarize, and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Developer ID signing (base64 .p12 + password + identity + keychain password).
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          # App Store Connect API-key notarization.
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/api_key.p8
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "keeper ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+          args: --config src-tauri/crates/keeper/tauri.conf.json --target aarch64-apple-darwin

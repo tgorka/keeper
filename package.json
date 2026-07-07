@@ -19,9 +19,10 @@
     "test:rust": "cargo nextest run --manifest-path src-tauri/Cargo.toml",
     "bindings:check": "bun run test:rust && test -z \"$(git status --porcelain -- src/lib/ipc/gen)\"",
     "check:core-tauri-free": "tree=$(cargo tree --manifest-path src-tauri/Cargo.toml -p keeper-core -e normal,build --prefix none) && ! printf '%s' \"$tree\" | grep -qE '(^|[[:space:]])tauri(-[a-z]+)* v'",
+    "check:licenses": "bun run scripts/check-js-licenses.ts",
     "check": "bun run lint && bun run typecheck && bun run test && bun run check:core-tauri-free",
     "check:rust": "cargo fmt --manifest-path src-tauri/Cargo.toml --all --check && cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings",
-    "check:all": "bun run check && bun run check:rust && bun run test:rust && bun run bindings:check",
+    "check:all": "bun run check && bun run check:rust && bun run test:rust && bun run bindings:check && bun run check:licenses",
     "prepare": "lefthook install"
   },
   "dependencies": {

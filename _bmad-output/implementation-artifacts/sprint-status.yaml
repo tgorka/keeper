@@ -129,7 +129,7 @@ development_status:
   10-4-click-through-and-bridge-health-alerts: done
   epic-10-retrospective: optional
   epic-11: backlog
-  11-1-signed-notarized-release-pipeline: backlog
+  11-1-signed-notarized-release-pipeline: done
   11-2-signed-auto-updates-and-egress-honesty: backlog
   11-3-performance-and-reliability-release-gates: backlog
   epic-11-retrospective: optional
