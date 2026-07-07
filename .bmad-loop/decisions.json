@@ -1,4 +1,13 @@
 {
+  "DW-12": {
+    "answered_at": "2026-07-06",
+    "bundle_name": "",
+    "effect": "build",
+    "intent": "Add a registry 'encrypted' column + a distinct EncryptionKeyMissing error variant and honest IPC/UI restore-failure surface; make find_restorable_accounts passphrase-aware; add a crash-recovery sweep GCing store_passphrase/session entries orphaned by an add that died before the registry-row insert. Likely alongside Epic 3 UTD/verification honest states.",
+    "key": "1",
+    "label": "Add encrypted flag + honest state",
+    "resolution": ""
+  },
   "DW-8": {
     "answered_at": "2026-07-06",
     "bundle_name": "",
