@@ -737,7 +737,9 @@ decision: 2026-07-06 Adopt click-capable backend — Adopt DW-99's click-capable
 origin: migrated from legacy ledger (spec-11-1-signed-notarized-release-pipeline.md), 2026-07-06
 location: scripts/check-js-licenses.ts (classifyLicense)
 reason: `classifyLicense` in `scripts/check-js-licenses.ts` tokenizes on OR/AND and returns `deny` on the first copyleft token regardless of operator; the I/O matrix in `spec-11-1` (inside the frozen intent-contract) specifies `(MIT OR GPL-2.0-only)` → deny and the test encodes it. This is intentional and safe (never leaks copyleft), and no current dependency triggers it (0 denied across 527 packages), but it is over-conservative — a future dual-licensed transitive dep would red the build and the only in-place fix is hand-editing the classifier. Not fixed now because it contradicts the frozen I/O matrix; revisit as an enhancement with an override channel.
-status: open
+status: done 2026-07-06
+resolution: closed by human decision: Keep the frozen deny-wins classifier; only add an override channel if and when a real dual-licensed dependency actually appears.
+decision: 2026-07-06 Keep deny-wins — Keep the frozen deny-wins classifier; only add an override channel if and when a real dual-licensed dependency actually appears.
 
 ### DW-102: The JS license gate scans the installed `node_modules` tree rather than the resolved `bun.lock` set, so its coverage depends on install/hoisting state; consider driving the scan from `bun.lock` for fully reproducible, hoist-independent results.
 
