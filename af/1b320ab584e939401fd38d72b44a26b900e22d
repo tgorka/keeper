@@ -1,0 +1,32 @@
+_bmad-output/planning-artifacts/prds/prd-keeper-2026-07-03/prd.md
+  s_8a8bc6b6bf6017::t_5d3f608e74b3cd 12
+  s_8a8bc6b6bf6017::t_1c395536b012d9 623-629
+  s_8a8bc6b6bf6017::t_02d381b69dd1fb 478
+  s_8a8bc6b6bf6017::t_eefde2b2b81b5b 630-771
+  s_8a8bc6b6bf6017::t_5b1b7a370f4f09 554-555
+  s_8a8bc6b6bf6017::t_0615c8284fbc4f 515
+  s_8a8bc6b6bf6017::t_3daddeaa5d9913 5
+  s_8a8bc6b6bf6017::t_61756fe4d1b3d9 99
+_bmad-output/planning-artifacts/prds/prd-keeper-2026-07-03/addendum.md
+  s_8a8bc6b6bf6017::t_8b5fc37e95f971 60-74
+  s_8a8bc6b6bf6017::t_eba4d83d1358c2 5
+  s_8a8bc6b6bf6017::t_babb7d0bfcdd2f 53
+_bmad-output/planning-artifacts/prds/prd-keeper-2026-07-03/.memlog.md
+  s_8a8bc6b6bf6017::t_d2fd1fcc2d825d 3,22-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "af1b320ab584e939401fd38d72b44a26b900e22d",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
