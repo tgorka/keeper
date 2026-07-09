@@ -84,7 +84,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "keeper ${{ github.ref_name }}${{ steps.signing.outputs.signed == 'false' && ' (unsigned build)' || '' }}"
-          releaseBody: ${{ steps.signing.outputs.signed == 'false' && 'Unsigned (ad-hoc) macOS build — first launch requires right-click → Open. Maintainers: add Apple signing secrets per docs/release.md for notarized releases.' || '' }}
+          releaseBody: "${{ steps.signing.outputs.signed == 'false' && 'Unsigned (ad-hoc) macOS build — first launch requires right-click → Open. Add Apple signing secrets per docs/release.md for notarized releases.' || '' }}"
           releaseDraft: true
           prerelease: false
           args: --config src-tauri/crates/keeper/tauri.conf.json --target aarch64-apple-darwin
