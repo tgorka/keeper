@@ -41,27 +41,38 @@ jobs:
       # the base64-encoded .p8; decode it to a file that tauri-action can read. Note
       # the secret is named APPLE_API_KEY_P8_BASE64 (not APPLE_API_KEY) so it never
       # collides with the APPLE_API_KEY env var below, which is the Key ID string.
-      - name: Decode App Store Connect API key
-        run: |
-          set -euo pipefail
-          test -n "$APPLE_API_KEY_BASE64" || { echo "APPLE_API_KEY_P8_BASE64 secret is empty"; exit 1; }
-          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/api_key.p8"
+      # Signing/notarization is OPTIONAL: with no Apple secrets configured the release
+      # still builds and publishes an UNSIGNED (ad-hoc) bundle, clearly labeled. Add the
+      # secrets (docs/release.md) to get Developer ID signing + notarization.
+      - name: Detect Apple signing secrets
+        id: signing
         env:
           APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APPLE_API_KEY_BASE64" ] && [ -n "$APPLE_CERTIFICATE" ]; then
+            echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/api_key.p8"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Apple signing secrets absent — publishing an unsigned (ad-hoc) build."
+          fi
 
       - name: Build, sign, notarize, and publish release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Developer ID signing (base64 .p12 + password + identity + keychain password).
+          # All empty when signing secrets are absent — tauri-action then builds unsigned.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.signed == 'true' && secrets.APPLE_SIGNING_IDENTITY || '-' }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          # App Store Connect API-key notarization.
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_KEY_PATH: ${{ runner.temp }}/api_key.p8
+          # App Store Connect API-key notarization (skipped when unsigned).
+          APPLE_API_ISSUER: ${{ steps.signing.outputs.signed == 'true' && secrets.APPLE_API_ISSUER || '' }}
+          APPLE_API_KEY: ${{ steps.signing.outputs.signed == 'true' && secrets.APPLE_API_KEY_ID || '' }}
+          APPLE_API_KEY_PATH: ${{ steps.signing.outputs.signed == 'true' && format('{0}/api_key.p8', runner.temp) || '' }}
           # Signed auto-updates (Story 11.2, NFR-12). Tauri signs the updater artifacts
           # with this minisign private key; the app verifies each download against the
           # committed `plugins.updater.pubkey` before installing. Both come only from
@@ -72,7 +83,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "keeper ${{ github.ref_name }}"
+          releaseName: "keeper ${{ github.ref_name }}${{ steps.signing.outputs.signed == 'false' && ' (unsigned build)' || '' }}"
+          releaseBody: ${{ steps.signing.outputs.signed == 'false' && 'Unsigned (ad-hoc) macOS build — first launch requires right-click → Open. Maintainers: add Apple signing secrets per docs/release.md for notarized releases.' || '' }}
           releaseDraft: true
           prerelease: false
           args: --config src-tauri/crates/keeper/tauri.conf.json --target aarch64-apple-darwin
