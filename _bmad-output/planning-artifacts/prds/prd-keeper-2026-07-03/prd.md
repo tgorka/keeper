@@ -2,14 +2,14 @@
 title: "PRD: keeper"
 status: final
 created: 2026-07-03
-updated: 2026-07-03
+updated: 2026-07-09
 ---
 
 # PRD: keeper
 
 ## 0. Document Purpose
 
-This PRD defines the macOS text-first MVP of keeper, an open-source (Apache-2.0), client-only universal messenger built on Matrix. It is written for the downstream BMAD chain — UX design, architecture, and epic/story creation — and for contributors who need a single authoritative statement of what MVP includes, excludes, and must prove. It builds on, and does not duplicate, four upstream inputs: the product brief and its addendum (`_bmad-output/planning-artifacts/briefs/brief-keeper-2026-07-03/`), the stakeholder requirements (`_bmad-output/planning-artifacts/product-inputs.md`), and the technical and market research reports (`_bmad-output/planning-artifacts/research-technical-2026-07-03.md`, `research-market-2026-07-03.md`). Vocabulary is anchored in §3 Glossary; functional requirements are numbered FR-1 through FR-54 with testable consequences; cross-cutting NFRs are numbered NFR-1 through NFR-14. Inline `[ASSUMPTION]` tags mark inferences made without stakeholder confirmation and are indexed in §12. Technical constraints already locked by the owner (stack, SDK versions, IPC patterns, licensing firewall) live in the brief addendum and this PRD's `addendum.md`; this document states *what* keeper does, not *how*.
+This PRD defines the macOS text-first MVP of keeper, an open-source (Apache-2.0), client-only universal messenger built on Matrix. It is written for the downstream BMAD chain — UX design, architecture, and epic/story creation — and for contributors who need a single authoritative statement of what MVP includes, excludes, and must prove. It builds on, and does not duplicate, four upstream inputs: the product brief and its addendum (`_bmad-output/planning-artifacts/briefs/brief-keeper-2026-07-03/`), the stakeholder requirements (`_bmad-output/planning-artifacts/product-inputs.md`), and the technical and market research reports (`_bmad-output/planning-artifacts/research-technical-2026-07-03.md`, `research-market-2026-07-03.md`). Vocabulary is anchored in §3 Glossary; functional requirements are numbered FR-1 through FR-54 for the macOS MVP with testable consequences; cross-cutting NFRs are numbered NFR-1 through NFR-14. **Phase 2 increment (2026-07-09):** with the macOS MVP implemented in full, §13 extends this PRD with the iOS/iPhone client phase — FR-55 through FR-65 and NFR-15 through NFR-18 — built on the authoritative iOS technical research (`_bmad-output/planning-artifacts/research-ios-2026-07-09.md`); MVP sections §1–§12 are unchanged and remain the authority for all shared behavior. Inline `[ASSUMPTION]` tags mark inferences made without stakeholder confirmation and are indexed in §12. Technical constraints already locked by the owner (stack, SDK versions, IPC patterns, licensing firewall) live in the brief addendum and this PRD's `addendum.md`; this document states *what* keeper does, not *how*.
 
 ## 1. Vision
 
@@ -96,7 +96,7 @@ The MVP must prove one thing: that a user-owned Matrix + Bridges stack, wrapped 
 
 ## 4. Features
 
-*FRs are numbered globally (FR-1 … FR-54). Every FR uses Glossary terms verbatim and carries testable consequences. "User" means the single macOS operator of the app.*
+*FRs are numbered globally (FR-1 … FR-54 in this section; the iOS phase continues the sequence with FR-55 … FR-65 in §13). Every FR uses Glossary terms verbatim and carries testable consequences. "User" means the single macOS operator of the app.*
 
 ### 4.1 Accounts & Authentication
 
@@ -475,7 +475,7 @@ User can click a notification to land in the exact Chat (correct Account) with t
 - **No server-side components, ever, in this repo.** No hosted homeservers, no hosted bridges, no relay, no cloud "assist" for any feature (contrast: Beeper's Send Later). If a feature needs a server, it is out or it is honest about being local-only.
 - **No bridges running inside the client** (Beeper on-device style). keeper manages external Bridges; it never becomes one. Reassess post-v1, explicitly not now.
 - **No voice/video calls in MVP.** Post-MVP via embedded Element Call widget once MatrixRTC stabilizes; no native VoIP implementation on any timeline.
-- **No mobile, no Windows/Linux in MVP.** macOS first; iPhone next after macOS proves the core.
+- **No mobile, no Windows/Linux in MVP.** macOS first; iPhone next after macOS proves the core. *(The core is proven: the iPhone phase is now specified as Phase 2 in §13. Windows/Linux remain out.)*
 - **No WhatsApp (or any Network) automation, broadcast, or bulk messaging — ever.** These trigger ban regimes and betray the user-safety posture.
 - **No agent/AI send path in MVP.** The Approval Pane ships; the propose-only agent API/MCP is a post-MVP experiment behind a flag, gated on design-partner validation. Nothing in MVP may send without explicit user approval (FR-41).
 - **No iMessage in MVP.** v1.x at earliest, only via the user's own Mac, labeled "advanced, may break on macOS updates."
@@ -512,7 +512,7 @@ User can click a notification to land in the exact Chat (correct Account) with t
 
 **Post-MVP / explicitly deferred:**
 - Voice/video calls (Element Call widget embed, once MatrixRTC stabilizes on self-hosted setups).
-- Mobile (iOS first), then Windows/Linux/Android/iPad on the same Rust core.
+- Mobile — **iOS now active as Phase 2, specified in §13**; Windows/Linux/Android/iPad remain later phases on the same Rust core.
 - Beeper Desktop API companion mode (reach On-Device Connection chats when Beeper Desktop is installed) — pragmatic add-on, never a foundation.
 - Email network, AI-bot client, terminal client (owner's long-term network list).
 
@@ -550,6 +550,8 @@ Three clocks aligned in 2025–2026, and none of them stays open forever: (1) **
 **Accessibility**
 
 - **NFR-14 Baseline accessibility:** all MVP flows operable via keyboard alone (a superset of FR-48–50); interactive controls carry accessibility labels for VoiceOver; contrast meets WCAG 2.1 AA for text in both light and dark themes. [ASSUMPTION] Full VoiceOver timeline-navigation polish is v1.x; the MVP bar is "operable and labeled."
+
+*Phase 2 (iOS) adds NFR-15 – NFR-18 in §13.3, measured on-device.*
 
 ## 8. Constraints & Guardrails
 
@@ -618,3 +620,152 @@ Three clocks aligned in 2025–2026, and none of them stays open forever: (1) **
 - §7 NFR-10 — At-rest encryption off by default (FileVault-typical Macs); confirm.
 - §7 NFR-14 — MVP accessibility bar is "operable + labeled"; full VoiceOver polish v1.x.
 - §9 SM-1 — "≥ 5 early adopters" target authored for measurability; brief left the count open.
+
+**Phase 2 (§13):**
+
+- §13 FR-60 — Full Dynamic Type adoption is fit-and-finish; the phase bar is graceful rem-based scaling.
+- §13 FR-62 — App badge counts total unreads across all Accounts (same aggregate as the Unified Inbox).
+- §13 FR-65 — The iOS Local Archive slice is excluded from device backup; the desktop Local Archive remains the durable, exportable copy this phase (disclosed in docs).
+- §13 NFR-15 — 3 s on-device cold-start bar is an authored number pending owner confirmation before release-gating.
+
+## 13. Phase 2: iOS/iPhone Client
+
+*Added 2026-07-09, after the macOS MVP shipped complete. This section is the Phase 2 increment: it specifies only what iOS adds or constrains, continues the global numbering (FR-55–FR-65, NFR-15–NFR-18), and adopts — not relitigates — the recommendations and risk register of the iOS technical research (`_bmad-output/planning-artifacts/research-ios-2026-07-09.md`). Sections §1–§12 remain authoritative for all shared behavior.*
+
+### 13.1 Phase Goal
+
+keeper runs on the owner's iPhone as a first-class client: the same Rust core and the same React frontend as macOS — one codebase, one IPC contract, no forked chat components. Every MVP capability that iOS permits behaves identically to desktop; every one it forbids (background sync/push, bbctl sidecar processes, global hotkeys, in-app updates, menu-bar tray) is hidden by capability flags or disclosed honestly — never silently broken.
+
+Distribution this phase is free Apple ID Personal Team signing: 7-day provisioning profiles re-armed from the owner's Mac, ~3 registered devices, no TestFlight or App Store. The audience is deliberately the owner-developer (plus hand-provisioned testers) dogfooding daily — SM-1's daily-driver bar extended to the phone. Nothing in this phase requires the paid Apple Developer Program; it is an explicit deferred decision gate (§13.5), not an omission.
+
+The phase opens with a UI-free walking skeleton that retires the three existential risks — toolchain, signing, core-on-iOS — before any UX investment (per AD-24 Plan A: Tauri mobile reusing keeper-core and the existing IPC contract).
+
+### 13.2 Features & Requirements
+
+#### 13.2.1 Platform Target & Build Seam
+
+##### FR-55: iOS app target
+System builds and runs as a native iOS app (`tauri ios`) from the existing workspace: keeper-core linked as a static library, the React frontend in WKWebView, free Personal Team signing.
+**Consequences (testable):**
+- `tauri ios dev` runs the app in the iOS Simulator and on the owner's iPhone (Personal Team signing via development-team config, Developer Mode enabled, certificate trusted on device); desktop build behavior is unchanged.
+- Walking-skeleton gate (phase-gating, before major UI work): on-device OIDC login completes via the `keeper://` deep link, the room list loads, text send/receive works in one E2EE Room, and app relaunch restores the session without re-login.
+- After the 7-day profile expiry, re-signing restores launch with all local data intact (stable bundle identifier).
+- CI runs an iOS compile check (`cargo check --target aarch64-apple-ios`) as a required PR gate so desktop work cannot silently break the port.
+
+##### FR-56: Desktop-only code excluded from the iOS build
+System compile-gates desktop-only surfaces out of the iOS target — tray/menu-bar, global-shortcut, autostart, updater, window-state, desktop deep-link registration — while the iOS shell registers only the notification and mobile deep-link plugins plus the shared IPC and media protocol.
+**Consequences (testable):**
+- The full workspace compiles for the iOS target with desktop-only plugins absent from the binary; desktop builds remain byte-identical in behavior.
+- iOS updates arrive by reinstall/re-sign; no in-app updater code path exists on iOS (surfaced per FR-57).
+
+##### FR-57: Platform capability flags
+System exposes platform capability flags over the IPC handshake; the UI hides surfaces unsupported on iOS: bbctl sidecar integration (FR-29), global hotkey settings (FR-50), updater controls, and tray/menu-bar + launch-at-login settings (FR-53's background-presence options).
+**Consequences (testable):**
+- With a capability off, its affordances do not render at all — no dead buttons, no error-on-tap; if reached programmatically, the sidecar path returns a clean "unsupported on this platform" error.
+- Bridge management beyond bbctl remains fully functional on iOS: discovery, native provisioning login, Bridge Bot fallback, Bridge Session health + re-login prompts, Network Risk Tier labels, start-new-Chat (FR-25–FR-28, FR-30–FR-32).
+- Capability flags are data-driven per platform so later targets (Android, iPad) reuse the same mechanism.
+
+#### 13.2.2 Phone UX
+
+##### FR-58: Phone layout tier
+User on a phone-width viewport (< 768 px) gets a single-pane navigation stack — Inbox → Room → Detail — reusing the existing components and selection state; desktop and tablet tiers are unchanged at ≥ 768 px. Realizes UJ-3 on the phone.
+**Consequences (testable):**
+- Unified Inbox, timeline, and detail render full-screen as pushed stack levels with a back affordance; back returns to the inbox preserving scroll position.
+- No forked chat components: the same component trees render in a new arrangement container driven by existing selection state.
+- The account/space rail becomes a drawer or inbox-header affordance; Command Palette functionality maps to pull-down search on phone.
+
+##### FR-59: Safe areas and keyboard avoidance
+System renders edge-to-edge respecting iOS safe areas, and the composer is never covered by the on-screen keyboard.
+**Consequences (testable):**
+- No unstyled bands at the notch or home indicator; header, composer, sheets, and overlays respect safe-area insets in portrait and landscape; the window background matches the theme (no launch or rotation flash).
+- Opening the keyboard lifts the composer above it; a timeline already at bottom stays pinned to bottom; dismissing the keyboard restores layout with no stranded offsets or overshoot.
+
+##### FR-60: Touch idioms
+User can operate every MVP interaction by touch: long-press opens the same context menus as desktop right-click; edge-swipe navigates back in the stack; swipe actions on inbox rows expose archive/mute; pull-to-refresh on the inbox triggers an immediate sync. Realizes UJ-3 on the phone.
+**Consequences (testable):**
+- Every context-menu action is reachable by touch; all tappables are ≥ 44 pt; system text-selection callouts and tap highlights are suppressed where they fight custom menus.
+- Pull-to-refresh visibly kicks the sync loop (the same action as foreground resume, FR-61).
+- Text sizing is rem-based so system Dynamic Type scaling degrades gracefully. [ASSUMPTION] Full Dynamic Type adoption is fit-and-finish, not phase-gating.
+
+#### 13.2.3 iOS Platform Behavior
+
+##### FR-61: Lifecycle-aware sync with honest disclosure
+System pauses the sync loop gracefully when the app backgrounds and resumes it with an immediate sync on foreground. keeper claims no background delivery: without push (paid-program gate, §13.5) there is no sync and no notification while backgrounded or suspended — and the UI and docs say so plainly.
+**Consequences (testable):**
+- Backgrounding stops the sliding-sync long-poll within seconds rather than letting it die mid-flight; foregrounding renders cached state instantly and shows new messages within 2 s on Wi-Fi.
+- A first-run/settings disclosure states that on iPhone keeper syncs and notifies only while open, and that background notifications await an explicit future decision — no fake "push while closed" promise anywhere (extends FR-53's honesty rule).
+
+##### FR-62: Foreground notifications and app badge
+System posts local notifications for new messages while the app is active — same content, preview, and mute/mention-only semantics as FR-51/FR-52 — and keeps the app icon badge equal to the unread count, updated on each sync.
+**Consequences (testable):**
+- Notifications for the currently visible Chat are suppressed (reusing desktop logic); previews-off and mute settings behave identically to macOS.
+- The badge reflects unread state as of the last sync and refreshes on foreground resume; it does not pretend to be live while suspended. [ASSUMPTION] Badge counts total unreads across all Accounts (the Unified Inbox aggregate).
+
+##### FR-63: iOS keychain sessions
+System stores session tokens and secrets in the iOS keychain through the existing platform seam, available after first unlock and never synced off-device.
+**Consequences (testable):**
+- Keychain items use after-first-unlock, this-device-only accessibility: readable by a resumed sync loop, invisible to other apps, excluded from iCloud Keychain — a Matrix device identity must never be cloned to another device.
+- Sessions survive app relaunch and 7-day re-sign cycles without re-login.
+
+##### FR-64: Media protocol on WKURLSchemeHandler
+System serves decrypted media on iOS through the same `keeper-media://` custom protocol with an identical URL format to macOS, including Range (200/206/416) support for seeking.
+**Consequences (testable):**
+- Encrypted images render in the timeline; video plays and seeks on-device (Range/206 path exercised); decrypted bytes never pass through IPC JSON — NFR-9 holds unchanged on iOS.
+- The retry-on-cache-miss path works after force-quit.
+
+##### FR-65: Backup exclusion and file protection for local stores
+System excludes keeper's databases (sync stores, crypto stores, Local Archive) from iCloud/device backup and applies a file-protection class that keeps a resumed sync loop working.
+**Consequences (testable):**
+- DB directories carry the backup-exclusion flag — multi-gigabyte, re-syncable state does not bloat user backups; files use the complete-until-first-user-authentication protection class (encrypted at rest without breaking database access after screen lock).
+- All account state lives under one data-directory root so a future App Group container move (NSE era) is a path change, not a migration of scattered files.
+- [ASSUMPTION] Backup exclusion covers the iOS Local Archive slice; the desktop Local Archive remains the durable, exportable copy this phase (FR-33–FR-37 promises stay anchored there), disclosed in the iOS docs.
+
+### 13.3 Phase NFRs
+
+*Continues §7's numbering. Measured on the owner's device (iPhone 12-class or newer), release build, real accounts.*
+
+- **NFR-15 Cold start on device:** launch → interactive Unified Inbox (cached Chats rendered, input accepted) in **< 3 s**. [ASSUMPTION] Authored bar (desktop NFR-1 is 2 s on Apple Silicon); confirm before release-gating.
+- **NFR-16 Memory hygiene under jetsam:** with multi-account sync running, keeper drops droppable caches (image memory cache, media byte buffers) on backgrounding and memory warnings; the in-memory media Range-slicing buffer is capped; a 24 h suspended soak with a large account survives without a jetsam kill; memory returns near baseline after backgrounding (Instruments-verified).
+- **NFR-17 Flaky-network resilience:** the UI always renders instantly from the local mirror; the sync loop uses Simplified Sliding Sync offline mode with backoff and exits it immediately on demand; airplane-mode toggles and Wi-Fi↔cellular handovers recover unaided; a stale resume (foreground with last sync minutes old) shows cached UI at once, kicks sync, and surfaces a subtle "connecting" state — including a sync-loop restart guard for the known stale-session edge (matrix-rust-sdk#3935).
+- **NFR-18 Resume integrity:** resuming from background — including overnight suspension — never leaves a blank or unresponsive webview (Tauri #14371); a reload guard detects a jettisoned webview process and restores the UI; this scenario is acceptance-tested from the walking skeleton onward.
+
+### 13.4 Out of Scope (this phase)
+
+- **APNs push and the Notification Service Extension** — the paid-program decision gate (§13.5). Impossible on free signing (blocked entitlements); deferred by explicit decision, not omission.
+- **App Store / TestFlight distribution**, and every other paid-program-dependent capability: App Groups, `https://` universal links, AltStore PAL notarization.
+- **iPad layout and Android** — later phases. The phone tier (FR-58) and capability-flag mechanism (FR-57) are deliberately platform-neutral so they carry over; Android's media-URL remapping helper is introduced only when Android starts, not speculatively.
+- **Calls** — unchanged (§5).
+- **iOS extras with no phase justification:** share extension, home-screen widgets, Siri intents, biometric app lock (mobile plugins exist; nothing this phase depends on them).
+
+### 13.5 Paid Apple Developer Program — the decision gate
+
+The single deliberate deferral of this phase. The $99/yr program is the sole unlock for APNs push, the NSE (background notification decryption, with its 24 MB memory ceiling and App-Group store-layout implications — kept cheap now by the single data-dir root, FR-65), TestFlight, App Groups, and AltStore PAL notarization for EU distribution. The gate opens only when push becomes a product goal — and it then forces a PRD-level question that keeper's client-only constraint makes hard: push must ride a homeserver operator's gateway, Beeper's, or a user-run Sygnal — never project infrastructure (NFR-11). Until the gate: the 7-day re-arm ritual is documented in the iOS docs, AltServer auto-refresh is the optional quality-of-life path, and test IPAs are shared via per-tester re-signing.
+
+### 13.6 Phase Success Metrics
+
+- **SM-7 Walking-skeleton gate:** the FR-55 on-device gate (OIDC login via deep link, room list, E2EE text send/receive, relaunch-restore) passes before phone-UX work begins — the AD-24 Plan A validation, binary and demo-able.
+- **SM-8 Phone daily-driver:** the owner uses keeper on iPhone as the primary phone messenger for ≥ 2 consecutive weeks — triage and replies happen on the phone, zero silent-loss incidents (NFR-5 extended to iOS), NFR-15–NFR-18 bars green, and the 7-day re-arm costs minutes per week, not hours.
+
+### 13.7 Phase Risks (Register)
+
+Adopted from the research risk register (research §5):
+
+- **Blank webview on resume (Tauri #14371)** — medium likelihood. Mitigation: reload guard (NFR-18), tested first thing in the walking skeleton, upstream fix tracked.
+- **`keyring` crate misbehaves on the iOS keychain** — medium. Mitigation: spike inside the walking skeleton; contained fallback to direct Security-framework calls behind the existing platform seam (FR-63).
+- **Keyboard/scroll quirks in the composer (WKWebView)** — high likelihood of quirks, low of blockers. Mitigation: time-boxed keyboard-avoidance work with documented patterns and a simpler viewport fallback (FR-59).
+- **7-day expiry friction erodes dogfooding** — medium. Mitigation: AltServer auto-refresh, documented weekly re-arm ritual; SM-8 explicitly tracks the cost.
+- **Large-media RAM slicing trips memory pressure** — low–medium. Mitigation: buffer cap (NFR-16); disk-backed streaming recorded as deferred work.
+
+### 13.8 Phase Decisions & Open Questions
+
+**Pre-answered (adopted from the research; revisit only on evidence):**
+
+- Minimum iOS version: **16.0**, set explicitly in the generated project.
+- Bundle identifier: **same as macOS** — no shared-container conflicts exist on free signing, and it keeps deep-link registration coherent.
+- **No routing library** this phase — the phone stack is a projection of existing selection state; history integration is an optional enhancer for system back-gesture semantics.
+- **Plan B (UniFFI + native SwiftUI shell) stays shelved.** Revisit triggers, recorded here as the research directs: (a) the blank-webview bug class proves unfixable across Tauri releases; (b) NSE work begins — noting the NSE is a Rust+Swift target under Plan A regardless, so even that is not a shell rewrite.
+
+**Open:**
+
+1. NFR-15 cold-start number needs owner confirmation before it becomes a release gate. Owner: product owner, at phase release.
+2. Paid-program timing — the §13.5 gate itself. Owner: PM/owner, when push demand is real.

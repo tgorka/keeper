@@ -2,7 +2,7 @@
 title: "Addendum: keeper PRD"
 status: final
 created: 2026-07-03
-updated: 2026-07-03
+updated: 2026-07-09
 ---
 
 # Addendum — keeper PRD
@@ -50,10 +50,25 @@ The PRD's §6.2 fast-follow list descends from market research §5 / Appendix A 
 - **Explicit-approval invariant as product guardrail (FR-41):** framed as a PRD-level contract so the post-MVP agent API cannot erode it through implementation drift. Two dispatch triggers only (composer send, Approval Pane approve); both user-initiated.
 - **Bridge health in MVP vs. dashboard in v1.x (FR-28):** the 60 s surfacing bar and re-login prompts are MVP because silent bridge death is a top-2 competitor complaint; the aggregate dashboard/alert-center is organization, not detection, and defers safely.
 - **Flagship-three quality gate (SM-2):** "flawless" is scoped to Telegram/WhatsApp/Signal so the release gate is falsifiable; other Networks work best-effort through the same UX. Prevents the unbounded "every bridge perfect" trap.
-- **Notification pipeline:** local sync loop only — no APNs/push infra on desktop (would violate client-only). The iOS phase will need push infrastructure decisions (sygnal/NSE); out of this PRD.
+- **Notification pipeline:** local sync loop only — no APNs/push infra on desktop (would violate client-only). *(Updated 2026-07-09: the iOS phase records push/NSE as an explicit paid-program decision gate — PRD §13.5; foreground-only notifications until that gate opens.)*
 
 ## 6. UX-phase pointers (not requirements)
 
 - Beeper patterns worth studying (market research §1.5): Favorites vs. Pins two-tier, inbox-zero Archive flow, ⌘K palette scope, Spacebar network filters (v1.x), Incognito manual-release interaction.
 - First-Run Wizard (FR-31) is the highest-leverage UX surface in the product; the setup-cliff mitigation order is: wizard → companion-stack docs (docker-compose, docs-only) → managed-host pointers (etke.cc-style) → Beeper Account path.
 - Approval Pane (FR-40) should be designed with the future agent-proposal column in mind (proposer attribution, batch approve/discard) without shipping any of it in MVP.
+
+## 7. iOS phase technical constraints (added 2026-07-09; source: `research-ios-2026-07-09.md`)
+
+Locked by the iOS research (authoritative for the phase; PRD §13 states the *what*, this records the *how* architecture must honor):
+
+- **Plan A confirmed (AD-24):** Tauri 2 mobile target reusing keeper-core and the existing IPC contract; Plan B (UniFFI + SwiftUI shell) shelved with recorded revisit triggers (PRD §13.8).
+- **Plugin availability:** notification and deep-link work on iOS; global-shortcut, updater, autostart, window-state, tray are desktop-only → `#[cfg(desktop)]` seams in the shell crate; desktop-only plugin deps behind target-gated Cargo dependencies; clipboard falls back to the web Clipboard API; opener replaced by a minimal native call where needed.
+- **Media transport:** wry implements `register_uri_scheme_protocol` via WKURLSchemeHandler on iOS — `keeper-media://` URL format identical to macOS; in-memory Range slicing carries a RAM cost (capped per NFR-16; disk-backed streaming is deferred work).
+- **Stores:** `matrix-sdk-sqlite` (bundled rusqlite) builds for `aarch64-apple-ios` — the same stack Element X ships; file protection `NSFileProtectionCompleteUntilFirstUserAuthentication` (not `Complete` — WAL access after lock); DB dirs `isExcludedFromBackup`; all account state under one `data_dir()` root for a cheap future App Group move.
+- **Keychain:** `keyring` v3 apple-native backend targets the iOS keychain; set `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`; contained fallback = direct `security-framework` generic-password calls behind the `Platform` port.
+- **Lifecycle hooks:** webview `visibilitychange` as the zero-native stopgap; micro Swift plugin on `UIApplication` background/foreground notifications as the correct path; SyncService pause/offline-mode/resume from matrix-sdk-ui.
+- **Signing/distribution:** free Personal Team (7-day profiles, ~3 devices, blocked entitlements: push, App Groups, iCloud, associated domains); automatic signing + re-sign-afterwards flow for shared IPAs (Sideloadly/zsign); AltServer auto-refresh as QoL; bundle ID stable and shared with macOS.
+- **Toolchain:** full Xcode + CocoaPods + `aarch64-apple-ios{,-sim}` rust targets; `gen/apple` committed (minus `build/`), persistent edits in `project.yml`/`Info.plist` only; min iOS 16.0 set explicitly; CI PR gate `cargo check --target aarch64-apple-ios`.
+- **Safe areas/keyboard:** `viewport-fit=cover` + `contentInsetAdjustmentBehavior = .never` + `env(safe-area-inset-*)` CSS vars; keyboard inset via `visualViewport` (evaluate `interactive-widget=resizes-content`).
+- **Epic shape (research §5):** Epic 12 walking skeleton (UI-free, retires toolchain/signing/core risks) → Epic 13 phone shell ∥ Epic 14 platform behavior → Epic 15 fit-and-finish + paid-program decision-gate story.
