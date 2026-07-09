@@ -1,0 +1,38 @@
+_bmad-output/planning-artifacts/ux-designs/ux-keeper-2026-07-03/DESIGN.md
+  s_8a8bc6b6bf6017::t_ad449050a7bd2a 124-134
+  s_8a8bc6b6bf6017::t_c948cc4b623347 234-235
+  s_8a8bc6b6bf6017::t_1c85adb22463bc 3,6
+  s_8a8bc6b6bf6017::t_fabb56c24c1cbd 66-69
+  s_8a8bc6b6bf6017::t_70fbeec1a9cce7 189-190
+_bmad-output/planning-artifacts/ux-designs/ux-keeper-2026-07-03/.memlog.md
+  s_8a8bc6b6bf6017::t_c42a7ef1ab428b 3,17-22
+.github/workflows/release.yml
+  s_8a8bc6b6bf6017::t_9784c0f1e18bda 62-63,70,72-75,86,91-116
+  s_8a8bc6b6bf6017::t_06dcefccc19357 117
+_bmad-output/planning-artifacts/ux-designs/ux-keeper-2026-07-03/EXPERIENCE.md
+  s_8a8bc6b6bf6017::t_124ce35ea8feec 176
+  s_8a8bc6b6bf6017::t_ceb13d749829b6 202
+  s_8a8bc6b6bf6017::t_01fcf4476674b3 28-29
+  s_8a8bc6b6bf6017::t_fbd109870a4272 22
+  s_8a8bc6b6bf6017::t_8fb2dc14a7141d 10,13
+  s_8a8bc6b6bf6017::t_dddd3528a0c4b8 32
+  s_8a8bc6b6bf6017::t_7c72cb56466138 73
+  s_8a8bc6b6bf6017::t_f0961759b1986d 18
+  s_8a8bc6b6bf6017::t_81c0bca042851f 206,208,213-252,254-360
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a5ebed2957ec57fe4256eef12e5f9a92de3b2145",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
