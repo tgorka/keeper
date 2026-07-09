@@ -94,7 +94,9 @@ jobs:
         if: steps.signing.outputs.signed == 'false'
         run: |
           set -euo pipefail
-          bun run tauri build --config src-tauri/crates/keeper/tauri.conf.json --target aarch64-apple-darwin --bundles app
+          # createUpdaterArtifacts=false: unsigned builds ship no updater artifacts, so
+          # the committed updater pubkey doesn't force TAURI_SIGNING_PRIVATE_KEY here.
+          bun run tauri build --config src-tauri/crates/keeper/tauri.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --target aarch64-apple-darwin --bundles app
           APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/keeper.app"
           codesign --force --deep -s - "$APP"
           VERSION="${GITHUB_REF_NAME#v}"
