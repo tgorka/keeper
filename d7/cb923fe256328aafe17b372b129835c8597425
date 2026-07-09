@@ -1,0 +1,23 @@
+_bmad-output/planning-artifacts/research-ios-2026-07-09.md
+  s_8a8bc6b6bf6017::t_02288c68e94a2f 43-56
+  s_8a8bc6b6bf6017::t_e9a001c2a9f80e 191-201,203-211,215-222,224-252
+  s_8a8bc6b6bf6017::t_abf56ec916c537 256-272
+  s_8a8bc6b6bf6017::t_1ce7d3cb6cca17 99-107
+  s_8a8bc6b6bf6017::t_ef22e79cf0bf58 1-42,57-98,108-190,202,212-214,223,253-255,273-281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d7cb923fe256328aafe17b372b129835c8597425",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
