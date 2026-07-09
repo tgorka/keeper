@@ -1,5 +1,5 @@
 # generated: 2026-07-03
-# last_updated: 2026-07-03
+# last_updated: 2026-07-09
 # project: keeper
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-03
-last_updated: 2026-07-03
+last_updated: 2026-07-09
 project: keeper
 project_key: NOKEY
 tracking_system: file-system
@@ -133,3 +133,37 @@ development_status:
   11-2-signed-auto-updates-and-egress-honesty: done
   11-3-performance-and-reliability-release-gates: done
   epic-11-retrospective: optional
+  epic-12: backlog
+  12-1-ios-project-init-and-repo-integration: backlog
+  12-2-desktop-mobile-compile-seam-and-capability-handshake: backlog
+  12-3-ios-platform-port-keychain-spike-and-data-directory: backlog
+  12-4-media-protocol-on-wkurlschemehandler-with-capped-buffers: backlog
+  12-5-ios-compile-check-in-ci: backlog
+  12-6-on-device-walking-skeleton-validation-sm-7-gate: backlog
+  epic-12-retrospective: optional
+  epic-13: backlog
+  13-1-phone-layout-tier-and-navigation-stack: backlog
+  13-2-phone-header-push-pop-transitions-and-edge-swipe-back: backlog
+  13-3-leading-drawer-with-status-cluster: backlog
+  13-4-merged-full-screen-search-surface: backlog
+  13-5-safe-areas-and-the-keyboard-avoiding-composer: backlog
+  13-6-touch-idioms-long-press-row-swipes-pull-to-refresh: backlog
+  13-7-capability-gated-surfaces-and-on-this-iphone-disclosure: backlog
+  epic-13-retrospective: optional
+  epic-14: backlog
+  14-1-lifecycle-pause-resume-through-one-rust-entry: backlog
+  14-2-honest-no-background-sync-disclosure: backlog
+  14-3-foreground-notifications-and-the-all-accounts-badge: backlog
+  14-4-resume-integrity-blank-webview-guard-and-stale-resume-pill: backlog
+  14-5-memory-hygiene-under-jetsam: backlog
+  14-6-flaky-network-resilience: backlog
+  14-7-backup-exclusion-and-file-protection: backlog
+  epic-14-retrospective: optional
+  epic-15: backlog
+  15-1-app-icons-and-launch-assets: backlog
+  15-2-docs-ios-md-free-signing-walkthrough: backlog
+  15-3-shareable-ipa-build-path-unsigned-export-for-re-signing: backlog
+  15-4-required-ios-ci-gate-and-release-hygiene: backlog
+  15-5-paid-program-decision-gate-recorded: backlog
+  15-6-final-device-install-and-phase-acceptance: backlog
+  epic-15-retrospective: optional
