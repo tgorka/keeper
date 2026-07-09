@@ -6,11 +6,13 @@ inputDocuments:
   - _bmad-output/planning-artifacts/architecture/architecture-keeper-2026-07-03/ARCHITECTURE-SPINE.md
   - _bmad-output/planning-artifacts/ux-designs/ux-keeper-2026-07-03/DESIGN.md
   - _bmad-output/planning-artifacts/ux-designs/ux-keeper-2026-07-03/EXPERIENCE.md
+  - _bmad-output/planning-artifacts/research-ios-2026-07-09.md
   - docs/project-context.md
 generated: 2026-07-03
+updated: 2026-07-09 (iOS phase — Epics 12–15 appended)
 mode: headless
-storyCount: 63
-epicCount: 11
+storyCount: 89
+epicCount: 15
 ---
 
 # keeper - Epic Breakdown
@@ -20,6 +22,8 @@ epicCount: 11
 This document provides the complete epic and story breakdown for keeper, decomposing the PRD (FR-1–FR-54, NFR-1–NFR-14), the Architecture Spine (AD-1–AD-25), and the UX design contract (DESIGN.md + EXPERIENCE.md) into implementable stories. Epics are ordered for incremental delivery on the existing Tauri + React scaffold (matrix-sdk 0.18 already wired in). Epic 1 produces a usable walking skeleton and doubles as the PRD OQ-1 exit gate (SSS + timeline channel + send/receive in a release build). Every story is sized for one dev session, carries acceptance criteria mapped to FR/NFR ids, and lists explicit dependencies on previous stories only.
 
 Post-MVP items (PRD §6.2) are flagged in the "Post-MVP — Not Storied" section at the end and deliberately have no stories.
+
+**Phase 2 increment (2026-07-09):** with all 11 desktop epics (63 stories) done, Epics 12–15 add the iOS/iPhone client per PRD §13 (FR-55–FR-65, NFR-15–NFR-18), the Architecture Spine iOS increment (AD-26–AD-32, AD-24 Plan A confirmed), the UX phone-tier contract (EXPERIENCE.md `Responsive & Platform` + DESIGN.md phone tokens), and the iOS technical research (`research-ios-2026-07-09.md` §5/§7/Appendix A). Epic 12 is a UI-free walking skeleton that retires the toolchain/signing/core-on-iOS risks and ends at the SM-7 on-device gate; Epics 13 (phone shell) and 14 (platform behavior) can proceed in parallel after it; Epic 15 hardens release hygiene. Stories are implementable without a physical device wherever possible (simulator and compile gates); exactly two stories are explicitly human-in-the-loop (12.6 on-device skeleton validation, 15.6 final device install) so the automation loop defers them to the coordinator rather than escalating.
 
 ## Requirements Inventory
 
@@ -80,6 +84,20 @@ Post-MVP items (PRD §6.2) are flagged in the "Post-MVP — Not Storied" section
 - FR-53: Background sync + notify with window closed; opt-in launch-at-login; honest quit semantics
 - FR-54: Notification click-through to exact Chat/Account/message
 
+*iOS phase (PRD §13):*
+
+- FR-55: iOS app target — builds and runs via `tauri ios` from the existing workspace (keeper-core as staticlib, React in WKWebView); free Personal Team signing; stable bundle id shared with macOS; on-device walking-skeleton gate; CI iOS compile check as required PR gate
+- FR-56: Desktop-only code compile-gated out of the iOS build (tray, global-shortcut, autostart, updater, window-state, desktop deep-link registration); iOS shell registers notification + mobile deep-link + IPC + media protocol only; updates arrive by reinstall/re-sign, no in-app updater path on iOS
+- FR-57: Platform capability flags over the IPC handshake; unsupported surfaces (bbctl, global hotkey, updater controls, tray/launch-at-login) never render — no dead buttons; bridge management otherwise fully functional on iOS; flags data-driven per platform for later targets
+- FR-58: Phone layout tier (< 768 px) — single-pane navigation stack Inbox → Room → Detail reusing existing components and selection state; desktop/tablet tiers unchanged ≥ 768 px; sidebar becomes a drawer; palette maps to pull-down search
+- FR-59: Safe areas and keyboard avoidance — edge-to-edge rendering respecting iOS safe-area insets on every surface; composer never covered by the on-screen keyboard; no stranded offsets or launch/rotation flash
+- FR-60: Touch idioms — long-press opens the same context menus as right-click; edge-swipe back; row swipe actions (archive/mute); pull-to-refresh kicks sync; every tappable ≥ 44 pt; rem-based text scaling degrades gracefully
+- FR-61: Lifecycle-aware sync with honest disclosure — graceful pause on background, immediate sync on foreground; no background delivery claimed anywhere (no fake "push while closed" promise)
+- FR-62: Foreground notifications + app icon badge = all-accounts unread aggregate updated per sync; visible-Chat suppression, previews-off, and mute/mention-only semantics identical to macOS
+- FR-63: iOS keychain sessions — after-first-unlock, this-device-only accessibility through the existing platform seam; never synced off-device; survive relaunch and 7-day re-sign cycles
+- FR-64: Media protocol on WKURLSchemeHandler — same `keeper-media://` URL format as macOS incl. Range (200/206/416) seeking; decrypted bytes never cross IPC JSON
+- FR-65: Backup exclusion + file protection for local stores — DB directories excluded from iCloud/device backup; complete-until-first-user-authentication protection class; all account state under one data-directory root
+
 ### NonFunctional Requirements
 
 - NFR-1: Cold start < 2 s to interactive Unified Inbox (cached render first)
@@ -96,6 +114,13 @@ Post-MVP items (PRD §6.2) are flagged in the "Post-MVP — Not Storied" section
 - NFR-12: Signed + notarized macOS builds, signed auto-updates, reproducible CI
 - NFR-13: Apache-2.0 licensing firewall (cargo-deny; no GPL/AGPL; provenance notes on ported code)
 - NFR-14: Baseline accessibility — keyboard-only operable, labeled for VoiceOver, WCAG 2.1 AA contrast both themes
+
+*iOS phase (PRD §13.3, measured on-device, release build, real accounts):*
+
+- NFR-15: Cold start on device < 3 s to interactive Unified Inbox (cached Chats rendered, input accepted) — authored bar; owner confirmation required before it becomes release-gating (PRD §13.8)
+- NFR-16: Memory hygiene under jetsam — droppable caches (image memory cache, media byte buffers) released on backgrounding and memory warnings; media Range-slicing buffer capped; 24 h suspended soak with a large account survives without a jetsam kill; memory returns near baseline (Instruments-verified)
+- NFR-17: Flaky-network resilience — UI always renders instantly from the local mirror; SSS offline mode with backoff, exited immediately on demand; airplane-mode toggles and Wi-Fi↔cellular handovers recover unaided; stale resume shows cached UI, kicks sync, surfaces a subtle "connecting" state incl. the sync-loop restart guard (matrix-rust-sdk#3935)
+- NFR-18: Resume integrity — resuming from background (incl. overnight suspension) never leaves a blank or unresponsive webview (tauri#14371); reload guard detects a jettisoned webview process and restores the UI; acceptance-tested from the walking skeleton onward
 
 ### Additional Requirements
 
@@ -124,6 +149,18 @@ From the Architecture Spine (AD-1–AD-25) — decisions that materially shape s
 - Epic-gating tests (not amendments): OQ-1 walking-skeleton release-build spike = Epic 1 exit gate; OQ-3 hungryserv surface verification against a real Beeper Account = Epic 2 exit check (degrade per-feature with disclosure).
 - Identity/DTO/date conventions per the spine's Consistency Conventions table (ULID account ids, `Vm` suffix, camelCase serde, ms-epoch timestamps).
 
+From the Architecture Spine iOS increment (AD-26–AD-32; AD-24 Plan A confirmed — Tauri mobile reusing keeper-core and the same IPC contract; Plan B shelved with recorded revisit triggers):
+
+- AD-26 one shell crate: iOS is the **same** `crates/keeper` crate built as a staticlib via `tauri ios` (`tauri::mobile_entry_point`) — no `keeper-ios` crate ever; desktop-only surface (tray module + `tray-icon` feature, global-shortcut, autostart, updater, window-state, desktop deep-link registration) behind `#[cfg(desktop)]`/target-gated Cargo deps; iOS registers notification + mobile deep-link + IPC + media protocol only; clipboard via web Clipboard API, opener replaced by a minimal native open call; `keeper-core` stays platform-free (variance only through the `Platform` port).
+- AD-27 a single `CapabilitiesVm` in `keeper-core::vm` (serde + ts-rs), served over the IPC handshake at startup, data-driven per platform; off capability ⇒ surface does not render at all; `Platform::sidecar_path` returns a clean Unsupported `IpcError` on iOS; the frontend never consults `navigator.userAgent`/build flags.
+- AD-28 `keeper-media://` runs unchanged on iOS (wry → WKURLSchemeHandler, identical URL format, no frontend media-URL helper); in-memory Range slicing **capped** (NFR-16); scheme-task invalidation tolerated by the fire-and-forget responder; disk-backed streaming is deferred work.
+- AD-29 secrets through the **existing** keyring/apple-native `Platform` port targeting the iOS keychain — spiked in the walking skeleton, contained fallback = direct security-framework generic-password calls behind the same port; `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`; DB dirs `NSFileProtectionCompleteUntilFirstUserAuthentication` (never `Complete`) + `isExcludedFromBackup`; all account state under the one `Platform::data_dir()` root (future App Group move = path change, not migration).
+- AD-30 foreground-only sync, honestly disclosed: graceful `SyncService` pause on background, resume + immediate sync on foreground rendering the cached mirror instantly; detection enters Rust through **one** lifecycle command (`visibilitychange` first; micro Swift plugin only as the correctness upgrade — same Rust entry either way); blank-webview reload guard (tauri#14371) mandatory from the walking skeleton onward; iOS notifications are foreground-local + badge-on-sync only, reusing AD-18; badge = the Unified Inbox unread aggregate from `inbox` (AD-20), never a second count.
+- AD-31 phone tier = third `phone` tier (< 768 px) in the existing `useShellLayout`; stack container is a **projection of existing zustand selection state** reusing InboxList/ChatView/DetailPanel — no routing library this phase (`history.pushState` optional enhancer); safe areas via `viewport-fit=cover` + `contentInsetAdjustmentBehavior = .never` + `env(safe-area-inset-*)` as theme CSS vars; keyboard via a `visualViewport`-driven `--kb-inset` var (evaluate `interactive-widget=resizes-content`).
+- AD-32 `gen/apple` generated under `crates/keeper` and committed (`build/` gitignored); persistent edits **only** in `project.yml`, `Info.plist` (`keeper://` CFBundleURLTypes), and `*_iOS/` sources; minimum iOS 16.0 set explicitly; Personal Team via `bundle.iOS.developmentTeam` or `TAURI_APPLE_DEVELOPMENT_TEAM` env (team id out of git); bundle id stable and shared with macOS; CI adds `cargo check --target aarch64-apple-ios` as a required PR gate (compile-only, existing macOS runner).
+- Phase gates: **SM-7** walking skeleton (on-device OIDC deep-link login, room list, E2EE text send/receive, relaunch-restore + keyring spike + resume reload guard exercised) must pass before phone-UX epics; **SM-8** phone daily-driver ≥ 2 consecutive weeks. NFR-15's 3 s bar is not release-gating until the owner confirms it (PRD §13.8).
+- Distribution posture: free Personal Team signing (7-day profiles re-armed from the owner's Mac, ~3 devices, blocked entitlements); test IPAs shared via per-tester re-signing (Sideloadly/zsign); AltServer auto-refresh optional; the paid Apple Developer Program is an explicit deferred decision gate (PRD §13.5), never an omission.
+
 ### UX Design Requirements
 
 From DESIGN.md + EXPERIENCE.md (behavioral + brand-layer deltas; each must be covered by a story):
@@ -149,6 +186,17 @@ From DESIGN.md + EXPERIENCE.md (behavioral + brand-layer deltas; each must be co
 - UX-DR19: Detail panel (⌘I) — chat info, members, shared media, per-chat controls (mute/mention-only, incognito override, archive, export, open raw Bridge Bot chat).
 - UX-DR20: Draft-conflict chip above composer ("Edited on another device — Use that version"); sign-out AlertDialog with keep-default and typed-account-name destructive path.
 
+Phone-tier increment (EXPERIENCE.md `Responsive & Platform` + DESIGN.md phone tokens; the phone tier is a projection of the desktop spine, not a second product):
+
+- UX-DR21: Phone-tier tokens — `phone-breakpoint` 768 px, `touch-target-min` 44 pt, `safe-area` CSS vars (`--safe-*`, viewport-fit=cover), `--kb-inset` keyboard var, `phone-header` 52 px (back chevron + previous-level title, flat 1 px-border pane language), `swipe-action` surfaces (archive = primary, read-toggle = secondary, mute = muted, discard = destructive; label past half-swipe threshold). Same tokens, same components, same density — no restyling.
+- UX-DR22: Navigation-stack behavior — three full-screen levels (Inbox → Room → Detail); push slides ~250 ms ease-out with under-level shift/dim, pop reverses, reduced-motion cuts; back affordance priority: header chevron → edge-swipe back (tracks finger, commits past 50 %/flick) → optional history integration; back always returns to Inbox preserving scroll position; opening a Chat does not auto-focus the composer; deep links set selection state and render at the right level.
+- UX-DR23: Leading drawer = the entire desktop sidebar in a Sheet (views/SPACES/NETWORKS/account switcher/settings gear/sync status), opened by the header avatar button (worst-state bridge-health dot overlay) or edge-swipe at level 0 only; Inbox-header status cluster: amber Approval chip (pending count > 0, deep-links to Approval Pane) + magnifier + compose; **no bottom tab bar** (decision on the record); quiet header when healthy.
+- UX-DR24: Merged full-screen Search surface replaces ⌘K + ⌘⇧F on phone — segmented scopes Chats / Messages (FTS with filter chips, deep-link to match) / Actions (full registry, context-aware), `>` prefix jumps to Actions; entered via header magnifier or pull-down on the Inbox list, with pull-to-refresh past the reveal threshold as one continuous axis; in-chat search via Room overflow → "Search in chat" (Messages pre-filtered); palette parity remains the release gate on phone.
+- UX-DR25: Phone composer — bottom-anchored above `calc(var(--kb-inset) + env(safe-area-inset-bottom))`; **send is a ≥ 44 pt button** (tap = FR-41 approval trigger #1), on-screen return key inserts a newline, hardware keyboard follows the desktop setting; autogrow to 5 lines then scroll; attach via + → system photo library/camera/Files; undo-send pill tap replaces ⌘⇧Z; bottom-pinned timeline stays pinned across keyboard open/dismiss.
+- UX-DR26: Touch idiom mapping table is normative — long-press = right-click everywhere (identical ContextMenus; bubble menu: React row, Reply, Edit, Delete ▸, Copy, Jump-to-original); row swipes: trailing → Archive + More (mute ▸), leading → read/unread; full-swipe commits first action; long-press-drag reorders Pins; Approval Pane touch: row tap → inline editor, explicit per-row Approve button ≥ 44 pt, trailing swipe → Discard with 5 s undo toast, still no approve-all; system callout/tap-highlight suppressed where custom menus exist; cheat sheet hidden on phone.
+- UX-DR27: Capability honesty surfaces — absent capabilities removed then disclosed once: Settings → About "On this iPhone" rendered list (foreground-only sync, no bbctl, no global hotkey, updates by reinstall/7-day signature, link to docs/ios.md); lifecycle honesty card on iOS first run + permanent Settings → Notifications copy ("…nothing here pretends to be push"); Archive & Storage line: phone Local Archive excluded from backup, the Mac remains the durable exportable copy.
+- UX-DR28: iOS accessibility + phone states — VoiceOver focus moves to the new level's header on push and returns on pop; escape gesture = back at every level; **no gesture is the sole path** (row swipes duplicated as VoiceOver custom actions + context menu; pull-to-refresh duplicated as "Sync now"); rem-based scaling holds at ~130 % text size; phone-tier state table honored (stale-resume "Connecting…" pill, reload-guard restore, queued-send caption "Queued — sends when keeper is open and back online", notification-permission-denied persistent state with Open Settings link, offline pull-to-refresh resolves to the offline pill, never an error toast).
+
 ### FR Coverage Map
 
 | FR | Epic | Notes |
@@ -172,6 +220,16 @@ From DESIGN.md + EXPERIENCE.md (behavioral + brand-layer deltas; each must be co
 | NFR-10 | Epic 2 (Story 2.6) | SDK-store passphrase choice per AD-22 |
 | NFR-11–NFR-13 | Epic 11 | Egress list, packaging, licensing gates |
 | NFR-1–NFR-4, NFR-8 | Epic 11 (gates) + designed-in throughout | CI perf harness makes them release gates |
+| FR-55, FR-56 | Epic 12 | Init + compile seam; CI check in 12.5; on-device gate = Story 12.6 (SM-7) |
+| FR-57 | Epic 12 (CapabilitiesVm + handshake) + Epic 13 (surface hiding, Story 13.7) | Split is deliberate: mechanism before UI |
+| FR-58, FR-59, FR-60 | Epic 13 | Stack navigation, safe areas/keyboard, touch idioms |
+| FR-61 | Epic 14 | Mechanics in 14.1, honesty copy in 14.2 |
+| FR-62 | Epic 14 | Foreground notifications + all-accounts badge |
+| FR-63 | Epic 12 | Keychain spike-first per AD-29 (Story 12.3) |
+| FR-64 | Epic 12 | WKURLSchemeHandler media with capped buffers (Story 12.4) |
+| FR-65 | Epic 14 | Backup exclusion + file protection (Story 14.7) |
+| NFR-15 | Epic 15 | Measured on-device in 15.6; authored bar pending owner confirmation |
+| NFR-16, NFR-17, NFR-18 | Epic 14 | Memory hygiene, network resilience, resume integrity |
 
 ## Epic List
 
@@ -218,6 +276,22 @@ Reliable native notifications from the local sync loop, with mutes/mention-only/
 ### Epic 11: Packaging, Release & Quality Gates
 Signed, notarized, auto-updating builds from reproducible CI, with the licensing firewall, the rendered egress list, and the performance/reliability bars turned into release gates.
 **FRs covered:** — (NFR-11, NFR-12, NFR-13; NFR-1–NFR-4/NFR-8 as CI gates)
+
+### Epic 12: iOS Walking Skeleton — Build, Sign, Run
+keeper compiles, signs, and runs on iPhone from the same workspace, UI-free: `gen/apple` committed, desktop-only code cfg-gated out with the CapabilitiesVm handshake, keychain spiked through the existing port, `keeper-media://` proven on WKURLSchemeHandler, a CI compile gate — ending at the SM-7 on-device gate before any phone-UX investment.
+**FRs covered:** FR-55, FR-56, FR-57 (mechanism), FR-63, FR-64 (+ AD-26–AD-29, AD-32; SM-7 exit gate)
+
+### Epic 13: iPhone Shell — Single-Pane Navigation
+The desktop shell projects onto a phone tier: navigation stack Inbox → Room → Detail from existing selection state, leading drawer with the status cluster, merged full-screen Search, safe-area/keyboard-aware composer, full touch idioms, and capability-honest surfaces with the "On this iPhone" disclosure.
+**FRs covered:** FR-58, FR-59, FR-60; FR-57 (surface leg); FR-48/FR-34 parity on phone (+ UX-DR21–UX-DR28)
+
+### Epic 14: iOS Platform Behavior
+The phone behaves honestly as an iOS citizen: foreground-only sync through one Rust lifecycle entry with plain disclosure, foreground notifications + all-accounts badge, resume integrity under webview jettison, memory hygiene under jetsam, flaky-network resilience, and backup exclusion + file protection for the local stores.
+**FRs covered:** FR-61, FR-62, FR-65; NFR-16, NFR-17, NFR-18
+
+### Epic 15: iOS Polish & Release
+Ship the phase: icons and launch assets, the free-signing walkthrough in docs/ios.md, a shareable IPA path for re-signing, the iOS CI gate wired as required, the paid-program decision gate recorded, and the final on-device acceptance that opens SM-8 dogfooding.
+**FRs covered:** — (FR-55 assets/docs/CI legs; NFR-15 measured; SM-8; PRD §13.5 decision record)
 
 ## Epic 1: Walking Skeleton — Sign In and Chat on Matrix
 
@@ -1699,6 +1773,618 @@ So that regressions fail builds instead of reaching users.
 **Given** induced bridge-session drops in the test environment
 **Then** the ≤ 60 s surfacing bar (NFR-6) is verified as part of the release checklist (SM-3).
 
+## Epic 12: iOS Walking Skeleton — Build, Sign, Run
+
+Prove keeper-on-iPhone before any UX investment, exactly as AD-24 Plan A prescribes: the same `crates/keeper` shell builds as an iOS staticlib, desktop-only code compile-gates out cleanly, the keychain and media protocol work through the existing ports, and CI guards the target forever after. The epic is deliberately UI-free and simulator/compile-first — only Story 12.6 needs a physical device. Exit gate (SM-7): on-device OIDC deep-link login, room list, E2EE text send/receive, and relaunch-restore, on free Personal Team signing.
+
+### Story 12.1: iOS Project Init and Repo Integration
+
+As a keeper developer,
+I want `tauri ios init` run and its generated Apple project integrated into the repo under the architecture's rules,
+So that the iOS target exists reproducibly, with a stable identity and no hand edits that regeneration can destroy.
+
+**Requirements:** FR-55 (init leg); AD-32
+**Dependencies:** none (desktop Epics 1–11 complete)
+
+**Acceptance Criteria:**
+
+**Given** the existing cargo workspace
+**When** `tauri ios init` generates `gen/apple` under `crates/keeper`
+**Then** `gen/apple` is committed with `build/` gitignored, and persistent edits live only in `project.yml` (minimum deployment target iOS 16.0 set explicitly, theme-matched background color), `Info.plist` (`CFBundleURLTypes` for `keeper://`), and the `*_iOS/` sources — regenerating the `.xcodeproj` loses nothing (AD-32)
+**And** the bundle identifier is the same as macOS, and signing uses `bundle.iOS.developmentTeam` or the `TAURI_APPLE_DEVELOPMENT_TEAM` env var so no team id ever lands in git.
+
+**Given** the iOS Simulator on the dev machine (Xcode 16.x, CocoaPods, rust targets `aarch64-apple-ios{,-sim}` — prerequisites noted for docs/ios.md)
+**When** `tauri ios dev` runs
+**Then** the app opens in the Simulator showing the existing login screen — no physical device required (FR-55).
+
+**Given** the desktop target
+**When** the branch builds
+**Then** desktop behavior is unchanged and `bun run check`, `bun run check:rust`, `bun run test:rust`, and `cargo deny check` all pass.
+
+### Story 12.2: Desktop/Mobile Compile Seam and Capability Handshake
+
+As a keeper developer,
+I want desktop-only surfaces cfg-gated out of the iOS build and a single CapabilitiesVm served over the IPC handshake,
+So that one shell crate serves both platforms and the UI never has to guess what exists.
+
+**Requirements:** FR-56, FR-57 (mechanism); AD-26, AD-27, AD-7
+**Dependencies:** 12.1
+
+**Acceptance Criteria:**
+
+**Given** the `crates/keeper` shell
+**When** the seam is complete
+**Then** the `tray` module + `tray-icon` cargo feature, global-shortcut, autostart, updater, window-state, and desktop deep-link registration sit behind `#[cfg(desktop)]`/`#[cfg(target_os)]` gates with target-gated Cargo dependencies, the iOS shell registers notification + mobile deep-link + IPC + media protocol only, clipboard needs are served by the web Clipboard API on iOS, and "open in browser" uses a minimal native open call (AD-26, FR-56)
+**And** `cargo check --target aarch64-apple-ios` passes for the whole workspace locally, no in-app updater code path exists on iOS, and desktop build behavior is byte-identical (regression: desktop quality gates green).
+
+**Given** the IPC handshake (AD-27)
+**When** the frontend starts
+**Then** a single `CapabilitiesVm` in `keeper-core::vm` (serde + ts-rs, camelCase, exported to `src/lib/ipc/gen/`) is served at startup into a `useCapabilitiesStore` zustand mirror, data-driven per platform so later targets reuse the mechanism (FR-57)
+**And** `Platform::sidecar_path` returns a clean Unsupported `IpcError` on iOS, and no TypeScript consults `navigator.userAgent` or build flags for feature gating (convention test).
+
+**Given** `keeper-core`
+**Then** it remains free of `cfg(target_os)` in business logic — platform variance enters only through the `Platform` port (AD-26/AD-24).
+
+### Story 12.3: iOS Platform Port — Keychain Spike and Data Directory
+
+As a user,
+I want my session tokens in the iOS keychain and keeper's data in its app container,
+So that sessions survive relaunches and re-signs without ever leaving my device.
+
+**Requirements:** FR-63; AD-29 (spike-first), NFR-9
+**Dependencies:** 12.2
+
+**Acceptance Criteria:**
+
+**Given** the iOS branch of the `Platform` impl
+**When** it lands
+**Then** `data_dir()` resolves to the app container (Application Support) with all account state under that one root (future App Group move = path change, not migration), and the existing keyring/apple-native port targets the iOS keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` — readable by a resumed sync loop, invisible to other apps, excluded from iCloud Keychain (FR-63, AD-29).
+
+**Given** the AD-29 spike
+**When** keychain set/get/delete is exercised in the Simulator
+**Then** the spike verdict is recorded: keep `keyring` as-is, or switch to the contained fallback — direct security-framework generic-password calls behind the **same** `Platform` port with call sites unchanged (on-device confirmation folds into Story 12.6).
+
+**Given** an app relaunch in the Simulator
+**Then** the session restores from keychain + SDK store without re-login, and no token or secret appears in logs or crosses IPC (NFR-9).
+
+### Story 12.4: Media Protocol on WKURLSchemeHandler with Capped Buffers
+
+As a user,
+I want encrypted images and videos to render and seek on iPhone exactly as on the Mac,
+So that media works without an iOS-specific transport fork or unbounded memory use.
+
+**Requirements:** FR-64; AD-28, AD-4, NFR-9, NFR-16 (buffer cap)
+**Dependencies:** 12.2
+
+**Acceptance Criteria:**
+
+**Given** the existing `keeper-media://` protocol
+**When** it runs on iOS (wry → WKURLSchemeHandler)
+**Then** the URL format is identical to macOS and the frontend needs no media-URL helper; an encrypted image renders in the timeline and a video plays **and seeks** in the Simulator — the Range 200/206/416 path exercised — with decrypted bytes never passing through IPC JSON (FR-64, NFR-9, AD-28).
+
+**Given** the in-memory Range-slicing path
+**When** large media streams
+**Then** the slicing buffer is capped (named constant + unit test asserting the cap), WebKit scheme-task invalidation is tolerated by the fire-and-forget responder, and disk-backed streaming is recorded in the deferred-work ledger, not implemented (AD-28, NFR-16).
+
+**Given** a force-quit with a cold media cache
+**When** the app relaunches and the timeline re-renders
+**Then** the retry-on-cache-miss path re-fetches and renders the media (FR-64).
+
+### Story 12.5: iOS Compile Check in CI
+
+As a maintainer,
+I want every PR compile-checked against the iOS target,
+So that desktop work can never silently break the port.
+
+**Requirements:** FR-55 (CI leg); AD-32, AD-23
+**Dependencies:** 12.2
+
+**Acceptance Criteria:**
+
+**Given** the existing GitHub Actions macOS runner
+**When** the workflow lands
+**Then** a job runs `cargo check --target aarch64-apple-ios` for the whole workspace on every PR — compile-only: no signing, no simulator build, no Apple credentials in CI (AD-32).
+
+**Given** current main
+**Then** the job is green, and a deliberately broken cfg seam on a scratch branch demonstrably fails it (spot-checked once, evidence in the PR).
+
+**Given** phase sequencing
+**Then** flipping this check to a *required* branch-protection status is left to Story 15.4 — the job itself exists and blocks by failure from this story onward.
+
+### Story 12.6: On-Device Walking-Skeleton Validation (SM-7 Gate)
+
+As the owner,
+I want the whole vertical slice proven on my actual iPhone under free signing,
+So that the three existential risks — toolchain, signing, core-on-iOS — are retired before phone-UX work begins.
+
+**Requirements:** FR-55 (on-device gate), FR-63 (device leg); SM-7; AD-30 (resume smoke), NFR-18 (first exercise)
+**Dependencies:** 12.1, 12.2, 12.3, 12.4, 12.5
+**Human-in-the-loop:** **yes** — requires the owner's physical iPhone and free Personal Team signing (Developer Mode enabled, personal-team certificate trusted on device). The automation loop defers this story to the coordinator instead of escalating; all other Epic 12 stories are device-free.
+
+**Acceptance Criteria:**
+
+**Given** the owner's iPhone with Developer Mode enabled
+**When** `tauri ios dev` deploys with Personal Team signing
+**Then** the app installs, launches, and the certificate-trust flow is completed and its steps recorded for docs/ios.md (FR-55).
+
+**Given** the SM-7 gate checklist
+**When** executed on-device
+**Then** OIDC login completes via the `keeper://` deep-link callback, the room list loads, text send/receive works in one E2EE Room, and app relaunch restores the session without re-login (FR-55, FR-63, SM-7).
+
+**Given** lifecycle reality
+**When** the app is backgrounded, foregrounded, and left suspended overnight
+**Then** the resume behavior is exercised and any blank-webview occurrence (tauri#14371) is recorded as direct input to Story 14.4's guard — this is NFR-18's first acceptance exercise per AD-30 — and on-device media rendering (Story 12.4 paths) is spot-checked.
+
+**Given** the 7-day profile expiry (validated later in the phase, noted here)
+**Then** re-signing restores launch with all local data intact, confirming the stable bundle identifier.
+
+**Epic 12 exit gate (SM-7):** all Story 12.6 ACs pass on-device. Phone-UX epics (13, 14) start only after this gate.
+
+## Epic 13: iPhone Shell — Single-Pane Navigation
+
+Project the desktop shell onto the phone tier: same components, same tokens, same IPC — one new arrangement container. Everything here is pure frontend plus small `gen/apple` glue, verifiable in the iOS Simulator or any < 768 px webview; no physical device required. Runs after the SM-7 gate, in parallel with Epic 14.
+
+### Story 13.1: Phone Layout Tier and Navigation Stack
+
+As an iPhone user,
+I want keeper to render one pane at a time — Inbox, Room, Detail — as a navigation stack,
+So that the desktop's three-pane product fits my phone without becoming a second app.
+
+**Requirements:** FR-58; AD-31; UX-DR21, UX-DR22 (projection)
+**Dependencies:** Epic 12 (SM-7 gate; capabilities plumbing from 12.2)
+
+**Acceptance Criteria:**
+
+**Given** `useShellLayout`
+**When** the viewport is < 768 px
+**Then** a third `phone` tier activates rendering a stack container — level 0 Inbox (Pins strip → FAVORITES → inbox, scoped by the active view/filter), level 1 Room (header → timeline → composer), level 2 Detail as a pushed page — while desktop and tablet tiers are unchanged at ≥ 768 px (regression-tested) (FR-58, AD-31).
+
+**Given** the component trees
+**When** the stack renders
+**Then** it reuses the existing InboxList/ChatView/DetailPanel trees unchanged (no forked chat components), driven by the existing zustand selection state (`selectedRoomId`, detail-open); no routing library is added (`history.pushState` integration is an optional enhancer, not a dependency), and a deep link (notification payload `(account_id, room_id, event_id)`) sets selection state and renders at the right level with back leading to the Inbox (FR-58, AD-31).
+
+**Given** navigation back to the Inbox
+**Then** the Inbox scroll position is preserved, and opening a Chat on the phone does **not** auto-focus the composer (UX-DR22).
+
+### Story 13.2: Phone Header, Push/Pop Transitions, and Edge-Swipe Back
+
+As an iPhone user,
+I want a real back affordance at every level — chevron, edge-swipe, or system gesture,
+So that moving through the stack feels native, reversible, and accessible.
+
+**Requirements:** FR-58 (back), FR-60 (edge-swipe); UX-DR21 (`phone-header`), UX-DR22, UX-DR28 (focus rules)
+**Dependencies:** 13.1
+
+**Acceptance Criteria:**
+
+**Given** the 52 px `phone-header` bar
+**When** a level renders
+**Then** the back chevron carries the previous level's title ("Inbox", or the Chat name on Detail) with a full 44 pt hit area, and the Room header reads: back → avatar + network badge → name + Account chip → incognito chip when applicable → overflow (⋯) with Search in chat, Mute ▸, Mention-only, Incognito for this Chat, Archive, Export — tapping the identity block pushes Detail (replacing ⌘I) (UX-DR21/22, FR-58).
+
+**Given** push and pop
+**When** levels change
+**Then** the new level slides in from the trailing edge over ~250 ms ease-out while the level beneath shifts back ~25 % and dims; pop reverses; reduced-motion renders cuts (UX-DR22).
+
+**Given** the leading screen edge
+**When** the user swipes from it at level ≥ 1
+**Then** an interactive edge-swipe back tracks the finger, commits past 50 % travel or on a flick, and cancels otherwise (WKWebView grants no native swipe to an in-page stack); at level 0 the same edge is reserved for the drawer (FR-60, UX-DR22).
+
+**Given** VoiceOver
+**Then** every push moves focus to the new level's header (back button first in swipe order), every pop returns focus to the pushing element, and the escape gesture triggers the same back action at every level (UX-DR28).
+
+### Story 13.3: Leading Drawer with Status Cluster
+
+As an iPhone user,
+I want the entire desktop sidebar reachable as a drawer, with the states that must never hide pinned to the Inbox header,
+So that navigation chrome stays out of the way without hiding honesty.
+
+**Requirements:** FR-58 (rail leg); UX-DR23; reuses UX-DR13/18
+**Dependencies:** 13.1
+
+**Acceptance Criteria:**
+
+**Given** the Inbox header's top-leading avatar button
+**When** tapped (or on edge-swipe from the leading edge at level 0 only)
+**Then** the entire desktop sidebar renders verbatim inside a leading Sheet — primary views (Inbox / Archive / Approval Pane with amber count / Bridges with health roll-up), SPACES, NETWORKS chips with health dots, Account switcher footer with the settings gear, and sync/offline status — and selecting a view or filter closes the drawer and applies it, with the active filter chip above the chat list exactly as on desktop (UX-DR23, FR-58).
+
+**Given** drawer dismissal
+**When** the user taps the scrim, edge-swipes, or selects a row
+**Then** the drawer closes and focus returns to the drawer button (UX-DR28).
+
+**Given** the Inbox header status cluster
+**When** state warrants it
+**Then** the avatar button carries a worst-state bridge-health dot overlay and the Account-filter state, an amber Approval chip shows the pending-Draft count whenever > 0 and deep-links to the Approval Pane, and magnifier + compose buttons trail — the header is quiet when everything is healthy, and **no bottom tab bar exists anywhere** (UX-DR23).
+
+### Story 13.4: Merged Full-Screen Search Surface
+
+As an iPhone user,
+I want one Search surface covering chats, messages, and actions,
+So that ⌘K and global search survive the trip to a keyboard-less device.
+
+**Requirements:** FR-48/FR-34 (parity on phone), FR-58 (palette mapping), FR-60 (pull-down); UX-DR24
+**Dependencies:** 13.1, 13.3 (header magnifier)
+
+**Acceptance Criteria:**
+
+**Given** the Search surface
+**When** opened via the header magnifier or a short pull-down on the Inbox list (pull past the reveal threshold becomes pull-to-refresh — one continuous axis, spinner beyond the field)
+**Then** it renders full-screen with segmented scopes: **Chats** (fuzzy chats/contacts across Accounts, network badge + account hue dot per row), **Messages** (offline FTS with the same filter chips, results deep-linking into timelines at the match), **Actions** (the full context-aware action registry) — all on the same engines and the same ≤ 100 ms / offline bars (FR-48, FR-34, UX-DR24).
+
+**Given** desktop muscle memory
+**When** `>` is typed as the first character
+**Then** the surface jumps to Actions scope; in-chat search maps to Room overflow → "Search in chat", opening Messages pre-filtered to the open Chat (UX-DR24).
+
+**Given** the parity release gate
+**Then** every registered action is reachable from Actions scope on the phone, and desktop-only actions are unregistered via capabilities so no dead entries appear (FR-48, FR-57).
+
+### Story 13.5: Safe Areas and the Keyboard-Avoiding Composer
+
+As an iPhone user,
+I want edge-to-edge rendering that respects the notch and a composer the keyboard can never cover,
+So that typing on the phone feels solid instead of glitchy.
+
+**Requirements:** FR-59; AD-31 (glue), AD-32 (`gen/apple` patch); UX-DR21, UX-DR25
+**Dependencies:** 13.1, 13.2 (header insets)
+
+**Acceptance Criteria:**
+
+**Given** the iOS webview
+**When** the app renders
+**Then** `viewport-fit=cover` is set, `contentInsetAdjustmentBehavior = .never` is pinned via the committed `gen/apple` Swift patch, and `env(safe-area-inset-*)` values are exposed as theme CSS vars padding the header, composer, drawer, sheets, and overlays in portrait and landscape — no unstyled bands at the notch or home indicator, and the window/launch background matches the active theme with no flash on launch or rotation (FR-59, AD-31/32).
+
+**Given** the on-screen keyboard
+**When** it opens and closes
+**Then** the composer sits at `bottom: calc(var(--kb-inset, 0px) + env(safe-area-inset-bottom))` with `--kb-inset` driven by `visualViewport` listeners (`interactive-widget=resizes-content` evaluated as the simpler path, decision recorded), a timeline already at bottom stays pinned to bottom, and dismissal restores layout with no stranded offsets or overshoot; the timeline scroller uses `overscroll-behavior: contain` (FR-59, UX-DR21).
+
+**Given** the phone composer deltas
+**Then** a ≥ 44 pt primary-tinted send button trails the field (tap = FR-41 approval trigger #1), the on-screen return key inserts a newline while a hardware keyboard follows the desktop Enter setting, autogrow caps at 5 lines then scrolls, attach goes via + → system photo library/camera/Files, and the undo-send pill floats above the composer with tap replacing ⌘⇧Z (UX-DR25).
+
+### Story 13.6: Touch Idioms — Long-Press, Row Swipes, Pull-to-Refresh
+
+As an iPhone user,
+I want every desktop action reachable by touch with proper iOS idioms,
+So that triage on the phone is as complete as at the desk.
+
+**Requirements:** FR-60; UX-DR26, UX-DR28 (gesture alternatives)
+**Dependencies:** 13.1, 13.4 (shared pull axis), 13.5 (scroll interplay)
+
+**Acceptance Criteria:**
+
+**Given** any surface with a desktop context menu
+**When** the user long-presses (rows, message bubbles, pins)
+**Then** the identical ContextMenu opens — the bubble menu leading with the emoji React row, then Reply, Edit (own), Delete ▸, Copy, Jump-to-original — with `-webkit-touch-callout`/tap-highlight suppressed where custom menus exist, and long-press-drag reordering the Pins strip (FR-60, UX-DR26).
+
+**Given** inbox and Approval rows
+**When** the user swipes
+**Then** trailing swipe reveals Archive + More (mute ▸) and leading swipe toggles read/unread, styled per the `swipe-action` tokens with the label appearing past the half-swipe commit threshold and full-swipe committing the first action; Approval rows get row-tap → inline editor, an explicit per-row Approve button ≥ 44 pt, and trailing swipe → Discard with the 5 s undo toast — still no approve-all (FR-60, FR-41, UX-DR26).
+
+**Given** pull-to-refresh on the Inbox
+**When** pulled past the search-reveal threshold
+**Then** it visibly kicks the sync loop (the same operation as foreground resume); offline, the spinner resolves into the persistent offline pill, never an error toast (FR-60, UX-DR28).
+
+**Given** the accessibility hard rule
+**Then** every tappable is ≥ 44 pt (icon buttons padded regardless of glyph), row swipe actions are duplicated as VoiceOver custom actions and in the long-press menu, and no gesture is the sole path to any action (UX-DR28, NFR-14).
+
+### Story 13.7: Capability-Gated Surfaces and "On this iPhone" Disclosure
+
+As an iPhone user,
+I want unsupported features removed — not broken — and one honest list of what this device can't do,
+So that iOS limits read as facts, never as bugs.
+
+**Requirements:** FR-56 (surface leg), FR-57; AD-27; UX-DR27
+**Dependencies:** 13.1, 13.3 (drawer/settings surfaces)
+
+**Acceptance Criteria:**
+
+**Given** capabilities off on iOS
+**When** the UI renders
+**Then** the bbctl "Run your own bridge" panel, the Shortcuts/global-hotkey settings section, updater controls, tray/menu-bar + launch-at-login options, and the hotkey cheat sheet do not render at all — no dead buttons, no error-on-tap — while bridge management stays fully functional: discovery, native provisioning login, Bridge Bot fallback, health + re-login, risk tiers, start-new-Chat (FR-57, FR-25–FR-28/FR-30–FR-32 unchanged).
+
+**Given** the gating mechanism
+**Then** all hiding flows exclusively from the capabilities store (never platform sniffing — convention test), desktop renders unchanged with all capabilities on, desktop-only palette actions are unregistered on iOS so Actions scope simply lacks them, and programmatic reach of a disabled capability returns the clean "unsupported on this platform" `IpcError` (FR-57, AD-27).
+
+**Given** Settings → About on iOS
+**When** rendered
+**Then** an "On this iPhone" rendered list states: syncs and notifies only while open (background notifications await an explicit future decision), no self-hosted bridge runner (manage from your Mac), no global hotkey, updates arrive by reinstall with a signature renewing every 7 days — plus a link to docs/ios.md; Settings → Archive & Storage adds the line that the phone's Local Archive is excluded from device backup and the Mac remains the durable, exportable copy this phase (UX-DR27, FR-65 disclosure).
+
+## Epic 14: iOS Platform Behavior
+
+Make keeper an honest iOS citizen: sync pauses and resumes through one Rust entry, nothing pretends to be push, notifications and the badge work in the foreground, and the phase's reliability bars — resume integrity, jetsam hygiene, flaky-network recovery, backup posture — are engineered in, not hoped for. Runs after the SM-7 gate, in parallel with Epic 13; automated/simulator verification wherever possible, with on-device soaks folded into SM-8 dogfooding rather than blocking stories.
+
+### Story 14.1: Lifecycle Pause/Resume Through One Rust Entry
+
+As an iPhone user,
+I want sync to stop cleanly when I leave and pick up instantly when I return,
+So that keeper behaves like the OS expects while never showing me stale confusion.
+
+**Requirements:** FR-61 (mechanics); AD-30
+**Dependencies:** Epic 12 (SM-7 gate)
+
+**Acceptance Criteria:**
+
+**Given** the app backgrounds
+**When** the lifecycle signal fires
+**Then** detection enters Rust through **one** lifecycle command in the shell (`lifecycle.rs`) — webview `visibilitychange` as the zero-native stopgap, with the micro Swift plugin on `UIApplication` notifications recorded as the upgrade path behind the same Rust entry — and `SyncService` pauses gracefully (stop/offline mode) within seconds instead of letting the sliding-sync long-poll die mid-flight (FR-61, AD-30).
+
+**Given** the app foregrounds
+**When** the same entry fires resume
+**Then** cached state renders instantly from the zustand mirrors (snapshot-then-diff), an immediate sync kicks, and new messages appear within 2 s on Wi-Fi (Simulator-verifiable) (FR-61, NFR-17).
+
+**Given** pull-to-refresh (Story 13.6)
+**Then** it converges on the same sync-kick operation as foreground resume — one code path, no second lifecycle truth (AD-30).
+
+### Story 14.2: Honest No-Background-Sync Disclosure
+
+As an iPhone user,
+I want keeper to tell me plainly that it only works while open,
+So that missed messages while closed read as physics, not betrayal.
+
+**Requirements:** FR-61 (copy leg); UX-DR27, UX-DR10/17
+**Dependencies:** 14.1
+
+**Acceptance Criteria:**
+
+**Given** the iOS first run (Wizard Done step, or first Inbox render for an existing Account)
+**When** the disclosure shows
+**Then** a one-time card states: "On iPhone, keeper syncs and notifies only while open. Close it and messages wait on your homeserver until you return — nothing is lost, and nothing here pretends to be push." — voice rules applied, shown once, and the same copy lives permanently in Settings → Notifications (FR-61, UX-DR27).
+
+**Given** the whole iOS surface
+**When** audited (copy-string sweep)
+**Then** no surface anywhere implies background delivery — extending FR-53's honesty rule — and the badge copy notes it is not live while suspended (FR-61, FR-62).
+
+**Given** docs
+**Then** docs/ios.md's limitations section (Story 15.2) matches this copy one-to-one, so app and docs never diverge on the promise.
+
+### Story 14.3: Foreground Notifications and the All-Accounts Badge
+
+As an iPhone user,
+I want notifications while I'm in the app and a truthful home-screen badge,
+So that the phone's attention surfaces work exactly as far as iOS allows.
+
+**Requirements:** FR-62; AD-30, AD-18 (reuse)
+**Dependencies:** 14.1
+
+**Acceptance Criteria:**
+
+**Given** new messages while the app is active
+**When** the notification rules engine evaluates them
+**Then** local notifications post via the notification plugin with the same content, preview toggle, and mute/mention-only semantics as FR-51/FR-52, and notifications for the currently visible Chat are suppressed by the reused desktop logic (FR-62, AD-18).
+
+**Given** the app icon badge
+**When** sync completes or the app foregrounds
+**Then** the badge equals the Unified Inbox unread aggregate across all Accounts — sourced from `inbox` (AD-20), never a second count — and refreshes on foreground resume without pretending to be live while suspended (FR-62, AD-30).
+
+**Given** notification permission denied at the OS level
+**When** Settings → Notifications renders
+**Then** a persistent inline state says "Notifications are off for keeper in iOS Settings." with an Open Settings deep link, notes the badge needs the same permission, and never re-prompts on its own (UX-DR28).
+
+### Story 14.4: Resume Integrity — Blank-Webview Guard and Stale-Resume Pill
+
+As an iPhone user,
+I want keeper to come back alive every single time I return to it,
+So that an overnight suspension never greets me with a blank screen or stale silence.
+
+**Requirements:** NFR-18, NFR-17 (restart guard); AD-30
+**Dependencies:** 14.1 (findings from 12.6 feed in)
+
+**Acceptance Criteria:**
+
+**Given** a jettisoned or unresponsive webview process on resume (tauri#14371)
+**When** the app foregrounds
+**Then** the reload guard detects it and restores the UI to the last stack level from cached state — never a blank or unresponsive screen — with the guard covered by an automated test wherever process termination can be simulated, the upstream fix tracked, and Story 12.6's on-device findings incorporated (NFR-18, AD-30).
+
+**Given** a stale resume (last sync minutes old)
+**When** the app foregrounds
+**Then** cached UI renders at once, sync kicks immediately, a quiet "Connecting…" pill shows under the Inbox header and clears on the first sync response, and the sync-loop restart guard handles the known stale-session edge (matrix-rust-sdk#3935) (NFR-17, UX-DR28).
+
+**Given** SM-8 dogfooding
+**Then** the overnight-suspension scenario sits on the dogfooding checklist with findings ledgered — the guard is acceptance-tested continuously from here on (NFR-18).
+
+### Story 14.5: Memory Hygiene Under Jetsam
+
+As an iPhone user,
+I want keeper to shed weight when backgrounded,
+So that iOS doesn't kill it while suspended and my session survives the day.
+
+**Requirements:** NFR-16; AD-28, AD-30
+**Dependencies:** 14.1, 12.4 (buffer cap)
+
+**Acceptance Criteria:**
+
+**Given** `didEnterBackground` or a memory warning
+**When** the signal reaches the shell
+**Then** droppable caches — the image memory cache and media byte buffers — are released, with automated tests asserting the drop hooks fire, and memory returns near baseline after backgrounding (Instruments-verified on Simulator) (NFR-16).
+
+**Given** large-media playback
+**When** the Range-slicing path streams
+**Then** the Story 12.4 buffer cap holds under sustained seeking (no unbounded growth in the memory graph), and disk-backed streaming of large video remains a deferred-work ledger entry (NFR-16, AD-28).
+
+**Given** the 24 h suspended soak with a large account
+**Then** it is executed as part of SM-8 on-device dogfooding (not a story-blocking device step) with the outcome recorded — survival without a jetsam kill is the bar (NFR-16).
+
+### Story 14.6: Flaky-Network Resilience
+
+As an iPhone user,
+I want keeper to shrug off airplane mode, dead spots, and Wi-Fi-to-cellular hops,
+So that mobile networking never costs me a message or a restart.
+
+**Requirements:** NFR-17; AD-30, AD-8
+**Dependencies:** 14.1, 14.4
+
+**Acceptance Criteria:**
+
+**Given** connectivity loss and restoration (simulated via Network Link Conditioner / link toggling in the test environment)
+**When** the network flaps
+**Then** the sync loop enters SSS offline mode with backoff and exits it immediately on demand (foreground resume or pull-to-refresh), the UI keeps rendering instantly from the local mirror throughout, the offline pill appears and clears with no toast spam, and recovery needs no app restart and never blanks the UI (NFR-17, AD-30/AD-8).
+
+**Given** messages sent while disconnected
+**When** the app is backgrounded before dispatch
+**Then** they carry the caption "Queued — sends when keeper is open and back online" and dispatch on foreground reconnect (an already-elapsed undo window dispatches immediately) — NFR-5's no-silent-loss promise extended to iOS (UX-DR28).
+
+**Given** on-device network scenarios (airplane-mode toggle, real Wi-Fi↔cellular handover)
+**Then** they sit on the SM-8 dogfooding checklist with unaided recovery as the bar, findings ledgered (NFR-17).
+
+### Story 14.7: Backup Exclusion and File Protection
+
+As an iPhone user,
+I want keeper's re-syncable gigabytes out of my backups and encrypted at rest without breaking sync,
+So that the storage posture is deliberate on iOS, not accidental.
+
+**Requirements:** FR-65; AD-29
+**Dependencies:** Epic 12 (12.3 data-dir root)
+
+**Acceptance Criteria:**
+
+**Given** keeper's database directories (SDK stores, `keeper.db`, `archive.db`)
+**When** they are created or opened on iOS
+**Then** each carries the `isExcludedFromBackup` resource flag — verified by reading the resource value back in a test — so multi-gigabyte re-syncable state never bloats device/iCloud backups (FR-65, AD-29).
+
+**Given** file protection
+**When** the stores are provisioned
+**Then** they use `NSFileProtectionCompleteUntilFirstUserAuthentication` — never `Complete` — so WAL access keeps a resumed sync loop working after screen lock; the class is asserted in code and lock-screen behavior is validated in SM-8 dogfooding (FR-65, AD-29).
+
+**Given** the layout invariant
+**Then** all account state remains under the one `Platform::data_dir()` root (the future App Group move stays a path change), and the Story 13.7 Archive & Storage disclosure matches the actual flagging — the phone archive is excluded from backup; the Mac remains the durable, exportable copy (FR-65).
+
+## Epic 15: iOS Polish & Release
+
+Ship the phase like the product it is: real icons and a flash-free launch, a signing walkthrough that makes the 7-day ritual cheap, a shareable IPA path, the CI gate made mandatory, the paid-program question answered on the record — and the final on-device acceptance that starts the SM-8 dogfooding clock.
+
+### Story 15.1: App Icons and Launch Assets
+
+As an iPhone user,
+I want keeper to look like keeper from the home screen to first paint,
+So that the phone build reads as finished, not sideloaded scaffolding.
+
+**Requirements:** FR-55 (assets), FR-59 (no-flash); AD-32
+**Dependencies:** Epic 12
+
+**Acceptance Criteria:**
+
+**Given** the iOS icon set and launch configuration
+**When** they land in `gen/apple`
+**Then** the full icon set renders on the home screen, Settings, and the app switcher, and the launch screen/window background matches the active theme in light and dark — no white/black flash on launch or rotation (FR-55, FR-59).
+
+**Given** AD-32's regeneration rule
+**Then** assets and launch config survive `.xcodeproj` regeneration — persistent edits only in `project.yml` and committed asset catalogs (AD-32).
+
+**Given** the desktop build
+**Then** it is unaffected (icons/bundling unchanged; quality gates green).
+
+### Story 15.2: docs/ios.md — Free Signing Walkthrough
+
+As the owner (and any hand-provisioned tester),
+I want one document that takes a Mac and an iPhone to a running keeper and keeps it running,
+So that the 7-day re-arm ritual costs minutes, not archaeology.
+
+**Requirements:** FR-55 (docs leg); PRD §13.5 posture; SM-8 support
+**Dependencies:** 12.6 (validated flow to document)
+
+**Acceptance Criteria:**
+
+**Given** `docs/ios.md`
+**When** written
+**Then** it covers: toolchain prerequisites (Xcode 16.x, CocoaPods, rust targets), Personal Team setup (`bundle.iOS.developmentTeam`/`TAURI_APPLE_DEVELOPMENT_TEAM`, Developer Mode, on-device certificate trust — as validated in 12.6), the **7-day re-arm ritual** with its expected per-week cost in minutes, the AltServer auto-refresh option, and the **Sideloadly/zsign re-sign alternative** for installing shared test IPAs without Xcode (FR-55, PRD §13.5).
+
+**Given** the limitations section
+**Then** it lists the platform limits one-to-one with the "On this iPhone" disclosure (no push/background sync, no bbctl, no global hotkey, reinstall updates, archive-backup posture) so app and docs never diverge (UX-DR27, Story 14.2 tie-in).
+
+**Given** repo rules
+**Then** the doc is English, honest in tone per the voice rules, and contains no team ids, credentials, or secrets.
+
+### Story 15.3: Shareable IPA Build Path — Unsigned Export for Re-Signing
+
+As a maintainer,
+I want a repeatable build that produces an IPA anyone can re-sign,
+So that hand-provisioned testers can install keeper without my Mac in the loop.
+
+**Requirements:** FR-55/FR-56 (distribution posture); AD-32
+**Dependencies:** Epic 12, 15.2 (doc integration)
+
+**Acceptance Criteria:**
+
+**Given** the documented build command/script
+**When** it runs on the dev machine
+**Then** it produces a release-configuration IPA suitable for per-tester re-signing via Sideloadly/zsign (unsigned export, or dev-signed with signature replacement documented), with the exact re-sign steps appended to docs/ios.md (FR-55).
+
+**Given** the artifact
+**Then** it contains no desktop-only plugin symbols (FR-56 seam verified against the shipped binary) and no signing material, team ids, or provisioning profiles land in the repo or CI (AD-32).
+
+**Given** validation
+**Then** a re-signed install is verified on a device as part of Story 15.6's checklist (the build path itself is device-free).
+
+### Story 15.4: Required iOS CI Gate and Release Hygiene
+
+As a maintainer,
+I want the iOS compile check promoted to a required gate and the release checklist to know iOS exists,
+So that the port's integrity is enforced, not remembered.
+
+**Requirements:** FR-55 (CI required); AD-32, AD-23
+**Dependencies:** 12.5
+
+**Acceptance Criteria:**
+
+**Given** the Story 12.5 `cargo check --target aarch64-apple-ios` job
+**When** this story completes
+**Then** it is wired as a **required** PR status (branch-protection/merge-queue configuration recorded in the repo docs), remaining compile-only — no signing, no simulator — so PR latency stays acceptable (AD-32).
+
+**Given** the release checklist (Epic 11's process)
+**When** updated
+**Then** it gains the iOS items: IPA build path exercised (15.3), docs/ios.md current (15.2), NFR-15 measurement recorded with its owner-confirmation status (PRD §13.8), and the egress posture note that iOS adds no new endpoints (NFR-11 unchanged).
+
+**Given** CI docs
+**Then** contributor documentation states the gate's scope and how to reproduce it locally (`cargo check --target aarch64-apple-ios`).
+
+### Story 15.5: Paid-Program Decision Gate Recorded
+
+As the product owner,
+I want the $99 Apple Developer Program question answered on the record as a deliberate deferral,
+So that push, TestFlight, and the NSE are a decision waiting for a trigger — never an omission.
+
+**Requirements:** PRD §13.5; spine Deferred items
+**Dependencies:** Epic 12 (phase reality to record against)
+
+**Acceptance Criteria:**
+
+**Given** the decisions ledger
+**When** the record lands
+**Then** it captures: what the paid program uniquely unlocks (APNs push, the NSE — with its 24 MB memory ceiling and App-Group store-layout implications — TestFlight, App Groups, AltStore PAL notarization), the opening trigger (push becomes a product goal), and the PRD-level constraint it will force — push must ride a homeserver operator's gateway, Beeper's, or a user-run Sygnal, never project infrastructure (NFR-11) (PRD §13.5).
+
+**Given** the cheap-now mitigations
+**Then** the record notes what this phase already paid for: the single `data_dir()` root making the App Group move a path change (AD-29), and Plan B's revisit triggers staying recorded (PRD §13.8).
+
+**Given** scope discipline
+**Then** this story changes no code — it is a decision record with PRD/architecture cross-references, closing the phase's single deliberate deferral.
+
+### Story 15.6: Final Device Install and Phase Acceptance
+
+As the owner,
+I want the release build on my iPhone through the documented path, measured and accepted,
+So that SM-8 dogfooding starts on evidence and the phase retrospective has its inputs.
+
+**Requirements:** SM-8 (start), NFR-15 (measure), FR-55; retrospective inputs
+**Dependencies:** 15.1, 15.2, 15.3, 15.4 (+ Epics 13 and 14 complete)
+**Human-in-the-loop:** **yes** — requires the owner's physical iPhone (install via free Personal Team signing or a re-signed IPA per docs/ios.md). The automation loop defers this story to the coordinator instead of escalating; it is the phase's second and final device step.
+
+**Acceptance Criteria:**
+
+**Given** the release build and docs/ios.md
+**When** the owner installs on their iPhone via the documented path (including one install through the Sideloadly re-sign flow to validate 15.3)
+**Then** the app launches with final icons and a flash-free launch, and an on-device spot-check passes the Epic 13/14 surface: safe areas at the notch and home indicator, keyboard avoidance, stack navigation and gestures, drawer and Search, foreground notifications and badge, lifecycle pause/resume, resume after overnight suspension.
+
+**Given** NFR-15
+**When** cold start is measured on-device (release build, real accounts, cached inbox)
+**Then** the launch → interactive Unified Inbox time is recorded, and the owner confirms or adjusts the 3 s bar — resolving PRD §13.8 open question 1 before the bar becomes release-gating (NFR-15).
+
+**Given** SM-8
+**When** acceptance passes
+**Then** the two-week phone daily-driver window opens with its checklist: 7-day re-arm cost tracked in minutes, the 24 h jetsam soak (14.5), airplane/handover scenarios (14.6), lock-screen store access (14.7), and a zero-silent-loss watch (NFR-5 extended to iOS).
+
+**Given** the phase retrospective
+**Then** its inputs are recorded: outcomes against the §13.7 risk register (blank webview, keyring, keyboard quirks, 7-day friction, media RAM), the deferred-work ledger entries opened this phase (disk-backed streaming, micro Swift lifecycle plugin, Dynamic Type), and the pointer to the 15.5 paid-program gate.
+
+**Epic 15 exit:** phase accepted on-device; SM-8 window running; retrospective inputs on file.
+
 ## Post-MVP — Not Storied (Flagged Only)
 
 Per PRD §5/§6.2 these are explicitly out of MVP; no stories exist for them and none may be smuggled in:
@@ -1707,8 +2393,15 @@ Per PRD §5/§6.2 these are explicitly out of MVP; no stories exist for them and
 - Bridge health dashboard + alert center (aggregate); bbctl full lifecycle supervision (auto-restart, log viewer)
 - iMessage via user's own Mac; voice-note recording; notification quick-reply; typing-only privacy toggle; per-Chat stay-archived override; Beeper-style custom views ("Spacebar")
 - Agent-proposed Drafts API/MCP (propose-only, behind a flag, after design-partner validation) — the Approval Pane's reserved proposer column is the only MVP concession
-- Voice/video calls (Element Call embed); mobile/Windows/Linux; Beeper Desktop API companion mode
+- Voice/video calls (Element Call embed); Windows/Linux/Android/iPad (iOS ships as Phase 2, Epics 12–15); Beeper Desktop API companion mode
 - Archive-at-rest encryption spike (AD-22); universal binaries
+
+iOS phase (PRD §13.4 + spine Deferred) — explicitly out of this phase, no stories:
+
+- APNs push + Notification Service Extension — behind the paid-program decision gate (§13.5, recorded in Story 15.5); App Store/TestFlight and every paid-program-dependent capability (App Groups, `https://` universal links, AltStore PAL notarization)
+- Share extension, home-screen widgets, Siri intents, biometric app lock; full Dynamic Type adoption (rem-scaling is the phase bar per FR-60)
+- Disk-backed streaming of large media (capped in-memory buffer is the phase posture, AD-28); micro Swift lifecycle plugin (only if `visibilitychange` proves unreliable, AD-30); Android's `convertMediaSrc` media-URL helper (introduced only when Android starts)
+- iPad layout; `NWPathMonitor`-driven fast retry; share-sheet media save
 
 ## Validation Summary
 
@@ -1718,6 +2411,16 @@ Per PRD §5/§6.2 these are explicitly out of MVP; no stories exist for them and
 - **Architecture compliance:** AD-6/7/8 land in Story 1.1 (keeper-core split in Epic 1 as required); AD-13 gate seeded in 1.6, completed 7.4/8.3; AD-14 seeded in 3.9, completed 8.1/8.2; databases/tables are created only by the first story needing them (keeper.db registry in 1.3, drafts in 7.1, outbox in 8.3, archive.db in 5.1).
 - **Dependencies:** every story depends only on earlier stories; each epic functions without any later epic (Epic 6's FR-28 notification leg is an explicit, documented enhancement in Epic 10, with in-app surfacing complete inside Epic 6).
 - **Sizing:** 63 stories across 11 epics, each scoped to a single dev session on the existing scaffold.
+
+**Phase 2 (iOS, appended 2026-07-09):**
+
+- **FR coverage:** FR-55–FR-65 all mapped (see FR Coverage Map); split FRs have both legs assigned — FR-57 (mechanism 12.2 / surfaces 13.7), FR-61 (mechanics 14.1 / copy 14.2), FR-55 (init 12.1 / CI 12.5+15.4 / on-device 12.6 / assets+docs 15.1–15.3).
+- **NFR coverage:** NFR-16–NFR-18 engineered and validated in Epic 14 (14.5, 14.6/14.4, 14.4); NFR-15 measured on-device in Story 15.6 and explicitly **not** release-gating until the owner confirms the 3 s bar (PRD §13.8).
+- **UX-DR coverage:** UX-DR21–UX-DR28 each referenced by at least one story's ACs.
+- **Architecture compliance:** AD-26/AD-27 land in 12.2 (one shell crate, CapabilitiesVm); AD-29 spike-first in 12.3 with on-device confirmation in 12.6; AD-28 cap in 12.4; AD-30's single lifecycle entry in 14.1 with the reload guard in 14.4 (first exercised at the 12.6 gate per the "walking skeleton onward" mandate); AD-31 projection in 13.1 with no router; AD-32 discipline in 12.1/12.5/15.1/15.4.
+- **Gates:** SM-7 = Epic 12 exit (Story 12.6); SM-8 opens at Story 15.6; Epic 13 and Epic 14 are parallelizable after SM-7; Epic 15 closes the phase.
+- **Human-in-the-loop:** exactly two stories require a physical device and the owner — 12.6 (on-device skeleton validation) and 15.6 (final device install) — both explicitly marked so the automation loop defers them to the coordinator rather than escalating; every other iOS story is implementable with simulator/compile gates alone.
+- **Sizing:** 26 stories across Epics 12–15 (6 + 7 + 7 + 6), each scoped to a single dev session; total 89 stories across 15 epics.
 
 
 
