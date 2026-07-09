@@ -4,17 +4,18 @@ type: architecture-spine
 purpose: build-substrate
 altitude: initiative
 paradigm: 'hexagonal Rust core + unidirectional view-model projection (Rust owns truth; UI renders streams; mutations round-trip through commands)'
-scope: 'keeper MVP — macOS Tauri 2 desktop Matrix client: multi-account, bridges, local archive, drafts/approval, incognito, undo-send'
+scope: 'keeper MVP — macOS Tauri 2 desktop Matrix client: multi-account, bridges, local archive, drafts/approval, incognito, undo-send — plus the iOS/iPhone phase (same core, same IPC contract, phone shell)'
 status: final
 created: '2026-07-03'
-updated: '2026-07-03'
-binds: [FR-1..FR-54, NFR-1..NFR-14]
+updated: '2026-07-09'
+binds: [FR-1..FR-65, NFR-1..NFR-18]
 sources:
   - _bmad-output/planning-artifacts/prds/prd-keeper-2026-07-03/prd.md
   - _bmad-output/planning-artifacts/prds/prd-keeper-2026-07-03/addendum.md
   - _bmad-output/planning-artifacts/briefs/brief-keeper-2026-07-03/addendum.md
   - _bmad-output/planning-artifacts/product-inputs.md
   - _bmad-output/planning-artifacts/research-technical-2026-07-03.md
+  - _bmad-output/planning-artifacts/research-ios-2026-07-09.md
   - docs/project-context.md
 companions: []
 ---
@@ -170,7 +171,46 @@ Allowed dependency direction is exactly the arrows above. `keeper-core` never im
 ### AD-25 — Settings live in Rust; no JS-writable store
 - **Binds:** settings, plugin set
 - **Prevents:** a second, JS-owned configuration source of truth
-- **Rule:** All settings live in `keeper.db` behind `keeper-core::settings`, exposed via commands + a settings stream. tauri-plugin-store and tauri-plugin-sql are not used. Plugin set: notification, deep-link, global-shortcut, updater, autostart, window-state, clipboard-manager, opener (single-instance deferred to Windows/Linux).
+- **Rule:** All settings live in `keeper.db` behind `keeper-core::settings`, exposed via commands + a settings stream. tauri-plugin-store and tauri-plugin-sql are not used. Plugin set: notification, deep-link, global-shortcut, updater, autostart, window-state, clipboard-manager, opener (single-instance deferred to Windows/Linux). Desktop-only members of this set are compile-gated out of mobile targets per AD-26.
+
+### iOS Phase (2026-07-09) — AD-26 … AD-32
+
+*Extends the frozen AD-1..25 for PRD §13 (FR-55–FR-65, NFR-15–NFR-18). AD-24 Plan A is hereby confirmed: Tauri mobile reusing `keeper-core` and the same IPC contract; Plan B (UniFFI + native shell) stays shelved with recorded revisit triggers (blank-webview bug class proves unfixable across Tauri releases; NSE work begins). Distribution this phase is free Personal Team signing — no APNs/App Groups/TestFlight entitlements exist.*
+
+### AD-26 — One shell crate, cfg-gated platform seams
+- **Binds:** FR-55, FR-56, repo layout, all shell code
+- **Prevents:** a forked iOS shell crate drifting from desktop; desktop plugin symbols in the iOS binary; keeper-core sprouting platform ifdefs
+- **Rule:** The iOS target is the **same** `crates/keeper` shell crate, built as a staticlib via `tauri ios` (`tauri::mobile_entry_point`); no `keeper-ios` crate ever. Desktop-only surface — `tray` module + `tray-icon` feature, global-shortcut, autostart, updater, window-state, desktop deep-link registration — sits behind `#[cfg(desktop)]` / `#[cfg(target_os)]` gates with target-gated Cargo dependencies; the iOS shell registers notification + deep-link (mobile scheme) + IPC + media protocol only. On iOS, clipboard needs are served by the web Clipboard API in the webview (clipboard-manager is desktop-tier) and "open in browser" by a minimal native open call replacing the opener plugin. `keeper-core` stays platform-free: platform variance enters only through the `Platform` port (AD-24), never as `cfg(target_os)` in core business logic.
+
+### AD-27 — Platform capability flags: one Capabilities VM
+- **Binds:** FR-57, FR-29/FR-50/FR-53 surfaces on iOS, IPC handshake
+- **Prevents:** UI and shell disagreeing about what exists per platform; per-feature ad-hoc platform sniffing in TS; dead buttons/error-on-tap
+- **Rule:** A single `CapabilitiesVm` in `keeper-core::vm` (serde + ts-rs like every DTO), served over the IPC handshake at startup and data-driven per platform (later targets reuse the mechanism). It governs: bbctl sidecar (absent on iOS — the OS forbids child processes; `Platform::sidecar_path` returns a clean Unsupported `IpcError`), global hotkeys, updater controls, tray/menu-bar + launch-at-login. A surface whose capability is off does not render at all. **Bridge management itself stays fully functional on iOS** — discovery, native provisioning login, Bridge Bot fallback, health + re-login, risk tiers, start-new-Chat. The frontend never consults `navigator.userAgent`/build flags for feature gating.
+
+### AD-28 — Media on iOS: same protocol, capped buffers
+- **Binds:** FR-64, NFR-9, NFR-16
+- **Prevents:** an iOS-specific media transport fork; AD-4's "no media over IPC" eroding on mobile; unbounded RAM in a jetsam-limited process
+- **Rule:** `keeper-media://` runs unchanged on iOS — wry maps the custom protocol to WKURLSchemeHandler with the scheme staying native, so URL format is identical to macOS and the frontend needs no media-URL helper (introduce a `convertMediaSrc`-style remap only when Android actually starts). Range slicing (200/206/416) stays in-memory from the SDK cache but the slicing buffer is **capped** (NFR-16); WebKit scheme-task invalidation is tolerated by the existing fire-and-forget responder. Disk-backed streaming of large media is deferred work, not a phase requirement.
+
+### AD-29 — iOS secrets & store protection behind the existing ports
+- **Binds:** FR-63, FR-65, NFR-9/NFR-10 on iOS
+- **Prevents:** a keychain implementation leaking past the `Platform` port; Matrix device identity cloned via iCloud Keychain; a file-protection class that breaks the resumed sync loop; multi-GB re-syncable state bloating backups
+- **Rule:** Sessions and secrets go through the **existing** keyring/apple-native `Platform` port targeting the iOS keychain — spiked in the walking skeleton; the contained fallback is direct security-framework generic-password calls behind the **same** port (call sites unchanged). Accessibility is `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` — readable by a resumed sync loop, never synced off-device. SQLite/DB directories carry `NSFileProtectionCompleteUntilFirstUserAuthentication` (never `Complete` — WAL access after lock) and `isExcludedFromBackup`. All account state remains under the one `Platform::data_dir()` root so a future App Group container move (NSE era) is a path change, not a migration.
+
+### AD-30 — Mobile lifecycle: foreground-only sync, honestly disclosed
+- **Binds:** FR-61, FR-62, NFR-17, NFR-18
+- **Prevents:** fake "push while closed" promises; long-polls killed mid-flight; two lifecycle sources fighting over `SyncService`; blank webview after resume shipping unguarded
+- **Rule:** On background the shell gracefully pauses `SyncService` (matrix-sdk-ui stop/offline mode); on foreground it resumes with an immediate sync, rendering the cached mirror instantly (AD-8 snapshot-then-diff) with a subtle "connecting" state and a stale-resume sync-loop restart guard (matrix-rust-sdk#3935). Detection enters Rust through one lifecycle command: webview `visibilitychange` first (zero-native stopgap), a micro Swift plugin on `UIApplication` notifications as the correctness upgrade — same Rust entry point either way. **No background sync or push without APNs**, which is the paid-program decision gate — disclosed plainly in UI and docs (FR-53 honesty extended). A reload guard for the blank-webview-on-resume bug (tauri#14371) is mandatory from the walking skeleton onward. Notifications on iOS are foreground-local + badge-on-sync only, reusing the AD-18 rules engine; the badge value is the Unified Inbox unread aggregate already computed by `inbox` (AD-20) — never a second count.
+
+### AD-31 — Phone layout tier: a projection of selection state, not a fork
+- **Binds:** FR-58, FR-59, FR-60, `src/` shell
+- **Prevents:** forked chat components; a router creeping in as a second navigation truth; per-component safe-area/keyboard hacks
+- **Rule:** A third `phone` tier (< 768 px) is added to the existing `useShellLayout`; desktop/tablet tiers are unchanged at ≥ 768 px. Phone renders a stack-navigation container — Inbox → Room → Detail — **reusing** the existing InboxList/ChatView/DetailPanel component trees, driven by the existing zustand selection state; the stack is a projection of that state and **no routing library** is added this phase (`history.pushState` integration is an optional enhancer for the system back gesture). Safe areas: `viewport-fit=cover` + `contentInsetAdjustmentBehavior = .never` + `env(safe-area-inset-*)` exposed as Tailwind theme CSS vars — app CSS owns all insets. Keyboard: a `visualViewport`-driven `--kb-inset` CSS var lifts the composer (evaluate `interactive-widget=resizes-content` as the simpler path); pinned-at-bottom timeline behavior is preserved. Touch idioms map onto existing actions (long-press → context menus, row swipes → archive/mute, pull-to-refresh → kick sync).
+
+### AD-32 — iOS build seed & CI gate
+- **Binds:** FR-55, distribution/toolchain, CI
+- **Prevents:** hand edits lost to `.xcodeproj` regeneration; desktop PRs silently breaking the iOS port; signing/team identifiers leaking into the repo
+- **Rule:** `tauri ios init` generates `gen/apple` under `crates/keeper` (relative to the crate holding `tauri.conf.json`); `gen/apple` is committed with `build/` gitignored, and persistent edits live **only** in `project.yml` (XcodeGen source of truth — the `.xcodeproj` is regenerated), `Info.plist` (`CFBundleURLTypes` for `keeper://`), and the `*_iOS/` sources (safe-area Swift patch). Minimum iOS 16.0 is set explicitly. Signing: automatic Personal Team via `bundle.iOS.developmentTeam` or the `TAURI_APPLE_DEVELOPMENT_TEAM` env var (team ID stays out of git); the bundle ID is stable and shared with macOS. CI adds `cargo check --target aarch64-apple-ios` as a **required PR gate** on the existing macOS runner — compile-only, no signing, no simulator build this phase.
 
 ## Consistency Conventions
 
@@ -183,7 +223,8 @@ Allowed dependency direction is exactly the arrows above. `keeper-core` never im
 | Rust style | Modules per domain noun; `thiserror` per module; `tracing` only; no `unwrap`/bare `expect` in production paths; `unsafe` denied; tests colocated `#[cfg(test)]` + `src-tauri/tests/`; runner cargo-nextest |
 | TS style | Biome-enforced (no `any`, `import type`, 2-space/100-col/double quotes); path alias `@/*`; zustand stores in `src/stores/` named `use<Domain>Store`; hooks kebab-case in `src/hooks/`; `src/components/ui/` is shadcn-generated only |
 | Data files | Network Risk Tiers + coupling caveats + known-bot registry = versioned JSON under `src-tauri/crates/keeper-core/data/` |
-| Secrets & logs | Secrets only in Keychain; `op://` for dev creds; logs carry ids, never content or tokens |
+| Secrets & logs | Secrets only in the platform keychain (macOS Keychain / iOS keychain, both behind the `Platform` port); `op://` for dev creds; logs carry ids, never content or tokens |
+| Platform gating | Compile-time: `#[cfg(desktop)]`/target-gated deps in the shell only, never in `keeper-core` (AD-26); runtime UI gating only via `CapabilitiesVm` (AD-27) — no platform sniffing in TS |
 | Language & tooling | English everywhere; bun only (never npm/pnpm/yarn); quality gates `bun run check`, `check:rust`, `test:rust` before done |
 
 ## Stack
@@ -200,7 +241,8 @@ Allowed dependency direction is exactly the arrows above. `keeper-core` never im
 | Tailwind CSS / shadcn-ui (radix, cva, lucide) | 4.x / current |
 | zustand | 5.0.x |
 | bun / Biome / Vitest / cargo-nextest / cargo-deny / lefthook | repo-pinned (bun.lock / Cargo.lock) |
-| CI | GitHub Actions macOS arm64 + tauri-action |
+| CI | GitHub Actions macOS arm64 + tauri-action (+ `cargo check --target aarch64-apple-ios` PR gate) |
+| iOS toolchain (dev-machine) | Xcode 16.x (iOS 18 SDK) + CocoaPods + rust targets `aarch64-apple-ios{,-sim}`; min deployment target iOS 16.0 |
 
 ## Structural Seed
 
@@ -228,17 +270,25 @@ src-tauri/
         platform.rs          # Platform port trait
         error.rs             # CoreError
     keeper/                  # Tauri shell (today's keeper_lib migrates here)
+      tauri.conf.json        # + bundle.iOS.developmentTeam (or TAURI_APPLE_DEVELOPMENT_TEAM env); mobile deep-link scheme
+      gen/apple/             # generated by `tauri ios init`; committed minus build/ (AD-32)
+                             #   project.yml (deployment target, background color), Info.plist (keeper:// CFBundleURLTypes), *_iOS/ safe-area patch
       src/
         commands/            # #[tauri::command] per domain; CoreError -> IpcError
         channels/            # core streams -> Channel<T> subscriptions
-        media_protocol.rs    # keeper-media:// (Range) from SDK media cache
-        tray.rs  deep_link.rs  plugins.rs
+        media_protocol.rs    # keeper-media:// (Range) from SDK media cache — WKURLSchemeHandler on iOS
+        platform/            # Platform impls: desktop + iOS (data_dir, keychain class, sidecar Unsupported)
+        lifecycle.rs         # foreground/background command -> SyncService pause/resume (AD-30)
+        tray.rs  deep_link.rs  plugins.rs   # desktop-only members behind #[cfg(desktop)] (AD-26)
 src/
-  lib/ipc/gen/               # ts-rs output (generated; CI-diffed, never hand-edited)
+  index.html                 # viewport-fit=cover (+ interactive-widget evaluation) (AD-31)
+  lib/ipc/gen/               # ts-rs output (generated; CI-diffed, never hand-edited) — includes CapabilitiesVm
   lib/ipc/                   # typed invoke/channel wrappers
-  stores/                    # zustand mirrors: accounts, inbox, timeline, bridges, send, drafts, settings
-  features/                  # wizard, inbox, chat, bridges, approval, palette, settings UI
+  stores/                    # zustand mirrors: accounts, inbox, timeline, bridges, send, drafts, settings (+ capabilities)
+  hooks/use-shell-layout.ts  # desktop / tablet / phone (<768px) tiers (AD-31)
+  features/                  # wizard, inbox, chat, bridges, approval, palette, settings UI (+ phone stack container)
   components/ui/             # shadcn-generated
+docs/ios.md                  # 7-day re-arm ritual, sideload/re-sign flows, platform limitations
 ```
 
 ```mermaid
@@ -255,7 +305,7 @@ graph LR
   PURGE["explicit 'delete Local Archive for account'"] -- "DELETE rows" --> ADB
 ```
 
-Deployment envelope: a single signed/notarized macOS app bundle (+ optional bbctl sidecar binary); external topology is entirely user-owned (homeserver, bridges, Beeper cloud). CI (GitHub Actions) is the only project-side infrastructure.
+Deployment envelope: a single signed/notarized macOS app bundle (+ optional bbctl sidecar binary), plus an iOS app signed with a free Personal Team (7-day profiles re-armed from the owner's Mac; test IPAs re-signed per-tester via Sideloadly/zsign; AltServer auto-refresh optional) — no App Store/TestFlight this phase. External topology is entirely user-owned (homeserver, bridges, Beeper cloud); no push infrastructure exists or is promised. CI (GitHub Actions) is the only project-side infrastructure.
 
 ## Capability → Architecture Map
 
@@ -275,8 +325,19 @@ Deployment envelope: a single signed/notarized macOS app bundle (+ optional bbct
 | NFR-9–11 security/privacy/egress | core confinement, Keychain, signals, no telemetry | AD-1, AD-10, AD-14, AD-21, AD-5 |
 | NFR-12–13 packaging, licensing | CI pipeline, cargo-deny | AD-23, AD-5 |
 | NFR-14 accessibility baseline | `features/` UI conventions + keyboard-first surfaces | AD-20 (keyboard parity), UX spec |
+| FR-55–56 iOS target & build seam | `crates/keeper` staticlib, `gen/apple`, cfg gates | AD-26, AD-32, AD-24 |
+| FR-57 capability flags | `keeper-core::vm::CapabilitiesVm` + capabilities store | AD-27, AD-7 |
+| FR-58–60 phone UX (stack, safe areas, keyboard, touch) | `use-shell-layout` phone tier + stack container in `features/` | AD-31, AD-9 |
+| FR-61–62 lifecycle sync, foreground notifications, badge | `lifecycle.rs` → `sync`; `notify` reuse | AD-30, AD-18 |
+| FR-63 iOS keychain sessions | `Platform` port iOS impl | AD-29, AD-10 |
+| FR-64 media on iOS | `media_protocol.rs` (WKURLSchemeHandler) | AD-28, AD-4 |
+| FR-65 backup exclusion & file protection | `Platform` iOS `data_dir` + first-launch flags | AD-29, AD-10 |
+| NFR-15 cold start on device | cached-mirror-first rendering; measured on-device | AD-8, AD-20, AD-30 |
+| NFR-16 jetsam memory hygiene | cache-drop on background/memory-warning; capped Range buffer | AD-28, AD-30 |
+| NFR-17 flaky-network resilience | SyncService offline mode + restart guard over the local mirror | AD-30, AD-8 |
+| NFR-18 resume integrity | blank-webview reload guard, walking-skeleton-tested | AD-30 |
 
-**PRD consistency check.** All FR-1–54 and NFR-1–9, 11–14 are implementable within this spine. One amendment required: **NFR-10** — "local stores (state, crypto, Local Archive) support passphrase-based at-rest encryption" is satisfiable for SDK stores in MVP but not for `archive.db` (FTS cannot index ciphertext; SQLCipher conflicts with matrix-sdk-sqlite's bundled SQLite linkage). Amend NFR-10 to scope MVP passphrase encryption to SDK stores, with archive-at-rest as a v1.x spike (AD-22). Two PRD open questions become epic-gating tests, not amendments: OQ-1 (walking-skeleton spike: SSS + E2EE + timeline channel + FTS in release build — first epic exit gate) and OQ-3 (hungryserv surface: verify `thirdparty/protocols`, `dev.keeper.draft` account data, `m.read.private`, push rules against a real Beeper account; degrade per-feature with disclosure).
+**PRD consistency check.** All FR-1–54 and NFR-1–9, 11–14 are implementable within this spine. **Phase 2 (2026-07-09):** FR-55–65 and NFR-16–18 are implementable within AD-26..32 with no PRD amendment; NFR-15's 3 s cold-start bar is authored pending owner confirmation (PRD §13.8) and is not release-gating until confirmed. The walking-skeleton gate (SM-7: on-device OIDC deep-link login, room list, E2EE send/receive, relaunch-restore — plus the keyring-on-iOS spike and the resume reload guard) must pass before phone-UX epics start. One amendment required: **NFR-10** — "local stores (state, crypto, Local Archive) support passphrase-based at-rest encryption" is satisfiable for SDK stores in MVP but not for `archive.db` (FTS cannot index ciphertext; SQLCipher conflicts with matrix-sdk-sqlite's bundled SQLite linkage). Amend NFR-10 to scope MVP passphrase encryption to SDK stores, with archive-at-rest as a v1.x spike (AD-22). Two PRD open questions become epic-gating tests, not amendments: OQ-1 (walking-skeleton spike: SSS + E2EE + timeline channel + FTS in release build — first epic exit gate) and OQ-3 (hungryserv surface: verify `thirdparty/protocols`, `dev.keeper.draft` account data, `m.read.private`, push rules against a real Beeper account; degrade per-feature with disclosure).
 
 ## Deferred
 
@@ -287,6 +348,10 @@ Deployment envelope: a single signed/notarized macOS app bundle (+ optional bbct
 - **Archive at-rest encryption spike** (SQLCipher-as-single-SQLite vs page-level crypto) — v1.x per AD-22.
 - **bbctl full lifecycle supervision, bridge health dashboard** — v1.x per PRD §6.2.
 - **Element Call widget embed, MatrixRTC** — post-MVP; stays out-of-process/AGPL-clean per AD-5.
-- **iOS push/NSE architecture, Windows/Linux packaging, universal binaries** — next platform phase (AD-24 keeps the seam).
+- **APNs push + NSE architecture** — behind the paid-program decision gate (PRD §13.5); AD-29's single data-dir root keeps the App Group move cheap; the Sygnal/gateway question is PRD-level when it opens.
+- **Windows/Linux packaging, universal binaries, Android, iPad layout** — later platform phases; AD-26/AD-27/AD-31 are the platform-neutral seams (Android's `convertMediaSrc` media-URL helper is introduced only when Android starts).
+- **Micro Swift lifecycle plugin** — only if `visibilitychange` proves unreliable (AD-30 keeps the Rust entry point stable either way).
+- **Disk-backed streaming of large media on iOS** — deferred; the capped in-memory buffer (AD-28/NFR-16) is the phase posture.
+- **`NWPathMonitor`-driven fast retry, share-sheet media save, full Dynamic Type adoption, biometric app lock** — fit-and-finish or later phases; nothing this phase depends on them.
 - **Threads, spaces management, custom filtered views** — not in MVP scope; inbox projection (AD-20) is the extension point.
 - **Homeserver companion-stack docs** — Synapse ≥ 1.114 as documented default (closes PRD OQ-2); docs-only, no code dependency.
