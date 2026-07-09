@@ -59,20 +59,20 @@ jobs:
             echo "::notice::Apple signing secrets absent — publishing an unsigned (ad-hoc) build."
           fi
 
-      - name: Build, sign, notarize, and publish release
+      - name: Build, sign, notarize, and publish release (signed path)
+        if: steps.signing.outputs.signed == 'true'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Developer ID signing (base64 .p12 + password + identity + keychain password).
-          # All empty when signing secrets are absent — tauri-action then builds unsigned.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.signed == 'true' && secrets.APPLE_SIGNING_IDENTITY || '-' }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          # App Store Connect API-key notarization (skipped when unsigned).
-          APPLE_API_ISSUER: ${{ steps.signing.outputs.signed == 'true' && secrets.APPLE_API_ISSUER || '' }}
-          APPLE_API_KEY: ${{ steps.signing.outputs.signed == 'true' && secrets.APPLE_API_KEY_ID || '' }}
-          APPLE_API_KEY_PATH: ${{ steps.signing.outputs.signed == 'true' && format('{0}/api_key.p8', runner.temp) || '' }}
+          # App Store Connect API-key notarization.
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/api_key.p8
           # Signed auto-updates (Story 11.2, NFR-12). Tauri signs the updater artifacts
           # with this minisign private key; the app verifies each download against the
           # committed `plugins.updater.pubkey` before installing. Both come only from
@@ -83,11 +83,37 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "keeper ${{ github.ref_name }}${{ steps.signing.outputs.signed == 'false' && ' (unsigned build)' || '' }}"
-          releaseBody: "${{ steps.signing.outputs.signed == 'false' && 'Unsigned (ad-hoc) macOS build — first launch requires right-click → Open. Add Apple signing secrets per docs/release.md for notarized releases.' || '' }}"
+          releaseName: "keeper ${{ github.ref_name }}"
           releaseDraft: true
           prerelease: false
           args: --config src-tauri/crates/keeper/tauri.conf.json --target aarch64-apple-darwin
+
+      # Unsigned path: plain ad-hoc build (no keychain import, no notarization), DMG via
+      # hdiutil (bundle_dmg AppleScript styling is flaky headless), draft release via gh.
+      - name: Build unsigned (ad-hoc) bundle
+        if: steps.signing.outputs.signed == 'false'
+        run: |
+          set -euo pipefail
+          bun run tauri build --config src-tauri/crates/keeper/tauri.conf.json --target aarch64-apple-darwin --bundles app
+          APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/keeper.app"
+          codesign --force --deep -s - "$APP"
+          VERSION="${GITHUB_REF_NAME#v}"
+          hdiutil create -volname "keeper" -srcfolder "$APP" -ov -format UDZO "keeper_${VERSION}_aarch64.dmg"
+          ditto -c -k --keepParent "$APP" "keeper_${VERSION}_aarch64_app.zip"
+
+      - name: Publish unsigned draft release
+        if: steps.signing.outputs.signed == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "keeper $GITHUB_REF_NAME (unsigned build)" \
+            --notes "Unsigned (ad-hoc) macOS build — first launch requires right-click → Open. Add Apple signing secrets per docs/release.md for notarized releases." \
+            "keeper_${VERSION}_aarch64.dmg" "keeper_${VERSION}_aarch64_app.zip" \
+          || gh release upload "$GITHUB_REF_NAME" "keeper_${VERSION}_aarch64.dmg" "keeper_${VERSION}_aarch64_app.zip" --clobber
 
       # Per-release egress diff note (Story 11.2, NFR-11, AD-23): docs/egress.md is the
       # canonical, diffable egress surface. Diff it against the previous tag into the job

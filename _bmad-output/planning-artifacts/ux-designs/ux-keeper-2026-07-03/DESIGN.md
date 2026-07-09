@@ -1,9 +1,9 @@
 ---
 name: keeper
-description: Open-source, client-only universal Matrix messenger for macOS. shadcn/ui on Tauri 2 + React 19 + Tailwind v4; this DESIGN.md specifies the brand-layer delta and the macOS-native envelope only.
+description: Open-source, client-only universal Matrix messenger for macOS and iPhone. shadcn/ui on Tauri 2 + React 19 + Tailwind v4; this DESIGN.md specifies the brand-layer delta and the platform envelopes only. The iOS phase adds layout tokens, not a second visual language.
 status: final
 created: 2026-07-03
-updated: 2026-07-03
+updated: 2026-07-09
 colors:
   # Brand overrides on top of shadcn defaults. All unlisted tokens inherit from
   # shadcn (background, foreground, muted, muted-foreground, popover, popover-foreground,
@@ -63,6 +63,10 @@ spacing:
   detail-panel-width: 320px
   conversation-min-width: 480px
   content-max-width: 720px       # timeline text measure inside the conversation pane
+  phone-breakpoint: 768px        # below this width: single-pane stack tier (PRD FR-58)
+  touch-target-min: 44px         # HIG minimum for every tappable on the phone tier (FR-60)
+  safe-area: 'env(safe-area-inset-*) exposed as --safe-top / --safe-right / --safe-bottom / --safe-left (viewport-fit=cover)'
+  kb-inset: '--kb-inset — visualViewport-driven on-screen-keyboard height; 0 when the keyboard is closed'
 components:
   chat-row:
     height: 64px
@@ -117,6 +121,17 @@ components:
     radius: '{rounded.lg}'
     result-active-background: 'shadcn accent'
     kbd-chip: '{typography.mono} on shadcn muted, radius {rounded.sm}'
+  swipe-action:
+    # Phone tier only. Revealed behind chat rows / Approval rows; full row height,
+    # glyph first, label appears past the half-swipe commit threshold.
+    archive: '{colors.primary} background, {colors.primary-foreground} glyph'   # archived = kept
+    read-toggle: 'shadcn secondary background, foreground glyph'
+    mute: 'shadcn muted background, muted-foreground glyph'
+    discard: 'shadcn destructive background and foreground'
+  phone-header:
+    height: 52px
+    back-affordance: 'chevron + previous-level title, {spacing.touch-target-min} hit area'
+    background: 'shadcn background, 1px bottom border — same flat-pane language as desktop'
 ---
 
 ## Brand & Style
@@ -171,6 +186,8 @@ Tailwind v4's 4px spacing scale is inherited as-is. The app frame is a fixed thr
 
 Density is macOS-utility, not web-comfortable: 64px chat rows, 8px vertical rhythm inside rows, 12px pane gutters.
 
+**Phone tier (< `{spacing.phone-breakpoint}`, iOS phase):** the same panes render one at a time as full-screen stack levels — Inbox → Room → Detail — under a `{components.phone-header}` bar. Nothing is restyled: same tokens, same components, same density, plus three phone-only constraints — every tappable ≥ `{spacing.touch-target-min}`, edge-to-edge rendering padded by `{spacing.safe-area}`, and the composer bottom-anchored above `{spacing.kb-inset}`. Row swipes reveal `{components.swipe-action}` surfaces. Behavior lives in `EXPERIENCE.md.Responsive & Platform`.
+
 ## Elevation & Depth
 
 Flat panes separated by 1px `border` lines — the three-pane frame has **no** shadows between panes. shadcn's default shadow language applies only to transient layers: popovers, dropdowns, dialogs, the command palette, and the undo-send pill (which floats above the composer). 
@@ -214,3 +231,5 @@ keeper-specific treatments (behavior in EXPERIENCE.md; visuals here):
 | Network identity as a 16px badge on the avatar | Per-network coloring of rows, panes, or bubbles |
 | Bold in chat list = unread, nothing else | Bold for emphasis, favorites, or pinned state |
 | Respect traffic-light insets in every sidebar state | Content or controls under the macOS window buttons |
+| Phone tier rearranges the same components under the same tokens | A second "mobile" visual language, forked chat components, or platform-specific restyling |
+| Respect safe-area insets on every phone surface, including sheets and overlays | Content under the notch or home indicator, unstyled bands at the screen edges |
