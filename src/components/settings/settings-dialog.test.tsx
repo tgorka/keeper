@@ -35,6 +35,8 @@ vi.mock("@/lib/ipc/client", () => ({
   ),
   egressList: vi.fn(() => Promise.resolve([])),
   verificationCancel: vi.fn(() => Promise.resolve()),
+  iosSyncDisclosureShownGet: vi.fn(() => Promise.resolve(true)),
+  iosSyncDisclosureShownSet: vi.fn(() => Promise.resolve()),
 }));
 
 // The About section (mounted by the dialog) imports the updater/process plugins;
@@ -51,6 +53,10 @@ import {
   SDK_STORE_UNENCRYPTED_STATUS,
   STORAGE_HONESTY_SENTENCE,
 } from "@/components/settings/at-rest-encryption-choice";
+import {
+  BADGE_NOT_LIVE_SENTENCE,
+  NO_BACKGROUND_SYNC_SENTENCE,
+} from "@/components/settings/no-background-sync-disclosure";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import type { AccountVm } from "@/lib/ipc/client";
 import {
@@ -455,9 +461,15 @@ describe("SettingsDialog", () => {
     expect(screen.getByRole("switch", { name: "Keep in menu bar" })).toBeInTheDocument();
     // No phone-tier Archive backup line on desktop.
     expect(screen.queryByText(/excluded from device backup/)).not.toBeInTheDocument();
+    // Story 10.3's "Background & dock" section and its ⌘W/⌘Q copy stay exactly as-is.
+    expect(screen.getByText("Background & dock")).toBeInTheDocument();
+    expect(screen.getByText(/keeps keeper running in the background/)).toBeInTheDocument();
+    // No iOS lifecycle-honesty copy on desktop (Story 14.2).
+    expect(screen.queryByText(NO_BACKGROUND_SYNC_SENTENCE)).not.toBeInTheDocument();
+    expect(screen.queryByText(BADGE_NOT_LIVE_SENTENCE)).not.toBeInTheDocument();
   });
 
-  it("iOS: hides the Shortcuts section and both background rows, and shows the Archive backup line", async () => {
+  it("iOS: hides the Shortcuts section and the whole Background & dock section, and shows the Archive backup line", async () => {
     mockPosture.mockResolvedValue(false);
     capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
     render(<SettingsDialog open onOpenChange={() => {}} />);
@@ -468,11 +480,23 @@ describe("SettingsDialog", () => {
     expect(screen.queryByText("Shortcuts")).not.toBeInTheDocument();
     expect(screen.queryByRole("switch", { name: "Launch at login" })).not.toBeInTheDocument();
     expect(screen.queryByRole("switch", { name: "Keep in menu bar" })).not.toBeInTheDocument();
-    // The Dock-badge radio is not capability-gated — it stays.
-    expect(screen.getByRole("radiogroup", { name: "Dock badge mode" })).toBeInTheDocument();
+    // The whole "Background & dock" section is gone on the phone tier (Story 14.2) —
+    // no ⌘W-keeps-syncing background-delivery claim, no desktop Dock-badge control.
+    expect(screen.queryByText("Background & dock")).not.toBeInTheDocument();
+    expect(screen.queryByText(/keeps keeper running in the background/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("radiogroup", { name: "Dock badge mode" })).not.toBeInTheDocument();
     // The hidden rows never probe their desktop-only backends (no dead Unsupported IPC).
     expect(mockLaunchGet).not.toHaveBeenCalled();
     expect(mockMenuBarGet).not.toHaveBeenCalled();
+  });
+
+  it("iOS: the Notifications section shows the canonical only-while-open sentence and the badge note (Story 14.2)", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(NO_BACKGROUND_SYNC_SENTENCE)).toBeInTheDocument();
+    expect(screen.getByText(BADGE_NOT_LIVE_SENTENCE)).toBeInTheDocument();
   });
 
   it("pre-hydration: hides the desktop-only surfaces by the safe default but does NOT flash the Archive backup line", async () => {

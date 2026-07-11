@@ -286,6 +286,8 @@ pub fn run() {
             ipc::delete_account_archive,
             ipc::dock_badge_mode_get,
             ipc::dock_badge_mode_set,
+            ipc::ios_sync_disclosure_shown_get,
+            ipc::ios_sync_disclosure_shown_set,
             ipc::launch_at_login_get,
             ipc::launch_at_login_set,
             ipc::menu_bar_presence_get,

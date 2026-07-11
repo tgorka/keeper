@@ -1552,6 +1552,24 @@ export async function dockBadgeModeSet(mode: DockBadgeMode): Promise<void> {
 }
 
 /**
+ * Read whether the one-time iOS no-background-sync disclosure has been shown
+ * (Story 14.2, FR-61). Absent = `false` (not yet shown). The latch is device-global
+ * and persisted in the Rust `settings` k/v table — never `localStorage`.
+ */
+export async function iosSyncDisclosureShownGet(): Promise<boolean> {
+  return await invoke<boolean>("ios_sync_disclosure_shown_get");
+}
+
+/**
+ * Latch the one-time iOS no-background-sync disclosure as shown (Story 14.2, FR-61).
+ * One-way — once persisted the card never re-appears, including across relaunch.
+ * Resolves once persisted.
+ */
+export async function iosSyncDisclosureShownSet(): Promise<void> {
+  await invoke<void>("ios_sync_disclosure_shown_set");
+}
+
+/**
  * Read whether launch-at-login is enabled (Story 10.3, FR-53, AD-25). The autostart
  * plugin's LaunchAgent state is authoritative; off by default on a fresh install.
  * Rejects with the {@link IpcError} envelope on a plugin failure.

@@ -7,6 +7,10 @@ import {
   SDK_STORE_UNENCRYPTED_STATUS,
   STORAGE_HONESTY_SENTENCE,
 } from "@/components/settings/at-rest-encryption-choice";
+import {
+  BADGE_NOT_LIVE_SENTENCE,
+  NO_BACKGROUND_SYNC_SENTENCE,
+} from "@/components/settings/no-background-sync-disclosure";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -80,7 +84,8 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   // Shortcuts section wherever the platform lacks it (the phone tier).
   const globalHotkey = useCapabilitiesStore((s) => s.capabilities.globalHotkey);
   // Whether this is the capability-reduced (phone) tier — drives the Archive
-  // backup-exclusion line below and the "On this iPhone" list in About.
+  // backup-exclusion line below, the "On this iPhone" list in About, and hides the
+  // desktop "Background & dock" section (Story 14.2).
   const reducedPlatform = useIsReducedCapabilityPlatform();
   // `undefined` = still loading; otherwise the resolved posture (`null` unchosen,
   // or `true`/`false`). Keeping "loading" distinct from a resolved value stops the
@@ -138,7 +143,11 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           <HonorRemoteDeletionsRow />
         </div>
         <NotificationsSection open={open} />
-        <BackgroundSection open={open} />
+        {/* The desktop "Background & dock" section (⌘W/⌘Q mechanics, Dock badge,
+            launch-at-login, menu bar) never renders on the reduced (phone) tier —
+            its keeps-syncing-in-background copy would be a false background-delivery
+            claim on iOS (Story 14.2, FR-53/FR-61). Desktop (Story 10.3) unchanged. */}
+        {!reducedPlatform && <BackgroundSection open={open} />}
         <PrivacySection open={open} />
         {globalHotkey && <ShortcutsSection open={open} />}
         <EncryptionSection />
@@ -246,6 +255,9 @@ const NOTIFY_PREVIEWS_SENTENCE =
  * not saved).
  */
 function NotificationsSection({ open }: { open: boolean }) {
+  // The reduced (phone) tier gets the permanent lifecycle-honesty copy below: the
+  // canonical only-while-open sentence plus the badge-not-live note (Story 14.2).
+  const reducedPlatform = useIsReducedCapabilityPlatform();
   // `undefined` = still loading; otherwise the resolved previews state.
   const [enabled, setEnabled] = useState<boolean | undefined>(undefined);
 
@@ -300,6 +312,12 @@ function NotificationsSection({ open }: { open: boolean }) {
         />
       </div>
       <p className="text-muted-foreground">{NOTIFY_PREVIEWS_SENTENCE}</p>
+      {reducedPlatform && (
+        <>
+          <p className="text-muted-foreground">{NO_BACKGROUND_SYNC_SENTENCE}</p>
+          <p className="text-muted-foreground">{BADGE_NOT_LIVE_SENTENCE}</p>
+        </>
+      )}
     </div>
   );
 }
@@ -325,8 +343,9 @@ const DOCK_BADGE_OPTIONS: ReadonlyArray<{ value: DockBadgeMode; label: string }>
  */
 function BackgroundSection({ open }: { open: boolean }) {
   // Launch-at-login and menu-bar presence are desktop-only capabilities; hide each
-  // row wherever the platform lacks it (the phone tier). The Dock-badge radio and
-  // the ⌘W/⌘Q copy are not capability-gated (Epic 14 territory) — left untouched.
+  // row wherever the platform lacks it. The whole section is additionally gated
+  // behind `!reducedPlatform` at its call site (Story 14.2) — on the phone tier the
+  // ⌘W-keeps-syncing copy would be a false background-delivery claim.
   const launchAtLogin = useCapabilitiesStore((s) => s.capabilities.launchAtLogin);
   const trayIcon = useCapabilitiesStore((s) => s.capabilities.trayIcon);
   // `undefined` = still loading; otherwise the resolved dock-badge mode.

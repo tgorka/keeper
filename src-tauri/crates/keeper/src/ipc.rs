@@ -2917,6 +2917,26 @@ pub async fn dock_badge_mode_set(
         .map_err(to_ipc_error)
 }
 
+/// Read whether the one-time iOS no-background-sync disclosure has been shown
+/// (Story 14.2, FR-61). Absent ⇒ `false` (not yet shown). The latch is device-global
+/// and lives in the `settings` k/v table under `ui.ios_sync_disclosure_shown`.
+/// Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn ios_sync_disclosure_shown_get(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::get_ios_sync_disclosure_shown(&data_dir).map_err(to_ipc_error)
+}
+
+/// Latch the one-time iOS no-background-sync disclosure as shown (Story 14.2, FR-61).
+/// Writes `"1"` into the `settings` k/v table — one-way; once acknowledged the card
+/// never re-appears, including across relaunch. Failures funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub fn ios_sync_disclosure_shown_set(state: State<'_, AppState>) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::set_ios_sync_disclosure_shown(&data_dir).map_err(to_ipc_error)
+}
+
 /// Read whether launch-at-login is enabled (Story 10.3, FR-53, AD-25). The autostart
 /// plugin is the single source of truth (its LaunchAgent state), so this reads
 /// `autolaunch().is_enabled()` rather than a shadow setting. Default off on a fresh

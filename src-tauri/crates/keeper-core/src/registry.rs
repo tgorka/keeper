@@ -500,6 +500,25 @@ pub fn set_dock_badge_mode(data_dir: &Path, mode: DockBadgeMode) -> Result<(), C
     set_setting(data_dir, NOTIFY_DOCK_BADGE_MODE_KEY, mode.as_registry_str())
 }
 
+/// The `settings` key holding the one-time iOS no-background-sync disclosure latch
+/// (Story 14.2). Stored as `"1"` once the card has been shown; absent = not yet shown.
+const UI_IOS_SYNC_DISCLOSURE_SHOWN_KEY: &str = "ui.ios_sync_disclosure_shown";
+
+/// Read whether the one-time iOS no-background-sync disclosure has been shown
+/// (Story 14.2, FR-61). Present `"1"` ⇒ `true`; absent ⇒ `false` (not yet shown).
+/// Device-global — the disclosure is about the platform, not an Account. Stored in
+/// the `settings` k/v table under `ui.ios_sync_disclosure_shown`.
+pub fn get_ios_sync_disclosure_shown(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, UI_IOS_SYNC_DISCLOSURE_SHOWN_KEY)?.as_deref() == Some("1"))
+}
+
+/// Latch the one-time iOS no-background-sync disclosure as shown (Story 14.2, FR-61).
+/// Writes `"1"` into the `settings` k/v table under `ui.ios_sync_disclosure_shown`.
+/// One-way — there is no unset; once acknowledged the card never re-appears.
+pub fn set_ios_sync_disclosure_shown(data_dir: &Path) -> Result<(), CoreError> {
+    set_setting(data_dir, UI_IOS_SYNC_DISCLOSURE_SHOWN_KEY, "1")
+}
+
 /// The `settings` key holding the opt-in menu-bar (tray) presence toggle (Story 10.3).
 /// Stored as `"1"`/`"0"`; absent = off (no tray by default).
 const SYSTEM_MENU_BAR_PRESENCE_KEY: &str = "system.menu_bar_presence";
@@ -1870,6 +1889,19 @@ mod tests {
             set_dock_badge_mode(&dir, mode).expect("persist mode");
             assert_eq!(get_dock_badge_mode(&dir).expect("read back"), mode);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ios_sync_disclosure_shown_defaults_false_and_round_trips() {
+        let dir = temp_dir();
+        // Absent ⇒ not yet shown (the card is due on the reduced tier).
+        assert!(!get_ios_sync_disclosure_shown(&dir).expect("read default"));
+        // Latching persists and reads back true; re-latching stays true (one-way).
+        set_ios_sync_disclosure_shown(&dir).expect("persist latch");
+        assert!(get_ios_sync_disclosure_shown(&dir).expect("read back"));
+        set_ios_sync_disclosure_shown(&dir).expect("re-latch");
+        assert!(get_ios_sync_disclosure_shown(&dir).expect("read after re-latch"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

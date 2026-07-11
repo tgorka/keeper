@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { LoginScreen } from "@/components/auth/login-screen";
 import { AppShell } from "@/components/layout/app-shell";
 import { AtRestEncryptionChoice } from "@/components/settings/at-rest-encryption-choice";
+import { NoBackgroundSyncDisclosure } from "@/components/settings/no-background-sync-disclosure";
 import { Toaster } from "@/components/ui/sonner";
 import { FirstRunWizard } from "@/components/wizard/first-run-wizard";
 import { useAppLifecycle } from "@/hooks/use-app-lifecycle";
@@ -103,6 +104,11 @@ function App() {
   return (
     <>
       <Toaster />
+      {/* The one-time iOS lifecycle-honesty card (Story 14.2, FR-61). Mounted above
+          the content gate, like the Toaster, so it overlays the shell the moment its
+          own gates open (reduced tier + an Account + wizard closed + latch unshown);
+          it renders null everywhere else. */}
+      <NoBackgroundSyncDisclosure />
       {content}
     </>
   );
