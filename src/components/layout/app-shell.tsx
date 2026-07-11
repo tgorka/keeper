@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useRef } from "react";
 import { ApprovalPane } from "@/components/approval/approval-pane";
 import { NewChatDialog } from "@/components/chat/new-chat-dialog";
 import { CheatSheetOverlay } from "@/components/cheat-sheet/cheat-sheet-overlay";
@@ -8,6 +8,7 @@ import { BridgesPane } from "@/components/layout/bridges-pane";
 import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
+import { PhoneShell } from "@/components/layout/phone-shell";
 import { SidebarPane } from "@/components/layout/sidebar-pane";
 import { VerifyBanner } from "@/components/layout/verify-banner";
 import { SearchOverlay } from "@/components/search/search-overlay";
@@ -32,10 +33,11 @@ import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useUnreadJump } from "@/hooks/use-unread-jump";
 import { useVerification } from "@/hooks/use-verification";
 import { useViewShortcuts } from "@/hooks/use-view-shortcuts";
+import { useDetailStore } from "@/lib/stores/detail-ui";
 import { usePrimaryView } from "@/lib/stores/primary-view";
 
 export function AppShell() {
-  const { sidebarCollapsed, detailFloating } = useShellLayout();
+  const { phone, sidebarCollapsed, detailFloating } = useShellLayout();
   // Stream every account's connectivity into the per-account status store: the
   // switcher glyphs, the shell offline pill, and the "Queued" send caption are
   // all pure projections of that single map.
@@ -79,18 +81,20 @@ export function AppShell() {
   // Which primary view the shell renders. "bridges" and "approval" each replace the
   // chat-list + conversation cluster with a full-surface pane (Story 6.1 / 7.3).
   const primaryView = usePrimaryView();
-  const [detailOpen, setDetailOpen] = useState(false);
+  // Detail-open lives in the lifted `detailStore` (Story 13.1) so the desktop
+  // frame and the phone stack project one shared signal; the toggle-focus-return
+  // on close stays here, wrapping the store's `closeDetail`.
+  const detailOpen = useDetailStore((s) => s.open);
+  const openDetail = useDetailStore((s) => s.openDetail);
+  const storeCloseDetail = useDetailStore((s) => s.closeDetail);
+  const toggleDetail = useDetailStore((s) => s.toggleDetail);
   const toggleRef = useRef<HTMLButtonElement>(null);
 
-  const openDetail = useCallback(() => setDetailOpen(true), []);
   const closeDetail = useCallback(() => {
-    setDetailOpen(false);
+    storeCloseDetail();
     // Return focus to the toggle control on close.
     toggleRef.current?.focus();
-  }, []);
-  const toggleDetail = useCallback(() => {
-    setDetailOpen((prev) => !prev);
-  }, []);
+  }, [storeCloseDetail]);
 
   const handleSheetOpenChange = useCallback(
     (open: boolean) => {
@@ -112,20 +116,29 @@ export function AppShell() {
         <div data-tauri-drag-region className="h-7 shrink-0" />
         <VerifyBanner />
         <div className="flex min-h-0 flex-1">
-          <SidebarPane collapsed={sidebarCollapsed} />
-          {primaryView === "bridges" ? (
-            <BridgesPane />
-          ) : primaryView === "approval" ? (
-            <ApprovalPane />
+          {phone ? (
+            // Below 768px the single-pane stack replaces the sidebar + panes row
+            // (Story 13.1); the global overlays/dialogs/shortcut hooks below stay
+            // mounted in both arrangements.
+            <PhoneShell />
           ) : (
             <>
-              <ChatListPane />
-              <ConversationPane
-                detailOpen={detailOpen}
-                onToggleDetail={toggleDetail}
-                toggleRef={toggleRef}
-              />
-              {detailOpen && !detailFloating && <DetailPanel />}
+              <SidebarPane collapsed={sidebarCollapsed} />
+              {primaryView === "bridges" ? (
+                <BridgesPane />
+              ) : primaryView === "approval" ? (
+                <ApprovalPane />
+              ) : (
+                <>
+                  <ChatListPane />
+                  <ConversationPane
+                    detailOpen={detailOpen}
+                    onToggleDetail={toggleDetail}
+                    toggleRef={toggleRef}
+                  />
+                  {detailOpen && !detailFloating && <DetailPanel />}
+                </>
+              )}
             </>
           )}
         </div>
@@ -139,7 +152,7 @@ export function AppShell() {
       <CommandPalette />
       <CheatSheetOverlay />
 
-      {detailFloating && (
+      {detailFloating && !phone && (
         <Sheet open={detailOpen} onOpenChange={handleSheetOpenChange}>
           <SheetContent side="right" className="w-[320px] p-0 sm:max-w-[320px]">
             <SheetHeader className="sr-only">

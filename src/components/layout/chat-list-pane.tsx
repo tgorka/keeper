@@ -20,6 +20,7 @@ import { FavoritesSection, hydrateFavoritesCollapsed } from "@/components/layout
 import { PinsStrip } from "@/components/layout/pins-strip";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useShellLayout } from "@/hooks/use-shell-layout";
 import type { InboxBatch, InboxRoomVm, NetworksSnapshot, SpacesSnapshot } from "@/lib/ipc/client";
 import {
   archiveRoom,
@@ -68,6 +69,9 @@ export function ChatListPane() {
   const favoritesRooms = useFavoritesRoomsStore((s) => s.rooms);
   const selected = useRoomsStore((s) => s.selected);
   const selectRoom = useRoomsStore((s) => s.selectRoom);
+  // Phone tier (Story 13.1): opening a Chat on the phone must not auto-focus the
+  // composer (UX-DR22) — the row-open Enter handler gates its focus request on this.
+  const { phone } = useShellLayout();
   // Account switcher filter (Story 2.5): a pure display filter over the already-
   // merged, Rust-ordered rooms — it hides non-matching rows without touching the
   // merged subscription or the sort. `null` shows every account.
@@ -526,7 +530,11 @@ export function ChatListPane() {
     if (e.key === "Enter") {
       e.preventDefault();
       selectRoom({ accountId: room.accountId, roomId: room.roomId });
-      composerStore.getState().requestFocus();
+      // Desktop keeps focus-on-open; the phone stack never steals composer focus
+      // when a Chat opens (UX-DR22, Story 13.1).
+      if (!phone) {
+        composerStore.getState().requestFocus();
+      }
       return;
     }
     if (e.key === "e" || e.key === "u" || e.key === "p" || e.key === "f" || e.key === "m") {

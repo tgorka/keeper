@@ -142,7 +142,7 @@ development_status:
   12-6-on-device-walking-skeleton-validation-sm-7-gate: backlog
   epic-12-retrospective: optional
   epic-13: backlog
-  13-1-phone-layout-tier-and-navigation-stack: backlog
+  13-1-phone-layout-tier-and-navigation-stack: done
   13-2-phone-header-push-pop-transitions-and-edge-swipe-back: backlog
   13-3-leading-drawer-with-status-cluster: backlog
   13-4-merged-full-screen-search-surface: backlog
