@@ -14,6 +14,17 @@
 //! Range-capable *from the cache*, exactly as the AC requires. Retry is
 //! pure-frontend (re-set `src` with a cache-busting suffix → re-request →
 //! re-fetch on a cache miss).
+//!
+//! **iOS (Story 12.4):** the same protocol runs on iOS via wry →
+//! `WKURLSchemeHandler` (registration is unconditional). There the Range slice
+//! is capped at [`MAX_MEDIA_RANGE_CHUNK`] as a jetsam guard: an open-ended
+//! `bytes=0-` would otherwise `.to_vec()` the whole body, allocating a second
+//! full-size copy alongside the in-memory media and pushing peak past the iOS
+//! jetsam limit. The cap bounds that copy; the webview transparently continues
+//! with follow-up Range requests. A WebKit scheme task invalidated mid-fetch is
+//! handled by the fire-and-forget `responder.respond(...)` (best-effort — on
+//! an invalidated task it is a no-op, not a panic); on-device tolerance is
+//! confirmed in Story 12.6. Retry-on-cold-cache is the same pure-frontend path.
 
 use keeper_core::media::{parse_media_url, MediaBytes, MediaHandle};
 use tauri::http::{header, Request, Response, StatusCode};
@@ -95,6 +106,24 @@ fn full_response(bytes: Vec<u8>, mimetype: &str) -> Response<Vec<u8>> {
         .unwrap_or_else(|_| not_found())
 }
 
+/// Per-response Range slice ceiling. iOS: a hard jetsam guard so one open-ended
+/// `bytes=0-` cannot allocate a second full-size copy of large media. The 8 MiB
+/// value sits well under the epic's 25 MB media bar, so legitimate large media
+/// simply streams in successive capped chunks (`<video>`/`<audio>` reissue
+/// forward Range requests). Desktop: `u64::MAX` — a no-op, keeping desktop Range
+/// behavior byte-identical.
+#[cfg(target_os = "ios")]
+const MAX_MEDIA_RANGE_CHUNK: u64 = 8 * 1024 * 1024;
+#[cfg(not(target_os = "ios"))]
+const MAX_MEDIA_RANGE_CHUNK: u64 = u64::MAX;
+
+/// Clamp an inclusive range `end` so the slice is at most `cap` bytes. Pure.
+/// `saturating_sub` keeps it total even for a degenerate `cap` of 0 (no
+/// underflow), though both `MAX_MEDIA_RANGE_CHUNK` values are far larger.
+fn capped_range_end(start: u64, end: u64, cap: u64) -> u64 {
+    end.min(start.saturating_add(cap.saturating_sub(1)))
+}
+
 /// Build a 206 Partial Content response for a satisfiable `Range`, a 200 for a
 /// malformed range (serve the full body), or a 416 for an unsatisfiable range.
 fn partial_or_full(bytes: Vec<u8>, mimetype: &str, range: &str) -> Response<Vec<u8>> {
@@ -102,6 +131,10 @@ fn partial_or_full(bytes: Vec<u8>, mimetype: &str, range: &str) -> Response<Vec<
     match parse_range(range, total) {
         // A satisfiable byte range → 206 with the slice + Content-Range.
         RangeParse::Satisfiable { start, end } => {
+            // Cap the slice at `MAX_MEDIA_RANGE_CHUNK` (iOS jetsam guard; a
+            // `u64::MAX` no-op on desktop) before slicing, so both the 206 body
+            // and the `Content-Range` header reflect the clamped end.
+            let end = capped_range_end(start, end, MAX_MEDIA_RANGE_CHUNK);
             // `end` is inclusive; slice is `start..=end`.
             let slice = bytes
                 .get(start as usize..=end as usize)
@@ -353,6 +386,26 @@ mod tests {
             "bytes 2-5/10"
         );
         assert_eq!(resp.body(), &vec![2u8, 3, 4, 5]);
+    }
+
+    #[test]
+    fn capped_range_end_clamps_saturates_and_noops() {
+        // Over-long range clamps to exactly `cap` bytes (inclusive end).
+        assert_eq!(capped_range_end(0, 100, 8), 7);
+        assert_eq!(
+            capped_range_end(10, u64::MAX, 8 * 1024 * 1024),
+            10 + 8 * 1024 * 1024 - 1
+        );
+        // No-op when the range already fits within the cap.
+        assert_eq!(capped_range_end(2, 5, 8 * 1024 * 1024), 5);
+        // No-op when `cap == u64::MAX` (desktop byte-identical guarantee).
+        assert_eq!(capped_range_end(0, 999, u64::MAX), 999);
+        assert_eq!(capped_range_end(500, u64::MAX, u64::MAX), u64::MAX);
+        // Saturates near `u64::MAX` without overflow.
+        assert_eq!(
+            capped_range_end(u64::MAX - 2, u64::MAX, 8 * 1024 * 1024),
+            u64::MAX
+        );
     }
 
     #[test]
