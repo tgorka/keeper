@@ -1,0 +1,55 @@
+src/components/layout/chat-list-pane.tsx
+  s_5fbbf892b89fa2::t_f4bc1a79db8fa2 23
+  s_5fbbf892b89fa2::t_e214e0411627dd 533-537
+  s_5fbbf892b89fa2::t_a7d81800dfbe69 72-74
+src/components/layout/phone-shell.test.tsx
+  s_5fbbf892b89fa2::t_908106ca3f5f75 1-290
+src/components/layout/app-shell.test.tsx
+  s_5fbbf892b89fa2::t_244e03c6f85262 1-2,4-37,68-104
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_5fbbf892b89fa2::t_a55a2fe45f5440 795-815
+_bmad-output/implementation-artifacts/spec-13-1-phone-layout-tier-and-navigation-stack.md
+  s_5fbbf892b89fa2::t_bdb6f1ddb16a31 1-4,6,9-12,15-77,87-93,107-129
+  s_5fbbf892b89fa2::t_15928e439e95f2 5,8
+  s_5fbbf892b89fa2::t_8965b213899a06 78-86
+  s_5fbbf892b89fa2::t_780ff2bb232fe5 94-106
+  s_5fbbf892b89fa2::t_118357015007bf 130-164
+  s_5fbbf892b89fa2::t_c255d379f25854 13-14
+  s_5fbbf892b89fa2::t_4bd8f29e08399a 7
+_bmad-output/implementation-artifacts/epic-13-context.md
+  s_5fbbf892b89fa2::t_8e15658a1c4e0b 34-36,38-44
+  s_5fbbf892b89fa2::t_2806b319611e47 1-33,37,45-55
+src/hooks/use-shell-layout.ts
+  s_5fbbf892b89fa2::t_42aa7857eb6e3f 3,8-9,21,24,32,38,45,50
+src/hooks/use-shell-layout.test.ts
+  s_5fbbf892b89fa2::t_4ea585d7e59bd4 34,42,50,54-77
+src/lib/stores/detail-ui.ts
+  s_5fbbf892b89fa2::t_a4ae2c9ad66b0c 1-39
+src/lib/stores/detail-ui.test.ts
+  s_5fbbf892b89fa2::t_8fda7fac6e0bfb 1-35
+src/components/layout/app-shell.tsx
+  s_5fbbf892b89fa2::t_e16eae2d3e48f7 11
+  s_5fbbf892b89fa2::t_7022eeff353617 84-90,94,97
+  s_5fbbf892b89fa2::t_a6c345e927dc7e 155
+  s_5fbbf892b89fa2::t_c069ce4ef0770b 36,40
+  s_5fbbf892b89fa2::t_88f6ede0b6830a 1
+  s_5fbbf892b89fa2::t_f2b3602d9c1b4c 119-123,126-141
+src/components/layout/phone-shell.tsx
+  s_5fbbf892b89fa2::t_0c79da83bc3c26 1-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "f54f0d8f7bc20142c35951873e64f77c932373f5",
+  "prompts": {},
+  "sessions": {
+    "s_5fbbf892b89fa2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5628306a-6542-47a5-bd11-2e07eaf5f900",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
