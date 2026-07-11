@@ -57,3 +57,33 @@ export const capabilitiesStore = createStore<CapabilitiesState>()((set) => ({
 export function useCapabilitiesStore<T>(selector: (state: CapabilitiesState) => T): T {
   return useStore(capabilitiesStore, selector);
 }
+
+/**
+ * Pure predicate: is this a capability-reduced platform (i.e. the phone tier)?
+ *
+ * True only when the mirror has hydrated (`hydrated === true`) AND every one of
+ * the optional surfaces is absent. All the flags are `cfg!(desktop)` in the Rust
+ * `capabilities` command, so "every flag `false`" equals "iOS" today while staying
+ * a pure capability read — never a platform sniff. The `hydrated` term is
+ * load-bearing: without it the all-`false` {@link DEFAULT_CAPABILITIES} safe
+ * default would advertise the iOS-only disclosures on desktop for the one frame
+ * before hydration resolves.
+ *
+ * The absence check derives from `Object.values` over the (all-boolean) VM rather
+ * than a hand-written flag list, so a capability added to `CapabilitiesVm` is
+ * folded in automatically and can never silently desync the predicate.
+ */
+export function isReducedCapabilityPlatform(state: CapabilitiesState): boolean {
+  const { hydrated, capabilities } = state;
+  return hydrated && Object.values(capabilities).every((present) => !present);
+}
+
+/**
+ * React hook wrapping {@link isReducedCapabilityPlatform} over the shared
+ * {@link capabilitiesStore}. Drives the "On this iPhone" disclosure and the
+ * Archive & Storage backup-exclusion line — the two capability-honest surfaces
+ * that render only on the reduced (phone) tier.
+ */
+export function useIsReducedCapabilityPlatform(): boolean {
+  return useCapabilitiesStore(isReducedCapabilityPlatform);
+}

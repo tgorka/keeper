@@ -59,6 +59,8 @@ import {
   honorRemoteDeletions,
   hotkeyGet,
   hotkeySet,
+  launchAtLoginGet,
+  menuBarPresenceGet,
   notifyGetPreviewEnabled,
   notifySetPreviewEnabled,
   setHonorRemoteDeletions,
@@ -66,6 +68,7 @@ import {
   undoSendWindow,
 } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
 import { keyBackupStore } from "@/lib/stores/key-backup";
 import { verificationStore } from "@/lib/stores/verification";
@@ -80,12 +83,25 @@ const mockHotkeyGet = vi.mocked(hotkeyGet);
 const mockHotkeySet = vi.mocked(hotkeySet);
 const mockNotifyGet = vi.mocked(notifyGetPreviewEnabled);
 const mockNotifySet = vi.mocked(notifySetPreviewEnabled);
+const mockLaunchGet = vi.mocked(launchAtLoginGet);
+const mockMenuBarGet = vi.mocked(menuBarPresenceGet);
 
 const DEFAULT_HOTKEY_VM: HotkeyVm = {
   accelerator: "Control+Alt+Space",
   isDefault: true,
   active: true,
   conflict: null,
+};
+
+/** All seven capabilities present = the desktop tier (every surface renders). */
+const DESKTOP_CAPABILITIES = {
+  trayIcon: true,
+  globalHotkey: true,
+  launchAtLogin: true,
+  inAppUpdater: true,
+  nativeMenuBar: true,
+  bridgeSidecar: true,
+  revealInFileManager: true,
 };
 
 function account(id: string): AccountVm {
@@ -122,6 +138,10 @@ describe("SettingsDialog", () => {
     keyBackupStore.getState().reset();
     verificationStore.setState({ flow: null, modalOpen: false, activeAccountId: null });
     wizardStore.setState({ active: false, dismissed: false, step: "welcome", accountId: null });
+    // Default the mirror to the desktop tier so the capability-gated surfaces (the
+    // Shortcuts section, the Launch-at-login / Keep-in-menu-bar rows) render for the
+    // existing assertions; the reduced-platform cases opt in explicitly.
+    capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
   });
 
   afterEach(() => {
@@ -130,6 +150,7 @@ describe("SettingsDialog", () => {
     encryptionStatusStore.getState().reset();
     keyBackupStore.getState().reset();
     verificationStore.setState({ flow: null, modalOpen: false, activeAccountId: null });
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
   });
 
   it("shows the honest archive.db/keeper.db + FileVault copy when open", async () => {
@@ -421,5 +442,50 @@ describe("SettingsDialog", () => {
     await waitFor(() => {
       expect(mockHotkeySet).toHaveBeenCalledWith("Control+Alt+Space");
     });
+  });
+
+  // ── Capability gating (Story 13.7) ─────────────────────────────────────────
+  it("desktop: renders the Shortcuts section, both background rows, and no reduced-platform disclosure", async () => {
+    mockPosture.mockResolvedValue(false);
+    // beforeEach already hydrated the desktop tier.
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText("Shortcuts")).toBeInTheDocument();
+    expect(await screen.findByRole("switch", { name: "Launch at login" })).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Keep in menu bar" })).toBeInTheDocument();
+    // No phone-tier Archive backup line on desktop.
+    expect(screen.queryByText(/excluded from device backup/)).not.toBeInTheDocument();
+  });
+
+  it("iOS: hides the Shortcuts section and both background rows, and shows the Archive backup line", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    // The Archive backup-exclusion line renders (reduced platform, hydrated).
+    expect(await screen.findByText(/excluded from device backup/)).toBeInTheDocument();
+    // The gated surfaces are absent — no dead affordances.
+    expect(screen.queryByText("Shortcuts")).not.toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: "Launch at login" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: "Keep in menu bar" })).not.toBeInTheDocument();
+    // The Dock-badge radio is not capability-gated — it stays.
+    expect(screen.getByRole("radiogroup", { name: "Dock badge mode" })).toBeInTheDocument();
+    // The hidden rows never probe their desktop-only backends (no dead Unsupported IPC).
+    expect(mockLaunchGet).not.toHaveBeenCalled();
+    expect(mockMenuBarGet).not.toHaveBeenCalled();
+  });
+
+  it("pre-hydration: hides the desktop-only surfaces by the safe default but does NOT flash the Archive backup line", async () => {
+    mockPosture.mockResolvedValue(false);
+    // All-false default AND not hydrated.
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    await screen.findByText(STORAGE_HONESTY_SENTENCE);
+    // Desktop-only surfaces hidden by the safe default…
+    expect(screen.queryByText("Shortcuts")).not.toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: "Launch at login" })).not.toBeInTheDocument();
+    // …but the iOS-only disclosure must NOT flash before the mirror resolves.
+    expect(screen.queryByText(/excluded from device backup/)).not.toBeInTheDocument();
   });
 });

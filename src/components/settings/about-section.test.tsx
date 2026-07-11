@@ -10,15 +10,32 @@ vi.mock("@tauri-apps/plugin-updater", () => ({
 vi.mock("@tauri-apps/plugin-process", () => ({
   relaunch: vi.fn(() => Promise.resolve()),
 }));
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: vi.fn(() => Promise.resolve()),
+}));
 
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import { AboutSection } from "@/components/settings/about-section";
 import { type EgressEndpointVm, egressList } from "@/lib/ipc/client";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 
 const mockEgress = vi.mocked(egressList);
 const mockCheck = vi.mocked(check);
 const mockRelaunch = vi.mocked(relaunch);
+const mockOpenUrl = vi.mocked(openUrl);
+
+/** All seven capabilities present = the desktop tier (updater block renders). */
+const DESKTOP_CAPABILITIES = {
+  trayIcon: true,
+  globalHotkey: true,
+  launchAtLogin: true,
+  inAppUpdater: true,
+  nativeMenuBar: true,
+  bridgeSidecar: true,
+  revealInFileManager: true,
+};
 
 const UPDATE_ENDPOINT = "https://github.com/tgorka/keeper/releases/latest/download/latest.json";
 
@@ -43,10 +60,16 @@ beforeEach(() => {
   mockCheck.mockResolvedValue(null);
   mockRelaunch.mockReset();
   mockRelaunch.mockResolvedValue(undefined);
+  mockOpenUrl.mockReset();
+  mockOpenUrl.mockResolvedValue(undefined);
+  // Default the mirror to the desktop tier so the software-update block renders for
+  // the egress/update-flow assertions; the reduced-platform cases opt in explicitly.
+  capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
 });
 
 afterEach(() => {
   vi.clearAllMocks();
+  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
 });
 
 describe("AboutSection egress list", () => {
@@ -207,5 +230,65 @@ describe("AboutSection update flow", () => {
       expect(screen.getByText("Update failed: signature verification failed")).toBeInTheDocument();
     });
     expect(mockRelaunch).not.toHaveBeenCalled();
+  });
+});
+
+describe("AboutSection capability gating (Story 13.7)", () => {
+  it("desktop: renders the software-update block and no 'On this iPhone' disclosure", async () => {
+    mockEgress.mockResolvedValue(NON_BEEPER_EGRESS);
+    // beforeEach already hydrated the desktop tier.
+    render(<AboutSection open />);
+
+    expect(await screen.findByText("Software updates")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check for updates" })).toBeInTheDocument();
+    expect(screen.queryByText("On this iPhone")).not.toBeInTheDocument();
+    // The egress list is present regardless (never gated).
+    expect(screen.getByText("https://matrix.example.org")).toBeInTheDocument();
+  });
+
+  it("iOS: hides the software-update block, keeps the egress list, and shows the 'On this iPhone' disclosure", async () => {
+    mockEgress.mockResolvedValue(NON_BEEPER_EGRESS);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(<AboutSection open />);
+
+    // The egress list stays ungated…
+    await waitFor(() => {
+      expect(screen.getByText("https://matrix.example.org")).toBeInTheDocument();
+    });
+    // …but the software-update block is gone (no dead "Check for updates" button).
+    expect(screen.queryByText("Software updates")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Check for updates" })).not.toBeInTheDocument();
+    // The "On this iPhone" list renders all four honesty lines.
+    expect(screen.getByText("On this iPhone")).toBeInTheDocument();
+    expect(screen.getByText(/syncs and notifies only while it's open/)).toBeInTheDocument();
+    expect(screen.getByText(/No self-hosted bridge runner/)).toBeInTheDocument();
+    expect(screen.getByText("No global summon hotkey.")).toBeInTheDocument();
+    expect(screen.getByText(/signature renews every 7 days/)).toBeInTheDocument();
+  });
+
+  it("iOS: the docs link opens docs/ios.md externally via openUrl (best-effort)", async () => {
+    mockEgress.mockResolvedValue(NON_BEEPER_EGRESS);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(<AboutSection open />);
+
+    const link = await screen.findByRole("link", { name: /iPhone/i });
+    fireEvent.click(link);
+    expect(mockOpenUrl).toHaveBeenCalledWith(
+      "https://github.com/tgorka/keeper/blob/main/docs/ios.md",
+    );
+  });
+
+  it("pre-hydration: hides the update block by the safe default but does NOT flash the 'On this iPhone' list", async () => {
+    mockEgress.mockResolvedValue(NON_BEEPER_EGRESS);
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+    render(<AboutSection open />);
+
+    await waitFor(() => {
+      expect(screen.getByText("https://matrix.example.org")).toBeInTheDocument();
+    });
+    // Desktop-only updater hidden by the safe default…
+    expect(screen.queryByText("Software updates")).not.toBeInTheDocument();
+    // …but the iOS-only disclosure must NOT flash before the mirror resolves.
+    expect(screen.queryByText("On this iPhone")).not.toBeInTheDocument();
   });
 });

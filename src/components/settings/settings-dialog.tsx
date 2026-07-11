@@ -43,6 +43,7 @@ import {
   undoSendWindow,
 } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
+import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { useEncryptionStatus } from "@/lib/stores/encryption-status";
 import { incognitoStore } from "@/lib/stores/incognito";
 import { keyBackupStore, useKeyBackupStatus } from "@/lib/stores/key-backup";
@@ -57,6 +58,16 @@ interface SettingsDialogProps {
 }
 
 /**
+ * The reduced-platform (phone tier) Archive & Storage disclosure (Story 13.7).
+ * Sentence case, no exclamation marks (project voice). Discloses that the phone's
+ * Local Archive is excluded from device backup this phase while the Mac stays the
+ * durable, exportable copy. The actual backup-exclusion file flagging is Epic 14-7;
+ * 13.7 adds only this honest line.
+ */
+const ARCHIVE_BACKUP_EXCLUSION_SENTENCE =
+  "This phone's Local Archive is excluded from device backup, so it is not copied off the phone. Your Mac remains the durable, exportable copy this phase.";
+
+/**
  * Settings dialog with a read-only Archive & Storage section (Story 2.6, AD-22,
  * UX-DR17). States plainly that `keeper.db`/`archive.db` are not
  * passphrase-encrypted in this version and rely on FileVault, and reflects
@@ -65,6 +76,12 @@ interface SettingsDialogProps {
  * only and is never re-prompted here.
  */
 export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
+  // The OS-global summon hotkey is a desktop-only capability; hide the whole
+  // Shortcuts section wherever the platform lacks it (the phone tier).
+  const globalHotkey = useCapabilitiesStore((s) => s.capabilities.globalHotkey);
+  // Whether this is the capability-reduced (phone) tier — drives the Archive
+  // backup-exclusion line below and the "On this iPhone" list in About.
+  const reducedPlatform = useIsReducedCapabilityPlatform();
   // `undefined` = still loading; otherwise the resolved posture (`null` unchosen,
   // or `true`/`false`). Keeping "loading" distinct from a resolved value stops the
   // status line from momentarily claiming "not encrypted" before the real posture
@@ -115,12 +132,15 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         <div className="flex flex-col gap-3 text-sm">
           <p>{sdkStatus}</p>
           <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>
+          {reducedPlatform && (
+            <p className="text-muted-foreground">{ARCHIVE_BACKUP_EXCLUSION_SENTENCE}</p>
+          )}
           <HonorRemoteDeletionsRow />
         </div>
         <NotificationsSection open={open} />
         <BackgroundSection open={open} />
         <PrivacySection open={open} />
-        <ShortcutsSection open={open} />
+        {globalHotkey && <ShortcutsSection open={open} />}
         <EncryptionSection />
         <SetupSection onOpenChange={onOpenChange} />
         <AboutSection open={open} />
@@ -304,6 +324,11 @@ const DOCK_BADGE_OPTIONS: ReadonlyArray<{ value: DockBadgeMode; label: string }>
  * failure (honest — never claims a state that was not saved).
  */
 function BackgroundSection({ open }: { open: boolean }) {
+  // Launch-at-login and menu-bar presence are desktop-only capabilities; hide each
+  // row wherever the platform lacks it (the phone tier). The Dock-badge radio and
+  // the ⌘W/⌘Q copy are not capability-gated (Epic 14 territory) — left untouched.
+  const launchAtLogin = useCapabilitiesStore((s) => s.capabilities.launchAtLogin);
+  const trayIcon = useCapabilitiesStore((s) => s.capabilities.trayIcon);
   // `undefined` = still loading; otherwise the resolved dock-badge mode.
   const [mode, setMode] = useState<DockBadgeMode | undefined>(undefined);
   const modeWriteId = useRef(0);
@@ -333,32 +358,39 @@ function BackgroundSection({ open }: { open: boolean }) {
           setMode("all");
         }
       });
-    void launchAtLoginGet()
-      .then((value) => {
-        if (!cancelled) {
-          setLaunch(value);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setLaunch(false);
-        }
-      });
-    void menuBarPresenceGet()
-      .then((value) => {
-        if (!cancelled) {
-          setMenuBar(value);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setMenuBar(false);
-        }
-      });
+    // Only probe the launch-at-login / menu-bar backends where the row is actually
+    // shown — on the phone tier these are `Unsupported` commands, so gating the fetch
+    // on the same capability that gates the row avoids a dead round-trip per open.
+    if (launchAtLogin) {
+      void launchAtLoginGet()
+        .then((value) => {
+          if (!cancelled) {
+            setLaunch(value);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setLaunch(false);
+          }
+        });
+    }
+    if (trayIcon) {
+      void menuBarPresenceGet()
+        .then((value) => {
+          if (!cancelled) {
+            setMenuBar(value);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setMenuBar(false);
+          }
+        });
+    }
     return () => {
       cancelled = true;
     };
-  }, [open]);
+  }, [open, launchAtLogin, trayIcon]);
 
   const onModeChange = (next: string) => {
     const value = next as DockBadgeMode;
@@ -422,24 +454,28 @@ function BackgroundSection({ open }: { open: boolean }) {
           ))}
         </RadioGroup>
       </div>
-      <div className="mt-1 flex items-center justify-between gap-2">
-        <Label htmlFor="launch-at-login">Launch at login</Label>
-        <Switch
-          id="launch-at-login"
-          checked={launch ?? false}
-          disabled={launch === undefined}
-          onCheckedChange={onLaunchChange}
-        />
-      </div>
-      <div className="flex items-center justify-between gap-2">
-        <Label htmlFor="menu-bar-presence">Keep in menu bar</Label>
-        <Switch
-          id="menu-bar-presence"
-          checked={menuBar ?? false}
-          disabled={menuBar === undefined}
-          onCheckedChange={onMenuBarChange}
-        />
-      </div>
+      {launchAtLogin && (
+        <div className="mt-1 flex items-center justify-between gap-2">
+          <Label htmlFor="launch-at-login">Launch at login</Label>
+          <Switch
+            id="launch-at-login"
+            checked={launch ?? false}
+            disabled={launch === undefined}
+            onCheckedChange={onLaunchChange}
+          />
+        </div>
+      )}
+      {trayIcon && (
+        <div className="flex items-center justify-between gap-2">
+          <Label htmlFor="menu-bar-presence">Keep in menu bar</Label>
+          <Switch
+            id="menu-bar-presence"
+            checked={menuBar ?? false}
+            disabled={menuBar === undefined}
+            onCheckedChange={onMenuBarChange}
+          />
+        </div>
+      )}
       <p className="text-muted-foreground">{BACKGROUND_QUIT_SENTENCE}</p>
     </div>
   );

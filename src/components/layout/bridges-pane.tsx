@@ -22,6 +22,7 @@ import { useBridgeDiscovery } from "@/hooks/use-bridge-discovery";
 import { COMPANION_STACK_DOCS_URL } from "@/lib/bridges";
 import type { AccountVm, BridgeNetworkVm } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 
 export function BridgesPane() {
   const accounts = useAccountsStore((s) => s.accounts);
@@ -78,6 +79,10 @@ interface AccountBridgesProps {
 function AccountBridges({ account, catalog }: AccountBridgesProps) {
   const { discovery, loading, error, retriable, retry } = useBridgeDiscovery(account.accountId);
   const isBeeper = account.provider === "beeper";
+  // The bbctl "run your own bridge" panel is a desktop-only capability (it spawns a
+  // local sidecar). Hide it wherever the platform lacks that capability — on the
+  // phone tier the runner is absent, but discovery/provisioning/health stay.
+  const bridgeSidecar = useCapabilitiesStore((s) => s.capabilities.bridgeSidecar);
 
   return (
     <div className="flex flex-col gap-3">
@@ -132,8 +137,11 @@ function AccountBridges({ account, catalog }: AccountBridgesProps) {
 
       {/* Beeper-only: run your own bridge via bbctl (Story 6.7). Non-Beeper accounts
           never render this section; the backend gate is defense-in-depth. On a
-          successful run we re-run discovery so the new bridge card appears. */}
-      {isBeeper && <BbctlPanel accountId={account.accountId} onBridgeAdded={retry} />}
+          successful run we re-run discovery so the new bridge card appears. Gated on
+          the `bridgeSidecar` capability so the runner is absent on the phone tier. */}
+      {isBeeper && bridgeSidecar && (
+        <BbctlPanel accountId={account.accountId} onBridgeAdded={retry} />
+      )}
     </div>
   );
 }

@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { CapabilitiesVm } from "@/lib/ipc/client";
-import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import {
+  capabilitiesStore,
+  DEFAULT_CAPABILITIES,
+  isReducedCapabilityPlatform,
+} from "@/lib/stores/capabilities";
 
 const desktopCapabilities: CapabilitiesVm = {
   trayIcon: true,
@@ -43,5 +47,41 @@ describe("capabilitiesStore", () => {
     capabilitiesStore.getState().applySnapshot(mobile);
     expect(capabilitiesStore.getState().capabilities).toEqual(mobile);
     expect(capabilitiesStore.getState().hydrated).toBe(true);
+  });
+});
+
+describe("isReducedCapabilityPlatform", () => {
+  it("desktop (all flags true, hydrated) is NOT reduced", () => {
+    capabilitiesStore.getState().applySnapshot(desktopCapabilities);
+    expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(false);
+  });
+
+  it("iOS (all flags false, hydrated) IS reduced", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES });
+    expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(true);
+  });
+
+  it("pre-hydration (all flags false, NOT hydrated) is NOT reduced — the hydrated gate", () => {
+    // The all-false safe default before the mirror resolves must never advertise the
+    // reduced-platform disclosures on desktop.
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+    expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(false);
+  });
+
+  it("a single present flag (hydrated) is NOT reduced — every flag must be absent", () => {
+    // Exercise each flag: with any one surface present, the platform is not reduced.
+    const flags: Array<keyof CapabilitiesVm> = [
+      "trayIcon",
+      "globalHotkey",
+      "launchAtLogin",
+      "inAppUpdater",
+      "nativeMenuBar",
+      "bridgeSidecar",
+      "revealInFileManager",
+    ];
+    for (const flag of flags) {
+      capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, [flag]: true });
+      expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(false);
+    }
   });
 });

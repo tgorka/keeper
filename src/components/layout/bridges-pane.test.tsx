@@ -29,6 +29,15 @@ const catalog: BridgeNetworkVm[] = [
 
 const bridgeCatalog = vi.fn(() => Promise.resolve(catalog));
 const bridgeDiscover = vi.fn((_accountId: string) => Promise.resolve(EMPTY_DISCOVERY));
+// The Beeper-only bbctl panel calls this on mount; stub "not available" so it renders
+// its guided-install branch (still labelled "Run your own bridge").
+const bbctlAvailability = vi.fn(() =>
+  Promise.resolve({
+    available: false,
+    install: { steps: ["Install bbctl"], docsUrl: "https://example.org/docs" },
+    networks: [],
+  }),
+);
 
 const EMPTY_DISCOVERY: BridgeDiscoveryVm = { homeserver: "example.org", networks: [] };
 const TWO_NETWORK_DISCOVERY: BridgeDiscoveryVm = {
@@ -45,12 +54,25 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     ...actual,
     bridgeCatalog: () => bridgeCatalog(),
     bridgeDiscover: (accountId: string) => bridgeDiscover(accountId),
+    bbctlAvailability: () => bbctlAvailability(),
   };
 });
 
 import { BridgesPane } from "@/components/layout/bridges-pane";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { accountsStore } from "@/lib/stores/accounts";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+
+/** All seven capabilities present = the desktop tier (bbctl panel renders). */
+const DESKTOP_CAPABILITIES = {
+  trayIcon: true,
+  globalHotkey: true,
+  launchAtLogin: true,
+  inAppUpdater: true,
+  nativeMenuBar: true,
+  bridgeSidecar: true,
+  revealInFileManager: true,
+};
 
 function account(id: string, userId: string, hue = 0, provider: Provider = "password"): AccountVm {
   return {
@@ -79,10 +101,15 @@ beforeEach(() => {
   bridgeCatalog.mockResolvedValue(catalog);
   bridgeDiscover.mockClear();
   bridgeDiscover.mockResolvedValue(EMPTY_DISCOVERY);
+  bbctlAvailability.mockClear();
+  // Default the mirror to the desktop tier so the bbctl panel renders for Beeper
+  // accounts; the reduced-platform case opts in explicitly.
+  capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
 });
 
 afterEach(() => {
   accountsStore.getState().clear();
+  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
 });
 
 describe("BridgesPane", () => {
@@ -176,5 +203,32 @@ describe("BridgesPane", () => {
     renderPane();
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/bad data/);
+  });
+
+  // ── Capability gating: bbctl panel → bridgeSidecar (Story 13.7) ─────────────
+  it("desktop: renders the bbctl 'Run your own bridge' panel for a Beeper account", async () => {
+    const beeper = account("01CX5ZZKBKACTAV9WEVGEMMVRZ", "@carol:beeper.com", 2, "beeper");
+    accountsStore.getState().hydrateAll([beeper]);
+    renderPane();
+
+    // The bbctl panel is present (its section is labelled "Run your own bridge").
+    expect(await screen.findByRole("region", { name: "Run your own bridge" })).toBeInTheDocument();
+  });
+
+  it("iOS: hides the bbctl panel while bridge discovery/cards stay intact", async () => {
+    bridgeDiscover.mockResolvedValue(TWO_NETWORK_DISCOVERY);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    const beeper = account("01CX5ZZKBKACTAV9WEVGEMMVRZ", "@carol:beeper.com", 2, "beeper");
+    accountsStore.getState().hydrateAll([beeper]);
+    renderPane();
+
+    // Discovery cards still render — bridge management is untouched…
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Connect Matrix" })).toBeInTheDocument();
+    });
+    // …but the bbctl runner panel is absent (no dead affordance), and it never even
+    // probes availability.
+    expect(screen.queryByRole("region", { name: "Run your own bridge" })).not.toBeInTheDocument();
+    expect(bbctlAvailability).not.toHaveBeenCalled();
   });
 });

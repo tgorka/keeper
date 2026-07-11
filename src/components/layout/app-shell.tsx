@@ -33,6 +33,7 @@ import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useUnreadJump } from "@/hooks/use-unread-jump";
 import { useVerification } from "@/hooks/use-verification";
 import { useViewShortcuts } from "@/hooks/use-view-shortcuts";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { useDetailStore } from "@/lib/stores/detail-ui";
 import { usePrimaryView } from "@/lib/stores/primary-view";
 
@@ -89,6 +90,12 @@ export function AppShell() {
   const storeCloseDetail = useDetailStore((s) => s.closeDetail);
   const toggleDetail = useDetailStore((s) => s.toggleDetail);
   const toggleRef = useRef<HTMLButtonElement>(null);
+  // The ⌘? cheat-sheet overlay and the native menu bar are the two projections of
+  // the same action registry (Story 9.3), so `nativeMenuBar` is the honest flag:
+  // where there's no native menu bar (the phone tier) the cheat sheet is unmounted.
+  // The `useCheatSheetShortcut()` hook stays wired above (rules-of-hooks); only the
+  // overlay is gated, so an unmounted overlay simply cannot render.
+  const nativeMenuBar = useCapabilitiesStore((s) => s.capabilities.nativeMenuBar);
 
   const closeDetail = useCallback(() => {
     storeCloseDetail();
@@ -150,7 +157,7 @@ export function AppShell() {
       <ExportDialog />
       <NewChatDialog />
       <CommandPalette />
-      <CheatSheetOverlay />
+      {nativeMenuBar && <CheatSheetOverlay />}
 
       {detailFloating && !phone && (
         <Sheet open={detailOpen} onOpenChange={handleSheetOpenChange}>

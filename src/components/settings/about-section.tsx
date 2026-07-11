@@ -1,8 +1,10 @@
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import { useEffect, useRef, useState } from "react";
+import { type MouseEvent, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { type EgressEndpointVm, egressList } from "@/lib/ipc/client";
+import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 
 /**
  * The honest disclosure of what the egress list is and the no-telemetry invariant
@@ -21,6 +23,33 @@ const EGRESS_HONESTY_SENTENCE =
  */
 const UPDATE_HONESTY_SENTENCE =
   "Updates are downloaded from GitHub and verified against keeper's signing key before they install. If verification fails, the update is refused.";
+
+/** The docs page opened from the "On this iPhone" disclosure (Story 13.7). */
+const IOS_DOCS_URL = "https://github.com/tgorka/keeper/blob/main/docs/ios.md";
+
+/**
+ * The four honesty lines of the reduced-platform (phone tier) "On this iPhone"
+ * disclosure (Story 13.7). Project voice: sentence case, no exclamation marks,
+ * honest consequence-naming. Each names a desktop-only affordance the phone lacks.
+ */
+const IOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
+  "keeper syncs and notifies only while it's open; background notifications await a future decision.",
+  "No self-hosted bridge runner — manage your own bridges from your Mac.",
+  "No global summon hotkey.",
+  "Updates arrive by reinstalling keeper; its signature renews every 7 days.",
+];
+
+/**
+ * Open the iOS docs page externally via the system opener, best-effort. Prevents
+ * the default in-webview navigation and swallows any opener rejection — mirrors the
+ * `void openUrl(url).catch(() => {})` pattern in `login-screen.tsx`.
+ */
+function openExternal(event: MouseEvent<HTMLAnchorElement>, url: string) {
+  event.preventDefault();
+  void openUrl(url).catch(() => {
+    // Best-effort: nothing actionable if the system opener fails.
+  });
+}
 
 /**
  * The states of the in-app update flow (Story 11.2, NFR-12). Every path — including a
@@ -67,6 +96,13 @@ function errorMessage(raw: unknown): string {
  * guard keeps every async resolution from setting state after unmount.
  */
 export function AboutSection({ open }: { open: boolean }) {
+  // The in-app updater is a desktop-only capability; hide the whole software-update
+  // sub-block wherever the platform lacks it (the phone tier). The egress list stays
+  // ungated. `inAppUpdater` never gates the egress list — only the update controls.
+  const inAppUpdater = useCapabilitiesStore((s) => s.capabilities.inAppUpdater);
+  // Whether this is the capability-reduced (phone) tier — drives the "On this
+  // iPhone" disclosure list below.
+  const reducedPlatform = useIsReducedCapabilityPlatform();
   // `undefined` = still loading; `null` = load failed; otherwise the egress list.
   const [endpoints, setEndpoints] = useState<EgressEndpointVm[] | null | undefined>(undefined);
   const [update, setUpdate] = useState<UpdateState>({ kind: "idle" });
@@ -199,51 +235,73 @@ export function AboutSection({ open }: { open: boolean }) {
         <p className="text-muted-foreground text-xs">{EGRESS_HONESTY_SENTENCE}</p>
       </div>
 
-      <div className="mt-1 flex flex-col gap-1.5">
-        <div className="flex items-center justify-between gap-2">
-          <span>Software updates</span>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={busy}
-            onClick={onCheckForUpdates}
-          >
-            {update.kind === "checking" ? "Checking…" : "Check for updates"}
-          </Button>
-        </div>
-        {update.kind === "upToDate" && (
-          <p className="text-muted-foreground text-xs" role="status">
-            keeper is up to date.
-          </p>
-        )}
-        {update.kind === "available" && (
+      {inAppUpdater && (
+        <div className="mt-1 flex flex-col gap-1.5">
           <div className="flex items-center justify-between gap-2">
-            <p className="text-muted-foreground text-xs" role="status">
-              Update {update.version} available.
-            </p>
-            <Button type="button" variant="outline" size="sm" onClick={onDownloadAndInstall}>
-              Download and install
+            <span>Software updates</span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              onClick={onCheckForUpdates}
+            >
+              {update.kind === "checking" ? "Checking…" : "Check for updates"}
             </Button>
           </div>
-        )}
-        {update.kind === "downloading" && (
-          <p className="text-muted-foreground text-xs" role="status">
-            Downloading and verifying {update.version}…
-          </p>
-        )}
-        {update.kind === "installedNeedsRestart" && (
-          <p className="text-muted-foreground text-xs" role="status">
-            Update installed. Restart keeper to finish.
-          </p>
-        )}
-        {update.kind === "error" && (
-          <p className="text-held text-xs" role="alert">
-            Update failed: {update.message}
-          </p>
-        )}
-        <p className="text-muted-foreground text-xs">{UPDATE_HONESTY_SENTENCE}</p>
-      </div>
+          {update.kind === "upToDate" && (
+            <p className="text-muted-foreground text-xs" role="status">
+              keeper is up to date.
+            </p>
+          )}
+          {update.kind === "available" && (
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-muted-foreground text-xs" role="status">
+                Update {update.version} available.
+              </p>
+              <Button type="button" variant="outline" size="sm" onClick={onDownloadAndInstall}>
+                Download and install
+              </Button>
+            </div>
+          )}
+          {update.kind === "downloading" && (
+            <p className="text-muted-foreground text-xs" role="status">
+              Downloading and verifying {update.version}…
+            </p>
+          )}
+          {update.kind === "installedNeedsRestart" && (
+            <p className="text-muted-foreground text-xs" role="status">
+              Update installed. Restart keeper to finish.
+            </p>
+          )}
+          {update.kind === "error" && (
+            <p className="text-held text-xs" role="alert">
+              Update failed: {update.message}
+            </p>
+          )}
+          <p className="text-muted-foreground text-xs">{UPDATE_HONESTY_SENTENCE}</p>
+        </div>
+      )}
+
+      {reducedPlatform && (
+        <div className="mt-1 flex flex-col gap-1.5">
+          <p className="font-medium">On this iPhone</p>
+          <ul className="flex flex-col gap-1">
+            {IOS_DISCLOSURE_LINES.map((line) => (
+              <li key={line} className="text-muted-foreground text-xs">
+                {line}
+              </li>
+            ))}
+          </ul>
+          <a
+            href={IOS_DOCS_URL}
+            onClick={(event) => openExternal(event, IOS_DOCS_URL)}
+            className="text-xs underline underline-offset-2"
+          >
+            What's different on iPhone
+          </a>
+        </div>
+      )}
     </div>
   );
 }

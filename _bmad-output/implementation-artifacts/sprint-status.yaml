@@ -148,7 +148,7 @@ development_status:
   13-4-merged-full-screen-search-surface: done
   13-5-safe-areas-and-the-keyboard-avoiding-composer: done
   13-6-touch-idioms-long-press-row-swipes-pull-to-refresh: done
-  13-7-capability-gated-surfaces-and-on-this-iphone-disclosure: backlog
+  13-7-capability-gated-surfaces-and-on-this-iphone-disclosure: done
   epic-13-retrospective: optional
   epic-14: backlog
   14-1-lifecycle-pause-resume-through-one-rust-entry: backlog
