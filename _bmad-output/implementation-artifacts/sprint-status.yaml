@@ -160,7 +160,7 @@ development_status:
   14-7-backup-exclusion-and-file-protection: done
   epic-14-retrospective: optional
   epic-15: backlog
-  15-1-app-icons-and-launch-assets: backlog
+  15-1-app-icons-and-launch-assets: done
   15-2-docs-ios-md-free-signing-walkthrough: backlog
   15-3-shareable-ipa-build-path-unsigned-export-for-re-signing: backlog
   15-4-required-ios-ci-gate-and-release-hygiene: backlog

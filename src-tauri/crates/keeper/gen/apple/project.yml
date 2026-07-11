@@ -40,6 +40,13 @@ targets:
       path: keeper_iOS/Info.plist
       properties:
         LSRequiresIPhoneOS: true
+        # Launch theming (Story 15.1, FR-59): the LaunchScreen background is the
+        # `LaunchBackground` asset-catalog color (light #FFFFFF / dark #0A0A0A) so the
+        # native launch matches the app's `--background` in both appearances with no flash.
+        # UIUserInterfaceStyle is intentionally OMITTED (stays Automatic) so the launch
+        # screen follows the system appearance, matching next-themes' defaultTheme="system".
+        # Do NOT add UIUserInterfaceStyle here — it would pin one appearance and reintroduce
+        # a launch flash for users on the other system theme.
         UILaunchStoryboardName: LaunchScreen
         UIRequiredDeviceCapabilities: [arm64, metal]
         UISupportedInterfaceOrientations:
