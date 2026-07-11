@@ -1,0 +1,56 @@
+src/lib/stores/leading-drawer.ts
+  s_7886ab74f5ba80::t_d25b536819bc7a 1-40
+src/components/layout/leading-drawer.test.tsx
+  s_7886ab74f5ba80::t_5f2115114e3941 110,113-116
+  s_7886ab74f5ba80::t_93ab52e7eae79c 1
+  s_7886ab74f5ba80::t_8258aa6873d9af 2-109,111-112,117-137,141-187
+  s_7886ab74f5ba80::t_3ecc7eda804efc 138-140
+src/components/layout/phone-shell.tsx
+  s_7886ab74f5ba80::t_00a1c0c1a9d19a 427
+  s_7886ab74f5ba80::t_46aab2b1d2358d 477-482
+  s_7886ab74f5ba80::t_5874bc467bbd8c 522-524
+  s_7886ab74f5ba80::t_5d42c875549cd6 357-375,379-426,428-434
+  s_7886ab74f5ba80::t_e6b026d54e88e2 46,48,51
+  s_7886ab74f5ba80::t_f046434ffe3bb1 376-378
+src/lib/stores/leading-drawer.test.ts
+  s_7886ab74f5ba80::t_d2558c9f3a08e8 1-31
+_bmad-output/implementation-artifacts/spec-13-3-leading-drawer-with-status-cluster.md
+  s_7886ab74f5ba80::t_5fbbfde71802db 8
+  s_7886ab74f5ba80::t_21a04ca94d9f3b 87-91
+  s_7886ab74f5ba80::t_be0da02d20b3ce 134-167
+  s_7886ab74f5ba80::t_838312c6aec49a 5
+  s_7886ab74f5ba80::t_713c8feebc2eb3 1-4,6-7,10-86,92-99,117-133
+  s_7886ab74f5ba80::t_83d8ff7fd22f6b 9
+  s_7886ab74f5ba80::t_282ba4e7dc8dbf 100-116
+src/components/layout/phone-inbox-header.tsx
+  s_7886ab74f5ba80::t_a9ac6f5f9696aa 1-62,64-81,86-128
+  s_7886ab74f5ba80::t_14a11a390b70cc 63,82-85
+src/components/layout/phone-shell.test.tsx
+  s_7886ab74f5ba80::t_e1eeed76bafcef 65
+  s_7886ab74f5ba80::t_81ef3ce0418298 9
+  s_7886ab74f5ba80::t_2bb96bd5b505d1 350-355
+  s_7886ab74f5ba80::t_545127584392d8 190
+  s_7886ab74f5ba80::t_a060d33984450f 54-56,60-64
+  s_7886ab74f5ba80::t_ba01a28ebb80b6 612-613,615-640,650-730
+  s_7886ab74f5ba80::t_e1c722097005c1 641-649
+src/components/layout/phone-inbox-header.test.tsx
+  s_7886ab74f5ba80::t_14a11a390b70cc 4
+  s_7886ab74f5ba80::t_3cd3ebb3423495 28,30-31,34
+  s_7886ab74f5ba80::t_a99a14d9956ec3 1-3,5-27,29,32-33,35-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "3733524e8b6e9dafa956d5d6309dc4c9038bb361",
+  "prompts": {},
+  "sessions": {
+    "s_7886ab74f5ba80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6be3dd6d-f273-4fcb-80b0-5271941f554c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
