@@ -1,0 +1,34 @@
+_bmad-output/implementation-artifacts/spec-14-4-resume-integrity-blank-webview-guard-and-stale-resume-pill.md
+  s_e6161dab3718bc::t_6df7e6f3efa0b9 144-156
+  s_f1f8757606bfc3::t_afd3cf2dbd399e 6
+  s_e6161dab3718bc::t_40de244f4ee455 209-210
+  s_e6161dab3718bc::t_b46cb771f56080 7
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_e6161dab3718bc::t_4ec1a053706970 868-871
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_f1f8757606bfc3::t_e76ff6a15c07b4 157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "cc30d2feba9d4a85fc8ccfce5c995a7d636fdfc7",
+  "prompts": {},
+  "sessions": {
+    "s_e6161dab3718bc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a5d86a1d-669d-46ab-9e79-843f13ba4d73",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_f1f8757606bfc3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1ff18f37-6490-4200-bdea-4ec52eff0462",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
