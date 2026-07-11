@@ -1,0 +1,29 @@
+scripts/gen-ios-icons.swift
+  s_9c4e0cc41093d8::t_1653e866d5b7ba 1-161
+_bmad-output/implementation-artifacts/spec-15-1-app-icons-and-launch-assets.md
+  s_9c4e0cc41093d8::t_74ab483e1e7904 5-6
+  s_9c4e0cc41093d8::t_35c40924199955 1-4,7-10,13-64,70-117
+  s_9c4e0cc41093d8::t_68a12b9eea1053 11-12
+  s_9c4e0cc41093d8::t_5427ba1a8033b2 65-69
+src-tauri/crates/keeper/gen/apple/Assets.xcassets/LaunchBackground.colorset/Contents.json
+  s_9c4e0cc41093d8::t_7411d7d84a693a 1-38
+src-tauri/crates/keeper/gen/apple/LaunchScreen.storyboard
+  s_9c4e0cc41093d8::t_163b9a1c1a1a9a 26-28
+  s_9c4e0cc41093d8::t_c0778176907cba 18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "949b804fe61105403938042537998b5a8cd58c8c",
+  "prompts": {},
+  "sessions": {
+    "s_9c4e0cc41093d8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "559d021e-5336-41bf-ac24-4373f3cf304c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
