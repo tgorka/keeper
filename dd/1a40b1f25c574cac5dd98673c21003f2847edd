@@ -1,0 +1,35 @@
+_bmad-output/implementation-artifacts/spec-15-1-app-icons-and-launch-assets.md
+  s_9c4e0cc41093d8::t_563089221d1fa7 5
+  s_9c4e0cc41093d8::t_b37bf9ada88cbc 140-167
+  s_9c4e0cc41093d8::t_8556e56f16ccff 77-98
+src-tauri/crates/keeper/gen/apple/LaunchScreen.storyboard
+  s_9c4e0cc41093d8::t_5f227677ecaa4d 6
+scripts/gen-ios-icons.swift
+  s_9c4e0cc41093d8::t_3aea2bf2f2aef5 164-165
+  s_9c4e0cc41093d8::t_5435b5356fe7d2 17-18
+  s_9c4e0cc41093d8::t_ef147cf1bd8abb 80-82
+  s_9c4e0cc41093d8::t_8a07eaa0ce6586 152-163,166-168
+  s_9c4e0cc41093d8::t_f6cc13e296338c 66-74
+  s_9c4e0cc41093d8::t_146a2bdb341f79 27-29
+  s_9c4e0cc41093d8::t_5b845a118b3366 179,182-188,190
+src-tauri/crates/keeper/gen/apple/project.yml
+  s_9c4e0cc41093d8::t_e9aef05ed40e87 43-49
+_bmad-output/implementation-artifacts/epic-15-context.md
+  s_9c4e0cc41093d8::t_202c562c6be858 1-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "dd1a40b1f25c574cac5dd98673c21003f2847edd",
+  "prompts": {},
+  "sessions": {
+    "s_9c4e0cc41093d8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "559d021e-5336-41bf-ac24-4373f3cf304c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
