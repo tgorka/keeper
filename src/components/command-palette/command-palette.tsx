@@ -18,24 +18,21 @@
 
 import { useCommandState } from "cmdk";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Badge } from "@/components/ui/badge";
 import {
   Command,
   CommandDialog,
   CommandEmpty,
   CommandGroup,
   CommandInput,
-  CommandItem,
   CommandList,
 } from "@/components/ui/command";
-import { Kbd } from "@/components/ui/kbd";
-import { accountHueVar } from "@/lib/account-hue";
 import type { PaletteChatVm, PaletteMode, PaletteResultsVm } from "@/lib/ipc/client";
 import { paletteQuery } from "@/lib/ipc/client";
 import { commandPaletteStore, useCommandPaletteStore } from "@/lib/stores/command-palette";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { dispatchPaletteAction } from "./actions";
+import { PaletteActionRow, PaletteChatRow } from "./palette-rows";
 
 /** Debounce (ms) before a keystroke fires `palette_query`. */
 const DEBOUNCE_MS = 120;
@@ -187,7 +184,7 @@ export function CommandPalette() {
           {results.contacts.length > 0 && (
             <CommandGroup heading="Contacts">
               {results.contacts.map((chat) => (
-                <ChatRow key={chat.id} chat={chat} onSelect={() => openChat(chat)} />
+                <PaletteChatRow key={chat.id} chat={chat} onSelect={() => openChat(chat)} />
               ))}
             </CommandGroup>
           )}
@@ -195,7 +192,7 @@ export function CommandPalette() {
           {results.chats.length > 0 && (
             <CommandGroup heading="Chats">
               {results.chats.map((chat) => (
-                <ChatRow key={chat.id} chat={chat} onSelect={() => openChat(chat)} />
+                <PaletteChatRow key={chat.id} chat={chat} onSelect={() => openChat(chat)} />
               ))}
             </CommandGroup>
           )}
@@ -203,19 +200,13 @@ export function CommandPalette() {
           {results.actions.length > 0 && (
             <CommandGroup heading={showActionHint ? "Actions — type > to filter" : "Actions"}>
               {results.actions.map((action) => (
-                <CommandItem
+                <PaletteActionRow
                   key={action.id}
-                  value={action.id}
+                  action={action}
                   onSelect={() => {
                     void runAction(action.id);
                   }}
-                >
-                  <span aria-hidden className="text-muted-foreground">
-                    ⚡
-                  </span>
-                  <span className="truncate">{action.title}</span>
-                  {action.shortcut !== null && <Kbd className="ml-auto">{action.shortcut}</Kbd>}
-                </CommandItem>
+                />
               ))}
             </CommandGroup>
           )}
@@ -236,27 +227,4 @@ function SelectionTracker({ onChange }: { onChange: (value: string) => void }) {
     onChange(value ?? "");
   }, [value, onChange]);
   return null;
-}
-
-/** One chat/contact result row: type glyph, hue dot, name, network badge. */
-function ChatRow({ chat, onSelect }: { chat: PaletteChatVm; onSelect: () => void }) {
-  return (
-    <CommandItem value={chat.id} onSelect={onSelect}>
-      <span aria-hidden className="text-muted-foreground">
-        {chat.isDirect ? "◍" : "◆"}
-      </span>
-      <span
-        aria-hidden
-        data-testid="account-hue-dot"
-        className="size-2 shrink-0 rounded-full"
-        style={{ backgroundColor: accountHueVar(chat.hueIndex) }}
-      />
-      <span className="truncate">{chat.displayName}</span>
-      {chat.network !== null && (
-        <Badge variant="secondary" className="ml-auto shrink-0">
-          {chat.network}
-        </Badge>
-      )}
-    </CommandItem>
-  );
 }

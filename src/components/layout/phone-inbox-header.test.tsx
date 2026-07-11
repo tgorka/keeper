@@ -4,11 +4,11 @@ import { PhoneInboxHeader } from "@/components/layout/phone-inbox-header";
 import type { AccountVm, BridgeHealthSnapshot } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { bridgeHealthStore } from "@/lib/stores/bridge-health";
-import { commandPaletteStore } from "@/lib/stores/command-palette";
 import { draftsStore } from "@/lib/stores/drafts";
 import { leadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { newChatStore } from "@/lib/stores/new-chat";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { searchSurfaceStore } from "@/lib/stores/search-surface";
 
 const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -41,7 +41,7 @@ beforeEach(() => {
   draftsStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
   leadingDrawerStore.getState().close();
-  commandPaletteStore.setState({ isOpen: false });
+  searchSurfaceStore.setState({ isOpen: false, scope: "chats", chatLock: null });
   newChatStore.setState({ isOpen: false });
 });
 
@@ -118,10 +118,13 @@ describe("PhoneInboxHeader", () => {
     expect(screen.getByText("A")).toBeInTheDocument();
   });
 
-  it("fires the command palette from the magnifier and the new-chat store from compose", () => {
+  it("opens the search surface from the magnifier and the new-chat store from compose", () => {
     render(<PhoneInboxHeader />);
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
-    expect(commandPaletteStore.getState().isOpen).toBe(true);
+    expect(searchSurfaceStore.getState().isOpen).toBe(true);
+    // The magnifier opens the merged surface in its default Chats scope — not the
+    // desktop command palette (Story 13.4 repoint).
+    expect(searchSurfaceStore.getState().scope).toBe("chats");
 
     fireEvent.click(screen.getByRole("button", { name: "New chat" }));
     expect(newChatStore.getState().isOpen).toBe(true);

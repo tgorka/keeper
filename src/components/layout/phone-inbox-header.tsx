@@ -12,8 +12,8 @@
  *   all-accounts avatar, with a worst-state bridge-health dot `AvatarBadge`
  *   overlay shown only for `degraded`/`disconnected` (hidden on `healthy`/`null`).
  * - Trailing: an amber Approval chip shown only when the pending-Draft count is
- *   > 0 (deep-links to the Approval Pane), a magnifier (interim: opens the
- *   command palette; Story 13.4 repoints it), and a compose button.
+ *   > 0 (deep-links to the Approval Pane), a magnifier (opens the merged
+ *   full-screen Search surface, Story 13.4), and a compose button.
  *
  * Every tappable target is ≥44pt with an accessible name. No forked sidebar and
  * no bottom tab bar — the drawer carries the nav.
@@ -27,11 +27,11 @@ import { initials } from "@/lib/account-initials";
 import { BRIDGE_HEALTH_DOT_CLASS, BRIDGE_HEALTH_LABEL } from "@/lib/bridges";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useWorstBridgeHealth } from "@/lib/stores/bridge-health";
-import { commandPaletteStore } from "@/lib/stores/command-palette";
 import { usePendingDraftCount } from "@/lib/stores/drafts";
 import { leadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { newChatStore } from "@/lib/stores/new-chat";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { searchSurfaceStore } from "@/lib/stores/search-surface";
 import { cn } from "@/lib/utils";
 
 const FOCUS_RING = "focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none";
@@ -39,9 +39,11 @@ const FOCUS_RING = "focus-visible:ring-2 focus-visible:ring-ring focus-visible:o
 interface PhoneInboxHeaderProps {
   /** Forwarded to the avatar drawer button so the shell can focus it on close (UX-DR28). */
   drawerButtonRef?: Ref<HTMLButtonElement>;
+  /** Forwarded to the magnifier so the shell can return focus to it on Search close (UX-DR28). */
+  magnifierRef?: Ref<HTMLButtonElement>;
 }
 
-export function PhoneInboxHeader({ drawerButtonRef }: PhoneInboxHeaderProps) {
+export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHeaderProps) {
   // The active account filter (Story 2.5): the avatar renders that account's cue
   // when set, else a neutral all-accounts avatar.
   const filterAccountId = useAccountsStore((s) => s.filterAccountId);
@@ -103,11 +105,12 @@ export function PhoneInboxHeader({ drawerButtonRef }: PhoneInboxHeaderProps) {
           </button>
         )}
         <Button
+          ref={magnifierRef}
           type="button"
           variant="ghost"
           size="icon"
           aria-label="Search"
-          onClick={() => commandPaletteStore.getState().open()}
+          onClick={() => searchSurfaceStore.getState().open()}
           className={cn("size-11 shrink-0", FOCUS_RING)}
         >
           <Search aria-hidden="true" />

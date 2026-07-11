@@ -10,6 +10,7 @@ import { leadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
+import { searchSurfaceStore } from "@/lib/stores/search-surface";
 
 // Mock the typed IPC wrapper so the mounted panes never touch Tauri. The inbox
 // subscription captures its `onInbox` handler so a test can stream rows; every
@@ -54,6 +55,10 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     // The leading drawer mounts SidebarPane → SettingsDialog, which reads the
     // encryption posture on open. Stub it so opening the drawer never hits Tauri.
     encryptionPosture: vi.fn(() => Promise.resolve(false)),
+    // The always-mounted PhoneSearchSurface queries these when opened; stub them
+    // so a pull-down/magnifier open in the stack tests never reaches Tauri.
+    paletteQuery: vi.fn(async () => ({ contacts: [], chats: [], actions: [] })),
+    searchArchive: vi.fn(async () => []),
   };
 });
 
@@ -188,6 +193,7 @@ beforeEach(() => {
   primaryViewStore.getState().setView("inbox");
   detailStore.setState({ open: false });
   leadingDrawerStore.getState().close();
+  searchSurfaceStore.setState({ isOpen: false, scope: "chats", chatLock: null });
   composerStore.setState({ focusNonce: 0 });
   subscribeInbox.mockReset();
   subscribeInbox.mockResolvedValue(1);
@@ -728,6 +734,74 @@ describe("PhoneShell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
     const content = await screen.findByTestId("leading-drawer-content");
     expect(content.className).toContain("motion-reduce:animate-none");
+  });
+
+  it("mounts the merged Search surface (closed) alongside the drawer at level 0", () => {
+    render(<PhoneShell />);
+    // Always mounted, store-driven, and closed by default (no surface content).
+    expect(searchSurfaceStore.getState().isOpen).toBe(false);
+    expect(screen.queryByTestId("phone-search-surface")).not.toBeInTheDocument();
+  });
+
+  it("opens Search via a level-0 pull-down past the reveal threshold (list at top)", () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    // No account → loading state, no ScrollArea viewport, so the list counts as
+    // at-top and the pull arms.
+    const zone = screen.getByTestId("pull-down-search");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientY: 120 });
+    expect(searchSurfaceStore.getState().isOpen).toBe(true);
+  });
+
+  it("does not open Search when the level-0 pull releases below the threshold", () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    const zone = screen.getByTestId("pull-down-search");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientY: 30 });
+    expect(searchSurfaceStore.getState().isOpen).toBe(false);
+  });
+
+  it("does not open Search when the Inbox list is scrolled away from the top", async () => {
+    await renderWithRooms([
+      { roomId: "!a:example.org", displayName: "Alpha" },
+      { roomId: "!b:example.org", displayName: "Beta" },
+    ]);
+    // Scroll the list's viewport away from the top so the pull is left to native
+    // scrolling (armed === false).
+    const viewport = document.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]');
+    if (viewport !== null) {
+      Object.defineProperty(viewport, "scrollTop", { configurable: true, value: 200 });
+    }
+    const zone = screen.getByTestId("pull-down-search");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientY: 300 });
+    expect(searchSurfaceStore.getState().isOpen).toBe(false);
+  });
+
+  it("keeps the 13.2 back-swipe and 13.3 drawer gestures unregressed with the surface mounted", async () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    // Drawer-open swipe still works at level 0.
+    const openZone = screen.getByTestId("edge-swipe-open");
+    fireEvent.pointerDown(openZone, { pointerId: 1, clientX: 5 });
+    fireEvent.pointerUp(openZone, { pointerId: 1, clientX: 250 });
+    expect(leadingDrawerStore.getState().isOpen).toBe(true);
+    leadingDrawerStore.getState().close();
+
+    // Back-swipe still pops at level >= 1.
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
+    const backZone = screen.getByTestId("edge-swipe-back");
+    fireEvent.pointerDown(backZone, { pointerId: 2, clientX: 5 });
+    fireEvent.pointerMove(backZone, { pointerId: 2, clientX: 250 });
+    fireEvent.pointerUp(backZone, { pointerId: 2, clientX: 250 });
+    expect(roomsStore.getState().selected).toBeNull();
   });
 
   it("closes Detail when the selection changes so it lands on the Room level (DW-109)", async () => {

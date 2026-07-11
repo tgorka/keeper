@@ -6,6 +6,7 @@ import { detailStore } from "@/lib/stores/detail-ui";
 import { exportStore } from "@/lib/stores/export";
 import { incognitoStore } from "@/lib/stores/incognito";
 import { roomsStore } from "@/lib/stores/rooms";
+import { searchSurfaceStore } from "@/lib/stores/search-surface";
 
 // Mock the typed IPC wrapper so the header's reused chat sub-parts (the
 // incognito chip's coupling-caveats fetch) never touch Tauri. Everything else
@@ -82,6 +83,7 @@ beforeEach(() => {
   roomsStore.getState().selectRoom(null);
   incognitoStore.getState().clear();
   detailStore.setState({ open: false });
+  searchSurfaceStore.setState({ isOpen: false, scope: "chats", chatLock: null });
   exportStore.setState({
     isOpen: false,
     preset: { scope: "everything", accountId: null, roomId: null },
@@ -136,14 +138,30 @@ describe("PhoneHeader", () => {
     render(<PhoneHeader level={1} onBack={vi.fn()} />);
 
     const menu = await openOverflowMenu();
-    // Export is the only entry today; Search/Mute/Mention-only/Archive land
-    // with their owning stories.
-    expect(within(menu).getAllByRole("menuitem")).toHaveLength(1);
+    // Search in chat + Export today; Mute/Mention-only/Archive land with their
+    // owning stories.
+    expect(within(menu).getAllByRole("menuitem")).toHaveLength(2);
     fireEvent.click(within(menu).getByRole("menuitem", { name: "Export" }));
 
     expect(exportStore.getState().isOpen).toBe(true);
     expect(exportStore.getState().preset).toEqual({
       scope: "chat",
+      accountId: selection.accountId,
+      roomId: selection.roomId,
+    });
+  });
+
+  it("opens the merged Search surface locked to the open chat from the overflow menu", async () => {
+    selectRoom();
+    render(<PhoneHeader level={1} onBack={vi.fn()} />);
+
+    const menu = await openOverflowMenu();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Search in chat" }));
+
+    const state = searchSurfaceStore.getState();
+    expect(state.isOpen).toBe(true);
+    expect(state.scope).toBe("messages");
+    expect(state.chatLock).toEqual({
       accountId: selection.accountId,
       roomId: selection.roomId,
     });

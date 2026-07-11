@@ -46,16 +46,26 @@ import { DetailPanel } from "@/components/layout/detail-panel";
 import { LeadingDrawer } from "@/components/layout/leading-drawer";
 import { PhoneHeader } from "@/components/layout/phone-header";
 import { PhoneInboxHeader } from "@/components/layout/phone-inbox-header";
+import { PhoneSearchSurface } from "@/components/layout/phone-search-surface";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { detailStore, useDetailStore } from "@/lib/stores/detail-ui";
 import { leadingDrawerStore, useLeadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
+import { searchSurfaceStore, useSearchSurfaceStore } from "@/lib/stores/search-surface";
 import { cn } from "@/lib/utils";
 
 /** Commit the edge-swipe as a flick when the drag averaged over this speed… */
 const FLICK_VELOCITY_PX_PER_MS = 0.5;
 /** …and travelled at least this far (so a tap on the edge zone never pops). */
 const FLICK_MIN_DX_PX = 40;
+
+/**
+ * The level-0 pull-down reveal threshold (Story 13.4): a downward pull that
+ * crosses this distance on release opens Search; below it snaps back with no
+ * open. Story 13.6 extends the same vertical axis beyond this point into
+ * pull-to-refresh, so the leg here stays minimal (open on release past threshold).
+ */
+const PULL_REVEAL_THRESHOLD_PX = 64;
 
 /** Clamp a drag delta to the swipeable range `0..width`. */
 function clampDx(dx: number, width: number): number {
@@ -420,6 +430,99 @@ export function PhoneShell() {
     openPointerRef.current = null;
   };
 
+  // ---- Level-0 pull-down to open Search (Story 13.4) ----------------------
+  // Mirrors the drawer-open pointer-threshold math on the *vertical* axis: a
+  // downward pull that starts while the Inbox list is scrolled to top and crosses
+  // the reveal threshold (or flicks) on release opens the Search surface; below the
+  // threshold it snaps back with no open. A pull that starts while the list is
+  // scrolled away from the top is left to native scrolling (armed === false). This
+  // owns only the open-Search leg — Story 13.6 extends the axis past the threshold
+  // into pull-to-refresh.
+  const searchSurfaceOpen = useSearchSurfaceStore((s) => s.isOpen);
+  const magnifierRef = useRef<HTMLButtonElement>(null);
+  const pullPointerRef = useRef<{
+    pointerId: number;
+    startY: number;
+    startT: number;
+    armed: boolean;
+  } | null>(null);
+
+  const onPullPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (pullPointerRef.current !== null) {
+      return;
+    }
+    // Arm only when the Inbox list is at its top (native scroll otherwise). The
+    // scroll viewport is the shadcn ScrollArea's; absent (empty/loading) counts as
+    // "at top" so the gesture still opens Search from an empty inbox.
+    const viewport = containerRef.current?.querySelector<HTMLElement>(
+      '[data-slot="scroll-area-viewport"]',
+    );
+    const atTop = viewport === null || viewport === undefined || viewport.scrollTop <= 0;
+    pullPointerRef.current = {
+      pointerId: e.pointerId,
+      startY: e.clientY,
+      startT: e.timeStamp,
+      armed: atTop,
+    };
+    if (atTop) {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    }
+  };
+
+  const onPullPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const pointer = pullPointerRef.current;
+    if (pointer === null || e.pointerId !== pointer.pointerId) {
+      return;
+    }
+    pullPointerRef.current = null;
+    if (!pointer.armed) {
+      return;
+    }
+    const dy = e.clientY - pointer.startY;
+    const dt = Math.max(e.timeStamp - pointer.startT, 1);
+    const flick = dy > FLICK_MIN_DX_PX && dy / dt > FLICK_VELOCITY_PX_PER_MS;
+    if (dy > PULL_REVEAL_THRESHOLD_PX || flick) {
+      searchSurfaceStore.getState().open();
+    }
+  };
+
+  const onPullPointerCancel = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const pointer = pullPointerRef.current;
+    if (pointer === null || e.pointerId !== pointer.pointerId) {
+      return;
+    }
+    pullPointerRef.current = null;
+  };
+
+  // UX-DR28: return focus to the Inbox magnifier when the Search surface
+  // transitions open → closed. Radix restores focus to the opener it captured, but
+  // the pull-down opens the surface with no focused trigger — so re-focus the
+  // magnifier here for that path (a magnifier-opened close is already covered by
+  // radix; re-focusing the same element is a harmless no-op).
+  const prevSearchOpenRef = useRef(searchSurfaceOpen);
+  useEffect(() => {
+    const wasOpen = prevSearchOpenRef.current;
+    prevSearchOpenRef.current = searchSurfaceOpen;
+    if (wasOpen && !searchSurfaceOpen) {
+      magnifierRef.current?.focus();
+    }
+  }, [searchSurfaceOpen]);
+
+  // The level-0 pull-down zone: a thin band across the top of the Inbox list,
+  // below the header, that arms the pull-to-open-Search gesture. Below-threshold
+  // releases and pulls that start scrolled-away no-op (native scroll).
+  const pullDownZone = (
+    <div
+      aria-hidden="true"
+      data-testid="pull-down-search"
+      className="absolute top-[var(--phone-header)] right-0 left-5 z-10 h-6 touch-none"
+      onPointerDown={onPullPointerDown}
+      onPointerUp={onPullPointerUp}
+      onPointerCancel={onPullPointerCancel}
+      onLostPointerCapture={onPullPointerCancel}
+    />
+  );
+
   const drawerOpenZone = (
     <div
       aria-hidden="true"
@@ -474,9 +577,11 @@ export function PhoneShell() {
         onFocusCapture={captureFocusFor(0)}
         className="min-h-0 min-w-0 flex-1"
       >
-        {/* Level 0's leading edge opens the drawer (the edge 13.2 reserved). */}
+        {/* Level 0's leading edge opens the drawer (the edge 13.2 reserved); the
+            top band pulls down to open Search (Story 13.4). */}
         {level === 0 && drawerOpenZone}
-        <PhoneInboxHeader drawerButtonRef={drawerButtonRef} />
+        {level === 0 && pullDownZone}
+        <PhoneInboxHeader drawerButtonRef={drawerButtonRef} magnifierRef={magnifierRef} />
         <div className="flex min-h-0 min-w-0 flex-1">
           <ChatListPane />
         </div>
@@ -522,6 +627,10 @@ export function PhoneShell() {
       {/* The always-mounted leading nav drawer (Story 13.3); a portalled Sheet,
           so it renders outside the stack's transform layers. */}
       <LeadingDrawer />
+      {/* The always-mounted merged full-screen Search surface (Story 13.4); a
+          portalled Dialog, store-driven, so it renders outside the transform
+          layers and never mounts on the desktop tier (this shell is phone-only). */}
+      <PhoneSearchSurface />
     </div>
   );
 }

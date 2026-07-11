@@ -8,13 +8,14 @@
  * in any streamed window). At the Room level the bar also renders the shared
  * `ConversationHeaderIdentity` block wrapped as an "Open details" button — the
  * phone's ⌘I replacement, pushing the Detail level via `detailStore` — the
- * shared `ConversationIncognitoChip`, and a ⋯ overflow menu whose only entry
- * today is **Export** (the same `exportStore` action as the desktop header).
- * Search-in-chat / Mute / Mention-only / Archive land with their owning stories
- * (13.4 / 10.2–13.7 / 4.2–13.6). No chat sub-parts are forked: identity and
- * incognito are the exact components the desktop header renders.
+ * shared `ConversationIncognitoChip`, and a ⋯ overflow menu carrying **Search in
+ * chat** (Story 13.4: opens the merged full-screen Search surface in Messages
+ * scope locked to this Chat via `searchSurfaceStore`) and **Export** (the same
+ * `exportStore` action as the desktop header). Mute / Mention-only / Archive land
+ * with their owning stories (10.2–13.7 / 4.2–13.6). No chat sub-parts are forked:
+ * identity and incognito are the exact components the desktop header renders.
  */
-import { ChevronLeft, Download, Ellipsis } from "lucide-react";
+import { ChevronLeft, Download, Ellipsis, Search } from "lucide-react";
 import type { Ref } from "react";
 import {
   ConversationHeaderIdentity,
@@ -31,6 +32,7 @@ import { useSelectedRoomVm } from "@/hooks/use-selected-room-vm";
 import { detailStore } from "@/lib/stores/detail-ui";
 import { exportStore } from "@/lib/stores/export";
 import { useRoomsStore } from "@/lib/stores/rooms";
+import { searchSurfaceStore } from "@/lib/stores/search-surface";
 
 interface PhoneHeaderProps {
   /** The stack level this header sits on: 1 = Room, 2 = Detail. */
@@ -97,18 +99,31 @@ export function PhoneHeader({ level, onBack, backRef }: PhoneHeaderProps) {
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               {accountId !== null && roomId !== null && (
-                <DropdownMenuItem
-                  onSelect={() =>
-                    exportStore.getState().open({
-                      scope: "chat",
-                      accountId,
-                      roomId,
-                    })
-                  }
-                >
-                  <Download aria-hidden="true" />
-                  Export
-                </DropdownMenuItem>
+                <>
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      searchSurfaceStore.getState().open({
+                        scope: "messages",
+                        chatLock: { accountId, roomId },
+                      })
+                    }
+                  >
+                    <Search aria-hidden="true" />
+                    Search in chat
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      exportStore.getState().open({
+                        scope: "chat",
+                        accountId,
+                        roomId,
+                      })
+                    }
+                  >
+                    <Download aria-hidden="true" />
+                    Export
+                  </DropdownMenuItem>
+                </>
               )}
             </DropdownMenuContent>
           </DropdownMenu>
