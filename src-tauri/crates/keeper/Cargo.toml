@@ -77,3 +77,10 @@ tauri-plugin-process = { workspace = true }
 # the desktop tree / build stay byte-identical.
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = { workspace = true }
+# iOS backup exclusion (Story 14.7, FR-65). The single audited `#[allow(unsafe_code)]`
+# FFI in `IosPlatform::exclude_from_backup` sets `NSURLIsExcludedFromBackupKey` via
+# objc2-foundation (features NSURL/NSError/NSString/NSValue, set on the workspace
+# catalog entry). Both crates are already in the tree transitively (tao/wry), so no
+# new crate version is pulled — only the dependency edge changes.
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }

@@ -581,6 +581,13 @@ pub async fn add_account<P: AuthProvider>(
             .await
             .map_err(|e| CoreError::Auth(AuthError::ServerUnreachable(e.to_string())))?;
 
+        // FR-65 (Story 14.7): the fresh SDK store directory now exists — flag it as
+        // excluded from device backup so the store and its SQLite `-wal`/`-shm`
+        // sidecars never reach iCloud/iTunes backups (directory-level exclusion
+        // covers the subtree). Best-effort: a failure is logged and swallowed — it
+        // must never abort the login.
+        crate::platform::exclude_from_backup_best_effort(platform, &sdk_dir);
+
         // Mechanism-specific credential→session step (AD-17).
         provider.authenticate(&client, platform).await?;
 
@@ -1012,6 +1019,9 @@ mod tests {
         fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
             Err(CoreError::Unsupported("sidecar unused in tests".to_owned()))
         }
+        fn exclude_from_backup(&self, _path: &std::path::Path) -> Result<(), CoreError> {
+            Ok(())
+        }
         fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
             Ok(())
         }
@@ -1121,6 +1131,9 @@ mod tests {
         }
         fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
             Err(CoreError::Unsupported("sidecar unused in tests".to_owned()))
+        }
+        fn exclude_from_backup(&self, _path: &std::path::Path) -> Result<(), CoreError> {
+            Ok(())
         }
         fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
             Ok(())

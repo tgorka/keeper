@@ -2923,6 +2923,8 @@ dependencies = [
  "dirs 6.0.0",
  "keeper-core",
  "keyring",
+ "objc2",
+ "objc2-foundation",
  "percent-encoding",
  "security-framework 3.7.0",
  "serde",

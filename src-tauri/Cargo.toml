@@ -89,6 +89,15 @@ keyring = { version = "3", features = ["apple-native"] }
 # build stay byte-identical. Consumed by the `keeper` crate under an iOS-only target table
 # to pin `AfterFirstUnlockThisDeviceOnly`. MIT/Apache — passes the cargo-deny license firewall.
 security-framework = "3"
+# iOS backup exclusion (Story 14.7, FR-65, AD-29). Catalog entries only — objc2 0.6 /
+# objc2-foundation 0.3 are already resolved in the lock transitively (tao/wry/muda), so no
+# new crate version is pulled; the only Cargo.lock change is the dependency edge on the
+# `keeper` crate. Consumed under an iOS-only target table for the single audited
+# `NSURLIsExcludedFromBackupKey` FFI behind `Platform::exclude_from_backup`. The feature
+# list names exactly the Foundation surfaces that call touches (NSURL + its NSError result,
+# NSString path, NSNumber value). MIT — passes the cargo-deny license firewall.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSURL", "NSError", "NSString", "NSValue"] }
 # Account registry + opaque account ids (both already present transitively via matrix-sdk).
 ulid = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }

@@ -50,4 +50,6 @@ carry function-level, audited `#[allow(unsafe_code)]` exceptions for platform FF
 safe binding. Current inventory:
 
 - iOS backup exclusion (`NSURL.setResourceValue(NSURLIsExcludedFromBackupKey)`) via
-  objc2-foundation, behind `Platform::exclude_from_backup` — story 14.7 (FR-65).
+  objc2-foundation, behind `Platform::exclude_from_backup` — the single function-level
+  `#[allow(unsafe_code)]` in `IosPlatform::exclude_from_backup`,
+  `crates/keeper/src/ipc.rs` — story 14.7 (FR-65).

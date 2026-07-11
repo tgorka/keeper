@@ -1,5 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<dict/>
+<!-- GENERATED MIRROR (Story 14.7, FR-65): XcodeGen regenerates this file from
+     project.yml `entitlements.properties` on every `xcodegen generate` — edit the
+     value THERE, not here (an edit made only here is silently reverted; this
+     comment is likewise stripped on regeneration, which is fine — the value is
+     what matters and it is pinned by crates/keeper/tests/entitlements_protection.rs).
+     Default data protection must stay CompleteUntilFirstUserAuthentication, never
+     NSFileProtectionComplete (which would lock the SQLite WAL after screen lock
+     and stall a resumed sync loop). -->
+<dict>
+	<key>com.apple.developer.default-data-protection</key>
+	<string>NSFileProtectionCompleteUntilFirstUserAuthentication</string>
+</dict>
 </plist>

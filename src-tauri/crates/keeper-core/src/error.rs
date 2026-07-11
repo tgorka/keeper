@@ -26,6 +26,15 @@ pub enum PlatformError {
     /// contains the secret value that was being stored or retrieved.
     #[error("keychain operation failed: {0}")]
     Keychain(String),
+
+    /// Excluding a store path from OS device backups failed (Story 14.7,
+    /// FR-65) — on iOS, setting `NSURLIsExcludedFromBackupKey` on the file or
+    /// directory URL. The message is a non-secret description of the failure
+    /// (path + `NSError` text — never store contents). Callers treat this as
+    /// best-effort hardening: logged and swallowed, never fatal to startup,
+    /// login, or session-restore.
+    #[error("backup exclusion failed: {0}")]
+    BackupExclusion(String),
 }
 
 /// Errors originating in the password login flow.

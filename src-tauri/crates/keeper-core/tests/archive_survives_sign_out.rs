@@ -109,6 +109,9 @@ impl Platform for LocalPlatform {
     fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
         Err(CoreError::Unsupported("sidecar unused in tests".to_owned()))
     }
+    fn exclude_from_backup(&self, _path: &Path) -> Result<(), CoreError> {
+        Ok(())
+    }
     fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
         Ok(())
     }

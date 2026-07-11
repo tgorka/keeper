@@ -7,7 +7,7 @@
 //! declared here and return [`CoreError::Unsupported`] from the shell impl for
 //! now — honest and non-panicking — until later stories fill them.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::CoreError;
 use crate::vm::NotifyTarget;
@@ -53,6 +53,20 @@ pub trait Platform: Send + Sync {
     /// Not wired in Story 1.1 — returns [`CoreError::Unsupported`].
     fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError>;
 
+    /// Exclude `path` (a file or directory under [`Platform::data_dir`]) from OS
+    /// device backups (Story 14.7, FR-65).
+    ///
+    /// On iOS this sets `NSURLIsExcludedFromBackupKey` on the file/directory URL
+    /// so the path never reaches iCloud/iTunes device backups; **directory-level
+    /// exclusion covers the whole subtree**, which is how the SQLite `-wal`/`-shm`
+    /// sidecars next to each `.db` are kept out of backup (callers flag the
+    /// containing directory, never a bare `.db` file). On desktop there is no
+    /// equivalent per-path backup-exclusion concept, so the port is an honest
+    /// no-op returning `Ok(())`. Callers pass absolute, already-created paths
+    /// rooted under `data_dir`, and must treat a failure as best-effort hardening
+    /// to log and swallow — never a reason to abort startup, login, or restore.
+    fn exclude_from_backup(&self, path: &Path) -> Result<(), CoreError>;
+
     /// Set (or clear) the OS dock badge (Story 10.3, FR-53). `Some(n)` shows the
     /// count `n`; `None` clears the badge. Driven from the Rust-computed
     /// cross-account unread/mention aggregate so it stays correct while the window
@@ -60,4 +74,22 @@ pub trait Platform: Send + Sync {
     /// wires this to the main window's badge; when no app handle is available
     /// (headless / tests) it is an honest no-op, never a panic.
     fn set_badge_count(&self, count: Option<u32>) -> Result<(), CoreError>;
+}
+
+/// Best-effort [`Platform::exclude_from_backup`]: log-and-continue on failure
+/// (Story 14.7, FR-65).
+///
+/// Backup exclusion is privacy hardening, not a correctness precondition — a
+/// failure must never panic the app, abort login or session-restore, or abort
+/// the archive path (which is invariant-bound to never abort startup). Every
+/// store-creation site calls through this funnel so no exclusion error can be
+/// `?`-propagated into a fatal path.
+pub(crate) fn exclude_from_backup_best_effort(platform: &dyn Platform, path: &Path) {
+    if let Err(error) = platform.exclude_from_backup(path) {
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "could not exclude path from device backup; continuing (best-effort hardening)"
+        );
+    }
 }

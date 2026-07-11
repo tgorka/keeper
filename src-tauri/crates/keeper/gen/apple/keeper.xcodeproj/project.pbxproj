@@ -39,6 +39,7 @@
 		A04991D007EFA51112A5BBC7 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
 		AEA6670D4EB1D0BE5FF4AC7E /* ipc.rs */ = {isa = PBXFileReference; path = ipc.rs; sourceTree = "<group>"; };
 		DE36DCA1F8B02DED03D6CFFB /* tray.rs */ = {isa = PBXFileReference; path = tray.rs; sourceTree = "<group>"; };
+		DF746BBF7E7FF745D1EEEA53 /* lifecycle.rs */ = {isa = PBXFileReference; path = lifecycle.rs; sourceTree = "<group>"; };
 		E4D516C547EC1AA422850DE4 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
 		E4FD926D1A59039E9D435F3C /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		F1D7017479F0FE2439C89CAC /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
@@ -151,6 +152,7 @@
 				0916BD7F28B1BAA74F7F064F /* hotkey.rs */,
 				AEA6670D4EB1D0BE5FF4AC7E /* ipc.rs */,
 				E4D516C547EC1AA422850DE4 /* lib.rs */,
+				DF746BBF7E7FF745D1EEEA53 /* lifecycle.rs */,
 				77414957F1E518186B02AF81 /* main.rs */,
 				6EB21D7DF791F3B3A776DC97 /* media_protocol.rs */,
 				395A2195C92EEAF5464E721D /* menu.rs */,

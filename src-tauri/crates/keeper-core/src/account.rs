@@ -605,7 +605,26 @@ impl AccountManager {
     /// account's post-decryption event handler on activation. A failure to open
     /// `archive.db` is logged and the manager still constructs with archiving
     /// disabled — the archive path must never block or abort the app.
-    pub fn new(data_dir: &Path) -> Self {
+    ///
+    /// `platform` is the shared [`Platform`] port: the manager flags the
+    /// `data_dir` **root** directory as excluded from device backup exactly once
+    /// here (Story 14.7, FR-65). Directory-level exclusion covers the whole
+    /// subtree — `keeper.db`, `archive.db`, their SQLite `-wal`/`-shm` sidecars,
+    /// and everything under `accounts/` — which is what keeps committed-but-
+    /// uncheckpointed WAL rows out of iCloud/iTunes backups. Best-effort: an
+    /// exclusion failure is logged and swallowed, never fatal to startup.
+    pub fn new(platform: &dyn Platform, data_dir: &Path) -> Self {
+        // Ensure the root exists before flagging it (the archive/registry opens
+        // below would create it anyway; doing it first makes "flag right after it
+        // exists" deterministic even if archive.db fails to open). Best-effort.
+        if let Err(e) = std::fs::create_dir_all(data_dir) {
+            tracing::warn!(
+                path = %data_dir.display(),
+                error = %e,
+                "could not create data dir before backup exclusion; continuing"
+            );
+        }
+        crate::platform::exclude_from_backup_best_effort(platform, data_dir);
         let archive = match ArchiveWriter::spawn(data_dir) {
             Ok(handle) => Some(handle),
             Err(e) => {
@@ -4659,6 +4678,14 @@ async fn activate(
         .await
         .map_err(|e| AccountError::RestoreFailed(e.to_string()))?;
 
+    // FR-65 (Story 14.7): the SDK store directory was just (re)opened — flag it as
+    // excluded from device backup on every activation (fresh login and each
+    // session-restore re-open funnel through here), so the store and its SQLite
+    // `-wal`/`-shm` sidecars never reach iCloud/iTunes backups. Re-flagging an
+    // already-excluded directory is an idempotent no-op. Best-effort: a failure is
+    // logged and swallowed — it must never abort restore.
+    crate::platform::exclude_from_backup_best_effort(platform.as_ref(), &sdk_dir);
+
     stored
         .restore_into(&client)
         .await
@@ -5930,24 +5957,65 @@ mod tests {
     use matrix_sdk_ui::eyeball_im::Vector;
     use std::path::PathBuf;
 
-    /// Fake platform with a fixed data dir; keychain ops are no-ops. Enough for
-    /// the sign-out idempotency test (the account is never active, so cleanup
-    /// touches only already-absent state).
+    /// Fake platform with a fixed data dir, an in-memory keychain (so `activate`
+    /// can read back a stored session), and a Story 14.7 **spy recorder** of every
+    /// path passed to `exclude_from_backup` — optionally failing that call to
+    /// prove exclusion is best-effort, never fatal.
     struct FakePlatform {
         data_dir: PathBuf,
+        keychain: std::sync::Mutex<HashMap<String, String>>,
+        /// Every path passed to `exclude_from_backup`, in call order.
+        excluded: std::sync::Mutex<Vec<PathBuf>>,
+        /// When true, `exclude_from_backup` returns `Err` (after recording).
+        fail_exclusion: bool,
+    }
+
+    impl FakePlatform {
+        fn new(data_dir: PathBuf) -> Self {
+            Self {
+                data_dir,
+                keychain: std::sync::Mutex::new(HashMap::new()),
+                excluded: std::sync::Mutex::new(Vec::new()),
+                fail_exclusion: false,
+            }
+        }
+
+        /// A platform whose `exclude_from_backup` always fails — the non-fatal
+        /// (log-and-continue) contract must keep everything else working.
+        fn failing_exclusion(data_dir: PathBuf) -> Self {
+            Self {
+                fail_exclusion: true,
+                ..Self::new(data_dir)
+            }
+        }
+
+        /// The recorded `exclude_from_backup` paths, in call order.
+        fn excluded_paths(&self) -> Vec<PathBuf> {
+            self.excluded.lock().expect("lock excluded").clone()
+        }
     }
 
     impl Platform for FakePlatform {
         fn data_dir(&self) -> Result<PathBuf, CoreError> {
             Ok(self.data_dir.clone())
         }
-        fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
+        fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError> {
+            self.keychain
+                .lock()
+                .expect("lock keychain")
+                .insert(key.to_owned(), value.to_owned());
             Ok(())
         }
-        fn keychain_get(&self, _key: &str) -> Result<Option<String>, CoreError> {
-            Ok(None)
+        fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError> {
+            Ok(self
+                .keychain
+                .lock()
+                .expect("lock keychain")
+                .get(key)
+                .cloned())
         }
-        fn keychain_delete(&self, _key: &str) -> Result<(), CoreError> {
+        fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
+            self.keychain.lock().expect("lock keychain").remove(key);
             Ok(())
         }
         fn open_url(&self, _url: &str) -> Result<(), CoreError> {
@@ -5963,6 +6031,19 @@ mod tests {
         }
         fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
             Err(CoreError::Unsupported("sidecar unused in tests".to_owned()))
+        }
+        fn exclude_from_backup(&self, path: &Path) -> Result<(), CoreError> {
+            self.excluded
+                .lock()
+                .expect("lock excluded")
+                .push(path.to_path_buf());
+            if self.fail_exclusion {
+                return Err(crate::error::PlatformError::BackupExclusion(
+                    "exclusion failed in test".to_owned(),
+                )
+                .into());
+            }
+            Ok(())
         }
         fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
             Ok(())
@@ -5980,10 +6061,8 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
-            data_dir: data_dir.clone(),
-        });
-        let manager = AccountManager::new(&data_dir);
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         // The account was never activated (absent from the manager map): shutdown
         // is a no-op and cleanup touches only already-absent persisted state.
@@ -6014,7 +6093,7 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let manager = AccountManager::new(&data_dir);
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         // No accounts are live: nothing to resume, nothing activated, no panic.
         manager.sync_now().await;
@@ -6038,11 +6117,216 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let manager = AccountManager::new(&data_dir);
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         // No accounts are live: nothing to pause, nothing torn down, no panic.
         manager.pause_all().await;
         assert!(manager.accounts.lock().await.is_empty());
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A unique temp data dir per test run (Story 14.7 exclusion tests).
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "keeper-backup-excl-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        dir
+    }
+
+    /// Seed the registry row + Keychain session `activate` needs to restore
+    /// `account_id` fully offline: `https://example.invalid` is never contacted at
+    /// build/restore time, and the session blob is the tagged password shape the
+    /// Keychain stores (same flat `MatrixSession` JSON as the auth tests).
+    fn seed_restorable_account(platform: &FakePlatform, data_dir: &Path, account_id: &str) {
+        registry::insert_account(
+            data_dir,
+            account_id,
+            "@alice:example.org",
+            "https://example.invalid",
+            "DEVID",
+            1,
+            0,
+            "password",
+        )
+        .expect("insert registry row");
+        let session_json = r#"{"kind":"Password","user_id":"@alice:example.org","device_id":"DEVID","access_token":"test-access-token"}"#;
+        platform
+            .keychain_set(&session_keychain_key(account_id), session_json)
+            .expect("seed keychain session");
+    }
+
+    /// Tear down the tasks/services a successful [`activate`] spawned so the test
+    /// runtime exits cleanly (mirrors the abort set `subscribe_room_list` uses for
+    /// a partial account).
+    async fn teardown_activated(activated: ActivatedAccount) {
+        let (
+            client,
+            sync,
+            reconnect_supervisor,
+            session_persister,
+            _archive_handler,
+            _redaction_handler,
+            _draft_handler,
+            _notify_handler,
+            outbox_scheduler,
+            _outbox_tx,
+        ) = activated;
+        reconnect_supervisor.abort();
+        session_persister.abort();
+        outbox_scheduler.abort();
+        sync.stop().await;
+        drop(client);
+    }
+
+    /// Story 14.7 (FR-65): constructing the manager flags the `data_dir` **root**
+    /// directory as backup-excluded exactly once — the directory-level flag is what
+    /// covers `keeper.db`, `archive.db`, their `-wal`/`-shm` sidecars, and the
+    /// `accounts/` subtree — and the root exists by the time it is flagged.
+    #[tokio::test]
+    async fn account_manager_new_flags_data_dir_root_for_backup_exclusion() {
+        let data_dir = unique_temp_dir("root");
+        let platform = FakePlatform::new(data_dir.clone());
+
+        let _manager = AccountManager::new(&platform, &data_dir);
+
+        assert_eq!(
+            platform.excluded_paths(),
+            vec![data_dir.clone()],
+            "the data_dir root must be flagged exactly once at manager construction"
+        );
+        assert!(
+            data_dir.is_dir(),
+            "the root must exist when it is flagged (flag right after creation)"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 14.7 (FR-65): a failing `exclude_from_backup` is best-effort — manager
+    /// construction (the startup/archive path, invariant-bound to never abort) still
+    /// succeeds, and the archive writer still comes up.
+    #[tokio::test]
+    async fn account_manager_new_survives_exclusion_failure() {
+        let data_dir = unique_temp_dir("root-nonfatal");
+        let platform = FakePlatform::failing_exclusion(data_dir.clone());
+
+        // Must not panic and must not skip the rest of construction.
+        let manager = AccountManager::new(&platform, &data_dir);
+
+        assert_eq!(
+            platform.excluded_paths(),
+            vec![data_dir.clone()],
+            "the exclusion attempt is still made (then logged and swallowed)"
+        );
+        assert!(
+            manager.archive.is_some(),
+            "archive writer still spawns after an exclusion failure"
+        );
+        assert!(
+            data_dir.join("archive.db").exists(),
+            "archive.db is still created after an exclusion failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 14.7 (FR-65): the central [`activate`] funnel — every session-restore
+    /// re-open path — flags the account's `accounts/<ulid>/sdk` **directory** right
+    /// after the SDK store (re)opens, and re-activating flags it again (restore runs
+    /// on every resume; re-flagging is idempotent and both calls succeed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activate_flags_sdk_dir_and_reflags_on_reactivation() {
+        let data_dir = unique_temp_dir("activate");
+        let account_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let fake = Arc::new(FakePlatform::new(data_dir.clone()));
+        seed_restorable_account(&fake, &data_dir, account_id);
+        let platform: Arc<dyn Platform> = fake.clone();
+        let sdk_dir = data_dir.join("accounts").join(account_id).join("sdk");
+
+        // First activation (e.g. cold-launch session restore).
+        let (draft_tx, _) = tokio::sync::broadcast::channel(4);
+        let activated = activate(
+            &platform,
+            account_id,
+            None,
+            draft_tx.clone(),
+            Arc::new(NotifyConfig::new(true)),
+        )
+        .await
+        .expect("offline activation succeeds");
+        teardown_activated(activated).await;
+
+        assert!(
+            sdk_dir.is_dir(),
+            "the sdk store dir exists after activation"
+        );
+        assert_eq!(
+            fake.excluded_paths(),
+            vec![sdk_dir.clone()],
+            "activation must flag the account's sdk directory (not a bare .db file)"
+        );
+
+        // Second activation (e.g. the next foreground resume) re-flags the same dir.
+        let activated = activate(
+            &platform,
+            account_id,
+            None,
+            draft_tx,
+            Arc::new(NotifyConfig::new(true)),
+        )
+        .await
+        .expect("re-activation succeeds");
+        teardown_activated(activated).await;
+
+        assert_eq!(
+            fake.excluded_paths(),
+            vec![sdk_dir.clone(), sdk_dir],
+            "re-activation flags the sdk dir again; both calls succeed"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 14.7 (FR-65): a failing `exclude_from_backup` never aborts activation —
+    /// the account still restores and comes live (log-and-continue, no panic, no
+    /// `?`-propagation into the restore path).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activate_survives_exclusion_failure() {
+        let data_dir = unique_temp_dir("activate-nonfatal");
+        let account_id = "01BX5ZZKBKACTAV9WEVGEMMVS0";
+        let fake = Arc::new(FakePlatform::failing_exclusion(data_dir.clone()));
+        seed_restorable_account(&fake, &data_dir, account_id);
+        let platform: Arc<dyn Platform> = fake.clone();
+
+        let (draft_tx, _) = tokio::sync::broadcast::channel(4);
+        let activated = activate(
+            &platform,
+            account_id,
+            None,
+            draft_tx,
+            Arc::new(NotifyConfig::new(true)),
+        )
+        .await
+        .expect("activation succeeds even when backup exclusion fails");
+        teardown_activated(activated).await;
+
+        let sdk_dir = data_dir.join("accounts").join(account_id).join("sdk");
+        assert_eq!(
+            fake.excluded_paths(),
+            vec![sdk_dir.clone()],
+            "the exclusion attempt is still made (then logged and swallowed)"
+        );
+        assert!(
+            sdk_dir.is_dir(),
+            "the sdk store survives the exclusion failure"
+        );
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -6058,7 +6342,7 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let manager = AccountManager::new(&data_dir);
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         // An unparsable room id is an honest typed error (→ TimelineUnavailable),
         // never a panic.
@@ -6105,10 +6389,8 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
-            data_dir: data_dir.clone(),
-        });
-        let manager = AccountManager::new(&data_dir);
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         // Seed one account with a known user_id + hue, plus a draft whose account is
         // registered but not live (no room can be resolved).
@@ -6187,13 +6469,11 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
-            data_dir: data_dir.clone(),
-        });
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
         // Window 0 exercises the immediate-dispatch path (Story 8.3): with a positive
         // window the approve would be held in the outbox instead of reaching the gate.
         registry::set_undo_send_window(&data_dir, 0).expect("disable undo-send window");
-        let manager = AccountManager::new(&data_dir);
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         // An unparsable room id is an honest typed error, never a panic.
         let bad_room = manager
@@ -6240,10 +6520,8 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
-            data_dir: data_dir.clone(),
-        });
-        let manager = AccountManager::new(&data_dir);
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         // An empty body → EmptyBody, not a dispatched no-op. The empty-body guard runs
         // ahead of the Undo-Send window check, so this holds at any window (Story 8.3).
@@ -6280,13 +6558,11 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
-            data_dir: data_dir.clone(),
-        });
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
         // Window 0 exercises the immediate-dispatch path (Story 8.3): a positive window
         // would hold the send in the outbox instead of reaching the gate.
         registry::set_undo_send_window(&data_dir, 0).expect("disable undo-send window");
-        let manager = AccountManager::new(&data_dir);
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         // An unparsable room id is an honest typed error, never a panic.
         let bad_room = manager
@@ -6332,11 +6608,9 @@ mod tests {
     #[tokio::test]
     async fn send_text_with_positive_window_holds_instead_of_dispatching() {
         let data_dir = outbox_test_dir("hold");
-        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
-            data_dir: data_dir.clone(),
-        });
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
         registry::set_undo_send_window(&data_dir, 10).expect("set window 10");
-        let manager = AccountManager::new(&data_dir);
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         let before = now_ms();
         // A non-live account: with window 0 this would be `NoOpenTimeline`; with a
@@ -6425,11 +6699,9 @@ mod tests {
     #[tokio::test]
     async fn cancel_held_send_deletes_row_and_writes_draft() {
         let data_dir = outbox_test_dir("cancel");
-        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
-            data_dir: data_dir.clone(),
-        });
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
         registry::set_undo_send_window(&data_dir, 30).expect("set window 30");
-        let manager = AccountManager::new(&data_dir);
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         manager
             .send_text(&platform, "acctA", "!room:example.org", "undo me")
@@ -6473,11 +6745,9 @@ mod tests {
     #[tokio::test]
     async fn send_approval_with_positive_window_holds() {
         let data_dir = outbox_test_dir("approval-hold");
-        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
-            data_dir: data_dir.clone(),
-        });
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
         registry::set_undo_send_window(&data_dir, 5).expect("set window 5");
-        let manager = AccountManager::new(&data_dir);
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         // A whitespace-only body is still rejected before the window branch.
         let empty = manager
@@ -6502,11 +6772,9 @@ mod tests {
         // so a malformed room id is a caller-visible error — never a held row the
         // scheduler later silently drops as unparsable (an approved message lost).
         let data_dir = outbox_test_dir("approval-badroom");
-        let platform: Arc<dyn Platform> = Arc::new(FakePlatform {
-            data_dir: data_dir.clone(),
-        });
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
         registry::set_undo_send_window(&data_dir, 5).expect("set window 5");
-        let manager = AccountManager::new(&data_dir);
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         let result = manager
             .send_approval(

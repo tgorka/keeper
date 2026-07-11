@@ -157,7 +157,7 @@ development_status:
   14-4-resume-integrity-blank-webview-guard-and-stale-resume-pill: done
   14-5-memory-hygiene-under-jetsam: done
   14-6-flaky-network-resilience: done
-  14-7-backup-exclusion-and-file-protection: backlog
+  14-7-backup-exclusion-and-file-protection: done
   epic-14-retrospective: optional
   epic-15: backlog
   15-1-app-icons-and-launch-assets: backlog

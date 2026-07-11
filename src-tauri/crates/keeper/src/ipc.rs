@@ -8,7 +8,7 @@
 //! in either module — commands delegate to `keeper-core`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -269,8 +269,10 @@ impl AppState {
             std::env::temp_dir().join("dev.tgorka.keeper")
         });
         Self {
+            // The manager flags the `data_dir` root as backup-excluded through the
+            // platform port (Story 14.7, FR-65) — best-effort, never startup-fatal.
+            accounts: AccountManager::new(platform.as_ref(), &data_dir),
             platform,
-            accounts: AccountManager::new(&data_dir),
             oauth_flows: Arc::new(OAuthFlowRegistry::new()),
             beeper_flows: Arc::new(BeeperFlowRegistry::new()),
             exports: Arc::new(ExportRegistry::default()),
@@ -491,6 +493,12 @@ impl Platform for DesktopPlatform {
             .map_err(|e| CoreError::Internal(format!("could not set dock badge count: {e}")))
     }
 
+    fn exclude_from_backup(&self, _path: &Path) -> Result<(), CoreError> {
+        // Per-path backup exclusion is an iOS-only concept (NSURLIsExcludedFromBackupKey);
+        // desktop has no equivalent, so this is an honest no-op (Story 14.7, FR-65).
+        Ok(())
+    }
+
     fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError> {
         // Tauri lays per-arch sidecars next to the running executable, suffixed with
         // the target triple (e.g. `bbctl-aarch64-apple-darwin`). Resolve there via
@@ -669,6 +677,54 @@ impl Platform for IosPlatform {
             .map_err(|e| CoreError::Internal(format!("could not set app icon badge count: {e}")))
     }
 
+    /// Exclude `path` from iCloud/iTunes device backups by setting
+    /// `NSURLIsExcludedFromBackupKey` on its file URL (Story 14.7, FR-65).
+    ///
+    /// This is the codebase's single authorized `unsafe` FFI: `isExcludedFromBackup`
+    /// has no safe binding, so the setter is reached through objc2-foundation behind
+    /// this port — function-level `#[allow(unsafe_code)]`, `// SAFETY:`-documented,
+    /// and listed in the audit inventory in `docs/constraints-and-limitations.md`
+    /// (coordinator policy amendment, 2026-07-11). Directory-level exclusion covers
+    /// the whole subtree, which is how each store's SQLite `-wal`/`-shm` sidecars
+    /// are kept out of backup. Precondition: callers pass absolute, already-created
+    /// **directories** rooted under `data_dir` (the `data_dir` root and each
+    /// `accounts/<ulid>/sdk`), hence `fileURLWithPath_isDirectory` with
+    /// `is_directory = true` — no extra stat.
+    #[allow(unsafe_code)]
+    fn exclude_from_backup(&self, path: &Path) -> Result<(), CoreError> {
+        // objc2 types are used inside the method body only, so no iOS-only import
+        // leaks to the desktop compile (mirrors the 12.3 keychain pattern).
+        use objc2_foundation::{NSNumber, NSString, NSURLIsExcludedFromBackupKey, NSURL};
+
+        // App-container paths are ASCII in practice; a non-UTF-8 path is near-
+        // unreachable and surfaces as an Err the (best-effort) callers log.
+        let path_str = path.to_str().ok_or_else(|| {
+            PlatformError::BackupExclusion(format!("path is not valid UTF-8: {}", path.display()))
+        })?;
+        let ns_path = NSString::from_str(path_str);
+        let url = NSURL::fileURLWithPath_isDirectory(&ns_path, true);
+        let value = NSNumber::new_bool(true);
+        // SAFETY: `NSURLIsExcludedFromBackupKey` is Apple's documented, process-
+        // lifetime `NSURLResourceKey` extern static — reading it carries no other
+        // obligation. `setResourceValue:forKey:error:` requires a valid file URL
+        // and a value of the key's documented type: `url` is a file URL built just
+        // above, `value` is the boolean `NSNumber` the key documents, and both are
+        // owned `Retained` references that outlive the call. The setter only
+        // writes the URL's resource cache + the path's extended attribute; a
+        // runtime failure (e.g. the path does not exist) is returned as
+        // `Err(NSError)`, never undefined behavior.
+        let result = unsafe {
+            url.setResourceValue_forKey_error(Some(&value), NSURLIsExcludedFromBackupKey)
+        };
+        result.map_err(|e| {
+            PlatformError::BackupExclusion(format!(
+                "could not set NSURLIsExcludedFromBackupKey on {}: {e}",
+                path.display()
+            ))
+            .into()
+        })
+    }
+
     fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError> {
         // No child processes / sidecars on iOS, ever (Story 12.2 boundary). The
         // `Unsupported` funnels through `to_ipc_error` to
@@ -837,6 +893,10 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         }
         CoreError::Platform(PlatformError::DirUnavailable(_)) => (IpcErrorCode::Internal, false),
         CoreError::Platform(PlatformError::Keychain(_)) => (IpcErrorCode::Internal, false),
+        // Story 14.7: backup exclusion is best-effort hardening — keeper-core logs and
+        // swallows it at every call site, so it should never reach a command edge. If it
+        // ever does, it is an internal, non-retriable condition (mirrors Keychain).
+        CoreError::Platform(PlatformError::BackupExclusion(_)) => (IpcErrorCode::Internal, false),
         CoreError::Internal(_) => (IpcErrorCode::Internal, false),
         CoreError::Auth(AuthError::ServerUnreachable(_)) => (IpcErrorCode::ServerUnreachable, true),
         CoreError::Auth(AuthError::InvalidCredentials) => (IpcErrorCode::InvalidCredentials, false),
@@ -3830,6 +3890,19 @@ mod tests {
     #[test]
     fn now_ms_is_positive() {
         assert!(now_ms() > 0);
+    }
+
+    /// Story 14.7 (FR-65): per-path backup exclusion is an iOS-only concept — the
+    /// desktop port is an honest no-op that returns `Ok(())` for any path (even one
+    /// that does not exist) and never fails a store-creation site.
+    #[cfg(desktop)]
+    #[test]
+    fn desktop_exclude_from_backup_is_a_noop_ok() {
+        let platform = DesktopPlatform;
+        assert!(platform
+            .exclude_from_backup(Path::new("/nonexistent/keeper-test-path"))
+            .is_ok());
+        assert!(platform.exclude_from_backup(&std::env::temp_dir()).is_ok());
     }
 
     /// Story 14.4: the `nav_state` slot round-trips through the same helpers the
