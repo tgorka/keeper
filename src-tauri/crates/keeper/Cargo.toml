@@ -37,12 +37,24 @@ keyring = { workspace = true }
 # Native file-picker dialog for the composer attach button (Story 3.7). Yields OS
 # file paths (never bytes over IPC). MIT/Apache — passes `cargo deny check`.
 tauri-plugin-dialog = { workspace = true }
+# Native OS notifications from the sync loop (Story 10.1, FR-51). Wires the
+# `Platform::notify` port to the OS notifier; the plugin is registered in `lib.rs`.
+tauri-plugin-notification = { workspace = true }
+# Percent-decoding raw-body IPC headers (filename/caption) for the pasted-image
+# send path (Story 3.7). Already in the tree via url/matrix-sdk.
+percent-encoding = { workspace = true }
+
+# Desktop-only surfaces (Story 12.2, compile seam): these crates are
+# `#![cfg(not(target_os = "ios"))]`-style desktop plugins, so iOS must never link
+# them. Cargo target tables only understand real target cfgs (never tauri-build's
+# injected `desktop`/`mobile`), hence the explicit target_os list.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+# The desktop-only `tray-icon` tauri feature backing the opt-in menu-bar presence
+# (Story 10.3, FR-53). Merges into the base `tauri` dep on desktop targets only.
+tauri = { workspace = true, features = ["tray-icon"] }
 # OS-level global summon/hide hotkey (Story 9.4, FR-50). Registration/toggle live in
 # `hotkey.rs`; the accelerator string persists via `keeper-core::registry`.
 tauri-plugin-global-shortcut = { workspace = true }
-# Native OS notifications from the sync loop (Story 10.1, FR-51). Wires the desktop
-# `Platform::notify` port to the OS notifier; the plugin is registered in `lib.rs`.
-tauri-plugin-notification = { workspace = true }
 # Opt-in launch-at-login (Story 10.3, FR-53, AD-25). Registered in `lib.rs`; toggled
 # through the `launch_at_login_set` command via `ManagerExt::autolaunch()`.
 tauri-plugin-autostart = { workspace = true }
@@ -51,6 +63,3 @@ tauri-plugin-autostart = { workspace = true }
 # `tauri-plugin-process` supplies `relaunch()` after applying an update.
 tauri-plugin-updater = { workspace = true }
 tauri-plugin-process = { workspace = true }
-# Percent-decoding raw-body IPC headers (filename/caption) for the pasted-image
-# send path (Story 3.7). Already in the tree via url/matrix-sdk.
-percent-encoding = { workspace = true }

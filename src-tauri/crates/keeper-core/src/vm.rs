@@ -77,6 +77,38 @@ pub struct PingVm {
     pub ts: i64,
 }
 
+/// The per-platform capability handshake (Story 12.2): a flat, data-driven set of
+/// booleans, one per optional platform surface, served by the shell's
+/// `capabilities` command at startup and mirrored by the frontend.
+///
+/// `false` means the surface is **absent** on this build — the UI hides it (Epic
+/// 13) rather than offering an action that would fail. The struct lives here in
+/// `keeper-core::vm` (the VM home) but is *populated* per-platform in the shell
+/// crate, keeping the core free of `cfg(target_os)` (AD-26). A later target
+/// (Android / Windows) reuses this same shape by reporting its own flags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CapabilitiesVm {
+    /// The opt-in menu-bar (tray) icon (Story 10.3) exists on this platform.
+    pub tray_icon: bool,
+    /// The OS-global summon/hide hotkey (Story 9.4) exists on this platform.
+    pub global_hotkey: bool,
+    /// The launch-at-login toggle (Story 10.3, AD-25) exists on this platform.
+    pub launch_at_login: bool,
+    /// The in-app updater flow (Story 11.2) exists on this platform (app-store
+    /// distribution channels never get an in-app updater).
+    pub in_app_updater: bool,
+    /// The registry-derived native menu bar (Story 9.3) exists on this platform.
+    pub native_menu_bar: bool,
+    /// The `bbctl` bridge sidecar (Story 6.7) can exist on this platform (no
+    /// child processes / sidecars on mobile).
+    pub bridge_sidecar: bool,
+    /// "Reveal in Finder"-style file-manager reveal (Story 5.5) exists on this
+    /// platform.
+    pub reveal_in_file_manager: bool,
+}
+
 /// Stable, string-serialized error taxonomy for the IPC envelope.
 ///
 /// Variants serialize to their camelCase names (e.g. `"unsupported"`) and are

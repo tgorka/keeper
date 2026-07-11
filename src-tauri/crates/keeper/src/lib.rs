@@ -5,36 +5,50 @@
 // default type-layout recursion depth; raise it as matrix-sdk recommends.
 #![recursion_limit = "256"]
 
+#[cfg(desktop)]
 mod hotkey;
 mod ipc;
 mod media_protocol;
+#[cfg(desktop)]
 mod menu;
+#[cfg(desktop)]
 mod tray;
 
-use tauri::{Manager, WindowEvent};
+use tauri::Manager;
+#[cfg(desktop)]
+use tauri::WindowEvent;
 use tauri_plugin_deep_link::DeepLinkExt;
 
 /// Application entry point. Registers the plugin set and the typed IPC command
 /// surface, then runs the Tauri event loop.
+///
+/// Desktop-only surfaces (tray, global hotkey, autostart, updater, native menu,
+/// close-to-hide, Reopen) are gated behind `#[cfg(desktop)]` (Story 12.2): the
+/// iOS shell registers only notification, deep-link, dialog, opener, the
+/// `keeper-media://` protocol, and the IPC `invoke_handler`. The sequential
+/// `builder` rebinding below preserves the exact desktop registration order.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         // Native file-picker for the composer attach button (Story 3.7). Returns
         // OS file paths; Rust reads the file — no media bytes cross IPC.
-        .plugin(tauri_plugin_dialog::init())
-        // OS-level global summon/hide hotkey (Story 9.4, FR-50). The single accelerator
-        // is registered in `setup()` via `hotkey::install`; its press handler toggles
-        // the main window on focus.
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        // Native OS notifications from the sync loop (Story 10.1, FR-51). The desktop
-        // `Platform::notify` port posts through this plugin; the app handle is stored in
-        // `setup()` and notification permission is requested best-effort there.
-        .plugin(tauri_plugin_notification::init())
-        // Opt-in launch-at-login (Story 10.3, FR-53, AD-25). The autostart plugin owns
-        // the LaunchAgent state authoritatively; it is off by default and only ever
-        // toggled by an explicit user action via the `launch_at_login_set` command.
+        .plugin(tauri_plugin_dialog::init());
+    // OS-level global summon/hide hotkey (Story 9.4, FR-50). The single accelerator
+    // is registered in `setup()` via `hotkey::install`; its press handler toggles
+    // the main window on focus.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+    // Native OS notifications from the sync loop (Story 10.1, FR-51). The
+    // `Platform::notify` port posts through this plugin; the app handle is stored in
+    // `setup()` and notification permission is requested best-effort there.
+    let builder = builder.plugin(tauri_plugin_notification::init());
+    // Opt-in launch-at-login (Story 10.3, FR-53, AD-25). The autostart plugin owns
+    // the LaunchAgent state authoritatively; it is off by default and only ever
+    // toggled by an explicit user action via the `launch_at_login_set` command.
+    #[cfg(desktop)]
+    let builder = builder
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -46,7 +60,8 @@ pub fn run() {
         // supplies `relaunch()` for the in-app update flow to restart into the new
         // build. The in-app "check for updates" control drives both from the webview.
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_process::init());
+    let builder = builder
         .manage(ipc::AppState::new())
         // The exclusive decrypted-media transport (Story 3.6, AD-4): decrypted
         // bytes reach the webview only over this Range-capable `keeper-media://`
@@ -75,16 +90,20 @@ pub fn run() {
             // `registry_sections()` the ⌘? cheat sheet renders. No accelerators are
             // bound (the JS hooks own every binding); the shortcut is display-only
             // label text. A menu click routes through `on_menu_event` below.
-            let native_menu = menu::build_menu(app.handle())?;
-            app.set_menu(native_menu)?;
-            app.on_menu_event(|app, event| {
-                menu::handle_menu_event(app, event.id().as_ref());
-            });
+            #[cfg(desktop)]
+            {
+                let native_menu = menu::build_menu(app.handle())?;
+                app.set_menu(native_menu)?;
+                app.on_menu_event(|app, event| {
+                    menu::handle_menu_event(app, event.id().as_ref());
+                });
+            }
 
             // Register the OS-global summon/hide hotkey (Story 9.4): the persisted-or-
             // default accelerator, whose press handler toggles the main window on focus
             // and emits `keeper://global-hotkey-activated`. Best-effort — a registration
             // failure leaves the app running with `hotkey_get().active = false`.
+            #[cfg(desktop)]
             hotkey::install(app.handle());
 
             // Store the app handle for the desktop notifier port (Story 10.1) so
@@ -102,6 +121,7 @@ pub fn run() {
             // Build the menu-bar (tray) icon at startup only when the persisted opt-in
             // toggle is on (Story 10.3, FR-53). Off by default → no tray. A read failure
             // defaults off (the tray is a convenience, never load-bearing).
+            #[cfg(desktop)]
             {
                 let state = app.state::<ipc::AppState>();
                 let present = state
@@ -137,6 +157,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             ipc::app_ping,
+            ipc::capabilities,
             ipc::bridge_catalog,
             ipc::bridge_discover,
             ipc::bridge_login_start,
@@ -266,21 +287,24 @@ pub fn run() {
             ipc::launch_at_login_set,
             ipc::menu_bar_presence_get,
             ipc::menu_bar_presence_set
-        ])
-        // Window-close (⌘W / red button) hides the main window instead of destroying it
-        // (Story 10.3, FR-53): the process keeps every account's `SyncService` and the
-        // notification pipeline alive so background behavior is byte-for-byte identical to
-        // foreground. A real quit goes through `RunEvent::ExitRequested` (below), not here.
-        .on_window_event(|window, event| {
-            if window.label() == "main" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    if let Err(error) = window.hide() {
-                        tracing::warn!(%error, "could not hide main window on close; leaving it open");
-                    }
+        ]);
+    // Window-close (⌘W / red button) hides the main window instead of destroying it
+    // (Story 10.3, FR-53): the process keeps every account's `SyncService` and the
+    // notification pipeline alive so background behavior is byte-for-byte identical to
+    // foreground. A real quit goes through `RunEvent::ExitRequested` (below), not here.
+    // Desktop-only: on iOS the OS owns app lifecycle — there is no window close.
+    #[cfg(desktop)]
+    let builder = builder.on_window_event(|window, event| {
+        if window.label() == "main" {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                if let Err(error) = window.hide() {
+                    tracing::warn!(%error, "could not hide main window on close; leaving it open");
                 }
             }
-        })
+        }
+    });
+    builder
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| match event {
@@ -312,6 +336,7 @@ pub fn run() {
             // view. The kept notification backend has NO per-notification click callback,
             // so this is deliberately coarse — never exact-message routing (deferred to
             // Epic 11).
+            #[cfg(desktop)]
             tauri::RunEvent::Reopen { .. } => {
                 tray::show_main_window(app_handle);
                 ipc::emit_notify_navigate(app_handle);

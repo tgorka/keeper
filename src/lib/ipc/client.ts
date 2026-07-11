@@ -32,6 +32,7 @@ export type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 export type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 export type { BridgeSessionHealthVm } from "./gen/BridgeSessionHealthVm";
 export type { BridgeStatus } from "./gen/BridgeStatus";
+export type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
@@ -111,6 +112,7 @@ import type { BridgeHealthSnapshot } from "./gen/BridgeHealthSnapshot";
 import type { BridgeLoginInput } from "./gen/BridgeLoginInput";
 import type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
+import type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
 import type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
@@ -173,6 +175,19 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
       retriable: false,
     } satisfies IpcError;
   }
+}
+
+/**
+ * Fetch the per-platform capability handshake (Story 12.2). A one-shot read of the
+ * Rust-authored {@link CapabilitiesVm}: one boolean per optional platform surface
+ * (tray icon, global hotkey, launch-at-login, in-app updater, native menu bar,
+ * bridge sidecar, reveal-in-file-manager), where `false` means the surface is
+ * absent on this build. The frontend mirrors this into the capabilities store at
+ * startup and NEVER derives platform facts from user agents or build flags —
+ * Rust is the only authority. Rejects with the {@link IpcError} envelope.
+ */
+export async function capabilities(): Promise<CapabilitiesVm> {
+  return await invoke<CapabilitiesVm>("capabilities");
 }
 
 /**

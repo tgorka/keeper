@@ -25,10 +25,10 @@ use keeper_core::platform::Platform;
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
-    ChatNotifyMode, ConnectionStatusBatch, CouplingCaveatVm, DemoBatch, DockBadgeMode,
-    DraftMirrorBatch, EditVersionVm, EgressEndpointVm, EncryptionStatusBatch, ExportPhase,
-    ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError, IpcErrorCode,
-    MenuSectionVm, NetworksSnapshot, NewChatResolutionVm, NotifyTarget, OutboxVm,
+    CapabilitiesVm, ChatNotifyMode, ConnectionStatusBatch, CouplingCaveatVm, DemoBatch,
+    DockBadgeMode, DraftMirrorBatch, EditVersionVm, EgressEndpointVm, EncryptionStatusBatch,
+    ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError,
+    IpcErrorCode, MenuSectionVm, NetworksSnapshot, NewChatResolutionVm, NotifyTarget, OutboxVm,
     PaginationStatusBatch, PaletteMode, PaletteResultsVm, PingVm, Provider, RemoteDraftVm,
     ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch,
     TypingBatch, VerificationFlowVm,
@@ -203,15 +203,29 @@ impl ExportRegistry {
 }
 
 impl AppState {
-    /// Construct the desktop app state with the real platform implementation.
+    /// Construct the app state with the platform implementation for this build
+    /// target (Story 12.2): [`DesktopPlatform`] on desktop, [`IosPlatform`] on iOS.
     ///
     /// Resolves the platform data dir up front so the [`AccountManager`] can open
     /// the single app-wide `archive.db` and spawn its serialized writer (Story
     /// 5.1). If the data dir cannot be resolved (should not happen on a supported
-    /// desktop), fall back to the OS temp dir for the archive path so startup still
+    /// platform), fall back to the OS temp dir for the archive path so startup still
     /// succeeds — archiving degrades rather than aborting the app.
     pub fn new() -> Self {
+        #[cfg(desktop)]
         let platform: Arc<dyn Platform> = Arc::new(DesktopPlatform);
+        #[cfg(target_os = "ios")]
+        let platform: Arc<dyn Platform> = Arc::new(IosPlatform);
+        // Story 12.2's compile seam supports desktop and iOS only. A non-iOS mobile
+        // target (e.g. Android) is `mobile` — so `run()` still reaches this via the
+        // `#[cfg_attr(mobile, ...)]` entry point — but binds no `platform` above.
+        // Fail loudly and specifically here rather than with a bare "cannot find
+        // value `platform`"; such a target needs its own `Platform` port impl.
+        #[cfg(all(not(desktop), not(target_os = "ios")))]
+        compile_error!(
+            "no Platform implementation for this build target: Story 12.2's seam covers \
+             desktop and iOS only; add a Platform port impl for other mobile targets"
+        );
         let data_dir = platform.data_dir().unwrap_or_else(|e| {
             tracing::error!(error = %e, "could not resolve data dir; archive falls back to temp");
             std::env::temp_dir().join("dev.tgorka.keeper")
@@ -280,6 +294,7 @@ fn record_last_notify_target(target: &NotifyTarget) {
 
 /// Read the "last notification target" recorded at dispatch (Story 10.4), for the coarse
 /// navigate emit on app activation. A poisoned lock recovers to the stored value.
+#[cfg(desktop)]
 pub fn last_notify_target() -> NotifyTarget {
     match last_notify_target_slot().lock() {
         Ok(slot) => slot.clone(),
@@ -292,6 +307,7 @@ pub fn last_notify_target() -> NotifyTarget {
 /// its KIND to a coarse view (Message → Inbox, Bridge → Bridges). Once consumed the
 /// target is reset to [`NotifyTarget::None`] so a later plain dock-click does not re-emit
 /// a stale landing.
+#[cfg(desktop)]
 pub const NOTIFY_NAVIGATE_EVENT: &str = "notify://navigate";
 
 /// Emit the coarse navigate event to the main window from the last recorded notification
@@ -300,6 +316,7 @@ pub const NOTIFY_NAVIGATE_EVENT: &str = "notify://navigate";
 /// A [`NotifyTarget::None`] (no notification since the last activation, e.g. a plain
 /// dock-click) is a no-op — only Message/Bridge targets emit. Best-effort: a missing
 /// window or an emit failure is logged at `warn`, never a panic.
+#[cfg(desktop)]
 pub fn emit_notify_navigate(app: &tauri::AppHandle) {
     use tauri::{Emitter, Manager};
 
@@ -322,6 +339,7 @@ pub fn emit_notify_navigate(app: &tauri::AppHandle) {
 
 /// The label of the main window (matches `tauri.conf.json` / the default capability),
 /// whose dock badge the desktop `Platform::set_badge_count` port drives (Story 10.3).
+#[cfg(desktop)]
 const MAIN_WINDOW_LABEL: &str = "main";
 
 /// The Tauri app handle used by the desktop `Platform::set_badge_count` port to set the
@@ -342,8 +360,10 @@ pub fn set_badge_app_handle(handle: tauri::AppHandle) {
 /// The data-dir port is fully wired via `dirs`; the remaining ports return
 /// [`CoreError::Unsupported`] until later stories fill them (honest, never
 /// panicking).
+#[cfg(desktop)]
 pub struct DesktopPlatform;
 
+#[cfg(desktop)]
 impl Platform for DesktopPlatform {
     fn data_dir(&self) -> Result<PathBuf, CoreError> {
         let base = dirs::data_dir().ok_or_else(|| {
@@ -456,6 +476,100 @@ impl Platform for DesktopPlatform {
                 "sidecar {name:?} not found next to the executable"
             )))
         }
+    }
+}
+
+/// Concrete [`Platform`] implementation for the iOS shell (Story 12.2).
+///
+/// The Apple-shared ports (data dir via `dirs`, keychain via `keyring`'s
+/// `apple-native` backend, browser-open via the opener plugin, notifications via
+/// the notification plugin) mirror the desktop bodies. The desktop-only ports are
+/// honest about their absence: `sidecar_path` returns [`CoreError::Unsupported`]
+/// (no child processes / sidecars on iOS — ever), and `set_badge_count` is a
+/// no-op (the desktop dock badge does not exist; an iOS app badge arrives with
+/// the push/notification work in a later story, never here).
+#[cfg(target_os = "ios")]
+pub struct IosPlatform;
+
+#[cfg(target_os = "ios")]
+impl Platform for IosPlatform {
+    fn data_dir(&self) -> Result<PathBuf, CoreError> {
+        // Inside the iOS sandbox `dirs::data_dir()` resolves to the app
+        // container's `Library/Application Support`.
+        let base = dirs::data_dir().ok_or_else(|| {
+            PlatformError::DirUnavailable("no OS data directory available".to_owned())
+        })?;
+        Ok(base.join("dev.tgorka.keeper"))
+    }
+
+    fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
+            .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
+        entry
+            .set_password(value)
+            .map_err(|e| PlatformError::Keychain(format!("could not store secret: {e}")))?;
+        Ok(())
+    }
+
+    fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
+            .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
+        match entry.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(PlatformError::Keychain(format!("could not read secret: {e}")).into()),
+        }
+    }
+
+    fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
+            .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
+        match entry.delete_credential() {
+            // Deleting a missing entry is a no-op (rollback safety).
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(PlatformError::Keychain(format!("could not delete secret: {e}")).into()),
+        }
+    }
+
+    fn open_url(&self, url: &str) -> Result<(), CoreError> {
+        // "Open in browser" stays `tauri_plugin_opener::open_url` on iOS too —
+        // it hands the URL to the OS (Safari / the default handler).
+        tauri_plugin_opener::open_url(url, None::<&str>)
+            .map_err(|e| CoreError::Internal(format!("could not open the system browser: {e}")))
+    }
+
+    fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
+        use tauri_plugin_notification::NotificationExt;
+
+        // Mirror the desktop port: record the coarse click-through target, then
+        // post through the (mobile-capable) notification plugin. When the handle
+        // is unset this is an honest `Unsupported`, never a panic.
+        record_last_notify_target(target);
+        let app = NOTIFY_APP.get().ok_or_else(|| {
+            CoreError::Unsupported("notification app handle is not set (headless)".to_owned())
+        })?;
+        app.notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show()
+            .map_err(|e| CoreError::Internal(format!("could not post notification: {e}")))
+    }
+
+    fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
+        // The desktop dock badge does not exist on iOS; the app-icon badge is a
+        // notification concern deferred to the phone-shell epic. Honest no-op —
+        // the Rust-computed aggregate simply reaches no OS surface here.
+        Ok(())
+    }
+
+    fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError> {
+        // No child processes / sidecars on iOS, ever (Story 12.2 boundary). The
+        // `Unsupported` funnels through `to_ipc_error` to
+        // `IpcErrorCode::Unsupported` (`retriable: false`) at the command edge.
+        Err(CoreError::Unsupported(format!(
+            "sidecar {name:?} is not available on iOS"
+        )))
     }
 }
 
@@ -809,6 +923,26 @@ pub fn app_ping(state: State<'_, AppState>) -> Result<PingVm, IpcError> {
     Ok(PingVm {
         message: "pong".to_owned(),
         ts: now_ms(),
+    })
+}
+
+/// The per-platform capability handshake (Story 12.2): the flat, data-driven
+/// [`CapabilitiesVm`] the frontend mirrors at startup so it never consults user
+/// agents or build flags. `false` means the surface is absent on this build.
+///
+/// Populated here — the shell is the platform adapter layer — with `cfg!(desktop)`
+/// so `keeper-core` stays free of `cfg(target_os)` (AD-26). A later target
+/// (Android / Windows) reuses the mechanism by reporting its own flags.
+#[tauri::command]
+pub fn capabilities() -> Result<CapabilitiesVm, IpcError> {
+    Ok(CapabilitiesVm {
+        tray_icon: cfg!(desktop),
+        global_hotkey: cfg!(desktop),
+        launch_at_login: cfg!(desktop),
+        in_app_updater: cfg!(desktop),
+        native_menu_bar: cfg!(desktop),
+        bridge_sidecar: cfg!(desktop),
+        reveal_in_file_manager: cfg!(desktop),
     })
 }
 
@@ -1641,6 +1775,7 @@ pub fn export_cancel(state: State<'_, AppState>, export_id: u64) -> Result<(), I
 /// Delegates to `tauri_plugin_opener::reveal_item_in_dir` (the `opener:default`
 /// capability grants `allow-reveal-item-in-dir`). An invalid / non-existent path
 /// maps to a non-retriable internal `IpcError` — never a panic.
+#[cfg(desktop)]
 #[tauri::command]
 pub fn reveal_path(path: String) -> Result<(), IpcError> {
     tauri_plugin_opener::reveal_item_in_dir(&path).map_err(|e| {
@@ -1648,6 +1783,19 @@ pub fn reveal_path(path: String) -> Result<(), IpcError> {
             "could not reveal the file: {e}"
         )))
     })
+}
+
+/// Mobile stub for [`reveal_path`] (Story 12.2): there is no user-visible file
+/// manager to reveal into on iOS — an honest `Unsupported` (`retriable: false`)
+/// through the single `to_ipc_error` funnel. The `revealInFileManager` capability
+/// is reported `false`, so Epic 13 hides the affordance before it is ever invoked.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn reveal_path(path: String) -> Result<(), IpcError> {
+    let _ = path;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "revealing a file in the OS file manager is desktop-only".to_owned(),
+    )))
 }
 
 /// Subscribe to an account's sliding-sync room list (FR-8, AD-8/9/19/20).
@@ -1763,6 +1911,7 @@ pub fn set_undo_send_window(state: State<'_, AppState>, seconds: u16) -> Result<
 /// Build the [`HotkeyVm`] for `accelerator`: `isDefault` vs the shipped default, `active`
 /// = whether it is currently registered with the OS, and the soft `conflict` warning.
 /// Pure over the app's global-shortcut state and the accelerator string.
+#[cfg(desktop)]
 fn hotkey_vm(app: &tauri::AppHandle, accelerator: String) -> HotkeyVm {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
     let is_default = accelerator == crate::hotkey::DEFAULT_HOTKEY;
@@ -1783,11 +1932,23 @@ fn hotkey_vm(app: &tauri::AppHandle, accelerator: String) -> HotkeyVm {
 /// accelerator (absent ⇒ the default `⌃⌥Space`), whether it equals the default, whether
 /// it is currently registered with the OS (`active`), and any soft conflict warning.
 /// Failures funnel through [`to_ipc_error`].
+#[cfg(desktop)]
 #[tauri::command]
 pub fn hotkey_get(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<HotkeyVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let accelerator = keeper_core::registry::get_global_hotkey(&data_dir).map_err(to_ipc_error)?;
     Ok(hotkey_vm(&app, accelerator))
+}
+
+/// Mobile stub for [`hotkey_get`] (Story 12.2): there is no OS-global hotkey on
+/// iOS — an honest `Unsupported` (`retriable: false`) through `to_ipc_error`. The
+/// `globalHotkey` capability is reported `false`, so Epic 13 hides the section.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn hotkey_get() -> Result<HotkeyVm, IpcError> {
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the OS-global summon hotkey is desktop-only".to_owned(),
+    )))
 }
 
 /// Reassign the OS-global summon hotkey (Story 9.4, FR-50). Validates the accelerator,
@@ -1797,6 +1958,7 @@ pub fn hotkey_get(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<H
 /// the new registration — or the OS accepts it but persisting the value fails — the old
 /// binding is restored (re-registered) and nothing is persisted, and the command returns
 /// `Err`. Logs carry accelerator strings only.
+#[cfg(desktop)]
 #[tauri::command]
 pub fn hotkey_set(
     app: tauri::AppHandle,
@@ -1869,6 +2031,18 @@ pub fn hotkey_set(
         return Err(to_ipc_error(error));
     }
     Ok(hotkey_vm(&app, accelerator))
+}
+
+/// Mobile stub for [`hotkey_set`] (Story 12.2): there is no OS-global hotkey on
+/// iOS — an honest `Unsupported` (`retriable: false`) through `to_ipc_error`.
+/// Nothing is validated, registered, or persisted.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn hotkey_set(accelerator: String) -> Result<HotkeyVm, IpcError> {
+    let _ = accelerator;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the OS-global summon hotkey is desktop-only".to_owned(),
+    )))
 }
 
 /// Cancel a held send by its `id` (Story 8.3): delete the `outbox` row, persist its
@@ -2688,6 +2862,7 @@ pub async fn dock_badge_mode_set(
 /// plugin is the single source of truth (its LaunchAgent state), so this reads
 /// `autolaunch().is_enabled()` rather than a shadow setting. Default off on a fresh
 /// install. Errors funnel through [`to_ipc_error`].
+#[cfg(desktop)]
 #[tauri::command]
 pub fn launch_at_login_get(app: tauri::AppHandle) -> Result<bool, IpcError> {
     use tauri_plugin_autostart::ManagerExt;
@@ -2698,10 +2873,22 @@ pub fn launch_at_login_get(app: tauri::AppHandle) -> Result<bool, IpcError> {
     })
 }
 
+/// Mobile stub for [`launch_at_login_get`] (Story 12.2): iOS has no LaunchAgent /
+/// autostart concept — an honest `Unsupported` (`retriable: false`). The
+/// `launchAtLogin` capability is reported `false`, so Epic 13 hides the toggle.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn launch_at_login_get() -> Result<bool, IpcError> {
+    Err(to_ipc_error(CoreError::Unsupported(
+        "launch-at-login is desktop-only".to_owned(),
+    )))
+}
+
 /// Set launch-at-login (Story 10.3, FR-53, AD-25). Enables/disables the LaunchAgent
 /// through the autostart plugin (authoritative — no shadow source of truth). Off by
 /// default; only ever toggled by an explicit user action. Errors funnel through
 /// [`to_ipc_error`].
+#[cfg(desktop)]
 #[tauri::command]
 pub fn launch_at_login_set(app: tauri::AppHandle, enabled: bool) -> Result<(), IpcError> {
     use tauri_plugin_autostart::ManagerExt;
@@ -2714,9 +2901,22 @@ pub fn launch_at_login_set(app: tauri::AppHandle, enabled: bool) -> Result<(), I
     result.map_err(|e| to_ipc_error(CoreError::Internal(format!("could not set autostart: {e}"))))
 }
 
+/// Mobile stub for [`launch_at_login_set`] (Story 12.2): iOS has no LaunchAgent /
+/// autostart concept — an honest `Unsupported` (`retriable: false`); nothing is
+/// toggled or persisted.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn launch_at_login_set(enabled: bool) -> Result<(), IpcError> {
+    let _ = enabled;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "launch-at-login is desktop-only".to_owned(),
+    )))
+}
+
 /// Read the menu-bar (tray) presence toggle (Story 10.3, FR-53). Reads the persisted
 /// `system.menu_bar_presence` setting (default off). Errors funnel through
 /// [`to_ipc_error`].
+#[cfg(desktop)]
 #[tauri::command]
 pub fn menu_bar_presence_get(state: State<'_, AppState>) -> Result<bool, IpcError> {
     state
@@ -2725,10 +2925,21 @@ pub fn menu_bar_presence_get(state: State<'_, AppState>) -> Result<bool, IpcErro
         .map_err(to_ipc_error)
 }
 
+/// Mobile stub for [`menu_bar_presence_get`] (Story 12.2): there is no menu-bar /
+/// tray icon on iOS, so presence is honestly `false` regardless of any persisted
+/// desktop-written value — the `trayIcon` capability is the single source of truth
+/// for surface presence (Epic 13), never this setting.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn menu_bar_presence_get() -> Result<bool, IpcError> {
+    Ok(false)
+}
+
 /// Set the menu-bar (tray) presence toggle (Story 10.3, FR-53). Persists into the
 /// `settings` k/v table under `system.menu_bar_presence`, then creates or destroys the
 /// tray icon live through the app handle. Off by default; only ever toggled by an
 /// explicit user action. Errors funnel through [`to_ipc_error`].
+#[cfg(desktop)]
 #[tauri::command]
 pub fn menu_bar_presence_set(
     app: tauri::AppHandle,
@@ -2742,6 +2953,19 @@ pub fn menu_bar_presence_set(
         .map_err(to_ipc_error)?;
     crate::tray::set_tray_presence(&app, enabled);
     Ok(())
+}
+
+/// Mobile stub for [`menu_bar_presence_set`] (Story 12.2): there is no menu-bar /
+/// tray icon on iOS — an honest `Unsupported` (`retriable: false`); nothing is
+/// persisted (the desktop-only flag must not silently change from a phone). The
+/// `trayIcon` capability is reported `false`, so Epic 13 hides the toggle.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn menu_bar_presence_set(enabled: bool) -> Result<(), IpcError> {
+    let _ = enabled;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the menu-bar (tray) presence is desktop-only".to_owned(),
+    )))
 }
 
 /// Read the per-Chat notification mode for `(accountId, roomId)` (Story 10.2). Resolves

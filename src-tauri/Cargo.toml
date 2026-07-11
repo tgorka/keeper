@@ -20,7 +20,10 @@ unwrap_used = "warn"
 [workspace.dependencies]
 # Tauri shell. The `tray-icon` feature backs the opt-in menu-bar presence (Story 10.3,
 # FR-53); the dock-badge port uses the in-core `set_badge_count` API (no extra feature).
-tauri = { version = "2", features = ["tray-icon"] }
+# The feature is desktop-only and is added by the `keeper` crate through a
+# target-gated dependency entry (Story 12.2) — Cargo target tables only understand
+# real target cfgs, so the base workspace dep stays featureless-of-tray here.
+tauri = { version = "2" }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-deep-link = "2"
