@@ -1,7 +1,26 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MediaPreviewOverlay } from "@/components/chat/media-preview-overlay";
 import type { MediaVm } from "@/lib/ipc/client";
+import { lifecycleStore } from "@/lib/stores/lifecycle";
+
+// The shed reads the shared lifecycleStore singleton; reset it after every test
+// so no phase leaks into an order-dependent sibling suite.
+afterEach(() => {
+  lifecycleStore.setState({ phase: "foreground" });
+});
+
+function background(): void {
+  act(() => {
+    lifecycleStore.getState().setPhase("background");
+  });
+}
+
+function foreground(): void {
+  act(() => {
+    lifecycleStore.getState().setPhase("foreground");
+  });
+}
 
 function media(overrides: Partial<MediaVm> = {}): MediaVm {
   return {
@@ -77,5 +96,55 @@ describe("MediaPreviewOverlay", () => {
     render(<MediaPreviewOverlay media={media()} onClose={onClose} />);
     fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it("drops the full-res image src on background and restores it on foreground (Story 14.5)", () => {
+    render(<MediaPreviewOverlay media={media()} onClose={() => {}} />);
+    const img = screen.getByAltText("photo.png") as HTMLImageElement;
+    expect(img.getAttribute("src")).toBe("keeper-media://media/acct/room/k1/full");
+
+    background();
+    expect(screen.getByAltText("photo.png").getAttribute("src")).toBeNull();
+
+    foreground();
+    expect(screen.getByAltText("photo.png").getAttribute("src")).toBe(
+      "keeper-media://media/acct/room/k1/full",
+    );
+  });
+
+  it("does NOT drop the video preview src across a shed cycle (regression guard)", () => {
+    // Dropping a <video> src would reset playback (autoPlay restarts from 0) and
+    // force a large re-download; video preview is exempt from the shed.
+    render(
+      <MediaPreviewOverlay
+        media={media({ kind: "video", filename: "clip.mp4", mimetype: "video/mp4" })}
+        onClose={() => {}}
+      />,
+    );
+    expect(document.querySelector("video")?.getAttribute("src")).toBe(
+      "keeper-media://media/acct/room/k1/full",
+    );
+
+    background();
+    expect(document.querySelector("video")?.getAttribute("src")).toBe(
+      "keeper-media://media/acct/room/k1/full",
+    );
+  });
+
+  it("does NOT drop the audio preview src across a shed cycle (regression guard)", () => {
+    render(
+      <MediaPreviewOverlay
+        media={media({ kind: "audio", thumbnailUrl: null, filename: "clip.ogg" })}
+        onClose={() => {}}
+      />,
+    );
+    expect(document.querySelector("audio")?.getAttribute("src")).toBe(
+      "keeper-media://media/acct/room/k1/full",
+    );
+
+    background();
+    expect(document.querySelector("audio")?.getAttribute("src")).toBe(
+      "keeper-media://media/acct/room/k1/full",
+    );
   });
 });

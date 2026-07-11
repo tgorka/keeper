@@ -24,10 +24,17 @@
  * IPC errors are swallowed (best-effort, no toast) — a failed pause/resume must
  * never surface UI. A later Swift `UIApplication` plugin will call the same
  * command; this hook is the interim driver only.
+ *
+ * This same dispatch also feeds the frontend {@link lifecycleStore} (Story 14.5)
+ * so the media shed derives from this one listener — one visibility signal, one
+ * lifecycle truth. The store write is only reached on the reduced tier (the hook
+ * attaches nothing on desktop), so desktop keeps the store at its `"foreground"`
+ * default and never sheds.
  */
 import { useEffect } from "react";
 import { appLifecycleChanged } from "@/lib/ipc/client";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
+import { lifecycleStore } from "@/lib/stores/lifecycle";
 
 export function useAppLifecycle(): void {
   const isReducedCapability = useIsReducedCapabilityPlatform();
@@ -58,6 +65,10 @@ export function useAppLifecycle(): void {
       if (phase === null) {
         return;
       }
+      // Feed the frontend lifecycle store alongside the IPC call so the media
+      // shed derives from this one listener (Story 14.5). Only reached on the
+      // reduced tier, so desktop keeps the store at its "foreground" default.
+      lifecycleStore.getState().setPhase(phase);
       // Best-effort: swallow IPC errors (no toast).
       void appLifecycleChanged(phase).catch(() => {});
     };

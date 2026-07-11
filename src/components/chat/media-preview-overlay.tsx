@@ -19,6 +19,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { MediaVm } from "@/lib/ipc/client";
+import { useMediaShed } from "@/lib/stores/lifecycle";
 
 interface MediaPreviewOverlayProps {
   /** The media to preview, or `null` when the overlay is closed. */
@@ -73,6 +74,14 @@ function PreviewBody({ media }: { media: MediaVm }) {
     setErrored(false);
     setNonce((n) => n + 1);
   }, []);
+  // Story 14.5: while backgrounded on the reduced (iOS) tier, drop the full-res
+  // IMAGE src — the single heaviest decoded holder — to release its bitmap. A
+  // brief re-load of the image on resume of an already-open overlay is the
+  // accepted cost (the URL is restored, not proven cache-served). Video/audio
+  // preview src is left untouched: dropping it would reset playback position and
+  // force a large re-download (autoPlay restarts from 0). Desktop keeps the
+  // store at "foreground", so `shed` is always false there.
+  const shed = useMediaShed();
 
   if (errored) {
     return (
@@ -92,7 +101,8 @@ function PreviewBody({ media }: { media: MediaVm }) {
   if (media.kind === "image") {
     return (
       <img
-        src={src}
+        key={shed ? "shed" : "live"}
+        src={shed ? undefined : src}
         alt={media.filename}
         onError={onError}
         className="max-h-[85vh] max-w-full rounded-lg object-contain"

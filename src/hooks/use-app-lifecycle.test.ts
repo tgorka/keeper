@@ -2,6 +2,7 @@ import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAppLifecycle } from "@/hooks/use-app-lifecycle";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { lifecycleStore } from "@/lib/stores/lifecycle";
 
 // Mock the IPC wrapper so the hook drives a spy, never a live Tauri backend.
 const appLifecycleChanged = vi.fn<(phase: "foreground" | "background") => Promise<void>>(() =>
@@ -44,6 +45,9 @@ beforeEach(() => {
 
 afterEach(() => {
   capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  // The lifecycle store is a module-load singleton; reset it so no phase leaks
+  // into an order-dependent sibling suite.
+  lifecycleStore.setState({ phase: "foreground" });
 });
 
 describe("useAppLifecycle", () => {
@@ -136,6 +140,32 @@ describe("useAppLifecycle", () => {
     setVisibility("hidden");
 
     expect(appLifecycleChanged).not.toHaveBeenCalled();
+  });
+
+  it("feeds the lifecycle store alongside the IPC call on the reduced tier", () => {
+    // The single listener also writes the frontend lifecycle store (Story 14.5),
+    // so the media shed derives from one lifecycle truth.
+    hydrateReducedTier();
+    renderHook(() => useAppLifecycle());
+    // Mount-time dispatch while visible: store reads foreground (shed false).
+    expect(lifecycleStore.getState().phase).toBe("foreground");
+
+    setVisibility("hidden");
+    expect(lifecycleStore.getState().phase).toBe("background");
+
+    setVisibility("visible");
+    expect(lifecycleStore.getState().phase).toBe("foreground");
+  });
+
+  it("never touches the lifecycle store on the desktop tier (byte-identical)", () => {
+    capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
+    renderHook(() => useAppLifecycle());
+
+    setVisibility("hidden");
+    setVisibility("visible");
+
+    // No listener attaches on desktop, so the store stays at its default.
+    expect(lifecycleStore.getState().phase).toBe("foreground");
   });
 
   it("swallows an IPC rejection (no toast, no throw)", () => {

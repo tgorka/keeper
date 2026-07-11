@@ -14,10 +14,11 @@
  * Quick-Look overlay. Width/height reserve layout so the thumbnail never reflows.
  */
 import { FileIcon, FileVideo, Loader2, RefreshCw } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { MediaVm } from "@/lib/ipc/client";
+import { useMediaShed } from "@/lib/stores/lifecycle";
 import { cn } from "@/lib/utils";
 
 interface MediaAttachmentProps {
@@ -85,6 +86,23 @@ export function MediaAttachment({
   const [errored, setErrored] = useState(false);
   // Bumped on retry to cache-bust the src and re-trigger load/error.
   const [nonce, setNonce] = useState(0);
+  // Story 14.5: on the reduced (iOS) tier, while backgrounded, drop the IMAGE
+  // src so WebKit can release its decoded bitmap; the request-scoped keeper-media://
+  // byte buffer frees when its (possibly-detached) fetch task completes, not
+  // necessarily on the instant the src clears. Desktop keeps the store at
+  // "foreground", so `shed` is always false. Audio/video/poster playback surfaces
+  // are intentionally NOT shed (see below).
+  const shed = useMediaShed();
+
+  // Drop the "loaded" flag when the image src is shed, so on the restore frame the
+  // skeleton — not a blank, undecoded <img> at full opacity — covers the re-decode
+  // until the remounted element fires onLoad again. Reading `shed` in the body keeps
+  // it a genuine dependency (no lint no-op).
+  useEffect(() => {
+    if (shed) {
+      setLoaded(false);
+    }
+  }, [shed]);
 
   const onRetry = useCallback(() => {
     setErrored(false);
@@ -120,9 +138,16 @@ export function MediaAttachment({
     }
 
     if (media.kind === "image") {
+      // While shed, drop the src so the decoded bitmap is released; `loaded` was
+      // reset when entering shed (above), so `imageLoaded` stays false through the
+      // restore until the remounted <img> fires onLoad — the existing skeleton
+      // covers the re-load in both directions. Keying the <img> on `shed` forces a
+      // remount across the shed cycle (fresh element, fresh decode).
+      const imageSrc = shed ? undefined : (thumbSrc ?? fullSrc);
+      const imageLoaded = loaded && !shed;
       return (
         <div className="relative max-w-[320px] overflow-hidden rounded-lg" style={aspectStyle}>
-          {!loaded && <Skeleton className="absolute inset-0 h-full w-full" />}
+          {!imageLoaded && <Skeleton className="absolute inset-0 h-full w-full" />}
           <button
             type="button"
             aria-label={`Open image ${media.filename}`}
@@ -131,11 +156,12 @@ export function MediaAttachment({
             className={cn(
               "block w-full",
               onOpenPreview != null && "cursor-pointer",
-              !loaded && "opacity-0",
+              !imageLoaded && "opacity-0",
             )}
           >
             <img
-              src={thumbSrc ?? fullSrc}
+              key={shed ? "shed" : "live"}
+              src={imageSrc}
               alt={media.filename}
               width={media.width ?? undefined}
               height={media.height ?? undefined}
@@ -210,7 +236,11 @@ export function MediaAttachment({
       return (
         <div className="flex max-w-[320px] flex-col gap-1">
           {/* Inline audio playback over the protocol (AC3). No skeleton needed —
-            the controls render immediately; loading is handled by the element. */}
+            the controls render immediately; loading is handled by the element.
+            NOT shed on background (Story 14.5): dropping an <audio> src resets
+            currentTime to 0 and forces a re-download on foreground, for the
+            negligible memory a preload="metadata" element holds. The image
+            branch above carries the whole memory win. */}
           {/* biome-ignore lint/a11y/useMediaCaption: user-sent voice/audio clips have no caption track. */}
           <audio
             src={fullSrc}

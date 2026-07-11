@@ -155,7 +155,7 @@ development_status:
   14-2-honest-no-background-sync-disclosure: done
   14-3-foreground-notifications-and-the-all-accounts-badge: done
   14-4-resume-integrity-blank-webview-guard-and-stale-resume-pill: done
-  14-5-memory-hygiene-under-jetsam: backlog
+  14-5-memory-hygiene-under-jetsam: done
   14-6-flaky-network-resilience: backlog
   14-7-backup-exclusion-and-file-protection: backlog
   epic-14-retrospective: optional

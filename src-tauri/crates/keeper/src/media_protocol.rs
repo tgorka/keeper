@@ -25,6 +25,14 @@
 //! handled by the fire-and-forget `responder.respond(...)` (best-effort — on
 //! an invalidated task it is a no-op, not a panic); on-device tolerance is
 //! confirmed in Story 12.6. Retry-on-cold-cache is the same pure-frontend path.
+//!
+//! **Memory hygiene (Story 14.5):** the media byte buffer is request-scoped —
+//! each `keeper-media://` request fetches, slices, responds, and drops its
+//! bytes; there is no persistent in-memory media cache to shed. The Story 12.4
+//! [`MAX_MEDIA_RANGE_CHUNK`] cap (unchanged here) bounds the slice each Range
+//! request materializes, so sustained seeking cannot escalate the per-request
+//! copy. The droppable *decoded-image* memory lives in the WKWebView renderer,
+//! not here; the frontend sheds it on background by dropping image `src`.
 
 use keeper_core::media::{parse_media_url, MediaBytes, MediaHandle};
 use tauri::http::{header, Request, Response, StatusCode};
@@ -406,6 +414,72 @@ mod tests {
             capped_range_end(u64::MAX - 2, u64::MAX, 8 * 1024 * 1024),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn capped_slice_len_bounded_per_request_across_seek_sweep() {
+        // Story 14.5: mirror the slice-materialization shape `partial_or_full`
+        // uses (clamp the inclusive end with `capped_range_end`, then
+        // `bytes.get(start..=end)`) and assert the actually-materialized buffer for
+        // each Range request is bounded by the iOS cap — a step beyond the pure
+        // clamp-arithmetic covered by `capped_range_end_clamps_saturates_and_noops`.
+        // It does not call `partial_or_full` itself (that needs a full response +
+        // responder context); the cap's wiring into the handler is covered by that
+        // arithmetic test plus on-device SM-8. Buffers are request-scoped (fetched,
+        // sliced, dropped per request), so there is no cross-seek accumulation to
+        // model — this verifies the PER-REQUEST cap on the materialized slice,
+        // which is what bounds peak memory under sustained seeking.
+        //
+        // Use a deliberately small local cap so a modest synthetic buffer can
+        // exceed it many times over (the production `MAX_MEDIA_RANGE_CHUNK` is
+        // 8 MiB on iOS — allocating past it per offset would be wasteful here).
+        // The clamp math is identical; only the constant differs.
+        const IOS_CAP: u64 = 4 * 1024;
+        let total: u64 = 64 * 1024;
+        let bytes: Vec<u8> = (0..total).map(|i| (i % 256) as u8).collect();
+        let last = total - 1;
+
+        // Sweep open-ended `bytes=start-` seeks across the whole buffer, plus a
+        // few offsets past the end to defend the saturating/degenerate paths.
+        for start in (0..total + 2 * IOS_CAP).step_by((IOS_CAP / 3) as usize) {
+            // Mirror `partial_or_full`'s slice shape: clamp the inclusive end, then
+            // materialize the slice the same way.
+            let end = capped_range_end(start, last, IOS_CAP);
+            let slice = bytes
+                .get(start as usize..=end as usize)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default();
+            // The materialized slice never exceeds the cap, at any offset.
+            assert!(
+                slice.len() as u64 <= IOS_CAP,
+                "materialized slice ({} bytes) exceeded cap ({IOS_CAP}) at start={start}",
+                slice.len(),
+            );
+            // In-bounds seeks materialize a non-empty, exactly-capped-or-shorter
+            // slice; a start past the end yields an empty slice (get() is None).
+            if start <= last {
+                let expected = (last - start + 1).min(IOS_CAP);
+                assert_eq!(
+                    slice.len() as u64,
+                    expected,
+                    "wrong slice len at start={start}"
+                );
+            } else {
+                assert!(
+                    slice.is_empty(),
+                    "expected empty slice past end at start={start}"
+                );
+            }
+        }
+
+        // A `u64::MAX` end (the `bytes=start-` shape before clamping to `last`)
+        // must still clamp to the cap under saturating arithmetic, never panic.
+        let end = capped_range_end(0, u64::MAX, IOS_CAP);
+        let slice = bytes
+            .get(0..=end as usize)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
+        assert!(slice.len() as u64 <= IOS_CAP);
     }
 
     #[test]

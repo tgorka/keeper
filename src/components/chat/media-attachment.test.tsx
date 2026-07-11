@@ -1,7 +1,26 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MediaAttachment } from "@/components/chat/media-attachment";
 import type { MediaVm } from "@/lib/ipc/client";
+import { lifecycleStore } from "@/lib/stores/lifecycle";
+
+// The shed reads the shared lifecycleStore singleton; reset it after every test
+// so no phase leaks into an order-dependent sibling suite.
+afterEach(() => {
+  lifecycleStore.setState({ phase: "foreground" });
+});
+
+function background(): void {
+  act(() => {
+    lifecycleStore.getState().setPhase("background");
+  });
+}
+
+function foreground(): void {
+  act(() => {
+    lifecycleStore.getState().setPhase("foreground");
+  });
+}
 
 function media(overrides: Partial<MediaVm> = {}): MediaVm {
   return {
@@ -122,5 +141,77 @@ describe("MediaAttachment", () => {
     render(<MediaAttachment media={media()} messageKey="k1" />);
     const button = screen.getByRole("button", { name: "Open image photo.png" });
     expect(button).toBeDisabled();
+  });
+
+  it("drops the image src on background and restores it on foreground (Story 14.5)", () => {
+    const { container } = render(<MediaAttachment media={media()} messageKey="k1" />);
+    const img = screen.getByAltText("photo.png") as HTMLImageElement;
+    expect(img.getAttribute("src")).toBe("keeper-media://media/acct/room/k1/thumb");
+    // Load the image so the skeleton is normally gone in the foreground.
+    fireEvent.load(img);
+    expect(container.querySelector('[data-slot="skeleton"]')).toBeNull();
+
+    // Background: the shed fires — the image src is dropped (bitmap released)
+    // and the skeleton is shown again so the re-load is covered on restore.
+    background();
+    const shed = screen.getByAltText("photo.png") as HTMLImageElement;
+    expect(shed.getAttribute("src")).toBeNull();
+    expect(container.querySelector('[data-slot="skeleton"]')).not.toBeNull();
+
+    // Foreground: the src is restored so the image re-hydrates.
+    foreground();
+    const restored = screen.getByAltText("photo.png") as HTMLImageElement;
+    expect(restored.getAttribute("src")).toBe("keeper-media://media/acct/room/k1/thumb");
+  });
+
+  it("does NOT drop the inline audio src across a shed cycle (regression guard)", () => {
+    // Dropping an <audio> src would reset playback to 0 and force a re-download;
+    // audio playback is explicitly exempt from the shed (Story 14.5, finding #1).
+    const { container } = render(
+      <MediaAttachment
+        media={media({
+          kind: "audio",
+          thumbnailUrl: null,
+          filename: "clip.ogg",
+          mimetype: "audio/ogg",
+          width: null,
+          height: null,
+        })}
+        messageKey="k1"
+      />,
+    );
+    const audio = container.querySelector("audio");
+    expect(audio?.getAttribute("src")).toBe("keeper-media://media/acct/room/k1/full");
+
+    background();
+    // The audio src stays put — playback is never reset by the shed.
+    expect(container.querySelector("audio")?.getAttribute("src")).toBe(
+      "keeper-media://media/acct/room/k1/full",
+    );
+    foreground();
+    expect(container.querySelector("audio")?.getAttribute("src")).toBe(
+      "keeper-media://media/acct/room/k1/full",
+    );
+  });
+
+  it("does NOT drop the video poster src across a shed cycle (regression guard)", () => {
+    // Dropping the poster <img> would flip hasPoster and morph the postered
+    // video to its placeholder across a background round-trip (Story 14.5).
+    const { container } = render(
+      <MediaAttachment
+        media={media({ kind: "video", filename: "clip.mp4", mimetype: "video/mp4" })}
+        messageKey="k1"
+      />,
+    );
+    const poster = screen.getByAltText("clip.mp4") as HTMLImageElement;
+    expect(poster.getAttribute("src")).toBe("keeper-media://media/acct/room/k1/thumb");
+
+    background();
+    // The poster src stays put — the video does not morph to its placeholder.
+    expect(screen.getByAltText("clip.mp4").getAttribute("src")).toBe(
+      "keeper-media://media/acct/room/k1/thumb",
+    );
+    // No FileVideo placeholder appears (hasPoster stayed true).
+    expect(container.querySelector("video")).toBeNull();
   });
 });
