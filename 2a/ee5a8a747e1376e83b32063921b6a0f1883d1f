@@ -1,0 +1,59 @@
+src/components/layout/phone-header.test.tsx
+  s_0129ce1bd5777b::t_67de15098e5694 1-174
+src/components/layout/phone-shell.test.tsx
+  s_0129ce1bd5777b::t_76d3e941833186 109
+  s_0129ce1bd5777b::t_bc775f30e97062 1,98-102,105,111,131,141-165,198,209,229-230,233,259,265,285,306,329-461,467-484,490-574,580-608,614-630
+  s_0129ce1bd5777b::t_7c1670b85c9e23 219-223,240-244,462-466,485-489,575-579,609-613
+src/hooks/use-reduced-motion.test.ts
+  s_0129ce1bd5777b::t_23c9257b9a9201 1-87
+src/components/layout/conversation-pane.tsx
+  s_0129ce1bd5777b::t_f2818bf06bdd77 1324-1333
+  s_0129ce1bd5777b::t_f3644fd22d1032 133-139
+  s_0129ce1bd5777b::t_ab0cdeb1227251 244-245,247
+  s_0129ce1bd5777b::t_0366186b3073c1 1407-1438,1440,1444-1447,1449,1451,1453
+  s_0129ce1bd5777b::t_063480decb23da 304,306
+  s_0129ce1bd5777b::t_9af2ca21da3e59 473-478
+src/components/layout/phone-header.tsx
+  s_0129ce1bd5777b::t_71ceb44d2dfe9e 1-119
+src/hooks/use-reduced-motion.ts
+  s_0129ce1bd5777b::t_76429f0f762386 1-38
+src/components/layout/phone-shell.tsx
+  s_0129ce1bd5777b::t_80e4f477898cf9 211-213,218,223-225
+  s_0129ce1bd5777b::t_54d0af8dc5bf38 131-143
+  s_0129ce1bd5777b::t_885b3e05a8d9da 271
+  s_0129ce1bd5777b::t_76d3e941833186 36
+  s_0129ce1bd5777b::t_61fb77f01179f3 366
+  s_0129ce1bd5777b::t_ec202b3e076650 2,10,12-30,32-35,37-42,46-47,50-130,144-173,176-193,202,208-210,219,226-227,239-270,272-365,367-376,379-383,385-416,418-433,435
+  s_0129ce1bd5777b::t_fea228a409ddba 378
+  s_0129ce1bd5777b::t_86e21b5b77bb8b 214-217,220-222
+_bmad-output/implementation-artifacts/spec-13-2-phone-header-push-pop-transitions-and-edge-swipe-back.md
+  s_0129ce1bd5777b::t_17c72029d3b15c 94-113
+  s_0129ce1bd5777b::t_c35bd730880ec3 5
+  s_0129ce1bd5777b::t_013852c1059b00 79-85
+  s_0129ce1bd5777b::t_bac7c07703a842 9
+  s_0129ce1bd5777b::t_b78d3f5f7d7068 8
+  s_0129ce1bd5777b::t_0172e621e74eab 139-173
+  s_0129ce1bd5777b::t_ccd98312537366 1-4,6-7,10-78,86-93,114-138
+src/index.css
+  s_0129ce1bd5777b::t_e6616e3e488e3d 93-95
+src/components/layout/conversation-pane.test.tsx
+  s_0129ce1bd5777b::t_fd471bdfba3cb3 278-305
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_0129ce1bd5777b::t_fba2982905365a 146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "2aee5a8a747e1376e83b32063921b6a0f1883d1f",
+  "prompts": {},
+  "sessions": {
+    "s_0129ce1bd5777b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec9a1a0d-d861-40b3-9b6a-a2ebf09521e8",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
