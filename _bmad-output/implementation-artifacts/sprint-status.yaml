@@ -161,7 +161,7 @@ development_status:
   epic-14-retrospective: optional
   epic-15: backlog
   15-1-app-icons-and-launch-assets: done
-  15-2-docs-ios-md-free-signing-walkthrough: backlog
+  15-2-docs-ios-md-free-signing-walkthrough: done
   15-3-shareable-ipa-build-path-unsigned-export-for-re-signing: backlog
   15-4-required-ios-ci-gate-and-release-hygiene: backlog
   15-5-paid-program-decision-gate-recorded: backlog

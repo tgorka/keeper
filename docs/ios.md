@@ -1,10 +1,24 @@
-# iOS build setup
+# keeper on iPhone
 
 keeper is a macOS-first Tauri 2 app that also targets iOS from the same codebase.
-This document covers the local prerequisites, signing without secrets, and the
-generate/regenerate loop for the Apple project under
-`src-tauri/crates/keeper/gen/apple/`. Booting the app in the Simulator is out of
-scope here — that arrives with the desktop/mobile compile seam in story 12.2.
+This document is the end-to-end walkthrough that takes a Mac + iPhone owner from a
+fresh checkout to a running keeper on their phone — and keeps it running — using
+free signing only. No paid Apple Developer Program membership is required.
+
+It covers, in reading order:
+
+1. [Prerequisites](#prerequisites)
+2. [Project generation and the regeneration loop](#project-generation-and-the-regeneration-loop)
+3. [Deployment target](#deployment-target)
+4. [Signing on a free Personal Team](#signing-on-a-free-personal-team)
+5. [First device install](#first-device-install)
+6. [The 7-day re-arm ritual](#the-7-day-re-arm-ritual)
+7. [AltServer auto-refresh (optional)](#altserver-auto-refresh-optional)
+8. [Sharing a build without Xcode](#sharing-a-build-without-xcode)
+9. [Verifying the core compiles for iOS](#verifying-the-core-compiles-for-ios)
+10. [Limitations](#limitations)
+
+All shell commands are run from the repository root unless stated otherwise.
 
 ## Prerequisites
 
@@ -25,19 +39,10 @@ scope here — that arrives with the desktop/mobile compile seam in story 12.2.
 
 - **bun** for all JS tooling (never npm/yarn/pnpm) and **tauri-cli 2.x**
   (`bun run tauri --version`).
-
-## Signing without secrets
-
-No Apple Team ID or signing identity is ever committed. The generated project uses
-the generic `iPhone Developer` identity and no `DEVELOPMENT_TEAM`. For local device
-builds, export your team id in your shell — never write it into any tracked file:
-
-```sh
-export APPLE_DEVELOPMENT_TEAM=XXXXXXXXXX   # your 10-char Apple Team ID
-```
-
-Simulator builds do not require a team. Keep team ids, provisioning profiles, and
-`.p12` identities out of the repo entirely.
+- An **iPhone** on iOS 16.0 or later and a USB cable for the first install.
+- Any **Apple ID**. A free Apple ID is enough — it grants a Personal Team (see
+  [Signing on a free Personal Team](#signing-on-a-free-personal-team)). You do not
+  need a paid Apple Developer Program membership.
 
 ## Project generation and the regeneration loop
 
@@ -75,15 +80,206 @@ re-commit of the regenerated project.
 
 Minimum iOS is **16.0**, set in `project.yml` (`options.deploymentTarget.iOS`) and the
 `Podfile`, and propagated into the project by `xcodegen generate`. The bundle
-identifier `dev.tgorka.keeper` is shared with the macOS build.
+identifier `dev.tgorka.keeper` is shared with the macOS build. Keeping the bundle id
+stable matters for free signing: your on-device data is keyed to it, and it survives
+the weekly re-arm (see [The 7-day re-arm ritual](#the-7-day-re-arm-ritual)).
+
+## Signing on a free Personal Team
+
+Any Apple ID — including a free one — automatically gets a **Personal Team**. That is
+all you need to run keeper on your own iPhone. The trade-offs versus a paid Apple
+Developer Program membership are real but livable for a personal build:
+
+- The provisioning profile **expires after 7 days**. When it lapses the app stops
+  launching until you re-sign it (see [The 7-day re-arm ritual](#the-7-day-re-arm-ritual)).
+- You can register **about three devices** against a free Personal Team.
+- There is **no TestFlight and no App Store** distribution. Sharing a build means
+  handing someone an IPA they re-sign themselves (see
+  [Sharing a build without Xcode](#sharing-a-build-without-xcode)).
+
+### Set your team, without committing any secret
+
+No Apple Team ID or signing identity is ever committed. The generated project uses
+the generic `iPhone Developer` identity and no hard-coded `DEVELOPMENT_TEAM`. Tauri v2
+fills it in from an environment variable at build time, so you export your team id in
+your shell — never write it into any tracked file:
+
+```sh
+export APPLE_DEVELOPMENT_TEAM=XXXXXXXXXX   # your 10-char Apple Team ID
+```
+
+`APPLE_DEVELOPMENT_TEAM` is the variable Tauri v2 reads: at build time it supplies the
+`bundle > iOS > developmentTeam` config value, so this repo deliberately **omits** that
+key from `tauri.conf.json` and lets the env var provide it — keeping the team id out of
+git. (If you grep `tauri.conf.json` for `developmentTeam` you will find nothing; that is
+expected.) Earlier Tauri betas read `TAURI_APPLE_DEVELOPMENT_TEAM`; that name was renamed
+to `APPLE_DEVELOPMENT_TEAM` before Tauri 2.0 and is what the current CLI (2.x) expects —
+use `APPLE_DEVELOPMENT_TEAM`, not the old name. You can find your Personal Team's id in
+Xcode under **Settings → Accounts → (your Apple ID) → Manage Certificates**, or in the
+Apple Developer account portal.
+
+`export` sets the variable for the current shell only. A new terminal without it will
+fail to sign, so add the line to your shell profile (e.g. `~/.zshrc`) if you want it to
+persist. Simulator builds do not require a team. Keep team ids, provisioning profiles,
+and `.p12` identities out of the repo entirely.
+
+## First device install
+
+The first time you deploy to a physical iPhone there is a one-time setup, and its
+steps have a deliberate order: Developer Mode only becomes available **after** the
+first deploy attempt, and the certificate can only be trusted **after** the app has
+installed. Follow the steps in this order and the chicken-and-egg resolves itself.
+
+1. **Connect and unlock.** Plug the iPhone into your Mac over USB, unlock it, and
+   accept the **Trust This Computer** prompt on the phone if it appears.
+
+2. **Set your team** if you have not already (see
+   [Signing on a free Personal Team](#signing-on-a-free-personal-team)):
+
+   ```sh
+   export APPLE_DEVELOPMENT_TEAM=XXXXXXXXXX
+   ```
+
+3. **Run the first build** from the repo root:
+
+   ```sh
+   bun run tauri ios dev --open
+   ```
+
+   This compiles the Rust core and the shell, signs with your Personal Team, and
+   attempts to deploy to the connected device; `--open` also opens the project in
+   Xcode so you can pick the target device and watch build/signing output. This first
+   attempt is what makes Developer Mode appear in the next step — it may not launch the
+   app yet.
+
+4. **Enable Developer Mode.** On iOS 16 and later, running your own builds requires
+   it. Go to **Settings → Privacy & Security → Developer Mode**, turn it on, and
+   **reboot** when prompted (confirm again after the phone restarts). The toggle only
+   appears once step 3 has attempted a deploy.
+
+5. **Trust the developer certificate.** A Personal-Team build is signed with a
+   certificate iOS does not trust by default. Go to **Settings → General → VPN &
+   Device Management**, tap your Apple ID under "Developer App", and choose **Trust**.
+   Until you do this the app icon appears but refuses to launch. (If no "Developer
+   App" entry is shown, make sure the phone has been online once so it can verify the
+   certificate, then reopen Settings.)
+
+6. **Launch.** Re-run `bun run tauri ios dev --open` (or just tap the app icon). With
+   Developer Mode on and the certificate trusted, keeper opens.
+
+After this first run, subsequent launches are just tapping the icon — until the 7-day
+profile expires (see [The 7-day re-arm ritual](#the-7-day-re-arm-ritual)).
+
+## The 7-day re-arm ritual
+
+A free Personal Team's provisioning profile is valid for **7 days**. When it expires
+the app will not launch: iOS refuses to run a binary whose profile has lapsed. The
+app itself is fine — only its signature has gone stale.
+
+To re-arm it, re-run the same dev command with the device connected:
+
+```sh
+bun run tauri ios dev --open
+```
+
+This re-signs and reinstalls the app with a fresh 7-day profile. Because the **bundle
+id is unchanged** (`dev.tgorka.keeper`), iOS treats it as the same app: **your data,
+accounts, and settings persist** — nothing is wiped, and you do not log back in.
+
+In practice this is a **roughly 30-second chore once a week** — a couple of minutes at
+most if a rebuild is involved. It is the price of free signing. If that weekly step is
+one you would rather not remember, automate it with AltServer (next section).
+
+## AltServer auto-refresh (optional)
+
+If the weekly re-arm is tedious, **AltStore Classic** with **AltServer** running on
+your Mac can refresh the 7-day signature **automatically over Wi-Fi**, so the app
+keeps working without you plugging in or running a command each week. AltServer
+watches for the impending expiry and re-signs the installed app in the background
+while your Mac and iPhone are on the same network.
+
+The refresh is not magic: it only happens while **AltServer is running, your Mac is
+awake, and both devices are on the same network** at the time the profile is about to
+lapse. If it misses that window (Mac asleep or away from home), the profile still
+expires and you fall back to the manual re-arm above. This is a pure quality-of-life
+upgrade — it changes nothing about how keeper is built or what it can do, it only
+removes the manual weekly chore. Set-up is on the AltStore side and out of scope for
+this document; treat it as optional. The 7-day limit itself is a property of free
+signing and does not go away — AltServer just handles the renewal for you.
+
+## Sharing a build without Xcode
+
+You can hand someone a build to run on their own iPhone without them installing Xcode.
+Produce a debugging IPA from the repo root:
+
+```sh
+bun run tauri ios build --export-method debugging
+```
+
+The tester then re-signs that IPA with **their own** free Apple ID (their own Personal
+Team) and installs it. Two Xcode-free ways to do that:
+
+- **Sideloadly** — a desktop app (macOS/Windows) that re-signs the IPA with the
+  tester's Apple ID and installs it to their connected iPhone in one step (re-sign on
+  install).
+- **zsign** — a cross-platform command-line re-signer. It re-signs the IPA with the
+  tester's own signing material and produces an installable IPA, with no Xcode
+  required at all.
+
+Either way the flow is **build with Tauri's default automatic signing, then re-sign
+afterwards** with the tester's identity. Do **not** switch the project to manual
+signing configurations to make sharing work — manual signing configs are known to
+break Tauri iOS builds (tauri#10668). Let the re-sign happen outside the project, on
+the tester's machine.
+
+On their phone, the tester goes through the same one-time
+[First device install](#first-device-install) setup — enabling Developer Mode and
+trusting **their own** certificate — before keeper will launch. The re-signed app
+carries the same free-signing limits for them: their own Personal Team, ~3 devices,
+and the same 7-day expiry (they re-arm or run AltServer on their own machine).
+
+> **Note:** This section covers how a tester **re-signs** an already-built IPA. A
+> hardened, repeatable IPA **build** recipe — a clean export with no desktop-only
+> plugin symbols, suitable for wider sharing — is not yet documented here and will be
+> added to this document later. The command above is enough to produce an IPA for the
+> re-sign flow.
 
 ## Verifying the core compiles for iOS
 
-The Tauri-free core compiles for iOS independently of the shell's compile seam:
+The Tauri-free core compiles for iOS independently of the shell:
 
 ```sh
 cd src-tauri && cargo check --target aarch64-apple-ios -p keeper-core
 ```
 
-Building and booting the full shell in the Simulator (`tauri ios dev`) depends on the
-desktop-only surfaces being cfg-gated out — that is story 12.2's exit criterion.
+CI enforces a compile-only gate for iOS (`cargo check --workspace --target
+aarch64-apple-ios` in `.github/workflows/ci.yml`); it does not build, sign, or run a
+device app — signing and on-device install remain a local, human-driven flow as
+documented above.
+
+## Limitations
+
+On a free Personal Team, keeper on iPhone is deliberately narrower than the desktop
+build. These are the same four points keeper shows in-app under **Settings → About →
+"On this iPhone"**:
+
+- keeper syncs and notifies only while it's open; background notifications await a future decision.
+- No self-hosted bridge runner — manage your own bridges from your Mac.
+- No global summon hotkey.
+- Updates arrive by reinstalling keeper; its signature renews every 7 days.
+
+> This list is mirrored from `IOS_DISCLOSURE_LINES` in
+> `src/components/settings/about-section.tsx`, which is the single source of truth —
+> the in-app "On this iPhone" disclosure links here, so the two must stay identical.
+> Edit both together or neither.
+
+The fourth item is the [7-day re-arm ritual](#the-7-day-re-arm-ritual) above:
+"reinstalling keeper" is exactly the weekly `bun run tauri ios dev` re-sign (or an
+AltServer auto-refresh), and it is how updates reach the phone — there is no
+in-app updater on the phone tier.
+
+On the first item, the canonical in-app wording spells out the sync consequence:
+"On iPhone, keeper syncs and notifies only while open. Close it and messages wait on
+your homeserver until you return — nothing is lost, and nothing here pretends to be
+push." The app-icon badge follows the same honesty: "The app-icon badge is not a live
+count while keeper is closed; it reflects what keeper knew when it was last open."
