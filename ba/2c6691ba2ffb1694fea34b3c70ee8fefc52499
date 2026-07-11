@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-15-2-docs-ios-md-free-signing-walkthrough.md
+  s_d125fb92d9c18a::t_033dd00b5b70e2 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "ba2c6691ba2ffb1694fea34b3c70ee8fefc52499",
+  "prompts": {},
+  "sessions": {
+    "s_d125fb92d9c18a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b2e320f3-72d6-46b9-9fa1-e142514449cb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
