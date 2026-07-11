@@ -1,0 +1,33 @@
+_bmad-output/implementation-artifacts/bmad-dev-auto-result-14-7-backup-exclusion-and-file-protection.md
+  s_3e0e52650d88bc::t_b9efe3c9187d71 1-40
+  s_3e0e52650d88bc::t_4633cacb018230 41-43
+  s_3e0e52650d88bc::t_c0e6fbd131141e 44-54
+docs/constraints-and-limitations.md
+  s_8a8bc6b6bf6017::t_70b8ac7c4de8c9 45-53
+docs/project-context.md
+  s_8a8bc6b6bf6017::t_445187d6423db8 55-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "8b0e5e3b755657c2bb562225a7bd285892b94825",
+  "prompts": {},
+  "sessions": {
+    "s_3e0e52650d88bc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8c215e00-0a00-4b11-ad44-1ae582c0952a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
