@@ -1,0 +1,38 @@
+src-tauri/crates/keeper/src/ipc.rs
+  s_9ae036920cfb58::t_16139be1896ed5 494,501-502,505-512,521-539,544-545,551-562,568-571,573
+  s_9ae036920cfb58::t_3c89df62dca290 495-499
+  s_9ae036920cfb58::t_cbc5ca90373ecf 500
+  s_9ae036920cfb58::t_3bba61005c4d6e 540-543
+_bmad-output/implementation-artifacts/spec-12-3-ios-platform-port-keychain-spike-and-data-directory.md
+  s_9ae036920cfb58::t_1f6f20afdc84bb 133-155
+  s_9ae036920cfb58::t_a1812b82ff8569 5
+  s_9ae036920cfb58::t_2cc12f0cc9ffc5 6
+  s_9ae036920cfb58::t_59236a86e9f7d6 7
+  s_9ae036920cfb58::t_2df5f2131236cf 1-4,8-68,72-83,97-132
+  s_9ae036920cfb58::t_7e2516741e061b 69-71
+  s_9ae036920cfb58::t_3c63b27dff91e6 84-96
+src-tauri/Cargo.toml
+  s_9ae036920cfb58::t_50de2a43e5562e 86-90
+  s_9ae036920cfb58::t_16139be1896ed5 91
+src-tauri/Cargo.lock
+  s_9ae036920cfb58::t_6d85d1963f89f4 2927
+src-tauri/crates/keeper/Cargo.toml
+  s_9ae036920cfb58::t_f77d6504f12c1a 71-73
+  s_9ae036920cfb58::t_16139be1896ed5 66-70,74-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "5e57d7abe75e1ab841f05adbd172a1e367a2ad22",
+  "prompts": {},
+  "sessions": {
+    "s_9ae036920cfb58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7c2ed3ed-4e94-4afc-87f7-eb900748db06",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
