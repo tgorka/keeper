@@ -1,0 +1,96 @@
+src-tauri/crates/keeper-core/src/platform.rs
+  s_91e2793ba166c3::t_fba7b83f6e8f94 78-95
+  s_91e2793ba166c3::t_7fab1a99070753 56-69
+  s_91e2793ba166c3::t_a3a4c7674507cc 10
+src-tauri/crates/keeper/Cargo.toml
+  s_91e2793ba166c3::t_0bc0f741585803 80-86
+src-tauri/crates/keeper-core/src/inbox.rs
+  s_91e2793ba166c3::t_7d63bc783269f9 712-714
+src-tauri/Cargo.toml
+  s_91e2793ba166c3::t_aacb964bf80bd6 92-100
+src-tauri/crates/keeper/tests/entitlements_protection.rs
+  s_91e2793ba166c3::t_bd3b8b5d19579e 71-72,101-102
+  s_91e2793ba166c3::t_bedc23d9e53960 1-70,73-100,103-116
+src-tauri/crates/keeper-core/src/bridges/health.rs
+  s_91e2793ba166c3::t_7e50c3c2e17283 813-815
+docs/constraints-and-limitations.md
+  s_91e2793ba166c3::t_0c58dc64f09ef1 53-55
+src-tauri/crates/keeper-core/src/notify.rs
+  s_91e2793ba166c3::t_762a5cd4cc043c 697-699
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_91e2793ba166c3::t_e24699057fbcac 895-904
+src-tauri/crates/keeper-core/tests/archive_survives_sign_out.rs
+  s_91e2793ba166c3::t_0beb82ce057bbc 112-114
+src-tauri/crates/keeper-core/src/auth.rs
+  s_91e2793ba166c3::t_bba241ff50680b 1022-1024,1135-1136
+  s_91e2793ba166c3::t_36c7515fec518b 584-590
+  s_099f6069e1a6f9::t_da1289340f4dc4 1137
+src-tauri/crates/keeper-core/src/error.rs
+  s_91e2793ba166c3::t_2ba8578ef74bcd 29-37
+_bmad-output/implementation-artifacts/spec-14-7-backup-exclusion-and-file-protection.md
+  s_099f6069e1a6f9::t_7c7a1d12827449 11
+  s_099f6069e1a6f9::t_b5be7e19d7c9a9 165
+  s_91e2793ba166c3::t_20a308d6532d1e 5,8
+  s_099f6069e1a6f9::t_4fbfddd7ce9353 47,49-50
+  s_099f6069e1a6f9::t_799d3e46fef73a 83-84,86,88
+  s_099f6069e1a6f9::t_d51b6592eaf3ee 1-4,7,9-10,12-26,30-46,48,51-57,61-70,81-82,85,87,89,124-127,133-153,155-164,166
+  s_91e2793ba166c3::t_2e2877d59970e3 112-123
+  s_099f6069e1a6f9::t_238c8bdb469177 58-60
+  s_099f6069e1a6f9::t_c53e9c4aefd85b 128-132
+  s_099f6069e1a6f9::t_2b713a39987041 27-29
+  s_099f6069e1a6f9::t_a2a9c66212956c 6
+  s_099f6069e1a6f9::t_52a47740fe95b5 90-111
+  s_91e2793ba166c3::t_d8c5da261c1e38 71-80
+  s_91e2793ba166c3::t_85220143254504 167-204
+  s_099f6069e1a6f9::t_d89b8929ff064f 154
+src-tauri/crates/keeper-core/src/account.rs
+  s_91e2793ba166c3::t_42ff0f4f09945b 5960-5963,5966-5970,5973-5995,6002-6006,6009,6017-6018,6035-6047
+  s_91e2793ba166c3::t_30c5dd3eca2175 6129-6265,6270-6324,6329-6333
+  s_099f6069e1a6f9::t_79952d6e144801 5971-5972
+  s_91e2793ba166c3::t_f6291851cbf525 4681-4688
+  s_91e2793ba166c3::t_15fa974b275cf6 6065,6096,6120,6345,6393,6476,6524,6565,6613,6704,6750,6777
+  s_91e2793ba166c3::t_1bc447cf290144 608-627
+  s_91e2793ba166c3::t_bd3b8b5d19579e 6010-6015,6266-6269,6325-6328
+  s_91e2793ba166c3::t_6fcf2c94623290 6064,6392,6472,6523,6561,6611,6702,6748,6775
+src-tauri/crates/keeper/gen/apple/project.yml
+  s_91e2793ba166c3::t_0b5cb1d12b5cea 58-65
+src-tauri/crates/keeper/src/ipc.rs
+  s_91e2793ba166c3::t_04702adc89612d 496-501
+  s_91e2793ba166c3::t_abcc4f3942ccaa 11
+  s_91e2793ba166c3::t_df079266cc8099 680-701,703-715,719-727
+  s_91e2793ba166c3::t_c02c99e2ee560e 272-274
+  s_91e2793ba166c3::t_bd3b8b5d19579e 702,716-718,3905
+  s_91e2793ba166c3::t_fe29661cd7f4a6 896-899
+  s_91e2793ba166c3::t_7187f15f1c9139 3895-3904,3906-3907
+src-tauri/crates/keeper/gen/apple/keeper_iOS/keeper_iOS.entitlements
+  s_91e2793ba166c3::t_2bc92256760521 12-15
+  s_91e2793ba166c3::t_c24f9eb4839a7c 4-11
+src-tauri/crates/keeper/gen/apple/keeper.xcodeproj/project.pbxproj
+  s_91e2793ba166c3::t_2bc92256760521 42,155
+src-tauri/Cargo.lock
+  s_91e2793ba166c3::t_8f7106b8214265 2926-2927
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "e59a621e0c7bd07b8eea4c118e9a91057491c814",
+  "prompts": {},
+  "sessions": {
+    "s_099f6069e1a6f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e86ef9a-7f26-4b14-9388-b4f2e0a16a73",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_91e2793ba166c3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7e18f0f4-198a-46dc-895b-a7ed148848fe",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
