@@ -29,6 +29,7 @@
  *   Room level — never on Detail. Desktop detail persistence is untouched
  *   (this component mounts only on the phone tier).
  */
+import { RefreshCw, WifiOff } from "lucide-react";
 import {
   type FocusEventHandler,
   type KeyboardEvent,
@@ -47,9 +48,12 @@ import { LeadingDrawer } from "@/components/layout/leading-drawer";
 import { PhoneHeader } from "@/components/layout/phone-header";
 import { PhoneInboxHeader } from "@/components/layout/phone-inbox-header";
 import { PhoneSearchSurface } from "@/components/layout/phone-search-surface";
+import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
 import { useKeyboardInset } from "@/hooks/use-keyboard-inset";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { syncNow } from "@/lib/ipc/client";
+import { accountStatusStore, useShellOffline } from "@/lib/stores/account-status";
 import { detailStore, useDetailStore } from "@/lib/stores/detail-ui";
 import { leadingDrawerStore, useLeadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
@@ -62,12 +66,25 @@ const FLICK_VELOCITY_PX_PER_MS = 0.5;
 const FLICK_MIN_DX_PX = 40;
 
 /**
- * The level-0 pull-down reveal threshold (Story 13.4): a downward pull that
- * crosses this distance on release opens Search; below it snaps back with no
- * open. Story 13.6 extends the same vertical axis beyond this point into
- * pull-to-refresh, so the leg here stays minimal (open on release past threshold).
+ * The level-0 pull-down reveal threshold (Story 13.4): a downward pull released
+ * in `[reveal, refresh)` opens Search; below it snaps back with no open.
  */
 const PULL_REVEAL_THRESHOLD_PX = 64;
+
+/**
+ * The second, larger threshold on the same pull axis (Story 13.6): released at
+ * or past this distance the pull triggers a refresh — `syncNow()` kicks each
+ * active account's SyncService — instead of opening Search. The indicator's
+ * affordance switches as the finger crosses it.
+ */
+const PULL_REFRESH_THRESHOLD_PX = 128;
+
+/**
+ * Fallback ceiling on the refresh spinner: it normally clears on the next
+ * connection-status tick, but a fully offline (tickless) session must still
+ * resolve — never a stuck spinner, never an error toast.
+ */
+const REFRESH_SPINNER_TIMEOUT_MS = 8000;
 
 /** Clamp a drag delta to the swipeable range `0..width`. */
 function clampDx(dx: number, width: number): number {
@@ -438,16 +455,21 @@ export function PhoneShell() {
     openPointerRef.current = null;
   };
 
-  // ---- Level-0 pull-down to open Search (Story 13.4) ----------------------
-  // Mirrors the drawer-open pointer-threshold math on the *vertical* axis: a
-  // downward pull that starts while the Inbox list is scrolled to top and crosses
-  // the reveal threshold (or flicks) on release opens the Search surface; below the
-  // threshold it snaps back with no open. A pull that starts while the list is
-  // scrolled away from the top is left to native scrolling (armed === false). This
-  // owns only the open-Search leg — Story 13.6 extends the axis past the threshold
-  // into pull-to-refresh.
+  // ---- Level-0 pull-down: open Search / refresh (Stories 13.4 + 13.6) -----
+  // One continuous gesture axis, mirroring the drawer-open pointer-threshold
+  // math vertically: a downward pull that starts while the Inbox list is
+  // scrolled to top and is released in `[reveal, refresh)` (or flicks) opens the
+  // Search surface; released at ≥ the refresh threshold it kicks the sync loop
+  // instead (Story 13.6). Below the reveal threshold it snaps back with no
+  // action, and a pull that starts scrolled away from the top is left to native
+  // scrolling (armed === false).
   const searchSurfaceOpen = useSearchSurfaceStore((s) => s.isOpen);
   const magnifierRef = useRef<HTMLButtonElement>(null);
+  const offline = useShellOffline();
+  // The live pull distance while an armed pull drags (drives the indicator's
+  // affordance switch), and the post-release refresh spinner.
+  const [pullDy, setPullDy] = useState<number | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const pullPointerRef = useRef<{
     pointerId: number;
     startY: number;
@@ -466,15 +488,29 @@ export function PhoneShell() {
       '[data-slot="scroll-area-viewport"]',
     );
     const atTop = viewport === null || viewport === undefined || viewport.scrollTop <= 0;
+    if (!atTop) {
+      // Not at the top: native scroll owns this gesture. Tracking an uncaptured
+      // pointer here would strand `pullPointerRef` if the finger then lifts off
+      // the thin pull band (no `pointerup` reaches the zone), and the guard above
+      // would kill every later pull. Leave the ref null so scrolling and future
+      // pulls both keep working.
+      return;
+    }
     pullPointerRef.current = {
       pointerId: e.pointerId,
       startY: e.clientY,
       startT: e.timeStamp,
-      armed: atTop,
+      armed: true,
     };
-    if (atTop) {
-      e.currentTarget.setPointerCapture(e.pointerId);
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const onPullPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const pointer = pullPointerRef.current;
+    if (pointer === null || e.pointerId !== pointer.pointerId || !pointer.armed) {
+      return;
     }
+    setPullDy(Math.max(e.clientY - pointer.startY, 0));
   };
 
   const onPullPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -483,10 +519,25 @@ export function PhoneShell() {
       return;
     }
     pullPointerRef.current = null;
+    setPullDy(null);
     if (!pointer.armed) {
       return;
     }
     const dy = e.clientY - pointer.startY;
+    // Past the refresh threshold the release refreshes instead of opening
+    // Search (Story 13.6): best-effort `syncNow()` resumes each active
+    // account's SyncService. An IpcError is swallowed and only clears the
+    // spinner — never an error toast; a fully offline session resolves the
+    // spinner into the persistent offline pill below.
+    if (dy >= PULL_REFRESH_THRESHOLD_PX) {
+      // Guard against a second qualifying pull re-firing `syncNow()` and
+      // re-arming the spinner timeout while a refresh is already in flight.
+      if (!refreshing) {
+        setRefreshing(true);
+        void syncNow().catch(() => setRefreshing(false));
+      }
+      return;
+    }
     const dt = Math.max(e.timeStamp - pointer.startT, 1);
     const flick = dy > FLICK_MIN_DX_PX && dy / dt > FLICK_VELOCITY_PX_PER_MS;
     if (dy > PULL_REVEAL_THRESHOLD_PX || flick) {
@@ -500,7 +551,23 @@ export function PhoneShell() {
       return;
     }
     pullPointerRef.current = null;
+    setPullDy(null);
   };
+
+  // The refresh spinner clears on the next connection-status tick (the streamed
+  // Rust status is the honest "sync answered" signal), with a timeout ceiling so
+  // a tickless offline session never strands a spinner.
+  useEffect(() => {
+    if (!refreshing) {
+      return;
+    }
+    const unsubscribe = accountStatusStore.subscribe(() => setRefreshing(false));
+    const timeout = window.setTimeout(() => setRefreshing(false), REFRESH_SPINNER_TIMEOUT_MS);
+    return () => {
+      unsubscribe();
+      window.clearTimeout(timeout);
+    };
+  }, [refreshing]);
 
   // UX-DR28: return focus to the Inbox magnifier when the Search surface
   // transitions open → closed. Radix restores focus to the opener it captured, but
@@ -517,19 +584,65 @@ export function PhoneShell() {
   }, [searchSurfaceOpen]);
 
   // The level-0 pull-down zone: a thin band across the top of the Inbox list,
-  // below the header, that arms the pull-to-open-Search gesture. Below-threshold
-  // releases and pulls that start scrolled-away no-op (native scroll).
+  // below the header, that arms the pull-to-open-Search / pull-to-refresh
+  // gesture axis. Below-threshold releases and pulls that start scrolled-away
+  // no-op (native scroll).
   const pullDownZone = (
     <div
       aria-hidden="true"
       data-testid="pull-down-search"
       className="absolute top-[calc(var(--safe-top)+var(--phone-header))] right-0 left-5 z-10 h-6 touch-none"
       onPointerDown={onPullPointerDown}
+      onPointerMove={onPullPointerMove}
       onPointerUp={onPullPointerUp}
       onPointerCancel={onPullPointerCancel}
       onLostPointerCapture={onPullPointerCancel}
     />
   );
+
+  // The pull indicator (Story 13.6): appears once the drag crosses the Search
+  // reveal band and switches affordance at the refresh threshold; after a
+  // refreshing release it stays as the spinner until the next status tick — or,
+  // when every signed-in account is offline, resolves into the persistent
+  // offline pill (same copy as the sidebar pill; never an error toast).
+  const showSpinner = refreshing || (pullDy !== null && pullDy >= PULL_REFRESH_THRESHOLD_PX);
+  const pullIndicator =
+    refreshing || (pullDy !== null && pullDy >= PULL_REVEAL_THRESHOLD_PX) ? (
+      <div
+        data-testid="pull-indicator"
+        className="pointer-events-none absolute top-[calc(var(--safe-top)+var(--phone-header))] right-0 left-0 z-10 flex justify-center pt-2"
+      >
+        {refreshing && offline ? (
+          <div
+            role="status"
+            data-testid="pull-offline-pill"
+            className="flex items-center gap-2 rounded-full bg-held/10 px-3 py-1.5 text-held text-xs shadow-xs"
+          >
+            <WifiOff aria-hidden="true" className="size-4 shrink-0" />
+            <span>{OFFLINE_PILL_TEXT}</span>
+          </div>
+        ) : showSpinner ? (
+          <div
+            role="status"
+            aria-label="Refreshing"
+            data-testid="pull-refresh-spinner"
+            className="rounded-full border border-border bg-background p-1.5 shadow-xs"
+          >
+            <RefreshCw
+              aria-hidden="true"
+              className={cn("size-4 text-muted-foreground", !reducedMotion && "animate-spin")}
+            />
+          </div>
+        ) : (
+          <div
+            data-testid="pull-release-search"
+            className="rounded-full border border-border bg-background px-3 py-1.5 text-muted-foreground text-xs shadow-xs"
+          >
+            Release to search
+          </div>
+        )}
+      </div>
+    ) : null;
 
   const drawerOpenZone = (
     <div
@@ -589,6 +702,7 @@ export function PhoneShell() {
             top band pulls down to open Search (Story 13.4). */}
         {level === 0 && drawerOpenZone}
         {level === 0 && pullDownZone}
+        {level === 0 && pullIndicator}
         <PhoneInboxHeader drawerButtonRef={drawerButtonRef} magnifierRef={magnifierRef} />
         <div className="flex min-h-0 min-w-0 flex-1">
           <ChatListPane />

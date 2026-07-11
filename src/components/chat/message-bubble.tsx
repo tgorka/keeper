@@ -14,9 +14,19 @@
 import { EditHistoryPopover } from "@/components/chat/edit-history-popover";
 import { MediaAttachment } from "@/components/chat/media-attachment";
 import { MessageActions } from "@/components/chat/message-actions";
+import { CURATED_EMOJI } from "@/components/chat/reaction-popover";
 import { ReadReceipts } from "@/components/chat/read-receipts";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import { useLongPress } from "@/hooks/use-long-press";
+import { useShellLayout } from "@/hooks/use-shell-layout";
 import { formatMessageTime } from "@/lib/format-time";
 import type { ReactionGroupVm, ReplyPreviewVm, TimelineItemVm } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
@@ -148,6 +158,80 @@ export function MessageBubble({
   // no remote event to redact — those use Cancel/Retry (Story 3.7), not Delete.
   const canDelete = isOwn && sendState === null;
 
+  // Phone long-press menu (Story 13.6): mounted only on the phone tier and only
+  // when the parent wired at least one action — the *identical* set the hover
+  // bar offers (React row / Reply / Edit-own / Delete-own), reusing the same
+  // handlers. Desktop keeps the hover action bar alone (no ContextMenu mounted).
+  const { phone } = useShellLayout();
+  const longPress = useLongPress();
+  const touchMenu = phone && Boolean(onReply || onEdit || onDelete || onToggleReaction);
+
+  const bubbleClass = cn(
+    "max-w-[75%] rounded-[14px] px-3 py-2 text-sm",
+    isOwn ? "bg-primary text-primary-foreground" : "bg-muted text-foreground",
+    selected && "ring-2 ring-ring ring-offset-1 ring-offset-background",
+  );
+
+  const bubbleContent = (
+    <>
+      {item.reply && <ReplyQuote reply={item.reply} isOwn={isOwn} onJumpTo={onJumpTo} />}
+      {item.media && (
+        <div className="mb-1">
+          <MediaAttachment
+            media={item.media}
+            messageKey={item.key}
+            onOpenPreview={onOpenPreview}
+            // While an own media echo is still sending, overlay an uploading
+            // indicator + Cancel (Story 3.7); derived purely from the existing
+            // send-state (no VM change). `sent`/`failed` have no overlay —
+            // `failed` reuses the SendStateCaption "Failed — Retry" below.
+            uploading={isOwn && sendState === "sending"}
+            onCancel={onCancelSend}
+          />
+        </div>
+      )}
+      {/* Text/caption: rendered only when there is a body (a media message
+          may carry an empty caption). */}
+      {item.body !== "" && <p className="whitespace-pre-wrap break-words">{item.body}</p>}
+      <div className="mt-1 flex items-center justify-end gap-1">
+        {item.isEdited && (
+          <EditedCaption
+            accountId={accountId}
+            roomId={roomId}
+            messageKey={item.key}
+            isOwn={isOwn}
+          />
+        )}
+        {time !== "" && (
+          <time
+            dateTime={new Date(item.timestamp).toISOString()}
+            className={cn(
+              "block text-right text-[10px] leading-none",
+              isOwn ? "text-primary-foreground/70" : "text-muted-foreground",
+            )}
+          >
+            {time}
+          </time>
+        )}
+      </div>
+    </>
+  );
+
+  // The bubble surface: on the phone tier it is additionally the long-press
+  // target (native callout/selection suppressed); off-phone it renders exactly
+  // as before.
+  const bubble = touchMenu ? (
+    <div
+      data-slot="bubble-long-press"
+      className={cn(bubbleClass, "touch-callout-none select-none")}
+      {...longPress}
+    >
+      {bubbleContent}
+    </div>
+  ) : (
+    <div className={bubbleClass}>{bubbleContent}</div>
+  );
+
   return (
     <div
       data-msg-key={item.key}
@@ -176,54 +260,54 @@ export function MessageBubble({
           </span>
         )}
         <div className={cn("flex items-center gap-1", isOwn ? "flex-row-reverse" : "flex-row")}>
-          <div
-            className={cn(
-              "max-w-[75%] rounded-[14px] px-3 py-2 text-sm",
-              isOwn ? "bg-primary text-primary-foreground" : "bg-muted text-foreground",
-              selected && "ring-2 ring-ring ring-offset-1 ring-offset-background",
-            )}
-          >
-            {item.reply && <ReplyQuote reply={item.reply} isOwn={isOwn} onJumpTo={onJumpTo} />}
-            {item.media && (
-              <div className="mb-1">
-                <MediaAttachment
-                  media={item.media}
-                  messageKey={item.key}
-                  onOpenPreview={onOpenPreview}
-                  // While an own media echo is still sending, overlay an uploading
-                  // indicator + Cancel (Story 3.7); derived purely from the existing
-                  // send-state (no VM change). `sent`/`failed` have no overlay —
-                  // `failed` reuses the SendStateCaption "Failed — Retry" below.
-                  uploading={isOwn && sendState === "sending"}
-                  onCancel={onCancelSend}
-                />
-              </div>
-            )}
-            {/* Text/caption: rendered only when there is a body (a media message
-                may carry an empty caption). */}
-            {item.body !== "" && <p className="whitespace-pre-wrap break-words">{item.body}</p>}
-            <div className="mt-1 flex items-center justify-end gap-1">
-              {item.isEdited && (
-                <EditedCaption
-                  accountId={accountId}
-                  roomId={roomId}
-                  messageKey={item.key}
-                  isOwn={isOwn}
-                />
-              )}
-              {time !== "" && (
-                <time
-                  dateTime={new Date(item.timestamp).toISOString()}
-                  className={cn(
-                    "block text-right text-[10px] leading-none",
-                    isOwn ? "text-primary-foreground/70" : "text-muted-foreground",
-                  )}
-                >
-                  {time}
-                </time>
-              )}
-            </div>
-          </div>
+          {touchMenu ? (
+            <ContextMenu>
+              <ContextMenuTrigger asChild>{bubble}</ContextMenuTrigger>
+              <ContextMenuContent>
+                {/* React row: the same curated set the hover bar's Popover
+                    offers, as ≥44pt menu items that close on pick. */}
+                {onToggleReaction && (
+                  <>
+                    {/* biome-ignore lint/a11y/useSemanticElements: a horizontal
+                        emoji row inside a Radix menu — a fieldset is not valid
+                        menu content, and the items are real menu items. */}
+                    <div className="flex items-center" role="group" aria-label="React">
+                      {CURATED_EMOJI.map((emoji) => (
+                        <ContextMenuItem
+                          key={emoji}
+                          className="size-11 justify-center p-0"
+                          aria-label={`React with ${emoji}`}
+                          onSelect={() => onToggleReaction(item.key, emoji)}
+                        >
+                          <span aria-hidden="true" className="text-base leading-none">
+                            {emoji}
+                          </span>
+                        </ContextMenuItem>
+                      ))}
+                    </div>
+                    <ContextMenuSeparator />
+                  </>
+                )}
+                {onReply && (
+                  <ContextMenuItem className="min-h-11" onSelect={() => onReply(item.key)}>
+                    Reply
+                  </ContextMenuItem>
+                )}
+                {canEdit && onEdit && (
+                  <ContextMenuItem className="min-h-11" onSelect={() => onEdit(item.key)}>
+                    Edit
+                  </ContextMenuItem>
+                )}
+                {canDelete && onDelete && (
+                  <ContextMenuItem className="min-h-11" onSelect={() => onDelete(item.key)}>
+                    Delete
+                  </ContextMenuItem>
+                )}
+              </ContextMenuContent>
+            </ContextMenu>
+          ) : (
+            bubble
+          )}
           {/* Action bar: revealed on hover/focus-within of the bubble row. */}
           {(onReply || onEdit || onDelete || onToggleReaction) && (
             <div className="opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">

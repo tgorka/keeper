@@ -28,6 +28,8 @@ import {
   ContextMenuItem,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { useLongPress } from "@/hooks/use-long-press";
+import { useShellLayout } from "@/hooks/use-shell-layout";
 import type { NetworkVm } from "@/lib/ipc/client";
 import { networkMuteGet, networkMuteSet, setNetworkFilter } from "@/lib/ipc/client";
 import { networksStore, useNetworksStore } from "@/lib/stores/networks";
@@ -42,6 +44,10 @@ import { cn } from "@/lib/utils";
 function NetworkRow({ network, isActive }: { network: NetworkVm; isActive: boolean }) {
   const [muted, setMuted] = useState<boolean | undefined>(undefined);
   const writeId = useRef(0);
+  // Phone touch idiom (Story 13.6): a long-press opens the same mute-toggle
+  // ContextMenu the desktop right-click does; the native callout is suppressed.
+  const { phone } = useShellLayout();
+  const longPress = useLongPress();
 
   useEffect(() => {
     let cancelled = false;
@@ -92,11 +98,15 @@ function NetworkRow({ network, isActive }: { network: NetworkVm; isActive: boole
         <button
           type="button"
           onClick={onRowClick}
+          {...longPress}
           aria-current={isActive ? "true" : undefined}
           aria-pressed={isActive}
           className={cn(
             "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
             isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent",
+            // Long-press target (Story 13.6): suppress the native callout and
+            // selection on the phone tier only.
+            phone && "touch-callout-none select-none",
           )}
         >
           <Avatar size="sm">
@@ -116,9 +126,13 @@ function NetworkRow({ network, isActive }: { network: NetworkVm; isActive: boole
       </ContextMenuTrigger>
       <ContextMenuContent>
         {muted ? (
-          <ContextMenuItem onSelect={onToggleMute}>Unmute Network</ContextMenuItem>
+          <ContextMenuItem className={phone ? "min-h-11" : undefined} onSelect={onToggleMute}>
+            Unmute Network
+          </ContextMenuItem>
         ) : (
-          <ContextMenuItem onSelect={onToggleMute}>Mute Network</ContextMenuItem>
+          <ContextMenuItem className={phone ? "min-h-11" : undefined} onSelect={onToggleMute}>
+            Mute Network
+          </ContextMenuItem>
         )}
       </ContextMenuContent>
     </ContextMenu>

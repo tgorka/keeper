@@ -420,4 +420,134 @@ describe("ApprovalPane no bulk affordance", () => {
     expect(screen.queryByRole("button", { name: /approve all/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /select all/i })).not.toBeInTheDocument();
   });
+
+  it("renders no per-row Approve button off the phone tier (desktop unchanged)", async () => {
+    listPendingDrafts.mockResolvedValue([draft({ roomId: "!r1:x", displayName: "Room One" })]);
+    render(<ApprovalPane />);
+    await screen.findByText("Room One");
+    expect(screen.queryByRole("button", { name: /^Approve draft/ })).not.toBeInTheDocument();
+  });
+});
+
+// ── Phone touch idioms (Story 13.6) ──────────────────────────────────────────
+describe("ApprovalPane phone touch idioms", () => {
+  const originalMatchMedia = window.matchMedia;
+
+  /** Mock matchMedia at a phone-tier width (mirrors the phone-shell tests). */
+  function mockPhoneViewport() {
+    window.matchMedia = vi.fn().mockImplementation((query: string) => {
+      const match = query.match(/max-width:\s*(\d+)px/);
+      const maxWidth = match ? Number(match[1]) : Number.POSITIVE_INFINITY;
+      return {
+        matches: query.includes("prefers-reduced-motion") ? false : 390 <= maxWidth,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      };
+    });
+  }
+
+  /** Mock every rect at the given width so the swipe reads a real drag range. */
+  function mockRowWidth(width: number) {
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+      width,
+      height: 72,
+      top: 0,
+      left: 0,
+      right: width,
+      bottom: 72,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    } as DOMRect);
+  }
+
+  beforeEach(() => {
+    mockPhoneViewport();
+  });
+
+  afterEach(() => {
+    window.matchMedia = originalMatchMedia;
+    vi.restoreAllMocks();
+  });
+
+  it("opens the inline editor on a row tap", async () => {
+    listPendingDrafts.mockResolvedValue([draft({ roomId: "!r1:x", displayName: "Room One" })]);
+    render(<ApprovalPane />);
+    const row = await screen.findByRole("button", { name: /Draft in Room One/ });
+    fireEvent.click(row);
+    expect(await screen.findByLabelText("Edit draft for Room One")).toBeInTheDocument();
+  });
+
+  it("approves through the single gate from the ≥44pt per-row Approve button", async () => {
+    listPendingDrafts.mockResolvedValue([
+      draft({ accountId: "a1", roomId: "!r1:x", displayName: "Room One", body: "half a message" }),
+    ]);
+    render(<ApprovalPane />);
+    const approve = await screen.findByRole("button", { name: "Approve draft for Room One" });
+    expect(approve).toHaveClass("min-h-11");
+    fireEvent.click(approve);
+    await waitFor(() => expect(approveDraft).toHaveBeenCalledWith("a1", "!r1:x", "half a message"));
+    // The Approve tap never also opened the row's editor.
+    expect(screen.queryByLabelText("Edit draft for Room One")).not.toBeInTheDocument();
+  });
+
+  it("discards behind the existing 5s undo toast on a trailing swipe", async () => {
+    mockRowWidth(320);
+    listPendingDrafts.mockResolvedValue([
+      draft({ accountId: "a1", roomId: "!r1:x", displayName: "Room One", body: "held text" }),
+    ]);
+    render(<ApprovalPane />);
+    const row = await screen.findByRole("button", { name: /Draft in Room One/ });
+
+    fireEvent.pointerDown(row, { pointerId: 1, clientX: 300, clientY: 30 });
+    fireEvent.pointerMove(row, { pointerId: 1, clientX: 100, clientY: 30 });
+    // Past the half-swipe commit the Discard label appears on the surface.
+    expect(screen.getByTestId("approval-swipe-discard")).toHaveTextContent("Discard");
+    fireEvent.pointerUp(row, { pointerId: 1, clientX: 100, clientY: 30 });
+
+    // The same discard path as ⌘⌫: local + mirror + marker cleared, 5s undo toast.
+    expect(clearDraft).toHaveBeenCalledWith("a1", "!r1:x");
+    expect(clearDraftMirror).toHaveBeenCalledWith("a1", "!r1:x");
+    expect(toastFn).toHaveBeenCalledWith(
+      "Draft discarded",
+      expect.objectContaining({ duration: 5000 }),
+    );
+    // Undo restores exactly like the keyboard path.
+    const opts = toastFn.mock.calls[0][1] as { action: { onClick: () => void } };
+    opts.action.onClick();
+    await waitFor(() => expect(saveDraft).toHaveBeenCalledWith("a1", "!r1:x", "held text"));
+    await waitFor(() => expect(mirrorDraft).toHaveBeenCalledWith("a1", "!r1:x", "held text"));
+  });
+
+  it("snaps back with no discard on a small swipe", async () => {
+    mockRowWidth(320);
+    listPendingDrafts.mockResolvedValue([draft({ roomId: "!r1:x", displayName: "Room One" })]);
+    render(<ApprovalPane />);
+    const row = await screen.findByRole("button", { name: /Draft in Room One/ });
+
+    fireEvent.pointerDown(row, { pointerId: 1, clientX: 300, clientY: 30 });
+    fireEvent.pointerMove(row, { pointerId: 1, clientX: 270, clientY: 30 });
+    fireEvent.pointerUp(row, { pointerId: 1, clientX: 270, clientY: 30 });
+    expect(clearDraft).not.toHaveBeenCalled();
+    expect(toastFn).not.toHaveBeenCalled();
+  });
+
+  it("still renders no approve-all / bulk affordance on the phone tier", async () => {
+    listPendingDrafts.mockResolvedValue([
+      draft({ roomId: "!r1:x", displayName: "Room One" }),
+      draft({ roomId: "!r2:x", displayName: "Room Two", body: "b2" }),
+    ]);
+    render(<ApprovalPane />);
+    await screen.findByText("Room One");
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /approve all/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /select all/i })).not.toBeInTheDocument();
+    // Exactly one per-draft Approve button per row — nothing broader.
+    expect(screen.getAllByRole("button", { name: /^Approve draft/ })).toHaveLength(2);
+  });
 });

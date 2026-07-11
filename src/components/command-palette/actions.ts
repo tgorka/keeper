@@ -25,6 +25,7 @@ import {
   markRoomRead,
   markRoomUnread,
   pinRoom,
+  syncNow,
   unarchiveRoom,
   unfavoriteRoom,
   unpinRoom,
@@ -67,6 +68,9 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
     const current = await incognitoGetGlobal();
     await incognitoSetGlobal(!current);
   },
+  // The non-gesture twin of pull-to-refresh (Story 13.6): resume every live
+  // account's sync loop through the single Rust `sync_now` entry.
+  "sync-now": () => syncNow(),
 
   // --- Open-chat actions (operate on the current conversation) ---
   "archive-chat": (ctx) => (ctx ? archiveRoom(ctx.accountId, ctx.roomId) : undefined),

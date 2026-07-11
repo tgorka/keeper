@@ -16,10 +16,20 @@
  * undo toast. No bulk / select-all / approve-all affordance — approving is strictly
  * per-draft and user-initiated.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type MouseEvent as ReactMouseEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { toast } from "sonner";
 import { Avatar, AvatarBadge, AvatarFallback } from "@/components/ui/avatar";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useReducedMotion } from "@/hooks/use-reduced-motion";
+import { useShellLayout } from "@/hooks/use-shell-layout";
+import { useSwipeActions } from "@/hooks/use-swipe-actions";
 import { accountHueVar } from "@/lib/account-hue";
 import { formatDraftAge } from "@/lib/format-time";
 import {
@@ -313,6 +323,28 @@ function ApprovalRow({
 }: ApprovalRowProps) {
   const [editValue, setEditValue] = useState(draft.body);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // ---- Phone touch idioms (Story 13.6) ------------------------------------
+  // Row-tap opens the inline editor, an explicit ≥44pt Approve button approves
+  // through the same single gate the desktop ⌘Enter uses, and a trailing swipe
+  // discards behind the existing 5s undo toast. All phone-gated; the desktop
+  // keyboard path (Enter / ⌘Enter / ⌘⌫) is untouched. Still no approve-all.
+  const { phone } = useShellLayout();
+  const reducedMotion = useReducedMotion();
+  const swipe = useSwipeActions({
+    enabled: phone,
+    trailing: { onCommit: onDiscard },
+  });
+  const onRowTap = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!phone || editing) {
+      return;
+    }
+    // Taps on the row's own controls (the Approve button, the editor) are
+    // theirs; only a tap on the row body opens the editor.
+    if ((event.target as HTMLElement).closest("button, textarea, a") !== null) {
+      return;
+    }
+    onEnterEdit();
+  };
   // True once an explicit Enter/Escape has committed the editor, so the ensuing
   // unmount `onBlur` doesn't fire a second `onSaveEdit` (double-discard on a
   // trimmed-empty body would toast/clear twice). Reset each time the editor opens.
@@ -399,7 +431,27 @@ function ApprovalRow({
   }, [editValue, onSaveEdit]);
 
   return (
-    <li className="border-border border-b last:border-b-0">
+    <li
+      className={cn(
+        "border-border border-b last:border-b-0",
+        // Phone (Story 13.6): the li is the swipe stage — the discard surface
+        // sits beneath the translating row.
+        phone && "relative overflow-hidden",
+      )}
+    >
+      {/* Trailing-swipe discard surface (phone): the verb label appears once
+          the release would commit; the commit runs the same onDiscard (and the
+          same 5s undo toast) as the desktop ⌘⌫. */}
+      {phone && swipe.dx < 0 && (
+        <div
+          aria-hidden="true"
+          data-testid="approval-swipe-discard"
+          className="absolute inset-y-0 right-0 flex items-center justify-end bg-swipe-discard pr-4 text-swipe-discard-foreground"
+          style={{ width: -swipe.dx }}
+        >
+          {swipe.committing === "trailing" && <span className="font-medium text-sm">Discard</span>}
+        </div>
+      )}
       {/* biome-ignore lint/a11y/useSemanticElements: a focusable row hosting an
           inline textarea and multiple actions is a composite widget, not a button;
           Enter opens the editor, ⌘Enter approves, ⌘⌫ discards. */}
@@ -409,10 +461,18 @@ function ApprovalRow({
         data-slot="approval-row"
         aria-label={`Draft in ${draft.displayName} on ${draft.accountUserId}. Enter to edit, Cmd+Enter to approve, Cmd+Backspace to discard.`}
         onKeyDown={onRowKeyDown}
+        onClick={onRowTap}
+        {...(phone ? swipe.handlers : {})}
+        style={phone ? { transform: `translateX(${swipe.dx}px)` } : undefined}
         className={cn(
           "relative flex w-full items-start gap-3 py-3 pr-4 pl-4 text-left",
           "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
           "hover:bg-accent",
+          phone && "touch-callout-none bg-background select-none",
+          phone &&
+            !swipe.dragging &&
+            !reducedMotion &&
+            "transition-transform duration-200 ease-out",
         )}
       >
         {/* 3 px per-account hue edge bar (UX-DR3). Decorative. */}
@@ -463,6 +523,22 @@ function ApprovalRow({
             </p>
           )}
         </div>
+        {/* Explicit ≥44pt per-row Approve (phone, Story 13.6): the touch twin of
+            ⌘Enter, through the same single-gate onApprove (in-flight guarded,
+            clears only on success). Strictly per-draft — no approve-all. */}
+        {phone && !editing && (
+          <button
+            type="button"
+            aria-label={`Approve draft for ${draft.displayName}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onApprove();
+            }}
+            className="min-h-11 min-w-11 shrink-0 self-center rounded-md border border-border px-3 text-sm outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+          >
+            Approve
+          </button>
+        )}
       </div>
     </li>
   );

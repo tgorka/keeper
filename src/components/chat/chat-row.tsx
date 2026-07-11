@@ -35,7 +35,7 @@
  */
 
 import { AtSign, BellOff, Pencil } from "lucide-react";
-import { forwardRef } from "react";
+import { forwardRef, type MouseEvent as ReactMouseEvent } from "react";
 import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -51,6 +51,10 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { useLongPress } from "@/hooks/use-long-press";
+import { useReducedMotion } from "@/hooks/use-reduced-motion";
+import { useShellLayout } from "@/hooks/use-shell-layout";
+import { useSwipeActions } from "@/hooks/use-swipe-actions";
 import { accountHueVar } from "@/lib/account-hue";
 import { BRIDGE_HEALTH_DOT_CLASS } from "@/lib/bridges";
 import { formatRoomTimestamp } from "@/lib/format-time";
@@ -71,6 +75,13 @@ import { useHasDraft } from "@/lib/stores/drafts";
 import { useFavoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { effectiveIsUnread, type RoomSelection, useRoomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
+
+/**
+ * The settled width (px) of the trailing swipe's revealed action pair (Story
+ * 13.6): two 72px, ≥44pt buttons — More (opens the row's long-press menu, whose
+ * Notifications submenu carries mute) and Archive/Unarchive.
+ */
+const TRAILING_ACTIONS_PX = 144;
 
 interface ChatRowProps {
   room: InboxRoomVm;
@@ -201,140 +212,314 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
       ? `, ${mentionCount} unread ${mentionCount === 1 ? "mention" : "mentions"}`
       : ", unread";
 
-  return (
-    <ContextMenu>
-      <ContextMenuTrigger asChild>
-        <button
-          ref={ref}
-          type="button"
-          tabIndex={tabIndex}
-          onClick={() => onSelect?.({ accountId: room.accountId, roomId: room.roomId })}
-          aria-label={`Conversation with ${room.displayName}${unreadLabel}`}
-          aria-current={selected ? "true" : undefined}
-          className={cn(
-            "relative flex h-16 w-full shrink-0 items-center gap-3 py-0 pr-3 pl-4 text-left",
-            "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-            selected ? "bg-accent" : "hover:bg-accent",
-          )}
-        >
-          {/* 3 px per-account hue edge bar (UX-DR3). Decorative — the account
+  // ---- Phone touch idioms (Story 13.6) ------------------------------------
+  // Long-press opens the identical ContextMenu above (the non-gesture duplicate
+  // of every swipe verb); a leading swipe toggles read/unread and a trailing
+  // swipe reveals More(mute ▸ via the Notifications submenu) + Archive, with a
+  // full swipe committing Archive. Everything is phone-gated so desktop/tablet
+  // renders byte-for-byte as before.
+  const { phone } = useShellLayout();
+  const reducedMotion = useReducedMotion();
+  const longPress = useLongPress();
+  const swipe = useSwipeActions({
+    enabled: phone,
+    leading: { onCommit: isUnread ? onMarkRead : onMarkUnread },
+    trailing: {
+      onCommit: room.isArchived ? onUnarchive : onArchive,
+      revealPx: TRAILING_ACTIONS_PX,
+    },
+  });
+  // Tapping the row while the trailing actions sit revealed closes them instead
+  // of opening the conversation (`revealed` is always null off-phone).
+  const onRowClick = () => {
+    if (swipe.revealed !== null) {
+      swipe.close();
+      return;
+    }
+    onSelect?.({ accountId: room.accountId, roomId: room.roomId });
+  };
+  // The revealed "More" button opens the row's existing long-press menu at the
+  // tap point — the mute path (Notifications ▸) without a gesture.
+  const onMoreTap = (e: ReactMouseEvent<HTMLButtonElement>) => {
+    const { currentTarget, clientX, clientY } = e;
+    swipe.close();
+    currentTarget.dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX, clientY }),
+    );
+  };
+  // ≥44pt menu items on the phone tier (the long-press menu is a touch target).
+  const menuItemClass = phone ? "min-h-11" : undefined;
+
+  const rowButton = (
+    <button
+      ref={ref}
+      type="button"
+      tabIndex={tabIndex}
+      onClick={onRowClick}
+      aria-label={`Conversation with ${room.displayName}${unreadLabel}`}
+      aria-current={selected ? "true" : undefined}
+      className={cn(
+        "relative flex h-16 w-full shrink-0 items-center gap-3 py-0 pr-3 pl-4 text-left",
+        "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+        selected ? "bg-accent" : "hover:bg-accent",
+      )}
+    >
+      {/* 3 px per-account hue edge bar (UX-DR3). Decorative — the account
               attribution is conveyed by the row's conversation content. */}
-          <span
-            aria-hidden="true"
-            data-testid="account-hue-bar"
-            className="absolute inset-y-0 left-0 w-[3px]"
-            style={{ backgroundColor: accountHueVar(room.hueIndex) }}
-          />
-          <RoomAvatar room={room} size="lg" />
-          <div className="flex min-w-0 flex-1 flex-col">
-            <div className="flex items-baseline justify-between gap-2">
-              <span className="flex min-w-0 items-center gap-1.5">
-                {/* Affected-row health dot (Story 6.5): shown iff this room's
+      <span
+        aria-hidden="true"
+        data-testid="account-hue-bar"
+        className="absolute inset-y-0 left-0 w-[3px]"
+        style={{ backgroundColor: accountHueVar(room.hueIndex) }}
+      />
+      <RoomAvatar room={room} size="lg" />
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="flex min-w-0 items-center gap-1.5">
+            {/* Affected-row health dot (Story 6.5): shown iff this room's
                     (accountId, networkId) session is unhealthy — a persistent,
                     Rust-authoritative indicator, never re-derived here. */}
-                {affectedHealth !== null && (
-                  <span
-                    aria-hidden="true"
-                    data-testid="bridge-health-dot"
-                    className={cn(
-                      "size-2 shrink-0 rounded-full",
-                      BRIDGE_HEALTH_DOT_CLASS[affectedHealth],
-                    )}
-                  />
+            {affectedHealth !== null && (
+              <span
+                aria-hidden="true"
+                data-testid="bridge-health-dot"
+                className={cn(
+                  "size-2 shrink-0 rounded-full",
+                  BRIDGE_HEALTH_DOT_CLASS[affectedHealth],
                 )}
-                <span
-                  className={cn("truncate text-sm", isUnread ? "font-semibold" : "font-medium")}
-                >
-                  {room.displayName}
-                </span>
-                {/* Durable mute glyph (Story 10.2, FR-52): a bell-off for a muted Chat
+              />
+            )}
+            <span className={cn("truncate text-sm", isUnread ? "font-semibold" : "font-medium")}>
+              {room.displayName}
+            </span>
+            {/* Durable mute glyph (Story 10.2, FR-52): a bell-off for a muted Chat
                     or muted Network, an at-sign for mention-only. Rust-authoritative
                     (`room.muteState`), never re-derived; DND is NOT stamped here. */}
-                {room.muteState === "muted" ? (
-                  <BellOff
-                    aria-label="Muted"
-                    data-testid="mute-glyph"
-                    className="size-3 shrink-0 text-muted-foreground"
-                  />
-                ) : room.muteState === "mention_only" ? (
-                  <AtSign
-                    aria-label="Mentions only"
-                    data-testid="mention-only-glyph"
-                    className="size-3 shrink-0 text-muted-foreground"
-                  />
-                ) : null}
+            {room.muteState === "muted" ? (
+              <BellOff
+                aria-label="Muted"
+                data-testid="mute-glyph"
+                className="size-3 shrink-0 text-muted-foreground"
+              />
+            ) : room.muteState === "mention_only" ? (
+              <AtSign
+                aria-label="Mentions only"
+                data-testid="mention-only-glyph"
+                className="size-3 shrink-0 text-muted-foreground"
+              />
+            ) : null}
+          </span>
+          {timestamp !== null && (
+            <span className="shrink-0 text-muted-foreground text-xs">{timestamp}</span>
+          )}
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <span className="flex min-w-0 items-center gap-1 truncate text-muted-foreground text-sm">
+            {hasDraft && (
+              <span
+                data-testid="draft-marker"
+                className="inline-flex shrink-0 items-center gap-1 text-held"
+              >
+                <Pencil aria-hidden="true" className="size-3" />
+                Draft
               </span>
-              {timestamp !== null && (
-                <span className="shrink-0 text-muted-foreground text-xs">{timestamp}</span>
-              )}
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <span className="flex min-w-0 items-center gap-1 truncate text-muted-foreground text-sm">
-                {hasDraft && (
-                  <span
-                    data-testid="draft-marker"
-                    className="inline-flex shrink-0 items-center gap-1 text-held"
-                  >
-                    <Pencil aria-hidden="true" className="size-3" />
-                    Draft
-                  </span>
-                )}
-                <span className="truncate">{room.lastMessage ?? ""}</span>
-              </span>
-              {/* Unread affordance (UX-DR3): a filled primary mention badge with
+            )}
+            <span className="truncate">{room.lastMessage ?? ""}</span>
+          </span>
+          {/* Unread affordance (UX-DR3): a filled primary mention badge with
                   the count, else a neutral dot for any other unread, else nothing. */}
-              {showMention ? (
-                <Badge variant="default" data-testid="mention-badge" aria-hidden="true">
-                  {mentionCount}
-                </Badge>
-              ) : isUnread ? (
-                <span
-                  aria-hidden="true"
-                  data-testid="unread-dot"
-                  className="size-2 shrink-0 rounded-full bg-muted-foreground"
-                />
-              ) : null}
+          {showMention ? (
+            <Badge variant="default" data-testid="mention-badge" aria-hidden="true">
+              {mentionCount}
+            </Badge>
+          ) : isUnread ? (
+            <span
+              aria-hidden="true"
+              data-testid="unread-dot"
+              className="size-2 shrink-0 rounded-full bg-muted-foreground"
+            />
+          ) : null}
+        </div>
+      </div>
+    </button>
+  );
+
+  return (
+    <ContextMenu>
+      {phone ? (
+        // Phone (Story 13.6): the trigger wraps a swipe stage — action surfaces
+        // beneath a translating row — and carries the long-press bridge into the
+        // very same ContextMenu the desktop right-click opens.
+        <ContextMenuTrigger asChild>
+          <div
+            data-testid="chat-row-swipe"
+            className="touch-callout-none relative select-none overflow-hidden"
+            {...swipe.handlers}
+            onPointerDown={(e) => {
+              longPress.onPointerDown(e);
+              swipe.handlers.onPointerDown(e);
+            }}
+            onPointerMove={(e) => {
+              longPress.onPointerMove(e);
+              swipe.handlers.onPointerMove(e);
+            }}
+            onPointerUp={(e) => {
+              longPress.onPointerUp(e);
+              swipe.handlers.onPointerUp(e);
+            }}
+            onPointerCancel={(e) => {
+              longPress.onPointerCancel(e);
+              swipe.handlers.onPointerCancel(e);
+            }}
+            onClickCapture={(e) => {
+              longPress.onClickCapture(e);
+              swipe.handlers.onClickCapture(e);
+            }}
+          >
+            {/* Leading (read/unread) surface: grows under the rightward drag;
+                the verb label appears once the release would commit. */}
+            {swipe.dx > 0 && (
+              <div
+                aria-hidden="true"
+                data-testid="swipe-leading"
+                className="absolute inset-y-0 left-0 flex items-center bg-swipe-read pl-4 text-swipe-read-foreground"
+                style={{ width: swipe.dx }}
+              >
+                {swipe.committing === "leading" && (
+                  <span className="font-medium text-sm">{isUnread ? "Read" : "Unread"}</span>
+                )}
+              </div>
+            )}
+            {/* Trailing surface: More + Archive buttons while revealed/dragging;
+                past the half-swipe commit the whole surface floods into the
+                Archive verb (the full-swipe affordance). */}
+            {swipe.dx < 0 && (
+              <div
+                data-testid="swipe-trailing"
+                className="absolute inset-y-0 right-0 flex items-stretch overflow-hidden"
+                style={{ width: -swipe.dx }}
+              >
+                {swipe.committing === "trailing" ? (
+                  <div
+                    data-testid="swipe-commit-label"
+                    className="flex flex-1 items-center justify-end bg-swipe-archive pr-4 text-swipe-archive-foreground"
+                  >
+                    <span className="font-medium text-sm">
+                      {room.isArchived ? "Unarchive" : "Archive"}
+                    </span>
+                  </div>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      aria-label={`More actions for ${room.displayName}`}
+                      onClick={onMoreTap}
+                      className="flex h-16 w-18 min-w-11 shrink-0 items-center justify-center bg-muted text-foreground text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+                    >
+                      More
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={
+                        room.isArchived
+                          ? `Unarchive ${room.displayName}`
+                          : `Archive ${room.displayName}`
+                      }
+                      onClick={() => {
+                        swipe.close();
+                        if (room.isArchived) {
+                          onUnarchive();
+                        } else {
+                          onArchive();
+                        }
+                      }}
+                      className="flex h-16 w-18 min-w-11 shrink-0 items-center justify-center bg-swipe-archive text-sm text-swipe-archive-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+                    >
+                      {room.isArchived ? "Unarchive" : "Archive"}
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+            <div
+              data-testid="chat-row-swipe-stage"
+              className={cn(
+                "relative",
+                // Snap-back/settle animate as a transform transition; an
+                // in-flight drag tracks the finger and reduced motion cuts.
+                !swipe.dragging && !reducedMotion && "transition-transform duration-200 ease-out",
+              )}
+              style={{ transform: `translateX(${swipe.dx}px)` }}
+            >
+              {rowButton}
             </div>
           </div>
-        </button>
-      </ContextMenuTrigger>
+        </ContextMenuTrigger>
+      ) : (
+        <ContextMenuTrigger asChild>{rowButton}</ContextMenuTrigger>
+      )}
       <ContextMenuContent>
         {isUnread ? (
-          <ContextMenuItem onSelect={onMarkRead}>Mark read</ContextMenuItem>
+          <ContextMenuItem className={menuItemClass} onSelect={onMarkRead}>
+            Mark read
+          </ContextMenuItem>
         ) : (
-          <ContextMenuItem onSelect={onMarkUnread}>Mark unread</ContextMenuItem>
+          <ContextMenuItem className={menuItemClass} onSelect={onMarkUnread}>
+            Mark unread
+          </ContextMenuItem>
         )}
         <ContextMenuSeparator />
         {room.isArchived ? (
-          <ContextMenuItem onSelect={onUnarchive}>Unarchive</ContextMenuItem>
+          <ContextMenuItem className={menuItemClass} onSelect={onUnarchive}>
+            Unarchive
+          </ContextMenuItem>
         ) : (
-          <ContextMenuItem onSelect={onArchive}>Archive</ContextMenuItem>
+          <ContextMenuItem className={menuItemClass} onSelect={onArchive}>
+            Archive
+          </ContextMenuItem>
         )}
         {room.isPinned ? (
-          <ContextMenuItem onSelect={onUnpin}>Unpin</ContextMenuItem>
+          <ContextMenuItem className={menuItemClass} onSelect={onUnpin}>
+            Unpin
+          </ContextMenuItem>
         ) : (
-          <ContextMenuItem onSelect={onPin}>Pin</ContextMenuItem>
+          <ContextMenuItem className={menuItemClass} onSelect={onPin}>
+            Pin
+          </ContextMenuItem>
         )}
         {room.isFavourite ? (
-          <ContextMenuItem onSelect={onUnfavorite}>Unfavorite</ContextMenuItem>
+          <ContextMenuItem className={menuItemClass} onSelect={onUnfavorite}>
+            Unfavorite
+          </ContextMenuItem>
         ) : (
-          <ContextMenuItem onSelect={onFavorite}>Favorite</ContextMenuItem>
+          <ContextMenuItem className={menuItemClass} onSelect={onFavorite}>
+            Favorite
+          </ContextMenuItem>
         )}
         <ContextMenuSeparator />
         <ContextMenuSub>
-          <ContextMenuSubTrigger>Notifications</ContextMenuSubTrigger>
+          <ContextMenuSubTrigger className={menuItemClass}>Notifications</ContextMenuSubTrigger>
           <ContextMenuSubContent>
             <ContextMenuRadioGroup value={notifyRadioValue}>
-              <ContextMenuRadioItem value="all" onSelect={() => setNotifyMode("all")}>
+              <ContextMenuRadioItem
+                className={menuItemClass}
+                value="all"
+                onSelect={() => setNotifyMode("all")}
+              >
                 All
               </ContextMenuRadioItem>
               <ContextMenuRadioItem
+                className={menuItemClass}
                 value="mention_only"
                 onSelect={() => setNotifyMode("mention_only")}
               >
                 Mentions only
               </ContextMenuRadioItem>
-              <ContextMenuRadioItem value="mute" onSelect={() => setNotifyMode("mute")}>
+              <ContextMenuRadioItem
+                className={menuItemClass}
+                value="mute"
+                onSelect={() => setNotifyMode("mute")}
+              >
                 Mute
               </ContextMenuRadioItem>
             </ContextMenuRadioGroup>

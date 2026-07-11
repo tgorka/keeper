@@ -23,10 +23,13 @@ import {
   ContextMenuItem,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { useLongPress } from "@/hooks/use-long-press";
+import { useShellLayout } from "@/hooks/use-shell-layout";
 import type { InboxRoomVm } from "@/lib/ipc/client";
 import { setFavoritesCollapsed, unfavoriteRoom } from "@/lib/ipc/client";
 import { favoritesUiStore, useFavoritesUiStore } from "@/lib/stores/favorites-ui";
 import type { RoomSelection } from "@/lib/stores/rooms";
+import { cn } from "@/lib/utils";
 
 interface FavoritesSectionProps {
   /** The Favorites window, in Rust-authoritative recency order. */
@@ -40,6 +43,11 @@ interface FavoritesSectionProps {
 export function FavoritesSection({ favorites, onSelect, selected }: FavoritesSectionProps) {
   const isCollapsed = useFavoritesUiStore((s) => s.isCollapsed);
   const setCollapsed = useFavoritesUiStore((s) => s.setCollapsed);
+  // Phone touch idiom (Story 13.6): a long-press opens the same Unfavorite
+  // ContextMenu the desktop right-click does; the native callout is suppressed.
+  // One shared hook instance serves every row (one press at a time).
+  const { phone } = useShellLayout();
+  const longPress = useLongPress();
 
   // Hidden entirely when empty (UX-DR4): no header, no toggle, no rows.
   if (favorites.length === 0) {
@@ -83,13 +91,17 @@ export function FavoritesSection({ favorites, onSelect, selected }: FavoritesSec
                     <button
                       type="button"
                       onClick={() => onSelect?.({ accountId: room.accountId, roomId: room.roomId })}
+                      {...longPress}
                       aria-label={`Favorite conversation with ${room.displayName}`}
                       aria-current={isSelected ? "true" : undefined}
-                      className={
+                      className={cn(
                         // Compact 48 px row (UX-DR4): avatar + single-line name.
-                        "flex h-12 w-full items-center gap-3 px-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset " +
-                        (isSelected ? "bg-accent" : "hover:bg-accent")
-                      }
+                        "flex h-12 w-full items-center gap-3 px-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+                        isSelected ? "bg-accent" : "hover:bg-accent",
+                        // Long-press target (Story 13.6): suppress the native
+                        // callout/selection on the phone tier only.
+                        phone && "touch-callout-none select-none",
+                      )}
                     >
                       <RoomAvatar room={room} size="lg" />
                       <span className="truncate text-sm">{room.displayName}</span>
@@ -97,6 +109,7 @@ export function FavoritesSection({ favorites, onSelect, selected }: FavoritesSec
                   </ContextMenuTrigger>
                   <ContextMenuContent>
                     <ContextMenuItem
+                      className={phone ? "min-h-11" : undefined}
                       onSelect={() => {
                         void unfavoriteRoom(room.accountId, room.roomId).catch(() => {});
                       }}

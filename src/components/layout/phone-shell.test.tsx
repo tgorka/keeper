@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm, InboxBatch, InboxRoomVm } from "@/lib/ipc/client";
+import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { composerStore } from "@/lib/stores/composer";
@@ -17,6 +18,7 @@ import { searchSurfaceStore } from "@/lib/stores/search-surface";
 // other subscription resolves a stub id and never emits, and one-shot reads
 // resolve benign empties — the stack under test only projects selection state.
 const subscribeInbox = vi.fn();
+const syncNow = vi.fn(async (): Promise<void> => {});
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
   return {
@@ -59,6 +61,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     // so a pull-down/magnifier open in the stack tests never reaches Tauri.
     paletteQuery: vi.fn(async () => ({ contacts: [], chats: [], actions: [] })),
     searchArchive: vi.fn(async () => []),
+    // Pull-to-refresh (Story 13.6): the sync-loop kick is a spy.
+    syncNow: () => syncNow(),
   };
 });
 
@@ -195,8 +199,11 @@ beforeEach(() => {
   leadingDrawerStore.getState().close();
   searchSurfaceStore.setState({ isOpen: false, scope: "chats", chatLock: null });
   composerStore.setState({ focusNonce: 0 });
+  accountStatusStore.getState().reset();
   subscribeInbox.mockReset();
   subscribeInbox.mockResolvedValue(1);
+  syncNow.mockReset();
+  syncNow.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -781,6 +788,26 @@ describe("PhoneShell", () => {
     expect(searchSurfaceStore.getState().isOpen).toBe(false);
   });
 
+  it("does not strand the pull after a scrolled-away press whose release never reaches the zone", async () => {
+    await renderWithRooms([{ roomId: "!a:example.org", displayName: "Alpha" }]);
+    const viewport = document.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]');
+    // Scrolled away: a press arms nothing and takes no pointer capture, so its
+    // release can land off the thin band (no pointerup on the zone here).
+    if (viewport !== null) {
+      Object.defineProperty(viewport, "scrollTop", { configurable: true, value: 200 });
+    }
+    const zone = screen.getByTestId("pull-down-search");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    // Back at the top: a fresh pull past the reveal threshold must still open
+    // Search — the earlier orphaned press must not have stranded the tracker.
+    if (viewport !== null) {
+      Object.defineProperty(viewport, "scrollTop", { configurable: true, value: 0 });
+    }
+    fireEvent.pointerDown(zone, { pointerId: 2, clientY: 5 });
+    fireEvent.pointerUp(zone, { pointerId: 2, clientY: 100 });
+    expect(searchSurfaceStore.getState().isOpen).toBe(true);
+  });
+
   it("keeps the 13.2 back-swipe and 13.3 drawer gestures unregressed with the surface mounted", async () => {
     mockRectWidth(390);
     render(<PhoneShell />);
@@ -833,6 +860,131 @@ describe("PhoneShell", () => {
     });
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
     expect(screen.getByRole("main")).toBeInTheDocument();
+  });
+});
+
+describe("PhoneShell pull-to-refresh (Story 13.6)", () => {
+  it("switches the pull affordance from Release-to-search to the refresh spinner across the threshold", () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    const zone = screen.getByTestId("pull-down-search");
+
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    // Below the reveal band: no indicator at all.
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 40 });
+    expect(screen.queryByTestId("pull-indicator")).not.toBeInTheDocument();
+    // In the Search band: the reveal affordance.
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 100 });
+    expect(screen.getByTestId("pull-release-search")).toHaveTextContent("Release to search");
+    expect(screen.queryByTestId("pull-refresh-spinner")).not.toBeInTheDocument();
+    // Past the refresh threshold: the spinner affordance takes over.
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 160 });
+    expect(screen.getByTestId("pull-refresh-spinner")).toBeInTheDocument();
+    expect(screen.queryByTestId("pull-release-search")).not.toBeInTheDocument();
+    fireEvent.pointerCancel(zone, { pointerId: 1 });
+  });
+
+  it("kicks the sync loop (not Search) when released past the refresh threshold", () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    const zone = screen.getByTestId("pull-down-search");
+
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 160 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientY: 160 });
+
+    expect(syncNow).toHaveBeenCalledTimes(1);
+    expect(searchSurfaceStore.getState().isOpen).toBe(false);
+    // The spinner persists past the release, until the next status tick.
+    expect(screen.getByTestId("pull-refresh-spinner")).toBeInTheDocument();
+  });
+
+  it("still opens Search when released inside the [reveal, refresh) band (13.4 preserved)", () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    const zone = screen.getByTestId("pull-down-search");
+
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientY: 105 });
+    expect(searchSurfaceStore.getState().isOpen).toBe(true);
+    expect(syncNow).not.toHaveBeenCalled();
+  });
+
+  it("clears the refresh spinner on the next connection-status tick", async () => {
+    mockRectWidth(390);
+    accountsStore.getState().addAccount(account);
+    render(<PhoneShell />);
+    const zone = screen.getByTestId("pull-down-search");
+
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 160 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientY: 160 });
+    expect(screen.getByTestId("pull-refresh-spinner")).toBeInTheDocument();
+
+    act(() => {
+      accountStatusStore.getState().setStatus(account.accountId, "online");
+    });
+    await waitFor(() => {
+      expect(screen.queryByTestId("pull-refresh-spinner")).not.toBeInTheDocument();
+    });
+  });
+
+  it("resolves the spinner into the persistent offline pill when every account is offline", () => {
+    mockRectWidth(390);
+    accountsStore.getState().addAccount(account);
+    act(() => {
+      accountStatusStore.getState().setStatus(account.accountId, "offline");
+    });
+    render(<PhoneShell />);
+    const zone = screen.getByTestId("pull-down-search");
+
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 160 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientY: 160 });
+
+    // The offline pill, not a spinner — and never an error toast (no toast
+    // surface is even wired into this path).
+    const pill = screen.getByTestId("pull-offline-pill");
+    expect(pill).toHaveTextContent(
+      "Offline — showing your local archive. Messages queue until you're back.",
+    );
+    expect(screen.queryByTestId("pull-refresh-spinner")).not.toBeInTheDocument();
+    // The kick is still attempted (best-effort resume — harmless offline).
+    expect(syncNow).toHaveBeenCalledTimes(1);
+  });
+
+  it("swallows a sync_now IpcError: the spinner clears with no toast", async () => {
+    mockRectWidth(390);
+    syncNow.mockRejectedValue({ code: "internal", message: "boom", retriable: false });
+    render(<PhoneShell />);
+    const zone = screen.getByTestId("pull-down-search");
+
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 160 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientY: 160 });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("pull-refresh-spinner")).not.toBeInTheDocument();
+    });
+    // No error surface: the shell renders no alert/toast for a failed kick.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("does not refresh from a pull that starts scrolled away from the top", async () => {
+    await renderWithRooms([
+      { roomId: "!a:example.org", displayName: "Alpha" },
+      { roomId: "!b:example.org", displayName: "Beta" },
+    ]);
+    const viewport = document.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]');
+    if (viewport !== null) {
+      Object.defineProperty(viewport, "scrollTop", { configurable: true, value: 200 });
+    }
+    const zone = screen.getByTestId("pull-down-search");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 200 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientY: 200 });
+    expect(syncNow).not.toHaveBeenCalled();
+    expect(searchSurfaceStore.getState().isOpen).toBe(false);
   });
 });
 

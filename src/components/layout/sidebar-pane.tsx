@@ -37,8 +37,10 @@ interface SidebarPaneProps {
   collapsed: boolean;
 }
 
-/** Exact offline-pill copy (UX-DR18) — kept verbatim. */
-const OFFLINE_PILL_TEXT = "Offline — showing your local archive. Messages queue until you're back.";
+/** Exact offline-pill copy (UX-DR18) — kept verbatim. Exported so the phone
+ * pull-to-refresh (Story 13.6) resolves its spinner into the same pill copy. */
+export const OFFLINE_PILL_TEXT =
+  "Offline — showing your local archive. Messages queue until you're back.";
 
 export function SidebarPane({ collapsed }: SidebarPaneProps) {
   const offline = useShellOffline();

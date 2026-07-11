@@ -2761,6 +2761,19 @@ pub async fn mark_room_read(
         .map_err(to_ipc_error)
 }
 
+/// Kick every live account's sync loop (Story 13.6): the phone pull-to-refresh
+/// and the global "Sync now" palette/menu action. Delegates to the core, which
+/// resumes each already-active account's `SyncService` via its idempotent
+/// `start()` — the same resume operation Epic 14-1's foreground wake will route
+/// through. It never builds a second sync loop and never activates signed-out
+/// accounts. Best-effort and infallible: `start()` cannot fail and an empty
+/// account set is a no-op, so this never returns an error in practice.
+#[tauri::command]
+pub async fn sync_now(state: State<'_, AppState>) -> Result<(), IpcError> {
+    state.accounts.sync_now().await;
+    Ok(())
+}
+
 /// Query the command palette (Story 9.1, epic 9 spine). Serves grouped, ranked,
 /// bounded results from the in-memory Rust index over **every** room across all
 /// accounts (chats + DM contacts) plus the static action registry — the frontend

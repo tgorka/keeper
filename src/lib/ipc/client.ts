@@ -1430,6 +1430,20 @@ export async function markRoomRead(accountId: string, roomId: string): Promise<v
 }
 
 /**
+ * Kick every live account's sync loop (Story 13.6: pull-to-refresh + the
+ * "Sync now" palette action). The Rust core resumes each already-active
+ * account's `SyncService` via its idempotent `start()` — a no-op while the
+ * loop is running, the same resume operation as a foreground wake (the Epic
+ * 14-1 lifecycle seam). It never builds a second sync loop and never activates
+ * signed-out accounts. Best-effort: callers may fire-and-forget and swallow
+ * rejections — pull-to-refresh clears its spinner with no toast on an
+ * {@link IpcError}.
+ */
+export async function syncNow(): Promise<void> {
+  await invoke<void>("sync_now");
+}
+
+/**
  * Release a PUBLIC read receipt on a room — the explicit "Mark read publicly" action
  * (Story 8.2, AD-14, FR-45). The Rust core dispatches exactly one public `m.read` on
  * the room's latest event through the signals seam regardless of the effective

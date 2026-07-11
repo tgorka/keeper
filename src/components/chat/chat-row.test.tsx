@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatRow } from "@/components/chat/chat-row";
 import type { BridgeHealth, InboxBatch, InboxRoomVm } from "@/lib/ipc/client";
@@ -549,5 +549,283 @@ describe("ChatRow", () => {
     fireEvent.click(await screen.findByText("Notifications"));
     fireEvent.click(await screen.findByText("All"));
     expect(chatNotifyModeSet).toHaveBeenCalledWith("acctZ", "!z:example.org", "all");
+  });
+
+  // ── Phone touch idioms (Story 13.6) ────────────────────────────────────────
+  it("renders no swipe stage off the phone tier (desktop byte-for-byte)", () => {
+    render(<ChatRow room={room()} />);
+    expect(screen.queryByTestId("chat-row-swipe")).not.toBeInTheDocument();
+  });
+});
+
+// ── Phone touch idioms (Story 13.6) ──────────────────────────────────────────
+describe("ChatRow phone touch idioms", () => {
+  const originalMatchMedia = window.matchMedia;
+
+  /** Mock matchMedia at a phone-tier width (mirrors the phone-shell tests). */
+  function mockPhoneViewport() {
+    window.matchMedia = vi.fn().mockImplementation((query: string) => {
+      const match = query.match(/max-width:\s*(\d+)px/);
+      const maxWidth = match ? Number(match[1]) : Number.POSITIVE_INFINITY;
+      return {
+        matches: query.includes("prefers-reduced-motion") ? false : 390 <= maxWidth,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      };
+    });
+  }
+
+  /** Mock every rect at the given width so the swipe reads a real drag range. */
+  function mockRowWidth(width: number) {
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+      width,
+      height: 64,
+      top: 0,
+      left: 0,
+      right: width,
+      bottom: 64,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    } as DOMRect);
+  }
+
+  /** Dispatch a pointer event with an explicit timeStamp (slow, non-flick drags). */
+  function firePointer(
+    el: Element,
+    type: "pointerdown" | "pointermove" | "pointerup",
+    init: { pointerId: number; clientX: number; clientY: number; timeStamp: number },
+  ) {
+    const event = new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      clientX: init.clientX,
+      clientY: init.clientY,
+    });
+    Object.defineProperty(event, "pointerId", { value: init.pointerId });
+    Object.defineProperty(event, "timeStamp", { value: init.timeStamp });
+    fireEvent(el, event);
+  }
+
+  /** Slow-settle the trailing actions open (More + Archive tappable). */
+  function settleTrailingReveal(wrapper: Element) {
+    firePointer(wrapper, "pointerdown", {
+      pointerId: 1,
+      clientX: 300,
+      clientY: 30,
+      timeStamp: 1000,
+    });
+    firePointer(wrapper, "pointermove", {
+      pointerId: 1,
+      clientX: 200,
+      clientY: 30,
+      timeStamp: 1200,
+    });
+    firePointer(wrapper, "pointerup", { pointerId: 1, clientX: 200, clientY: 30, timeStamp: 1400 });
+  }
+
+  beforeEach(() => {
+    mockPhoneViewport();
+  });
+
+  afterEach(() => {
+    window.matchMedia = originalMatchMedia;
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("opens the row's identical context menu on a stationary long-press", async () => {
+    vi.useFakeTimers();
+    render(<ChatRow room={room()} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+    fireEvent.pointerDown(wrapper, { pointerId: 1, clientX: 100, clientY: 30 });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    vi.useRealTimers();
+    // The same menu the desktop right-click opens: triage verbs + Notifications.
+    expect(await screen.findByText("Mark unread")).toBeInTheDocument();
+    expect(screen.getByText("Archive")).toBeInTheDocument();
+    expect(screen.getByText("Notifications")).toBeInTheDocument();
+  });
+
+  it("does not open the menu when the press moves (scroll intent)", () => {
+    vi.useFakeTimers();
+    render(<ChatRow room={room()} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+    fireEvent.pointerDown(wrapper, { pointerId: 1, clientX: 100, clientY: 30 });
+    fireEvent.pointerMove(wrapper, { pointerId: 1, clientX: 100, clientY: 60 });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(screen.queryByText("Mark unread")).not.toBeInTheDocument();
+  });
+
+  it("suppresses the native callout on the swipe/long-press stage", () => {
+    render(<ChatRow room={room()} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+    expect(wrapper).toHaveClass("touch-callout-none");
+    expect(wrapper).toHaveClass("select-none");
+  });
+
+  it("reveals More + Archive mid-drag and floods the Archive label past half-swipe", () => {
+    mockRowWidth(320);
+    render(<ChatRow room={room()} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+
+    fireEvent.pointerDown(wrapper, { pointerId: 1, clientX: 300, clientY: 30 });
+    fireEvent.pointerMove(wrapper, { pointerId: 1, clientX: 200, clientY: 30 });
+    // Below the half-swipe commit: the two revealed buttons, no flooded label.
+    expect(
+      screen.getByRole("button", { name: "More actions for Alice Smith" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Archive Alice Smith" })).toBeInTheDocument();
+    expect(screen.queryByTestId("swipe-commit-label")).not.toBeInTheDocument();
+
+    // Past half the width the label appears (the full-swipe affordance).
+    fireEvent.pointerMove(wrapper, { pointerId: 1, clientX: 100, clientY: 30 });
+    expect(screen.getByTestId("swipe-commit-label")).toHaveTextContent("Archive");
+    fireEvent.pointerCancel(wrapper, { pointerId: 1 });
+  });
+
+  it("commits Archive on a full trailing swipe", () => {
+    mockRowWidth(320);
+    render(<ChatRow room={room({ accountId: "acctB", roomId: "!s:example.org" })} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+
+    fireEvent.pointerDown(wrapper, { pointerId: 1, clientX: 300, clientY: 30 });
+    fireEvent.pointerMove(wrapper, { pointerId: 1, clientX: 100, clientY: 30 });
+    fireEvent.pointerUp(wrapper, { pointerId: 1, clientX: 100, clientY: 30 });
+    expect(archiveRoom).toHaveBeenCalledWith("acctB", "!s:example.org");
+  });
+
+  it("commits Unarchive on the trailing swipe of an archived row", () => {
+    mockRowWidth(320);
+    render(<ChatRow room={room({ isArchived: true })} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+
+    fireEvent.pointerDown(wrapper, { pointerId: 1, clientX: 300, clientY: 30 });
+    fireEvent.pointerMove(wrapper, { pointerId: 1, clientX: 100, clientY: 30 });
+    fireEvent.pointerUp(wrapper, { pointerId: 1, clientX: 100, clientY: 30 });
+    expect(unarchiveRoom).toHaveBeenCalled();
+    expect(archiveRoom).not.toHaveBeenCalled();
+  });
+
+  it("toggles unread on a leading swipe with the verb label past half-swipe", () => {
+    mockRowWidth(320);
+    render(<ChatRow room={room({ isUnread: false })} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+
+    fireEvent.pointerDown(wrapper, { pointerId: 1, clientX: 20, clientY: 30 });
+    fireEvent.pointerMove(wrapper, { pointerId: 1, clientX: 220, clientY: 30 });
+    expect(screen.getByTestId("swipe-leading")).toHaveTextContent("Unread");
+    fireEvent.pointerUp(wrapper, { pointerId: 1, clientX: 220, clientY: 30 });
+    expect(markRoomUnread).toHaveBeenCalled();
+    expect(markRoomRead).not.toHaveBeenCalled();
+  });
+
+  it("marks an unread row read on the leading swipe (with the optimistic overlay)", () => {
+    mockRowWidth(320);
+    render(<ChatRow room={room({ isUnread: true })} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+
+    fireEvent.pointerDown(wrapper, { pointerId: 1, clientX: 20, clientY: 30 });
+    fireEvent.pointerMove(wrapper, { pointerId: 1, clientX: 220, clientY: 30 });
+    fireEvent.pointerUp(wrapper, { pointerId: 1, clientX: 220, clientY: 30 });
+    expect(markRoomRead).toHaveBeenCalled();
+    // The same optimistic within-one-frame flip the menu action uses.
+    expect(screen.getByText("Alice Smith")).toHaveClass("font-medium");
+  });
+
+  it("snaps back with no action on a small release", () => {
+    mockRowWidth(320);
+    render(<ChatRow room={room()} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+
+    fireEvent.pointerDown(wrapper, { pointerId: 1, clientX: 300, clientY: 30 });
+    fireEvent.pointerMove(wrapper, { pointerId: 1, clientX: 270, clientY: 30 });
+    fireEvent.pointerUp(wrapper, { pointerId: 1, clientX: 270, clientY: 30 });
+    expect(archiveRoom).not.toHaveBeenCalled();
+    expect(screen.getByTestId("chat-row-swipe-stage").style.transform).toBe("translateX(0px)");
+  });
+
+  it("does not open the conversation on the click after a snap-back swipe", () => {
+    mockRowWidth(320);
+    const onSelect = vi.fn();
+    render(<ChatRow room={room()} onSelect={onSelect} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+
+    // Drag past the intent slop then release back at the origin, then the
+    // browser-synthesized click must be swallowed (not tap through to open).
+    fireEvent.pointerDown(wrapper, { pointerId: 1, clientX: 300, clientY: 30 });
+    fireEvent.pointerMove(wrapper, { pointerId: 1, clientX: 280, clientY: 30 });
+    fireEvent.pointerUp(wrapper, { pointerId: 1, clientX: 300, clientY: 30 });
+    fireEvent.click(screen.getByRole("button", { name: "Conversation with Alice Smith" }));
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("leaves vertical scrolling alone (|dy| > |dx| bails out)", () => {
+    mockRowWidth(320);
+    render(<ChatRow room={room()} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+
+    fireEvent.pointerDown(wrapper, { pointerId: 1, clientX: 200, clientY: 30 });
+    fireEvent.pointerMove(wrapper, { pointerId: 1, clientX: 195, clientY: 80 });
+    expect(screen.getByTestId("chat-row-swipe-stage").style.transform).toBe("translateX(0px)");
+    fireEvent.pointerUp(wrapper, { pointerId: 1, clientX: 195, clientY: 80 });
+    expect(archiveRoom).not.toHaveBeenCalled();
+    expect(markRoomRead).not.toHaveBeenCalled();
+    expect(markRoomUnread).not.toHaveBeenCalled();
+  });
+
+  it("opens the row menu (mute ▸ Notifications) from the settled More button", async () => {
+    mockRowWidth(320);
+    render(<ChatRow room={room()} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+
+    settleTrailingReveal(wrapper);
+    const more = screen.getByRole("button", { name: "More actions for Alice Smith" });
+    fireEvent.click(more);
+    // The identical ContextMenu opens — mute lives in its Notifications submenu.
+    fireEvent.click(await screen.findByText("Notifications"));
+    fireEvent.click(await screen.findByText("Mute"));
+    expect(chatNotifyModeSet).toHaveBeenCalledWith(
+      "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "!abc:example.org",
+      "mute",
+    );
+  });
+
+  it("archives from the settled Archive button", () => {
+    mockRowWidth(320);
+    render(<ChatRow room={room()} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+
+    settleTrailingReveal(wrapper);
+    fireEvent.click(screen.getByRole("button", { name: "Archive Alice Smith" }));
+    expect(archiveRoom).toHaveBeenCalled();
+    // The reveal closes after the action.
+    expect(screen.getByTestId("chat-row-swipe-stage").style.transform).toBe("translateX(0px)");
+  });
+
+  it("closes a settled reveal on row tap instead of opening the conversation", () => {
+    mockRowWidth(320);
+    const onSelect = vi.fn();
+    render(<ChatRow room={room()} onSelect={onSelect} />);
+    const wrapper = screen.getByTestId("chat-row-swipe");
+
+    settleTrailingReveal(wrapper);
+    fireEvent.click(screen.getByRole("button", { name: "Conversation with Alice Smith" }));
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(screen.getByTestId("chat-row-swipe-stage").style.transform).toBe("translateX(0px)");
+
+    // The next tap opens the conversation as usual.
+    fireEvent.click(screen.getByRole("button", { name: "Conversation with Alice Smith" }));
+    expect(onSelect).toHaveBeenCalledTimes(1);
   });
 });

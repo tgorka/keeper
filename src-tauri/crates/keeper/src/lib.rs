@@ -240,6 +240,7 @@ pub fn run() {
             ipc::send_attachment_bytes,
             ipc::cancel_send,
             ipc::mark_room_read,
+            ipc::sync_now,
             ipc::palette_query,
             ipc::cheat_sheet_sections,
             ipc::release_receipt,

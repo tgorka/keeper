@@ -14,9 +14,11 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 
 /**
  * The curated reaction set. Arbitrary Matrix reaction strings pass through
- * unchanged, so these emoji are sent verbatim as the reaction key.
+ * unchanged, so these emoji are sent verbatim as the reaction key. Exported so
+ * the phone bubble long-press menu (Story 13.6) offers the identical set — one
+ * curated list, no fork.
  */
-const CURATED_EMOJI = ["👍", "❤️", "😂", "😮", "😢", "🎉", "🙏", "🔥"] as const;
+export const CURATED_EMOJI = ["👍", "❤️", "😂", "😮", "😢", "🎉", "🙏", "🔥"] as const;
 
 interface ReactionPopoverProps {
   /** Fired with the chosen emoji when the user picks one; closes the popover. */

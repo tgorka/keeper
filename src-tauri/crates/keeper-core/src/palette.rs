@@ -448,6 +448,16 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             None,
             false,
         ),
+        // Story 13.6: the non-gesture twin of the phone pull-to-refresh — kicks
+        // every live account's sync loop through the single Rust `sync_now` entry.
+        action(
+            "sync-now",
+            "Sync Now",
+            "Accounts",
+            &["sync", "refresh", "reconnect", "pull to refresh"],
+            None,
+            false,
+        ),
         // --- Open-chat actions (operate on the current conversation) ---
         // Toggle pairs share a `toggle_group`; the cheat sheet + native menu render
         // each pair as ONE row, resolving direction from the open room's flag.
@@ -885,6 +895,7 @@ mod tests {
             "start-export",
             "add-account",
             "toggle-incognito-global",
+            "sync-now",
             "archive-chat",
             "pin-chat",
             "favorite-chat",
@@ -1085,6 +1096,8 @@ mod tests {
                 "Mute / mention-only / unmute a chat",
                 &["mute-chat", "mention-only-chat", "unmute-chat"],
             ),
+            // Epic 13 — pull-to-refresh's non-gesture path (Story 13.6).
+            ("Sync now (kick the sync loop)", &["sync-now"]),
         ];
 
         // Justified exclusions — surfaces intentionally NOT registered as palette

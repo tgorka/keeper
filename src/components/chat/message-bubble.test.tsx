@@ -1,5 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble";
 import type { MediaVm } from "@/lib/ipc/client";
 
@@ -481,5 +481,160 @@ describe("MessageBubble", () => {
     expect(screen.getByText("Failed")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(onRetry).toHaveBeenCalledWith("f-1");
+  });
+});
+
+// ── Phone long-press menu (Story 13.6) ────────────────────────────────────────
+describe("MessageBubble phone touch menu", () => {
+  const originalMatchMedia = window.matchMedia;
+
+  /** Mock matchMedia at a phone-tier width (mirrors the phone-shell tests). */
+  function mockPhoneViewport() {
+    window.matchMedia = vi.fn().mockImplementation((query: string) => {
+      const match = query.match(/max-width:\s*(\d+)px/);
+      const maxWidth = match ? Number(match[1]) : Number.POSITIVE_INFINITY;
+      return {
+        matches: query.includes("prefers-reduced-motion") ? false : 390 <= maxWidth,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      };
+    });
+  }
+
+  beforeEach(() => {
+    mockPhoneViewport();
+  });
+
+  afterEach(() => {
+    window.matchMedia = originalMatchMedia;
+    vi.useRealTimers();
+  });
+
+  /** The phone bubble long-press surface (mounted only with actions wired). */
+  function bubbleSurface(): HTMLElement {
+    const node = document.querySelector<HTMLElement>('[data-slot="bubble-long-press"]');
+    if (node === null) {
+      throw new Error("bubble long-press surface not mounted");
+    }
+    return node;
+  }
+
+  it("opens a menu with exactly the hover bar's actions on an own sent message", async () => {
+    const onReply = vi.fn();
+    const onEdit = vi.fn();
+    const onDelete = vi.fn();
+    const onToggleReaction = vi.fn();
+    render(
+      <MessageBubble
+        item={msg({ key: "m-1", isOwn: true, sendState: null })}
+        grouped={false}
+        onReply={onReply}
+        onEdit={onEdit}
+        onDelete={onDelete}
+        onToggleReaction={onToggleReaction}
+      />,
+    );
+    fireEvent.contextMenu(bubbleSurface());
+    // React row + Reply + Edit (own) + Delete (own, sent) — and nothing else
+    // (no Copy, no Jump-to-original entry, no Delete submenu).
+    expect(await screen.findByText("Reply")).toBeInTheDocument();
+    expect(screen.getByText("Edit")).toBeInTheDocument();
+    expect(screen.getByText("Delete")).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "React" })).toBeInTheDocument();
+    expect(screen.queryByText("Copy")).not.toBeInTheDocument();
+    expect(screen.queryByText(/jump/i)).not.toBeInTheDocument();
+  });
+
+  it("opens the menu via a stationary long-press", async () => {
+    vi.useFakeTimers();
+    render(<MessageBubble item={msg()} grouped={false} onReply={vi.fn()} />);
+    const surface = bubbleSurface();
+    fireEvent.pointerDown(surface, { pointerId: 1, clientX: 60, clientY: 40 });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    vi.useRealTimers();
+    expect(await screen.findByText("Reply")).toBeInTheDocument();
+  });
+
+  it("routes menu picks through the same handlers as the hover bar", async () => {
+    const onReply = vi.fn();
+    const onToggleReaction = vi.fn();
+    render(
+      <MessageBubble
+        item={msg({ key: "m-2" })}
+        grouped={false}
+        onReply={onReply}
+        onToggleReaction={onToggleReaction}
+      />,
+    );
+    fireEvent.contextMenu(bubbleSurface());
+    fireEvent.click(await screen.findByLabelText("React with 👍"));
+    expect(onToggleReaction).toHaveBeenCalledWith("m-2", "👍");
+
+    fireEvent.contextMenu(bubbleSurface());
+    fireEvent.click(await screen.findByText("Reply"));
+    expect(onReply).toHaveBeenCalledWith("m-2");
+  });
+
+  it("offers no Edit/Delete on a remote message", async () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: false })}
+        grouped={false}
+        onReply={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+    fireEvent.contextMenu(bubbleSurface());
+    expect(await screen.findByText("Reply")).toBeInTheDocument();
+    expect(screen.queryByText("Edit")).not.toBeInTheDocument();
+    expect(screen.queryByText("Delete")).not.toBeInTheDocument();
+  });
+
+  it("offers no Delete on an in-flight own echo (Cancel/Retry territory)", async () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sending" })}
+        grouped={false}
+        onReply={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+    fireEvent.contextMenu(bubbleSurface());
+    expect(await screen.findByText("Reply")).toBeInTheDocument();
+    expect(screen.queryByText("Delete")).not.toBeInTheDocument();
+  });
+
+  it("suppresses the native callout on the long-press surface", () => {
+    render(<MessageBubble item={msg()} grouped={false} onReply={vi.fn()} />);
+    const surface = bubbleSurface();
+    expect(surface).toHaveClass("touch-callout-none");
+    expect(surface).toHaveClass("select-none");
+  });
+
+  it("mounts no long-press surface when no actions are wired", () => {
+    render(<MessageBubble item={msg()} grouped={false} />);
+    expect(document.querySelector('[data-slot="bubble-long-press"]')).toBeNull();
+  });
+
+  it("mounts no ContextMenu off the phone tier (desktop hover bar only)", () => {
+    window.matchMedia = originalMatchMedia;
+    render(<MessageBubble item={msg()} grouped={false} onReply={vi.fn()} />);
+    expect(document.querySelector('[data-slot="bubble-long-press"]')).toBeNull();
+    const bubble = screen.getByText("hello there").closest("div");
+    expect(bubble).not.toBeNull();
+    if (bubble !== null) {
+      fireEvent.contextMenu(bubble);
+    }
+    expect(screen.queryByText("Reply")).not.toBeInTheDocument();
+    // The hover action bar is still the desktop path.
+    expect(screen.getByRole("button", { name: "Reply" })).toBeInTheDocument();
   });
 });

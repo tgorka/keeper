@@ -670,6 +670,36 @@ impl AccountManager {
         index.query(query, mode, open_chat)
     }
 
+    /// Kick every live account's sync loop (Story 13.6: pull-to-refresh and the
+    /// "Sync now" palette action; the Epic 14-1 foreground-resume seam).
+    ///
+    /// Resumes each **already-active** account's [`SyncService`] via its
+    /// idempotent `start()` — matrix-sdk-ui 0.18 documents it as safe to call
+    /// repeatedly: a no-op while `Running`, an exit-and-retry from the offline
+    /// state, and a clean restart after `Terminated`/`Error`. This never builds
+    /// a second `Client`/`SyncService`, never force-activates signed-out (or
+    /// never-subscribed) accounts, and never tears down live streams. Epic 14-1
+    /// should route lifecycle foreground-resume through this same entry rather
+    /// than adding a competing one.
+    ///
+    /// Best-effort and infallible: `start()` itself cannot fail, and an empty
+    /// manager is a no-op.
+    pub async fn sync_now(&self) {
+        // Clone the handles' `SyncService` Arcs under the lock, then resume
+        // outside it so a slow (re)start never blocks other account operations.
+        let services: Vec<(String, std::sync::Arc<SyncService>)> = {
+            let accounts = self.accounts.lock().await;
+            accounts
+                .iter()
+                .map(|(account_id, handle)| (account_id.clone(), handle.sync.clone()))
+                .collect()
+        };
+        for (account_id, sync) in services {
+            sync.start().await;
+            tracing::debug!(account_id = %account_id, "sync-now: resumed sync service");
+        }
+    }
+
     /// Subscribe to the account's room list, activating the account if it is not
     /// already live. Spawns a supervised producer task that emits a `Reset`
     /// snapshot batch first, then diff batches, into `sink`. Returns the new
@@ -5897,6 +5927,29 @@ mod tests {
             .sign_out(&platform, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
             .await
             .expect("second sign_out should succeed");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 13.6: `sync_now` resumes only *already-live* accounts — an empty
+    /// manager (nothing signed in / nothing activated) is a clean no-op that
+    /// never builds a Client/SyncService and never errors.
+    #[tokio::test]
+    async fn sync_now_with_no_live_accounts_is_a_noop() {
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!(
+            "keeper-sync-now-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let manager = AccountManager::new(&data_dir);
+
+        // No accounts are live: nothing to resume, nothing activated, no panic.
+        manager.sync_now().await;
+        assert!(manager.accounts.lock().await.is_empty());
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
