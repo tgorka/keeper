@@ -83,6 +83,12 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 dirs = "6"
 # Keychain (macOS Keychain via the OS-native backend) — shell-only, the only genuinely new crate.
 keyring = { version = "3", features = ["apple-native"] }
+# iOS keychain fallback (Story 12.3, AD-29). Catalog entry only — 3.7.0 is already
+# resolved in the lock via keyring, so no new crate version is pulled; the only Cargo.lock
+# change is the dependency edge recorded on the `keeper` crate, and the desktop dep tree /
+# build stay byte-identical. Consumed by the `keeper` crate under an iOS-only target table
+# to pin `AfterFirstUnlockThisDeviceOnly`. MIT/Apache — passes the cargo-deny license firewall.
+security-framework = "3"
 # Account registry + opaque account ids (both already present transitively via matrix-sdk).
 ulid = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }

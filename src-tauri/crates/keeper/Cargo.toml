@@ -63,3 +63,13 @@ tauri-plugin-autostart = { workspace = true }
 # `tauri-plugin-process` supplies `relaunch()` after applying an update.
 tauri-plugin-updater = { workspace = true }
 tauri-plugin-process = { workspace = true }
+
+# iOS-only keychain fallback (Story 12.3, AD-29). Spike verdict: keyring's `apple-native`
+# iOS backend calls `set_generic_password` with no options and exposes no accessibility
+# API, so it cannot pin `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. iOS therefore
+# switches to a contained `security-framework` fallback behind the same `Platform` port
+# (call sites unchanged); desktop keeps `keyring`. 3.7.0 is already resolved via keyring, so
+# no new crate version is pulled — the only Cargo.lock change is this dependency edge, and
+# the desktop tree / build stay byte-identical.
+[target.'cfg(target_os = "ios")'.dependencies]
+security-framework = { workspace = true }

@@ -136,7 +136,7 @@ development_status:
   epic-12: backlog
   12-1-ios-project-init-and-repo-integration: done
   12-2-desktop-mobile-compile-seam-and-capability-handshake: done
-  12-3-ios-platform-port-keychain-spike-and-data-directory: backlog
+  12-3-ios-platform-port-keychain-spike-and-data-directory: done
   12-4-media-protocol-on-wkurlschemehandler-with-capped-buffers: backlog
   12-5-ios-compile-check-in-ci: backlog
   12-6-on-device-walking-skeleton-validation-sm-7-gate: backlog

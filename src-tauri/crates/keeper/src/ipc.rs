@@ -491,11 +491,26 @@ impl Platform for DesktopPlatform {
 #[cfg(target_os = "ios")]
 pub struct IosPlatform;
 
+/// `errSecItemNotFound` (`-25300`) — the Security Framework status returned when no
+/// keychain item matches. `security_framework` does not re-export it, and although
+/// `security-framework-sys` (which does) is already in the tree transitively, using its
+/// constant would mean declaring a direct `-sys` dependency. Since this is a stable,
+/// ABI-fixed Apple `OSStatus`, a local `const` is safe; `Error::code()` yields an `i32`,
+/// so the comparison is a plain numeric match (Story 12.3, AD-29).
+#[cfg(target_os = "ios")]
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
 #[cfg(target_os = "ios")]
 impl Platform for IosPlatform {
+    /// The single app-container root for all account state on iOS.
+    ///
+    /// Inside the iOS sandbox `dirs::data_dir()` resolves to the app container's
+    /// `Library/Application Support`, so this returns
+    /// `{container}/Library/Application Support/dev.tgorka.keeper` — the one root under
+    /// which `accounts/<ulid>/sdk`, `keeper.db`, and `archive.db` all live (Story 12.3).
+    /// A future App Group move relocates this single path; it is a path change, not a
+    /// data migration (`NSFileProtection*` / `isExcludedFromBackup` are Epic 14 / 14.7).
     fn data_dir(&self) -> Result<PathBuf, CoreError> {
-        // Inside the iOS sandbox `dirs::data_dir()` resolves to the app
-        // container's `Library/Application Support`.
         let base = dirs::data_dir().ok_or_else(|| {
             PlatformError::DirUnavailable("no OS data directory available".to_owned())
         })?;
@@ -503,30 +518,59 @@ impl Platform for IosPlatform {
     }
 
     fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError> {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
-            .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
-        entry
-            .set_password(value)
+        use security_framework::access_control::{ProtectionMode, SecAccessControl};
+        use security_framework::passwords::{
+            delete_generic_password, set_generic_password_options, PasswordOptions,
+        };
+
+        // Pin the item to `AfterFirstUnlockThisDeviceOnly` via a protection-only
+        // access control (flags = 0, no biometry/passcode/user-presence): readable
+        // headless by the resumed sync loop, never iCloud-synced, invisible to other
+        // apps (Story 12.3, AD-29).
+        let access_control = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
+            0,
+        )
+        .map_err(|e| PlatformError::Keychain(format!("could not build access control: {e}")))?;
+        let mut options = PasswordOptions::new_generic_password(KEYCHAIN_SERVICE, key);
+        options.set_access_control(access_control);
+        // Delete any prior item so the fresh `SecItemAdd` carries the protection class
+        // (an update whose match query carries `kSecAttrAccessControl` is fragile). A
+        // missing item is fine — this is a best-effort clear before the authoritative add.
+        // The two calls are not atomic, but keychain keys here are write-once per account
+        // (`session/<ulid>`, `store_passphrase/<ulid>`); a failure between them surfaces as
+        // an `Err` and degrades to re-login (a session-less account is skipped on restore),
+        // never silent corruption.
+        let _ = delete_generic_password(KEYCHAIN_SERVICE, key);
+        set_generic_password_options(value.as_bytes(), options)
             .map_err(|e| PlatformError::Keychain(format!("could not store secret: {e}")))?;
         Ok(())
     }
 
     fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError> {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
-            .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
-        match entry.get_password() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
+        use security_framework::passwords::get_generic_password;
+
+        match get_generic_password(KEYCHAIN_SERVICE, key) {
+            Ok(bytes) => {
+                let secret = String::from_utf8(bytes).map_err(|e| {
+                    PlatformError::Keychain(format!("stored secret was not valid UTF-8: {e}"))
+                })?;
+                Ok(Some(secret))
+            }
+            // A missing item is `Ok(None)`, not an error (accessibility is not part of
+            // the match query, so an AC-protected item is still found with no prompt).
+            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
             Err(e) => Err(PlatformError::Keychain(format!("could not read secret: {e}")).into()),
         }
     }
 
     fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
-            .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
-        match entry.delete_credential() {
+        use security_framework::passwords::delete_generic_password;
+
+        match delete_generic_password(KEYCHAIN_SERVICE, key) {
+            Ok(()) => Ok(()),
             // Deleting a missing entry is a no-op (rollback safety).
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
             Err(e) => Err(PlatformError::Keychain(format!("could not delete secret: {e}")).into()),
         }
     }
