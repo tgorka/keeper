@@ -167,6 +167,16 @@ describe("PhoneHeader", () => {
     });
   });
 
+  it("pads the bar by the safe-area top inset above the 52px content (Story 13.5)", () => {
+    selectRoom();
+    render(<PhoneHeader level={1} onBack={vi.fn()} />);
+    // jsdom cannot evaluate env(), so assert the class plumbing: the notch band
+    // pads above the content row and the bar's height grows by the same inset.
+    const header = screen.getByRole("banner");
+    expect(header.className).toContain("pt-[var(--safe-top)]");
+    expect(header.className).toContain("h-[calc(var(--safe-top)+var(--phone-header))]");
+  });
+
   it("shows the incognito chip only when incognito is effective for the chat", () => {
     selectRoom();
     const { unmount } = render(<PhoneHeader level={1} onBack={vi.fn()} />);

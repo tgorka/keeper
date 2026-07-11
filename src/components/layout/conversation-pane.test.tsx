@@ -1825,3 +1825,79 @@ describe("ConversationPane — Incognito control (Story 8.2)", () => {
     );
   });
 });
+
+describe("ConversationPane — safe areas & keyboard-avoiding composer (Story 13.5)", () => {
+  /**
+   * Mock matchMedia at a phone-tier width (mirrors phone-shell.test.tsx): any
+   * `max-width: <bp>` query matches when the simulated viewport is below it, so
+   * `useShellLayout().phone` reads true at 390px.
+   */
+  const originalMatchMedia = window.matchMedia;
+  function mockViewportWidth(width: number) {
+    window.matchMedia = vi.fn().mockImplementation((query: string) => {
+      const match = query.match(/max-width:\s*(\d+)px/);
+      const maxWidth = match ? Number(match[1]) : Number.POSITIVE_INFINITY;
+      return {
+        matches: width <= maxWidth,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      };
+    });
+  }
+
+  afterEach(() => {
+    window.matchMedia = originalMatchMedia;
+  });
+
+  /** Select a room, render the pane, and stream one message into the timeline. */
+  async function renderWithMessage() {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+    await waitFor(() => {
+      expect(captured.onBatch).not.toBeNull();
+    });
+    captured.onBatch?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hello")] }],
+    });
+    await waitFor(() => {
+      expect(screen.getByText("hello")).toBeInTheDocument();
+    });
+  }
+
+  it("phone: the composer footer carries the kb-inset + safe-bottom padding", async () => {
+    mockViewportWidth(390);
+    await renderWithMessage();
+    // jsdom cannot evaluate env()/var(), so assert the class plumbing: the
+    // footer floats at calc(var(--kb-inset, 0px) + var(--safe-bottom)).
+    const footer = screen.getByTestId("composer-footer");
+    expect(footer.className).toContain("pb-[calc(var(--kb-inset,0px)_+_var(--safe-bottom))]");
+  });
+
+  it("phone: the timeline scroller contains its overscroll", async () => {
+    mockViewportWidth(390);
+    await renderWithMessage();
+    const scroller = screen.getByLabelText("Messages").parentElement;
+    expect(scroller?.className).toContain("overscroll-contain");
+  });
+
+  it("desktop (≥768px): the composer footer carries no keyboard/safe-area inset", async () => {
+    mockViewportWidth(1024);
+    await renderWithMessage();
+    const footer = screen.getByTestId("composer-footer");
+    // Assert the semantic invariant (no keyboard/safe-area inset leaks onto
+    // desktop), not a brittle exact-string match on the merged className.
+    expect(footer.className).not.toContain("kb-inset");
+    expect(footer.className).not.toContain("safe-bottom");
+    expect(footer.className).toContain("border-t");
+  });
+});

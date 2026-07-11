@@ -863,3 +863,114 @@ describe("Composer cross-device mirror (Story 7.2)", () => {
     }
   });
 });
+
+describe("Composer phone deltas (Story 13.5)", () => {
+  const ACCT = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const ROOM = "!r1:example.org";
+
+  /**
+   * Mock matchMedia at a phone-tier width (mirrors phone-shell.test.tsx): any
+   * `max-width: <bp>` query matches when the simulated viewport is below it, so
+   * `useShellLayout().phone` reads true at 390px and false at 1024px.
+   */
+  const originalMatchMedia = window.matchMedia;
+  function mockViewportWidth(width: number) {
+    window.matchMedia = vi.fn().mockImplementation((query: string) => {
+      const match = query.match(/max-width:\s*(\d+)px/);
+      const maxWidth = match ? Number(match[1]) : Number.POSITIVE_INFINITY;
+      return {
+        matches: width <= maxWidth,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      };
+    });
+  }
+
+  beforeEach(() => {
+    mockViewportWidth(390);
+  });
+  afterEach(() => {
+    window.matchMedia = originalMatchMedia;
+  });
+
+  it("phone: the on-screen return inserts a newline and never sends (button-only send)", () => {
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={onSend} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+
+    fireEvent.change(textarea, { target: { value: "line one" } });
+    const enter = fireEvent.keyDown(textarea, { key: "Enter" });
+
+    // The send branch is skipped: nothing dispatched, and the default (newline
+    // insertion) is not prevented — fireEvent returns false when a handler
+    // called preventDefault.
+    expect(onSend).not.toHaveBeenCalled();
+    expect(enter).toBe(true);
+  });
+
+  it("phone: the send button tap sends (FR-41 trigger) and carries the ≥44pt sizing", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={onSend} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    const sendButton = screen.getByRole("button", { name: "Send message" });
+
+    // ≥44pt hit target (h-11 = 44px), primary-tinted (the default variant).
+    expect(sendButton.className).toContain("h-11");
+    expect(sendButton.className).toContain("min-w-11");
+
+    fireEvent.change(textarea, { target: { value: "tap to send" } });
+    fireEvent.click(sendButton);
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith("tap to send");
+    });
+  });
+
+  it("phone: attach is a ≥44pt + presenting the native picker", async () => {
+    open.mockResolvedValue("/home/alice/photo.png");
+    render(
+      <Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} onSendAttachments={vi.fn()} />,
+    );
+    const attach = screen.getByRole("button", { name: "Attach file" });
+    // ≥44pt hit target rendering the `+` glyph (lucide Plus), not the paperclip.
+    expect(attach.className).toContain("size-11");
+    expect(attach.querySelector("svg.lucide-plus")).not.toBeNull();
+    expect(attach.querySelector("svg.lucide-paperclip")).toBeNull();
+
+    fireEvent.click(attach);
+    await waitFor(() => {
+      expect(screen.getByText("photo.png")).toBeInTheDocument();
+    });
+    expect(open).toHaveBeenCalledWith({ multiple: true });
+  });
+
+  it("phone: autogrow caps at 5 lines then scrolls", () => {
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    expect(textarea.className).toContain("max-h-[calc(5*1.5rem+1rem)]");
+    expect(textarea.className).not.toContain("max-h-[calc(8*1.5rem+1rem)]");
+  });
+
+  it("desktop (≥768px): Enter sends, default button size, 8-line cap — byte-for-byte", async () => {
+    mockViewportWidth(1024);
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={onSend} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+
+    // No phone sizing classes leak onto the desktop send button or textarea.
+    const sendButton = screen.getByRole("button", { name: "Send message" });
+    expect(sendButton.className).not.toContain("h-11");
+    expect(textarea.className).toContain("max-h-[calc(8*1.5rem+1rem)]");
+    expect(textarea.className).not.toContain("max-h-[calc(5*1.5rem+1rem)]");
+
+    fireEvent.change(textarea, { target: { value: "desktop enter" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith("desktop enter");
+    });
+  });
+});

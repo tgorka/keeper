@@ -47,7 +47,9 @@ import { LeadingDrawer } from "@/components/layout/leading-drawer";
 import { PhoneHeader } from "@/components/layout/phone-header";
 import { PhoneInboxHeader } from "@/components/layout/phone-inbox-header";
 import { PhoneSearchSurface } from "@/components/layout/phone-search-surface";
+import { useKeyboardInset } from "@/hooks/use-keyboard-inset";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
+import { useShellLayout } from "@/hooks/use-shell-layout";
 import { detailStore, useDetailStore } from "@/lib/stores/detail-ui";
 import { leadingDrawerStore, useLeadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
@@ -213,6 +215,12 @@ export function PhoneShell() {
   const detailOpen = useDetailStore((s) => s.open);
   const toggleDetail = useDetailStore((s) => s.toggleDetail);
   const reducedMotion = useReducedMotion();
+
+  // Keyboard avoidance (Story 13.5, UX-DR25): only the phone tier drives the
+  // `--kb-inset` var — the visualViewport listener never runs on desktop/tablet,
+  // so the desktop layout stays byte-for-byte.
+  const { phone } = useShellLayout();
+  useKeyboardInset({ enabled: phone });
 
   // One visible level, derived purely from existing selection state:
   //   detailOpen && selected -> 2 (Detail); selected -> 1 (Room); else 0 (Inbox).
@@ -515,7 +523,7 @@ export function PhoneShell() {
     <div
       aria-hidden="true"
       data-testid="pull-down-search"
-      className="absolute top-[var(--phone-header)] right-0 left-5 z-10 h-6 touch-none"
+      className="absolute top-[calc(var(--safe-top)+var(--phone-header))] right-0 left-5 z-10 h-6 touch-none"
       onPointerDown={onPullPointerDown}
       onPointerUp={onPullPointerUp}
       onPointerCancel={onPullPointerCancel}
@@ -527,7 +535,7 @@ export function PhoneShell() {
     <div
       aria-hidden="true"
       data-testid="edge-swipe-open"
-      className="absolute top-[var(--phone-header)] bottom-0 left-0 z-10 w-5 touch-none"
+      className="absolute top-[calc(var(--safe-top)+var(--phone-header))] bottom-0 left-0 z-10 w-5 touch-none"
       onPointerDown={onOpenEdgePointerDown}
       onPointerUp={onOpenEdgePointerUp}
       onPointerCancel={onOpenEdgePointerCancel}

@@ -56,7 +56,10 @@ export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHe
   const pendingDraftCount = usePendingDraftCount();
 
   return (
-    <header className="flex h-[var(--phone-header)] shrink-0 items-center gap-1 border-border border-b px-1">
+    // Safe-area top inset (Story 13.5, FR-59): the notch/status-bar band pads
+    // *above* the 52px content row (total = safe-top + 52px), keeping every
+    // ≥44pt target clear of the notch; --safe-top resolves to 0 off-phone.
+    <header className="flex h-[calc(var(--safe-top)+var(--phone-header))] shrink-0 items-center gap-1 border-border border-b px-1 pt-[var(--safe-top)]">
       <button
         ref={drawerButtonRef}
         type="button"

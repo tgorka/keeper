@@ -647,9 +647,10 @@ describe("PhoneShell", () => {
   it("keeps the drawer-open swipe zone below the header so it never shadows the avatar button", () => {
     render(<PhoneShell />);
     const zone = screen.getByTestId("edge-swipe-open");
-    // The zone must start below the 52px header (never `inset-y-0`) so a tap on the
-    // avatar drawer button's leading edge activates the button, not a below-threshold swipe.
-    expect(zone.className).toContain("top-[var(--phone-header)]");
+    // The zone must start below the header — safe-top + 52px since Story 13.5,
+    // never `inset-y-0` — so a tap on the avatar drawer button's leading edge
+    // activates the button, not a below-threshold swipe.
+    expect(zone.className).toContain("top-[calc(var(--safe-top)+var(--phone-header))]");
     expect(zone.className).not.toContain("inset-y-0");
   });
 
@@ -832,5 +833,81 @@ describe("PhoneShell", () => {
     });
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
     expect(screen.getByRole("main")).toBeInTheDocument();
+  });
+});
+
+describe("PhoneShell keyboard inset (Story 13.5)", () => {
+  /**
+   * A minimal `visualViewport` stand-in (jsdom has none): a real `EventTarget`
+   * carrying the mutable `height`/`offsetTop` the keyboard-inset hook reads.
+   */
+  class MockVisualViewport extends EventTarget {
+    height: number;
+    offsetTop = 0;
+
+    constructor(height: number) {
+      super();
+      this.height = height;
+    }
+  }
+
+  function installVisualViewport(viewport: MockVisualViewport | undefined) {
+    Object.defineProperty(window, "visualViewport", {
+      value: viewport as unknown as VisualViewport | undefined,
+      configurable: true,
+      writable: true,
+    });
+  }
+
+  afterEach(() => {
+    installVisualViewport(undefined);
+    document.documentElement.style.removeProperty("--kb-inset");
+  });
+
+  it("drives --kb-inset from visualViewport on the phone tier", () => {
+    Object.defineProperty(window, "innerHeight", {
+      value: 700,
+      configurable: true,
+      writable: true,
+    });
+    const viewport = new MockVisualViewport(700);
+    installVisualViewport(viewport);
+    render(<PhoneShell />);
+
+    // Keyboard closed: the visual viewport fills the layout viewport.
+    expect(document.documentElement.style.getPropertyValue("--kb-inset")).toBe("0px");
+
+    // Keyboard opens: the composer inset rises to the covered height…
+    act(() => {
+      viewport.height = 420;
+      viewport.dispatchEvent(new Event("resize"));
+    });
+    expect(document.documentElement.style.getPropertyValue("--kb-inset")).toBe("280px");
+
+    // …and dismissal returns it to 0px with no stranded offset.
+    act(() => {
+      viewport.height = 700;
+      viewport.dispatchEvent(new Event("resize"));
+    });
+    expect(document.documentElement.style.getPropertyValue("--kb-inset")).toBe("0px");
+  });
+
+  it("does not subscribe to visualViewport off the phone tier", () => {
+    // ≥768px: the shell's tier gate must leave the keyboard engine off even if
+    // the component itself is mounted.
+    mockViewportWidth(1024);
+    const viewport = new MockVisualViewport(700);
+    installVisualViewport(viewport);
+    const addSpy = vi.spyOn(viewport, "addEventListener");
+    render(<PhoneShell />);
+
+    expect(addSpy).not.toHaveBeenCalled();
+    // A keyboard-sized viewport change moves nothing: the var stays at its idle
+    // value ("" fresh, or the "0px" a previous unmount's cleanup restored).
+    act(() => {
+      viewport.height = 420;
+      viewport.dispatchEvent(new Event("resize"));
+    });
+    expect(["", "0px"]).toContain(document.documentElement.style.getPropertyValue("--kb-inset"));
   });
 });

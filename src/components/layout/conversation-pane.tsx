@@ -44,6 +44,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Skeleton } from "@/components/ui/skeleton";
 import { useCouplingCaveats } from "@/hooks/use-coupling-caveats";
 import { useSelectedRoomVm } from "@/hooks/use-selected-room-vm";
+import { useShellLayout } from "@/hooks/use-shell-layout";
 import { accountHueVar } from "@/lib/account-hue";
 import { initials } from "@/lib/account-initials";
 import type {
@@ -479,6 +480,10 @@ export function ConversationPane({
   const selected = useRoomsStore((s) => s.selected);
   const accountId = selected?.accountId ?? null;
   const selectedRoomId = selected?.roomId ?? null;
+  // Phone tier (Story 13.5): gates the composer footer's keyboard/safe-area
+  // bottom inset and the keyboard-resize bottom-pin. Desktop/tablet renders
+  // byte-for-byte as before.
+  const { phone } = useShellLayout();
   // The open room's stable machine `networkId` (Story 6.5) — the health join key.
   // `null` for a native room or when the room's VM isn't in any streamed window.
   const selectedRoom = useSelectedRoomVm();
@@ -856,6 +861,45 @@ export function ConversationPane({
 
   const rows = toRenderedRows(items);
   const roomLoaded = accountId !== null && selectedRoomId !== null && loaded && !errored;
+  const hasRows = rows.length > 0;
+
+  // Keep a bottom-pinned timeline pinned across keyboard open/dismiss (Story
+  // 13.5, UX-DR25): on phone the kb-inset/safe-area footer padding resizes the
+  // scroller, which would otherwise strand the view off the bottom. A
+  // ResizeObserver tracks whether the user was near the bottom *before* each
+  // resize and re-anchors only then — reading up-timeline is never yanked, and
+  // dismissal leaves no stranded offset. Phone-only, so desktop window-resize
+  // behavior is untouched; jsdom's no-op ResizeObserver stub makes it inert in
+  // tests. Batch-driven scrolling stays owned by the layout effect above.
+  useEffect(() => {
+    // The scroller only renders for a loaded room with visible rows; the
+    // `roomLoaded`/`hasRows` gates re-run the effect when it (conditionally
+    // rendered) mounts for a freshly loaded room, so the observer always
+    // attaches to the live element.
+    if (!phone || !roomLoaded || !hasRows) {
+      return;
+    }
+    const el = scrollRef.current;
+    if (el === null || typeof ResizeObserver === "undefined") {
+      return;
+    }
+    let pinned = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+    const trackPin = () => {
+      pinned = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+    };
+    el.addEventListener("scroll", trackPin);
+    const observer = new ResizeObserver(() => {
+      if (pinned) {
+        el.scrollTop = el.scrollHeight;
+        trackPin();
+      }
+    });
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      el.removeEventListener("scroll", trackPin);
+    };
+  }, [phone, roomLoaded, hasRows]);
 
   // Held sends for this Chat (Story 8.3), oldest-first — a pure mirror of the Rust
   // `outbox` stream. Rendered as amber "Held" bubbles at the timeline tail, distinct
@@ -1485,7 +1529,14 @@ export function ConversationPane({
         // biome-ignore lint/a11y/noStaticElementInteractions: message-list keyboard affordances (↑/↓/r/e) live on the scroll region; individual actions have their own labeled buttons.
         <div
           ref={scrollRef}
-          className="flex min-h-0 flex-1 flex-col overflow-y-auto"
+          // `overscroll-contain` (Story 13.5, phone-gated): the timeline's scroll
+          // never chains into the page, so a keyboard open/dismiss or an
+          // over-scroll flick leaves no stranded body offset behind the fixed
+          // phone shell. Gated on the phone tier so desktop stays byte-for-byte.
+          className={cn(
+            "flex min-h-0 flex-1 flex-col overflow-y-auto",
+            phone && "overscroll-contain",
+          )}
           onKeyDown={onKeyDown}
           onScroll={onScroll}
         >
@@ -1576,7 +1627,18 @@ export function ConversationPane({
         </div>
       )}
       {selectedRoomId !== null && (
-        <div className="shrink-0 border-border border-t">
+        <div
+          data-testid="composer-footer"
+          // Phone (Story 13.5): the footer bottom-insets by the live keyboard
+          // height plus the home-indicator safe area, floating the composer (and
+          // the undo-send pill / typing indicator stacked above it) over the
+          // on-screen keyboard. Both vars are 0px when idle/off-phone; desktop
+          // carries no inset class at all.
+          className={cn(
+            "shrink-0 border-border border-t",
+            phone && "pb-[calc(var(--kb-inset,0px)_+_var(--safe-bottom))]",
+          )}
+        >
           <div className="mx-auto w-full max-w-[720px] px-4 py-3">
             {/* Honest, non-blocking search deep-link fallback (Story 5.4): shown when
                 the matched message is further back than the loaded window reaches

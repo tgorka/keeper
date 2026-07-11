@@ -22,7 +22,7 @@
  * text"). Entering edit prefills the textarea with the message body (`editPrefill`).
  */
 import { open } from "@tauri-apps/plugin-dialog";
-import { Paperclip, X } from "lucide-react";
+import { Paperclip, Plus, X } from "lucide-react";
 import {
   type ClipboardEvent,
   type KeyboardEvent,
@@ -33,6 +33,7 @@ import {
 } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { useShellLayout } from "@/hooks/use-shell-layout";
 import {
   clearDraft,
   clearDraftMirror,
@@ -166,6 +167,12 @@ export function Composer({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState(false);
+  // Phone-tier composer deltas (Story 13.5, UX-DR25): ≥44pt send/attach targets,
+  // a 5-line autogrow cap, and Enter→newline (send is button-only on phone —
+  // WKWebView cannot reliably distinguish a hardware keyboard, so the touch
+  // default wins). Everything is tier-gated on the shared layout hook — never
+  // user-agent sniffing, never a forked composer.
+  const { phone } = useShellLayout();
   // The remote (cross-device) draft body currently offered as a local-wins conflict
   // chip (Story 7.2), or `null` when nothing is offered. Set when a differing remote
   // draft arrives against non-empty local text; cleared on adopt / when it stops
@@ -742,8 +749,12 @@ export function Composer({
       onEmptyArrowUp();
       return;
     }
-    // Enter sends; ⇧Enter (or any modifier) inserts a newline.
-    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+    // Desktop: Enter sends; ⇧Enter (or any modifier) inserts a newline. Phone
+    // (Story 13.5): the on-screen return key inserts a newline — the send branch
+    // is skipped entirely, making the ≥44pt send button the sole send path (the
+    // FR-41 approval trigger). The IME `isComposing` guard is shared: a
+    // composing Enter never sends on any tier.
+    if (!phone && e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       void send();
     }
@@ -832,8 +843,11 @@ export function Composer({
             aria-label="Attach file"
             disabled={disabled}
             onClick={() => void pickFiles()}
+            // Phone (Story 13.5): the attach affordance is a ≥44pt `+`
+            // presenting the same native picker; desktop keeps the 36px paperclip.
+            className={cn(phone && "size-11")}
           >
-            <Paperclip aria-hidden="true" />
+            {phone ? <Plus aria-hidden="true" /> : <Paperclip aria-hidden="true" />}
           </Button>
         )}
         <Textarea
@@ -877,11 +891,13 @@ export function Composer({
           onPaste={onPaste}
           rows={1}
           // Autogrow via `field-sizing-content` (from the shadcn base) capped at
-          // eight lines, then scroll. While Incognito is effective for this chat
-          // (Story 8.1), tint the focus ring violet with the reserved `--incognito`
-          // token, overriding the base ring/border color.
+          // eight lines (five on the phone tier, Story 13.5), then scroll. While
+          // Incognito is effective for this chat (Story 8.1), tint the focus ring
+          // violet with the reserved `--incognito` token, overriding the base
+          // ring/border color.
           className={cn(
-            "max-h-[calc(8*1.5rem+1rem)] min-h-9 resize-none",
+            "min-h-9 resize-none",
+            phone ? "max-h-[calc(5*1.5rem+1rem)]" : "max-h-[calc(8*1.5rem+1rem)]",
             incognitoEffective && "focus-visible:border-incognito focus-visible:ring-incognito/50",
           )}
           data-incognito={incognitoEffective ? "true" : undefined}
@@ -891,6 +907,10 @@ export function Composer({
           onClick={() => void send()}
           disabled={!canSend}
           aria-label={pending?.mode === "edit" ? "Save edit" : "Send message"}
+          // Phone (Story 13.5): a ≥44pt primary-tinted hit target — the sole send
+          // path on touch (tap = the FR-41 approval trigger). Desktop keeps the
+          // default button size.
+          className={cn(phone && "h-11 min-w-11")}
         >
           {pending?.mode === "edit" ? "Save" : "Send"}
         </Button>

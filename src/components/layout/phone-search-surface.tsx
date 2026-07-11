@@ -189,6 +189,9 @@ export function PhoneSearchSurface() {
           aria-label="Search"
           className={cn(
             "fixed inset-0 z-50 flex flex-col bg-background text-sm text-foreground outline-none",
+            // Safe-area padding (Story 13.5): the full-screen overlay's content
+            // clears the notch and home indicator; the vars resolve to 0 off-phone.
+            "pt-[var(--safe-top)] pb-[var(--safe-bottom)]",
             "data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0",
             "motion-reduce:animate-none motion-reduce:transition-none",
           )}

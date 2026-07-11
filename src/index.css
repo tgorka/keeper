@@ -93,6 +93,17 @@
   /* Phone-tier stack header height (Story 13.2, UX-DR21): the single 52px bar
      the PhoneShell renders at the Room and Detail levels. */
   --phone-header: 52px;
+  /* Safe-area insets (Story 13.5, FR-59/UX-DR21): populated by viewport-fit=cover
+     on notched/home-indicator devices; env() resolves to the 0px fallback
+     everywhere else (desktop, jsdom), so the padding is inert off-phone. */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  /* Keyboard inset (Story 13.5, UX-DR25): the height the on-screen keyboard
+     covers, driven by the visualViewport hook (use-keyboard-inset.ts) on the
+     phone tier only; 0px whenever the keyboard is closed or off-phone. */
+  --kb-inset: 0px;
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);
   --sidebar-primary: oklch(0.205 0 0);

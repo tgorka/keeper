@@ -56,7 +56,11 @@ export function PhoneHeader({ level, onBack, backRef }: PhoneHeaderProps) {
   const backLabel = backTitle === null ? "Back" : `Back to ${backTitle}`;
 
   return (
-    <header className="flex h-[var(--phone-header)] shrink-0 items-center gap-1 border-border border-b pr-1">
+    // Safe-area top inset (Story 13.5, FR-59): the notch/status-bar band pads
+    // *above* the 52px content row (total = safe-top + 52px), so the bar never
+    // slides under the notch in either orientation; --safe-top resolves to 0
+    // off-phone/jsdom, leaving the desktop layout untouched.
+    <header className="flex h-[calc(var(--safe-top)+var(--phone-header))] shrink-0 items-center gap-1 border-border border-b pt-[var(--safe-top)] pr-1">
       <button
         ref={backRef}
         type="button"
