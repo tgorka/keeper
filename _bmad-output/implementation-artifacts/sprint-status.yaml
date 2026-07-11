@@ -134,7 +134,7 @@ development_status:
   11-3-performance-and-reliability-release-gates: done
   epic-11-retrospective: optional
   epic-12: backlog
-  12-1-ios-project-init-and-repo-integration: backlog
+  12-1-ios-project-init-and-repo-integration: done
   12-2-desktop-mobile-compile-seam-and-capability-handshake: backlog
   12-3-ios-platform-port-keychain-spike-and-data-directory: backlog
   12-4-media-protocol-on-wkurlschemehandler-with-capped-buffers: backlog

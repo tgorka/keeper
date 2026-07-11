@@ -770,3 +770,24 @@ origin: migrated from legacy ledger (spec-11-2-signed-auto-updates-and-egress-ho
 location: tauri.conf.json + .github/workflows/release.yml
 reason: `tauri.conf.json` commits a build-valid scaffold pubkey that `docs/release.md` instructs the maintainer to replace, and `.github/workflows/release.yml` feeds `TAURI_SIGNING_PRIVATE_KEY`/`..._PASSWORD` from GitHub secrets, but no build- or release-time check binds the two. The endpoint-drift guard (`egress_update_endpoint_matches_tauri_conf`) pins only the update *URL*, not the far more security-relevant pubkey. This is inherent to the story's chosen scaffold + human-release-provisioning model (mirrors 11.1's Apple-secret model, which is frozen in the intent contract), so it is not a spec defect and not auto-patchable — a real fix is a release-process decision (e.g. a CI step that, after tauri-action signs, verifies the emitted `latest.json` signature against the committed `plugins.updater.pubkey` before the draft is considered good, failing the job on mismatch). The spec's manual release-time checklist already asks a prior-version app to verify against the committed pubkey, but that is post-hoc and manual. Revisit when the first real keypair is provisioned (Epic 11 release hardening).
 status: open
+
+### DW-105: The committed iOS `Podfile` declares a `target 'keeper_macOS'` that does not exist in the generated `.xcodeproj` (only `keeper_iOS` is defined), so `pod install` in `gen/apple/` would fail with "Unable to find a target named `keeper_macOS`".
+
+origin: spec-12-1-ios-project-init-and-repo-integration.md, 2026-07-11
+location: src-tauri/crates/keeper/gen/apple/Podfile (target 'keeper_macOS') vs project.yml (only keeper_iOS)
+reason: Stock `tauri ios init` boilerplate — Tauri emits a two-target Podfile (iOS + macOS) but XcodeGen only builds the `keeper_iOS` target from `project.yml`. keeper currently uses no CocoaPods dependencies and the documented build/regeneration loop never invokes `pod install`, so there is no trigger today — impact is a latent trap only for a future developer who adds a pod and runs `pod install`. Both review reviewers (adversarial + edge-case) flagged it independently and confirmed it low-severity. Not fixed in 12.1 because it is generated boilerplate unrelated to init+repo-integration scope, and hand-editing the Podfile risks diverging from Tauri's expected scaffold; revisit if/when CocoaPods dependencies are introduced for iOS.
+status: open
+
+### DW-106: `rust-toolchain.toml` pins only `aarch64-apple-ios` and `aarch64-apple-ios-sim`; the iOS-Simulator `x86_64-apple-ios` target is not pinned, so a Simulator build on an Intel Mac would fail on a missing Rust target.
+
+origin: spec-12-1-ios-project-init-and-repo-integration.md, 2026-07-11
+location: rust-toolchain.toml (targets) + src-tauri/crates/keeper/gen/apple/project.yml (x86_64 Externals / EXCLUDED_ARCHS references)
+reason: The generated `project.yml` references `x86_64` Externals paths and `EXCLUDED_ARCHS[sdk=iphoneos*] = x86_64`, but the pinned Rust targets are Apple-Silicon-only. On an Apple-Silicon dev box (the current environment) this is a non-issue; on an Intel Mac the Simulator core build would need `x86_64-apple-ios`. Out of scope for 12.1 (Simulator boot is 12.2's exit criterion, and CI runs on Apple-Silicon macos-latest), surfaced incidentally by adversarial review. Revisit alongside the 12.2 Simulator seam or 12.5 iOS CI if Intel-host support is required.
+status: open
+
+### DW-107: The generated `ExportOptions.plist` hard-codes `method = debugging` (a development/debug export, not distribution) with no `teamID`/`signingStyle`.
+
+origin: spec-12-1-ios-project-init-and-repo-integration.md, 2026-07-11
+location: src-tauri/crates/keeper/gen/apple/ExportOptions.plist
+reason: Correct and intentional for 12.1's unsigned, dev-only init scope (no signing secrets committed; device signing is via the `APPLE_DEVELOPMENT_TEAM` env var documented in docs/ios.md). It becomes relevant only for a later signed-distribution/TestFlight release story (Epic 12 device/release work), which must override the export method and inject the team at archive/export time rather than committing it. Deferred as a forward pointer for that release story, not a 12.1 defect.
+status: open
