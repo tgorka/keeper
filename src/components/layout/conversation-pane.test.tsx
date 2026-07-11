@@ -275,6 +275,34 @@ describe("ConversationPane", () => {
     expect(screen.getByLabelText("Messages")).toBeInTheDocument();
   });
 
+  it("consumes Escape only when there is composer context to clear (phone-shell cascade)", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+    captured.onBatch?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi from bob")] }],
+    });
+    const bubble = await screen.findByText("hi from bob");
+
+    // With a pending reply, Escape clears it AND is marked handled (preventDefault),
+    // so the phone-shell Escape handler does not also pop the level.
+    composerStore.setState({
+      pending: { mode: "reply", targetKey: "k1", sender: "Bob", bodyPreview: "hi from bob" },
+    });
+    const handledWithPending = fireEvent.keyDown(bubble, { key: "Escape" });
+    expect(composerStore.getState().pending).toBeNull();
+    expect(handledWithPending).toBe(false); // preventDefault called → shell won't pop
+
+    // With nothing to clear, Escape is left unhandled so it bubbles to the shell,
+    // which pops a stack level (UX-DR28).
+    const handledWhenEmpty = fireEvent.keyDown(bubble, { key: "Escape" });
+    expect(handledWhenEmpty).toBe(true); // not prevented → bubbles for the back-pop
+  });
+
   it("renders a streamed UTD item as an honest stub (never blank)", async () => {
     const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
     subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {

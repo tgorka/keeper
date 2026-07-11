@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm, InboxBatch, InboxRoomVm } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
@@ -95,16 +95,20 @@ function inboxRoom(roomId: string, displayName: string): InboxRoomVm {
 
 /**
  * Mock matchMedia at a phone-tier width so any `max-width: <bp>` query matches
- * when the simulated viewport is below that breakpoint — the mounted
- * `ChatListPane` reads `useShellLayout().phone` for the composer-focus gate.
+ * when the simulated viewport is below that breakpoint, and drive the
+ * `(prefers-reduced-motion: reduce)` query for `useReducedMotion` (Story 13.2).
+ * Tests default to reduced motion so pops unmount synchronously (jsdom never
+ * fires `transitionend`); motion-specific tests pass `reducedMotion: false`
+ * and end transitions by hand.
  */
 const originalMatchMedia = window.matchMedia;
-function mockViewportWidth(width: number) {
+function mockViewportWidth(width: number, { reducedMotion = true } = {}) {
   window.matchMedia = vi.fn().mockImplementation((query: string) => {
     const match = query.match(/max-width:\s*(\d+)px/);
     const maxWidth = match ? Number(match[1]) : Number.POSITIVE_INFINITY;
+    const matches = query.includes("prefers-reduced-motion") ? reducedMotion : width <= maxWidth;
     return {
-      matches: width <= maxWidth,
+      matches,
       media: query,
       onchange: null,
       addEventListener: vi.fn(),
@@ -124,7 +128,7 @@ async function renderWithRooms(rooms: Array<{ roomId: string; displayName: strin
     return Promise.resolve(1);
   });
   accountsStore.getState().addAccount(account);
-  render(<PhoneShell />);
+  const view = render(<PhoneShell />);
   act(() => {
     captured.onInbox?.({
       ops: [{ op: "reset", rooms: rooms.map((r) => inboxRoom(r.roomId, r.displayName)) }],
@@ -134,6 +138,31 @@ async function renderWithRooms(rooms: Array<{ roomId: string; displayName: strin
   await waitFor(() => {
     expect(screen.getByText(rooms[0].displayName)).toBeInTheDocument();
   });
+  return view;
+}
+
+/** The stack-level wrapper for the given level (presence + transform target). */
+function stackLevel(level: 0 | 1 | 2): HTMLElement {
+  const node = document.querySelector<HTMLElement>(`[data-level="${level}"]`);
+  if (node === null) {
+    throw new Error(`stack level ${level} is not mounted`);
+  }
+  return node;
+}
+
+/** Mock every rect at the given width so the edge-swipe reads a real drag range. */
+function mockRectWidth(width: number) {
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+    width,
+    height: 700,
+    top: 0,
+    left: 0,
+    right: width,
+    bottom: 700,
+    x: 0,
+    y: 0,
+    toJSON: () => ({}),
+  } as DOMRect);
 }
 
 beforeEach(() => {
@@ -166,7 +195,7 @@ describe("PhoneShell", () => {
     expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
     expect(screen.queryByRole("main")).not.toBeInTheDocument();
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Back" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Back/ })).not.toBeInTheDocument();
   });
 
   it("pushes the Room level over the still-mounted Inbox when a room is selected", async () => {
@@ -177,7 +206,7 @@ describe("PhoneShell", () => {
     await waitFor(() => {
       expect(screen.getByRole("main")).toBeInTheDocument();
     });
-    expect(screen.getByRole("button", { name: "Back" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Back to Inbox" })).toBeInTheDocument();
     // Level 0 stays mounted underneath the opaque Room overlay.
     expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
@@ -187,22 +216,32 @@ describe("PhoneShell", () => {
     render(<PhoneShell />);
     act(() => {
       roomsStore.getState().selectRoom(selection);
+    });
+    // Open Detail in a separate commit: the DW-109 effect closes Detail on any
+    // selection change, so a same-batch select+open would (correctly) land on
+    // the Room level.
+    act(() => {
       detailStore.getState().openDetail();
     });
     await waitFor(() => {
       expect(screen.getByRole("complementary", { name: "Details" })).toBeInTheDocument();
     });
-    // The Room and Inbox levels stay mounted underneath; exactly one back
-    // control (the topmost level's) is exposed to assistive tech.
+    // The Room and Inbox levels stay mounted underneath. With no streamed room
+    // VM the Detail header's back name degrades to a generic "Back".
     expect(screen.getByRole("main")).toBeInTheDocument();
     expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "Back" })).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Back" })).toBeInTheDocument();
   });
 
   it("back pops exactly one level: Detail -> Room -> Inbox", async () => {
     render(<PhoneShell />);
     act(() => {
       roomsStore.getState().selectRoom(selection);
+    });
+    // Open Detail in a separate commit: the DW-109 effect closes Detail on any
+    // selection change, so a same-batch select+open would (correctly) land on
+    // the Room level.
+    act(() => {
       detailStore.getState().openDetail();
     });
     await waitFor(() => {
@@ -217,13 +256,13 @@ describe("PhoneShell", () => {
     expect(roomsStore.getState().selected).toEqual(selection);
 
     // Level 1 -> 0: selection clears, only the Inbox remains.
-    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to Inbox" }));
     expect(roomsStore.getState().selected).toBeNull();
     await waitFor(() => {
       expect(screen.queryByRole("main")).not.toBeInTheDocument();
     });
     expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Back" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Back/ })).not.toBeInTheDocument();
   });
 
   it("keeps the Inbox list mounted (same node) across a push and back", async () => {
@@ -243,7 +282,7 @@ describe("PhoneShell", () => {
     // scroll offset is preserved.
     expect(screen.getByRole("list", { name: "Conversations" })).toBe(list);
 
-    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to Inbox" }));
     await waitFor(() => {
       expect(screen.queryByRole("main")).not.toBeInTheDocument();
     });
@@ -264,7 +303,7 @@ describe("PhoneShell", () => {
     });
     expect(roomsStore.getState().selected).toEqual(selection);
 
-    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to Inbox" }));
     expect(roomsStore.getState().selected).toBeNull();
     await waitFor(() => {
       expect(screen.queryByRole("main")).not.toBeInTheDocument();
@@ -286,5 +325,307 @@ describe("PhoneShell", () => {
       expect(screen.getByRole("main")).toBeInTheDocument();
     });
     expect(composerStore.getState().focusNonce).toBe(0);
+  });
+
+  it("renders exactly one header bar at the Room level (UX-DR21)", async () => {
+    await renderWithRooms([{ roomId: "!a:example.org", displayName: "Alpha" }]);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
+
+    // One PhoneHeader-owned bar: back "Inbox" + identity → Detail + ⋯ overflow.
+    expect(screen.getAllByRole("banner")).toHaveLength(1);
+    const header = screen.getByRole("banner");
+    expect(within(header).getByRole("button", { name: "Back to Inbox" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "Open details" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "More" })).toBeInTheDocument();
+    // ConversationPane's own header row is suppressed (showHeader={false}): its
+    // desktop-only controls must not exist anywhere in the stack.
+    expect(screen.queryByRole("button", { name: "Toggle detail panel" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Export this chat" })).not.toBeInTheDocument();
+  });
+
+  it("pushes Detail when the header identity block is tapped", async () => {
+    await renderWithRooms([{ roomId: "!a:example.org", displayName: "Alpha" }]);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Open details" }));
+    await waitFor(() => {
+      expect(screen.getByRole("complementary", { name: "Details" })).toBeInTheDocument();
+    });
+    // The Detail header's back chevron carries the room's display name.
+    expect(screen.getByRole("button", { name: "Back to Alpha" })).toBeInTheDocument();
+  });
+
+  it("slides a push in with the level beneath shifted back 25% when motion is allowed", async () => {
+    mockViewportWidth(390, { reducedMotion: false });
+    render(<PhoneShell />);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
+
+    const room = stackLevel(1);
+    expect(room.className).toContain("transition-transform");
+    expect(room.className).toContain("duration-[250ms]");
+    expect(room.style.transform).toBe("translateX(0)");
+    // The covered Inbox shifts back and is dimmed + inert underneath.
+    const inbox = stackLevel(0);
+    expect(inbox.style.transform).toBe("translateX(-25%)");
+    expect(inbox.className).toContain("brightness-95");
+  });
+
+  it("renders pushes as instant cuts (duration-0) under prefers-reduced-motion", async () => {
+    render(<PhoneShell />);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
+    expect(stackLevel(1).className).toContain("duration-0");
+    expect(stackLevel(1).style.transform).toBe("translateX(0)");
+  });
+
+  it("keeps a popped level mounted until its slide-out transition ends", async () => {
+    mockViewportWidth(390, { reducedMotion: false });
+    render(<PhoneShell />);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to Inbox" }));
+    expect(roomsStore.getState().selected).toBeNull();
+    // Presence: the Room level stays mounted at the trailing edge while the
+    // pop transition runs…
+    const room = stackLevel(1);
+    expect(screen.getByRole("main")).toBeInTheDocument();
+    expect(room.style.transform).toBe("translateX(100%)");
+    // …and unmounts when its own transform transition completes.
+    fireEvent.transitionEnd(room, { propertyName: "transform" });
+    expect(screen.queryByRole("main")).not.toBeInTheDocument();
+  });
+
+  it("moves focus to the new back button on push and restores the pusher on pop", async () => {
+    await renderWithRooms([{ roomId: "!a:example.org", displayName: "Alpha" }]);
+    const row = screen.getByRole("button", { name: "Conversation with Alpha" });
+
+    // Push 0 -> 1 from the focused row: focus lands on the Room back button.
+    act(() => {
+      row.focus();
+    });
+    fireEvent.click(row);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Back to Inbox" })).toHaveFocus();
+    });
+
+    // Push 1 -> 2 from the identity block: focus lands on the Detail back button.
+    const identity = screen.getByRole("button", { name: "Open details" });
+    act(() => {
+      identity.focus();
+    });
+    fireEvent.click(identity);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Back to Alpha" })).toHaveFocus();
+    });
+
+    // Pop 2 -> 1 restores the element that pushed Detail…
+    fireEvent.click(screen.getByRole("button", { name: "Back to Alpha" }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Open details" })).toHaveFocus();
+    });
+
+    // …and pop 1 -> 0 restores the Inbox row that pushed the Room.
+    fireEvent.click(screen.getByRole("button", { name: "Back to Inbox" }));
+    await waitFor(() => {
+      expect(row).toHaveFocus();
+    });
+  });
+
+  it("pops one level per Escape press", async () => {
+    await renderWithRooms([{ roomId: "!a:example.org", displayName: "Alpha" }]);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    // Open Detail in a separate commit: the DW-109 effect closes Detail on any
+    // selection change, so a same-batch select+open would (correctly) land on
+    // the Room level.
+    act(() => {
+      detailStore.getState().openDetail();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("complementary", { name: "Details" })).toBeInTheDocument();
+    });
+
+    fireEvent.keyDown(screen.getByRole("complementary", { name: "Details" }), { key: "Escape" });
+    expect(detailStore.getState().open).toBe(false);
+    expect(roomsStore.getState().selected).toEqual(selection);
+
+    fireEvent.keyDown(screen.getByRole("button", { name: "Back to Inbox" }), { key: "Escape" });
+    expect(roomsStore.getState().selected).toBeNull();
+  });
+
+  it("marks covered levels inert while a higher level is on top", async () => {
+    await renderWithRooms([{ roomId: "!a:example.org", displayName: "Alpha" }]);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    // Open Detail in a separate commit: the DW-109 effect closes Detail on any
+    // selection change, so a same-batch select+open would (correctly) land on
+    // the Room level.
+    act(() => {
+      detailStore.getState().openDetail();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("complementary", { name: "Details" })).toBeInTheDocument();
+    });
+
+    expect(stackLevel(0)).toHaveAttribute("inert");
+    expect(stackLevel(1)).toHaveAttribute("inert");
+    expect(stackLevel(2)).not.toHaveAttribute("inert");
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to Alpha" }));
+    expect(stackLevel(0)).toHaveAttribute("inert");
+    expect(stackLevel(1)).not.toHaveAttribute("inert");
+  });
+
+  it("commits back when an edge-swipe crosses half the width", async () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
+
+    const zone = screen.getByTestId("edge-swipe-back");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientX: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientX: 250 });
+    // Mid-drag the active level tracks the finger and the covered level returns
+    // proportionally toward 0.
+    expect(stackLevel(1).style.transform).toBe("translateX(245px)");
+    expect(stackLevel(0).style.transform).not.toBe("translateX(-25%)");
+    fireEvent.pointerUp(zone, { pointerId: 1, clientX: 250 });
+
+    expect(roomsStore.getState().selected).toBeNull();
+    await waitFor(() => {
+      expect(screen.queryByRole("main")).not.toBeInTheDocument();
+    });
+  });
+
+  it("snaps back without popping when the edge-swipe releases below the threshold", async () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
+
+    const zone = screen.getByTestId("edge-swipe-back");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientX: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientX: 30 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientX: 30 });
+
+    // Below half width and below the flick minimum: no pop, the level snaps to 0.
+    expect(roomsStore.getState().selected).toEqual(selection);
+    expect(screen.getByRole("main")).toBeInTheDocument();
+    expect(stackLevel(1).style.transform).toBe("translateX(0)");
+  });
+
+  it("commits back on a fast flick even below half the width", async () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
+
+    const zone = screen.getByTestId("edge-swipe-back");
+    // ~95px in the few ms between synchronously-fired events: a flick.
+    fireEvent.pointerDown(zone, { pointerId: 1, clientX: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientX: 100 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientX: 100 });
+
+    expect(roomsStore.getState().selected).toBeNull();
+  });
+
+  it("pops from the Detail level too when the edge-swipe commits", async () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    // Open Detail in a separate commit: the DW-109 effect closes Detail on any
+    // selection change, so a same-batch select+open would (correctly) land on
+    // the Room level.
+    act(() => {
+      detailStore.getState().openDetail();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("complementary", { name: "Details" })).toBeInTheDocument();
+    });
+
+    const zone = screen.getByTestId("edge-swipe-back");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientX: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientX: 250 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientX: 250 });
+
+    // Exactly one level pops: Detail closes, the Room survives.
+    expect(detailStore.getState().open).toBe(false);
+    expect(roomsStore.getState().selected).toEqual(selection);
+  });
+
+  it("reserves level 0's leading edge (no back gesture) for the drawer", () => {
+    render(<PhoneShell />);
+    // The edge-swipe hit zone exists only on the active overlay at level >= 1.
+    expect(screen.queryByTestId("edge-swipe-back")).not.toBeInTheDocument();
+  });
+
+  it("closes Detail when the selection changes so it lands on the Room level (DW-109)", async () => {
+    await renderWithRooms([
+      { roomId: "!a:example.org", displayName: "Alpha" },
+      { roomId: "!b:example.org", displayName: "Beta" },
+    ]);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    // Open Detail in a separate commit: the DW-109 effect closes Detail on any
+    // selection change, so a same-batch select+open would (correctly) land on
+    // the Room level.
+    act(() => {
+      detailStore.getState().openDetail();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("complementary", { name: "Details" })).toBeInTheDocument();
+    });
+
+    // A different room is selected while Detail is open: the stack must land on
+    // the Room level, never on Detail.
+    act(() => {
+      roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!b:example.org" });
+    });
+    await waitFor(() => {
+      expect(detailStore.getState().open).toBe(false);
+    });
+    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    expect(screen.getByRole("main")).toBeInTheDocument();
   });
 });

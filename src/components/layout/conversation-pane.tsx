@@ -130,6 +130,13 @@ interface ConversationPaneProps {
   detailOpen: boolean;
   onToggleDetail: () => void;
   toggleRef?: Ref<HTMLButtonElement>;
+  /**
+   * Whether to render the pane's own header row (Story 13.2). The phone stack
+   * passes `false` because its `PhoneHeader` owns the single 52px bar (UX-DR21);
+   * desktop callers omit it and keep the header exactly as before. Only the
+   * header row is skipped — timeline, banner, and composer are unchanged.
+   */
+  showHeader?: boolean;
 }
 
 /** The `utd`-variant of {@link TimelineItemVm} (rendered as an honest stub). */
@@ -234,9 +241,10 @@ function AccountInitialChip({ userId, hueIndex }: { userId: string; hueIndex: nu
  * account-initial chip. When the room's VM is not in any streamed window, it
  * degrades to the account chip alone (looked up from {@link accountsStore} by the
  * selection's `accountId`) — never a crash. Renders nothing when no room is open or
- * the account is unknown.
+ * the account is unknown. Exported so the phone stack's `PhoneHeader` (Story 13.2)
+ * reuses the identical identity block — never a fork.
  */
-function ConversationHeaderIdentity({ accountId }: { accountId: string | null }) {
+export function ConversationHeaderIdentity({ accountId }: { accountId: string | null }) {
   const room = useSelectedRoomVm();
   const account = useAccountsStore((s) =>
     accountId === null ? null : (s.accounts.find((a) => a.accountId === accountId) ?? null),
@@ -293,8 +301,9 @@ export function incognitoChipLabel(source: IncognitoVm["source"]): string {
  * the user enable per-Chat Incognito; the coupling caveat surfaces inline in that
  * enable affordance too (FR-44: the caveat at toggle time). All caveat copy comes from
  * Rust ({@link useCouplingCaveats}); precedence is never re-resolved on the frontend.
+ * Exported so the phone stack's `PhoneHeader` (Story 13.2) reuses the identical chip.
  */
-function ConversationIncognitoChip({
+export function ConversationIncognitoChip({
   accountId,
   roomId,
   networkId,
@@ -461,7 +470,12 @@ export function ConversationHealthBanner({
   );
 }
 
-export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: ConversationPaneProps) {
+export function ConversationPane({
+  detailOpen,
+  onToggleDetail,
+  toggleRef,
+  showHeader = true,
+}: ConversationPaneProps) {
   const selected = useRoomsStore((s) => s.selected);
   const accountId = selected?.accountId ?? null;
   const selectedRoomId = selected?.roomId ?? null;
@@ -1307,8 +1321,16 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
         .map((it) => it.key);
 
       if (e.key === "Escape") {
-        composerStore.getState().clear();
-        composerStore.getState().clearSelection();
+        // Only consume Escape when there is pending composer context or a selected
+        // message to clear; otherwise let it bubble so the phone stack shell can pop
+        // a level (UX-DR28, Story 13.2). preventDefault is a no-op on desktop
+        // (nothing else reads it) and drives the shell's `defaultPrevented` guard.
+        const { pending, selectedKey } = composerStore.getState();
+        if (pending !== null || selectedKey !== null) {
+          composerStore.getState().clear();
+          composerStore.getState().clearSelection();
+          e.preventDefault();
+        }
         return;
       }
 
@@ -1382,51 +1404,53 @@ export function ConversationPane({ detailOpen, onToggleDetail, toggleRef }: Conv
 
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col bg-background">
-      <div className="flex shrink-0 items-center justify-between gap-2 border-border border-b p-2">
-        <div className="flex min-w-0 items-center gap-2">
-          <ConversationHeaderIdentity accountId={accountId} />
-          <ConversationIncognitoChip
-            // Key by roomId so a room switch remounts the chip: it can never leave a
-            // Popover bound (open) to the previously selected chat.
-            key={selectedRoomId ?? ""}
-            accountId={accountId}
-            roomId={selectedRoomId}
-            networkId={selectedNetworkId}
-          />
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
-          {accountId !== null && selectedRoomId !== null && (
+      {showHeader && (
+        <div className="flex shrink-0 items-center justify-between gap-2 border-border border-b p-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <ConversationHeaderIdentity accountId={accountId} />
+            <ConversationIncognitoChip
+              // Key by roomId so a room switch remounts the chip: it can never leave a
+              // Popover bound (open) to the previously selected chat.
+              key={selectedRoomId ?? ""}
+              accountId={accountId}
+              roomId={selectedRoomId}
+              networkId={selectedNetworkId}
+            />
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            {accountId !== null && selectedRoomId !== null && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label="Export this chat"
+                onClick={() =>
+                  exportStore.getState().open({
+                    scope: "chat",
+                    accountId,
+                    roomId: selectedRoomId,
+                  })
+                }
+                className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+              >
+                <Download aria-hidden="true" />
+              </Button>
+            )}
             <Button
+              ref={toggleRef}
               type="button"
               variant="ghost"
               size="icon"
-              aria-label="Export this chat"
-              onClick={() =>
-                exportStore.getState().open({
-                  scope: "chat",
-                  accountId,
-                  roomId: selectedRoomId,
-                })
-              }
-              className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+              aria-label="Toggle detail panel"
+              aria-pressed={detailOpen}
+              onClick={onToggleDetail}
+              className="shrink-0 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
             >
-              <Download aria-hidden="true" />
+              <PanelRight aria-hidden="true" />
             </Button>
-          )}
-          <Button
-            ref={toggleRef}
-            type="button"
-            variant="ghost"
-            size="icon"
-            aria-label="Toggle detail panel"
-            aria-pressed={detailOpen}
-            onClick={onToggleDetail}
-            className="shrink-0 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-          >
-            <PanelRight aria-hidden="true" />
-          </Button>
+          </div>
         </div>
-      </div>
+      )}
       {/* Non-dismissible in-conversation re-link banner (Story 6.5, UX-DR11): shown iff
           the open room's (accountId, networkId) session is unhealthy → opens the login
           stepper for that exact bridge. Persistent until the session recovers. */}
