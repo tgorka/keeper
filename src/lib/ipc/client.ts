@@ -13,6 +13,7 @@ import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
 import type { IpcError } from "./gen/IpcError";
 import type { LifecyclePhase } from "./gen/LifecyclePhase";
+import type { NotificationPermission } from "./gen/NotificationPermission";
 import type { NotifyTarget } from "./gen/NotifyTarget";
 
 export type { AccountVm } from "./gen/AccountVm";
@@ -72,6 +73,7 @@ export type { MuteState } from "./gen/MuteState";
 export type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 export type { NetworkVm } from "./gen/NetworkVm";
 export type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
+export type { NotificationPermission } from "./gen/NotificationPermission";
 export type { NotifyTarget } from "./gen/NotifyTarget";
 export type { OutboxVm } from "./gen/OutboxVm";
 export type { PaginationState } from "./gen/PaginationState";
@@ -1549,6 +1551,43 @@ export async function dockBadgeModeGet(): Promise<DockBadgeMode> {
  */
 export async function dockBadgeModeSet(mode: DockBadgeMode): Promise<void> {
   await invoke<void>("dock_badge_mode_set", { mode });
+}
+
+/**
+ * Report the currently-visible Chat to the shared notify engine (Story 14.3, AD-18). A
+ * `{ accountId, roomId }` selection sets the active Chat (a message for exactly it is
+ * suppressed — its content is already on screen); `null` clears it. Reported by the iOS
+ * shell from `roomsStore.selected` on the reduced tier only, so desktop notification
+ * behavior is unchanged. Best-effort: callers fire-and-forget and swallow rejections.
+ */
+export async function activeChatSet(
+  selection: { accountId: string; roomId: string } | null,
+): Promise<void> {
+  await invoke<void>("active_chat_set", {
+    accountId: selection?.accountId ?? null,
+    roomId: selection?.roomId ?? null,
+  });
+}
+
+/**
+ * Read the OS notification-permission state (Story 14.3). Maps the notification plugin's
+ * `permission_state()` to `"granted" | "denied" | "unknown"` in Rust; a prompt state, an
+ * unset handle, or a read error resolves to `"unknown"` (the UI then hides the persistent
+ * "off" surface). Never re-prompts. Resolves with the current state; degrades to
+ * `"unknown"` rather than rejecting.
+ */
+export async function notificationPermissionState(): Promise<NotificationPermission> {
+  return await invoke<NotificationPermission>("notification_permission_state");
+}
+
+/**
+ * Open this app's page in the iOS system Settings (Story 14.3). Routes `app-settings:`
+ * through the Rust opener (`Platform::open_url`) so it bypasses the opener JS default
+ * scope (which only permits `mailto`/`tel`/`http(s)`). Used by the permission-denied
+ * "Open Settings" affordance; never re-prompts. Best-effort — callers swallow rejection.
+ */
+export async function iosOpenAppSettings(): Promise<void> {
+  await invoke<void>("ios_open_app_settings");
 }
 
 /**

@@ -1461,6 +1461,26 @@ impl DockBadgeMode {
     }
 }
 
+/// The OS notification-permission state the iOS Settings surface reads (Story 14.3).
+///
+/// Read in Rust from `tauri-plugin-notification`'s `permission_state()` and mapped to
+/// this typed enum so the notification-permission concern stays in one place and is
+/// testable. `Granted`/`Denied` mirror the plugin's states; every other plugin state
+/// (prompt / prompt-with-rationale), an unset app handle, or a read error maps to
+/// `Unknown` — the UI then hides the persistent "off" surface rather than guessing.
+/// Never drives a re-prompt (UX-DR28). Serializes to `"granted" | "denied" | "unknown"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum NotificationPermission {
+    /// OS notification permission is granted — notifications (and the app-icon badge) post.
+    Granted,
+    /// OS notification permission is denied — the persistent iOS "off" surface renders.
+    Denied,
+    /// Prompt / not-yet-decided / unreadable — the UI shows no persistent "off" state.
+    Unknown,
+}
+
 /// The click-through target carried by every native notification (Story 10.4, FR-51).
 ///
 /// Attached at the notification dispatch site so a click can land the user in the

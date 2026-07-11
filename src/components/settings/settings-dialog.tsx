@@ -36,10 +36,13 @@ import {
   hotkeySet,
   incognitoGetGlobal,
   incognitoSetGlobal,
+  iosOpenAppSettings,
   launchAtLoginGet,
   launchAtLoginSet,
   menuBarPresenceGet,
   menuBarPresenceSet,
+  type NotificationPermission,
+  notificationPermissionState,
   notifyGetPreviewEnabled,
   notifySetPreviewEnabled,
   setHonorRemoteDeletions,
@@ -248,24 +251,46 @@ const UNDO_SEND_SENTENCE =
 const NOTIFY_PREVIEWS_SENTENCE =
   "Native notifications for new messages show the sender and chat, plus a short preview of the message. Turn this off to hide the message content: notifications then show only the sender and chat, never the text. Notifications are always on-device and never leave this Mac.";
 
+/** The persistent inline state when iOS notification permission is denied (Story 14.3).
+ * Fixed copy; never re-prompts (UX-DR28). */
+const NOTIFICATIONS_OFF_SENTENCE = "Notifications are off for keeper in iOS Settings.";
+
+/** Note that the app-icon badge needs the same iOS notification permission (Story 14.3). */
+const BADGE_NEEDS_PERMISSION_SENTENCE =
+  "The app icon badge needs the same permission, so it will not show until you turn notifications on.";
+
 /**
  * Notifications section (Story 10.1): the "Show message previews" `Switch`, bound to
  * `notifySetPreviewEnabled`. Reads its initial state via `notifyGetPreviewEnabled()` on
  * open. On a persist failure the toggle reverts (honest — never claims a state that was
  * not saved).
+ *
+ * On the reduced (phone) tier it additionally renders (Story 14.3): the "App icon badge"
+ * mode radio (reusing the shared {@link DOCK_BADGE_OPTIONS} + `dockBadgeMode*` IPC), and a
+ * persistent permission-denied inline state (queried via `notificationPermissionState()`
+ * on open) with an Open-Settings deep link and a note the badge needs the same permission.
+ * Never re-prompts.
  */
 function NotificationsSection({ open }: { open: boolean }) {
-  // The reduced (phone) tier gets the permanent lifecycle-honesty copy below: the
-  // canonical only-while-open sentence plus the badge-not-live note (Story 14.2).
+  // The reduced (phone) tier gets the permanent lifecycle-honesty copy below (the
+  // canonical only-while-open sentence plus the badge-not-live note, Story 14.2), the
+  // "App icon badge" mode radio, and the permission-denied inline state (Story 14.3).
   const reducedPlatform = useIsReducedCapabilityPlatform();
   // `undefined` = still loading; otherwise the resolved previews state.
   const [enabled, setEnabled] = useState<boolean | undefined>(undefined);
+  // The iOS app-icon badge mode (reuses the shared DockBadgeMode). `undefined` = loading.
+  const [badgeMode, setBadgeMode] = useState<DockBadgeMode | undefined>(undefined);
+  // The OS notification-permission state (Story 14.3). `undefined` = still loading; the
+  // persistent "off" surface renders only when this resolves to `"denied"`.
+  const [permission, setPermission] = useState<NotificationPermission | undefined>(undefined);
 
   useEffect(() => {
     if (!open) {
       return;
     }
     setEnabled(undefined);
+    setBadgeMode(undefined);
+    setPermission(undefined);
     let cancelled = false;
     void notifyGetPreviewEnabled()
       .then((value) => {
@@ -279,13 +304,42 @@ function NotificationsSection({ open }: { open: boolean }) {
           setEnabled(true);
         }
       });
+    // The badge radio and permission surface are reduced-tier-only; only probe their
+    // backends there so desktop opens make no dead round-trip.
+    if (reducedPlatform) {
+      void dockBadgeModeGet()
+        .then((value) => {
+          if (!cancelled) {
+            setBadgeMode(value);
+          }
+        })
+        .catch(() => {
+          // On a read failure, fall back to the honest default (badge all unreads).
+          if (!cancelled) {
+            setBadgeMode("all");
+          }
+        });
+      void notificationPermissionState()
+        .then((value) => {
+          if (!cancelled) {
+            setPermission(value);
+          }
+        })
+        .catch(() => {
+          // On a read failure treat as unknown — hide the persistent "off" surface.
+          if (!cancelled) {
+            setPermission("unknown");
+          }
+        });
+    }
     return () => {
       cancelled = true;
     };
-  }, [open]);
+  }, [open, reducedPlatform]);
 
   // Monotonic token so a failed persist only reverts when no newer toggle superseded it.
   const writeId = useRef(0);
+  const badgeWriteId = useRef(0);
 
   const onCheckedChange = (next: boolean) => {
     writeId.current += 1;
@@ -295,6 +349,19 @@ function NotificationsSection({ open }: { open: boolean }) {
     void notifySetPreviewEnabled(next).catch(() => {
       if (id === writeId.current) {
         setEnabled(prev);
+      }
+    });
+  };
+
+  const onBadgeModeChange = (next: string) => {
+    const value = next as DockBadgeMode;
+    badgeWriteId.current += 1;
+    const id = badgeWriteId.current;
+    const prev = badgeMode ?? "all";
+    setBadgeMode(value);
+    void dockBadgeModeSet(value).catch(() => {
+      if (id === badgeWriteId.current) {
+        setBadgeMode(prev);
       }
     });
   };
@@ -314,8 +381,48 @@ function NotificationsSection({ open }: { open: boolean }) {
       <p className="text-muted-foreground">{NOTIFY_PREVIEWS_SENTENCE}</p>
       {reducedPlatform && (
         <>
+          <div className="mt-1 flex flex-col gap-2">
+            <Label>App icon badge</Label>
+            <RadioGroup
+              value={badgeMode ?? ""}
+              onValueChange={onBadgeModeChange}
+              aria-label="App icon badge mode"
+              className="gap-2"
+            >
+              {DOCK_BADGE_OPTIONS.map((option) => (
+                <div key={option.value} className="flex items-center gap-2">
+                  <RadioGroupItem
+                    id={`app-badge-${option.value}`}
+                    value={option.value}
+                    disabled={badgeMode === undefined}
+                  />
+                  <Label htmlFor={`app-badge-${option.value}`} className="font-normal">
+                    {option.label}
+                  </Label>
+                </div>
+              ))}
+            </RadioGroup>
+          </div>
           <p className="text-muted-foreground">{NO_BACKGROUND_SYNC_SENTENCE}</p>
           <p className="text-muted-foreground">{BADGE_NOT_LIVE_SENTENCE}</p>
+          {permission === "denied" && (
+            <div className="mt-1 flex flex-col gap-2 rounded-md border border-border p-2">
+              <p className="text-muted-foreground">{NOTIFICATIONS_OFF_SENTENCE}</p>
+              <p className="text-muted-foreground">{BADGE_NEEDS_PERMISSION_SENTENCE}</p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="self-start"
+                onClick={() => {
+                  // Best-effort deep link through the Rust opener; never re-prompts.
+                  void iosOpenAppSettings().catch(() => {});
+                }}
+              >
+                Open Settings
+              </Button>
+            </div>
+          )}
         </>
       )}
     </div>

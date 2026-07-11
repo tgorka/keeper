@@ -55,6 +55,13 @@ pub struct NotifyConfig {
     /// Seeded from the registry and replaced wholesale on each per-Network toggle;
     /// read under a short `RwLock` in the notify decision.
     muted_networks: RwLock<HashSet<String>>,
+    /// The `(account_id, room_id)` of the currently-visible Chat, or `None` when no Chat
+    /// is on screen (Story 14.3, AD-18). A message for exactly this Chat is suppressed —
+    /// its content is already visible, so a banner would be redundant. Reported by the
+    /// iOS shell from `roomsStore.selected` **only on the reduced tier** (desktop never
+    /// sets it, so desktop notification behavior is unchanged). Ephemeral process state,
+    /// never persisted; read under a short `RwLock` in the notify decision.
+    active_room: RwLock<Option<(String, String)>>,
 }
 
 impl NotifyConfig {
@@ -78,6 +85,7 @@ impl NotifyConfig {
             previews_enabled: AtomicBool::new(previews_enabled),
             dnd_enabled: AtomicBool::new(dnd_enabled),
             muted_networks: RwLock::new(muted_networks),
+            active_room: RwLock::new(None),
         }
     }
 
@@ -141,6 +149,47 @@ impl NotifyConfig {
         };
         *set = networks;
     }
+
+    /// Record the currently-visible Chat (Story 14.3, AD-18). Reported by the iOS shell
+    /// from `roomsStore.selected` on the reduced tier; a message for exactly this
+    /// `(account_id, room_id)` is then suppressed in [`should_notify`]. A poisoned lock is
+    /// recovered rather than propagated — visible-Chat suppression is a comfort feature and
+    /// must never abort the notify path.
+    pub fn set_active_room(&self, account_id: &str, room_id: &str) {
+        let mut slot = match self.active_room.write() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = Some((account_id.to_owned(), room_id.to_owned()));
+    }
+
+    /// Clear the currently-visible Chat (Story 14.3) — no Chat is on screen, so no message
+    /// is suppressed on this ground. A poisoned lock is recovered rather than propagated.
+    pub fn clear_active_room(&self) {
+        let mut slot = match self.active_room.write() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = None;
+    }
+
+    /// Whether `(account_id, room_id)` is the currently-visible Chat (Story 14.3). A
+    /// poisoned lock fails open (treated as "not active" ⇒ still notifies) rather than
+    /// panicking — over-notifying is safer than dropping a genuine notification.
+    pub fn is_active_room(&self, account_id: &str, room_id: &str) -> bool {
+        match self.active_room.read() {
+            Ok(slot) => slot
+                .as_ref()
+                .is_some_and(|(a, r)| a == account_id && r == room_id),
+            Err(poisoned) => {
+                tracing::warn!("active-room lock poisoned; failing open (not the active room)");
+                poisoned
+                    .into_inner()
+                    .as_ref()
+                    .is_some_and(|(a, r)| a == account_id && r == room_id)
+            }
+        }
+    }
 }
 
 /// The extracted, SDK-free context a single [`dispatch`] decision operates on. Built
@@ -186,14 +235,16 @@ pub struct NotifyContext {
 /// - the room's synced push rules elected to notify this event (`room_push_notifies`) —
 ///   this ANDs in per-Chat mute and mention-only,
 /// - global Do-Not-Disturb is off (`!dnd_enabled`),
-/// - the room's Network is not muted (`!network_muted`).
+/// - the room's Network is not muted (`!network_muted`),
+/// - the message's Chat is not the one currently on screen (`!is_active_room`).
 ///
-/// The first three gates are the unchanged Story 10.1 rules; the last three are the
-/// Story 10.2 suppression layer. Backlog suppression drops cold-launch history (the
-/// inbox already shows it) while still notifying messages that arrive during a live
-/// background session. `room_push_notifies` / `network_muted` are computed fail-open by
-/// the handler, so a transient rule/network read error over-notifies rather than
-/// dropping a genuine notification.
+/// The first three gates are the unchanged Story 10.1 rules; the next three are the
+/// Story 10.2 suppression layer; the last is the Story 14.3 visible-Chat suppression
+/// (AD-18) — a banner for the Chat already on screen is redundant. Backlog suppression
+/// drops cold-launch history (the inbox already shows it) while still notifying messages
+/// that arrive during a live background session. `room_push_notifies` / `network_muted` /
+/// `is_active_room` are computed fail-open by the caller, so a transient read error
+/// over-notifies rather than dropping a genuine notification.
 #[allow(clippy::too_many_arguments)]
 pub fn should_notify(
     is_self: bool,
@@ -203,6 +254,7 @@ pub fn should_notify(
     room_push_notifies: bool,
     dnd_enabled: bool,
     network_muted: bool,
+    is_active_room: bool,
 ) -> bool {
     !is_self
         && notifies
@@ -210,6 +262,7 @@ pub fn should_notify(
         && room_push_notifies
         && !dnd_enabled
         && !network_muted
+        && !is_active_room
 }
 
 /// Derive the preview string for a message type (pure rule).
@@ -296,8 +349,11 @@ pub fn dispatch(
     baseline_ms: u64,
     ctx: &NotifyContext,
 ) {
-    // Read global DND from the shared config at decision time; the per-Chat push verdict
-    // and per-Network mute are already resolved into the context by the handler.
+    // Read global DND and the currently-visible Chat from the shared config at decision
+    // time; the per-Chat push verdict and per-Network mute are already resolved into the
+    // context by the handler. Visible-Chat suppression (Story 14.3, AD-18) drops a banner
+    // for the Chat already on screen — the signal is set only on the reduced tier, so
+    // desktop (where `active_room` is always `None`) behaves exactly as before.
     if !should_notify(
         ctx.is_self,
         ctx.event_ts_ms,
@@ -306,6 +362,7 @@ pub fn dispatch(
         ctx.room_push_notifies,
         config.dnd_enabled(),
         ctx.network_muted,
+        config.is_active_room(account_id, room_id),
     ) {
         return;
     }
@@ -688,32 +745,43 @@ mod tests {
     }
 
     // ── should_notify ──────────────────────────────────────────────────────────
-    // The last three args are the Story 10.2 gates: room_push_notifies, dnd_enabled,
-    // network_muted. The default "would notify" tuple is (…, true, false, false).
+    // The last four args are the suppression gates: room_push_notifies (10.2),
+    // dnd_enabled (10.2), network_muted (10.2), is_active_room (14.3). The default
+    // "would notify" tuple is (…, true, false, false, false).
     #[test]
     fn should_notify_true_for_live_other_message() {
-        assert!(should_notify(false, 100, 50, true, true, false, false));
+        assert!(should_notify(
+            false, 100, 50, true, true, false, false, false
+        ));
     }
 
     #[test]
     fn should_notify_false_for_own_echo() {
-        assert!(!should_notify(true, 100, 50, true, true, false, false));
+        assert!(!should_notify(
+            true, 100, 50, true, true, false, false, false
+        ));
     }
 
     #[test]
     fn should_notify_false_for_backlog() {
         // origin_ts strictly before the baseline is suppressed backlog.
-        assert!(!should_notify(false, 40, 50, true, true, false, false));
+        assert!(!should_notify(
+            false, 40, 50, true, true, false, false, false
+        ));
     }
 
     #[test]
     fn should_notify_true_at_exact_baseline() {
-        assert!(should_notify(false, 50, 50, true, true, false, false));
+        assert!(should_notify(
+            false, 50, 50, true, true, false, false, false
+        ));
     }
 
     #[test]
     fn should_notify_false_for_non_notifying_type() {
-        assert!(!should_notify(false, 100, 50, false, true, false, false));
+        assert!(!should_notify(
+            false, 100, 50, false, true, false, false, false
+        ));
     }
 
     // ── should_notify: Story 10.2 suppression gates ─────────────────────────────
@@ -721,37 +789,103 @@ mod tests {
     fn should_notify_false_when_room_push_rules_suppress() {
         // Chat muted / mention-only non-mention: the synced ruleset did NOT elect to
         // notify this event → no notification, even though every 10.1 gate passes.
-        assert!(!should_notify(false, 100, 50, true, false, false, false));
+        assert!(!should_notify(
+            false, 100, 50, true, false, false, false, false
+        ));
     }
 
     #[test]
     fn should_notify_true_when_room_push_rules_notify() {
         // Mention-only with a mention/reply (ruleset yielded Action::Notify) → notifies.
-        assert!(should_notify(false, 100, 50, true, true, false, false));
+        assert!(should_notify(
+            false, 100, 50, true, true, false, false, false
+        ));
     }
 
     #[test]
     fn should_notify_false_when_dnd_enabled() {
         // Global DND silences every account/Chat regardless of the other gates.
-        assert!(!should_notify(false, 100, 50, true, true, true, false));
+        assert!(!should_notify(
+            false, 100, 50, true, true, true, false, false
+        ));
     }
 
     #[test]
     fn should_notify_false_when_network_muted() {
         // The room's Network is in the muted set → no notification.
-        assert!(!should_notify(false, 100, 50, true, true, false, true));
+        assert!(!should_notify(
+            false, 100, 50, true, true, false, true, false
+        ));
+    }
+
+    // ── should_notify: Story 14.3 visible-Chat suppression ──────────────────────
+    #[test]
+    fn should_notify_false_when_active_room() {
+        // The message is for the Chat currently on screen → suppressed, even though every
+        // other gate passes (its content is already visible).
+        assert!(!should_notify(
+            false, 100, 50, true, true, false, false, true
+        ));
+    }
+
+    #[test]
+    fn should_notify_true_when_not_active_room() {
+        // The visible-Chat gate off (a different Chat is open, or none) → notifies.
+        assert!(should_notify(
+            false, 100, 50, true, true, false, false, false
+        ));
     }
 
     #[test]
     fn should_notify_requires_all_gates_together() {
         // Every gate must hold; flipping any one to its suppressing value drops it.
-        assert!(should_notify(false, 100, 50, true, true, false, false));
-        assert!(!should_notify(true, 100, 50, true, true, false, false)); // self
-        assert!(!should_notify(false, 100, 50, false, true, false, false)); // type
-        assert!(!should_notify(false, 40, 50, true, true, false, false)); // backlog
-        assert!(!should_notify(false, 100, 50, true, false, false, false)); // push-rule
-        assert!(!should_notify(false, 100, 50, true, true, true, false)); // dnd
-        assert!(!should_notify(false, 100, 50, true, true, false, true)); // network
+        assert!(should_notify(
+            false, 100, 50, true, true, false, false, false
+        ));
+        assert!(!should_notify(
+            true, 100, 50, true, true, false, false, false
+        )); // self
+        assert!(!should_notify(
+            false, 100, 50, false, true, false, false, false
+        )); // type
+        assert!(!should_notify(
+            false, 40, 50, true, true, false, false, false
+        )); // backlog
+        assert!(!should_notify(
+            false, 100, 50, true, false, false, false, false
+        )); // push-rule
+        assert!(!should_notify(
+            false, 100, 50, true, true, true, false, false
+        )); // dnd
+        assert!(!should_notify(
+            false, 100, 50, true, true, false, true, false
+        )); // network
+        assert!(!should_notify(
+            false, 100, 50, true, true, false, false, true
+        )); // active room
+    }
+
+    // ── NotifyConfig: Story 14.3 active-room set/clear/round-trip ────────────────
+    #[test]
+    fn notify_config_active_room_round_trips() {
+        let config = NotifyConfig::new(true);
+        // Default: no active room, so nothing is ever the active room.
+        assert!(!config.is_active_room("acct", "!room:example.org"));
+
+        // Set: exactly that (account, room) is active; a different account or room is not.
+        config.set_active_room("acct", "!room:example.org");
+        assert!(config.is_active_room("acct", "!room:example.org"));
+        assert!(!config.is_active_room("acct", "!other:example.org"));
+        assert!(!config.is_active_room("other", "!room:example.org"));
+
+        // Replacing the active room moves the suppression to the new Chat.
+        config.set_active_room("acct", "!other:example.org");
+        assert!(!config.is_active_room("acct", "!room:example.org"));
+        assert!(config.is_active_room("acct", "!other:example.org"));
+
+        // Clear: no Chat is active again.
+        config.clear_active_room();
+        assert!(!config.is_active_room("acct", "!other:example.org"));
     }
 
     // ── preview_for ────────────────────────────────────────────────────────────
@@ -1017,6 +1151,47 @@ mod tests {
             &ctx_gated(100, true, true),
         );
         assert!(platform.calls().is_empty());
+    }
+
+    #[test]
+    fn dispatch_suppresses_active_room_and_resumes_after_clear() {
+        // Story 14.3: a message for the currently-visible Chat is suppressed; once the Chat
+        // is cleared (closed), the same context notifies again.
+        let platform = CapturingPlatform::new();
+        let config = NotifyConfig::new(true);
+        config.set_active_room("acct", "!room:example.org");
+        dispatch(
+            &platform,
+            &config,
+            "acct",
+            "!room:example.org",
+            50,
+            &ctx_gated(100, true, false),
+        );
+        assert!(platform.calls().is_empty());
+
+        // A message for a DIFFERENT room still notifies while the first Chat is open.
+        dispatch(
+            &platform,
+            &config,
+            "acct",
+            "!other:example.org",
+            50,
+            &ctx_gated(100, true, false),
+        );
+        assert_eq!(platform.calls().len(), 1);
+
+        // Closing the Chat clears the suppression → the original room notifies again.
+        config.clear_active_room();
+        dispatch(
+            &platform,
+            &config,
+            "acct",
+            "!room:example.org",
+            50,
+            &ctx_gated(100, true, false),
+        );
+        assert_eq!(platform.calls().len(), 2);
     }
 
     #[test]

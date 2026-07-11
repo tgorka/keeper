@@ -30,10 +30,10 @@ use keeper_core::vm::{
     CapabilitiesVm, ChatNotifyMode, ConnectionStatusBatch, CouplingCaveatVm, DemoBatch,
     DockBadgeMode, DraftMirrorBatch, EditVersionVm, EgressEndpointVm, EncryptionStatusBatch,
     ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError,
-    IpcErrorCode, MenuSectionVm, NetworksSnapshot, NewChatResolutionVm, NotifyTarget, OutboxVm,
-    PaginationStatusBatch, PaletteMode, PaletteResultsVm, PingVm, Provider, RemoteDraftVm,
-    ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch,
-    TypingBatch, VerificationFlowVm,
+    IpcErrorCode, MenuSectionVm, NetworksSnapshot, NewChatResolutionVm, NotificationPermission,
+    NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode, PaletteResultsVm, PingVm, Provider,
+    RemoteDraftVm, ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot,
+    TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -493,6 +493,14 @@ impl Platform for DesktopPlatform {
 #[cfg(target_os = "ios")]
 pub struct IosPlatform;
 
+/// The label of the main webview window whose app-icon badge the iOS
+/// `Platform::set_badge_count` port drives (Story 14.3). Matches the Tauri default
+/// window label (no explicit `label` in `tauri.conf.json`), the same `"main"` the
+/// desktop `MAIN_WINDOW_LABEL` uses; declared separately because that constant is
+/// `#[cfg(desktop)]`.
+#[cfg(target_os = "ios")]
+const IOS_MAIN_WINDOW_LABEL: &str = "main";
+
 /// `errSecItemNotFound` (`-25300`) — the Security Framework status returned when no
 /// keychain item matches. `security_framework` does not re-export it, and although
 /// `security-framework-sys` (which does) is already in the tree transitively, using its
@@ -602,11 +610,25 @@ impl Platform for IosPlatform {
             .map_err(|e| CoreError::Internal(format!("could not post notification: {e}")))
     }
 
-    fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
-        // The desktop dock badge does not exist on iOS; the app-icon badge is a
-        // notification concern deferred to the phone-shell epic. Honest no-op —
-        // the Rust-computed aggregate simply reaches no OS surface here.
-        Ok(())
+    fn set_badge_count(&self, count: Option<u32>) -> Result<(), CoreError> {
+        use tauri::Manager;
+
+        // Mirror the desktop port (Story 14.3): reach the write-once badge app handle,
+        // get the main webview window, and set its badge count. On iOS this maps to
+        // `applicationIconBadgeNumber` (via tao) — the already-computed Unified-Inbox
+        // aggregate (AD-20) finally reaches the OS icon; no native code, no second count.
+        // When the handle or window is unset (headless / very early startup) this is an
+        // honest no-op — the badge is a comfort signal and must never abort the merge.
+        let Some(app) = BADGE_APP.get() else {
+            return Ok(());
+        };
+        let Some(window) = app.get_webview_window(IOS_MAIN_WINDOW_LABEL) else {
+            // No main window yet (very early startup) — nothing to badge; honest no-op.
+            return Ok(());
+        };
+        window
+            .set_badge_count(count.map(i64::from))
+            .map_err(|e| CoreError::Internal(format!("could not set app icon badge count: {e}")))
     }
 
     fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError> {
@@ -2914,6 +2936,74 @@ pub async fn dock_badge_mode_set(
         .accounts
         .dock_badge_mode_set(&state.platform, mode)
         .await
+        .map_err(to_ipc_error)
+}
+
+/// Report the currently-visible Chat to the shared notify engine (Story 14.3, AD-18).
+///
+/// Both `Some` ⇒ set the active `(account_id, room_id)`; both `None` ⇒ clear it. A message
+/// for exactly the active Chat is suppressed by `should_notify` (its content is already on
+/// screen). Reported by the iOS shell from `roomsStore.selected` on the reduced tier only,
+/// so desktop notification behavior is unchanged (desktop never invokes this). Ephemeral
+/// process state, never persisted; infallible in practice.
+#[tauri::command]
+pub fn active_chat_set(
+    state: State<'_, AppState>,
+    account_id: Option<String>,
+    room_id: Option<String>,
+) -> Result<(), IpcError> {
+    match (account_id, room_id) {
+        (Some(account_id), Some(room_id)) => {
+            state.accounts.set_active_room(&account_id, &room_id);
+        }
+        // Any incomplete pair (or both `None`) clears the active Chat — no partial state.
+        _ => state.accounts.clear_active_room(),
+    }
+    Ok(())
+}
+
+/// Read the OS notification-permission state (Story 14.3). Reaches the write-once
+/// notification app handle and the plugin's `permission_state()`, mapping to the typed
+/// [`NotificationPermission`] the iOS Settings surface reads. `Granted`/`Denied` mirror the
+/// plugin; every other plugin state (prompt / prompt-with-rationale), an unset handle, or a
+/// read error resolves to `Unknown` (the UI then hides the persistent "off" state rather
+/// than guessing). Never re-prompts. Infallible — degrades to `Unknown` rather than erroring.
+#[tauri::command]
+pub fn notification_permission_state(
+    _state: State<'_, AppState>,
+) -> Result<NotificationPermission, IpcError> {
+    use tauri::plugin::PermissionState;
+    use tauri_plugin_notification::NotificationExt;
+
+    let Some(app) = NOTIFY_APP.get() else {
+        // Headless / pre-setup: no handle to read, so the state is unknown.
+        return Ok(NotificationPermission::Unknown);
+    };
+    let permission = match app.notification().permission_state() {
+        Ok(PermissionState::Granted) => NotificationPermission::Granted,
+        Ok(PermissionState::Denied) => NotificationPermission::Denied,
+        // Prompt / prompt-with-rationale / any future state: not a persistent "off".
+        Ok(_) => NotificationPermission::Unknown,
+        Err(error) => {
+            tracing::warn!(%error, "notify: could not read permission state; treating as unknown");
+            NotificationPermission::Unknown
+        }
+    };
+    Ok(permission)
+}
+
+/// Open this app's page in the iOS system Settings (Story 14.3). Delegates to the Rust
+/// opener (`Platform::open_url("app-settings:")`) so the deep link bypasses the opener JS
+/// default scope (which only permits `mailto`/`tel`/`http(s)`). Used by the
+/// permission-denied "Open Settings" affordance; never re-prompts. On desktop the opener
+/// handles the URL through the OS as usual. Failures funnel through [`to_ipc_error`] but
+/// the caller treats this best-effort (swallows rejection).
+#[tauri::command]
+pub fn ios_open_app_settings(state: State<'_, AppState>) -> Result<(), IpcError> {
+    const IOS_APP_SETTINGS_URL: &str = "app-settings:";
+    state
+        .platform
+        .open_url(IOS_APP_SETTINGS_URL)
         .map_err(to_ipc_error)
 }
 

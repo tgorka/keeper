@@ -3488,6 +3488,33 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Record the currently-visible Chat (Story 14.3, AD-18) — delegates to the shared
+    /// [`NotifyConfig`] so every live notify handler suppresses a banner for exactly this
+    /// `(account_id, room_id)`. Ephemeral process state, never persisted (mirrors
+    /// [`Self::notify_previews_set`] but with no registry write). Reported by the iOS shell
+    /// from `roomsStore.selected` on the reduced tier; desktop never calls it.
+    pub fn set_active_room(&self, account_id: &str, room_id: &str) {
+        self.notify.set_active_room(account_id, room_id);
+    }
+
+    /// Clear the currently-visible Chat (Story 14.3) — no Chat is on screen, so no message
+    /// is suppressed on that ground. Delegates to the shared [`NotifyConfig`].
+    pub fn clear_active_room(&self) {
+        self.notify.clear_active_room();
+    }
+
+    /// Re-assert the app-icon badge from the current merged inbox state (Story 14.3).
+    ///
+    /// Re-pokes the live inbox merger's `reapply_badge` — the same mechanism
+    /// [`Self::dock_badge_mode_set`] uses — so the badge reflects the current aggregate
+    /// **without** computing a second count (AD-20). Called on iOS foreground resume so the
+    /// badge is refreshed once the app is running again; a no-op when no inbox is subscribed.
+    pub async fn reassert_badge(&self) {
+        if let Some(handle) = self.inbox.lock().await.as_ref() {
+            handle.merger.reapply_badge().await;
+        }
+    }
+
     /// Read the global Do-Not-Disturb switch (Story 10.2, AD-18). Returns the in-memory
     /// [`NotifyConfig`] value (seeded from the persisted registry at construction).
     pub fn dnd_get(&self) -> bool {

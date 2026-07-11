@@ -153,7 +153,7 @@ development_status:
   epic-14: backlog
   14-1-lifecycle-pause-resume-through-one-rust-entry: done
   14-2-honest-no-background-sync-disclosure: done
-  14-3-foreground-notifications-and-the-all-accounts-badge: backlog
+  14-3-foreground-notifications-and-the-all-accounts-badge: done
   14-4-resume-integrity-blank-webview-guard-and-stale-resume-pill: backlog
   14-5-memory-hygiene-under-jetsam: backlog
   14-6-flaky-network-resilience: backlog

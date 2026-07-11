@@ -54,7 +54,14 @@ pub async fn app_lifecycle_changed(
     phase: LifecyclePhase,
 ) -> Result<(), IpcError> {
     match phase {
-        LifecyclePhase::Foreground => state.accounts.sync_now().await,
+        LifecyclePhase::Foreground => {
+            state.accounts.sync_now().await;
+            // Re-assert the app-icon badge from the current aggregate now the app is
+            // running again (Story 14.3, AD-20) — reuses the inbox merger's
+            // `reapply_badge` (never a second count). Desktop never invokes this command;
+            // on iOS the honest-no-op badge port makes this reach the OS. Best-effort.
+            state.accounts.reassert_badge().await;
+        }
         LifecyclePhase::Background => state.accounts.pause_all().await,
     }
     Ok(())

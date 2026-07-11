@@ -11,6 +11,8 @@ vi.mock("@/lib/ipc/client", () => ({
   notifySetPreviewEnabled: vi.fn(() => Promise.resolve()),
   dockBadgeModeGet: vi.fn(() => Promise.resolve("all")),
   dockBadgeModeSet: vi.fn(() => Promise.resolve()),
+  notificationPermissionState: vi.fn(() => Promise.resolve("granted")),
+  iosOpenAppSettings: vi.fn(() => Promise.resolve()),
   launchAtLoginGet: vi.fn(() => Promise.resolve(false)),
   launchAtLoginSet: vi.fn(() => Promise.resolve()),
   menuBarPresenceGet: vi.fn(() => Promise.resolve(false)),
@@ -60,13 +62,16 @@ import {
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import type { AccountVm } from "@/lib/ipc/client";
 import {
+  dockBadgeModeSet,
   encryptionPosture,
   type HotkeyVm,
   honorRemoteDeletions,
   hotkeyGet,
   hotkeySet,
+  iosOpenAppSettings,
   launchAtLoginGet,
   menuBarPresenceGet,
+  notificationPermissionState,
   notifyGetPreviewEnabled,
   notifySetPreviewEnabled,
   setHonorRemoteDeletions,
@@ -91,6 +96,9 @@ const mockNotifyGet = vi.mocked(notifyGetPreviewEnabled);
 const mockNotifySet = vi.mocked(notifySetPreviewEnabled);
 const mockLaunchGet = vi.mocked(launchAtLoginGet);
 const mockMenuBarGet = vi.mocked(menuBarPresenceGet);
+const mockPermissionState = vi.mocked(notificationPermissionState);
+const mockOpenAppSettings = vi.mocked(iosOpenAppSettings);
+const mockBadgeModeSet = vi.mocked(dockBadgeModeSet);
 
 const DEFAULT_HOTKEY_VM: HotkeyVm = {
   accelerator: "Control+Alt+Space",
@@ -139,6 +147,12 @@ describe("SettingsDialog", () => {
     mockNotifySet.mockClear();
     mockNotifyGet.mockResolvedValue(true);
     mockNotifySet.mockResolvedValue(undefined);
+    mockPermissionState.mockClear();
+    mockPermissionState.mockResolvedValue("granted");
+    mockOpenAppSettings.mockClear();
+    mockOpenAppSettings.mockResolvedValue(undefined);
+    mockBadgeModeSet.mockClear();
+    mockBadgeModeSet.mockResolvedValue(undefined);
     accountsStore.getState().clear();
     encryptionStatusStore.getState().reset();
     keyBackupStore.getState().reset();
@@ -497,6 +511,77 @@ describe("SettingsDialog", () => {
 
     expect(await screen.findByText(NO_BACKGROUND_SYNC_SENTENCE)).toBeInTheDocument();
     expect(screen.getByText(BADGE_NOT_LIVE_SENTENCE)).toBeInTheDocument();
+  });
+
+  // ── Story 14.3: iOS app-icon badge radio + permission-denied surface ─────────
+  it("iOS: renders the App icon badge mode radio in the Notifications section (Story 14.3)", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(
+      await screen.findByRole("radiogroup", { name: "App icon badge mode" }),
+    ).toBeInTheDocument();
+  });
+
+  it("iOS: permission denied shows the inline state and Open-Settings calls iosOpenAppSettings (Story 14.3)", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockPermissionState.mockResolvedValue("denied");
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    // The fixed permission-denied sentence and the badge-needs-permission note render.
+    expect(
+      await screen.findByText("Notifications are off for keeper in iOS Settings."),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/app icon badge needs the same permission/i)).toBeInTheDocument();
+
+    // Tapping Open Settings routes through the Rust deep link (no re-prompt).
+    fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
+    expect(mockOpenAppSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("iOS: granted permission hides the inline permission state (Story 14.3)", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockPermissionState.mockResolvedValue("granted");
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    // Wait for the badge radio to confirm the reduced-tier section has resolved.
+    await screen.findByRole("radiogroup", { name: "App icon badge mode" });
+    expect(
+      screen.queryByText("Notifications are off for keeper in iOS Settings."),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open Settings" })).not.toBeInTheDocument();
+  });
+
+  it("iOS: unknown permission hides the inline permission state (Story 14.3)", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockPermissionState.mockResolvedValue("unknown");
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    await screen.findByRole("radiogroup", { name: "App icon badge mode" });
+    expect(
+      screen.queryByText("Notifications are off for keeper in iOS Settings."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("desktop: shows neither the App icon badge radio nor the permission state (Story 14.3)", async () => {
+    mockPosture.mockResolvedValue(false);
+    // beforeEach hydrated the desktop tier.
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    // The desktop Dock badge radio (Background & dock) is present, but not the iOS one.
+    await screen.findByRole("radiogroup", { name: "Dock badge mode" });
+    expect(
+      screen.queryByRole("radiogroup", { name: "App icon badge mode" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Notifications are off for keeper in iOS Settings."),
+    ).not.toBeInTheDocument();
+    // No permission probe on desktop (reduced-tier only).
+    expect(mockPermissionState).not.toHaveBeenCalled();
   });
 
   it("pre-hydration: hides the desktop-only surfaces by the safe default but does NOT flash the Archive backup line", async () => {

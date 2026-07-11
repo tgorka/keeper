@@ -5,6 +5,7 @@ import { AtRestEncryptionChoice } from "@/components/settings/at-rest-encryption
 import { NoBackgroundSyncDisclosure } from "@/components/settings/no-background-sync-disclosure";
 import { Toaster } from "@/components/ui/sonner";
 import { FirstRunWizard } from "@/components/wizard/first-run-wizard";
+import { useActiveChatReporter } from "@/hooks/use-active-chat-reporter";
 import { useAppLifecycle } from "@/hooks/use-app-lifecycle";
 import { useCapabilitiesHydrate } from "@/hooks/use-capabilities-hydrate";
 import { useNotifyNavigate } from "@/hooks/use-notify-navigate";
@@ -30,6 +31,10 @@ function App() {
   // pauses each live sync loop gracefully, foreground routes through the same
   // sync-now kick as pull-to-refresh. Inert on desktop — Story 10.3 untouched.
   useAppLifecycle();
+  // Report the currently-open Chat to the shared notify engine on the reduced-capability
+  // (iOS) tier only (Story 14.3, AD-18): a foreground notification for the Chat already
+  // on screen is suppressed. Inert on desktop — notification behavior is unchanged there.
+  useActiveChatReporter();
   const hydrated = useAccountsStore((s) => s.hydrated);
   const hasAccount = useAccountsStore((s) => s.accounts.length > 0);
   const addAccountOpen = useAddAccountStore((s) => s.open);
