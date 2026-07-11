@@ -1,0 +1,93 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_597b93f12347ab::t_714dd4d5a6ff6f 865-867
+  s_597b93f12347ab::t_e16329024f48cf 858-864
+src/hooks/use-stale-resume-pill.test.ts
+  s_597b93f12347ab::t_b3c5db205827cb 1-176
+src/lib/webview-reload.ts
+  s_597b93f12347ab::t_2eb0d955dcba51 1-12
+src/lib/ipc/gen/NavState.ts
+  s_597b93f12347ab::t_6063b3c3feb07a 1-3,6,14-24,26-27
+  s_597b93f12347ab::t_a0fab2fe3bc780 4-5,7-13,25
+src-tauri/crates/keeper-core/src/vm.rs
+  s_597b93f12347ab::t_1f836ef27dded0 1484-1505
+src/components/layout/phone-shell.tsx
+  s_597b93f12347ab::t_7d2a9e678a8590 649-656,659
+  s_597b93f12347ab::t_3e5d7d259c41c6 733
+  s_597b93f12347ab::t_1c5b7fcef0f82c 648,657-658,660-673
+  s_597b93f12347ab::t_aef49a2b503254 55
+src/components/layout/phone-shell.test.tsx
+  s_597b93f12347ab::t_d56b89f532cc7b 1000-1053,1055-1059,1063-1066,1070,1086-1088
+  s_597b93f12347ab::t_5d97806ae2fe50 75-82
+  s_597b93f12347ab::t_03e61cab75895f 1054,1060-1062,1067-1069,1071-1085
+  s_597b93f12347ab::t_da784fb4cd4d75 215
+src-tauri/crates/keeper/src/lifecycle.rs
+  s_597b93f12347ab::t_728d9a0bb7c93d 15-28,35-62,86-95,106-116,124-136,140-152,154-202
+  s_597b93f12347ab::t_765892f059ecc1 153
+src-tauri/crates/keeper/src/ipc.rs
+  s_597b93f12347ab::t_13d7c36855c901 73-108
+  s_597b93f12347ab::t_aad798e53cae28 33-34
+  s_597b93f12347ab::t_765892f059ecc1 35-36
+  s_597b93f12347ab::t_3eb913ac289e0a 278-279
+  s_597b93f12347ab::t_1637b3e7972b33 3003-3042
+  s_597b93f12347ab::t_7ae705f2a2b86f 3835-3893
+src/hooks/use-nav-state-persistence.test.ts
+  s_597b93f12347ab::t_38d724780e615f 1-235
+src/hooks/use-stale-resume-pill.ts
+  s_597b93f12347ab::t_bc8fae0e7e530e 80-81
+  s_597b93f12347ab::t_8c7393198cd97a 1-79,82-118
+src/App.tsx
+  s_597b93f12347ab::t_cd2e6f5c38ff5b 40-48
+  s_597b93f12347ab::t_7f6ece74badd28 11,14
+src/lib/ipc/client.ts
+  s_597b93f12347ab::t_4ca74fd0801be3 1575-1610
+  s_597b93f12347ab::t_ecc7f309486ecd 16
+  s_597b93f12347ab::t_f28db3ce913e84 74
+  s_597b93f12347ab::t_511b123be354d5 1574
+src/hooks/use-webview-guard.ts
+  s_597b93f12347ab::t_099051d645647f 111-115
+  s_597b93f12347ab::t_c7c0634b10b814 132
+  s_597b93f12347ab::t_ce19f705ddb9b4 31
+  s_597b93f12347ab::t_9e3ed9d6ecb3a2 80-85
+  s_597b93f12347ab::t_eaf7c5672cc603 181-182,184
+  s_597b93f12347ab::t_3100c34c60ea40 155,158
+  s_597b93f12347ab::t_5ab885252de56a 1-30,32-79,86-110,116-131,133-154,156-157,159-173,175-180,183,185-192
+  s_597b93f12347ab::t_83568884fc0bb0 174
+_bmad-output/implementation-artifacts/spec-14-4-resume-integrity-blank-webview-guard-and-stale-resume-pill.md
+  s_597b93f12347ab::t_fad89689230194 10
+  s_597b93f12347ab::t_96876407cdf09e 1-4,8-9,12-62,65-77,94-102,109,128,144-146,148,160-166
+  s_597b93f12347ab::t_fc31ead125217c 5
+  s_597b93f12347ab::t_19f8cc265591e7 11
+  s_597b93f12347ab::t_29511875593aec 63-64
+  s_597b93f12347ab::t_c541b6095a8e4d 147
+  s_597b93f12347ab::t_d1004c6184d50b 167-196
+  s_597b93f12347ab::t_a44bd38d13da8c 7
+  s_597b93f12347ab::t_a122c9724c11c4 149-159
+  s_597b93f12347ab::t_9d45c4a80b413f 78-93
+  s_597b93f12347ab::t_1fb35afc2e933b 6
+  s_597b93f12347ab::t_16464819c49127 103-108,110-127
+  s_597b93f12347ab::t_ea7331e11dc2bd 129-143
+src/hooks/use-nav-state-persistence.ts
+  s_597b93f12347ab::t_ff00b05e3b2908 1-124,129-190
+  s_597b93f12347ab::t_75432295cafeb3 125-128
+src/hooks/use-webview-guard.test.ts
+  s_597b93f12347ab::t_63bbc600bacea1 125-136
+  s_597b93f12347ab::t_8074cb96cb303a 1-124,137-228
+src-tauri/crates/keeper/src/lib.rs
+  s_597b93f12347ab::t_de9fbc2d2d2d02 290-292
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "66026a998246433a7430e0c43b3c667494ad177e",
+  "prompts": {},
+  "sessions": {
+    "s_597b93f12347ab": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45ad94df-5206-459b-8f52-298b035f1f2b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
