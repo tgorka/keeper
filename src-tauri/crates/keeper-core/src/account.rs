@@ -371,6 +371,15 @@ fn emit_outbox_snapshot(
 /// that an idle account's scheduler is negligible.
 const OUTBOX_SCHEDULER_TICK_MS: u64 = 250;
 
+/// Pure due-check for an outbox row (Stories 8.3/14.6): a held row dispatches once its
+/// `dispatch_at_ts` has elapsed. Extracted from the scheduler's inline filter so the
+/// elapsed-while-suspended regression test exercises the exact comparison the scheduler
+/// uses — a row whose window elapsed during an iOS suspension is immediately due on the
+/// first tick after resume, with no app restart.
+fn outbox_row_due(dispatch_at_ts: i64, now: i64) -> bool {
+    dispatch_at_ts <= now
+}
+
 /// The lifetime-of-account Undo-Send outbox scheduler (Story 8.3, NFR-8).
 ///
 /// Ticks every [`OUTBOX_SCHEDULER_TICK_MS`]; on each tick it reads this account's held
@@ -422,7 +431,10 @@ async fn run_outbox_scheduler(
         let now = now_ms();
         // Oldest-first (the query orders by held_at_ts asc): dispatch every elapsed row.
         let mut changed = false;
-        for row in rows.into_iter().filter(|r| r.dispatch_at_ts <= now) {
+        for row in rows
+            .into_iter()
+            .filter(|r| outbox_row_due(r.dispatch_at_ts, now))
+        {
             // Already dispatched to the SDK queue on a prior tick; only its delete is
             // pending. Retry the delete — never re-dispatch.
             if awaiting_delete.contains(&row.id) {
@@ -6346,6 +6358,65 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 14.6 (NFR-5): an Undo-Send row whose window elapsed while the app was
+    /// suspended is not silently lost and is selected as due once keeper resumes. The
+    /// row is written, then re-read through a *fresh* `list_outbox_rows_for_account`
+    /// open — the same disk round-trip a process restart/resume takes — proving it
+    /// persisted; and the scheduler's own [`outbox_row_due`] predicate (the exact filter
+    /// `run_outbox_scheduler` applies each tick) selects it, so the next post-resume tick
+    /// dispatches it with no app restart. Driving the live scheduler loop across a real
+    /// suspend/resume is the on-device SM-8 bar, not a host test — this pins the two
+    /// host-verifiable halves (durability + due-selection), not the tick itself.
+    #[test]
+    fn outbox_row_elapsed_while_suspended_is_durable_and_due() {
+        let data_dir = outbox_test_dir("suspended");
+        // Held ~60s ago with a 10s window: the window elapsed ~50s into a suspension.
+        let held_at = now_ms() - 60_000;
+        let dispatch_at = held_at + 10_000;
+        registry::insert_outbox(
+            &data_dir,
+            "row-suspended",
+            "acctA",
+            "!room:example.org",
+            "queued across suspension",
+            held_at,
+            dispatch_at,
+        )
+        .expect("insert elapsed outbox row");
+
+        // Durable: a fresh registry open lost nothing — the row survives the paused
+        // period exactly as it would a process restart.
+        let rows = registry::list_outbox_rows_for_account(&data_dir, "acctA").expect("list outbox");
+        assert_eq!(
+            rows.len(),
+            1,
+            "row survives the suspension (no silent loss)"
+        );
+        assert_eq!(rows[0].body, "queued across suspension");
+        assert_eq!(rows[0].dispatch_at_ts, dispatch_at);
+
+        // Due: the scheduler's own predicate selects the elapsed row, so the next
+        // post-resume tick dispatches it — no restart needed.
+        assert!(
+            outbox_row_due(rows[0].dispatch_at_ts, now_ms()),
+            "an elapsed row is due after resume"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// The extracted due-predicate pins the scheduler's dispatch boundary: a row is due
+    /// exactly when `dispatch_at_ts <= now` — the `<=` includes the equality instant, so a
+    /// window ending precisely on a tick dispatches — while a still-future window is not
+    /// yet due. Guards a refactor from silently flipping `<=` to `<` (which would strand a
+    /// row whose window ends exactly on a tick until the following tick).
+    #[test]
+    fn outbox_row_due_at_and_around_the_boundary() {
+        assert!(outbox_row_due(5, 6), "already-elapsed window is due");
+        assert!(outbox_row_due(5, 5), "window ending exactly now is due");
+        assert!(!outbox_row_due(6, 5), "still-future window is not yet due");
     }
 
     /// Story 8.3: `cancel_held_send` deletes the row, writes the body as the room

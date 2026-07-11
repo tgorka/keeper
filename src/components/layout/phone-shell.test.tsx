@@ -4,6 +4,7 @@ import type { AccountVm, InboxBatch, InboxRoomVm } from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { composerStore } from "@/lib/stores/composer";
 import { detailStore } from "@/lib/stores/detail-ui";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
@@ -208,6 +209,7 @@ beforeEach(() => {
   searchSurfaceStore.setState({ isOpen: false, scope: "chats", chatLock: null });
   composerStore.setState({ focusNonce: 0 });
   accountStatusStore.getState().reset();
+  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
   subscribeInbox.mockReset();
   subscribeInbox.mockResolvedValue(1);
   syncNow.mockReset();
@@ -1083,6 +1085,120 @@ describe("PhoneShell stale-resume pill (Story 14.4)", () => {
       accountStatusStore.getState().setStatus(account.accountId, "offline");
     });
     expect(screen.queryByTestId("stale-resume-pill")).not.toBeInTheDocument();
+  });
+});
+
+describe("PhoneShell persistent offline pill (Story 14.6)", () => {
+  /** All seven capabilities present = the desktop tier (the pill never renders). */
+  const DESKTOP_CAPABILITIES = {
+    trayIcon: true,
+    globalHotkey: true,
+    launchAtLogin: true,
+    inAppUpdater: true,
+    nativeMenuBar: true,
+    bridgeSidecar: true,
+    revealInFileManager: true,
+  };
+
+  /** Hydrate the capabilities mirror as the reduced (iOS/phone) tier. */
+  function arrangeReducedTier() {
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+  }
+
+  /** One signed-in account whose connection status is `offline`. */
+  function arrangeOfflineAccount() {
+    accountsStore.getState().addAccount(account);
+    act(() => {
+      accountStatusStore.getState().setStatus(account.accountId, "offline");
+    });
+  }
+
+  it("shows the persistent pill while every account is offline, with no toast", () => {
+    arrangeReducedTier();
+    arrangeOfflineAccount();
+    render(<PhoneShell />);
+
+    const pill = screen.getByTestId("offline-pill");
+    expect(pill).toHaveTextContent(
+      "Offline — showing your local archive. Messages queue until you're back.",
+    );
+    expect(pill).toHaveAttribute("role", "status");
+    // Pill only — never a toast/alert; the Inbox keeps rendering underneath.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
+  });
+
+  it("clears the pill on reconnect (status back to online)", () => {
+    arrangeReducedTier();
+    arrangeOfflineAccount();
+    render(<PhoneShell />);
+    expect(screen.getByTestId("offline-pill")).toBeInTheDocument();
+
+    act(() => {
+      accountStatusStore.getState().setStatus(account.accountId, "online");
+    });
+    expect(screen.queryByTestId("offline-pill")).not.toBeInTheDocument();
+  });
+
+  it("owns the header slot over the Connecting… pill while offline (single-pill precedence)", () => {
+    staleResumePill.connecting = true;
+    arrangeReducedTier();
+    arrangeOfflineAccount();
+    render(<PhoneShell />);
+
+    // Offline within the post-resume window: the offline pill — never a
+    // dishonest "Connecting…" — and never both at once.
+    expect(screen.getByTestId("offline-pill")).toBeInTheDocument();
+    expect(screen.queryByTestId("stale-resume-pill")).not.toBeInTheDocument();
+  });
+
+  it("yields to an active pull gesture, then returns on release", () => {
+    mockRectWidth(390);
+    arrangeReducedTier();
+    arrangeOfflineAccount();
+    render(<PhoneShell />);
+    expect(screen.getByTestId("offline-pill")).toBeInTheDocument();
+
+    // An armed drag (even below the reveal band) owns the shared slot.
+    const zone = screen.getByTestId("pull-down-search");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 40 });
+    expect(screen.queryByTestId("offline-pill")).not.toBeInTheDocument();
+
+    // Gesture ends without a refresh: the persistent surface returns.
+    fireEvent.pointerCancel(zone, { pointerId: 1 });
+    expect(screen.getByTestId("offline-pill")).toBeInTheDocument();
+  });
+
+  it("yields to the refresh-scoped pull-offline pill while a refresh is in flight", () => {
+    mockRectWidth(390);
+    arrangeReducedTier();
+    arrangeOfflineAccount();
+    render(<PhoneShell />);
+
+    // A released pull past the refresh threshold puts a refresh in flight: the
+    // pull-offline pill owns the slot — exactly one connectivity indicator.
+    const zone = screen.getByTestId("pull-down-search");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 160 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientY: 160 });
+    expect(screen.getByTestId("pull-offline-pill")).toBeInTheDocument();
+    expect(screen.queryByTestId("offline-pill")).not.toBeInTheDocument();
+  });
+
+  it("never renders on the desktop tier, even when every account is offline", () => {
+    capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
+    arrangeOfflineAccount();
+    render(<PhoneShell />);
+    expect(screen.queryByTestId("offline-pill")).not.toBeInTheDocument();
+  });
+
+  it("never renders pre-hydration (the safe default must not advertise the phone pill)", () => {
+    // beforeEach leaves the mirror un-hydrated: all-false DEFAULT_CAPABILITIES
+    // with hydrated=false is the desktop-safe default, not the reduced tier.
+    arrangeOfflineAccount();
+    render(<PhoneShell />);
+    expect(screen.queryByTestId("offline-pill")).not.toBeInTheDocument();
   });
 });
 

@@ -248,6 +248,77 @@ describe("MessageBubble", () => {
     expect(screen.queryByText("Queued — sends when you're back online")).not.toBeInTheDocument();
   });
 
+  it("rewords the Queued caption for the reduced (iOS) tier (Story 14.6)", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sending" })}
+        grouped={false}
+        groupTail={true}
+        offline={true}
+        reducedCapability={true}
+      />,
+    );
+    // Honest about foreground-only sync: keeper must be open for the send to go.
+    const caption = screen.getByText("Queued — sends when keeper is open and back online");
+    expect(caption).toBeInTheDocument();
+    expect(caption).toHaveClass("text-held");
+    expect(screen.queryByText("Queued — sends when you're back online")).not.toBeInTheDocument();
+  });
+
+  it("keeps the desktop Queued wording when reducedCapability is false (default)", () => {
+    render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sending" })}
+        grouped={false}
+        groupTail={true}
+        offline={true}
+      />,
+    );
+    expect(screen.getByText("Queued — sends when you're back online")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Queued — sends when keeper is open and back online"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("leaves Sending…, Sent, and Failed — Retry untouched on the reduced tier", () => {
+    // Online + sending: the tier flag never rewords the plain Sending… caption.
+    const { rerender } = render(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sending" })}
+        grouped={false}
+        groupTail={true}
+        reducedCapability={true}
+      />,
+    );
+    expect(screen.getByText("Sending…")).toBeInTheDocument();
+
+    rerender(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "sent" })}
+        grouped={false}
+        groupTail={true}
+        offline={true}
+        reducedCapability={true}
+      />,
+    );
+    expect(screen.getByText("Sent")).toBeInTheDocument();
+
+    rerender(
+      <MessageBubble
+        item={msg({ isOwn: true, sendState: "failed" })}
+        grouped={false}
+        groupTail={true}
+        offline={true}
+        reducedCapability={true}
+      />,
+    );
+    expect(screen.getByText("Failed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(
+      screen.queryByText("Queued — sends when keeper is open and back online"),
+    ).not.toBeInTheDocument();
+  });
+
   it("calls onRetry with the message key when Retry is activated", () => {
     const onRetry = vi.fn();
     render(

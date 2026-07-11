@@ -83,6 +83,7 @@ import { useAccountStatus } from "@/lib/stores/account-status";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { attachmentId, attachmentsStore, type PendingAttachment } from "@/lib/stores/attachments";
 import { useBridgeHealth } from "@/lib/stores/bridge-health";
+import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { composerStore, useComposerStore } from "@/lib/stores/composer";
 import { exportStore } from "@/lib/stores/export";
 import { refreshIncognito, useIncognito, useIncognitoPolicyVersion } from "@/lib/stores/incognito";
@@ -497,6 +498,11 @@ export function ConversationPane({
   // The open conversation's account status drives the "Queued" caption. An empty
   // key (no room open) reads as `undefined` → not offline.
   const offline = useAccountStatus(accountId ?? "") === "offline";
+  // Reduced-capability (iOS/phone) tier flag (Story 14.6), resolved here — where
+  // `offline` is derived — and threaded to each bubble the same way: on the
+  // reduced tier the offline "Queued …" caption reads "sends when keeper is open
+  // and back online" (foreground-only sync honesty); desktop wording unchanged.
+  const reducedCapability = useIsReducedCapabilityPlatform();
   const [errored, setErrored] = useState(false);
   const [loaded, setLoaded] = useState(false);
   // The opaque render key of the media message whose preview overlay is open, or
@@ -1568,6 +1574,7 @@ export function ConversationPane({
                     groupTail={row.groupTail}
                     onRetry={onRetry}
                     offline={offline}
+                    reducedCapability={reducedCapability}
                     onReply={onReply}
                     onEdit={onEdit}
                     onDelete={onDelete}

@@ -71,6 +71,15 @@ interface MessageBubbleProps {
    * you're back online` instead of `Sending…`. `sent`/`failed` are unaffected.
    */
   offline?: boolean;
+  /**
+   * Whether this build runs on the reduced-capability (iOS/phone) tier (Story
+   * 14.6). Resolved by the parent where `offline` is derived (the tier hook must
+   * not run inside `SendStateCaption`, a plain function) and threaded the same
+   * way: it only rewords the offline `Queued …` caption to `sends when keeper is
+   * open and back online` — honest about foreground-only sync. Desktop wording
+   * and every other caption state are unchanged.
+   */
+  reducedCapability?: boolean;
   /** Begin a reply to this message (Story 3.4). Mounts the action bar's Reply. */
   onReply?: (key: string) => void;
   /**
@@ -138,6 +147,7 @@ export function MessageBubble({
   groupTail = true,
   onRetry,
   offline = false,
+  reducedCapability = false,
   onReply,
   onEdit,
   onDelete,
@@ -338,6 +348,7 @@ export function MessageBubble({
           groupTail={groupTail}
           onRetry={onRetry}
           offline={offline}
+          reducedCapability={reducedCapability}
           readCount={item.readers.length}
         />
         {/* Read-receipt micro-avatar cluster (Story 3.9): the other members whose
@@ -476,6 +487,12 @@ interface SendStateCaptionProps {
   onRetry?: (key: string) => void;
   offline: boolean;
   /**
+   * Reduced-capability (iOS/phone) tier flag (Story 14.6), resolved by the
+   * parent and threaded like `offline`: gates only the offline `Queued …`
+   * caption wording.
+   */
+  reducedCapability: boolean;
+  /**
    * The number of *other* members whose read receipt sits on this message (Story
    * 3.9). When this own message is sent (`state === null`) and at least one other
    * member has read it, the caption shows an explicit "Read ✓" tick.
@@ -490,7 +507,9 @@ interface SendStateCaptionProps {
  * and only under the last bubble of a same-sender group. While the account is
  * `offline`, a still-`sending` *own* message reads the amber `Queued — sends when
  * you're back online` (a pure projection of the connection status + `isOwn`)
- * instead of `Sending…`. A sent own message that at least one other member has read
+ * instead of `Sending…` — on the reduced-capability (iOS) tier the wording is
+ * `Queued — sends when keeper is open and back online`, honest about
+ * foreground-only sync (Story 14.6). A sent own message that at least one other member has read
  * shows an explicit `Read ✓` tick instead of `Sent` (Story 3.9). A remote message
  * (`sendState: null`) with no readers renders nothing.
  */
@@ -501,6 +520,7 @@ function SendStateCaption({
   groupTail,
   onRetry,
   offline,
+  reducedCapability,
   readCount = 0,
 }: SendStateCaptionProps) {
   if (state === "failed") {
@@ -532,7 +552,11 @@ function SendStateCaption({
   if (state === "sending") {
     if (offline && isOwn) {
       return (
-        <span className="mt-0.5 text-held text-xs">Queued — sends when you're back online</span>
+        <span className="mt-0.5 text-held text-xs">
+          {reducedCapability
+            ? "Queued — sends when keeper is open and back online"
+            : "Queued — sends when you're back online"}
+        </span>
       );
     }
     return <span className="mt-0.5 text-muted-foreground text-xs">Sending…</span>;

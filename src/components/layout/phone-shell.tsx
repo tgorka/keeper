@@ -55,6 +55,7 @@ import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useStaleResumePill } from "@/hooks/use-stale-resume-pill";
 import { syncNow } from "@/lib/ipc/client";
 import { accountStatusStore, useShellOffline } from "@/lib/stores/account-status";
+import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { detailStore, useDetailStore } from "@/lib/stores/detail-ui";
 import { leadingDrawerStore, useLeadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
@@ -467,6 +468,10 @@ export function PhoneShell() {
   const searchSurfaceOpen = useSearchSurfaceStore((s) => s.isOpen);
   const magnifierRef = useRef<HTMLButtonElement>(null);
   const offline = useShellOffline();
+  // Reduced-capability (iOS/phone) tier gate for the persistent offline pill
+  // (Story 14.6): false on desktop and pre-hydration, so a narrow desktop window
+  // mounting this shell keeps its connectivity UI byte-identical.
+  const isReducedCapability = useIsReducedCapabilityPlatform();
   // The live pull distance while an armed pull drags (drives the indicator's
   // affordance switch), and the post-release refresh spinner.
   const [pullDy, setPullDy] = useState<number | null>(null);
@@ -528,8 +533,9 @@ export function PhoneShell() {
     // Past the refresh threshold the release refreshes instead of opening
     // Search (Story 13.6): best-effort `syncNow()` resumes each active
     // account's SyncService. An IpcError is swallowed and only clears the
-    // spinner — never an error toast; a fully offline session resolves the
-    // spinner into the persistent offline pill below.
+    // spinner — never an error toast; a fully offline session shows the
+    // refresh-scoped pull-offline pill instead of a spinner and, on the reduced
+    // tier, settles into the persistent offline pill (Story 14.6) below.
     if (dy >= PULL_REFRESH_THRESHOLD_PX) {
       // Guard against a second qualifying pull re-firing `syncNow()` and
       // re-arming the spinner timeout while a refresh is already in flight.
@@ -603,9 +609,11 @@ export function PhoneShell() {
 
   // The pull indicator (Story 13.6): appears once the drag crosses the Search
   // reveal band and switches affordance at the refresh threshold; after a
-  // refreshing release it stays as the spinner until the next status tick — or,
-  // when every signed-in account is offline, resolves into the persistent
-  // offline pill (same copy as the sidebar pill; never an error toast).
+  // refreshing release it stays as the spinner until the next status tick. A
+  // refresh in flight while every signed-in account is offline shows the
+  // offline pill copy instead of a spinner (never an error toast) — a
+  // transient, refresh-scoped surface; the *persistent* offline surface is the
+  // standalone pill below (Story 14.6).
   const showSpinner = refreshing || (pullDy !== null && pullDy >= PULL_REFRESH_THRESHOLD_PX);
   const pullIndicator =
     refreshing || (pullDy !== null && pullDy >= PULL_REVEAL_THRESHOLD_PX) ? (
@@ -642,6 +650,33 @@ export function PhoneShell() {
             Release to search
           </div>
         )}
+      </div>
+    ) : null;
+
+  // The persistent offline pill (Story 14.6, reduced tier only): the phone's
+  // standing connectivity surface while every signed-in account is offline,
+  // rendered from the same `useShellOffline()` source and `OFFLINE_PILL_TEXT`
+  // copy as the sidebar/pull pills — one connectivity truth, no second store.
+  // Single-pill precedence for this shared header slot: an active pull gesture
+  // (`pullDy`) and the refresh spinner / pull-offline pill (`refreshing`) both
+  // outrank it, and it outranks the "Connecting…" pill (which already requires
+  // `!offline`), so at most one connectivity indicator ever shows. Clears the
+  // moment connectivity returns (`offline` flips false) — never a toast; the UI
+  // keeps rendering from the local mirror throughout.
+  const offlinePill =
+    isReducedCapability && offline && !refreshing && pullDy === null ? (
+      <div
+        data-testid="offline-band"
+        className="pointer-events-none absolute top-[calc(var(--safe-top)+var(--phone-header))] right-0 left-0 z-10 flex justify-center pt-2"
+      >
+        <div
+          role="status"
+          data-testid="offline-pill"
+          className="flex items-center gap-2 rounded-full bg-held/10 px-3 py-1.5 text-held text-xs shadow-xs"
+        >
+          <WifiOff aria-hidden="true" className="size-4 shrink-0" />
+          <span>{OFFLINE_PILL_TEXT}</span>
+        </div>
       </div>
     ) : null;
 
@@ -730,6 +765,7 @@ export function PhoneShell() {
         {level === 0 && drawerOpenZone}
         {level === 0 && pullDownZone}
         {level === 0 && pullIndicator}
+        {level === 0 && offlinePill}
         {level === 0 && connectingPill}
         <PhoneInboxHeader drawerButtonRef={drawerButtonRef} magnifierRef={magnifierRef} />
         <div className="flex min-h-0 min-w-0 flex-1">
