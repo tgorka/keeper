@@ -6,6 +6,7 @@ import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { composerStore } from "@/lib/stores/composer";
 import { detailStore } from "@/lib/stores/detail-ui";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
+import { leadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
@@ -50,8 +51,17 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     loadRemoteDraft: vi.fn(async () => null),
     mirrorDraft: vi.fn(async (): Promise<void> => {}),
     clearDraftMirror: vi.fn(async (): Promise<void> => {}),
+    // The leading drawer mounts SidebarPane → SettingsDialog, which reads the
+    // encryption posture on open. Stub it so opening the drawer never hits Tauri.
+    encryptionPosture: vi.fn(() => Promise.resolve(false)),
   };
 });
+
+// SidebarPane's account footer renders `useSignOut` (imports the IPC client);
+// mock the hook so opening the drawer never reaches Tauri.
+vi.mock("@/hooks/use-sign-out", () => ({
+  useSignOut: () => vi.fn(),
+}));
 
 // The conversation pane subscribes to native drag-drop via `getCurrentWebview()`.
 // Mock it so the listener registers (and unregisters) without a real Tauri webview.
@@ -177,6 +187,7 @@ beforeEach(() => {
   favoritesRoomsStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
   detailStore.setState({ open: false });
+  leadingDrawerStore.getState().close();
   composerStore.setState({ focusNonce: 0 });
   subscribeInbox.mockReset();
   subscribeInbox.mockResolvedValue(1);
@@ -336,9 +347,12 @@ describe("PhoneShell", () => {
       expect(screen.getByRole("main")).toBeInTheDocument();
     });
 
-    // One PhoneHeader-owned bar: back "Inbox" + identity → Detail + ⋯ overflow.
-    expect(screen.getAllByRole("banner")).toHaveLength(1);
-    const header = screen.getByRole("banner");
+    // One PhoneHeader-owned bar inside the active Room level: back "Inbox" +
+    // identity → Detail + ⋯ overflow. (Level 0's own Inbox header stays mounted
+    // but inert underneath — a different level's bar, not a second Room bar.)
+    const roomLevel = stackLevel(1);
+    expect(within(roomLevel).getAllByRole("banner")).toHaveLength(1);
+    const header = within(roomLevel).getByRole("banner");
     expect(within(header).getByRole("button", { name: "Back to Inbox" })).toBeInTheDocument();
     expect(within(header).getByRole("button", { name: "Open details" })).toBeInTheDocument();
     expect(within(header).getByRole("button", { name: "More" })).toBeInTheDocument();
@@ -595,8 +609,125 @@ describe("PhoneShell", () => {
 
   it("reserves level 0's leading edge (no back gesture) for the drawer", () => {
     render(<PhoneShell />);
-    // The edge-swipe hit zone exists only on the active overlay at level >= 1.
+    // The edge-swipe-BACK hit zone exists only on the active overlay at level >= 1;
+    // level 0's leading edge carries the drawer-OPEN zone instead.
     expect(screen.queryByTestId("edge-swipe-back")).not.toBeInTheDocument();
+    expect(screen.getByTestId("edge-swipe-open")).toBeInTheDocument();
+  });
+
+  it("shows exactly one Inbox header with the status cluster and no bottom tab bar at level 0", () => {
+    render(<PhoneShell />);
+    // Exactly one header bar (the Inbox header) at level 0.
+    expect(screen.getAllByRole("banner")).toHaveLength(1);
+    const header = screen.getByRole("banner");
+    expect(within(header).getByRole("button", { name: "Open navigation" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "Search" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "New chat" })).toBeInTheDocument();
+    // No bottom tab bar anywhere.
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+    // The chat list renders below the header (its loading state with no account).
+    expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
+  });
+
+  it("opens the leading drawer from the Inbox header avatar and renders the reused sidebar", async () => {
+    render(<PhoneShell />);
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    // The reused SidebarPane nav mounts inside the drawer.
+    const nav = await screen.findByRole("navigation", { name: "Views" });
+    expect(within(nav).getByRole("button", { name: /^Chats/ })).toBeInTheDocument();
+    expect(leadingDrawerStore.getState().isOpen).toBe(true);
+  });
+
+  it("keeps the drawer-open swipe zone below the header so it never shadows the avatar button", () => {
+    render(<PhoneShell />);
+    const zone = screen.getByTestId("edge-swipe-open");
+    // The zone must start below the 52px header (never `inset-y-0`) so a tap on the
+    // avatar drawer button's leading edge activates the button, not a below-threshold swipe.
+    expect(zone.className).toContain("top-[var(--phone-header)]");
+    expect(zone.className).not.toContain("inset-y-0");
+  });
+
+  it("opens the drawer via a level-0 leading-edge swipe past the threshold", () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    const zone = screen.getByTestId("edge-swipe-open");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientX: 5 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientX: 250 });
+    expect(leadingDrawerStore.getState().isOpen).toBe(true);
+  });
+
+  it("does not open the drawer when the level-0 edge swipe releases below the threshold", () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    const zone = screen.getByTestId("edge-swipe-open");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientX: 5 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientX: 30 });
+    expect(leadingDrawerStore.getState().isOpen).toBe(false);
+  });
+
+  it("keeps the level >= 1 edge-swipe popping (13.2 non-regression) with no drawer-open zone", async () => {
+    mockRectWidth(390);
+    render(<PhoneShell />);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
+    // At level 1 the leading edge is the back-swipe, not the drawer-open zone.
+    expect(screen.queryByTestId("edge-swipe-open")).not.toBeInTheDocument();
+    const zone = screen.getByTestId("edge-swipe-back");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientX: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientX: 250 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientX: 250 });
+    expect(roomsStore.getState().selected).toBeNull();
+    expect(leadingDrawerStore.getState().isOpen).toBe(false);
+  });
+
+  it("closes the drawer and returns focus to the avatar button when a row/view is selected", async () => {
+    render(<PhoneShell />);
+    const avatar = screen.getByRole("button", { name: "Open navigation" });
+    act(() => {
+      avatar.focus();
+    });
+    fireEvent.click(avatar);
+    const nav = await screen.findByRole("navigation", { name: "Views" });
+
+    // Selecting a primary view applies it and closes the drawer.
+    fireEvent.click(within(nav).getByRole("button", { name: /^Approvals/ }));
+    expect(primaryViewStore.getState().view).toBe("approval");
+    await waitFor(() => {
+      expect(leadingDrawerStore.getState().isOpen).toBe(false);
+    });
+    // Focus returns to the avatar drawer button (UX-DR28).
+    await waitFor(() => {
+      expect(avatar).toHaveFocus();
+    });
+  });
+
+  it("closes the drawer on Escape and restores focus to the avatar button", async () => {
+    render(<PhoneShell />);
+    const avatar = screen.getByRole("button", { name: "Open navigation" });
+    act(() => {
+      avatar.focus();
+    });
+    fireEvent.click(avatar);
+    const dialog = await screen.findByRole("dialog");
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => {
+      expect(leadingDrawerStore.getState().isOpen).toBe(false);
+    });
+    await waitFor(() => {
+      expect(avatar).toHaveFocus();
+    });
+  });
+
+  it("renders the drawer content with the reduced-motion cut class", async () => {
+    render(<PhoneShell />);
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    const content = await screen.findByTestId("leading-drawer-content");
+    expect(content.className).toContain("motion-reduce:animate-none");
   });
 
   it("closes Detail when the selection changes so it lands on the Room level (DW-109)", async () => {

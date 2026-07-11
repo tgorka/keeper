@@ -43,9 +43,12 @@ import {
 import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
+import { LeadingDrawer } from "@/components/layout/leading-drawer";
 import { PhoneHeader } from "@/components/layout/phone-header";
+import { PhoneInboxHeader } from "@/components/layout/phone-inbox-header";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { detailStore, useDetailStore } from "@/lib/stores/detail-ui";
+import { leadingDrawerStore, useLeadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
 
@@ -351,6 +354,84 @@ export function PhoneShell() {
     setDrag(null);
   };
 
+  // ---- Leading drawer (Story 13.3) ----------------------------------------
+  const drawerOpen = useLeadingDrawerStore((s) => s.isOpen);
+  const drawerButtonRef = useRef<HTMLButtonElement>(null);
+  // UX-DR28: return focus to the avatar drawer button whenever the drawer
+  // transitions open → closed (the edge-swipe-open path radix cannot auto-restore
+  // for; a button-opened close is already covered by radix, and re-focusing the
+  // same element is a no-op).
+  const prevDrawerOpenRef = useRef(drawerOpen);
+  useEffect(() => {
+    const wasOpen = prevDrawerOpenRef.current;
+    prevDrawerOpenRef.current = drawerOpen;
+    if (wasOpen && !drawerOpen) {
+      drawerButtonRef.current?.focus();
+    }
+  }, [drawerOpen]);
+
+  // The level-0 leading-edge swipe-to-open zone (mirrors the 13.2 back-swipe
+  // pointer math): a leading→trailing drag past half the width, or a rightward
+  // flick, opens the drawer. Reserved for level 0 only — level ≥ 1's leading edge
+  // is the back-swipe. The zone starts *below* the header so it never overlaps the
+  // avatar drawer button's 44pt hit area (the top-left corner is the tap
+  // affordance; the list's leading edge is the swipe affordance).
+  const openPointerRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startT: number;
+    width: number;
+  } | null>(null);
+
+  const onOpenEdgePointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (openPointerRef.current !== null) {
+      return;
+    }
+    const rectWidth = containerRef.current?.getBoundingClientRect().width ?? 0;
+    const width = rectWidth > 0 ? rectWidth : window.innerWidth;
+    openPointerRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startT: e.timeStamp,
+      width,
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const onOpenEdgePointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const pointer = openPointerRef.current;
+    if (pointer === null || e.pointerId !== pointer.pointerId) {
+      return;
+    }
+    openPointerRef.current = null;
+    const dx = clampDx(e.clientX - pointer.startX, pointer.width);
+    const dt = Math.max(e.timeStamp - pointer.startT, 1);
+    const flick = dx > FLICK_MIN_DX_PX && dx / dt > FLICK_VELOCITY_PX_PER_MS;
+    if (dx > pointer.width * 0.5 || flick) {
+      leadingDrawerStore.getState().open();
+    }
+  };
+
+  const onOpenEdgePointerCancel = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const pointer = openPointerRef.current;
+    if (pointer === null || e.pointerId !== pointer.pointerId) {
+      return;
+    }
+    openPointerRef.current = null;
+  };
+
+  const drawerOpenZone = (
+    <div
+      aria-hidden="true"
+      data-testid="edge-swipe-open"
+      className="absolute top-[var(--phone-header)] bottom-0 left-0 z-10 w-5 touch-none"
+      onPointerDown={onOpenEdgePointerDown}
+      onPointerUp={onOpenEdgePointerUp}
+      onPointerCancel={onOpenEdgePointerCancel}
+      onLostPointerCapture={onOpenEdgePointerCancel}
+    />
+  );
+
   // The ~20px leading-edge hit zone, rendered only inside the *active* overlay
   // (level ≥ 1). Level 0's leading edge is deliberately bare — reserved for the
   // Story 13.3 drawer.
@@ -393,7 +474,12 @@ export function PhoneShell() {
         onFocusCapture={captureFocusFor(0)}
         className="min-h-0 min-w-0 flex-1"
       >
-        <ChatListPane />
+        {/* Level 0's leading edge opens the drawer (the edge 13.2 reserved). */}
+        {level === 0 && drawerOpenZone}
+        <PhoneInboxHeader drawerButtonRef={drawerButtonRef} />
+        <div className="flex min-h-0 min-w-0 flex-1">
+          <ChatListPane />
+        </div>
       </StackLevel>
       <StackLevel
         levelIndex={1}
@@ -433,6 +519,9 @@ export function PhoneShell() {
           <DetailPanel />
         </div>
       </StackLevel>
+      {/* The always-mounted leading nav drawer (Story 13.3); a portalled Sheet,
+          so it renders outside the stack's transform layers. */}
+      <LeadingDrawer />
     </div>
   );
 }
