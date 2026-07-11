@@ -42,3 +42,12 @@ risk sections.
   mobile phase.
 - **E-mail, AI-bot client, terminal client** are future-phase items tracked in the PRD's
   post-MVP section, not storied yet.
+
+## Audited `unsafe` FFI inventory (shell crate only)
+
+Policy (2026-07-11): `unsafe_code` stays denied workspace-wide; the `keeper` shell crate may
+carry function-level, audited `#[allow(unsafe_code)]` exceptions for platform FFI with no
+safe binding. Current inventory:
+
+- iOS backup exclusion (`NSURL.setResourceValue(NSURLIsExcludedFromBackupKey)`) via
+  objc2-foundation, behind `Platform::exclude_from_backup` — story 14.7 (FR-65).

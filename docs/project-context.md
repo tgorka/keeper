@@ -52,7 +52,13 @@ Keeper is an open-source, Beeper-style Matrix messenger client (Apache-2.0). It 
 
 ### Rust Rules (src-tauri/)
 
-- `unsafe_code = "deny"` — no `unsafe` blocks, ever.
+- `unsafe_code = "deny"` (workspace lint). In `keeper-core` and all business logic: no
+  `unsafe`, ever. In the `keeper` shell crate ONLY, a narrowly-scoped, function-level
+  `#[allow(unsafe_code)]` is permitted for platform FFI that has no safe binding (e.g.
+  iOS `NSURLIsExcludedFromBackupKey` via objc2), under these conditions: one function per
+  concern, behind the `Platform` port, with a `// SAFETY:` comment citing the API contract,
+  and listed in the audit inventory in docs/constraints-and-limitations.md. (Coordinator
+  policy amendment, 2026-07-11, story 14.7.)
 - `clippy::unwrap_used = "warn"` and clippy runs with `-D warnings`: **never use `.unwrap()` (or bare `.expect()`) in production paths.** Use `?` with `thiserror` error types; `expect` is tolerated only in tests and startup code that cannot proceed (e.g. `tauri::Builder::run`).
 - `clippy --all-targets -- -D warnings` must pass — treat every clippy lint as an error.
 - Use `tracing` for logging (not `println!`/`eprintln!`).
