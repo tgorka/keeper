@@ -1,0 +1,60 @@
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_de00f0870e9825::t_a19be048669847 155
+src/App.tsx
+  s_de00f0870e9825::t_66887db82b8a38 5
+  s_de00f0870e9825::t_2dfc55989fc860 107-111
+_bmad-output/implementation-artifacts/spec-14-2-honest-no-background-sync-disclosure.md
+  s_de00f0870e9825::t_88d5c535419f10 1-4,6-8,12-72,82-88,107-119
+  s_de00f0870e9825::t_361032bcfe0d60 89-106
+  s_de00f0870e9825::t_0d0e2bc8df9c90 73-81
+  s_de00f0870e9825::t_498837af9dfec3 10
+  s_de00f0870e9825::t_492ff4e9c68815 9
+  s_de00f0870e9825::t_32e185d0d7a568 5
+  s_de00f0870e9825::t_de20d14ef22db8 11
+  s_de00f0870e9825::t_6c5c4575d12435 120-147
+src/components/settings/no-background-sync-disclosure.tsx
+  s_de00f0870e9825::t_e4a8c09422fd13 1-126
+src-tauri/crates/keeper-core/src/registry.rs
+  s_de00f0870e9825::t_fe477b498d1c80 1895
+  s_de00f0870e9825::t_0b0c73cdfa1ceb 1896-1907
+  s_de00f0870e9825::t_eb4ed7fc798cda 503-521
+src-tauri/crates/keeper/src/ipc.rs
+  s_de00f0870e9825::t_af3a9a30519080 2920-2939
+src/components/settings/settings-dialog.tsx
+  s_de00f0870e9825::t_296d92a22257d0 346-348
+  s_de00f0870e9825::t_6bce8c709dfef9 315-320
+  s_de00f0870e9825::t_5ebc46e970c288 87-88
+  s_de00f0870e9825::t_39eeb55f74a042 146-150
+  s_de00f0870e9825::t_237dd72c2c987e 10-13
+  s_de00f0870e9825::t_2b228632ccb122 258-260
+src/components/settings/settings-dialog.test.tsx
+  s_de00f0870e9825::t_1c3b300e85704d 472,483-487,493-499
+  s_de00f0870e9825::t_18ffb288612704 38-39
+  s_de00f0870e9825::t_12478db47c7b70 500-501
+  s_de00f0870e9825::t_a4af52d11a6857 56-59
+  s_de00f0870e9825::t_53270a6a5119b0 464-469
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_de00f0870e9825::t_b25f3d937525d5 854-857
+src/components/settings/no-background-sync-disclosure.test.tsx
+  s_de00f0870e9825::t_50f9f821ebbbc4 1-176
+src/lib/ipc/client.ts
+  s_de00f0870e9825::t_7d1d52d4ff452d 1554-1571
+src-tauri/crates/keeper/src/lib.rs
+  s_de00f0870e9825::t_b3b315e0494a12 289-290
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "02a35a9703d8babb6b042d6591c86e23834cd3b4",
+  "prompts": {},
+  "sessions": {
+    "s_de00f0870e9825": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cbced247-d17a-4d30-b054-f274f736e303",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
