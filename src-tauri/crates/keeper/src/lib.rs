@@ -8,6 +8,7 @@
 #[cfg(desktop)]
 mod hotkey;
 mod ipc;
+mod lifecycle;
 mod media_protocol;
 #[cfg(desktop)]
 mod menu;
@@ -241,6 +242,7 @@ pub fn run() {
             ipc::cancel_send,
             ipc::mark_room_read,
             ipc::sync_now,
+            lifecycle::app_lifecycle_changed,
             ipc::palette_query,
             ipc::cheat_sheet_sections,
             ipc::release_receipt,

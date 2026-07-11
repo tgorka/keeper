@@ -12,6 +12,7 @@ import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
 import type { IpcError } from "./gen/IpcError";
+import type { LifecyclePhase } from "./gen/LifecyclePhase";
 import type { NotifyTarget } from "./gen/NotifyTarget";
 
 export type { AccountVm } from "./gen/AccountVm";
@@ -60,6 +61,7 @@ export type { IncognitoScope } from "./gen/IncognitoScope";
 export type { IncognitoVm } from "./gen/IncognitoVm";
 export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
+export type { LifecyclePhase } from "./gen/LifecyclePhase";
 export type { LoginFieldVm } from "./gen/LoginFieldVm";
 export type { LoginFlowVm } from "./gen/LoginFlowVm";
 export type { MediaKindVm } from "./gen/MediaKindVm";
@@ -1441,6 +1443,23 @@ export async function markRoomRead(accountId: string, roomId: string): Promise<v
  */
 export async function syncNow(): Promise<void> {
   await invoke<void>("sync_now");
+}
+
+/**
+ * Report an app-lifecycle transition to the single Rust lifecycle entry (Epic
+ * 14-1). `"background"` gracefully pauses every live account's `SyncService`
+ * (the sliding-sync long-poll ends cleanly, account state retained);
+ * `"foreground"` routes through the same `AccountManager::sync_now()` sync-kick
+ * pull-to-refresh uses, so the two cannot diverge.
+ *
+ * On iOS this is driven from the webview `visibilitychange` event (the
+ * zero-native stopgap, {@link useAppLifecycle}); a future Swift `UIApplication`
+ * plugin will call the same command. Never invoked on desktop, so Story 10.3
+ * background operation is untouched. Best-effort: callers fire-and-forget and
+ * swallow rejections (no toast).
+ */
+export async function appLifecycleChanged(phase: LifecyclePhase): Promise<void> {
+  await invoke<void>("app_lifecycle_changed", { phase });
 }
 
 /**

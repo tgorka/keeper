@@ -4,6 +4,7 @@ import { AppShell } from "@/components/layout/app-shell";
 import { AtRestEncryptionChoice } from "@/components/settings/at-rest-encryption-choice";
 import { Toaster } from "@/components/ui/sonner";
 import { FirstRunWizard } from "@/components/wizard/first-run-wizard";
+import { useAppLifecycle } from "@/hooks/use-app-lifecycle";
 import { useCapabilitiesHydrate } from "@/hooks/use-capabilities-hydrate";
 import { useNotifyNavigate } from "@/hooks/use-notify-navigate";
 import { useSessionRestore } from "@/hooks/use-session-restore";
@@ -23,6 +24,11 @@ function App() {
   // a notification click summons the app and lands it on the Inbox (message) or the
   // Bridges view (bridge alert). Coarse only — no exact-message deep landing in MVP.
   useNotifyNavigate();
+  // Drive the single Rust lifecycle entry from the webview `visibilitychange`
+  // event on the reduced-capability (iOS) tier only (Epic 14-1): background
+  // pauses each live sync loop gracefully, foreground routes through the same
+  // sync-now kick as pull-to-refresh. Inert on desktop — Story 10.3 untouched.
+  useAppLifecycle();
   const hydrated = useAccountsStore((s) => s.hydrated);
   const hasAccount = useAccountsStore((s) => s.accounts.length > 0);
   const addAccountOpen = useAddAccountStore((s) => s.open);

@@ -700,6 +700,36 @@ impl AccountManager {
         }
     }
 
+    /// Gracefully pause every live account's sync loop (the Epic 14-1
+    /// background-pause counterpart to [`sync_now`]).
+    ///
+    /// On lifecycle background (iOS app leaving the foreground) this stops each
+    /// **already-active** account's [`SyncService`] via its graceful `stop()` so
+    /// the sliding-sync long-poll ends cleanly rather than dying mid-flight. It
+    /// is *pause*, not teardown: accounts, streams, producers, and the reconnect
+    /// supervisor all stay up (that is `shutdown`'s job for sign-out/quit), so a
+    /// later foreground [`sync_now`] resumes instantly via `start()`. It never
+    /// activates signed-out (or never-subscribed) accounts.
+    ///
+    /// Best-effort and infallible: `stop()` itself cannot fail, and an empty (or
+    /// all-asleep) manager is a no-op.
+    pub async fn pause_all(&self) {
+        // Clone the handles' `SyncService` Arcs under the lock, then pause
+        // outside it so a slow stop never blocks other account operations —
+        // mirroring `sync_now`'s structure exactly.
+        let services: Vec<(String, std::sync::Arc<SyncService>)> = {
+            let accounts = self.accounts.lock().await;
+            accounts
+                .iter()
+                .map(|(account_id, handle)| (account_id.clone(), handle.sync.clone()))
+                .collect()
+        };
+        for (account_id, sync) in services {
+            sync.stop().await;
+            tracing::debug!(account_id = %account_id, "pause-all: stopped sync service");
+        }
+    }
+
     /// Subscribe to the account's room list, activating the account if it is not
     /// already live. Spawns a supervised producer task that emits a `Reset`
     /// snapshot batch first, then diff batches, into `sink`. Returns the new
@@ -5949,6 +5979,30 @@ mod tests {
 
         // No accounts are live: nothing to resume, nothing activated, no panic.
         manager.sync_now().await;
+        assert!(manager.accounts.lock().await.is_empty());
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Epic 14-1: `pause_all` pauses only *already-live* accounts — an empty
+    /// manager (nothing signed in / nothing activated) is a clean no-op that
+    /// never builds a Client/SyncService, never tears anything down, and never
+    /// errors. Mirrors `sync_now_with_no_live_accounts_is_a_noop`.
+    #[tokio::test]
+    async fn pause_all_with_no_live_accounts_is_a_noop() {
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!(
+            "keeper-pause-all-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let manager = AccountManager::new(&data_dir);
+
+        // No accounts are live: nothing to pause, nothing torn down, no panic.
+        manager.pause_all().await;
         assert!(manager.accounts.lock().await.is_empty());
 
         let _ = std::fs::remove_dir_all(&data_dir);

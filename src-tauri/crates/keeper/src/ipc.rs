@@ -1,9 +1,11 @@
 //! IPC command layer for the keeper shell (AD-8, AD-21).
 //!
-//! This is the single place where [`CoreError`] is mapped to the `IpcError`
-//! envelope, where `#[tauri::command]`s live, and where the concrete
-//! [`Platform`] port is implemented. No business logic lives here — commands
-//! delegate to `keeper-core`.
+//! This is the place where [`CoreError`] is mapped to the `IpcError` envelope,
+//! where the bulk of the `#[tauri::command]`s live, and where the concrete
+//! [`Platform`] port is implemented. The app-lifecycle command is the one
+//! deliberate peer seam — it lives in [`crate::lifecycle`] (Epic 14-1) so the
+//! single Rust lifecycle entry point is self-contained. No business logic lives
+//! in either module — commands delegate to `keeper-core`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

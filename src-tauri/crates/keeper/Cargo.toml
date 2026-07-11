@@ -27,6 +27,10 @@ tauri-plugin-opener = { workspace = true }
 tauri-plugin-deep-link = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Generates the `LifecyclePhase` frontend binding (Epic 14-1) into
+# `src/lib/ipc/gen/` via the `#[ts(export)]` export test, matching keeper-core's
+# VM export step. Bindings dir is set by the workspace `TS_RS_EXPORT_DIR` env.
+ts-rs = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
