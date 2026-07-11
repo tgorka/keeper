@@ -44,6 +44,22 @@ jobs:
       - run: cargo nextest run --no-tests=pass
         working-directory: src-tauri
 
+  ios:
+    name: iOS (compile check)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # Compile-only iOS gate (AD-32): no signing, no simulator, no Apple creds.
+      # Blocks by failure; required-status wiring is Story 15.4.
+      - run: cargo check --workspace --target aarch64-apple-ios
+        working-directory: src-tauri
+
   licenses:
     name: License firewall (cargo-deny, JS)
     runs-on: macos-latest
