@@ -13,6 +13,7 @@ import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
 import type { IpcError } from "./gen/IpcError";
 import type { LifecyclePhase } from "./gen/LifecyclePhase";
+import type { NavState } from "./gen/NavState";
 import type { NotificationPermission } from "./gen/NotificationPermission";
 import type { NotifyTarget } from "./gen/NotifyTarget";
 
@@ -70,6 +71,7 @@ export type { MediaVm } from "./gen/MediaVm";
 export type { MenuItemVm } from "./gen/MenuItemVm";
 export type { MenuSectionVm } from "./gen/MenuSectionVm";
 export type { MuteState } from "./gen/MuteState";
+export type { NavState } from "./gen/NavState";
 export type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 export type { NetworkVm } from "./gen/NetworkVm";
 export type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
@@ -1567,6 +1569,43 @@ export async function activeChatSet(
     accountId: selection?.accountId ?? null,
     roomId: selection?.roomId ?? null,
   });
+}
+
+/**
+ * Record the last phone-stack navigation level in Rust (Story 14.4). Reported by the
+ * iOS shell on the reduced tier whenever a Chat is open (`detailOpen` marks the level-2
+ * Detail), so a webview reload after a content-process jettison (tauri#14371) can land
+ * the user exactly where they were. Nav *selection* only — never message/room data.
+ * Best-effort: callers fire-and-forget and swallow rejections.
+ */
+export async function navStateSet(
+  selection: { accountId: string; roomId: string },
+  detailOpen: boolean,
+): Promise<void> {
+  await invoke<void>("nav_state_set", {
+    accountId: selection.accountId,
+    roomId: selection.roomId,
+    detailOpen,
+  });
+}
+
+/**
+ * Clear the Rust-held navigation level (Story 14.4) — the user returned to the Inbox,
+ * so a later reload honestly starts at level 0. Best-effort: callers fire-and-forget
+ * and swallow rejections.
+ */
+export async function navStateClear(): Promise<void> {
+  await invoke<void>("nav_state_clear");
+}
+
+/**
+ * Read the Rust-held navigation level (Story 14.4), or `null` on a cold launch (a true
+ * app kill restarts Rust fresh — no stored nav means the Inbox). A read, not a take:
+ * the shell keeps reporting over it. A rejection is treated as "no stored nav" by
+ * callers (start at the Inbox).
+ */
+export async function navStateGet(): Promise<NavState | null> {
+  return await invoke<NavState | null>("nav_state_get");
 }
 
 /**

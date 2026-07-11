@@ -52,6 +52,7 @@ import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
 import { useKeyboardInset } from "@/hooks/use-keyboard-inset";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { useStaleResumePill } from "@/hooks/use-stale-resume-pill";
 import { syncNow } from "@/lib/ipc/client";
 import { accountStatusStore, useShellOffline } from "@/lib/stores/account-status";
 import { detailStore, useDetailStore } from "@/lib/stores/detail-ui";
@@ -644,6 +645,32 @@ export function PhoneShell() {
       </div>
     ) : null;
 
+  // The stale-resume "Connecting…" pill (Story 14.4): a quiet transient indicator
+  // under the Inbox header while a resumed sync is still answering. Hidden while
+  // an ACTUAL refresh spinner is in flight (`refreshing`, which says the same
+  // thing) and while genuinely offline (`offline` — "Connecting…" would be
+  // dishonest when there is no connection; the offline surface owns that state,
+  // Review R2). Also suppressed during an active pull gesture (`pullDy`), whose
+  // band shares this exact slot — so the reconnect pill and the pull affordance
+  // never overlap; a passive resume with no gesture still shows it (Review R2).
+  // Clears on the sync answering or its own timeout backstop — never stuck.
+  const connecting = useStaleResumePill();
+  const connectingPill =
+    connecting && !refreshing && !offline && pullDy === null ? (
+      <div
+        data-testid="stale-resume-band"
+        className="pointer-events-none absolute top-[calc(var(--safe-top)+var(--phone-header))] right-0 left-0 z-10 flex justify-center pt-2"
+      >
+        <div
+          role="status"
+          data-testid="stale-resume-pill"
+          className="rounded-full bg-held/10 px-3 py-1.5 text-held text-xs shadow-xs"
+        >
+          Connecting…
+        </div>
+      </div>
+    ) : null;
+
   const drawerOpenZone = (
     <div
       aria-hidden="true"
@@ -703,6 +730,7 @@ export function PhoneShell() {
         {level === 0 && drawerOpenZone}
         {level === 0 && pullDownZone}
         {level === 0 && pullIndicator}
+        {level === 0 && connectingPill}
         <PhoneInboxHeader drawerButtonRef={drawerButtonRef} magnifierRef={magnifierRef} />
         <div className="flex min-h-0 min-w-0 flex-1">
           <ChatListPane />

@@ -30,10 +30,10 @@ use keeper_core::vm::{
     CapabilitiesVm, ChatNotifyMode, ConnectionStatusBatch, CouplingCaveatVm, DemoBatch,
     DockBadgeMode, DraftMirrorBatch, EditVersionVm, EgressEndpointVm, EncryptionStatusBatch,
     ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError,
-    IpcErrorCode, MenuSectionVm, NetworksSnapshot, NewChatResolutionVm, NotificationPermission,
-    NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode, PaletteResultsVm, PingVm, Provider,
-    RemoteDraftVm, ResolveSupportVm, RoomListBatch, SearchFilterVm, SearchHitVm, SpacesSnapshot,
-    TimelineBatch, TypingBatch, VerificationFlowVm,
+    IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
+    NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
+    PaletteResultsVm, PingVm, Provider, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
+    SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -70,6 +70,42 @@ pub struct AppState {
     /// spawns, and registers the handle atomically under one lock (so a fast-terminating
     /// task can never leave a resident handle); `bbctl_run_cancel` aborts and removes.
     pub bbctl_runs: Arc<BbctlRunRegistry>,
+    /// When the app last reported `Background` (Story 14.4). A **wall-clock**
+    /// [`SystemTime`] — never `Instant`, whose Apple `mach_absolute_time` base does not
+    /// advance while the device sleeps, so an overnight suspension would read as
+    /// near-zero elapsed and the matrix-rust-sdk#3935 stale-session restart would never
+    /// trip. Earliest-wins: `Background` records only when this is `None` (a
+    /// duplicate/late report can't shrink a long suspension); `Foreground` *takes* it.
+    pub paused_at: Mutex<Option<SystemTime>>,
+    /// The last phone-stack navigation level (Story 14.4) — nav *selection* only,
+    /// never message/room data. Survives a jettisoned web-content process because it
+    /// lives here in Rust; a true app kill starts fresh (`None` ⇒ cold launch ⇒ Inbox).
+    pub nav_state: Mutex<Option<NavState>>,
+}
+
+/// Lock an optional-slot mutex, recovering a poisoned lock instead of propagating —
+/// these slots hold plain data (a timestamp, a nav selection) with no invariant a
+/// mid-write panic could break, and a resume/nav concern must never panic the app.
+pub(crate) fn slot_lock<T>(slot: &Mutex<Option<T>>) -> std::sync::MutexGuard<'_, Option<T>> {
+    match slot.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Store a value into an optional slot (poison-recovering).
+pub(crate) fn slot_set<T>(slot: &Mutex<Option<T>>, value: T) {
+    *slot_lock(slot) = Some(value);
+}
+
+/// Read (clone) the current value of an optional slot (poison-recovering).
+pub(crate) fn slot_get<T: Clone>(slot: &Mutex<Option<T>>) -> Option<T> {
+    slot_lock(slot).clone()
+}
+
+/// Take (consume) the current value of an optional slot (poison-recovering).
+pub(crate) fn slot_take<T>(slot: &Mutex<Option<T>>) -> Option<T> {
+    slot_lock(slot).take()
 }
 
 /// The two registry maps, held under a single lock so target-reservation and
@@ -239,6 +275,8 @@ impl AppState {
             beeper_flows: Arc::new(BeeperFlowRegistry::new()),
             exports: Arc::new(ExportRegistry::default()),
             bbctl_runs: Arc::new(BbctlRunRegistry::default()),
+            paused_at: Mutex::new(None),
+            nav_state: Mutex::new(None),
         }
     }
 }
@@ -2962,6 +3000,46 @@ pub fn active_chat_set(
     Ok(())
 }
 
+/// Record the last phone-stack navigation level (Story 14.4). Reported by the iOS shell
+/// on the reduced tier whenever a Chat is open (`detail_open` marks the level-2 Detail),
+/// so a webview reload after a content-process jettison (tauri#14371) can land the user
+/// exactly where they were. Nav *selection* only — never message/room data (AD-8).
+/// Ephemeral process state, never persisted; infallible in practice.
+#[tauri::command]
+pub fn nav_state_set(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    detail_open: bool,
+) -> Result<(), IpcError> {
+    slot_set(
+        &state.nav_state,
+        NavState {
+            account_id,
+            room_id,
+            detail_open,
+        },
+    );
+    Ok(())
+}
+
+/// Clear the stored navigation level (Story 14.4) — the user returned to the Inbox, so
+/// a later reload honestly starts at level 0. Idempotent; infallible in practice.
+#[tauri::command]
+pub fn nav_state_clear(state: State<'_, AppState>) -> Result<(), IpcError> {
+    slot_take(&state.nav_state);
+    Ok(())
+}
+
+/// Read the stored navigation level (Story 14.4), or `None` on a cold launch (a true
+/// app kill restarts Rust fresh, so no stored nav ⇒ the Inbox). A read, not a take —
+/// the shell keeps reporting over it, and a StrictMode effect re-run must never
+/// consume the state out from under its sibling read. Infallible in practice.
+#[tauri::command]
+pub fn nav_state_get(state: State<'_, AppState>) -> Result<Option<NavState>, IpcError> {
+    Ok(slot_get(&state.nav_state))
+}
+
 /// Read the OS notification-permission state (Story 14.3). Reaches the write-once
 /// notification app handle and the plugin's `permission_state()`, mapping to the typed
 /// [`NotificationPermission`] the iOS Settings surface reads. `Granted`/`Denied` mirror the
@@ -3752,6 +3830,65 @@ mod tests {
     #[test]
     fn now_ms_is_positive() {
         assert!(now_ms() > 0);
+    }
+
+    /// Story 14.4: the `nav_state` slot round-trips through the same helpers the
+    /// `nav_state_set`/`nav_state_get`/`nav_state_clear` commands delegate to —
+    /// set stores, get reads WITHOUT consuming, clear (take) empties.
+    #[test]
+    fn nav_state_slot_set_get_clear_round_trip() {
+        let slot: Mutex<Option<NavState>> = Mutex::new(None);
+        assert_eq!(slot_get(&slot), None, "cold launch: no stored nav");
+
+        let nav = NavState {
+            account_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            room_id: "!room:example.org".to_owned(),
+            detail_open: true,
+        };
+        slot_set(&slot, nav.clone());
+        assert_eq!(slot_get(&slot), Some(nav.clone()));
+        // `get` is a read, not a take — a second read still sees the value
+        // (StrictMode-safe: a re-run can never consume it out from under a sibling).
+        assert_eq!(slot_get(&slot), Some(nav.clone()));
+
+        // A re-set overwrites (the reporter pushes the latest level).
+        let updated = NavState {
+            detail_open: false,
+            ..nav
+        };
+        slot_set(&slot, updated.clone());
+        assert_eq!(slot_get(&slot), Some(updated.clone()));
+
+        // Clear (take) consumes; clearing again is an idempotent no-op.
+        assert_eq!(slot_take(&slot), Some(updated));
+        assert_eq!(slot_get(&slot), None);
+        assert_eq!(slot_take(&slot), None);
+    }
+
+    /// Story 14.4: the slot helpers recover a poisoned lock instead of panicking —
+    /// a resume/nav concern must never take the app down.
+    #[test]
+    fn nav_state_slot_recovers_a_poisoned_lock() {
+        let slot: Arc<Mutex<Option<NavState>>> = Arc::new(Mutex::new(Some(NavState {
+            account_id: "acct".to_owned(),
+            room_id: "!r:example.org".to_owned(),
+            detail_open: false,
+        })));
+        // Poison the lock by panicking while holding it on another thread.
+        let poisoner = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock();
+            panic!("poison the slot lock");
+        })
+        .join();
+        assert!(slot.is_poisoned(), "the lock should be poisoned");
+        assert_eq!(
+            slot_get(&slot).map(|nav| nav.room_id),
+            Some("!r:example.org".to_owned()),
+            "a poisoned slot still reads its stored value"
+        );
+        assert!(slot_take(&slot).is_some());
+        assert_eq!(slot_get(&slot), None);
     }
 
     /// Egress honesty guard (Story 11.2, NFR-11): the About surface shows

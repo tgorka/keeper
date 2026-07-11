@@ -72,6 +72,14 @@ vi.mock("@/hooks/use-sign-out", () => ({
   useSignOut: () => vi.fn(),
 }));
 
+// The stale-resume "Connecting…" pill state (Story 14.4) is driven by a
+// visibility/status hook with its own unit suite; here the shell's RENDERING of
+// that state is under test, so the hook is a settable stub.
+const staleResumePill = { connecting: false };
+vi.mock("@/hooks/use-stale-resume-pill", () => ({
+  useStaleResumePill: () => staleResumePill.connecting,
+}));
+
 // The conversation pane subscribes to native drag-drop via `getCurrentWebview()`.
 // Mock it so the listener registers (and unregisters) without a real Tauri webview.
 vi.mock("@tauri-apps/api/webview", () => ({
@@ -204,6 +212,7 @@ beforeEach(() => {
   subscribeInbox.mockResolvedValue(1);
   syncNow.mockReset();
   syncNow.mockResolvedValue(undefined);
+  staleResumePill.connecting = false;
 });
 
 afterEach(() => {
@@ -985,6 +994,95 @@ describe("PhoneShell pull-to-refresh (Story 13.6)", () => {
     fireEvent.pointerUp(zone, { pointerId: 1, clientY: 200 });
     expect(syncNow).not.toHaveBeenCalled();
     expect(searchSurfaceStore.getState().isOpen).toBe(false);
+  });
+});
+
+describe("PhoneShell stale-resume pill (Story 14.4)", () => {
+  it("renders the quiet Connecting… pill under the Inbox header while connecting", () => {
+    staleResumePill.connecting = true;
+    render(<PhoneShell />);
+
+    const pill = screen.getByTestId("stale-resume-pill");
+    expect(pill).toHaveTextContent("Connecting…");
+    expect(pill).toHaveAttribute("role", "status");
+  });
+
+  it("is absent when not connecting", () => {
+    render(<PhoneShell />);
+    expect(screen.queryByTestId("stale-resume-pill")).not.toBeInTheDocument();
+  });
+
+  it("is absent at level ≥ 1 (the pill is an Inbox-header surface)", async () => {
+    staleResumePill.connecting = true;
+    render(<PhoneShell />);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("stale-resume-pill")).not.toBeInTheDocument();
+  });
+
+  it("hides only while an actual refresh spinner is in flight, then returns", async () => {
+    mockRectWidth(390);
+    staleResumePill.connecting = true;
+    accountsStore.getState().addAccount(account);
+    render(<PhoneShell />);
+    expect(screen.getByTestId("stale-resume-pill")).toBeInTheDocument();
+
+    // A released pull past the refresh threshold puts a real spinner in flight —
+    // the two indicators would say the same thing, so the pill yields.
+    const zone = screen.getByTestId("pull-down-search");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 160 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientY: 160 });
+    expect(screen.getByTestId("pull-refresh-spinner")).toBeInTheDocument();
+    expect(screen.queryByTestId("stale-resume-pill")).not.toBeInTheDocument();
+
+    // The refresh resolves on the next status tick: the pill may return (the
+    // connecting state itself is the pill hook's concern).
+    act(() => {
+      accountStatusStore.getState().setStatus(account.accountId, "online");
+    });
+    await waitFor(() => {
+      expect(screen.queryByTestId("pull-refresh-spinner")).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId("stale-resume-pill")).toBeInTheDocument();
+  });
+
+  it("yields to the pull affordance during an active reveal drag, then returns", () => {
+    mockRectWidth(390);
+    staleResumePill.connecting = true;
+    render(<PhoneShell />);
+
+    // Drag into the Search reveal band [reveal, refresh) without releasing: the
+    // reveal affordance and the pill share this exact absolute slot, so during an
+    // active gesture the pull affordance owns it and the pill yields — no overlap
+    // (Review R2). The user is interacting, not passively watching for reconnect.
+    const zone = screen.getByTestId("pull-down-search");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 100 });
+    expect(screen.getByTestId("pull-release-search")).toBeInTheDocument();
+    expect(screen.queryByTestId("stale-resume-pill")).not.toBeInTheDocument();
+
+    // Gesture ends without a refresh: the passive reconnect indicator returns.
+    fireEvent.pointerCancel(zone, { pointerId: 1 });
+    expect(screen.getByTestId("stale-resume-pill")).toBeInTheDocument();
+  });
+
+  it("stays hidden while genuinely offline (Connecting… would be dishonest)", () => {
+    staleResumePill.connecting = true;
+    accountsStore.getState().addAccount(account);
+    render(<PhoneShell />);
+    // Pill is up while connectivity is unknown/online…
+    expect(screen.getByTestId("stale-resume-pill")).toBeInTheDocument();
+    // …but the moment every account is offline, "Connecting…" is untrue — the
+    // offline surface owns that state, so the pill yields (Review R2).
+    act(() => {
+      accountStatusStore.getState().setStatus(account.accountId, "offline");
+    });
+    expect(screen.queryByTestId("stale-resume-pill")).not.toBeInTheDocument();
   });
 });
 

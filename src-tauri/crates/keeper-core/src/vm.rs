@@ -1481,6 +1481,28 @@ pub enum NotificationPermission {
     Unknown,
 }
 
+/// The last phone-stack navigation level, held in Rust so it survives a jettisoned
+/// WKWebView web-content process (Story 14.4, tauri#14371).
+///
+/// Nav *selection* only — never message/room data (AD-8: the streams re-deliver a
+/// full snapshot on re-subscribe after any reload). Reported by the iOS shell on the
+/// reduced tier whenever a Chat is open (`detail_open` marks the level-2 Detail);
+/// cleared on return to the Inbox. Ephemeral process state, never persisted: a true
+/// app kill restarts Rust fresh, so a cold launch honestly starts at the Inbox.
+/// Deliberately independent from 14.3's `NotifyConfig.active_room`
+/// (notification-suppression state) — the two concerns never share a slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NavState {
+    /// The opaque keeper account id of the open Chat.
+    pub account_id: String,
+    /// The Matrix room id of the open Chat.
+    pub room_id: String,
+    /// Whether the level-2 Detail panel was open on top of the Room.
+    pub detail_open: bool,
+}
+
 /// The click-through target carried by every native notification (Story 10.4, FR-51).
 ///
 /// Attached at the notification dispatch site so a click can land the user in the

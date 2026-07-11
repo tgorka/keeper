@@ -8,8 +8,10 @@ import { FirstRunWizard } from "@/components/wizard/first-run-wizard";
 import { useActiveChatReporter } from "@/hooks/use-active-chat-reporter";
 import { useAppLifecycle } from "@/hooks/use-app-lifecycle";
 import { useCapabilitiesHydrate } from "@/hooks/use-capabilities-hydrate";
+import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";
 import { useNotifyNavigate } from "@/hooks/use-notify-navigate";
 import { useSessionRestore } from "@/hooks/use-session-restore";
+import { useWebviewGuard } from "@/hooks/use-webview-guard";
 import { encryptionPosture } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useAddAccountStore } from "@/lib/stores/add-account";
@@ -35,6 +37,15 @@ function App() {
   // (iOS) tier only (Story 14.3, AD-18): a foreground notification for the Chat already
   // on screen is suppressed. Inert on desktop — notification behavior is unchanged there.
   useActiveChatReporter();
+  // Persist the last phone-stack level in Rust and restore it after a reload on the
+  // reduced-capability (iOS) tier only (Story 14.4): a webview reload after a
+  // content-process jettison lands the user exactly where they were, and a cold
+  // launch starts fresh at the Inbox. Inert on desktop.
+  useNavStatePersistence();
+  // Reload a blank/frozen webview once (loop-guarded) on a resume that fails the
+  // animation-frame liveness probe, on the reduced-capability (iOS) tier only
+  // (Story 14.4, tauri#14371). Never reloads a healthy webview. Inert on desktop.
+  useWebviewGuard();
   const hydrated = useAccountsStore((s) => s.hydrated);
   const hasAccount = useAccountsStore((s) => s.accounts.length > 0);
   const addAccountOpen = useAddAccountStore((s) => s.open);
