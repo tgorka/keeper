@@ -1,0 +1,138 @@
+src/components/chat/message-bubble.test.tsx
+  s_0ed7c98260cf26::t_d00ffa2473538b 486-640
+  s_0ed7c98260cf26::t_dd1e5c2457cb0e 1-2
+src/index.css
+  s_0ed7c98260cf26::t_75e33470a234f3 177-184
+  s_0ed7c98260cf26::t_e1ba0ff3a6ceed 98-106
+  s_0ed7c98260cf26::t_9977ea73121613 19-24
+  s_0ed7c98260cf26::t_6b84509ec3ee92 205-212
+src/components/layout/networks-group.tsx
+  s_0ed7c98260cf26::t_a17fbda516c535 101,107-109
+  s_0ed7c98260cf26::t_f7023d3180aeea 47-50
+  s_0ed7c98260cf26::t_0598f285655f40 129-131,133-135
+  s_0ed7c98260cf26::t_c7deeb12e72ca5 31-32
+src-tauri/crates/keeper-core/src/palette.rs
+  s_0ed7c98260cf26::t_7ff63d7bc65f57 451-460
+  s_0ed7c98260cf26::t_d93270d4006349 898
+  s_0ed7c98260cf26::t_6f32a921a4afad 1099-1100
+src/components/layout/phone-shell.test.tsx
+  s_0ed7c98260cf26::t_88de503d82389a 21
+  s_0ed7c98260cf26::t_c69bf6704746d4 866-990
+  s_0ed7c98260cf26::t_63355df24e8e1d 791-810
+  s_0ed7c98260cf26::t_8f269993a221e7 4
+  s_0ed7c98260cf26::t_b0cff496981cbf 202,205-206
+  s_0ed7c98260cf26::t_81ceda6f0d26e2 64-65
+src/components/layout/pins-strip.tsx
+  s_0ed7c98260cf26::t_5a9ef0904b19fe 99,271
+  s_0ed7c98260cf26::t_38d30f726a234b 279-281
+  s_0ed7c98260cf26::t_80fa5f298ff0ef 2,12-18,22,28,31-32,36-39,58-75,82-98,100-209,233-235,239,242-257,261,265,268-270,272,283,285,288-301,305-314,321,328-349
+src/hooks/use-long-press.ts
+  s_0ed7c98260cf26::t_e4f273f7984329 1-167
+src/hooks/use-long-press.test.tsx
+  s_0ed7c98260cf26::t_f5a7cdca5ddb39 1-163
+src/components/layout/sidebar-pane.tsx
+  s_0ed7c98260cf26::t_a8405fe5df33e9 40-43
+src/components/approval/approval-pane.tsx
+  s_0ed7c98260cf26::t_5a9ef0904b19fe 19-26,452
+  s_0ed7c98260cf26::t_3560afbe21d9a7 434-451,453-454,464-466,471-475
+  s_0ed7c98260cf26::t_c0b984b491d865 30-32
+  s_0ed7c98260cf26::t_58ad7e1696b9a6 526-541
+  s_0ed7c98260cf26::t_4eb203f30b1f3d 326-347
+src/components/chat/chat-row.tsx
+  s_0ed7c98260cf26::t_5ec25e1a6471b1 79-85
+  s_0ed7c98260cf26::t_09f7fed79cf48e 54-57
+  s_0ed7c98260cf26::t_5a9ef0904b19fe 254-267,269-279,282-288,290-295,298-324,326-344
+  s_0ed7c98260cf26::t_a7334ce6c97e96 345-373,378-405,407-440,442-454,457-460,463-465,467-469,473-475,477-479,482-484,486-488,491-493,495-497,501,504-508,512,518-522
+  s_0ed7c98260cf26::t_0ed492f36770db 38
+  s_0ed7c98260cf26::t_762b20c77d8230 215-253
+  s_0ed7c98260cf26::t_2656986da97974 374-377
+src-tauri/crates/keeper-core/src/account.rs
+  s_0ed7c98260cf26::t_1d00b4fc23c9ca 673-702
+  s_0ed7c98260cf26::t_c19dfcb3b96ecd 5934-5956
+src-tauri/crates/keeper/src/ipc.rs
+  s_0ed7c98260cf26::t_52cbad878a85c2 2764-2776
+src/lib/ipc/client.ts
+  s_0ed7c98260cf26::t_c4aaa4ed256bf4 1433-1445
+  s_0ed7c98260cf26::t_e778bc066d49e0 1432
+src/components/layout/favorites-section.tsx
+  s_0ed7c98260cf26::t_d60e3fdcf62c56 94,97,99-104
+  s_0ed7c98260cf26::t_70a7a7e20b1857 26-27,32
+  s_0ed7c98260cf26::t_131eca019278ff 112
+  s_0ed7c98260cf26::t_25b4275393e7fa 46-50
+src/components/chat/message-bubble.tsx
+  s_0ed7c98260cf26::t_1a95061edfc228 263-270,274-310
+  s_0ed7c98260cf26::t_70a1b1ab68c867 17,21-29
+  s_0ed7c98260cf26::t_ee16e883974ad8 161-234
+  s_0ed7c98260cf26::t_6468f9710a102d 271-273
+_bmad-output/implementation-artifacts/spec-13-6-touch-idioms-long-press-row-swipes-pull-to-refresh.md
+  s_0ed7c98260cf26::t_2cdbc44a32ac69 5
+  s_0ed7c98260cf26::t_cac9b475e0df67 124-179
+  s_0ed7c98260cf26::t_092a735fa8bdca 6
+  s_0ed7c98260cf26::t_f513e9b3caa851 1-4,7-80,93-123
+  s_0ed7c98260cf26::t_9db7fd80e9480d 81-92
+src/components/chat/reaction-popover.tsx
+  s_0ed7c98260cf26::t_5c7834652e2fae 17-19,21
+src/components/chat/chat-row.test.tsx
+  s_0ed7c98260cf26::t_537c0141597373 1
+  s_0ed7c98260cf26::t_3580509726073c 757-771
+  s_0ed7c98260cf26::t_5a9ef0904b19fe 617-628
+  s_0ed7c98260cf26::t_fe517268a87a25 553-616,629-756,772-830
+src/components/layout/pins-strip.test.tsx
+  s_0ed7c98260cf26::t_071149925a2905 135-166,172-173,179-181,184,186-187,190-313
+  s_0ed7c98260cf26::t_3a98323c646199 1-2
+  s_0ed7c98260cf26::t_4682323c1f9ff2 167-171,174-178,182-183,185,188-189
+src/components/approval/approval-pane.test.tsx
+  s_0ed7c98260cf26::t_3edcdae90c6306 423-493,495-552
+  s_0ed7c98260cf26::t_5a9ef0904b19fe 494
+src/hooks/use-swipe-actions.test.tsx
+  s_0ed7c98260cf26::t_f92dbc6fd3aaed 277,280,287-293,295-299,301,303
+  s_0ed7c98260cf26::t_bd6659420b1819 262-276,278-279,281-286,294,300,302,304
+  s_0ed7c98260cf26::t_447edfa0359382 1-2,4-23,25-26,28-30,33-37,39-261,305
+  s_0ed7c98260cf26::t_5a9ef0904b19fe 3
+  s_0ed7c98260cf26::t_0b28753ac1bd17 24,27,38
+  s_0ed7c98260cf26::t_d304ea68d18947 31-32
+src/hooks/use-swipe-actions.ts
+  s_0ed7c98260cf26::t_7575f117d550af 61-67
+  s_0ed7c98260cf26::t_1d76ac1ae97422 160
+  s_0ed7c98260cf26::t_5a9ef0904b19fe 105
+  s_0ed7c98260cf26::t_ca0a38390e3e40 110-113
+  s_0ed7c98260cf26::t_c0dd4d844fb31e 1-60,68-104,106-109,114-159,161-214,218-231,235-239,242-244,247-254,263-279
+  s_0ed7c98260cf26::t_514bbafbaed402 215-217
+  s_0ed7c98260cf26::t_2ddef1735b3001 232-234,240-241,245-246
+  s_0ed7c98260cf26::t_258ff9e79ba92f 255-262
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_0ed7c98260cf26::t_7b333cc85fd886 150
+src-tauri/crates/keeper/src/lib.rs
+  s_0ed7c98260cf26::t_4f22556732d084 243
+src/components/layout/phone-shell.tsx
+  s_0ed7c98260cf26::t_c8526ea3cb3a2e 587-589,596,603-645
+  s_0ed7c98260cf26::t_0b2a79af44da11 69-70,74-87
+  s_0ed7c98260cf26::t_10e2db4d6fcafc 32,51,55-56
+  s_0ed7c98260cf26::t_0003b1326d6b06 705
+  s_0ed7c98260cf26::t_a1c4d7e77673ba 458-465,468-472,508-511,513,522,527-532,539-540,554,557-570
+  s_0ed7c98260cf26::t_f71c85cf287067 491-498,503,505
+  s_0ed7c98260cf26::t_878822e1d70aed 533-538
+  s_0ed7c98260cf26::t_f64c82f14a56c8 88
+  s_0ed7c98260cf26::t_82c632b8b04beb 506-507
+  s_0ed7c98260cf26::t_88ea18b0a6e7ab 571
+  s_0ed7c98260cf26::t_e40497cdbab941 646
+src/components/command-palette/actions.ts
+  s_0ed7c98260cf26::t_e81efc404699e6 71-73
+  s_0ed7c98260cf26::t_88fc195f8c8c57 28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "7b4ad286e368d69f8e800e5175994c71ae2827d9",
+  "prompts": {},
+  "sessions": {
+    "s_0ed7c98260cf26": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6f9e59c-2fd6-4bb0-aa3f-834dd419021b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
