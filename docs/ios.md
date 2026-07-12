@@ -351,3 +351,6 @@ On the first item, the canonical in-app wording spells out the sync consequence:
 your homeserver until you return — nothing is lost, and nothing here pretends to be
 push." The app-icon badge follows the same honesty: "The app-icon badge is not a live
 count while keeper is closed; it reflects what keeper knew when it was last open."
+
+The "future decision" the first item names is recorded in [decisions.md](decisions.md) D-1 —
+the deferred paid Apple Developer Program that would unlock APNs push and the NSE.

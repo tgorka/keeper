@@ -26,6 +26,8 @@ risk sections.
 - **No WhatsApp automation features** (bulk send, auto-reply) — ban-bait for bridge users.
 - **No native VoIP implementation now.** MatrixRTC (MSC4143) is pre-spec and volatile;
   calls arrive post-MVP via the Element Call widget.
+- **No paid Apple Developer Program yet** (so no APNs push, NSE, TestFlight, or App Groups) —
+  deferred by decision; see [decisions.md](decisions.md) D-1.
 
 ## Hard / risky (do with eyes open)
 

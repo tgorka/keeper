@@ -164,6 +164,6 @@ development_status:
   15-2-docs-ios-md-free-signing-walkthrough: done
   15-3-shareable-ipa-build-path-unsigned-export-for-re-signing: done
   15-4-required-ios-ci-gate-and-release-hygiene: done
-  15-5-paid-program-decision-gate-recorded: backlog
+  15-5-paid-program-decision-gate-recorded: done
   15-6-final-device-install-and-phase-acceptance: backlog
   epic-15-retrospective: optional
