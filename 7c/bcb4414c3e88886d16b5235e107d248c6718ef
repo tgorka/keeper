@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-15-5-paid-program-decision-gate-recorded.md
+  s_a30c2bd02a9f43::t_0ee7fbe7212684 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "7cbcb4414c3e88886d16b5235e107d248c6718ef",
+  "prompts": {},
+  "sessions": {
+    "s_a30c2bd02a9f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26011850-38a8-4a53-aa6b-a6ddf608b55a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
