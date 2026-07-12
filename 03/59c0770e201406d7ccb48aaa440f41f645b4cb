@@ -1,0 +1,19 @@
+src-tauri/crates/keeper/src/lib.rs
+  s_8a8bc6b6bf6017::t_b9b1ecdc97d826 141-151,154-165,168
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "0359c0770e201406d7ccb48aaa440f41f645b4cb",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
