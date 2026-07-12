@@ -125,3 +125,43 @@ local repro from `src-tauri/`), `.github/workflows/ci.yml` (stale
 Block-If guard passed: the CI iOS job `name:` is exactly `iOS (compile check)`. No secrets
 introduced. These edits are held pending the block resolution.
 
+---
+
+### Update — dev-auto run 2026-07-11 (re-invoked)
+
+**Status: still `blocked` (spec frontmatter is stale), but the block is RESOLVED in the
+tree — only a coordinator status-flip remains. No dev work to do.**
+
+The coordinator resolved the block via **option (a)** and committed it as
+`481d426` ("Fix iOS badge port: UNUserNotificationCenter::setBadgeCount (FR-62)"),
+which landed *after* the defective `4f2bd5b`. That single commit:
+
+- **Fixed the root cause:** `crates/keeper/src/ipc.rs` now calls
+  `UNUserNotificationCenter::setBadgeCount` (safe `objc2-user-notifications` binding, iOS
+  16+) instead of the `#[cfg(desktop)]` `WebviewWindow::set_badge_count`; the unused
+  `IOS_MAIN_WINDOW_LABEL` was dropped. New dep added under the cargo-deny firewall.
+- **Committed all of story 15.4's docs deliverables** in the same commit:
+  `docs/release.md` (required-check bullet + `## iOS release checklist`), `README.md`
+  (gate scope + `src-tauri/` local repro), `.github/workflows/ci.yml` (stale comment
+  replaced with "recorded as a required PR status check in docs/release.md").
+
+**Verified on HEAD (`481d426`) this run:**
+- The promoted gate is **GREEN**: `cargo check --workspace --target aarch64-apple-ios`
+  (from `src-tauri/`) → `Finished` (aarch64-apple-ios target installed). The story's
+  "gate must be green before docs call it required" premise now holds.
+- All four deliverable files present and correct on HEAD (release.md required-checks +
+  iOS checklist, README iOS gate + local repro, ci.yml comment, ipc.rs badge fix).
+- Block-If guard still passes: CI job `name:` is exactly `iOS (compile check)`.
+- Working tree clean; nothing left to implement — every acceptance criterion is met by
+  committed content.
+
+**Why this run HALTs instead of proceeding:** the spec's frozen `status` is `blocked`.
+An unattended dev-auto step must not self-promote a frozen CRITICAL block to `done`/review
+— resolving/closing a block is a coordinator / `bmad-loop-resolve` action. The coordinator
+committed the code+docs fix but did not flip the spec status, so automation hands back.
+
+**Action needed (coordinator / `bmad-loop-resolve`):** flip this spec's status to `done`
+(work is complete and committed on `481d426`), or to `in-review` if a formal dev-auto
+review pass is wanted. Consider bumping `baseline_revision` from `4f2bd5b` to `481d426`.
+No further code or docs changes are required.
+
