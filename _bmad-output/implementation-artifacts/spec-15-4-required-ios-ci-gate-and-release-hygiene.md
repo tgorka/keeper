@@ -165,3 +165,28 @@ committed the code+docs fix but did not flip the spec status, so automation hand
 review pass is wanted. Consider bumping `baseline_revision` from `4f2bd5b` to `481d426`.
 No further code or docs changes are required.
 
+---
+
+### Update — dev-auto run 2026-07-11 (third invocation)
+
+**Status: STILL `blocked` in frontmatter; block remains RESOLVED in the tree. No dev work
+exists. HALTing — the pending action is a coordinator status-flip, which automation must
+not perform.**
+
+Re-verified on HEAD `fdb0ce4` ("Housekeeping: archive superseded paused runs", one commit
+past `481d426`; that housekeeping commit touched only this spec's result note — 1 markdown
+file, no source):
+- iOS compile gate **GREEN**: `cargo check --workspace --target aarch64-apple-ios` (from
+  `src-tauri/`) → `Finished` in 0.95s. The "gate green before docs call it required"
+  premise holds.
+- Badge fix present: `crates/keeper/src/ipc.rs:651` iOS `set_badge_count` impl calls
+  `UNUserNotificationCenter::setBadgeCount` (not the `#[cfg(desktop)]`
+  `WebviewWindow::set_badge_count`).
+- Block-If guard passes: CI job `name:` is exactly `iOS (compile check)`
+  (`.github/workflows/ci.yml:48`).
+- Working tree clean; all four deliverable files correct and committed.
+
+Nothing changed since the re-invoked run above. This run adds no edits and hands back for
+the same reason: an unattended dev-auto step cannot close a frozen CRITICAL block. Flip
+status to `done` (or `in-review`) via the coordinator / `bmad-loop-resolve`.
+
