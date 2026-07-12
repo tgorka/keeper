@@ -14,9 +14,10 @@ It covers, in reading order:
 5. [First device install](#first-device-install)
 6. [The 7-day re-arm ritual](#the-7-day-re-arm-ritual)
 7. [AltServer auto-refresh (optional)](#altserver-auto-refresh-optional)
-8. [Sharing a build without Xcode](#sharing-a-build-without-xcode)
-9. [Verifying the core compiles for iOS](#verifying-the-core-compiles-for-ios)
-10. [Limitations](#limitations)
+8. [Building a shareable IPA](#building-a-shareable-ipa)
+9. [Sharing a build without Xcode](#sharing-a-build-without-xcode)
+10. [Verifying the core compiles for iOS](#verifying-the-core-compiles-for-ios)
+11. [Limitations](#limitations)
 
 All shell commands are run from the repository root unless stated otherwise.
 
@@ -207,16 +208,89 @@ removes the manual weekly chore. Set-up is on the AltStore side and out of scope
 this document; treat it as optional. The 7-day limit itself is a property of free
 signing and does not go away — AltServer just handles the renewal for you.
 
-## Sharing a build without Xcode
+## Building a shareable IPA
 
-You can hand someone a build to run on their own iPhone without them installing Xcode.
-Produce a debugging IPA from the repo root:
+To hand a build to someone else you first produce an IPA. This is the repeatable
+recipe; the [next section](#sharing-a-build-without-xcode) covers how the tester
+re-signs and installs it.
+
+Run from the repo root (set your team first — see
+[Signing on a free Personal Team](#signing-on-a-free-personal-team)):
 
 ```sh
+export APPLE_DEVELOPMENT_TEAM=XXXXXXXXXX
 bun run tauri ios build --export-method debugging
 ```
 
-The tester then re-signs that IPA with **their own** free Apple ID (their own Personal
+The IPA lands under the (gitignored) build tree, typically at:
+
+```
+src-tauri/crates/keeper/gen/apple/build/arm64/keeper.ipa
+```
+
+The exact subdirectory and filename are derived from the product name and export, so
+confirm the precise path from your first build's output. Everything under `build/` is
+excluded by `src-tauri/.gitignore`, so an IPA left at that path is never committed.
+
+### What "debugging" export means, and why not "unsigned"
+
+`--export-method debugging` produces a **dev-signed** IPA: Tauri's automatic signing
+signs it with the owner's free Personal Team, the same way `bun run tauri ios dev`
+does. It is not a literal unsigned artifact. A truly unsigned Tauri export is not
+achievable without switching to manual signing configurations, and those are known to
+break Tauri iOS builds (tauri#10668).
+
+So the sharing posture is **dev-signed, then re-signed**: you build with Tauri's
+default automatic signing, and the tester replaces the signature with **their own**
+identity before installing (see [Sharing a build without Xcode](#sharing-a-build-without-xcode)).
+Never switch the project to manual signing to make sharing work — let the re-sign
+happen outside the project, on the tester's machine.
+
+### No signing material in the repo or CI (AD-32)
+
+Producing this IPA requires no secret to be committed. The team id is supplied only via
+the `APPLE_DEVELOPMENT_TEAM` environment variable (see
+[Set your team, without committing any secret](#set-your-team-without-committing-any-secret));
+`tauri.conf.json` deliberately omits `developmentTeam`. No `.p12` identity, provisioning
+profile, or Team ID is tracked in git or referenced by CI. CI never builds, signs, or
+exports an IPA — it only compiles (see
+[Verifying the core compiles for iOS](#verifying-the-core-compiles-for-ios)).
+
+### Verify the desktop/iOS compile seam (FR-56)
+
+The iOS build must not link the desktop-only Tauri plugins. Verify that seam holds with:
+
+```sh
+bun run verify:ios-ipa                 # graph check; also scans a built IPA if one exists
+bun run verify:ios-ipa path/to/keeper.ipa   # graph check + scan this specific IPA
+```
+
+The check has two layers:
+
+- **Dependency-graph seam check (authoritative).** It runs
+  `cargo tree -p keeper --target aarch64-apple-ios` and asserts that
+  `tray-icon`, `tauri-plugin-global-shortcut`, `tauri-plugin-autostart`,
+  `tauri-plugin-updater`, and `tauri-plugin-process` are **absent** from the iOS build
+  closure, then runs the same for `aarch64-apple-darwin` as a differential control and
+  asserts they are **present** there (so a mis-scoped tree cannot silently pass). This
+  holds structurally because those crates are declared under
+  `cfg(not(any(target_os = "ios", target_os = "android")))` in
+  `src-tauri/crates/keeper/Cargo.toml`, and it is already enforced every CI run by the
+  `cargo check --target aarch64-apple-ios` gate.
+- **IPA symbol scan (best-effort).** If you pass a built IPA (or one exists under the
+  build tree above), it unzips the IPA, finds the `Payload/*.app` Mach-O executable, and
+  checks for the forbidden plugin symbols. Release iOS binaries are usually stripped, so
+  a **non-match cannot prove absence** — only the graph check above is authoritative; a
+  match, on the other hand, is a strong signal worth chasing. For symbol-level certainty
+  after a build, scan the unstripped Rust staticlib under `gen/apple/Externals/`. With no
+  IPA present the scan is skipped and the graph result governs the outcome.
+
+## Sharing a build without Xcode
+
+Once you have the IPA from [Building a shareable IPA](#building-a-shareable-ipa), you
+can hand it to someone to run on their own iPhone without them installing Xcode.
+
+The tester re-signs that IPA with **their own** free Apple ID (their own Personal
 Team) and installs it. Two Xcode-free ways to do that:
 
 - **Sideloadly** — a desktop app (macOS/Windows) that re-signs the IPA with the
@@ -237,12 +311,6 @@ On their phone, the tester goes through the same one-time
 trusting **their own** certificate — before keeper will launch. The re-signed app
 carries the same free-signing limits for them: their own Personal Team, ~3 devices,
 and the same 7-day expiry (they re-arm or run AltServer on their own machine).
-
-> **Note:** This section covers how a tester **re-signs** an already-built IPA. A
-> hardened, repeatable IPA **build** recipe — a clean export with no desktop-only
-> plugin symbols, suitable for wider sharing — is not yet documented here and will be
-> added to this document later. The command above is enough to produce an IPA for the
-> re-sign flow.
 
 ## Verifying the core compiles for iOS
 
