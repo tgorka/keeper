@@ -138,20 +138,34 @@ pub fn run() {
                 }
             }
 
+            // Check + request notification permission OFF the main thread. On iOS
+            // both calls round-trip through `run_mobile_plugin`, which parks the
+            // calling thread on a channel until the Swift side responds — and
+            // `request_permission()` only responds once the user answers the OS
+            // permission dialog. Running it inline here (setup runs on the UIKit
+            // main thread) starved the main run loop, so the WKWebView custom-
+            // protocol handler could never serve index.html: the app sat on a
+            // white screen until the dialog was answered (first-boot hang).
+            // A detached thread keeps boot non-blocking on every platform; the
+            // request stays best-effort exactly as before — a failure only means
+            // the OS drops notifications, it never blocks startup.
             {
                 use tauri_plugin_notification::NotificationExt;
-                let notifier = app.notification();
-                match notifier.permission_state() {
-                    Ok(tauri_plugin_notification::PermissionState::Granted) => {}
-                    Ok(_) => {
-                        if let Err(e) = notifier.request_permission() {
-                            tracing::warn!(error = %e, "could not request notification permission");
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let notifier = handle.notification();
+                    match notifier.permission_state() {
+                        Ok(tauri_plugin_notification::PermissionState::Granted) => {}
+                        Ok(_) => {
+                            if let Err(e) = notifier.request_permission() {
+                                tracing::warn!(error = %e, "could not request notification permission");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "could not read notification permission state");
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "could not read notification permission state");
-                    }
-                }
+                });
             }
 
             Ok(())
