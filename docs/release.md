@@ -159,6 +159,24 @@ install (a 100k+-event archive; 1 and 5 configured accounts).
   disconnect-notice path; this live end-to-end check is what confirms the ≤ 60 s bar on real
   bridge grammars.
 
+## iOS release checklist
+
+The `iOS (compile check)` CI job (see below) only guards that the workspace compiles for
+`aarch64-apple-ios`; it does not build, sign, or run the app. These items cover the rest of
+iOS release hygiene and are checked by hand at release time.
+
+- [ ] **IPA build path exercised (Story 15.3).** Run `bun run verify:ios-ipa` and confirm the
+  unsigned IPA export succeeds, following the build recipe in [`docs/ios.md`](ios.md).
+- [ ] **`docs/ios.md` current (Story 15.2).** Confirm [`docs/ios.md`](ios.md) is up to date and
+  its `## Limitations` section is still one-to-one with the in-app "On this iPhone" disclosure
+  (Settings → About).
+- [ ] **NFR-15 cold-start measured and recorded, with owner-confirmation status.** Measure
+  launch → interactive Unified Inbox on device and record the figure. The 3 s bar is an
+  *authored* target only; note whether owner confirmation to make it release-gating has landed
+  yet (PRD §13.8, Story 15.6) — never report this as a hard pass/fail.
+- [ ] **No new egress endpoints (NFR-11).** Confirm the iOS build adds no new network egress
+  endpoints beyond what [`docs/egress.md`](egress.md) already documents for desktop.
+
 ## Required status checks (branch protection)
 
 Required checks are enforced via repository **branch-protection settings**, not YAML. A repo
@@ -169,8 +187,9 @@ admin must, under **Settings → Branches → Branch protection rules** for `mai
 - **Frontend** — biome lint, `tsc` typecheck, vitest.
 - **Rust** — `rustfmt --check`, clippy `-D warnings`, cargo-nextest.
 - **Tauri build** — `tauri build --no-bundle`.
+- **iOS (compile check)** — `cargo check --workspace --target aarch64-apple-ios` (Rust, device-free compile gate; no signing/simulator).
 
-These correspond to the `licenses`, `frontend`, `rust`, and `build` jobs in
+These correspond to the `licenses`, `frontend`, `rust`, `build`, and `ios` jobs in
 `.github/workflows/ci.yml`. **CI is the license source of truth**: the JS gate scans the
 installed `node_modules` tree, so run it via CI (which does a clean `bun install
 --frozen-lockfile`) rather than trusting a local run against a possibly-stale tree. `bun run

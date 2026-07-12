@@ -2,10 +2,10 @@
 title: 'Required iOS CI Gate and Release Hygiene'
 type: 'chore'
 created: '2026-07-11'
-status: 'blocked'
+status: blocked
 review_loop_iteration: 0
 followup_review_recommended: false
-baseline_revision: 'acfe0e13042ae5831949091efb0b5309cd3de0cb'
+baseline_revision: '4f2bd5b4132ce5f97192a06a23baa70029e5b7a1'
 context:
   - '{project-root}/docs/project-context.md'
 warnings: []
@@ -41,10 +41,10 @@ warnings: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [x] `docs/release.md` -- In `## Required status checks`, add a bullet `- **iOS (compile check)** — `cargo check --workspace --target aarch64-apple-ios` (Rust, device-free compile gate; no signing/simulator).` and extend the "These correspond to the ... jobs" sentence to include `ios`. -- FR-55: promote the compile check to a required PR status (AD-32, recorded not YAML-enforced).
-- [x] `docs/release.md` -- Add a new `## iOS release checklist` section (after the SM-3 sign-off block) with four `[ ]` items: IPA build path exercised (Story 15.3 — `bun run verify:ios-ipa` + the `docs/ios.md` build recipe); `docs/ios.md` current with its `## Limitations` still one-to-one with the in-app "On this iPhone" disclosure (Story 15.2); NFR-15 cold-start (launch → interactive Unified Inbox) measured and recorded **with its owner-confirmation status** (authored 3 s bar, not yet gating — PRD §13.8 / Story 15.6); egress note that iOS adds no new endpoints (NFR-11 unchanged, `docs/egress.md`). -- release checklist gains iOS items.
-- [x] `README.md` -- In `## Development`, document the iOS compile gate: its scope (compile-only, no signing/simulator/creds; blocks PRs) and the exact local reproduction `cargo check --target aarch64-apple-ios` run from `src-tauri/`. -- FR-55: contributor docs state the gate's scope and how to reproduce locally.
-- [x] `.github/workflows/ci.yml` -- Replace the stale `# ... required-status wiring is Story 15.4.` comment on the `ios:` job with one noting the check is a required PR status recorded in `docs/release.md`. Comment-only; do not alter the job's `runs-on`/steps. -- keep the workflow self-consistent with the docs.
+- [ ] `docs/release.md` -- In `## Required status checks`, add a bullet `- **iOS (compile check)** — `cargo check --workspace --target aarch64-apple-ios` (Rust, device-free compile gate; no signing/simulator).` and extend the "These correspond to the ... jobs" sentence to include `ios`. -- FR-55: promote the compile check to a required PR status (AD-32, recorded not YAML-enforced).
+- [ ] `docs/release.md` -- Add a new `## iOS release checklist` section (after the SM-3 sign-off block) with four `[ ]` items: IPA build path exercised (Story 15.3 — `bun run verify:ios-ipa` + the `docs/ios.md` build recipe); `docs/ios.md` current with its `## Limitations` still one-to-one with the in-app "On this iPhone" disclosure (Story 15.2); NFR-15 cold-start (launch → interactive Unified Inbox) measured and recorded **with its owner-confirmation status** (authored 3 s bar, not yet gating — PRD §13.8 / Story 15.6); egress note that iOS adds no new endpoints (NFR-11 unchanged, `docs/egress.md`). -- release checklist gains iOS items.
+- [ ] `README.md` -- In `## Development`, document the iOS compile gate: its scope (compile-only, no signing/simulator/creds; blocks PRs) and the exact local reproduction `cargo check --target aarch64-apple-ios` run from `src-tauri/`. -- FR-55: contributor docs state the gate's scope and how to reproduce locally.
+- [ ] `.github/workflows/ci.yml` -- Replace the stale `# ... required-status wiring is Story 15.4.` comment on the `ios:` job with one noting the check is a required PR status recorded in `docs/release.md`. Comment-only; do not alter the job's `runs-on`/steps. -- keep the workflow self-consistent with the docs.
 
 **Acceptance Criteria:**
 - Given `docs/release.md`, when read, then `## Required status checks` lists `iOS (compile check)` as a required check mapped to the `ios` job, described as compile-only (no signing/simulator), and the "correspond to ... jobs" sentence names `ios`.
@@ -71,43 +71,57 @@ warnings: []
 
 ## Auto Run Result
 
-Status: **blocked**
+**Status:** blocked (dev-auto run 2026-07-11)
 
-Blocking condition: **iOS compile gate is red at baseline — cannot promote a failing check to a required PR status.**
+**Blocking condition:** The story's own Design Notes + Verification require the promoted
+`iOS (compile check)` gate to be **green on this tree** before the docs call it a *required*
+status. It is **red**. The prior "block resolution" commit `4f2bd5b`
+("Resolve story 15-4 block: iOS badge via UNUserNotificationCenter FFI") is **defective**:
+`git show --stat 4f2bd5b` changes only two markdown files (this spec + the dev-auto result
+note) — its diff touches **zero source files**. The coordinator-authorized badge-FFI code
+fix was never applied, so the compile-seam call at `crates/keeper/src/ipc.rs:676`
+(`window.set_badge_count(...)`, desktop-only) still stands and the iOS target does not
+compile.
 
-### What was completed (correct, in the working tree — uncommitted)
-
-All three documentation/CI edits were made exactly per spec and independently verified; all five acceptance criteria are met:
-
-- `docs/release.md` — added `iOS (compile check)` to `## Required status checks` (mapped to the `ios` job, compile-only) and a new `## iOS release checklist` section with the four iOS items (15.3 IPA path, 15.2 docs/limitations mirror, NFR-15 cold-start-with-owner-confirmation, NFR-11 no-new-endpoints).
-- `README.md` — documented the iOS gate's scope + local repro (`cargo check --target aarch64-apple-ios` from `src-tauri/`).
-- `.github/workflows/ci.yml` — refreshed only the stale `ios:`-job comment (job scope unchanged).
-- `git diff --name-only` → exactly those three files; no secrets/Team IDs introduced.
-
-### Why blocked (pre-existing regression, out of this story's scope)
-
-The story's Verification requires `cargo check --workspace --target aarch64-apple-ios` to succeed, and the story's whole purpose is to make that check a **required** merge gate. It does **not** compile on this tree (baseline `acfe0e1`, clean tree, Tauri 2.11.5, iOS target installed):
-
+**Reproduced (from `src-tauri/`):**
 ```
+cargo check --workspace --target aarch64-apple-ios
 error[E0599]: no method named `set_badge_count` found for struct `tauri::WebviewWindow<R>`
-   --> crates/keeper/src/ipc.rs:676:14
+   --> crates/keeper/src/ipc.rs:676
 error: could not compile `keeper` (lib) due to 1 previous error
 ```
+(`aarch64-apple-ios` rustup target is installed — not a toolchain issue.)
 
-**Root cause (confirmed in the Tauri source):** `WebviewWindow::set_badge_count` / `Window::set_badge_count` live in `#[cfg(desktop)]` impl blocks in Tauri 2.11.5 (`webview_window.rs:1912` gate over the method at `:2157`; `window/mod.rs` mirror). They are **desktop-only** and do not exist on `aarch64-apple-ios`. Story **14.3**'s badge port (`crates/keeper/src/ipc.rs:659-677`, inside `#[cfg(target_os = "ios")] impl Platform for IosPlatform`) calls this desktop-only API, so the iOS target has been **uncompilable since Story 14.3** was committed. The `iOS (compile check)` CI job has therefore been red on `main` for ~7 stories (14.4→15.3); the automation loop did not catch it because it commits directly to `main` without gating on CI results.
+**Why this halts the run:** Fixing the gate requires the coordinator-authorized code change
+recorded in `bmad-dev-auto-result-15-4-required-ios-ci-gate-and-release-hygiene.md`
+(replace the desktop-only `WebviewWindow::set_badge_count` call with
+`UNUserNotificationCenter.setBadgeCount` via `objc2-user-notifications`, a second audited
+function-level `#[allow(unsafe_code)]` FFI exception, audit inventory updated in
+`docs/constraints-and-limitations.md`). That is a substantial unsafe-FFI change with a new
+dependency (cargo-deny license firewall) and a policy/audit update — and this story's
+**read-only intent-contract explicitly forbids code changes** and limits scope to
+`docs/release.md`, `README.md`, `.github/workflows/ci.yml`. An unattended dev step must not
+silently override the frozen contract to land that change. This is a CRITICAL contradiction
+between the frozen spec and reality — it needs coordinator/human resolution.
 
-**Why this blocks 15.4 specifically:** promoting a currently-red compile check to a *required* PR status would, the moment branch protection is flipped, block **every** future merge until the iOS build is fixed. Recording it as required while it is red is dishonest and actively harmful — it violates the story's own green-before-required premise.
+**Resolution options (for the coordinator / `bmad-loop-resolve`):**
+- (a) Re-apply the intended code fix from commit `4f2bd5b` to
+  `crates/keeper/src/ipc.rs:659-678` (badge via `UNUserNotificationCenter`), update the
+  unsafe-FFI audit inventory, confirm `cargo check --target aarch64-apple-ios` +
+  `cargo deny check` pass, then re-drive 15.4's docs; **or**
+- (b) split the badge FFI fix into its own story and relax this story's "the promoted gate
+  is green on this tree" premise (record the gate as required with a known-red follow-up),
+  so the docs can honestly ship.
 
-### Prerequisite work needed before 15.4 can complete (coordinator decision)
+**Work completed and left in the working tree (uncommitted, correct — do not redo):**
+The docs deliverables are done and all five acceptance criteria (docs content) pass.
+Modified files: `docs/release.md` (required-checks bullet for `iOS (compile check)` mapped
+to the `ios` job + "correspond to … jobs" now naming `ios`; new `## iOS release checklist`
+after the SM-3 block with the four cross-referenced items), `README.md` (`## Development`
+now documents the gate's compile-only scope + the `cargo check --target aarch64-apple-ios`
+local repro from `src-tauri/`), `.github/workflows/ci.yml` (stale
+"required-status wiring is Story 15.4" comment on the `ios:` job replaced with a
+"recorded as a required PR status check in docs/release.md" note; job steps unchanged).
+Block-If guard passed: the CI iOS job `name:` is exactly `iOS (compile check)`. No secrets
+introduced. These edits are held pending the block resolution.
 
-Make the iOS target compile again — a separate bug/story, not a docs change (this spec is explicitly "no code changes / never edit source"). The iOS badge path in `crates/keeper/src/ipc.rs::IosPlatform::set_badge_count` must stop calling the desktop-only Tauri API. Design options for the coordinator/dev to choose:
-
-1. **cfg the iOS badge to a documented honest no-op** (badge deferred on iOS) — smallest, but drops the all-accounts badge on the OS icon that 14.3 aimed for; must reconcile with 14.3's AC and the "On this iPhone" disclosure.
-2. **Reach `UIApplication.applicationIconBadgeNumber` via objc2** behind the `Platform` port — restores the badge, but is unsafe FFI requiring a `// SAFETY:` comment and an entry in the `docs/constraints-and-limitations.md` audit inventory (per the 2026-07-11 policy amendment).
-3. **A Tauri mobile badge API / plugin** if one is available at the pinned version — investigate.
-
-Recommended path: open a bug story to fix the iOS badge compile (option 2 is closest to 14.3's intent), land it so `cargo check --target aarch64-apple-ios` is green, then re-drive story 15.4 (its docs edits above are already done and correct and can be kept or re-applied).
-
-### Working-tree state at HALT
-
-`docs/release.md`, `README.md`, `.github/workflows/ci.yml` carry the (correct) 15.4 edits; `spec-15-4-…md` is new. No commits, branches, or pushes were made. The next run / coordinator should decide whether to keep these edits in place or stash them while the prerequisite badge fix lands.

@@ -539,14 +539,6 @@ impl Platform for DesktopPlatform {
 #[cfg(target_os = "ios")]
 pub struct IosPlatform;
 
-/// The label of the main webview window whose app-icon badge the iOS
-/// `Platform::set_badge_count` port drives (Story 14.3). Matches the Tauri default
-/// window label (no explicit `label` in `tauri.conf.json`), the same `"main"` the
-/// desktop `MAIN_WINDOW_LABEL` uses; declared separately because that constant is
-/// `#[cfg(desktop)]`.
-#[cfg(target_os = "ios")]
-const IOS_MAIN_WINDOW_LABEL: &str = "main";
-
 /// `errSecItemNotFound` (`-25300`) — the Security Framework status returned when no
 /// keychain item matches. `security_framework` does not re-export it, and although
 /// `security-framework-sys` (which does) is already in the tree transitively, using its
@@ -657,24 +649,19 @@ impl Platform for IosPlatform {
     }
 
     fn set_badge_count(&self, count: Option<u32>) -> Result<(), CoreError> {
-        use tauri::Manager;
+        // Story 14.3 fix (FR-62): `WebviewWindow::set_badge_count` is `#[cfg(desktop)]`
+        // in Tauri and does not exist on iOS (found by Story 15.4's compile gate).
+        // Use `UNUserNotificationCenter::setBadgeCount` instead — the modern iOS 16+
+        // API, and a SAFE binding in objc2-user-notifications (no unsafe block).
+        // `None`/0 clears the badge. Best-effort by design: the completion handler is
+        // omitted, so a runtime refusal (e.g. badge permission denied) is silently
+        // ignored — the badge is a comfort signal and must never fail the caller.
+        use objc2_user_notifications::UNUserNotificationCenter;
 
-        // Mirror the desktop port (Story 14.3): reach the write-once badge app handle,
-        // get the main webview window, and set its badge count. On iOS this maps to
-        // `applicationIconBadgeNumber` (via tao) — the already-computed Unified-Inbox
-        // aggregate (AD-20) finally reaches the OS icon; no native code, no second count.
-        // When the handle or window is unset (headless / very early startup) this is an
-        // honest no-op — the badge is a comfort signal and must never abort the merge.
-        let Some(app) = BADGE_APP.get() else {
-            return Ok(());
-        };
-        let Some(window) = app.get_webview_window(IOS_MAIN_WINDOW_LABEL) else {
-            // No main window yet (very early startup) — nothing to badge; honest no-op.
-            return Ok(());
-        };
-        window
-            .set_badge_count(count.map(i64::from))
-            .map_err(|e| CoreError::Internal(format!("could not set app icon badge count: {e}")))
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        let value = count.map_or(0isize, |c| isize::try_from(c).unwrap_or(isize::MAX));
+        center.setBadgeCount_withCompletionHandler(value, None);
+        Ok(())
     }
 
     /// Exclude `path` from iCloud/iTunes device backups by setting

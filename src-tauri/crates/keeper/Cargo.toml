@@ -84,3 +84,8 @@ security-framework = { workspace = true }
 # new crate version is pulled — only the dependency edge changes.
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
+# iOS app-icon badge (Story 14.3 fix, FR-62). `UNUserNotificationCenter::setBadgeCount`
+# replaces the desktop-only `WebviewWindow::set_badge_count` call that broke the
+# aarch64-apple-ios compile (found by Story 15.4). The objc2 0.3 binding is a SAFE API —
+# no unsafe block needed. Crate already in the tree transitively; only the edge changes.
+objc2-user-notifications = { workspace = true }

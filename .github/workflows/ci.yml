@@ -56,7 +56,7 @@ jobs:
         with:
           workspaces: src-tauri
       # Compile-only iOS gate (AD-32): no signing, no simulator, no Apple creds.
-      # Blocks by failure; required-status wiring is Story 15.4.
+      # Blocks by failure; recorded as a required PR status check in docs/release.md.
       - run: cargo check --workspace --target aarch64-apple-ios
         working-directory: src-tauri
 

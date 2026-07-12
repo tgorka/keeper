@@ -98,6 +98,10 @@ security-framework = "3"
 # NSString path, NSNumber value). MIT — passes the cargo-deny license firewall.
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSURL", "NSError", "NSString", "NSValue"] }
+# iOS app-icon badge (Story 14.3 fix, FR-62): safe `UNUserNotificationCenter::setBadgeCount`
+# binding (block2 feature for the optional completion handler). Already resolved in the lock
+# transitively; MIT — passes the cargo-deny license firewall.
+objc2-user-notifications = { version = "0.3", features = ["UNUserNotificationCenter", "block2"] }
 # Account registry + opaque account ids (both already present transitively via matrix-sdk).
 ulid = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }

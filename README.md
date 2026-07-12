@@ -53,6 +53,13 @@ bun run check:all    # everything
 - `pre-commit`: Biome (auto-fix staged), rustfmt, secret scan
 - `pre-push`: typecheck, clippy, frontend tests
 
+CI also runs a required `iOS (compile check)` gate: compile-only (no signing, no simulator,
+no Apple credentials), and it blocks PRs on failure. Reproduce it locally from `src-tauri/`:
+
+```sh
+cargo check --target aarch64-apple-ios
+```
+
 ## Credentials
 
 This is an open-source repo — **never commit credentials**. Development credentials
