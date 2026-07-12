@@ -57,7 +57,7 @@ CI also runs a required `iOS (compile check)` gate: compile-only (no signing, no
 no Apple credentials), and it blocks PRs on failure. Reproduce it locally from `src-tauri/`:
 
 ```sh
-cargo check --target aarch64-apple-ios
+cargo check --workspace --target aarch64-apple-ios
 ```
 
 ## Credentials
