@@ -1010,6 +1010,12 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         // process error. Retriable: the run Sheet offers Retry. The message is
         // bbctl's own verbatim text (or keeper's honest gate/install reason).
         CoreError::Bridge(BridgeError::Bbctl(_)) => (IpcErrorCode::SyncUnavailable, true),
+        // Recording errors (Story 16.2) do not cross the IPC command surface in this
+        // story — the recording session machine and its `keeper-rec` port are driven
+        // shell-side, not from a command. This arm keeps the funnel exhaustive; a
+        // dedicated recording IPC surface (with its own honest codes) arrives in a
+        // later recording story (16.3+). Until then, an internal, non-retriable error.
+        CoreError::Recording(_) => (IpcErrorCode::Internal, false),
     };
     IpcError {
         code,

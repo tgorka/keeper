@@ -12,6 +12,7 @@ mod lifecycle;
 mod media_protocol;
 #[cfg(desktop)]
 mod menu;
+mod recorder;
 #[cfg(desktop)]
 mod tray;
 

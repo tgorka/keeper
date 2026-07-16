@@ -6,6 +6,8 @@
 
 use thiserror::Error;
 
+use crate::recording::SessionState;
+
 /// Errors originating in a [`crate::platform::Platform`] port implementation.
 ///
 /// This is the first module-level enum rolling up into [`CoreError`]; later
@@ -423,6 +425,36 @@ pub enum BridgeError {
     Bbctl(String),
 }
 
+/// Errors originating in the platform-free recording session machine and its
+/// [`Recorder`](crate::recording::Recorder) port (Story 16.2, Epic 16, AD-33,
+/// AD-21).
+///
+/// A secret-free taxonomy: no message ever contains a captured-media path, media
+/// bytes, token, or session material — only a non-secret description of a state or
+/// sidecar failure. Recording does not cross the IPC command surface in this story
+/// (a dedicated surface arrives in a later recording story), so all variants map to
+/// `IpcErrorCode::Internal` (non-retriable) in the shell's single funnel; the arm
+/// exists only to keep that funnel exhaustive.
+#[derive(Debug, Error)]
+pub enum RecordingError {
+    /// A [`RecordingEvent`](crate::recording::RecordingEvent) was applied in a state
+    /// where it is not a legal transition — rejected, never silently adopted. `from`
+    /// is the state the session was in; `event` is a stable, secret-free event label.
+    #[error("illegal recording transition: {event} is not allowed from {from:?}")]
+    IllegalTransition {
+        /// The state the session was in when the illegal event arrived.
+        from: SessionState,
+        /// A stable, secret-free label for the rejected event.
+        event: String,
+    },
+
+    /// The `keeper-rec` sidecar could not be spawned, or its stdout stream failed
+    /// with an I/O error. The wrapped string is a non-secret description of the
+    /// spawn/IO failure — never a captured-media path or bytes.
+    #[error("recording sidecar failed: {0}")]
+    SidecarFailed(String),
+}
+
 /// The hexagon error root. Every fallible core operation surfaces one of these.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -478,6 +510,11 @@ pub enum CoreError {
     /// JSON (Story 6.1).
     #[error(transparent)]
     Bridge(#[from] BridgeError),
+
+    /// A recording session transition or `keeper-rec` sidecar run failed (Story
+    /// 16.2, AD-33). Does not cross the IPC command surface in this story.
+    #[error(transparent)]
+    Recording(#[from] RecordingError),
 
     /// A requested capability is not supported on this platform/build. Honest,
     /// non-panicking signal used by not-yet-wired [`crate::platform::Platform`]

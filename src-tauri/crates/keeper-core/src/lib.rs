@@ -26,6 +26,7 @@ pub mod notify;
 pub mod oauth;
 pub mod palette;
 pub mod platform;
+pub mod recording;
 pub mod registry;
 pub mod send;
 pub mod signals;

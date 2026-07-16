@@ -912,3 +912,53 @@ status: open
   summary: Validate on a real signed/notarized release that keeper-rec's hardened-runtime signature and entitlements survive tauri-action's bundle re-sign inside the notarized .app, and that the empty entitlements file suffices once real ScreenCaptureKit + system-audio capture lands (Story 16.6).
   evidence: The signed release path pre-signs keeper-rec (hardened runtime + entitlements) before tauri-action bundles/notarizes (tauri#11992 workaround); whether tauri's deep bundle-sign preserves that signature/entitlements can only be confirmed with real Developer ID secrets + hardware, which are outside this unattended loop. The empty <dict/> entitlements is correct for the getCapabilities stub but may need audio/capture entitlements under hardened runtime when 16.6 exercises live capture. The signed-path verify (codesign -dv) currently checks the standalone binary, not the copy inside the .app.
   status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
+  summary: `DesktopRecorder::run_session` treats a mid-stream stdout read error identically to a clean EOF, so a truncated/failed recording is reported as a clean end. Surface a `SidecarFailed` when the reader hits an I/O error (16.6 real-capture hardening).
+  evidence: The reader task does `Err(_) => break`, closing the channel exactly like EOF; the consumer then falls through to a (now status-checked) `child.wait()` but a pipe/device error mid-capture with a still-success process status yields no `Failed`. Mirrors the bbctl precedent; only material once a long-running capture daemon streams for the session lifetime (16.6).
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
+  summary: `run_session` uses an unbounded channel and an uncapped `read_until`, giving no backpressure or per-line bound against a chatty or wedged `keeper-rec`; add a bounded channel and/or line-length cap (16.6).
+  evidence: `tokio::sync::mpsc::unbounded_channel` + `read_until(b'\n', …)` with no length limit; a sidecar flooding stdout or writing a huge newline-less line grows memory without bound. Inherited from the bbctl pattern (whose output is trusted-short); a capture daemon is a higher-exposure surface.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
+  summary: `child.wait()` after stdout EOF has no timeout, so a `keeper-rec` that closes stdout but hangs deadlocks `run_session`; add a `tokio::time::timeout` + kill fallback (16.6).
+  evidence: After the read loop, `child.wait().await` is unbounded; a detached/hung child that reached stdout EOF never resolves the future. Mirrors bbctl (also un-timed); the stub sidecar exits promptly today, so the hang only manifests with the real capture daemon.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
+  summary: Crash-recovery entry — `RecordingSession::apply` only accepts `Recovered` from `Stopping`, but a realistic self-salvage arrives from `Recording`/`Rotating`; model the crash-recovery transitions in Epic 17.
+  evidence: `parse_event` maps `"state":"recovered"` to `RecordingEvent::Recovered`, yet `apply` rejects it outside `Stopping` (an `IllegalTransition` would fail a salvaged recording). The epic explicitly defers full crash-recovery entry semantics to Epic 17; 16.2 keeps `Recovered` as a reachable terminal only via a graceful stop.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
+  summary: `SegmentClosed { index }` — the reported index is parsed but never validated against the internal counter (no gap/dup/monotonicity check), so `segments_closed()` can silently drift; enforce with Epic 17 segmentation.
+  evidence: `apply` does `saturating_add(1)` on a counter and ignores the parsed `index`. A sidecar reporting out-of-order/duplicate indices would desync the count from reality — harmless in the 16.2 skeleton (no consumer) but load-bearing once a consumer enumerates segment files. Real segment-index semantics land with Epic 17.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
+  summary: The sidecar-provided `Failed` message is copied verbatim into the error taxonomy with no length cap or path scrub, so the module's secret-free invariant depends entirely on keeper-rec; add a `cap_message`-style bound when real capture errors land (16.6).
+  evidence: `parse_event` copies `message` verbatim into `RecordingEvent::Failed`; `error.rs` promises no message ever carries a captured-media path/token, but nothing in the platform-free core enforces it (bbctl caps its sidecar messages via `cap_message`). A keeper-rec bug could leak a capture path into logs/UI.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
+  summary: `drive_session`'s `on_state` is a batched, post-resolution replay rather than a live feed; wire a channel-based live progress feed when a real consumer (progress UI) needs one (16.3+).
+  evidence: The `Recorder::run_session` sink is `Box<dyn FnMut + Send>` (`'static`) and cannot borrow the non-`'static` `on_state`, so transitions are buffered and flushed when the run resolves. The live per-event feed is the sink itself; a live `on_state` needs a channel bridge, best added against a real progress-UI requirement in a later story.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
+  summary: No single-session guard — two concurrent `run_session` calls on a `DesktopRecorder` would spawn two competing `keeper-rec` captures; enforce the "one capture target per session" invariant at the command/registry layer in 16.3+.
+  evidence: The port is reentrant with no dedupe; the epic invariant "only one capture target per session" must be enforced where sessions are owned (a registry like `BbctlRunRegistry`), which does not exist until an IPC/command surface lands (16.3+).
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
+  summary: A non-zero `keeper-rec` exit that follows an already-reported terminal (`finalized`/`recovered`/`error`) masks that terminal — `drive_session` returns the generic `SidecarFailed` exit-status error instead of the honest finalized/failed outcome the session already reached. Reconcile once keeper-rec's exit-code contract is defined (16.4/16.6).
+  evidence: `run_session` returns `Err(SidecarFailed)` on `!status.success()` unconditionally, and `drive_session` evaluates `run_result?` before consulting the buffered terminal/first-error; a sidecar that emits `{"event":"state","state":"finalized"}` then exits non-zero (or emits `{"event":"error",…}` → `Failed` then exits non-zero) has its terminal/message superseded by the generic exit-status text. No consumer until 16.3+, and keeper-rec's exit conventions are not fixed until the typed wire contract (16.4) / real capture (16.6); both follow-up reviewers flagged it independently. The exit-status check itself was a prior-pass patch, so this is the interaction it introduced at the seam 16.3+ depends on.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
+  summary: The `DesktopRecorder::run_session` spawn/stream/reap body — including the prior-pass `kill_on_drop` and exit-status-inspection patches — has no automated test; only the pure state machine/parser and the no-sidecar `is_available()==false` path are covered. Add a fake-executable harness (a scripted binary emitting NDJSON on stdout) to exercise parse→forward→reap without hardware, ahead of the real-capture path (16.6).
+  evidence: Every test in `recording.rs`/`recorder.rs` exercises either the platform-free machine or the `is_available()` short-circuit; the actual `tokio::process` spawn, byte-level line read, `parse_event` forwarding, `AbortOnDrop` teardown, and `child.wait()` status check are unexercised (the module's own test even notes `run_session` "is not spawned here"). Real `keeper-rec` capture is deferred to 16.6 (dev-signed hardware), but the stream/reap logic is testable now with a fake stdout-emitting executable and is the seam 16.3+ builds on.
+  status: open
