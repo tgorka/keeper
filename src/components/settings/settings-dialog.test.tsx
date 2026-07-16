@@ -182,6 +182,17 @@ describe("SettingsDialog", () => {
     expect(screen.getByText("Archive & Storage")).toBeInTheDocument();
   });
 
+  it("caps the dialog height and scrolls inside so lower sections stay reachable", async () => {
+    mockPosture.mockResolvedValue(false);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    // The tall Settings body must scroll within the dialog rather than overflow
+    // off-screen (regression: Encryption/Verify/Restore were clipped and unreachable).
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.className).toContain("overflow-y-auto");
+    expect(dialog.className).toContain("max-h-[85vh]");
+  });
+
   it("reflects the encrypted SDK-store status when posture is on", async () => {
     mockPosture.mockResolvedValue(true);
     render(<SettingsDialog open onOpenChange={() => {}} />);

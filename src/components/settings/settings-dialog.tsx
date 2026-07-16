@@ -132,7 +132,11 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      {/* The Settings body is taller than the viewport; cap it and scroll inside
+          the dialog so lower sections (Encryption/Setup/About) stay reachable
+          instead of being clipped off-screen (shadcn DialogContent has no
+          max-height/overflow of its own). */}
+      <DialogContent className="max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Settings</DialogTitle>
           <DialogDescription>Archive &amp; Storage</DialogDescription>
