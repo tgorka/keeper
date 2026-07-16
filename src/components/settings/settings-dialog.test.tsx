@@ -188,9 +188,16 @@ describe("SettingsDialog", () => {
 
     // The tall Settings body must scroll within the dialog rather than overflow
     // off-screen (regression: Encryption/Verify/Restore were clipped and unreachable).
+    // The dialog itself is height-capped; the sections live in a dedicated
+    // vertical-scroll region (a flex-col block so paragraph copy wraps and is never
+    // clipped on the right — putting overflow on the grid DialogContent did that).
     const dialog = await screen.findByRole("dialog");
-    expect(dialog.className).toContain("overflow-y-auto");
     expect(dialog.className).toContain("max-h-[85vh]");
+    const scrollRegion = dialog.querySelector(".overflow-y-auto");
+    expect(scrollRegion).not.toBeNull();
+    expect(scrollRegion?.className).toContain("min-w-0");
+    // The dialog grid must NOT carry the scroll (that is the clipping bug).
+    expect(dialog.className).not.toContain("overflow-y-auto");
   });
 
   it("reflects the encrypted SDK-store status when posture is on", async () => {

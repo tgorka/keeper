@@ -132,34 +132,39 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      {/* The Settings body is taller than the viewport; cap it and scroll inside
-          the dialog so lower sections (Encryption/Setup/About) stay reachable
-          instead of being clipped off-screen (shadcn DialogContent has no
-          max-height/overflow of its own). */}
-      <DialogContent className="max-h-[85vh] overflow-y-auto">
+      {/* The Settings body is taller than the viewport, so it must scroll. Cap the
+          dialog height and put ALL sections inside a single flex-col scroll region
+          (below), rather than putting overflow on the grid DialogContent itself:
+          a grid container's `auto` column sizes to its widest child's max-content
+          and won't wrap, and `overflow-y-auto` on it forces `overflow-x` to `auto`
+          too — together that clipped the paragraph text on the right. A block/flex
+          scroll region lets the copy wrap (`min-w-0`) and only scrolls vertically. */}
+      <DialogContent className="max-h-[85vh] gap-0">
         <DialogHeader>
           <DialogTitle>Settings</DialogTitle>
           <DialogDescription>Archive &amp; Storage</DialogDescription>
         </DialogHeader>
-        <div className="flex flex-col gap-3 text-sm">
-          <p>{sdkStatus}</p>
-          <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>
-          {reducedPlatform && (
-            <p className="text-muted-foreground">{ARCHIVE_BACKUP_EXCLUSION_SENTENCE}</p>
-          )}
-          <HonorRemoteDeletionsRow />
+        <div className="-mr-2 mt-2 flex min-w-0 flex-col gap-4 overflow-y-auto pr-2">
+          <div className="flex min-w-0 flex-col gap-3 text-sm">
+            <p>{sdkStatus}</p>
+            <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>
+            {reducedPlatform && (
+              <p className="text-muted-foreground">{ARCHIVE_BACKUP_EXCLUSION_SENTENCE}</p>
+            )}
+            <HonorRemoteDeletionsRow />
+          </div>
+          <NotificationsSection open={open} />
+          {/* The desktop "Background & dock" section (⌘W/⌘Q mechanics, Dock badge,
+              launch-at-login, menu bar) never renders on the reduced (phone) tier —
+              its keeps-syncing-in-background copy would be a false background-delivery
+              claim on iOS (Story 14.2, FR-53/FR-61). Desktop (Story 10.3) unchanged. */}
+          {!reducedPlatform && <BackgroundSection open={open} />}
+          <PrivacySection open={open} />
+          {globalHotkey && <ShortcutsSection open={open} />}
+          <EncryptionSection />
+          <SetupSection onOpenChange={onOpenChange} />
+          <AboutSection open={open} />
         </div>
-        <NotificationsSection open={open} />
-        {/* The desktop "Background & dock" section (⌘W/⌘Q mechanics, Dock badge,
-            launch-at-login, menu bar) never renders on the reduced (phone) tier —
-            its keeps-syncing-in-background copy would be a false background-delivery
-            claim on iOS (Story 14.2, FR-53/FR-61). Desktop (Story 10.3) unchanged. */}
-        {!reducedPlatform && <BackgroundSection open={open} />}
-        <PrivacySection open={open} />
-        {globalHotkey && <ShortcutsSection open={open} />}
-        <EncryptionSection />
-        <SetupSection onOpenChange={onOpenChange} />
-        <AboutSection open={open} />
       </DialogContent>
     </Dialog>
   );
