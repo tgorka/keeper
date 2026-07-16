@@ -1117,8 +1117,10 @@ pub fn bridge_catalog() -> Result<Vec<BridgeNetworkVm>, IpcError> {
 /// networks. Resolves with a [`BridgeDiscoveryVm`] (the account's `homeserver` server
 /// name + discovered networks; an empty list is the honest "no bridges found" state,
 /// not an error). A homeserver lacking `thirdparty/protocols` degrades to the other
-/// two sources rather than erroring. Failures funnel through [`to_ipc_error`]: an
-/// unknown account → `internal` (non-retriable), a total transport failure →
+/// two sources rather than erroring. A registered-but-not-live account is activated
+/// on demand (the First-Run Wizard reaches discovery right after login, before any
+/// room-list subscription). Failures funnel through [`to_ipc_error`]: an account id
+/// absent from the registry → `internal` (non-retriable), a total transport failure →
 /// `syncUnavailable` (retriable). No bot MXID, token, or session material crosses IPC.
 #[tauri::command]
 pub async fn bridge_discover(
@@ -1127,7 +1129,7 @@ pub async fn bridge_discover(
 ) -> Result<BridgeDiscoveryVm, IpcError> {
     state
         .accounts
-        .discover_bridges(&account_id)
+        .discover_bridges(&state.platform, &account_id)
         .await
         .map_err(to_ipc_error)
 }
@@ -1151,7 +1153,7 @@ pub async fn bridge_login_start(
     let sink = Box::new(move |vm: BridgeLoginVm| channel.send(vm).is_ok());
     state
         .accounts
-        .start_bridge_login(&account_id, &network_id, sink)
+        .start_bridge_login(&state.platform, &account_id, &network_id, sink)
         .await
         .map_err(to_ipc_error)
 }
@@ -1169,7 +1171,7 @@ pub async fn bridge_login_submit(
 ) -> Result<(), IpcError> {
     state
         .accounts
-        .submit_bridge_login(&account_id, session_id, input)
+        .submit_bridge_login(&state.platform, &account_id, session_id, input)
         .await
         .map_err(to_ipc_error)
 }
@@ -1289,7 +1291,7 @@ pub async fn bridge_bot_room(
 ) -> Result<String, IpcError> {
     state
         .accounts
-        .bridge_bot_room(&account_id, &network_id)
+        .bridge_bot_room(&state.platform, &account_id, &network_id)
         .await
         .map_err(to_ipc_error)
 }
@@ -1330,7 +1332,7 @@ pub async fn resolve_bridge_identifier(
 ) -> Result<NewChatResolutionVm, IpcError> {
     state
         .accounts
-        .resolve_bridge_identifier(&account_id, &network_id, &identifier)
+        .resolve_bridge_identifier(&state.platform, &account_id, &network_id, &identifier)
         .await
         .map_err(to_ipc_error)
 }

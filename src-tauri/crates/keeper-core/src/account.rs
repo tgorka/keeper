@@ -1910,24 +1910,106 @@ impl AccountManager {
             })
     }
 
-    /// Run zero-config bridge discovery for a live account (Story 6.2, FR-25,
-    /// AD-16). Clones the account's `Client` under the manager lock, then runs the
-    /// three-source discovery pass ([`crate::bridges::discover`]) outside the lock
-    /// (it performs Matrix I/O). A missing account surfaces the non-retriable
-    /// [`BridgeError::AccountNotFound`]; a total transport failure surfaces the
-    /// retriable [`BridgeError::Discovery`]. No bot MXID, token, or session
-    /// material crosses back — only non-secret network ids + statuses.
+    /// Resolve the account's live `Client` for a bridge entry point, activating
+    /// the account on demand (Story 6.2, FR-25). The First-Run Wizard reaches
+    /// bridge discovery right after Beeper login — before any room-list
+    /// subscription has lazily activated the account — and the Bridges view is
+    /// reachable the same way right after a cold start, so bridge entry points
+    /// must activate exactly like `acquire_room_list` rather than demand an
+    /// already-live account. An id genuinely absent from the durable registry
+    /// keeps the honest, non-retriable [`BridgeError::AccountNotFound`]; a
+    /// *registered* account that fails to activate surfaces the activation
+    /// error itself (never `AccountNotFound`).
+    async fn bridge_client(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+    ) -> Result<Client, CoreError> {
+        let data_dir = platform.data_dir()?;
+        if registry::get_account(&data_dir, account_id)?.is_none() {
+            return Err(BridgeError::AccountNotFound(account_id.to_owned()).into());
+        }
+        self.ensure_live(platform, account_id).await
+    }
+
+    /// Activate `account_id` if it is not already live and return its `Client`
+    /// clone. The activation block mirrors [`acquire_room_list`](Self::acquire_room_list)
+    /// exactly (same [`activate`] arguments, same [`AccountHandle`] shape),
+    /// idempotently under the accounts lock — a concurrent caller never spawns a
+    /// second `Client`/`SyncService`. An activation failure propagates before
+    /// anything is inserted, so there is no partial handle to clean up.
+    async fn ensure_live(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+    ) -> Result<Client, CoreError> {
+        let mut accounts = self.accounts.lock().await;
+        if !accounts.contains_key(account_id) {
+            let (
+                client,
+                sync,
+                reconnect_supervisor,
+                session_persister,
+                archive_handler,
+                redaction_handler,
+                draft_handler,
+                notify_handler,
+                outbox_scheduler,
+                outbox_tx,
+            ) = activate(
+                platform,
+                account_id,
+                self.archive.clone(),
+                self.draft_mirror_tx.clone(),
+                self.notify.clone(),
+            )
+            .await?;
+            accounts.insert(
+                account_id.to_owned(),
+                AccountHandle {
+                    client,
+                    sync,
+                    subscriptions: Arc::new(Mutex::new(HashMap::new())),
+                    timelines: Arc::new(Mutex::new(HashMap::new())),
+                    reconnect_supervisor,
+                    session_persister,
+                    archive_handler,
+                    redaction_handler,
+                    draft_handler,
+                    notify_handler,
+                    verification_flow_tx: Arc::new(Mutex::new(None)),
+                    login_sessions: Arc::new(Mutex::new(HashMap::new())),
+                    outbox_scheduler,
+                    outbox_tx,
+                    outbox_subs: Arc::new(Mutex::new(HashMap::new())),
+                },
+            );
+            tracing::info!(account_id = %account_id, "account activated on demand");
+        }
+        accounts
+            .get(account_id)
+            .map(|h| h.client.clone())
+            .ok_or_else(|| {
+                CoreError::Internal("account handle vanished after activation".to_owned())
+            })
+    }
+
+    /// Run zero-config bridge discovery for an account (Story 6.2, FR-25,
+    /// AD-16), activating it on demand if it is registered but not yet live
+    /// (the First-Run Wizard reaches discovery before any room-list
+    /// subscription). Resolves the `Client` via [`Self::bridge_client`], then
+    /// runs the three-source discovery pass ([`crate::bridges::discover`])
+    /// outside the lock (it performs Matrix I/O). An id absent from the registry
+    /// surfaces the non-retriable [`BridgeError::AccountNotFound`]; a total
+    /// transport failure surfaces the retriable [`BridgeError::Discovery`]. No
+    /// bot MXID, token, or session material crosses back — only non-secret
+    /// network ids + statuses.
     pub async fn discover_bridges(
         &self,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
     ) -> Result<crate::vm::BridgeDiscoveryVm, CoreError> {
-        let client = {
-            let accounts = self.accounts.lock().await;
-            accounts.get(account_id).map(|h| h.client.clone())
-        };
-        let Some(client) = client else {
-            return Err(BridgeError::AccountNotFound(account_id.to_owned()).into());
-        };
+        let client = self.bridge_client(platform, account_id).await?;
         Ok(crate::bridges::discover(&client).await?)
     }
 
@@ -2179,22 +2261,28 @@ impl AccountManager {
     ///
     /// The access token is read here and handed *only* to the transport as a Bearer
     /// header — it never crosses IPC (only rendered VM state reaches the frontend).
-    /// A missing account surfaces [`BridgeError::AccountNotFound`]; an unreachable
+    /// An id absent from the registry surfaces [`BridgeError::AccountNotFound`]
+    /// (a registered-but-not-live account is activated on demand); an unreachable
     /// provisioning API surfaces [`BridgeError::Provisioning`] (both before the task
     /// spawns). The driver self-reaps its session entry on natural completion.
     pub async fn start_bridge_login(
         &self,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         network_id: &str,
         sink: BridgeLoginSink,
     ) -> Result<u64, CoreError> {
-        // Resolve the live client + its login-session registry under the lock.
-        let (client, sessions) = {
+        // Resolve the client (activating the account on demand), then its
+        // login-session registry from the now-live handle.
+        let client = self.bridge_client(platform, account_id).await?;
+        let sessions = {
             let accounts = self.accounts.lock().await;
-            match accounts.get(account_id) {
-                Some(handle) => (handle.client.clone(), handle.login_sessions.clone()),
-                None => return Err(BridgeError::AccountNotFound(account_id.to_owned()).into()),
-            }
+            accounts
+                .get(account_id)
+                .map(|h| h.login_sessions.clone())
+                .ok_or_else(|| {
+                    CoreError::Internal("account handle vanished after activation".to_owned())
+                })?
         };
 
         // The provisioning API is served alongside the account's homeserver C-S API,
@@ -2288,18 +2376,23 @@ impl AccountManager {
 
     /// Push a [`BridgeLoginInput`] (a flow choice or field values) into a running
     /// bridge-login session (Story 6.3). A stale / unknown `session_id` surfaces
-    /// [`BridgeError::Provisioning`] (the session already ended); a missing account
-    /// surfaces [`BridgeError::AccountNotFound`].
+    /// [`BridgeError::Provisioning`] (the session already ended); an id absent
+    /// from the registry surfaces [`BridgeError::AccountNotFound`] (a
+    /// registered-but-not-live account is activated on demand — its fresh handle
+    /// then honestly reports the session as ended rather than the account as
+    /// missing).
     pub async fn submit_bridge_login(
         &self,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         session_id: u64,
         input: BridgeLoginInput,
     ) -> Result<(), CoreError> {
+        self.bridge_client(platform, account_id).await?;
         let accounts = self.accounts.lock().await;
-        let handle = accounts
-            .get(account_id)
-            .ok_or_else(|| BridgeError::AccountNotFound(account_id.to_owned()))?;
+        let handle = accounts.get(account_id).ok_or_else(|| {
+            CoreError::Internal("account handle vanished after activation".to_owned())
+        })?;
         let sessions = handle.login_sessions.lock().await;
         let session = sessions.get(&session_id).ok_or_else(|| {
             BridgeError::Provisioning("no active bridge-login session for this id".to_owned())
@@ -2342,25 +2435,21 @@ impl AccountManager {
         }
     }
 
-    /// Resolve-or-create the Bridge Bot DM room for `network_id` on a live account
-    /// (Story 6.4, FR-27, UX-DR19) and return its room id, so the frontend can
-    /// navigate straight to the raw Bridge Bot chat (the manual escape hatch from the
-    /// card Manage menu / a login failure). A missing account surfaces
-    /// [`BridgeError::AccountNotFound`]; an unresolvable / uncreatable bot DM surfaces
-    /// [`BridgeError::Bot`]. No bot MXID or session material crosses back — only the
-    /// non-secret room id.
+    /// Resolve-or-create the Bridge Bot DM room for `network_id` (Story 6.4,
+    /// FR-27, UX-DR19), activating the account on demand if it is registered but
+    /// not yet live, and return its room id, so the frontend can navigate
+    /// straight to the raw Bridge Bot chat (the manual escape hatch from the
+    /// card Manage menu / a login failure). An id absent from the registry
+    /// surfaces [`BridgeError::AccountNotFound`]; an unresolvable / uncreatable
+    /// bot DM surfaces [`BridgeError::Bot`]. No bot MXID or session material
+    /// crosses back — only the non-secret room id.
     pub async fn bridge_bot_room(
         &self,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         network_id: &str,
     ) -> Result<String, CoreError> {
-        let client = {
-            let accounts = self.accounts.lock().await;
-            match accounts.get(account_id) {
-                Some(handle) => handle.client.clone(),
-                None => return Err(BridgeError::AccountNotFound(account_id.to_owned()).into()),
-            }
-        };
+        let client = self.bridge_client(platform, account_id).await?;
         let (room, _bot_mxid) = crate::bridges::resolve_bot_room(&client, network_id).await?;
         Ok(room.room_id().to_string())
     }
@@ -2394,13 +2483,15 @@ impl AccountManager {
     /// a typo'd identifier). The returned room id is opened verbatim — keeper never
     /// scans joined rooms.
     ///
-    /// A missing account surfaces [`BridgeError::AccountNotFound`]. A bot-only account
+    /// An id absent from the registry surfaces [`BridgeError::AccountNotFound`]
+    /// (a registered-but-not-live account is activated on demand). A bot-only account
     /// (`Provisioning::connect` → `Ok(None)`) surfaces an honest
     /// [`BridgeError::Provisioning`] naming the Bridge Bot chat (no fabricated resolve
     /// from a bot's prose). A resolve/create error surfaces the bridge's own message
     /// verbatim so the dialog renders "Not found on {Network}" with the input retained.
     pub async fn resolve_bridge_identifier(
         &self,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         network_id: &str,
         identifier: &str,
@@ -2413,14 +2504,9 @@ impl AccountManager {
             return Err(BridgeError::Provisioning("identifier is empty".to_owned()).into());
         }
 
-        // Resolve the live client under the accounts lock (AccountNotFound on miss).
-        let client = {
-            let accounts = self.accounts.lock().await;
-            match accounts.get(account_id) {
-                Some(handle) => handle.client.clone(),
-                None => return Err(BridgeError::AccountNotFound(account_id.to_owned()).into()),
-            }
-        };
+        // Resolve the client, activating the account on demand (AccountNotFound
+        // only for an id absent from the registry).
+        let client = self.bridge_client(platform, account_id).await?;
 
         // Same resolved-homeserver-host + Bearer-token discipline as start_bridge_login:
         // the provisioning API is served alongside the account's homeserver C-S API, so
@@ -6326,6 +6412,87 @@ mod tests {
         assert!(
             sdk_dir.is_dir(),
             "the sdk store survives the exclusion failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 6.2 (FR-25), First-Run Wizard step 3: bridge discovery on an account
+    /// that is registered but not yet live must activate it on demand — exactly
+    /// like the room-list path — instead of failing with the non-retriable
+    /// `AccountNotFound`. The wizard reaches discovery right after Beeper login,
+    /// before any room-list subscription has lazily activated the account (and
+    /// the Bridges view is reachable the same way right after a cold start).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discover_bridges_activates_registered_account_on_demand() {
+        let data_dir = unique_temp_dir("bridge-activate");
+        let account_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let fake = Arc::new(FakePlatform::new(data_dir.clone()));
+        seed_restorable_account(&fake, &data_dir, account_id);
+        let platform: Arc<dyn Platform> = fake.clone();
+        let manager = AccountManager::new(platform.as_ref(), &data_dir);
+        assert!(
+            manager.accounts.lock().await.is_empty(),
+            "precondition: the registered account starts not-live"
+        );
+
+        let result = manager.discover_bridges(&platform, account_id).await;
+
+        // The registered account was activated on demand (the fix): the handle is
+        // live in the manager regardless of how the subsequent discovery I/O
+        // fared against the unreachable seeded homeserver.
+        assert!(
+            manager.accounts.lock().await.contains_key(account_id),
+            "discover_bridges must activate a registered-but-not-live account"
+        );
+        // And whatever discovery returned (offline, a retriable Discovery error
+        // is expected), it must never be the pre-fix AccountNotFound.
+        assert!(
+            !matches!(
+                result,
+                Err(CoreError::Bridge(BridgeError::AccountNotFound(_)))
+            ),
+            "a registered account must never surface AccountNotFound"
+        );
+
+        // Tear down the on-demand handle so the test runtime exits cleanly
+        // (mirrors the partial-account abort set used by acquire_room_list).
+        let removed = manager.accounts.lock().await.remove(account_id);
+        if let Some(dead) = removed {
+            dead.reconnect_supervisor.abort();
+            dead.session_persister.abort();
+            dead.outbox_scheduler.abort();
+            dead.sync.stop().await;
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 6.2 (FR-25): an account id genuinely absent from the durable
+    /// registry keeps the honest, non-retriable `AccountNotFound` — on-demand
+    /// activation must not blur "unknown account" into an activation attempt or
+    /// an activation error.
+    #[tokio::test]
+    async fn discover_bridges_unknown_account_keeps_account_not_found() {
+        let data_dir = unique_temp_dir("bridge-unknown");
+        let fake = Arc::new(FakePlatform::new(data_dir.clone()));
+        let platform: Arc<dyn Platform> = fake.clone();
+        let manager = AccountManager::new(platform.as_ref(), &data_dir);
+
+        let result = manager
+            .discover_bridges(&platform, "01UNKNOWNACCOUNTIDXXXXXXXX")
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(CoreError::Bridge(BridgeError::AccountNotFound(ref id)))
+                    if id == "01UNKNOWNACCOUNTIDXXXXXXXX"
+            ),
+            "an id absent from the registry surfaces AccountNotFound, got: {result:?}"
+        );
+        assert!(
+            manager.accounts.lock().await.is_empty(),
+            "an unknown id must never activate anything"
         );
 
         let _ = std::fs::remove_dir_all(&data_dir);
