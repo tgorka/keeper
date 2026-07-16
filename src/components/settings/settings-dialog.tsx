@@ -132,20 +132,22 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      {/* The Settings body is taller than the viewport, so it must scroll. The grid
-          DialogContent is height-capped and clips (`overflow-hidden`); its rows are
-          `auto` (header) + `minmax(0,1fr)` (body) so the body row can shrink below its
-          content and hand a bounded height to the scroll region. The scroll region
-          itself carries `overflow-y-auto min-h-0` (min-h-0 is required — a flex/grid
-          child defaults to min-height:auto = content size, which would grow past the
-          cap and bleed out of the dialog instead of scrolling) and `min-w-0` so the
-          copy wraps rather than being clipped on the right. */}
-      <DialogContent className="grid max-h-[85vh] grid-rows-[auto_minmax(0,1fr)] gap-0 overflow-hidden">
+      {/* The Settings body is taller than the viewport, so it must scroll. Override
+          the shadcn DialogContent from `grid` to a height-capped `flex flex-col` that
+          clips (`overflow-hidden`): the header sizes to content, and the body below is
+          `flex-1 min-h-0` so it takes the remaining bounded height and scrolls within
+          it. `min-h-0` is required — a flex child defaults to min-height:auto (= its
+          content size), which would grow past the cap and bleed out of the dialog
+          instead of scrolling. `min-w-0` lets the copy wrap rather than clip on the
+          right. (An arbitrary `grid-rows-[…minmax(0,1fr)]` looked equivalent but the
+          comma inside `minmax()` isn't emitted by the Tailwind arbitrary-value parser,
+          so no rule was generated and the cap never applied — flex avoids that.) */}
+      <DialogContent className="flex max-h-[85vh] flex-col gap-0 overflow-hidden">
         <DialogHeader>
           <DialogTitle>Settings</DialogTitle>
           <DialogDescription>Archive &amp; Storage</DialogDescription>
         </DialogHeader>
-        <div className="-mr-2 mt-2 flex min-h-0 min-w-0 flex-col gap-4 overflow-y-auto pr-2">
+        <div className="-mr-2 mt-2 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto pr-2">
           <div className="flex min-w-0 flex-col gap-3 text-sm">
             <p>{sdkStatus}</p>
             <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>

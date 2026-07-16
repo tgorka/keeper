@@ -192,14 +192,17 @@ describe("SettingsDialog", () => {
     // vertical-scroll region (a flex-col block so paragraph copy wraps and is never
     // clipped on the right — putting overflow on the grid DialogContent did that).
     const dialog = await screen.findByRole("dialog");
-    // Grid is height-capped and clips; its body row can shrink (minmax(0,1fr)).
+    // The dialog is a height-capped flex column that clips; the body row grows into
+    // the remaining space and scrolls there (not the dialog itself).
     expect(dialog.className).toContain("max-h-[85vh]");
     expect(dialog.className).toContain("overflow-hidden");
-    expect(dialog.className).toContain("grid-rows-[auto_minmax(0,1fr)]");
-    // The scroll lives on the inner body region, which must be able to shrink
-    // (min-h-0) and wrap its copy (min-w-0) — not on the grid itself.
+    expect(dialog.className).toContain("flex");
+    expect(dialog.className).toContain("flex-col");
     const scrollRegion = dialog.querySelector(".overflow-y-auto");
     expect(scrollRegion).not.toBeNull();
+    // flex-1 + min-h-0 is the canonical "scroll inside a flex column" pattern;
+    // min-w-0 lets copy wrap instead of clipping on the right.
+    expect(scrollRegion?.className).toContain("flex-1");
     expect(scrollRegion?.className).toContain("min-h-0");
     expect(scrollRegion?.className).toContain("min-w-0");
     expect(dialog.className).not.toContain("overflow-y-auto");
