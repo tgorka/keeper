@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-16-1-keeper-rec-swiftpm-scaffold-codesign-and-externalbin-wiring.md
+  s_849bfc6fed7fee::t_91a048157b1ba7 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "81f2f57eaaa7b3bb6d1e64c3ecf177f1f569d08c",
+  "prompts": {},
+  "sessions": {
+    "s_849bfc6fed7fee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "117d07e0-1e56-4a9f-a57d-07af4c0d1b5d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
