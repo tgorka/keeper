@@ -1,5 +1,5 @@
 # generated: 2026-07-03
-# last_updated: 2026-07-09
+# last_updated: 2026-07-16
 # project: keeper
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-03
-last_updated: 2026-07-09
+last_updated: 2026-07-16
 project: keeper
 project_key: NOKEY
 tracking_system: file-system
@@ -167,3 +167,40 @@ development_status:
   15-5-paid-program-decision-gate-recorded: done
   15-6-final-device-install-and-phase-acceptance: backlog
   epic-15-retrospective: optional
+  epic-16: backlog
+  16-1-keeper-rec-swiftpm-scaffold-codesign-and-externalbin-wiring: backlog
+  16-2-recording-core-module-and-recorder-port: backlog
+  16-3-recording-capability-flag-and-gated-recording-surface: backlog
+  16-4-ndjson-rpc-handshake-getcapabilities-and-listsources: backlog
+  16-5-screen-recording-permission-pre-flight: backlog
+  16-6-full-screen-system-audio-capture-to-a-single-fmp4: backlog
+  epic-16-retrospective: optional
+  epic-17: backlog
+  17-1-dual-writer-gapless-size-based-rotation-in-keeper-rec: backlog
+  17-2-session-folder-manifest-json-and-segment-ledger: backlog
+  17-3-startup-recovery-of-orphaned-segments: backlog
+  17-4-automated-gapless-concat-test-nfr-22: backlog
+  17-5-segment-size-and-duration-cap-settings: backlog
+  epic-17-retrospective: optional
+  epic-18: backlog
+  18-1-tray-recording-state-elapsed-segment-size-stop-open-folder: backlog
+  18-2-forced-tray-presence-and-honest-quit-while-recording: backlog
+  18-3-in-app-active-recording-banner-and-segment-meter: backlog
+  18-4-loud-failure-triad-tray-error-notification-banner: backlog
+  18-5-disk-space-guard-warn-and-graceful-stop-and-finalize: backlog
+  epic-18-retrospective: optional
+  epic-19: backlog
+  19-1-application-window-picker-scshareablecontent-live-list: backlog
+  19-2-system-audio-toggle-and-per-app-audio-scoping: backlog
+  19-3-microphone-picker-and-separate-track: backlog
+  19-4-microphone-hot-unplug-resilience: backlog
+  19-5-destination-folder-chooser-and-fps-advanced-control: backlog
+  epic-19-retrospective: optional
+  epic-20: backlog
+  20-1-optional-webcam-as-a-separate-synchronized-file: backlog
+  20-2-microphone-and-camera-tcc-pre-flight-rows: backlog
+  20-3-completion-reveal-in-finder-and-startup-recovery-notice: backlog
+  20-4-palette-actions-global-hotkey-capability-gating-and-zero-egress-audit: backlog
+  20-5-reliability-envelope-4-h-soak-and-cpu-memory-verification: backlog
+  20-6-sm-9-sm-10-phase-acceptance-docs-recording-md-and-retrospective-inputs: backlog
+  epic-20-retrospective: optional
