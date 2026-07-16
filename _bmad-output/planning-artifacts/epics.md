@@ -7,12 +7,13 @@ inputDocuments:
   - _bmad-output/planning-artifacts/ux-designs/ux-keeper-2026-07-03/DESIGN.md
   - _bmad-output/planning-artifacts/ux-designs/ux-keeper-2026-07-03/EXPERIENCE.md
   - _bmad-output/planning-artifacts/research-ios-2026-07-09.md
+  - _bmad-output/planning-artifacts/research-recording-2026-07-16.md
   - docs/project-context.md
 generated: 2026-07-03
-updated: 2026-07-09 (iOS phase — Epics 12–15 appended)
+updated: 2026-07-16 (Screen Recording phase — Epics 16–20 appended)
 mode: headless
-storyCount: 89
-epicCount: 15
+storyCount: 116
+epicCount: 20
 ---
 
 # keeper - Epic Breakdown
@@ -24,6 +25,8 @@ This document provides the complete epic and story breakdown for keeper, decompo
 Post-MVP items (PRD §6.2) are flagged in the "Post-MVP — Not Storied" section at the end and deliberately have no stories.
 
 **Phase 2 increment (2026-07-09):** with all 11 desktop epics (63 stories) done, Epics 12–15 add the iOS/iPhone client per PRD §13 (FR-55–FR-65, NFR-15–NFR-18), the Architecture Spine iOS increment (AD-26–AD-32, AD-24 Plan A confirmed), the UX phone-tier contract (EXPERIENCE.md `Responsive & Platform` + DESIGN.md phone tokens), and the iOS technical research (`research-ios-2026-07-09.md` §5/§7/Appendix A). Epic 12 is a UI-free walking skeleton that retires the toolchain/signing/core-on-iOS risks and ends at the SM-7 on-device gate; Epics 13 (phone shell) and 14 (platform behavior) can proceed in parallel after it; Epic 15 hardens release hygiene. Stories are implementable without a physical device wherever possible (simulator and compile gates); exactly two stories are explicitly human-in-the-loop (12.6 on-device skeleton validation, 15.6 final device install) so the automation loop defers them to the coordinator rather than escalating.
+
+**Phase 3 increment (2026-07-16):** Epics 16–20 add the macOS Screen Recording phase per PRD §14 (FR-66–FR-76, NFR-19–NFR-22) + addendum §8, the Architecture Spine recording increment (AD-33–AD-39, no PRD amendment required), the UX `Screen Recording (macOS — Phase 3)` contract (EXPERIENCE.md recording surfaces/state table + DESIGN.md recording-red token and components), and the recording technical research (`research-recording-2026-07-16.md` §8 story sketch R.1–R.7, whose route/format/floor are adopted, not relitigated). The route is locked: a first-party Swift sidecar `keeper-rec` (ScreenCaptureKit + AVAssetWriter) spawned launch-on-demand over NDJSON-RPC stdio (the bbctl precedent), with a platform-free `keeper-core::recording` module owning the state machine, manifest, ledger, and recovery. Epic 16 is a walking skeleton that retires the existential risks — TCC permissions, sidecar signing, capture-to-file — ending at the R.1 / SM-9-seed exit (a real recording plays back); Epics 17 (segmentation & recovery) and 18 (tray & loud failures) build on it; Epic 19 adds sources/devices; Epic 20 adds webcam, guards, docs, and the SM-9/SM-10 phase acceptance. The capture surfaces render only behind the `recording` capability flag (FR-66), macOS ≥ 13.0; iOS never records. Recording adds zero network destinations (FR-76). Stories are implementable with compile gates, unit tests, and stub sidecars wherever possible; exactly three stories are explicitly human-in-the-loop — 16.6 (first real capture on dev-signed hardware), 20.5 (4 h soak + CPU/memory envelope on reference hardware), 20.6 (SM-9/SM-10 phase acceptance) — because macOS 15+ silently rejects ScreenCaptureKit for ad-hoc-signed binaries (Cap #1722), so real capture requires an Apple Development certificate and a physical Mac; the automation loop defers those three to the coordinator rather than escalating.
 
 ## Requirements Inventory
 
@@ -98,6 +101,20 @@ Post-MVP items (PRD §6.2) are flagged in the "Post-MVP — Not Storied" section
 - FR-64: Media protocol on WKURLSchemeHandler — same `keeper-media://` URL format as macOS incl. Range (200/206/416) seeking; decrypted bytes never cross IPC JSON
 - FR-65: Backup exclusion + file protection for local stores — DB directories excluded from iCloud/device backup; complete-until-first-user-authentication protection class; all account state under one data-directory root
 
+*Screen Recording phase (PRD §14):*
+
+- FR-66: Recording capability gating — `recording` capability flag over the IPC handshake, present only on desktop macOS ≥ 13.0; every recording surface (Settings section, tray affordances, palette actions) renders only when on; data-driven per platform; app-wide `minimumSystemVersion` stays 11.0; iOS never
+- FR-67: Permission pre-flight with honest states — live-detect Screen Recording (plus Microphone/Camera when those sources are enabled), request via system prompt where allowed, deep-link to the exact System Settings pane otherwise; states granted / not-yet-requested / denied-with-fix-path detected at render; Start disabled naming the blocking permission; discloses relaunch-after-grant and the macOS 15+ monthly re-confirm; mic/camera requested only when enabled
+- FR-68: Source selection — full display (with its audio) or a single running application; live picker of displays and apps with names/icons, re-enumerated as apps launch/quit; app-scoped capture excludes keeper, other apps, and notification banners; vanished-source picks fail clearly at Start; one capture target per Recording Session
+- FR-69: Audio sources — system audio toggle (default on) + microphone picker (default system default input); each enabled source written as its own AAC track, never premixed; keeper's own notification sounds excluded; mic hot-unplug never aborts (video + system audio keep rolling, mic track silence-filled, fallback to default input, persistent warning)
+- FR-70: Optional webcam as a separate synchronized file — camera picker (built-in/external/Continuity Camera; default off) recording `camera-####` files in the same session folder, time-anchored and rotated at the same segment boundaries; aligned within one frame; webcam off touches no Camera permission; camera loss mid-recording never aborts; no PiP burn-in this phase
+- FR-71: Recording Session output — chosen folder (default `~/Movies/keeper`), one timestamped session folder per recording with segment files and a `manifest.json` (capture target, devices, segment list, status); folder validation (exists/writable/free space) before Start; atomic manifest updates; cleanly finalized segments are ordinary `.mp4` (H.264 + AAC)
+- FR-72: Continuous segmented recording with size-based rotation — rotate at the configured segment size (default 500 MB) with a duration-cap fallback (default 30 min); rotation gapless; segment size user-configurable; N segments concatenate with no missing/duplicated frames and continuous timestamps (bar NFR-22)
+- FR-73: Crash safety and startup recovery — crash-safe fragmented format losing at most the last fragment (~4 s); startup and pre-recording scan marks interrupted sessions recovered in their manifests and surfaces a once-per-session notice; recovered files play as-is, no remux
+- FR-74: Tray/menu-bar recording state — idle/recording/warning-error with live elapsed time and current-segment info, one-click Stop Recording and Open Recordings Folder; recording forces the tray visible even when the FR-53 opt-in toggle is off, restoring prior state exactly at Stop; quit-while-recording warns then finalizes; macOS's own capture pill untouched
+- FR-75: Loud failure surfacing — every fault (recorder crash/exit, writer stall, permission revocation, device loss, disk-guard) surfaces via tray error state + native notification within 5 s with one-click restart; non-fatal warnings persist until resolved/acknowledged; NFR-5's no-silent-loss extends so every session reaches finalized / recovered / failed
+- FR-76: Local-only recording — recordings, manifests, and settings never leave the machine; zero new network destinations (NFR-11 egress diff empty for the phase); no upload/share/transcription/cloud affordance anywhere in the recording UI
+
 ### NonFunctional Requirements
 
 - NFR-1: Cold start < 2 s to interactive Unified Inbox (cached render first)
@@ -121,6 +138,13 @@ Post-MVP items (PRD §6.2) are flagged in the "Post-MVP — Not Storied" section
 - NFR-16: Memory hygiene under jetsam — droppable caches (image memory cache, media byte buffers) released on backgrounding and memory warnings; media Range-slicing buffer capped; 24 h suspended soak with a large account survives without a jetsam kill; memory returns near baseline (Instruments-verified)
 - NFR-17: Flaky-network resilience — UI always renders instantly from the local mirror; SSS offline mode with backoff, exited immediately on demand; airplane-mode toggles and Wi-Fi↔cellular handovers recover unaided; stale resume shows cached UI, kicks sync, surfaces a subtle "connecting" state incl. the sync-loop restart guard (matrix-rust-sdk#3935)
 - NFR-18: Resume integrity — resuming from background (incl. overnight suspension) never leaves a blank or unresponsive webview (tauri#14371); reload guard detects a jettisoned webview process and restores the UI; acceptance-tested from the walking skeleton onward
+
+*Screen Recording phase (PRD §14.3, measured on Apple Silicon, release build, dev-signed per §14.7; authored bars owner-sign-off at phase release, mirroring the AD-22/NFR-3 posture):*
+
+- NFR-19: Long-run capture stability — a 4 h continuous recording (1080p-class, 30 fps, system audio + microphone) completes with zero recorder crashes, writer stalls, or A/V desync and no unbounded memory growth; sample-buffer queues bounded with drop-oldest-video (audio never dropped); sustained dropping raises a warning (FR-75). [ASSUMPTION] 4 h bar authored, confirm before release-gating
+- NFR-20: Disk-space guard — warns below a warning threshold and gracefully stops-and-finalizes below a hard floor; never runs the disk to exhaustion or dies mid-write. [ASSUMPTION] warn < 10 GB free, stop < 2 GB; authored pending confirmation
+- NFR-21: Recording performance envelope — 1080p-class at 30 fps with both audio tracks adds < 100% of one core average CPU and < 400 MB combined RSS (sidecar + keeper overhead), and messaging bars NFR-1–NFR-4 still hold while recording. [ASSUMPTION] numbers authored, measure on reference hardware before gating
+- NFR-22: Segment handover gaplessness — rotation cuts on keyframes with continuous host-clock-anchored timestamps; concatenating a session's segments yields monotonic timestamps with no gap/overlap exceeding one frame, and screen↔camera alignment holds within one frame across the session; an automated concatenate-and-assert test gates release
 
 ### Additional Requirements
 
@@ -161,6 +185,16 @@ From the Architecture Spine iOS increment (AD-26–AD-32; AD-24 Plan A confirmed
 - Phase gates: **SM-7** walking skeleton (on-device OIDC deep-link login, room list, E2EE text send/receive, relaunch-restore + keyring spike + resume reload guard exercised) must pass before phone-UX epics; **SM-8** phone daily-driver ≥ 2 consecutive weeks. NFR-15's 3 s bar is not release-gating until the owner confirms it (PRD §13.8).
 - Distribution posture: free Personal Team signing (7-day profiles re-armed from the owner's Mac, ~3 devices, blocked entitlements); test IPAs shared via per-tester re-signing (Sideloadly/zsign); AltServer auto-refresh optional; the paid Apple Developer Program is an explicit deferred decision gate (PRD §13.5), never an omission.
 
+From the Architecture Spine Screen Recording increment (AD-33–AD-39; extends the frozen AD-1..32, no PRD amendment; route/format/floor locked by the recording research, adopted not relitigated):
+
+- AD-33 recording split: `keeper-core::recording` owns the session state machine (`idle → preflight → recording → rotating → stopping → finalized | recovered | failed`), manifest schema, segment ledger, folder validation, and recovery reconciliation — platform-free, no `tauri`, no Apple API; the sidecar spawn and stdio framing live in the `keeper` shell behind a `Recorder` Platform-style port (a trait beside `Platform`, AD-24); the macOS impl spawns `keeper-rec` via `Platform::sidecar_path`, every non-macOS impl and iOS returns `CoreError::Unsupported`; core never holds a process handle.
+- AD-34 `keeper-rec` sidecar & NDJSON-RPC stdio contract: a SwiftPM binary (ScreenCaptureKit + AVAssetWriter) spawned launch-on-demand via `Platform::sidecar_path` + Tauri `externalBin` (the bbctl precedent, AD-16 / Story 6.7); one JSON object per line; commands `getCapabilities` (version/feature-flags/per-TCC-permission handshake), `listSources`, `start{filter, audio, mic, camera, dir, segmentMB, fps}`, `stop`; events `state{recording, elapsedSec, segmentIndex, bytes, warning}`, `segmentClosed{path, bytes, track}`, `error{code, message, fatal}`; the contract shape is the invariant, exact field lists code-owned via AD-7.
+- AD-35 recording capability gating: `CapabilitiesVm` (AD-27) gains a `recording` flag (serde + ts-rs, AD-7), true only on desktop macOS ≥ 13.0 (the system-audio floor); the macOS 15+ in-stream-mic branch lives inside `keeper-rec`, invisible to the flag; every recording surface renders only when on (AD-27 "no dead buttons"); the frontend never sniffs `navigator.userAgent`/build flags.
+- AD-36 recording permissions/TCC: a pre-flight through the `Recorder` port → `keeper-rec` `getCapabilities` probe, surfaced as `RecordingPermissionVm` (`keeper-core::vm`, ts-rs) tracking three TCC classes distinctly — Screen Recording (`CGPreflightScreenCaptureAccess`/`CGRequestScreenCaptureAccess`, one real prompt per app lifetime, Settings deep link), Microphone (`NSMicrophoneUsageDescription`), Camera (`NSCameraUsageDescription`); mic/camera probed only when enabled; usage strings in keeper's bundle `Info.plist` (Tauri `bundle.macOS.infoPlist` merge); the sidecar is spawned, never a LaunchAgent (TCC attributes the child to keeper); quirks disclosed honestly; revocation mid-recording is a loud failure (AD-39).
+- AD-37 recording format, segmentation ownership & recovery: fragmented MP4 (`.mpeg4CMAFCompliant`, ~4 s fragments), H.264 + up to two unmixed AAC tracks (48 kHz), 30 fps default at source resolution (60 selectable), clean finalize defragments to ordinary `.mp4`; dual-AVAssetWriter gapless size-based rotation lives entirely in `keeper-rec` (start writer B at the next keyframe PTS, dual-route until B's first keyframe, finalize A async; bytes-budget deadline corrected against on-disk growth; duration-cap fallback); `keeper-core` owns only the segment ledger + manifest (`<folder>/keeper-rec <local ts>/`, atomic-rename on every `segmentClosed`/status change; `screen-####.mp4` and, webcam on, `camera-####.mp4` from a second in-sidecar writer, host-clock anchored, no PiP); a startup recovery pass (and one before each new recording) marks stale `recording` manifests `recovered` and plays the orphaned tail as-is.
+- AD-38 `keeper-rec` source layout, build, codesign & CI: a top-level SwiftPM package `tools/keeper-rec/` deliberately outside `src-tauri/crates/` (no Cargo/SwiftPM collision), first-party Apache-2.0 linking only Apple system frameworks (cargo-deny AD-5 untouched, no ffmpeg); `bundle.externalBin` = `binaries/keeper-rec`, Tauri appends the triple so the runtime name is `keeper-rec-aarch64-apple-darwin`; CI on the existing macOS signing runner does `swift build -c release --arch arm64` → explicit codesign (hardened runtime + keeper's entitlements) before `tauri build` (externalBin notarization rough edge, tauri#11992), aarch64-only, no lipo; dev-signing requirement (not a product blocker): local builds exercising recording need an Apple Development certificate (macOS 15+ ad-hoc SCK rejection, Cap #1722).
+- AD-39 tray recording state & honest quit (extends Story 10.3 / AD-18): the opt-in tray (`crates/keeper/src/tray.rs`, single mutex-guarded `TrayIcon` slot) gains states `idle → recording → warning/error` via `TrayIcon::set_icon` (record-dot + warning-badge assets); a ~1 Hz tick updates a disabled menu line and the menu adds Stop Recording + Open Recordings Folder; recording temporarily forces tray presence and restores the exact prior state at stop; quit-while-recording = warn → `stop` RPC → flush → kill-timeout guard (never orphans `keeper-rec`); every fault is loud via the AD-18 notification pipeline within 5 s with one-click restart; NFR-5's no-silent-loss extends so every session reaches `finalized | recovered | failed`. Reliability envelope: buffer-bounding/drop policy/rotation correctness live in `keeper-rec`; the disk-guard policy (pre-start validation, warn threshold, hard-floor stop-and-finalize) lives in `keeper-core::recording` driven by free-space on `state` events; the CI perf/concat harness is the gate (extends AD-21 measurement hooks).
+
 ### UX Design Requirements
 
 From DESIGN.md + EXPERIENCE.md (behavioral + brand-layer deltas; each must be covered by a story):
@@ -197,6 +231,15 @@ Phone-tier increment (EXPERIENCE.md `Responsive & Platform` + DESIGN.md phone to
 - UX-DR27: Capability honesty surfaces — absent capabilities removed then disclosed once: Settings → About "On this iPhone" rendered list (foreground-only sync, no bbctl, no global hotkey, updates by reinstall/7-day signature, link to docs/ios.md); lifecycle honesty card on iOS first run + permanent Settings → Notifications copy ("…nothing here pretends to be push"); Archive & Storage line: phone Local Archive excluded from backup, the Mac remains the durable exportable copy.
 - UX-DR28: iOS accessibility + phone states — VoiceOver focus moves to the new level's header on push and returns on pop; escape gesture = back at every level; **no gesture is the sole path** (row swipes duplicated as VoiceOver custom actions + context menu; pull-to-refresh duplicated as "Sync now"); rem-based scaling holds at ~130 % text size; phone-tier state table honored (stale-resume "Connecting…" pill, reload-guard restore, queued-send caption "Queued — sends when keeper is open and back online", notification-permission-denied persistent state with Open Settings link, offline pull-to-refresh resolves to the offline pill, never an error toast).
 
+Screen Recording increment (EXPERIENCE.md `Screen Recording (macOS — Phase 3)` + DESIGN.md recording-red token and recording components; every treatment renders only behind the `recording` capability flag, FR-66):
+
+- UX-DR29: Recording view (`⌘5`, sidebar entry only when the flag is on, carrying a `recording-dot` while capture is live) — a single non-chat utility surface (no timeline, no composer, no chat list) flipping in place between *pre-record setup* (a stack of shadcn `Card` sections — Source, Audio, Webcam, Destination, Segmenting, collapsed Advanced-fps), *active recording*, and *completion/recovery*; centered `content-max-width` single column, not a pane frame; Start gated on the permission pre-flight; it lives beside Bridges and Settings, not in the inbox.
+- UX-DR30: Recording-red token — the live-capture color (`recording` / `recording-dark`, `#E5322D`), used ONLY as the `recording-dot`, the active-recording banner edge, the tray record badge, and the loud error banner; deliberately warmer/brighter than `destructive`/`bridge-disconnected` so a live indicator never reads as a delete button, and the two never share a surface; never on buttons, text, hovers, or decoration.
+- UX-DR31: Active-recording banner + segment meter — `active-recording-banner` pinned to the top of the Recording view, persistent while capture is live or faulted (never toast-only): record dot + `mono` "Recording — 12:34 · segment 3 · 412 MB" + Stop (destructive-outline); the `segment-meter` fills toward the segment size and resets at each gapless rotation; warning variant (mic unplug, low disk) and error variant (recorder exit, writer stall, permission revoked, disk floor) are the loud-failure surface with "Restart recording"; the in-app twin of the tray; Pause absent this phase.
+- UX-DR32: Tray recording states — `tray-recording` icons idle / recording (record-dot badge) / warning-error (amber outline / recording-red filled badge); a `mono` elapsed·segment·size disabled menu line ticking ~1 Hz (live < 1 s of Start), Stop Recording, and Open Recordings Folder above Show keeper / Quit; recording forces the tray visible even when the FR-53 opt-in toggle is off and restores the prior state exactly at Stop; macOS's own purple screen-recording pill left untouched (the tray adds what the pill lacks — elapsed, segment, Stop, errors).
+- UX-DR33: Permission pre-flight rows — one `permission-row` per required permission (Screen Recording always; Microphone / Camera only when those sources are enabled), each live-detected at render (never cached optimistically), re-detected on focus/return; request via system prompt where allowed, deep-link to the exact System Settings pane otherwise; Start disabled until every required grant is green, naming the blocking permission; honest `note-line`s: relaunch-may-be-needed, macOS 15+ monthly re-confirm, and the subtle dev-facing "ad-hoc dev builds may be blocked on macOS 15+ — sign with an Apple Development certificate".
+- UX-DR34: Completion / recovery card + recording voice — on Stop, a `Card`: "Saved N segments · {size}" + session-folder path (`mono`) + primary **Reveal in Finder**, no preview/trim/share; the recovery notice ("A recording was interrupted; N segments were saved") uses the same card shape with a `bridge-degraded`-tinted edge, surfaced once per interrupted session and linking the folder; recording voice per the State Patterns table — "Recorded locally. Nothing uploads.", app-scoped disclosure ("only {App}'s windows and audio — keeper, other apps, and notification banners are excluded"), sentence case, no exclamation marks, Glossary-capitalized "Recording Session"/"segment".
+
 ### FR Coverage Map
 
 | FR | Epic | Notes |
@@ -230,6 +273,21 @@ Phone-tier increment (EXPERIENCE.md `Responsive & Platform` + DESIGN.md phone to
 | FR-65 | Epic 14 | Backup exclusion + file protection (Story 14.7) |
 | NFR-15 | Epic 15 | Measured on-device in 15.6; authored bar pending owner confirmation |
 | NFR-16, NFR-17, NFR-18 | Epic 14 | Memory hygiene, network resilience, resume integrity |
+| FR-66 | Epic 16 | CapabilitiesVm `recording` flag + gated surface (Story 16.3) |
+| FR-67 | Epic 16 (Screen leg, 16.5) + Epic 20 (Mic/Camera rows, 20.2) | Pre-flight mechanism before source-enabled probes |
+| FR-68 | Epic 16 (full-screen leg, 16.6) + Epic 19 (app picker, 19.1) | Full-screen first, app-scoped after the core is trustworthy |
+| FR-69 | Epic 16 (system-audio leg, 16.6) + Epic 19 (toggle 19.2 / mic 19.3 / hot-unplug 19.4) | Split is deliberate: capture core before device breadth |
+| FR-70 | Epic 20 | Webcam separate synchronized file (Story 20.1) |
+| FR-71 | Epic 16 (single-file leg, 16.6) + Epic 17 (session folder/manifest, 17.2) + Epic 19 (folder chooser, 19.5) | Manifest/ledger in E17; destination UI in E19 |
+| FR-72 | Epic 17 | Segmented rotation + size/duration settings (17.1, 17.5); fps in Epic 19 (19.5) |
+| FR-73 | Epic 17 (recovery, 17.3) + Epic 20 (recovery notice UI, 20.3) | Recovery pass in core; once-per-session notice in the view |
+| FR-74 | Epic 18 | Tray state/elapsed/Stop/Open Folder (18.1); forced-visibility + honest quit (18.2) |
+| FR-75 | Epic 18 | Loud-failure triad (18.4); banner variants (18.3); disk-guard leg (18.5) |
+| FR-76 | Epic 20 | Zero-egress audit + local-only invariant (Story 20.4) |
+| NFR-19 | Epic 20 | 4 h soak measured on reference hardware (Story 20.5); authored bar pending owner confirmation |
+| NFR-20 | Epic 18 | Disk-space guard policy in `keeper-core::recording` (Story 18.5) |
+| NFR-21 | Epic 20 | CPU/memory envelope measured (Story 20.5); authored numbers pending owner confirmation |
+| NFR-22 | Epic 17 | Gapless dual-writer rotation (17.1) + automated concat-assert CI gate (17.4) |
 
 ## Epic List
 
@@ -292,6 +350,26 @@ The phone behaves honestly as an iOS citizen: foreground-only sync through one R
 ### Epic 15: iOS Polish & Release
 Ship the phase: icons and launch assets, the free-signing walkthrough in docs/ios.md, a shareable IPA path for re-signing, the iOS CI gate wired as required, the paid-program decision gate recorded, and the final on-device acceptance that opens SM-8 dogfooding.
 **FRs covered:** — (FR-55 assets/docs/CI legs; NFR-15 measured; SM-8; PRD §13.5 decision record)
+
+### Epic 16: Recording Walking Skeleton — Sidecar, Permissions, Capture to File
+keeper spawns the first-party `keeper-rec` Swift sidecar, gates a `recording` capability on macOS ≥ 13.0, negotiates the NDJSON-RPC handshake, runs an honest Screen Recording permission pre-flight, and records a full display with system audio to a single fMP4 in a chosen folder — driven from a ⌘5 Recording view with Start/Stop and elapsed. This retires the TCC, signing, and capture-to-file risks. Exit: a real recording plays back (R.1 / SM-9 seed).
+**FRs covered:** FR-66, FR-67 (Screen leg), FR-68 (full-screen leg), FR-69 (system-audio leg), FR-71 (single-file leg) (+ AD-33–AD-36, AD-38; SM-9 seed)
+
+### Epic 17: Segmentation & Recovery — Hours-Long, Crash-Safe Capture
+Continuous recording rotates gaplessly into size-bounded segments, each session gets a folder + atomic `manifest.json` + a segment ledger, interrupted sessions recover on startup, and an automated concatenate-and-assert test proves the handover is gapless.
+**FRs covered:** FR-72, FR-71 (session folder/manifest leg), FR-73 (recovery leg); NFR-22 (+ AD-37)
+
+### Epic 18: Tray & Loud Failures — The Menu Bar Tells the Truth
+The tray carries recording / warning / error states with a live elapsed·segment·size line, Stop, and Open Recordings Folder; recording forces the tray visible and restores it; quitting while recording finalizes cleanly; and every fault surfaces loudly across tray, notification, and banner — including the disk-space guard.
+**FRs covered:** FR-74, FR-75; NFR-20 (+ AD-39, AD-18)
+
+### Epic 19: Sources & Devices — Choose What and Whom to Capture
+A live application/window picker (SCShareableContent) with app-scoped audio, a system-audio toggle, a microphone picker written as a separate track with hot-unplug resilience, a destination-folder chooser, and an advanced fps control.
+**FRs covered:** FR-68 (app-picker leg), FR-69 (toggle / mic / hot-unplug legs), FR-71 (folder-chooser leg), FR-72 (fps leg) (+ AD-34, AD-36)
+
+### Epic 20: Webcam & Polish — Ship the Phase
+Optional webcam as a separate synchronized file, the Microphone/Camera pre-flight rows, palette actions + optional global hotkey + the capability-gating and zero-egress audits, docs/recording.md, the reliability envelope (4 h soak + CPU/memory), and the SM-9/SM-10 phase acceptance with retrospective inputs.
+**FRs covered:** FR-70, FR-67 (Mic/Camera rows), FR-76; NFR-19, NFR-21 (+ SM-9, SM-10 acceptance; AD-37)
 
 ## Epic 1: Walking Skeleton — Sign In and Chat on Matrix
 
@@ -2385,6 +2463,612 @@ So that SM-8 dogfooding starts on evidence and the phase retrospective has its i
 
 **Epic 15 exit:** phase accepted on-device; SM-8 window running; retrospective inputs on file.
 
+## Epic 16: Recording Walking Skeleton — Sidecar, Permissions, Capture to File
+
+Prove the whole recording vertical slice on the locked architecture before any feature breadth: the `keeper-rec` Swift sidecar built, codesigned, and bundled; a platform-free `keeper-core::recording` state machine behind a `Recorder` port; the `recording` capability flag; the NDJSON-RPC handshake; an honest Screen Recording permission pre-flight; and a full display + system audio captured to a single fMP4 from a ⌘5 Recording view. Exit (R.1 / SM-9 seed): a real recording plays back. This epic retires the existential risks — TCC, sidecar signing, capture-to-file — that PRD §14.1 and research §8 name first.
+
+### Story 16.1: keeper-rec SwiftPM Scaffold, Codesign & externalBin Wiring
+
+As a keeper developer,
+I want the `keeper-rec` Swift capture sidecar built, codesigned, and bundled as a Tauri `externalBin` from CI,
+So that every later recording story spawns a real signed capture binary instead of a stub.
+
+**Requirements:** AD-38, AD-34 (package shape); NFR-13 (licensing firewall); FR-66 (build/toolchain)
+**Dependencies:** none
+
+**Acceptance Criteria:**
+
+**Given** the recording route locked to a first-party Swift sidecar (addendum §8)
+**When** the scaffold lands
+**Then** a SwiftPM package lives at top-level `tools/keeper-rec/` (`Package.swift` + `Sources/keeper-rec/`), deliberately outside `src-tauri/crates/` so Cargo and SwiftPM tooling don't collide, is Apache-2.0, and links only Apple system frameworks (ScreenCaptureKit/AVFoundation) — no ffmpeg, so `cargo deny check` (AD-5) is untouched (AD-38).
+
+**Given** CI on the existing macOS signing runner
+**When** the build job runs
+**Then** it does `swift build -c release --arch arm64`, then **explicitly codesigns** `keeper-rec` (hardened runtime + keeper's entitlements) **before** `tauri build` (the `externalBin` notarization rough edge, tauri#11992), aarch64-only with no lipo, and `bundle.externalBin` is declared as `binaries/keeper-rec` so the bundled/runtime name resolves to `keeper-rec-aarch64-apple-darwin` matching `DesktopPlatform::sidecar_path` (AD-38).
+
+**Given** the minimal binary
+**Then** `keeper-rec` answers a `getCapabilities` line on stdio and exits cleanly, and the dev-signing requirement (local builds exercising recording need an Apple Development certificate — macOS 15+ silently rejects ad-hoc SCK, Cap #1722) is captured in a code comment and the release/dev docs as a DevEx note, explicitly not a product blocker (AD-38).
+
+### Story 16.2: recording Core Module & Recorder Port
+
+As a keeper developer,
+I want a platform-free `keeper-core::recording` state machine and a `Recorder` shell port,
+So that recording logic sits on the hexagonal seam and a capture crash can never reach the messaging core.
+
+**Requirements:** AD-33, AD-24, AD-21
+**Dependencies:** 16.1
+
+**Acceptance Criteria:**
+
+**Given** the `keeper-core` platform-free rule (AD-6/AD-24)
+**When** the module lands
+**Then** `keeper-core::recording` owns the session state machine (`idle → preflight → recording → rotating → stopping → finalized | recovered | failed`) with **no `tauri` and no Apple API** anywhere in its tree (enforced by a `cargo tree`/unit-test check), and errors flow `thiserror` → `CoreError` per AD-21 (AD-33).
+
+**Given** the port seam
+**When** the shell wires recording
+**Then** a `Recorder` trait sits beside `Platform` (AD-24): the macOS impl (`crates/keeper/src/recorder.rs`, `#[cfg(desktop)]`) spawns `keeper-rec` via `Platform::sidecar_path`, and every non-macOS impl and iOS returns `CoreError::Unsupported` (mirroring `sidecar_path` honesty, AD-27) (AD-33).
+
+**Given** the isolation invariant
+**Then** the core state machine never holds a process handle — the port parses sidecar events and feeds them in — and a unit test drives the state machine through a full lifecycle with a fake `Recorder` (AD-33).
+
+### Story 16.3: recording Capability Flag & Gated Recording Surface
+
+As a user on an unsupported platform,
+I want no recording affordance to appear at all,
+So that recording is absent, never a dead button.
+
+**Requirements:** FR-66, AD-35, AD-27, AD-7; UX-DR29 (shell)
+**Dependencies:** 16.2
+
+**Acceptance Criteria:**
+
+**Given** `CapabilitiesVm` served over the IPC handshake (AD-27)
+**When** it is computed
+**Then** it gains a `recording` flag (serde + ts-rs, AD-7) that is **true only on desktop macOS ≥ 13.0** (the system-audio floor); the app-wide `minimumSystemVersion` stays 11.0; iOS never (AD-35).
+
+**Given** the recording surfaces
+**When** the app renders
+**Then** the ⌘5 Recording sidebar entry, the Settings → Recording section, and the Command Palette recording actions render **only when the flag is on** (AD-27 "no dead buttons"), and the frontend never consults `navigator.userAgent`/build flags (AD-35).
+
+**Given** the flag on
+**Then** an empty Recording view shell renders behind ⌘5 — the centered `content-max-width` setup card stack (Source/Audio/Webcam/Destination/Segmenting/Advanced placeholders), no timeline or composer — ready for later stories (UX-DR29).
+
+### Story 16.4: NDJSON-RPC Handshake — getCapabilities & listSources
+
+As a keeper developer,
+I want the host↔sidecar wire protocol with a version handshake and source enumeration,
+So that keeper and `keeper-rec` never drift and the UI can list capture sources.
+
+**Requirements:** AD-34, AD-7
+**Dependencies:** 16.1, 16.2
+
+**Acceptance Criteria:**
+
+**Given** the NDJSON-RPC contract (AD-34)
+**When** host and sidecar communicate
+**Then** the wire format is **one JSON object per line on stdio**, `getCapabilities` (host→rec, id-correlated) returns macOS version + feature flags + per-TCC permission states **and carries the protocol-version handshake**, and a version mismatch yields a clean `Unsupported`/error surface, never a crash (AD-34).
+
+**Given** source enumeration
+**When** `listSources` is invoked
+**Then** it returns displays, applications, microphones, and cameras, surfaced as ts-rs VMs (AD-7); the contract *shape* is the invariant while exact field lists stay code-owned (AD-34).
+
+**Given** the parser
+**Then** stdio framing and event parsing (`state`, `segmentClosed`, `error`) have unit tests against a recorded fixture stream, so the protocol is testable without a live signed capture (AD-34).
+
+### Story 16.5: Screen Recording Permission Pre-flight
+
+As a user,
+I want keeper to show the true Screen Recording permission state and route me to fix it,
+So that I never hit a silent grant failure or a spinner waiting on a grant that will never come.
+
+**Requirements:** FR-67 (Screen Recording leg), AD-36; UX-DR33
+**Dependencies:** 16.3, 16.4
+
+**Acceptance Criteria:**
+
+**Given** the pre-flight through the `Recorder` port → `keeper-rec` `getCapabilities` probe
+**When** the Recording setup renders
+**Then** a `RecordingPermissionVm` (`keeper-core::vm`, ts-rs) tracks the Screen Recording class distinctly as granted / not-yet-requested / denied-with-fix-path, **detected at render time via `CGPreflightScreenCaptureAccess`, never cached optimistically**, and re-detected on focus/return (FR-67, AD-36).
+
+**Given** a missing grant
+**When** the user acts
+**Then** keeper requests via `CGRequestScreenCaptureAccess` where the OS allows (one real prompt per app lifetime) and deep-links to `x-apple.systempreferences:…Privacy_ScreenCapture` when only manual granting remains, with honest `note-line`s stating the macOS quirks plainly — relaunch-may-be-needed, macOS 15+ monthly re-confirm, and the subtle dev-facing "ad-hoc dev builds may be blocked on macOS 15+ — sign with an Apple Development certificate" (FR-67, UX-DR33).
+
+**Given** an ungranted permission
+**Then** Start is disabled with the blocking permission named (FR-67); the sidecar is spawned (never a LaunchAgent) so TCC attributes the child to keeper, using keeper's usage strings (AD-36). *(Real grant validation on hardware rides Story 16.6.)*
+
+### Story 16.6: Full-Screen + System-Audio Capture to a Single fMP4
+
+As a user,
+I want to record a full display with its audio to a video file and stop it cleanly,
+So that keeper proves it can capture end to end.
+
+**Requirements:** FR-68 (full-screen leg), FR-69 (system-audio leg), FR-71 (single-file leg); AD-37 (format), AD-34 (start/stop); UX-DR29, UX-DR30
+**Dependencies:** 16.5
+**Human-in-the-loop:** **yes** — requires a physical Mac, a real Screen Recording grant, and an **Apple Development-signed build** (macOS 15+ silently rejects ad-hoc ScreenCaptureKit, Cap #1722). This is the recording phase's first device step; the automation loop defers it to the coordinator instead of escalating.
+
+**Acceptance Criteria:**
+
+**Given** a granted Screen Recording permission and a dev-signed build
+**When** the user sets Source = a full display with system audio on and presses Start
+**Then** `keeper-rec` builds an `SCContentFilter` over `SCShareableContent`, captures with `capturesAudio` + `excludeCurrentProcessAudio = true`, and writes a **single fragmented MP4** (H.264 + one AAC system-audio track, ~4 s fragments) to the chosen folder; the Recording view flips to *active* with a `recording-red` record dot and a `mono` elapsed line ticking, and macOS posts its own purple pill in parallel (FR-68/FR-69, AD-37, UX-DR29/UX-DR30).
+
+**Given** an active recording
+**When** the user presses Stop
+**Then** the current file finalizes (defragmenting to an ordinary `.mp4`) and plays back in QuickTime with continuous audio and video, and keeper's own notification sounds are absent from the audio (FR-69, AD-37).
+
+**Given** the walking-skeleton exit (R.1 / SM-9 seed)
+**Then** the full cycle — pre-flight → full-screen + system-audio capture → single playable fMP4 in the chosen folder → clean Stop — runs on a Development-signed build on macOS 13+ hardware.
+
+**Epic 16 exit gate (R.1 / SM-9 seed):** a real recording plays back on dev-signed hardware.
+
+## Epic 17: Segmentation & Recovery — Hours-Long, Crash-Safe Capture
+
+Turn the single-file skeleton into hours-long, crash-safe capture: gapless size-based rotation in the sidecar, a per-session folder with an atomic `manifest.json` and a segment ledger in `keeper-core`, startup recovery of orphaned segments, the automated concatenate-and-assert gate for gaplessness (NFR-22), and the segment-size/duration-cap settings. This is research R.2.
+
+### Story 17.1: Dual-Writer Gapless Size-Based Rotation in keeper-rec
+
+As a user,
+I want long recordings to roll over into new files without a hiccup,
+So that a crash costs at most a few seconds and files stay a manageable size.
+
+**Requirements:** FR-72 (rotation), AD-37, NFR-22 (mechanics)
+**Dependencies:** Epic 16
+
+**Acceptance Criteria:**
+
+**Given** the dual-AVAssetWriter mechanism (addendum §8, AD-37)
+**When** the current segment reaches the configured size
+**Then** `keeper-rec` starts writer B at the next keyframe PTS, routes to both writers until B's first keyframe lands, and finalizes A asynchronously — a **gapless handover** with no pause, no dropped audio, and no user-visible hiccup; the size trigger is a bytes-budget deadline corrected against observable on-disk growth, with a duration-cap fallback so low-motion recordings still rotate (FR-72, AD-37).
+
+**Given** each rotation
+**When** a segment closes
+**Then** `keeper-rec` emits a `segmentClosed{path, bytes, track}` event, and all PTS are host-clock-anchored so timestamps stay continuous across the cut (NFR-22).
+
+**Given** the container
+**Then** it stays fragmented MP4 (`.mpeg4CMAFCompliant`, ~4 s fragments) throughout rotation so size is observable live and a mid-segment kill loses at most the last fragment (AD-37).
+
+### Story 17.2: Session Folder, manifest.json & Segment Ledger
+
+As a user,
+I want every recording to produce one self-describing folder,
+So that an external tool — or keeper's recovery — can always read a consistent picture of the session.
+
+**Requirements:** FR-71 (session folder/manifest leg), AD-37, AD-33
+**Dependencies:** 17.1
+
+**Acceptance Criteria:**
+
+**Given** a started recording
+**When** the session is created
+**Then** `keeper-core::recording` creates `<folder>/keeper-rec <local timestamp>/` and owns a `manifest.json` describing capture target, devices, segment list, and status, plus a segment ledger fed from the sidecar's `segmentClosed`/`state` events (FR-71, AD-33).
+
+**Given** any segment close or status change
+**When** the manifest updates
+**Then** it is written by **atomic rename** so an external reader never sees a torn file, segment names are local-time-stamped, filesystem-safe, and lexicographically ordered, and the status transitions `recording → finalized` on clean Stop (FR-71, AD-37).
+
+**Given** a cleanly finalized session
+**Then** its segments are ordinary `.mp4` (H.264 + AAC) playable everywhere with no keeper-specific tooling (FR-71).
+
+### Story 17.3: Startup Recovery of Orphaned Segments
+
+As a user,
+I want a crashed recording's segments to be found and marked, not lost,
+So that an interruption costs the tail fragment, never the meeting.
+
+**Requirements:** FR-73 (recovery leg), AD-37
+**Dependencies:** 17.2
+
+**Acceptance Criteria:**
+
+**Given** an unfinalized session (stale `recording` manifest) from a recorder/keeper/power crash
+**When** keeper starts up or is about to begin a new recording
+**Then** a recovery pass reconciles orphaned segments: the stale manifest is marked `recovered`, the orphaned tail fMP4 plays as-is with no remux, and every earlier segment is untouched (FR-73, AD-37).
+
+**Given** a force-kill of the recorder mid-segment
+**When** the partial segment is inspected
+**Then** it is playable up to the last complete fragment (~4 s bound), verified by an induced-kill test on committed fixture output (FR-73).
+
+**Given** the recovery result
+**Then** the `recovered` state is recorded for the once-per-session notice UI in Story 20.3 — recovery is the safety net; the live loud-failure notification is Story 18.4 (FR-73).
+
+### Story 17.4: Automated Gapless-Concat Test (NFR-22)
+
+As a maintainer,
+I want a test that proves segment handover is gapless,
+So that A/V-sync regressions across rotation fail the build, not the user's recording.
+
+**Requirements:** NFR-22, AD-37, AD-21
+**Dependencies:** 17.1, 17.2
+
+**Acceptance Criteria:**
+
+**Given** a session's segments
+**When** the concat-assert test runs
+**Then** it concatenates them and asserts **monotonic timestamps with no gap or overlap exceeding one frame duration**, and the test is wired into the CI perf/concat harness as a **release gate** (extends AD-21 measurement hooks) (NFR-22).
+
+**Given** the CI signing constraint
+**When** the test executes
+**Then** it runs against committed fixture segments (or output produced on the signed runner) so gaplessness is gated without being blocked on a physical capture (NFR-22, AD-38).
+
+**Given** Epic 20's webcam
+**Then** the harness leaves a screen↔camera one-frame-alignment assertion hook to be populated when `camera-####` files exist (Story 20.1) (NFR-22).
+
+### Story 17.5: Segment-Size & Duration-Cap Settings
+
+As a user,
+I want to choose how large each segment gets,
+So that recordings match my disk and cleanup habits.
+
+**Requirements:** FR-72 (settings leg), AD-25
+**Dependencies:** 17.1, 17.2
+
+**Acceptance Criteria:**
+
+**Given** recording settings
+**When** they are read or written
+**Then** segment size (default 500 MB) and duration-cap fallback (default 30 min) persist in `keeper.db` behind `keeper-core::settings` — no `tauri-plugin-store`/sql (AD-25) — and are passed to the sidecar on `start{segmentMB, …}` (FR-72).
+
+**Given** a configured segment size
+**When** recording runs
+**Then** the value is respected within one keyframe interval of file growth (FR-72).
+
+**Given** the two surfaces
+**Then** Settings → Recording and the setup card mirror the same values, and changing either affects future sessions only (FR-72, UX-DR29).
+
+## Epic 18: Tray & Loud Failures — The Menu Bar Tells the Truth
+
+Make the menu bar the always-truthful recording surface and every fault loud: tray recording/warning/error states with a live elapsed·segment·size line, Stop, and Open Recordings Folder; forced tray presence with exact restore; honest quit-while-recording; the in-app active-recording banner; the loud-failure triad (tray + notification + banner); and the disk-space guard. This is research R.3 plus the NFR-20 guard, extending Story 10.3 / AD-18.
+
+### Story 18.1: Tray Recording State — Elapsed·Segment·Size, Stop, Open Folder
+
+As a user,
+I want the menu bar to show that keeper is recording, for how long, and let me stop with one click,
+So that a live recording is never something I can forget about.
+
+**Requirements:** FR-74, AD-39; UX-DR32
+**Dependencies:** Epic 16, Epic 17 (segment info)
+
+**Acceptance Criteria:**
+
+**Given** the opt-in tray (`crates/keeper/src/tray.rs`, single mutex-guarded `TrayIcon` slot)
+**When** a recording starts
+**Then** within 1 s the tray reflects `recording` via `TrayIcon::set_icon` (record-dot badge asset), a ~1 Hz tick updates a disabled menu line (`"Recording — 12:34 · segment 3, 412 MB"`), and the menu adds **Stop Recording** and **Open Recordings Folder** (FR-74, AD-39).
+
+**Given** the tray menu
+**When** the user chooses Stop Recording
+**Then** the current segment finalizes and the session reaches `finalized`; Open Recordings Folder reveals the session folder (FR-74).
+
+**Given** macOS's own screen-recording indicator
+**Then** the system purple pill is left untouched — keeper's tray adds what the pill lacks (elapsed, segment, Stop, error states) (FR-74, AD-39).
+
+### Story 18.2: Forced Tray Presence & Honest Quit-While-Recording
+
+As a user,
+I want the recording indicator to always be visible and quitting to never orphan a recorder,
+So that recording is never silently running and quitting never loses the tail.
+
+**Requirements:** FR-74, AD-39; FR-53 (quit-honesty extension)
+**Dependencies:** 18.1
+
+**Acceptance Criteria:**
+
+**Given** the FR-53 opt-in tray toggle is **off**
+**When** a recording starts
+**Then** recording **temporarily forces the tray visible**, and Stop restores the exact prior tray configuration — a recording indicator that isn't visible is a bug (FR-74, AD-39).
+
+**Given** a quit (`⌘Q`) while recording
+**When** the user confirms
+**Then** keeper warns first, then runs the `stop` RPC → flush → **kill-timeout guard**, finalizing the current segment before exit and never orphaning `keeper-rec` — extending FR-53's quit honesty; even a hung sidecar is force-terminated after the timeout (FR-74, AD-39).
+
+### Story 18.3: In-App Active-Recording Banner & Segment Meter
+
+As a user,
+I want an in-app twin of the tray while I'm in the Recording view,
+So that the recording state is honest whether I'm looking at the menu bar or the app.
+
+**Requirements:** FR-74/FR-75 (in-app surface); UX-DR31, UX-DR30
+**Dependencies:** 18.1
+
+**Acceptance Criteria:**
+
+**Given** an active recording
+**When** the Recording view is open
+**Then** the `active-recording-banner` pins to the top — record dot + `mono` "Recording — 12:34 · segment 3 · 412 MB" + Stop (destructive-outline) — **persistent, never toast-only**, and the `segment-meter` fills toward the segment size and resets at each gapless rotation (UX-DR31).
+
+**Given** the recording-red token
+**Then** it appears **only** on the record dot, the banner edge, and the error banner — never on buttons, text, hovers, or decoration — and reduced-motion keeps the dot steady, never pulsing (UX-DR30).
+
+**Given** a fault
+**Then** the banner renders warning and error variants (the loud-failure surface wired in Story 18.4) with a "Restart recording" affordance; Pause is absent this phase (UX-DR31).
+
+### Story 18.4: Loud-Failure Triad — Tray Error + Notification + Banner
+
+As a user,
+I want every recording fault to be impossible to miss,
+So that no recording ever fails silently.
+
+**Requirements:** FR-75, AD-39, AD-18, NFR-5
+**Dependencies:** 18.1, 18.3
+
+**Acceptance Criteria:**
+
+**Given** a recorder crash/exit, writer stall, or device loss
+**When** the fault occurs
+**Then** the tray flips to `error`, a native notification posts within 5 s through the **AD-18 pipeline** (FR-51/NFR-7) offering one-click restart of the recording, and the banner shows the error variant naming the reason; the session manifest records the true terminal status `failed` (FR-75, AD-39).
+
+**Given** any started Recording Session
+**Then** it reaches a user-visible terminal state — `finalized | recovered | failed` — extending NFR-5's no-silent-loss to recordings; non-fatal warnings persist until resolved or acknowledged, never a dismissed-and-gone toast (FR-75, NFR-5).
+
+**Given** the induced-failure coverage
+**Then** recorder-kill, writer-stall, and device-loss legs are induced in automated tests here; the **live permission-revoke-mid-record** leg (with already-written segments intact) is validated on hardware at SM-10 acceptance (Story 20.6) (FR-75).
+
+### Story 18.5: Disk-Space Guard — Warn & Graceful Stop-and-Finalize
+
+As a user,
+I want keeper to protect me from filling the disk mid-meeting,
+So that a long recording degrades gracefully instead of dying mid-write.
+
+**Requirements:** NFR-20, AD-39, AD-33
+**Dependencies:** 18.3, 18.4, Epic 17 (finalize path)
+
+**Acceptance Criteria:**
+
+**Given** a start request
+**When** the target folder is validated
+**Then** pre-start free-space validation runs (alongside exists/writable) with an actionable error before any capture begins (NFR-20, FR-71).
+
+**Given** a running recording
+**When** free space on the target volume crosses a threshold
+**Then** the disk-guard **policy in `keeper-core::recording`** — driven by free-space on the sidecar's `state` events (AD-39 ownership split) — raises a **persistent warning** below the warn threshold (authored default 10 GB) and **gracefully stops-and-finalizes** below the hard floor (authored default 2 GB), saying so, rather than running the volume to exhaustion or dying mid-write (NFR-20).
+
+**Given** the authored thresholds
+**Then** they are owner-sign-off items at phase release (PRD §14.7) and are testable via a simulated low-free-space signal without physically filling a disk (NFR-20).
+
+## Epic 19: Sources & Devices — Choose What and Whom to Capture
+
+Give the user real control over what and whom to capture: a live application/window picker with app-scoped audio, a system-audio toggle, a microphone written as its own track with hot-unplug resilience, a destination-folder chooser, and an advanced fps control. This is research R.4 + R.5.
+
+### Story 19.1: Application/Window Picker — SCShareableContent Live List
+
+As a user,
+I want to record a single application instead of my whole screen,
+So that only the app I'm demoing is in the file — not my notifications or other windows.
+
+**Requirements:** FR-68 (app-picker leg), AD-34; UX-DR29
+**Dependencies:** Epic 16, Epic 17
+
+**Acceptance Criteria:**
+
+**Given** `listSources` (AD-34)
+**When** the source picker renders
+**Then** it lists Displays then Applications with names and icons (single-select), and **re-enumerates as applications launch and quit** (FR-68).
+
+**Given** an app-scoped selection
+**When** recording runs
+**Then** only that application's windows are captured — keeper itself, other apps, and incoming notification banners never appear in the file — and the setup discloses this inline ("only {App}'s windows and audio — keeper, other apps, and notification banners are excluded") (FR-68, UX-DR34).
+
+**Given** a source that disappeared before Start
+**When** the user presses Start
+**Then** a clear inline error appears, never a hung recording; on multi-display setups each display is individually selectable (FR-68).
+
+### Story 19.2: System-Audio Toggle & Per-App Audio Scoping
+
+As a user,
+I want to choose whether the recorded content's audio is captured,
+So that I control what sound lands in the file — and my own notification sounds never do.
+
+**Requirements:** FR-69 (system-audio leg), FR-68
+**Dependencies:** 19.1
+
+**Acceptance Criteria:**
+
+**Given** the Audio card
+**When** it renders
+**Then** a System audio `Switch` (default **on**) is labelled as "the audio the recorded content plays" — not a device pick — and system audio is captured via `capturesAudio` scoped by the same `SCContentFilter` with `excludeCurrentProcessAudio = true` (FR-69).
+
+**Given** an app-scoped recording with system audio on
+**Then** only that application's audio is captured, keeper's own notification sounds are excluded, and system audio is written as its **own AAC track**, never premixed (FR-69).
+
+### Story 19.3: Microphone Picker & Separate Track
+
+As a user,
+I want to add my microphone as a separate audio track,
+So that my voice is captured alongside the content and can be edited independently later.
+
+**Requirements:** FR-69 (mic leg), AD-36 (mic probe)
+**Dependencies:** 19.2
+
+**Acceptance Criteria:**
+
+**Given** the Audio card
+**When** the microphone `device-picker` renders
+**Then** it defaults to "System default input", and Microphone permission is requested **only when this source is enabled**, never preemptively (FR-69, AD-36).
+
+**Given** an enabled microphone
+**When** recording runs
+**Then** the mic is written as its **own AAC track** (never premixed with system audio) so stock players (QuickTime, browsers, VLC) play the two together and editors can separate them, using in-stream `captureMicrophone` on macOS 15+ and a parallel `AVCaptureSession` on 13–14 (same writer either way, invisible to the user) (FR-69).
+
+### Story 19.4: Microphone Hot-Unplug Resilience
+
+As a user,
+I want unplugging my mic mid-meeting to never kill the recording,
+So that a bumped cable costs a warning, not the whole session.
+
+**Requirements:** FR-69 (hot-unplug leg); FR-74/FR-75 (warning surface)
+**Dependencies:** 19.3, Epic 18 (warning surface)
+
+**Acceptance Criteria:**
+
+**Given** a running recording with a microphone
+**When** the mic is unplugged
+**Then** the recording **never aborts** — video and system audio keep rolling, the mic track continues **silence-filled**, keeper attempts fallback to the system default input, and a **persistent warning state** is raised on the tray and banner (FR-69, FR-74/FR-75).
+
+**Given** device churn
+**When** microphones connect/disconnect
+**Then** keeper re-enumerates on device notifications; the never-abort behavior is validated via a simulated device-removal signal (real Continuity-Camera/mic churn on hardware is folded into SM-10 acceptance, Story 20.6) (FR-69).
+
+### Story 19.5: Destination-Folder Chooser & fps Advanced Control
+
+As a user,
+I want to pick where recordings are saved and, if I care, the frame rate,
+So that files land where I expect and the defaults stay out of my way.
+
+**Requirements:** FR-71 (folder-chooser leg), FR-72 (fps leg), AD-25
+**Dependencies:** Epic 17 (settings), 19.1
+
+**Acceptance Criteria:**
+
+**Given** the Destination card
+**When** it renders
+**Then** a folder chooser shows the remembered default `~/Movies/keeper`, and a **validate-on-Start** check (exists, writable, free space per NFR-20) blocks start with actionable errors (FR-71).
+
+**Given** the collapsed Advanced group
+**When** the user opens it
+**Then** fps is selectable (30 default, 60 selectable) and passed to the sidecar on `start{fps}` (FR-72).
+
+**Given** the two surfaces
+**Then** folder and fps persist in `keeper.db` behind `keeper-core::settings` (AD-25), mirror Settings → Recording, and changing either affects the next session only (FR-71/FR-72).
+
+## Epic 20: Webcam & Polish — Ship the Phase
+
+Close the phase: optional webcam as a separate synchronized file, the Microphone/Camera pre-flight rows, the completion/recovery card, palette actions + optional global hotkey + the capability-gating and zero-egress audits, docs/recording.md, the reliability envelope (4 h soak + CPU/memory), and the SM-9/SM-10 phase acceptance with retrospective inputs. This is research R.6 + R.7.
+
+### Story 20.1: Optional Webcam as a Separate Synchronized File
+
+As a user,
+I want my webcam recorded alongside the screen as its own file,
+So that I have a talking-head track without burning it into the screen recording.
+
+**Requirements:** FR-70, AD-37; NFR-22 (alignment)
+**Dependencies:** Epic 17 (rotation/manifest), Epic 19 (device-picker pattern)
+
+**Acceptance Criteria:**
+
+**Given** the Webcam card
+**When** it renders
+**Then** a `Switch` (default **off**) reveals a camera `device-picker` (built-in / external / Continuity Camera); Camera permission is requested only when enabled, and webcam off produces no camera files and touches no Camera permission (FR-70, AD-36).
+
+**Given** an enabled webcam
+**When** recording runs
+**Then** the camera records `camera-####.mp4` in the same session folder from a **second in-sidecar AVAssetWriter**, host-clock anchored and **rotated at the same segment boundaries** as `screen-####`, so played side by side from any segment index the two stay aligned within one video frame — populating the Story 17.4 screen↔camera alignment assertion (FR-70, AD-37, NFR-22).
+
+**Given** camera loss mid-recording
+**Then** the screen recording continues (never aborts) with a warning raised, and there is **no PiP burn-in and no self-view bubble** this phase; UX copy may note that macOS 14+ can composite the camera via the system presenter overlay — an OS behavior, not a keeper feature (FR-70, UX-DR34).
+
+### Story 20.2: Microphone & Camera TCC Pre-flight Rows
+
+As a user,
+I want the permission pre-flight to cover my mic and camera when I enable them,
+So that every source I turn on has an honest, fixable permission state before I start.
+
+**Requirements:** FR-67 (Mic/Camera legs), AD-36; UX-DR33
+**Dependencies:** 16.5 (pre-flight mechanism), 19.3 (mic), 20.1 (camera)
+
+**Acceptance Criteria:**
+
+**Given** the pre-flight (from Story 16.5)
+**When** microphone or webcam is enabled
+**Then** it adds a Microphone row and/or a Camera row, each live-detected at render (never cached), requested via the system prompt on enable (never preemptively), with a deep-link fix-path when only manual granting remains; the camera row is absent when webcam is off (FR-67, AD-36, UX-DR33).
+
+**Given** a blocking source permission
+**Then** Start is disabled naming it, and `NSMicrophoneUsageDescription` / `NSCameraUsageDescription` are present in keeper's bundle `Info.plist` via the Tauri `bundle.macOS.infoPlist` merge (FR-67, AD-36).
+
+### Story 20.3: Completion / Reveal-in-Finder & Startup Recovery Notice
+
+As a user,
+I want a clear end-of-recording summary and an honest notice when a session was interrupted,
+So that I always know where my files are and that nothing was silently lost.
+
+**Requirements:** FR-71 (completion leg), FR-73 (recovery-notice leg); UX-DR34
+**Dependencies:** Epic 17 (recovery/ledger), 16.6 (stop path), 18.1 (tray restore)
+
+**Acceptance Criteria:**
+
+**Given** a Stop
+**When** the session finalizes
+**Then** the Recording view shows a completion `Card` — "Saved N segments · {size}" + the session-folder path in `mono` + a primary **Reveal in Finder** — with no preview, trim, or share affordance, and the tray returns to its exact prior configuration (FR-71, FR-76, UX-DR34).
+
+**Given** an interrupted session (marked `recovered` by Story 17.3)
+**When** keeper starts or is about to begin a new recording
+**Then** it surfaces **once** as "A recording was interrupted; N segments were saved" — the same card shape with a `bridge-degraded`-tinted edge, linking the folder — and recovered files play as-is with no remux (FR-73, UX-DR34).
+
+### Story 20.4: Palette Actions, Global Hotkey, Capability-Gating & Zero-Egress Audit
+
+As a user,
+I want to start/stop recording from the palette or a global hotkey, and I want proof recording never leaks,
+So that recording is fast to reach and provably local-only.
+
+**Requirements:** FR-66 (gating audit), FR-48 (palette), FR-50 (hotkey), FR-76 (egress); AD-35
+**Dependencies:** 16.3, Epic 18, Epic 19
+
+**Acceptance Criteria:**
+
+**Given** the `recording` flag on
+**When** the Command Palette and Shortcuts render
+**Then** "Start recording", "Stop recording", and "Open recordings folder" actions are registered **only behind the flag** (FR-66/FR-48), and an optional configurable global Start/Stop Recording hotkey (unset by default) is assignable in Settings → Shortcuts with conflict detection (FR-50) — Stop remains one click from the tray regardless (FR-74).
+
+**Given** the destructive-by-omission guard
+**Then** there are no single-key verbs on this surface and `Esc` does **not** stop a recording — stopping is always explicit (UX-DR29).
+
+**Given** the gating audit
+**Then** a test confirms no recording surface (sidebar, Settings, palette, tray) renders on macOS < 13.0 or iOS — absent, not disabled (FR-66, AD-35).
+
+**Given** the zero-egress audit
+**Then** a full record → stop → recover cycle contacts no new hosts, and the NFR-11 per-release egress inventory diff for the phase is **empty** — verifiable at review and at runtime; no upload/share/transcription/cloud affordance exists anywhere in the recording UI (FR-76).
+
+### Story 20.5: Reliability Envelope — 4 h Soak & CPU/Memory Verification
+
+As the owner,
+I want the long-run and performance bars measured on real hardware,
+So that "records for hours without falling over" is evidence, not a hope.
+
+**Requirements:** NFR-19, NFR-21, AD-39
+**Dependencies:** Epic 17, Epic 18, Epic 19, 20.1
+**Human-in-the-loop:** **yes** — a 4 h continuous capture on reference Apple Silicon with an **Apple Development-signed build**; the automation loop defers it to the coordinator instead of escalating.
+
+**Acceptance Criteria:**
+
+**Given** a 4 h continuous recording (1080p-class display, 30 fps, system audio + microphone)
+**When** the soak runs on reference hardware
+**Then** it completes with **zero** recorder crashes, writer stalls, or A/V desync and no unbounded memory growth; sample-buffer queues stay bounded with a **drop-oldest-video** policy (audio never dropped), and sustained dropping raises a warning (FR-75) (NFR-19).
+
+**Given** the performance envelope
+**When** measured during recording
+**Then** it adds **< 100% of one core** average CPU and **< 400 MB** combined RSS (sidecar + keeper), and keeper's messaging bars NFR-1–NFR-4 still hold while recording (NFR-21).
+
+**Given** the authored bars (NFR-19 duration, NFR-21 numbers)
+**Then** the measurements are recorded and the owner confirms or adjusts them (PRD §14.7 open #1) before they become release gates — mirroring the AD-22/NFR-3 posture (NFR-19, NFR-21).
+
+### Story 20.6: SM-9 / SM-10 Phase Acceptance, docs/recording.md & Retrospective Inputs
+
+As the owner,
+I want the phase demonstrated end-to-end on hardware, documented, and accepted,
+So that recording ships on evidence and the retrospective has its inputs.
+
+**Requirements:** SM-9, SM-10; FR-75 (induced-failure matrix), FR-76 (egress); FR-67/AD-38 (docs disclosures); retrospective inputs
+**Dependencies:** 20.1, 20.2, 20.3, 20.4, 20.5 (+ Epics 16–19 complete)
+**Human-in-the-loop:** **yes** — a physical Mac with a Development-signed build, real TCC grants (including a live permission-revoke mid-record) and real device churn. This is the phase's final device step; the automation loop defers it to the coordinator instead of escalating.
+
+**Acceptance Criteria:**
+
+**Given** SM-9 on a Development-signed build on macOS 13+ hardware
+**When** the end-to-end gate runs
+**Then** permission pre-flight → full-screen **and** app-scoped recording with system audio + microphone (+ webcam as a separate file) → segments rotate at the configured size into the chosen folder with a valid manifest → an induced crash recovers per FR-73 — binary, demo-able, release-gating (SM-9, validates FR-66–FR-76).
+
+**Given** SM-10
+**When** reliability is checked
+**Then** the NFR-19 soak (Story 20.5) is green, the induced-failure matrix (recorder kill, mic unplug, disk floor, **permission revoke**) surfaces loudly in **100%** of tests with already-written segments intact (FR-75), zero silent recording-loss incidents occur during dogfooding, and the NFR-11 egress diff for the phase is empty (FR-76) (SM-10).
+
+**Given** `docs/recording.md`
+**When** written
+**Then** it covers the **dev-signing requirement** (Apple Development certificate; macOS 15+ ad-hoc SCK rejection, Cap #1722), the **monthly re-auth nag** for non-picker SCK, the untouched macOS purple capture pill, and the disk-guard / segment-size / folder defaults — **one-to-one with the in-app disclosures** so app and docs never diverge; English, honest per the voice rules, and free of credentials or signing material (FR-67, AD-38).
+
+**Given** the phase retrospective
+**Then** its inputs are recorded: outcomes against the §14.6 risk register (TCC/ad-hoc signing, sidecar notarization, monthly nag, disk exhaustion, long-run stability, gapless-rotation correctness, API drift, device churn) and the deferred-work ledger opened this phase (pause/resume, webcam PiP burn-in + self-view, `SCContentSharingPicker` path, HEVC/HDR, DND-while-recording, orphan-segment remux, in-app recordings browsing, Windows/Linux recording).
+
+**Epic 20 exit / phase acceptance:** SM-9 green on dev-signed hardware; SM-10 reliability bars met; docs/recording.md current; authored bars owner-confirmed; retrospective inputs on file.
+
 ## Post-MVP — Not Storied (Flagged Only)
 
 Per PRD §5/§6.2 these are explicitly out of MVP; no stories exist for them and none may be smuggled in:
@@ -2402,6 +3086,15 @@ iOS phase (PRD §13.4 + spine Deferred) — explicitly out of this phase, no sto
 - Share extension, home-screen widgets, Siri intents, biometric app lock; full Dynamic Type adoption (rem-scaling is the phase bar per FR-60)
 - Disk-backed streaming of large media (capped in-memory buffer is the phase posture, AD-28); micro Swift lifecycle plugin (only if `visibilitychange` proves unreliable, AD-30); Android's `convertMediaSrc` media-URL helper (introduced only when Android starts)
 - iPad layout; `NWPathMonitor`-driven fast retry; share-sheet media save
+
+Screen Recording phase (PRD §14.4 + spine Deferred) — explicitly out of this phase, no stories:
+
+- **Video editing — never** (§5): keeper records; it does not trim, annotate, or compose. **Any cloud upload, share service, transcription, or remote processing — never** (§5, FR-76): the recording UI ends at Reveal in Finder.
+- Pause/resume, webcam **PiP burn-in**, and a camera self-view preview bubble — deliberately after the capture core is trustworthy (AD-34's contract + AD-37's format are the carry-over seams)
+- `SCContentSharingPicker` system-picker path (macOS 14+, also silences the monthly re-auth nag), HEVC/HDR capture, DND-while-recording, and an orphan-segment "tidy" remux pass — later
+- The `persistent-content-capture` entitlement (would remove the monthly re-auth nag) — requires the paid Apple Developer Program and Apple approval; sits behind the §13.5-class paid-program gate (recorded in Story 15.5), accepted and disclosed instead (FR-67)
+- In-app recordings browsing (a list of past sessions inside keeper) — MVP is folder + Finder + the tray's Open Recordings Folder (PRD §14.7 open #2); the inbox/settings projection patterns (AD-20/AD-25) are the extension point
+- Windows/Linux recording — follows those platforms (§6.2); `CapabilitiesVm.recording` (AD-35) and the platform-free `recording` module (AD-33) are the platform-neutral seams (a non-macOS `Recorder` impl replaces `keeper-rec`)
 
 ## Validation Summary
 
@@ -2421,6 +3114,16 @@ iOS phase (PRD §13.4 + spine Deferred) — explicitly out of this phase, no sto
 - **Gates:** SM-7 = Epic 12 exit (Story 12.6); SM-8 opens at Story 15.6; Epic 13 and Epic 14 are parallelizable after SM-7; Epic 15 closes the phase.
 - **Human-in-the-loop:** exactly two stories require a physical device and the owner — 12.6 (on-device skeleton validation) and 15.6 (final device install) — both explicitly marked so the automation loop defers them to the coordinator rather than escalating; every other iOS story is implementable with simulator/compile gates alone.
 - **Sizing:** 26 stories across Epics 12–15 (6 + 7 + 7 + 6), each scoped to a single dev session; total 89 stories across 15 epics.
+
+**Phase 3 (Screen Recording, appended 2026-07-16):**
+
+- **FR coverage:** FR-66–FR-76 all mapped (see FR Coverage Map); split FRs have every leg assigned — FR-67 (Screen leg 16.5 / Mic+Camera rows 20.2), FR-68 (full-screen 16.6 / app-picker 19.1), FR-69 (system-audio 16.6 / toggle 19.2 / mic 19.3 / hot-unplug 19.4), FR-71 (single-file 16.6 / session-folder+manifest 17.2 / folder-chooser 19.5 / completion 20.3), FR-72 (rotation 17.1 / settings 17.5 / fps 19.5), FR-73 (recovery 17.3 / notice 20.3).
+- **NFR coverage:** NFR-22 engineered in Story 17.1 and gated by the automated concat-assert test 17.4; NFR-20 disk guard in 18.5; NFR-19 soak and NFR-21 CPU/memory envelope measured on reference hardware in Story 20.5 and explicitly **not** release-gating until the owner confirms the authored bars (PRD §14.7 open #1), mirroring the AD-22/NFR-3 posture.
+- **UX-DR coverage:** UX-DR29–UX-DR34 each referenced by at least one story's ACs (recording view/gating, recording-red token, active banner + segment meter, tray states, permission rows, completion/recovery + voice).
+- **Architecture compliance:** AD-38 (sidecar layout/codesign/externalBin) lands in 16.1; AD-33 (recording split + Recorder port) in 16.2; AD-35 (capability flag) in 16.3; AD-34 (NDJSON-RPC contract) in 16.4/16.6; AD-36 (three TCC classes) in 16.5/20.2; AD-37 (format/segmentation/recovery) across 16.6/17.1/17.2/17.3/20.1; AD-39 (tray + honest quit + loud failure) across 18.1–18.5; the platform-free `recording` core never holds an Apple API or process handle (16.2), and every recording surface renders only behind `CapabilitiesVm.recording` (16.3, audited in 20.4).
+- **Gates:** R.1 / SM-9-seed = Epic 16 exit (Story 16.6, real recording plays back); the NFR-22 concat-assert gate lands in 17.4; SM-9 (end-to-end) and SM-10 (reliability + induced-failure matrix + empty egress diff) are accepted in Story 20.6; Epics 17 and 18 build on Epic 16 and Epic 19 follows, with Epic 20 closing the phase.
+- **Human-in-the-loop:** exactly three stories require a physical Mac, real TCC grants, and an Apple Development-signed build (macOS 15+ rejects ad-hoc ScreenCaptureKit, Cap #1722) — 16.6 (first real capture / walking-skeleton exit), 20.5 (4 h soak + CPU/memory envelope), and 20.6 (SM-9/SM-10 phase acceptance) — all explicitly marked so the automation loop defers them to the coordinator; every other recording story is implementable with compile gates, unit tests, stub sidecars, fixture segments, and simulated fault/low-disk/device-removal signals.
+- **Sizing:** 27 stories across Epics 16–20 (6 + 5 + 5 + 5 + 6), each scoped to a single dev session on the existing macOS app; total 116 stories across 20 epics.
 
 
 
