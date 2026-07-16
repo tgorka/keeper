@@ -5,7 +5,8 @@ macOS-first, with iOS/iPadOS, Windows, Android, and Linux planned (single Tauri 
 
 Keeper is a **client only** — it connects to Matrix homeservers (including Beeper's) and to
 [mautrix bridges](https://github.com/mautrix) you host yourself or run locally, in the same way
-the Beeper apps do. No server-side components live in this repository.
+the Beeper apps do. No server-side components live in this repository. To self-host a
+compatible homeserver + bridges, see [deploy/companion-stack](deploy/companion-stack/).
 
 ## Features (planned / in progress)
 

@@ -23,6 +23,8 @@ risk sections.
   are study-only references. cargo-deny enforces an Apache/MIT-compatible dependency tree.
 - **No hosted anything.** No relay servers, no credential custody, no hosted bridges — ToS
   and liability stay with the user, which is the project's legal posture.
+  [deploy/companion-stack](../deploy/companion-stack/) provides self-hosting configs only
+  (Synapse + mautrix bridges operated by the user; keeper hosts nothing).
 - **No WhatsApp automation features** (bulk send, auto-reply) — ban-bait for bridge users.
 - **No native VoIP implementation now.** MatrixRTC (MSC4143) is pre-spec and volatile;
   calls arrive post-MVP via the Element Call widget.
