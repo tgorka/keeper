@@ -92,16 +92,55 @@ jobs:
       # hdiutil (bundle_dmg AppleScript styling is flaky headless), draft release via gh.
       - name: Build unsigned (ad-hoc) bundle
         if: steps.signing.outputs.signed == 'false'
+        env:
+          # Updater (minisign) signing is independent of Apple codesigning: when the
+          # keypair secrets exist, even Apple-unsigned builds ship signed updater
+          # artifacts + latest.json, so in-app auto-update works. Without them the
+          # build falls back to no updater artifacts (first bootstrap releases).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # "-" = ad-hoc codesign during bundling, so the updater tar.gz contains the
+          # final (ad-hoc-signed) app rather than an unsigned one.
+          APPLE_SIGNING_IDENTITY: "-"
         run: |
           set -euo pipefail
-          # createUpdaterArtifacts=false: unsigned builds ship no updater artifacts, so
-          # the committed updater pubkey doesn't force TAURI_SIGNING_PRIVATE_KEY here.
-          bun run tauri build --config src-tauri/crates/keeper/tauri.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --target aarch64-apple-darwin --bundles app
-          APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/keeper.app"
-          codesign --force --deep -s - "$APP"
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            bun run tauri build --config src-tauri/crates/keeper/tauri.conf.json --target aarch64-apple-darwin --bundles app
+          else
+            bun run tauri build --config src-tauri/crates/keeper/tauri.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --target aarch64-apple-darwin --bundles app
+          fi
+          BUNDLE="src-tauri/target/aarch64-apple-darwin/release/bundle/macos"
+          APP="$BUNDLE/keeper.app"
+          codesign --verify "$APP" 2>/dev/null || codesign --force --deep -s - "$APP"
           VERSION="${GITHUB_REF_NAME#v}"
           hdiutil create -volname "keeper" -srcfolder "$APP" -ov -format UDZO "keeper_${VERSION}_aarch64.dmg"
           ditto -c -k --keepParent "$APP" "keeper_${VERSION}_aarch64_app.zip"
+          # Updater artifacts (only when the signing key was present): normalize names
+          # and compose latest.json for the tauri-plugin-updater endpoint
+          # (.../releases/latest/download/latest.json).
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            TARBALL=$(find "$BUNDLE" -maxdepth 1 -name "keeper*.app.tar.gz" | head -1)
+            SIGFILE="$TARBALL.sig"
+            cp "$TARBALL" "keeper_${VERSION}_aarch64.app.tar.gz"
+            cp "$SIGFILE" "keeper_${VERSION}_aarch64.app.tar.gz.sig"
+            SIGNATURE=$(cat "$SIGFILE")
+            PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/keeper_${VERSION}_aarch64.app.tar.gz"
+            SIGNATURE="$SIGNATURE" URL="$URL" VERSION="$VERSION" PUB_DATE="$PUB_DATE" python3 - <<'PY'
+          import json, os
+          json.dump({
+              "version": os.environ["VERSION"],
+              "notes": "keeper release",
+              "pub_date": os.environ["PUB_DATE"],
+              "platforms": {
+                  "darwin-aarch64": {
+                      "signature": os.environ["SIGNATURE"],
+                      "url": os.environ["URL"],
+                  }
+              },
+          }, open("latest.json", "w"), indent=2)
+          PY
+          fi
 
       - name: Publish unsigned draft release
         if: steps.signing.outputs.signed == 'false'
@@ -110,12 +149,14 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          ASSETS=("keeper_${VERSION}_aarch64.dmg" "keeper_${VERSION}_aarch64_app.zip")
+          [ -f latest.json ] && ASSETS+=("keeper_${VERSION}_aarch64.app.tar.gz" "keeper_${VERSION}_aarch64.app.tar.gz.sig" "latest.json")
           gh release create "$GITHUB_REF_NAME" \
             --draft \
             --title "keeper $GITHUB_REF_NAME (unsigned build)" \
-            --notes "Unsigned (ad-hoc) macOS build — first launch requires right-click → Open. Add Apple signing secrets per docs/release.md for notarized releases." \
-            "keeper_${VERSION}_aarch64.dmg" "keeper_${VERSION}_aarch64_app.zip" \
-          || gh release upload "$GITHUB_REF_NAME" "keeper_${VERSION}_aarch64.dmg" "keeper_${VERSION}_aarch64_app.zip" --clobber
+            --notes "Unsigned (ad-hoc) macOS build — first launch requires right-click → Open. In-app auto-update is enabled via signed updater artifacts. Add Apple signing secrets per docs/release.md for notarized releases." \
+            "${ASSETS[@]}" \
+          || gh release upload "$GITHUB_REF_NAME" "${ASSETS[@]}" --clobber
 
       # Per-release egress diff note (Story 11.2, NFR-11, AD-23): docs/egress.md is the
       # canonical, diffable egress surface. Diff it against the previous tag into the job
