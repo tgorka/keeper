@@ -1,0 +1,45 @@
+src-tauri/crates/keeper-core/src/recording.rs
+  s_b447f058d0fe8f::t_b15b16084c999f 740-741,744
+  s_b447f058d0fe8f::t_eb839e33cee1ed 739,742-743,745-746,754-755
+_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md
+  s_b447f058d0fe8f::t_795786cd1e7caf 187-191
+  s_b447f058d0fe8f::t_2f236065d52ad9 9
+  s_8b5b218cd31ce5::t_63d38d62d8ebae 5
+  s_b447f058d0fe8f::t_ce77b0869e38e4 95-103
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_b447f058d0fe8f::t_59444172a1f072 955-964
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_1b93e9af0c02cd::t_88ebbcecf30dae 172
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "9d831f4588017324e720ae06ea0516928504477c",
+  "prompts": {},
+  "sessions": {
+    "s_1b93e9af0c02cd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bdd93b72-c573-4e08-9894-1d953bf91806",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_8b5b218cd31ce5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ac61d8c2-8e6a-443e-99d8-587317898f09",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_b447f058d0fe8f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "966088eb-677d-44e6-aef8-7ad455905652",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
