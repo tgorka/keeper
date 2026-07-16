@@ -1,0 +1,150 @@
+src/components/layout/phone-search-surface.test.tsx
+  s_b8766f6952d181::t_fe8d16ce521068 49
+src/hooks/use-webview-guard.test.ts
+  s_b8766f6952d181::t_87a20d89847672 28
+src-tauri/crates/keeper/src/ipc.rs
+  s_b8766f6952d181::t_fd3ea7f92025f7 2916-2922
+  s_b8766f6952d181::t_ac3081eeed9867 2935-2939
+  s_b8766f6952d181::t_bf4487b79e85eb 1105-1108
+src-tauri/crates/keeper-core/src/account.rs
+  s_b8766f6952d181::t_8e242b9bc2c1e1 699,702
+_bmad-output/implementation-artifacts/spec-16-3-recording-capability-flag-and-gated-recording-surface.md
+  s_b8766f6952d181::t_a77d3c30ef1fad 92
+  s_09359ba34cb97a::t_83a68da5490012 1-4,8-77,93-101,103-123
+  s_09359ba34cb97a::t_51eae5e53b1eba 6
+  s_b8766f6952d181::t_86809bdbd87ef0 124-167
+  s_09359ba34cb97a::t_4aaad23fbdc4cd 102
+  s_b8766f6952d181::t_15e2952f3cdc20 5
+  s_b8766f6952d181::t_6b5c96b0606647 84-91
+  s_b8766f6952d181::t_b4e794e3676ac1 79-83
+  s_b8766f6952d181::t_4df4a75183f904 78
+  s_09359ba34cb97a::t_aac7920c4ab72a 7
+src/components/layout/sidebar-pane.tsx
+  s_b8766f6952d181::t_f88197a7551dd6 89,91-92,104-108,113-114
+  s_b8766f6952d181::t_cc1a53a23bc7a5 1
+  s_b8766f6952d181::t_26ed7eb8c42b1e 12
+  s_b8766f6952d181::t_07696df9947af5 22-25,32-36
+  s_b8766f6952d181::t_a59150d5ac7c99 70-76
+  s_b8766f6952d181::t_8f0fa7beff98d9 37
+src/components/layout/recording-pane.tsx
+  s_b8766f6952d181::t_e9f3517292babf 1-64
+src/components/layout/app-shell.tsx
+  s_b8766f6952d181::t_fb997da01d3718 32
+  s_b8766f6952d181::t_41cb95126caef6 104-107
+  s_b8766f6952d181::t_ff472df8d6459b 67-69
+  s_b8766f6952d181::t_ad0805c79d4d2e 143-145
+  s_b8766f6952d181::t_8d716ab40898d1 12
+src/hooks/use-recording-shortcut.ts
+  s_b8766f6952d181::t_1c53a25b568259 12
+  s_b8766f6952d181::t_fe645993142a7f 1-11,13-47
+src/lib/rendered-window.ts
+  s_b8766f6952d181::t_557e6e383d99ef 7-8
+  s_b8766f6952d181::t_0949f9767c8893 21-22
+src-tauri/crates/keeper-core/src/vm.rs
+  s_b8766f6952d181::t_782a81e5852e55 2420-2424
+  s_b8766f6952d181::t_c00f356404b349 110-114
+src/lib/ipc/gen/CapabilitiesVm.ts
+  s_b8766f6952d181::t_4732a5ecef4507 47-50
+  s_b8766f6952d181::t_fbf369b5693353 45-46,51-52
+src/components/command-palette/palette-rows.test.tsx
+  s_b8766f6952d181::t_406e254a3ca32a 30
+src/components/settings/no-background-sync-disclosure.test.tsx
+  s_b8766f6952d181::t_87a20d89847672 31
+src/components/layout/app-shell.test.tsx
+  s_b8766f6952d181::t_d17cabff7961c5 39-40
+  s_b8766f6952d181::t_ecef49e33164f2 109-129
+  s_b8766f6952d181::t_fd9ea984e33d50 4,6
+src/hooks/use-nav-state-persistence.test.ts
+  s_b8766f6952d181::t_87a20d89847672 30
+src/components/command-palette/actions.ts
+  s_b8766f6952d181::t_040d0f8fa24eff 60-63
+src/hooks/use-stale-resume-pill.test.ts
+  s_b8766f6952d181::t_87a20d89847672 20
+src/lib/stores/primary-view.ts
+  s_b8766f6952d181::t_d86b35e26f3b95 14-17,19
+src/components/layout/sidebar-pane.test.tsx
+  s_b8766f6952d181::t_3933fa1841ec2c 27
+  s_b8766f6952d181::t_90da48082d9005 63,72
+  s_b8766f6952d181::t_fb499be7a38e2f 266-292
+src/components/command-palette/command-palette.test.tsx
+  s_b8766f6952d181::t_0d5339a12acf4a 60
+src/components/settings/settings-dialog.tsx
+  s_b8766f6952d181::t_c827e610c69fd9 172
+  s_b8766f6952d181::t_ea47c3875476eb 89-91
+  s_b8766f6952d181::t_1d71060d447395 978-1000
+  s_b8766f6952d181::t_c7cdca9b072e17 170-171
+src/hooks/use-active-chat-reporter.test.ts
+  s_b8766f6952d181::t_87a20d89847672 24
+src-tauri/crates/keeper/src/menu.rs
+  s_b8766f6952d181::t_20bbca0a504dcc 98-101
+src/components/cheat-sheet/cheat-sheet-overlay.test.tsx
+  s_b8766f6952d181::t_87a20d89847672 31
+src/components/settings/settings-dialog.test.tsx
+  s_b8766f6952d181::t_e9dd8c9a7da6db 110-112,121
+  s_b8766f6952d181::t_32ac8c64209769 629-649
+src/components/layout/bridges-pane.test.tsx
+  s_b8766f6952d181::t_87a20d89847672 75
+src/hooks/use-app-lifecycle.test.ts
+  s_b8766f6952d181::t_87a20d89847672 24
+src/lib/ipc/gen/PaletteActionVm.ts
+  s_b8766f6952d181::t_4732a5ecef4507 42-45
+  s_b8766f6952d181::t_dc6adc6f1b4663 41,46-47
+src/components/settings/about-section.test.tsx
+  s_b8766f6952d181::t_87a20d89847672 38
+src/lib/stores/capabilities.test.ts
+  s_b8766f6952d181::t_36e1f7c840305b 17
+  s_b8766f6952d181::t_6d7ed5f9e539fa 36
+  s_b8766f6952d181::t_7b32f1dc75763d 83
+src/lib/stores/capabilities.ts
+  s_b8766f6952d181::t_a64fe913882e5c 32
+src/components/layout/phone-shell.test.tsx
+  s_b8766f6952d181::t_a69705b664557c 1101
+src/hooks/use-cheat-sheet-shortcut.test.ts
+  s_b8766f6952d181::t_87a20d89847672 16
+src-tauri/crates/keeper/src/macos_version.rs
+  s_b8766f6952d181::t_6f83b47db1fe88 49
+  s_b8766f6952d181::t_f419ebe489a010 1-48,60-86
+  s_b8766f6952d181::t_a2ed4ee215509c 50-59
+src-tauri/crates/keeper-core/src/palette.rs
+  s_b8766f6952d181::t_8e5c2b962b8c3a 153-157
+  s_b8766f6952d181::t_45551a72c92184 1015,1082,1099
+  s_b8766f6952d181::t_e235ece7eaac0b 299-302,309-310
+  s_b8766f6952d181::t_a1bb2ec81afbaa 361-363,376,394
+  s_b8766f6952d181::t_f37b4cad8aca3c 311-312
+  s_b8766f6952d181::t_604efdc33084b6 805,834,839,848,861,868,878,888,896,957,966,1279
+  s_b8766f6952d181::t_d11626b517712b 904-947
+  s_b8766f6952d181::t_d73ccad59efcc3 903
+  s_b8766f6952d181::t_2db2333d6321ee 432-448
+  s_b8766f6952d181::t_0e4fc3026ec41b 160-166,173,176
+  s_b8766f6952d181::t_b214200641c62e 1265
+  s_b8766f6952d181::t_6985f7a833e0ca 1122-1124
+  s_b8766f6952d181::t_b8ae746f68fddb 636-645
+src-tauri/crates/keeper/src/lib.rs
+  s_b8766f6952d181::t_453a0f6fe1e6a1 12
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_b8766f6952d181::t_d6063bdee4e815 173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "6dd5ee58e7b8bc31467331a92335f4a588fc4da4",
+  "prompts": {},
+  "sessions": {
+    "s_09359ba34cb97a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b30541d7-f7bd-4611-a964-5c328d150202",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_b8766f6952d181": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c06e7236-601e-4b94-a500-149a720d19c8",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
