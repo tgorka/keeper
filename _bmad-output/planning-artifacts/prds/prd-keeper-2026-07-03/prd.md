@@ -2,14 +2,14 @@
 title: "PRD: keeper"
 status: final
 created: 2026-07-03
-updated: 2026-07-09
+updated: 2026-07-16
 ---
 
 # PRD: keeper
 
 ## 0. Document Purpose
 
-This PRD defines the macOS text-first MVP of keeper, an open-source (Apache-2.0), client-only universal messenger built on Matrix. It is written for the downstream BMAD chain — UX design, architecture, and epic/story creation — and for contributors who need a single authoritative statement of what MVP includes, excludes, and must prove. It builds on, and does not duplicate, four upstream inputs: the product brief and its addendum (`_bmad-output/planning-artifacts/briefs/brief-keeper-2026-07-03/`), the stakeholder requirements (`_bmad-output/planning-artifacts/product-inputs.md`), and the technical and market research reports (`_bmad-output/planning-artifacts/research-technical-2026-07-03.md`, `research-market-2026-07-03.md`). Vocabulary is anchored in §3 Glossary; functional requirements are numbered FR-1 through FR-54 for the macOS MVP with testable consequences; cross-cutting NFRs are numbered NFR-1 through NFR-14. **Phase 2 increment (2026-07-09):** with the macOS MVP implemented in full, §13 extends this PRD with the iOS/iPhone client phase — FR-55 through FR-65 and NFR-15 through NFR-18 — built on the authoritative iOS technical research (`_bmad-output/planning-artifacts/research-ios-2026-07-09.md`); MVP sections §1–§12 are unchanged and remain the authority for all shared behavior. Inline `[ASSUMPTION]` tags mark inferences made without stakeholder confirmation and are indexed in §12. Technical constraints already locked by the owner (stack, SDK versions, IPC patterns, licensing firewall) live in the brief addendum and this PRD's `addendum.md`; this document states *what* keeper does, not *how*.
+This PRD defines the macOS text-first MVP of keeper, an open-source (Apache-2.0), client-only universal messenger built on Matrix. It is written for the downstream BMAD chain — UX design, architecture, and epic/story creation — and for contributors who need a single authoritative statement of what MVP includes, excludes, and must prove. It builds on, and does not duplicate, four upstream inputs: the product brief and its addendum (`_bmad-output/planning-artifacts/briefs/brief-keeper-2026-07-03/`), the stakeholder requirements (`_bmad-output/planning-artifacts/product-inputs.md`), and the technical and market research reports (`_bmad-output/planning-artifacts/research-technical-2026-07-03.md`, `research-market-2026-07-03.md`). Vocabulary is anchored in §3 Glossary; functional requirements are numbered FR-1 through FR-54 for the macOS MVP with testable consequences; cross-cutting NFRs are numbered NFR-1 through NFR-14. **Phase 2 increment (2026-07-09):** with the macOS MVP implemented in full, §13 extends this PRD with the iOS/iPhone client phase — FR-55 through FR-65 and NFR-15 through NFR-18 — built on the authoritative iOS technical research (`_bmad-output/planning-artifacts/research-ios-2026-07-09.md`); MVP sections §1–§12 are unchanged and remain the authority for all shared behavior. **Phase 3 increment (2026-07-16):** §14 adds the macOS Screen Recording phase — FR-66 through FR-76 and NFR-19 through NFR-22 — built on the authoritative recording research (`_bmad-output/planning-artifacts/research-recording-2026-07-16.md`), whose recommendations and risk register it adopts rather than relitigates. Inline `[ASSUMPTION]` tags mark inferences made without stakeholder confirmation and are indexed in §12. Technical constraints already locked by the owner (stack, SDK versions, IPC patterns, licensing firewall) live in the brief addendum and this PRD's `addendum.md`; this document states *what* keeper does, not *how*.
 
 ## 1. Vision
 
@@ -96,7 +96,7 @@ The MVP must prove one thing: that a user-owned Matrix + Bridges stack, wrapped 
 
 ## 4. Features
 
-*FRs are numbered globally (FR-1 … FR-54 in this section; the iOS phase continues the sequence with FR-55 … FR-65 in §13). Every FR uses Glossary terms verbatim and carries testable consequences. "User" means the single macOS operator of the app.*
+*FRs are numbered globally (FR-1 … FR-54 in this section; the iOS phase continues the sequence with FR-55 … FR-65 in §13, and the Screen Recording phase with FR-66 … FR-76 in §14). Every FR uses Glossary terms verbatim and carries testable consequences. "User" means the single macOS operator of the app.*
 
 ### 4.1 Accounts & Authentication
 
@@ -479,6 +479,7 @@ User can click a notification to land in the exact Chat (correct Account) with t
 - **No WhatsApp (or any Network) automation, broadcast, or bulk messaging — ever.** These trigger ban regimes and betray the user-safety posture.
 - **No agent/AI send path in MVP.** The Approval Pane ships; the propose-only agent API/MCP is a post-MVP experiment behind a flag, gated on design-partner validation. Nothing in MVP may send without explicit user approval (FR-41).
 - **No iMessage in MVP.** v1.x at earliest, only via the user's own Mac, labeled "advanced, may break on macOS updates."
+- **No video editing, and no recording upload — ever.** The Screen Recording phase (§14) writes local files to a user-chosen folder, full stop: no editor, no share-link or cloud-processing service, zero new network destinations (FR-76).
 - **No monetization surface.** No accounts-with-us, no license keys, no telemetry-driven upsell. keeper is free OSS; sustainability questions live outside this PRD.
 - **Not a Matrix admin tool.** keeper manages Bridges from a user's perspective; homeserver administration (user management, federation config) is out.
 - **Not chasing Beeper feature-for-feature.** Reminders/snooze, scheduled send, message-request filtering, labels, note-to-self are deliberate v1.x fast-follows (§6.2), not silent MVP creep.
@@ -515,6 +516,7 @@ User can click a notification to land in the exact Chat (correct Account) with t
 - Mobile — **iOS now active as Phase 2, specified in §13**; Windows/Linux/Android/iPad remain later phases on the same Rust core.
 - Beeper Desktop API companion mode (reach On-Device Connection chats when Beeper Desktop is installed) — pragmatic add-on, never a foundation.
 - Email network, AI-bot client, terminal client (owner's long-term network list).
+- Screen recording — **now active as Phase 3, specified in §14** (macOS desktop only; recording on Windows/Linux follows those platforms if and when they exist).
 
 ### 6.3 Why Now
 
@@ -551,7 +553,7 @@ Three clocks aligned in 2025–2026, and none of them stays open forever: (1) **
 
 - **NFR-14 Baseline accessibility:** all MVP flows operable via keyboard alone (a superset of FR-48–50); interactive controls carry accessibility labels for VoiceOver; contrast meets WCAG 2.1 AA for text in both light and dark themes. [ASSUMPTION] Full VoiceOver timeline-navigation polish is v1.x; the MVP bar is "operable and labeled."
 
-*Phase 2 (iOS) adds NFR-15 – NFR-18 in §13.3, measured on-device.*
+*Phase 2 (iOS) adds NFR-15 – NFR-18 in §13.3, measured on-device. Phase 3 (Screen Recording) adds NFR-19 – NFR-22 in §14.3.*
 
 ## 8. Constraints & Guardrails
 
@@ -627,6 +629,15 @@ Three clocks aligned in 2025–2026, and none of them stays open forever: (1) **
 - §13 FR-62 — App badge counts total unreads across all Accounts (same aggregate as the Unified Inbox).
 - §13 FR-65 — The iOS Local Archive slice is excluded from device backup; the desktop Local Archive remains the durable, exportable copy this phase (disclosed in docs).
 - §13 NFR-15 — 3 s on-device cold-start bar is an authored number pending owner confirmation before release-gating.
+
+**Phase 3 (§14):**
+
+- §14 FR-68 — One capture target per Recording Session; simultaneous multi-target capture is out of this phase.
+- §14 FR-70 / NFR-22 — Screen↔camera alignment bound (one video frame at the configured frame rate) is an authored number.
+- §14 FR-71/FR-72 — Defaults authored from the research's product synthesis: `~/Movies/keeper` folder, 500 MB segments, 30-minute duration-cap fallback, 30 fps.
+- §14 NFR-19 — The 4 h continuous-soak bar is an authored number ("e.g. 4 h" in the owner ask) pending confirmation before release-gating.
+- §14 NFR-20 — Disk-guard thresholds (warn below 10 GB free, stop below 2 GB) are authored defaults.
+- §14 NFR-21 — CPU/memory envelope numbers are authored pending measurement on reference hardware.
 
 ## 13. Phase 2: iOS/iPhone Client
 
@@ -769,3 +780,154 @@ Adopted from the research risk register (research §5):
 
 1. NFR-15 cold-start number needs owner confirmation before it becomes a release gate. Owner: product owner, at phase release.
 2. Paid-program timing — the §13.5 gate itself. Owner: PM/owner, when push demand is real.
+
+## 14. Phase 3: Screen Recording (macOS)
+
+*Added 2026-07-16. This section is the Phase 3 increment: it specifies only what screen recording adds, continues the global numbering (FR-66–FR-76, NFR-19–NFR-22), and adopts — not relitigates — the recommendations and risk register of the recording technical research (`_bmad-output/planning-artifacts/research-recording-2026-07-16.md`). Sections §1–§13 remain authoritative for all existing behavior.*
+
+### 14.1 Phase Goal
+
+keeper records the user's on-screen activity — meetings, presentations, demos — to ordinary local video files in a folder the user chose. The user picks what to capture (a full display or a single application), which audio rides along (system audio on by default, a microphone from a device picker), and optionally a webcam recorded as a separate synchronized file. Recording runs continuously for hours, saving size-bounded segments as it goes, so a crash — keeper's, the recorder's, or the machine's — costs at most the last few seconds, never the meeting. The menu bar always tells the truth: recording state, elapsed time, one-click Stop; every fault is loud, never silent.
+
+The capability is macOS-desktop-only, gated at macOS 13.0 through the existing per-platform capability-flag mechanism (FR-57's `CapabilitiesVm`); the app-wide minimum stays 11.0 and iOS never records. The capture pipeline lives in a small first-party Swift sidecar (`keeper-rec`) spawned on demand through the existing sidecar mechanism — keeper itself owns the UI, settings, tray, and session manifest; a recorder crash can never take the messaging app down (route, format, and floor locked by the research; recorded in §14.7 and the addendum). Like every keeper feature, recording is local-only: files stay on the machine and the feature adds zero new network destinations.
+
+The phase opens with a walking skeleton that retires the existential risks — TCC permissions, sidecar signing, and the capture-to-file pipeline — before feature breadth (research epic sketch R.1).
+
+### 14.2 Features & Requirements
+
+#### 14.2.1 Capability Gating & Permissions
+
+##### FR-66: Recording capability gating
+System exposes screen recording as a `recording` capability flag over the IPC handshake, present only on desktop macOS ≥ 13.0; every recording surface — Settings section, tray affordances, Command Palette actions — renders only when the flag is on. Reuses FR-57's capability-flag mechanism.
+**Consequences (testable):**
+- On macOS < 13.0 and on iOS, no recording affordance renders anywhere — no dead buttons, no error-on-tap; the app-wide `minimumSystemVersion` stays 11.0.
+- The flag is data-driven per platform, so recording on a future Windows/Linux target reuses the same mechanism without UI rework.
+- Internal version branches (e.g., in-stream microphone capture on macOS 15+) never change the user-visible feature set across 13.0+.
+
+##### FR-67: Permission pre-flight with honest states
+User sees an explicit permission pre-flight before recording can start: keeper live-detects and displays the true state of Screen Recording — plus Microphone and Camera when those sources are enabled — requests each via the system prompt where the OS allows, and deep-links to the exact System Settings pane when only manual granting remains.
+**Consequences (testable):**
+- Each permission renders one of granted / not yet requested / denied-with-fix-path; the displayed state is detected at render time, never cached optimistically; Start is disabled until every required permission is granted, with the blocking permission named.
+- The Screen Recording flow states macOS's quirks plainly: a relaunch may be needed after granting, and macOS 15+ re-confirms the grant monthly — disclosed, not hidden.
+- Microphone and Camera permissions are requested only when the user enables those sources — never preemptively.
+- Permission revocation mid-recording surfaces as a loud failure per FR-75, with already-written segments intact.
+
+#### 14.2.2 Capture Sources
+
+##### FR-68: Source selection — full screen or a selected application
+User chooses what to record: a full display (with its audio) or a single running application; the picker lists live displays and running applications with names and icons.
+**Consequences (testable):**
+- Recording a selected application captures only that application's windows — and, with system audio on, only that application's audio; other windows, keeper itself, and incoming notification banners from other apps never appear in the file.
+- On multi-display setups each display is individually selectable. [ASSUMPTION] One capture target per Recording Session; simultaneous multi-target capture is out of this phase.
+- The source list refreshes as applications launch and quit; picking a source that has since disappeared yields a clear error at start, never a hung recording.
+
+##### FR-69: Audio sources — system audio toggle and microphone picker
+User can toggle system audio (default: on) and select a microphone from a device picker (default: system default input); each enabled audio source is written as its own track in the screen file — never premixed.
+**Consequences (testable):**
+- The screen file carries up to two AAC tracks (system audio, microphone) that stock players (QuickTime, browsers, VLC) play together and editors can separate; muting or removing one side later is always possible.
+- keeper's own notification sounds are excluded from system-audio capture — a message arriving mid-meeting never lands in the recording's audio.
+- Microphone hot-unplug mid-recording never aborts: video and system audio keep rolling, the mic track continues (silence-filled), keeper attempts fallback to the system default input, and a persistent warning state is raised (FR-74/FR-75).
+
+##### FR-70: Optional webcam as a separate synchronized file
+User can enable a webcam from a device picker (built-in, external, Continuity Camera; default: off); the camera records to separate files in the same session folder, time-anchored to the screen recording and rotated at the same segment boundaries.
+**Consequences (testable):**
+- With webcam on, the session folder contains `camera-####` files whose segment boundaries match `screen-####`; played side by side from any segment index, the two stay aligned within one video frame at the configured frame rate. [ASSUMPTION] The one-frame bound is authored; confirm on reference hardware.
+- Webcam off produces no camera files and touches no Camera permission; camera loss mid-recording follows FR-69's never-abort rule (screen recording continues, warning raised).
+- No picture-in-picture burn-in this phase (§14.4); UX copy may note that macOS 14+ can composite the camera via the system presenter overlay — a free OS behavior, not a keeper feature.
+
+#### 14.2.3 Output, Segmentation & Recovery
+
+##### FR-71: Recording Session output — chosen folder, session folder, manifest
+User picks — and keeper remembers — a recordings folder (default `~/Movies/keeper`); each recording creates one timestamped session folder containing the segment files and a `manifest.json` describing the session (capture target, devices, segment list, status).
+**Consequences (testable):**
+- Files land exactly where the user chose; changing the folder in Settings affects future sessions only; folder validation (exists, writable, free space per NFR-20) runs before start with actionable errors.
+- Segment names are local-time-stamped, filesystem-safe, and lexicographically ordered; the manifest updates atomically at every segment close and status change — an external tool can always read a consistent manifest.
+- Cleanly finalized segments are ordinary `.mp4` files (H.264 + AAC) playable everywhere with no keeper-specific tooling.
+
+##### FR-72: Continuous segmented recording with size-based rotation
+System records continuously, rotating to a new segment when the current file reaches the user-configured segment size (default 500 MB), with a duration-cap fallback (default 30 min) so low-motion recordings still rotate; rotation is gapless.
+**Consequences (testable):**
+- A recording spanning N segments concatenates into playback with no missing or duplicated frames and continuous timestamps (bar: NFR-22); rotation causes no pause, no dropped audio, no user-visible hiccup.
+- Segment size is user-configurable in Settings; the configured value is respected within one keyframe interval of file growth.
+- [ASSUMPTION] 500 MB / 30 min defaults authored from the research's product synthesis; adjust on dogfooding evidence without PRD change.
+
+##### FR-73: Crash safety and startup recovery
+System writes segments in a crash-safe fragmented format so that any interruption — recorder crash, keeper crash, power loss — loses at most the last fragment (~4 s); on startup and before each new recording, keeper scans for interrupted sessions, marks them recovered in their manifests, and surfaces a notice.
+**Consequences (testable):**
+- Force-killing the recorder mid-segment leaves the partial segment playable up to the last complete fragment; every earlier segment of the session is untouched.
+- The recovery notice ("A recording was interrupted; N segments were saved") appears once per interrupted session and links to the session folder; recovered files play as-is, with no remux step required.
+- An interruption during recording additionally surfaces live as an error per FR-75 — recovery is the safety net, not the notification.
+
+#### 14.2.4 Control Surface & Honesty
+
+##### FR-74: Tray/menu-bar recording state with elapsed time and Stop
+System shows recording state in the menu bar — idle / recording / warning-error — with live elapsed time and current-segment info while recording, and one-click Stop Recording and Open Recordings Folder actions; recording forces the tray visible even when the user's opt-in tray toggle (FR-53) is off, restoring the prior tray state at stop.
+**Consequences (testable):**
+- Within 1 s of start the tray reflects recording; a ~1 Hz tick updates an elapsed/segment line ("Recording — 12:34 · segment 3, 412 MB"); Stop finalizes the current segment and returns the tray to its prior configuration exactly.
+- Quitting keeper while recording warns first, then stops and finalizes cleanly before exit (kill-timeout guarded) — extending FR-53's quit honesty; it never orphans a running recorder.
+- macOS's own screen-recording indicator (the menu-bar pill) remains untouched; keeper's tray adds what the system pill lacks — elapsed time, segment info, Stop, and error states.
+
+##### FR-75: Loud failure surfacing — no silent recording loss
+System surfaces every recording fault loudly — recorder crash or unexpected exit, writer stall, permission revocation, device loss, disk-guard triggers — via the tray error state plus a native notification; no recording failure mode is silent.
+**Consequences (testable):**
+- Killing the recorder process flips the tray to error and posts a notification within 5 s (the FR-51/NFR-7 pipeline), offering one-click restart of the recording; the session manifest records the true terminal status.
+- Non-fatal warnings (mic unplug, low disk) show a persistent warning state until resolved or acknowledged — never a dismissed-and-gone toast (FR-28's persistence rule applied to recording).
+- NFR-5's no-silent-loss rule extends to recordings: every started Recording Session reaches a user-visible terminal state — finalized, recovered, or failed-with-reason.
+
+##### FR-76: Local-only recording — zero new egress
+System keeps recording entirely local: recordings, manifests, and recording settings never leave the machine, and the feature adds zero new network destinations to keeper's documented egress surface (NFR-11).
+**Consequences (testable):**
+- The per-release egress inventory diff (NFR-11) is empty for this phase — verifiable at review and at runtime (no new hosts contacted during a full record/stop/recover cycle).
+- No upload, share-link, transcription, or cloud-processing affordance exists anywhere in the recording UI; sharing a recording is the user's act with ordinary files, outside keeper.
+
+### 14.3 Phase NFRs
+
+*Continues §7's numbering. Measured on Apple Silicon (M1 or later), release build, signed per §14.7, unless stated.*
+
+- **NFR-19 Long-run capture stability:** a **4 h** continuous recording (1080p-class display, 30 fps, system audio + microphone) completes with zero recorder crashes, writer stalls, or A/V desync and no unbounded memory growth; sample-buffer queues are bounded with a drop-oldest-video policy — audio is never dropped — and sustained dropping raises a warning (FR-75). [ASSUMPTION] The 4 h bar is authored; confirm before release-gating.
+- **NFR-20 Disk-space guard:** recording warns when free space on the target volume falls below a warning threshold and gracefully stops-and-finalizes below a hard floor — it never runs the disk to exhaustion or dies mid-write. [ASSUMPTION] Defaults: warn below 10 GB free, stop below 2 GB; authored pending confirmation.
+- **NFR-21 Recording performance envelope:** recording 1080p-class content at 30 fps with both audio tracks adds **< 100% of one core** average CPU and **< 400 MB** combined RSS (sidecar + keeper overhead), and keeper's messaging bars (NFR-1–NFR-4) still hold while recording — a meeting is exactly when the messenger must stay responsive. [ASSUMPTION] Numbers authored; measure on reference hardware before gating.
+- **NFR-22 Segment handover gaplessness:** rotation cuts on keyframes with continuous host-clock-anchored timestamps; concatenating a session's segments yields monotonic timestamps with no gap or overlap exceeding one frame duration, and screen↔camera alignment holds within one frame across the full session; an automated concatenate-and-assert test gates release.
+
+### 14.4 Out of Scope (this phase)
+
+- **Video editing — never** (§5). keeper records; it does not trim, annotate, or compose.
+- **Any cloud upload, share service, or remote processing — never** (§5, FR-76).
+- **Pause/resume**, **webcam PiP burn-in**, and a camera self-view preview bubble — later stories, deliberately after the capture core is trustworthy.
+- **`SCContentSharingPicker` system-picker path** (macOS 14+, also silences the monthly re-auth nag), **HEVC/HDR capture**, **DND-while-recording**, and an orphan-segment "tidy" remux pass — later.
+- **Windows/Linux recording** — follows those platforms (§6.2); the capability flag (FR-66) and the platform-free recording module are built to carry over.
+- **The `persistent-content-capture` entitlement** (would remove the monthly re-auth nag) — requires the paid Apple Developer Program and an Apple approval process; sits behind the §13.5-class paid-program gate, accepted and documented instead (§14.7).
+
+### 14.5 Phase Success Metrics
+
+- **SM-9 Recording end-to-end gate:** on a Development-signed build on macOS 13+ hardware: permission pre-flight → full-screen *and* app-scoped recording with system audio + microphone (+ webcam as a separate file) → segments rotate at the configured size into the chosen folder with a valid manifest → an induced crash recovers per FR-73. Binary, demo-able, release-gating. Validates FR-66–FR-76.
+- **SM-10 Recording reliability bars:** the NFR-19 soak green; the induced-failure matrix (recorder kill, mic unplug, disk floor, permission revoke) surfaces loudly in 100% of tests (FR-75); zero silent recording-loss incidents during dogfooding; the NFR-11 egress diff for the phase is empty (FR-76).
+
+### 14.6 Phase Risks (Register)
+
+Adopted from the research risk register (research §8):
+
+- **TCC vs ad-hoc dev builds** — macOS 15+ silently rejects ScreenCaptureKit access for ad-hoc-signed binaries, and identity churn resets grants (Cap #1722). High (DevEx), not a product blocker: local development of this feature requires Apple Development-certificate signing (free account suffices; the iOS phase already established free-team signing); release builds are already Developer-ID signed + notarized. Recorded as a dev-signing requirement in the release docs.
+- **Sidecar signing/notarization rough edge** (Tauri `externalBin`, #11992) — medium. Mitigation: explicitly codesign `keeper-rec` (hardened runtime + entitlements) in CI before bundling; aarch64-only shipping avoids the universal-binary step.
+- **Monthly re-authorization nag on macOS 15+** for non-picker capture — low/medium. Mitigation: accept + disclose in MVP (FR-67); adopt the system-picker path later; the entitlement escape is paid-program-gated (§14.4).
+- **Disk exhaustion during long recordings** — medium. Mitigation: NFR-20 guard; segment sizing keeps cleanup easy.
+- **Long-run stability** (backpressure, writer stalls, thermal) — medium. Mitigation: bounded queues with drop-oldest-video (NFR-19), fragment-bounded data loss (FR-73), soak-test story, restart recovery via manifest.
+- **Gapless-rotation correctness** (A/V sync across segments) — medium. Mitigation: keyframe-cut dual-writer handover, host-clock PTS, the NFR-22 automated concatenation test.
+- **macOS API drift** (Tahoe+ permission UX changes) — low. Mitigation: all Apple API churn is isolated in the small Swift sidecar; the capability handshake lets keeper degrade gracefully.
+- **Webcam/mic device churn** (Continuity Camera appearing/disappearing) — low. Mitigation: re-enumerate on device notifications; never hard-fail a running recording on device loss (FR-69/FR-70).
+
+### 14.7 Phase Decisions & Open Questions
+
+**Pre-answered (adopted from the research; revisit only on evidence):**
+
+- **Architecture route locked:** a first-party Swift sidecar `keeper-rec` (ScreenCaptureKit + AVAssetWriter, ~1–2 kLOC, Apache-2.0, in-repo SwiftPM) controlled over NDJSON-RPC on stdio, spawned launch-on-demand through the existing sidecar mechanism (the bbctl precedent); keeper-core owns a platform-free recording module (state machine, manifest schema, settings), the shell owns spawn/stdio/tray glue. Keeps the workspace `unsafe_code = "deny"` posture intact and isolates capture crashes from messaging. In-process Rust bindings and an ffmpeg sidecar were evaluated and rejected (rationale in the addendum §8).
+- **Capability floor 13.0** (system-audio capture requires it), runtime-gated via FR-66; internal macOS 15+ branch for in-stream microphone capture; app minimum stays 11.0; iOS never.
+- **Format locked:** fragmented MP4 `.mp4`, H.264 video + up to two unmixed AAC tracks, ~4 s fragment interval, 30 fps default at source resolution (60 selectable), defragmented to ordinary MP4 on clean finalize.
+- **Defaults:** system audio on, microphone = system default input, webcam off, 500 MB segments, `~/Movies/keeper`.
+- **Dev-signing requirement:** local builds exercising recording must be signed with an Apple Development certificate (macOS 15+ ad-hoc rejection); a DevEx requirement documented in release/dev docs — explicitly not a product blocker.
+- **TCC attribution:** the sidecar is spawned (never a LaunchAgent) so all permission prompts and System Settings entries attribute to keeper, using keeper's usage strings.
+
+**Open:**
+
+1. Authored bars need owner confirmation before they become release gates: NFR-19 soak duration, NFR-20 thresholds, NFR-21 CPU/memory envelope, the FR-70/NFR-22 one-frame alignment bound. Owner: product owner, at phase release.
+2. In-app recordings browsing (a list of past sessions inside keeper) is deliberately unspecified — MVP is folder-and-Finder plus the tray's Open Recordings Folder. Revisit on dogfooding evidence. Owner: PM.

@@ -2,7 +2,7 @@
 title: "Addendum: keeper PRD"
 status: final
 created: 2026-07-03
-updated: 2026-07-09
+updated: 2026-07-16
 ---
 
 # Addendum — keeper PRD
@@ -72,3 +72,16 @@ Locked by the iOS research (authoritative for the phase; PRD §13 states the *wh
 - **Toolchain:** full Xcode + CocoaPods + `aarch64-apple-ios{,-sim}` rust targets; `gen/apple` committed (minus `build/`), persistent edits in `project.yml`/`Info.plist` only; min iOS 16.0 set explicitly; CI PR gate `cargo check --target aarch64-apple-ios`.
 - **Safe areas/keyboard:** `viewport-fit=cover` + `contentInsetAdjustmentBehavior = .never` + `env(safe-area-inset-*)` CSS vars; keyboard inset via `visualViewport` (evaluate `interactive-widget=resizes-content`).
 - **Epic shape (research §5):** Epic 12 walking skeleton (UI-free, retires toolchain/signing/core risks) → Epic 13 phone shell ∥ Epic 14 platform behavior → Epic 15 fit-and-finish + paid-program decision-gate story.
+
+## 8. Screen Recording phase technical constraints (added 2026-07-16; source: `research-recording-2026-07-16.md`)
+
+Locked by the recording research (authoritative for the phase; PRD §14 states the *what*, this records the *how* architecture must honor):
+
+- **Route (b) locked — Swift sidecar:** `keeper-rec` (SwiftPM, in-repo, Apache-2.0) owns SCK stream setup → sample buffers → dual-AVAssetWriter segmented fMP4 writing; spawned launch-on-demand via `Platform::sidecar_path` + Tauri `externalBin` (bbctl mechanism, Story 6.7 / AD-16); control protocol = NDJSON-RPC over stdio (`getCapabilities` version/feature/permission handshake, `listSources`, `start`, `stop`; interleaved `state`/`segmentClosed` events). Rejected alternatives: in-process Rust bindings (`screencapturekit-rs` has no writer half; cidre/objc2 = large unsafe surface vs. the function-level audited-unsafe policy; Cap's fork-heavy posture is the cautionary tale) and ffmpeg/avfoundation (no per-app capture, no system audio without a virtual driver, GPL vs. cargo-deny firewall).
+- **API mapping:** full screen / selected app = `SCContentFilter` over `SCShareableContent`; system audio = `capturesAudio` (13+) scoped by the same filter, `excludeCurrentProcessAudio = true`; mic = in-stream `captureMicrophone` + `microphoneCaptureDeviceID` on 15+, parallel `AVCaptureSession` on 13–14 (same writer either way); webcam = `AVCaptureDevice.DiscoverySession` + second AVAssetWriter, host-clock anchored. `SCRecordingOutput` (15+) rejected as primary writer: one output per stream, no segment rotation.
+- **Segmentation mechanics:** dual-writer gapless handover — start writer B at the next keyframe PTS, route to both until B's first keyframe lands, finalize A asynchronously; size trigger = bytes-budget deadline corrected against observable on-disk growth (fMP4 makes size observable live); duration-cap fallback. Container: `outputFileTypeProfile = .mpeg4CMAFCompliant`, ~4 s fragments; clean finalize defragments to ordinary MP4.
+- **Session layout:** `<folder>/keeper-rec <local timestamp>/` with `manifest.json` (atomic rename on every segment close / status change; states `recording` → `finalized` | `recovered`), `screen-####.mp4`, `camera-####.mp4`. Recovery pass on startup and before each new recording.
+- **TCC facts:** Screen Recording detected via `CGPreflightScreenCaptureAccess()`, requested via `CGRequestScreenCaptureAccess()` (one real prompt per app lifetime); Settings deep link `x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture`; `NSMicrophoneUsageDescription`/`NSCameraUsageDescription` in keeper's bundle Info.plist (Tauri infoPlist merge). Child-process TCC attribution = responsible process (keeper) — the sidecar must be spawned, never a LaunchAgent. macOS 15+: ad-hoc-signed binaries silently rejected for SCK (Cap #1722) → Apple Development-cert signing required for local dev of this feature; monthly re-auth nag for non-picker SCK accepted + disclosed (picker path and `persistent-content-capture` entitlement are later/gated).
+- **Signing/CI:** explicitly codesign `keeper-rec` (hardened runtime + keeper's entitlements) in CI before `tauri build` (externalBin notarization rough edge, tauri#11992); aarch64-only, no lipo; SwiftPM build step rides the existing macOS signing runners.
+- **Tray extension (Story 10.3 surface):** second/third tray icon assets (record-dot, warning badge) via `TrayIcon::set_icon`; 1 Hz menu-item text tick; recording temporarily forces tray presence with exact restore at stop; quit-while-recording = warn → `stop` RPC → flush → kill-timeout guard. The macOS purple capture pill is system-owned and untouched.
+- **Epic shape (research §8):** R.1 walking skeleton (sidecar build/sign/bundle + RPC handshake + permission flow + full-screen+system-audio to one fMP4) → R.2 segmentation/manifest/recovery (+ soak) → R.3 tray states + honest quit → R.4 app-picker capture → R.5 device pickers + mic track + hot-unplug → R.6 webcam separate file → R.7 guards/settings/gating audit/docs (nag, pill, dev-signing).
