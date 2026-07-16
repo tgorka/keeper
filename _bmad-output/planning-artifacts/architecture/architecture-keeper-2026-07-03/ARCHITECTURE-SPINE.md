@@ -4,11 +4,11 @@ type: architecture-spine
 purpose: build-substrate
 altitude: initiative
 paradigm: 'hexagonal Rust core + unidirectional view-model projection (Rust owns truth; UI renders streams; mutations round-trip through commands)'
-scope: 'keeper MVP — macOS Tauri 2 desktop Matrix client: multi-account, bridges, local archive, drafts/approval, incognito, undo-send — plus the iOS/iPhone phase (same core, same IPC contract, phone shell)'
+scope: 'keeper MVP — macOS Tauri 2 desktop Matrix client: multi-account, bridges, local archive, drafts/approval, incognito, undo-send — plus the iOS/iPhone phase (same core, same IPC contract, phone shell) and the macOS Screen Recording phase (first-party Swift capture sidecar)'
 status: final
 created: '2026-07-03'
-updated: '2026-07-09'
-binds: [FR-1..FR-65, NFR-1..NFR-18]
+updated: '2026-07-16'
+binds: [FR-1..FR-76, NFR-1..NFR-22]
 sources:
   - _bmad-output/planning-artifacts/prds/prd-keeper-2026-07-03/prd.md
   - _bmad-output/planning-artifacts/prds/prd-keeper-2026-07-03/addendum.md
@@ -16,6 +16,7 @@ sources:
   - _bmad-output/planning-artifacts/product-inputs.md
   - _bmad-output/planning-artifacts/research-technical-2026-07-03.md
   - _bmad-output/planning-artifacts/research-ios-2026-07-09.md
+  - _bmad-output/planning-artifacts/research-recording-2026-07-16.md
   - docs/project-context.md
 companions: []
 ---
@@ -212,6 +213,60 @@ Allowed dependency direction is exactly the arrows above. `keeper-core` never im
 - **Prevents:** hand edits lost to `.xcodeproj` regeneration; desktop PRs silently breaking the iOS port; signing/team identifiers leaking into the repo
 - **Rule:** `tauri ios init` generates `gen/apple` under `crates/keeper` (relative to the crate holding `tauri.conf.json`); `gen/apple` is committed with `build/` gitignored, and persistent edits live **only** in `project.yml` (XcodeGen source of truth — the `.xcodeproj` is regenerated), `Info.plist` (`CFBundleURLTypes` for `keeper://`), and the `*_iOS/` sources (safe-area Swift patch). Minimum iOS 16.0 is set explicitly. Signing: automatic Personal Team via `bundle.iOS.developmentTeam` or the `TAURI_APPLE_DEVELOPMENT_TEAM` env var (team ID stays out of git); the bundle ID is stable and shared with macOS. CI adds `cargo check --target aarch64-apple-ios` as a **required PR gate** on the existing macOS runner — compile-only, no signing, no simulator build this phase.
 
+### Screen Recording Phase (2026-07-16) — AD-33 … AD-39
+
+*Extends the frozen AD-1..32 for PRD §14 (FR-66–FR-76, NFR-19–NFR-22) + addendum §8, on the authoritative `research-recording-2026-07-16.md` (recommendations and risk register adopted, not relitigated). macOS-desktop-only; gated at macOS 13.0 via `CapabilitiesVm` (AD-27); iOS never records. The route is **locked** by the research: a first-party Swift sidecar `keeper-rec` (ScreenCaptureKit + AVAssetWriter) over NDJSON-RPC stdio — in-process Rust bindings (no maintained safe AVAssetWriter binding; unsafe surface vs. the audited-unsafe policy) and an ffmpeg/avfoundation sidecar (no per-app capture, no driverless system audio, GPL vs. the cargo-deny firewall) were evaluated and rejected. No PRD amendment is required.*
+
+```mermaid
+graph TD
+  UI["src/ — recording UI (Settings · palette actions)"] -- "commands" --> SHELL["keeper shell"]
+  SHELL -- "Channels: state · segment · error VMs" --> UI
+  SHELL --> CORE["keeper-core::recording (platform-free: state machine · manifest · ledger · recovery)"]
+  CORE -- "typed intents" --> PORT["Recorder port (shell)"]
+  PORT -- "macOS: spawn + NDJSON-RPC stdio" --> REC["keeper-rec (Swift: SCK + dual AVAssetWriter)"]
+  PORT -. "non-macOS/iOS: Unsupported" .-> X["(no surface)"]
+  REC -- "segmentClosed · state · error events" --> PORT
+  REC -- "fMP4 segments + manifest.json" --> FOLDER[("<chosen folder>/keeper-rec <ts>/")]
+  TRAY["tray.rs — recording/warning state, elapsed, Stop"] --> SHELL
+```
+
+### AD-33 — Recording split: platform-free `recording` core + `Recorder` shell port
+- **Binds:** FR-66, FR-71, FR-73, FR-75, NFR-19
+- **Prevents:** Apple/process code leaking into `keeper-core`; a second recording truth in TS; a capture crash reaching the messaging core
+- **Rule:** `keeper-core::recording` owns the session state machine (`idle → preflight → recording → rotating → stopping → finalized | recovered | failed`), the manifest schema, the segment ledger, folder validation, and the recovery reconciliation — with **no `tauri` and no Apple API** (platform-free like all of `keeper-core`, AD-6/AD-24). The actual sidecar spawn and stdio framing live in the `keeper` shell behind a `Recorder` **Platform-style port** (a trait beside `Platform`, AD-24): the macOS impl spawns `keeper-rec` via `Platform::sidecar_path`; every non-macOS impl (and iOS) returns `CoreError::Unsupported` (mirroring `sidecar_path` honesty, AD-27). The port parses sidecar events and feeds them into the core state machine; core never holds a process handle.
+
+### AD-34 — `keeper-rec` Swift sidecar & NDJSON-RPC stdio contract
+- **Binds:** FR-68–FR-72, addendum §8; sidecar transport
+- **Prevents:** ad-hoc per-message envelopes; host/sidecar protocol drift; blocking on binding-crate feature lag
+- **Rule:** `keeper-rec` is a SwiftPM binary (ScreenCaptureKit + AVAssetWriter) spawned launch-on-demand via `Platform::sidecar_path` + Tauri `externalBin` — the **bbctl precedent** (AD-16, Story 6.7). The wire format is **one JSON object per line on stdio**. Commands (host→rec, id-correlated): `getCapabilities` (macOS version, feature flags, per-TCC permission states — carries the **protocol-version handshake**), `listSources` (displays, apps, mics, cameras), `start{filter, audio, mic, camera, dir, segmentMB, fps}`, `stop` (returns the final manifest). Events (rec→host, unsolicited): `state{recording, elapsedSec, segmentIndex, bytes, warning}`, `segmentClosed{path, bytes, track}`, `error{code, message, fatal}`. The **contract shape** is the invariant; exact field lists are code-owned (VM side via AD-7). First-party Swift gets every SCK feature without waiting on binding crates.
+
+### AD-35 — Recording capability gating: `CapabilitiesVm.recording`
+- **Binds:** FR-66, FR-57 surface; IPC handshake
+- **Prevents:** dead recording buttons on unsupported platforms; per-feature platform sniffing in TS
+- **Rule:** `CapabilitiesVm` (AD-27) gains a `recording` flag (serde + ts-rs like every DTO, AD-7), **true only on desktop macOS ≥ 13.0** (the system-audio floor); the app-wide `minimumSystemVersion` stays 11.0 and **iOS never** (no child processes, AD-27). The internal macOS 15+ branch (in-stream microphone) lives entirely inside `keeper-rec`, invisible to the flag. Every recording surface — Settings section, tray affordances, Command Palette actions — renders only when the flag is on (AD-27 "no dead buttons"). The frontend never consults `navigator.userAgent`/build flags.
+
+### AD-36 — Recording permissions/TCC: three classes, pre-flight through the `Recorder` port
+- **Binds:** FR-67, FR-69, FR-70
+- **Prevents:** silent permission failures; hidden OS quirks; wrong TCC attribution
+- **Rule:** A permission pre-flight runs through the `Recorder` port → `keeper-rec` `getCapabilities` (a `SCShareableContent` + `CGPreflightScreenCaptureAccess` probe), surfaced as a `RecordingPermissionVm` (`keeper-core::vm`, ts-rs) that tracks the three TCC classes **distinctly**: **Screen Recording** (`kTCCServiceScreenCapture`; detect `CGPreflightScreenCaptureAccess`, request `CGRequestScreenCaptureAccess` — one real prompt per app lifetime; Settings deep link `x-apple.systempreferences:…Privacy_ScreenCapture`), **Microphone** (`NSMicrophoneUsageDescription`), **Camera** (`NSCameraUsageDescription`). Mic/Camera classes are probed only when those sources are enabled; the camera is untouched when webcam is off (FR-70). Usage strings live in keeper's bundle `Info.plist` (Tauri `bundle.macOS.infoPlist` merge). TCC attributes the spawned child to keeper (responsible process) — the sidecar is **spawned, never a LaunchAgent**. macOS quirks are disclosed honestly (FR-67): relaunch-after-grant, and the macOS 15+ monthly re-auth nag for non-picker SCK. Revocation mid-recording is a loud failure (AD-39), with written segments intact.
+
+### AD-37 — Recording format, segmentation ownership & recovery
+- **Binds:** FR-71, FR-72, FR-73, NFR-22
+- **Prevents:** `keeper-core` reimplementing capture; moov-at-end total-loss on crash; a manifest inconsistent with on-disk segments
+- **Rule:** Container is **fragmented MP4** (`outputFileTypeProfile = .mpeg4CMAFCompliant`, ~4 s fragments), **H.264 video + up to two _unmixed_ AAC tracks** (system audio + microphone, 48 kHz), 30 fps default at source resolution (60 selectable); a clean finalize defragments to an ordinary `.mp4` playable everywhere. The **dual-AVAssetWriter gapless size-based rotation lives entirely in `keeper-rec`** (start writer B at the next keyframe PTS, dual-route until B's first keyframe lands, finalize A async; size trigger = bytes-budget deadline corrected against observable on-disk growth; duration-cap fallback). `keeper-core` owns **only** the segment ledger + manifest: `<folder>/keeper-rec <local ts>/` holding `manifest.json` (atomic-rename on every `segmentClosed`/status change; states `recording → finalized | recovered`), `screen-####.mp4`, and — webcam on — `camera-####.mp4` (a separate synchronized file from a second in-sidecar writer, host-clock anchored, rotated at the same boundaries; **no PiP burn-in this phase**). A **startup recovery pass** (and one before each new recording) reconciles orphaned segments: stale `recording` manifests are marked `recovered` with a one-line notice; the orphaned tail fMP4 plays as-is, no remux in MVP.
+
+### AD-38 — `keeper-rec` source layout, build, codesign & CI
+- **Binds:** FR-66 build/toolchain, NFR-11/NFR-13 licensing, distribution, CI
+- **Prevents:** Cargo/SwiftPM tooling collision; ad-hoc TCC rejection surprising contributors; unsigned-`externalBin` notarization failures; licensing-firewall regressions
+- **Rule:** `keeper-rec` source lives in a **top-level SwiftPM package `tools/keeper-rec/`** (`Package.swift` + `Sources/keeper-rec/`), deliberately **outside `src-tauri/crates/`** so the Cargo workspace and SwiftPM tooling don't collide. It is first-party **Apache-2.0** and links only Apple system frameworks (ScreenCaptureKit/AVFoundation), so **cargo-deny (AD-5) is untouched** (Swift is not in the tree it scans) and there is **no ffmpeg**. `externalBin` is declared in `tauri.conf.json` `bundle.externalBin` as `binaries/keeper-rec`; Tauri appends the per-arch triple, so the bundled and runtime name is `keeper-rec-aarch64-apple-darwin` (matching `DesktopPlatform::sidecar_path`'s `<name>-<triple>` resolution). CI on the existing macOS signing runner: `swift build -c release --arch arm64` → **explicit codesign** of `keeper-rec` (hardened runtime + keeper's entitlements) **before `tauri build`** (the `externalBin` notarization rough edge, tauri#11992); aarch64-only, no lipo. This adds a **Swift-toolchain build dependency** to CI (Xcode is already present for signing/notarization). Dev-signing requirement, documented and **not a product blocker**: local builds exercising recording need an **Apple Development certificate** — macOS 15+ silently rejects SCK for ad-hoc binaries (Cap #1722); the iOS phase already established free-team signing.
+
+### AD-39 — Tray recording state & honest quit (extends Story 10.3 / AD-18)
+- **Binds:** FR-74, FR-75, NFR-5 (recording)
+- **Prevents:** an invisible recording indicator; an orphaned recorder on quit; silent recording-loss
+- **Rule:** The opt-in tray (`crates/keeper/src/tray.rs`, single mutex-guarded `TrayIcon` slot) gains recording states `idle → recording → warning/error` via `TrayIcon::set_icon` (keeper ships record-dot + warning-badge assets); a ~1 Hz tick updates a disabled menu line (`"Recording — 12:34 · segment 3, 412 MB"`) and the menu adds **Stop Recording** + **Open Recordings Folder**. Recording **temporarily forces tray presence** even when the FR-53 opt-in toggle is off, restoring the exact prior tray state at stop (a recording indicator that isn't visible is a bug). Quit-while-recording = warn → `stop` RPC → flush → kill-timeout guard (extends FR-53 quit honesty; never orphans `keeper-rec`). Every recording fault (recorder crash/exit, writer stall, permission revocation, device loss, disk-guard) is **loud**: tray error state + a native notification through the **AD-18 pipeline** within 5 s, offering one-click restart; NFR-5's no-silent-loss extends so every session reaches `finalized | recovered | failed`. The macOS purple capture pill is system-owned and untouched.
+
+*Reliability envelope (PRD §14.3 — authored bars, owner-sign-off at phase release, not architecture-blocking, mirroring the AD-22/NFR-3 posture): NFR-19 4 h soak with bounded sample-buffer queues (**drop-oldest video, audio never dropped**; sustained drop → warning); NFR-20 disk guard (warn < 10 GB / stop-and-finalize < 2 GB on the target volume); NFR-21 (< 100% of one core + < 400 MB combined RSS, messaging NFR-1..4 still hold while recording); NFR-22 (keyframe-cut host-clock PTS, concat monotonic and screen↔camera aligned within one frame — an automated concatenate-and-assert test gates release). Ownership split: buffer-bounding, drop policy, and rotation correctness live in `keeper-rec`; the disk-guard **policy** (pre-start free-space validation, warn threshold, hard-floor stop-and-finalize decision) lives in `keeper-core::recording` (AD-33), driven by free-space reported on the sidecar's `state` events. The CI perf/concat harness is the gate (extends AD-21 measurement hooks).*
+
 ## Consistency Conventions
 
 | Concern | Convention |
@@ -225,6 +280,7 @@ Allowed dependency direction is exactly the arrows above. `keeper-core` never im
 | Data files | Network Risk Tiers + coupling caveats + known-bot registry = versioned JSON under `src-tauri/crates/keeper-core/data/` |
 | Secrets & logs | Secrets only in the platform keychain (macOS Keychain / iOS keychain, both behind the `Platform` port); `op://` for dev creds; logs carry ids, never content or tokens |
 | Platform gating | Compile-time: `#[cfg(desktop)]`/target-gated deps in the shell only, never in `keeper-core` (AD-26); runtime UI gating only via `CapabilitiesVm` (AD-27) — no platform sniffing in TS |
+| Sidecars | First-party helper binaries spawned launch-on-demand via `Platform::sidecar_path` (`<name>-<triple>` next to the exe, e.g. `keeper-rec-aarch64-apple-darwin`); absent → clean `Unsupported`; drivers behind a Platform-style port (bbctl AD-16, `keeper-rec` AD-33/AD-34). NDJSON (one JSON object per line) on stdio with a `getCapabilities` version handshake |
 | Language & tooling | English everywhere; bun only (never npm/pnpm/yarn); quality gates `bun run check`, `check:rust`, `test:rust` before done |
 
 ## Stack
@@ -243,6 +299,8 @@ Allowed dependency direction is exactly the arrows above. `keeper-core` never im
 | bun / Biome / Vitest / cargo-nextest / cargo-deny / lefthook | repo-pinned (bun.lock / Cargo.lock) |
 | CI | GitHub Actions macOS arm64 + tauri-action (+ `cargo check --target aarch64-apple-ios` PR gate) |
 | iOS toolchain (dev-machine) | Xcode 16.x (iOS 18 SDK) + CocoaPods + rust targets `aarch64-apple-ios{,-sim}`; min deployment target iOS 16.0 |
+| `keeper-rec` (recording sidecar) | first-party Swift, SwiftPM package `tools/keeper-rec/`; ScreenCaptureKit + AVFoundation/AVAssetWriter (system frameworks only); Apache-2.0; no ffmpeg; codesigned aarch64 externalBin (AD-38) |
+| Swift toolchain (CI + recording dev) | Xcode Swift (on the existing macOS signing runner); recording capability floor macOS 13.0 (`CapabilitiesVm`), internal 15+ mic branch; local recording dev needs an Apple Development cert (AD-38) |
 
 ## Structural Seed
 
@@ -263,6 +321,7 @@ src-tauri/
         archive/             # ingest, version chains, fts.rs, export/{json,md}.rs
         bridges/             # discovery.rs, transport/{provisioning,bot}.rs, health.rs, bbctl.rs
         signals/             # incognito policy + sole receipt/typing/presence emitter
+        recording/           # macOS Screen Recording (AD-33): session state machine, manifest, segment ledger, folder validation, recovery — platform-free (Recorder port injected)
         notify/              # notification rules engine
         keychain/            # keyring wrapper behind Platform port
         settings/            # typed settings over keeper.db
@@ -270,7 +329,7 @@ src-tauri/
         platform.rs          # Platform port trait
         error.rs             # CoreError
     keeper/                  # Tauri shell (today's keeper_lib migrates here)
-      tauri.conf.json        # + bundle.iOS.developmentTeam (or TAURI_APPLE_DEVELOPMENT_TEAM env); mobile deep-link scheme
+      tauri.conf.json        # + bundle.iOS.developmentTeam (or TAURI_APPLE_DEVELOPMENT_TEAM env); mobile deep-link scheme; bundle.externalBin ["binaries/keeper-rec"] + bundle.macOS.infoPlist NSMicrophoneUsageDescription/NSCameraUsageDescription (AD-36/AD-38)
       gen/apple/             # generated by `tauri ios init`; committed minus build/ (AD-32)
                              #   project.yml (deployment target, background color), Info.plist (keeper:// CFBundleURLTypes), *_iOS/ safe-area patch
       src/
@@ -279,14 +338,19 @@ src-tauri/
         media_protocol.rs    # keeper-media:// (Range) from SDK media cache — WKURLSchemeHandler on iOS
         platform/            # Platform impls: desktop + iOS (data_dir, keychain class, sidecar Unsupported)
         lifecycle.rs         # foreground/background command -> SyncService pause/resume (AD-30)
-        tray.rs  deep_link.rs  plugins.rs   # desktop-only members behind #[cfg(desktop)] (AD-26)
+        recorder.rs          # Recorder port impl (AD-33): macOS spawns keeper-rec + NDJSON-RPC stdio; non-macOS = Unsupported; #[cfg(desktop)]
+        tray.rs  deep_link.rs  plugins.rs   # desktop-only members behind #[cfg(desktop)] (AD-26); tray.rs gains recording/warning state (AD-39)
+tools/
+  keeper-rec/                # first-party Swift capture sidecar (AD-34/AD-38) — SwiftPM, OUTSIDE the cargo workspace
+    Package.swift            # Apple system frameworks only (SCK + AVFoundation); Apache-2.0; no ffmpeg
+    Sources/keeper-rec/      # SCK stream setup, dual-AVAssetWriter fMP4 rotation, mic/webcam, NDJSON-RPC stdio loop
 src/
   index.html                 # viewport-fit=cover (+ interactive-widget evaluation) (AD-31)
   lib/ipc/gen/               # ts-rs output (generated; CI-diffed, never hand-edited) — includes CapabilitiesVm
   lib/ipc/                   # typed invoke/channel wrappers
-  stores/                    # zustand mirrors: accounts, inbox, timeline, bridges, send, drafts, settings (+ capabilities)
+  stores/                    # zustand mirrors: accounts, inbox, timeline, bridges, send, drafts, settings (+ capabilities, recording)
   hooks/use-shell-layout.ts  # desktop / tablet / phone (<768px) tiers (AD-31)
-  features/                  # wizard, inbox, chat, bridges, approval, palette, settings UI (+ phone stack container)
+  features/                  # wizard, inbox, chat, bridges, approval, palette, settings UI (+ phone stack container, recording settings/picker — gated on CapabilitiesVm.recording, AD-35)
   components/ui/             # shadcn-generated
 docs/ios.md                  # 7-day re-arm ritual, sideload/re-sign flows, platform limitations
 ```
@@ -305,7 +369,7 @@ graph LR
   PURGE["explicit 'delete Local Archive for account'"] -- "DELETE rows" --> ADB
 ```
 
-Deployment envelope: a single signed/notarized macOS app bundle (+ optional bbctl sidecar binary), plus an iOS app signed with a free Personal Team (7-day profiles re-armed from the owner's Mac; test IPAs re-signed per-tester via Sideloadly/zsign; AltServer auto-refresh optional) — no App Store/TestFlight this phase. External topology is entirely user-owned (homeserver, bridges, Beeper cloud); no push infrastructure exists or is promised. CI (GitHub Actions) is the only project-side infrastructure.
+Deployment envelope: a single signed/notarized macOS app bundle (+ optional bbctl sidecar binary + the codesigned `keeper-rec` recording sidecar as an `externalBin`, AD-38), plus an iOS app signed with a free Personal Team (7-day profiles re-armed from the owner's Mac; test IPAs re-signed per-tester via Sideloadly/zsign; AltServer auto-refresh optional) — no App Store/TestFlight this phase. External topology is entirely user-owned (homeserver, bridges, Beeper cloud); no push infrastructure exists or is promised. CI (GitHub Actions) is the only project-side infrastructure.
 
 ## Capability → Architecture Map
 
@@ -336,8 +400,16 @@ Deployment envelope: a single signed/notarized macOS app bundle (+ optional bbct
 | NFR-16 jetsam memory hygiene | cache-drop on background/memory-warning; capped Range buffer | AD-28, AD-30 |
 | NFR-17 flaky-network resilience | SyncService offline mode + restart guard over the local mirror | AD-30, AD-8 |
 | NFR-18 resume integrity | blank-webview reload guard, walking-skeleton-tested | AD-30 |
+| FR-66 recording capability gating | `keeper-core::vm::CapabilitiesVm.recording` (macOS ≥ 13) | AD-35, AD-27, AD-7 |
+| FR-67 permission pre-flight (Screen/Mic/Camera) | `RecordingPermissionVm` via `Recorder` port → `keeper-rec` probe | AD-36, AD-33 |
+| FR-68–70 source/audio/webcam selection | `keeper-rec` SCK `SCContentFilter` + AVCapture; `recording` module VMs | AD-34, AD-37, AD-33 |
+| FR-71–73 session folder, segmentation, crash-safety & recovery | `keeper-core::recording` (ledger/manifest/recovery) + `keeper-rec` (fMP4 dual-writer) | AD-37, AD-33 |
+| FR-74–75 tray state, elapsed, Stop, loud failure | `tray.rs` recording states + `notify` pipeline | AD-39, AD-18 |
+| FR-76 local-only recording, zero new egress | no network in `recording`/`keeper-rec`; NFR-11 egress diff empty | AD-5, AD-33 |
+| NFR-19–21 soak, disk-guard, CPU/mem envelope | bounded queues + disk guard in `keeper-rec`; CI perf harness | AD-37, AD-39, AD-21 |
+| NFR-22 gapless handover | keyframe-cut dual-writer host-clock PTS; concat-assert CI gate | AD-37 |
 
-**PRD consistency check.** All FR-1–54 and NFR-1–9, 11–14 are implementable within this spine. **Phase 2 (2026-07-09):** FR-55–65 and NFR-16–18 are implementable within AD-26..32 with no PRD amendment; NFR-15's 3 s cold-start bar is authored pending owner confirmation (PRD §13.8) and is not release-gating until confirmed. The walking-skeleton gate (SM-7: on-device OIDC deep-link login, room list, E2EE send/receive, relaunch-restore — plus the keyring-on-iOS spike and the resume reload guard) must pass before phone-UX epics start. One amendment required: **NFR-10** — "local stores (state, crypto, Local Archive) support passphrase-based at-rest encryption" is satisfiable for SDK stores in MVP but not for `archive.db` (FTS cannot index ciphertext; SQLCipher conflicts with matrix-sdk-sqlite's bundled SQLite linkage). Amend NFR-10 to scope MVP passphrase encryption to SDK stores, with archive-at-rest as a v1.x spike (AD-22). Two PRD open questions become epic-gating tests, not amendments: OQ-1 (walking-skeleton spike: SSS + E2EE + timeline channel + FTS in release build — first epic exit gate) and OQ-3 (hungryserv surface: verify `thirdparty/protocols`, `dev.keeper.draft` account data, `m.read.private`, push rules against a real Beeper account; degrade per-feature with disclosure).
+**PRD consistency check.** All FR-1–54 and NFR-1–9, 11–14 are implementable within this spine. **Phase 2 (2026-07-09):** FR-55–65 and NFR-16–18 are implementable within AD-26..32 with no PRD amendment; NFR-15's 3 s cold-start bar is authored pending owner confirmation (PRD §13.8) and is not release-gating until confirmed. The walking-skeleton gate (SM-7: on-device OIDC deep-link login, room list, E2EE send/receive, relaunch-restore — plus the keyring-on-iOS spike and the resume reload guard) must pass before phone-UX epics start. One amendment required: **NFR-10** — "local stores (state, crypto, Local Archive) support passphrase-based at-rest encryption" is satisfiable for SDK stores in MVP but not for `archive.db` (FTS cannot index ciphertext; SQLCipher conflicts with matrix-sdk-sqlite's bundled SQLite linkage). Amend NFR-10 to scope MVP passphrase encryption to SDK stores, with archive-at-rest as a v1.x spike (AD-22). Two PRD open questions become epic-gating tests, not amendments: OQ-1 (walking-skeleton spike: SSS + E2EE + timeline channel + FTS in release build — first epic exit gate) and OQ-3 (hungryserv surface: verify `thirdparty/protocols`, `dev.keeper.draft` account data, `m.read.private`, push rules against a real Beeper account; degrade per-feature with disclosure). **Phase 3 (2026-07-16):** FR-66–FR-76 and NFR-19–NFR-22 are implementable within AD-33..39 with **no PRD amendment required**. The authored reliability bars (NFR-19 soak duration, NFR-20 disk thresholds, NFR-21 CPU/memory envelope, the FR-70/NFR-22 one-frame alignment bound) are owner-sign-off items at phase release — not architecture blockers — mirroring the AD-22/NFR-3 posture; the CI concat-assert + perf harness is the gate once confirmed. SM-9 (Development-signed end-to-end recording gate) and SM-10 (reliability + induced-failure matrix + empty egress diff) map to the R.1 walking-skeleton epic and AD-39's loud-failure surface. One DevEx requirement (not a product blocker) is documented in release/dev docs: local builds exercising recording must be Apple-Development-signed (macOS 15+ ad-hoc SCK rejection, AD-38).
 
 ## Deferred
 
@@ -355,3 +427,6 @@ Deployment envelope: a single signed/notarized macOS app bundle (+ optional bbct
 - **`NWPathMonitor`-driven fast retry, share-sheet media save, full Dynamic Type adoption, biometric app lock** — fit-and-finish or later phases; nothing this phase depends on them.
 - **Threads, spaces management, custom filtered views** — not in MVP scope; inbox projection (AD-20) is the extension point.
 - **Homeserver companion-stack docs** — Synapse ≥ 1.114 as documented default (closes PRD OQ-2); docs-only, no code dependency.
+- **Recording later stories** (PRD §14.4) — pause/resume, webcam PiP burn-in + camera self-view bubble, the `SCContentSharingPicker` system-picker path (macOS 14+, also silences the monthly re-auth nag), HEVC/HDR capture, DND-while-recording, and an orphan-segment "tidy" remux pass. AD-34's contract and AD-37's format are the carry-over seams; the `persistent-content-capture` entitlement (nag removal) sits behind the paid-program gate.
+- **In-app recordings browsing** (PRD §14.7 Open #2) — a list of past sessions inside keeper; MVP is folder + Finder + the tray's Open Recordings Folder. Inbox/settings projection patterns (AD-20/AD-25) are the extension point.
+- **Windows/Linux recording** — follows those platforms; `CapabilitiesVm.recording` (AD-35) and the platform-free `recording` module (AD-33) are the platform-neutral seams (a non-macOS `Recorder` impl replaces `keeper-rec`).
