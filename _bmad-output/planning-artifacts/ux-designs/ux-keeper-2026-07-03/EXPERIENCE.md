@@ -8,14 +8,15 @@ sources:
   - _bmad-output/planning-artifacts/briefs/brief-keeper-2026-07-03/addendum.md
   - _bmad-output/planning-artifacts/research-market-2026-07-03.md
   - _bmad-output/planning-artifacts/research-ios-2026-07-09.md
+  - _bmad-output/planning-artifacts/research-recording-2026-07-16.md
   - docs/project-context.md
 created: 2026-07-03
-updated: 2026-07-09
+updated: 2026-07-16
 ---
 
 # keeper — Experience Spine
 
-> macOS desktop (MVP) + iPhone (Phase 2, PRD §13). Paired with `DESIGN.md` (visual identity; token references `{...}` resolve there). Spines win on conflict with any mock or import. FR/NFR numbers reference the PRD. UX benchmark: the Beeper desktop app — left sidebar with unified inbox + Spaces/filter chips, chat list, main conversation pane, right detail panel, ⌘K, keyboard-first. The phone tier is a projection of this spine, not a second product: everything not restated in `Responsive & Platform` behaves exactly as specified for desktop.
+> macOS desktop (MVP) + iPhone (Phase 2, PRD §13) + Screen Recording (macOS, Phase 3, PRD §14). Paired with `DESIGN.md` (visual identity; token references `{...}` resolve there). Spines win on conflict with any mock or import. FR/NFR numbers reference the PRD. UX benchmark: the Beeper desktop app — left sidebar with unified inbox + Spaces/filter chips, chat list, main conversation pane, right detail panel, ⌘K, keyboard-first. The phone tier is a projection of this spine, not a second product: everything not restated in `Responsive & Platform` behaves exactly as specified for desktop. Screen recording is a desktop-only utility surface gated behind the `recording` capability flag (FR-66) — specified in `Screen Recording (macOS — Phase 3)` and absent everywhere the flag is off.
 
 ## Foundation
 
@@ -27,11 +28,13 @@ One operator, unlimited Accounts, one window (plus transient overlays). Keyboard
 
 **Phase 2 adds the iPhone** (FR-55–FR-65): the same Rust core, the same React component trees, the same IPC contract, rendered in WKWebView on a phone-width viewport. Two contract extensions carry the whole phase: a **phone layout tier** below `{spacing.phone-breakpoint}` that projects the three-pane frame into a single-pane navigation stack driven by existing selection state (no router, FR-58 and PRD §13.8), and **platform capability flags** over the IPC handshake (FR-57) that remove unsupported surfaces — bbctl, global hotkey, updater, tray/background presence — rather than letting them render dead. On the phone, touch is the primary input and every desktop interaction has a touch path (FR-60); the full mapping lives in `Responsive & Platform`.
 
+**Phase 3 adds screen recording** (FR-66–FR-76), a desktop-macOS-only utility carried by the same capability-flag mechanism (FR-57): a `recording` flag present only on macOS ≥ 13.0 renders the recording surfaces; everywhere else they are absent, never dead. The capture pipeline lives in a first-party Swift sidecar (`keeper-rec`) spawned on demand (the bbctl precedent) — the UI stays a pure renderer of a Rust-owned recording state machine, so a recorder crash can never take the messenger down, and the UI never invents recording state. Recording is local-only: it adds zero network destinations (FR-76). It is a *utility, not a conversation* — it has no chat list, no timeline, no composer — so it lives beside Bridges and Settings, not in the inbox. The full specification is `Screen Recording (macOS — Phase 3)`.
+
 ## Information Architecture
 
 Persistent frame: **[Sidebar 260px] [Chat list 320px] [Conversation ≥480px] [Detail panel 320px, toggleable]** — widths and collapse rules in `DESIGN.md.Layout & Spacing`. On the phone tier (< `{spacing.phone-breakpoint}`) the same frame renders one pane at a time as a navigation stack — Inbox → Room → Detail — with the sidebar as a leading drawer; the IA below is unchanged, only its arrangement differs (see `Responsive & Platform`).
 
-**Sidebar** (shadcn `Sidebar`, collapsible to icon rail): traffic-light inset header with app name → primary views (Inbox `⌘1`, Archive `⌘2`, Approval Pane `⌘3` with amber count badge, Bridges `⌘4` with health dot roll-up) → SPACES group (per-Space rows, view-and-filter only, FR-23) → NETWORKS group (filter chips per connected Network with `{components.bridge-health-dot}`) → footer: Account switcher (per-Account avatar + hue dot + sync state) and global sync/offline status.
+**Sidebar** (shadcn `Sidebar`, collapsible to icon rail): traffic-light inset header with app name → primary views (Inbox `⌘1`, Archive `⌘2`, Approval Pane `⌘3` with amber count badge, Bridges `⌘4` with health dot roll-up, and — only when the `recording` capability is on — Recording `⌘5`, carrying a `{components.recording-dot}` while capture is live) → SPACES group (per-Space rows, view-and-filter only, FR-23) → NETWORKS group (filter chips per connected Network with `{components.bridge-health-dot}`) → footer: Account switcher (per-Account avatar + hue dot + sync state) and global sync/offline status.
 
 **Chat list**: Pins strip (circular, top, FR-22) → FAVORITES section (FR-21) → chronological Unified Inbox (FR-18), scoped by whatever sidebar view/filter is active. **Conversation**: header (avatar + `{components.network-badge}`, name, Account chip, incognito chip, mute glyph) → timeline → composer. **Detail panel**: chat info, members, shared media, per-chat controls (mute/mention-only, incognito override, archive, export this chat, view raw Bridge Bot chat).
 
@@ -51,9 +54,12 @@ Persistent frame: **[Sidebar 260px] [Chat list 320px] [Conversation ≥480px] [D
 | In-chat search | `⌘F` | Same engine scoped to the open Chat |
 | Export | Detail panel / search results / `⌘K` | Chat/Account/full archive → JSON + Markdown, background with progress (FR-35) |
 | Multi-account switcher | Sidebar footer / `⌘K` | Account list, per-Account state, add Account, sign out (keep/delete archive choice, FR-6) |
-| Settings | `⌘,` | Accounts, Privacy (incognito defaults, undo-send window), Notifications, Archive & Storage, Shortcuts, Appearance, About/Egress |
+| Settings | `⌘,` | Accounts, Privacy (incognito defaults, undo-send window), Notifications, Archive & Storage, Shortcuts, Recording (desktop, `recording` flag only), Appearance, About/Egress |
 | Command Palette | `⌘K` | Fuzzy-find Chats, contacts, and actions; `>` prefix for action mode (FR-48) |
 | Hotkey cheat sheet | `⌘?` | Overlay reference of all shortcuts (FR-49) |
+| Recording (desktop, `recording` flag only) | Sidebar / `⌘5` / `⌘K` / global Start hotkey | The recording utility view: pre-record setup ↔ active recording ↔ completion, in place (FR-67–75) |
+| Recording tray | macOS menu bar | Always-truthful active-state surface: idle / recording / error, elapsed + segment, Stop, Open Recordings Folder (FR-74/75) |
+| Settings → Recording | `⌘,` → Recording | Persistent recording defaults: folder, segment size, duration cap, fps, default devices, disk-guard note (FR-71/72) |
 
 Modal discipline: one dialog level; sheets don't stack on dialogs; the palette closes anything below it. Every surface above is reachable from the Command Palette — palette parity is a release gate (FR-48).
 
@@ -72,7 +78,11 @@ Microcopy. Brand voice lives in `DESIGN.md.Brand & Style`: plain, honest, calm. 
 | "Search your archive — works offline." | "Supercharge your message history 🚀" |
 | "On iPhone, keeper syncs and notifies only while open. Nothing is lost — messages wait on your homeserver." | Any copy implying background delivery or push before the §13.5 gate opens |
 | Risk tier copy verbatim from the tier table (PRD addendum §2) | Softening ("totally safe") or scare-mongering ("you WILL be banned") |
-| Sentence case everywhere; no exclamation marks; "Chat", "Account", "Bridge", "Network" capitalized per Glossary | Title Case Buttons, emoji in system copy, "please" in errors |
+| "Recorded locally. Nothing uploads." / "Reveal in Finder" | "Share your recording ✨" or any upload/cloud/transcription affordance |
+| "Recorder stopped unexpectedly — 4 segments were saved. Restart recording?" | A dismissible toast for a recording failure, or a silent stop |
+| "Screen Recording permission is off. Open System Settings to grant it. A relaunch may be needed, and macOS re-confirms this monthly." | Hiding the relaunch/monthly-reconfirm quirk, or a spinner that waits on a grant that will never come |
+| "Only Zoom's windows and audio are recorded. keeper, other apps, and notification banners stay out of the file." | "Recording your screen" (when app-scoped) |
+| Sentence case everywhere; no exclamation marks; "Chat", "Account", "Bridge", "Network", "Recording Session", "segment" capitalized per Glossary | Title Case Buttons, emoji in system copy, "please" in errors |
 
 ## Component Patterns
 
@@ -103,6 +113,15 @@ Behavioral. Visual specs live in `DESIGN.md.Components` or in shadcn defaults.
 | Wizard stepper | First-Run Wizard | Steps: Welcome → Add Account (three tabs: Homeserver login / OIDC / Beeper; the honest no-homeserver fork links companion-stack docs, managed hosts, Beeper path) → Bridge discovery (found list with tier badges) → per-Bridge login (reuses Bridge login stepper) → Done (lands in Inbox). Every step has "Skip for now"; wizard is re-enterable from Settings (FR-31). Progress dots, no lock-in, `Esc` asks once then exits to Inbox. |
 | Notification | macOS native | Sender + Chat + preview (preview omissible, FR-51); grouped per Chat. Click lands in the exact Chat and Account with the message in view (FR-54). Bridge-health notifications use the same pipeline and deep-link into the re-login flow (FR-28). |
 | Cheat sheet | `⌘?` overlay | Full shortcut reference as a searchable `Dialog`; generated from the same registry the palette uses, so it can't drift. |
+| Recording view | `⌘5` / palette | Non-chat utility surface flipping in place: **setup** (Source / Audio / Webcam / Destination / Segmenting / Advanced-fps cards) → **active** (`{components.active-recording-banner}` + source summary + `{components.segment-meter}`) → **completion / recovery** card. No timeline, no composer; Start is gated on permission pre-flight. Behavior detail in `Screen Recording`. |
+| Source picker | Recording setup | Live list of `{components.source-picker-row}` (Displays, then Applications) re-enumerated as apps launch/quit (FR-68). Single-select. App-scoped capture is disclosed as "only {App}'s windows and audio — keeper, other apps, and notification banners are excluded". A source that vanished before Start yields a clear inline error, never a hung start. |
+| Audio controls | Recording setup | System-audio `Switch` (default on; labelled "the audio the recorded content plays", not a device pick — FR-69); microphone `{components.device-picker}` (default "System default input"). Copy states the two are written as separate tracks, not mixed, and that keeper's own notification sounds are excluded. Requesting Microphone permission happens only when this is enabled (FR-67). |
+| Webcam control | Recording setup | `Switch` (default off) revealing a camera `{components.device-picker}` (built-in / external / Continuity Camera). Copy: "records to a separate file, synced to the screen" (FR-70); a note that macOS 14+ can composite the camera via the system presenter overlay — an OS behavior, not a keeper feature. Camera permission is requested only when enabled. No self-view bubble, no PiP this phase. |
+| Destination + Segmenting | Recording setup | Folder chooser showing the remembered default `~/Movies/keeper` (FR-71) with a validate-on-Start check (exists, writable, free space — NFR-20); segment-size stepper (default 500 MB) with a duration-cap fallback field (default 30 min, FR-72); fps lives in a collapsed Advanced group (30 default, 60 selectable). Changing any of these in the view mirrors Settings → Recording; changes affect the next session only. |
+| Permission pre-flight | Recording setup (before Start) | A `{components.permission-row}` per required permission — Screen Recording always; Microphone / Camera only when enabled — each live-detected at render (never cached optimistically, FR-67). Request via system prompt where allowed; deep-link to the exact System Settings pane where only manual granting remains. Start disabled until all green, naming the blocking permission. Honest note lines: relaunch-may-be-needed, macOS 15+ monthly re-confirm, and the subtle dev-facing "ad-hoc dev builds may be blocked on macOS 15+ — sign with an Apple Development certificate". |
+| Active-recording banner | Recording view + persistent | `{components.active-recording-banner}`: record dot, `mono` "Recording — 12:34 · segment 3 · 412 MB", Stop. In-app twin of the tray; persistent, never toast-only. Warning variant (mic unplugged, low disk) and error variant (recorder exit, writer stall, permission revoked, disk floor) are the loud-failure surface (FR-75) with "Restart recording". Pause deferred (§14.4). |
+| Recording tray | macOS menu bar | `{components.tray-recording}` states idle / recording / warning-error; a `mono` elapsed·segment·size line (disabled item, ~1 Hz tick, live < 1 s of start), Stop Recording, Open Recordings Folder, above Show keeper / Quit. Recording forces the tray visible even when the FR-53 opt-in toggle is off and restores the prior state exactly at Stop. Quitting keeper while recording warns, then stops and finalizes before exit (never orphans the recorder). macOS's own purple pill is left untouched. |
+| Completion / recovery card | Recording view + notification | On Stop: "Saved N segments · {size}" + session-folder path (`mono`) + **Reveal in Finder**; no preview/trim/share (FR-76). On startup or before a new recording, an interrupted session surfaces once as "A recording was interrupted; N segments were saved" linking the folder; recovered files play as-is (FR-73). |
 
 ## State Patterns
 
@@ -142,6 +161,17 @@ Every state below is persistent-by-default: anything representing risk or loss s
 | Notification previews off | macOS notifications | Sender + Chat only, no content (FR-51). |
 | DND / muted | Notifications | Global DND toggle in sidebar footer menu; muted Chats/Networks accumulate unread silently (FR-52); mention-only Chats notify on mentions and replies-to-user only. |
 | App quit vs. background | Settings copy + quit | Window close keeps syncing (menu-bar presence optional); `⌘Q` fully stops sync and Settings says exactly that — no fake push promise (FR-53). |
+| Recording: capability off | Everywhere | On iOS and macOS < 13.0 no recording affordance renders — no sidebar entry, no Settings section, no palette action, no tray items; not a disabled state, an absent one (FR-66). |
+| Recording: permission blocked | Recording setup | Start disabled; the blocking permission named inline with its System Settings deep-link and the macOS quirk notes; state is re-detected on focus/return, so granting-and-returning updates it without a manual refresh (FR-67). |
+| Recording: idle → armed | Recording view + tray | Setup complete and permissions green: Start enabled. Within 1 s of Start the tray flips to recording and the in-app banner appears; macOS posts its own purple pill in parallel (FR-74). |
+| Recording: running | Banner + tray + segment meter | `mono` elapsed·segment·size ticks ~1 Hz; the `{components.segment-meter}` fills toward the segment size and resets at each gapless rotation (FR-72); source summary stays visible. |
+| Recording: warning (non-fatal) | Banner + tray badge | Mic hot-unplug (video + system audio keep rolling, mic track silence-filled, fallback to default input attempted) or free space below the warn threshold: a persistent warning state until resolved or acknowledged — never a dismissed-and-gone toast (FR-69/75, NFR-20). |
+| Recording: loud failure | Banner (error) + notification + tray error | Recorder crash/exit, writer stall, permission revoked mid-record, device loss, or disk hard-floor: tray → error and a native notification within 5 s, "Restart recording" offered; already-written segments intact; the manifest records the true terminal status. No recording fault is silent (FR-75, extends NFR-5). |
+| Recording: disk floor stop | Banner + tray | Below the hard floor keeper stops-and-finalizes gracefully rather than dying mid-write, and says so; it never runs the volume to exhaustion (NFR-20). |
+| Recording: source vanished | Recording setup | A picked display/app that disappeared before Start yields a clear inline error at Start, never a hung recording (FR-68). |
+| Recording: stopped / completed | Completion card | Current segment finalized; "Saved N segments · {size}" + folder path + Reveal in Finder; tray returns to its exact prior configuration (FR-71/74). |
+| Recording: interrupted → recovered | Completion-shape notice | On startup / before a new recording, an unfinalized session is marked recovered and surfaced once ("A recording was interrupted; N segments were saved") linking the folder; files play as-is, no remux (FR-73). |
+| Recording: quit while recording | Quit path | `⌘Q` warns first, then stops and finalizes the current segment before exit (kill-timeout guarded) — extends FR-53's quit honesty; never orphans the recorder (FR-74). |
 
 ## Interaction Primitives
 
@@ -170,6 +200,11 @@ Every state below is persistent-by-default: anything representing risk or loss s
 **Approval Pane**
 - `j`/`k` move · `Enter` edit inline · `⌘Enter` approve (send) · `⌘⌫` discard (5 s undo toast)
 
+**Recording (desktop, `recording` flag only)**
+- `⌘5` open the Recording view · palette actions "Start recording", "Stop recording", "Open recordings folder" (registered only behind the flag, FR-66/48)
+- Optional configurable global **Start/Stop Recording** hotkey (unset by default; assigned in Settings → Shortcuts alongside the summon hotkey, conflict-checked at assignment) — Stop is always one click from the tray regardless
+- No single-key verbs here (this is not a list surface); Stop in the active view is a focusable button, `Esc` does **not** stop a recording (destructive-by-omission guard — stopping is always explicit)
+
 **Meta**
 - `⌘?` cheat sheet · `⌘W` close window (sync continues) · `⌘Q` quit (sync stops)
 
@@ -187,6 +222,10 @@ keeper's differentiator is honesty rendered as UI. These rules bind every surfac
 - **Explicit-approval invariant (FR-41):** the Approval Pane empty state and Settings → Privacy both carry "Nothing sends without you." No UI ever offers scheduled, background, or bulk dispatch.
 - **Egress honesty (NFR-11):** Settings → About lists every endpoint keeper talks to (your Homeservers, Beeper API if used, the update endpoint) — a rendered list, not a doc link.
 - **Incognito coupling (FR-44):** per-Network caveats surface at toggle time, inline, from the same data structure as risk tiers.
+- **Local-only recording (FR-76):** the recording setup states "Recorded locally. Nothing uploads." plainly; no upload, share-link, transcription, or cloud affordance exists anywhere in the recording UI, and Settings → About's egress list (NFR-11) gains nothing for this phase — the recording feature adds zero network destinations, and that emptiness is the disclosure.
+- **No silent recording loss (FR-75, extends NFR-5):** every started Recording Session reaches a user-visible terminal state — finalized, recovered, or failed-with-reason. Recording faults are persistent tray-error + banner + notification, never a dismissible toast (the FR-28 persistence rule applied to capture).
+- **App-scoped capture disclosure (FR-68):** recording a single application discloses inline that only that app's windows and audio are captured — keeper, other apps, and notification banners are excluded from the file.
+- **Recording permission honesty (FR-67):** macOS's quirks are stated, not hidden — relaunch-after-grant, the macOS 15+ monthly re-confirm, and the dev-facing ad-hoc-signing caveat; permission state is always live-detected, never optimistically cached.
 
 ## Accessibility Floor
 
@@ -200,6 +239,7 @@ Behavioral floor per NFR-14 ("operable and labeled"); visual contrast lives in `
 - **Reduced motion:** countdown ring becomes numeric text; pane transitions become cuts; the bridge-dot pulse becomes a static state change.
 - **Targets & text:** rows are full-width targets; icon-only controls ≥ 24px with tooltips; all text respects macOS text-size scaling since layout is token-based, not pixel-locked imagery.
 - **Phone tier:** the iOS-specific floor (VoiceOver in WKWebView, Dynamic-Type-style rem scaling, 44 pt targets, gesture alternatives) is specified in `Responsive & Platform → Accessibility on iOS` and extends — never replaces — this section.
+- **Recording (desktop):** every recording flow — permission pre-flight, source/device pick, Start, Stop, recovery — completes with keyboard alone and mirrors into the native menu bar. VoiceOver labels carry live state: "Recording, 12 minutes 34 seconds, segment 3, button" on the banner; permission rows announce "Screen Recording, denied, Open System Settings, button". The elapsed time announces on demand and on state change, **not** once per second (the undo-pill rule). Recording start/stop and every fault announce **assertively** — they are loss-risk events, like bridge health. The tray menu is reachable via the macOS menu-bar-extra keyboard path (Control-F8 / VoiceOver menu-bar navigation); Stop and Open Recordings Folder are real, labelled menu items. `Esc` never stops a recording — stopping is always an explicit focusable action.
 
 ## Responsive & Platform
 
@@ -359,6 +399,71 @@ Extends the Accessibility Floor; VoiceOver here means VoiceOver against the WKWe
 - **Dynamic-Type-ish scaling (FR-60):** rem-based type end to end; at large text sizes rows grow and text wraps — nothing clips, nothing becomes a two-line ellipsis where content matters. Full Dynamic Type mapping is fit-and-finish.
 - **Targets:** ≥ 44 pt everywhere, including swipe-action buttons (full row height) and the composer send button.
 
+## Screen Recording (macOS — Phase 3)
+
+Desktop-macOS-only, gated behind the `recording` capability flag (FR-66); everything here is absent on iOS and macOS < 13.0. Recording is a **utility, not a conversation** — no chat list, no timeline, no composer — so it does not enter the inbox; it lives beside Bridges and Settings. The UI is a pure renderer of a Rust-owned recording state machine fed by the `keeper-rec` Swift sidecar; the UI never invents recording state.
+
+### IA decision — where recording lives, and why
+
+Three entry points, each earning its place; there is deliberately **no** recording control in the chat surface.
+
+1. **A `Recording` sidebar entry (`⌘5`), capability-gated.** Recording is a first-class utility on the same footing as Bridges — a place you deliberately go to set up and monitor a session — so it belongs in the sidebar's primary-views group, not the chat list (a recording is not a Chat) and not buried in Settings (an active session needs a real home surface, not a preferences pane). The entry carries a `{components.recording-dot}` while capture is live, so the sidebar tells the truth at a glance.
+2. **A global start control** — Command Palette actions ("Start recording" / "Stop recording" / "Open recordings folder") and an optional configurable global Start/Stop hotkey (unset by default) — because starting a recording is often something you do *from another app* about to be recorded, so keyboard-first start without hunting for the window matters. Stop is always additionally one click from the tray.
+3. **The tray as the always-truthful active surface** (FR-74) — the one place recording state is visible when keeper's window is buried behind the thing being recorded.
+
+**Settings → Recording** holds the persistent defaults (folder, segment size, duration cap, fps, default devices, disk-guard thresholds); the setup view mirrors them and can override per session. Two things are deliberately **not** built this phase: an in-app **recordings browser** (a list of past sessions inside keeper) — MVP is folder-and-Finder plus the tray's Open Recordings Folder; it *could* be added later, folder-backed, but it is out this phase (PRD §14.7 open Q2) — and any **editing/preview/share** affordance, which is out forever (§14.4/FR-76).
+
+### Pre-record setup
+
+One scrollable single column (`{spacing.content-max-width}`, centered) of `Card` sections; sensible defaults are visible and everything is overridable:
+
+- **Source (FR-68).** `{components.source-picker-row}` list, "Displays" then "Applications" (`section-label` headers), live-enumerated and refreshed as apps launch/quit; each row shows name + app icon. Single-select (one target per session this phase). Picking an application discloses inline: "Only {App}'s windows and audio are recorded — keeper, other apps, and notification banners stay out of the file." A source that has vanished before Start errors clearly at Start, never hangs.
+- **Audio (FR-69).** System audio `Switch` (default **on**) — labelled as "the audio the recorded content plays", not a device pick (it taps whatever the captured content plays; keeper's own notification sounds are excluded). Microphone `{components.device-picker}` (default **"System default input"**). Copy states plainly that system audio and mic are written as **separate tracks, not mixed** — either side stays removable later.
+- **Webcam (FR-70).** `Switch` (default **off**) revealing a camera `{components.device-picker}` (built-in / external / Continuity Camera). Copy: "records to a separate file, synced to the screen." A subtle note: macOS 14+ can composite the camera via the system presenter overlay — an OS behavior, not a keeper feature. No self-view bubble, no PiP this phase.
+- **Destination (FR-71).** Folder chooser showing the remembered default `~/Movies/keeper`; validated at Start (exists, writable, free space per NFR-20) with actionable errors. Each session writes a timestamped session folder with a `manifest.json` and segment files.
+- **Segmenting (FR-72).** Segment-size stepper (default **500 MB**) with a duration-cap fallback field (default **30 min**) so low-motion recordings still rotate. Rotation is gapless.
+- **Advanced (collapsed).** fps (30 default, 60 selectable) at source resolution. Collapsed because the defaults are right for almost everyone.
+
+Group footer, always visible: **"Recorded locally. Nothing uploads."** (FR-76.)
+
+### Permission pre-flight (FR-67)
+
+Before Start, a `{components.permission-row}` per **required** permission — Screen Recording always; Microphone and Camera **only when those sources are enabled** (never requested preemptively). Each row's state is **live-detected at render**, never optimistically cached: `Granted` / `Not requested yet` / `Denied`. keeper requests via the system prompt where the OS allows and deep-links to the exact System Settings pane where only manual granting remains. **Start is disabled until every required permission is green, with the blocking permission named.**
+
+Honest quirk notes (`caption`), because macOS makes them unavoidable:
+- Screen Recording: "A relaunch may be needed after granting" and "macOS 15+ re-confirms this grant monthly."
+- Dev-facing, subtle: "Ad-hoc dev builds may be blocked on macOS 15+ — sign with an Apple Development certificate." (Shown only in dev/unsigned contexts; a release build never nags a normal user with it.)
+
+Permission revoked mid-recording is not handled here — it is a loud failure (below, FR-75), with already-written segments intact.
+
+### Active recording — in-app state + tray (FR-74)
+
+**In-app** (`{components.active-recording-banner}` pinned to the top of the Recording view): a `{components.recording-dot}`, "Recording", a `mono` line **elapsed · segment # · size on disk** ticking ~1 Hz, a **source summary** (what's being captured, which audio, webcam on/off), the `{components.segment-meter}` filling toward the segment size and resetting each rotation, and a **Stop** button. **Pause is deferred** (§14.4) — not rendered, not greyed; simply absent this phase.
+
+**Tray / menu bar** (`{components.tray-recording}`): the icon flips idle → recording within 1 s of Start; the menu carries a `mono` "Recording — 12:34 · segment 3, 412 MB" line (disabled, ~1 Hz), **Stop Recording**, and **Open Recordings Folder**, above the existing Show keeper / Quit. **Recording forces the tray visible even when the user's opt-in tray toggle (FR-53) is off**, and restores the prior tray state exactly at Stop — a recording indicator that isn't visible is a bug. macOS's own **purple screen-recording pill** stays untouched; keeper's tray adds what the pill lacks (elapsed, segment, Stop, error states). Quitting keeper while recording **warns first, then stops and finalizes** the current segment before exit (kill-timeout guarded) — never orphans the recorder.
+
+### Loud failure surfacing (FR-75) — no silent recording loss
+
+Every fault is loud and persistent — the messenger's no-silent-loss ethos (NFR-5) extended to capture. The triad fires together: **tray error state + native notification (within 5 s) + persistent in-app error banner**, never a toast alone.
+
+- **Fatal** (recorder crash/unexpected exit, writer stall, permission revoked mid-record, disk hard-floor): banner + notification offer **"Restart recording"**; already-written segments are intact; the manifest records the true terminal status.
+- **Non-fatal warnings** (mic hot-unplug, low disk) raise a **persistent warning state** until resolved or acknowledged — never dismissed-and-gone. Mic unplug specifically **never aborts**: video and system audio keep rolling, the mic track is silence-filled, keeper attempts fallback to the default input, and the warning stands (FR-69).
+- **Disk floor** (NFR-20): below the hard floor keeper **stops-and-finalizes gracefully** and says so, rather than dying mid-write.
+
+Invariant: every started Recording Session reaches a user-visible terminal state — **finalized, recovered, or failed-with-reason.**
+
+### Post-record & recovery (FR-71/73)
+
+On **Stop**: the current segment finalizes and the Recording view shows a completion `Card` — "Saved N segments · {total size}", the session-folder path in `mono`, and a primary **Reveal in Finder**. No in-app preview, scrub, trim, annotate, or share — ever (§14.4/FR-76). The tray returns to its exact prior configuration.
+
+On **startup or before a new recording**, keeper scans for interrupted sessions (manifest still in `recording` state), marks them `recovered`, and surfaces the notice **once**: "A recording was interrupted; N segments were saved" linking the session folder. Recovered fragmented-MP4 files play as-is — no remux step.
+
+**Recordings browser — could / deferred (PRD §14.7 open Q2):** a folder-backed list of past sessions inside keeper (session name, date, duration, size, Reveal-in-Finder per row) is a plausible later addition that would reuse `Card`/list patterns and read the same manifests; it is **out this phase** — MVP is folder-and-Finder plus the tray's Open Recordings Folder. Logged as a spine assumption, not built.
+
+### Recording — accessibility
+
+Extends the Accessibility Floor. Every flow completes keyboard-only and mirrors into the native menu bar. VoiceOver: the banner announces "Recording, 12 minutes 34 seconds, segment 3"; permission rows announce name + state + action ("Screen Recording, denied, Open System Settings, button"); elapsed announces on demand and on state change, not per second. Start/Stop and every fault announce **assertively** (loss-risk, like bridge health). The tray items are real labelled menu items reachable via the macOS menu-bar-extra keyboard path. `Esc` never stops a recording — stopping is always an explicit focusable action. Reduced motion: the record dot never pulses, the segment meter animates by cuts.
+
 ## Inspiration & Anti-patterns
 
 - **Lifted from Beeper Desktop (the benchmark):** the three-pane unified inbox with a Spaces/filters rail; Favorites vs. Pins as distinct tiers; inbox-zero archive flow with auto-return; `⌘K` as the everything-surface; incognito with manual read release. keeper's bet is Beeper's shell with ownership underneath.
@@ -369,6 +474,13 @@ Extends the Accessibility Floor; VoiceOver here means VoiceOver against the WKWe
 - **Rejected — cloud-assisted conveniences:** no "delivers even when off" promises anywhere; deferred features (scheduled send) will say "app must be running" in the same breath as the feature name.
 - **Rejected — gamification, celebration animations, streaks:** archival calm; inbox zero is its own reward.
 - **Rejected — hiding the Bridge Bot:** the raw bot Chat stays reachable behind every native flow; keeper wraps, never walls.
+- **Lifted from CleanShot X (recording UX gold standard):** source / audio / webcam in one calm panel, device pickers remembered per mode, sensible visible defaults — CleanShot-grade simplicity over OBS's verbose settings wall (research §3). Its auto-DND-while-recording is admired but deferred (§14.4).
+- **Lifted from Screen Studio & Cap Studio mode:** screen and camera recorded as *separate synchronized files*, composed only at export — which for keeper means never, because keeper doesn't edit. This dodges live GPU compositing entirely (research §5).
+- **Lifted from OBS "Automatically split output" + record-to-crash-safe-container:** the only mainstream size/time-batched capture; keeper takes the mechanic (size-based segment rotation) and the crash-safety posture (fragmented MP4) while rejecting the settings-heavy UI (research §3/§4).
+- **Rejected — Loom/Cap instant-share and webcam burn-in:** no share link, no cloud, no PiP burn-in; keeper records to local files and hands them to Finder. Sharing is the user's act with ordinary files, outside keeper (FR-76).
+- **Rejected — QuickTime's moov-at-end format:** a crash loses the whole file; keeper's fragmented-MP4 + segment recovery is the direct answer (research §3/§4, FR-73).
+- **Rejected — any in-app editor, preview scrubber, or trim:** keeper records; it does not trim, annotate, or compose (§14.4). The recording UI ends at Reveal in Finder.
+- **Rejected — silent recording failure:** the whole point of the tray/banner/notification triad is that a dead recorder is never discovered hours later at Stop — the messenger's no-silent-loss ethos (NFR-5) extended to capture.
 
 ## Key Flows
 
@@ -432,3 +544,13 @@ Failure beat: she wants it gone instead — the separate destructive sign-out op
 5. **Climax:** the Approval Pane as a deliberate airlock — morning-Noor overrides midnight-Noor, and nothing ever sends without her explicit action.
 
 Failure beat: she deletes an already-delivered message — the confirmation says plainly: Matrix redaction issued, removal on the bridged network is best-effort, her own local archive copy follows her Archive & Storage setting.
+
+### Flow 7 — Piotr records a 90-minute workshop and trusts it survived (UJ-7, PRD §14)
+
+1. Ten minutes before his workshop Piotr presses his global Start hotkey; keeper's Recording view surfaces. Source: he picks the "Keynote" application (not the whole display — his Slack and Mail stay out of the file, disclosed right at the picker). System audio is already on; he leaves the microphone on "System default input" and flips Webcam on, choosing his Continuity Camera.
+2. The permission pre-flight shows Screen Recording and Microphone **Granted**; Camera reads **Not requested yet** — he clicks Request, the system prompt appears, he allows, the row goes green. Start enables.
+3. He clicks **Start**. Within a second the tray shows the record dot and macOS posts its own purple pill; the in-app banner reads "Recording — 00:04 · segment 1 · 12 MB". He switches to Keynote and forgets keeper exists.
+4. Forty minutes in, at 500 MB, the segment meter resets and `screen-0002.mp4` begins — gaplessly, no hiccup, `camera-0002.mp4` rotating in lockstep. His AirPods die at minute 70; the tray badges amber and the banner raises a persistent "Microphone disconnected — recording continues on the built-in mic" warning. Nothing stops.
+5. **Climax:** at minute 90 he clicks Stop in the tray. The current segment finalizes; the completion card reads "Saved 3 segments · 3.6 GB" with the session folder path and **Reveal in Finder**. Three ordinary `.mp4` files, screen and camera as separate synced tracks, play in QuickTime with no keeper tooling. The tray returns to its prior hidden state.
+
+Failure beat: mid-workshop his Mac's disk crosses the hard floor — keeper does not run it to exhaustion; it stops-and-finalizes gracefully, the tray flips to error, and a notification says "Recording stopped — low disk. 2 segments saved." Later a colleague force-quits the machine during a *different* recording; on next launch keeper surfaces "A recording was interrupted; 4 segments were saved" and the partial tail plays up to its last fragment — the meeting is not lost.

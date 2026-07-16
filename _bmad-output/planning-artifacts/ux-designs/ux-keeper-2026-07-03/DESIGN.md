@@ -3,7 +3,7 @@ name: keeper
 description: Open-source, client-only universal Matrix messenger for macOS and iPhone. shadcn/ui on Tauri 2 + React 19 + Tailwind v4; this DESIGN.md specifies the brand-layer delta and the platform envelopes only. The iOS phase adds layout tokens, not a second visual language.
 status: final
 created: 2026-07-03
-updated: 2026-07-09
+updated: 2026-07-16
 colors:
   # Brand overrides on top of shadcn defaults. All unlisted tokens inherit from
   # shadcn (background, foreground, muted, muted-foreground, popover, popover-foreground,
@@ -26,6 +26,13 @@ colors:
   bridge-disconnected: '#DC2626'     # shares hue with shadcn destructive by design
   search-highlight: '#FDE68A'        # FTS match highlight (light)
   search-highlight-dark: '#78560A'
+  # Screen Recording (Phase 3, PRD §14). Live-capture red — deliberately NOT the
+  # destructive/bridge-disconnected red: warmer and brighter, and only ever worn by
+  # the record dot and the active-recording pill/banner, never by a button or body text.
+  recording: '#E5322D'               # active capture — "recording is live"
+  recording-foreground: '#FFFFFF'
+  recording-dark: '#FF6259'
+  recording-foreground-dark: '#2A0605'
 typography:
   # macOS system stack everywhere; the platform owns rendered metrics.
   body:
@@ -132,6 +139,43 @@ components:
     height: 52px
     back-affordance: 'chevron + previous-level title, {spacing.touch-target-min} hit area'
     background: 'shadcn background, 1px bottom border — same flat-pane language as desktop'
+  # Screen Recording (Phase 3, PRD §14) — desktop-only, renders only when the
+  # `recording` capability flag is on (FR-66). Glyphs are part of the recording glyph set.
+  recording-dot:
+    size: 10px
+    fill: '{colors.recording}'
+    radius: '{rounded.full}'
+    motion: 'steady when recording; reduced-motion never pulses. The single sanctioned use of recording-red.'
+  recording-glyphs:
+    set: 'record-dot, display (monitor), app-window, camera (webcam on/off), microphone (on/off/muted), system-audio (speaker waves), stop (filled square), reveal-in-finder'
+    style: 'stroke glyphs matching the system SF Symbols weight; camera/mic carry a slashed "off" variant'
+  tray-recording:
+    idle: 'existing app-icon template (Story 10.3 unchanged)'
+    recording: 'template icon with a {colors.recording} record-dot badge, bottom-right'
+    warning-error: 'template icon with an amber (warning) / {colors.recording} (error) badge; error badge is filled, warning is outline'
+    menu-elapsed-line: '{typography.mono} disabled menu item, ~1 Hz text update'
+  source-picker-row:
+    height: 44px
+    layout: 'leading glyph (display/app-window) + name + optional app icon; single-select radio semantics'
+    radius: '{rounded.md}'
+    active-background: 'shadcn accent'
+  device-picker:
+    control: 'shadcn Select; leading device glyph (camera/microphone), "System default" always first for mic'
+    disabled-state: 'greyed with helper caption when the source toggle is off'
+  permission-row:
+    layout: 'permission name + live status pill + right-aligned action (Request / Open System Settings)'
+    granted: '{colors.bridge-healthy} check glyph + "Granted"'
+    not-requested: 'shadcn muted dot + "Not requested yet"'
+    denied: '{colors.bridge-disconnected} glyph + "Denied" + "Open System Settings" action'
+    note-line: '{typography.caption} for macOS quirks (relaunch-after-grant, monthly re-confirm, ad-hoc-dev-build caveat)'
+  active-recording-banner:
+    placement: 'top of the Recording view; persistent while capture is live or faulted'
+    recording: '{colors.recording} 3px left edge, {recording-dot} + "Recording", {typography.mono} elapsed · segment · size, Stop button (destructive-outline)'
+    warning: 'amber left edge + persistent warning line (mic unplugged / low disk); never auto-clears'
+    error: '{colors.recording} filled banner + reason + "Restart recording" — loud, not a toast (FR-75)'
+    radius: '{rounded.md}'
+  segment-meter:
+    style: 'shadcn Progress bar toward the configured segment size; {typography.caption} "segment N · 412 / 500 MB"; resets each rotation'
 ---
 
 ## Brand & Style
@@ -153,9 +197,10 @@ keeper inherits shadcn/ui defaults wholesale (Tailwind v4 CSS-variable theming i
 - **Incognito violet (`{colors.incognito}` / `{colors.incognito-dark}`)** — outbound-signal suppression. Used on the incognito chip in chat headers, the composer's incognito border tint, and the scope indicator in settings. Only violet may signal incognito, and violet signals nothing else.
 - **Bridge health trio (`{colors.bridge-healthy}` / `{colors.bridge-degraded}` / `{colors.bridge-disconnected}`)** — semantic status only: bridge session dots, network row states, health banners. Disconnected shares the red family with shadcn `destructive` on purpose — a dead bridge is data loss in progress.
 - **Search highlight (`{colors.search-highlight}` / dark variant)** — FTS match emphasis in search results and in-timeline jump targets. Background tint behind matched terms; never borders, never text color.
+- **Recording red (`{colors.recording}` / `{colors.recording-dark}`, Phase 3)** — the live-capture color, and *not* a fifth brand hue on the chrome: it appears only as the `{components.recording-dot}` and on the `{components.active-recording-banner}` / tray record badge while capture is running. It is deliberately warmer and brighter than `destructive`/`bridge-disconnected` so a live indicator never reads as a delete button, and the two never share a surface — recording red says "on," destructive red says "gone." When capture is faulted, the same red carries the loud error banner (FR-75). Never on buttons, text, hovers, or decoration; if it isn't the record state, it isn't recording red.
 - **Everything else inherits shadcn** — `background`, `foreground`, `muted`, `border`, `ring`, `card`, `popover`, `destructive`, and the `sidebar-*` family stay stock. If a color can't be justified by one of the three brand ideas, it isn't overridden.
 
-Avoid: gradients, per-network theming of the app chrome (network identity lives in badges, not wallpaper), red for anything but destruction/disconnection, more than these four brand hues.
+Avoid: gradients, per-network theming of the app chrome (network identity lives in badges, not wallpaper), red for anything but destruction/disconnection or live capture, more than these four brand hues plus the semantic status set (bridge trio, recording red).
 
 ## Typography
 
@@ -217,6 +262,16 @@ keeper-specific treatments (behavior in EXPERIENCE.md; visuals here):
 - **Command palette** — shadcn `Command` in a 640px `{rounded.lg}` panel; results show type glyph (chat/contact/action), network badge for chats, account hue dot, and a right-aligned kbd chip for actions with shortcuts. Active row uses stock shadcn accent.
 - **QR login panel** — white card (`{rounded.lg}`) containing the QR at ≥ 240px with quiet zone, network glyph centered, `caption` instruction line, live state word below (Waiting for scan… / Linked ✓ in `{colors.bridge-healthy}`). QR renders identically in dark mode (white card is mandatory for scannability).
 
+Screen Recording (Phase 3, desktop-only — every treatment below renders only when the `recording` capability flag is on; behavior in `EXPERIENCE.md.Screen Recording`):
+
+- **Recording view** — a single non-chat utility surface (no timeline, no composer) that flips between two states in place: *pre-record setup* (a stack of shadcn `Card` sections — Source, Audio, Webcam, Destination, Segmenting, and a collapsed Advanced for fps) and *active recording* (the `{components.active-recording-banner}` pinned to the top, the source summary, and the `{components.segment-meter}`). Uses `{spacing.content-max-width}` as a centered single column; it is not a pane frame.
+- **Source picker** — a scrollable list of `{components.source-picker-row}` grouped "Displays" then "Applications" (`section-label` headers), each row a live entry with name and app icon; a subtle "refreshing…" affordance while the list re-enumerates. Full-screen displays show a monitor glyph; apps show their icon. Single-select.
+- **Audio + Webcam controls** — a `Switch` for System audio (default on) and a `{components.device-picker}` for the microphone (default "System default input"); a `Switch` for Webcam (default off) revealing its camera `{components.device-picker}`. Each toggle-off greys its picker with a helper `caption`. Honest copy sits under the group: "Recorded locally. Nothing uploads." System audio and mic are labelled as *separate tracks*, not a mix.
+- **Permission pre-flight** — a `{components.permission-row}` per required permission (Screen Recording always; Microphone / Camera only when those sources are enabled), each showing the live-detected state. The `note-line` carries macOS quirks plainly, including the subtle dev-facing "ad-hoc dev builds may be blocked on macOS 15+ — sign with an Apple Development certificate" caveat. Start is disabled with the blocking permission named until every required grant is green.
+- **Active-recording banner** — `{components.active-recording-banner}`: recording-red edge, record dot, `mono` elapsed · segment · size line, Stop. It is the in-app twin of the tray, persistent and never a toast; its warning and error variants are the loud-failure surface (FR-75). Pause is not present this phase.
+- **Tray recording states** — `{components.tray-recording}`: idle → recording (record-dot badge) → warning/error (badge). The menu gains a `mono` elapsed/segment line (disabled, ~1 Hz), Stop Recording, and Open Recordings Folder above the existing Show keeper / Quit. Recording forces the tray visible even when the opt-in tray toggle is off, and restores the prior state at stop. keeper never touches macOS's own purple screen-recording pill — the tray adds what the pill lacks (elapsed, segment, Stop, errors).
+- **Completion card** — on Stop or recovery, a `Card` in the Recording view: "Saved N segments · 3.6 GB" with the session-folder path in `mono` and a primary **Reveal in Finder** action. No preview, no trim, no share — recording produces ordinary files and hands them off (FR-76). The parallel recovery notice ("A recording was interrupted; N segments were saved") uses the same card shape with a `bridge-degraded`-tinted edge.
+
 ## Do's and Don'ts
 
 | Do | Don't |
@@ -233,3 +288,7 @@ keeper-specific treatments (behavior in EXPERIENCE.md; visuals here):
 | Respect traffic-light insets in every sidebar state | Content or controls under the macOS window buttons |
 | Phone tier rearranges the same components under the same tokens | A second "mobile" visual language, forked chat components, or platform-specific restyling |
 | Respect safe-area insets on every phone surface, including sheets and overlays | Content under the notch or home indicator, unstyled bands at the screen edges |
+| Recording red only for the live record dot / active pill / loud error banner | Recording red on buttons, text, hovers, or as a fifth brand hue on the chrome |
+| Recording faults are persistent banners + tray error + notification | Toast-only recording errors, or a record indicator that isn't visible while capture runs |
+| Recording UI ends at Reveal in Finder — ordinary local files | Any in-app trim/annotate/preview-scrub, upload, share link, or transcription affordance |
+| Render every recording surface only behind the `recording` capability flag | Dead recording buttons on iOS or macOS < 13 |
