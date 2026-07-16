@@ -45,6 +45,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "externalBin": ["binaries/keeper-rec"],
     "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",

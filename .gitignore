@@ -37,3 +37,10 @@ coverage
 .bmad-loop/runs/
 .bmad-loop/cache/
 .bmad-loop/archive/
+
+# Built keeper-rec sidecar — a generated artifact, never committed (built by
+# scripts/build-keeper-rec.sh before every Tauri dev/build).
+src-tauri/crates/keeper/binaries/
+
+# SwiftPM build products for the keeper-rec sidecar package.
+tools/keeper-rec/.build/

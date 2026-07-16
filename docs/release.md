@@ -86,6 +86,33 @@ two are deliberately named apart so the file secret and the Key-ID env var never
 Hardened runtime is applied automatically by Tauri's signer; no entitlements file is required
 (WKWebView JIT runs in its own system-entitled process).
 
+## Recording sidecar (keeper-rec)
+
+keeper spawns a first-party Swift capture sidecar, `keeper-rec` (SwiftPM package at
+`tools/keeper-rec/`, Apache-2.0, aarch64-only). It is bundled via Tauri's `bundle.externalBin`
+as `binaries/keeper-rec`, which Tauri resolves per-triple to `keeper-rec-aarch64-apple-darwin`.
+
+Because `externalBin` binaries are copied into the app bundle as-is and must already carry a
+valid signature before notarization (tauri#11992), the sidecar is **built and codesigned before
+the app bundle** in the release workflow:
+
+- **Signed path:** the Developer ID certificate is imported into a temp keychain, then
+  `bun run rec:build` builds the sidecar and `codesign --force --options runtime --entitlements
+  src-tauri/crates/keeper/keeper-rec.entitlements --sign "$APPLE_SIGNING_IDENTITY"` signs it with
+  the hardened runtime — all *before* the `tauri-action` step bundles and notarizes the app.
+- **Unsigned path:** `bun run rec:build` builds the sidecar and it is ad-hoc-signed
+  (`codesign --force --options runtime -s -`) before `tauri build`.
+
+Locally, `bun run rec:build` is chained into `bun run tauri:dev` and `bun run tauri:build`, so the
+sidecar is always freshly built into `binaries/` before Tauri consults `externalBin` (the built
+binary is git-ignored, never committed). The CI `--no-bundle` build inherits the same chain.
+
+> **Dev-signing reality (DevEx, not a product blocker).** Local builds that exercise **real
+> recording** need an **Apple Development certificate**, because macOS 15+ silently rejects
+> ScreenCaptureKit for ad-hoc-signed binaries (Cap #1722). This affects only the live-capture
+> path (Story 16.6, human-in-the-loop on real hardware); the `getCapabilities` handshake stub and
+> the bundling/signing wiring build and run fine without a certificate.
+
 ## How to cut a release
 
 1. Ensure `main` is green (CI passes, including the license firewall).

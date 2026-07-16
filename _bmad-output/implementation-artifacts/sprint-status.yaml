@@ -168,7 +168,7 @@ development_status:
   15-6-final-device-install-and-phase-acceptance: backlog
   epic-15-retrospective: optional
   epic-16: backlog
-  16-1-keeper-rec-swiftpm-scaffold-codesign-and-externalbin-wiring: backlog
+  16-1-keeper-rec-swiftpm-scaffold-codesign-and-externalbin-wiring: done
   16-2-recording-core-module-and-recorder-port: backlog
   16-3-recording-capability-flag-and-gated-recording-surface: backlog
   16-4-ndjson-rpc-handshake-getcapabilities-and-listsources: backlog

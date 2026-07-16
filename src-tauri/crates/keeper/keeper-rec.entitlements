@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Minimal hardened-runtime entitlements for the keeper-rec capture sidecar.
+  An empty dict is sufficient: Screen Recording and microphone access are
+  TCC-gated at runtime, not entitlement-gated. Capture-specific entitlements
+  (if any) are revisited when real capture lands in Story 16.6.
+-->
+<plist version="1.0">
+<dict/>
+</plist>

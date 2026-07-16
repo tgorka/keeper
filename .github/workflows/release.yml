@@ -59,6 +59,41 @@ jobs:
             echo "::notice::Apple signing secrets absent — publishing an unsigned (ad-hoc) build."
           fi
 
+      # Build + codesign the keeper-rec capture sidecar BEFORE tauri-action bundles
+      # and notarizes the app (the externalBin notarization rough edge, tauri#11992):
+      # externalBin is copied into the bundle as-is, so it must already carry a valid
+      # hardened-runtime Developer ID signature or notarization staples fail. We import
+      # the Developer ID cert into a temp keychain (reusing the existing signing
+      # secrets), build the sidecar, then sign it in place. tauri-action reuses the same
+      # login keychain for its own signing, so the identity remains available to it.
+      - name: Import Developer ID certificate (signed path)
+        if: steps.signing.outputs.signed == 'true'
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          keychain-password: ${{ secrets.KEYCHAIN_PASSWORD }}
+
+      - name: Build & codesign keeper-rec sidecar (signed path)
+        if: steps.signing.outputs.signed == 'true'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # `signed==true` only guarantees the cert + notarization key are present;
+          # the identity string is a separate secret. Fail clearly if it's unset
+          # rather than letting `codesign --sign ""` produce an ambiguous error.
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "error: APPLE_SIGNING_IDENTITY is empty on the signed path." >&2
+            exit 1
+          fi
+          bun run rec:build
+          BIN="src-tauri/crates/keeper/binaries/keeper-rec-aarch64-apple-darwin"
+          codesign --force --options runtime \
+            --entitlements src-tauri/crates/keeper/keeper-rec.entitlements \
+            --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
+          codesign -dv --verbose=2 "$BIN"
+
       - name: Build, sign, notarize, and publish release (signed path)
         if: steps.signing.outputs.signed == 'true'
         uses: tauri-apps/tauri-action@v0
@@ -104,6 +139,13 @@ jobs:
           APPLE_SIGNING_IDENTITY: "-"
         run: |
           set -euo pipefail
+          # Build the keeper-rec sidecar and ad-hoc-sign it (hardened runtime) before
+          # tauri build bundles it via externalBin — mirrors the signed path, minus a
+          # Developer ID identity. macOS 15+ rejects ad-hoc SCK at runtime (Cap #1722),
+          # but that only affects real capture, not this bundling/handshake stub.
+          bun run rec:build
+          REC_BIN="src-tauri/crates/keeper/binaries/keeper-rec-aarch64-apple-darwin"
+          codesign --force --options runtime -s - "$REC_BIN"
           if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
             bun run tauri build --config src-tauri/crates/keeper/tauri.conf.json --target aarch64-apple-darwin --bundles app
           else
