@@ -1,4 +1,4 @@
-import { Archive, Inbox, MessageSquare, Radio, Settings, WifiOff } from "lucide-react";
+import { Archive, Inbox, MessageSquare, Radio, Settings, Video, WifiOff } from "lucide-react";
 import { useState } from "react";
 import { AccountFooter } from "@/components/layout/account-footer";
 import { NetworksGroup } from "@/components/layout/networks-group";
@@ -9,6 +9,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { BridgeHealth } from "@/lib/ipc/client";
 import { useShellOffline } from "@/lib/stores/account-status";
 import { useWorstBridgeHealth } from "@/lib/stores/bridge-health";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { usePendingDraftCount } from "@/lib/stores/drafts";
 import { primaryViewStore, usePrimaryView } from "@/lib/stores/primary-view";
 import { cn } from "@/lib/utils";
@@ -18,13 +19,21 @@ interface SidebarView {
   icon: typeof MessageSquare;
 }
 
-const VIEWS: SidebarView[] = [
+/** The always-present nav entries, in order. The capability-gated Recording entry
+ * (Story 16.3) is spliced in before Settings only when the `recording` capability
+ * is on — never a dead ⌘5 button on platforms that cannot record (AD-27). */
+const BASE_VIEWS: SidebarView[] = [
   { label: "Chats", icon: MessageSquare },
   { label: "Archive", icon: Archive },
   { label: "Approvals", icon: Inbox },
   { label: "Bridges", icon: Radio },
-  { label: "Settings", icon: Settings },
 ];
+
+/** The capability-gated Recording nav entry (Story 16.3). */
+const RECORDING_VIEW: SidebarView = { label: "Recording", icon: Video };
+
+/** Settings sits last, after every primary-view entry. */
+const SETTINGS_VIEW: SidebarView = { label: "Settings", icon: Settings };
 
 /** The `--bridge-*` tint class for a rolled-up worst health (Story 6.5). */
 const HEALTH_DOT_CLASS: Record<BridgeHealth, string> = {
@@ -58,6 +67,13 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
   // The count of chats with a pending draft across all accounts (Story 7.3). Drives
   // the amber "Approvals" count badge — shown only when at least one draft is held.
   const pendingDraftCount = usePendingDraftCount();
+  // Screen recording is a desktop-macOS-≥13 capability (Story 16.3): the Recording
+  // nav entry (and its ⌘5) is present only when the flag is on, never a dead button.
+  const recording = useCapabilitiesStore((s) => s.capabilities.recording);
+  // Splice the gated Recording entry in before Settings only when supported.
+  const views: SidebarView[] = recording
+    ? [...BASE_VIEWS, RECORDING_VIEW, SETTINGS_VIEW]
+    : [...BASE_VIEWS, SETTINGS_VIEW];
 
   return (
     <nav
@@ -70,10 +86,10 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
       {/* Reserve the macOS traffic-light inset (78x12px) in every state. */}
       <div className={cn("shrink-0", collapsed ? "pt-3 pl-3" : "pt-3 pl-[78px]")} />
       <ul className={cn("flex flex-col gap-1 p-2", collapsed && "items-center")}>
-        {VIEWS.map((view) => {
+        {views.map((view) => {
           const Icon = view.icon;
-          // "Chats", "Archive", and "Bridges" switch the primary view; Settings
-          // opens the dialog.
+          // "Chats", "Archive", "Bridges", and "Recording" switch the primary view;
+          // Settings opens the dialog.
           const onClick =
             view.label === "Settings"
               ? () => setSettingsOpen(true)
@@ -85,14 +101,17 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                     ? () => primaryViewStore.getState().setView("approval")
                     : view.label === "Bridges"
                       ? () => primaryViewStore.getState().setView("bridges")
-                      : undefined;
-          // Reflect the active primary view on the Chats/Archive/Approvals/Bridges
-          // entries.
+                      : view.label === "Recording"
+                        ? () => primaryViewStore.getState().setView("recording")
+                        : undefined;
+          // Reflect the active primary view on the Chats/Archive/Approvals/Bridges/
+          // Recording entries.
           const active =
             (view.label === "Chats" && primaryView === "inbox") ||
             (view.label === "Archive" && primaryView === "archive") ||
             (view.label === "Approvals" && primaryView === "approval") ||
-            (view.label === "Bridges" && primaryView === "bridges");
+            (view.label === "Bridges" && primaryView === "bridges") ||
+            (view.label === "Recording" && primaryView === "recording");
           // The Bridges entry carries the worst-state health roll-up dot (Story
           // 6.1): shown only when at least one bridge reports non-null health.
           const healthDot =

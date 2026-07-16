@@ -29,6 +29,7 @@ export const DEFAULT_CAPABILITIES: CapabilitiesVm = Object.freeze({
   nativeMenuBar: false,
   bridgeSidecar: false,
   revealInFileManager: false,
+  recording: false,
 });
 
 export interface CapabilitiesState {

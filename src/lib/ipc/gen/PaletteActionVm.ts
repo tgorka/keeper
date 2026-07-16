@@ -39,6 +39,13 @@ shortcut: string | null,
  */
 requiresOpenChat: boolean, 
 /**
+ * `true` when the action requires the `recording` capability (Story 16.3):
+ * the shell filters it out of the palette, cheat sheet, and native menu when
+ * screen recording is unavailable, so a recording action is absent (never a
+ * dead button) on platforms that cannot record.
+ */
+requiresRecording: boolean, 
+/**
  * The toggle-pair group this action belongs to (Story 9.3), e.g. `"archive"`
  * for both `archive-chat` and `unarchive-chat`. `None` for a non-toggle action.
  * The palette ignores this (backward-safe); the cheat sheet + native menu

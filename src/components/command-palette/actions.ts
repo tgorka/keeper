@@ -57,6 +57,10 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
   "open-archive": () => primaryViewStore.getState().setView("archive"),
   "open-approval": () => primaryViewStore.getState().setView("approval"),
   "open-bridges": () => primaryViewStore.getState().setView("bridges"),
+  // Story 16.3: switch to the Recording view. The action is registry-gated on the
+  // `recording` capability in Rust, so it only reaches this dispatch when recording
+  // is available (desktop macOS ≥ 13.0).
+  "open-recording": () => primaryViewStore.getState().setView("recording"),
 
   // --- Global actions (dialogs / commands) ---
   "new-chat": () => newChatStore.getState().open(),

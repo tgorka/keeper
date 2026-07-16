@@ -72,6 +72,7 @@ const DESKTOP_CAPABILITIES = {
   nativeMenuBar: true,
   bridgeSidecar: true,
   revealInFileManager: true,
+  recording: false,
 };
 
 function account(id: string, userId: string, hue = 0, provider: Provider = "password"): AccountVm {

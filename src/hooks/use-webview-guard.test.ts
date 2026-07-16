@@ -25,6 +25,7 @@ const DESKTOP_CAPABILITIES = {
   nativeMenuBar: true,
   bridgeSidecar: true,
   revealInFileManager: true,
+  recording: false,
 };
 
 function setVisibility(state: "hidden" | "visible"): void {

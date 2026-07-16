@@ -86,6 +86,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   // The OS-global summon hotkey is a desktop-only capability; hide the whole
   // Shortcuts section wherever the platform lacks it (the phone tier).
   const globalHotkey = useCapabilitiesStore((s) => s.capabilities.globalHotkey);
+  // Screen recording is a desktop-macOS-≥13 capability (Story 16.3); render the
+  // Recording section only where it exists — never a dead settings surface.
+  const recording = useCapabilitiesStore((s) => s.capabilities.recording);
   // Whether this is the capability-reduced (phone) tier — drives the Archive
   // backup-exclusion line below, the "On this iPhone" list in About, and hides the
   // desktop "Background & dock" section (Story 14.2).
@@ -164,6 +167,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           {!reducedPlatform && <BackgroundSection open={open} />}
           <PrivacySection open={open} />
           {globalHotkey && <ShortcutsSection open={open} />}
+          {/* The Recording section is desktop-macOS-≥13 only (Story 16.3): absent on
+              every platform that cannot record, never a dead affordance. */}
+          {recording && <RecordingSection />}
           <EncryptionSection />
           <SetupSection onOpenChange={onOpenChange} />
           <AboutSection open={open} />
@@ -965,6 +971,29 @@ function ShortcutsSection({ open }: { open: boolean }) {
           {error}
         </p>
       )}
+    </div>
+  );
+}
+
+/** The honest local-only disclosure for the Recording section (Story 16.3).
+ * Recording voice: sentence case, no exclamation marks, honest local-only framing.
+ * Recording adds zero network destinations. */
+const RECORDING_LOCAL_ONLY_SENTENCE =
+  "Screen recording saves to a folder on this Mac. Nothing uploads. Recording setup arrives in a later update.";
+
+/**
+ * Settings → Recording section (Story 16.3). Desktop-macOS-≥13 only — the whole
+ * section is capability-gated at its call site so it is absent (never a dead
+ * affordance) on platforms that cannot record. This story ships only the honest
+ * placeholder shell (the real controls arrive in later Epic 16 stories),
+ * following the {@link ShortcutsSection} idiom: a bordered section, a title, and
+ * honest placeholder copy.
+ */
+function RecordingSection() {
+  return (
+    <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
+      <p className="font-medium">Recording</p>
+      <p className="text-muted-foreground">{RECORDING_LOCAL_ONLY_SENTENCE}</p>
     </div>
   );
 }

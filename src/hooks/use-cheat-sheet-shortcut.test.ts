@@ -13,6 +13,7 @@ const DESKTOP_CAPABILITIES = {
   nativeMenuBar: true,
   bridgeSidecar: true,
   revealInFileManager: true,
+  recording: false,
 };
 
 function press(

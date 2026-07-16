@@ -95,7 +95,10 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     menu.append(&edit_menu)?;
 
     // --- One generated submenu per registry category (single source of truth). ---
-    for section in registry_sections() {
+    // Pass the recording capability so the native menu omits the recording action
+    // when screen recording is unavailable (Story 16.3), staying in lockstep with
+    // the palette and cheat sheet.
+    for section in registry_sections(crate::macos_version::recording_supported()) {
         // Each generated item's id IS its canonical registry dispatch id; no
         // accelerator is bound (the JS hooks own every binding).
         let mut items: Vec<MenuItem<R>> = Vec::with_capacity(section.items.len());

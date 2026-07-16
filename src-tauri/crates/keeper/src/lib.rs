@@ -9,6 +9,7 @@
 mod hotkey;
 mod ipc;
 mod lifecycle;
+mod macos_version;
 mod media_protocol;
 #[cfg(desktop)]
 mod menu;

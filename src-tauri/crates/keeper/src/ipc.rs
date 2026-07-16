@@ -1102,6 +1102,10 @@ pub fn capabilities() -> Result<CapabilitiesVm, IpcError> {
         native_menu_bar: cfg!(desktop),
         bridge_sidecar: cfg!(desktop),
         reveal_in_file_manager: cfg!(desktop),
+        // Screen recording (Story 16.3) is desktop macOS ≥ 13.0 only — a runtime
+        // OS-version probe in the shell adapter (AD-35), not a bare `cfg!(desktop)`.
+        // Any detection failure defaults to `false` (safe-hide).
+        recording: crate::macos_version::recording_supported(),
     })
 }
 
@@ -2909,7 +2913,13 @@ pub async fn palette_query(
     mode: PaletteMode,
     open_chat: bool,
 ) -> Result<PaletteResultsVm, IpcError> {
-    Ok(state.accounts.palette_query(&query, mode, open_chat).await)
+    // The recording capability gates the `open-recording` action out of the palette
+    // (and thus the cheat sheet + native menu) when unavailable (Story 16.3).
+    let recording = crate::macos_version::recording_supported();
+    Ok(state
+        .accounts
+        .palette_query(&query, mode, open_chat, recording)
+        .await)
 }
 
 /// Return the category-grouped, toggle-collapsed registry projection (Story 9.3).
@@ -2922,7 +2932,11 @@ pub async fn palette_query(
 /// fails.
 #[tauri::command]
 pub fn cheat_sheet_sections() -> Result<Vec<MenuSectionVm>, IpcError> {
-    Ok(keeper_core::palette::registry_sections())
+    // Gate the recording action out of the cheat sheet when the capability is off
+    // (Story 16.3), keeping it in lockstep with the palette and native menu.
+    Ok(keeper_core::palette::registry_sections(
+        crate::macos_version::recording_supported(),
+    ))
 }
 
 /// Read the resolved Incognito state for `(accountId, roomId)` (Story 8.1). Delegates

@@ -107,6 +107,11 @@ pub struct CapabilitiesVm {
     /// "Reveal in Finder"-style file-manager reveal (Story 5.5) exists on this
     /// platform.
     pub reveal_in_file_manager: bool,
+    /// Screen recording (Story 16.3) exists on this platform: `true` only on
+    /// desktop macOS ≥ 13.0 (the system-audio floor), `false` on older macOS,
+    /// every non-macOS desktop, and iOS. Computed in the shell from a runtime
+    /// OS-version probe, keeping `keeper-core` free of `cfg(target_os)` (AD-26).
+    pub recording: bool,
 }
 
 /// Stable, string-serialized error taxonomy for the IPC envelope.
@@ -2412,6 +2417,11 @@ pub struct PaletteActionVm {
     pub shortcut: Option<String>,
     /// `true` when the action operates on the currently open chat.
     pub requires_open_chat: bool,
+    /// `true` when the action requires the `recording` capability (Story 16.3):
+    /// the shell filters it out of the palette, cheat sheet, and native menu when
+    /// screen recording is unavailable, so a recording action is absent (never a
+    /// dead button) on platforms that cannot record.
+    pub requires_recording: bool,
     /// The toggle-pair group this action belongs to (Story 9.3), e.g. `"archive"`
     /// for both `archive-chat` and `unarchive-chat`. `None` for a non-toggle action.
     /// The palette ignores this (backward-safe); the cheat sheet + native menu

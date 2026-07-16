@@ -107,7 +107,9 @@ const DEFAULT_HOTKEY_VM: HotkeyVm = {
   conflict: null,
 };
 
-/** All seven capabilities present = the desktop tier (every surface renders). */
+/** The desktop tier (every desktop surface renders). `recording` is `false` here so
+ * the existing desktop assertions are unaffected; the recording-gating cases opt in
+ * explicitly by hydrating a snapshot with `recording: true`. */
 const DESKTOP_CAPABILITIES = {
   trayIcon: true,
   globalHotkey: true,
@@ -116,6 +118,7 @@ const DESKTOP_CAPABILITIES = {
   nativeMenuBar: true,
   bridgeSidecar: true,
   revealInFileManager: true,
+  recording: false,
 };
 
 function account(id: string): AccountVm {
@@ -622,5 +625,26 @@ describe("SettingsDialog", () => {
     expect(screen.queryByRole("switch", { name: "Launch at login" })).not.toBeInTheDocument();
     // …but the iOS-only disclosure must NOT flash before the mirror resolves.
     expect(screen.queryByText(/excluded from device backup/)).not.toBeInTheDocument();
+  });
+
+  // ── Recording section (Story 16.3) ─────────────────────────────────────────
+  it("shows the Recording section only when the recording capability is on", async () => {
+    mockPosture.mockResolvedValue(false);
+    // beforeEach hydrated the desktop tier with recording: false → section absent.
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    await screen.findByText(STORAGE_HONESTY_SENTENCE);
+    expect(screen.queryByText("Recording")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Screen recording saves to a folder/)).not.toBeInTheDocument();
+  });
+
+  it("renders the Recording section with honest local-only copy when recording is on", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_CAPABILITIES, recording: true });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText("Recording")).toBeInTheDocument();
+    // Honest local-only framing — nothing uploads.
+    expect(screen.getByText(/Screen recording saves to a folder/)).toBeInTheDocument();
+    expect(screen.getByText(/Nothing uploads/)).toBeInTheDocument();
   });
 });

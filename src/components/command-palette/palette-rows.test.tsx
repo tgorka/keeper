@@ -27,6 +27,7 @@ function action(
     keywords: p.keywords ?? [],
     shortcut: p.shortcut ?? null,
     requiresOpenChat: p.requiresOpenChat ?? false,
+    requiresRecording: p.requiresRecording ?? false,
     toggleGroup: p.toggleGroup ?? null,
   };
 }

@@ -14,6 +14,7 @@ const desktopCapabilities: CapabilitiesVm = {
   nativeMenuBar: true,
   bridgeSidecar: true,
   revealInFileManager: true,
+  recording: true,
 };
 
 afterEach(() => {
@@ -32,6 +33,7 @@ describe("capabilitiesStore", () => {
       nativeMenuBar: false,
       bridgeSidecar: false,
       revealInFileManager: false,
+      recording: false,
     });
   });
 
@@ -78,6 +80,7 @@ describe("isReducedCapabilityPlatform", () => {
       "nativeMenuBar",
       "bridgeSidecar",
       "revealInFileManager",
+      "recording",
     ];
     for (const flag of flags) {
       capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, [flag]: true });

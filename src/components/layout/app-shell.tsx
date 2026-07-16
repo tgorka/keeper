@@ -9,6 +9,7 @@ import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
 import { PhoneShell } from "@/components/layout/phone-shell";
+import { RecordingPane } from "@/components/layout/recording-pane";
 import { SidebarPane } from "@/components/layout/sidebar-pane";
 import { VerifyBanner } from "@/components/layout/verify-banner";
 import { SearchOverlay } from "@/components/search/search-overlay";
@@ -28,6 +29,7 @@ import { useKeyBackupStatuses } from "@/hooks/use-key-backup-statuses";
 import { useMenuActions } from "@/hooks/use-menu-actions";
 import { useNewChatShortcut } from "@/hooks/use-new-chat-shortcut";
 import { useQuickSwitcher } from "@/hooks/use-quick-switcher";
+import { useRecordingShortcut } from "@/hooks/use-recording-shortcut";
 import { useSearchShortcuts } from "@/hooks/use-search-shortcuts";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useUnreadJump } from "@/hooks/use-unread-jump";
@@ -62,6 +64,9 @@ export function AppShell() {
   useNewChatShortcut();
   // Wire ⌘4 to the Bridges surface (Story 6.1).
   useBridgesShortcut();
+  // Wire ⌘5 to the Recording surface (Story 16.3); a no-op unless the recording
+  // capability is on (desktop macOS ≥ 13.0).
+  useRecordingShortcut();
   // Wire ⌘3 to the Approval Pane (Story 7.3).
   useApprovalShortcut();
   // Wire ⌘K to toggle the command palette (Story 9.1).
@@ -96,6 +101,10 @@ export function AppShell() {
   // The `useCheatSheetShortcut()` hook stays wired above (rules-of-hooks); only the
   // overlay is gated, so an unmounted overlay simply cannot render.
   const nativeMenuBar = useCapabilitiesStore((s) => s.capabilities.nativeMenuBar);
+  // Screen recording is a desktop-macOS-≥13 capability (Story 16.3): the ⌘5
+  // Recording view renders only when the flag is on, so a stale "recording"
+  // primary-view can never show the pane on a platform that cannot record.
+  const recording = useCapabilitiesStore((s) => s.capabilities.recording);
 
   const closeDetail = useCallback(() => {
     storeCloseDetail();
@@ -131,7 +140,9 @@ export function AppShell() {
           ) : (
             <>
               <SidebarPane collapsed={sidebarCollapsed} />
-              {primaryView === "bridges" ? (
+              {recording && primaryView === "recording" ? (
+                <RecordingPane />
+              ) : primaryView === "bridges" ? (
                 <BridgesPane />
               ) : primaryView === "approval" ? (
                 <ApprovalPane />

@@ -42,4 +42,11 @@ bridgeSidecar: boolean,
  * "Reveal in Finder"-style file-manager reveal (Story 5.5) exists on this
  * platform.
  */
-revealInFileManager: boolean, };
+revealInFileManager: boolean, 
+/**
+ * Screen recording (Story 16.3) exists on this platform: `true` only on
+ * desktop macOS ≥ 13.0 (the system-audio floor), `false` on older macOS,
+ * every non-macOS desktop, and iOS. Computed in the shell from a runtime
+ * OS-version probe, keeping `keeper-core` free of `cfg(target_os)` (AD-26).
+ */
+recording: boolean, };

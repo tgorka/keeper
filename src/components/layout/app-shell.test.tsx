@@ -1,7 +1,9 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppShell } from "@/components/layout/app-shell";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { detailStore } from "@/lib/stores/detail-ui";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 
 /**
@@ -34,6 +36,8 @@ afterEach(() => {
   // one test's open panel never leaks into the next.
   detailStore.setState({ open: false });
   roomsStore.getState().selectRoom(null);
+  primaryViewStore.getState().setView("inbox");
+  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
 });
 
 describe("AppShell", () => {
@@ -101,5 +105,26 @@ describe("AppShell", () => {
     expect(screen.getByRole("navigation", { name: "Views" })).toBeInTheDocument();
     expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
     expect(screen.getByRole("main")).toBeInTheDocument();
+  });
+
+  // ── Recording view (Story 16.3) ────────────────────────────────────────────
+  it("renders the Recording pane for the recording view when the capability is on", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true });
+    primaryViewStore.getState().setView("recording");
+    render(<AppShell />);
+
+    // The Recording section shell replaces the chat-list + conversation cluster.
+    expect(screen.getByRole("region", { name: "Recording" })).toBeInTheDocument();
+    expect(screen.queryByText("Select a conversation to start reading.")).not.toBeInTheDocument();
+  });
+
+  it("does not render the Recording pane when the recording capability is off", () => {
+    // A stale "recording" primary-view must never show the pane where recording is
+    // unavailable (the flag is off) — no dead surface.
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: true });
+    primaryViewStore.getState().setView("recording");
+    render(<AppShell />);
+
+    expect(screen.queryByRole("region", { name: "Recording" })).not.toBeInTheDocument();
   });
 });

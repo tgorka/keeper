@@ -1098,6 +1098,7 @@ describe("PhoneShell persistent offline pill (Story 14.6)", () => {
     nativeMenuBar: true,
     bridgeSidecar: true,
     revealInFileManager: true,
+    recording: false,
   };
 
   /** Hydrate the capabilities mirror as the reduced (iOS/phone) tier. */

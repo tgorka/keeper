@@ -24,6 +24,7 @@ import type { BridgeHealth } from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { bridgeHealthStore } from "@/lib/stores/bridge-health";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { draftsStore } from "@/lib/stores/drafts";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 
@@ -59,6 +60,7 @@ beforeEach(() => {
   primaryViewStore.getState().setView("inbox");
   bridgeHealthStore.getState().reset();
   draftsStore.getState().clear();
+  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
 });
 
 afterEach(() => {
@@ -67,6 +69,7 @@ afterEach(() => {
   primaryViewStore.getState().setView("inbox");
   bridgeHealthStore.getState().reset();
   draftsStore.getState().clear();
+  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
 });
 
 /** Seed one session's live health into the store. */
@@ -257,6 +260,33 @@ describe("SidebarPane approvals", () => {
       </TooltipProvider>,
     );
     expect(document.querySelector('[data-slot="approval-count"]')).not.toBeInTheDocument();
+  });
+});
+
+describe("SidebarPane recording entry (Story 16.3)", () => {
+  it("hides the Recording entry when the recording capability is off (the default)", () => {
+    renderSidebar();
+    expect(screen.queryByRole("button", { name: "Recording" })).not.toBeInTheDocument();
+  });
+
+  it("shows the Recording entry only when the recording capability is on", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true });
+    renderSidebar();
+    expect(screen.getByRole("button", { name: "Recording" })).toBeInTheDocument();
+  });
+
+  it("switches the primary view to recording when the Recording entry is clicked", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true });
+    renderSidebar();
+    expect(primaryViewStore.getState().view).toBe("inbox");
+
+    fireEvent.click(screen.getByRole("button", { name: "Recording" }));
+
+    expect(primaryViewStore.getState().view).toBe("recording");
+    expect(screen.getByRole("button", { name: "Recording" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
   });
 });
 

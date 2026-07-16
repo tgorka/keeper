@@ -11,11 +11,12 @@ import { createStore } from "zustand/vanilla";
 
 /**
  * Which primary window the shell renders: the Unified Inbox, the Archive, the
- * Bridges surface (Story 6.1), or the Approval Pane (Story 7.3). "inbox"/"archive"
- * pick which window the chat-list pane shows; "bridges" and "approval" each replace
- * the chat-list + conversation cluster entirely.
+ * Bridges surface (Story 6.1), the Approval Pane (Story 7.3), or the Recording
+ * view (Story 16.3). "inbox"/"archive" pick which window the chat-list pane shows;
+ * "bridges", "approval", and "recording" each replace the chat-list + conversation
+ * cluster entirely.
  */
-export type PrimaryView = "inbox" | "archive" | "bridges" | "approval";
+export type PrimaryView = "inbox" | "archive" | "bridges" | "approval" | "recording";
 
 export interface PrimaryViewState {
   /** The active primary view; defaults to the Unified Inbox. */
