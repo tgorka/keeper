@@ -376,17 +376,27 @@ pub struct SessionParams {
     pub display_id: Option<u32>,
     /// Whether to capture system audio (true in the walking skeleton).
     pub system_audio: bool,
+    /// Segment size in decimal MB before a gapless rotation (Story 17.5,
+    /// FR-72); the sidecar's `segmentMB`.
+    pub segment_mb: u32,
+    /// Duration-cap rotation fallback in whole seconds (Story 17.5, FR-72);
+    /// the sidecar's `maxSegmentSeconds`.
+    pub max_segment_seconds: u32,
 }
 
-/// Build the one-line `startRecording` request (Story 16.6; no trailing newline —
-/// the shell port owns line framing). Wire shape:
-/// `{"id":<id>,"method":"startRecording","params":{"path":…,"systemAudio":…[,"displayId":…]}}`.
-/// Additive to the v1 protocol — keeper and keeper-rec ship in lockstep, so
-/// [`PROTOCOL_VERSION`] is unchanged.
+/// Build the one-line `startRecording` request (Story 16.6 + 17.5; no trailing
+/// newline — the shell port owns line framing). Wire shape:
+/// `{"id":<id>,"method":"startRecording","params":{"path":…,"systemAudio":…,
+/// "segmentMB":…,"maxSegmentSeconds":…[,"displayId":…]}}`. `segmentMB` /
+/// `maxSegmentSeconds` are additive fields the 17.1 sidecar already reads
+/// (defaulting when absent), so — per the additive precedent — keeper and
+/// keeper-rec ship in lockstep and [`PROTOCOL_VERSION`] is unchanged.
 pub fn start_recording_request(id: u64, params: &SessionParams) -> String {
     let mut wire = serde_json::json!({
         "path": params.output_path,
         "systemAudio": params.system_audio,
+        "segmentMB": params.segment_mb,
+        "maxSegmentSeconds": params.max_segment_seconds,
     });
     if let Some(display_id) = params.display_id {
         wire["displayId"] = display_id.into();
@@ -1489,6 +1499,41 @@ mod tests {
         assert!(!request_screen_recording_request(7).contains('\n'));
     }
 
+    #[test]
+    fn start_recording_request_carries_the_segmentation_params() {
+        // Story 17.5 (FR-72): every `start` always carries the configured
+        // segment size and duration cap (in seconds) alongside the 16.6 fields.
+        let params = SessionParams {
+            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            display_id: Some(7),
+            system_audio: true,
+            segment_mb: 800,
+            max_segment_seconds: 2700,
+        };
+        let line = start_recording_request(4, &params);
+        assert!(!line.contains('\n'), "the shell port owns line framing");
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
+        assert_eq!(wire["id"], 4);
+        assert_eq!(wire["method"], "startRecording");
+        assert_eq!(wire["params"]["path"], "/tmp/keeper-rec/screen-0000.mp4");
+        assert_eq!(wire["params"]["systemAudio"], true);
+        assert_eq!(wire["params"]["displayId"], 7);
+        assert_eq!(wire["params"]["segmentMB"], 800);
+        assert_eq!(wire["params"]["maxSegmentSeconds"], 2700);
+
+        // Without a display id the segmentation fields still always appear.
+        let main_display = SessionParams {
+            display_id: None,
+            ..params
+        };
+        let wire: serde_json::Value =
+            serde_json::from_str(&start_recording_request(5, &main_display))
+                .expect("request is JSON");
+        assert!(wire["params"].get("displayId").is_none());
+        assert_eq!(wire["params"]["segmentMB"], 800);
+        assert_eq!(wire["params"]["maxSegmentSeconds"], 2700);
+    }
+
     // --- Screen Recording pre-flight (Story 16.5) ----------------------------
 
     #[test]
@@ -1790,6 +1835,8 @@ mod tests {
             output_path: "/tmp/keeper-test.mp4".to_owned(),
             display_id: None,
             system_audio: true,
+            segment_mb: 500,
+            max_segment_seconds: 1800,
         }
     }
 

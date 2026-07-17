@@ -19,6 +19,10 @@ vi.mock("@/lib/ipc/client", () => ({
   menuBarPresenceSet: vi.fn(() => Promise.resolve()),
   undoSendWindow: vi.fn(() => Promise.resolve(10)),
   setUndoSendWindow: vi.fn(() => Promise.resolve()),
+  // The Recording section mounts the shared segmentation control (Story 17.5),
+  // which lazily hydrates from this read when `recording` is on.
+  recordingSettingsGet: vi.fn(() => Promise.resolve({ segmentMb: 500, durationCapMinutes: 30 })),
+  recordingSettingsSet: vi.fn((vm: unknown) => Promise.resolve(vm)),
   hotkeyGet: vi.fn(() =>
     Promise.resolve({
       accelerator: "Control+Alt+Space",

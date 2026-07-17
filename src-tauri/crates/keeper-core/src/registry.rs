@@ -754,6 +754,94 @@ pub fn set_undo_send_window(data_dir: &Path, secs: u16) -> Result<(), CoreError>
     set_setting(data_dir, UNDO_SEND_WINDOW_KEY, &clamped.to_string())
 }
 
+/// The `settings` key holding the recording segment size in decimal MB (Story
+/// 17.5, FR-72). Stored as a decimal string; absent / unparsable ⇒ the default of
+/// 500 MB. Passed to the `keeper-rec` sidecar as `segmentMB` on every `start`.
+const RECORDING_SEGMENT_MB_KEY: &str = "recording.segment_mb";
+
+/// The default recording segment size in MB when the setting is absent or
+/// unparsable (Epic 17's authored default; the sidecar's own fallback matches).
+pub const RECORDING_SEGMENT_MB_DEFAULT: u32 = 500;
+
+/// The smallest accepted recording segment size in MB; values are clamped to
+/// `100..=5000` (authored bounds, adjustable on dogfooding evidence).
+pub const RECORDING_SEGMENT_MB_MIN: u32 = 100;
+
+/// The largest accepted recording segment size in MB; values are clamped to
+/// `100..=5000` (authored bounds, adjustable on dogfooding evidence).
+pub const RECORDING_SEGMENT_MB_MAX: u32 = 5000;
+
+/// Read the recording segment size in MB (Story 17.5, FR-72). Absent /
+/// unparsable ⇒ the default of 500; a stored value is clamped to `100..=5000`
+/// defensively (a hand-edited row can never surface out of range). Stored in the
+/// `settings` k/v table under `recording.segment_mb`.
+pub fn get_recording_segment_mb(data_dir: &Path) -> Result<u32, CoreError> {
+    let raw = get_setting(data_dir, RECORDING_SEGMENT_MB_KEY)?;
+    let mb = raw
+        .as_deref()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(RECORDING_SEGMENT_MB_DEFAULT);
+    Ok(mb.clamp(RECORDING_SEGMENT_MB_MIN, RECORDING_SEGMENT_MB_MAX))
+}
+
+/// Write the recording segment size in MB (Story 17.5, FR-72), clamping to
+/// `100..=5000` before persisting a decimal string under
+/// `recording.segment_mb`. Applies to the next Recording Session only — a
+/// running session's params are read once at start.
+pub fn set_recording_segment_mb(data_dir: &Path, mb: u32) -> Result<(), CoreError> {
+    let clamped = mb.clamp(RECORDING_SEGMENT_MB_MIN, RECORDING_SEGMENT_MB_MAX);
+    set_setting(data_dir, RECORDING_SEGMENT_MB_KEY, &clamped.to_string())
+}
+
+/// The `settings` key holding the recording duration-cap fallback in whole
+/// minutes (Story 17.5, FR-72). Stored as a decimal string; absent / unparsable
+/// ⇒ the default of 30 min. Converted to seconds (`× 60`) and passed to the
+/// sidecar as `maxSegmentSeconds` on every `start`.
+const RECORDING_DURATION_CAP_MINUTES_KEY: &str = "recording.duration_cap_minutes";
+
+/// The default recording duration cap in minutes when the setting is absent or
+/// unparsable (30 min → the sidecar's own 1800 s fallback).
+pub const RECORDING_DURATION_CAP_MINUTES_DEFAULT: u16 = 30;
+
+/// The smallest accepted recording duration cap in minutes; values are clamped
+/// to `1..=600` (authored bounds, adjustable on dogfooding evidence).
+pub const RECORDING_DURATION_CAP_MINUTES_MIN: u16 = 1;
+
+/// The largest accepted recording duration cap in minutes; values are clamped
+/// to `1..=600` (authored bounds, adjustable on dogfooding evidence).
+pub const RECORDING_DURATION_CAP_MINUTES_MAX: u16 = 600;
+
+/// Read the recording duration cap in minutes (Story 17.5, FR-72). Absent /
+/// unparsable ⇒ the default of 30; a stored value is clamped to `1..=600`
+/// defensively. Stored in the `settings` k/v table under
+/// `recording.duration_cap_minutes`.
+pub fn get_recording_duration_cap_minutes(data_dir: &Path) -> Result<u16, CoreError> {
+    let raw = get_setting(data_dir, RECORDING_DURATION_CAP_MINUTES_KEY)?;
+    let minutes = raw
+        .as_deref()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(RECORDING_DURATION_CAP_MINUTES_DEFAULT);
+    Ok(minutes.clamp(
+        RECORDING_DURATION_CAP_MINUTES_MIN,
+        RECORDING_DURATION_CAP_MINUTES_MAX,
+    ))
+}
+
+/// Write the recording duration cap in minutes (Story 17.5, FR-72), clamping to
+/// `1..=600` before persisting a decimal string under
+/// `recording.duration_cap_minutes`. Applies to the next Recording Session only.
+pub fn set_recording_duration_cap_minutes(data_dir: &Path, minutes: u16) -> Result<(), CoreError> {
+    let clamped = minutes.clamp(
+        RECORDING_DURATION_CAP_MINUTES_MIN,
+        RECORDING_DURATION_CAP_MINUTES_MAX,
+    );
+    set_setting(
+        data_dir,
+        RECORDING_DURATION_CAP_MINUTES_KEY,
+        &clamped.to_string(),
+    )
+}
+
 /// A single held-send row from the `outbox` table (Story 8.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRow {
@@ -1764,6 +1852,85 @@ mod tests {
         assert_eq!(
             get_undo_send_window(&dir).expect("get garbage"),
             UNDO_SEND_WINDOW_DEFAULT
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recording_segment_mb_defaults_and_clamps() {
+        let dir = temp_dir();
+        // Absent setting reads the default of 500.
+        assert_eq!(
+            get_recording_segment_mb(&dir).expect("get default"),
+            RECORDING_SEGMENT_MB_DEFAULT
+        );
+        // Round-trip an in-range value.
+        set_recording_segment_mb(&dir, 800).expect("set 800");
+        assert_eq!(get_recording_segment_mb(&dir).expect("get 800"), 800);
+        // Below the floor clamps to 100 on write.
+        set_recording_segment_mb(&dir, 10).expect("set 10");
+        assert_eq!(
+            get_recording_segment_mb(&dir).expect("get floor"),
+            RECORDING_SEGMENT_MB_MIN
+        );
+        // Above the ceiling clamps to 5000 on write.
+        set_recording_segment_mb(&dir, 99_999).expect("set 99999");
+        assert_eq!(
+            get_recording_segment_mb(&dir).expect("get ceiling"),
+            RECORDING_SEGMENT_MB_MAX
+        );
+        // A stored garbage value falls back to the default on read.
+        set_setting(&dir, RECORDING_SEGMENT_MB_KEY, "abc").expect("set garbage");
+        assert_eq!(
+            get_recording_segment_mb(&dir).expect("get garbage"),
+            RECORDING_SEGMENT_MB_DEFAULT
+        );
+        // A hand-edited out-of-range row clamps on read too.
+        set_setting(&dir, RECORDING_SEGMENT_MB_KEY, "7").expect("set raw 7");
+        assert_eq!(
+            get_recording_segment_mb(&dir).expect("get raw clamped"),
+            RECORDING_SEGMENT_MB_MIN
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recording_duration_cap_minutes_defaults_and_clamps() {
+        let dir = temp_dir();
+        // Absent setting reads the default of 30.
+        assert_eq!(
+            get_recording_duration_cap_minutes(&dir).expect("get default"),
+            RECORDING_DURATION_CAP_MINUTES_DEFAULT
+        );
+        // Round-trip an in-range value.
+        set_recording_duration_cap_minutes(&dir, 45).expect("set 45");
+        assert_eq!(
+            get_recording_duration_cap_minutes(&dir).expect("get 45"),
+            45
+        );
+        // Below the floor clamps to 1 on write (0 never disables the cap).
+        set_recording_duration_cap_minutes(&dir, 0).expect("set 0");
+        assert_eq!(
+            get_recording_duration_cap_minutes(&dir).expect("get floor"),
+            RECORDING_DURATION_CAP_MINUTES_MIN
+        );
+        // Above the ceiling clamps to 600 on write.
+        set_recording_duration_cap_minutes(&dir, 5000).expect("set 5000");
+        assert_eq!(
+            get_recording_duration_cap_minutes(&dir).expect("get ceiling"),
+            RECORDING_DURATION_CAP_MINUTES_MAX
+        );
+        // A stored garbage value falls back to the default on read.
+        set_setting(&dir, RECORDING_DURATION_CAP_MINUTES_KEY, "abc").expect("set garbage");
+        assert_eq!(
+            get_recording_duration_cap_minutes(&dir).expect("get garbage"),
+            RECORDING_DURATION_CAP_MINUTES_DEFAULT
+        );
+        // A hand-edited out-of-range row clamps on read too.
+        set_setting(&dir, RECORDING_DURATION_CAP_MINUTES_KEY, "0").expect("set raw 0");
+        assert_eq!(
+            get_recording_duration_cap_minutes(&dir).expect("get raw clamped"),
+            RECORDING_DURATION_CAP_MINUTES_MIN
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

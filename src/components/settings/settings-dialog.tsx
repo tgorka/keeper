@@ -11,6 +11,7 @@ import {
   BADGE_NOT_LIVE_SENTENCE,
   NO_BACKGROUND_SYNC_SENTENCE,
 } from "@/components/settings/no-background-sync-disclosure";
+import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -54,6 +55,7 @@ import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stor
 import { useEncryptionStatus } from "@/lib/stores/encryption-status";
 import { incognitoStore } from "@/lib/stores/incognito";
 import { keyBackupStore, useKeyBackupStatus } from "@/lib/stores/key-backup";
+import { ensureRecordingSettingsHydrated } from "@/lib/stores/recording-settings";
 import { verificationStore } from "@/lib/stores/verification";
 import { wizardStore } from "@/lib/stores/wizard";
 
@@ -169,7 +171,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           {globalHotkey && <ShortcutsSection open={open} />}
           {/* The Recording section is desktop-macOS-≥13 only (Story 16.3): absent on
               every platform that cannot record, never a dead affordance. */}
-          {recording && <RecordingSection />}
+          {recording && <RecordingSection open={open} />}
           <EncryptionSection />
           <SetupSection onOpenChange={onOpenChange} />
           <AboutSection open={open} />
@@ -979,21 +981,30 @@ function ShortcutsSection({ open }: { open: boolean }) {
  * Recording voice: sentence case, no exclamation marks, honest local-only framing.
  * Recording adds zero network destinations. */
 const RECORDING_LOCAL_ONLY_SENTENCE =
-  "Screen recording saves to a folder on this Mac. Nothing uploads. Recording setup arrives in a later update.";
+  "Screen recording saves to a folder on this Mac. Nothing uploads.";
 
 /**
- * Settings → Recording section (Story 16.3). Desktop-macOS-≥13 only — the whole
- * section is capability-gated at its call site so it is absent (never a dead
- * affordance) on platforms that cannot record. This story ships only the honest
- * placeholder shell (the real controls arrive in later Epic 16 stories),
- * following the {@link ShortcutsSection} idiom: a bordered section, a title, and
- * honest placeholder copy.
+ * Settings → Recording section (Story 16.3; segmentation controls Story 17.5).
+ * Desktop-macOS-≥13 only — the whole section is capability-gated at its call
+ * site so it is absent (never a dead affordance) on platforms that cannot
+ * record. Hosts the shared {@link RecordingSettingsControls} (the same control
+ * the pre-record "Segmenting" card mounts, bound to one store so the two
+ * surfaces mirror each other) and hydrates that store on open, mirroring the
+ * other sections' load-on-open idiom.
  */
-function RecordingSection() {
+function RecordingSection({ open }: { open: boolean }) {
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    void ensureRecordingSettingsHydrated();
+  }, [open]);
+
   return (
     <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
       <p className="font-medium">Recording</p>
       <p className="text-muted-foreground">{RECORDING_LOCAL_ONLY_SENTENCE}</p>
+      <RecordingSettingsControls />
     </div>
   );
 }

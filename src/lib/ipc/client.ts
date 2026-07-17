@@ -88,6 +88,7 @@ export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
+export type { RecordingSettingsVm } from "./gen/RecordingSettingsVm";
 export type { RecordingStatusVm } from "./gen/RecordingStatusVm";
 export type { RecordingUiState } from "./gen/RecordingUiState";
 export type { RemoteDraftVm } from "./gen/RemoteDraftVm";
@@ -141,6 +142,7 @@ import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 import type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
+import type { RecordingSettingsVm } from "./gen/RecordingSettingsVm";
 import type { RecordingStatusVm } from "./gen/RecordingStatusVm";
 import type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 import type { ResolveSupportVm } from "./gen/ResolveSupportVm";
@@ -1704,6 +1706,30 @@ export async function recordingStop(): Promise<void> {
  */
 export async function recordingStatus(): Promise<RecordingStatusVm> {
   return await invoke<RecordingStatusVm>("recording_status");
+}
+
+/**
+ * Read the effective segmentation settings (Story 17.5, FR-72) — the segment
+ * size (MB) and duration-cap fallback (minutes) persisted in the Rust `settings`
+ * k/v table. The Rust getters default (500 MB / 30 min) and clamp defensively,
+ * so the resolved VM always sits in the authored bounds. Both settings surfaces
+ * hydrate their shared store from this.
+ */
+export async function recordingSettingsGet(): Promise<RecordingSettingsVm> {
+  return await invoke<RecordingSettingsVm>("recording_settings_get");
+}
+
+/**
+ * Persist the segmentation settings (Story 17.5, FR-72). Rust clamps to the
+ * authored bounds (segment 100–5000 MB, duration cap 1–600 min — clamp, not
+ * reject), writes both values, and resolves the effective (clamped) VM so the
+ * UI never displays an unsaved value. A running session is unaffected — edits
+ * apply to the next Recording Session only.
+ */
+export async function recordingSettingsSet(
+  settings: RecordingSettingsVm,
+): Promise<RecordingSettingsVm> {
+  return await invoke<RecordingSettingsVm>("recording_settings_set", { settings });
 }
 
 /**

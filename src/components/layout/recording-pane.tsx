@@ -22,6 +22,7 @@ import {
   RecordingPermissionRow,
   SCREEN_RECORDING_PERMISSION_NAME,
 } from "@/components/recording/recording-permission-row";
+import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -47,7 +48,9 @@ export const START_BLOCKED_NOTE = `Start needs the ${SCREEN_RECORDING_PERMISSION
 /** Placeholder copy for each not-yet-built setup card (recording voice). */
 const PLACEHOLDER_COPY = "Configured in a later update.";
 
-/** The setup cards this shell reserves, each a later-story surface. */
+/** The setup cards this shell reserves. "Segmenting" is live (Story 17.5,
+ * FR-72 — the shared segment-size + duration-cap control); the rest are
+ * later-story surfaces ("Destination" is Epic 19). */
 const SETUP_CARDS: readonly string[] = [
   "Source",
   "Audio",
@@ -142,14 +145,28 @@ export function RecordingPane() {
             </CardContent>
           </Card>
 
-          {SETUP_CARDS.map((title) => (
-            <Card key={title} size="sm">
-              <CardHeader>
-                <CardTitle>{title}</CardTitle>
-                <p className="text-muted-foreground text-sm">{PLACEHOLDER_COPY}</p>
-              </CardHeader>
-            </Card>
-          ))}
+          {SETUP_CARDS.map((title) =>
+            title === "Segmenting" ? (
+              // The live pre-record segmentation controls (Story 17.5): the
+              // same shared control Settings → Recording mounts, bound to one
+              // store so the two surfaces mirror each other.
+              <Card key={title} size="sm">
+                <CardHeader>
+                  <CardTitle>{title}</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <RecordingSettingsControls />
+                </CardContent>
+              </Card>
+            ) : (
+              <Card key={title} size="sm">
+                <CardHeader>
+                  <CardTitle>{title}</CardTitle>
+                  <p className="text-muted-foreground text-sm">{PLACEHOLDER_COPY}</p>
+                </CardHeader>
+              </Card>
+            ),
+          )}
         </div>
       </ScrollArea>
     </section>

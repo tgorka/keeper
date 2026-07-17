@@ -37,9 +37,10 @@ use keeper_core::vm::{
     ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError,
     IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
     NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
-    PaletteResultsVm, PingVm, Provider, RecordingPermissionVm, RecordingStatusVm, RecordingUiState,
-    RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm,
-    SearchHitVm, SpacesSnapshot, TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
+    PaletteResultsVm, PingVm, Provider, RecordingPermissionVm, RecordingSettingsVm,
+    RecordingStatusVm, RecordingUiState, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
+    ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot, TccPermission,
+    TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -3397,6 +3398,15 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
     )
     .map_err(|e| to_ipc_error(e.into()))?;
 
+    // Read the segmentation settings at start time (Story 17.5, FR-72): the
+    // registry getters default + clamp, so a fresh install starts with the
+    // authored 500 MB / 30 min. Read once here — a later edit never mutates a
+    // running session; it applies to the next Recording Session only.
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let segment_mb =
+        keeper_core::registry::get_recording_segment_mb(&data_dir).map_err(to_ipc_error)?;
+    let duration_cap_minutes = keeper_core::registry::get_recording_duration_cap_minutes(&data_dir)
+        .map_err(to_ipc_error)?;
     let params = SessionParams {
         // Seeding `screen-0000.mp4` lets 17.1's `nextSegmentPath` produce
         // `screen-0001.mp4`, … inside the folder with no Swift change.
@@ -3406,6 +3416,9 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
             .into_owned(),
         display_id: None,
         system_audio: true,
+        segment_mb,
+        // Minutes → seconds for the sidecar's `maxSegmentSeconds` (30 → 1800).
+        max_segment_seconds: u32::from(duration_cap_minutes) * 60,
     };
     let status = Arc::new(Mutex::new(RecordingStatusVm {
         state: RecordingUiState::Preflight,
@@ -3580,6 +3593,44 @@ pub fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatusVm,
         .as_ref()
         .map(|run| status_lock(&run.status).clone())
         .unwrap_or_else(RecordingStatusVm::idle))
+}
+
+/// Read the effective segmentation settings from `keeper.db` (Story 17.5,
+/// FR-72). Both surfaces (Settings → Recording and the pre-record "Segmenting"
+/// card) hydrate their shared store from this. The registry getters default
+/// (500 MB / 30 min) and clamp defensively, so the VM is always in the authored
+/// bounds. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn recording_settings_get(state: State<'_, AppState>) -> Result<RecordingSettingsVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    Ok(RecordingSettingsVm {
+        segment_mb: keeper_core::registry::get_recording_segment_mb(&data_dir)
+            .map_err(to_ipc_error)?,
+        duration_cap_minutes: keeper_core::registry::get_recording_duration_cap_minutes(&data_dir)
+            .map_err(to_ipc_error)?,
+    })
+}
+
+/// Persist the segmentation settings (Story 17.5, FR-72): clamp to the authored
+/// bounds (segment `100..=5000` MB, duration cap `1..=600` min — clamp, not
+/// reject), write both into the `settings` k/v table, and return the effective
+/// (re-read) VM so the UI never displays an unsaved value. A running session is
+/// never mutated — `recording_start` re-reads at start, so edits apply to the
+/// next Recording Session only. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn recording_settings_set(
+    state: State<'_, AppState>,
+    settings: RecordingSettingsVm,
+) -> Result<RecordingSettingsVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::set_recording_segment_mb(&data_dir, settings.segment_mb)
+        .map_err(to_ipc_error)?;
+    keeper_core::registry::set_recording_duration_cap_minutes(
+        &data_dir,
+        settings.duration_cap_minutes,
+    )
+    .map_err(to_ipc_error)?;
+    recording_settings_get(state)
 }
 
 /// Read whether the one-time iOS no-background-sync disclosure has been shown

@@ -319,7 +319,9 @@ pub fn run() {
             ipc::open_screen_recording_settings,
             ipc::recording_start,
             ipc::recording_stop,
-            ipc::recording_status
+            ipc::recording_status,
+            ipc::recording_settings_get,
+            ipc::recording_settings_set
         ]);
     // Window-close (⌘W / red button) hides the main window instead of destroying it
     // (Story 10.3, FR-53): the process keeps every account's `SyncService` and the

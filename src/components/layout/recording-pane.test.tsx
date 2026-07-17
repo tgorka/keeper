@@ -8,6 +8,10 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingStart: vi.fn(),
   recordingStop: vi.fn(),
   recordingStatus: vi.fn(),
+  // The "Segmenting" card mounts the shared settings control (Story 17.5),
+  // which lazily hydrates from this read.
+  recordingSettingsGet: vi.fn(() => Promise.resolve({ segmentMb: 500, durationCapMinutes: 30 })),
+  recordingSettingsSet: vi.fn((vm: unknown) => Promise.resolve(vm)),
 }));
 
 import {
@@ -21,6 +25,10 @@ import {
   OPEN_SETTINGS_LABEL,
   REQUEST_PERMISSION_LABEL,
 } from "@/components/recording/recording-permission-row";
+import {
+  DURATION_CAP_LABEL,
+  SEGMENT_SIZE_LABEL,
+} from "@/components/settings/recording-settings-controls";
 import type { RecordingPermissionVm, RecordingStatusVm } from "@/lib/ipc/client";
 import {
   openScreenRecordingSettings,
@@ -95,6 +103,16 @@ describe("RecordingPane", () => {
     for (const title of ["Source", "Audio", "Webcam", "Destination", "Segmenting", "Advanced"]) {
       expect(screen.getByText(title)).toBeInTheDocument();
     }
+    await waitFor(() => expect(mockFetch).toHaveBeenCalled());
+  });
+
+  it("mounts the live segmentation control inside the Segmenting card (Story 17.5)", async () => {
+    render(<RecordingPane />);
+
+    // The Segmenting card is not a placeholder — it hosts the shared
+    // segment-size + duration-cap control, hydrated from the store.
+    expect(await screen.findByLabelText(SEGMENT_SIZE_LABEL)).toHaveValue(500);
+    expect(screen.getByLabelText(DURATION_CAP_LABEL)).toHaveValue(30);
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
   });
 

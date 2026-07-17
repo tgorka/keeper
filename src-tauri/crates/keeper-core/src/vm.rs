@@ -2729,6 +2729,26 @@ impl RecordingStatusVm {
     }
 }
 
+/// The user-configurable segmentation settings (Story 17.5, FR-72): the segment
+/// size and the duration-cap rotation fallback, as persisted in the `settings`
+/// k/v table (`recording.segment_mb` / `recording.duration_cap_minutes`).
+///
+/// Both surfaces (Settings → Recording and the pre-record "Segmenting" card)
+/// render exactly this VM. The setter command clamps to the authored bounds
+/// (segment `100..=5000` MB, duration cap `1..=600` min) and returns the
+/// effective VM, so the UI never displays an unsaved value. Read again at every
+/// `recording_start` — edits apply to the next Recording Session only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingSettingsVm {
+    /// Segment size in decimal MB (the sidecar's `segmentMB`; default 500).
+    pub segment_mb: u32,
+    /// Duration-cap rotation fallback in whole minutes (default 30; sent to the
+    /// sidecar as `maxSegmentSeconds = minutes × 60`).
+    pub duration_cap_minutes: u16,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
