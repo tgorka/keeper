@@ -533,11 +533,15 @@ impl Platform for DesktopPlatform {
     }
 
     fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError> {
-        // Tauri lays per-arch sidecars next to the running executable, suffixed with
-        // the target triple (e.g. `bbctl-aarch64-apple-darwin`). Resolve there via
+        // Tauri lays sidecars next to the running executable under two layouts:
+        // in dev the per-arch source name keeps its target-triple suffix (e.g.
+        // `keeper-rec-aarch64-apple-darwin`), while the bundler STRIPS the suffix
+        // when packaging (`Contents/MacOS/keeper-rec` in the .app). Probe both —
+        // triple-suffixed first (dev), bare name second (bundle). Resolve via
         // `current_exe()` — `DesktopPlatform` is a unit struct with no `AppHandle`.
-        // In dev/CI (no bundled binary) the file is absent → an honest `Unsupported`,
-        // which is the guided-install path (Story 6.7, AC-2), never a panic.
+        // With neither present (e.g. CI with no bundled binary) → an honest
+        // `Unsupported`, which is the guided-install path (Story 6.7, AC-2),
+        // never a panic.
         let exe = std::env::current_exe().map_err(|e| {
             CoreError::Unsupported(format!("could not resolve the running executable: {e}"))
         })?;
@@ -546,17 +550,18 @@ impl Platform for DesktopPlatform {
         })?;
         let triple = tauri::utils::platform::target_triple()
             .map_err(|e| CoreError::Unsupported(format!("could not resolve target triple: {e}")))?;
-        let mut candidate = dir.join(format!("{name}-{triple}"));
-        if cfg!(target_os = "windows") {
-            candidate.set_extension("exe");
+        for base in [format!("{name}-{triple}"), name.to_owned()] {
+            let mut candidate = dir.join(base);
+            if cfg!(target_os = "windows") {
+                candidate.set_extension("exe");
+            }
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
-        if candidate.is_file() {
-            Ok(candidate)
-        } else {
-            Err(CoreError::Unsupported(format!(
-                "sidecar {name:?} not found next to the executable"
-            )))
-        }
+        Err(CoreError::Unsupported(format!(
+            "sidecar {name:?} not found next to the executable"
+        )))
     }
 }
 
