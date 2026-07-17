@@ -1,0 +1,38 @@
+src-tauri/crates/keeper/src/ipc.rs
+  s_549fe0e64b2dbd::t_50eabacfd2097f 3427-3434,3436-3443
+_bmad-output/implementation-artifacts/spec-17-3-startup-recovery-of-orphaned-segments.md
+  s_549fe0e64b2dbd::t_f1936ba0444a2f 125
+  s_549fe0e64b2dbd::t_3fd930d89d923f 82-91
+  s_422f084a7b422e::t_6746222f040c0e 7
+  s_549fe0e64b2dbd::t_d41228d0864d6d 126
+  s_549fe0e64b2dbd::t_ba2908c67fc563 144,149-150
+  s_549fe0e64b2dbd::t_a45c0cf6cf3e5d 131-133,136-141
+src-tauri/crates/keeper-core/src/recording.rs
+  s_549fe0e64b2dbd::t_17202b636f1891 2556-2560
+  s_549fe0e64b2dbd::t_5bd98f4cbecacf 915-937,954-959
+  s_549fe0e64b2dbd::t_fd530cd0cbc66c 2542-2555,2561-2574
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "5a6f77776be1eb8c6ed6c1cf46867cad7ae07fe4",
+  "prompts": {},
+  "sessions": {
+    "s_422f084a7b422e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a451daf7-bc1e-4c26-adef-86f1419ec2a4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_549fe0e64b2dbd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e53a8ca1-eabc-4640-aaed-64c0e3729607",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
