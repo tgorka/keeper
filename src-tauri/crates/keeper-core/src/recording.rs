@@ -23,6 +23,7 @@
 use std::future::Future;
 
 use crate::error::{CoreError, RecordingError};
+use crate::vm::{RecordingCapabilitiesVm, RecordingSourcesVm, TccPermission};
 
 /// The states a screen-recording session walks through (Story 16.2, AD-33).
 ///
@@ -256,6 +257,182 @@ pub fn parse_event(line: &str) -> Option<RecordingEvent> {
     }
 }
 
+// --- NDJSON-RPC request/response wire half (Story 16.4, AD-34) -----------------
+//
+// The host→sidecar request channel: id-correlated, one JSON object per line.
+// Everything here is pure string/JSON logic — the round-trip I/O (spawn, piped
+// stdin, id-correlated read, reap) lives only in the shell port
+// (`keeper/src/recorder.rs`, `#[cfg(desktop)]`), keeping the dependency firewall
+// intact.
+
+/// The NDJSON-RPC protocol version keeper expects `keeper-rec` to speak (Story
+/// 16.4, AD-34). Carried by the `getCapabilities` handshake: the sidecar reports
+/// its version in `result.protocolVersion` and the host compares it against this
+/// constant via [`verify_protocol_version`]. A mismatch is an honest
+/// [`CoreError::Unsupported`], never a crash.
+///
+/// The sidecar hardcodes the same value in
+/// `tools/keeper-rec/Sources/keeper-rec/main.swift` (`capabilitiesResult`) — there
+/// is no shared source of truth across the language boundary, so bump both
+/// together; a drift surfaces at runtime as an honest `Unsupported`, not silently.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Build the one-line `getCapabilities` request (no trailing newline — the shell
+/// port owns line framing). Wire shape: `{"id":<id>,"method":"getCapabilities"}`.
+pub fn capabilities_request(id: u64) -> String {
+    serde_json::json!({ "id": id, "method": "getCapabilities" }).to_string()
+}
+
+/// Build the one-line `listSources` request (no trailing newline — the shell port
+/// owns line framing). Wire shape: `{"id":<id>,"method":"listSources"}`.
+pub fn list_sources_request(id: u64) -> String {
+    serde_json::json!({ "id": id, "method": "listSources" }).to_string()
+}
+
+/// Extract the correlation `id` from one sidecar stdout line, or `None` when the
+/// line is not an id-carrying response (an unsolicited event, garbage, a blank —
+/// anything the awaiting reader should skip). Pure and tolerant: never a panic.
+pub fn response_id(line: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    value.as_object()?.get("id")?.as_u64()
+}
+
+/// Shorthand for a non-secret [`RecordingError::Protocol`].
+fn protocol_error(message: impl Into<String>) -> RecordingError {
+    RecordingError::Protocol(message.into())
+}
+
+/// Unwrap the `result` object out of one id-correlated response line, surfacing a
+/// sidecar `{id,error}` answer and any malformed/missing `result` as
+/// [`RecordingError::Protocol`]. `method` labels the failing call in the message.
+fn response_result(line: &str, method: &str) -> Result<serde_json::Value, RecordingError> {
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|e| protocol_error(format!("{method}: response is not valid JSON: {e}")))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| protocol_error(format!("{method}: response is not a JSON object")))?;
+    if let Some(error) = obj.get("error") {
+        let code = error
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no message");
+        return Err(protocol_error(format!(
+            "{method}: keeper-rec answered with an error: {code}: {message}"
+        )));
+    }
+    obj.get("result")
+        .cloned()
+        .ok_or_else(|| protocol_error(format!("{method}: response carries no result object")))
+}
+
+/// Parse one TCC permission string out of the response's `permissions` object.
+fn parse_tcc(
+    permissions: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<TccPermission, RecordingError> {
+    let raw = permissions
+        .get(key)
+        .cloned()
+        .ok_or_else(|| protocol_error(format!("getCapabilities: missing permission {key:?}")))?;
+    serde_json::from_value(raw).map_err(|e| {
+        protocol_error(format!(
+            "getCapabilities: unrecognized permission state for {key:?}: {e}"
+        ))
+    })
+}
+
+/// Parse the id-correlated `getCapabilities` response line into a
+/// [`RecordingCapabilitiesVm`] (Story 16.4, AD-34).
+///
+/// Wire → VM mapping is deliberate (the contract shape is the invariant; field
+/// lists stay code-owned): the wire carries `macos` and a nested
+/// `permissions{screenRecording,microphone,camera}` object, the VM surfaces
+/// `macosVersion` and flattened per-TCC states. A sidecar `error` answer and any
+/// malformed / missing field surface as [`RecordingError::Protocol`] — never a
+/// panic. The protocol-*version* comparison is separate: [`verify_protocol_version`].
+pub fn parse_capabilities_result(line: &str) -> Result<RecordingCapabilitiesVm, RecordingError> {
+    let result = response_result(line, "getCapabilities")?;
+    let obj = result
+        .as_object()
+        .ok_or_else(|| protocol_error("getCapabilities: result is not an object"))?;
+    let protocol_version = obj
+        .get("protocolVersion")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| protocol_error("getCapabilities: missing/mistyped protocolVersion"))?;
+    let macos_version = obj
+        .get("macos")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| protocol_error("getCapabilities: missing/mistyped macos version"))?
+        .to_owned();
+    let features = obj
+        .get("features")
+        .cloned()
+        .ok_or_else(|| protocol_error("getCapabilities: missing features object"))
+        .and_then(|raw| {
+            serde_json::from_value(raw)
+                .map_err(|e| protocol_error(format!("getCapabilities: malformed features: {e}")))
+        })?;
+    let permissions = obj
+        .get("permissions")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| protocol_error("getCapabilities: missing permissions object"))?;
+    Ok(RecordingCapabilitiesVm {
+        protocol_version,
+        macos_version,
+        features,
+        screen_recording: parse_tcc(permissions, "screenRecording")?,
+        microphone: parse_tcc(permissions, "microphone")?,
+        camera: parse_tcc(permissions, "camera")?,
+    })
+}
+
+/// Parse the id-correlated `listSources` response line into a
+/// [`RecordingSourcesVm`] (Story 16.4, AD-34). The wire `result` matches the VM
+/// shape field-for-field; a sidecar `error` answer and any malformed / missing
+/// field surface as [`RecordingError::Protocol`] — never a panic.
+pub fn parse_sources_result(line: &str) -> Result<RecordingSourcesVm, RecordingError> {
+    let result = response_result(line, "listSources")?;
+    serde_json::from_value(result)
+        .map_err(|e| protocol_error(format!("listSources: malformed result: {e}")))
+}
+
+/// Extract just `result.protocolVersion` from a `getCapabilities` response line —
+/// nothing else (Story 16.4, AD-34). The handshake must run *before* the full
+/// result shape is validated: a future sidecar whose result shape changed across a
+/// version bump must still surface an honest version [`CoreError::Unsupported`]
+/// (via [`verify_protocol_version`]), not a shape [`RecordingError::Protocol`] from
+/// [`parse_capabilities_result`]. A sidecar `error` answer or a missing/mistyped
+/// `protocolVersion` is a genuine protocol fault (version cannot be negotiated).
+pub fn response_protocol_version(line: &str) -> Result<u32, RecordingError> {
+    let result = response_result(line, "getCapabilities")?;
+    result
+        .as_object()
+        .and_then(|obj| obj.get("protocolVersion"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| protocol_error("getCapabilities: missing/mistyped protocolVersion"))
+}
+
+/// Compare the sidecar-reported protocol version against [`PROTOCOL_VERSION`]
+/// (Story 16.4, AD-34). A reachable, parseable sidecar that speaks a different
+/// protocol is an *unsupported* condition — the honest not-available funnel —
+/// never a crash. (A response we cannot even parse is instead a
+/// [`RecordingError::Protocol`] fault, surfaced by the parse fns.)
+pub fn verify_protocol_version(reported: u32) -> Result<(), CoreError> {
+    if reported == PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(CoreError::Unsupported(format!(
+            "unsupported keeper-rec protocol version {reported} (keeper speaks {PROTOCOL_VERSION})"
+        )))
+    }
+}
+
 /// The screen-recording sidecar port (Story 16.2, AD-24, AD-27) — sits beside
 /// [`crate::platform::Platform`].
 ///
@@ -278,6 +455,21 @@ pub trait Recorder {
         &self,
         on_event: Box<dyn FnMut(RecordingEvent) + Send>,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
+
+    /// Run the `getCapabilities` handshake round-trip (Story 16.4, AD-34):
+    /// version, feature flags, and per-TCC permission states, with the protocol
+    /// version already verified against [`PROTOCOL_VERSION`]. An unavailable
+    /// sidecar or a protocol-version mismatch resolves
+    /// [`CoreError::Unsupported`]; a malformed response resolves
+    /// [`RecordingError::Protocol`] via [`CoreError::Recording`]. Never a panic.
+    fn get_capabilities(
+        &self,
+    ) -> impl Future<Output = Result<RecordingCapabilitiesVm, CoreError>> + Send;
+
+    /// Run the `listSources` round-trip (Story 16.4, AD-34): the displays /
+    /// applications / microphones / cameras the sidecar can offer as capture
+    /// sources. Same error surface as [`Recorder::get_capabilities`].
+    fn list_sources(&self) -> impl Future<Output = Result<RecordingSourcesVm, CoreError>> + Send;
 }
 
 /// Drive one recording session to its terminal [`SessionState`] (Story 16.2).
@@ -590,6 +782,206 @@ mod tests {
         assert_eq!(parse_event(""), None);
     }
 
+    /// A recorded multi-line NDJSON fixture stream (Story 16.4 AC): `state` /
+    /// `segmentClosed` / `error` lines interleaved with a blank and a garbage line.
+    /// Replaying it line-by-line through [`parse_event`] must yield exactly the
+    /// recognized event sequence, skipping blank/garbage — no hardware, no panic.
+    const EVENT_FIXTURE_STREAM: &str = concat!(
+        r#"{"event":"state","state":"preflight"}"#,
+        "\n",
+        r#"{"event":"state","state":"recording"}"#,
+        "\n",
+        "\n", // blank line — skipped
+        r#"{"event":"segmentClosed","index":0}"#,
+        "\n",
+        "this line is garbage, not JSON\n",
+        r#"{"event":"state","state":"rotating"}"#,
+        "\n",
+        r#"{"event":"state","state":"recording"}"#,
+        "\n",
+        r#"{"event":"error","message":"disk full"}"#,
+        "\n",
+    );
+
+    #[test]
+    fn event_fixture_stream_replays_to_exact_sequence() {
+        let events: Vec<RecordingEvent> = EVENT_FIXTURE_STREAM
+            .lines()
+            .filter_map(parse_event)
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                RecordingEvent::PreflightStarted,
+                RecordingEvent::CaptureStarted,
+                RecordingEvent::SegmentClosed { index: 0 },
+                RecordingEvent::SegmentRotating,
+                RecordingEvent::CaptureStarted,
+                RecordingEvent::Failed {
+                    message: "disk full".to_owned()
+                },
+            ],
+            "blank/garbage lines must be skipped, recognized lines mapped in order"
+        );
+    }
+
+    // --- NDJSON-RPC wire half (Story 16.4) ----------------------------------
+
+    /// A healthy `getCapabilities` response line matching [`PROTOCOL_VERSION`].
+    const CAPABILITIES_RESPONSE: &str = r#"{"id":1,"result":{"protocolVersion":1,"macos":"15.5.0","features":{"systemAudio":true,"microphone":false,"camera":false},"permissions":{"screenRecording":"granted","microphone":"notDetermined","camera":"notDetermined"}}}"#;
+
+    /// A healthy `listSources` response line (real display, deferred lists empty).
+    const SOURCES_RESPONSE: &str = r#"{"id":2,"result":{"displays":[{"id":1,"width":3456,"height":2234,"isMain":true}],"applications":[],"microphones":[],"cameras":[]}}"#;
+
+    #[test]
+    fn request_builders_emit_the_wire_shape() {
+        assert_eq!(
+            capabilities_request(1),
+            r#"{"id":1,"method":"getCapabilities"}"#
+        );
+        assert_eq!(
+            list_sources_request(2),
+            r#"{"id":2,"method":"listSources"}"#
+        );
+        // No line framing inside the request — the shell port owns the newline.
+        assert!(!capabilities_request(7).contains('\n'));
+    }
+
+    #[test]
+    fn response_id_extracts_only_id_carrying_lines() {
+        assert_eq!(response_id(CAPABILITIES_RESPONSE), Some(1));
+        assert_eq!(response_id(SOURCES_RESPONSE), Some(2));
+        assert_eq!(
+            response_id(r#"{"id":9,"error":{"code":"x","message":"y"}}"#),
+            Some(9)
+        );
+        // Unsolicited events, garbage, blanks → None (the awaiting reader skips them).
+        assert_eq!(
+            response_id(r#"{"event":"state","state":"recording"}"#),
+            None
+        );
+        assert_eq!(response_id("garbage"), None);
+        assert_eq!(response_id(""), None);
+        assert_eq!(response_id(r#"{"id":"not-a-number"}"#), None);
+    }
+
+    #[test]
+    fn parse_capabilities_result_maps_the_wire_to_the_vm() {
+        let vm = parse_capabilities_result(CAPABILITIES_RESPONSE).expect("healthy response");
+        assert_eq!(vm.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(vm.macos_version, "15.5.0");
+        assert!(vm.features.system_audio);
+        assert!(!vm.features.microphone);
+        assert!(!vm.features.camera);
+        assert_eq!(vm.screen_recording, TccPermission::Granted);
+        assert_eq!(vm.microphone, TccPermission::NotDetermined);
+        assert_eq!(vm.camera, TccPermission::NotDetermined);
+    }
+
+    #[test]
+    fn parse_capabilities_result_surfaces_protocol_faults() {
+        // Non-JSON, missing result, sidecar error answer, malformed fields — all
+        // surface RecordingError::Protocol, never a panic.
+        let cases = [
+            "not json",
+            r#"{"id":1}"#,
+            r#"{"id":1,"error":{"code":"unknownMethod","message":"nope"}}"#,
+            r#"{"id":1,"result":{}}"#,
+            r#"{"id":1,"result":{"protocolVersion":"one","macos":"15.5.0"}}"#,
+            r#"{"id":1,"result":{"protocolVersion":1,"macos":"15.5.0","features":{"systemAudio":true,"microphone":false,"camera":false},"permissions":{"screenRecording":"maybe","microphone":"notDetermined","camera":"notDetermined"}}}"#,
+        ];
+        for line in cases {
+            assert!(
+                matches!(
+                    parse_capabilities_result(line),
+                    Err(RecordingError::Protocol(_))
+                ),
+                "line {line:?} must surface a Protocol error"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_sources_result_maps_the_wire_to_the_vm() {
+        let vm = parse_sources_result(SOURCES_RESPONSE).expect("healthy response");
+        assert_eq!(vm.displays.len(), 1);
+        assert_eq!(vm.displays[0].id, 1);
+        assert_eq!(vm.displays[0].width, 3456);
+        assert_eq!(vm.displays[0].height, 2234);
+        assert!(vm.displays[0].is_main);
+        assert!(vm.applications.is_empty());
+        assert!(vm.microphones.is_empty());
+        assert!(vm.cameras.is_empty());
+    }
+
+    #[test]
+    fn parse_sources_result_surfaces_protocol_faults() {
+        let cases = [
+            "not json",
+            r#"{"id":2}"#,
+            r#"{"id":2,"error":{"code":"boom","message":"broken"}}"#,
+            r#"{"id":2,"result":{"displays":"not-a-list"}}"#,
+            r#"{"id":2,"result":{"displays":[]}}"#, // missing the other lists
+        ];
+        for line in cases {
+            assert!(
+                matches!(parse_sources_result(line), Err(RecordingError::Protocol(_))),
+                "line {line:?} must surface a Protocol error"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_version_match_proceeds_mismatch_is_unsupported() {
+        assert!(verify_protocol_version(PROTOCOL_VERSION).is_ok());
+        let err = verify_protocol_version(PROTOCOL_VERSION + 1)
+            .expect_err("a version skew must be rejected");
+        match err {
+            CoreError::Unsupported(message) => {
+                assert!(
+                    message.contains("protocol version 2"),
+                    "message must name the reported version, got: {message}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_protocol_version_extracts_before_shape_validation() {
+        // The healthy v1 response yields its version.
+        assert_eq!(
+            response_protocol_version(CAPABILITIES_RESPONSE).expect("v1 version"),
+            1
+        );
+        // A future/shape-changed response still yields its version WITHOUT needing
+        // the v1 `features`/`permissions` shape — this is what lets the handshake
+        // report Unsupported (not Protocol) for a version bump that changed shape.
+        assert_eq!(
+            response_protocol_version(
+                r#"{"id":1,"result":{"protocolVersion":2,"capabilities":{"x":1}}}"#
+            )
+            .expect("v2 version despite changed shape"),
+            2
+        );
+        // A sidecar error answer or a missing/mistyped version is a Protocol fault
+        // (the version cannot be negotiated at all).
+        for line in [
+            r#"{"id":1,"error":{"code":"unknownMethod","message":"nope"}}"#,
+            r#"{"id":1,"result":{}}"#,
+            r#"{"id":1,"result":{"protocolVersion":"two"}}"#,
+            "not json",
+        ] {
+            assert!(
+                matches!(
+                    response_protocol_version(line),
+                    Err(RecordingError::Protocol(_))
+                ),
+                "line {line:?} must surface a Protocol fault"
+            );
+        }
+    }
+
     // --- FakeRecorder + drive_session --------------------------------------
 
     /// A scripted [`Recorder`]: replays a fixed event sequence through `on_event`,
@@ -608,6 +1000,37 @@ mod tests {
         }
     }
 
+    /// A canned, protocol-matching capabilities VM for the fake port.
+    fn canned_capabilities() -> RecordingCapabilitiesVm {
+        RecordingCapabilitiesVm {
+            protocol_version: PROTOCOL_VERSION,
+            macos_version: "15.5.0".to_owned(),
+            features: crate::vm::RecordingFeaturesVm {
+                system_audio: true,
+                microphone: false,
+                camera: false,
+            },
+            screen_recording: TccPermission::Granted,
+            microphone: TccPermission::NotDetermined,
+            camera: TccPermission::NotDetermined,
+        }
+    }
+
+    /// A canned sources VM for the fake port (one display, deferred lists empty).
+    fn canned_sources() -> RecordingSourcesVm {
+        RecordingSourcesVm {
+            displays: vec![crate::vm::RecordingDisplayVm {
+                id: 1,
+                width: 3456,
+                height: 2234,
+                is_main: true,
+            }],
+            applications: vec![],
+            microphones: vec![],
+            cameras: vec![],
+        }
+    }
+
     impl Recorder for FakeRecorder {
         fn is_available(&self) -> bool {
             self.available
@@ -622,6 +1045,24 @@ mod tests {
                 on_event(event);
             }
             Ok(())
+        }
+
+        async fn get_capabilities(&self) -> Result<RecordingCapabilitiesVm, CoreError> {
+            if !self.available {
+                return Err(CoreError::Unsupported(
+                    "keeper-rec is not available".to_owned(),
+                ));
+            }
+            Ok(canned_capabilities())
+        }
+
+        async fn list_sources(&self) -> Result<RecordingSourcesVm, CoreError> {
+            if !self.available {
+                return Err(CoreError::Unsupported(
+                    "keeper-rec is not available".to_owned(),
+                ));
+            }
+            Ok(canned_sources())
         }
     }
 
@@ -717,6 +1158,25 @@ mod tests {
         assert!(matches!(
             err,
             CoreError::Recording(RecordingError::IllegalTransition { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn fake_recorder_answers_the_new_port_methods() {
+        let recorder = FakeRecorder::new(true, vec![]);
+        let capabilities = recorder.get_capabilities().await.expect("canned VM");
+        assert_eq!(capabilities, canned_capabilities());
+        let sources = recorder.list_sources().await.expect("canned VM");
+        assert_eq!(sources, canned_sources());
+
+        let unavailable = FakeRecorder::new(false, vec![]);
+        assert!(matches!(
+            unavailable.get_capabilities().await,
+            Err(CoreError::Unsupported(_))
+        ));
+        assert!(matches!(
+            unavailable.list_sources().await,
+            Err(CoreError::Unsupported(_))
         ));
     }
 

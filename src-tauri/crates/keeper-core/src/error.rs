@@ -453,6 +453,15 @@ pub enum RecordingError {
     /// spawn/IO failure — never a captured-media path or bytes.
     #[error("recording sidecar failed: {0}")]
     SidecarFailed(String),
+
+    /// A `keeper-rec` NDJSON-RPC response violated the typed wire contract (Story
+    /// 16.4, AD-34): the sidecar answered with an `error` object, the response was
+    /// not parseable JSON, or a required `result` field was missing/mistyped. The
+    /// wrapped string is a non-secret description of the wire fault — never a
+    /// captured-media path, media bytes, or session material. Distinct from a
+    /// protocol-*version* mismatch, which is an honest [`CoreError::Unsupported`].
+    #[error("recording protocol error: {0}")]
+    Protocol(String),
 }
 
 /// The hexagon error root. Every fallible core operation surfaces one of these.

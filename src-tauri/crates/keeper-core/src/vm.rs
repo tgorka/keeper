@@ -2491,6 +2491,134 @@ pub struct PaletteResultsVm {
     pub actions: Vec<PaletteActionVm>,
 }
 
+/// A macOS TCC (privacy database) permission state as reported by the `keeper-rec`
+/// sidecar (Story 16.4, Epic 16, AD-34).
+///
+/// The sidecar is the process that will capture (16.6), so *its* grant is the one
+/// that matters. In this story only `screenRecording` is probed live (a
+/// non-prompting CoreGraphics preflight in the sidecar); `microphone`/`camera` stay
+/// provisional `NotDetermined` until AVFoundation detection lands (16.6/19). The
+/// preflight is two-valued, so it only reports `Granted` vs `NotDetermined` — it
+/// cannot distinguish an explicit `Denied` from a never-requested state. The
+/// authoritative granted / not-yet-requested / denied tri-state and its live
+/// pre-flight UI (request, deep-link, re-detection) are Story 16.5's. Serializes
+/// to `"granted" | "denied" | "notDetermined"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum TccPermission {
+    /// The permission is granted to the capturing process.
+    Granted,
+    /// The permission is not currently granted (denied or revoked).
+    Denied,
+    /// The permission has not been decided yet (or detection is deferred).
+    NotDetermined,
+}
+
+/// The capture feature flags the `keeper-rec` sidecar reports via `getCapabilities`
+/// (Story 16.4, AD-34). Shape-locked; values are code-owned and honest about what
+/// the sidecar build actually supports today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingFeaturesVm {
+    /// Whether system-audio capture is supported (true on the macOS 13+ sidecar).
+    pub system_audio: bool,
+    /// Whether microphone capture is supported (false until AVFoundation lands, 16.6).
+    pub microphone: bool,
+    /// Whether camera/webcam capture is supported (false until AVFoundation lands, 20.x).
+    pub camera: bool,
+}
+
+/// The `getCapabilities` handshake result (Story 16.4, AD-34): the sidecar's
+/// protocol version, macOS version, feature flags, and per-TCC permission states.
+///
+/// `protocol_version` carries the handshake — the host compares it against
+/// `keeper_core::recording::PROTOCOL_VERSION` and surfaces a mismatch as an honest
+/// `Unsupported`, never a crash. Consumed by 16.5's permission pre-flight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingCapabilitiesVm {
+    /// The NDJSON-RPC protocol version the sidecar speaks.
+    pub protocol_version: u32,
+    /// The sidecar host's macOS version, e.g. `"15.5.0"` (display-only, never parsed
+    /// for gating — the `recording` capability flag owns the version gate).
+    pub macos_version: String,
+    /// What this sidecar build can capture.
+    pub features: RecordingFeaturesVm,
+    /// The Screen Recording state of the sidecar process from a non-prompting
+    /// preflight — `Granted` or `NotDetermined` only (the preflight cannot confirm
+    /// an explicit `Denied`; 16.5's live pre-flight resolves the full tri-state).
+    pub screen_recording: TccPermission,
+    /// The Microphone TCC state (provisional `NotDetermined` until 16.6).
+    pub microphone: TccPermission,
+    /// The Camera TCC state (provisional `NotDetermined` until 16.6/20.x).
+    pub camera: TccPermission,
+}
+
+/// One recordable display reported by `listSources` (Story 16.4, AD-34) — real
+/// values from the sidecar's active-display enumeration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingDisplayVm {
+    /// The CoreGraphics display id (stable for the session, not across reboots).
+    pub id: u32,
+    /// The display width in points.
+    pub width: u32,
+    /// The display height in points.
+    pub height: u32,
+    /// Whether this is the main display (menu-bar display).
+    pub is_main: bool,
+}
+
+/// One recordable application reported by `listSources` (Story 16.4). Shape-locked
+/// now; real enumeration needs ScreenCaptureKit shareable content and lands with
+/// capture/source breadth (16.6/19) — until then the list is empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingApplicationVm {
+    /// The application bundle identifier.
+    pub bundle_id: String,
+    /// The human-readable application name.
+    pub name: String,
+    /// The running process id.
+    pub pid: i32,
+}
+
+/// One recordable audio/video device (microphone or camera) reported by
+/// `listSources` (Story 16.4). Shape-locked now; real enumeration needs
+/// AVFoundation and lands with 16.6/19 — until then the lists are empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingDeviceVm {
+    /// The device's unique identifier.
+    pub id: String,
+    /// The human-readable device name.
+    pub name: String,
+}
+
+/// The `listSources` result (Story 16.4, AD-34): everything the sidecar can
+/// currently offer as a capture source. In this story `displays` is real;
+/// `applications`/`microphones`/`cameras` are shape-complete but empty
+/// (SCK/AVFoundation enumeration is 16.6/19; the source-picker UI is Epic 19).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingSourcesVm {
+    /// The active displays (real, from the sidecar's display enumeration).
+    pub displays: Vec<RecordingDisplayVm>,
+    /// Recordable applications (empty until SCK enumeration lands).
+    pub applications: Vec<RecordingApplicationVm>,
+    /// Microphone devices (empty until AVFoundation enumeration lands).
+    pub microphones: Vec<RecordingDeviceVm>,
+    /// Camera devices (empty until AVFoundation enumeration lands).
+    pub cameras: Vec<RecordingDeviceVm>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -171,7 +171,7 @@ development_status:
   16-1-keeper-rec-swiftpm-scaffold-codesign-and-externalbin-wiring: done
   16-2-recording-core-module-and-recorder-port: done
   16-3-recording-capability-flag-and-gated-recording-surface: done
-  16-4-ndjson-rpc-handshake-getcapabilities-and-listsources: backlog
+  16-4-ndjson-rpc-handshake-getcapabilities-and-listsources: done
   16-5-screen-recording-permission-pre-flight: backlog
   16-6-full-screen-system-audio-capture-to-a-single-fmp4: backlog
   epic-16-retrospective: optional

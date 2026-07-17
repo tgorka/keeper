@@ -962,3 +962,23 @@ status: open
   summary: The `DesktopRecorder::run_session` spawn/stream/reap body — including the prior-pass `kill_on_drop` and exit-status-inspection patches — has no automated test; only the pure state machine/parser and the no-sidecar `is_available()==false` path are covered. Add a fake-executable harness (a scripted binary emitting NDJSON on stdout) to exercise parse→forward→reap without hardware, ahead of the real-capture path (16.6).
   evidence: Every test in `recording.rs`/`recorder.rs` exercises either the platform-free machine or the `is_available()` short-circuit; the actual `tokio::process` spawn, byte-level line read, `parse_event` forwarding, `AbortOnDrop` teardown, and `child.wait()` status check are unexercised (the module's own test even notes `run_session` "is not spawned here"). Real `keeper-rec` capture is deferred to 16.6 (dev-signed hardware), but the stream/reap logic is testable now with a fake stdout-emitting executable and is the seam 16.3+ builds on.
   status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-4-ndjson-rpc-handshake-getcapabilities-and-listsources.md`
+  summary: The new `DesktopRecorder::request_response` round-trip has no read/round-trip timeout — a `keeper-rec` that spawns, reads the request line, then hangs (deadlock, wedged CoreGraphics, waiting on a dialog) leaves `get_capabilities()`/`list_sources()` pending forever, and with them 16.5's pre-flight. `kill_on_drop` only fires if the future is dropped, and nothing drops it.
+  evidence: `request_response` loops on `reader.read_until(...).await` and then `child.wait().await` with no `tokio::time::timeout` anywhere. A bounded request/response call especially warrants a timeout (unlike the streaming `run_session`). This extends the 16.2-deferred `wait()`-timeout concern to the new request path; 16.6 owns the capture-session lifecycle timeout policy (start/stop/round-trip). Both review reviewers flagged it independently.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-4-ndjson-rpc-handshake-getcapabilities-and-listsources.md`
+  summary: `request_response` reads response lines with `read_until(b'\n', &mut buf)` and no per-line length cap, so a buggy/replaced sidecar emitting a huge line before the correlated response accumulates it unbounded in memory.
+  evidence: The read loop has no size limit; this extends the 16.2-deferred unbounded-line/backpressure concern to the request path. Low likelihood (first-party trusted sidecar) but an unbounded-allocation path driven by external process output; cap/skip-on-overflow belongs with 16.6's capture-path hardening.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-4-ndjson-rpc-handshake-getcapabilities-and-listsources.md`
+  summary: `RecordingError::Protocol` and `response_result` interpolate the sidecar-supplied `error.code`/`error.message` (and serde's offending-value text) verbatim into error strings; the "never a secret" guarantee is documented host-side but is actually enforced sidecar-side.
+  evidence: `response_result` embeds `error.code`/`error.message` from the sidecar and the parsers embed `{e}` from serde. Safe now (keeper-rec emits only benign strings), but once 16.6 flows real capture paths/device names an error message could carry a path into a `Protocol` string. Cap+scrub alongside the 16.2-deferred `Failed`-message sanitization when real capture errors land (16.6).
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-16-4-ndjson-rpc-handshake-getcapabilities-and-listsources.md`
+  summary: id-correlation uses fixed per-method ids (`1` for getCapabilities, `2` for listSources) with no method-echo verification; correct only because each call spawns a fresh process and issues exactly one request. 16.6's persistent multi-request capture session (start/stop/events over one long-lived process) will collide on fixed ids.
+  evidence: `request_response` correlates purely on `response_id == id` with a constant id per method and never verifies the response answers the method asked. For 16.6's persistent session this needs monotonically-increasing request ids and response/method validation (defense-in-depth) to avoid mismatching a reply to the wrong outstanding request.
+  status: open
