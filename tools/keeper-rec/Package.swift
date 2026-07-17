@@ -11,15 +11,27 @@ let package = Package(
         .executableTarget(
             name: "keeper-rec",
             path: "Sources/keeper-rec",
+            // Language mode 5: the capture engine (Story 16.6) is a classic
+            // delegate + serial-DispatchQueue design (SCStreamOutput callbacks
+            // append into AVAssetWriter inputs on one media queue); Swift 6
+            // strict concurrency has no non-invasive way to express that
+            // queue-confined ownership yet.
+            swiftSettings: [
+                .swiftLanguageMode(.v5),
+            ],
             // CoreGraphics is used for the Screen Recording preflight
-            // (`CGPreflightScreenCaptureAccess`) and active-display enumeration
-            // (`CGGetActiveDisplayList`). SwiftPM auto-links it via the SDK
-            // umbrella on macOS, but link it explicitly so the build stays
-            // reproducible under stricter/explicit-linking toolchains.
-            // ScreenCaptureKit / AVFoundation are NOT linked here — they land
-            // with real capture (16.6 / 19).
+            // (`CGPreflightScreenCaptureAccess`), active-display enumeration
+            // (`CGGetActiveDisplayList`), and pixel-size lookup. ScreenCaptureKit
+            // + AVFoundation drive real capture (Story 16.6): SCStream delivers
+            // screen + system-audio sample buffers, AVAssetWriter writes the
+            // fragmented MP4. SwiftPM auto-links via the SDK umbrella on macOS,
+            // but link explicitly so the build stays reproducible under
+            // stricter/explicit-linking toolchains.
             linkerSettings: [
                 .linkedFramework("CoreGraphics"),
+                .linkedFramework("ScreenCaptureKit"),
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("CoreMedia"),
             ]
         ),
     ]

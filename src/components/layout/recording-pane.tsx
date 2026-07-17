@@ -26,6 +26,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useRecordingPermission } from "@/hooks/use-recording-permission";
+import { isLiveRecording, useRecordingSession } from "@/hooks/use-recording-session";
 
 /** Honest local-only subtitle (recording voice: sentence case, no exclamation
  * marks). Recording adds zero network destinations. */
@@ -33,6 +34,12 @@ const RECORDING_SUBTITLE = "Recorded locally. Nothing uploads.";
 
 /** The gated Start affordance's label (recording voice). */
 export const START_RECORDING_LABEL = "Start recording";
+
+/** The live-session stop affordance's label (recording voice). */
+export const STOP_RECORDING_LABEL = "Stop";
+
+/** The finalized-outcome note prefix (the saved file's path follows). */
+export const FINALIZED_NOTE_PREFIX = "Saved to";
 
 /** Names the blocking permission while Start is disabled (FR-67). */
 export const START_BLOCKED_NOTE = `Start needs the ${SCREEN_RECORDING_PERMISSION_NAME} permission.`;
@@ -52,6 +59,8 @@ const SETUP_CARDS: readonly string[] = [
 
 export function RecordingPane() {
   const { permission, request, openSettings } = useRecordingPermission();
+  const { status, elapsed, start, stop } = useRecordingSession();
+  const live = isLiveRecording(status);
 
   return (
     <section
@@ -64,17 +73,50 @@ export function RecordingPane() {
           <p className="text-muted-foreground text-sm">{RECORDING_SUBTITLE}</p>
         </div>
         <div className="flex shrink-0 flex-col items-end gap-1">
-          <Button
-            type="button"
-            disabled={!permission.canStart}
-            onClick={() => {
-              // Inert placeholder — capture wiring lands in Story 16.6.
-            }}
-          >
-            {START_RECORDING_LABEL}
-          </Button>
-          {!permission.canStart && (
+          {live ? (
+            <div className="flex items-center gap-3">
+              {/* The live record dot + ticking mono elapsed line (UX-DR30). */}
+              <span className="flex items-center gap-2" role="status" aria-label="Recording active">
+                <span
+                  aria-hidden="true"
+                  className="size-2.5 animate-pulse rounded-full bg-recording-red"
+                />
+                <span className="font-mono text-sm tabular-nums">{elapsed ?? "0:00"}</span>
+              </span>
+              <Button
+                type="button"
+                variant="destructive"
+                disabled={status.state === "stopping"}
+                onClick={() => {
+                  void stop();
+                }}
+              >
+                {status.state === "stopping" ? "Stopping…" : STOP_RECORDING_LABEL}
+              </Button>
+            </div>
+          ) : (
+            <Button
+              type="button"
+              disabled={!permission.canStart}
+              onClick={() => {
+                void start();
+              }}
+            >
+              {START_RECORDING_LABEL}
+            </Button>
+          )}
+          {!permission.canStart && !live && (
             <p className="text-muted-foreground text-xs">{START_BLOCKED_NOTE}</p>
+          )}
+          {status.state === "finalized" && status.outputPath !== null && (
+            <p className="text-muted-foreground text-xs" role="status">
+              {FINALIZED_NOTE_PREFIX} <span className="font-mono">{status.outputPath}</span>
+            </p>
+          )}
+          {status.state === "failed" && (
+            <p className="text-held text-xs" role="alert">
+              Recording failed: {status.error ?? "unknown error"}
+            </p>
           )}
         </div>
       </header>

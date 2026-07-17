@@ -299,6 +299,46 @@ pub fn request_screen_recording_request(id: u64) -> String {
     serde_json::json!({ "id": id, "method": "requestScreenRecording" }).to_string()
 }
 
+/// The parameters of one capture session (Story 16.6, FR-68/FR-69/FR-71, AD-37).
+///
+/// The host owns the output path (directory + local-time-stamped filename); the
+/// sidecar creates parent directories as needed and writes exactly this file.
+/// `display_id` picks a specific display (`None` = the main display);
+/// `system_audio` toggles the AAC system-audio track (with keeper's own process
+/// audio excluded — FR-69).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionParams {
+    /// Absolute path of the `.mp4` file to write.
+    pub output_path: String,
+    /// The macOS display id to capture, or `None` for the main display.
+    pub display_id: Option<u32>,
+    /// Whether to capture system audio (true in the walking skeleton).
+    pub system_audio: bool,
+}
+
+/// Build the one-line `startRecording` request (Story 16.6; no trailing newline —
+/// the shell port owns line framing). Wire shape:
+/// `{"id":<id>,"method":"startRecording","params":{"path":…,"systemAudio":…[,"displayId":…]}}`.
+/// Additive to the v1 protocol — keeper and keeper-rec ship in lockstep, so
+/// [`PROTOCOL_VERSION`] is unchanged.
+pub fn start_recording_request(id: u64, params: &SessionParams) -> String {
+    let mut wire = serde_json::json!({
+        "path": params.output_path,
+        "systemAudio": params.system_audio,
+    });
+    if let Some(display_id) = params.display_id {
+        wire["displayId"] = display_id.into();
+    }
+    serde_json::json!({ "id": id, "method": "startRecording", "params": wire }).to_string()
+}
+
+/// Build the one-line `stop` request (Story 16.6; no trailing newline — the shell
+/// port owns line framing). Wire shape: `{"id":<id>,"method":"stop"}`. The sidecar
+/// answers with `stopping`/`finalized` (or `error`) *events*, then exits.
+pub fn stop_recording_request(id: u64) -> String {
+    serde_json::json!({ "id": id, "method": "stop" }).to_string()
+}
+
 /// Extract the correlation `id` from one sidecar stdout line, or `None` when the
 /// line is not an id-carrying response (an unsolicited event, garbage, a blank —
 /// anything the awaiting reader should skip). Pure and tolerant: never a panic.
@@ -498,13 +538,18 @@ pub trait Recorder {
     /// `false` (never an error) is the honest not-available signal.
     fn is_available(&self) -> bool;
 
-    /// Run one recording session, forwarding each recognized [`RecordingEvent`] to
-    /// `on_event` **as it arrives**. Resolves `Ok(())` when the sidecar's event
+    /// Run one recording session (Story 16.6): start capture per `params`,
+    /// forwarding each recognized [`RecordingEvent`] to `on_event` **as it
+    /// arrives**. When `stop` resolves, the port requests a graceful
+    /// stop-and-finalize (the sidecar then emits its `stopping`/`finalized`
+    /// events and ends the stream). Resolves `Ok(())` when the sidecar's event
     /// stream ends cleanly; a spawn/IO failure resolves
     /// [`CoreError::Recording`], and an unavailable sidecar resolves
     /// [`CoreError::Unsupported`]. Never panics on absent / garbage output.
     fn run_session(
         &self,
+        params: SessionParams,
+        stop: impl Future<Output = ()> + Send + 'static,
         on_event: Box<dyn FnMut(RecordingEvent) + Send>,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
@@ -548,6 +593,8 @@ pub trait Recorder {
 /// mid-stream sidecar/IO failure never silently discards the progress already seen.
 pub async fn drive_session<R: Recorder>(
     recorder: &R,
+    params: SessionParams,
+    stop: impl Future<Output = ()> + Send + 'static,
     mut on_state: impl FnMut(SessionState) + Send,
 ) -> Result<SessionState, CoreError> {
     use std::sync::{Arc, Mutex};
@@ -584,7 +631,7 @@ pub async fn drive_session<R: Recorder>(
         }) as Box<dyn FnMut(RecordingEvent) + Send>
     };
 
-    let run_result = recorder.run_session(sink).await;
+    let run_result = recorder.run_session(params, stop, sink).await;
 
     // Replay every buffered transition BEFORE propagating any error, so a mid-stream
     // sidecar/IO failure never silently discards the progress already observed.
@@ -1166,6 +1213,8 @@ mod tests {
 
         async fn run_session(
             &self,
+            _params: SessionParams,
+            _stop: impl Future<Output = ()> + Send + 'static,
             mut on_event: Box<dyn FnMut(RecordingEvent) + Send>,
         ) -> Result<(), CoreError> {
             let events = std::mem::take(&mut *self.events.lock().expect("events lock"));
@@ -1204,6 +1253,15 @@ mod tests {
         }
     }
 
+    /// Canned params for the fake port (never touch the filesystem).
+    fn test_params() -> SessionParams {
+        SessionParams {
+            output_path: "/tmp/keeper-test.mp4".to_owned(),
+            display_id: None,
+            system_audio: true,
+        }
+    }
+
     fn state_collector() -> (
         impl FnMut(SessionState) + Send,
         Arc<Mutex<Vec<SessionState>>>,
@@ -1230,7 +1288,7 @@ mod tests {
             ],
         );
         let (on_state, seen) = state_collector();
-        let terminal = drive_session(&recorder, on_state)
+        let terminal = drive_session(&recorder, test_params(), std::future::pending(), on_state)
             .await
             .expect("clean lifecycle");
         assert_eq!(terminal, SessionState::Finalized);
@@ -1260,7 +1318,7 @@ mod tests {
             ],
         );
         let (on_state, _seen) = state_collector();
-        let terminal = drive_session(&recorder, on_state)
+        let terminal = drive_session(&recorder, test_params(), std::future::pending(), on_state)
             .await
             .expect("failure branch is not a drive error");
         assert_eq!(terminal, SessionState::Failed);
@@ -1278,7 +1336,7 @@ mod tests {
             ],
         );
         let (on_state, _seen) = state_collector();
-        let terminal = drive_session(&recorder, on_state)
+        let terminal = drive_session(&recorder, test_params(), std::future::pending(), on_state)
             .await
             .expect("recovered branch");
         assert_eq!(terminal, SessionState::Recovered);
@@ -1290,7 +1348,7 @@ mod tests {
         // CoreError::Recording, not a silent state adoption.
         let recorder = FakeRecorder::new(true, vec![RecordingEvent::SegmentClosed { index: 0 }]);
         let (on_state, _seen) = state_collector();
-        let err = drive_session(&recorder, on_state)
+        let err = drive_session(&recorder, test_params(), std::future::pending(), on_state)
             .await
             .expect_err("illegal transition must surface");
         assert!(matches!(

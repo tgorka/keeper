@@ -11,6 +11,7 @@
     --color-held-foreground: var(--held-foreground);
     --color-incognito: var(--incognito);
     --color-incognito-foreground: var(--incognito-foreground);
+    --color-recording-red: var(--recording-red);
     --color-bridge-healthy: var(--bridge-healthy);
     --color-bridge-degraded: var(--bridge-degraded);
     --color-bridge-disconnected: var(--bridge-disconnected);
@@ -90,6 +91,7 @@
   --held-foreground: #ffffff;
   --incognito: #6d28d9;
   --incognito-foreground: #ffffff;
+  --recording-red: #dc2626;
   --bridge-healthy: #16a34a;
   --bridge-degraded: #d97706;
   --bridge-disconnected: #dc2626;
@@ -169,6 +171,7 @@
   --held-foreground: #231303;
   --incognito: #a78bfa;
   --incognito-foreground: #1e1038;
+  --recording-red: #ef4444;
   --bridge-healthy: #16a34a;
   --bridge-degraded: #d97706;
   --bridge-disconnected: #dc2626;

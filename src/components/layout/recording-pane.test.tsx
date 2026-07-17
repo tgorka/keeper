@@ -5,27 +5,54 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingPermission: vi.fn(),
   requestScreenRecordingPermission: vi.fn(),
   openScreenRecordingSettings: vi.fn(),
+  recordingStart: vi.fn(),
+  recordingStop: vi.fn(),
+  recordingStatus: vi.fn(),
 }));
 
 import {
+  FINALIZED_NOTE_PREFIX,
   RecordingPane,
   START_BLOCKED_NOTE,
   START_RECORDING_LABEL,
+  STOP_RECORDING_LABEL,
 } from "@/components/layout/recording-pane";
 import {
   OPEN_SETTINGS_LABEL,
   REQUEST_PERMISSION_LABEL,
 } from "@/components/recording/recording-permission-row";
-import type { RecordingPermissionVm } from "@/lib/ipc/client";
+import type { RecordingPermissionVm, RecordingStatusVm } from "@/lib/ipc/client";
 import {
   openScreenRecordingSettings,
   recordingPermission,
+  recordingStart,
+  recordingStatus,
+  recordingStop,
   requestScreenRecordingPermission,
 } from "@/lib/ipc/client";
 
 const mockFetch = vi.mocked(recordingPermission);
 const mockRequest = vi.mocked(requestScreenRecordingPermission);
 const mockOpenSettings = vi.mocked(openScreenRecordingSettings);
+const mockStart = vi.mocked(recordingStart);
+const mockStop = vi.mocked(recordingStop);
+const mockStatus = vi.mocked(recordingStatus);
+
+const IDLE_STATUS: RecordingStatusVm = {
+  state: "idle",
+  segmentsClosed: 0,
+  startedAtEpochMs: null,
+  outputPath: null,
+  error: null,
+};
+
+const RECORDING_STATUS: RecordingStatusVm = {
+  state: "recording",
+  segmentsClosed: 0,
+  startedAtEpochMs: 1_700_000_000_000,
+  outputPath: "/Users/alice/Movies/keeper/keeper-rec test.mp4",
+  error: null,
+};
 
 const GRANTED: RecordingPermissionVm = { screenRecording: "granted", canStart: true };
 const NOT_YET: RecordingPermissionVm = { screenRecording: "notYetRequested", canStart: false };
@@ -38,6 +65,12 @@ beforeEach(() => {
   mockRequest.mockResolvedValue(GRANTED);
   mockOpenSettings.mockReset();
   mockOpenSettings.mockResolvedValue(undefined);
+  mockStart.mockReset();
+  mockStart.mockResolvedValue(RECORDING_STATUS);
+  mockStop.mockReset();
+  mockStop.mockResolvedValue(undefined);
+  mockStatus.mockReset();
+  mockStatus.mockResolvedValue(IDLE_STATUS);
 });
 
 afterEach(() => {
@@ -129,5 +162,58 @@ describe("RecordingPane", () => {
     expect(
       await screen.findByRole("button", { name: REQUEST_PERMISSION_LABEL }),
     ).toBeInTheDocument();
+  });
+
+  // --- Live session (Story 16.6) ------------------------------------------
+
+  it("Start flips the header into the live-session UI (red dot + Stop)", async () => {
+    mockFetch.mockResolvedValue(GRANTED);
+    render(<RecordingPane />);
+
+    const startButton = await screen.findByRole("button", { name: START_RECORDING_LABEL });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    fireEvent.click(startButton);
+
+    expect(await screen.findByRole("status", { name: "Recording active" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: STOP_RECORDING_LABEL })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: START_RECORDING_LABEL })).not.toBeInTheDocument();
+    expect(mockStart).toHaveBeenCalledTimes(1);
+  });
+
+  it("Stop requests the graceful stop", async () => {
+    mockFetch.mockResolvedValue(GRANTED);
+    mockStatus.mockResolvedValue(RECORDING_STATUS);
+    render(<RecordingPane />);
+
+    fireEvent.click(await screen.findByRole("button", { name: STOP_RECORDING_LABEL }));
+    await waitFor(() => expect(mockStop).toHaveBeenCalledTimes(1));
+  });
+
+  it("a finalized session renders the saved-file note with the path", async () => {
+    mockFetch.mockResolvedValue(GRANTED);
+    mockStatus.mockResolvedValue({
+      ...RECORDING_STATUS,
+      state: "finalized",
+    });
+    render(<RecordingPane />);
+
+    expect(await screen.findByText(new RegExp(FINALIZED_NOTE_PREFIX))).toBeInTheDocument();
+    expect(screen.getByText(RECORDING_STATUS.outputPath ?? "")).toBeInTheDocument();
+    // Back to the Start affordance (a terminal state is not live).
+    expect(screen.getByRole("button", { name: START_RECORDING_LABEL })).toBeInTheDocument();
+  });
+
+  it("a failed start surfaces the honest failure line", async () => {
+    mockFetch.mockResolvedValue(GRANTED);
+    mockStart.mockRejectedValue({ message: "keeper-rec could not spawn" });
+    render(<RecordingPane />);
+
+    const startButton = await screen.findByRole("button", { name: START_RECORDING_LABEL });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    fireEvent.click(startButton);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Recording failed: keeper-rec could not spawn",
+    );
   });
 });

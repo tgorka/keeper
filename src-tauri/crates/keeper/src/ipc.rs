@@ -24,7 +24,10 @@ use keeper_core::error::{
 };
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
-use keeper_core::recording::{resolve_screen_recording_access, Recorder};
+use keeper_core::recording::{
+    resolve_screen_recording_access, Recorder, RecordingEvent, RecordingSession, SessionParams,
+    SessionState,
+};
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
@@ -33,9 +36,9 @@ use keeper_core::vm::{
     ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError,
     IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
     NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
-    PaletteResultsVm, PingVm, Provider, RecordingPermissionVm, RemoteDraftVm, ResolveSupportVm,
-    RoomListBatch, ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot,
-    TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
+    PaletteResultsVm, PingVm, Provider, RecordingPermissionVm, RecordingStatusVm, RecordingUiState,
+    RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm,
+    SearchHitVm, SpacesSnapshot, TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -106,6 +109,23 @@ pub struct AppState {
     /// never persisted — a fresh session must never cache a denial (or a grant)
     /// optimistically.
     pub recording_permission_requested: AtomicBool,
+    /// The (at most one) live recording session (Story 16.6): the graceful-stop
+    /// trigger plus the status snapshot the driver task keeps current. `None`
+    /// until the first `recording_start` of this app lifetime; a terminal
+    /// session stays in the slot (its outcome is what `recording_status`
+    /// reports) until the next start replaces it.
+    pub recording_run: Mutex<Option<RecordingRun>>,
+}
+
+/// The live half of one recording session (Story 16.6, AD-33): the shell owns
+/// the process-facing pieces (the stop trigger and the polled status snapshot);
+/// the platform-free state machine lives inside the driver task.
+pub struct RecordingRun {
+    /// Fires the graceful `stop` request into the session task (one-shot;
+    /// `None` after a stop was requested).
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The status snapshot shared with (and kept current by) the driver task.
+    status: Arc<Mutex<RecordingStatusVm>>,
 }
 
 /// Lock an optional-slot mutex, recovering a poisoned lock instead of propagating —
@@ -312,6 +332,7 @@ impl AppState {
             nav_state: Mutex::new(None),
             recorder,
             recording_permission_requested: AtomicBool::new(false),
+            recording_run: Mutex::new(None),
         }
     }
 }
@@ -3280,6 +3301,176 @@ pub fn open_screen_recording_settings(state: State<'_, AppState>) -> Result<(), 
         .platform
         .open_url(SCREEN_RECORDING_SETTINGS_URL)
         .map_err(to_ipc_error)
+}
+
+/// Project a [`SessionState`] into the UI-facing [`RecordingUiState`] (Story 16.6).
+fn recording_ui_state(state: SessionState) -> RecordingUiState {
+    match state {
+        SessionState::Idle => RecordingUiState::Idle,
+        SessionState::Preflight => RecordingUiState::Preflight,
+        SessionState::Recording => RecordingUiState::Recording,
+        SessionState::Rotating => RecordingUiState::Rotating,
+        SessionState::Stopping => RecordingUiState::Stopping,
+        SessionState::Finalized => RecordingUiState::Finalized,
+        SessionState::Recovered => RecordingUiState::Recovered,
+        SessionState::Failed => RecordingUiState::Failed,
+    }
+}
+
+/// Lock a shared recording-status snapshot, recovering a poisoned lock (plain
+/// data, no invariant a mid-write panic could break — never panic the app).
+fn status_lock(status: &Mutex<RecordingStatusVm>) -> std::sync::MutexGuard<'_, RecordingStatusVm> {
+    status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The current Unix epoch in milliseconds (0 on a pre-1970 clock — never a panic).
+fn epoch_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Start the (at most one) full-screen + system-audio recording session (Story
+/// 16.6, FR-68/FR-69/FR-71, AD-37): resolve the output file
+/// (`~/Movies/keeper/keeper-rec <local timestamp>.mp4`, directory created by the
+/// sidecar), spawn the driver task (fresh `keeper-rec` child; NDJSON events fold
+/// through the platform-free session machine into the polled status snapshot),
+/// and return the initial snapshot. A still-live prior session is an honest
+/// error — never two capture children. Failures funnel through [`to_ipc_error`];
+/// a mid-session failure surfaces on the snapshot (`state: failed` + message),
+/// never a silent reset.
+#[tauri::command]
+pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStatusVm, IpcError> {
+    let mut guard = slot_lock(&state.recording_run);
+    if let Some(run) = guard.as_ref() {
+        let live = !matches!(
+            status_lock(&run.status).state,
+            RecordingUiState::Finalized | RecordingUiState::Recovered | RecordingUiState::Failed
+        );
+        if live {
+            return Err(IpcError {
+                code: IpcErrorCode::Internal,
+                message: "a recording is already running".to_owned(),
+                account_id: None,
+                retriable: false,
+            });
+        }
+    }
+
+    // Default destination (the Destination card is a later story): the user's
+    // Movies folder, falling back to the app data dir where Movies is absent.
+    let directory = dirs::video_dir()
+        .unwrap_or(state.platform.data_dir().map_err(to_ipc_error)?)
+        .join("keeper");
+    let filename = chrono::Local::now()
+        .format("keeper-rec %Y-%m-%d %H.%M.%S.mp4")
+        .to_string();
+    let output_path = directory.join(filename).to_string_lossy().into_owned();
+
+    let params = SessionParams {
+        output_path: output_path.clone(),
+        display_id: None,
+        system_audio: true,
+    };
+    let status = Arc::new(Mutex::new(RecordingStatusVm {
+        state: RecordingUiState::Preflight,
+        segments_closed: 0,
+        started_at_epoch_ms: None,
+        output_path: Some(output_path),
+        error: None,
+    }));
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let recorder = state.recorder.clone();
+    let task_status = status.clone();
+    tauri::async_runtime::spawn(async move {
+        // Fold sidecar events through the platform-free machine into the shared
+        // snapshot as they arrive (live — unlike `drive_session`'s buffered replay).
+        let mut machine = RecordingSession::new();
+        let sink_status = task_status.clone();
+        let sink = Box::new(move |event: RecordingEvent| {
+            let failure = match &event {
+                RecordingEvent::Failed { message } => Some(message.clone()),
+                _ => None,
+            };
+            let started = matches!(event, RecordingEvent::CaptureStarted);
+            if machine.apply(event).is_ok() {
+                let mut snapshot = status_lock(&sink_status);
+                snapshot.state = recording_ui_state(machine.state());
+                snapshot.segments_closed = machine.segments_closed();
+                if started && snapshot.started_at_epoch_ms.is_none() {
+                    snapshot.started_at_epoch_ms = Some(epoch_ms_now());
+                }
+                if let Some(message) = failure {
+                    snapshot.error = Some(message);
+                }
+            }
+        }) as Box<dyn FnMut(RecordingEvent) + Send>;
+
+        let outcome = recorder
+            .run_session(
+                params,
+                async move {
+                    // A dropped sender (stop after terminal) must also resolve.
+                    let _ = stop_rx.await;
+                },
+                sink,
+            )
+            .await;
+
+        // A run failure (spawn fault, non-zero exit, unsupported) that did not
+        // already surface as a terminal event becomes an honest failed snapshot.
+        if let Err(error) = outcome {
+            let mut snapshot = status_lock(&task_status);
+            if !matches!(
+                snapshot.state,
+                RecordingUiState::Finalized
+                    | RecordingUiState::Recovered
+                    | RecordingUiState::Failed
+            ) {
+                snapshot.state = RecordingUiState::Failed;
+                snapshot.error = Some(error.to_string());
+            }
+        }
+    });
+
+    let snapshot = status_lock(&status).clone();
+    *guard = Some(RecordingRun {
+        stop_tx: Some(stop_tx),
+        status,
+    });
+    Ok(snapshot)
+}
+
+/// Request a graceful stop of the live recording session (Story 16.6): fires the
+/// one-shot stop trigger; the sidecar finalizes the file (`stopping` →
+/// `finalized` on the polled snapshot) and exits. Idempotent — a second stop (or
+/// a stop after the session ended) is a no-op, never an error, never a kill.
+#[tauri::command]
+pub fn recording_stop(state: State<'_, AppState>) -> Result<(), IpcError> {
+    let mut guard = slot_lock(&state.recording_run);
+    if let Some(run) = guard.as_mut() {
+        if let Some(tx) = run.stop_tx.take() {
+            // A send failure means the driver task already ended — nothing to stop.
+            let _ = tx.send(());
+        }
+    }
+    Ok(())
+}
+
+/// Read the current recording-session status snapshot (Story 16.6) — the poll
+/// the Recording view's active-session UI renders from. No session yet this app
+/// lifetime ⇒ the honest idle snapshot. Infallible in practice.
+#[tauri::command]
+pub fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatusVm, IpcError> {
+    let guard = slot_lock(&state.recording_run);
+    Ok(guard
+        .as_ref()
+        .map(|run| status_lock(&run.status).clone())
+        .unwrap_or_else(RecordingStatusVm::idle))
 }
 
 /// Read whether the one-time iOS no-background-sync disclosure has been shown

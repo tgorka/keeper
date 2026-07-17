@@ -81,6 +81,9 @@ mime_guess = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # Platform ports
 dirs = "6"
+# Local-time-stamped recording filenames (Story 16.6, FR-71) — clock-only, no
+# default features (no oldtime/wasm baggage). MIT/Apache — passes `cargo deny check`.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Keychain (macOS Keychain via the OS-native backend) — shell-only, the only genuinely new crate.
 keyring = { version = "3", features = ["apple-native"] }
 # iOS keychain fallback (Story 12.3, AD-29). Catalog entry only — 3.7.0 is already

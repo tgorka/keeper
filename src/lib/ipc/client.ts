@@ -88,6 +88,8 @@ export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
+export type { RecordingStatusVm } from "./gen/RecordingStatusVm";
+export type { RecordingUiState } from "./gen/RecordingUiState";
 export type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 export type { ReplyPreviewVm } from "./gen/ReplyPreviewVm";
 export type { ResolveSupportVm } from "./gen/ResolveSupportVm";
@@ -139,6 +141,7 @@ import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 import type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
+import type { RecordingStatusVm } from "./gen/RecordingStatusVm";
 import type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 import type { ResolveSupportVm } from "./gen/ResolveSupportVm";
 import type { RoomListBatch } from "./gen/RoomListBatch";
@@ -1669,6 +1672,38 @@ export async function requestScreenRecordingPermission(): Promise<RecordingPermi
  */
 export async function openScreenRecordingSettings(): Promise<void> {
   await invoke<void>("open_screen_recording_settings");
+}
+
+/**
+ * Start the (at most one) full-screen + system-audio recording session (Story
+ * 16.6, FR-68/FR-69/FR-71). The Rust command resolves the output file
+ * (`~/Movies/keeper/keeper-rec <local timestamp>.mp4`), spawns the capture
+ * sidecar session, and resolves the initial {@link RecordingStatusVm} snapshot.
+ * Progress is polled via {@link recordingStatus}; a mid-session failure surfaces
+ * on the snapshot (`state: "failed"` + message), never a silent reset. Rejects
+ * with the {@link IpcError} envelope when a session is already live or the
+ * sidecar cannot spawn.
+ */
+export async function recordingStart(): Promise<RecordingStatusVm> {
+  return await invoke<RecordingStatusVm>("recording_start");
+}
+
+/**
+ * Request a graceful stop of the live recording session (Story 16.6): the
+ * sidecar finalizes the file (`stopping` -> `finalized` on the polled snapshot)
+ * and exits. Idempotent -- a second stop is a no-op, never an error.
+ */
+export async function recordingStop(): Promise<void> {
+  await invoke<void>("recording_stop");
+}
+
+/**
+ * Read the current recording-session status snapshot (Story 16.6) -- what the
+ * Recording view's active-session UI polls and renders from. No session yet
+ * this app lifetime resolves the honest idle snapshot.
+ */
+export async function recordingStatus(): Promise<RecordingStatusVm> {
+  return await invoke<RecordingStatusVm>("recording_status");
 }
 
 /**

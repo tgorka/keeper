@@ -2661,6 +2661,74 @@ pub struct RecordingPermissionVm {
     pub can_start: bool,
 }
 
+/// The UI-facing state of the (at most one) live recording session (Story 16.6,
+/// AD-33). A plain string projection of `keeper_core::recording::SessionState`
+/// plus `idle` for "no session yet this app lifetime". Serializes to
+/// `"idle" | "preflight" | "recording" | "rotating" | "stopping" | "finalized" |
+/// "recovered" | "failed"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum RecordingUiState {
+    /// No session has run yet (or the last one's outcome was acknowledged).
+    Idle,
+    /// The sidecar is pre-flighting (permission / source checks).
+    Preflight,
+    /// Capture is live.
+    Recording,
+    /// A segment rotation is in progress (Epic 17; unreachable in 16.6).
+    Rotating,
+    /// A stop was requested; the output is finalizing.
+    Stopping,
+    /// Terminal — the recording finalized into a playable file.
+    Finalized,
+    /// Terminal — a partial recording was salvaged (Epic 17; unreachable in 16.6).
+    Recovered,
+    /// Terminal — the session failed (`error` carries the honest message).
+    Failed,
+}
+
+/// The recording-session status snapshot the Recording view polls (Story 16.6,
+/// FR-68/FR-69/FR-71, UX-DR30).
+///
+/// The single source of truth for the active-session UI: the state drives the
+/// record dot + Stop affordance, `started_at_epoch_ms` anchors the ticking
+/// elapsed line (computed client-side from the host-reported start instant, so a
+/// slow poll never freezes the clock), `output_path` names the file being
+/// written (and, after `finalized`, the playable result), and `error` is the
+/// honest failure message on `failed` — never a silent reset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingStatusVm {
+    /// The session state driving the active-recording UI.
+    pub state: RecordingUiState,
+    /// Segments closed so far (0 in 16.6 — rotation is Epic 17).
+    pub segments_closed: u32,
+    /// When capture started (Unix epoch ms), for the ticking elapsed line.
+    /// Emitted to TypeScript as `number` (Tauri IPC delivers JSON numbers, and
+    /// epoch milliseconds sit far inside `Number.MAX_SAFE_INTEGER`).
+    #[ts(type = "number | null")]
+    pub started_at_epoch_ms: Option<u64>,
+    /// The absolute path of the file being (or last) written.
+    pub output_path: Option<String>,
+    /// The honest failure message when `state == failed`.
+    pub error: Option<String>,
+}
+
+impl RecordingStatusVm {
+    /// The boot/default snapshot: no session yet.
+    pub fn idle() -> Self {
+        Self {
+            state: RecordingUiState::Idle,
+            segments_closed: 0,
+            started_at_epoch_ms: None,
+            output_path: None,
+            error: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

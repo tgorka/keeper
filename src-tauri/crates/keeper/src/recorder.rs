@@ -30,7 +30,8 @@ use keeper_core::platform::Platform;
 use keeper_core::recording::{
     capabilities_request, list_sources_request, parse_capabilities_result, parse_event,
     parse_request_screen_recording_result, parse_sources_result, request_screen_recording_request,
-    response_id, response_protocol_version, verify_protocol_version, RecordingEvent,
+    response_id, response_protocol_version, start_recording_request, stop_recording_request,
+    verify_protocol_version, RecordingEvent, SessionParams,
 };
 #[cfg(any(desktop, target_os = "ios"))]
 use keeper_core::vm::{RecordingCapabilitiesVm, RecordingSourcesVm};
@@ -72,6 +73,17 @@ const LIST_SOURCES_REQUEST_ID: u64 = 2;
 /// (Story 16.5).
 #[cfg(desktop)]
 const REQUEST_SCREEN_RECORDING_REQUEST_ID: u64 = 3;
+
+/// The fixed correlation id for the session-opening `startRecording` request
+/// (Story 16.6). Each session is a fresh sidecar spawn, so a constant is
+/// unambiguous; the id-carrying acknowledgement is skipped by the event reader
+/// ([`parse_event`] recognizes only `event` lines).
+#[cfg(desktop)]
+const START_RECORDING_REQUEST_ID: u64 = 4;
+
+/// The fixed correlation id for the session-closing `stop` request (Story 16.6).
+#[cfg(desktop)]
+const STOP_RECORDING_REQUEST_ID: u64 = 5;
 
 /// The bound on one permission pre-flight round-trip against the sidecar (Story
 /// 16.5; closes the deferred unbounded-`request_response` spinner risk). The
@@ -121,7 +133,8 @@ async fn bounded<T>(
 /// [`RecordingError::SidecarFailed`](keeper_core::error::RecordingError::SidecarFailed),
 /// a clean exit without an answer as
 /// [`RecordingError::Protocol`](keeper_core::error::RecordingError::Protocol).
-/// Never a panic. `run_session` (16.2) is untouched — it keeps stdin null.
+/// Never a panic. (`run_session` pipes stdin too since 16.6 — it carries the
+/// start/stop requests — but stays a separate, streaming code path.)
 #[cfg(desktop)]
 async fn request_response(
     path: &std::path::Path,
@@ -324,10 +337,12 @@ impl keeper_core::recording::Recorder for DesktopRecorder {
 
     async fn run_session(
         &self,
+        params: SessionParams,
+        stop: impl std::future::Future<Output = ()> + Send + 'static,
         mut on_event: Box<dyn FnMut(RecordingEvent) + Send>,
     ) -> Result<(), CoreError> {
         use keeper_core::error::RecordingError;
-        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         // An unresolvable sidecar is the honest not-available path — return the
         // existing `Unsupported` verbatim (matching `sidecar_path` honesty), never a
@@ -335,7 +350,10 @@ impl keeper_core::recording::Recorder for DesktopRecorder {
         let path = self.platform.sidecar_path(KEEPER_REC_SIDECAR_NAME)?;
 
         let mut child = tokio::process::Command::new(&path)
-            .stdin(std::process::Stdio::null())
+            // Piped stdin carries the `startRecording` request and, when `stop`
+            // resolves, the graceful `stop` request (Story 16.6). Held open for
+            // the whole session — the sidecar exits on its own after finalizing.
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             // Kill the capture daemon if this future is dropped before EOF (driver
             // cancel / app quit) — never orphan a live screen-capture process.
@@ -347,11 +365,48 @@ impl keeper_core::recording::Recorder for DesktopRecorder {
                 )))
             })?;
 
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            CoreError::Recording(RecordingError::SidecarFailed(
+                "could not open keeper-rec stdin".to_owned(),
+            ))
+        })?;
+
         let stdout = child.stdout.take().ok_or_else(|| {
             CoreError::Recording(RecordingError::SidecarFailed(
                 "could not capture keeper-rec stdout".to_owned(),
             ))
         })?;
+
+        // Fire the start request. A write failure here means the sidecar died at
+        // spawn — surface it as the honest sidecar failure it is.
+        let start_line = format!(
+            "{}\n",
+            start_recording_request(START_RECORDING_REQUEST_ID, &params)
+        );
+        stdin.write_all(start_line.as_bytes()).await.map_err(|e| {
+            CoreError::Recording(RecordingError::SidecarFailed(format!(
+                "could not send startRecording to keeper-rec: {e}"
+            )))
+        })?;
+        stdin.flush().await.map_err(|e| {
+            CoreError::Recording(RecordingError::SidecarFailed(format!(
+                "could not flush startRecording to keeper-rec: {e}"
+            )))
+        })?;
+
+        // Forward the caller's stop intent as the graceful `stop` request. The
+        // task owns stdin (kept open — closing it would EOF the sidecar's request
+        // loop early); it is aborted on drop with the rest of the session.
+        let _stopper = AbortOnDrop(tokio::spawn(async move {
+            stop.await;
+            let stop_line = format!("{}\n", stop_recording_request(STOP_RECORDING_REQUEST_ID));
+            // Best-effort: if the sidecar already exited (failed/finalized), the
+            // pipe is broken and the session is ending anyway.
+            let _ = stdin.write_all(stop_line.as_bytes()).await;
+            let _ = stdin.flush().await;
+            // Keep stdin open until the sidecar exits on its own.
+            std::future::pending::<()>().await;
+        }));
 
         // Stream `Vec<u8>` lines byte-level so a non-UTF-8 line is skipped (decoded
         // lossily below), never treated as a false EOF. Wrapped in `AbortOnDrop` so
@@ -438,6 +493,8 @@ impl keeper_core::recording::Recorder for IosRecorder {
 
     async fn run_session(
         &self,
+        _params: keeper_core::recording::SessionParams,
+        _stop: impl std::future::Future<Output = ()> + Send + 'static,
         _on_event: Box<dyn FnMut(keeper_core::recording::RecordingEvent) + Send>,
     ) -> Result<(), CoreError> {
         Err(CoreError::Unsupported(

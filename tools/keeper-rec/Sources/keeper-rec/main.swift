@@ -30,12 +30,19 @@ import Foundation
 // a recoverable error instead of a signal.
 signal(SIGPIPE, SIG_IGN)
 
+/// Serializes every stdout write: RPC replies leave the main request loop while
+/// capture events (Story 16.6) arrive from dispatch queues — interleaved bytes
+/// would corrupt the NDJSON framing.
+private let stdoutLock = NSLock()
+
 /// Write a JSON object followed by a newline to stdout, safely (no forced unwrap).
 /// Returns false if serialization or the write fails so callers can exit cleanly.
-private func writeLine(_ object: [String: Any]) -> Bool {
+func writeLine(_ object: [String: Any]) -> Bool {
     guard let data = try? JSONSerialization.data(withJSONObject: object) else {
         return false
     }
+    stdoutLock.lock()
+    defer { stdoutLock.unlock() }
     let handle = FileHandle.standardOutput
     // The throwing `write(contentsOf:)` surfaces a broken pipe as a Swift error
     // (caught by `try?`) rather than raising an uncaught ObjC exception.
@@ -44,6 +51,13 @@ private func writeLine(_ object: [String: Any]) -> Bool {
         _ = try? handle.write(contentsOf: newline)
     }
     return true
+}
+
+/// Emit one capture-progress NDJSON event line (Story 16.6). Best-effort: a
+/// broken pipe here means the host is gone; the capture teardown paths handle
+/// process exit themselves.
+func emitEvent(_ object: [String: Any]) {
+    _ = writeLine(object)
 }
 
 /// The per-TCC permission states, keyed exactly as the wire contract expects.
@@ -126,10 +140,16 @@ private func sourcesResult() -> [String: Any] {
     ]
 }
 
+// The one capture session this process can host (Story 16.6). Created lazily on
+// the first `startRecording`; main-thread only.
+let captureEngine = CaptureEngine()
+
 // The request loop: read lines until EOF. A malformed line (not JSON, not an
 // object, no string method) is skipped — never a crash, never garbage output. An
 // unknown method gets an id-correlated {id,error} answer so the host can fail
-// honestly instead of hanging. EOF (the host closed our stdin) → clean exit 0.
+// honestly instead of hanging. EOF (the host closed our stdin) → clean exit 0,
+// or — when a capture is live — a graceful stop-and-finalize (a vanished host
+// must not leave an unplayable file when a clean finalize is still possible).
 while let line = readLine(strippingNewline: true) {
     guard !line.isEmpty,
           let data = line.data(using: .utf8),
@@ -156,6 +176,39 @@ while let line = readLine(strippingNewline: true) {
         // prompt and reads back false — the host resolves that to its honest
         // denied-with-fix-path (System Settings deep link).
         response = ["id": id, "result": ["granted": CGRequestScreenCaptureAccess()]]
+    case "startRecording":
+        // Story 16.6: begin the one capture session this process can host.
+        // Progress flows as NDJSON *events* (preflight → recording → … ), not
+        // through this reply — the reply only acknowledges the request shape.
+        let params = msg["params"] as? [String: Any]
+        guard let path = params?["path"] as? String, !path.isEmpty else {
+            response = [
+                "id": id,
+                "error": ["code": "badParams", "message": "startRecording needs params.path"],
+            ]
+            break
+        }
+        guard !captureEngine.isActive else {
+            response = [
+                "id": id,
+                "error": ["code": "busy", "message": "a capture session is already active"],
+            ]
+            break
+        }
+        let displayId = (params?["displayId"] as? NSNumber)?.uint32Value
+        let systemAudio = (params?["systemAudio"] as? Bool) ?? true
+        response = ["id": id, "result": ["starting": true]]
+        _ = writeLine(response)
+        captureEngine.start(path: path, displayId: displayId, systemAudio: systemAudio)
+        continue
+    case "stop":
+        // Story 16.6: stop-and-finalize. The engine emits `stopping` /
+        // `finalized` events and exits the process itself once the file's
+        // `moov` is written — this loop just keeps draining stdin until then.
+        response = ["id": id, "result": ["stopping": true]]
+        _ = writeLine(response)
+        captureEngine.stop()
+        continue
     default:
         response = [
             "id": id,
@@ -173,4 +226,13 @@ while let line = readLine(strippingNewline: true) {
     }
 }
 
-exit(0)
+// EOF. With a live capture, the host vanished mid-recording (crash / kill of the
+// pipe, not a clean `stop`): finalize what we have so the file stays playable,
+// then let the engine's completion path exit. `dispatchMain()` parks the main
+// thread so the media queue can finish; the engine always exits the process.
+if captureEngine.isActive {
+    captureEngine.stop()
+    dispatchMain()
+} else {
+    exit(0)
+}

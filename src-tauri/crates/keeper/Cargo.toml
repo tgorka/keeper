@@ -36,6 +36,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
+chrono = { workspace = true }
 # macOS Keychain access for the keychain_* Platform ports (shell-only glue).
 keyring = { workspace = true }
 # Native file-picker dialog for the composer attach button (Story 3.7). Yields OS
