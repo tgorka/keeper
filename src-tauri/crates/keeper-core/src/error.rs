@@ -462,6 +462,15 @@ pub enum RecordingError {
     /// protocol-*version* mismatch, which is an honest [`CoreError::Unsupported`].
     #[error("recording protocol error: {0}")]
     Protocol(String),
+
+    /// A session-folder or `manifest.json` filesystem operation failed (Story
+    /// 17.2, FR-71, AD-33): creating the session folder, writing the sibling
+    /// temp file, renaming it over `manifest.json`, or scanning the folder for
+    /// the terminal reconcile. The wrapped string is a secret-free description —
+    /// the failing operation name plus the `io::Error` display only, never a
+    /// filesystem path, token, or media bytes.
+    #[error("recording manifest I/O failed: {0}")]
+    ManifestIo(String),
 }
 
 /// The hexagon error root. Every fallible core operation surfaces one of these.

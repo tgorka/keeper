@@ -21,6 +21,9 @@
 //! sidecar can't be resolved.
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, RecordingError};
 use crate::vm::{
@@ -71,9 +74,24 @@ pub enum RecordingEvent {
     SegmentRotating,
     /// A segment finished closing. Legal only while `Recording`/`Rotating`; it bumps
     /// the session's segment counter and does NOT change state.
+    ///
+    /// Story 17.1 enriched the sidecar's `segmentClosed` line with the closed
+    /// file's `path`/`bytes`/`track`; Story 17.2 carries them here (best-effort —
+    /// absent or mistyped extras parse as `None`, never a dropped event) so the
+    /// shell's segment ledger needs no second parse path.
     SegmentClosed {
         /// The zero-based index of the segment that just closed.
         index: u32,
+        /// The absolute path of the closed segment file, when the sidecar
+        /// reported it (Story 17.1's enriched shape).
+        path: Option<String>,
+        /// The closed segment's size in bytes, when reported. Informational —
+        /// the terminal manifest reconcile always re-reads the authoritative
+        /// size from disk.
+        bytes: Option<u64>,
+        /// The track the segment belongs to (`"screen"` in Epic 17), when
+        /// reported.
+        track: Option<String>,
     },
     /// A stop was requested / begun (`Recording → Stopping`, or `Rotating → Stopping`).
     Stopping,
@@ -241,7 +259,25 @@ pub fn parse_event(line: &str) -> Option<RecordingEvent> {
         },
         "segmentClosed" => {
             let index = u32::try_from(obj.get("index")?.as_u64()?).ok()?;
-            Some(RecordingEvent::SegmentClosed { index })
+            // The Story 17.1 enrichment (`path`/`bytes`/`track`) is read
+            // best-effort: an absent or mistyped extra parses as `None` — a
+            // bare index-only `segmentClosed` stays a legal event, never a
+            // dropped one (the counter bump must survive a lean sidecar line).
+            let path = obj
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let bytes = obj.get("bytes").and_then(serde_json::Value::as_u64);
+            let track = obj
+                .get("track")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            Some(RecordingEvent::SegmentClosed {
+                index,
+                path,
+                bytes,
+                track,
+            })
         }
         "error" => {
             // A malformed / absent `message` must NOT swallow the failure — surface a
@@ -525,6 +561,349 @@ pub fn verify_protocol_version(reported: u32) -> Result<(), CoreError> {
     }
 }
 
+// --- Session folder, manifest.json & segment ledger (Story 17.2, FR-71, AD-33) --
+//
+// The per-session folder `keeper-rec <local ts>/` holds the `screen-####.mp4`
+// segments plus an atomically-written `manifest.json` an external reader (or
+// keeper's own 17.3 recovery) can always parse consistently. Everything here is
+// `std::fs` + serde only — firewall-clean (no shell, no Apple framework, no
+// process API). The shell's event sink owns the flow: `create` at start,
+// `record_segment` per enriched `segmentClosed` (a *live* view), `set_status`
+// per state change, and `reconcile_from_dir` at every terminal (disk is the
+// authoritative segment list). Core is time-agnostic — the local-timestamp
+// string is supplied by the shell, never generated here.
+
+/// The `manifest.json` schema version (Story 17.2).
+pub const MANIFEST_VERSION: u32 = 1;
+
+/// Segment files this session owns are named `screen-####.mp4`. The terminal
+/// reconcile ingests only this stem prefix, so a stray `*.mp4` (a user drop, or a
+/// future Epic 20 `camera-####.mp4` sharing the folder) with a trailing digit run
+/// never pollutes the authoritative screen-track ledger.
+const SEGMENT_STEM_PREFIX: &str = "screen-";
+
+/// The persisted `status` of a session manifest (Story 17.2). Lowercase on the
+/// wire: `"recording" | "finalized" | "recovered" | "failed"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestStatus {
+    /// The session is (or was, if the app died) live — every non-terminal state.
+    Recording,
+    /// Terminal — the session finalized cleanly.
+    Finalized,
+    /// Terminal — a partial recording was salvaged.
+    Recovered,
+    /// Terminal — the session failed.
+    Failed,
+}
+
+impl ManifestStatus {
+    /// Map a [`SessionState`] to the persisted status: every non-terminal state
+    /// is `"recording"`; the three terminals map to their own status.
+    pub fn from_state(state: SessionState) -> Self {
+        match state {
+            SessionState::Finalized => Self::Finalized,
+            SessionState::Recovered => Self::Recovered,
+            SessionState::Failed => Self::Failed,
+            SessionState::Idle
+            | SessionState::Preflight
+            | SessionState::Recording
+            | SessionState::Rotating
+            | SessionState::Stopping => Self::Recording,
+        }
+    }
+}
+
+/// One segment in the manifest's ledger (Story 17.2). `file` is the segment's
+/// **basename** (relative to the session folder) so the manifest stays portable
+/// and self-describing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentEntry {
+    /// The zero-based segment index (from `segmentClosed` live, or the
+    /// filename's trailing numeric run at reconcile).
+    pub index: u32,
+    /// The segment file's basename, e.g. `"screen-0003.mp4"`.
+    pub file: String,
+    /// The segment size in bytes. The terminal reconcile always takes this from
+    /// `fs::metadata` — disk is authoritative, never a stale event-fed value.
+    pub bytes: u64,
+    /// The track the segment belongs to (`"screen"` throughout Epic 17).
+    pub track: String,
+}
+
+/// What the session captures (Story 17.2). Epic 17 records a display;
+/// application/window targets are a later epic's concern.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureTarget {
+    /// The target kind — `"display"` throughout Epic 17.
+    pub kind: String,
+    /// The captured display id, or `None` for the main display.
+    pub display_id: Option<u32>,
+}
+
+impl CaptureTarget {
+    /// A display capture target (`None` = the main display).
+    pub fn display(display_id: Option<u32>) -> Self {
+        Self {
+            kind: "display".to_owned(),
+            display_id,
+        }
+    }
+}
+
+/// Which device tracks the session records (Story 17.2). `microphone`/`camera`
+/// stay constant `false` until Epic 19/20.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDevices {
+    /// Whether the system-audio AAC track is recorded.
+    pub system_audio: bool,
+    /// Whether a microphone track is recorded (constant `false` in Epic 17).
+    pub microphone: bool,
+    /// Whether a camera track is recorded (constant `false` in Epic 17).
+    pub camera: bool,
+}
+
+/// The per-session `manifest.json` plus the folder it lives in (Story 17.2,
+/// FR-71, AD-33) — the segment ledger that makes a session self-describing.
+///
+/// Serialized shape (camelCase; see the story's Design Notes):
+/// `{ version, session, status, captureTarget, devices, segments }`. The folder
+/// path is runtime-only (`#[serde(skip)]`) — the manifest never persists an
+/// absolute path, keeping it portable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionManifest {
+    /// The manifest schema version ([`MANIFEST_VERSION`]).
+    pub version: u32,
+    /// The session folder's basename, e.g. `"keeper-rec 2026-07-17 14.23.45"`.
+    pub session: String,
+    /// The persisted session status.
+    pub status: ManifestStatus,
+    /// What the session captures.
+    pub capture_target: CaptureTarget,
+    /// Which device tracks are recorded.
+    pub devices: SessionDevices,
+    /// The segment ledger — a live event-fed view during recording, rebuilt
+    /// authoritatively from disk at every terminal.
+    pub segments: Vec<SegmentEntry>,
+    /// The absolute session folder path (runtime-only, never serialized).
+    #[serde(skip)]
+    folder: PathBuf,
+}
+
+/// Build a secret-free [`RecordingError::ManifestIo`]: the failing operation name
+/// plus the `io::Error` display only — never a filesystem path.
+fn manifest_io(operation: &str, error: &std::io::Error) -> RecordingError {
+    RecordingError::ManifestIo(format!("{operation}: {error}"))
+}
+
+impl SessionManifest {
+    /// Create the session folder and its initial `recording` manifest (Story
+    /// 17.2). The folder must **not** pre-exist — `fs::create_dir` fails on an
+    /// existing directory, so a prior session's folder is never adopted (the
+    /// shell disambiguates the name on collision before calling this). Missing
+    /// *parent* directories (e.g. `~/Movies/keeper`) are created. Any real fs
+    /// failure surfaces as [`RecordingError::ManifestIo`].
+    pub fn create(
+        folder: PathBuf,
+        capture_target: CaptureTarget,
+        devices: SessionDevices,
+    ) -> Result<Self, RecordingError> {
+        if let Some(parent) = folder.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| manifest_io("create session base directory", &e))?;
+        }
+        // `create_dir` (NOT `create_dir_all`) — an already-existing session
+        // folder is an error, never silently reused (same-second restart guard).
+        std::fs::create_dir(&folder).map_err(|e| manifest_io("create session folder", &e))?;
+        let session = folder
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let manifest = Self {
+            version: MANIFEST_VERSION,
+            session,
+            status: ManifestStatus::Recording,
+            capture_target,
+            devices,
+            segments: Vec::new(),
+            folder,
+        };
+        manifest.write()?;
+        Ok(manifest)
+    }
+
+    /// The absolute session folder path this manifest lives in.
+    pub fn folder(&self) -> &Path {
+        &self.folder
+    }
+
+    /// Append one segment to the ledger — the **live** incremental view an
+    /// external reader sees during recording. The event-fed list can be
+    /// incomplete or wrong (a suppressed `segmentClosed`, a `bytes` fallback);
+    /// the terminal [`Self::reconcile_from_dir`] discards and rebuilds it.
+    pub fn record_segment(&mut self, entry: SegmentEntry) {
+        self.segments.push(entry);
+    }
+
+    /// Set the persisted session status (the caller then [`Self::write`]s).
+    pub fn set_status(&mut self, status: ManifestStatus) {
+        self.status = status;
+    }
+
+    /// Atomically (re)write `manifest.json`: serialize, write the sibling
+    /// `.manifest.json.tmp` in the **same** folder, then `fs::rename` it over
+    /// `manifest.json` (same-directory rename → atomic on APFS). An external
+    /// reader polling the file sees the pre- or post-update manifest, never a
+    /// torn one. A failure surfaces as [`RecordingError::ManifestIo`] and
+    /// leaves the prior manifest intact (the rename never happened).
+    pub fn write(&self) -> Result<(), RecordingError> {
+        let json = serde_json::to_vec_pretty(self)
+            .map_err(|e| RecordingError::ManifestIo(format!("serialize manifest: {e}")))?;
+        let tmp = self.folder.join(".manifest.json.tmp");
+        std::fs::write(&tmp, json).map_err(|e| manifest_io("write manifest temp file", &e))?;
+        std::fs::rename(&tmp, self.folder.join("manifest.json")).map_err(|e| {
+            // The rename never landed — clean up the temp so a failed final write
+            // doesn't litter the "self-describing" session folder with a dotfile.
+            let _ = std::fs::remove_file(&tmp);
+            manifest_io("rename manifest into place", &e)
+        })?;
+        Ok(())
+    }
+
+    /// Rebuild the segment ledger **entirely from the on-disk `.mp4` files** —
+    /// run at *every* terminal (`finalized`, `recovered`, `failed`) before the
+    /// final write. Disk is authoritative: the event-fed list is discarded, the
+    /// index comes from each stem's trailing numeric run
+    /// ([`segment_index_from_stem`]), and `bytes` always comes from
+    /// `fs::metadata().len()` — never a stale/zero event-fed size. This lists
+    /// the final segment (which has no `segmentClosed`), backfills a segment
+    /// whose event a mid-rotation stop suppressed (DW-992), and repairs any
+    /// wrong size. Best-effort per entry: a non-segment file (no numeric run),
+    /// a non-file, or an unreadable entry is skipped with a `tracing::warn` —
+    /// never aborting the terminal write. The result is sorted by
+    /// `(index, file)` for determinism across equal indices. Only a failure to
+    /// read the folder itself is an error.
+    pub fn reconcile_from_dir(&mut self) -> Result<(), RecordingError> {
+        let entries =
+            std::fs::read_dir(&self.folder).map_err(|e| manifest_io("read session folder", &e))?;
+        let mut segments: Vec<SegmentEntry> = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(%error, "manifest reconcile: skipping unreadable dir entry");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
+                tracing::warn!("manifest reconcile: skipping non-UTF-8 file name");
+                continue;
+            };
+            let is_mp4 = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
+            if !is_mp4 {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                tracing::warn!("manifest reconcile: skipping .mp4 with a non-UTF-8 stem");
+                continue;
+            };
+            // Only this session's own `screen-####.mp4` segments are authoritative
+            // ledger entries — a stray `*.mp4` with a trailing digit run must not
+            // pollute the screen-track list or collide on `index`.
+            if !stem.starts_with(SEGMENT_STEM_PREFIX) {
+                continue;
+            }
+            let Some(index) = segment_index_from_stem(stem) else {
+                tracing::warn!(
+                    "manifest reconcile: skipping screen-* file without a segment index"
+                );
+                continue;
+            };
+            // `fs::metadata` (follows symlinks) — the authoritative size of the
+            // real file; an unreadable/dangling entry is skipped, never fatal.
+            let metadata = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    tracing::warn!(%error, "manifest reconcile: skipping unreadable segment");
+                    continue;
+                }
+            };
+            if !metadata.is_file() {
+                tracing::warn!("manifest reconcile: skipping non-file .mp4 entry");
+                continue;
+            }
+            segments.push(SegmentEntry {
+                index,
+                file: file.to_owned(),
+                bytes: metadata.len(),
+                track: "screen".to_owned(),
+            });
+        }
+        // Deterministic order even across equal indices (two files whose stems
+        // share a numeric run) — sort by (index, file), both compared.
+        segments.sort_by(|a, b| (a.index, a.file.as_str()).cmp(&(b.index, b.file.as_str())));
+        self.segments = segments;
+        Ok(())
+    }
+}
+
+/// Derive the fs-safe session folder basename `keeper-rec <local ts>` from the
+/// shell-supplied local-timestamp string (Story 17.2). Core is time-agnostic —
+/// it validates and formats, never generates the timestamp.
+///
+/// Rejected (as [`RecordingError::ManifestIo`], message secret-free): an empty
+/// or all-whitespace timestamp; a path separator (`/`, `\`), a `:`, a NUL, or
+/// any control character; a leading dot (a hidden folder); and a trailing `.`
+/// or trailing space (some filesystems normalize these away, diverging the
+/// folder basename from `manifest.session`).
+pub fn session_folder_name(local_ts: &str) -> Result<String, RecordingError> {
+    if local_ts.trim().is_empty() {
+        return Err(RecordingError::ManifestIo(
+            "session timestamp is empty or all-whitespace".to_owned(),
+        ));
+    }
+    if local_ts
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c == ':' || c.is_control())
+    {
+        return Err(RecordingError::ManifestIo(
+            "session timestamp contains a path separator, colon, or control character".to_owned(),
+        ));
+    }
+    if local_ts.starts_with('.') {
+        return Err(RecordingError::ManifestIo(
+            "session timestamp starts with a dot".to_owned(),
+        ));
+    }
+    if local_ts.ends_with('.') || local_ts.ends_with(' ') {
+        return Err(RecordingError::ManifestIo(
+            "session timestamp ends with a dot or space".to_owned(),
+        ));
+    }
+    Ok(format!("keeper-rec {local_ts}"))
+}
+
+/// Extract the segment index from a filename stem's **trailing numeric run**
+/// (`"screen-0003"` → `3`), or `None` when the stem has no trailing digits (a
+/// stray non-segment file) or the run overflows `u32`. Pure and total.
+pub fn segment_index_from_stem(stem: &str) -> Option<u32> {
+    let run_start = stem
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_digit())
+        .last()
+        .map(|(i, _)| i)?;
+    stem[run_start..].parse().ok()
+}
+
 /// The screen-recording sidecar port (Story 16.2, AD-24, AD-27) — sits beside
 /// [`crate::platform::Platform`].
 ///
@@ -656,7 +1035,19 @@ pub async fn drive_session<R: Recorder>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// A bare index-only [`RecordingEvent::SegmentClosed`] (no 17.1 enrichment) —
+    /// the shape most state-machine tests need.
+    fn segment_closed(index: u32) -> RecordingEvent {
+        RecordingEvent::SegmentClosed {
+            index,
+            path: None,
+            bytes: None,
+            track: None,
+        }
+    }
 
     // --- pure transition table ---------------------------------------------
 
@@ -695,7 +1086,7 @@ mod tests {
             .apply(RecordingEvent::CaptureStarted)
             .expect("legal transition");
         session
-            .apply(RecordingEvent::SegmentClosed { index: 0 })
+            .apply(segment_closed(0))
             .expect("segmentClosed legal while Recording");
         assert_eq!(session.state(), SessionState::Recording);
         assert_eq!(session.segments_closed(), 1);
@@ -704,7 +1095,7 @@ mod tests {
             .apply(RecordingEvent::SegmentRotating)
             .expect("legal transition");
         session
-            .apply(RecordingEvent::SegmentClosed { index: 1 })
+            .apply(segment_closed(1))
             .expect("segmentClosed legal while Rotating");
         assert_eq!(session.state(), SessionState::Rotating);
         assert_eq!(session.segments_closed(), 2);
@@ -749,7 +1140,7 @@ mod tests {
     fn illegal_segment_closed_while_idle_is_rejected() {
         let mut session = RecordingSession::new();
         let err = session
-            .apply(RecordingEvent::SegmentClosed { index: 0 })
+            .apply(segment_closed(0))
             .expect_err("segmentClosed while Idle is illegal");
         match err {
             RecordingError::IllegalTransition { from, event } => {
@@ -838,20 +1229,25 @@ mod tests {
     fn parse_segment_closed_reads_index() {
         assert_eq!(
             parse_event(r#"{"event":"segmentClosed","index":3}"#),
-            Some(RecordingEvent::SegmentClosed { index: 3 })
+            Some(segment_closed(3))
         );
     }
 
     #[test]
-    fn parse_enriched_segment_closed_still_yields_index_only() {
-        // Story 17.1 cross-language seam guard: the sidecar enriches
-        // `segmentClosed` with `path`/`bytes`/`track` for the Story 17.2 ledger;
-        // the shipped parser must keep yielding `SegmentClosed{index}` (extras
-        // dropped) and the state machine must bump its counter unchanged.
+    fn parse_enriched_segment_closed_yields_the_ledger_fields() {
+        // Story 17.1/17.2 cross-language seam guard: the sidecar's enriched
+        // `segmentClosed` (`path`/`bytes`/`track`) parses into the enriched
+        // event carrying the segment-ledger data, and the state machine still
+        // bumps its counter without a state change.
         let line = r#"{"event":"segmentClosed","index":2,"path":"/rec/keeper/screen-0002.mp4","bytes":123,"track":"screen"}"#;
         assert_eq!(
             parse_event(line),
-            Some(RecordingEvent::SegmentClosed { index: 2 })
+            Some(RecordingEvent::SegmentClosed {
+                index: 2,
+                path: Some("/rec/keeper/screen-0002.mp4".to_owned()),
+                bytes: Some(123),
+                track: Some("screen".to_owned()),
+            })
         );
         let mut session = RecordingSession::new();
         session
@@ -866,6 +1262,20 @@ mod tests {
             .expect("segmentClosed legal while Recording");
         assert_eq!(session.state(), SessionState::Recording);
         assert_eq!(session.segments_closed(), 1);
+    }
+
+    #[test]
+    fn parse_bare_segment_closed_is_tolerated_with_none_extras() {
+        // Absent OR mistyped enrichment fields must not drop the event — the
+        // index is the only required field; extras degrade to `None`.
+        assert_eq!(
+            parse_event(r#"{"event":"segmentClosed","index":5}"#),
+            Some(segment_closed(5))
+        );
+        assert_eq!(
+            parse_event(r#"{"event":"segmentClosed","index":5,"path":7,"bytes":"big","track":[]}"#),
+            Some(segment_closed(5))
+        );
     }
 
     #[test]
@@ -946,7 +1356,7 @@ mod tests {
             vec![
                 RecordingEvent::PreflightStarted,
                 RecordingEvent::CaptureStarted,
-                RecordingEvent::SegmentClosed { index: 0 },
+                segment_closed(0),
                 RecordingEvent::SegmentRotating,
                 RecordingEvent::CaptureStarted,
                 RecordingEvent::Failed {
@@ -1372,7 +1782,7 @@ mod tests {
     async fn drive_session_surfaces_illegal_transition_error() {
         // An illegal first event (segmentClosed while Idle) surfaces as a
         // CoreError::Recording, not a silent state adoption.
-        let recorder = FakeRecorder::new(true, vec![RecordingEvent::SegmentClosed { index: 0 }]);
+        let recorder = FakeRecorder::new(true, vec![segment_closed(0)]);
         let (on_state, _seen) = state_collector();
         let err = drive_session(&recorder, test_params(), std::future::pending(), on_state)
             .await
@@ -1408,6 +1818,271 @@ mod tests {
             unavailable.request_screen_recording().await,
             Err(CoreError::Unsupported(_))
         ));
+    }
+
+    // --- session folder, manifest.json & segment ledger (Story 17.2) --------
+
+    /// A fresh, uniquely-named temp dir path under `std::env::temp_dir()` that
+    /// does NOT yet exist (the code under test creates it). Uniqueness comes
+    /// from a per-test label + a static counter — deliberately no process id
+    /// (the dependency firewall bans process APIs from this file, tests
+    /// included); a leftover dir from an aborted prior run is removed first.
+    fn fresh_temp_dir(label: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("keeper-story-17-2-{label}-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The Epic 17 device set: system audio on, microphone/camera constant off.
+    fn test_devices() -> SessionDevices {
+        SessionDevices {
+            system_audio: true,
+            microphone: false,
+            camera: false,
+        }
+    }
+
+    /// Create a session folder + initial manifest at `folder`.
+    fn test_manifest(folder: std::path::PathBuf) -> SessionManifest {
+        SessionManifest::create(folder, CaptureTarget::display(None), test_devices())
+            .expect("create session folder + initial manifest")
+    }
+
+    /// Shorthand for the expected reconciled entry shape.
+    fn screen_entry(index: u32, file: &str, bytes: u64) -> SegmentEntry {
+        SegmentEntry {
+            index,
+            file: file.to_owned(),
+            bytes,
+            track: "screen".to_owned(),
+        }
+    }
+
+    #[test]
+    fn manifest_status_maps_states_to_the_persisted_status() {
+        for state in [
+            SessionState::Idle,
+            SessionState::Preflight,
+            SessionState::Recording,
+            SessionState::Rotating,
+            SessionState::Stopping,
+        ] {
+            assert_eq!(ManifestStatus::from_state(state), ManifestStatus::Recording);
+        }
+        assert_eq!(
+            ManifestStatus::from_state(SessionState::Finalized),
+            ManifestStatus::Finalized
+        );
+        assert_eq!(
+            ManifestStatus::from_state(SessionState::Recovered),
+            ManifestStatus::Recovered
+        );
+        assert_eq!(
+            ManifestStatus::from_state(SessionState::Failed),
+            ManifestStatus::Failed
+        );
+    }
+
+    #[test]
+    fn manifest_create_writes_the_initial_recording_shape() {
+        let folder = fresh_temp_dir("shape");
+        let manifest = test_manifest(folder.clone());
+        let raw = std::fs::read_to_string(folder.join("manifest.json")).expect("manifest on disk");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("parseable manifest");
+        assert_eq!(value["version"], MANIFEST_VERSION);
+        assert_eq!(value["session"], manifest.session.as_str());
+        assert!(
+            manifest.session.starts_with("keeper-story-17-2-shape"),
+            "session is the folder basename"
+        );
+        assert_eq!(value["status"], "recording");
+        assert_eq!(value["captureTarget"]["kind"], "display");
+        assert!(value["captureTarget"]["displayId"].is_null());
+        assert_eq!(value["devices"]["systemAudio"], true);
+        assert_eq!(value["devices"]["microphone"], false);
+        assert_eq!(value["devices"]["camera"], false);
+        assert_eq!(value["segments"], serde_json::json!([]));
+        // Round-trip: the persisted JSON deserializes back to the same data
+        // (the folder path is runtime-only and deliberately not persisted).
+        let parsed: SessionManifest = serde_json::from_str(&raw).expect("round-trip");
+        assert_eq!(parsed.version, manifest.version);
+        assert_eq!(parsed.session, manifest.session);
+        assert_eq!(parsed.status, ManifestStatus::Recording);
+        assert_eq!(parsed.capture_target, manifest.capture_target);
+        assert_eq!(parsed.devices, manifest.devices);
+        assert_eq!(parsed.segments, manifest.segments);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn session_folder_name_derives_and_rejects_unsafe_timestamps() {
+        assert_eq!(
+            session_folder_name("2026-07-17 14.23.45").expect("fs-safe timestamp"),
+            "keeper-rec 2026-07-17 14.23.45"
+        );
+        for bad in [
+            "",             // empty
+            "   ",          // all-whitespace
+            "\t \t",        // all-whitespace (tabs)
+            "2026/07/17",   // path separator
+            "2026\\07\\17", // backslash separator
+            "14:23:45",     // colon
+            "14.23\u{0}45", // NUL
+            "14.23\n45",    // control char
+            ".2026-07-17",  // leading dot (hidden folder)
+            "2026-07-17.",  // trailing dot (fs-normalized away)
+            "2026-07-17 ",  // trailing space (fs-normalized away)
+        ] {
+            assert!(
+                matches!(session_folder_name(bad), Err(RecordingError::ManifestIo(_))),
+                "timestamp {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_index_from_stem_reads_the_trailing_numeric_run() {
+        assert_eq!(segment_index_from_stem("screen-0000"), Some(0));
+        assert_eq!(segment_index_from_stem("screen-0042"), Some(42));
+        assert_eq!(segment_index_from_stem("clip7"), Some(7));
+        assert_eq!(segment_index_from_stem("notes"), None);
+        assert_eq!(segment_index_from_stem(""), None);
+        // A run that overflows u32 is not an index — the file is a stray.
+        assert_eq!(segment_index_from_stem("screen-99999999999999999999"), None);
+    }
+
+    #[test]
+    fn write_is_atomic_temp_then_rename_and_stays_parseable() {
+        let folder = fresh_temp_dir("atomic");
+        let mut manifest = test_manifest(folder.clone());
+        manifest.record_segment(screen_entry(0, "screen-0000.mp4", 123));
+        manifest.write().expect("atomic rewrite");
+        assert!(
+            !folder.join(".manifest.json.tmp").exists(),
+            "the sibling temp file must be renamed over manifest.json"
+        );
+        let raw = std::fs::read_to_string(folder.join("manifest.json")).expect("manifest on disk");
+        let parsed: SessionManifest = serde_json::from_str(&raw).expect("always parseable");
+        assert_eq!(
+            parsed.segments,
+            vec![screen_entry(0, "screen-0000.mp4", 123)]
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn create_refuses_an_existing_folder() {
+        let folder = fresh_temp_dir("existing");
+        std::fs::create_dir_all(&folder).expect("pre-existing folder");
+        let result =
+            SessionManifest::create(folder.clone(), CaptureTarget::display(None), test_devices());
+        assert!(
+            matches!(result, Err(RecordingError::ManifestIo(_))),
+            "a prior session's folder must never be adopted"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn reconcile_rebuilds_from_disk_backfills_and_overrides_stale_bytes() {
+        let folder = fresh_temp_dir("reconcile");
+        let mut manifest = test_manifest(folder.clone());
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("segment 0");
+        std::fs::write(folder.join("screen-0001.mp4"), vec![0u8; 20]).expect("segment 1");
+        std::fs::write(folder.join("screen-0002.mp4"), vec![0u8; 30]).expect("final segment");
+        // Event-fed live view: segment 0 landed with a stale zero size, segment
+        // 1's `segmentClosed` was suppressed by a mid-rotation stop (DW-992),
+        // and segment 2 is the final segment (never gets a `segmentClosed`).
+        manifest.record_segment(screen_entry(0, "screen-0000.mp4", 0));
+        manifest.reconcile_from_dir().expect("terminal reconcile");
+        assert_eq!(
+            manifest.segments,
+            vec![
+                screen_entry(0, "screen-0000.mp4", 10), // disk bytes override the stale 0
+                screen_entry(1, "screen-0001.mp4", 20), // DW-992 backfill
+                screen_entry(2, "screen-0002.mp4", 30), // final segment included
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn reconcile_ingests_only_screen_segments_and_sorts_deterministically() {
+        let folder = fresh_temp_dir("strays");
+        let mut manifest = test_manifest(folder.clone());
+        std::fs::write(folder.join("screen-0002.mp4"), vec![0u8; 5]).expect("segment 2");
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 4]).expect("segment 0");
+        // Strays that must NOT enter the authoritative screen-track ledger:
+        std::fs::write(folder.join("extra-0001.mp4"), vec![0u8; 6]).expect("wrong prefix");
+        std::fs::write(folder.join("camera-0000.mp4"), vec![0u8; 6]).expect("future track prefix");
+        std::fs::write(folder.join("notes.mp4"), vec![0u8; 7]).expect("no numeric run");
+        std::fs::write(folder.join("cover.png"), vec![0u8; 8]).expect("non-mp4");
+        std::fs::create_dir(folder.join("screen-0009.mp4")).expect("dir masquerading as segment");
+        manifest
+            .reconcile_from_dir()
+            .expect("strays are skipped, never aborting");
+        let names: Vec<&str> = manifest.segments.iter().map(|s| s.file.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["screen-0000.mp4", "screen-0002.mp4"],
+            "only screen-####.mp4 segments enter the ledger, sorted by (index, file); \
+             wrong-prefix / no-run / non-mp4 / directory entries are skipped"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_skips_an_unreadable_entry_without_aborting() {
+        let folder = fresh_temp_dir("unreadable");
+        let mut manifest = test_manifest(folder.clone());
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 9]).expect("healthy segment");
+        // A dangling symlink: `fs::metadata` (which follows links) fails on it,
+        // so the entry must be skipped — one bad entry never fails the
+        // terminal write.
+        std::os::unix::fs::symlink(folder.join("gone.mp4"), folder.join("screen-0001.mp4"))
+            .expect("dangling symlink");
+        manifest
+            .reconcile_from_dir()
+            .expect("one unreadable entry must not abort the reconcile");
+        assert_eq!(
+            manifest.segments,
+            vec![screen_entry(0, "screen-0000.mp4", 9)]
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn reconcile_and_write_complete_the_manifest_on_every_terminal() {
+        // The exact manifest API the shell's event sink drives at a terminal —
+        // for ALL THREE terminals, not just Finalized: reconcile from disk, map
+        // the state, atomic write.
+        for (state, wire) in [
+            (SessionState::Finalized, "finalized"),
+            (SessionState::Recovered, "recovered"),
+            (SessionState::Failed, "failed"),
+        ] {
+            let folder = fresh_temp_dir(&format!("terminal-{wire}"));
+            let mut manifest = test_manifest(folder.clone());
+            std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 11]).expect("segment 0");
+            std::fs::write(folder.join("screen-0001.mp4"), vec![0u8; 22]).expect("final segment");
+            manifest.reconcile_from_dir().expect("terminal reconcile");
+            manifest.set_status(ManifestStatus::from_state(state));
+            manifest.write().expect("terminal write");
+            let raw =
+                std::fs::read_to_string(folder.join("manifest.json")).expect("manifest on disk");
+            let value: serde_json::Value = serde_json::from_str(&raw).expect("parseable manifest");
+            assert_eq!(value["status"], wire, "terminal {wire} persists its status");
+            let segments = value["segments"].as_array().expect("segments array");
+            assert_eq!(segments.len(), 2, "terminal {wire} lists every segment");
+            assert_eq!(segments[0]["file"], "screen-0000.mp4");
+            assert_eq!(segments[0]["bytes"], 11);
+            assert_eq!(segments[1]["file"], "screen-0001.mp4");
+            assert_eq!(segments[1]["bytes"], 22);
+            let _ = std::fs::remove_dir_all(&folder);
+        }
     }
 
     // --- dependency firewall (AD-33) ---------------------------------------

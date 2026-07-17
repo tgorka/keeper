@@ -25,7 +25,8 @@ use keeper_core::error::{
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::recording::{
-    resolve_screen_recording_access, Recorder, RecordingEvent, RecordingSession, SessionParams,
+    resolve_screen_recording_access, session_folder_name, CaptureTarget, ManifestStatus, Recorder,
+    RecordingEvent, RecordingSession, SegmentEntry, SessionDevices, SessionManifest, SessionParams,
     SessionState,
 };
 use keeper_core::vm::{
@@ -3334,14 +3335,17 @@ fn epoch_ms_now() -> u64 {
 }
 
 /// Start the (at most one) full-screen + system-audio recording session (Story
-/// 16.6, FR-68/FR-69/FR-71, AD-37): resolve the output file
-/// (`~/Movies/keeper/keeper-rec <local timestamp>.mp4`, directory created by the
-/// sidecar), spawn the driver task (fresh `keeper-rec` child; NDJSON events fold
-/// through the platform-free session machine into the polled status snapshot),
-/// and return the initial snapshot. A still-live prior session is an honest
-/// error — never two capture children. Failures funnel through [`to_ipc_error`];
-/// a mid-session failure surfaces on the snapshot (`state: failed` + message),
-/// never a silent reset.
+/// 16.6 + 17.2, FR-68/FR-69/FR-71, AD-33/AD-37): create the per-session folder
+/// `~/Movies/keeper/keeper-rec <local timestamp>/` with its initial `recording`
+/// `manifest.json`, spawn the driver task (fresh `keeper-rec` child; NDJSON
+/// events fold through the platform-free session machine into the polled status
+/// snapshot AND the segment ledger), and return the initial snapshot. The
+/// sidecar writes `screen-0000.mp4` (then `screen-0001.mp4`, … on rotation)
+/// inside the folder. A still-live prior session is an honest error — never two
+/// capture children. Pre-spawn folder/manifest failures funnel through
+/// [`to_ipc_error`] (no session task exists yet); a mid-session manifest-write
+/// failure is logged only and never flips the live session to `failed` (the
+/// single-child start-guard keys off the snapshot).
 #[tauri::command]
 pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStatusVm, IpcError> {
     let mut guard = slot_lock(&state.recording_run);
@@ -3365,13 +3369,41 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
     let directory = dirs::video_dir()
         .unwrap_or(state.platform.data_dir().map_err(to_ipc_error)?)
         .join("keeper");
-    let filename = chrono::Local::now()
-        .format("keeper-rec %Y-%m-%d %H.%M.%S.mp4")
-        .to_string();
-    let output_path = directory.join(filename).to_string_lossy().into_owned();
+    // The shell supplies the local timestamp (core is time-agnostic); the core
+    // derives + validates the fs-safe folder basename (Story 17.2).
+    let local_ts = chrono::Local::now().format("%Y-%m-%d %H.%M.%S").to_string();
+    let base_name = session_folder_name(&local_ts).map_err(|e| to_ipc_error(e.into()))?;
+    // The session folder must be UNIQUE — a same-second sequential restart must
+    // never reuse (and cross-write) the prior session's folder. Disambiguate
+    // with ` (2)`, ` (3)`, … until a fresh name is found; `SessionManifest::
+    // create` additionally refuses an existing directory outright.
+    let mut folder = directory.join(&base_name);
+    let mut suffix: u32 = 2;
+    while folder.exists() {
+        folder = directory.join(format!("{base_name} ({suffix})"));
+        suffix = suffix.saturating_add(1);
+    }
+    // Create the folder + the initial `recording` manifest. This synchronous
+    // pre-spawn failure is a legitimate command error — no session task exists
+    // yet, so surfacing it cannot desync any start-guard.
+    let manifest = SessionManifest::create(
+        folder.clone(),
+        CaptureTarget::display(None),
+        SessionDevices {
+            system_audio: true,
+            microphone: false,
+            camera: false,
+        },
+    )
+    .map_err(|e| to_ipc_error(e.into()))?;
 
     let params = SessionParams {
-        output_path: output_path.clone(),
+        // Seeding `screen-0000.mp4` lets 17.1's `nextSegmentPath` produce
+        // `screen-0001.mp4`, … inside the folder with no Swift change.
+        output_path: folder
+            .join("screen-0000.mp4")
+            .to_string_lossy()
+            .into_owned(),
         display_id: None,
         system_audio: true,
     };
@@ -3379,7 +3411,8 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
         state: RecordingUiState::Preflight,
         segments_closed: 0,
         started_at_epoch_ms: None,
-        output_path: Some(output_path),
+        // The session is a folder now (Story 17.2) — the VM points at it.
+        output_path: Some(folder.to_string_lossy().into_owned()),
         error: None,
     }));
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -3390,6 +3423,11 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
         // Fold sidecar events through the platform-free machine into the shared
         // snapshot as they arrive (live — unlike `drive_session`'s buffered replay).
         let mut machine = RecordingSession::new();
+        let mut manifest = manifest;
+        // Warn at most once per session on a manifest-write failure: a persistent
+        // fault (read-only volume, deleted folder) would otherwise spam the log on
+        // every event across an hours-long recording. Non-fatal either way.
+        let mut manifest_write_warned = false;
         let sink_status = task_status.clone();
         let sink = Box::new(move |event: RecordingEvent| {
             let failure = match &event {
@@ -3397,15 +3435,78 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
                 _ => None,
             };
             let started = matches!(event, RecordingEvent::CaptureStarted);
+            // Capture the ledger entry before `apply` consumes the event: the
+            // basename comes from the sidecar-reported path (synthesized from
+            // the index when absent); `bytes`/`track` degrade to 0/"screen".
+            // This is only the LIVE view — the terminal reconcile rebuilds the
+            // list authoritatively from disk.
+            let segment = match &event {
+                RecordingEvent::SegmentClosed {
+                    index,
+                    path,
+                    bytes,
+                    track,
+                } => Some(SegmentEntry {
+                    index: *index,
+                    file: path
+                        .as_deref()
+                        .and_then(|p| Path::new(p).file_name())
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("screen-{index:04}.mp4")),
+                    bytes: bytes.unwrap_or(0),
+                    track: track.clone().unwrap_or_else(|| "screen".to_owned()),
+                }),
+                _ => None,
+            };
             if machine.apply(event).is_ok() {
-                let mut snapshot = status_lock(&sink_status);
-                snapshot.state = recording_ui_state(machine.state());
-                snapshot.segments_closed = machine.segments_closed();
-                if started && snapshot.started_at_epoch_ms.is_none() {
-                    snapshot.started_at_epoch_ms = Some(epoch_ms_now());
+                {
+                    let mut snapshot = status_lock(&sink_status);
+                    snapshot.state = recording_ui_state(machine.state());
+                    snapshot.segments_closed = machine.segments_closed();
+                    if started && snapshot.started_at_epoch_ms.is_none() {
+                        snapshot.started_at_epoch_ms = Some(epoch_ms_now());
+                    }
+                    if let Some(message) = failure {
+                        snapshot.error = Some(message);
+                    }
                 }
-                if let Some(message) = failure {
-                    snapshot.error = Some(message);
+                // Segment ledger + manifest (Story 17.2). Best-effort by
+                // design: a mid-session write/reconcile failure is LOGGED ONLY
+                // — it must never change `machine` state or force the snapshot
+                // to `Failed`, because capture is still live and the
+                // single-child start-guard keys off the snapshot (a false
+                // `Failed` would let a second `keeper-rec` child spawn). The
+                // last good manifest stays on disk.
+                if let Some(entry) = segment {
+                    manifest.record_segment(entry);
+                }
+                manifest.set_status(ManifestStatus::from_state(machine.state()));
+                if matches!(
+                    machine.state(),
+                    SessionState::Finalized | SessionState::Recovered | SessionState::Failed
+                ) {
+                    // EVERY terminal rebuilds the segment list from disk —
+                    // disk is authoritative (final segment, DW-992 backfill,
+                    // real sizes) — before the final write.
+                    if let Err(error) = manifest.reconcile_from_dir() {
+                        tracing::warn!(
+                            %error,
+                            "recording manifest: terminal disk reconcile failed; \
+                             writing the event-fed view instead"
+                        );
+                    }
+                }
+                if let Err(error) = manifest.write() {
+                    if !manifest_write_warned {
+                        manifest_write_warned = true;
+                        tracing::warn!(
+                            %error,
+                            "recording manifest: atomic write failed; the last good \
+                             manifest stays on disk and further write failures this \
+                             session are suppressed (session unaffected)"
+                        );
+                    }
                 }
             }
         }) as Box<dyn FnMut(RecordingEvent) + Send>;

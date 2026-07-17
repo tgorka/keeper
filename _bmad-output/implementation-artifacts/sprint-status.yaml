@@ -177,7 +177,7 @@ development_status:
   epic-16-retrospective: optional
   epic-17: backlog
   17-1-dual-writer-gapless-size-based-rotation-in-keeper-rec: done
-  17-2-session-folder-manifest-json-and-segment-ledger: backlog
+  17-2-session-folder-manifest-json-and-segment-ledger: done
   17-3-startup-recovery-of-orphaned-segments: backlog
   17-4-automated-gapless-concat-test-nfr-22: backlog
   17-5-segment-size-and-duration-cap-settings: backlog
