@@ -1,3 +1,4 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
@@ -105,6 +106,11 @@ export function AboutSection({ open }: { open: boolean }) {
   const reducedPlatform = useIsReducedCapabilityPlatform();
   // `undefined` = still loading; `null` = load failed; otherwise the egress list.
   const [endpoints, setEndpoints] = useState<EgressEndpointVm[] | null | undefined>(undefined);
+  // The installed app version, read once per open from the bundle metadata
+  // (`getVersion()` — the version in tauri.conf.json the running binary was built
+  // with). `undefined` = still loading; `null` = read failed (render "unknown"
+  // rather than guessing).
+  const [appVersion, setAppVersion] = useState<string | null | undefined>(undefined);
   const [update, setUpdate] = useState<UpdateState>({ kind: "idle" });
   // The detected-but-not-yet-installed update, held between the two clicks. Not state:
   // it is not rendered, only consumed by the install step.
@@ -133,6 +139,18 @@ export function AboutSection({ open }: { open: boolean }) {
     setUpdate({ kind: "idle" });
     pendingUpdate.current = null;
     let cancelled = false;
+    void getVersion()
+      .then((version) => {
+        if (!cancelled) {
+          setAppVersion(version);
+        }
+      })
+      .catch(() => {
+        // No Tauri runtime / read failure: render an honest "unknown", never a guess.
+        if (!cancelled) {
+          setAppVersion(null);
+        }
+      });
     void egressList()
       .then((list) => {
         if (!cancelled) {
@@ -206,6 +224,13 @@ export function AboutSection({ open }: { open: boolean }) {
   return (
     <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
       <p className="font-medium">About</p>
+
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-muted-foreground">Installed version</span>
+        <span className="font-mono text-xs">
+          {appVersion === undefined ? "…" : (appVersion ?? "unknown")}
+        </span>
+      </div>
 
       <div className="flex flex-col gap-1">
         <p className="text-muted-foreground">Network destinations</p>

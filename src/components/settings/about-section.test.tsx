@@ -4,6 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/ipc/client", () => ({
   egressList: vi.fn(() => Promise.resolve([])),
 }));
+vi.mock("@tauri-apps/api/app", () => ({
+  getVersion: vi.fn(() => Promise.resolve("0.0.0-test")),
+}));
 vi.mock("@tauri-apps/plugin-updater", () => ({
   check: vi.fn(() => Promise.resolve(null)),
 }));
@@ -14,6 +17,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(() => Promise.resolve()),
 }));
 
+import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
@@ -25,6 +29,7 @@ const mockEgress = vi.mocked(egressList);
 const mockCheck = vi.mocked(check);
 const mockRelaunch = vi.mocked(relaunch);
 const mockOpenUrl = vi.mocked(openUrl);
+const mockGetVersion = vi.mocked(getVersion);
 
 /** All seven capabilities present = the desktop tier (updater block renders). */
 const DESKTOP_CAPABILITIES = {
@@ -63,6 +68,8 @@ beforeEach(() => {
   mockRelaunch.mockResolvedValue(undefined);
   mockOpenUrl.mockReset();
   mockOpenUrl.mockResolvedValue(undefined);
+  mockGetVersion.mockReset();
+  mockGetVersion.mockResolvedValue("0.0.0-test");
   // Default the mirror to the desktop tier so the software-update block renders for
   // the egress/update-flow assertions; the reduced-platform cases opt in explicitly.
   capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
@@ -110,6 +117,27 @@ describe("AboutSection egress list", () => {
 
     await waitFor(() => {
       expect(screen.getByText("Could not load the egress list.")).toBeInTheDocument();
+    });
+  });
+});
+
+describe("AboutSection installed version", () => {
+  it("renders the installed version once open", async () => {
+    mockGetVersion.mockResolvedValue("1.2.3");
+    render(<AboutSection open />);
+
+    expect(screen.getByText("Installed version")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText("1.2.3")).toBeInTheDocument();
+    });
+  });
+
+  it("renders an honest 'unknown' when the version read fails", async () => {
+    mockGetVersion.mockRejectedValue(new Error("no runtime"));
+    render(<AboutSection open />);
+
+    await waitFor(() => {
+      expect(screen.getByText("unknown")).toBeInTheDocument();
     });
   });
 });

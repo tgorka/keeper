@@ -41,8 +41,12 @@ vi.mock("@/lib/ipc/client", () => ({
   iosSyncDisclosureShownSet: vi.fn(() => Promise.resolve()),
 }));
 
-// The About section (mounted by the dialog) imports the updater/process plugins;
-// mock them so the dialog renders in jsdom without a Tauri runtime.
+// The About section (mounted by the dialog) imports the updater/process plugins
+// and the app-version read; mock them so the dialog renders in jsdom without a
+// Tauri runtime.
+vi.mock("@tauri-apps/api/app", () => ({
+  getVersion: vi.fn(() => Promise.resolve("0.0.0-test")),
+}));
 vi.mock("@tauri-apps/plugin-updater", () => ({
   check: vi.fn(() => Promise.resolve(null)),
 }));
