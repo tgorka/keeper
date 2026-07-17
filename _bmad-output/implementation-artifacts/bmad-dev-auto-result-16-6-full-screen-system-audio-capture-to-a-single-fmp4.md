@@ -128,3 +128,34 @@ now-persistent, long-lived capture session that stub sidecars could not exercise
 **Epic 16 exit gate:** all Story 16.6 ACs must pass on dev-signed hardware — a real
 recording plays back — before Epic 17 (segmentation & recovery) and Epic 18 (tray &
 loud failures) build on it.
+
+## Coordinator resolution (2026-07-17) — IMPLEMENTED AND DEVICE-VERIFIED
+
+The human-in-the-loop hand-off completed. The coordinator implemented the story
+(commit `a4d1ef0`, all `check:all` gates green) and ran the live device
+verification on the physical Mac (macOS 26.5.2, /Applications install, real TCC
+grant):
+
+- **Start** → sidecar `SCStream` capture began; the Recording view flipped to
+  active (recording-red pulse dot + ticking `mono` elapsed line) and macOS
+  posted its own menu-bar recording indicator in parallel.
+- **72.7 s full-screen + system-audio capture** → single fragmented MP4
+  (`~/Movies/keeper/keeper-rec 2026-07-17 11.18.33.mp4`, 70.8 MB): H.264
+  1440×900 + one AAC 48 kHz stereo track; **20 `moof` fragments** (~4 s each)
+  confirming the fMP4 contract (AD-37).
+- **Stop** → clean finalize (single `moov` written); the file **plays back in
+  QuickTime** with continuous A/V; system sounds + speech played during capture
+  measure peak −3.1 dBFS on the extracted audio track (not silence);
+  `excludesCurrentProcessAudio` active.
+- Empirical note superseding Cap #1722 for this OS: on macOS 26.5.2 an
+  **ad-hoc-signed** keeper-rec captured successfully once the user granted
+  Screen Recording manually in System Settings (the OS never posts a prompt —
+  `CGRequestScreenCaptureAccess` is denied `authReason=5` service-policy). An
+  Apple Development certificate remains the DevEx recommendation because every
+  ad-hoc rebuild invalidates the TCC grant (new cdhash), but it is NOT a
+  capture blocker on this OS.
+
+**Story 16.6 status: done. Epic 16 exit gate (R.1 / SM-9 seed): PASSED — a real
+recording plays back on hardware.** The re-armed dev session should verify the
+existing implementation against the gates and mark the story done; do NOT
+re-defer (the device leg is complete) and do NOT re-implement.
