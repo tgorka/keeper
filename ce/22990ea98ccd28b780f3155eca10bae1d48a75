@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-17-1-dual-writer-gapless-size-based-rotation-in-keeper-rec.md
+  s_5805cf25f6dfe1::t_cc76b2ee0e441e 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "ce22990ea98ccd28b780f3155eca10bae1d48a75",
+  "prompts": {},
+  "sessions": {
+    "s_5805cf25f6dfe1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5cf66123-5059-4878-8718-51e1cef0a93f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
