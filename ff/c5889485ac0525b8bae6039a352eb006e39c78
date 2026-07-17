@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_4717ce1e32fb9e::t_c575b8a4775e62 1000-1009
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "ffc5889485ac0525b8bae6039a352eb006e39c78",
+  "prompts": {},
+  "sessions": {
+    "s_4717ce1e32fb9e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aaeedfb94036aeb04",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
