@@ -64,7 +64,8 @@ pub enum SessionState {
 /// NDJSON (via [`parse_event`]) and feeds into the machine — host intent
 /// (start/stop) becomes a command the sidecar acts on and then *reports back* as one
 /// of these, so the core needs no process handle or command side-channel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// (No `Eq`: the Story 17.4 `pts_start`/`pts_end` bounds are `f64` seconds.)
+#[derive(Debug, Clone, PartialEq)]
 pub enum RecordingEvent {
     /// The sidecar started its pre-flight (`Idle → Preflight`).
     PreflightStarted,
@@ -92,6 +93,15 @@ pub enum RecordingEvent {
         /// The track the segment belongs to (`"screen"` in Epic 17), when
         /// reported.
         track: Option<String>,
+        /// The segment's first appended video sample's PTS in **original
+        /// capture-clock seconds** (Story 17.4, NFR-22), when reported. The
+        /// muxer rebases every segment file's own timeline to 0, so this
+        /// host-clock bound exists only at capture time — the manifest
+        /// persists it for the gapless-concat gate.
+        pts_start: Option<f64>,
+        /// The segment's last appended video sample's PTS in original
+        /// capture-clock seconds, when reported.
+        pts_end: Option<f64>,
     },
     /// A stop was requested / begun (`Recording → Stopping`, or `Rotating → Stopping`).
     Stopping,
@@ -272,11 +282,22 @@ pub fn parse_event(line: &str) -> Option<RecordingEvent> {
                 .get("track")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
+            // Story 17.4's host-clock PTS bounds (seconds) — same best-effort
+            // tolerance: absent/mistyped bounds degrade to `None`. A
+            // non-finite value is rejected too, so the bounds persisted on the
+            // manifest stay provably finite (`serde_json` refuses to serialize
+            // NaN/Infinity, which would otherwise fail a terminal manifest
+            // write for the whole session).
+            let finite = |v: &serde_json::Value| v.as_f64().filter(|f| f.is_finite());
+            let pts_start = obj.get("ptsStart").and_then(finite);
+            let pts_end = obj.get("ptsEnd").and_then(finite);
             Some(RecordingEvent::SegmentClosed {
                 index,
                 path,
                 bytes,
                 track,
+                pts_start,
+                pts_end,
             })
         }
         "error" => {
@@ -313,6 +334,11 @@ pub fn parse_event(line: &str) -> Option<RecordingEvent> {
 /// `tools/keeper-rec/Sources/keeper-rec/main.swift` (`capabilitiesResult`) — there
 /// is no shared source of truth across the language boundary, so bump both
 /// together; a drift surfaces at runtime as an honest `Unsupported`, not silently.
+///
+/// Story 17.4 (NFR-22) added the additive `ptsStart`/`ptsEnd` fields (original
+/// capture-clock seconds) to the sidecar's `segmentClosed` event, consumed
+/// tolerantly by [`parse_event`] — per the additive-change precedent (16.5's
+/// `requestScreenRecording`, 16.6's `startRecording`/`stop`) the version stays 1.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Build the one-line `getCapabilities` request (no trailing newline — the shell
@@ -617,7 +643,8 @@ impl ManifestStatus {
 /// One segment in the manifest's ledger (Story 17.2). `file` is the segment's
 /// **basename** (relative to the session folder) so the manifest stays portable
 /// and self-describing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// (No `Eq`: the Story 17.4 PTS bounds are `f64` seconds.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SegmentEntry {
     /// The zero-based segment index (from `segmentClosed` live, or the
@@ -630,6 +657,17 @@ pub struct SegmentEntry {
     pub bytes: u64,
     /// The track the segment belongs to (`"screen"` throughout Epic 17).
     pub track: String,
+    /// The segment's first appended video sample's PTS in **original
+    /// capture-clock seconds** (Story 17.4, NFR-22) — known only at capture
+    /// time (the muxer rebases each file's timeline to 0), so missing bounds
+    /// (older sidecar, recovered sessions) are persisted as `null`, never
+    /// invented. `#[serde(default)]` keeps pre-17.4 manifests parseable.
+    #[serde(default)]
+    pub pts_start: Option<f64>,
+    /// The segment's last appended video sample's PTS in original
+    /// capture-clock seconds, `null` when unknown.
+    #[serde(default)]
+    pub pts_end: Option<f64>,
 }
 
 /// What the session captures (Story 17.2). Epic 17 records a display;
@@ -673,7 +711,8 @@ pub struct SessionDevices {
 /// `{ version, session, status, captureTarget, devices, segments }`. The folder
 /// path is runtime-only (`#[serde(skip)]`) — the manifest never persists an
 /// absolute path, keeping it portable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// (No `Eq`: the segment ledger carries `f64` PTS bounds since Story 17.4.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionManifest {
     /// The manifest schema version ([`MANIFEST_VERSION`]).
@@ -787,9 +826,26 @@ impl SessionManifest {
     /// never aborting the terminal write. The result is sorted by
     /// `(index, file)` for determinism across equal indices. Only a failure to
     /// read the folder itself is an error.
+    ///
+    /// **PTS bounds survive the rebuild (Story 17.4, NFR-22).** Disk is the
+    /// truth for everything disk can observe (`index`/`file`/`bytes`/`track`),
+    /// but the host clock is the truth for time: the muxer rebases every
+    /// segment file's own timeline to 0, so the original capture-clock
+    /// `pts_start`/`pts_end` can NEVER be recovered from the `.mp4` files.
+    /// Each rebuilt entry therefore inherits the bounds the event-fed ledger
+    /// already recorded for its index (`None` — persisted as `null` — when no
+    /// prior entry exists: the final segment, a DW-992 backfill, an older
+    /// sidecar).
     pub fn reconcile_from_dir(&mut self) -> Result<(), RecordingError> {
         let entries =
             std::fs::read_dir(&self.folder).map_err(|e| manifest_io("read session folder", &e))?;
+        // Snapshot the only-capture-time-known bounds by index before the
+        // event-fed list is discarded.
+        let known_bounds: std::collections::HashMap<u32, (Option<f64>, Option<f64>)> = self
+            .segments
+            .iter()
+            .map(|s| (s.index, (s.pts_start, s.pts_end)))
+            .collect();
         let mut segments: Vec<SegmentEntry> = Vec::new();
         for entry in entries {
             let entry = match entry {
@@ -840,11 +896,14 @@ impl SessionManifest {
                 tracing::warn!("manifest reconcile: skipping non-file .mp4 entry");
                 continue;
             }
+            let (pts_start, pts_end) = known_bounds.get(&index).copied().unwrap_or((None, None));
             segments.push(SegmentEntry {
                 index,
                 file: file.to_owned(),
                 bytes: metadata.len(),
                 track: "screen".to_owned(),
+                pts_start,
+                pts_end,
             });
         }
         // Deterministic order even across equal indices (two files whose stems
@@ -1038,14 +1097,16 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
-    /// A bare index-only [`RecordingEvent::SegmentClosed`] (no 17.1 enrichment) —
-    /// the shape most state-machine tests need.
+    /// A bare index-only [`RecordingEvent::SegmentClosed`] (no 17.1/17.4
+    /// enrichment) — the shape most state-machine tests need.
     fn segment_closed(index: u32) -> RecordingEvent {
         RecordingEvent::SegmentClosed {
             index,
             path: None,
             bytes: None,
             track: None,
+            pts_start: None,
+            pts_end: None,
         }
     }
 
@@ -1235,11 +1296,12 @@ mod tests {
 
     #[test]
     fn parse_enriched_segment_closed_yields_the_ledger_fields() {
-        // Story 17.1/17.2 cross-language seam guard: the sidecar's enriched
-        // `segmentClosed` (`path`/`bytes`/`track`) parses into the enriched
+        // Story 17.1/17.2/17.4 cross-language seam guard: the sidecar's
+        // enriched `segmentClosed` (`path`/`bytes`/`track` + the 17.4
+        // host-clock `ptsStart`/`ptsEnd` bounds) parses into the enriched
         // event carrying the segment-ledger data, and the state machine still
         // bumps its counter without a state change.
-        let line = r#"{"event":"segmentClosed","index":2,"path":"/rec/keeper/screen-0002.mp4","bytes":123,"track":"screen"}"#;
+        let line = r#"{"event":"segmentClosed","index":2,"path":"/rec/keeper/screen-0002.mp4","bytes":123,"track":"screen","ptsStart":1000.5,"ptsEnd":1030.25}"#;
         assert_eq!(
             parse_event(line),
             Some(RecordingEvent::SegmentClosed {
@@ -1247,6 +1309,8 @@ mod tests {
                 path: Some("/rec/keeper/screen-0002.mp4".to_owned()),
                 bytes: Some(123),
                 track: Some("screen".to_owned()),
+                pts_start: Some(1000.5),
+                pts_end: Some(1030.25),
             })
         );
         let mut session = RecordingSession::new();
@@ -1267,14 +1331,45 @@ mod tests {
     #[test]
     fn parse_bare_segment_closed_is_tolerated_with_none_extras() {
         // Absent OR mistyped enrichment fields must not drop the event — the
-        // index is the only required field; extras degrade to `None`.
+        // index is the only required field; extras (including the 17.4 PTS
+        // bounds) degrade to `None`.
         assert_eq!(
             parse_event(r#"{"event":"segmentClosed","index":5}"#),
             Some(segment_closed(5))
         );
         assert_eq!(
-            parse_event(r#"{"event":"segmentClosed","index":5,"path":7,"bytes":"big","track":[]}"#),
+            parse_event(
+                r#"{"event":"segmentClosed","index":5,"path":7,"bytes":"big","track":[],"ptsStart":"soon","ptsEnd":null}"#
+            ),
             Some(segment_closed(5))
+        );
+    }
+
+    #[test]
+    fn parse_segment_closed_bounds_are_read_independently() {
+        // One present + one absent/mistyped bound must not couple: each bound
+        // degrades to `None` on its own (a partial report keeps what it can).
+        assert_eq!(
+            parse_event(r#"{"event":"segmentClosed","index":1,"ptsStart":2.5}"#),
+            Some(RecordingEvent::SegmentClosed {
+                index: 1,
+                path: None,
+                bytes: None,
+                track: None,
+                pts_start: Some(2.5),
+                pts_end: None,
+            })
+        );
+        assert_eq!(
+            parse_event(r#"{"event":"segmentClosed","index":1,"ptsStart":"x","ptsEnd":9.75}"#),
+            Some(RecordingEvent::SegmentClosed {
+                index: 1,
+                path: None,
+                bytes: None,
+                track: None,
+                pts_start: None,
+                pts_end: Some(9.75),
+            })
         );
     }
 
@@ -1850,13 +1945,32 @@ mod tests {
             .expect("create session folder + initial manifest")
     }
 
-    /// Shorthand for the expected reconciled entry shape.
+    /// Shorthand for the expected reconciled entry shape (no PTS bounds — the
+    /// shape a disk-only rebuild produces when the event-fed ledger had none).
     fn screen_entry(index: u32, file: &str, bytes: u64) -> SegmentEntry {
         SegmentEntry {
             index,
             file: file.to_owned(),
             bytes,
             track: "screen".to_owned(),
+            pts_start: None,
+            pts_end: None,
+        }
+    }
+
+    /// Shorthand for an event-fed entry carrying the Story 17.4 host-clock
+    /// PTS bounds.
+    fn screen_entry_with_bounds(
+        index: u32,
+        file: &str,
+        bytes: u64,
+        pts_start: f64,
+        pts_end: f64,
+    ) -> SegmentEntry {
+        SegmentEntry {
+            pts_start: Some(pts_start),
+            pts_end: Some(pts_end),
+            ..screen_entry(index, file, bytes)
         }
     }
 
@@ -2006,6 +2120,74 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn reconcile_preserves_event_fed_pts_bounds_by_index() {
+        // Story 17.4 (NFR-22): disk is authoritative for index/file/bytes/track
+        // — everything disk CAN observe — but the host-clock PTS bounds exist
+        // only in the event-fed ledger (the muxer rebased the files to 0), so
+        // the rebuild must carry them over by index and record `None` where no
+        // prior entry exists (here: the final segment, which never gets a
+        // `segmentClosed`).
+        let folder = fresh_temp_dir("bounds");
+        let mut manifest = test_manifest(folder.clone());
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("segment 0");
+        std::fs::write(folder.join("screen-0001.mp4"), vec![0u8; 20]).expect("segment 1");
+        std::fs::write(folder.join("screen-0002.mp4"), vec![0u8; 30]).expect("final segment");
+        // Event-fed view: bounds present, but segment 0's bytes are stale.
+        manifest.record_segment(screen_entry_with_bounds(
+            0,
+            "screen-0000.mp4",
+            0,
+            1000.0,
+            1029.75,
+        ));
+        manifest.record_segment(screen_entry_with_bounds(
+            1,
+            "screen-0001.mp4",
+            20,
+            1029.8,
+            1059.5,
+        ));
+        manifest.reconcile_from_dir().expect("terminal reconcile");
+        assert_eq!(
+            manifest.segments,
+            vec![
+                // Disk bytes win; the event-fed host-clock bounds survive.
+                screen_entry_with_bounds(0, "screen-0000.mp4", 10, 1000.0, 1029.75),
+                screen_entry_with_bounds(1, "screen-0001.mp4", 20, 1029.8, 1059.5),
+                // No prior entry → bounds honestly null, never invented.
+                screen_entry(2, "screen-0002.mp4", 30),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn segment_entry_serializes_missing_bounds_as_null_and_reads_old_manifests() {
+        // Missing bounds are persisted as explicit `null` (the spec's "recorded
+        // as null" — no skip_serializing_if), and a pre-17.4 manifest without
+        // the fields still deserializes (tolerant recovery paths).
+        let json = serde_json::to_value(screen_entry(0, "screen-0000.mp4", 10)).expect("serialize");
+        assert!(json["ptsStart"].is_null(), "absent ptsStart must be null");
+        assert!(json["ptsEnd"].is_null(), "absent ptsEnd must be null");
+        let json = serde_json::to_value(screen_entry_with_bounds(
+            1,
+            "screen-0001.mp4",
+            20,
+            1000.0,
+            1029.75,
+        ))
+        .expect("serialize");
+        assert_eq!(json["ptsStart"], 1000.0);
+        assert_eq!(json["ptsEnd"], 1029.75);
+        // Pre-17.4 wire shape (no bounds fields at all) → None, never an error.
+        let old: SegmentEntry = serde_json::from_str(
+            r#"{"index":3,"file":"screen-0003.mp4","bytes":7,"track":"screen"}"#,
+        )
+        .expect("pre-17.4 entry deserializes");
+        assert_eq!(old, screen_entry(3, "screen-0003.mp4", 7));
     }
 
     #[test]

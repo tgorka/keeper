@@ -30,10 +30,14 @@ For the release-time manual measurements CI cannot run unattended, see
 | NFR-3 | Idle memory | ~500 MB with 5 accounts, ~300 MB with 1 account | **Release checklist — measure & flag.** See the assumption note below; these budgets are **not** hard CI gates. |
 | NFR-8 | Crash safety (zero lost persisted events on kill) | Zero previously-committed rows lost; `PRAGMA integrity_check` = `ok` | **CI:** `src-tauri/crates/keeper-core/tests/crash_safety.rs` (real SIGKILL of a writing child for archive ingest, outbox insert, and settings write). |
 | NFR-6 | Bridge-health drop reflected + notified | ≤ 60 s | **CI (logic):** the immediate disconnect-**notice** path in `src-tauri/crates/keeper-core/src/bridges/health.rs` (`disconnected_notice_flips_immediately_*`, `aggregator_notifies_once_on_transition_into_disconnected`) flips state with no debounce and notifies once. **No hard ≤ 60 s CI gate** covers the *silent-drop* (liveness-tick) case — its worst case can exceed 60 s (see below). **Live end-to-end:** release checklist. |
+| NFR-22 | Segment handover gaplessness | Concatenated manifest PTS bounds monotonic; no boundary gap/overlap > one frame (`P = 1/frameRate`) | **CI:** the `keeper-rec` concat gate (`tools/keeper-rec/Tests/keeper-recTests/ConcatAssert*.swift`, Story 17.4) in the `recording` job — asserts per-boundary `ptsStart(k+1) − ptsEnd(k) ≈ P` from the session manifest's host-clock bounds plus intra-file PTS monotonicity via `AVAssetReader`, on fixtures generated on the runner (extends AD-21's measurement-hook discipline; negative controls prove the check is non-vacuous). |
 
-All CI-enforced gates run inside the existing required `Rust (fmt, clippy, test)`
-cargo-nextest job — there is no separate perf CI job, so a regression fails the
-same required check that already runs the 120k FTS gate.
+All CI-enforced gates except NFR-22 run inside the existing required
+`Rust (fmt, clippy, test)` cargo-nextest job — there is no separate perf CI job,
+so a regression fails the same required check that already runs the 120k FTS
+gate. NFR-22 runs in the `recording` job (`swift test` via
+`scripts/test-keeper-rec.sh`), which `docs/release.md` lists among the required
+status checks.
 
 ## Cold-start honesty (NFR-1)
 

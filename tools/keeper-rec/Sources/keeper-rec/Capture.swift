@@ -19,10 +19,20 @@
 // retired writer asynchronously. The `SCStream` itself is never touched: one
 // capture source, PTS host-clock-anchored and continuous across the cut, no
 // dropped frame or audio. Each closed segment is announced as
-// `segmentClosed{index,path,bytes,track:"screen"}` bracketed by
+// `segmentClosed{index,path,bytes,track:"screen",ptsStart,ptsEnd}` bracketed by
 // `state:"rotating"` / `state:"recording"`; the FINAL segment on a clean stop
 // is closed by `finalized` instead (a `segmentClosed` while the host is
-// Stopping would be an illegal host transition).
+// Stopping would be an illegal host transition), so its PTS bounds are not
+// reported — an accepted Story 17.4 limitation (the NFR-22 CI gate runs on
+// generated fixtures that carry complete bounds).
+//
+// `ptsStart`/`ptsEnd` (Story 17.4, NFR-22, coordinator-authorized 17.1
+// amendment) are the retiring segment's first/last appended video sample's
+// PTS in **original capture-clock seconds** — recorded HERE, before
+// `startSession(atSourceTime:)` rebases the file's own timeline to 0. Once
+// muxed, a gapless and a gapped session read back bit-identically from the
+// files; the host clock is the only place the boundary truth exists, so the
+// manifest persists it and the concat gate asserts against it.
 //
 // Threading: every SCStream sample callback (both `.screen` and `.audio`) is
 // delivered on the single serial `mediaQueue`, which also runs the rotation
@@ -104,6 +114,16 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
     /// policy's `isFirstFrameOfSegment` guard — never rotate a just-opened
     /// segment, even under a tiny budget).
     private var segmentHasVideo = false
+    /// The current segment's FIRST appended video sample's PTS in original
+    /// capture-clock seconds (Story 17.4, NFR-22) — captured before the writer
+    /// rebases the file timeline to 0. `nil` until the segment's first video
+    /// frame is appended; reported as `ptsStart` on the retiring segment's
+    /// `segmentClosed`.
+    private var segmentFirstVideoPTS: Double?
+    /// The current segment's LAST appended video sample's PTS in original
+    /// capture-clock seconds — updated on every appended video frame; reported
+    /// as `ptsEnd` on the retiring segment's `segmentClosed`.
+    private var segmentLastVideoPTS: Double?
     /// True from cut-begin until the retired writer's finalize completion has
     /// emitted its `segmentClosed` + `recording` pair. No overlapping
     /// rotations, so the host always sees rotating → segmentClosed → recording
@@ -305,6 +325,15 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
             exit(0)
         }
 
+        // The retiring segment's host-clock video PTS bounds (Story 17.4,
+        // NFR-22): everything it accumulated BEFORE this cut. Read here — the
+        // muxer rebases each file's own timeline to 0, so the original
+        // capture-clock bounds exist only in this process, at this moment. The
+        // cut keyframe goes to writer B below, so the NEW segment's first PTS
+        // is exactly `keyframePTS`.
+        let retiringPTSStart = segmentFirstVideoPTS
+        let retiringPTSEnd = segmentLastVideoPTS
+
         // Hand over: writer B opens at the cut keyframe's PTS and takes this
         // keyframe and everything after it; A gets nothing more. Audio has no
         // keyframes — it simply follows `current`, splitting at the same
@@ -315,6 +344,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
         current = next
         segmentStartPTS = keyframePTS
         segmentHasVideo = false
+        segmentFirstVideoPTS = nil
+        segmentLastVideoPTS = nil
         // The cut keyframe MUST land in writer B, or the new segment would start
         // on a non-keyframe and be non-self-decodable (breaking the gapless /
         // independently-playable invariant, AD-37). A freshly `startWriting`+
@@ -329,6 +360,12 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
         }
         next.videoInput.append(sampleBuffer)
         segmentHasVideo = true
+        // The new segment opens on the cut keyframe: its first AND (so far)
+        // last appended video PTS is the cut PTS itself. A non-numeric cut
+        // PTS leaves the bounds nil (reported as null) rather than seeding a
+        // NaN that would later break the segment's JSON event line.
+        segmentFirstVideoPTS = keyframePTS.isNumeric ? keyframePTS.seconds : nil
+        segmentLastVideoPTS = segmentFirstVideoPTS
 
         retiring.videoInput.markAsFinished()
         retiring.audioInput?.markAsFinished()
@@ -348,13 +385,22 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
                 // or `recording` line now would be an illegal transition; the
                 // stop path owns all remaining signalling (`finalized`).
                 if !stopping {
-                    emitEvent([
+                    // Additive `ptsStart`/`ptsEnd` (Story 17.4, NFR-22): the
+                    // retiring segment's original capture-clock video bounds.
+                    // A rotation only ever retires a segment that appended
+                    // video (the policy never cuts a first frame), so the
+                    // bounds are present in practice; the host parser reads
+                    // them best-effort either way.
+                    var closed: [String: Any] = [
                         "event": "segmentClosed",
                         "index": retiring.index,
                         "path": retiring.path,
                         "bytes": onDiskBytes(atPath: retiring.path),
                         "track": "screen",
-                    ])
+                    ]
+                    if let retiringPTSStart { closed["ptsStart"] = retiringPTSStart }
+                    if let retiringPTSEnd { closed["ptsEnd"] = retiringPTSEnd }
+                    emitEvent(closed)
                     emitEvent(["event": "state", "state": "recording", "path": next.path])
                 }
                 finalizeGroup.leave()
@@ -460,6 +506,19 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
             if current.videoInput.isReadyForMoreMediaData {
                 current.videoInput.append(sampleBuffer)
                 segmentHasVideo = true
+                // Track the segment's appended-video PTS bounds in original
+                // capture-clock seconds (Story 17.4, NFR-22) — the muxer is
+                // about to rebase the file timeline, so this is the only
+                // moment the host-clock bounds can be observed. Only a numeric
+                // PTS is recorded: a non-numeric CMTime's `.seconds` is NaN,
+                // and a NaN in the `segmentClosed` payload would make
+                // JSONSerialization throw and silently drop the whole event
+                // line (index and all), not just the bound.
+                if pts.isNumeric {
+                    let seconds = pts.seconds
+                    if segmentFirstVideoPTS == nil { segmentFirstVideoPTS = seconds }
+                    segmentLastVideoPTS = seconds
+                }
             }
         case .audio:
             // Audio before the session anchor is dropped (the anchor is video).

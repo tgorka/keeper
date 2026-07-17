@@ -92,6 +92,11 @@ private func capabilitiesResult() -> [String: Any] {
         // (the Rust host). The two constants have no shared source of truth across
         // the language boundary; a drift is caught at runtime by the host's
         // handshake (→ a clean Unsupported), but bump both together on purpose.
+        // Story 17.4 added the additive `ptsStart`/`ptsEnd` fields (original
+        // capture-clock seconds) to the `segmentClosed` event — consumed
+        // tolerantly by the host parser, so per the additive-change precedent
+        // (16.5's requestScreenRecording, 16.6's startRecording/stop) the
+        // version stays 1.
         "protocolVersion": 1,
         "macos": macos,
         "features": [

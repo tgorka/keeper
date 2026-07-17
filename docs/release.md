@@ -215,8 +215,9 @@ admin must, under **Settings → Branches → Branch protection rules** for `mai
 - **Rust** — `rustfmt --check`, clippy `-D warnings`, cargo-nextest.
 - **Tauri build** — `tauri build --no-bundle`.
 - **iOS (compile check)** — `cargo check --workspace --target aarch64-apple-ios` (Rust, device-free compile gate; no signing/simulator).
+- **Recording sidecar (gapless-concat, NFR-22)** — `swift test` on the `keeper-rec` package (rotation unit tests + the gapless-concat gate, fixtures generated on the runner; no capture hardware, no signing). Maps to the `recording` job in `ci.yml`.
 
-These correspond to the `licenses`, `frontend`, `rust`, `build`, and `ios` jobs in
+These correspond to the `licenses`, `frontend`, `rust`, `build`, `ios`, and `recording` jobs in
 `.github/workflows/ci.yml`. **CI is the license source of truth**: the JS gate scans the
 installed `node_modules` tree, so run it via CI (which does a clean `bun install
 --frozen-lockfile`) rather than trusting a local run against a possibly-stale tree. `bun run

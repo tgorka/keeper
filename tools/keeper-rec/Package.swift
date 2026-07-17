@@ -35,16 +35,31 @@ let package = Package(
             ]
         ),
         // Unit tests for the pure, Foundation-only logic (Rotation.swift,
-        // Story 17.1): no capture hardware, no code-signing needed, so they
-        // run in CI (`bun run rec:test` → scripts/test-keeper-rec.sh). The
-        // test target depends on the executable target directly (supported
-        // since Swift 5.5) and uses `@testable import keeper_rec`.
+        // Story 17.1) PLUS the NFR-22 gapless-concat gate (Story 17.4): the
+        // gate generates real fMP4 fixture segments with AVAssetWriter and
+        // reads them back with AVAssetReader — muxing only, no
+        // ScreenCaptureKit, so still no capture hardware and no code-signing;
+        // the whole suite runs in CI (`bun run rec:test` →
+        // scripts/test-keeper-rec.sh). The test target depends on the
+        // executable target directly (supported since Swift 5.5) and uses
+        // `@testable import keeper_rec`.
         .testTarget(
             name: "keeper-recTests",
             dependencies: ["keeper-rec"],
             path: "Tests/keeper-recTests",
             swiftSettings: [
                 .swiftLanguageMode(.v5),
+            ],
+            // Explicit-linking parity with the executable target: AVFoundation
+            // (writer/reader), CoreMedia (CMTime/CMSampleBuffer), CoreVideo
+            // (fixture pixel buffers), VideoToolbox (the H.264 encode behind
+            // AVAssetWriter) — so the concat harness builds reproducibly under
+            // stricter/explicit-linking toolchains.
+            linkerSettings: [
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("CoreMedia"),
+                .linkedFramework("CoreVideo"),
+                .linkedFramework("VideoToolbox"),
             ]
         ),
     ]

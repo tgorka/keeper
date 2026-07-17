@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Run the keeper-rec sidecar's unit tests (Story 17.1): the pure rotation
-# policy + segment-path derivation in Rotation.swift. Foundation-only logic —
-# no capture hardware, no code-signing — so this runs anywhere macOS Swift
-# does, including CI (the `recording` job). Story 17.4 later extends this
-# harness with the gapless-concat gate.
+# Run the keeper-rec sidecar's unit tests: the pure rotation policy +
+# segment-path derivation (Rotation.swift, Story 17.1) AND the NFR-22
+# gapless-concat gate (ConcatAssert*.swift, Story 17.4). The concat gate
+# generates its fMP4 fixtures on the runner via AVAssetWriter and asserts the
+# manifest's host-clock PTS bounds plus intra-file monotonicity — muxing only,
+# no ScreenCaptureKit, so still no capture hardware and no code-signing; the
+# whole suite runs anywhere macOS Swift does, including CI (the `recording`
+# job).
 set -euo pipefail
 
 # Resolve the repo root from this script's location so it works from any cwd.

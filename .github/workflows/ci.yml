@@ -45,13 +45,14 @@ jobs:
         working-directory: src-tauri
 
   recording:
-    name: Recording sidecar (unit tests)
+    name: Recording sidecar (unit tests + gapless-concat gate)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      # Pure-logic unit tests only (Rotation.swift, Story 17.1): Foundation-only
-      # code, so no capture hardware and no code-signing are needed. Story 17.4
-      # extends this harness with the gapless-concat gate.
+      # Pure-logic unit tests (Rotation.swift, Story 17.1) plus the NFR-22
+      # gapless-concat gate (Story 17.4): fixtures are generated on the runner
+      # via AVAssetWriter (muxing only, no ScreenCaptureKit), so still no
+      # capture hardware and no code-signing are needed.
       - run: bash scripts/test-keeper-rec.sh
 
   ios:

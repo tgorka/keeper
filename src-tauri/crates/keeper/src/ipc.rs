@@ -3446,6 +3446,8 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
                     path,
                     bytes,
                     track,
+                    pts_start,
+                    pts_end,
                 } => Some(SegmentEntry {
                     index: *index,
                     file: path
@@ -3456,6 +3458,12 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
                         .unwrap_or_else(|| format!("screen-{index:04}.mp4")),
                     bytes: bytes.unwrap_or(0),
                     track: track.clone().unwrap_or_else(|| "screen".to_owned()),
+                    // Story 17.4 (NFR-22): the host-clock PTS bounds exist only
+                    // in this event — the terminal disk reconcile preserves
+                    // them by index (they cannot be re-read from the rebased
+                    // segment files).
+                    pts_start: *pts_start,
+                    pts_end: *pts_end,
                 }),
                 _ => None,
             };
