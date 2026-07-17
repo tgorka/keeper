@@ -1,0 +1,88 @@
+src/lib/ipc/gen/RecordingStatusVm.ts
+  s_8a8bc6b6bf6017::t_d48810025cd6e0 26-27,29
+  s_8a8bc6b6bf6017::t_7a64405b0fe334 1-25,28,30-37
+tools/keeper-rec/Sources/keeper-rec/Capture.swift
+  s_8a8bc6b6bf6017::t_8bc3d0afdc3096 1-162,164-205,207-211,213-268,272-287
+  s_8a8bc6b6bf6017::t_d3c6d7c1fa96d4 206,212
+  s_8a8bc6b6bf6017::t_b97d6ea2012da6 269-271
+  s_8a8bc6b6bf6017::t_b31d242a9cd6a7 163
+src/components/layout/recording-pane.test.tsx
+  s_8a8bc6b6bf6017::t_adc294be771a6e 8-10,14,18,24,28-30,37-55,68-73,166-218
+src-tauri/crates/keeper-core/src/vm.rs
+  s_8a8bc6b6bf6017::t_ed94f62023b049 2664-2708,2712-2731
+  s_8a8bc6b6bf6017::t_059dd06ffa4c06 2709-2711
+src/lib/ipc/client.ts
+  s_8a8bc6b6bf6017::t_dc3bf679b29e59 91-92,144,1677-1707
+  s_8a8bc6b6bf6017::t_9e082d68c759c1 1708
+tools/keeper-rec/Package.swift
+  s_8a8bc6b6bf6017::t_07ec5b323ecba0 14-21,23-29,32-34
+tools/keeper-rec/Sources/keeper-rec/main.swift
+  s_8a8bc6b6bf6017::t_b24f886503725f 179-211
+  s_8a8bc6b6bf6017::t_2e7275e0bbe3d9 33-37,40,44-45,56-60
+  s_8a8bc6b6bf6017::t_a8e139241e45e7 143-146,150-152
+  s_8a8bc6b6bf6017::t_f55c91f7fa1ab6 61,229-238
+  s_8a8bc6b6bf6017::t_283197a907d961 62
+src-tauri/Cargo.toml
+  s_8a8bc6b6bf6017::t_3788fcf98bb306 84-86
+_bmad-output/implementation-artifacts/bmad-dev-auto-result-16-6-full-screen-system-audio-capture-to-a-single-fmp4.md
+  s_cf48e71d27ea8e::t_38560d3d59326a 1-130
+src-tauri/crates/keeper/Cargo.toml
+  s_8a8bc6b6bf6017::t_74d8137872752b 39
+src-tauri/crates/keeper/src/recorder.rs
+  s_8a8bc6b6bf6017::t_795e6321c1f200 77-87
+  s_8a8bc6b6bf6017::t_84623175da5f87 340-341,345,353-356,368-373,380-409
+  s_8a8bc6b6bf6017::t_b28706c86a0bcc 33-34
+  s_8a8bc6b6bf6017::t_a6e06548e80379 136-137
+  s_8a8bc6b6bf6017::t_e8d120d3d95b23 496-497
+  s_8a8bc6b6bf6017::t_17e6050d3ede67 410
+src-tauri/crates/keeper/src/lib.rs
+  s_8a8bc6b6bf6017::t_9701e5c505c36d 319-322
+src/hooks/use-recording-session.ts
+  s_8a8bc6b6bf6017::t_fe37ab87b3c4c0 1-155
+src-tauri/crates/keeper-core/src/recording.rs
+  s_8a8bc6b6bf6017::t_e66082aed2a309 541-545,551-552
+  s_8a8bc6b6bf6017::t_e94f017f0a2aba 1256-1264,1291,1321,1339,1351
+  s_8a8bc6b6bf6017::t_79c43609db420c 1216-1217
+  s_8a8bc6b6bf6017::t_2dff66867ae38d 302-312,314-341
+  s_8a8bc6b6bf6017::t_885630486c645a 313
+  s_8a8bc6b6bf6017::t_a9f8b449933077 596-597
+  s_8a8bc6b6bf6017::t_123e1e78f452ad 634
+src/index.css
+  s_8a8bc6b6bf6017::t_502c4abadfcf33 14,94,174
+src/components/layout/recording-pane.tsx
+  s_8a8bc6b6bf6017::t_1bff863cfbbc8b 29,38-43,62-63,76-108,111-120
+src-tauri/crates/keeper/src/ipc.rs
+  s_8a8bc6b6bf6017::t_1093f921cc7c76 3323-3325
+  s_8a8bc6b6bf6017::t_fdc5299960dca9 27-30,39-41
+  s_8a8bc6b6bf6017::t_6553675cfb0334 335
+  s_8a8bc6b6bf6017::t_8c4610ec917677 112-128
+  s_8a8bc6b6bf6017::t_d3a03577902b2f 3306-3322,3326-3475
+src/lib/ipc/gen/RecordingUiState.ts
+  s_8a8bc6b6bf6017::t_7a64405b0fe334 1-10
+src-tauri/Cargo.lock
+  s_8a8bc6b6bf6017::t_a78b9de133014a 2921,2923,2953
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "a4d1ef04835c1dcb14a194a74a34bae9363e0766",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_cf48e71d27ea8e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f419f429-f9fa-4aee-8174-ebff0c1482eb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
