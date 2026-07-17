@@ -139,7 +139,7 @@ development_status:
   12-3-ios-platform-port-keychain-spike-and-data-directory: done
   12-4-media-protocol-on-wkurlschemehandler-with-capped-buffers: done
   12-5-ios-compile-check-in-ci: done
-  12-6-on-device-walking-skeleton-validation-sm-7-gate: backlog
+  12-6-on-device-walking-skeleton-validation-sm-7-gate: optional
   epic-12-retrospective: optional
   epic-13: backlog
   13-1-phone-layout-tier-and-navigation-stack: done
@@ -165,7 +165,7 @@ development_status:
   15-3-shareable-ipa-build-path-unsigned-export-for-re-signing: done
   15-4-required-ios-ci-gate-and-release-hygiene: done
   15-5-paid-program-decision-gate-recorded: done
-  15-6-final-device-install-and-phase-acceptance: backlog
+  15-6-final-device-install-and-phase-acceptance: optional
   epic-15-retrospective: optional
   epic-16: backlog
   16-1-keeper-rec-swiftpm-scaffold-codesign-and-externalbin-wiring: done
