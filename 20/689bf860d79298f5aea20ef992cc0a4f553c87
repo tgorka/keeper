@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-17-5-segment-size-and-duration-cap-settings.md
+  s_53f3107ebc4c42::t_42c8e5bd2c27b3 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "20689bf860d79298f5aea20ef992cc0a4f553c87",
+  "prompts": {},
+  "sessions": {
+    "s_53f3107ebc4c42": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a835ad5-dc38-472b-a45a-f12cfb03874c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
