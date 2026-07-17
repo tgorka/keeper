@@ -176,7 +176,7 @@ development_status:
   16-6-full-screen-system-audio-capture-to-a-single-fmp4: done
   epic-16-retrospective: optional
   epic-17: backlog
-  17-1-dual-writer-gapless-size-based-rotation-in-keeper-rec: backlog
+  17-1-dual-writer-gapless-size-based-rotation-in-keeper-rec: done
   17-2-session-folder-manifest-json-and-segment-ledger: backlog
   17-3-startup-recovery-of-orphaned-segments: backlog
   17-4-automated-gapless-concat-test-nfr-22: backlog

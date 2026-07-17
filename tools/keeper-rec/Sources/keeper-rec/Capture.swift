@@ -1,23 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The full-screen + system-audio capture engine (Story 16.6, FR-68, FR-69,
-// FR-71, AD-37).
+// The full-screen + system-audio capture engine (Story 16.6 → 17.1, FR-68,
+// FR-69, FR-71, AD-37).
 //
 // One `SCStream` over an `SCContentFilter` for a whole display, with
 // `capturesAudio` + `excludeCurrentProcessAudio` (keeper's own notification
-// sounds are absent from the recording), feeding one `AVAssetWriter` writing a
-// **single fragmented MP4** (H.264 video + one AAC system-audio track, ~4 s
+// sounds are absent from the recording), feeding a **rotating chain of
+// `AVAssetWriter`s** (dual-writer gapless rotation, Story 17.1). Each segment
+// is a fragmented MP4 (H.264 video + one AAC system-audio track, ~4 s
 // fragments via `movieFragmentInterval`) so a mid-session kill loses at most
-// the last fragment. A clean stop finishes the writer, which finalizes the
-// file's `moov` — the result is an ordinary playable `.mp4`.
+// the last fragment; a clean `finishWriting` finalizes each segment's `moov`
+// into an ordinary playable `.mp4`.
+//
+// Rotation (Story 17.1): when the current segment's **observed on-disk** size
+// reaches the byte budget — or the duration-cap fallback fires first — the
+// engine starts the next writer at the current complete frame's PTS, hands
+// that frame and everything after it to the new writer, and finalizes the
+// retired writer asynchronously. The `SCStream` itself is never touched: one
+// capture source, PTS host-clock-anchored and continuous across the cut, no
+// dropped frame or audio. Each closed segment is announced as
+// `segmentClosed{index,path,bytes,track:"screen"}` bracketed by
+// `state:"rotating"` / `state:"recording"`; the FINAL segment on a clean stop
+// is closed by `finalized` instead (a `segmentClosed` while the host is
+// Stopping would be an illegal host transition).
 //
 // Threading: every SCStream sample callback (both `.screen` and `.audio`) is
-// delivered on the single serial `mediaQueue`, which also runs the finalize
-// path — writer state is queue-confined, no locks. Progress is reported as
-// NDJSON event lines on stdout (the Story 16.2 contract):
-// `{"event":"state","state":"preflight"|"recording"|"stopping"|"finalized"}`
-// and `{"event":"error","message":"…"}` — the host's parser drops unknown
-// extras, so the `recording` line also carries the output `path`.
+// delivered on the single serial `mediaQueue`, which also runs the rotation
+// and finalize paths — writer state is queue-confined, no locks. Progress is
+// reported as NDJSON event lines on stdout (the Story 16.2 contract):
+// `{"event":"state","state":"preflight"|"recording"|"rotating"|"stopping"|"finalized"}`,
+// `{"event":"segmentClosed",…}`, and `{"event":"error","message":"…"}` — the
+// host's parser drops unknown extras, so event lines may carry a `path`.
 
 import AVFoundation
 import CoreGraphics
@@ -25,37 +38,91 @@ import CoreMedia
 import Foundation
 import ScreenCaptureKit
 
-/// A capture-start failure with a human-readable, non-secret message.
+/// A capture failure with a human-readable, non-secret message.
 struct CaptureError: Error, CustomStringConvertible {
     let message: String
     init(_ message: String) { self.message = message }
     var description: String { message }
 }
 
+/// One segment's writer stack: the `AVAssetWriter`, its inputs, the file it
+/// writes, and its 0-based session index. Created by
+/// `CaptureEngine.makeSegmentWriter` and touched only on `mediaQueue` after
+/// capture is live.
+private final class SegmentWriter {
+    let writer: AVAssetWriter
+    let videoInput: AVAssetWriterInput
+    let audioInput: AVAssetWriterInput?
+    let path: String
+    let index: Int
+
+    init(
+        writer: AVAssetWriter, videoInput: AVAssetWriterInput,
+        audioInput: AVAssetWriterInput?, path: String, index: Int
+    ) {
+        self.writer = writer
+        self.videoInput = videoInput
+        self.audioInput = audioInput
+        self.path = path
+        self.index = index
+    }
+}
+
 /// The single capture session this process can run (one session per sidecar
 /// spawn — AD-34; the host spawns a fresh `keeper-rec` per recording).
 final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
     /// The one serial queue owning all writer state: SCStream delivers both
-    /// output types here, and stop/finalize runs here too.
+    /// output types here, and rotation/stop/finalize run here too.
     private let mediaQueue = DispatchQueue(label: "dev.tgorka.keeper-rec.media")
 
     private var stream: SCStream?
-    private var writer: AVAssetWriter?
-    private var videoInput: AVAssetWriterInput?
-    private var audioInput: AVAssetWriterInput?
+    /// The writer currently receiving samples (segment N). Swapped on rotation.
+    private var current: SegmentWriter?
+    /// The pure rotation trigger (byte budget + duration cap), fixed at start.
+    private var policy = RotationPolicy(
+        segmentMB: RotationPolicy.defaultSegmentMB,
+        maxSegmentSeconds: RotationPolicy.defaultMaxSegmentSeconds)
+    /// Balanced around every writer's `finishWriting`; the clean-stop path
+    /// waits on it so `exit` never abandons a segment mid-`moov`.
+    private let finalizeGroup = DispatchGroup()
+
+    // Writer-construction inputs, seeded once in `beginCapture` and reused for
+    // every rotation target (same display, same tracks, every segment).
+    private var pixelWidth = 2
+    private var pixelHeight = 2
+    private var wantsAudio = false
+
     /// Set on `mediaQueue` when the writer session has been anchored at the
     /// first complete video frame's PTS.
     private var sessionStarted = false
     /// Set on `mediaQueue` when a stop began — later samples are dropped.
     private var stopping = false
+    /// PTS of the current segment's anchor frame — the elapsed-time base for
+    /// the duration-cap fallback. Host-clock timeline, shared by all segments.
+    private var segmentStartPTS = CMTime.invalid
+    /// Whether the current segment has received a video frame yet (feeds the
+    /// policy's `isFirstFrameOfSegment` guard — never rotate a just-opened
+    /// segment, even under a tiny budget).
+    private var segmentHasVideo = false
+    /// True from cut-begin until the retired writer's finalize completion has
+    /// emitted its `segmentClosed` + `recording` pair. No overlapping
+    /// rotations, so the host always sees rotating → segmentClosed → recording
+    /// strictly in order (anything else would be an illegal host transition).
+    private var rotationInFlight = false
+
     /// Whether `start` was called (main-thread only; gates the EOF-as-stop path).
     private(set) var isActive = false
 
     /// Begin capturing `displayId` (or the main display) with system audio to
-    /// `path`. Emits `preflight` immediately, then `recording` (with the path)
+    /// `path`, rotating segments per `segmentMB` / `maxSegmentSeconds` (Story
+    /// 17.1). Emits `preflight` immediately, then `recording` (with the path)
     /// once frames are flowing, or a single honest `error` line on any failure.
-    func start(path: String, displayId: UInt32?, systemAudio: Bool) {
+    func start(
+        path: String, displayId: UInt32?, systemAudio: Bool, segmentMB: Int,
+        maxSegmentSeconds: Int
+    ) {
         isActive = true
+        policy = RotationPolicy(segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds)
         emitEvent(["event": "state", "state": "preflight"])
         Task {
             do {
@@ -89,16 +156,65 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
         }
     }
 
-    /// Build the writer + stream and start capturing. Runs on the Task executor;
-    /// writer state it seeds is only touched again on `mediaQueue`.
+    /// Build segment 0's writer + the stream and start capturing. Runs on the
+    /// Task executor; writer state it seeds is only touched again on
+    /// `mediaQueue`.
     private func beginCapture(display: SCDisplay, path: String, systemAudio: Bool) throws {
+        // Capture at the display's true pixel size (SCDisplay reports points).
+        pixelWidth = max(2, CGDisplayPixelsWide(display.displayID))
+        pixelHeight = max(2, CGDisplayPixelsHigh(display.displayID))
+        wantsAudio = systemAudio
+
+        let first = try makeSegmentWriter(path: path, index: 0)
+
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let config = SCStreamConfiguration()
+        config.width = pixelWidth
+        config.height = pixelHeight
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        config.showsCursor = true
+        config.queueDepth = 8
+        config.pixelFormat = kCVPixelFormatType_32BGRA
+        if systemAudio {
+            // System-audio capture with keeper's own sounds excluded (FR-69).
+            config.capturesAudio = true
+            config.excludesCurrentProcessAudio = true
+            config.sampleRate = 48_000
+            config.channelCount = 2
+        }
+
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: mediaQueue)
+        if systemAudio {
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: mediaQueue)
+        }
+
+        self.current = first
+        self.stream = stream
+
+        stream.startCapture { error in
+            if let error {
+                emitEvent([
+                    "event": "error",
+                    "message": "capture start failed: \(String(describing: error))",
+                ])
+                exit(0)
+            }
+            // Capture is live (FR-68); the extra `path` names the output file
+            // (the host's tolerant parser keeps or drops it freely).
+            emitEvent(["event": "state", "state": "recording", "path": path])
+        }
+    }
+
+    /// Build one segment's writer stack (fragmented MP4, H.264 + optional AAC)
+    /// and start it writing. Called for segment 0 from `beginCapture` and for
+    /// each rotation target on `mediaQueue`. A failure (e.g. a non-writable
+    /// directory) throws — the callers surface it as a single `error` event and
+    /// a clean exit.
+    private func makeSegmentWriter(path: String, index: Int) throws -> SegmentWriter {
         let url = URL(fileURLWithPath: path)
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-
-        // Capture at the display's true pixel size (SCDisplay reports points).
-        let pixelWidth = max(2, CGDisplayPixelsWide(display.displayID))
-        let pixelHeight = max(2, CGDisplayPixelsHigh(display.displayID))
 
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         // Fragmented MP4 (~4 s fragments, AD-37): size is observable live and a
@@ -126,7 +242,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
         writer.add(videoInput)
 
         var audioInput: AVAssetWriterInput?
-        if systemAudio {
+        if wantsAudio {
             let input = AVAssetWriterInput(
                 mediaType: .audio,
                 outputSettings: [
@@ -149,50 +265,107 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
             )
         }
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-        let config = SCStreamConfiguration()
-        config.width = pixelWidth
-        config.height = pixelHeight
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        config.showsCursor = true
-        config.queueDepth = 8
-        config.pixelFormat = kCVPixelFormatType_32BGRA
-        if systemAudio {
-            // System-audio capture with keeper's own sounds excluded (FR-69).
-            config.capturesAudio = true
-            config.excludesCurrentProcessAudio = true
-            config.sampleRate = 48_000
-            config.channelCount = 2
+        return SegmentWriter(
+            writer: writer, videoInput: videoInput, audioInput: audioInput, path: path,
+            index: index)
+    }
+
+    /// The observed **on-disk** size of `path` in bytes (0 when unreadable).
+    /// This — not an in-memory appended-byte tally — feeds the rotation
+    /// trigger: fMP4 buffering makes appended counts run ahead of what a crash
+    /// would actually preserve on disk.
+    private func onDiskBytes(atPath path: String) -> UInt64 {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        return (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+    }
+
+    /// Perform one gapless dual-writer handover at `keyframePTS` (Story 17.1),
+    /// on `mediaQueue`: emit `rotating`, start the next writer anchored at the
+    /// cut frame's PTS (the same host-clock timeline — continuous across the
+    /// cut), append the cut keyframe to it, and finalize the retired writer
+    /// asynchronously. `segmentClosed{index,path,bytes,track}` + `recording`
+    /// follow from the retired writer's finalize completion, so the host sees
+    /// the bracket strictly in order. Any failure surfaces as a single `error`
+    /// line and a clean exit (the sidecar invariant).
+    private func rotate(
+        at keyframePTS: CMTime, keyframe sampleBuffer: CMSampleBuffer, retiring: SegmentWriter
+    ) {
+        rotationInFlight = true
+        emitEvent(["event": "state", "state": "rotating"])
+
+        let next: SegmentWriter
+        do {
+            next = try makeSegmentWriter(
+                path: nextSegmentPath(from: retiring.path), index: retiring.index + 1)
+        } catch {
+            emitEvent([
+                "event": "error",
+                "message": "segment rotation failed: \(String(describing: error))",
+            ])
+            exit(0)
         }
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: self)
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: mediaQueue)
-        if systemAudio {
-            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: mediaQueue)
+        // Hand over: writer B opens at the cut keyframe's PTS and takes this
+        // keyframe and everything after it; A gets nothing more. Audio has no
+        // keyframes — it simply follows `current`, splitting at the same
+        // handover boundary (a boundary sample kept whole on one side is
+        // within the one-frame tolerance; the writer trims pre-session
+        // samples).
+        next.writer.startSession(atSourceTime: keyframePTS)
+        current = next
+        segmentStartPTS = keyframePTS
+        segmentHasVideo = false
+        // The cut keyframe MUST land in writer B, or the new segment would start
+        // on a non-keyframe and be non-self-decodable (breaking the gapless /
+        // independently-playable invariant, AD-37). A freshly `startWriting`+
+        // `startSession`'d real-time input is ready immediately; if it somehow is
+        // not, fail loudly rather than silently produce a corrupt segment.
+        guard next.videoInput.isReadyForMoreMediaData else {
+            emitEvent([
+                "event": "error",
+                "message": "rotation writer was not ready for the cut keyframe",
+            ])
+            exit(0)
         }
+        next.videoInput.append(sampleBuffer)
+        segmentHasVideo = true
 
-        self.writer = writer
-        self.videoInput = videoInput
-        self.audioInput = audioInput
-        self.stream = stream
-
-        stream.startCapture { error in
-            if let error {
-                emitEvent([
-                    "event": "error",
-                    "message": "capture start failed: \(String(describing: error))",
-                ])
-                exit(0)
+        retiring.videoInput.markAsFinished()
+        retiring.audioInput?.markAsFinished()
+        finalizeGroup.enter()
+        retiring.writer.finishWriting { [self] in
+            mediaQueue.async { [self] in
+                guard retiring.writer.status == .completed else {
+                    emitEvent([
+                        "event": "error",
+                        "message":
+                            "segment finalize failed: \(retiring.writer.error.map(String.init(describing:)) ?? "unknown")",
+                    ])
+                    exit(0)
+                }
+                rotationInFlight = false
+                // While stopping, the host is in `Stopping` — a segmentClosed
+                // or `recording` line now would be an illegal transition; the
+                // stop path owns all remaining signalling (`finalized`).
+                if !stopping {
+                    emitEvent([
+                        "event": "segmentClosed",
+                        "index": retiring.index,
+                        "path": retiring.path,
+                        "bytes": onDiskBytes(atPath: retiring.path),
+                        "track": "screen",
+                    ])
+                    emitEvent(["event": "state", "state": "recording", "path": next.path])
+                }
+                finalizeGroup.leave()
             }
-            // Capture is live (FR-68); the extra `path` names the output file
-            // (the host's tolerant parser keeps or drops it freely).
-            emitEvent(["event": "state", "state": "recording", "path": path])
         }
     }
 
-    /// Stop cleanly: emit `stopping`, stop the stream, finish the writer (which
-    /// finalizes the `moov` — an ordinary playable `.mp4`), emit `finalized`,
-    /// and exit. Safe to call once; later samples are dropped via `stopping`.
+    /// Stop cleanly: emit `stopping`, stop the stream, finish the current
+    /// writer (which finalizes its `moov` — an ordinary playable `.mp4`), wait
+    /// for any in-flight retired-writer finalize, emit `finalized`, and exit.
+    /// Safe to call once; later samples are dropped via `stopping`.
     func stop() {
         emitEvent(["event": "state", "state": "stopping"])
         guard let stream else {
@@ -207,27 +380,36 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
         }
     }
 
-    /// Finish the writer on `mediaQueue` and exit. No frames captured → an
-    /// honest error (an empty writer cannot produce a playable file).
+    /// Finish the current writer on `mediaQueue` and exit once every segment's
+    /// finalize has completed. The FINAL segment intentionally emits no
+    /// `segmentClosed` — while the host is Stopping that would be an illegal
+    /// transition; `finalized` is its closure signal (Story 17.1 contract). No
+    /// frames captured → an honest error (an empty writer cannot produce a
+    /// playable file).
     private func finishAndExit() {
-        guard let writer, sessionStarted, writer.status == .writing else {
-            self.writer?.cancelWriting()
+        guard let current, sessionStarted, current.writer.status == .writing else {
+            self.current?.writer.cancelWriting()
             emitEvent([
                 "event": "error",
                 "message": "no frames were captured before stop",
             ])
             exit(0)
         }
-        videoInput?.markAsFinished()
-        audioInput?.markAsFinished()
-        writer.finishWriting {
-            if writer.status == .completed {
+        current.videoInput.markAsFinished()
+        current.audioInput?.markAsFinished()
+        finalizeGroup.enter()
+        current.writer.finishWriting { self.finalizeGroup.leave() }
+        // Wait for the final writer AND any still-running retired-writer
+        // finalize before reporting — `exit` must never abandon a segment
+        // mid-`moov`.
+        finalizeGroup.notify(queue: mediaQueue) {
+            if current.writer.status == .completed {
                 emitEvent(["event": "state", "state": "finalized"])
             } else {
                 emitEvent([
                     "event": "error",
                     "message":
-                        "finalize failed: \(writer.error.map(String.init(describing:)) ?? "unknown")",
+                        "finalize failed: \(current.writer.error.map(String.init(describing:)) ?? "unknown")",
                 ])
             }
             exit(0)
@@ -240,7 +422,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
         _ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
         of type: SCStreamOutputType
     ) {
-        guard sampleBuffer.isValid, !stopping, let writer else { return }
+        guard sampleBuffer.isValid, !stopping, let current else { return }
         switch type {
         case .screen:
             // Only complete frames carry image data (idle/suspended frames do not).
@@ -250,19 +432,40 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
                 let statusRaw = attachments.first?[.status] as? Int,
                 statusRaw == SCFrameStatus.complete.rawValue
             else { return }
+            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             // Anchor the writer session at the first complete video frame's PTS
             // so video and audio share one host-clock timeline (NFR-22 seed).
             if !sessionStarted {
-                writer.startSession(
-                    atSourceTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+                current.writer.startSession(atSourceTime: pts)
                 sessionStarted = true
+                segmentStartPTS = pts
             }
-            if let videoInput, videoInput.isReadyForMoreMediaData {
-                videoInput.append(sampleBuffer)
+            // Rotation decision at every complete frame. SCStream delivers raw
+            // (unencoded) frames, so every complete frame is a valid keyframe
+            // cut point: the next writer's H.264 encoder opens its stream with
+            // an IDR keyframe, making the new segment self-decodable from
+            // sample one — hence `isKeyframe: true` here.
+            if !rotationInFlight {
+                let elapsed = CMTimeSubtract(pts, segmentStartPTS).seconds
+                if policy.shouldRotate(
+                    observedBytes: onDiskBytes(atPath: current.path),
+                    elapsedSeconds: elapsed.isFinite ? elapsed : 0,
+                    isKeyframe: true,
+                    isFirstFrameOfSegment: !segmentHasVideo)
+                {
+                    rotate(at: pts, keyframe: sampleBuffer, retiring: current)
+                    return
+                }
+            }
+            if current.videoInput.isReadyForMoreMediaData {
+                current.videoInput.append(sampleBuffer)
+                segmentHasVideo = true
             }
         case .audio:
             // Audio before the session anchor is dropped (the anchor is video).
-            guard sessionStarted, let audioInput, audioInput.isReadyForMoreMediaData else {
+            guard sessionStarted, let audioInput = current.audioInput,
+                audioInput.isReadyForMoreMediaData
+            else {
                 return
             }
             audioInput.append(sampleBuffer)
@@ -277,7 +480,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         // The OS tore the stream down (display unplugged, session revoked…):
-        // surface honestly and salvage nothing here (recovery is Epic 17).
+        // surface honestly and salvage nothing here (recovery is Story 17.3).
         emitEvent([
             "event": "error",
             "message": "capture stopped: \(String(describing: error))",

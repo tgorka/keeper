@@ -843,6 +843,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_enriched_segment_closed_still_yields_index_only() {
+        // Story 17.1 cross-language seam guard: the sidecar enriches
+        // `segmentClosed` with `path`/`bytes`/`track` for the Story 17.2 ledger;
+        // the shipped parser must keep yielding `SegmentClosed{index}` (extras
+        // dropped) and the state machine must bump its counter unchanged.
+        let line = r#"{"event":"segmentClosed","index":2,"path":"/rec/keeper/screen-0002.mp4","bytes":123,"track":"screen"}"#;
+        assert_eq!(
+            parse_event(line),
+            Some(RecordingEvent::SegmentClosed { index: 2 })
+        );
+        let mut session = RecordingSession::new();
+        session
+            .apply(RecordingEvent::PreflightStarted)
+            .expect("legal transition");
+        session
+            .apply(RecordingEvent::CaptureStarted)
+            .expect("legal transition");
+        let event = parse_event(line).expect("enriched line parses");
+        session
+            .apply(event)
+            .expect("segmentClosed legal while Recording");
+        assert_eq!(session.state(), SessionState::Recording);
+        assert_eq!(session.segments_closed(), 1);
+    }
+
+    #[test]
     fn parse_error_reads_message() {
         assert_eq!(
             parse_event(r#"{"event":"error","message":"boom"}"#),

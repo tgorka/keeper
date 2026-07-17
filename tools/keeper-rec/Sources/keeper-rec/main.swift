@@ -197,9 +197,21 @@ while let line = readLine(strippingNewline: true) {
         }
         let displayId = (params?["displayId"] as? NSNumber)?.uint32Value
         let systemAudio = (params?["systemAudio"] as? Bool) ?? true
+        // Story 17.1: optional segmenting knobs, additive to the v1 protocol
+        // (Story 17.5 later feeds configured values from keeper.db). Missing
+        // fields fall back to the authored defaults; non-positive values are
+        // clamped inside RotationPolicy.
+        let segmentMB =
+            (params?["segmentMB"] as? NSNumber)?.intValue
+            ?? RotationPolicy.defaultSegmentMB
+        let maxSegmentSeconds =
+            (params?["maxSegmentSeconds"] as? NSNumber)?.intValue
+            ?? RotationPolicy.defaultMaxSegmentSeconds
         response = ["id": id, "result": ["starting": true]]
         _ = writeLine(response)
-        captureEngine.start(path: path, displayId: displayId, systemAudio: systemAudio)
+        captureEngine.start(
+            path: path, displayId: displayId, systemAudio: systemAudio,
+            segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds)
         continue
     case "stop":
         // Story 16.6: stop-and-finalize. The engine emits `stopping` /

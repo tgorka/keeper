@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "rec:build": "bash scripts/build-keeper-rec.sh",
+    "rec:test": "bash scripts/test-keeper-rec.sh",
     "tauri:dev": "bun run rec:build && tauri dev --config src-tauri/crates/keeper/tauri.conf.json",
     "tauri:build": "bun run rec:build && tauri build --config src-tauri/crates/keeper/tauri.conf.json",
     "lint": "biome check .",

@@ -1,5 +1,5 @@
 ---
-status: blocked
+status: ready-for-dev
 ---
 
 # BMad Dev Auto Result
