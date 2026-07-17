@@ -1,0 +1,61 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_4052a5630c34d8::t_b7ba8930c90a15 995-999
+src-tauri/crates/keeper-core/src/recording.rs
+  s_4052a5630c34d8::t_aef2d6268c998b 77-81,85-94
+  s_4052a5630c34d8::t_b0556612a8983e 825-827
+  s_4052a5630c34d8::t_81212e5ef30af6 579-584
+  s_4052a5630c34d8::t_6336f1d0b2a6e9 1051
+  s_4052a5630c34d8::t_116ca07fe7cb4f 1896-1899,1926-1936,1968-1971,2050-2053
+  s_4052a5630c34d8::t_4cb00fbdf0942e 768-773
+  s_4052a5630c34d8::t_dd32188c452740 2012,2015-2019,2029-2031
+  s_4052a5630c34d8::t_bc02b5a8c2e5a4 1359
+  s_4052a5630c34d8::t_ccf8f70f614c02 807-811,814-824
+  s_4052a5630c34d8::t_a375deef5d1059 262-280
+  s_4052a5630c34d8::t_d1ea8caf41ae84 24-26
+  s_4052a5630c34d8::t_a3e71a4d8f90e6 1232,1237-1241,1245-1250,1267-1278
+  s_4052a5630c34d8::t_cd88a821bf5951 1785
+  s_4052a5630c34d8::t_4fbd95fc855716 1280
+  s_4052a5630c34d8::t_b8ebd38c5ab6cc 1089,1098
+  s_4052a5630c34d8::t_8f95b0975f5838 1143
+  s_4052a5630c34d8::t_2d5be05d71ff07 564-578,585-767,774-806,812-813,828-906
+  s_4052a5630c34d8::t_adf2e4d40c5b37 1279,1823-1895,1900-1925,1937-1967,1972-2011,2013-2014,2020-2028,2032-2049,2054-2087
+  s_4052a5630c34d8::t_94ad0739fc55d0 1038,1041-1050
+src-tauri/crates/keeper-core/src/error.rs
+  s_4052a5630c34d8::t_e9bc939d50a834 465-473
+src-tauri/crates/keeper/src/ipc.rs
+  s_4052a5630c34d8::t_cb317407b6fc67 3338-3348,3372-3398,3401-3402,3414-3415,3426,3438-3461,3463-3482,3484-3500
+  s_4052a5630c34d8::t_5db0cde5700c21 28-29
+  s_4052a5630c34d8::t_cab2d04163b255 3427-3430
+  s_4052a5630c34d8::t_0d39f7e6aad683 3501-3509
+  s_4052a5630c34d8::t_116ca07fe7cb4f 3403-3406
+_bmad-output/implementation-artifacts/spec-17-2-session-folder-manifest-json-and-segment-ledger.md
+  s_4052a5630c34d8::t_44c21f4ed0c212 111-123
+  s_4052a5630c34d8::t_65842dc276b8ec 7
+  s_4052a5630c34d8::t_96366308f8a3f0 128-129,131,134-135
+  s_4052a5630c34d8::t_1ac15230e29da6 8
+  s_4052a5630c34d8::t_208d6b94b4b9d5 1-4,9-60,62,64-68,74-80,124-127,130,132-133,136-152
+  s_4052a5630c34d8::t_b9f39502a46955 69-73
+  s_4052a5630c34d8::t_1c3c893a3c4ce3 153-182
+  s_4052a5630c34d8::t_980e456bdf34f3 6
+  s_4052a5630c34d8::t_c39950f37e87e9 61,63
+  s_4052a5630c34d8::t_370113eace0e30 81-110
+  s_4052a5630c34d8::t_d18752d6c3230d 5
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_4052a5630c34d8::t_7cf6cc55e42e8c 180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "712fc7a51258a36a95b5da11c9ad7bbaa5fb91dc",
+  "prompts": {},
+  "sessions": {
+    "s_4052a5630c34d8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aefc8971-0c7c-4759-bda7-35908aabc81e",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
