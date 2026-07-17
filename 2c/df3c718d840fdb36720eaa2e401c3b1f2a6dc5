@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-16-4-ndjson-rpc-handshake-getcapabilities-and-listsources.md
+  s_a98f764797c480::t_6d8a98fa3abf3c 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "2cdf3c718d840fdb36720eaa2e401c3b1f2a6dc5",
+  "prompts": {},
+  "sessions": {
+    "s_a98f764797c480": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e91eb276-ec2b-42e9-ae72-75dc04db6fff",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
