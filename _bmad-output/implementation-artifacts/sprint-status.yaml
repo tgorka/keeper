@@ -173,7 +173,7 @@ development_status:
   16-3-recording-capability-flag-and-gated-recording-surface: done
   16-4-ndjson-rpc-handshake-getcapabilities-and-listsources: done
   16-5-screen-recording-permission-pre-flight: done
-  16-6-full-screen-system-audio-capture-to-a-single-fmp4: backlog
+  16-6-full-screen-system-audio-capture-to-a-single-fmp4: done
   epic-16-retrospective: optional
   epic-17: backlog
   17-1-dual-writer-gapless-size-based-rotation-in-keeper-rec: backlog
