@@ -1,0 +1,91 @@
+src/lib/ipc/gen/RecordingPermissionVm.ts
+  s_2f3c75829d12b4::t_c46dbf96172888 1-21
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_2f3c75829d12b4::t_add56c6fab860b 985-989
+src/hooks/use-recording-permission.ts
+  s_2f3c75829d12b4::t_2e71d3d9548a27 49-54,57,60,66,73,76,80-82
+  s_2f3c75829d12b4::t_3016a597a771be 104-106
+  s_2f3c75829d12b4::t_131ad3e289ece6 46
+  s_2f3c75829d12b4::t_4bb766fc6337e2 1-45,47-48,55-56,58-59,61-65,67-72,74-75,77-79,83-103,107-117
+src/lib/ipc/client.ts
+  s_2f3c75829d12b4::t_3701f36596af33 99
+  s_2f3c75829d12b4::t_a31ce4ab978573 90
+  s_2f3c75829d12b4::t_8830d1eb7e692b 1635-1673
+  s_2f3c75829d12b4::t_6f5e4f4174a7e4 141
+tools/keeper-rec/Sources/keeper-rec/main.swift
+  s_2f3c75829d12b4::t_ca1ce078d4f37a 150-158
+src-tauri/crates/keeper-core/src/vm.rs
+  s_2f3c75829d12b4::t_0b9f811e4f358d 2622-2663
+src/lib/ipc/gen/ScreenRecordingAccess.ts
+  s_2f3c75829d12b4::t_c46dbf96172888 1-15
+src/components/layout/recording-pane.tsx
+  s_2f3c75829d12b4::t_7d32d19ba30ce2 25-26
+  s_2f3c75829d12b4::t_2dfbeff5178535 2-3,6-14,21-24,28,34-39,54-55,61-79,86-102
+src-tauri/crates/keeper-core/src/recording.rs
+  s_2f3c75829d12b4::t_0b4b25f2e30e69 905-908,911-920,929-944,949-975
+  s_2f3c75829d12b4::t_b566c814d657aa 1195-1204
+  s_2f3c75829d12b4::t_f39a3e69cd0ea5 294-301
+  s_2f3c75829d12b4::t_40c6f864429b98 525-531
+  s_2f3c75829d12b4::t_a8623cad0e5e6c 921-928,945-948
+  s_2f3c75829d12b4::t_7688b393983f14 414-455
+  s_2f3c75829d12b4::t_e478924221f77d 1309-1312,1323-1324
+  s_2f3c75829d12b4::t_fc846aa76f9eb8 26-28
+  s_2f3c75829d12b4::t_dd1bf8561d6e4f 1325-1326
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_2f3c75829d12b4::t_7ddc3b5404c036 175
+src-tauri/crates/keeper/src/lib.rs
+  s_2f3c75829d12b4::t_05db7659edc435 316-319
+src/hooks/use-recording-permission.test.tsx
+  s_2f3c75829d12b4::t_f3c0582724ae8b 1-9,14-98,100-109,151-186
+  s_2f3c75829d12b4::t_131ad3e289ece6 10-13,99
+  s_2f3c75829d12b4::t_6515dbc4dd48e7 110-150
+src/components/recording/recording-permission-row.test.tsx
+  s_2f3c75829d12b4::t_9c7e254f285b4d 1-10,12-18,24-75
+  s_2f3c75829d12b4::t_131ad3e289ece6 11,19-23
+src-tauri/crates/keeper/Info.plist
+  s_2f3c75829d12b4::t_46e804c4beb52e 1-14
+src/components/layout/recording-pane.test.tsx
+  s_2f3c75829d12b4::t_3024ebebc05ae6 1-133
+src-tauri/crates/keeper/src/recorder.rs
+  s_2f3c75829d12b4::t_4e71de0a9ff49a 423,603-654
+  s_2f3c75829d12b4::t_c32dc118c8d01c 459-464
+  s_2f3c75829d12b4::t_1c0537206af375 594
+  s_2f3c75829d12b4::t_717a0ec6a77ead 279-301
+  s_2f3c75829d12b4::t_3f3d590fe81de9 238-239,241-252
+  s_2f3c75829d12b4::t_50788743c98cf0 32-33
+  s_2f3c75829d12b4::t_893a085dbbaee5 71-110
+  s_2f3c75829d12b4::t_29b489e9f8953f 412,419-422
+  s_2f3c75829d12b4::t_c2e0d076ae7ada 576
+src-tauri/crates/keeper/src/ipc.rs
+  s_2f3c75829d12b4::t_baa330e04613a0 3242-3249
+  s_2f3c75829d12b4::t_715fc9bbc368cf 296-301,313-314
+  s_2f3c75829d12b4::t_39230094ad06a9 43-53
+  s_2f3c75829d12b4::t_9fc0adba5b75f0 27,36-38
+  s_2f3c75829d12b4::t_ec297398d2d8ab 97-108
+  s_2f3c75829d12b4::t_798566c04f4df4 3190-3241,3250-3279
+src/components/recording/recording-permission-row.tsx
+  s_2f3c75829d12b4::t_7cb5670edbb68b 1-94
+_bmad-output/implementation-artifacts/spec-16-5-screen-recording-permission-pre-flight.md
+  s_2f3c75829d12b4::t_d5729afbed8cfd 139-161
+  s_2f3c75829d12b4::t_93b9fa209761ef 6
+  s_2f3c75829d12b4::t_7056f30b905071 118-138
+  s_2f3c75829d12b4::t_eee2d3ac857921 74-86
+  s_2f3c75829d12b4::t_ae62dfd59d9844 1-4,7-73,87-117
+  s_2f3c75829d12b4::t_a49d25ca960299 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "41ea8073ff6b912c3a02dea3f943cfc72e4263b4",
+  "prompts": {},
+  "sessions": {
+    "s_2f3c75829d12b4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5f5a5f48-7099-47d3-8a9b-f566c9945346",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
