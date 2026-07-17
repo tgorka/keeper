@@ -147,6 +147,15 @@ while let line = readLine(strippingNewline: true) {
         response = ["id": id, "result": capabilitiesResult()]
     case "listSources":
         response = ["id": id, "result": sourcesResult()]
+    case "requestScreenRecording":
+        // Story 16.5: ask TCC for Screen Recording access. Returns immediately
+        // with the current grant; where the state is undetermined the OS posts
+        // its one real prompt per app lifetime asynchronously (attributed to
+        // keeper — this sidecar is keeper's own child process, and the usage
+        // string lives in keeper's bundle Info.plist). A prior denial shows no
+        // prompt and reads back false — the host resolves that to its honest
+        // denied-with-fix-path (System Settings deep link).
+        response = ["id": id, "result": ["granted": CGRequestScreenCaptureAccess()]]
     default:
         response = [
             "id": id,

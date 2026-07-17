@@ -87,6 +87,7 @@ export type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
+export type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 export type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 export type { ReplyPreviewVm } from "./gen/ReplyPreviewVm";
 export type { ResolveSupportVm } from "./gen/ResolveSupportVm";
@@ -95,6 +96,7 @@ export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
 export type { SasEmojiVm } from "./gen/SasEmojiVm";
+export type { ScreenRecordingAccess } from "./gen/ScreenRecordingAccess";
 export type { SearchFilterVm } from "./gen/SearchFilterVm";
 export type { SearchHitVm } from "./gen/SearchHitVm";
 export type { SendState } from "./gen/SendState";
@@ -136,6 +138,7 @@ import type { OutboxVm } from "./gen/OutboxVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
+import type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 import type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 import type { ResolveSupportVm } from "./gen/ResolveSupportVm";
 import type { RoomListBatch } from "./gen/RoomListBatch";
@@ -1627,6 +1630,45 @@ export async function notificationPermissionState(): Promise<NotificationPermiss
  */
 export async function iosOpenAppSettings(): Promise<void> {
   await invoke<void>("ios_open_app_settings");
+}
+
+/**
+ * Resolve the live Screen Recording permission pre-flight (Story 16.5, FR-67,
+ * AD-36). The Rust command probes the `keeper-rec` sidecar's non-prompting
+ * preflight (a fresh child process per call — live detection, never a cached
+ * grant, bounded by a shell timeout so a wedged sidecar resolves a clean error)
+ * and lifts it into the honest tri-state {@link RecordingPermissionVm}. Called at
+ * Recording-view render and re-called on focus/return. Rejects with the
+ * {@link IpcError} envelope on a sidecar failure — callers swallow to a safe
+ * default (Start disabled) rather than surfacing a spinner.
+ */
+export async function recordingPermission(): Promise<RecordingPermissionVm> {
+  return await invoke<RecordingPermissionVm>("recording_permission");
+}
+
+/**
+ * Request Screen Recording access (Story 16.5, FR-67, AD-36). The Rust command
+ * marks the session "already requested" flag, runs the sidecar
+ * `requestScreenRecording` round-trip (`CGRequestScreenCaptureAccess` — the OS
+ * posts its one real prompt per app lifetime where allowed; a prior denial shows
+ * no prompt at all), and resolves the re-resolved {@link RecordingPermissionVm}:
+ * granted unlocks Start; not granted resolves denied-with-fix-path so the row
+ * offers the System Settings deep link. Rejects with the {@link IpcError}
+ * envelope on a sidecar failure — callers swallow to a safe default.
+ */
+export async function requestScreenRecordingPermission(): Promise<RecordingPermissionVm> {
+  return await invoke<RecordingPermissionVm>("request_screen_recording_permission");
+}
+
+/**
+ * Open the macOS System Settings pane for Screen Recording (Story 16.5, FR-67) —
+ * the fix path for a denied grant, where re-prompting is impossible. Routes the
+ * `x-apple.systempreferences:…Privacy_ScreenCapture` deep link through the Rust
+ * opener (`Platform::open_url`) so it bypasses the opener JS default scope.
+ * Never re-prompts. Best-effort — callers swallow rejection.
+ */
+export async function openScreenRecordingSettings(): Promise<void> {
+  await invoke<void>("open_screen_recording_settings");
 }
 
 /**

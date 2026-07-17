@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Tauri v2 merges this file into the generated macOS bundle Info.plist (it is
+  colocated with tauri.conf.json). Story 16.5 (AD-36): the Screen Recording TCC
+  usage string shown when keeper (via its keeper-rec child sidecar) requests
+  access. Honest local-only framing — recording adds zero network destinations.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>keeper records your screen only when you start a recording. Everything is saved locally on this Mac. Nothing uploads.</string>
+</dict>
+</plist>

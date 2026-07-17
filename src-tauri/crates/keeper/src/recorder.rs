@@ -29,8 +29,8 @@ use keeper_core::platform::Platform;
 #[cfg(desktop)]
 use keeper_core::recording::{
     capabilities_request, list_sources_request, parse_capabilities_result, parse_event,
-    parse_sources_result, response_id, response_protocol_version, verify_protocol_version,
-    RecordingEvent,
+    parse_request_screen_recording_result, parse_sources_result, request_screen_recording_request,
+    response_id, response_protocol_version, verify_protocol_version, RecordingEvent,
 };
 #[cfg(any(desktop, target_os = "ios"))]
 use keeper_core::vm::{RecordingCapabilitiesVm, RecordingSourcesVm};
@@ -67,6 +67,46 @@ const CAPABILITIES_REQUEST_ID: u64 = 1;
 /// The fixed correlation id for the one-shot `listSources` round-trip.
 #[cfg(desktop)]
 const LIST_SOURCES_REQUEST_ID: u64 = 2;
+
+/// The fixed correlation id for the one-shot `requestScreenRecording` round-trip
+/// (Story 16.5).
+#[cfg(desktop)]
+const REQUEST_SCREEN_RECORDING_REQUEST_ID: u64 = 3;
+
+/// The bound on one permission pre-flight round-trip against the sidecar (Story
+/// 16.5; closes the deferred unbounded-`request_response` spinner risk). The
+/// pre-flight re-runs on every focus/return, so a wedged sidecar must resolve a
+/// clean error rather than pending forever — the exact "spinner waiting on a
+/// grant that will never come" the story exists to prevent. Generous versus the
+/// expected millisecond round-trip (`CGRequestScreenCaptureAccess` returns
+/// immediately; the OS prompt is posted asynchronously), tight enough that the
+/// Recording view recovers promptly.
+#[cfg(desktop)]
+const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bound a pre-flight round-trip future with `timeout` (Story 16.5): on expiry
+/// the future is dropped — `kill_on_drop` reaps the wedged sidecar — and a clean
+/// [`RecordingError::SidecarFailed`](keeper_core::error::RecordingError::SidecarFailed)
+/// names the unanswered method. The timeout lives here in the shell only;
+/// `keeper-core` stays tokio-free.
+#[cfg(desktop)]
+async fn bounded<T>(
+    method: &str,
+    timeout: std::time::Duration,
+    round_trip: impl std::future::Future<Output = Result<T, CoreError>>,
+) -> Result<T, CoreError> {
+    use keeper_core::error::RecordingError;
+
+    match tokio::time::timeout(timeout, round_trip).await {
+        Ok(result) => result,
+        Err(_) => Err(CoreError::Recording(RecordingError::SidecarFailed(
+            format!(
+                "keeper-rec did not answer {method} within {:.1}s",
+                timeout.as_secs_f64()
+            ),
+        ))),
+    }
+}
 
 /// One id-correlated NDJSON-RPC round-trip against the `keeper-rec` sidecar at
 /// `path` (Story 16.4, AD-34): spawn with **stdin piped + stdout piped +
@@ -195,12 +235,21 @@ async fn request_response(
 /// The `getCapabilities` round-trip + protocol-version handshake against the
 /// sidecar at `path` (Story 16.4). Split from the trait method so the fake-
 /// executable harness can drive the real body without a bundled sidecar.
+/// Bounded by `timeout` (Story 16.5) — the trait method passes
+/// [`PREFLIGHT_TIMEOUT`]; tests pass a short bound to exercise the hang path.
 #[cfg(desktop)]
-async fn fetch_capabilities(path: &std::path::Path) -> Result<RecordingCapabilitiesVm, CoreError> {
-    let line = request_response(
-        path,
-        &capabilities_request(CAPABILITIES_REQUEST_ID),
-        CAPABILITIES_REQUEST_ID,
+async fn fetch_capabilities(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<RecordingCapabilitiesVm, CoreError> {
+    let line = bounded(
+        "getCapabilities",
+        timeout,
+        request_response(
+            path,
+            &capabilities_request(CAPABILITIES_REQUEST_ID),
+            CAPABILITIES_REQUEST_ID,
+        ),
     )
     .await?;
     // Verify the protocol version BEFORE validating the full result shape. A real
@@ -225,6 +274,29 @@ async fn fetch_sources(path: &std::path::Path) -> Result<RecordingSourcesVm, Cor
     )
     .await?;
     parse_sources_result(&line).map_err(CoreError::Recording)
+}
+
+/// The `requestScreenRecording` round-trip against the sidecar at `path` (Story
+/// 16.5, AD-36): the sidecar calls `CGRequestScreenCaptureAccess` (TCC attributes
+/// the request to keeper because the sidecar is keeper's own child process) and
+/// answers `{granted}`. Bounded by `timeout` like [`fetch_capabilities`]. Split
+/// from the trait method so the fake-executable harness can drive the real body.
+#[cfg(desktop)]
+async fn fetch_request_screen_recording(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<bool, CoreError> {
+    let line = bounded(
+        "requestScreenRecording",
+        timeout,
+        request_response(
+            path,
+            &request_screen_recording_request(REQUEST_SCREEN_RECORDING_REQUEST_ID),
+            REQUEST_SCREEN_RECORDING_REQUEST_ID,
+        ),
+    )
+    .await?;
+    parse_request_screen_recording_result(&line).map_err(CoreError::Recording)
 }
 
 /// The desktop (macOS) [`Recorder`](keeper_core::recording::Recorder) impl (Story
@@ -337,12 +409,17 @@ impl keeper_core::recording::Recorder for DesktopRecorder {
         // An unresolvable sidecar is the honest not-available path — `Unsupported`
         // verbatim from `sidecar_path`, never a spawn, never a panic.
         let path = self.platform.sidecar_path(KEEPER_REC_SIDECAR_NAME)?;
-        fetch_capabilities(&path).await
+        fetch_capabilities(&path, PREFLIGHT_TIMEOUT).await
     }
 
     async fn list_sources(&self) -> Result<RecordingSourcesVm, CoreError> {
         let path = self.platform.sidecar_path(KEEPER_REC_SIDECAR_NAME)?;
         fetch_sources(&path).await
+    }
+
+    async fn request_screen_recording(&self) -> Result<bool, CoreError> {
+        let path = self.platform.sidecar_path(KEEPER_REC_SIDECAR_NAME)?;
+        fetch_request_screen_recording(&path, PREFLIGHT_TIMEOUT).await
     }
 }
 
@@ -375,6 +452,12 @@ impl keeper_core::recording::Recorder for IosRecorder {
     }
 
     async fn list_sources(&self) -> Result<RecordingSourcesVm, CoreError> {
+        Err(CoreError::Unsupported(
+            "recording is not available on iOS".to_owned(),
+        ))
+    }
+
+    async fn request_screen_recording(&self) -> Result<bool, CoreError> {
         Err(CoreError::Unsupported(
             "recording is not available on iOS".to_owned(),
         ))
@@ -490,7 +573,7 @@ mod tests {
             CANNED_CAPABILITIES.replace("\"protocolVersion\":1", "\"protocolVersion\":2");
         let script = format!("#!/bin/sh\nread line\necho '{mismatched}'\n");
         let sidecar = FakeSidecar::write("version-skew", &script);
-        let err = fetch_capabilities(sidecar.path())
+        let err = fetch_capabilities(sidecar.path(), PREFLIGHT_TIMEOUT)
             .await
             .expect_err("a version skew must be rejected");
         assert!(
@@ -508,12 +591,64 @@ mod tests {
         let future = r#"{"id":1,"result":{"protocolVersion":2,"macos":"16.0.0","capabilities":{"totally":"different"}}}"#;
         let script = format!("#!/bin/sh\nread line\necho '{future}'\n");
         let sidecar = FakeSidecar::write("future-shape", &script);
-        let err = fetch_capabilities(sidecar.path())
+        let err = fetch_capabilities(sidecar.path(), PREFLIGHT_TIMEOUT)
             .await
             .expect_err("a future-version sidecar must be rejected");
         assert!(
             matches!(err, CoreError::Unsupported(_)),
             "a shape-changed future version must be Unsupported, not Protocol; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_request_screen_recording_round_trips_the_fake_sidecar() {
+        // The real `fetch_request_screen_recording` body against a fake sidecar
+        // echoing the id-correlated `{granted}` result — both outcomes.
+        for (granted, expected) in [("true", true), ("false", false)] {
+            let response = format!(r#"{{"id":3,"result":{{"granted":{granted}}}}}"#);
+            let script = format!("#!/bin/sh\nread line\necho '{response}'\n");
+            let sidecar = FakeSidecar::write(&format!("request-{granted}"), &script);
+            let outcome = fetch_request_screen_recording(sidecar.path(), PREFLIGHT_TIMEOUT)
+                .await
+                .expect("requestScreenRecording must round-trip");
+            assert_eq!(outcome, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hung_sidecar_resolves_a_clean_timeout_error_not_a_spinner() {
+        // The spinner guard (Story 16.5): a sidecar that reads the request and then
+        // wedges (sleeps past the bound) must resolve a clean SidecarFailed within
+        // the timeout — never pend forever. `kill_on_drop` reaps the wedged child
+        // when the timed-out round-trip future is dropped. A short test-only bound
+        // keeps the suite fast; the script sleeps well past it.
+        let script = "#!/bin/sh\nread line\nsleep 30\n";
+        let bound = std::time::Duration::from_millis(200);
+
+        let sidecar = FakeSidecar::write("hang-capabilities", script);
+        let err = fetch_capabilities(sidecar.path(), bound)
+            .await
+            .expect_err("a hung getCapabilities must time out");
+        assert!(
+            matches!(
+                &err,
+                CoreError::Recording(keeper_core::error::RecordingError::SidecarFailed(m))
+                    if m.contains("getCapabilities")
+            ),
+            "expected a timeout SidecarFailed naming getCapabilities, got {err:?}"
+        );
+
+        let sidecar = FakeSidecar::write("hang-request", script);
+        let err = fetch_request_screen_recording(sidecar.path(), bound)
+            .await
+            .expect_err("a hung requestScreenRecording must time out");
+        assert!(
+            matches!(
+                &err,
+                CoreError::Recording(keeper_core::error::RecordingError::SidecarFailed(m))
+                    if m.contains("requestScreenRecording")
+            ),
+            "expected a timeout SidecarFailed naming requestScreenRecording, got {err:?}"
         );
     }
 

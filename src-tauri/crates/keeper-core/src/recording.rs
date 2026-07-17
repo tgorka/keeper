@@ -23,7 +23,9 @@
 use std::future::Future;
 
 use crate::error::{CoreError, RecordingError};
-use crate::vm::{RecordingCapabilitiesVm, RecordingSourcesVm, TccPermission};
+use crate::vm::{
+    RecordingCapabilitiesVm, RecordingSourcesVm, ScreenRecordingAccess, TccPermission,
+};
 
 /// The states a screen-recording session walks through (Story 16.2, AD-33).
 ///
@@ -289,6 +291,14 @@ pub fn list_sources_request(id: u64) -> String {
     serde_json::json!({ "id": id, "method": "listSources" }).to_string()
 }
 
+/// Build the one-line `requestScreenRecording` request (Story 16.5, AD-36; no
+/// trailing newline — the shell port owns line framing). Wire shape:
+/// `{"id":<id>,"method":"requestScreenRecording"}`. Additive to the v1 protocol —
+/// keeper and keeper-rec ship in lockstep, so [`PROTOCOL_VERSION`] is unchanged.
+pub fn request_screen_recording_request(id: u64) -> String {
+    serde_json::json!({ "id": id, "method": "requestScreenRecording" }).to_string()
+}
+
 /// Extract the correlation `id` from one sidecar stdout line, or `None` when the
 /// line is not an id-carrying response (an unsolicited event, garbage, a blank —
 /// anything the awaiting reader should skip). Pure and tolerant: never a panic.
@@ -401,6 +411,48 @@ pub fn parse_sources_result(line: &str) -> Result<RecordingSourcesVm, RecordingE
         .map_err(|e| protocol_error(format!("listSources: malformed result: {e}")))
 }
 
+/// Parse the id-correlated `requestScreenRecording` response line (Story 16.5,
+/// AD-36) into the sidecar-reported grant outcome (`result.granted`). `true`
+/// means the OS reports the grant green after the request; `false` means it was
+/// not granted (an explicit denial, a dismissed prompt, or a prior denial where
+/// no prompt is shown at all). A sidecar `error` answer and any malformed /
+/// missing field surface as [`RecordingError::Protocol`] — never a panic.
+pub fn parse_request_screen_recording_result(line: &str) -> Result<bool, RecordingError> {
+    let result = response_result(line, "requestScreenRecording")?;
+    result
+        .as_object()
+        .and_then(|obj| obj.get("granted"))
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| protocol_error("requestScreenRecording: missing/mistyped granted"))
+}
+
+/// Lift the sidecar's two-valued Screen Recording preflight into the honest
+/// tri-state (Story 16.5, FR-67, AD-36) — pure and total, unit-tested without a
+/// Mac.
+///
+/// `preflight` is the sidecar's non-prompting probe (which cannot distinguish an
+/// explicit denial from a never-requested state, so it reports `NotDetermined`
+/// for both); `requested` is the host's *session* "already requested this app
+/// lifetime" flag. Mapping:
+///
+/// - `Granted → Granted` (regardless of the flag),
+/// - `Denied → Denied` (a future preflight that CAN confirm a denial is honored),
+/// - `NotDetermined + not yet requested → NotYetRequested` (the OS prompt is
+///   still available),
+/// - `NotDetermined + already requested → Denied` (the one real prompt per app
+///   lifetime is spent; the fix path is System Settings).
+pub fn resolve_screen_recording_access(
+    preflight: TccPermission,
+    requested: bool,
+) -> ScreenRecordingAccess {
+    match (preflight, requested) {
+        (TccPermission::Granted, _) => ScreenRecordingAccess::Granted,
+        (TccPermission::Denied, _) => ScreenRecordingAccess::Denied,
+        (TccPermission::NotDetermined, false) => ScreenRecordingAccess::NotYetRequested,
+        (TccPermission::NotDetermined, true) => ScreenRecordingAccess::Denied,
+    }
+}
+
 /// Extract just `result.protocolVersion` from a `getCapabilities` response line —
 /// nothing else (Story 16.4, AD-34). The handshake must run *before* the full
 /// result shape is validated: a future sidecar whose result shape changed across a
@@ -470,6 +522,13 @@ pub trait Recorder {
     /// applications / microphones / cameras the sidecar can offer as capture
     /// sources. Same error surface as [`Recorder::get_capabilities`].
     fn list_sources(&self) -> impl Future<Output = Result<RecordingSourcesVm, CoreError>> + Send;
+
+    /// Run the `requestScreenRecording` round-trip (Story 16.5, AD-36): ask the
+    /// sidecar to request Screen Recording access (the OS shows its one real
+    /// prompt where allowed) and resolve the reported grant outcome — `true` when
+    /// the grant is green after the request, `false` otherwise. Same error
+    /// surface as [`Recorder::get_capabilities`].
+    fn request_screen_recording(&self) -> impl Future<Output = Result<bool, CoreError>> + Send;
 }
 
 /// Drive one recording session to its terminal [`SessionState`] (Story 16.2).
@@ -843,8 +902,77 @@ mod tests {
             list_sources_request(2),
             r#"{"id":2,"method":"listSources"}"#
         );
+        assert_eq!(
+            request_screen_recording_request(3),
+            r#"{"id":3,"method":"requestScreenRecording"}"#
+        );
         // No line framing inside the request — the shell port owns the newline.
         assert!(!capabilities_request(7).contains('\n'));
+        assert!(!request_screen_recording_request(7).contains('\n'));
+    }
+
+    // --- Screen Recording pre-flight (Story 16.5) ----------------------------
+
+    #[test]
+    fn resolve_screen_recording_access_covers_every_branch() {
+        use ScreenRecordingAccess as A;
+        use TccPermission as P;
+        // Granted wins regardless of the session flag.
+        assert_eq!(
+            resolve_screen_recording_access(P::Granted, false),
+            A::Granted
+        );
+        assert_eq!(
+            resolve_screen_recording_access(P::Granted, true),
+            A::Granted
+        );
+        // An (already-confirmed) denial is a denial regardless of the flag.
+        assert_eq!(resolve_screen_recording_access(P::Denied, false), A::Denied);
+        assert_eq!(resolve_screen_recording_access(P::Denied, true), A::Denied);
+        // Undetermined: the flag decides — prompt still available vs spent.
+        assert_eq!(
+            resolve_screen_recording_access(P::NotDetermined, false),
+            A::NotYetRequested
+        );
+        assert_eq!(
+            resolve_screen_recording_access(P::NotDetermined, true),
+            A::Denied
+        );
+    }
+
+    #[test]
+    fn parse_request_screen_recording_result_reads_granted() {
+        assert!(
+            parse_request_screen_recording_result(r#"{"id":3,"result":{"granted":true}}"#)
+                .expect("granted true")
+        );
+        assert!(
+            !parse_request_screen_recording_result(r#"{"id":3,"result":{"granted":false}}"#)
+                .expect("granted false")
+        );
+    }
+
+    #[test]
+    fn parse_request_screen_recording_result_surfaces_protocol_faults() {
+        // Non-JSON, missing result, sidecar error answer, missing/mistyped
+        // `granted` — all surface RecordingError::Protocol, never a panic.
+        let cases = [
+            "not json",
+            r#"{"id":3}"#,
+            r#"{"id":3,"error":{"code":"unknownMethod","message":"nope"}}"#,
+            r#"{"id":3,"result":{}}"#,
+            r#"{"id":3,"result":{"granted":"yes"}}"#,
+            r#"{"id":3,"result":"granted"}"#,
+        ];
+        for line in cases {
+            assert!(
+                matches!(
+                    parse_request_screen_recording_result(line),
+                    Err(RecordingError::Protocol(_))
+                ),
+                "line {line:?} must surface a Protocol error"
+            );
+        }
     }
 
     #[test]
@@ -1064,6 +1192,16 @@ mod tests {
             }
             Ok(canned_sources())
         }
+
+        async fn request_screen_recording(&self) -> Result<bool, CoreError> {
+            if !self.available {
+                return Err(CoreError::Unsupported(
+                    "keeper-rec is not available".to_owned(),
+                ));
+            }
+            // Canned grant — the fake port answers the wire, it never fakes TCC.
+            Ok(true)
+        }
     }
 
     fn state_collector() -> (
@@ -1168,6 +1306,10 @@ mod tests {
         assert_eq!(capabilities, canned_capabilities());
         let sources = recorder.list_sources().await.expect("canned VM");
         assert_eq!(sources, canned_sources());
+        assert!(recorder
+            .request_screen_recording()
+            .await
+            .expect("canned grant outcome"));
 
         let unavailable = FakeRecorder::new(false, vec![]);
         assert!(matches!(
@@ -1176,6 +1318,10 @@ mod tests {
         ));
         assert!(matches!(
             unavailable.list_sources().await,
+            Err(CoreError::Unsupported(_))
+        ));
+        assert!(matches!(
+            unavailable.request_screen_recording().await,
             Err(CoreError::Unsupported(_))
         ));
     }

@@ -24,6 +24,7 @@ use keeper_core::error::{
 };
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
+use keeper_core::recording::{resolve_screen_recording_access, Recorder};
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
@@ -32,11 +33,23 @@ use keeper_core::vm::{
     ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError,
     IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
     NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
-    PaletteResultsVm, PingVm, Provider, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
-    SearchFilterVm, SearchHitVm, SpacesSnapshot, TimelineBatch, TypingBatch, VerificationFlowVm,
+    PaletteResultsVm, PingVm, Provider, RecordingPermissionVm, RemoteDraftVm, ResolveSupportVm,
+    RoomListBatch, ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot,
+    TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
+
+/// The build-target [`Recorder`] impl behind the recording IPC commands (Story
+/// 16.5). The `Recorder` trait is not object-safe (its async methods are RPITIT),
+/// so the concrete type is selected at compile time per target rather than held
+/// as a trait object: the desktop recorder spawns `keeper-rec` per round-trip;
+/// the iOS one honestly answers [`CoreError::Unsupported`] (the frontend never
+/// calls these commands there — the `recording` capability is `false`).
+#[cfg(desktop)]
+type PlatformRecorder = crate::recorder::DesktopRecorder;
+#[cfg(target_os = "ios")]
+type PlatformRecorder = crate::recorder::IosRecorder;
 
 /// Tauri-managed application state holding the injected platform port and the
 /// single-account supervisor.
@@ -81,6 +94,18 @@ pub struct AppState {
     /// never message/room data. Survives a jettisoned web-content process because it
     /// lives here in Rust; a true app kill starts fresh (`None` ⇒ cold launch ⇒ Inbox).
     pub nav_state: Mutex<Option<NavState>>,
+    /// The `keeper-rec` sidecar port behind the recording pre-flight commands
+    /// (Story 16.5). Compile-time-selected per target (see [`PlatformRecorder`]);
+    /// every round-trip spawns a fresh child sidecar so TCC attributes the
+    /// request to keeper (AD-36) — a persistent session is 16.6's concern.
+    pub recorder: Arc<PlatformRecorder>,
+    /// Whether Screen Recording has been requested this app lifetime (Story
+    /// 16.5). The OS shows its one real prompt per app lifetime, so this session
+    /// flag is what lifts the two-valued preflight into the honest tri-state
+    /// (`notDetermined` + already-requested ⇒ denied-with-fix-path). Deliberately
+    /// never persisted — a fresh session must never cache a denial (or a grant)
+    /// optimistically.
+    pub recording_permission_requested: AtomicBool,
 }
 
 /// Lock an optional-slot mutex, recovering a poisoned lock instead of propagating —
@@ -268,6 +293,12 @@ impl AppState {
             tracing::error!(error = %e, "could not resolve data dir; archive falls back to temp");
             std::env::temp_dir().join("dev.tgorka.keeper")
         });
+        // The recorder shares the platform port (for sidecar resolution) on
+        // desktop; iOS is the honest Unsupported impl (see `PlatformRecorder`).
+        #[cfg(desktop)]
+        let recorder = Arc::new(crate::recorder::DesktopRecorder::new(platform.clone()));
+        #[cfg(target_os = "ios")]
+        let recorder = Arc::new(crate::recorder::IosRecorder);
         Self {
             // The manager flags the `data_dir` root as backup-excluded through the
             // platform port (Story 14.7, FR-65) — best-effort, never startup-fatal.
@@ -279,6 +310,8 @@ impl AppState {
             bbctl_runs: Arc::new(BbctlRunRegistry::default()),
             paused_at: Mutex::new(None),
             nav_state: Mutex::new(None),
+            recorder,
+            recording_permission_requested: AtomicBool::new(false),
         }
     }
 }
@@ -3151,6 +3184,96 @@ pub fn ios_open_app_settings(state: State<'_, AppState>) -> Result<(), IpcError>
     state
         .platform
         .open_url(IOS_APP_SETTINGS_URL)
+        .map_err(to_ipc_error)
+}
+
+/// Project a resolved Screen Recording tri-state into the [`RecordingPermissionVm`]
+/// the Recording view renders (Story 16.5, FR-67). `can_start` is `true` only when
+/// the grant is green — Screen Recording is the sole required permission this epic.
+fn recording_permission_vm(access: ScreenRecordingAccess) -> RecordingPermissionVm {
+    RecordingPermissionVm {
+        screen_recording: access,
+        can_start: access == ScreenRecordingAccess::Granted,
+    }
+}
+
+/// Resolve the live Screen Recording permission pre-flight (Story 16.5, FR-67,
+/// AD-36). Runs the sidecar `getCapabilities` probe (a fresh child `keeper-rec`
+/// per call — live detection, never a cached grant; bounded by the shell's
+/// pre-flight timeout so a wedged sidecar resolves a clean error) and lifts the
+/// two-valued preflight into the honest tri-state with the session
+/// "already requested" flag via the pure core resolver. Called at Recording-view
+/// render and re-called on every focus/return. Failures (sidecar unavailable /
+/// hung / iOS) funnel through [`to_ipc_error`]; the frontend swallows them to a
+/// safe default (Start disabled) — never a crash, never an infinite spinner.
+#[tauri::command]
+pub async fn recording_permission(
+    state: State<'_, AppState>,
+) -> Result<RecordingPermissionVm, IpcError> {
+    let capabilities = state
+        .recorder
+        .get_capabilities()
+        .await
+        .map_err(to_ipc_error)?;
+    let requested = state.recording_permission_requested.load(Ordering::Relaxed);
+    Ok(recording_permission_vm(resolve_screen_recording_access(
+        capabilities.screen_recording,
+        requested,
+    )))
+}
+
+/// Request Screen Recording access through the sidecar (Story 16.5, FR-67,
+/// AD-36): sets the session "already requested" flag, runs the
+/// `requestScreenRecording` round-trip (`CGRequestScreenCaptureAccess` in the
+/// child sidecar, so TCC shows keeper's own usage string and the OS posts its one
+/// real prompt per app lifetime where allowed), and re-resolves the tri-state
+/// from the reported outcome: granted ⇒ Start unlocks; not granted (a prior
+/// denial shows no prompt at all) ⇒ denied-with-fix-path, and the row offers the
+/// System Settings deep link. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub async fn request_screen_recording_permission(
+    state: State<'_, AppState>,
+) -> Result<RecordingPermissionVm, IpcError> {
+    let granted = state
+        .recorder
+        .request_screen_recording()
+        .await
+        .map_err(to_ipc_error)?;
+    // Latch the session "already requested" flag only after the round-trip actually
+    // reached the sidecar (Ok ⇒ `CGRequestScreenCaptureAccess` ran, so the one real
+    // OS prompt was posted/spent). If the round-trip errors (sidecar unavailable /
+    // hung), no prompt was shown — leaving the flag clear keeps a later probe honest
+    // as "not yet requested" rather than a spurious denied-with-fix-path.
+    state
+        .recording_permission_requested
+        .store(true, Ordering::Relaxed);
+    // Re-resolve through the same pure mapping the fetch path uses. The request
+    // outcome IS the live OS answer: granted reads back as a green preflight;
+    // not-granted stays two-valued undetermined, which the now-set session flag
+    // resolves to the honest denied-with-fix-path.
+    let preflight = if granted {
+        TccPermission::Granted
+    } else {
+        TccPermission::NotDetermined
+    };
+    Ok(recording_permission_vm(resolve_screen_recording_access(
+        preflight, true,
+    )))
+}
+
+/// Open the macOS System Settings pane for Screen Recording (Story 16.5, FR-67)
+/// — the fix path for a denied grant, where re-prompting is impossible. Mirrors
+/// [`ios_open_app_settings`]: the deep link goes through the Rust opener
+/// (`Platform::open_url`) so it bypasses the opener JS default scope. Never
+/// re-prompts. Failures funnel through [`to_ipc_error`] but the caller treats
+/// this best-effort (swallows rejection).
+#[tauri::command]
+pub fn open_screen_recording_settings(state: State<'_, AppState>) -> Result<(), IpcError> {
+    const SCREEN_RECORDING_SETTINGS_URL: &str =
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+    state
+        .platform
+        .open_url(SCREEN_RECORDING_SETTINGS_URL)
         .map_err(to_ipc_error)
 }
 

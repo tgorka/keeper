@@ -2619,6 +2619,48 @@ pub struct RecordingSourcesVm {
     pub cameras: Vec<RecordingDeviceVm>,
 }
 
+/// The honest Screen Recording tri-state the permission pre-flight resolves
+/// (Story 16.5, Epic 16, FR-67, AD-36).
+///
+/// The sidecar's non-prompting preflight is two-valued ([`TccPermission`]:
+/// `Granted` vs `NotDetermined`) — it cannot tell an explicit denial from a
+/// never-requested state. `keeper_core::recording::resolve_screen_recording_access`
+/// lifts it into this tri-state with a host *session* "already requested this app
+/// lifetime" flag (one real OS prompt per app lifetime; the flag never persists
+/// across sessions, so a grant is never cached optimistically). Serializes to
+/// `"granted" | "notYetRequested" | "denied"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ScreenRecordingAccess {
+    /// The permission is granted — capture can start.
+    Granted,
+    /// The permission has never been requested this app lifetime — the OS prompt
+    /// is still available (`CGRequestScreenCaptureAccess` will show it).
+    NotYetRequested,
+    /// The permission is not granted and a prompt will not help (an explicit
+    /// denial, or a request already spent this session) — the fix path is the
+    /// System Settings deep link.
+    Denied,
+}
+
+/// The screen-recording permission pre-flight result the Recording view renders
+/// (Story 16.5, FR-67, AD-36).
+///
+/// Live-detected through the `Recorder` port on every fetch (render and
+/// focus/return re-detection) — never cached. `can_start` is the single Start
+/// gate: `true` only when every required permission (Screen Recording alone in
+/// this epic) is granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingPermissionVm {
+    /// The resolved Screen Recording tri-state.
+    pub screen_recording: ScreenRecordingAccess,
+    /// Whether Start may be enabled (`true` only when the grant is green).
+    pub can_start: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
