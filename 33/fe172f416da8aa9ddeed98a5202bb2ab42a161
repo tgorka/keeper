@@ -1,0 +1,73 @@
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_4b014b5c6dc810::t_7f9bafc154882b 188
+src/hooks/use-recording-session.ts
+  s_4b014b5c6dc810::t_b02c2f50e136fb 38-42
+src/components/layout/recording-pane.tsx
+  s_4b014b5c6dc810::t_43c655da58bea2 80-83
+  s_4b014b5c6dc810::t_2c4e329427e20f 21
+  s_4b014b5c6dc810::t_477657c3fa76f9 110-121
+src/components/recording/active-recording-banner.tsx
+  s_4b014b5c6dc810::t_da738e76665f92 28,68,99
+  s_4b014b5c6dc810::t_4d0fbf92c357fa 1-27,29-67,69-98,100-110,116-130
+  s_4b014b5c6dc810::t_28ffec09408e06 111-115
+src-tauri/crates/keeper/src/ipc.rs
+  s_4b014b5c6dc810::t_13ca353566303a 3616-3624,3640
+  s_4b014b5c6dc810::t_d81ad4a6c582a7 3589-3591
+  s_4b014b5c6dc810::t_f41335f13fbaef 28-30
+  s_4b014b5c6dc810::t_b27783d786423b 3444-3449
+  s_4b014b5c6dc810::t_2820cdfd565562 3625-3628
+  s_4b014b5c6dc810::t_9154e120a97fc4 3629-3639,3641
+  s_4b014b5c6dc810::t_d2d3a465f503fe 137-142
+src/lib/ipc/gen/RecordingStatusVm.ts
+  s_4b014b5c6dc810::t_e3df9e2e0680b5 46-48,50,55,57
+  s_4b014b5c6dc810::t_ec1960f8f20767 39-45,49,51-54,56,58-65
+src-tauri/crates/keeper-core/src/vm.rs
+  s_4b014b5c6dc810::t_425da1d6179bce 2742-2746,2751-2754,2757-2763
+  s_4b014b5c6dc810::t_5d31726766b82b 2825-2836
+  s_4b014b5c6dc810::t_4da8198bd48437 2775-2777
+  s_4b014b5c6dc810::t_c2165e98fd0318 2747-2750,2755-2756
+src/lib/recording-format.ts
+  s_4b014b5c6dc810::t_61f544011076d9 38-41,44
+  s_4b014b5c6dc810::t_207a5de8f40d6a 13-15
+  s_4b014b5c6dc810::t_23aca8ee629ec4 1-12,16-37,42-43,45
+src-tauri/crates/keeper/src/tray.rs
+  s_4b014b5c6dc810::t_6e8d9a366460a4 481-483
+  s_4b014b5c6dc810::t_d349b05dcbc870 484-488
+src-tauri/crates/keeper-core/src/recording.rs
+  s_4b014b5c6dc810::t_e6e968e5fe6b73 1020-1069
+  s_4b014b5c6dc810::t_1eb1aada23682c 2399-2411,2417-2456
+  s_4b014b5c6dc810::t_d349b05dcbc870 2412-2416
+_bmad-output/implementation-artifacts/spec-18-3-in-app-active-recording-banner-and-segment-meter.md
+  s_4b014b5c6dc810::t_0394bebc96e372 1-4,8-80,90-116
+  s_4b014b5c6dc810::t_8398960b318b8b 81-89
+  s_4b014b5c6dc810::t_d9a56cc88983cd 117-154
+  s_4b014b5c6dc810::t_876cbac6df4080 6
+  s_4b014b5c6dc810::t_76db4a4a352b9c 5
+  s_4b014b5c6dc810::t_adcfb654421679 7
+src/components/layout/recording-pane.test.tsx
+  s_4b014b5c6dc810::t_2ed6dc2c60eed1 193,201-203,205
+  s_4b014b5c6dc810::t_1c3fa6d2614fb3 55-57,66-68
+src/components/recording/active-recording-banner.test.tsx
+  s_4b014b5c6dc810::t_eea0e17eb85c63 93-104
+  s_4b014b5c6dc810::t_c0e2047120aadf 1-63,65-92,105-151,157-164
+  s_4b014b5c6dc810::t_da738e76665f92 64,152-156
+src/lib/recording-format.test.ts
+  s_4b014b5c6dc810::t_c46a875629c64d 33-35
+  s_4b014b5c6dc810::t_cba13298247273 1-32,36-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "33fe172f416da8aa9ddeed98a5202bb2ab42a161",
+  "prompts": {},
+  "sessions": {
+    "s_4b014b5c6dc810": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "195c36fa-f38c-49d9-be89-a21eaccf3e67",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
