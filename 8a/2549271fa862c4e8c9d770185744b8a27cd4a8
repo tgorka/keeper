@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-18-1-tray-recording-state-elapsed-segment-size-stop-open-folder.md
+  s_127eba1253a329::t_d594e6c5a69da6 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "8a2549271fa862c4e8c9d770185744b8a27cd4a8",
+  "prompts": {},
+  "sessions": {
+    "s_127eba1253a329": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d114e4eb-ac6f-472a-88e7-d20673a54957",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
