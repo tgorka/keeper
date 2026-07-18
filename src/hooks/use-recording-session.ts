@@ -35,6 +35,11 @@ export const IDLE_RECORDING_STATUS: RecordingStatusVm = Object.freeze({
   startedAtEpochMs: null,
   outputPath: null,
   error: null,
+  // Read-time byte figures + session-captured cap (Story 18.3): zero with no
+  // session; the enriched Rust snapshot fills them while one is live.
+  onDiskBytes: 0,
+  currentSegmentBytes: 0,
+  segmentCapMb: 0,
 });
 
 /** Whether a snapshot represents a live (pollable, stoppable) session. */

@@ -1017,6 +1017,56 @@ pub fn session_bytes_on_disk(folder: &Path) -> u64 {
     total
 }
 
+/// The on-disk length of this session's **current** (open) segment — the
+/// highest-index `screen-####.mp4` file in `folder` (Story 18.3) — the numerator
+/// behind the in-app segment meter.
+///
+/// Applies the exact ownership rule of [`session_bytes_on_disk`]
+/// ([`SEGMENT_STEM_PREFIX`] plus a trailing numeric run), so a stray `*.mp4`, a
+/// future `camera-####.mp4`, `manifest.json`, and directories are ignored.
+/// Whereas [`session_bytes_on_disk`] sums *all* segments (the total size line),
+/// this returns only the length of the highest-index one — the segment capture
+/// is actively writing — so the figure naturally falls back toward ~0 at each
+/// gapless rotation as a fresh segment file starts. Best-effort and total: a
+/// missing/unreadable folder, no matching segment, or an unreadable entry
+/// contributes 0, never an error, never a panic.
+pub fn current_segment_bytes_on_disk(folder: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return 0;
+    };
+    let mut current: Option<(u32, u64)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_mp4 = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
+        if !is_mp4 {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !stem.starts_with(SEGMENT_STEM_PREFIX) {
+            continue;
+        }
+        let Some(index) = segment_index_from_stem(stem) else {
+            continue;
+        };
+        // `fs::metadata` (follows symlinks) — the real file's current length.
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        if current.is_none_or(|(highest, _)| index >= highest) {
+            current = Some((index, metadata.len()));
+        }
+    }
+    current.map_or(0, |(_, bytes)| bytes)
+}
+
 /// The screen-recording sidecar port (Story 16.2, AD-24, AD-27) — sits beside
 /// [`crate::platform::Platform`].
 ///
@@ -2343,6 +2393,64 @@ mod tests {
         assert_eq!(session_bytes_on_disk(&folder), 10);
         std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 25]).expect("more bytes flushed");
         assert_eq!(session_bytes_on_disk(&folder), 25);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    // --- current-segment bytes (Story 18.3) ---------------------------------
+
+    #[test]
+    fn current_segment_bytes_is_zero_for_no_segments() {
+        // Missing folder, then an empty one, then one holding only foreign files
+        // — every case yields 0 (no `screen-####.mp4` to measure).
+        let folder = fresh_temp_dir("current-none");
+        assert_eq!(
+            current_segment_bytes_on_disk(&folder),
+            0,
+            "missing folder is 0"
+        );
+        std::fs::create_dir_all(&folder).expect("session folder");
+        assert_eq!(
+            current_segment_bytes_on_disk(&folder),
+            0,
+            "empty folder is 0"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn current_segment_bytes_reports_a_single_growing_segment() {
+        let folder = fresh_temp_dir("current-growing");
+        std::fs::create_dir_all(&folder).expect("session folder");
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 123]).expect("segment 0");
+        assert_eq!(current_segment_bytes_on_disk(&folder), 123);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn current_segment_bytes_reads_the_highest_index_after_rotation() {
+        // Post-rotation: a full `screen-0000.mp4` plus a fresh `screen-0001.mp4`
+        // — the meter tracks the highest index (the open segment), not the total.
+        let folder = fresh_temp_dir("current-rotated");
+        std::fs::create_dir_all(&folder).expect("session folder");
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 500]).expect("closed segment");
+        std::fs::write(folder.join("screen-0001.mp4"), vec![0u8; 40]).expect("open segment");
+        assert_eq!(current_segment_bytes_on_disk(&folder), 40);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn current_segment_bytes_ignores_foreign_files() {
+        // Same ownership rule as `session_bytes_on_disk`: only `screen-####.mp4`
+        // is measured; a `camera-####.mp4` (higher trailing run), a `manifest.json`,
+        // a no-run `.mp4`, and a directory masquerading as a segment are ignored.
+        let folder = fresh_temp_dir("current-foreign");
+        std::fs::create_dir_all(&folder).expect("session folder");
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 77]).expect("real segment");
+        std::fs::write(folder.join("camera-0009.mp4"), vec![0u8; 40]).expect("foreign track");
+        std::fs::write(folder.join("manifest.json"), b"{}").expect("manifest");
+        std::fs::write(folder.join("notes.mp4"), vec![0u8; 50]).expect("no numeric run");
+        std::fs::create_dir(folder.join("screen-0009.mp4")).expect("dir masquerading as segment");
+        assert_eq!(current_segment_bytes_on_disk(&folder), 77);
         let _ = std::fs::remove_dir_all(&folder);
     }
 

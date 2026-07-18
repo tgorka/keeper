@@ -2739,6 +2739,28 @@ pub struct RecordingStatusVm {
     pub output_path: Option<String>,
     /// The honest failure message when `state == failed`.
     pub error: Option<String>,
+    /// Total on-disk bytes of this session's `screen-####.mp4` segments (Story
+    /// 18.3) — the banner's and tray's `size` line. **Read-time**, not
+    /// driver-maintained: `recording_snapshot` fills it best-effort from disk
+    /// each read (0 when there is no session/folder, so the *stored* snapshot
+    /// the driver keeps carries 0).
+    ///
+    /// Emitted as `number` (like `started_at_epoch_ms`): a byte count sits far
+    /// inside `Number.MAX_SAFE_INTEGER`, and the banner does plain numeric math.
+    #[ts(type = "number")]
+    pub on_disk_bytes: u64,
+    /// On-disk bytes of the **current** (highest-index, open) segment (Story
+    /// 18.3) — the segment meter's numerator, which falls back toward ~0 at each
+    /// gapless rotation. Read-time (see [`Self::on_disk_bytes`]); 0 with no
+    /// session/segment. Emitted as `number` (see [`Self::on_disk_bytes`]).
+    #[ts(type = "number")]
+    pub current_segment_bytes: u64,
+    /// The **session-captured** segment-size cap in decimal MB (Story 18.3) —
+    /// the meter's denominator, read from settings once at `recording_start` and
+    /// carried on the live run. Session-captured (never re-read from the mutable
+    /// settings store, so a mid-session cap edit cannot skew a running meter); 0
+    /// when there is no session.
+    pub segment_cap_mb: u32,
 }
 
 impl RecordingStatusVm {
@@ -2750,6 +2772,9 @@ impl RecordingStatusVm {
             started_at_epoch_ms: None,
             output_path: None,
             error: None,
+            on_disk_bytes: 0,
+            current_segment_bytes: 0,
+            segment_cap_mb: 0,
         }
     }
 }
@@ -2795,6 +2820,18 @@ mod tests {
                 "is_terminal({state:?})"
             );
         }
+    }
+
+    /// Story 18.3: the idle snapshot carries zeroed byte/cap fields — the
+    /// stored/default snapshot never invents size or a cap (those are read-time /
+    /// session-captured, filled only when a session exists).
+    #[test]
+    fn recording_status_idle_zeroes_bytes_and_cap() {
+        let idle = RecordingStatusVm::idle();
+        assert_eq!(idle.state, RecordingUiState::Idle);
+        assert_eq!(idle.on_disk_bytes, 0);
+        assert_eq!(idle.current_segment_bytes, 0);
+        assert_eq!(idle.segment_cap_mb, 0);
     }
 
     #[test]

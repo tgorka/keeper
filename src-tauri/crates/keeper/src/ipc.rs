@@ -25,9 +25,9 @@ use keeper_core::error::{
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::recording::{
-    resolve_screen_recording_access, session_folder_name, CaptureTarget, ManifestStatus, Recorder,
-    RecordingEvent, RecordingSession, SegmentEntry, SessionDevices, SessionManifest, SessionParams,
-    SessionState,
+    current_segment_bytes_on_disk, resolve_screen_recording_access, session_bytes_on_disk,
+    session_folder_name, CaptureTarget, ManifestStatus, Recorder, RecordingEvent, RecordingSession,
+    SegmentEntry, SessionDevices, SessionManifest, SessionParams, SessionState,
 };
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
@@ -134,6 +134,12 @@ pub struct RecordingRun {
     /// only force-kill lever (the child is a local inside `run_session`).
     /// `None` after [`finalize_recording_for_quit`] took it.
     driver: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// The segment-size cap (decimal MB) captured from the segmentation settings
+    /// at `recording_start` (Story 18.3) — the segment meter's denominator,
+    /// surfaced as `RecordingStatusVm::segment_cap_mb` by [`recording_snapshot`].
+    /// Session-captured so a mid-session settings edit (which applies to the next
+    /// session) never skews a running meter.
+    segment_cap_mb: u32,
 }
 
 /// Lock an optional-slot mutex, recovering a poisoned lock instead of propagating —
@@ -3435,6 +3441,12 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
         // The session is a folder now (Story 17.2) — the VM points at it.
         output_path: Some(folder.to_string_lossy().into_owned()),
         error: None,
+        // Byte figures are read-time (filled by `recording_snapshot`) and the
+        // cap is surfaced from the run (Story 18.3) — the stored snapshot the
+        // driver keeps carries zeros, never inventing size or a cap here.
+        on_disk_bytes: 0,
+        current_segment_bytes: 0,
+        segment_cap_mb: 0,
     }));
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -3574,6 +3586,9 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
         stop_tx: Some(stop_tx),
         status,
         driver: Some(driver),
+        // The meter denominator, captured from this session's settings read
+        // (Story 18.3) — never re-read from the mutable store while live.
+        segment_cap_mb: segment_mb,
     });
     Ok(snapshot)
 }
@@ -3598,11 +3613,32 @@ pub(crate) fn stop_active_recording(state: &AppState) {
 /// and the tray's ~1 Hz tick render from. No session yet this app lifetime ⇒
 /// the honest idle snapshot.
 pub(crate) fn recording_snapshot(state: &AppState) -> RecordingStatusVm {
-    let guard = slot_lock(&state.recording_run);
-    guard
-        .as_ref()
-        .map(|run| status_lock(&run.status).clone())
-        .unwrap_or_else(RecordingStatusVm::idle)
+    // Clone the driver-kept snapshot and capture the session cap under the slot
+    // lock, then RELEASE it before the best-effort disk I/O below (Story 18.3) —
+    // never hold the `recording_run` slot across blocking `read_dir`/`stat`
+    // syscalls, so a slow/unreadable volume can't stall `stop`/`start`/quit.
+    let (mut snapshot, segment_cap_mb) = {
+        let guard = slot_lock(&state.recording_run);
+        let Some(run) = guard.as_ref() else {
+            return RecordingStatusVm::idle();
+        };
+        // Bind the clone first so the transient `status` MutexGuard drops before
+        // `guard` (both released here, before the disk I/O below).
+        let snapshot = status_lock(&run.status).clone();
+        (snapshot, run.segment_cap_mb)
+    };
+    // Enrich the driver-kept snapshot with the read-time byte figures and the
+    // session-captured cap (Story 18.3), so the tray and the in-app banner render
+    // byte-identical size/segment/meter figures from this one shared read. The
+    // driver never maintains these on the stored snapshot; they are filled here
+    // best-effort — a missing/unreadable folder simply yields 0 (never an error).
+    if let Some(folder) = snapshot.output_path.as_deref() {
+        let folder = Path::new(folder);
+        snapshot.on_disk_bytes = session_bytes_on_disk(folder);
+        snapshot.current_segment_bytes = current_segment_bytes_on_disk(folder);
+    }
+    snapshot.segment_cap_mb = segment_cap_mb;
+    snapshot
 }
 
 /// How long a confirmed quit waits for the live recording session to reach a

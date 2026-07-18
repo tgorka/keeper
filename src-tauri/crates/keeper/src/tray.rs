@@ -28,11 +28,9 @@
 //! *mode/flag*. Every step here is best-effort: a tray build failure is logged at `warn`
 //! and the app keeps running (the tray is a convenience, never load-bearing).
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use keeper_core::recording::session_bytes_on_disk;
 use keeper_core::vm::{RecordingStatusVm, RecordingUiState};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder};
@@ -480,12 +478,14 @@ fn status_line(snapshot: &RecordingStatusVm) -> String {
         return "Starting…".to_owned();
     };
     let elapsed_secs = crate::ipc::epoch_ms_now().saturating_sub(started_ms) / 1000;
-    let bytes = snapshot
-        .output_path
-        .as_deref()
-        .map(|path| session_bytes_on_disk(Path::new(path)))
-        .unwrap_or(0);
-    format_status_line(elapsed_secs, snapshot.segments_closed, bytes)
+    // The size figure now rides the shared enriched snapshot (Story 18.3):
+    // `recording_snapshot` sums the session's segments once, so the tray and the
+    // in-app banner render the identical byte figure — no second on-disk read.
+    format_status_line(
+        elapsed_secs,
+        snapshot.segments_closed,
+        snapshot.on_disk_bytes,
+    )
 }
 
 /// Format an elapsed duration as `mm:ss` below one hour (minutes unpadded,

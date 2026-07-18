@@ -185,7 +185,7 @@ development_status:
   epic-18: in-progress
   18-1-tray-recording-state-elapsed-segment-size-stop-open-folder: done
   18-2-forced-tray-presence-and-honest-quit-while-recording: done
-  18-3-in-app-active-recording-banner-and-segment-meter: backlog
+  18-3-in-app-active-recording-banner-and-segment-meter: done
   18-4-loud-failure-triad-tray-error-notification-banner: backlog
   18-5-disk-space-guard-warn-and-graceful-stop-and-finalize: backlog
   epic-18-retrospective: optional

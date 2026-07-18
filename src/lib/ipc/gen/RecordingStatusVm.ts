@@ -36,4 +36,30 @@ outputPath: string | null,
 /**
  * The honest failure message when `state == failed`.
  */
-error: string | null, };
+error: string | null, 
+/**
+ * Total on-disk bytes of this session's `screen-####.mp4` segments (Story
+ * 18.3) — the banner's and tray's `size` line. **Read-time**, not
+ * driver-maintained: `recording_snapshot` fills it best-effort from disk
+ * each read (0 when there is no session/folder, so the *stored* snapshot
+ * the driver keeps carries 0).
+ *
+ * Emitted as `number` (like `started_at_epoch_ms`): a byte count sits far
+ * inside `Number.MAX_SAFE_INTEGER`, and the banner does plain numeric math.
+ */
+onDiskBytes: number, 
+/**
+ * On-disk bytes of the **current** (highest-index, open) segment (Story
+ * 18.3) — the segment meter's numerator, which falls back toward ~0 at each
+ * gapless rotation. Read-time (see [`Self::on_disk_bytes`]); 0 with no
+ * session/segment. Emitted as `number` (see [`Self::on_disk_bytes`]).
+ */
+currentSegmentBytes: number, 
+/**
+ * The **session-captured** segment-size cap in decimal MB (Story 18.3) —
+ * the meter's denominator, read from settings once at `recording_start` and
+ * carried on the live run. Session-captured (never re-read from the mutable
+ * settings store, so a mid-session cap edit cannot skew a running meter); 0
+ * when there is no session.
+ */
+segmentCapMb: number, };

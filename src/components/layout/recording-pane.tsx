@@ -18,6 +18,7 @@
  * UX-DR29 — centers its content at content-max-width (`mx-auto w-full
  * max-w-[720px]`, the conversation-pane realization) rather than going full-bleed.
  */
+import { ActiveRecordingBanner } from "@/components/recording/active-recording-banner";
 import {
   RecordingPermissionRow,
   SCREEN_RECORDING_PERMISSION_NAME,
@@ -76,28 +77,10 @@ export function RecordingPane() {
           <p className="text-muted-foreground text-sm">{RECORDING_SUBTITLE}</p>
         </div>
         <div className="flex shrink-0 flex-col items-end gap-1">
-          {live ? (
-            <div className="flex items-center gap-3">
-              {/* The live record dot + ticking mono elapsed line (UX-DR30). */}
-              <span className="flex items-center gap-2" role="status" aria-label="Recording active">
-                <span
-                  aria-hidden="true"
-                  className="size-2.5 animate-pulse rounded-full bg-recording-red"
-                />
-                <span className="font-mono text-sm tabular-nums">{elapsed ?? "0:00"}</span>
-              </span>
-              <Button
-                type="button"
-                variant="destructive"
-                disabled={status.state === "stopping"}
-                onClick={() => {
-                  void stop();
-                }}
-              >
-                {status.state === "stopping" ? "Stopping…" : STOP_RECORDING_LABEL}
-              </Button>
-            </div>
-          ) : (
+          {/* The live record dot / ticking elapsed / Stop cluster now lives in
+              the pinned banner below the header (Story 18.3) — the header keeps
+              only the idle Start affordance and the terminal notes. */}
+          {!live && (
             <Button
               type="button"
               disabled={!permission.canStart}
@@ -123,6 +106,18 @@ export function RecordingPane() {
           )}
         </div>
       </header>
+
+      {/* The in-app active-recording banner + segment meter (Story 18.3):
+          pinned between the header and the scrolling body, persistent while
+          live, and a pure renderer of the enriched Rust snapshot. It renders
+          `null` on any terminal/idle state. */}
+      <ActiveRecordingBanner
+        status={status}
+        elapsed={elapsed}
+        onStop={() => {
+          void stop();
+        }}
+      />
 
       <ScrollArea className="min-h-0 flex-1">
         {/* Centered single column at content-max-width (UX-DR29), not a full-bleed

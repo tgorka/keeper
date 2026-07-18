@@ -52,6 +52,9 @@ const IDLE_STATUS: RecordingStatusVm = {
   startedAtEpochMs: null,
   outputPath: null,
   error: null,
+  onDiskBytes: 0,
+  currentSegmentBytes: 0,
+  segmentCapMb: 0,
 };
 
 const RECORDING_STATUS: RecordingStatusVm = {
@@ -60,6 +63,9 @@ const RECORDING_STATUS: RecordingStatusVm = {
   startedAtEpochMs: 1_700_000_000_000,
   outputPath: "/Users/alice/Movies/keeper/keeper-rec test.mp4",
   error: null,
+  onDiskBytes: 412_000_000,
+  currentSegmentBytes: 100_000_000,
+  segmentCapMb: 500,
 };
 
 const GRANTED: RecordingPermissionVm = { screenRecording: "granted", canStart: true };
@@ -184,7 +190,7 @@ describe("RecordingPane", () => {
 
   // --- Live session (Story 16.6) ------------------------------------------
 
-  it("Start flips the header into the live-session UI (red dot + Stop)", async () => {
+  it("Start mounts the pinned active-recording banner (Recording + Stop)", async () => {
     mockFetch.mockResolvedValue(GRANTED);
     render(<RecordingPane />);
 
@@ -192,8 +198,11 @@ describe("RecordingPane", () => {
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
 
-    expect(await screen.findByRole("status", { name: "Recording active" })).toBeInTheDocument();
+    // The live dot/elapsed/Stop cluster now lives in the banner (Story 18.3),
+    // not the header — the Start affordance is gone while live.
+    expect(await screen.findByText("Recording")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: STOP_RECORDING_LABEL })).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Segment size" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: START_RECORDING_LABEL })).not.toBeInTheDocument();
     expect(mockStart).toHaveBeenCalledTimes(1);
   });
