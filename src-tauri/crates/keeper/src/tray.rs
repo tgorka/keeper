@@ -1,4 +1,5 @@
-//! Opt-in menu-bar (tray) presence (Story 10.3, FR-53).
+//! Opt-in menu-bar (tray) presence (Story 10.3, FR-53) + the live recording
+//! state (Story 18.1, AD-33..39).
 //!
 //! When enabled, keeper shows a macOS menu-bar item that keeps the app reachable while
 //! the window is hidden: "Show keeper" raises + focuses the main window, "Quit" exits the
@@ -6,15 +7,30 @@
 //! shell creates or destroys the tray icon live off the Settings toggle and rebuilds it at
 //! startup when the persisted setting is on.
 //!
+//! While a screen-recording session is live (Story 18.1), the same single tray
+//! flips to a `recording` rendering: a record-dot icon, a ~1 Hz-refreshed
+//! disabled status line (`Recording — 12:34 · segment 3, 412 MB`), and **Stop
+//! Recording** / **Open Recordings Folder** items ahead of Show/Quit. The tray
+//! is a pure renderer of the Rust-owned [`RecordingStatusVm`] snapshot (driven
+//! by the tick in `lib.rs`); on any terminal or idle state it restores the idle
+//! icon + menu. macOS's own purple recording pill is system-owned and never
+//! touched — the tray only adds what the pill lacks. Forcing the tray visible
+//! while the opt-in toggle is off is Story 18.2's concern: no tray ⇒ the tick
+//! is a silent no-op.
+//!
 //! Tray glue is a shell/OS concern (AD-24) — `keeper-core` only owns the persisted
 //! *mode/flag*. Every step here is best-effort: a tray build failure is logged at `warn`
 //! and the app keeps running (the tray is a convenience, never load-bearing).
 
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use tauri::menu::{MenuBuilder, MenuItemBuilder};
-use tauri::tray::{TrayIcon, TrayIconBuilder};
-use tauri::{AppHandle, Manager};
+use keeper_core::recording::session_bytes_on_disk;
+use keeper_core::vm::{RecordingStatusVm, RecordingUiState};
+use tauri::image::Image;
+use tauri::menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder};
+use tauri::tray::{TrayIcon, TrayIconBuilder, TrayIconId};
+use tauri::{AppHandle, Manager, Wry};
 
 /// The label of the main window (matches `tauri.conf.json` / the default capability).
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -23,15 +39,47 @@ const MAIN_WINDOW_LABEL: &str = "main";
 const SHOW_ID: &str = "tray-show";
 /// The menu item id for "Quit".
 const QUIT_ID: &str = "tray-quit";
+/// The menu item id for "Stop Recording" (Story 18.1).
+const STOP_ID: &str = "tray-stop-recording";
+/// The menu item id for "Open Recordings Folder" (Story 18.1).
+const OPEN_FOLDER_ID: &str = "tray-open-recordings-folder";
+/// The menu item id for the disabled elapsed/segment/size line (Story 18.1).
+const STATUS_ID: &str = "tray-recording-status";
 
-/// The live tray icon handle, if the tray is currently present. Held so
-/// [`set_tray_presence`] can destroy it when the user toggles menu-bar presence off.
-/// `None` means no tray is shown (the default). Guarded by a `Mutex` since the toggle
-/// command and startup both touch it.
-static TRAY: OnceLock<Mutex<Option<TrayIcon>>> = OnceLock::new();
+/// The bundled record-dot menu-bar icon shown while a recording is live (Story
+/// 18.1). Decoded per transition via [`Image::from_bytes`] (the `image-png`
+/// tauri feature) — a decode failure just keeps the current icon.
+const RECORDING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-recording.png");
 
-fn tray_slot() -> &'static Mutex<Option<TrayIcon>> {
+/// The live tray, if menu-bar presence is currently on. `None` means no tray is
+/// shown (the default). Guarded by a `Mutex` since the Settings toggle command,
+/// startup, and the ~1 Hz recording tick all touch it.
+struct TrayState {
+    /// The tray icon handle; dropping it removes the menu-bar item.
+    icon: TrayIcon,
+    /// The disabled elapsed/segment/size line while the recording menu is
+    /// installed (`None` in the idle Show/Quit menu — this doubles as the
+    /// rendered-mode flag). Held so each tick refreshes the text via
+    /// `set_text` — no menu rebuild, no flicker, an open menu stays open; the
+    /// whole menu is swapped only on an idle↔recording transition.
+    status_item: Option<MenuItem<Wry>>,
+}
+
+/// The single tray slot (see [`TrayState`]).
+static TRAY: OnceLock<Mutex<Option<TrayState>>> = OnceLock::new();
+
+fn tray_slot() -> &'static Mutex<Option<TrayState>> {
     TRAY.get_or_init(|| Mutex::new(None))
+}
+
+/// Lock the tray slot, recovering a poisoned lock — the slot holds plain
+/// handles with no invariant a mid-write panic could break, and a tray concern
+/// must never panic the app.
+fn tray_guard() -> MutexGuard<'static, Option<TrayState>> {
+    match tray_slot().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// Raise and focus the main window (the tray "Show keeper" action + a re-summon path).
@@ -54,37 +102,99 @@ pub fn show_main_window(app: &AppHandle) {
     }
 }
 
-/// Build and install the tray icon with a "Show keeper" + "Quit" menu (Story 10.3).
-/// Reuses the app's default window icon so no extra asset is bundled. Best-effort — on a
-/// menu/tray build failure it logs at `warn` and leaves no tray (the app keeps running).
-fn build_tray(app: &AppHandle) -> Option<TrayIcon> {
-    let show = match MenuItemBuilder::with_id(SHOW_ID, "Show keeper").build(app) {
-        Ok(item) => item,
-        Err(error) => {
-            tracing::warn!(%error, "tray: could not build 'Show keeper' item");
-            return None;
-        }
+/// Fire the graceful recording stop from the tray (Story 18.1): the identical
+/// idempotent one-shot trigger the `recording_stop` command fires — the current
+/// segment finalizes and the session reaches its terminal state.
+fn stop_recording(app: &AppHandle) {
+    let state = app.state::<crate::ipc::AppState>();
+    crate::ipc::stop_active_recording(&state);
+}
+
+/// Reveal the current session folder (`output_path`) in the OS file manager
+/// (Story 18.1), via the same opener plugin as the export "Reveal in Finder".
+/// Best-effort: no session folder or a reveal failure is logged, never a panic.
+fn open_recordings_folder(app: &AppHandle) {
+    let state = app.state::<crate::ipc::AppState>();
+    let snapshot = crate::ipc::recording_snapshot(&state);
+    let Some(path) = snapshot.output_path else {
+        tracing::warn!("tray: no recording session folder to open");
+        return;
     };
-    let quit = match MenuItemBuilder::with_id(QUIT_ID, "Quit").build(app) {
-        Ok(item) => item,
+    if let Err(error) = tauri_plugin_opener::reveal_item_in_dir(&path) {
+        tracing::warn!(%error, "tray: could not reveal the recordings folder");
+    }
+}
+
+/// Build one tray menu item, logging the failed label and returning `None` on a
+/// build failure (the caller then leaves the tray/menu unchanged).
+fn menu_item(app: &AppHandle, id: &str, label: &str, enabled: bool) -> Option<MenuItem<Wry>> {
+    match MenuItemBuilder::with_id(id, label)
+        .enabled(enabled)
+        .build(app)
+    {
+        Ok(item) => Some(item),
         Err(error) => {
-            tracing::warn!(%error, "tray: could not build 'Quit' item");
-            return None;
+            tracing::warn!(%error, label, "tray: could not build menu item");
+            None
         }
-    };
-    let menu = match MenuBuilder::new(app).items(&[&show, &quit]).build() {
-        Ok(menu) => menu,
+    }
+}
+
+/// Build the idle tray menu: "Show keeper" + "Quit" (Story 10.3).
+fn build_idle_menu(app: &AppHandle) -> Option<Menu<Wry>> {
+    let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
+    let quit = menu_item(app, QUIT_ID, "Quit", true)?;
+    match MenuBuilder::new(app).items(&[&show, &quit]).build() {
+        Ok(menu) => Some(menu),
         Err(error) => {
             tracing::warn!(%error, "tray: could not build tray menu");
-            return None;
+            None
         }
-    };
+    }
+}
+
+/// Build the recording tray menu (Story 18.1): the disabled status `line`, then
+/// Stop Recording + Open Recordings Folder, then the idle Show/Quit pair.
+/// Returns the menu together with the held status item so the ~1 Hz tick can
+/// refresh the line via `set_text`.
+fn build_recording_menu(app: &AppHandle, line: &str) -> Option<(Menu<Wry>, MenuItem<Wry>)> {
+    let status = menu_item(app, STATUS_ID, line, false)?;
+    let stop = menu_item(app, STOP_ID, "Stop Recording", true)?;
+    let open = menu_item(app, OPEN_FOLDER_ID, "Open Recordings Folder", true)?;
+    let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
+    let quit = menu_item(app, QUIT_ID, "Quit", true)?;
+    let menu = MenuBuilder::new(app)
+        .item(&status)
+        .separator()
+        .items(&[&stop, &open])
+        .separator()
+        .items(&[&show, &quit])
+        .build();
+    match menu {
+        Ok(menu) => Some((menu, status)),
+        Err(error) => {
+            tracing::warn!(%error, "tray: could not build recording tray menu");
+            None
+        }
+    }
+}
+
+/// Build and install the tray icon with the idle "Show keeper" + "Quit" menu
+/// (Story 10.3). Reuses the app's default window icon so the idle state needs no
+/// extra asset. The single `on_menu_event` handler covers the recording items
+/// too (Story 18.1) — it is registered on the tray, not a menu, so it survives
+/// every `set_menu` swap. Best-effort — on a menu/tray build failure it logs at
+/// `warn` and leaves no tray (the app keeps running).
+fn build_tray(app: &AppHandle) -> Option<TrayIcon> {
+    let menu = build_idle_menu(app)?;
     let mut builder = TrayIconBuilder::new()
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id().as_ref() {
             SHOW_ID => show_main_window(app),
             QUIT_ID => app.exit(0),
+            STOP_ID => stop_recording(app),
+            OPEN_FOLDER_ID => open_recordings_folder(app),
             _ => {}
         });
     // Reuse the bundled default window icon so the tray needs no separate asset.
@@ -102,18 +212,219 @@ fn build_tray(app: &AppHandle) -> Option<TrayIcon> {
 
 /// Create or destroy the tray icon to match `enabled` (Story 10.3). Idempotent: enabling
 /// when a tray already exists rebuilds it; disabling when none exists is a no-op. Called
-/// from the Settings command and at startup for the persisted setting.
+/// from the Settings command and at startup for the persisted setting. A rebuild lands in
+/// the idle rendering; a live recording re-applies its state on the next ~1 Hz tick.
 pub fn set_tray_presence(app: &AppHandle, enabled: bool) {
-    let slot = tray_slot();
-    let mut guard = match slot.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let tray = if enabled { build_tray(app) } else { None };
+    let mut guard = tray_guard();
     if enabled {
         // Replace any existing tray so a re-enable never leaks a second icon.
-        *guard = build_tray(app);
+        *guard = tray.map(|icon| TrayState {
+            icon,
+            status_item: None,
+        });
     } else {
         // Dropping the handle removes the tray icon.
         *guard = None;
+    }
+}
+
+/// Render the tray from the authoritative recording snapshot (Story 18.1) — the
+/// ~1 Hz tick in `lib.rs` calls this every second. No tray present (opt-in
+/// toggle off) ⇒ a silent no-op (forcing presence is Story 18.2). On a live
+/// state the icon/menu swap fires only on the idle→recording transition while
+/// the disabled line refreshes every tick; on idle/terminal the idle tray is
+/// restored once. Best-effort throughout.
+///
+/// Lock discipline (deadlock-critical): every `TrayIcon`/`MenuItem` call below
+/// blocks on an internal main-thread dispatch, and [`set_tray_presence`] — which
+/// can run *on* the main thread (startup, a sync command) — takes the same tray
+/// lock. So the guard is never held across those calls: handles are cloned out,
+/// mutations run lock-free, and the new status item is stored back under a fresh
+/// lock, checked against the tray id in case the slot was rebuilt meanwhile.
+pub fn apply_recording_state(app: &AppHandle, snapshot: &RecordingStatusVm) {
+    let (tray, status_item) = {
+        let guard = tray_guard();
+        match guard.as_ref() {
+            Some(state) => (state.icon.clone(), state.status_item.clone()),
+            None => return,
+        }
+    };
+    let live = matches!(
+        snapshot.state,
+        RecordingUiState::Preflight
+            | RecordingUiState::Recording
+            | RecordingUiState::Rotating
+            | RecordingUiState::Stopping
+    );
+    if live {
+        let line = status_line(snapshot);
+        if let Some(item) = status_item {
+            // Already in the recording rendering — refresh only the line.
+            if let Err(error) = item.set_text(&line) {
+                tracing::warn!(%error, "tray: could not refresh the recording status line");
+            }
+            return;
+        }
+        // idle → recording transition: record-dot icon + recording menu.
+        match Image::from_bytes(RECORDING_ICON_PNG) {
+            Ok(icon) => {
+                if let Err(error) = tray.set_icon(Some(icon)) {
+                    tracing::warn!(%error, "tray: could not set the record-dot icon");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "tray: could not decode the record-dot icon"),
+        }
+        // A menu build/install failure leaves `status_item` unset, so the next
+        // tick simply retries the transition.
+        let Some((menu, status)) = build_recording_menu(app, &line) else {
+            return;
+        };
+        if let Err(error) = tray.set_menu(Some(menu)) {
+            tracing::warn!(%error, "tray: could not install the recording menu");
+            return;
+        }
+        store_status_item(tray.id(), Some(status));
+    } else if status_item.is_some() {
+        // recording → idle/terminal transition: restore the idle menu FIRST, and
+        // only clear the rendered-mode flag once it is actually installed. A
+        // menu build/install failure returns with the flag still set and the
+        // recording menu still on screen, so the next tick retries the teardown
+        // — never clears the flag while the Stop/Open menu is still installed
+        // (which would strand it for the app lifetime, since a terminal state
+        // with no `status_item` re-enters neither branch).
+        let Some(menu) = build_idle_menu(app) else {
+            return;
+        };
+        if let Err(error) = tray.set_menu(Some(menu)) {
+            tracing::warn!(%error, "tray: could not restore the idle menu");
+            return;
+        }
+        // The icon is cosmetic — a failure here does not desync the flag/menu.
+        if let Err(error) = tray.set_icon(app.default_window_icon().cloned()) {
+            tracing::warn!(%error, "tray: could not restore the idle icon");
+        }
+        store_status_item(tray.id(), None);
+    }
+}
+
+/// Store the recording status-line item (or clear it) back into the tray slot —
+/// unless the slot was rebuilt (toggle off→on) while the menu was installed
+/// lock-free, in which case the fresh tray's own state wins.
+fn store_status_item(tray_id: &TrayIconId, item: Option<MenuItem<Wry>>) {
+    let mut guard = tray_guard();
+    if let Some(state) = guard.as_mut() {
+        if state.icon.id() == tray_id {
+            state.status_item = item;
+        }
+    }
+}
+
+/// Compose this tick's status line from the authoritative snapshot (Story 18.1):
+/// elapsed from the host-reported start instant (clamped to 0 against clock
+/// skew), segment index = closed + 1, size summed live from the session folder
+/// on disk (the same file-ownership rule as the terminal manifest reconcile).
+/// Pre-capture — `preflight`, or no start instant yet — honestly reads
+/// "Starting…", never a panic.
+fn status_line(snapshot: &RecordingStatusVm) -> String {
+    let started_ms = match snapshot.state {
+        RecordingUiState::Recording | RecordingUiState::Rotating | RecordingUiState::Stopping => {
+            snapshot.started_at_epoch_ms
+        }
+        _ => None,
+    };
+    let Some(started_ms) = started_ms else {
+        return "Starting…".to_owned();
+    };
+    let elapsed_secs = crate::ipc::epoch_ms_now().saturating_sub(started_ms) / 1000;
+    let bytes = snapshot
+        .output_path
+        .as_deref()
+        .map(|path| session_bytes_on_disk(Path::new(path)))
+        .unwrap_or(0);
+    format_status_line(elapsed_secs, snapshot.segments_closed, bytes)
+}
+
+/// Format an elapsed duration as `mm:ss` below one hour (minutes unpadded,
+/// seconds zero-padded) and `h:mm:ss` from one hour up: 754 → `12:34`,
+/// 3723 → `1:02:03`. Pure.
+fn format_elapsed(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// Format a byte count in whole decimal MB (`10^6`, matching the `segment_mb`
+/// convention), rolling to one-decimal GB at ≥ 1000 MB: 412_800_000 → `412 MB`,
+/// 1_290_000_000 → `1.2 GB`. Truncates (never rounds up), so the figure never
+/// overstates what has reached disk. Pure, integer-only.
+fn format_size(bytes: u64) -> String {
+    let mb = bytes / 1_000_000;
+    if mb >= 1000 {
+        // Whole tenths of a GB: 1_290_000_000 → 12 tenths → "1.2 GB".
+        let tenths = bytes / 100_000_000;
+        format!("{}.{} GB", tenths / 10, tenths % 10)
+    } else {
+        format!("{mb} MB")
+    }
+}
+
+/// Compose the disabled tray status line (Story 18.1): the shown segment index
+/// is `segments_closed + 1` (the segment currently being written). Pure:
+/// `(754, 2, 412_000_000)` → `Recording — 12:34 · segment 3, 412 MB`.
+fn format_status_line(elapsed_secs: u64, segments_closed: u32, bytes: u64) -> String {
+    format!(
+        "Recording — {} · segment {}, {}",
+        format_elapsed(elapsed_secs),
+        segments_closed.saturating_add(1),
+        format_size(bytes)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_elapsed_pads_seconds_and_rolls_to_hours() {
+        assert_eq!(format_elapsed(0), "0:00");
+        assert_eq!(format_elapsed(59), "0:59");
+        assert_eq!(format_elapsed(754), "12:34");
+        assert_eq!(format_elapsed(3600), "1:00:00");
+        assert_eq!(format_elapsed(3723), "1:02:03");
+    }
+
+    #[test]
+    fn format_size_truncates_decimal_mb_and_rolls_to_gb_at_1000() {
+        assert_eq!(format_size(0), "0 MB");
+        assert_eq!(format_size(412_800_000), "412 MB");
+        assert_eq!(format_size(999_999_999), "999 MB");
+        assert_eq!(format_size(1_000_000_000), "1.0 GB");
+        assert_eq!(format_size(1_290_000_000), "1.2 GB");
+    }
+
+    #[test]
+    fn format_status_line_composes_elapsed_segment_and_size() {
+        // Live, 2 segments closed (⇒ writing segment 3), 754 s elapsed, 412 MB.
+        assert_eq!(
+            format_status_line(754, 2, 412_000_000),
+            "Recording — 12:34 · segment 3, 412 MB"
+        );
+    }
+
+    #[test]
+    fn status_line_reads_starting_before_capture() {
+        // Preflight, and a (theoretical) live state without a start instant,
+        // both render the honest pre-capture line — never a panic.
+        let mut snapshot = RecordingStatusVm::idle();
+        snapshot.state = RecordingUiState::Preflight;
+        assert_eq!(status_line(&snapshot), "Starting…");
+        snapshot.state = RecordingUiState::Recording;
+        assert_eq!(status_line(&snapshot), "Starting…");
     }
 }

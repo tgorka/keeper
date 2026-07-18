@@ -182,8 +182,8 @@ development_status:
   17-4-automated-gapless-concat-test-nfr-22: done
   17-5-segment-size-and-duration-cap-settings: done
   epic-17-retrospective: optional
-  epic-18: backlog
-  18-1-tray-recording-state-elapsed-segment-size-stop-open-folder: backlog
+  epic-18: in-progress
+  18-1-tray-recording-state-elapsed-segment-size-stop-open-folder: done
   18-2-forced-tray-presence-and-honest-quit-while-recording: backlog
   18-3-in-app-active-recording-banner-and-segment-meter: backlog
   18-4-loud-failure-triad-tray-error-notification-banner: backlog

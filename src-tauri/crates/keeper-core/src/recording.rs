@@ -973,6 +973,50 @@ pub fn segment_index_from_stem(stem: &str) -> Option<u32> {
     stem[run_start..].parse().ok()
 }
 
+/// Sum the on-disk byte sizes of this session's own `screen-####.mp4` segment
+/// files in `folder` (Story 18.1) — the live figure behind the tray's
+/// elapsed/segment/size line.
+///
+/// Applies the exact ownership rule of [`SessionManifest::reconcile_from_dir`]
+/// ([`SEGMENT_STEM_PREFIX`] plus a trailing numeric run), so the growing tray
+/// figure always matches what the eventual terminal manifest will report: a
+/// stray `*.mp4` (a user drop, a future `camera-####.mp4`), `manifest.json`,
+/// and directories never count. Best-effort and total — a missing/unreadable
+/// folder or entry contributes 0, never an error, never a panic (the figure is
+/// a convenience readout, not a ledger).
+pub fn session_bytes_on_disk(folder: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_mp4 = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
+        if !is_mp4 {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !stem.starts_with(SEGMENT_STEM_PREFIX) || segment_index_from_stem(stem).is_none() {
+            continue;
+        }
+        // `fs::metadata` (follows symlinks) — the real file's current length; a
+        // mid-write segment simply reports what has reached disk so far.
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        total = total.saturating_add(metadata.len());
+    }
+    total
+}
+
 /// The screen-recording sidecar port (Story 16.2, AD-24, AD-27) — sits beside
 /// [`crate::platform::Platform`].
 ///
@@ -2259,6 +2303,46 @@ mod tests {
             "only screen-####.mp4 segments enter the ledger, sorted by (index, file); \
              wrong-prefix / no-run / non-mp4 / directory entries are skipped"
         );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    // --- live session bytes (Story 18.1) ------------------------------------
+
+    #[test]
+    fn session_bytes_sums_this_sessions_segments_only() {
+        let folder = fresh_temp_dir("bytes");
+        std::fs::create_dir_all(&folder).expect("session folder");
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("segment 0");
+        std::fs::write(folder.join("screen-0001.mp4"), vec![0u8; 20]).expect("segment 1");
+        // Foreign files that must NOT count (same ownership rule as reconcile):
+        std::fs::write(folder.join("manifest.json"), b"{}").expect("manifest");
+        std::fs::write(folder.join("camera-0000.mp4"), vec![0u8; 40]).expect("future track prefix");
+        std::fs::write(folder.join("notes.mp4"), vec![0u8; 50]).expect("no numeric run");
+        std::fs::create_dir(folder.join("screen-0009.mp4")).expect("dir masquerading as segment");
+        assert_eq!(session_bytes_on_disk(&folder), 30);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn session_bytes_is_zero_for_a_missing_or_empty_folder() {
+        // `fresh_temp_dir` returns a path that does NOT exist yet.
+        let folder = fresh_temp_dir("bytes-missing");
+        assert_eq!(session_bytes_on_disk(&folder), 0, "missing folder is 0");
+        std::fs::create_dir_all(&folder).expect("empty session folder");
+        assert_eq!(session_bytes_on_disk(&folder), 0, "empty folder is 0");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn session_bytes_reports_a_growing_segments_current_length() {
+        // A mid-write current segment reports whatever has reached disk so far
+        // — the tray figure grows live, never waiting for `segmentClosed`.
+        let folder = fresh_temp_dir("bytes-growing");
+        std::fs::create_dir_all(&folder).expect("session folder");
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("first flush");
+        assert_eq!(session_bytes_on_disk(&folder), 10);
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 25]).expect("more bytes flushed");
+        assert_eq!(session_bytes_on_disk(&folder), 25);
         let _ = std::fs::remove_dir_all(&folder);
     }
 

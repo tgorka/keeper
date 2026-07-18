@@ -55,8 +55,10 @@ percent-encoding = { workspace = true }
 # injected `desktop`/`mobile`), hence the explicit target_os list.
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 # The desktop-only `tray-icon` tauri feature backing the opt-in menu-bar presence
-# (Story 10.3, FR-53). Merges into the base `tauri` dep on desktop targets only.
-tauri = { workspace = true, features = ["tray-icon"] }
+# (Story 10.3, FR-53) plus `image-png`, which unlocks `Image::from_bytes` for the
+# bundled record-dot tray icon (Story 18.1). Merges into the base `tauri` dep on
+# desktop targets only.
+tauri = { workspace = true, features = ["tray-icon", "image-png"] }
 # OS-level global summon/hide hotkey (Story 9.4, FR-50). Registration/toggle live in
 # `hotkey.rs`; the accelerator string persists via `keeper-core::registry`.
 tauri-plugin-global-shortcut = { workspace = true }

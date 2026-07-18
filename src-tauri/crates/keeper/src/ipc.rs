@@ -3328,7 +3328,9 @@ fn status_lock(status: &Mutex<RecordingStatusVm>) -> std::sync::MutexGuard<'_, R
 }
 
 /// The current Unix epoch in milliseconds (0 on a pre-1970 clock — never a panic).
-fn epoch_ms_now() -> u64 {
+/// `pub(crate)` since Story 18.1: the tray's status line derives elapsed from the
+/// same clock the driver task stamps `started_at_epoch_ms` with.
+pub(crate) fn epoch_ms_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -3567,12 +3569,12 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
     Ok(snapshot)
 }
 
-/// Request a graceful stop of the live recording session (Story 16.6): fires the
-/// one-shot stop trigger; the sidecar finalizes the file (`stopping` →
-/// `finalized` on the polled snapshot) and exits. Idempotent — a second stop (or
-/// a stop after the session ended) is a no-op, never an error, never a kill.
-#[tauri::command]
-pub fn recording_stop(state: State<'_, AppState>) -> Result<(), IpcError> {
+/// Fire the graceful stop trigger of the live recording session, if any (Story
+/// 16.6 + 18.1): the one-shot the driver task's `stop` future awaits. Shared
+/// verbatim by the [`recording_stop`] command and the tray's **Stop Recording**
+/// item, so both fire the identical idempotent trigger — a second stop (or a
+/// stop after the session ended) is a no-op, never an error, never a kill.
+pub(crate) fn stop_active_recording(state: &AppState) {
     let mut guard = slot_lock(&state.recording_run);
     if let Some(run) = guard.as_mut() {
         if let Some(tx) = run.stop_tx.take() {
@@ -3580,19 +3582,35 @@ pub fn recording_stop(state: State<'_, AppState>) -> Result<(), IpcError> {
             let _ = tx.send(());
         }
     }
+}
+
+/// Read (clone) the current recording-session status snapshot (Story 16.6 +
+/// 18.1) — the single authoritative figure both the [`recording_status`] poll
+/// and the tray's ~1 Hz tick render from. No session yet this app lifetime ⇒
+/// the honest idle snapshot.
+pub(crate) fn recording_snapshot(state: &AppState) -> RecordingStatusVm {
+    let guard = slot_lock(&state.recording_run);
+    guard
+        .as_ref()
+        .map(|run| status_lock(&run.status).clone())
+        .unwrap_or_else(RecordingStatusVm::idle)
+}
+
+/// Request a graceful stop of the live recording session (Story 16.6): fires the
+/// one-shot stop trigger; the sidecar finalizes the file (`stopping` →
+/// `finalized` on the polled snapshot) and exits. Idempotent — a second stop (or
+/// a stop after the session ended) is a no-op, never an error, never a kill.
+#[tauri::command]
+pub fn recording_stop(state: State<'_, AppState>) -> Result<(), IpcError> {
+    stop_active_recording(&state);
     Ok(())
 }
 
 /// Read the current recording-session status snapshot (Story 16.6) — the poll
-/// the Recording view's active-session UI renders from. No session yet this app
-/// lifetime ⇒ the honest idle snapshot. Infallible in practice.
+/// the Recording view's active-session UI renders from. Infallible in practice.
 #[tauri::command]
 pub fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatusVm, IpcError> {
-    let guard = slot_lock(&state.recording_run);
-    Ok(guard
-        .as_ref()
-        .map(|run| status_lock(&run.status).clone())
-        .unwrap_or_else(RecordingStatusVm::idle))
+    Ok(recording_snapshot(&state))
 }
 
 /// Read the effective segmentation settings from `keeper.db` (Story 17.5,

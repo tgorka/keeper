@@ -140,6 +140,34 @@ pub fn run() {
                 }
             }
 
+            // Drive the tray's recording rendering (Story 18.1): a ~1 Hz tick
+            // reads the authoritative `RecordingStatusVm` snapshot and hands it
+            // to the tray, which renders record-dot icon + live status line
+            // within 1 s of a start and restores the idle tray on any terminal.
+            // No explicit `run_on_main_thread` needed — every tray/menu call
+            // dispatches to the main thread internally (and the tray module
+            // never holds its lock across such a dispatch). With no tray
+            // present the tick is a silent no-op; it never forces presence
+            // (Story 18.2's concern).
+            #[cfg(desktop)]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                    // A stalled main thread must not queue a burst of catch-up
+                    // renders afterwards.
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        let snapshot = {
+                            let state = handle.state::<ipc::AppState>();
+                            ipc::recording_snapshot(&state)
+                        };
+                        tray::apply_recording_state(&handle, &snapshot);
+                    }
+                });
+            }
+
             // Check + request notification permission OFF the main thread. On iOS
             // both calls round-trip through `run_mobile_plugin`, which parks the
             // calling thread on a channel until the Swift side responds — and
