@@ -1,0 +1,50 @@
+src-tauri/Cargo.lock
+  s_127eba1253a329::t_30a037e423e439 623-628,2622-2634,3676-3685,4471-4476,5849
+src-tauri/crates/keeper/src/lib.rs
+  s_127eba1253a329::t_e9b64205b012d7 143-170
+src-tauri/crates/keeper-core/src/vm.rs
+  s_127eba1253a329::t_baa3ce9d805fce 2714-2715
+  s_127eba1253a329::t_d4e18007bd24fe 2697-2700
+src-tauri/crates/keeper/Cargo.toml
+  s_127eba1253a329::t_21e80d104dac7f 58-61
+src-tauri/crates/keeper/src/tray.rs
+  s_127eba1253a329::t_d1288945c70aa3 1-2,10-20,25-26,28-33,42-52,54-66,68-71,75-84,105-121,123-130,135,137-138,140-148,151,153-189,196-197,215-216,218-219,222-225,231-288,304-430
+  s_127eba1253a329::t_bc587a790ad1f6 131-134
+  s_127eba1253a329::t_718d56914dcdd4 289-303
+_bmad-output/implementation-artifacts/epic-18-context.md
+  s_127eba1253a329::t_50449c94bbd358 1-54
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_127eba1253a329::t_e7bba929c7d07f 185-186
+src-tauri/crates/keeper/src/ipc.rs
+  s_127eba1253a329::t_f05b6a4ca3aec2 3331-3333
+  s_127eba1253a329::t_d6359ae61139a9 3572-3577,3585-3605,3610,3613
+src-tauri/crates/keeper-core/src/recording.rs
+  s_127eba1253a329::t_ba832ff792c654 2309-2348
+  s_127eba1253a329::t_8bdc58340a7330 976-1019
+_bmad-output/implementation-artifacts/spec-18-1-tray-recording-state-elapsed-segment-size-stop-open-folder.md
+  s_127eba1253a329::t_57c4d85b189c26 98-131
+  s_127eba1253a329::t_d594e6c5a69da6 7
+  s_127eba1253a329::t_2121db5b994886 5
+  s_127eba1253a329::t_30607daeecd93f 6
+  s_127eba1253a329::t_5cc8de51be2bb0 70-74
+  s_127eba1253a329::t_daf1b2c3747d3b 69
+  s_127eba1253a329::t_709d3b06cb5d4a 85-86
+  s_127eba1253a329::t_7e8f85b7b8479d 12
+  s_127eba1253a329::t_cae75d51158d54 1-4,8-11,13-68,75-84,87-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "b568a42f92492f4129456b0dee2fe634aa1a5e2a",
+  "prompts": {},
+  "sessions": {
+    "s_127eba1253a329": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d114e4eb-ac6f-472a-88e7-d20673a54957",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
