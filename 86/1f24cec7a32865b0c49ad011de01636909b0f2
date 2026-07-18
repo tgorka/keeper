@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-18-3-in-app-active-recording-banner-and-segment-meter.md
+  s_4b014b5c6dc810::t_adcfb654421679 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "861f24cec7a32865b0c49ad011de01636909b0f2",
+  "prompts": {},
+  "sessions": {
+    "s_4b014b5c6dc810": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "195c36fa-f38c-49d9-be89-a21eaccf3e67",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
