@@ -14,15 +14,22 @@
 //! is a pure renderer of the Rust-owned [`RecordingStatusVm`] snapshot (driven
 //! by the tick in `lib.rs`); on any terminal or idle state it restores the idle
 //! icon + menu. macOS's own purple recording pill is system-owned and never
-//! touched — the tray only adds what the pill lacks. Forcing the tray visible
-//! while the opt-in toggle is off is Story 18.2's concern: no tray ⇒ the tick
-//! is a silent no-op.
+//! touched — the tray only adds what the pill lacks.
+//!
+//! Forced presence (Story 18.2): an invisible live recording is a bug, so when
+//! the opt-in toggle is off (empty slot) and a session is live, the same tick
+//! force-builds the tray and remembers that *it* created it
+//! ([`FORCED_PRESENCE`]); on the terminal tick the forced tray is dropped,
+//! restoring the exact prior configuration. The persisted
+//! `system.menu_bar_presence` setting is never written — it stays the source
+//! of truth for "prior config".
 //!
 //! Tray glue is a shell/OS concern (AD-24) — `keeper-core` only owns the persisted
 //! *mode/flag*. Every step here is best-effort: a tray build failure is logged at `warn`
 //! and the app keeps running (the tray is a convenience, never load-bearing).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use keeper_core::recording::session_bytes_on_disk;
@@ -67,6 +74,14 @@ struct TrayState {
 
 /// The single tray slot (see [`TrayState`]).
 static TRAY: OnceLock<Mutex<Option<TrayState>>> = OnceLock::new();
+
+/// Whether the current tray was created by [`apply_recording_state`] forcing
+/// presence for a live recording (Story 18.2) rather than by the user's FR-53
+/// opt-in toggle. A module `static` (not a [`TrayState`] field) so it survives
+/// the slot's build/drop cycle. Cleared by any explicit [`set_tray_presence`]
+/// call — the user then owns the tray's presence again; if a recording is
+/// still live, the next ~1 Hz tick simply re-forces it.
+static FORCED_PRESENCE: AtomicBool = AtomicBool::new(false);
 
 fn tray_slot() -> &'static Mutex<Option<TrayState>> {
     TRAY.get_or_init(|| Mutex::new(None))
@@ -215,6 +230,11 @@ fn build_tray(app: &AppHandle) -> Option<TrayIcon> {
 /// from the Settings command and at startup for the persisted setting. A rebuild lands in
 /// the idle rendering; a live recording re-applies its state on the next ~1 Hz tick.
 pub fn set_tray_presence(app: &AppHandle, enabled: bool) {
+    // Any explicit presence call supersedes a recording-forced tray (Story
+    // 18.2): the user (or the startup replay of the persisted setting) now
+    // owns presence. Toggling off mid-recording leaves an invisible live
+    // recording for at most ~1 s — the next tick re-forces the tray.
+    FORCED_PRESENCE.store(false, Ordering::Relaxed);
     let tray = if enabled { build_tray(app) } else { None };
     let mut guard = tray_guard();
     if enabled {
@@ -229,83 +249,206 @@ pub fn set_tray_presence(app: &AppHandle, enabled: bool) {
     }
 }
 
-/// Render the tray from the authoritative recording snapshot (Story 18.1) — the
-/// ~1 Hz tick in `lib.rs` calls this every second. No tray present (opt-in
-/// toggle off) ⇒ a silent no-op (forcing presence is Story 18.2). On a live
-/// state the icon/menu swap fires only on the idle→recording transition while
-/// the disabled line refreshes every tick; on idle/terminal the idle tray is
-/// restored once. Best-effort throughout.
+/// What this tick does to the tray slot — the pure decision returned by
+/// [`decide_presence`] (Story 18.2); [`apply_recording_state`] performs the
+/// matching GUI side effect best-effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresenceAction {
+    /// Live recording, no tray: force-build the tray (and mark it ours).
+    ForcePresent,
+    /// Live recording, tray present: Story 18.1's recording render/refresh.
+    RenderRecording,
+    /// Terminal/idle and *we* forced the tray: drop it (restore prior config).
+    DropTray,
+    /// Terminal/idle, user-owned tray: Story 18.1's idle restore.
+    RestoreIdle,
+    /// Terminal/idle, no tray: nothing to do.
+    Noop,
+}
+
+/// Decide this tick's presence action from the authoritative snapshot state
+/// plus the current slot/forced flags (Story 18.2). Pure — the unit-testable
+/// seam between the recording state machine and the GUI side effects. A live
+/// state with an absent slot force-builds regardless of `forced` (a forced
+/// tray that vanished mid-recording self-heals the same way); a terminal/idle
+/// state drops the slot only when *we* created it.
+fn decide_presence(state: RecordingUiState, present: bool, forced: bool) -> PresenceAction {
+    if state.is_live() {
+        if present {
+            PresenceAction::RenderRecording
+        } else {
+            PresenceAction::ForcePresent
+        }
+    } else if !present {
+        // `state.is_terminal()` from here down (the exact complement).
+        PresenceAction::Noop
+    } else if forced {
+        PresenceAction::DropTray
+    } else {
+        PresenceAction::RestoreIdle
+    }
+}
+
+/// Render the tray from the authoritative recording snapshot (Story 18.1 +
+/// 18.2) — the ~1 Hz tick in `lib.rs` calls this every second. The pure
+/// [`decide_presence`] picks this tick's action: a live session with an empty
+/// slot (opt-in toggle off) force-builds the tray (Story 18.2, marked via
+/// [`FORCED_PRESENCE`]); a terminal/idle state drops a forced tray (restoring
+/// the prior configuration) or restores the user-owned tray to idle (18.1).
+/// On a live state with a present tray the icon/menu swap fires only on the
+/// idle→recording transition while the disabled line refreshes every tick.
+/// Best-effort throughout — a force-build failure just retries next tick.
 ///
 /// Lock discipline (deadlock-critical): every `TrayIcon`/`MenuItem` call below
 /// blocks on an internal main-thread dispatch, and [`set_tray_presence`] — which
 /// can run *on* the main thread (startup, a sync command) — takes the same tray
 /// lock. So the guard is never held across those calls: handles are cloned out,
-/// mutations run lock-free, and the new status item is stored back under a fresh
-/// lock, checked against the tray id in case the slot was rebuilt meanwhile.
+/// mutations (including the drop of a forced tray) run lock-free, and the new
+/// status item is stored back under a fresh lock, checked against the tray id
+/// in case the slot was rebuilt meanwhile.
 pub fn apply_recording_state(app: &AppHandle, snapshot: &RecordingStatusVm) {
     let (tray, status_item) = {
         let guard = tray_guard();
         match guard.as_ref() {
-            Some(state) => (state.icon.clone(), state.status_item.clone()),
-            None => return,
+            Some(state) => (Some(state.icon.clone()), state.status_item.clone()),
+            None => (None, None),
         }
     };
-    let live = matches!(
-        snapshot.state,
-        RecordingUiState::Preflight
-            | RecordingUiState::Recording
-            | RecordingUiState::Rotating
-            | RecordingUiState::Stopping
-    );
-    if live {
-        let line = status_line(snapshot);
-        if let Some(item) = status_item {
-            // Already in the recording rendering — refresh only the line.
-            if let Err(error) = item.set_text(&line) {
-                tracing::warn!(%error, "tray: could not refresh the recording status line");
+    let forced = FORCED_PRESENCE.load(Ordering::Relaxed);
+    match decide_presence(snapshot.state, tray.is_some(), forced) {
+        PresenceAction::ForcePresent => force_present(app, snapshot),
+        PresenceAction::RenderRecording => {
+            if let Some(tray) = tray {
+                render_recording(app, &tray, status_item, snapshot);
             }
-            return;
         }
-        // idle → recording transition: record-dot icon + recording menu.
-        match Image::from_bytes(RECORDING_ICON_PNG) {
-            Ok(icon) => {
-                if let Err(error) = tray.set_icon(Some(icon)) {
-                    tracing::warn!(%error, "tray: could not set the record-dot icon");
+        PresenceAction::DropTray => {
+            // Re-check ownership under the tray lock before taking (review
+            // patch): `decide_presence` saw `forced` from a snapshot taken
+            // earlier, and this tick runs on a worker thread while
+            // `set_tray_presence` runs on the main thread. A concurrent
+            // `set_tray_presence(true)` (Settings toggle / startup replay)
+            // clears `FORCED_PRESENCE` and installs a *user-owned* tray in the
+            // window between that snapshot and here; taking unconditionally
+            // would drop the user's freshly-installed opt-in tray (and, being
+            // terminal, the next tick's `Noop` would never rebuild it). The
+            // `set_tray_presence` unlock happens-before this lock, so its
+            // `FORCED_PRESENCE = false` store is visible: only take the tray we
+            // still own. Drop it OUTSIDE the lock — removing the icon dispatches
+            // to the main thread (per the lock discipline above).
+            let dropped = {
+                let mut guard = tray_guard();
+                if FORCED_PRESENCE.swap(false, Ordering::Relaxed) {
+                    guard.take()
+                } else {
+                    None
                 }
+            };
+            drop(dropped);
+        }
+        PresenceAction::RestoreIdle => {
+            // Only an installed recording menu needs restoring — an idle tray
+            // in a terminal state is already in its prior configuration.
+            if let (Some(tray), true) = (tray, status_item.is_some()) {
+                restore_idle(app, &tray);
             }
-            Err(error) => tracing::warn!(%error, "tray: could not decode the record-dot icon"),
         }
-        // A menu build/install failure leaves `status_item` unset, so the next
-        // tick simply retries the transition.
-        let Some((menu, status)) = build_recording_menu(app, &line) else {
-            return;
-        };
-        if let Err(error) = tray.set_menu(Some(menu)) {
-            tracing::warn!(%error, "tray: could not install the recording menu");
-            return;
-        }
-        store_status_item(tray.id(), Some(status));
-    } else if status_item.is_some() {
-        // recording → idle/terminal transition: restore the idle menu FIRST, and
-        // only clear the rendered-mode flag once it is actually installed. A
-        // menu build/install failure returns with the flag still set and the
-        // recording menu still on screen, so the next tick retries the teardown
-        // — never clears the flag while the Stop/Open menu is still installed
-        // (which would strand it for the app lifetime, since a terminal state
-        // with no `status_item` re-enters neither branch).
-        let Some(menu) = build_idle_menu(app) else {
-            return;
-        };
-        if let Err(error) = tray.set_menu(Some(menu)) {
-            tracing::warn!(%error, "tray: could not restore the idle menu");
-            return;
-        }
-        // The icon is cosmetic — a failure here does not desync the flag/menu.
-        if let Err(error) = tray.set_icon(app.default_window_icon().cloned()) {
-            tracing::warn!(%error, "tray: could not restore the idle icon");
-        }
-        store_status_item(tray.id(), None);
+        PresenceAction::Noop => {}
     }
+}
+
+/// Force the tray into existence for a live recording (Story 18.2): the FR-53
+/// opt-in toggle is off (empty slot) but an invisible live recording is a bug,
+/// so build the tray, remember that *we* created it, and render this tick's
+/// recording state onto it. The persisted `system.menu_bar_presence` setting
+/// is never written — dropping the forced tray on the terminal tick restores
+/// the exact prior configuration. Best-effort: a build failure warns (inside
+/// [`build_tray`]) and the next ~1 Hz tick retries.
+fn force_present(app: &AppHandle, snapshot: &RecordingStatusVm) {
+    let Some(icon) = build_tray(app) else {
+        return;
+    };
+    let stored = {
+        let mut guard = tray_guard();
+        if guard.is_none() {
+            *guard = Some(TrayState {
+                icon: icon.clone(),
+                status_item: None,
+            });
+            FORCED_PRESENCE.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    };
+    if !stored {
+        // A tray appeared concurrently (Settings toggle / startup replay) —
+        // the user's tray wins; our fresh icon drops here, removing the
+        // transient duplicate menu-bar item (outside the lock).
+        return;
+    }
+    render_recording(app, &icon, None, snapshot);
+}
+
+/// Render the recording state onto a present tray (Story 18.1): on the
+/// idle→recording transition swap in the record-dot icon + recording menu; on
+/// every later tick refresh only the disabled status line via `set_text` — no
+/// menu rebuild, no flicker, an open menu stays open.
+fn render_recording(
+    app: &AppHandle,
+    tray: &TrayIcon,
+    status_item: Option<MenuItem<Wry>>,
+    snapshot: &RecordingStatusVm,
+) {
+    let line = status_line(snapshot);
+    if let Some(item) = status_item {
+        // Already in the recording rendering — refresh only the line.
+        if let Err(error) = item.set_text(&line) {
+            tracing::warn!(%error, "tray: could not refresh the recording status line");
+        }
+        return;
+    }
+    // idle → recording transition: record-dot icon + recording menu.
+    match Image::from_bytes(RECORDING_ICON_PNG) {
+        Ok(icon) => {
+            if let Err(error) = tray.set_icon(Some(icon)) {
+                tracing::warn!(%error, "tray: could not set the record-dot icon");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "tray: could not decode the record-dot icon"),
+    }
+    // A menu build/install failure leaves `status_item` unset, so the next
+    // tick simply retries the transition.
+    let Some((menu, status)) = build_recording_menu(app, &line) else {
+        return;
+    };
+    if let Err(error) = tray.set_menu(Some(menu)) {
+        tracing::warn!(%error, "tray: could not install the recording menu");
+        return;
+    }
+    store_status_item(tray.id(), Some(status));
+}
+
+/// Restore a user-owned tray to the idle rendering after a recording ended
+/// (Story 18.1): restore the idle menu FIRST, and only clear the rendered-mode
+/// flag once it is actually installed. A menu build/install failure returns
+/// with the flag still set and the recording menu still on screen, so the next
+/// tick retries the teardown — never clears the flag while the Stop/Open menu
+/// is still installed (which would strand it for the app lifetime, since a
+/// terminal state with no `status_item` re-enters neither branch).
+fn restore_idle(app: &AppHandle, tray: &TrayIcon) {
+    let Some(menu) = build_idle_menu(app) else {
+        return;
+    };
+    if let Err(error) = tray.set_menu(Some(menu)) {
+        tracing::warn!(%error, "tray: could not restore the idle menu");
+        return;
+    }
+    // The icon is cosmetic — a failure here does not desync the flag/menu.
+    if let Err(error) = tray.set_icon(app.default_window_icon().cloned()) {
+        tracing::warn!(%error, "tray: could not restore the idle icon");
+    }
+    store_status_item(tray.id(), None);
 }
 
 /// Store the recording status-line item (or clear it) back into the tray slot —
@@ -389,6 +532,48 @@ fn format_status_line(elapsed_secs: u64, segments_closed: u32, bytes: u64) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Story 18.2: the `decide_presence` I/O matrix over every state × slot ×
+    /// forced combination — live+absent force-builds (even with a stale forced
+    /// flag: self-healing), live+present renders (18.1), terminal+present drops
+    /// only a forced tray (else the 18.1 idle restore), terminal+absent no-ops.
+    #[test]
+    fn decide_presence_covers_the_io_matrix() {
+        use PresenceAction::*;
+        use RecordingUiState::*;
+        for state in [Preflight, Recording, Rotating, Stopping] {
+            assert_eq!(
+                decide_presence(state, false, false),
+                ForcePresent,
+                "{state:?}"
+            );
+            assert_eq!(
+                decide_presence(state, false, true),
+                ForcePresent,
+                "{state:?}"
+            );
+            assert_eq!(
+                decide_presence(state, true, false),
+                RenderRecording,
+                "{state:?}"
+            );
+            assert_eq!(
+                decide_presence(state, true, true),
+                RenderRecording,
+                "{state:?}"
+            );
+        }
+        for state in [Idle, Finalized, Recovered, Failed] {
+            assert_eq!(decide_presence(state, true, true), DropTray, "{state:?}");
+            assert_eq!(
+                decide_presence(state, true, false),
+                RestoreIdle,
+                "{state:?}"
+            );
+            assert_eq!(decide_presence(state, false, false), Noop, "{state:?}");
+            assert_eq!(decide_presence(state, false, true), Noop, "{state:?}");
+        }
+    }
 
     #[test]
     fn format_elapsed_pads_seconds_and_rolls_to_hours() {

@@ -8,9 +8,10 @@ import type { RecordingUiState } from "./RecordingUiState";
  * The single source of truth for the active-session UI: the state drives the
  * record dot + Stop affordance, `started_at_epoch_ms` anchors the ticking
  * elapsed line (computed client-side from the host-reported start instant, so a
- * slow poll never freezes the clock), `output_path` names the file being
- * written (and, after `finalized`, the playable result), and `error` is the
- * honest failure message on `failed` — never a silent reset.
+ * slow poll never freezes the clock), `output_path` is the session **folder**
+ * holding the `screen-####.mp4` segments (Story 17.2 — not a single file; the
+ * tray sums it live and "Open Recordings Folder" reveals it), and `error` is
+ * the honest failure message on `failed` — never a silent reset.
  */
 export type RecordingStatusVm = { 
 /**
@@ -28,7 +29,8 @@ segmentsClosed: number,
  */
 startedAtEpochMs: number | null, 
 /**
- * The absolute path of the file being (or last) written.
+ * The absolute path of the session **folder** being (or last) written —
+ * the directory holding the `screen-####.mp4` segments (Story 17.2).
  */
 outputPath: string | null, 
 /**

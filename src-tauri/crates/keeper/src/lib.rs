@@ -17,10 +17,28 @@ mod recorder;
 #[cfg(desktop)]
 mod tray;
 
+#[cfg(desktop)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tauri::Manager;
 #[cfg(desktop)]
 use tauri::WindowEvent;
 use tauri_plugin_deep_link::DeepLinkExt;
+#[cfg(desktop)]
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+
+/// Whether the quit-while-recording confirm was accepted (Story 18.2). Set by
+/// the dialog callback right before it re-requests the exit, so the second
+/// `ExitRequested` pass skips the confirm and runs the stop→finalize→kill-
+/// timeout path. Never reset — the process is exiting once it is set.
+#[cfg(desktop)]
+static QUIT_CONFIRMED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a quit-while-recording confirm sheet is currently up (Story 18.2),
+/// so repeated ⌘Q presses never stack a second sheet. Cleared by the dialog
+/// callback (on cancel the next ⌘Q asks again).
+#[cfg(desktop)]
+static QUIT_CONFIRM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Application entry point. Registers the plugin set and the typed IPC command
 /// surface, then runs the Tauri event loop.
@@ -372,11 +390,61 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| match event {
             // App-quit (⌘Q / native Quit): gracefully stop every account's sync with a
-            // bounded wait, then let the process exit (never `prevent_exit`). This is the
-            // honest-quit guarantee made mechanical — no hidden background process
-            // survives a quit. If shutdown exceeds the bound, still exit (log at warn).
-            tauri::RunEvent::ExitRequested { .. } => {
+            // bounded wait, then let the process exit. This is the honest-quit
+            // guarantee made mechanical — no hidden background process survives a
+            // quit. If shutdown exceeds the bound, still exit (log at warn).
+            //
+            // Quit-while-recording (Story 18.2) warns FIRST: a live session shows a
+            // modal OkCancel confirm before anything stops. The plugin's
+            // `blocking_show` must never run on this (main) thread — the sheet's
+            // completion needs the main runloop the block would freeze — so the
+            // confirm is the async twin of blocking: prevent this exit, show the
+            // sheet, and have the callback re-request the exit with
+            // `QUIT_CONFIRMED` set; the second pass then runs stop → bounded
+            // finalize (→ force-kill on timeout) BEFORE the bounded sync shutdown.
+            // Cancel simply leaves the app (and recording) running. With no live
+            // recording this arm is byte-for-byte the pre-18.2 quit path.
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                // iOS never records (the recorder is honestly `Unsupported`), so the
+                // desktop-only quit guard below is the only consumer of `api`.
+                #[cfg(not(desktop))]
+                let _ = api;
                 let state = app_handle.state::<ipc::AppState>();
+                #[cfg(desktop)]
+                if ipc::recording_snapshot(&state).state.is_live() {
+                    if !QUIT_CONFIRMED.load(Ordering::Relaxed) {
+                        api.prevent_exit();
+                        if QUIT_CONFIRM_IN_FLIGHT.swap(true, Ordering::Relaxed) {
+                            // A confirm sheet is already up — never stack a second.
+                            return;
+                        }
+                        // The confirm attaches to the main window as a sheet — raise
+                        // the window first so a quit from the tray (window hidden)
+                        // shows a visible dialog, never an invisible stuck quit.
+                        tray::show_main_window(app_handle);
+                        let handle = app_handle.clone();
+                        app_handle
+                            .dialog()
+                            .message(
+                                "Recording in progress — quit will stop and finalize \
+                                 the current segment",
+                            )
+                            .title("Quit keeper?")
+                            .buttons(MessageDialogButtons::OkCancel)
+                            .show(move |confirmed| {
+                                QUIT_CONFIRM_IN_FLIGHT.store(false, Ordering::Relaxed);
+                                if confirmed {
+                                    QUIT_CONFIRMED.store(true, Ordering::Relaxed);
+                                    handle.exit(0);
+                                }
+                            });
+                        return;
+                    }
+                    // Confirmed quit: graceful stop → await finalize under the
+                    // kill-timeout → abort the driver (sidecar force-killed via
+                    // `kill_on_drop`) if it hangs. Bounded — quit is never stuck.
+                    ipc::finalize_recording_for_quit(&state);
+                }
                 // A short, bounded graceful shutdown: `shutdown_all` awaits each
                 // account's `sync.stop()`. Bounding it keeps quit responsive even if a
                 // network teardown hangs.

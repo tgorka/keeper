@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use keeper_core::account::AccountManager;
 use keeper_core::auth;
@@ -128,6 +128,12 @@ pub struct RecordingRun {
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// The status snapshot shared with (and kept current by) the driver task.
     status: Arc<Mutex<RecordingStatusVm>>,
+    /// The driver-task handle (Story 18.2). Aborting it drops the
+    /// `run_session` future, whose `kill_on_drop(true)` child then
+    /// force-terminates the `keeper-rec` sidecar — the quit kill-timeout's
+    /// only force-kill lever (the child is a local inside `run_session`).
+    /// `None` after [`finalize_recording_for_quit`] took it.
+    driver: Option<tauri::async_runtime::JoinHandle<()>>,
 }
 
 /// Lock an optional-slot mutex, recovering a poisoned lock instead of propagating —
@@ -3434,7 +3440,9 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
 
     let recorder = state.recorder.clone();
     let task_status = status.clone();
-    tauri::async_runtime::spawn(async move {
+    // The handle is stored into the run slot below (Story 18.2): aborting it is
+    // the quit kill-timeout's force-kill lever (see `RecordingRun::driver`).
+    let driver = tauri::async_runtime::spawn(async move {
         // Fold sidecar events through the platform-free machine into the shared
         // snapshot as they arrive (live — unlike `drive_session`'s buffered replay).
         let mut machine = RecordingSession::new();
@@ -3565,6 +3573,7 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
     *guard = Some(RecordingRun {
         stop_tx: Some(stop_tx),
         status,
+        driver: Some(driver),
     });
     Ok(snapshot)
 }
@@ -3594,6 +3603,102 @@ pub(crate) fn recording_snapshot(state: &AppState) -> RecordingStatusVm {
         .as_ref()
         .map(|run| status_lock(&run.status).clone())
         .unwrap_or_else(RecordingStatusVm::idle)
+}
+
+/// How long a confirmed quit waits for the live recording session to reach a
+/// terminal state before force-killing the sidecar (Story 18.2). An authored
+/// default — product sign-off at phase release, not an architecture constant.
+const QUIT_FINALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often [`finalize_within`] re-reads the shared status snapshot while the
+/// quit waits (Story 18.2): short enough that a normal finalize adds well under
+/// a poll interval of latency to the quit.
+const QUIT_FINALIZE_POLL: Duration = Duration::from_millis(100);
+
+/// Bounded wait for the aborted driver task to actually unwind after a
+/// kill-timeout (Story 18.2, review patch). `JoinHandle::abort` only *schedules*
+/// cancellation; the sidecar's SIGKILL isn't delivered until a worker polls and
+/// drops the `run_session` future (`kill_on_drop`). Blocking on the handle makes
+/// that drop — and the kill — happen before quit proceeds, closing the race
+/// where the process exits and orphans `keeper-rec`. Bounded so a wedged unwind
+/// can't itself hang quit; in practice the handle resolves in milliseconds.
+const QUIT_KILL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The outcome of awaiting a recording finalize under a bound (Story 18.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizeOutcome {
+    /// The session reached a terminal state (`finalized`/`recovered`/`failed`
+    /// — or was already terminal) within the bound.
+    Finalized,
+    /// The session was still live when the bound elapsed (hung sidecar).
+    TimedOut,
+}
+
+/// Poll the shared status snapshot until the session reaches a terminal state
+/// or `timeout` elapses (Story 18.2). An already-terminal snapshot resolves
+/// immediately without sleeping. The driver task keeps the snapshot current on
+/// the runtime worker threads, so this can be `block_on`'d from the main
+/// thread during `ExitRequested` (the established quit pattern).
+async fn finalize_within(
+    status: &Arc<Mutex<RecordingStatusVm>>,
+    timeout: Duration,
+    poll: Duration,
+) -> FinalizeOutcome {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if status_lock(status).state.is_terminal() {
+            return FinalizeOutcome::Finalized;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return FinalizeOutcome::TimedOut;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Stop and finalize the live recording session for a confirmed quit (Story
+/// 18.2): fire the graceful `stop` trigger (the same idempotent one-shot as
+/// Stop everywhere else), then await the session reaching a terminal state
+/// under [`QUIT_FINALIZE_TIMEOUT`]. On timeout, abort the stored driver task —
+/// dropping `run_session` drops the sidecar child, whose `kill_on_drop(true)`
+/// force-terminates it — then block (bounded by [`QUIT_KILL_JOIN_TIMEOUT`]) on
+/// the handle so that drop, and thus the kill, actually completes before quit
+/// proceeds — so quit is never hung and `keeper-rec` is never orphaned. A quit
+/// with no (or an already-terminal) session returns at once; force-kill fires
+/// ONLY on the quit kill-timeout, never on a normal Stop.
+pub(crate) fn finalize_recording_for_quit(state: &AppState) {
+    stop_active_recording(state);
+    let taken = {
+        let mut guard = slot_lock(&state.recording_run);
+        guard
+            .as_mut()
+            .map(|run| (run.status.clone(), run.driver.take()))
+    };
+    let Some((status, driver)) = taken else {
+        return;
+    };
+    let outcome = tauri::async_runtime::block_on(finalize_within(
+        &status,
+        QUIT_FINALIZE_TIMEOUT,
+        QUIT_FINALIZE_POLL,
+    ));
+    if outcome == FinalizeOutcome::TimedOut {
+        tracing::warn!(
+            timeout_secs = QUIT_FINALIZE_TIMEOUT.as_secs(),
+            "quit: recording did not finalize within the kill-timeout; \
+             aborting the driver task (sidecar force-terminated via kill_on_drop)"
+        );
+        if let Some(driver) = driver {
+            driver.abort();
+            // `abort()` only schedules cancellation — block (bounded) on the
+            // handle so the `run_session` future is actually dropped (and its
+            // `kill_on_drop` child SIGKILLed) before we let the process exit,
+            // rather than racing process teardown and orphaning the sidecar.
+            let _ = tauri::async_runtime::block_on(async {
+                tokio::time::timeout(QUIT_KILL_JOIN_TIMEOUT, driver).await
+            });
+        }
+    }
 }
 
 /// Request a graceful stop of the live recording session (Story 16.6): fires the
@@ -4396,6 +4501,50 @@ mod tests {
     #[test]
     fn now_ms_is_positive() {
         assert!(now_ms() > 0);
+    }
+
+    /// A `Stopping` snapshot for the quit-finalize tests (Story 18.2).
+    fn stopping_status() -> Arc<Mutex<RecordingStatusVm>> {
+        let mut snapshot = RecordingStatusVm::idle();
+        snapshot.state = RecordingUiState::Stopping;
+        Arc::new(Mutex::new(snapshot))
+    }
+
+    /// Story 18.2 (paused clock): a sidecar that finalizes inside the bound
+    /// resolves `Finalized` — no force-kill leg is reached.
+    #[tokio::test(start_paused = true)]
+    async fn finalize_within_resolves_when_status_turns_terminal_before_timeout() {
+        let status = stopping_status();
+        let writer = status.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            status_lock(&writer).state = RecordingUiState::Finalized;
+        });
+        let outcome =
+            finalize_within(&status, Duration::from_secs(10), Duration::from_millis(100)).await;
+        assert_eq!(outcome, FinalizeOutcome::Finalized);
+    }
+
+    /// Story 18.2 (paused clock): a snapshot that is already terminal at entry
+    /// resolves `Finalized` immediately — quit adds no wait at all.
+    #[tokio::test(start_paused = true)]
+    async fn finalize_within_resolves_immediately_when_already_terminal() {
+        let status = Arc::new(Mutex::new(RecordingStatusVm::idle()));
+        let before = tokio::time::Instant::now();
+        let outcome =
+            finalize_within(&status, Duration::from_secs(10), Duration::from_millis(100)).await;
+        assert_eq!(outcome, FinalizeOutcome::Finalized);
+        assert_eq!(tokio::time::Instant::now(), before, "no sleep on entry");
+    }
+
+    /// Story 18.2 (paused clock): a sidecar hung past the bound resolves
+    /// `TimedOut` — the caller then aborts the driver (force-kill leg).
+    #[tokio::test(start_paused = true)]
+    async fn finalize_within_times_out_on_a_hung_sidecar() {
+        let status = stopping_status();
+        let outcome =
+            finalize_within(&status, Duration::from_secs(10), Duration::from_millis(100)).await;
+        assert_eq!(outcome, FinalizeOutcome::TimedOut);
     }
 
     /// Story 14.7 (FR-65): per-path backup exclusion is an iOS-only concept — the

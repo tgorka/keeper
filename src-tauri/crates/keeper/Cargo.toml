@@ -49,6 +49,11 @@ tauri-plugin-notification = { workspace = true }
 # send path (Story 3.7). Already in the tree via url/matrix-sdk.
 percent-encoding = { workspace = true }
 
+[dev-dependencies]
+# Paused-clock (`tokio::time::pause`) tests for the quit finalize bound (Story
+# 18.2, `finalize_within`). Test-only feature -- the shipped binary is unchanged.
+tokio = { workspace = true, features = ["test-util"] }
+
 # Desktop-only surfaces (Story 12.2, compile seam): these crates are
 # `#![cfg(not(target_os = "ios"))]`-style desktop plugins, so iOS must never link
 # them. Cargo target tables only understand real target cfgs (never tauri-build's

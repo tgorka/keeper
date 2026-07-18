@@ -2688,6 +2688,29 @@ pub enum RecordingUiState {
     Failed,
 }
 
+impl RecordingUiState {
+    /// Whether a session in this state is live — capture running or winding
+    /// down (Story 18.2): the states where the tray must be present and a quit
+    /// must warn first. Exhaustive by design: a new variant forces a decision
+    /// here.
+    pub fn is_live(self) -> bool {
+        match self {
+            Self::Preflight | Self::Recording | Self::Rotating | Self::Stopping => true,
+            Self::Idle | Self::Finalized | Self::Recovered | Self::Failed => false,
+        }
+    }
+
+    /// Whether this state is settled — no session yet, or a terminal outcome
+    /// (Story 18.2). The exact complement of [`Self::is_live`], spelled out as
+    /// its own exhaustive `match` so a new variant forces both decisions.
+    pub fn is_terminal(self) -> bool {
+        match self {
+            Self::Idle | Self::Finalized | Self::Recovered | Self::Failed => true,
+            Self::Preflight | Self::Recording | Self::Rotating | Self::Stopping => false,
+        }
+    }
+}
+
 /// The recording-session status snapshot the Recording view polls (Story 16.6,
 /// FR-68/FR-69/FR-71, UX-DR30).
 ///
@@ -2754,6 +2777,25 @@ pub struct RecordingSettingsVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Story 18.2: `is_live`/`is_terminal` partition every `RecordingUiState`
+    /// variant — live = Preflight/Recording/Rotating/Stopping, terminal =
+    /// Idle/Finalized/Recovered/Failed — and are exact complements.
+    #[test]
+    fn recording_ui_state_live_terminal_partition_covers_all_variants() {
+        use RecordingUiState::*;
+        for state in [
+            Idle, Preflight, Recording, Rotating, Stopping, Finalized, Recovered, Failed,
+        ] {
+            let expected_live = matches!(state, Preflight | Recording | Rotating | Stopping);
+            assert_eq!(state.is_live(), expected_live, "is_live({state:?})");
+            assert_eq!(
+                state.is_terminal(),
+                !expected_live,
+                "is_terminal({state:?})"
+            );
+        }
+    }
 
     #[test]
     fn ipc_error_code_serializes_camel_case() {
