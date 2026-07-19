@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-19-2-system-audio-toggle-and-per-app-audio-scoping.md
+  s_452b613bcc2054::t_b824dce92ad470 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "2efa1d518c62399c3efa9458bfa51b9507c64cc5",
+  "prompts": {},
+  "sessions": {
+    "s_452b613bcc2054": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "30253aae-5dfd-436d-98bb-5f777a404de0",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
