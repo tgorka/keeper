@@ -19,6 +19,7 @@
  * max-w-[720px]`, the conversation-pane realization) rather than going full-bleed.
  */
 import { ActiveRecordingBanner } from "@/components/recording/active-recording-banner";
+import { RecordingAudioControls } from "@/components/recording/recording-audio-controls";
 import {
   RecordingPermissionRow,
   SCREEN_RECORDING_PERMISSION_NAME,
@@ -30,6 +31,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useRecordingPermission } from "@/hooks/use-recording-permission";
 import { isLiveRecording, useRecordingSession } from "@/hooks/use-recording-session";
+import { systemAudioEnabled } from "@/lib/stores/recording-audio";
 import { selectedRecordingTarget } from "@/lib/stores/recording-source";
 
 /** Honest local-only subtitle (recording voice: sentence case, no exclamation
@@ -52,9 +54,10 @@ export const START_BLOCKED_NOTE = `Start needs the ${SCREEN_RECORDING_PERMISSION
 const PLACEHOLDER_COPY = "Configured in a later update.";
 
 /** The setup cards this shell reserves. "Source" (Story 19.1 — the live
- * application/window/display picker) and "Segmenting" (Story 17.5, FR-72 — the
- * shared segment-size + duration-cap control) are live; the rest are later-story
- * surfaces ("Destination" is Story 19.5). */
+ * application/window/display picker), "Audio" (Story 19.2 — the system-audio
+ * toggle), and "Segmenting" (Story 17.5, FR-72 — the shared segment-size +
+ * duration-cap control) are live; the rest are later-story surfaces
+ * ("Destination" is Story 19.5). */
 const SETUP_CARDS: readonly string[] = [
   "Source",
   "Audio",
@@ -90,7 +93,9 @@ export function RecordingPane() {
               onClick={() => {
                 // Story 19.1: start the session for the picker's selected target
                 // (a display or an application; the main display by default).
-                void start(selectedRecordingTarget());
+                // Story 19.2: thread the Audio card's system-audio toggle
+                // (default on) read imperatively at click time.
+                void start(selectedRecordingTarget(), systemAudioEnabled());
               }}
             >
               {START_RECORDING_LABEL}
@@ -158,6 +163,17 @@ export function RecordingPane() {
                       the setup cards stay mounted during a live session, so the
                       picker must stop spawning enumeration children. */}
                   <RecordingSourcePicker active={!live} />
+                </CardContent>
+              </Card>
+            ) : title === "Audio" ? (
+              // The live Audio card (Story 19.2): the system-audio Switch,
+              // default on, with the content-audio label and disclosure.
+              <Card key={title} size="sm">
+                <CardHeader>
+                  <CardTitle>{title}</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <RecordingAudioControls />
                 </CardContent>
               </Card>
             ) : title === "Segmenting" ? (

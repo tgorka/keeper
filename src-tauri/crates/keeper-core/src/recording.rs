@@ -1682,6 +1682,26 @@ mod tests {
     }
 
     #[test]
+    fn start_recording_request_carries_system_audio_off() {
+        // Story 19.2: toggling the Audio card off threads `system_audio: false`
+        // all the way to the wire's `"systemAudio"` field — the sidecar reads
+        // this to skip `capturesAudio`/`excludesCurrentProcessAudio` and write
+        // no audio track (16.6). The default-`true` case is covered by
+        // `start_recording_request_carries_the_segmentation_params` above.
+        let params = SessionParams {
+            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            display_id: None,
+            application: None,
+            system_audio: false,
+            segment_mb: 500,
+            max_segment_seconds: 1800,
+        };
+        let line = start_recording_request(6, &params);
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
+        assert_eq!(wire["params"]["systemAudio"], false);
+    }
+
+    #[test]
     fn start_recording_request_app_target_wins_over_display() {
         // Story 19.1: an application target emits `applicationPid`+`bundleId`
         // and OMITS `displayId` (even when a display id is also set), so the

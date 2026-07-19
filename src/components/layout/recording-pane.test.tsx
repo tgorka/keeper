@@ -32,6 +32,10 @@ import {
   STOP_RECORDING_LABEL,
 } from "@/components/layout/recording-pane";
 import {
+  SYSTEM_AUDIO_LABEL,
+  SYSTEM_AUDIO_SWITCH_TESTID,
+} from "@/components/recording/recording-audio-controls";
+import {
   OPEN_SETTINGS_LABEL,
   REQUEST_PERMISSION_LABEL,
 } from "@/components/recording/recording-permission-row";
@@ -48,6 +52,7 @@ import {
   recordingStop,
   requestScreenRecordingPermission,
 } from "@/lib/ipc/client";
+import { resetRecordingAudioForTest } from "@/lib/stores/recording-audio";
 import { resetRecordingSourceForTest } from "@/lib/stores/recording-source";
 
 const mockFetch = vi.mocked(recordingPermission);
@@ -102,6 +107,8 @@ afterEach(() => {
   // Stop the picker's poll timer + restore the default selection between tests
   // (Story 19.1) — a leaked interval would keep firing into the next test.
   resetRecordingSourceForTest();
+  // Restore the default-on system-audio toggle between tests (Story 19.2).
+  resetRecordingAudioForTest();
   vi.clearAllMocks();
 });
 
@@ -133,6 +140,15 @@ describe("RecordingPane", () => {
     // segment-size + duration-cap control, hydrated from the store.
     expect(await screen.findByLabelText(SEGMENT_SIZE_LABEL)).toHaveValue(500);
     expect(screen.getByLabelText(DURATION_CAP_LABEL)).toHaveValue(30);
+    await waitFor(() => expect(mockFetch).toHaveBeenCalled());
+  });
+
+  it("mounts the live system-audio control inside the Audio card, checked by default (Story 19.2)", async () => {
+    render(<RecordingPane />);
+
+    // The Audio card is not a placeholder — it hosts the system-audio Switch.
+    expect(await screen.findByText(SYSTEM_AUDIO_LABEL)).toBeInTheDocument();
+    expect(screen.getByTestId(SYSTEM_AUDIO_SWITCH_TESTID)).toHaveAttribute("aria-checked", "true");
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
   });
 
@@ -219,6 +235,33 @@ describe("RecordingPane", () => {
     expect(screen.getByRole("progressbar", { name: "Segment size" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: START_RECORDING_LABEL })).not.toBeInTheDocument();
     expect(mockStart).toHaveBeenCalledTimes(1);
+  });
+
+  it("Start threads the system-audio toggle's current value (Story 19.2)", async () => {
+    mockFetch.mockResolvedValue(GRANTED);
+    render(<RecordingPane />);
+
+    // Default on: the first arg is the default target, the second `true`.
+    const startButton = await screen.findByRole("button", { name: START_RECORDING_LABEL });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    fireEvent.click(startButton);
+    await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true);
+  });
+
+  it("Start carries an off system-audio toggle through to recording_start", async () => {
+    mockFetch.mockResolvedValue(GRANTED);
+    render(<RecordingPane />);
+
+    const toggle = await screen.findByTestId(SYSTEM_AUDIO_SWITCH_TESTID);
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+
+    const startButton = screen.getByRole("button", { name: START_RECORDING_LABEL });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    fireEvent.click(startButton);
+    await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), false);
   });
 
   it("Stop requests the graceful stop", async () => {

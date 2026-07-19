@@ -63,8 +63,10 @@ export interface UseRecordingSession {
   /** The ticking `H:MM:SS` elapsed line, or `null` before capture starts. */
   elapsed: string | null;
   /** Start the session for the selected capture target (Story 19.1) — a display
-   * or an application; omit for the main-display default (no-op while live). */
-  start: (target?: RecordingTargetVm) => Promise<void>;
+   * or an application; omit for the main-display default (no-op while live) —
+   * and the Audio card's system-audio toggle (Story 19.2); omit for the
+   * default-on path. */
+  start: (target?: RecordingTargetVm, systemAudio?: boolean) => Promise<void>;
   /** Request the graceful stop-and-finalize (idempotent). */
   stop: () => Promise<void>;
 }
@@ -130,9 +132,9 @@ export function useRecordingSession(): UseRecordingSession {
     };
   }, [startedAt, live]);
 
-  const start = useCallback(async (target?: RecordingTargetVm) => {
+  const start = useCallback(async (target?: RecordingTargetVm, systemAudio?: boolean) => {
     try {
-      const vm = await recordingStart(target);
+      const vm = await recordingStart(target, systemAudio);
       if (mounted.current) {
         setStatus(vm);
       }

@@ -251,8 +251,10 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
         // Story 19.1: an application target is exclusionary — `including:[app]`
         // keeps only that app's windows in the file. The display-only branch
         // (16.6) is unchanged. `excludesCurrentProcessAudio` (set below when
-        // `systemAudio`) keeps keeper's own sounds out either way (audio behavior
-        // is unchanged — 19.2 owns per-app audio scoping).
+        // `systemAudio`) keeps keeper's own sounds out either way. Story 19.2:
+        // per-app/per-display audio scoping is active via this same shared
+        // filter + `excludesCurrentProcessAudio` — no separate audio filter
+        // exists; the toggle only decides whether the audio track is added.
         let filter: SCContentFilter
         if let application {
             filter = SCContentFilter(

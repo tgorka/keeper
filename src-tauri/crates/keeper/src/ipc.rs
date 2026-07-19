@@ -3409,7 +3409,11 @@ fn resolve_capture_target(
 pub async fn recording_start(
     state: State<'_, AppState>,
     target: Option<RecordingTargetVm>,
+    system_audio: Option<bool>,
 ) -> Result<RecordingStatusVm, IpcError> {
+    // Story 19.2: the Audio card's ephemeral per-session toggle. `None` (no
+    // explicit choice reached the command) preserves the 16.6 default-on path.
+    let system_audio = system_audio.unwrap_or(true);
     // Story 19.1: map the picker's selected target into the manifest capture
     // target + the sidecar's video-target params. `None` (no picker selection)
     // preserves the 16.6 main-display default. A vanished application fails
@@ -3458,7 +3462,7 @@ pub async fn recording_start(
         folder.clone(),
         capture_target,
         SessionDevices {
-            system_audio: true,
+            system_audio,
             microphone: false,
             camera: false,
         },
@@ -3485,7 +3489,7 @@ pub async fn recording_start(
         // (or `None` = main display, the unchanged 16.6 path).
         display_id: target_display_id,
         application,
-        system_audio: true,
+        system_audio,
         segment_mb,
         // Minutes → seconds for the sidecar's `maxSegmentSeconds` (30 → 1800).
         max_segment_seconds: u32::from(duration_cap_minutes) * 60,

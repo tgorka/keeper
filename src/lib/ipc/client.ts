@@ -1692,10 +1692,18 @@ export async function openScreenRecordingSettings(): Promise<void> {
  * with the {@link IpcError} envelope when a session is already live or the
  * sidecar cannot spawn.
  */
-export async function recordingStart(target?: RecordingTargetVm): Promise<RecordingStatusVm> {
+export async function recordingStart(
+  target?: RecordingTargetVm,
+  systemAudio?: boolean,
+): Promise<RecordingStatusVm> {
   // Story 19.1: the picker's selected source/target (a display or an
   // application). Omitted (`undefined`) preserves the 16.6 main-display default.
-  return await invoke<RecordingStatusVm>("recording_start", { target: target ?? null });
+  // Story 19.2: the Audio card's ephemeral per-session toggle. Omitted
+  // preserves the 16.6 default-on path (`system_audio.unwrap_or(true)` in Rust).
+  return await invoke<RecordingStatusVm>("recording_start", {
+    target: target ?? null,
+    systemAudio: systemAudio ?? null,
+  });
 }
 
 /**
