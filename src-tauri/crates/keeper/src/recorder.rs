@@ -276,14 +276,26 @@ async fn fetch_capabilities(
     Ok(vm)
 }
 
-/// The `listSources` round-trip against the sidecar at `path` (Story 16.4). No
-/// version handshake here — `getCapabilities` owns it.
+/// The `listSources` round-trip against the sidecar at `path` (Story 16.4 →
+/// 19.1). No version handshake here — `getCapabilities` owns it. Bounded by
+/// `timeout` (Story 19.1): enumeration is now async on the sidecar
+/// (`SCShareableContent.current`), so a wedged sidecar must resolve a clean
+/// error rather than hanging the picker's ~3s poll — the same anti-spinner
+/// guard [`fetch_capabilities`] uses. Split from the trait method so the
+/// fake-executable harness can drive the real body.
 #[cfg(desktop)]
-async fn fetch_sources(path: &std::path::Path) -> Result<RecordingSourcesVm, CoreError> {
-    let line = request_response(
-        path,
-        &list_sources_request(LIST_SOURCES_REQUEST_ID),
-        LIST_SOURCES_REQUEST_ID,
+async fn fetch_sources(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<RecordingSourcesVm, CoreError> {
+    let line = bounded(
+        "listSources",
+        timeout,
+        request_response(
+            path,
+            &list_sources_request(LIST_SOURCES_REQUEST_ID),
+            LIST_SOURCES_REQUEST_ID,
+        ),
     )
     .await?;
     parse_sources_result(&line).map_err(CoreError::Recording)
@@ -469,7 +481,7 @@ impl keeper_core::recording::Recorder for DesktopRecorder {
 
     async fn list_sources(&self) -> Result<RecordingSourcesVm, CoreError> {
         let path = self.platform.sidecar_path(KEEPER_REC_SIDECAR_NAME)?;
-        fetch_sources(&path).await
+        fetch_sources(&path, PREFLIGHT_TIMEOUT).await
     }
 
     async fn request_screen_recording(&self) -> Result<bool, CoreError> {
@@ -711,14 +723,41 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_sources_round_trips_the_fake_sidecar() {
-        let response = r#"{"id":2,"result":{"displays":[{"id":1,"width":1920,"height":1080,"isMain":true}],"applications":[],"microphones":[],"cameras":[]}}"#;
+        // Story 19.1: the sources round-trip now carries real applications
+        // (name/pid/bundleId + an optional icon data-URI), no longer an empty
+        // list — the fake sidecar echoes a canned display + application.
+        let response = r#"{"id":2,"result":{"displays":[{"id":1,"width":1920,"height":1080,"isMain":true}],"applications":[{"bundleId":"com.apple.Safari","name":"Safari","pid":501,"icon":"data:image/png;base64,iVBORw0KGgo="}],"microphones":[],"cameras":[]}}"#;
         let script = format!("#!/bin/sh\nread line\necho '{response}'\n");
         let sidecar = FakeSidecar::write("sources", &script);
-        let vm = fetch_sources(sidecar.path())
+        let vm = fetch_sources(sidecar.path(), PREFLIGHT_TIMEOUT)
             .await
             .expect("listSources must round-trip");
         assert_eq!(vm.displays.len(), 1);
         assert_eq!(vm.displays[0].width, 1920);
-        assert!(vm.applications.is_empty());
+        assert_eq!(vm.applications.len(), 1);
+        assert_eq!(vm.applications[0].bundle_id, "com.apple.Safari");
+        assert_eq!(vm.applications[0].pid, 501);
+        assert!(vm.applications[0].icon.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_hung_list_sources_resolves_a_clean_timeout_error_not_a_spinner() {
+        // Story 19.1: `listSources` enumeration is async on the sidecar
+        // (SCShareableContent), so a wedged sidecar must resolve a clean
+        // SidecarFailed within the bound rather than hanging the picker poll.
+        let script = "#!/bin/sh\nread line\nsleep 30\n";
+        let bound = std::time::Duration::from_millis(200);
+        let sidecar = FakeSidecar::write("hang-sources", script);
+        let err = fetch_sources(sidecar.path(), bound)
+            .await
+            .expect_err("a hung listSources must time out");
+        assert!(
+            matches!(
+                &err,
+                CoreError::Recording(keeper_core::error::RecordingError::SidecarFailed(m))
+                    if m.contains("listSources")
+            ),
+            "expected a timeout SidecarFailed naming listSources, got {err:?}"
+        );
     }
 }

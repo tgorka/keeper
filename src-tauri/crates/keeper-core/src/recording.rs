@@ -361,19 +361,37 @@ pub fn request_screen_recording_request(id: u64) -> String {
     serde_json::json!({ "id": id, "method": "requestScreenRecording" }).to_string()
 }
 
+/// A single-application capture target (Story 19.1) — the running process id and
+/// bundle identifier the sidecar re-resolves live against `SCShareableContent` at
+/// Start. Pure data; no platform token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationTarget {
+    /// The application's running process id.
+    pub pid: i32,
+    /// The application's bundle identifier.
+    pub bundle_id: String,
+}
+
 /// The parameters of one capture session (Story 16.6, FR-68/FR-69/FR-71, AD-37).
 ///
 /// The host owns the output path (directory + local-time-stamped filename); the
 /// sidecar creates parent directories as needed and writes exactly this file.
-/// `display_id` picks a specific display (`None` = the main display);
-/// `system_audio` toggles the AAC system-audio track (with keeper's own process
-/// audio excluded — FR-69).
+/// The video target is additive (Story 19.1): `application` (`Some`) scopes
+/// capture to one app's windows and **wins** over `display_id`; otherwise
+/// `display_id` picks a specific display (`None` = the main display), the
+/// unchanged 16.6 path. `system_audio` toggles the AAC system-audio track (with
+/// keeper's own process audio excluded — FR-69).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionParams {
     /// Absolute path of the `.mp4` file to write.
     pub output_path: String,
-    /// The macOS display id to capture, or `None` for the main display.
+    /// The macOS display id to capture, or `None` for the main display. Ignored
+    /// when `application` is `Some` (an application target wins).
     pub display_id: Option<u32>,
+    /// The single-application capture target (Story 19.1), or `None` for a
+    /// display target. When `Some`, the wire carries `applicationPid`+`bundleId`
+    /// and omits `displayId`.
+    pub application: Option<ApplicationTarget>,
     /// Whether to capture system audio (true in the walking skeleton).
     pub system_audio: bool,
     /// Segment size in decimal MB before a gapless rotation (Story 17.5,
@@ -398,7 +416,14 @@ pub fn start_recording_request(id: u64, params: &SessionParams) -> String {
         "segmentMB": params.segment_mb,
         "maxSegmentSeconds": params.max_segment_seconds,
     });
-    if let Some(display_id) = params.display_id {
+    // An application target wins (Story 19.1): emit `applicationPid`+`bundleId`
+    // and omit `displayId` entirely, so the sidecar builds an app-scoped filter.
+    // Otherwise emit `displayId` only when a specific display was picked — the
+    // 16.6 display path stays byte-for-byte unchanged.
+    if let Some(application) = &params.application {
+        wire["applicationPid"] = application.pid.into();
+        wire["bundleId"] = application.bundle_id.clone().into();
+    } else if let Some(display_id) = params.display_id {
         wire["displayId"] = display_id.into();
     }
     serde_json::json!({ "id": id, "method": "startRecording", "params": wire }).to_string()
@@ -680,15 +705,27 @@ pub struct SegmentEntry {
     pub pts_end: Option<f64>,
 }
 
-/// What the session captures (Story 17.2). Epic 17 records a display;
-/// application/window targets are a later epic's concern.
+/// What the session captures (Story 17.2 → 19.1). `kind` is `"display"` or
+/// `"application"`; the other fields are populated per kind (`display_id` for a
+/// display, `bundle_id`+`pid` for an application) and serialized only when
+/// present, so a display manifest stays byte-compatible with pre-19.1 readers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureTarget {
-    /// The target kind — `"display"` throughout Epic 17.
+    /// The target kind — `"display"` or `"application"` (Story 19.1).
     pub kind: String,
-    /// The captured display id, or `None` for the main display.
+    /// The captured display id, or `None` for the main display / an application
+    /// target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_id: Option<u32>,
+    /// The captured application's bundle identifier (Story 19.1), or `None` for
+    /// a display target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    /// The captured application's process id (Story 19.1), or `None` for a
+    /// display target. Informational — the manifest records what was targeted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
 }
 
 impl CaptureTarget {
@@ -697,6 +734,19 @@ impl CaptureTarget {
         Self {
             kind: "display".to_owned(),
             display_id,
+            bundle_id: None,
+            pid: None,
+        }
+    }
+
+    /// A single-application capture target (Story 19.1) — the exclusionary
+    /// app-scoped capture the manifest records.
+    pub fn application(bundle_id: String, pid: i32) -> Self {
+        Self {
+            kind: "application".to_owned(),
+            display_id: None,
+            bundle_id: Some(bundle_id),
+            pid: Some(pid),
         }
     }
 }
@@ -1571,8 +1621,10 @@ mod tests {
     /// A healthy `getCapabilities` response line matching [`PROTOCOL_VERSION`].
     const CAPABILITIES_RESPONSE: &str = r#"{"id":1,"result":{"protocolVersion":1,"macos":"15.5.0","features":{"systemAudio":true,"microphone":false,"camera":false},"permissions":{"screenRecording":"granted","microphone":"notDetermined","camera":"notDetermined"}}}"#;
 
-    /// A healthy `listSources` response line (real display, deferred lists empty).
-    const SOURCES_RESPONSE: &str = r#"{"id":2,"result":{"displays":[{"id":1,"width":3456,"height":2234,"isMain":true}],"applications":[],"microphones":[],"cameras":[]}}"#;
+    /// A healthy `listSources` response line: a real display plus a real
+    /// application (Story 19.1) — one with an icon data-URI, one without (icon
+    /// `null`) — exercising the `RecordingApplicationVm.icon: Option` mapping.
+    const SOURCES_RESPONSE: &str = r#"{"id":2,"result":{"displays":[{"id":1,"width":3456,"height":2234,"isMain":true}],"applications":[{"bundleId":"com.apple.Safari","name":"Safari","pid":501,"icon":"data:image/png;base64,iVBORw0KGgo="},{"bundleId":"com.example.NoIcon","name":"No Icon","pid":777,"icon":null}],"microphones":[],"cameras":[]}}"#;
 
     #[test]
     fn request_builders_emit_the_wire_shape() {
@@ -1600,6 +1652,7 @@ mod tests {
         let params = SessionParams {
             output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
             display_id: Some(7),
+            application: None,
             system_audio: true,
             segment_mb: 800,
             max_segment_seconds: 2700,
@@ -1626,6 +1679,66 @@ mod tests {
         assert!(wire["params"].get("displayId").is_none());
         assert_eq!(wire["params"]["segmentMB"], 800);
         assert_eq!(wire["params"]["maxSegmentSeconds"], 2700);
+    }
+
+    #[test]
+    fn start_recording_request_app_target_wins_over_display() {
+        // Story 19.1: an application target emits `applicationPid`+`bundleId`
+        // and OMITS `displayId` (even when a display id is also set), so the
+        // sidecar builds the exclusionary app-scoped filter.
+        let params = SessionParams {
+            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            // A stray display id must be ignored once an app target is present.
+            display_id: Some(7),
+            application: Some(ApplicationTarget {
+                pid: 4242,
+                bundle_id: "com.apple.Safari".to_owned(),
+            }),
+            system_audio: true,
+            segment_mb: 500,
+            max_segment_seconds: 1800,
+        };
+        let line = start_recording_request(9, &params);
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
+        assert_eq!(wire["params"]["applicationPid"], 4242);
+        assert_eq!(wire["params"]["bundleId"], "com.apple.Safari");
+        assert!(
+            wire["params"].get("displayId").is_none(),
+            "an application target must omit displayId"
+        );
+        // The always-present segmentation + audio fields are unchanged.
+        assert_eq!(wire["params"]["systemAudio"], true);
+        assert_eq!(wire["params"]["segmentMB"], 500);
+        assert_eq!(wire["params"]["maxSegmentSeconds"], 1800);
+    }
+
+    #[test]
+    fn capture_target_application_round_trips() {
+        // Story 19.1: the manifest's application `CaptureTarget` serializes to
+        // `{kind:"application",bundleId,pid}` (no `displayId`) and round-trips.
+        let target = CaptureTarget::application("com.apple.Safari".to_owned(), 501);
+        let value = serde_json::to_value(&target).expect("serialize");
+        assert_eq!(value["kind"], "application");
+        assert_eq!(value["bundleId"], "com.apple.Safari");
+        assert_eq!(value["pid"], 501);
+        assert!(
+            value.get("displayId").is_none(),
+            "an application target omits displayId"
+        );
+        let parsed: CaptureTarget = serde_json::from_value(value).expect("round-trip");
+        assert_eq!(parsed, target);
+
+        // The display target stays compatible: `kind:"display"`, no app fields.
+        let display = CaptureTarget::display(Some(3));
+        let value = serde_json::to_value(&display).expect("serialize");
+        assert_eq!(value["kind"], "display");
+        assert_eq!(value["displayId"], 3);
+        assert!(value.get("bundleId").is_none());
+        assert!(value.get("pid").is_none());
+        assert_eq!(
+            serde_json::from_value::<CaptureTarget>(value).expect("round-trip"),
+            display
+        );
     }
 
     // --- Screen Recording pre-flight (Story 16.5) ----------------------------
@@ -1754,7 +1867,18 @@ mod tests {
         assert_eq!(vm.displays[0].width, 3456);
         assert_eq!(vm.displays[0].height, 2234);
         assert!(vm.displays[0].is_main);
-        assert!(vm.applications.is_empty());
+        // Real applications with icons (Story 19.1): name/pid/bundleId + an
+        // `Option` icon data-URI (`None` when the sidecar reported `null`).
+        assert_eq!(vm.applications.len(), 2);
+        assert_eq!(vm.applications[0].bundle_id, "com.apple.Safari");
+        assert_eq!(vm.applications[0].name, "Safari");
+        assert_eq!(vm.applications[0].pid, 501);
+        assert_eq!(
+            vm.applications[0].icon.as_deref(),
+            Some("data:image/png;base64,iVBORw0KGgo=")
+        );
+        assert_eq!(vm.applications[1].pid, 777);
+        assert!(vm.applications[1].icon.is_none());
         assert!(vm.microphones.is_empty());
         assert!(vm.cameras.is_empty());
     }
@@ -1928,6 +2052,7 @@ mod tests {
         SessionParams {
             output_path: "/tmp/keeper-test.mp4".to_owned(),
             display_id: None,
+            application: None,
             system_audio: true,
             segment_mb: 500,
             max_segment_seconds: 1800,

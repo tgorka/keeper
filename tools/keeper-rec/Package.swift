@@ -32,6 +32,11 @@ let package = Package(
                 .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreMedia"),
+                // AppKit provides `NSRunningApplication(processIdentifier:)?.icon`
+                // for the application-picker icons (Story 19.1) — no third-party
+                // dependency. Explicit link keeps the build reproducible under
+                // stricter/explicit-linking toolchains.
+                .linkedFramework("AppKit"),
             ]
         ),
         // Unit tests for the pure, Foundation-only logic (Rotation.swift,

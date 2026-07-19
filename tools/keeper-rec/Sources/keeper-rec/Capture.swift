@@ -133,13 +133,16 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
     /// Whether `start` was called (main-thread only; gates the EOF-as-stop path).
     private(set) var isActive = false
 
-    /// Begin capturing `displayId` (or the main display) with system audio to
-    /// `path`, rotating segments per `segmentMB` / `maxSegmentSeconds` (Story
-    /// 17.1). Emits `preflight` immediately, then `recording` (with the path)
-    /// once frames are flowing, or a single honest `error` line on any failure.
+    /// Begin capturing to `path` (Story 17.1). The video target is one of
+    /// (Story 19.1): a specific `applicationPid` (app-scoped, exclusionary — only
+    /// that app's windows land in the file), a specific `displayId`, or the main
+    /// display (`applicationPid == nil && displayId == nil`). Rotating segments
+    /// per `segmentMB` / `maxSegmentSeconds`. Emits `preflight` immediately, then
+    /// `recording` (with the path) once frames are flowing, or a single honest
+    /// `error` line on any failure — including a vanished application pid.
     func start(
-        path: String, displayId: UInt32?, systemAudio: Bool, segmentMB: Int,
-        maxSegmentSeconds: Int
+        path: String, displayId: UInt32?, applicationPid: Int32?, applicationBundleId: String?,
+        systemAudio: Bool, segmentMB: Int, maxSegmentSeconds: Int
     ) {
         isActive = true
         policy = RotationPolicy(segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds)
@@ -151,6 +154,58 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
                 // which surfaces as the honest error event below (Cap #1722).
                 let content = try await SCShareableContent.excludingDesktopWindows(
                     false, onScreenWindowsOnly: false)
+
+                // Story 19.1: an application target is captured app-scoped. The
+                // pid is re-resolved against LIVE shareable content — a pid that
+                // vanished between the picker's last poll and Start is absent
+                // here and fails cleanly (honest `error` → host `Failed`), never
+                // a hung recording.
+                if let wantedPid = applicationPid {
+                    // Re-resolve against LIVE shareable content, matching BOTH
+                    // pid and (when provided) bundle id — the OS recycles a pid to
+                    // a different app within seconds, so pid alone could capture
+                    // the wrong app. A vanished or rebound pid is absent here and
+                    // fails cleanly (honest `error` → host `Failed`).
+                    guard
+                        let app = content.applications.first(where: {
+                            $0.processID == wantedPid
+                                && (applicationBundleId == nil
+                                    || $0.bundleIdentifier == applicationBundleId)
+                        })
+                    else {
+                        throw CaptureError(
+                            "the selected application is no longer running")
+                    }
+                    // App-scoped capture lives on a display: anchor to the display
+                    // hosting the app's frontmost on-screen window (falling back to
+                    // the main display, then any). An app with NO on-screen window
+                    // would yield an empty (black) filter, so fail honestly instead
+                    // of recording nothing.
+                    let appWindows = content.windows.filter {
+                        $0.owningApplication?.processID == wantedPid && $0.isOnScreen
+                    }
+                    guard let anchor = appWindows.first else {
+                        throw CaptureError(
+                            "the selected application has no on-screen window to record")
+                    }
+                    let center = CGPoint(x: anchor.frame.midX, y: anchor.frame.midY)
+                    guard
+                        let display = content.displays.first(where: {
+                            $0.frame.contains(center)
+                        })
+                            ?? content.displays.first(where: {
+                                CGDisplayIsMain($0.displayID) != 0
+                            })
+                            ?? content.displays.first
+                    else {
+                        throw CaptureError("no recordable display found")
+                    }
+                    try self.beginCapture(
+                        display: display, application: app, path: path,
+                        systemAudio: systemAudio)
+                    return
+                }
+
                 let display: SCDisplay
                 if let wanted = displayId {
                     guard let match = content.displays.first(where: { $0.displayID == wanted })
@@ -165,7 +220,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
                 } else {
                     throw CaptureError("no recordable display found")
                 }
-                try self.beginCapture(display: display, path: path, systemAudio: systemAudio)
+                try self.beginCapture(
+                    display: display, application: nil, path: path, systemAudio: systemAudio)
             } catch {
                 emitEvent([
                     "event": "error",
@@ -178,8 +234,13 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
 
     /// Build segment 0's writer + the stream and start capturing. Runs on the
     /// Task executor; writer state it seeds is only touched again on
-    /// `mediaQueue`.
-    private func beginCapture(display: SCDisplay, path: String, systemAudio: Bool) throws {
+    /// `mediaQueue`. When `application` is non-nil the filter is app-scoped
+    /// (Story 19.1) — only that application's windows land in the file; keeper,
+    /// other apps, and notification banners are absent because they are not the
+    /// target app. When nil the whole display is captured (the 16.6 path).
+    private func beginCapture(
+        display: SCDisplay, application: SCRunningApplication?, path: String, systemAudio: Bool
+    ) throws {
         // Capture at the display's true pixel size (SCDisplay reports points).
         pixelWidth = max(2, CGDisplayPixelsWide(display.displayID))
         pixelHeight = max(2, CGDisplayPixelsHigh(display.displayID))
@@ -187,7 +248,18 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
 
         let first = try makeSegmentWriter(path: path, index: 0)
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        // Story 19.1: an application target is exclusionary — `including:[app]`
+        // keeps only that app's windows in the file. The display-only branch
+        // (16.6) is unchanged. `excludesCurrentProcessAudio` (set below when
+        // `systemAudio`) keeps keeper's own sounds out either way (audio behavior
+        // is unchanged — 19.2 owns per-app audio scoping).
+        let filter: SCContentFilter
+        if let application {
+            filter = SCContentFilter(
+                display: display, including: [application], exceptingWindows: [])
+        } else {
+            filter = SCContentFilter(display: display, excludingWindows: [])
+        }
         let config = SCStreamConfiguration()
         config.width = pixelWidth
         config.height = pixelHeight

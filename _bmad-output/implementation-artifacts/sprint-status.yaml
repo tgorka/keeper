@@ -189,8 +189,8 @@ development_status:
   18-4-loud-failure-triad-tray-error-notification-banner: backlog
   18-5-disk-space-guard-warn-and-graceful-stop-and-finalize: backlog
   epic-18-retrospective: optional
-  epic-19: backlog
-  19-1-application-window-picker-scshareablecontent-live-list: backlog
+  epic-19: in-progress
+  19-1-application-window-picker-scshareablecontent-live-list: done
   19-2-system-audio-toggle-and-per-app-audio-scoping: backlog
   19-3-microphone-picker-and-separate-track: backlog
   19-4-microphone-hot-unplug-resilience: backlog

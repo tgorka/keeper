@@ -26,8 +26,9 @@ use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::recording::{
     current_segment_bytes_on_disk, resolve_screen_recording_access, session_bytes_on_disk,
-    session_folder_name, CaptureTarget, ManifestStatus, Recorder, RecordingEvent, RecordingSession,
-    SegmentEntry, SessionDevices, SessionManifest, SessionParams, SessionState,
+    session_folder_name, ApplicationTarget, CaptureTarget, ManifestStatus, Recorder,
+    RecordingEvent, RecordingSession, SegmentEntry, SessionDevices, SessionManifest, SessionParams,
+    SessionState,
 };
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
@@ -38,9 +39,9 @@ use keeper_core::vm::{
     IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
     NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
     PaletteResultsVm, PingVm, Provider, RecordingPermissionVm, RecordingSettingsVm,
-    RecordingStatusVm, RecordingUiState, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
-    ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot, TccPermission,
-    TimelineBatch, TypingBatch, VerificationFlowVm,
+    RecordingSourcesVm, RecordingStatusVm, RecordingTargetVm, RecordingUiState, RemoteDraftVm,
+    ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm, SearchHitVm,
+    SpacesSnapshot, TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -3349,6 +3350,49 @@ pub(crate) fn epoch_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Enumerate the recordable sources — displays and applications — the source
+/// picker polls (Story 19.1). Runs the sidecar `listSources` round-trip (a fresh
+/// child `keeper-rec` per call; bounded by the shell's pre-flight timeout so a
+/// wedged sidecar resolves a clean error, never a hung poll) and returns the live
+/// [`RecordingSourcesVm`]: real displays plus real applications (name/pid/bundleId
+/// + an optional ≤64px PNG icon data-URI, keeper excluded). Called on a ~3s poll
+/// while the idle setup surface is visible and on window focus. Gated by the
+/// `recording` capability — an unsupported platform answers `Unsupported` with no
+/// spawn. Failures funnel through [`to_ipc_error`]; the picker swallows them to
+/// the prior list (a transient enumeration failure never blanks the picker).
+#[tauri::command]
+pub async fn recording_list_sources(
+    state: State<'_, AppState>,
+) -> Result<RecordingSourcesVm, IpcError> {
+    if !crate::macos_version::recording_supported() {
+        return Err(to_ipc_error(CoreError::Unsupported(
+            "recording is not available on this platform".to_owned(),
+        )));
+    }
+    state.recorder.list_sources().await.map_err(to_ipc_error)
+}
+
+/// Map a picker [`RecordingTargetVm`] into the session's manifest [`CaptureTarget`]
+/// and the sidecar [`SessionParams`] video-target fields (Story 19.1). An
+/// application target wins (records app-scoped; `display_id` unused); a display
+/// target (or `None`) records the display (`None` = the main display, the
+/// unchanged 16.6 path).
+fn resolve_capture_target(
+    target: Option<RecordingTargetVm>,
+) -> (CaptureTarget, Option<u32>, Option<ApplicationTarget>) {
+    match target {
+        Some(RecordingTargetVm::Application { pid, bundle_id }) => (
+            CaptureTarget::application(bundle_id.clone(), pid),
+            None,
+            Some(ApplicationTarget { pid, bundle_id }),
+        ),
+        Some(RecordingTargetVm::Display { display_id }) => {
+            (CaptureTarget::display(display_id), display_id, None)
+        }
+        None => (CaptureTarget::display(None), None, None),
+    }
+}
+
 /// Start the (at most one) full-screen + system-audio recording session (Story
 /// 16.6 + 17.2, FR-68/FR-69/FR-71, AD-33/AD-37): create the per-session folder
 /// `~/Movies/keeper/keeper-rec <local timestamp>/` with its initial `recording`
@@ -3362,7 +3406,16 @@ pub(crate) fn epoch_ms_now() -> u64 {
 /// failure is logged only and never flips the live session to `failed` (the
 /// single-child start-guard keys off the snapshot).
 #[tauri::command]
-pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStatusVm, IpcError> {
+pub async fn recording_start(
+    state: State<'_, AppState>,
+    target: Option<RecordingTargetVm>,
+) -> Result<RecordingStatusVm, IpcError> {
+    // Story 19.1: map the picker's selected target into the manifest capture
+    // target + the sidecar's video-target params. `None` (no picker selection)
+    // preserves the 16.6 main-display default. A vanished application fails
+    // cleanly at the sidecar (an honest `error` → `Failed`), never here.
+    let (capture_target, target_display_id, application) = resolve_capture_target(target);
+
     let mut guard = slot_lock(&state.recording_run);
     if let Some(run) = guard.as_ref() {
         let live = !matches!(
@@ -3403,7 +3456,7 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
     // yet, so surfacing it cannot desync any start-guard.
     let manifest = SessionManifest::create(
         folder.clone(),
-        CaptureTarget::display(None),
+        capture_target,
         SessionDevices {
             system_audio: true,
             microphone: false,
@@ -3428,7 +3481,10 @@ pub async fn recording_start(state: State<'_, AppState>) -> Result<RecordingStat
             .join("screen-0000.mp4")
             .to_string_lossy()
             .into_owned(),
-        display_id: None,
+        // Story 19.1: an application target wins; otherwise the selected display
+        // (or `None` = main display, the unchanged 16.6 path).
+        display_id: target_display_id,
+        application,
         system_audio: true,
         segment_mb,
         // Minutes → seconds for the sidecar's `maxSegmentSeconds` (30 → 1800).
@@ -4537,6 +4593,44 @@ mod tests {
     #[test]
     fn now_ms_is_positive() {
         assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn resolve_capture_target_maps_each_kind() {
+        // Story 19.1: an application target maps to an application manifest
+        // CaptureTarget, no display id, and the sidecar ApplicationTarget.
+        let (target, display_id, application) =
+            resolve_capture_target(Some(RecordingTargetVm::Application {
+                pid: 501,
+                bundle_id: "com.apple.Safari".to_owned(),
+            }));
+        assert_eq!(
+            target,
+            CaptureTarget::application("com.apple.Safari".to_owned(), 501)
+        );
+        assert_eq!(display_id, None);
+        assert_eq!(
+            application,
+            Some(ApplicationTarget {
+                pid: 501,
+                bundle_id: "com.apple.Safari".to_owned(),
+            })
+        );
+
+        // A specific display maps to a display target carrying that id.
+        let (target, display_id, application) =
+            resolve_capture_target(Some(RecordingTargetVm::Display {
+                display_id: Some(7),
+            }));
+        assert_eq!(target, CaptureTarget::display(Some(7)));
+        assert_eq!(display_id, Some(7));
+        assert_eq!(application, None);
+
+        // No selection preserves the 16.6 main-display default.
+        let (target, display_id, application) = resolve_capture_target(None);
+        assert_eq!(target, CaptureTarget::display(None));
+        assert_eq!(display_id, None);
+        assert_eq!(application, None);
     }
 
     /// A `Stopping` snapshot for the quit-finalize tests (Story 18.2).

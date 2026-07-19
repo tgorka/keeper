@@ -17,7 +17,7 @@
  * not flicker the UI back to idle mid-recording).
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { RecordingStatusVm } from "@/lib/ipc/client";
+import type { RecordingStatusVm, RecordingTargetVm } from "@/lib/ipc/client";
 import { recordingStart, recordingStatus, recordingStop } from "@/lib/ipc/client";
 
 /** The states with a session worth polling (anything non-terminal, non-idle). */
@@ -62,8 +62,9 @@ export interface UseRecordingSession {
   status: RecordingStatusVm;
   /** The ticking `H:MM:SS` elapsed line, or `null` before capture starts. */
   elapsed: string | null;
-  /** Start the full-screen + system-audio session (no-op while one is live). */
-  start: () => Promise<void>;
+  /** Start the session for the selected capture target (Story 19.1) — a display
+   * or an application; omit for the main-display default (no-op while live). */
+  start: (target?: RecordingTargetVm) => Promise<void>;
   /** Request the graceful stop-and-finalize (idempotent). */
   stop: () => Promise<void>;
 }
@@ -129,9 +130,9 @@ export function useRecordingSession(): UseRecordingSession {
     };
   }, [startedAt, live]);
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (target?: RecordingTargetVm) => {
     try {
-      const vm = await recordingStart();
+      const vm = await recordingStart(target);
       if (mounted.current) {
         setStatus(vm);
       }

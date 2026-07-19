@@ -363,6 +363,7 @@ pub fn run() {
             ipc::recording_permission,
             ipc::request_screen_recording_permission,
             ipc::open_screen_recording_settings,
+            ipc::recording_list_sources,
             ipc::recording_start,
             ipc::recording_stop,
             ipc::recording_status,

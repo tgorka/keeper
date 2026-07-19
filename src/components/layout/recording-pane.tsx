@@ -23,12 +23,14 @@ import {
   RecordingPermissionRow,
   SCREEN_RECORDING_PERMISSION_NAME,
 } from "@/components/recording/recording-permission-row";
+import { RecordingSourcePicker } from "@/components/recording/recording-source-picker";
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useRecordingPermission } from "@/hooks/use-recording-permission";
 import { isLiveRecording, useRecordingSession } from "@/hooks/use-recording-session";
+import { selectedRecordingTarget } from "@/lib/stores/recording-source";
 
 /** Honest local-only subtitle (recording voice: sentence case, no exclamation
  * marks). Recording adds zero network destinations. */
@@ -49,9 +51,10 @@ export const START_BLOCKED_NOTE = `Start needs the ${SCREEN_RECORDING_PERMISSION
 /** Placeholder copy for each not-yet-built setup card (recording voice). */
 const PLACEHOLDER_COPY = "Configured in a later update.";
 
-/** The setup cards this shell reserves. "Segmenting" is live (Story 17.5,
- * FR-72 — the shared segment-size + duration-cap control); the rest are
- * later-story surfaces ("Destination" is Epic 19). */
+/** The setup cards this shell reserves. "Source" (Story 19.1 — the live
+ * application/window/display picker) and "Segmenting" (Story 17.5, FR-72 — the
+ * shared segment-size + duration-cap control) are live; the rest are later-story
+ * surfaces ("Destination" is Story 19.5). */
 const SETUP_CARDS: readonly string[] = [
   "Source",
   "Audio",
@@ -85,7 +88,9 @@ export function RecordingPane() {
               type="button"
               disabled={!permission.canStart}
               onClick={() => {
-                void start();
+                // Story 19.1: start the session for the picker's selected target
+                // (a display or an application; the main display by default).
+                void start(selectedRecordingTarget());
               }}
             >
               {START_RECORDING_LABEL}
@@ -141,7 +146,21 @@ export function RecordingPane() {
           </Card>
 
           {SETUP_CARDS.map((title) =>
-            title === "Segmenting" ? (
+            title === "Source" ? (
+              // The live source picker (Story 19.1): displays + applications,
+              // polled ~3s while idle, single-select, app-scope disclosed.
+              <Card key={title} size="sm">
+                <CardHeader>
+                  <CardTitle>{title}</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  {/* Pause the ~3s source poll while recording (Story 19.1):
+                      the setup cards stay mounted during a live session, so the
+                      picker must stop spawning enumeration children. */}
+                  <RecordingSourcePicker active={!live} />
+                </CardContent>
+              </Card>
+            ) : title === "Segmenting" ? (
               // The live pre-record segmentation controls (Story 17.5): the
               // same shared control Settings → Recording mounts, bound to one
               // store so the two surfaces mirror each other.

@@ -87,9 +87,13 @@ export type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
+export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
+export type { RecordingDisplayVm } from "./gen/RecordingDisplayVm";
 export type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 export type { RecordingSettingsVm } from "./gen/RecordingSettingsVm";
+export type { RecordingSourcesVm } from "./gen/RecordingSourcesVm";
 export type { RecordingStatusVm } from "./gen/RecordingStatusVm";
+export type { RecordingTargetVm } from "./gen/RecordingTargetVm";
 export type { RecordingUiState } from "./gen/RecordingUiState";
 export type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 export type { ReplyPreviewVm } from "./gen/ReplyPreviewVm";
@@ -143,7 +147,9 @@ import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 import type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 import type { RecordingSettingsVm } from "./gen/RecordingSettingsVm";
+import type { RecordingSourcesVm } from "./gen/RecordingSourcesVm";
 import type { RecordingStatusVm } from "./gen/RecordingStatusVm";
+import type { RecordingTargetVm } from "./gen/RecordingTargetVm";
 import type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 import type { ResolveSupportVm } from "./gen/ResolveSupportVm";
 import type { RoomListBatch } from "./gen/RoomListBatch";
@@ -1686,8 +1692,25 @@ export async function openScreenRecordingSettings(): Promise<void> {
  * with the {@link IpcError} envelope when a session is already live or the
  * sidecar cannot spawn.
  */
-export async function recordingStart(): Promise<RecordingStatusVm> {
-  return await invoke<RecordingStatusVm>("recording_start");
+export async function recordingStart(target?: RecordingTargetVm): Promise<RecordingStatusVm> {
+  // Story 19.1: the picker's selected source/target (a display or an
+  // application). Omitted (`undefined`) preserves the 16.6 main-display default.
+  return await invoke<RecordingStatusVm>("recording_start", { target: target ?? null });
+}
+
+/**
+ * Enumerate the recordable sources — displays and applications — the source
+ * picker polls (Story 19.1). The Rust command runs the `keeper-rec`
+ * `listSources` round-trip (a fresh child process per call, bounded by a shell
+ * timeout so a wedged sidecar resolves a clean error, never a hung poll) and
+ * resolves the live {@link RecordingSourcesVm}: real displays plus real
+ * applications (name/pid/bundleId + an optional ≤64px PNG icon data-URI, keeper
+ * excluded). Called on a ~3s poll while the idle setup surface is visible and on
+ * window focus. Rejects with the {@link IpcError} envelope on a sidecar failure —
+ * the picker swallows it to the prior list rather than blanking.
+ */
+export async function listRecordingSources(): Promise<RecordingSourcesVm> {
+  return await invoke<RecordingSourcesVm>("recording_list_sources");
 }
 
 /**

@@ -2573,9 +2573,10 @@ pub struct RecordingDisplayVm {
     pub is_main: bool,
 }
 
-/// One recordable application reported by `listSources` (Story 16.4). Shape-locked
-/// now; real enumeration needs ScreenCaptureKit shareable content and lands with
-/// capture/source breadth (16.6/19) — until then the list is empty.
+/// One recordable application reported by `listSources` (Story 16.4/19.1). Real
+/// enumeration lands in Story 19.1 via the sidecar's `SCShareableContent`
+/// enumeration: keeper's own bundle id is excluded (it can never be a target),
+/// apps that own no on-screen window are dropped, and the list is name-sorted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -2586,6 +2587,11 @@ pub struct RecordingApplicationVm {
     pub name: String,
     /// The running process id.
     pub pid: i32,
+    /// The app's icon as a bounded (≤64×64px) PNG `data:image/png;base64,…`
+    /// URI (Story 19.1), or `None` when an icon can't be produced — the picker
+    /// then falls back to a generic app glyph. Kept small so the polled list
+    /// never becomes a large-payload-over-IPC violation.
+    pub icon: Option<String>,
 }
 
 /// One recordable audio/video device (microphone or camera) reported by
@@ -2617,6 +2623,39 @@ pub struct RecordingSourcesVm {
     pub microphones: Vec<RecordingDeviceVm>,
     /// Camera devices (empty until AVFoundation enumeration lands).
     pub cameras: Vec<RecordingDeviceVm>,
+}
+
+/// The single capture target a Recording Session records (Story 19.1) — the
+/// picker's selection and the `recording_start` input.
+///
+/// An internally-tagged union (`{kind:"display"|"application", …}`) so invalid
+/// combinations are unrepresentable: a display target carries only a
+/// `displayId`, an application target only a `pid`+`bundleId`. `Display` with a
+/// `None`/absent `displayId` means the main display (the unchanged 16.6
+/// default). The shell maps this into a `keeper_core::recording::CaptureTarget`
+/// (the manifest) and a `SessionParams.application`/`display_id` (the wire).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum RecordingTargetVm {
+    /// Capture a whole display (`None`/absent `displayId` = the main display).
+    Display {
+        /// The CoreGraphics display id, or `None` for the main display.
+        #[serde(default)]
+        display_id: Option<u32>,
+    },
+    /// Capture a single application's windows (exclusionary: keeper, other apps,
+    /// and notification banners stay out of the file).
+    Application {
+        /// The application's running process id (re-resolved live at Start).
+        pid: i32,
+        /// The application's bundle identifier (for the manifest + disclosure).
+        bundle_id: String,
+    },
 }
 
 /// The honest Screen Recording tri-state the permission pre-flight resolves

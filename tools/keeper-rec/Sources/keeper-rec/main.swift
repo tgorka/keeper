@@ -21,8 +21,10 @@
 // capture builds need an Apple Development certificate (a DevEx requirement, not
 // a product blocker). This request loop itself needs no special signing.
 
+import AppKit
 import CoreGraphics
 import Foundation
+import ScreenCaptureKit
 
 // If the parent closes the read end of our stdout before we finish writing, a
 // SIGPIPE would terminate us with signal 13 (exit 141) — violating the invariant
@@ -133,13 +135,107 @@ private func listDisplays() -> [[String: Any]] {
     }
 }
 
-/// The `listSources` result: real displays; applications (SCShareableContent)
-/// and microphones/cameras (AVFoundation) deferred as empty arrays — the shape
-/// is the locked contract, enumeration lands with 16.6/19.
-private func sourcesResult() -> [String: Any] {
+/// keeper's own bundle id — never offered as an application capture target
+/// (Story 19.1: keeper can never record itself, and app-scoped capture already
+/// excludes it from the file). Matches the bundle id in keeper's Info.plist.
+private let keeperBundleId = "dev.tgorka.keeper"
+
+/// Render one application's icon as a bounded (≤64×64px) PNG `data:image/png;
+/// base64,…` URI (Story 19.1), or `nil` when no icon can be produced — the
+/// picker then shows a generic glyph. Kept small so the polled source list never
+/// becomes a large-payload-over-IPC violation. Nil-safe throughout: any failure
+/// (no running app, no icon, encode failure) degrades to `nil`, never a crash.
+private func iconDataURI(forPid pid: pid_t) -> String? {
+    guard let running = NSRunningApplication(processIdentifier: pid),
+        let icon = running.icon
+    else {
+        return nil
+    }
+    // Downscale into a 64×64 bitmap and PNG-encode it. Drawing into a fixed
+    // NSBitmapImageRep bounds the payload regardless of the source icon size.
+    let side = 64
+    guard
+        let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: side, pixelsHigh: side,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+    else {
+        return nil
+    }
+    rep.size = NSSize(width: side, height: side)
+    guard let context = NSGraphicsContext(bitmapImageRep: rep) else {
+        return nil
+    }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = context
+    icon.draw(
+        in: NSRect(x: 0, y: 0, width: side, height: side),
+        from: .zero, operation: .copy, fraction: 1.0)
+    NSGraphicsContext.restoreGraphicsState()
+    guard let png = rep.representation(using: .png, properties: [:]) else {
+        return nil
+    }
+    return "data:image/png;base64,\(png.base64EncodedString())"
+}
+
+/// Enumerate the recordable applications via `SCShareableContent` (Story 19.1):
+/// real running apps that own at least one on-screen window, keeper's own bundle
+/// excluded (it can never be a target), deduped by pid, name-sorted, each with
+/// name/pid/bundleId + an optional ≤64px PNG icon data-URI. An enumeration
+/// failure (ungranted / ad-hoc-rejected process) degrades to an empty list —
+/// honest, never a hang or crash (the pre-flight, Story 16.5, owns the fix path).
+private func listApplications() async -> [[String: Any]] {
+    guard
+        let content = try? await SCShareableContent.excludingDesktopWindows(
+            false, onScreenWindowsOnly: true)
+    else {
+        return []
+    }
+    // Only apps that own ≥1 on-screen window are recordable targets. The window
+    // list is already on-screen-only above; collect the distinct owning pids.
+    var pidsWithWindows = Set<pid_t>()
+    for window in content.windows where window.isOnScreen {
+        if let owner = window.owningApplication {
+            pidsWithWindows.insert(owner.processID)
+        }
+    }
+    var seen = Set<pid_t>()
+    var apps: [[String: Any]] = []
+    for app in content.applications {
+        let pid = app.processID
+        guard pidsWithWindows.contains(pid), !seen.contains(pid) else { continue }
+        let bundleId = app.bundleIdentifier
+        // keeper can never be a capture target (it also can never appear in an
+        // app-scoped file); drop it from the offered list.
+        guard bundleId != keeperBundleId else { continue }
+        seen.insert(pid)
+        var entry: [String: Any] = [
+            "bundleId": bundleId,
+            "name": app.applicationName,
+            "pid": Int(pid),
+        ]
+        if let icon = iconDataURI(forPid: pid) {
+            entry["icon"] = icon
+        }
+        apps.append(entry)
+    }
+    // Name-sorted (case-insensitive, locale-aware) for a stable picker order.
+    apps.sort { lhs, rhs in
+        let a = (lhs["name"] as? String) ?? ""
+        let b = (rhs["name"] as? String) ?? ""
+        return a.localizedCaseInsensitiveCompare(b) == .orderedAscending
+    }
+    return apps
+}
+
+/// The `listSources` result (Story 16.4 → 19.1): real displays (CoreGraphics)
+/// and real applications (SCShareableContent). Microphones/cameras (AVFoundation)
+/// stay deferred as empty arrays — the shape is the locked contract; Epic 19.3/20
+/// land them. `async` because application enumeration awaits shareable content.
+private func sourcesResult() async -> [String: Any] {
     return [
         "displays": listDisplays(),
-        "applications": [] as [[String: Any]],
+        "applications": await listApplications(),
         "microphones": [] as [[String: Any]],
         "cameras": [] as [[String: Any]],
     ]
@@ -171,7 +267,15 @@ while let line = readLine(strippingNewline: true) {
     case "getCapabilities":
         response = ["id": id, "result": capabilitiesResult()]
     case "listSources":
-        response = ["id": id, "result": sourcesResult()]
+        // Story 19.1: application enumeration is async (`SCShareableContent`),
+        // so answer off a `Task` and serialize the reply through the same
+        // `writeLine`/`stdoutLock` the request loop uses — never interleaving
+        // bytes with a concurrent reply. A failed write means the host is gone;
+        // there is nothing to exit for here (the loop exits at EOF).
+        Task {
+            _ = writeLine(["id": id, "result": await sourcesResult()])
+        }
+        continue
     case "requestScreenRecording":
         // Story 16.5: ask TCC for Screen Recording access. Returns immediately
         // with the current grant; where the state is undetermined the OS posts
@@ -201,6 +305,16 @@ while let line = readLine(strippingNewline: true) {
             break
         }
         let displayId = (params?["displayId"] as? NSNumber)?.uint32Value
+        // Story 19.1: an optional application capture target. When present the
+        // engine scopes capture to that app's windows (exclusionary) and ignores
+        // `displayId`; the app is re-resolved live against SCShareableContent at
+        // start, so a vanished pid fails with an honest `error` event (never a
+        // hung recording). `bundleId` is informational for the engine.
+        let applicationPid = (params?["applicationPid"] as? NSNumber)?.int32Value
+        // The app's bundle id (when app-scoped): the engine re-resolves the pid
+        // against live shareable content matching BOTH pid and bundle id, so a
+        // recycled pid can't capture the wrong app.
+        let applicationBundleId = params?["bundleId"] as? String
         let systemAudio = (params?["systemAudio"] as? Bool) ?? true
         // Story 17.1: optional segmenting knobs, additive to the v1 protocol
         // (Story 17.5 later feeds configured values from keeper.db). Missing
@@ -215,7 +329,8 @@ while let line = readLine(strippingNewline: true) {
         response = ["id": id, "result": ["starting": true]]
         _ = writeLine(response)
         captureEngine.start(
-            path: path, displayId: displayId, systemAudio: systemAudio,
+            path: path, displayId: displayId, applicationPid: applicationPid,
+            applicationBundleId: applicationBundleId, systemAudio: systemAudio,
             segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds)
         continue
     case "stop":

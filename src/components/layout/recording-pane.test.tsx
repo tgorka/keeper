@@ -8,6 +8,16 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingStart: vi.fn(),
   recordingStop: vi.fn(),
   recordingStatus: vi.fn(),
+  // The "Source" card mounts the live picker (Story 19.1), which polls this.
+  // A real main display keeps the default (main-display) selection available.
+  listRecordingSources: vi.fn(() =>
+    Promise.resolve({
+      displays: [{ id: 1, width: 3456, height: 2234, isMain: true }],
+      applications: [],
+      microphones: [],
+      cameras: [],
+    }),
+  ),
   // The "Segmenting" card mounts the shared settings control (Story 17.5),
   // which lazily hydrates from this read.
   recordingSettingsGet: vi.fn(() => Promise.resolve({ segmentMb: 500, durationCapMinutes: 30 })),
@@ -38,6 +48,7 @@ import {
   recordingStop,
   requestScreenRecordingPermission,
 } from "@/lib/ipc/client";
+import { resetRecordingSourceForTest } from "@/lib/stores/recording-source";
 
 const mockFetch = vi.mocked(recordingPermission);
 const mockRequest = vi.mocked(requestScreenRecordingPermission);
@@ -88,6 +99,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Stop the picker's poll timer + restore the default selection between tests
+  // (Story 19.1) — a leaked interval would keep firing into the next test.
+  resetRecordingSourceForTest();
   vi.clearAllMocks();
 });
 
