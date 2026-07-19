@@ -40,8 +40,10 @@
 // and finalize paths — writer state is queue-confined, no locks. Progress is
 // reported as NDJSON event lines on stdout (the Story 16.2 contract):
 // `{"event":"state","state":"preflight"|"recording"|"rotating"|"stopping"|"finalized"}`,
-// `{"event":"segmentClosed",…}`, and `{"event":"error","message":"…"}` — the
-// host's parser drops unknown extras, so event lines may carry a `path`.
+// `{"event":"segmentClosed",…}`, the non-fatal
+// `{"event":"warning","code":…,"message":…}` (Story 19.4 — mic loss never
+// aborts the session), and `{"event":"error","message":"…"}` — the host's
+// parser drops unknown extras, so event lines may carry a `path`.
 
 import AVFoundation
 import CoreGraphics
@@ -117,8 +119,39 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// AVCaptureSession feeding the same per-segment `micInput` the 15+
     /// in-stream `.microphone` output would — one writer, user-invisible OS
     /// split. `nil` on macOS 15+ (the SCStream carries the mic) and while the
-    /// mic is off.
+    /// mic is off. Also stood up on 15+ as the mic-loss *fallback* feed
+    /// (Story 19.4) — see `attemptMicFallback`.
     private var micSession: AVCaptureSession?
+    /// Best-effort uniqueID of the device actually feeding the mic track
+    /// (Story 19.4): the picked device, else a snapshot of the system default
+    /// input at start (re-snapshotted when a fallback attaches). Feeds
+    /// `MicHealth.decide` so an unrelated device's removal never raises a
+    /// false warning.
+    private var activeMicDeviceId: String?
+    /// Set on `mediaQueue` when the mic is lost (Story 19.4) — the
+    /// silence-fill gate. Cleared when a real mic sample flows again (the
+    /// fallback device came up).
+    private var micLost = false
+    /// The repeating silence-fill timer on `mediaQueue` (Story 19.4), armed on
+    /// the first loss and cancelled at stop.
+    private var silenceTimer: DispatchSourceTimer?
+    /// The mic track's written tail — the next acceptable mic PTS (Story
+    /// 19.4). Real samples and silence-fill both advance it; `appendMicSample`
+    /// trims any sample landing below it (a late buffer from a dying device, a
+    /// fallback overlapping an already-silence-filled span) so the track's
+    /// timeline never rewinds.
+    private var micPTSLowerBound = CMTime.invalid
+    /// Cached LPCM format description for generated silence buffers (Story 19.4).
+    private var silenceFormatDescription: CMFormatDescription?
+    /// Device-removal / runtime-error observer tokens (Story 19.4), removed at
+    /// stop so no late signal fires into a winding-down engine.
+    private var micObservers: [NSObjectProtocol] = []
+    /// The current mic `AVCaptureSession`'s runtime-error observer (Story 19.4),
+    /// kept apart from `micObservers` so a fallback that re-arms the session
+    /// REPLACES it rather than accumulating one observer per fallback (which
+    /// would fire `handleMicLost` N times for a single later error). Removed at
+    /// stop with the rest.
+    private var micSessionRuntimeObserver: NSObjectProtocol?
 
     /// Set on `mediaQueue` when the writer session has been anchored at the
     /// first complete video frame's PTS.
@@ -276,6 +309,15 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         // Seed BEFORE `makeSegmentWriter` — segment 0's writer must already
         // carry the mic input when the mic source is enabled.
         wantsMic = micEnabled
+        if micEnabled {
+            // Story 19.4: best-effort snapshot of the device that will feed
+            // the mic track — the picked device, else the current system
+            // default input (whose concrete id the in-stream 15+ path never
+            // reports). `nil` (no default input either) stays conservative:
+            // any audio removal then warns rather than silently gapping.
+            activeMicDeviceId = micDeviceId ?? AVCaptureDevice.default(for: .audio)?.uniqueID
+            installMicDisconnectObserver()
+        }
 
         let first = try makeSegmentWriter(path: path, index: 0)
 
@@ -474,6 +516,29 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         }
         session.addOutput(output)
         micSession = session
+        // Story 19.4: the concrete device now feeding the mic track (the
+        // resolved default when `deviceId` was nil) — the identity
+        // `MicHealth.decide` matches removals against.
+        activeMicDeviceId = device.uniqueID
+        // Story 19.4 (closes the 19.3 deferred gap): a yanked device on this
+        // path surfaces as a *session runtime error*, not a stream teardown —
+        // observe it and route it into the same non-fatal mic-loss branch a
+        // device-disconnect notification takes. Never `error`/exit: mic-only
+        // loss must not kill the session.
+        // Replace (never accumulate) the prior session's runtime-error
+        // observer — a fallback re-arms this session (Story 19.4), so one
+        // observer must track only the current session.
+        if let prior = micSessionRuntimeObserver {
+            NotificationCenter.default.removeObserver(prior)
+        }
+        micSessionRuntimeObserver = NotificationCenter.default.addObserver(
+            forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.mediaQueue.async {
+                self.handleMicLost(removedDeviceId: self.activeMicDeviceId)
+            }
+        }
         // `startRunning` blocks while the session spins up — keep it off the
         // request loop and `mediaQueue`. Mic samples arriving before the video
         // anchor are dropped by the append guard, exactly like system audio.
@@ -492,7 +557,195 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         guard sampleBuffer.isValid, !stopping, sessionStarted,
             let micInput = current?.micInput, micInput.isReadyForMoreMediaData
         else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        // Lower-bound PTS trim (Story 19.4): real samples, silence-fill, and a
+        // fallback source all share the one written-tail cursor — a sample
+        // landing below it (a late buffer from a dying device, a fallback
+        // overlapping an already-silence-filled span) would rewind the track's
+        // timeline, so it is dropped rather than appended out of order.
+        if pts.isNumeric, micPTSLowerBound.isNumeric, CMTimeCompare(pts, micPTSLowerBound) < 0 {
+            return
+        }
         micInput.append(sampleBuffer)
+        // A real mic sample flowing again ends the lost span — the
+        // silence-fill (which only pads while `micLost`) yields to it.
+        micLost = false
+        if pts.isNumeric {
+            let duration = CMSampleBufferGetDuration(sampleBuffer)
+            micPTSLowerBound = duration.isNumeric ? CMTimeAdd(pts, duration) : pts
+        }
+    }
+
+    // MARK: - Microphone hot-unplug resilience (Story 19.4)
+
+    /// Drive the identical mic-loss branch a real hardware unplug takes — the
+    /// NDJSON-RPC test hook (`simulateMicRemoval`). With no active session
+    /// this is a clean no-op (the smoke asserts a clean exit 0); with a
+    /// mic-off session `MicHealth.decide` makes it a no-op on `mediaQueue`.
+    func simulateMicRemoval() {
+        guard isActive else { return }
+        mediaQueue.async { [self] in
+            handleMicLost(removedDeviceId: activeMicDeviceId)
+        }
+    }
+
+    /// Observe device disconnects for the mic-loss path (Story 19.4) — the
+    /// notification fires for every `AVCaptureDevice`, so non-audio devices
+    /// are filtered here; whether THIS removal matters is `MicHealth.decide`'s
+    /// call (the same pure branch the simulated removal drives).
+    private func installMicDisconnectObserver() {
+        let token = NotificationCenter.default.addObserver(
+            forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: nil
+        ) { [weak self] note in
+            guard let self,
+                let device = note.object as? AVCaptureDevice, device.hasMediaType(.audio)
+            else { return }
+            let removedId = device.uniqueID
+            self.mediaQueue.async { self.handleMicLost(removedDeviceId: removedId) }
+        }
+        micObservers.append(token)
+    }
+
+    /// The one mic-loss branch (Story 19.4) — on `mediaQueue`, fed by a device
+    /// disconnect, a 13–14 session runtime error, or `simulateMicRemoval`
+    /// (identical path for all three). NEVER emits `error` and never exits:
+    /// mic loss is non-fatal — video + system audio keep rolling, the mic
+    /// track is silence-filled, and a fallback to the system default input is
+    /// attempted. The host renders the sticky warning; on-hardware silence /
+    /// fallback A/V-sync correctness is Story 20.6.
+    private func handleMicLost(removedDeviceId: String?) {
+        guard !stopping else { return }
+        // Idempotent while already lost (Story 19.4): a repeated disconnect
+        // notification, the fallback session's own runtime error, or a repeated
+        // `simulateMicRemoval` must not re-emit the warning or re-attempt
+        // fallback. A real sample flowing again clears `micLost`
+        // (`appendMicSample`), so a genuine second loss after recovery still
+        // warns.
+        guard !micLost else { return }
+        let decision = MicHealth.decide(
+            micEnabled: wantsMic,
+            removedDeviceId: removedDeviceId,
+            activeDeviceId: activeMicDeviceId,
+            fallbackAvailable: AVCaptureDevice.default(for: .audio) != nil)
+        guard decision.shouldWarn else { return }
+        emitEvent([
+            "event": "warning",
+            "code": decision.code,
+            "message": decision.message,
+        ])
+        micLost = true
+        startSilenceFill()
+        if decision.fallbackToDefault {
+            attemptMicFallback()
+        }
+    }
+
+    /// Attempt to re-feed the mic track from the system default input (Story
+    /// 19.4) — on `mediaQueue`. Reuses the 13–14 parallel-AVCaptureSession
+    /// machinery on every OS version: on 15+ the SCStream's own `.microphone`
+    /// output stays attached, and whichever source delivers first wins via the
+    /// PTS trim (real churn behavior is Story 20.6). Best-effort: a failure
+    /// downgrades the warning to the honest no-input message (last-write-wins
+    /// on the host) and the track stays silence-filled.
+    private func attemptMicFallback() {
+        // Retire a dead 13–14 session first — off the media queue
+        // (`stopRunning` blocks, and its output delivers here).
+        if let dead = micSession {
+            micSession = nil
+            DispatchQueue.global(qos: .userInitiated).async { dead.stopRunning() }
+        }
+        do {
+            try startMicCaptureSession(deviceId: nil)
+        } catch {
+            emitEvent([
+                "event": "warning",
+                "code": MicHealth.warningCode,
+                "message": MicHealth.noInputMessage,
+            ])
+        }
+    }
+
+    /// Arm the repeating silence-fill (Story 19.4) — on `mediaQueue`. While
+    /// the mic is lost the track is padded with generated LPCM silence from
+    /// the written tail forward, so the file carries an explicit silent span
+    /// instead of a gap (the writer's AAC converter encodes it like any device
+    /// format). Armed once; the handler self-gates on `micLost`.
+    private func startSilenceFill() {
+        guard silenceTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: mediaQueue)
+        timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250))
+        timer.setEventHandler { [weak self] in self?.appendSilenceChunk() }
+        timer.resume()
+        silenceTimer = timer
+    }
+
+    /// Append one chunk of silence up to "now" (host clock — the same
+    /// timeline SCStream and AVCaptureSession stamp samples with), on
+    /// `mediaQueue`. The fill cursor is the shared written-tail lower bound;
+    /// a cursor that fell far behind (a stalled queue) is clamped so one tick
+    /// never fabricates minutes of audio.
+    private func appendSilenceChunk() {
+        guard micLost, !stopping, sessionStarted,
+            let micInput = current?.micInput, micInput.isReadyForMoreMediaData
+        else { return }
+        let sampleRate: Int32 = 48_000
+        let now = CMClockGetTime(CMClockGetHostTimeClock())
+        let maxFill = CMTime(value: CMTimeValue(sampleRate), timescale: sampleRate)  // 1 s
+        let tick = CMTime(value: CMTimeValue(sampleRate / 4), timescale: sampleRate)  // 250 ms
+        var cursor = micPTSLowerBound
+        if !cursor.isNumeric || CMTimeCompare(CMTimeSubtract(now, cursor), maxFill) > 0 {
+            cursor = CMTimeSubtract(now, tick)
+        }
+        let duration = CMTimeSubtract(now, cursor)
+        guard duration.isNumeric, duration.seconds > 0 else { return }
+        let frames = min(Int(sampleRate), Int((duration.seconds * Double(sampleRate)).rounded(.down)))
+        guard frames > 0, let buffer = makeSilenceBuffer(at: cursor, frames: frames) else {
+            return
+        }
+        micInput.append(buffer)
+        micPTSLowerBound = CMTimeAdd(
+            cursor, CMTime(value: CMTimeValue(frames), timescale: sampleRate))
+    }
+
+    /// Build a mono 16-bit 48 kHz LPCM buffer of `frames` zero samples at
+    /// `pts` (Story 19.4). Nil on any CoreMedia failure — the tick simply
+    /// retries; never a crash.
+    private func makeSilenceBuffer(at pts: CMTime, frames: Int) -> CMSampleBuffer? {
+        if silenceFormatDescription == nil {
+            var asbd = AudioStreamBasicDescription(
+                mSampleRate: 48_000, mFormatID: kAudioFormatLinearPCM,
+                mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+                mBytesPerPacket: 2, mFramesPerPacket: 1, mBytesPerFrame: 2,
+                mChannelsPerFrame: 1, mBitsPerChannel: 16, mReserved: 0)
+            var format: CMFormatDescription?
+            guard
+                CMAudioFormatDescriptionCreate(
+                    allocator: kCFAllocatorDefault, asbd: &asbd, layoutSize: 0, layout: nil,
+                    magicCookieSize: 0, magicCookie: nil, extensions: nil,
+                    formatDescriptionOut: &format) == noErr
+            else { return nil }
+            silenceFormatDescription = format
+        }
+        guard let format = silenceFormatDescription else { return nil }
+        let bytes = frames * 2
+        var blockBuffer: CMBlockBuffer?
+        guard
+            CMBlockBufferCreateWithMemoryBlock(
+                allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: bytes,
+                blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
+                dataLength: bytes, flags: 0, blockBufferOut: &blockBuffer) == noErr,
+            let block = blockBuffer,
+            CMBlockBufferFillDataBytes(
+                with: 0, blockBuffer: block, offsetIntoDestination: 0, dataLength: bytes) == noErr
+        else { return nil }
+        var sampleBuffer: CMSampleBuffer?
+        guard
+            CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+                allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format,
+                sampleCount: frames, presentationTimeStamp: pts, packetDescriptions: nil,
+                sampleBufferOut: &sampleBuffer) == noErr
+        else { return nil }
+        return sampleBuffer
     }
 
     // MARK: - AVCaptureAudioDataOutputSampleBufferDelegate (on mediaQueue, macOS 13–14)
@@ -629,6 +882,17 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// Safe to call once; later samples are dropped via `stopping`.
     func stop() {
         emitEvent(["event": "state", "state": "stopping"])
+        // Story 19.4: a device removal during teardown must not fire the
+        // mic-loss path into a winding-down engine (the `stopping` flag also
+        // guards, but removal is cheap and final).
+        for token in micObservers {
+            NotificationCenter.default.removeObserver(token)
+        }
+        micObservers.removeAll()
+        if let token = micSessionRuntimeObserver {
+            NotificationCenter.default.removeObserver(token)
+            micSessionRuntimeObserver = nil
+        }
         if let micSession {
             // Story 19.3: wind down the 13–14 mic session off the media queue
             // (`stopRunning` blocks, and its output delivers on `mediaQueue` —
@@ -637,13 +901,21 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             DispatchQueue.global(qos: .userInitiated).async {
                 micSession.stopRunning()
             }
+            // Story 19.4 (closes the 19.3 deferred gap): drop the handle so no
+            // later path can touch a wound-down session.
+            self.micSession = nil
         }
         guard let stream else {
             // Stop before capture ever started: nothing to finalize.
             emitEvent(["event": "error", "message": "stop before capture started"])
             exit(0)
         }
-        mediaQueue.async { self.stopping = true }
+        mediaQueue.async {
+            self.stopping = true
+            // Story 19.4: the silence-fill has nothing more to pad.
+            self.silenceTimer?.cancel()
+            self.silenceTimer = nil
+        }
         stream.stopCapture { _ in
             // A stop error is irrelevant here — finalize whatever was written.
             self.mediaQueue.async { self.finishAndExit() }
@@ -768,6 +1040,9 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         // The OS tore the stream down (display unplugged, session revoked…):
         // surface honestly and salvage nothing here (recovery is Story 17.3).
+        // Deliberately fatal ONLY for whole-stream loss (Story 19.4): a
+        // mic-only fault never routes here — it takes the non-fatal
+        // `handleMicLost` warning path instead.
         emitEvent([
             "event": "error",
             "message": "capture stopped: \(String(describing: error))",

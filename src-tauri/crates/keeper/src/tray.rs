@@ -466,7 +466,10 @@ fn store_status_item(tray_id: &TrayIconId, item: Option<MenuItem<Wry>>) {
 /// skew), segment index = closed + 1, size summed live from the session folder
 /// on disk (the same file-ownership rule as the terminal manifest reconcile).
 /// Pre-capture — `preflight`, or no start instant yet — honestly reads
-/// "Starting…", never a panic.
+/// "Starting…", never a panic. A sticky session warning (Story 19.4 — e.g. a
+/// mic hot-unplug) marks the line via [`format_warning_line`]: the session is
+/// still live (presence/`is_live` untouched, same recording icon), so the
+/// normal recording line stays and the warning rides on it.
 fn status_line(snapshot: &RecordingStatusVm) -> String {
     let started_ms = match snapshot.state {
         RecordingUiState::Recording | RecordingUiState::Rotating | RecordingUiState::Stopping => {
@@ -474,18 +477,33 @@ fn status_line(snapshot: &RecordingStatusVm) -> String {
         }
         _ => None,
     };
-    let Some(started_ms) = started_ms else {
-        return "Starting…".to_owned();
+    let base = match started_ms {
+        Some(started_ms) => {
+            let elapsed_secs = crate::ipc::epoch_ms_now().saturating_sub(started_ms) / 1000;
+            // The size figure now rides the shared enriched snapshot (Story 18.3):
+            // `recording_snapshot` sums the session's segments once, so the tray and the
+            // in-app banner render the identical byte figure — no second on-disk read.
+            format_status_line(
+                elapsed_secs,
+                snapshot.segments_closed,
+                snapshot.on_disk_bytes,
+            )
+        }
+        None => "Starting…".to_owned(),
     };
-    let elapsed_secs = crate::ipc::epoch_ms_now().saturating_sub(started_ms) / 1000;
-    // The size figure now rides the shared enriched snapshot (Story 18.3):
-    // `recording_snapshot` sums the session's segments once, so the tray and the
-    // in-app banner render the identical byte figure — no second on-disk read.
-    format_status_line(
-        elapsed_secs,
-        snapshot.segments_closed,
-        snapshot.on_disk_bytes,
-    )
+    match snapshot.warning.as_deref() {
+        Some(message) => format_warning_line(&base, message),
+        None => base,
+    }
+}
+
+/// Mark a status line with the sticky, non-dismissible session warning (Story
+/// 19.4): the recording line stays first (the session IS still live), the
+/// warning message rides behind it under a leading `⚠` marker. Pure:
+/// `("Recording — 12:34 · segment 3, 412 MB", "mic lost")` →
+/// `⚠ Recording — 12:34 · segment 3, 412 MB — mic lost`.
+fn format_warning_line(base: &str, message: &str) -> String {
+    format!("⚠ {base} — {message}")
 }
 
 /// Format an elapsed duration as `mm:ss` below one hour (minutes unpadded,
@@ -611,5 +629,32 @@ mod tests {
         assert_eq!(status_line(&snapshot), "Starting…");
         snapshot.state = RecordingUiState::Recording;
         assert_eq!(status_line(&snapshot), "Starting…");
+    }
+
+    #[test]
+    fn format_warning_line_marks_the_line_and_keeps_the_recording_first() {
+        assert_eq!(
+            format_warning_line(
+                "Recording — 12:34 · segment 3, 412 MB",
+                "microphone disconnected — using system default input"
+            ),
+            "⚠ Recording — 12:34 · segment 3, 412 MB — \
+             microphone disconnected — using system default input"
+        );
+    }
+
+    #[test]
+    fn status_line_marks_the_sticky_warning() {
+        // Story 19.4: a warned snapshot renders the warning-marked line while
+        // the presence/`is_live` semantics stay untouched (the state is still
+        // live). The no-start-instant base keeps this deterministic.
+        let mut snapshot = RecordingStatusVm::idle();
+        snapshot.state = RecordingUiState::Recording;
+        snapshot.warning = Some("microphone disconnected — no microphone input".to_owned());
+        assert_eq!(
+            status_line(&snapshot),
+            "⚠ Starting… — microphone disconnected — no microphone input"
+        );
+        assert!(snapshot.state.is_live(), "mic loss is still live/present");
     }
 }

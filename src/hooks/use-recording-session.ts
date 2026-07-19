@@ -35,6 +35,8 @@ export const IDLE_RECORDING_STATUS: RecordingStatusVm = Object.freeze({
   startedAtEpochMs: null,
   outputPath: null,
   error: null,
+  // The sticky, non-fatal session warning (Story 19.4): none before a session.
+  warning: null,
   // Read-time byte figures + session-captured cap (Story 18.3): zero with no
   // session; the enriched Rust snapshot fills them while one is live.
   onDiskBytes: 0,

@@ -16,6 +16,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import type { RecordingSourcesVm } from "@/lib/ipc/client";
 
 export interface RecordingMicState {
   /** Whether the next session captures the microphone (default off). */
@@ -64,6 +65,24 @@ export function setMicEnabled(enabled: boolean): void {
 /** Set the device selection (bound to the Audio card's device `Select`). */
 export function setMicDeviceId(deviceId: string | null): void {
   recordingMicStore.getState().setMicDeviceId(deviceId);
+}
+
+/**
+ * Whether the mic device selection still exists in the live enumeration (Story
+ * 19.4) — mirrors `recording-source.ts::isSelectionAvailable`. `null` sources
+ * (never polled) is "not yet known" → available (never a spurious reset before
+ * the first enumeration lands); `null` deviceId (System default input) is
+ * always available; a real id is available only while it is still enumerated
+ * in `sources.microphones`.
+ */
+export function isMicSelectionAvailable(
+  deviceId: string | null,
+  sources: RecordingSourcesVm | null,
+): boolean {
+  if (sources === null || deviceId === null) {
+    return true;
+  }
+  return sources.microphones.some((mic) => mic.id === deviceId);
 }
 
 /** Test-only reset: restore the default-off toggle + default input. */

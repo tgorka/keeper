@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -20,7 +20,12 @@ import {
 } from "@/components/recording/recording-audio-controls";
 import { requestMicrophonePermission } from "@/lib/ipc/client";
 import { resetRecordingAudioForTest, systemAudioEnabled } from "@/lib/stores/recording-audio";
-import { micDeviceId, micEnabled, resetRecordingMicForTest } from "@/lib/stores/recording-mic";
+import {
+  micDeviceId,
+  micEnabled,
+  resetRecordingMicForTest,
+  setMicDeviceId,
+} from "@/lib/stores/recording-mic";
 import { recordingSourceStore, resetRecordingSourceForTest } from "@/lib/stores/recording-source";
 
 const mockRequestMic = vi.mocked(requestMicrophonePermission);
@@ -200,5 +205,59 @@ describe("RecordingAudioControls", () => {
     // the default keeps this jsdom-safe).
     expect(picker).toHaveTextContent(MIC_DEFAULT_DEVICE_LABEL);
     expect(micDeviceId()).toBeNull();
+  });
+
+  // --- Pre-Start mic reconciliation (Story 19.4) ---------------------------
+
+  it("reconciles a vanished selected mic back to the system default input", async () => {
+    recordingSourceStore.getState().setSources({
+      displays: [],
+      applications: [],
+      microphones: [{ id: "X", name: "USB Microphone" }],
+      cameras: [],
+    });
+    setMicDeviceId("X");
+    render(<RecordingAudioControls />);
+    // While the device is still enumerated the selection stays.
+    expect(micDeviceId()).toBe("X");
+
+    // The device disappears from the next poll → the picker reconciles to
+    // "System default input" (`null`), so Start ships no dead id.
+    act(() => {
+      recordingSourceStore.getState().setSources({
+        displays: [],
+        applications: [],
+        microphones: [],
+        cameras: [],
+      });
+    });
+
+    await waitFor(() => expect(micDeviceId()).toBeNull());
+    expect(screen.getByTestId(MIC_DEVICE_SELECT_TESTID)).toHaveTextContent(
+      MIC_DEFAULT_DEVICE_LABEL,
+    );
+    // Reconciliation is never a permission trigger (the mic was never enabled).
+    expect(mockRequestMic).not.toHaveBeenCalled();
+  });
+
+  it("never resets a real selection before the first enumeration lands", () => {
+    // `sources: null` (never polled) must not be read as "the device vanished".
+    setMicDeviceId("X");
+    render(<RecordingAudioControls />);
+    expect(micDeviceId()).toBe("X");
+  });
+
+  it("never touches the default (null) selection, even with no devices enumerated", () => {
+    recordingSourceStore.getState().setSources({
+      displays: [],
+      applications: [],
+      microphones: [],
+      cameras: [],
+    });
+    render(<RecordingAudioControls />);
+    expect(micDeviceId()).toBeNull();
+    expect(screen.getByTestId(MIC_DEVICE_SELECT_TESTID)).toHaveTextContent(
+      MIC_DEFAULT_DEVICE_LABEL,
+    );
   });
 });

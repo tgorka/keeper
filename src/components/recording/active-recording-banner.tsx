@@ -8,8 +8,14 @@
  * recording state (size and cap come from the VM; elapsed is the hook's reused
  * `formatElapsed`). It renders **only** while the session is live
  * (preflight/recording/rotating/stopping) — any terminal/idle state renders
- * `null` (the pane's header carries those notes). Warning/error variants are
- * Story 18.4 and are deliberately absent here.
+ * `null` (the pane's header carries those notes).
+ *
+ * The warning variant (Story 19.4): when `status.warning` is set (a sticky,
+ * non-fatal session warning — e.g. a microphone hot-unplug), the left edge
+ * turns amber and a persistent, non-dismissible warning line renders under the
+ * live row. It never auto-clears — the Rust snapshot owns the slot (reset only
+ * when a new session starts) and this stays a pure renderer of it. The full
+ * loud-failure triad (native notification leg) remains Story 18.4.
  *
  * Chrome: a recording-red 3px left edge, a reduced-motion-aware record dot,
  * "Recording", a monospace `elapsed · segment · size` line, and a
@@ -52,7 +58,8 @@ export function ActiveRecordingBanner({ status, elapsed, onStop }: ActiveRecordi
   const reducedMotion = useReducedMotion();
 
   // Render nothing on any terminal/idle state — the banner is a live-only
-  // surface (warning/error variants are Story 18.4).
+  // surface (the mic-loss warning, Story 19.4, is a live-session state too;
+  // terminal error surfaces are Story 18.4).
   if (!isLiveRecording(status)) {
     return null;
   }
@@ -68,10 +75,18 @@ export function ActiveRecordingBanner({ status, elapsed, onStop }: ActiveRecordi
   const fraction = showMeter ? Math.min(1, Math.max(0, status.currentSegmentBytes / capBytes)) : 0;
   const usedMb = bytesToWholeMb(status.currentSegmentBytes);
 
+  // The sticky, non-dismissible session warning (Story 19.4): amber left
+  // edge + a persistent warning line. `held` is the app's amber token (the
+  // same one the denied-permission captions use).
+  const warning = status.warning;
+
   return (
     <div
       data-slot="active-recording-banner"
-      className="shrink-0 border-recording-red border-l-[3px] bg-card px-6 py-3"
+      className={cn(
+        "shrink-0 border-l-[3px] bg-card px-6 py-3",
+        warning === null ? "border-recording-red" : "border-held",
+      )}
     >
       {/* Assertive announcement of state + segment only (never the per-second
           elapsed): keyed content changes on start/stop/rotation. */}
@@ -100,6 +115,20 @@ export function ActiveRecordingBanner({ status, elapsed, onStop }: ActiveRecordi
           {stopping ? BANNER_STOPPING_LABEL : BANNER_STOP_LABEL}
         </Button>
       </div>
+
+      {/* The persistent warning line (Story 19.4): non-dismissible (no close
+          affordance), announced as an alert once when it appears, and rendered
+          for as long as the snapshot carries it (i.e. the rest of the session). */}
+      {warning !== null && (
+        <p
+          role="alert"
+          data-testid="recording-warning"
+          className="mt-1.5 flex items-center gap-1.5 text-held text-xs"
+        >
+          <span aria-hidden="true">⚠</span>
+          {warning}
+        </p>
+      )}
 
       {showMeter && (
         <div className="mt-2 flex flex-col gap-1">

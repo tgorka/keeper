@@ -1,6 +1,8 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
+import type { RecordingSourcesVm } from "@/lib/ipc/client";
 import {
+  isMicSelectionAvailable,
   micDeviceId,
   micEnabled,
   recordingMicStore,
@@ -59,5 +61,33 @@ describe("recording-mic store", () => {
     resetRecordingMicForTest();
     expect(micEnabled()).toBe(false);
     expect(micDeviceId()).toBeNull();
+  });
+});
+
+describe("isMicSelectionAvailable", () => {
+  const sources = (microphones: RecordingSourcesVm["microphones"]): RecordingSourcesVm => ({
+    displays: [],
+    applications: [],
+    microphones,
+    cameras: [],
+  });
+
+  it("treats never-polled sources as available (no spurious reset before the first poll)", () => {
+    expect(isMicSelectionAvailable(null, null)).toBe(true);
+    expect(isMicSelectionAvailable("X", null)).toBe(true);
+  });
+
+  it("the system default input (null) is always available, even with no devices", () => {
+    expect(isMicSelectionAvailable(null, sources([]))).toBe(true);
+    expect(isMicSelectionAvailable(null, sources([{ id: "X", name: "USB Microphone" }]))).toBe(
+      true,
+    );
+  });
+
+  it("a real id is available only while it is still enumerated", () => {
+    const list = sources([{ id: "X", name: "USB Microphone" }]);
+    expect(isMicSelectionAvailable("X", list)).toBe(true);
+    expect(isMicSelectionAvailable("Y", list)).toBe(false);
+    expect(isMicSelectionAvailable("X", sources([]))).toBe(false);
   });
 });

@@ -394,6 +394,17 @@ while let line = readLine(strippingNewline: true) {
             micEnabled: micEnabled, micDeviceId: micDeviceId,
             segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds)
         continue
+    case "simulateMicRemoval":
+        // Story 19.4: drive the IDENTICAL mic-loss branch a real hardware
+        // unplug takes (CaptureEngine.handleMicLost → MicHealth.decide →
+        // non-fatal warning + silence-fill + fallback). A test/simulation
+        // hook only — the host never sends it in production. With no active
+        // session (or a mic-off one) it is a clean no-op: the reply below
+        // still answers, and EOF still exits 0 (the smoke asserts this).
+        response = ["id": id, "result": ["simulated": captureEngine.isActive]]
+        _ = writeLine(response)
+        captureEngine.simulateMicRemoval()
+        continue
     case "stop":
         // Story 16.6: stop-and-finalize. The engine emits `stopping` /
         // `finalized` events and exits the process itself once the file's

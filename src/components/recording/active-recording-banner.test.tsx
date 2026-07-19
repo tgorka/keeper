@@ -31,10 +31,14 @@ const LIVE: RecordingStatusVm = {
   startedAtEpochMs: 1_700_000_000_000,
   outputPath: "/Users/alice/Movies/keeper/session",
   error: null,
+  warning: null,
   onDiskBytes: 412_000_000,
   currentSegmentBytes: 250_000_000,
   segmentCapMb: 500,
 };
+
+/** The sticky mic-loss warning message the sidecar emits (Story 19.4). */
+const MIC_WARNING = "microphone disconnected — using system default input";
 
 afterEach(() => {
   window.matchMedia = originalMatchMedia;
@@ -144,6 +148,64 @@ describe("ActiveRecordingBanner", () => {
     renderBanner({ state: "stopping" });
     const stop = screen.getByRole("button", { name: BANNER_STOPPING_LABEL });
     expect(stop).toBeDisabled();
+  });
+
+  // --- The sticky warning variant (Story 19.4) -----------------------------
+
+  it("renders the amber warning variant while status.warning is set", () => {
+    mockReducedMotion(false);
+    const { container } = render(
+      <ActiveRecordingBanner
+        status={{ ...LIVE, warning: MIC_WARNING }}
+        elapsed="12:34"
+        onStop={vi.fn()}
+      />,
+    );
+    const banner = container.querySelector('[data-slot="active-recording-banner"]');
+    expect(banner).toHaveClass("border-held");
+    expect(banner).not.toHaveClass("border-recording-red");
+    // The warning line is an alert carrying the honest sidecar message…
+    expect(screen.getByRole("alert")).toHaveTextContent(MIC_WARNING);
+    // …while the session stays visibly live (recording line + Stop intact).
+    expect(screen.getByText("Recording")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: BANNER_STOP_LABEL })).toBeEnabled();
+  });
+
+  it("stays on the recording-red edge with no warning", () => {
+    mockReducedMotion(false);
+    const { container } = render(
+      <ActiveRecordingBanner status={LIVE} elapsed="12:34" onStop={vi.fn()} />,
+    );
+    const banner = container.querySelector('[data-slot="active-recording-banner"]');
+    expect(banner).toHaveClass("border-recording-red");
+    expect(banner).not.toHaveClass("border-held");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("the warning persists across later live states and is non-dismissible", () => {
+    // The slot is sticky in the Rust snapshot; the banner must keep rendering
+    // it for every later live state (rotation, stopping) and offer NO close
+    // affordance — the only button is Stop.
+    mockReducedMotion(false);
+    const { rerender } = render(
+      <ActiveRecordingBanner
+        status={{ ...LIVE, warning: MIC_WARNING }}
+        elapsed="12:34"
+        onStop={vi.fn()}
+      />,
+    );
+    for (const state of ["rotating", "recording", "stopping"] as const) {
+      rerender(
+        <ActiveRecordingBanner
+          status={{ ...LIVE, state, warning: MIC_WARNING }}
+          elapsed="13:00"
+          onStop={vi.fn()}
+        />,
+      );
+      expect(screen.getByRole("alert")).toHaveTextContent(MIC_WARNING);
+    }
+    // Non-dismissible: no close/dismiss button exists — only Stop.
+    expect(screen.getAllByRole("button")).toHaveLength(1);
   });
 
   it("announces state and segment assertively (not the per-second elapsed)", () => {

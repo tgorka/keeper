@@ -23,7 +23,7 @@
  * {@link recording-mic.ts}) — per-session, never persisted, never mirrored
  * into Settings → Recording. Destination/fps (19.5) stay out of scope.
  */
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -36,6 +36,7 @@ import { Switch } from "@/components/ui/switch";
 import { requestMicrophonePermission, type TccPermission } from "@/lib/ipc/client";
 import { setSystemAudioEnabled, useSystemAudioEnabled } from "@/lib/stores/recording-audio";
 import {
+  isMicSelectionAvailable,
   setMicDeviceId,
   setMicEnabled,
   useMicDeviceId,
@@ -94,11 +95,34 @@ export const MIC_DEVICE_SELECT_TESTID = "mic-device-select";
  * collides with this reserved token. */
 const MIC_DEFAULT_DEVICE_VALUE = "__default__";
 
-export function RecordingAudioControls() {
+export interface RecordingAudioControlsProps {
+  /** Whether the setup surface is interactive (mirrors the source picker):
+   * `false` while a session is live, freezing pre-Start reconciliation so a
+   * mounted-but-inactive card never rewrites the user's mic selection. */
+  active?: boolean;
+}
+
+export function RecordingAudioControls({ active = true }: RecordingAudioControlsProps = {}) {
   const enabled = useSystemAudioEnabled();
   const micOn = useMicEnabled();
   const deviceId = useMicDeviceId();
-  const microphones = useRecordingSources()?.microphones ?? [];
+  const sources = useRecordingSources();
+  const microphones = sources?.microphones ?? [];
+
+  // Pre-Start reconciliation (Story 19.4): a specifically-selected mic that
+  // vanished from the live enumeration falls back to "System default input"
+  // (`null`), so Start never ships a dead device id. The default/`null`
+  // selection is never touched (always available), a never-polled `null`
+  // sources list reconciles nothing, and the reset is a store write only —
+  // no permission re-request, no Start gating. Gated on `active` for parity
+  // with the source picker's pause-while-live contract: the card stays mounted
+  // during a live session, and a live-session poll must never silently reset
+  // the selection mid-recording (the running sidecar owns the mic by then).
+  useEffect(() => {
+    if (active && !isMicSelectionAvailable(deviceId, sources)) {
+      setMicDeviceId(null);
+    }
+  }, [active, deviceId, sources]);
   // The lazy permission outcome (Story 19.3): `null` until the user enables
   // the mic (nothing is probed on render), then the honest tri-state from the
   // one request the enable triggered. Component-local — like the toggle it

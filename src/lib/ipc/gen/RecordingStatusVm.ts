@@ -38,6 +38,15 @@ outputPath: string | null,
  */
 error: string | null, 
 /**
+ * The sticky, non-fatal session warning (Story 19.4) — e.g. a microphone
+ * unplugged mid-recording. Set on the first sidecar `warning` event
+ * (last-write-wins message, NOT gated on any state — the session stays
+ * live) and never cleared for the rest of the session; it resets to
+ * `None` only when a new session starts. Drives the tray's
+ * warning-marked status line and the banner's amber variant.
+ */
+warning: string | null, 
+/**
  * Total on-disk bytes of this session's `screen-####.mp4` segments (Story
  * 18.3) — the banner's and tray's `size` line. **Read-time**, not
  * driver-maintained: `recording_snapshot` fills it best-effort from disk

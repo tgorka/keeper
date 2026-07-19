@@ -103,6 +103,19 @@ pub enum RecordingEvent {
         /// capture-clock seconds, when reported.
         pts_end: Option<f64>,
     },
+    /// A non-fatal, sticky session warning (Story 19.4) — e.g. a microphone
+    /// unplugged mid-recording (`code: "micLost"`). Legal only while the
+    /// session is live (`Recording`/`Rotating`/`Stopping`); like
+    /// [`RecordingEvent::SegmentClosed`] it updates a session field (the
+    /// sticky warning message) and NEVER changes [`SessionState`] — a
+    /// mic-only fault must not take the terminal `Failed` path.
+    Warning {
+        /// A stable, machine-readable warning code (e.g. `"micLost"`).
+        code: String,
+        /// A non-secret, human-readable description of the warning (never a
+        /// path, token, or media bytes).
+        message: String,
+    },
     /// A stop was requested / begun (`Recording → Stopping`, or `Rotating → Stopping`).
     Stopping,
     /// The recording finalized cleanly (`Stopping → Finalized`) — terminal.
@@ -126,14 +139,20 @@ pub enum RecordingEvent {
 pub struct RecordingSession {
     state: SessionState,
     segments_closed: u32,
+    /// The sticky, non-fatal session warning (Story 19.4): set by
+    /// [`RecordingEvent::Warning`] (last-write-wins message) and never cleared
+    /// for the session's lifetime — a fresh session starts clean.
+    warning: Option<String>,
 }
 
 impl RecordingSession {
-    /// A fresh session in [`SessionState::Idle`] with no segments closed.
+    /// A fresh session in [`SessionState::Idle`] with no segments closed and
+    /// no warning raised.
     pub fn new() -> Self {
         Self {
             state: SessionState::Idle,
             segments_closed: 0,
+            warning: None,
         }
     }
 
@@ -146,6 +165,13 @@ impl RecordingSession {
     /// [`RecordingEvent::SegmentClosed`]).
     pub fn segments_closed(&self) -> u32 {
         self.segments_closed
+    }
+
+    /// The sticky, non-fatal session warning (Story 19.4), or `None` when the
+    /// session never warned. Last-write-wins; never cleared for the session's
+    /// lifetime (a fresh session starts clean via [`RecordingSession::new`]).
+    pub fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
     }
 
     /// Apply a sidecar-reported [`RecordingEvent`], advancing the machine per the
@@ -163,7 +189,9 @@ impl RecordingSession {
     /// ```
     ///
     /// [`RecordingEvent::SegmentClosed`] is legal only in `Recording`/`Rotating`
-    /// (bumps the counter, no state change). Anything else →
+    /// (bumps the counter, no state change), and [`RecordingEvent::Warning`]
+    /// only in `Recording`/`Rotating`/`Stopping` (sets the sticky warning, no
+    /// state change — Story 19.4). Anything else →
     /// [`RecordingError::IllegalTransition`].
     pub fn apply(&mut self, event: RecordingEvent) -> Result<(), RecordingError> {
         use RecordingEvent as E;
@@ -187,6 +215,23 @@ impl RecordingSession {
             return match self.state {
                 S::Recording | S::Rotating => {
                     self.segments_closed = self.segments_closed.saturating_add(1);
+                    Ok(())
+                }
+                _ => Err(self.illegal(&event)),
+            };
+        }
+
+        // A `Warning` is non-fatal and sticky (Story 19.4): legal only while
+        // the session is live (`Recording`/`Rotating`/`Stopping`), it records
+        // the message (last-write-wins) and NEVER changes state — the
+        // `SegmentClosed` precedent. In a terminal (or not-yet-live) state it
+        // is rejected like any other misplaced event; the shell's sink drops
+        // the rejection best-effort, so a late warning never resurrects a
+        // settled session.
+        if let E::Warning { message, .. } = &event {
+            return match self.state {
+                S::Recording | S::Rotating | S::Stopping => {
+                    self.warning = Some(message.clone());
                     Ok(())
                 }
                 _ => Err(self.illegal(&event)),
@@ -232,6 +277,7 @@ fn event_label(event: &RecordingEvent) -> &'static str {
         RecordingEvent::CaptureStarted => "captureStarted",
         RecordingEvent::SegmentRotating => "segmentRotating",
         RecordingEvent::SegmentClosed { .. } => "segmentClosed",
+        RecordingEvent::Warning { .. } => "warning",
         RecordingEvent::Stopping => "stopping",
         RecordingEvent::Finalized => "finalized",
         RecordingEvent::Recovered => "recovered",
@@ -250,6 +296,8 @@ fn event_label(event: &RecordingEvent) -> &'static str {
 /// - `"event":"state"` + `"state":"<s>"` — maps `"preflight"`, `"recording"`,
 ///   `"rotating"`, `"stopping"`, `"finalized"`, `"recovered"` to the matching event.
 /// - `"event":"segmentClosed"` + `"index":<u32>` — [`RecordingEvent::SegmentClosed`].
+/// - `"event":"warning"` + `"code"`/`"message"` — [`RecordingEvent::Warning`]
+///   (Story 19.4; both fields best-effort, defaulted when missing/blank).
 /// - `"event":"error"` + `"message":"<m>"` — [`RecordingEvent::Failed`].
 ///
 /// Anything else (unknown `event`, unknown `state`, missing/mistyped field, non-JSON)
@@ -299,6 +347,27 @@ pub fn parse_event(line: &str) -> Option<RecordingEvent> {
                 pts_start,
                 pts_end,
             })
+        }
+        "warning" => {
+            // Story 19.4: the non-fatal warning line. Best-effort like
+            // `segmentClosed`: a missing / mistyped / blank `code` or
+            // `message` degrades to a stable, non-secret default and any
+            // unknown extra key is ignored — the warning itself is never
+            // dropped (a lost mic-loss signal would leave the user unwarned
+            // while the mic track runs silent).
+            let code = obj
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .filter(|code| !code.trim().is_empty())
+                .unwrap_or("unknown")
+                .to_owned();
+            let message = obj
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("keeper-rec reported a recording warning")
+                .to_owned();
+            Some(RecordingEvent::Warning { code, message })
         }
         "error" => {
             // A malformed / absent `message` must NOT swallow the failure — surface a
@@ -1470,6 +1539,177 @@ mod tests {
             })
             .is_err());
         assert_eq!(session.state(), SessionState::Finalized);
+    }
+
+    // --- non-fatal warning (Story 19.4) -------------------------------------
+
+    /// A `micLost` warning event with the given message.
+    fn warning(message: &str) -> RecordingEvent {
+        RecordingEvent::Warning {
+            code: "micLost".to_owned(),
+            message: message.to_owned(),
+        }
+    }
+
+    #[test]
+    fn warning_keeps_state_and_is_sticky_across_events() {
+        // The never-abort proof (Story 19.4): a mic-loss warning mid-recording
+        // changes NO state, segments keep closing, the sticky message is
+        // last-write-wins, and the session still reaches `Finalized` on stop.
+        let mut session = RecordingSession::new();
+        session
+            .apply(RecordingEvent::PreflightStarted)
+            .expect("legal transition");
+        session
+            .apply(RecordingEvent::CaptureStarted)
+            .expect("legal transition");
+        session
+            .apply(warning(
+                "microphone disconnected — using system default input",
+            ))
+            .expect("warning is legal while Recording");
+        assert_eq!(session.state(), SessionState::Recording, "no state change");
+        assert_eq!(
+            session.warning(),
+            Some("microphone disconnected — using system default input")
+        );
+        // Segments keep closing; the warning survives every later event.
+        session
+            .apply(segment_closed(0))
+            .expect("segmentClosed still legal after a warning");
+        session
+            .apply(RecordingEvent::SegmentRotating)
+            .expect("legal transition");
+        session
+            .apply(warning("microphone disconnected — no microphone input"))
+            .expect("warning is legal while Rotating");
+        assert_eq!(
+            session.warning(),
+            Some("microphone disconnected — no microphone input"),
+            "the sticky message is last-write-wins"
+        );
+        session
+            .apply(RecordingEvent::CaptureStarted)
+            .expect("legal transition");
+        session
+            .apply(RecordingEvent::Stopping)
+            .expect("legal transition");
+        session
+            .apply(warning("late but still live"))
+            .expect("warning is legal while Stopping");
+        session
+            .apply(RecordingEvent::Finalized)
+            .expect("legal transition");
+        assert_eq!(
+            session.state(),
+            SessionState::Finalized,
+            "a warned session still finalizes — never Failed"
+        );
+        assert_eq!(session.warning(), Some("late but still live"));
+        assert_eq!(session.segments_closed(), 1);
+    }
+
+    #[test]
+    fn warning_outside_live_states_is_rejected_without_effect() {
+        // Idle and Preflight: not live yet — rejected, no warning recorded.
+        for events in [vec![], vec![RecordingEvent::PreflightStarted]] {
+            let mut session = RecordingSession::new();
+            for event in events {
+                session.apply(event).expect("legal setup transition");
+            }
+            let before = session.state();
+            let err = session
+                .apply(warning("too early"))
+                .expect_err("warning outside live states is illegal");
+            assert!(matches!(
+                err,
+                RecordingError::IllegalTransition { event, .. } if event == "warning"
+            ));
+            assert_eq!(session.state(), before, "state unchanged");
+            assert_eq!(session.warning(), None, "no warning set");
+        }
+        // Terminal: a late warning never resurrects a settled session.
+        let mut session = RecordingSession::new();
+        session
+            .apply(RecordingEvent::PreflightStarted)
+            .expect("legal transition");
+        session
+            .apply(RecordingEvent::CaptureStarted)
+            .expect("legal transition");
+        session
+            .apply(RecordingEvent::Stopping)
+            .expect("legal transition");
+        session
+            .apply(RecordingEvent::Finalized)
+            .expect("legal transition");
+        assert!(session.apply(warning("too late")).is_err());
+        assert_eq!(session.state(), SessionState::Finalized);
+        assert_eq!(session.warning(), None);
+    }
+
+    #[test]
+    fn parse_warning_reads_code_and_message() {
+        assert_eq!(
+            parse_event(
+                r#"{"event":"warning","code":"micLost","message":"microphone disconnected — using system default input"}"#
+            ),
+            Some(warning(
+                "microphone disconnected — using system default input"
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_warning_tolerates_missing_or_malformed_fields() {
+        // A missing / mistyped / blank `code` or `message` degrades to the
+        // stable default, and unknown extra keys are ignored — the warning is
+        // never dropped (unlike an unknown discriminator, which yields None).
+        for line in [
+            r#"{"event":"warning"}"#,
+            r#"{"event":"warning","code":"micLost"}"#,
+            r#"{"event":"warning","message":42}"#,
+            r#"{"event":"warning","code":7,"message":"   "}"#,
+            r#"{"event":"warning","code":"","message":null}"#,
+        ] {
+            match parse_event(line) {
+                Some(RecordingEvent::Warning { code, message }) => {
+                    assert!(!code.trim().is_empty(), "line {line:?}: defaulted code");
+                    assert!(
+                        !message.trim().is_empty(),
+                        "line {line:?}: defaulted message"
+                    );
+                }
+                other => panic!("line {line:?} must parse as a Warning, got {other:?}"),
+            }
+        }
+        // A fully-specified line with an unknown extra key keeps its fields.
+        assert_eq!(
+            parse_event(r#"{"event":"warning","code":"micLost","message":"m","extra":true}"#),
+            Some(warning("m"))
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_session_with_a_warning_still_finalizes() {
+        // The simulated-signal never-abort proof at the drive level (Story
+        // 19.4): a warning mid-stream is folded in without an error and the
+        // run still resolves the Finalized terminal.
+        let recorder = FakeRecorder::new(
+            true,
+            vec![
+                RecordingEvent::PreflightStarted,
+                RecordingEvent::CaptureStarted,
+                warning("microphone disconnected — using system default input"),
+                segment_closed(0),
+                RecordingEvent::Stopping,
+                RecordingEvent::Finalized,
+            ],
+        );
+        let (on_state, _seen) = state_collector();
+        let terminal = drive_session(&recorder, test_params(), std::future::pending(), on_state)
+            .await
+            .expect("a warning is never a drive error");
+        assert_eq!(terminal, SessionState::Finalized);
     }
 
     // --- parse_event fixtures ----------------------------------------------

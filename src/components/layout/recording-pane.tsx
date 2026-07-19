@@ -181,7 +181,7 @@ export function RecordingPane() {
                   <CardTitle>{title}</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <RecordingAudioControls />
+                  <RecordingAudioControls active={!live} />
                 </CardContent>
               </Card>
             ) : title === "Segmenting" ? (

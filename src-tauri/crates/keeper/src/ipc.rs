@@ -3540,6 +3540,9 @@ pub async fn recording_start(
         // The session is a folder now (Story 17.2) — the VM points at it.
         output_path: Some(folder.to_string_lossy().into_owned()),
         error: None,
+        // A new session starts clean (Story 19.4): the sticky warning slot is
+        // reset here and ONLY here — the sink below never writes `None` back.
+        warning: None,
         // Byte figures are read-time (filled by `recording_snapshot`) and the
         // cap is surfaced from the run (Story 18.3) — the stored snapshot the
         // driver keeps carries zeros, never inventing size or a cap here.
@@ -3566,6 +3569,15 @@ pub async fn recording_start(
         let sink = Box::new(move |event: RecordingEvent| {
             let failure = match &event {
                 RecordingEvent::Failed { message } => Some(message.clone()),
+                _ => None,
+            };
+            // Story 19.4: a non-fatal warning (e.g. mic hot-unplug) is sticky
+            // on the shared snapshot — last-write-wins message, never cleared
+            // back to `None` mid-session, and NOT gated on `state == failed`
+            // (the session stays live; the tray + banner render the warning
+            // beside the normal recording state).
+            let warning = match &event {
+                RecordingEvent::Warning { message, .. } => Some(message.clone()),
                 _ => None,
             };
             let started = matches!(event, RecordingEvent::CaptureStarted);
@@ -3611,6 +3623,9 @@ pub async fn recording_start(
                     }
                     if let Some(message) = failure {
                         snapshot.error = Some(message);
+                    }
+                    if let Some(message) = warning {
+                        snapshot.warning = Some(message);
                     }
                 }
                 // Segment ledger + manifest (Story 17.2). Best-effort by
