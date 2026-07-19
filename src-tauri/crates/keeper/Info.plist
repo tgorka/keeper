@@ -10,5 +10,12 @@
 <dict>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>keeper records your screen only when you start a recording. Everything is saved locally on this Mac. Nothing uploads.</string>
+	<!--
+	  Story 19.3 (FR-69, AD-36): the Microphone TCC usage string shown when keeper
+	  (via its keeper-rec child sidecar) requests access — lazily, only when the
+	  user enables the mic source. Same honest local-only framing.
+	-->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>keeper records your microphone only when you enable it for a recording. Everything is saved locally on this Mac. Nothing uploads.</string>
 </dict>
 </plist>

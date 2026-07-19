@@ -8,6 +8,8 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingStart: vi.fn(),
   recordingStop: vi.fn(),
   recordingStatus: vi.fn(),
+  // The Audio card's mic Switch fires this lazily on enable (Story 19.3).
+  requestMicrophonePermission: vi.fn(() => Promise.resolve("granted")),
   // The "Source" card mounts the live picker (Story 19.1), which polls this.
   // A real main display keeps the default (main-display) selection available.
   listRecordingSources: vi.fn(() =>
@@ -32,6 +34,7 @@ import {
   STOP_RECORDING_LABEL,
 } from "@/components/layout/recording-pane";
 import {
+  MIC_SWITCH_TESTID,
   SYSTEM_AUDIO_LABEL,
   SYSTEM_AUDIO_SWITCH_TESTID,
 } from "@/components/recording/recording-audio-controls";
@@ -53,6 +56,7 @@ import {
   requestScreenRecordingPermission,
 } from "@/lib/ipc/client";
 import { resetRecordingAudioForTest } from "@/lib/stores/recording-audio";
+import { resetRecordingMicForTest } from "@/lib/stores/recording-mic";
 import { resetRecordingSourceForTest } from "@/lib/stores/recording-source";
 
 const mockFetch = vi.mocked(recordingPermission);
@@ -109,6 +113,8 @@ afterEach(() => {
   resetRecordingSourceForTest();
   // Restore the default-on system-audio toggle between tests (Story 19.2).
   resetRecordingAudioForTest();
+  // Restore the default-off mic selection between tests (Story 19.3).
+  resetRecordingMicForTest();
   vi.clearAllMocks();
 });
 
@@ -241,12 +247,13 @@ describe("RecordingPane", () => {
     mockFetch.mockResolvedValue(GRANTED);
     render(<RecordingPane />);
 
-    // Default on: the first arg is the default target, the second `true`.
+    // Default on: the first arg is the default target, the second `true`; the
+    // mic defaults off (Story 19.3): `false` + `null` (system default input).
     const startButton = await screen.findByRole("button", { name: START_RECORDING_LABEL });
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true);
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, false, null);
   });
 
   it("Start carries an off system-audio toggle through to recording_start", async () => {
@@ -261,7 +268,24 @@ describe("RecordingPane", () => {
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), false);
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), false, false, null);
+  });
+
+  it("Start threads an enabled mic through to recording_start (Story 19.3)", async () => {
+    mockFetch.mockResolvedValue(GRANTED);
+    render(<RecordingPane />);
+
+    // Enable the mic on the Audio card (this also fires the lazy permission
+    // request — mocked granted); the device stays the system default (null).
+    const micToggle = await screen.findByTestId(MIC_SWITCH_TESTID);
+    fireEvent.click(micToggle);
+    expect(micToggle).toHaveAttribute("aria-checked", "true");
+
+    const startButton = screen.getByRole("button", { name: START_RECORDING_LABEL });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    fireEvent.click(startButton);
+    await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, true, null);
   });
 
   it("Stop requests the graceful stop", async () => {

@@ -7,7 +7,8 @@
 // `capturesAudio` + `excludeCurrentProcessAudio` (keeper's own notification
 // sounds are absent from the recording), feeding a **rotating chain of
 // `AVAssetWriter`s** (dual-writer gapless rotation, Story 17.1). Each segment
-// is a fragmented MP4 (H.264 video + one AAC system-audio track, ~4 s
+// is a fragmented MP4 (H.264 video + an optional AAC system-audio track + an
+// optional, separate AAC microphone track — Story 19.3, never premixed; ~4 s
 // fragments via `movieFragmentInterval`) so a mid-session kill loses at most
 // the last fragment; a clean `finishWriting` finalizes each segment's `moov`
 // into an ordinary playable `.mp4`.
@@ -63,16 +64,22 @@ private final class SegmentWriter {
     let writer: AVAssetWriter
     let videoInput: AVAssetWriterInput
     let audioInput: AVAssetWriterInput?
+    /// The microphone's own AAC track (Story 19.3, AD-36) — a second, unmixed
+    /// audio input beside the system-audio one, present only when the mic
+    /// source is enabled. Rebuilt per segment like every other input, so the
+    /// mic track survives rotation exactly like the system-audio track.
+    let micInput: AVAssetWriterInput?
     let path: String
     let index: Int
 
     init(
         writer: AVAssetWriter, videoInput: AVAssetWriterInput,
-        audioInput: AVAssetWriterInput?, path: String, index: Int
+        audioInput: AVAssetWriterInput?, micInput: AVAssetWriterInput?, path: String, index: Int
     ) {
         self.writer = writer
         self.videoInput = videoInput
         self.audioInput = audioInput
+        self.micInput = micInput
         self.path = path
         self.index = index
     }
@@ -80,7 +87,9 @@ private final class SegmentWriter {
 
 /// The single capture session this process can run (one session per sidecar
 /// spawn — AD-34; the host spawns a fresh `keeper-rec` per recording).
-final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
+final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
+    AVCaptureAudioDataOutputSampleBufferDelegate
+{
     /// The one serial queue owning all writer state: SCStream delivers both
     /// output types here, and rotation/stop/finalize run here too.
     private let mediaQueue = DispatchQueue(label: "dev.tgorka.keeper-rec.media")
@@ -101,6 +110,15 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
     private var pixelWidth = 2
     private var pixelHeight = 2
     private var wantsAudio = false
+    /// Whether the mic source is enabled (Story 19.3) — every segment writer
+    /// then carries the second, unmixed mic AAC track.
+    private var wantsMic = false
+    /// The macOS 13–14 microphone path (Story 19.3, AD-36): an audio-only
+    /// AVCaptureSession feeding the same per-segment `micInput` the 15+
+    /// in-stream `.microphone` output would — one writer, user-invisible OS
+    /// split. `nil` on macOS 15+ (the SCStream carries the mic) and while the
+    /// mic is off.
+    private var micSession: AVCaptureSession?
 
     /// Set on `mediaQueue` when the writer session has been anchored at the
     /// first complete video frame's PTS.
@@ -136,13 +154,16 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
     /// Begin capturing to `path` (Story 17.1). The video target is one of
     /// (Story 19.1): a specific `applicationPid` (app-scoped, exclusionary — only
     /// that app's windows land in the file), a specific `displayId`, or the main
-    /// display (`applicationPid == nil && displayId == nil`). Rotating segments
+    /// display (`applicationPid == nil && displayId == nil`). `micEnabled`
+    /// (Story 19.3) adds the microphone as its own, unmixed AAC track
+    /// (`micDeviceId` nil = the system default input). Rotating segments
     /// per `segmentMB` / `maxSegmentSeconds`. Emits `preflight` immediately, then
     /// `recording` (with the path) once frames are flowing, or a single honest
     /// `error` line on any failure — including a vanished application pid.
     func start(
         path: String, displayId: UInt32?, applicationPid: Int32?, applicationBundleId: String?,
-        systemAudio: Bool, segmentMB: Int, maxSegmentSeconds: Int
+        systemAudio: Bool, micEnabled: Bool, micDeviceId: String?,
+        segmentMB: Int, maxSegmentSeconds: Int
     ) {
         isActive = true
         policy = RotationPolicy(segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds)
@@ -202,7 +223,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
                     }
                     try self.beginCapture(
                         display: display, application: app, path: path,
-                        systemAudio: systemAudio)
+                        systemAudio: systemAudio, micEnabled: micEnabled,
+                        micDeviceId: micDeviceId)
                     return
                 }
 
@@ -221,7 +243,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
                     throw CaptureError("no recordable display found")
                 }
                 try self.beginCapture(
-                    display: display, application: nil, path: path, systemAudio: systemAudio)
+                    display: display, application: nil, path: path, systemAudio: systemAudio,
+                    micEnabled: micEnabled, micDeviceId: micDeviceId)
             } catch {
                 emitEvent([
                     "event": "error",
@@ -238,13 +261,21 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
     /// (Story 19.1) — only that application's windows land in the file; keeper,
     /// other apps, and notification banners are absent because they are not the
     /// target app. When nil the whole display is captured (the 16.6 path).
+    /// `micEnabled` (Story 19.3, AD-36) adds the second, unmixed mic AAC track:
+    /// in-stream `captureMicrophone` + the `.microphone` output on macOS 15+, a
+    /// parallel audio-only `AVCaptureSession` on 13–14 — same writer either way,
+    /// invisible to the user and to the capability flag.
     private func beginCapture(
-        display: SCDisplay, application: SCRunningApplication?, path: String, systemAudio: Bool
+        display: SCDisplay, application: SCRunningApplication?, path: String, systemAudio: Bool,
+        micEnabled: Bool, micDeviceId: String?
     ) throws {
         // Capture at the display's true pixel size (SCDisplay reports points).
         pixelWidth = max(2, CGDisplayPixelsWide(display.displayID))
         pixelHeight = max(2, CGDisplayPixelsHigh(display.displayID))
         wantsAudio = systemAudio
+        // Seed BEFORE `makeSegmentWriter` — segment 0's writer must already
+        // carry the mic input when the mic source is enabled.
+        wantsMic = micEnabled
 
         let first = try makeSegmentWriter(path: path, index: 0)
 
@@ -276,11 +307,37 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
             config.sampleRate = 48_000
             config.channelCount = 2
         }
+        if micEnabled {
+            if #available(macOS 15.0, *) {
+                // Story 19.3 (AD-36): on macOS 15+ the mic rides the SAME
+                // SCStream — `.microphone` samples arrive through the one
+                // capture source, keeping the timeline shared with video and
+                // system audio. A picked device is addressed by its uniqueID;
+                // absent, the OS uses the system default input.
+                config.captureMicrophone = true
+                if let micDeviceId {
+                    config.microphoneCaptureDeviceID = micDeviceId
+                }
+            }
+        }
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: mediaQueue)
         if systemAudio {
             try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: mediaQueue)
+        }
+        if micEnabled {
+            if #available(macOS 15.0, *) {
+                // The `.microphone` output delivers on the same serial
+                // `mediaQueue` as every other sample — writer state stays
+                // queue-confined, no locks.
+                try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: mediaQueue)
+            } else {
+                // macOS 13–14 (AD-36): no in-stream mic — stand up the parallel
+                // audio-only AVCaptureSession feeding the same per-segment
+                // `micInput`. User-invisible: same writer, same second track.
+                try startMicCaptureSession(deviceId: micDeviceId)
+            }
         }
 
         self.current = first
@@ -353,6 +410,29 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
             audioInput = input
         }
 
+        var micInput: AVAssetWriterInput?
+        if wantsMic {
+            // The microphone's OWN track (Story 19.3, AD-36): a second AAC
+            // input with the same shape as the system-audio one, never
+            // premixed — stock players play the tracks together, editors can
+            // separate them. The writer's internal converter adapts the
+            // device's native format (e.g. a mono mic) to this output shape.
+            let input = AVAssetWriterInput(
+                mediaType: .audio,
+                outputSettings: [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVSampleRateKey: 48_000,
+                    AVNumberOfChannelsKey: 2,
+                    AVEncoderBitRateKey: 192_000,
+                ])
+            input.expectsMediaDataInRealTime = true
+            guard writer.canAdd(input) else {
+                throw CaptureError("could not add the microphone AAC track")
+            }
+            writer.add(input)
+            micInput = input
+        }
+
         guard writer.startWriting() else {
             throw CaptureError(
                 "could not start writing: \(writer.error.map(String.init(describing:)) ?? "unknown")"
@@ -360,8 +440,68 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
         }
 
         return SegmentWriter(
-            writer: writer, videoInput: videoInput, audioInput: audioInput, path: path,
-            index: index)
+            writer: writer, videoInput: videoInput, audioInput: audioInput, micInput: micInput,
+            path: path, index: index)
+    }
+
+    /// Stand up the macOS 13–14 microphone path (Story 19.3, AD-36): an
+    /// audio-only `AVCaptureSession` whose `AVCaptureAudioDataOutput` delivers
+    /// samples on the same serial `mediaQueue` the SCStream uses, feeding the
+    /// same per-segment `micInput` the 15+ in-stream `.microphone` output
+    /// would — one writer, user-invisible OS split. macOS 15+ never calls this.
+    /// A missing/unopenable device throws — surfaced by the caller as a single
+    /// honest `error` event, never a hung recording.
+    private func startMicCaptureSession(deviceId: String?) throws {
+        let device: AVCaptureDevice?
+        if let deviceId {
+            device = AVCaptureDevice(uniqueID: deviceId)
+        } else {
+            device = AVCaptureDevice.default(for: .audio)
+        }
+        guard let device else {
+            throw CaptureError("the selected microphone is not available")
+        }
+        let session = AVCaptureSession()
+        let input = try AVCaptureDeviceInput(device: device)
+        guard session.canAddInput(input) else {
+            throw CaptureError("could not open the microphone input")
+        }
+        session.addInput(input)
+        let output = AVCaptureAudioDataOutput()
+        output.setSampleBufferDelegate(self, queue: mediaQueue)
+        guard session.canAddOutput(output) else {
+            throw CaptureError("could not attach the microphone output")
+        }
+        session.addOutput(output)
+        micSession = session
+        // `startRunning` blocks while the session spins up — keep it off the
+        // request loop and `mediaQueue`. Mic samples arriving before the video
+        // anchor are dropped by the append guard, exactly like system audio.
+        DispatchQueue.global(qos: .userInitiated).async {
+            session.startRunning()
+        }
+    }
+
+    /// Append one microphone sample to the current segment's mic track (Story
+    /// 19.3) — on `mediaQueue`, from either OS path (the `.microphone` stream
+    /// output on 15+, the parallel `AVCaptureSession` on 13–14). Mirrors the
+    /// system-audio guard: samples before the video anchor (or after stop) are
+    /// dropped, and the mic simply follows `current`, splitting at the same
+    /// rotation handover boundary as system audio.
+    private func appendMicSample(_ sampleBuffer: CMSampleBuffer) {
+        guard sampleBuffer.isValid, !stopping, sessionStarted,
+            let micInput = current?.micInput, micInput.isReadyForMoreMediaData
+        else { return }
+        micInput.append(sampleBuffer)
+    }
+
+    // MARK: - AVCaptureAudioDataOutputSampleBufferDelegate (on mediaQueue, macOS 13–14)
+
+    func captureOutput(
+        _ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        appendMicSample(sampleBuffer)
     }
 
     /// The observed **on-disk** size of `path` in bytes (0 when unreadable).
@@ -443,6 +583,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
 
         retiring.videoInput.markAsFinished()
         retiring.audioInput?.markAsFinished()
+        retiring.micInput?.markAsFinished()
         finalizeGroup.enter()
         retiring.writer.finishWriting { [self] in
             mediaQueue.async { [self] in
@@ -488,6 +629,15 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
     /// Safe to call once; later samples are dropped via `stopping`.
     func stop() {
         emitEvent(["event": "state", "state": "stopping"])
+        if let micSession {
+            // Story 19.3: wind down the 13–14 mic session off the media queue
+            // (`stopRunning` blocks, and its output delivers on `mediaQueue` —
+            // stopping from there could deadlock on an in-flight callback).
+            // Late mic samples are dropped by the `stopping` flag either way.
+            DispatchQueue.global(qos: .userInitiated).async {
+                micSession.stopRunning()
+            }
+        }
         guard let stream else {
             // Stop before capture ever started: nothing to finalize.
             emitEvent(["event": "error", "message": "stop before capture started"])
@@ -517,6 +667,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
         }
         current.videoInput.markAsFinished()
         current.audioInput?.markAsFinished()
+        current.micInput?.markAsFinished()
         finalizeGroup.enter()
         current.writer.finishWriting { self.finalizeGroup.leave() }
         // Wait for the final writer AND any still-running retired-writer
@@ -603,9 +754,12 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput {
             }
             audioInput.append(sampleBuffer)
         default:
-            // `.microphone` (macOS 15+) and any future output types are not
-            // captured in this story (microphone capture is Epic 19/20).
-            break
+            // `.microphone` (macOS 15+, Story 19.3) rides the same SCStream —
+            // route it to the current segment's own mic track. Any other
+            // future output type is dropped.
+            if #available(macOS 15.0, *), type == .microphone {
+                appendMicSample(sampleBuffer)
+            }
         }
     }
 

@@ -16,6 +16,7 @@ import {
 } from "@/components/recording/recording-source-picker";
 import type { RecordingSourcesVm } from "@/lib/ipc/client";
 import { listRecordingSources } from "@/lib/ipc/client";
+import { resetRecordingAudioForTest, setSystemAudioEnabled } from "@/lib/stores/recording-audio";
 import {
   resetRecordingSourceForTest,
   selectedRecordingTarget,
@@ -51,6 +52,8 @@ beforeEach(() => {
 
 afterEach(() => {
   resetRecordingSourceForTest();
+  // Restore the default-on system-audio toggle (the disclosure reads it).
+  resetRecordingAudioForTest();
   vi.clearAllMocks();
 });
 
@@ -84,8 +87,24 @@ describe("RecordingSourcePicker", () => {
       pid: 501,
       bundleId: "com.apple.Safari",
     });
-    // The inline exclusion disclosure names the app.
-    expect(screen.getByText(appScopeDisclosure("Safari"))).toBeInTheDocument();
+    // The inline exclusion disclosure names the app (system audio defaults on,
+    // so the "and audio" clause is present).
+    expect(screen.getByText(appScopeDisclosure("Safari", true))).toBeInTheDocument();
+    expect(screen.getByText(/windows and audio are recorded/)).toBeInTheDocument();
+  });
+
+  it("drops the audio clause from the disclosure while system audio is off (Story 19.3)", async () => {
+    // The 19.2-deferred contradiction: with system audio off, the disclosure
+    // must not claim the app's audio is recorded.
+    setSystemAudioEnabled(false);
+    render(<RecordingSourcePicker />);
+    const safari = await screen.findByText("Safari");
+    fireEvent.click(safari);
+
+    expect(screen.getByText(appScopeDisclosure("Safari", false))).toBeInTheDocument();
+    expect(screen.queryByText(/windows and audio are recorded/)).not.toBeInTheDocument();
+    // The exclusion half of the disclosure is intact either way.
+    expect(screen.getByText(/stay out of the file/)).toBeInTheDocument();
   });
 
   it("keyboard arrow navigation updates the selection (not only mouse clicks)", async () => {

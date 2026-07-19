@@ -10,6 +10,8 @@ import {
   networkMuteSet,
   notifyGetPreviewEnabled,
   notifySetPreviewEnabled,
+  recordingStart,
+  requestMicrophonePermission,
   setNetworkFilter,
   setSpaceFilter,
   subscribe,
@@ -241,5 +243,46 @@ describe("chatNotifyModeGet / chatNotifyModeSet (Story 10.2)", () => {
       roomId: "!r:example.org",
       mode: "mute",
     });
+  });
+});
+
+describe("recordingStart / requestMicrophonePermission (Story 19.3)", () => {
+  it("recordingStart with every arg omitted sends the honest nulls (defaults in Rust)", async () => {
+    invokeMock.mockResolvedValueOnce({ state: "preflight" });
+    await recordingStart();
+    expect(invokeMock).toHaveBeenCalledWith("recording_start", {
+      target: null,
+      systemAudio: null,
+      microphoneEnabled: null,
+      microphoneDeviceId: null,
+    });
+  });
+
+  it("recordingStart threads the mic selection through as microphoneEnabled/DeviceId", async () => {
+    invokeMock.mockResolvedValueOnce({ state: "preflight" });
+    await recordingStart({ kind: "display", displayId: null }, false, true, "X");
+    expect(invokeMock).toHaveBeenCalledWith("recording_start", {
+      target: { kind: "display", displayId: null },
+      systemAudio: false,
+      microphoneEnabled: true,
+      microphoneDeviceId: "X",
+    });
+  });
+
+  it("recordingStart maps a null device id (system default input) verbatim", async () => {
+    invokeMock.mockResolvedValueOnce({ state: "preflight" });
+    await recordingStart(undefined, true, true, null);
+    expect(invokeMock).toHaveBeenCalledWith("recording_start", {
+      target: null,
+      systemAudio: true,
+      microphoneEnabled: true,
+      microphoneDeviceId: null,
+    });
+  });
+
+  it("requestMicrophonePermission resolves the sidecar-reported tri-state", async () => {
+    invokeMock.mockResolvedValueOnce("denied");
+    await expect(requestMicrophonePermission()).resolves.toBe("denied");
+    expect(invokeMock).toHaveBeenCalledWith("request_microphone_permission", undefined);
   });
 });

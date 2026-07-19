@@ -109,6 +109,7 @@ export type { SearchHitVm } from "./gen/SearchHitVm";
 export type { SendState } from "./gen/SendState";
 export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 export type { SpaceVm } from "./gen/SpaceVm";
+export type { TccPermission } from "./gen/TccPermission";
 export type { TimelineBatch } from "./gen/TimelineBatch";
 export type { TimelineItemVm } from "./gen/TimelineItemVm";
 export type { TimelineOp } from "./gen/TimelineOp";
@@ -156,6 +157,7 @@ import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { SearchFilterVm } from "./gen/SearchFilterVm";
 import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
+import type { TccPermission } from "./gen/TccPermission";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
 import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
@@ -1695,15 +1697,37 @@ export async function openScreenRecordingSettings(): Promise<void> {
 export async function recordingStart(
   target?: RecordingTargetVm,
   systemAudio?: boolean,
+  micEnabled?: boolean,
+  micDeviceId?: string | null,
 ): Promise<RecordingStatusVm> {
   // Story 19.1: the picker's selected source/target (a display or an
   // application). Omitted (`undefined`) preserves the 16.6 main-display default.
   // Story 19.2: the Audio card's ephemeral per-session toggle. Omitted
   // preserves the 16.6 default-on path (`system_audio.unwrap_or(true)` in Rust).
+  // Story 19.3: the Audio card's ephemeral mic selection. Omitted preserves the
+  // mic-off default (`microphone_enabled.unwrap_or(false)` in Rust);
+  // `microphoneDeviceId` null = the system default input.
   return await invoke<RecordingStatusVm>("recording_start", {
     target: target ?? null,
     systemAudio: systemAudio ?? null,
+    microphoneEnabled: micEnabled ?? null,
+    microphoneDeviceId: micDeviceId ?? null,
   });
+}
+
+/**
+ * Request microphone access (Story 19.3, FR-69, AD-36). The Rust command runs
+ * the sidecar `requestMicrophone` round-trip (`AVCaptureDevice.requestAccess`
+ * in the child sidecar — the OS posts its one real prompt per app lifetime
+ * where the state is undetermined, attributed to keeper via
+ * `NSMicrophoneUsageDescription`) and resolves the authoritative post-request
+ * {@link TccPermission} tri-state. Called **only** when the user enables the
+ * mic source on the Audio card — never preemptively, never on render. Rejects
+ * with the {@link IpcError} envelope on a sidecar failure — the caller
+ * swallows it to a no-claim caption rather than crashing.
+ */
+export async function requestMicrophonePermission(): Promise<TccPermission> {
+  return await invoke<TccPermission>("request_microphone_permission");
 }
 
 /**
@@ -1711,9 +1735,10 @@ export async function recordingStart(
  * picker polls (Story 19.1). The Rust command runs the `keeper-rec`
  * `listSources` round-trip (a fresh child process per call, bounded by a shell
  * timeout so a wedged sidecar resolves a clean error, never a hung poll) and
- * resolves the live {@link RecordingSourcesVm}: real displays plus real
+ * resolves the live {@link RecordingSourcesVm}: real displays, real
  * applications (name/pid/bundleId + an optional ≤64px PNG icon data-URI, keeper
- * excluded). Called on a ~3s poll while the idle setup surface is visible and on
+ * excluded), and real microphones (Story 19.3 — `{id, name}` rows for the Audio
+ * card's device picker). Called on a ~3s poll while the idle setup surface is visible and on
  * window focus. Rejects with the {@link IpcError} envelope on a sidecar failure —
  * the picker swallows it to the prior list rather than blanking.
  */

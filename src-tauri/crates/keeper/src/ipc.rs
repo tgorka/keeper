@@ -26,7 +26,7 @@ use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::recording::{
     current_segment_bytes_on_disk, resolve_screen_recording_access, session_bytes_on_disk,
-    session_folder_name, ApplicationTarget, CaptureTarget, ManifestStatus, Recorder,
+    session_folder_name, ApplicationTarget, CaptureTarget, ManifestStatus, MicSelection, Recorder,
     RecordingEvent, RecordingSession, SegmentEntry, SessionDevices, SessionManifest, SessionParams,
     SessionState,
 };
@@ -3318,6 +3318,28 @@ pub fn open_screen_recording_settings(state: State<'_, AppState>) -> Result<(), 
         .map_err(to_ipc_error)
 }
 
+/// Request microphone access through the sidecar (Story 19.3, FR-69, AD-36):
+/// runs the `requestMicrophone` round-trip (`AVCaptureDevice.requestAccess(for:
+/// .audio)` in the child sidecar, so TCC shows keeper's own usage string —
+/// `NSMicrophoneUsageDescription` in keeper's Info.plist — and the OS posts its
+/// one real prompt per app lifetime where allowed) and resolves the authoritative
+/// post-request [`TccPermission`] tri-state. Called lazily — only when the user
+/// enables the mic source on the Audio card, never preemptively (the setup
+/// surface renders without probing; FR-69). A denial is surfaced as an honest
+/// inline caption on the card, never a blocker — the rich per-source pre-flight
+/// rows are Story 20.2. Failures (sidecar unavailable / hung / iOS) funnel
+/// through [`to_ipc_error`].
+#[tauri::command]
+pub async fn request_microphone_permission(
+    state: State<'_, AppState>,
+) -> Result<TccPermission, IpcError> {
+    state
+        .recorder
+        .request_microphone()
+        .await
+        .map_err(to_ipc_error)
+}
+
 /// Project a [`SessionState`] into the UI-facing [`RecordingUiState`] (Story 16.6).
 fn recording_ui_state(state: SessionState) -> RecordingUiState {
     match state {
@@ -3410,10 +3432,22 @@ pub async fn recording_start(
     state: State<'_, AppState>,
     target: Option<RecordingTargetVm>,
     system_audio: Option<bool>,
+    microphone_enabled: Option<bool>,
+    microphone_device_id: Option<String>,
 ) -> Result<RecordingStatusVm, IpcError> {
     // Story 19.2: the Audio card's ephemeral per-session toggle. `None` (no
     // explicit choice reached the command) preserves the 16.6 default-on path.
     let system_audio = system_audio.unwrap_or(true);
+    // Story 19.3: the Audio card's ephemeral mic selection — off unless
+    // explicitly enabled (`None` → `false`, the lazy-permission default), the
+    // device id `None` → the system default input. The one resolved flag feeds
+    // BOTH the sidecar wire (`SessionParams.microphone`) and the manifest
+    // (`SessionDevices.microphone`), so an off session honestly records
+    // `devices.microphone = false` and no mic track.
+    let mic_on = microphone_enabled.unwrap_or(false);
+    let microphone = mic_on.then_some(MicSelection {
+        device_id: microphone_device_id,
+    });
     // Story 19.1: map the picker's selected target into the manifest capture
     // target + the sidecar's video-target params. `None` (no picker selection)
     // preserves the 16.6 main-display default. A vanished application fails
@@ -3463,7 +3497,9 @@ pub async fn recording_start(
         capture_target,
         SessionDevices {
             system_audio,
-            microphone: false,
+            // Story 19.3: the mic leg is live — the manifest records whether
+            // this session captures a microphone track.
+            microphone: mic_on,
             camera: false,
         },
     )
@@ -3490,6 +3526,9 @@ pub async fn recording_start(
         display_id: target_display_id,
         application,
         system_audio,
+        // Story 19.3: `Some` only when the mic source is enabled — the wire
+        // then carries `micEnabled` (+ `micDeviceId` for a specific device).
+        microphone,
         segment_mb,
         // Minutes → seconds for the sidecar's `maxSegmentSeconds` (30 → 1800).
         max_segment_seconds: u32::from(duration_cap_minutes) * 60,

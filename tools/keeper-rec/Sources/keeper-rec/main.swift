@@ -11,17 +11,18 @@
 // - getCapabilities: protocol-version handshake + macOS version + feature flags
 //   + per-TCC permission states. `screenRecording` is real (CoreGraphics
 //   preflight — non-prompting, and authoritative because THIS process is the
-//   one that will capture); `microphone`/`camera` stay provisional
-//   "notDetermined" until AVFoundation detection lands (16.6/19).
-// - listSources: real active displays via CoreGraphics; applications (needs
-//   SCShareableContent) and microphones/cameras (need AVFoundation) are empty
-//   arrays — the shape is locked, enumeration is deferred (16.6/19).
+//   one that will capture); `microphone` is real too (AVFoundation, Story
+//   19.3); `camera` stays provisional "notDetermined" until 20.x.
+// - listSources: real active displays via CoreGraphics, real applications via
+//   SCShareableContent (19.1), real microphones via AVFoundation (19.3);
+//   cameras stay an empty array until 20.x.
 //
 // Cap #1722: macOS 15+ silently rejects ad-hoc-signed ScreenCaptureKit — real
 // capture builds need an Apple Development certificate (a DevEx requirement, not
 // a product blocker). This request loop itself needs no special signing.
 
 import AppKit
+import AVFoundation
 import CoreGraphics
 import Foundation
 import ScreenCaptureKit
@@ -62,6 +63,20 @@ func emitEvent(_ object: [String: Any]) {
     _ = writeLine(object)
 }
 
+/// Map this process's AVFoundation authorization for `mediaType` onto the wire's
+/// TCC tri-state string (Story 19.3). Unlike the Screen Recording preflight,
+/// AVFoundation reports the authoritative granted / denied / notDetermined
+/// directly and without prompting; `.restricted` counts as denied (the user
+/// cannot grant it, so the honest surface is the denied fix-path).
+private func avPermissionString(for mediaType: AVMediaType) -> String {
+    switch AVCaptureDevice.authorizationStatus(for: mediaType) {
+    case .authorized: return "granted"
+    case .denied, .restricted: return "denied"
+    case .notDetermined: return "notDetermined"
+    @unknown default: return "notDetermined"
+    }
+}
+
 /// The per-TCC permission states, keyed exactly as the wire contract expects.
 ///
 /// `screenRecording` uses the real, non-prompting CoreGraphics preflight of THIS
@@ -73,13 +88,13 @@ func emitEvent(_ object: [String: Any]) {
 /// a first-run user would wrongly steer 16.5 to a dead-end "open System Settings"
 /// prompt. The authoritative granted / not-yet-requested / denied tri-state
 /// (request, prompt, deep-link, live re-detection) is Story 16.5's pre-flight
-/// surface. `microphone`/`camera` are provisional "notDetermined" until
-/// AVFoundation detection lands (16.6/19).
+/// surface. `microphone` is the real, non-prompting AVFoundation tri-state
+/// (Story 19.3); `camera` stays provisional "notDetermined" until 20.x.
 private func permissionsPayload() -> [String: Any] {
     let screenRecording = CGPreflightScreenCaptureAccess() ? "granted" : "notDetermined"
     return [
         "screenRecording": screenRecording,
-        "microphone": "notDetermined",
+        "microphone": avPermissionString(for: .audio),
         "camera": "notDetermined",
     ]
 }
@@ -105,8 +120,11 @@ private func capabilitiesResult() -> [String: Any] {
             // System-audio capture is supported on the macOS 13+ floor this
             // sidecar is built for (Package.swift platforms: .macOS(.v13)).
             "systemAudio": true,
-            // Microphone / camera capture paths are not built yet (16.6 / 20.x).
-            "microphone": false,
+            // Microphone capture is live (Story 19.3, AD-36): in-stream on
+            // macOS 15+, a parallel AVCaptureSession on 13–14 — supported on
+            // the whole floor either way, so the flag never leaks the split.
+            "microphone": true,
+            // Camera capture is not built yet (20.x).
             "camera": false,
         ],
         "permissions": permissionsPayload(),
@@ -228,15 +246,36 @@ private func listApplications() async -> [[String: Any]] {
     return apps
 }
 
-/// The `listSources` result (Story 16.4 → 19.1): real displays (CoreGraphics)
-/// and real applications (SCShareableContent). Microphones/cameras (AVFoundation)
-/// stay deferred as empty arrays — the shape is the locked contract; Epic 19.3/20
-/// land them. `async` because application enumeration awaits shareable content.
+/// Enumerate the audio-input devices via `AVCaptureDevice.DiscoverySession`
+/// (Story 19.3): real microphones as `{id, name}` rows for the Audio card's
+/// device picker ("System default input" is the picker's own first row — the
+/// host never needs a device id for the default). The macOS-14 device-type
+/// rename is handled per-availability; a host with no input devices degrades to
+/// an empty list — honest, never a crash.
+private func listMicrophones() -> [[String: Any]] {
+    let deviceTypes: [AVCaptureDevice.DeviceType]
+    if #available(macOS 14.0, *) {
+        deviceTypes = [.microphone, .external]
+    } else {
+        deviceTypes = [.builtInMicrophone, .externalUnknown]
+    }
+    let discovery = AVCaptureDevice.DiscoverySession(
+        deviceTypes: deviceTypes, mediaType: .audio, position: .unspecified)
+    return discovery.devices.map { device in
+        ["id": device.uniqueID, "name": device.localizedName]
+    }
+}
+
+/// The `listSources` result (Story 16.4 → 19.3): real displays (CoreGraphics),
+/// real applications (SCShareableContent), and real microphones (AVFoundation).
+/// Cameras stay deferred as an empty array — the shape is the locked contract;
+/// Epic 20 lands them. `async` because application enumeration awaits shareable
+/// content.
 private func sourcesResult() async -> [String: Any] {
     return [
         "displays": listDisplays(),
         "applications": await listApplications(),
-        "microphones": [] as [[String: Any]],
+        "microphones": listMicrophones(),
         "cameras": [] as [[String: Any]],
     ]
 }
@@ -285,6 +324,21 @@ while let line = readLine(strippingNewline: true) {
         // prompt and reads back false — the host resolves that to its honest
         // denied-with-fix-path (System Settings deep link).
         response = ["id": id, "result": ["granted": CGRequestScreenCaptureAccess()]]
+    case "requestMicrophone":
+        // Story 19.3 (FR-69, AD-36): ask TCC for microphone access — the host
+        // only ever sends this lazily, when the user enables the mic source.
+        // Where the state is undetermined the OS posts its one real prompt per
+        // app lifetime (attributed to keeper — this sidecar is keeper's child
+        // process; the usage string is keeper's NSMicrophoneUsageDescription)
+        // and `requestAccess` resolves once the user answers; an already-decided
+        // state resolves immediately with no prompt. The reply carries the
+        // authoritative post-request tri-state, serialized through the same
+        // `writeLine`/`stdoutLock` as every concurrent event line.
+        Task {
+            _ = await AVCaptureDevice.requestAccess(for: .audio)
+            _ = writeLine(["id": id, "result": ["status": avPermissionString(for: .audio)]])
+        }
+        continue
     case "startRecording":
         // Story 16.6: begin the one capture session this process can host.
         // Progress flows as NDJSON *events* (preflight → recording → … ), not
@@ -316,6 +370,12 @@ while let line = readLine(strippingNewline: true) {
         // recycled pid can't capture the wrong app.
         let applicationBundleId = params?["bundleId"] as? String
         let systemAudio = (params?["systemAudio"] as? Bool) ?? true
+        // Story 19.3: the optional microphone leg — off unless explicitly
+        // enabled (absent `micEnabled` means off, preserving the pre-19.3
+        // wire); `micDeviceId` nil = the system default input. The mic is
+        // written as its own AAC track, never premixed (AD-36).
+        let micEnabled = (params?["micEnabled"] as? Bool) ?? false
+        let micDeviceId = params?["micDeviceId"] as? String
         // Story 17.1: optional segmenting knobs, additive to the v1 protocol
         // (Story 17.5 later feeds configured values from keeper.db). Missing
         // fields fall back to the authored defaults; non-positive values are
@@ -331,6 +391,7 @@ while let line = readLine(strippingNewline: true) {
         captureEngine.start(
             path: path, displayId: displayId, applicationPid: applicationPid,
             applicationBundleId: applicationBundleId, systemAudio: systemAudio,
+            micEnabled: micEnabled, micDeviceId: micDeviceId,
             segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds)
         continue
     case "stop":

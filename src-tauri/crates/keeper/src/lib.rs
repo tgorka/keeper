@@ -362,6 +362,7 @@ pub fn run() {
             ipc::menu_bar_presence_set,
             ipc::recording_permission,
             ipc::request_screen_recording_permission,
+            ipc::request_microphone_permission,
             ipc::open_screen_recording_settings,
             ipc::recording_list_sources,
             ipc::recording_start,

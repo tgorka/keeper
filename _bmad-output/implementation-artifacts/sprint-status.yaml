@@ -192,7 +192,7 @@ development_status:
   epic-19: in-progress
   19-1-application-window-picker-scshareablecontent-live-list: done
   19-2-system-audio-toggle-and-per-app-audio-scoping: done
-  19-3-microphone-picker-and-separate-track: backlog
+  19-3-microphone-picker-and-separate-track: done
   19-4-microphone-hot-unplug-resilience: backlog
   19-5-destination-folder-chooser-and-fps-advanced-control: backlog
   epic-19-retrospective: optional

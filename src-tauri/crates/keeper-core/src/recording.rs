@@ -361,6 +361,16 @@ pub fn request_screen_recording_request(id: u64) -> String {
     serde_json::json!({ "id": id, "method": "requestScreenRecording" }).to_string()
 }
 
+/// Build the one-line `requestMicrophone` request (Story 19.3, FR-69, AD-36; no
+/// trailing newline — the shell port owns line framing). Wire shape:
+/// `{"id":<id>,"method":"requestMicrophone"}`. Only ever sent lazily — when the
+/// user enables the mic source, never preemptively. Additive to the v1 protocol
+/// — keeper and keeper-rec ship in lockstep, so [`PROTOCOL_VERSION`] is
+/// unchanged (the 16.5 `requestScreenRecording` precedent).
+pub fn request_microphone_request(id: u64) -> String {
+    serde_json::json!({ "id": id, "method": "requestMicrophone" }).to_string()
+}
+
 /// A single-application capture target (Story 19.1) — the running process id and
 /// bundle identifier the sidecar re-resolves live against `SCShareableContent` at
 /// Start. Pure data; no platform token.
@@ -370,6 +380,17 @@ pub struct ApplicationTarget {
     pub pid: i32,
     /// The application's bundle identifier.
     pub bundle_id: String,
+}
+
+/// The microphone selection of one capture session (Story 19.3, FR-69, AD-36)
+/// — present on [`SessionParams`] only when the mic source is enabled. Pure
+/// data; no platform token (the device id is an opaque string the sidecar
+/// resolves against its own enumeration).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicSelection {
+    /// The selected input device's unique id, or `None` for the system default
+    /// input.
+    pub device_id: Option<String>,
 }
 
 /// The parameters of one capture session (Story 16.6, FR-68/FR-69/FR-71, AD-37).
@@ -394,6 +415,11 @@ pub struct SessionParams {
     pub application: Option<ApplicationTarget>,
     /// Whether to capture system audio (true in the walking skeleton).
     pub system_audio: bool,
+    /// The microphone selection (Story 19.3, FR-69), or `None` when the mic
+    /// source is off (the default). When `Some`, the wire carries
+    /// `micEnabled:true` (+ `micDeviceId` when a specific device is picked)
+    /// and the sidecar writes the mic as its own, unmixed AAC track.
+    pub microphone: Option<MicSelection>,
     /// Segment size in decimal MB before a gapless rotation (Story 17.5,
     /// FR-72); the sidecar's `segmentMB`.
     pub segment_mb: u32,
@@ -425,6 +451,16 @@ pub fn start_recording_request(id: u64, params: &SessionParams) -> String {
         wire["bundleId"] = application.bundle_id.clone().into();
     } else if let Some(display_id) = params.display_id {
         wire["displayId"] = display_id.into();
+    }
+    // The mic source (Story 19.3): additive fields, absent entirely while the
+    // mic is off so the 16.6/19.2 wire stays byte-for-byte unchanged.
+    // `micDeviceId` is emitted only for a specific device — its absence with
+    // `micEnabled:true` means the system default input.
+    if let Some(microphone) = &params.microphone {
+        wire["micEnabled"] = true.into();
+        if let Some(device_id) = &microphone.device_id {
+            wire["micDeviceId"] = device_id.clone().into();
+        }
     }
     serde_json::json!({ "id": id, "method": "startRecording", "params": wire }).to_string()
 }
@@ -561,6 +597,24 @@ pub fn parse_request_screen_recording_result(line: &str) -> Result<bool, Recordi
         .and_then(|obj| obj.get("granted"))
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| protocol_error("requestScreenRecording: missing/mistyped granted"))
+}
+
+/// Parse the id-correlated `requestMicrophone` response line (Story 19.3,
+/// FR-69, AD-36) into the sidecar-reported post-request TCC state
+/// (`result.status`). Unlike Screen Recording's two-valued preflight, the
+/// sidecar's audio-permission probe reports the authoritative granted /
+/// denied / notDetermined tri-state directly, so no session-flag lifting is
+/// needed here. A sidecar `error` answer and any malformed / missing field
+/// surface as [`RecordingError::Protocol`] — never a panic.
+pub fn parse_request_microphone_result(line: &str) -> Result<TccPermission, RecordingError> {
+    let result = response_result(line, "requestMicrophone")?;
+    let raw = result
+        .as_object()
+        .and_then(|obj| obj.get("status"))
+        .cloned()
+        .ok_or_else(|| protocol_error("requestMicrophone: missing status"))?;
+    serde_json::from_value(raw)
+        .map_err(|e| protocol_error(format!("requestMicrophone: unrecognized status: {e}")))
 }
 
 /// Lift the sidecar's two-valued Screen Recording preflight into the honest
@@ -1166,6 +1220,14 @@ pub trait Recorder {
     /// the grant is green after the request, `false` otherwise. Same error
     /// surface as [`Recorder::get_capabilities`].
     fn request_screen_recording(&self) -> impl Future<Output = Result<bool, CoreError>> + Send;
+
+    /// Run the `requestMicrophone` round-trip (Story 19.3, FR-69, AD-36): ask
+    /// the sidecar to request microphone access (the OS shows its one real
+    /// prompt where allowed) and resolve the reported post-request
+    /// [`TccPermission`] tri-state. Only ever called lazily — when the user
+    /// enables the mic source, never preemptively. Same error surface as
+    /// [`Recorder::get_capabilities`].
+    fn request_microphone(&self) -> impl Future<Output = Result<TccPermission, CoreError>> + Send;
 }
 
 /// Drive one recording session to its terminal [`SessionState`] (Story 16.2).
@@ -1640,9 +1702,14 @@ mod tests {
             request_screen_recording_request(3),
             r#"{"id":3,"method":"requestScreenRecording"}"#
         );
+        assert_eq!(
+            request_microphone_request(6),
+            r#"{"id":6,"method":"requestMicrophone"}"#
+        );
         // No line framing inside the request — the shell port owns the newline.
         assert!(!capabilities_request(7).contains('\n'));
         assert!(!request_screen_recording_request(7).contains('\n'));
+        assert!(!request_microphone_request(7).contains('\n'));
     }
 
     #[test]
@@ -1654,6 +1721,7 @@ mod tests {
             display_id: Some(7),
             application: None,
             system_audio: true,
+            microphone: None,
             segment_mb: 800,
             max_segment_seconds: 2700,
         };
@@ -1693,12 +1761,124 @@ mod tests {
             display_id: None,
             application: None,
             system_audio: false,
+            microphone: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
         };
         let line = start_recording_request(6, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
         assert_eq!(wire["params"]["systemAudio"], false);
+    }
+
+    #[test]
+    fn start_recording_request_omits_mic_fields_while_off() {
+        // Story 19.3: a mic-off session (`microphone: None`) carries NO
+        // `micEnabled`/`micDeviceId` key at all — the 16.6/19.2 wire stays
+        // byte-for-byte unchanged, and the sidecar adds no mic track.
+        let params = SessionParams {
+            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            display_id: None,
+            application: None,
+            system_audio: true,
+            microphone: None,
+            segment_mb: 500,
+            max_segment_seconds: 1800,
+        };
+        let line = start_recording_request(10, &params);
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
+        assert!(
+            wire["params"].get("micEnabled").is_none(),
+            "a mic-off session must not carry micEnabled"
+        );
+        assert!(
+            wire["params"].get("micDeviceId").is_none(),
+            "a mic-off session must not carry micDeviceId"
+        );
+    }
+
+    #[test]
+    fn start_recording_request_carries_mic_enabled_with_default_input() {
+        // Story 19.3: the mic on with the system default input — `micEnabled:
+        // true` and NO `micDeviceId` (its absence means the default device).
+        let params = SessionParams {
+            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            display_id: None,
+            application: None,
+            system_audio: true,
+            microphone: Some(MicSelection { device_id: None }),
+            segment_mb: 500,
+            max_segment_seconds: 1800,
+        };
+        let line = start_recording_request(11, &params);
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
+        assert_eq!(wire["params"]["micEnabled"], true);
+        assert!(
+            wire["params"].get("micDeviceId").is_none(),
+            "the system default input must omit micDeviceId"
+        );
+        // The 16.6/19.2 fields ride along unchanged.
+        assert_eq!(wire["params"]["systemAudio"], true);
+        assert_eq!(wire["params"]["segmentMB"], 500);
+    }
+
+    #[test]
+    fn start_recording_request_carries_mic_device_id() {
+        // Story 19.3: a specific device picked in the Audio card threads its
+        // opaque unique id through as `micDeviceId`.
+        let params = SessionParams {
+            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            display_id: None,
+            application: None,
+            system_audio: false,
+            microphone: Some(MicSelection {
+                device_id: Some("X".to_owned()),
+            }),
+            segment_mb: 500,
+            max_segment_seconds: 1800,
+        };
+        let line = start_recording_request(12, &params);
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
+        assert_eq!(wire["params"]["micEnabled"], true);
+        assert_eq!(wire["params"]["micDeviceId"], "X");
+        // The mic is independent of system audio — off here, mic still on.
+        assert_eq!(wire["params"]["systemAudio"], false);
+    }
+
+    #[test]
+    fn parse_request_microphone_result_maps_every_status() {
+        // Story 19.3: the sidecar's post-request audio-permission tri-state
+        // maps onto `TccPermission` verbatim.
+        for (status, expected) in [
+            ("granted", TccPermission::Granted),
+            ("denied", TccPermission::Denied),
+            ("notDetermined", TccPermission::NotDetermined),
+        ] {
+            let line = format!(r#"{{"id":6,"result":{{"status":"{status}"}}}}"#);
+            assert_eq!(
+                parse_request_microphone_result(&line).expect("status parses"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn parse_request_microphone_result_surfaces_faults() {
+        // A sidecar `error` answer, a missing status, and an unknown status
+        // string all surface as `Protocol` — never a panic.
+        for line in [
+            r#"{"id":6,"error":{"code":"unknownMethod","message":"unknown method"}}"#,
+            r#"{"id":6,"result":{}}"#,
+            r#"{"id":6,"result":{"status":"maybe"}}"#,
+            "not json",
+        ] {
+            assert!(
+                matches!(
+                    parse_request_microphone_result(line),
+                    Err(RecordingError::Protocol(_))
+                ),
+                "line {line:?} must surface a Protocol fault"
+            );
+        }
     }
 
     #[test]
@@ -1715,6 +1895,7 @@ mod tests {
                 bundle_id: "com.apple.Safari".to_owned(),
             }),
             system_audio: true,
+            microphone: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
         };
@@ -2065,6 +2246,16 @@ mod tests {
             // Canned grant — the fake port answers the wire, it never fakes TCC.
             Ok(true)
         }
+
+        async fn request_microphone(&self) -> Result<TccPermission, CoreError> {
+            if !self.available {
+                return Err(CoreError::Unsupported(
+                    "keeper-rec is not available".to_owned(),
+                ));
+            }
+            // Canned grant — the fake port answers the wire, it never fakes TCC.
+            Ok(TccPermission::Granted)
+        }
     }
 
     /// Canned params for the fake port (never touch the filesystem).
@@ -2074,6 +2265,7 @@ mod tests {
             display_id: None,
             application: None,
             system_audio: true,
+            microphone: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
         }

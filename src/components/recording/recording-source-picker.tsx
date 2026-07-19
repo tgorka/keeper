@@ -23,6 +23,7 @@ import { AppWindow, Monitor } from "lucide-react";
 import { type ReactNode, useEffect } from "react";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import type { RecordingTargetVm } from "@/lib/ipc/client";
+import { useSystemAudioEnabled } from "@/lib/stores/recording-audio";
 import {
   isSameTarget,
   isSelectionAvailable,
@@ -55,9 +56,13 @@ export const SELECTION_UNAVAILABLE_NOTE = "This source is no longer available.";
 /** Test id for the picker root. */
 export const SOURCE_PICKER_TESTID = "recording-source-picker";
 
-/** The inline app-scope disclosure (Story 19.1) — `{App}` is interpolated. */
-export function appScopeDisclosure(appName: string): string {
-  return `Only ${appName}'s windows and audio are recorded — keeper, other apps, and notification banners stay out of the file.`;
+/** The inline app-scope disclosure (Story 19.1) — `{App}` is interpolated.
+ * Story 19.3 (deferred from 19.2): the "and audio" clause is honest only while
+ * the Audio card's system-audio toggle is on — with system audio off, no app
+ * audio lands in the file, so the clause is dropped. */
+export function appScopeDisclosure(appName: string, systemAudioOn: boolean): string {
+  const scope = systemAudioOn ? "windows and audio are" : "windows are";
+  return `Only ${appName}'s ${scope} recorded — keeper, other apps, and notification banners stay out of the file.`;
 }
 
 /** Encode a target as a stable RadioGroup value string. */
@@ -104,6 +109,9 @@ export function RecordingSourcePicker({ active = true }: { active?: boolean }) {
   const sources = useRecordingSources();
   const selected = useSelectedRecordingTarget();
   const refreshing = useRecordingSourcesRefreshing();
+  // Story 19.3 (deferred from 19.2): the app-scope disclosure must not claim
+  // the app's audio is recorded while the Audio card has system audio off.
+  const systemAudioOn = useSystemAudioEnabled();
 
   // Poll while the idle setup surface is visible (`active`); stop while a session
   // is recording (`active === false`) or on unmount — otherwise a fresh
@@ -235,10 +243,11 @@ export function RecordingSourcePicker({ active = true }: { active?: boolean }) {
       </RadioGroup>
 
       {/* Inline app-scope disclosure (Story 19.1): shown whenever an application
-          is selected — states the exclusion plainly. */}
+          is selected — states the exclusion plainly, with the audio clause
+          conditioned on the system-audio toggle (Story 19.3). */}
       {selected.kind === "application" && (
         <p className="text-muted-foreground text-xs">
-          {appScopeDisclosure(selectedApp?.name ?? "the selected application")}
+          {appScopeDisclosure(selectedApp?.name ?? "the selected application", systemAudioOn)}
         </p>
       )}
 

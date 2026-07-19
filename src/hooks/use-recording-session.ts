@@ -64,9 +64,15 @@ export interface UseRecordingSession {
   elapsed: string | null;
   /** Start the session for the selected capture target (Story 19.1) — a display
    * or an application; omit for the main-display default (no-op while live) —
-   * and the Audio card's system-audio toggle (Story 19.2); omit for the
-   * default-on path. */
-  start: (target?: RecordingTargetVm, systemAudio?: boolean) => Promise<void>;
+   * the Audio card's system-audio toggle (Story 19.2); omit for the
+   * default-on path — and the Audio card's mic selection (Story 19.3); omit
+   * for the mic-off default (`micDeviceId` null = system default input). */
+  start: (
+    target?: RecordingTargetVm,
+    systemAudio?: boolean,
+    micEnabled?: boolean,
+    micDeviceId?: string | null,
+  ) => Promise<void>;
   /** Request the graceful stop-and-finalize (idempotent). */
   stop: () => Promise<void>;
 }
@@ -132,27 +138,35 @@ export function useRecordingSession(): UseRecordingSession {
     };
   }, [startedAt, live]);
 
-  const start = useCallback(async (target?: RecordingTargetVm, systemAudio?: boolean) => {
-    try {
-      const vm = await recordingStart(target, systemAudio);
-      if (mounted.current) {
-        setStatus(vm);
+  const start = useCallback(
+    async (
+      target?: RecordingTargetVm,
+      systemAudio?: boolean,
+      micEnabled?: boolean,
+      micDeviceId?: string | null,
+    ) => {
+      try {
+        const vm = await recordingStart(target, systemAudio, micEnabled, micDeviceId);
+        if (mounted.current) {
+          setStatus(vm);
+        }
+      } catch (raw) {
+        // An honest failed snapshot — never a crash, never a silent no-op.
+        if (mounted.current) {
+          const message =
+            typeof raw === "object" && raw !== null && "message" in raw
+              ? String((raw as { message: unknown }).message)
+              : "could not start the recording";
+          setStatus({
+            ...IDLE_RECORDING_STATUS,
+            state: "failed",
+            error: message,
+          });
+        }
       }
-    } catch (raw) {
-      // An honest failed snapshot — never a crash, never a silent no-op.
-      if (mounted.current) {
-        const message =
-          typeof raw === "object" && raw !== null && "message" in raw
-            ? String((raw as { message: unknown }).message)
-            : "could not start the recording";
-        setStatus({
-          ...IDLE_RECORDING_STATUS,
-          state: "failed",
-          error: message,
-        });
-      }
-    }
-  }, []);
+    },
+    [],
+  );
 
   const stop = useCallback(async () => {
     // Best-effort: the outcome arrives through the poll (stopping → finalized).

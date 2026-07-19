@@ -32,6 +32,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { useRecordingPermission } from "@/hooks/use-recording-permission";
 import { isLiveRecording, useRecordingSession } from "@/hooks/use-recording-session";
 import { systemAudioEnabled } from "@/lib/stores/recording-audio";
+import { micDeviceId, micEnabled } from "@/lib/stores/recording-mic";
 import { selectedRecordingTarget } from "@/lib/stores/recording-source";
 
 /** Honest local-only subtitle (recording voice: sentence case, no exclamation
@@ -95,7 +96,14 @@ export function RecordingPane() {
                 // (a display or an application; the main display by default).
                 // Story 19.2: thread the Audio card's system-audio toggle
                 // (default on) read imperatively at click time.
-                void start(selectedRecordingTarget(), systemAudioEnabled());
+                // Story 19.3: thread the Audio card's mic selection (default
+                // off; device null = system default input) the same way.
+                void start(
+                  selectedRecordingTarget(),
+                  systemAudioEnabled(),
+                  micEnabled(),
+                  micDeviceId(),
+                );
               }}
             >
               {START_RECORDING_LABEL}
