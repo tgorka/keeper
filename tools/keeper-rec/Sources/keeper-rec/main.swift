@@ -114,6 +114,9 @@ private func capabilitiesResult() -> [String: Any] {
         // tolerantly by the host parser, so per the additive-change precedent
         // (16.5's requestScreenRecording, 16.6's startRecording/stop) the
         // version stays 1.
+        // Story 19.5 added the additive `fps` field to `startRecording`
+        // (always emitted by the host, decoded best-effort here with a default
+        // of 30) — per the same additive precedent the version stays 1.
         "protocolVersion": 1,
         "macos": macos,
         "features": [
@@ -386,13 +389,18 @@ while let line = readLine(strippingNewline: true) {
         let maxSegmentSeconds =
             (params?["maxSegmentSeconds"] as? NSNumber)?.intValue
             ?? RotationPolicy.defaultMaxSegmentSeconds
+        // Story 19.5: the capture frame rate — additive like `segmentMB`, the
+        // host always emits it, but decode best-effort with the 30 default so
+        // an older host stays compatible. The engine normalizes to {30, 60}
+        // via `normalizeFps` before it reaches SCStreamConfiguration.
+        let fps = (params?["fps"] as? NSNumber)?.intValue ?? 30
         response = ["id": id, "result": ["starting": true]]
         _ = writeLine(response)
         captureEngine.start(
             path: path, displayId: displayId, applicationPid: applicationPid,
             applicationBundleId: applicationBundleId, systemAudio: systemAudio,
             micEnabled: micEnabled, micDeviceId: micDeviceId,
-            segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds)
+            segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds, fps: fps)
         continue
     case "simulateMicRemoval":
         // Story 19.4: drive the IDENTICAL mic-loss branch a real hardware

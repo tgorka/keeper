@@ -85,10 +85,12 @@ export function RecordingSettingsControls() {
     if (clamped === current) {
       return;
     }
+    // Spread the live VM so the co-settings (including 19.5's destination +
+    // fps) ride along unchanged — a segment edit never clobbers them.
     const next =
       field === "segment"
-        ? { segmentMb: clamped, durationCapMinutes: live.durationCapMinutes }
-        : { segmentMb: live.segmentMb, durationCapMinutes: clamped };
+        ? { ...live, segmentMb: clamped }
+        : { ...live, durationCapMinutes: clamped };
     void applyRecordingSettings(next);
   };
 

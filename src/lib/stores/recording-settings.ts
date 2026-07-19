@@ -36,6 +36,11 @@ export const RECORDING_DURATION_CAP_MINUTES_DEFAULT = 30;
 export const RECORDING_DURATION_CAP_MINUTES_MIN = 1;
 /** Largest accepted duration cap in minutes (mirrors the Rust clamp ceiling). */
 export const RECORDING_DURATION_CAP_MINUTES_MAX = 600;
+/** Default capture frame rate (Story 19.5; mirrors the Rust registry default). */
+export const RECORDING_FPS_DEFAULT = 30;
+/** The only legal frame rates (Story 19.5; mirrors the Rust normalize set —
+ * anything else is normalized to the default backend-side). */
+export const RECORDING_FPS_ALLOWED: readonly number[] = [30, 60];
 
 export interface RecordingSettingsState {
   /**

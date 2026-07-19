@@ -19,9 +19,17 @@ vi.mock("@/lib/ipc/client", () => ({
   menuBarPresenceSet: vi.fn(() => Promise.resolve()),
   undoSendWindow: vi.fn(() => Promise.resolve(10)),
   setUndoSendWindow: vi.fn(() => Promise.resolve()),
-  // The Recording section mounts the shared segmentation control (Story 17.5),
-  // which lazily hydrates from this read when `recording` is on.
-  recordingSettingsGet: vi.fn(() => Promise.resolve({ segmentMb: 500, durationCapMinutes: 30 })),
+  // The Recording section mounts the shared segmentation + destination + fps
+  // controls (Story 17.5 + 19.5), which lazily hydrate from this read when
+  // `recording` is on.
+  recordingSettingsGet: vi.fn(() =>
+    Promise.resolve({
+      segmentMb: 500,
+      durationCapMinutes: 30,
+      destinationDir: "/Users/alice/Movies/keeper",
+      fps: 30,
+    }),
+  ),
   recordingSettingsSet: vi.fn((vm: unknown) => Promise.resolve(vm)),
   hotkeyGet: vi.fn(() =>
     Promise.resolve({
@@ -56,6 +64,11 @@ vi.mock("@tauri-apps/plugin-updater", () => ({
 }));
 vi.mock("@tauri-apps/plugin-process", () => ({
   relaunch: vi.fn(() => Promise.resolve()),
+}));
+// The Recording section's Destination chooser (Story 19.5) opens the OS-native
+// directory picker; mock it so the dialog renders without a Tauri runtime.
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: vi.fn(() => Promise.resolve(null)),
 }));
 
 import {
@@ -651,8 +664,18 @@ describe("SettingsDialog", () => {
     render(<SettingsDialog open onOpenChange={() => {}} />);
 
     expect(await screen.findByText("Recording")).toBeInTheDocument();
-    // Honest local-only framing — nothing uploads.
-    expect(screen.getByText(/Screen recording saves to a folder/)).toBeInTheDocument();
-    expect(screen.getByText(/Nothing uploads/)).toBeInTheDocument();
+    // Honest local-only framing (19.5 copy: the folder is user-visible now) —
+    // nothing uploads. Both the section line and the Destination chooser's own
+    // disclosure carry the no-upload sentence.
+    expect(screen.getByText(/Screen recording saves to the folder below/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Nothing uploads/).length).toBeGreaterThanOrEqual(1);
+    // The Destination + Advanced controls are mounted in the section (19.5).
+    expect(screen.getByTestId("recording-destination-path")).toHaveTextContent(
+      "/Users/alice/Movies/keeper",
+    );
+    expect(screen.getByTestId("recording-advanced-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
   });
 });

@@ -20,10 +20,23 @@ vi.mock("@/lib/ipc/client", () => ({
       cameras: [],
     }),
   ),
-  // The "Segmenting" card mounts the shared settings control (Story 17.5),
-  // which lazily hydrates from this read.
-  recordingSettingsGet: vi.fn(() => Promise.resolve({ segmentMb: 500, durationCapMinutes: 30 })),
+  // The "Segmenting" / "Destination" / "Advanced" cards mount the shared
+  // settings controls (Story 17.5 + 19.5), which lazily hydrate from this read.
+  recordingSettingsGet: vi.fn(() =>
+    Promise.resolve({
+      segmentMb: 500,
+      durationCapMinutes: 30,
+      destinationDir: "/Users/alice/Movies/keeper",
+      fps: 30,
+    }),
+  ),
   recordingSettingsSet: vi.fn((vm: unknown) => Promise.resolve(vm)),
+}));
+
+// The Destination card's folder chooser (Story 19.5) opens the OS-native
+// directory picker; mock it so the pane renders without a Tauri runtime.
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: vi.fn(() => Promise.resolve(null)),
 }));
 
 import {
@@ -34,10 +47,15 @@ import {
   STOP_RECORDING_LABEL,
 } from "@/components/layout/recording-pane";
 import {
+  ADVANCED_TOGGLE_TESTID,
+  FPS_SELECT_TESTID,
+} from "@/components/recording/recording-advanced-controls";
+import {
   MIC_SWITCH_TESTID,
   SYSTEM_AUDIO_LABEL,
   SYSTEM_AUDIO_SWITCH_TESTID,
 } from "@/components/recording/recording-audio-controls";
+import { DESTINATION_PATH_TESTID } from "@/components/recording/recording-destination-controls";
 import {
   OPEN_SETTINGS_LABEL,
   REQUEST_PERMISSION_LABEL,
@@ -148,6 +166,19 @@ describe("RecordingPane", () => {
     // segment-size + duration-cap control, hydrated from the store.
     expect(await screen.findByLabelText(SEGMENT_SIZE_LABEL)).toHaveValue(500);
     expect(screen.getByLabelText(DURATION_CAP_LABEL)).toHaveValue(30);
+    await waitFor(() => expect(mockFetch).toHaveBeenCalled());
+  });
+
+  it("mounts the destination chooser and the collapsed Advanced group (Story 19.5)", async () => {
+    render(<RecordingPane />);
+
+    // The Destination card shows the Rust-resolved effective folder.
+    expect(await screen.findByTestId(DESTINATION_PATH_TESTID)).toHaveTextContent(
+      "/Users/alice/Movies/keeper",
+    );
+    // The Advanced card renders collapsed — fps hidden behind the disclosure.
+    expect(screen.getByTestId(ADVANCED_TOGGLE_TESTID)).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId(FPS_SELECT_TESTID)).not.toBeInTheDocument();
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
   });
 

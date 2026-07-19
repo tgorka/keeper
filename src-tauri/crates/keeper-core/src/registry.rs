@@ -842,6 +842,79 @@ pub fn set_recording_duration_cap_minutes(data_dir: &Path, minutes: u16) -> Resu
     )
 }
 
+/// The `settings` key holding the user-chosen recording destination folder
+/// (Story 19.5, AD-25). Stored as the raw absolute path string; absent / empty ⇒
+/// no explicit choice — the SHELL resolves the effective default
+/// (`dirs::video_dir()/keeper`, falling back to the app data dir) because that
+/// resolution needs a platform probe this core crate must not hold.
+const RECORDING_DESTINATION_DIR_KEY: &str = "recording.destination_dir";
+
+/// Read the user-chosen recording destination folder (Story 19.5). `None` when
+/// the setting is absent or empty — the caller (shell) resolves the effective
+/// default. No validation here: the path is validated at Start time by the
+/// `recording_start` pre-flight (probe → `evaluate_destination`), never on read.
+pub fn get_recording_destination_dir(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    let raw = get_setting(data_dir, RECORDING_DESTINATION_DIR_KEY)?;
+    Ok(raw.filter(|v| !v.trim().is_empty()))
+}
+
+/// Write the user-chosen recording destination folder (Story 19.5) verbatim
+/// under `recording.destination_dir`. Applies to the next Recording Session
+/// only — `recording_start` reads it once at Start and never mid-session.
+pub fn set_recording_destination_dir(data_dir: &Path, dir: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, RECORDING_DESTINATION_DIR_KEY, dir)
+}
+
+/// The `settings` key holding the recording frame rate (Story 19.5). Stored as
+/// a decimal string; absent / unparsable / out-of-set ⇒ the default of 30.
+/// Passed to the `keeper-rec` sidecar as `fps` on every `start`.
+const RECORDING_FPS_KEY: &str = "recording.fps";
+
+/// The default recording frame rate when the setting is absent, unparsable, or
+/// out of the legal set (the epic's authored default; the sidecar's own
+/// `normalizeFps` fallback matches).
+pub const RECORDING_FPS_DEFAULT: u32 = 30;
+
+/// The only non-default legal recording frame rate (the collapsed Advanced
+/// control offers exactly {30, 60}).
+pub const RECORDING_FPS_ALTERNATE: u32 = 60;
+
+/// Normalize a frame-rate value to the legal set {30, 60}: anything that is not
+/// exactly 60 becomes the default of 30 — a corrupted persisted value can never
+/// surface as a degenerate `timescale` downstream (the sidecar normalizes again
+/// defensively with the identical rule).
+pub fn normalize_recording_fps(fps: u32) -> u32 {
+    if fps == RECORDING_FPS_ALTERNATE {
+        RECORDING_FPS_ALTERNATE
+    } else {
+        RECORDING_FPS_DEFAULT
+    }
+}
+
+/// Read the recording frame rate (Story 19.5). Absent / unparsable ⇒ the
+/// default of 30; a stored value is normalized to {30, 60} defensively (a
+/// hand-edited row can never surface out of the set). Stored in the `settings`
+/// k/v table under `recording.fps`.
+pub fn get_recording_fps(data_dir: &Path) -> Result<u32, CoreError> {
+    let raw = get_setting(data_dir, RECORDING_FPS_KEY)?;
+    let fps = raw
+        .as_deref()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(RECORDING_FPS_DEFAULT);
+    Ok(normalize_recording_fps(fps))
+}
+
+/// Write the recording frame rate (Story 19.5), normalizing to {30, 60} before
+/// persisting a decimal string under `recording.fps`. Applies to the next
+/// Recording Session only — a running session's params are read once at start.
+pub fn set_recording_fps(data_dir: &Path, fps: u32) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        RECORDING_FPS_KEY,
+        &normalize_recording_fps(fps).to_string(),
+    )
+}
+
 /// A single held-send row from the `outbox` table (Story 8.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRow {
@@ -1933,6 +2006,82 @@ mod tests {
             RECORDING_DURATION_CAP_MINUTES_MIN
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recording_destination_dir_defaults_to_none_and_round_trips() {
+        let dir = temp_dir();
+        // Absent setting reads `None` — the shell resolves the effective default.
+        assert_eq!(
+            get_recording_destination_dir(&dir).expect("get default"),
+            None
+        );
+        // Round-trip a chosen folder verbatim (no clamp, no normalization).
+        set_recording_destination_dir(&dir, "/Users/x/Recordings").expect("set folder");
+        assert_eq!(
+            get_recording_destination_dir(&dir).expect("get folder"),
+            Some("/Users/x/Recordings".to_owned())
+        );
+        // An empty (or whitespace-only) stored value reads `None` — "cleared"
+        // and "never set" are the same effective-default state.
+        set_recording_destination_dir(&dir, "").expect("set empty");
+        assert_eq!(
+            get_recording_destination_dir(&dir).expect("get empty"),
+            None
+        );
+        set_recording_destination_dir(&dir, "   ").expect("set blank");
+        assert_eq!(
+            get_recording_destination_dir(&dir).expect("get blank"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recording_fps_defaults_and_normalizes() {
+        let dir = temp_dir();
+        // Absent setting reads the default of 30.
+        assert_eq!(
+            get_recording_fps(&dir).expect("get default"),
+            RECORDING_FPS_DEFAULT
+        );
+        // Round-trip the only non-default legal value.
+        set_recording_fps(&dir, 60).expect("set 60");
+        assert_eq!(get_recording_fps(&dir).expect("get 60"), 60);
+        // An out-of-set value normalizes to 30 on write.
+        set_recording_fps(&dir, 45).expect("set 45");
+        assert_eq!(
+            get_recording_fps(&dir).expect("get normalized"),
+            RECORDING_FPS_DEFAULT
+        );
+        // A stored garbage value falls back to the default on read.
+        set_setting(&dir, RECORDING_FPS_KEY, "abc").expect("set garbage");
+        assert_eq!(
+            get_recording_fps(&dir).expect("get garbage"),
+            RECORDING_FPS_DEFAULT
+        );
+        // A hand-edited out-of-set row normalizes on read too — never a
+        // degenerate frame rate downstream.
+        for raw in ["0", "45", "120", "4294967295"] {
+            set_setting(&dir, RECORDING_FPS_KEY, raw).expect("set raw");
+            assert_eq!(
+                get_recording_fps(&dir).expect("get raw normalized"),
+                RECORDING_FPS_DEFAULT,
+                "raw {raw:?} must normalize to the default"
+            );
+        }
+        set_setting(&dir, RECORDING_FPS_KEY, "60").expect("set raw 60");
+        assert_eq!(get_recording_fps(&dir).expect("get raw 60"), 60);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_recording_fps_maps_everything_but_60_to_30() {
+        assert_eq!(normalize_recording_fps(30), 30);
+        assert_eq!(normalize_recording_fps(60), 60);
+        for out_of_set in [0, 1, 29, 31, 45, 59, 61, 120, u32::MAX] {
+            assert_eq!(normalize_recording_fps(out_of_set), 30);
+        }
     }
 
     #[test]

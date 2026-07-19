@@ -190,13 +190,15 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// display (`applicationPid == nil && displayId == nil`). `micEnabled`
     /// (Story 19.3) adds the microphone as its own, unmixed AAC track
     /// (`micDeviceId` nil = the system default input). Rotating segments
-    /// per `segmentMB` / `maxSegmentSeconds`. Emits `preflight` immediately, then
+    /// per `segmentMB` / `maxSegmentSeconds`. `fps` (Story 19.5) selects the
+    /// capture frame rate, normalized to {30, 60} before it reaches the stream
+    /// configuration. Emits `preflight` immediately, then
     /// `recording` (with the path) once frames are flowing, or a single honest
     /// `error` line on any failure — including a vanished application pid.
     func start(
         path: String, displayId: UInt32?, applicationPid: Int32?, applicationBundleId: String?,
         systemAudio: Bool, micEnabled: Bool, micDeviceId: String?,
-        segmentMB: Int, maxSegmentSeconds: Int
+        segmentMB: Int, maxSegmentSeconds: Int, fps: Int
     ) {
         isActive = true
         policy = RotationPolicy(segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds)
@@ -257,7 +259,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                     try self.beginCapture(
                         display: display, application: app, path: path,
                         systemAudio: systemAudio, micEnabled: micEnabled,
-                        micDeviceId: micDeviceId)
+                        micDeviceId: micDeviceId, fps: fps)
                     return
                 }
 
@@ -277,7 +279,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 }
                 try self.beginCapture(
                     display: display, application: nil, path: path, systemAudio: systemAudio,
-                    micEnabled: micEnabled, micDeviceId: micDeviceId)
+                    micEnabled: micEnabled, micDeviceId: micDeviceId, fps: fps)
             } catch {
                 emitEvent([
                     "event": "error",
@@ -300,7 +302,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// invisible to the user and to the capability flag.
     private func beginCapture(
         display: SCDisplay, application: SCRunningApplication?, path: String, systemAudio: Bool,
-        micEnabled: Bool, micDeviceId: String?
+        micEnabled: Bool, micDeviceId: String?, fps: Int
     ) throws {
         // Capture at the display's true pixel size (SCDisplay reports points).
         pixelWidth = max(2, CGDisplayPixelsWide(display.displayID))
@@ -338,7 +340,9 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         let config = SCStreamConfiguration()
         config.width = pixelWidth
         config.height = pixelHeight
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        // Story 19.5: the selected frame rate, re-normalized defensively to
+        // {30, 60} so a bad wire value can never yield a degenerate timescale.
+        config.minimumFrameInterval = CMTime(value: 1, timescale: Int32(normalizeFps(fps)))
         config.showsCursor = true
         config.queueDepth = 8
         config.pixelFormat = kCVPixelFormatType_32BGRA

@@ -81,6 +81,12 @@ mime_guess = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # Platform ports
 dirs = "6"
+# Destination free-space probe for the recording validate-on-Start pre-flight
+# (Story 19.5). Shell-only — keeper-core holds the pure `evaluate_destination`
+# decision and no filesystem-probe dependency (AD-33). The default `sync`
+# feature is exactly the blocking `fs4::available_space` statvfs probe; no
+# async runtime integration is pulled in. Apache-2.0/MIT — passes `cargo deny check`.
+fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 # Local-time-stamped recording filenames (Story 16.6, FR-71) — clock-only, no
 # default features (no oldtime/wasm baggage). MIT/Apache — passes `cargo deny check`.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

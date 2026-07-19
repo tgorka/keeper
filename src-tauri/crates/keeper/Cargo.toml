@@ -37,6 +37,11 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
+# Destination free-space probe for the recording validate-on-Start pre-flight
+# (Story 19.5, AD-33). Shell-only: keeper-core holds the pure decision fn
+# (`evaluate_destination`) and never a filesystem-probe dependency.
+# Apache-2.0/MIT — passes `cargo deny check`.
+fs4 = { workspace = true }
 # macOS Keychain access for the keychain_* Platform ports (shell-only glue).
 keyring = { workspace = true }
 # Native file-picker dialog for the composer attach button (Story 3.7). Yields OS

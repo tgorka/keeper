@@ -18,7 +18,14 @@ import { resetRecordingSettingsForTest } from "@/lib/stores/recording-settings";
 const mockGet = vi.mocked(recordingSettingsGet);
 const mockSet = vi.mocked(recordingSettingsSet);
 
-const DEFAULTS: RecordingSettingsVm = { segmentMb: 500, durationCapMinutes: 30 };
+const DEFAULTS: RecordingSettingsVm = {
+  segmentMb: 500,
+  durationCapMinutes: 30,
+  // Story 19.5: the co-settings ride the same VM; a segment/duration edit must
+  // carry them along unchanged.
+  destinationDir: "/Users/alice/Movies/keeper",
+  fps: 30,
+};
 
 beforeEach(() => {
   resetRecordingSettingsForTest();
@@ -46,7 +53,7 @@ function durationInput(index = 0): HTMLInputElement {
 
 describe("RecordingSettingsControls", () => {
   it("hydrates lazily and shows the persisted values with the next-session note", async () => {
-    mockGet.mockResolvedValue({ segmentMb: 800, durationCapMinutes: 45 });
+    mockGet.mockResolvedValue({ ...DEFAULTS, segmentMb: 800, durationCapMinutes: 45 });
     render(<RecordingSettingsControls />);
 
     await waitFor(() => expect(segmentInput()).toHaveValue(800));
@@ -62,16 +69,18 @@ describe("RecordingSettingsControls", () => {
     // Below the floor: 10 → 100.
     fireEvent.change(segmentInput(), { target: { value: "10" } });
     fireEvent.blur(segmentInput());
-    await waitFor(() =>
-      expect(mockSet).toHaveBeenCalledWith({ segmentMb: 100, durationCapMinutes: 30 }),
-    );
+    await waitFor(() => expect(mockSet).toHaveBeenCalledWith({ ...DEFAULTS, segmentMb: 100 }));
     await waitFor(() => expect(segmentInput()).toHaveValue(100));
 
     // Above the ceiling: 5000 caps the duration field at 600.
     fireEvent.change(durationInput(), { target: { value: "5000" } });
     fireEvent.blur(durationInput());
     await waitFor(() =>
-      expect(mockSet).toHaveBeenCalledWith({ segmentMb: 100, durationCapMinutes: 600 }),
+      expect(mockSet).toHaveBeenCalledWith({
+        ...DEFAULTS,
+        segmentMb: 100,
+        durationCapMinutes: 600,
+      }),
     );
     await waitFor(() => expect(durationInput()).toHaveValue(600));
   });
@@ -79,16 +88,14 @@ describe("RecordingSettingsControls", () => {
   it("calls the setter on an in-range edit and displays the effective VM it returns", async () => {
     // Rust may clamp differently than the local bounds (e.g. after an authored
     // bounds change) — the field must show the *effective* persisted value.
-    mockSet.mockResolvedValue({ segmentMb: 1000, durationCapMinutes: 30 });
+    mockSet.mockResolvedValue({ ...DEFAULTS, segmentMb: 1000 });
     render(<RecordingSettingsControls />);
     await waitFor(() => expect(segmentInput()).toHaveValue(500));
 
     fireEvent.change(segmentInput(), { target: { value: "1024" } });
     fireEvent.blur(segmentInput());
 
-    await waitFor(() =>
-      expect(mockSet).toHaveBeenCalledWith({ segmentMb: 1024, durationCapMinutes: 30 }),
-    );
+    await waitFor(() => expect(mockSet).toHaveBeenCalledWith({ ...DEFAULTS, segmentMb: 1024 }));
     await waitFor(() => expect(segmentInput()).toHaveValue(1000));
   });
 
@@ -129,7 +136,7 @@ describe("RecordingSettingsControls", () => {
 
     // Optimistic first, then the honest revert once the write rejects.
     await waitFor(() => expect(segmentInput()).toHaveValue(500));
-    expect(mockSet).toHaveBeenCalledWith({ segmentMb: 800, durationCapMinutes: 30 });
+    expect(mockSet).toHaveBeenCalledWith({ ...DEFAULTS, segmentMb: 800 });
   });
 
   it("discards a non-numeric entry on blur without persisting", async () => {

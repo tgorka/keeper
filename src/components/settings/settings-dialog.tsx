@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
+import { RecordingAdvancedControls } from "@/components/recording/recording-advanced-controls";
+import { RecordingDestinationControls } from "@/components/recording/recording-destination-controls";
 import { AboutSection } from "@/components/settings/about-section";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
@@ -977,20 +979,23 @@ function ShortcutsSection({ open }: { open: boolean }) {
   );
 }
 
-/** The honest local-only disclosure for the Recording section (Story 16.3).
- * Recording voice: sentence case, no exclamation marks, honest local-only framing.
- * Recording adds zero network destinations. */
+/** The honest local-only disclosure for the Recording section (Story 16.3;
+ * copy updated in 19.5 now that the destination folder is user-visible and
+ * user-chosen). Recording voice: sentence case, no exclamation marks, honest
+ * local-only framing. Recording adds zero network destinations. */
 const RECORDING_LOCAL_ONLY_SENTENCE =
-  "Screen recording saves to a folder on this Mac. Nothing uploads.";
+  "Screen recording saves to the folder below on this Mac. Nothing uploads.";
 
 /**
- * Settings → Recording section (Story 16.3; segmentation controls Story 17.5).
- * Desktop-macOS-≥13 only — the whole section is capability-gated at its call
- * site so it is absent (never a dead affordance) on platforms that cannot
- * record. Hosts the shared {@link RecordingSettingsControls} (the same control
- * the pre-record "Segmenting" card mounts, bound to one store so the two
- * surfaces mirror each other) and hydrates that store on open, mirroring the
- * other sections' load-on-open idiom.
+ * Settings → Recording section (Story 16.3; segmentation controls Story 17.5;
+ * destination + fps Story 19.5). Desktop-macOS-≥13 only — the whole section is
+ * capability-gated at its call site so it is absent (never a dead affordance)
+ * on platforms that cannot record. Hosts the shared
+ * {@link RecordingSettingsControls}, {@link RecordingDestinationControls}, and
+ * {@link RecordingAdvancedControls} (the same controls the pre-record setup
+ * cards mount, bound to one store so the surfaces mirror each other) and
+ * hydrates that store on open, mirroring the other sections' load-on-open
+ * idiom.
  */
 function RecordingSection({ open }: { open: boolean }) {
   useEffect(() => {
@@ -1004,7 +1009,9 @@ function RecordingSection({ open }: { open: boolean }) {
     <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
       <p className="font-medium">Recording</p>
       <p className="text-muted-foreground">{RECORDING_LOCAL_ONLY_SENTENCE}</p>
+      <RecordingDestinationControls />
       <RecordingSettingsControls />
+      <RecordingAdvancedControls />
     </div>
   );
 }

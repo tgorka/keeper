@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{CoreError, RecordingError};
+use crate::error::{CoreError, DestinationRejection, RecordingError};
 use crate::vm::{
     RecordingCapabilitiesVm, RecordingSourcesVm, ScreenRecordingAccess, TccPermission,
 };
@@ -408,7 +408,51 @@ pub fn parse_event(line: &str) -> Option<RecordingEvent> {
 /// capture-clock seconds) to the sidecar's `segmentClosed` event, consumed
 /// tolerantly by [`parse_event`] — per the additive-change precedent (16.5's
 /// `requestScreenRecording`, 16.6's `startRecording`/`stop`) the version stays 1.
+///
+/// Story 19.5 added the additive, always-present `fps` field to
+/// `startRecording` (like `segmentMB`), decoded best-effort by the sidecar with
+/// a default of 30 when absent — per the same additive precedent the version
+/// stays 1.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The shared disk-guard hard floor in bytes (Story 19.5; 2 GiB): the minimum
+/// free space the destination volume must have for a Recording Session to
+/// start. Story 18.5's *live* during-recording guard (warn at 10 GB, graceful
+/// stop-and-finalize at this floor) will consume the same constant — 19.5
+/// provides only the pre-Start leg via [`evaluate_destination`].
+pub const RECORDING_MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Decide whether the destination folder can host a Recording Session (Story
+/// 19.5, AD-33) from already-probed facts — pure and platform-free, so the
+/// low-free-space path unit-tests by injecting a small `free_bytes`, never by
+/// filling a real disk. The SHELL gathers the facts (`create_dir_all` →
+/// `creatable_or_exists`, a probe-file write+remove → `writable`, an
+/// `available_space` probe → `free_bytes`) and calls this BEFORE creating any
+/// session folder or spawning the sidecar; a rejection means no capture begins.
+///
+/// Rejections are ordered by actionability: a folder that cannot exist at all
+/// ([`DestinationRejection::NotADirectory`]) trumps writability, which trumps
+/// free space — the user fixes the most fundamental problem first.
+pub fn evaluate_destination(
+    creatable_or_exists: bool,
+    writable: bool,
+    free_bytes: u64,
+    min_free_bytes: u64,
+) -> Result<(), DestinationRejection> {
+    if !creatable_or_exists {
+        return Err(DestinationRejection::NotADirectory);
+    }
+    if !writable {
+        return Err(DestinationRejection::NotWritable);
+    }
+    if free_bytes < min_free_bytes {
+        return Err(DestinationRejection::InsufficientSpace {
+            free_bytes,
+            required_bytes: min_free_bytes,
+        });
+    }
+    Ok(())
+}
 
 /// Build the one-line `getCapabilities` request (no trailing newline — the shell
 /// port owns line framing). Wire shape: `{"id":<id>,"method":"getCapabilities"}`.
@@ -495,21 +539,29 @@ pub struct SessionParams {
     /// Duration-cap rotation fallback in whole seconds (Story 17.5, FR-72);
     /// the sidecar's `maxSegmentSeconds`.
     pub max_segment_seconds: u32,
+    /// Capture frame rate (Story 19.5): 30 (default) or 60, already normalized
+    /// by the registry read; the sidecar's `fps` (normalized again defensively
+    /// Swift-side, so a bad value can never reach `SCStreamConfiguration`).
+    pub fps: u32,
 }
 
-/// Build the one-line `startRecording` request (Story 16.6 + 17.5; no trailing
-/// newline — the shell port owns line framing). Wire shape:
+/// Build the one-line `startRecording` request (Story 16.6 + 17.5 + 19.5; no
+/// trailing newline — the shell port owns line framing). Wire shape:
 /// `{"id":<id>,"method":"startRecording","params":{"path":…,"systemAudio":…,
-/// "segmentMB":…,"maxSegmentSeconds":…[,"displayId":…]}}`. `segmentMB` /
-/// `maxSegmentSeconds` are additive fields the 17.1 sidecar already reads
-/// (defaulting when absent), so — per the additive precedent — keeper and
-/// keeper-rec ship in lockstep and [`PROTOCOL_VERSION`] is unchanged.
+/// "segmentMB":…,"maxSegmentSeconds":…,"fps":…[,"displayId":…]}}`. `segmentMB`
+/// / `maxSegmentSeconds` (17.5) and the always-present `fps` (19.5) are
+/// additive fields the sidecar reads best-effort (defaulting when absent), so —
+/// per the additive precedent — keeper and keeper-rec ship in lockstep and
+/// [`PROTOCOL_VERSION`] is unchanged. The destination stays fully host-side:
+/// there is no `dir` wire field; the sidecar keeps deriving its directory from
+/// the one absolute `path`.
 pub fn start_recording_request(id: u64, params: &SessionParams) -> String {
     let mut wire = serde_json::json!({
         "path": params.output_path,
         "systemAudio": params.system_audio,
         "segmentMB": params.segment_mb,
         "maxSegmentSeconds": params.max_segment_seconds,
+        "fps": params.fps,
     });
     // An application target wins (Story 19.1): emit `applicationPid`+`bundleId`
     // and omit `displayId` entirely, so the sidecar builds an app-scoped filter.
@@ -1964,6 +2016,7 @@ mod tests {
             microphone: None,
             segment_mb: 800,
             max_segment_seconds: 2700,
+            fps: 30,
         };
         let line = start_recording_request(4, &params);
         assert!(!line.contains('\n'), "the shell port owns line framing");
@@ -1975,6 +2028,7 @@ mod tests {
         assert_eq!(wire["params"]["displayId"], 7);
         assert_eq!(wire["params"]["segmentMB"], 800);
         assert_eq!(wire["params"]["maxSegmentSeconds"], 2700);
+        assert_eq!(wire["params"]["fps"], 30);
 
         // Without a display id the segmentation fields still always appear.
         let main_display = SessionParams {
@@ -2004,6 +2058,7 @@ mod tests {
             microphone: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
+            fps: 30,
         };
         let line = start_recording_request(6, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2023,6 +2078,7 @@ mod tests {
             microphone: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
+            fps: 30,
         };
         let line = start_recording_request(10, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2048,6 +2104,7 @@ mod tests {
             microphone: Some(MicSelection { device_id: None }),
             segment_mb: 500,
             max_segment_seconds: 1800,
+            fps: 30,
         };
         let line = start_recording_request(11, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2075,6 +2132,7 @@ mod tests {
             }),
             segment_mb: 500,
             max_segment_seconds: 1800,
+            fps: 30,
         };
         let line = start_recording_request(12, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2138,6 +2196,7 @@ mod tests {
             microphone: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
+            fps: 30,
         };
         let line = start_recording_request(9, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2151,6 +2210,91 @@ mod tests {
         assert_eq!(wire["params"]["systemAudio"], true);
         assert_eq!(wire["params"]["segmentMB"], 500);
         assert_eq!(wire["params"]["maxSegmentSeconds"], 1800);
+    }
+
+    #[test]
+    fn start_recording_request_always_carries_fps() {
+        // Story 19.5: every `start` carries an always-present `"fps"` field
+        // (like `segmentMB`) — 30 by default and 60 when selected. The sidecar
+        // decodes it best-effort (absent → 30), so the field stays additive and
+        // PROTOCOL_VERSION stays 1.
+        for fps in [30u32, 60] {
+            let params = SessionParams {
+                output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+                display_id: None,
+                application: None,
+                system_audio: true,
+                microphone: None,
+                segment_mb: 500,
+                max_segment_seconds: 1800,
+                fps,
+            };
+            let line = start_recording_request(13, &params);
+            let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
+            assert_eq!(wire["params"]["fps"], fps, "fps {fps} must ride the wire");
+        }
+    }
+
+    #[test]
+    fn evaluate_destination_accepts_a_usable_folder() {
+        // Story 19.5: exists/creatable + writable + roomy volume → Ok.
+        assert!(
+            evaluate_destination(true, true, 500 * 1_000_000_000, RECORDING_MIN_FREE_BYTES).is_ok()
+        );
+    }
+
+    #[test]
+    fn evaluate_destination_rejects_a_non_directory() {
+        // A destination that neither exists nor can be created is the most
+        // fundamental rejection — it wins over writability and free space.
+        assert_eq!(
+            evaluate_destination(false, false, 0, RECORDING_MIN_FREE_BYTES),
+            Err(DestinationRejection::NotADirectory)
+        );
+    }
+
+    #[test]
+    fn evaluate_destination_rejects_an_unwritable_folder() {
+        assert_eq!(
+            evaluate_destination(true, false, 500 * 1_000_000_000, RECORDING_MIN_FREE_BYTES),
+            Err(DestinationRejection::NotWritable)
+        );
+    }
+
+    #[test]
+    fn evaluate_destination_rejects_simulated_low_free_space() {
+        // The simulated-signal proof: the low-free-space path is exercised by
+        // injecting a small `free_bytes` — never by filling a real disk. The
+        // rejection carries both figures so the error can name the shortfall.
+        let free = RECORDING_MIN_FREE_BYTES - 1;
+        assert_eq!(
+            evaluate_destination(true, true, free, RECORDING_MIN_FREE_BYTES),
+            Err(DestinationRejection::InsufficientSpace {
+                free_bytes: free,
+                required_bytes: RECORDING_MIN_FREE_BYTES,
+            })
+        );
+        // The rejection's message is actionable and secret-free — it names the
+        // figures and the fix, never a filesystem path.
+        let message = DestinationRejection::InsufficientSpace {
+            free_bytes: free,
+            required_bytes: RECORDING_MIN_FREE_BYTES,
+        }
+        .to_string();
+        assert!(message.contains("free up space"), "actionable: {message}");
+        assert!(!message.contains('/'), "secret-free (no path): {message}");
+    }
+
+    #[test]
+    fn evaluate_destination_accepts_the_exact_floor() {
+        // Exactly the hard floor is enough — the guard is `<`, not `<=`.
+        assert!(evaluate_destination(
+            true,
+            true,
+            RECORDING_MIN_FREE_BYTES,
+            RECORDING_MIN_FREE_BYTES
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2508,6 +2652,7 @@ mod tests {
             microphone: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
+            fps: 30,
         }
     }
 

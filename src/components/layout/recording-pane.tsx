@@ -19,7 +19,9 @@
  * max-w-[720px]`, the conversation-pane realization) rather than going full-bleed.
  */
 import { ActiveRecordingBanner } from "@/components/recording/active-recording-banner";
+import { RecordingAdvancedControls } from "@/components/recording/recording-advanced-controls";
 import { RecordingAudioControls } from "@/components/recording/recording-audio-controls";
+import { RecordingDestinationControls } from "@/components/recording/recording-destination-controls";
 import {
   RecordingPermissionRow,
   SCREEN_RECORDING_PERMISSION_NAME,
@@ -56,9 +58,10 @@ const PLACEHOLDER_COPY = "Configured in a later update.";
 
 /** The setup cards this shell reserves. "Source" (Story 19.1 — the live
  * application/window/display picker), "Audio" (Story 19.2 — the system-audio
- * toggle), and "Segmenting" (Story 17.5, FR-72 — the shared segment-size +
- * duration-cap control) are live; the rest are later-story surfaces
- * ("Destination" is Story 19.5). */
+ * toggle), "Segmenting" (Story 17.5, FR-72 — the shared segment-size +
+ * duration-cap control), "Destination" and "Advanced" (Story 19.5 — the folder
+ * chooser and the collapsed fps group) are live; "Webcam" is a later-story
+ * surface (20.x). */
 const SETUP_CARDS: readonly string[] = [
   "Source",
   "Audio",
@@ -194,6 +197,29 @@ export function RecordingPane() {
                 </CardHeader>
                 <CardContent>
                   <RecordingSettingsControls />
+                </CardContent>
+              </Card>
+            ) : title === "Destination" ? (
+              // The live Destination folder chooser (Story 19.5): the same
+              // shared control Settings → Recording mounts — the effective
+              // folder, the native dir picker, next-session scope.
+              <Card key={title} size="sm">
+                <CardHeader>
+                  <CardTitle>{title}</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <RecordingDestinationControls />
+                </CardContent>
+              </Card>
+            ) : title === "Advanced" ? (
+              // The collapsed Advanced group (Story 19.5): fps 30/60 behind a
+              // hand-rolled disclosure, shared with Settings → Recording.
+              <Card key={title} size="sm">
+                <CardHeader>
+                  <CardTitle>{title}</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <RecordingAdvancedControls />
                 </CardContent>
               </Card>
             ) : (

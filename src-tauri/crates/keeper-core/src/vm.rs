@@ -2826,14 +2826,16 @@ impl RecordingStatusVm {
     }
 }
 
-/// The user-configurable segmentation settings (Story 17.5, FR-72): the segment
-/// size and the duration-cap rotation fallback, as persisted in the `settings`
-/// k/v table (`recording.segment_mb` / `recording.duration_cap_minutes`).
+/// The user-configurable recording settings (Story 17.5 + 19.5, FR-72): the
+/// segment size, the duration-cap rotation fallback, the destination folder,
+/// and the frame rate, as persisted in the `settings` k/v table
+/// (`recording.segment_mb` / `recording.duration_cap_minutes` /
+/// `recording.destination_dir` / `recording.fps`).
 ///
-/// Both surfaces (Settings → Recording and the pre-record "Segmenting" card)
-/// render exactly this VM. The setter command clamps to the authored bounds
-/// (segment `100..=5000` MB, duration cap `1..=600` min) and returns the
-/// effective VM, so the UI never displays an unsaved value. Read again at every
+/// All settings surfaces (Settings → Recording and the pre-record setup cards)
+/// render exactly this VM. The setter command normalizes (segment `100..=5000`
+/// MB, duration cap `1..=600` min, fps {30, 60}) and returns the effective VM,
+/// so the UI never displays an unsaved value. Read again at every
 /// `recording_start` — edits apply to the next Recording Session only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -2844,6 +2846,14 @@ pub struct RecordingSettingsVm {
     /// Duration-cap rotation fallback in whole minutes (default 30; sent to the
     /// sidecar as `maxSegmentSeconds = minutes × 60`).
     pub duration_cap_minutes: u16,
+    /// The EFFECTIVE destination folder (Story 19.5): the persisted user choice
+    /// when one exists, otherwise the shell-resolved default
+    /// (`~/Movies/keeper`, falling back to the app data dir). Always a concrete
+    /// absolute path — the "unset vs default" ambiguity never reaches the UI.
+    pub destination_dir: String,
+    /// Capture frame rate (Story 19.5): 30 (default) or 60, normalized on
+    /// read/write; the sidecar's `fps`.
+    pub fps: u32,
 }
 
 #[cfg(test)]

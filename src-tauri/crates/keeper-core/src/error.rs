@@ -471,6 +471,62 @@ pub enum RecordingError {
     /// filesystem path, token, or media bytes.
     #[error("recording manifest I/O failed: {0}")]
     ManifestIo(String),
+
+    /// The destination folder failed the validate-on-Start pre-flight (Story
+    /// 19.5): `recording_start` probed the chosen folder, the pure
+    /// [`evaluate_destination`](crate::recording::evaluate_destination) decision
+    /// rejected it, and no capture began — no session folder, no sidecar. The
+    /// `reason` carries the actionable, secret-free cause (the message never
+    /// leaks a raw path beyond the folder the user already chose and sees).
+    #[error("{reason}")]
+    DestinationInvalid {
+        /// The actionable, secret-free rejection cause.
+        reason: DestinationRejection,
+    },
+}
+
+/// Why the recording destination folder was rejected by the validate-on-Start
+/// pre-flight (Story 19.5, Epic 19). Produced by the pure, platform-free
+/// [`evaluate_destination`](crate::recording::evaluate_destination) decision
+/// from already-probed facts — the shell gathers exists-or-creatable, writable,
+/// and free-space; core only decides. Every `Display` is actionable and
+/// secret-free: it names what is wrong and what the user can do, never a raw
+/// filesystem path, token, or media bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum DestinationRejection {
+    /// The destination does not exist and could not be created (or exists but
+    /// is not a usable directory).
+    #[error(
+        "the destination folder doesn't exist and couldn't be created — choose another folder"
+    )]
+    NotADirectory,
+
+    /// The destination exists but a probe-file write failed — recording there
+    /// would fail on the first segment.
+    #[error("the destination folder isn't writable — choose another folder")]
+    NotWritable,
+
+    /// The destination volume has less free space than the shared hard floor
+    /// ([`RECORDING_MIN_FREE_BYTES`](crate::recording::RECORDING_MIN_FREE_BYTES)).
+    /// Carries the probed figures so the message can name the shortfall.
+    #[error(
+        "not enough free space to record: {} free, at least {} needed — free up space or choose another folder",
+        format_gb(*free_bytes),
+        format_gb(*required_bytes)
+    )]
+    InsufficientSpace {
+        /// The probed free bytes on the destination volume.
+        free_bytes: u64,
+        /// The required hard floor in bytes.
+        required_bytes: u64,
+    },
+}
+
+/// Format a byte count as a short decimal-GB figure for user-facing rejection
+/// messages ("1.5 GB"). One decimal place; secret-free (a number, never a path).
+fn format_gb(bytes: u64) -> String {
+    let gb = bytes as f64 / 1_000_000_000.0;
+    format!("{gb:.1} GB")
 }
 
 /// The hexagon error root. Every fallible core operation surfaces one of these.

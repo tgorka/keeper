@@ -20,15 +20,16 @@ use keeper_core::demo::snapshot_then_diff;
 use keeper_core::egress::{compute_egress, EGRESS_UPDATE_ENDPOINT};
 use keeper_core::error::{
     AccountError, ArchiveError, AuthError, BackupError, BridgeError, CoreError, InboxError,
-    MediaError, PlatformError, SendError, SignalError, TimelineError, VerificationError,
+    MediaError, PlatformError, RecordingError, SendError, SignalError, TimelineError,
+    VerificationError,
 };
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::recording::{
-    current_segment_bytes_on_disk, resolve_screen_recording_access, session_bytes_on_disk,
-    session_folder_name, ApplicationTarget, CaptureTarget, ManifestStatus, MicSelection, Recorder,
-    RecordingEvent, RecordingSession, SegmentEntry, SessionDevices, SessionManifest, SessionParams,
-    SessionState,
+    current_segment_bytes_on_disk, evaluate_destination, resolve_screen_recording_access,
+    session_bytes_on_disk, session_folder_name, ApplicationTarget, CaptureTarget, ManifestStatus,
+    MicSelection, Recorder, RecordingEvent, RecordingSession, SegmentEntry, SessionDevices,
+    SessionManifest, SessionParams, SessionState, RECORDING_MIN_FREE_BYTES,
 };
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
@@ -1084,11 +1085,20 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         // process error. Retriable: the run Sheet offers Retry. The message is
         // bbctl's own verbatim text (or keeper's honest gate/install reason).
         CoreError::Bridge(BridgeError::Bbctl(_)) => (IpcErrorCode::SyncUnavailable, true),
-        // Recording errors (Story 16.2) do not cross the IPC command surface in this
-        // story — the recording session machine and its `keeper-rec` port are driven
-        // shell-side, not from a command. This arm keeps the funnel exhaustive; a
-        // dedicated recording IPC surface (with its own honest codes) arrives in a
-        // later recording story (16.3+). Until then, an internal, non-retriable error.
+        // A rejected recording destination (Story 19.5) — the validate-on-Start
+        // pre-flight blocked capture before any session folder or sidecar
+        // existed. Retriable, mirroring the `ExportIo` destination arm: the user
+        // can free space or choose another folder and press Start again. The
+        // message is the rejection's actionable, secret-free `Display`.
+        CoreError::Recording(RecordingError::DestinationInvalid { .. }) => {
+            (IpcErrorCode::Internal, true)
+        }
+        // Other recording errors (Story 16.2) do not cross the IPC command surface
+        // in this story — the recording session machine and its `keeper-rec` port
+        // are driven shell-side, not from a command. This arm keeps the funnel
+        // exhaustive; a dedicated recording IPC surface (with its own honest codes)
+        // arrives in a later recording story (16.3+). Until then, an internal,
+        // non-retriable error.
         CoreError::Recording(_) => (IpcErrorCode::Internal, false),
     };
     IpcError {
@@ -3470,11 +3480,44 @@ pub async fn recording_start(
         }
     }
 
-    // Default destination (the Destination card is a later story): the user's
-    // Movies folder, falling back to the app data dir where Movies is absent.
-    let directory = dirs::video_dir()
-        .unwrap_or(state.platform.data_dir().map_err(to_ipc_error)?)
-        .join("keeper");
+    // Settings are read from the registry once, at Start time — never re-read
+    // mid-session (AD-25): a mid-session edit persists and mirrors both
+    // surfaces but only affects the next Recording Session.
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    // The destination pre-flight gate (Story 19.5, AD-33): the user-chosen (or
+    // default `~/Movies/keeper`) folder is probed shell-side — exists-or-
+    // creatable via `create_dir_all`, writable via a real probe-file
+    // write+remove (metadata perms are unreliable on macOS), free space via
+    // `fs4::available_space` — and the pure core `evaluate_destination`
+    // decides. A rejection blocks HERE, before the collision-suffix loop /
+    // `SessionManifest::create` / any sidecar spawn: no session folder is
+    // created and no capture begins.
+    let directory = effective_destination_dir(&data_dir)?;
+    let creatable_or_exists = std::fs::create_dir_all(&directory).is_ok() && directory.is_dir();
+    let writable = creatable_or_exists && destination_writable(&directory);
+    // An exists-but-unprobeable volume must not block capture on a broken
+    // probe: an errored probe reads as "plenty" (only a real low figure
+    // rejects). The 0 on the non-directory branch never surfaces — the pure
+    // decision checks NotADirectory first.
+    let free_bytes = if creatable_or_exists {
+        fs4::available_space(&directory).unwrap_or_else(|e| {
+            tracing::warn!("recording destination free-space probe failed: {e}");
+            u64::MAX
+        })
+    } else {
+        0
+    };
+    evaluate_destination(
+        creatable_or_exists,
+        writable,
+        free_bytes,
+        RECORDING_MIN_FREE_BYTES,
+    )
+    .map_err(|reason| {
+        to_ipc_error(CoreError::Recording(RecordingError::DestinationInvalid {
+            reason,
+        }))
+    })?;
     // The shell supplies the local timestamp (core is time-agnostic); the core
     // derives + validates the fs-safe folder basename (Story 17.2).
     let local_ts = chrono::Local::now().format("%Y-%m-%d %H.%M.%S").to_string();
@@ -3505,15 +3548,16 @@ pub async fn recording_start(
     )
     .map_err(|e| to_ipc_error(e.into()))?;
 
-    // Read the segmentation settings at start time (Story 17.5, FR-72): the
-    // registry getters default + clamp, so a fresh install starts with the
-    // authored 500 MB / 30 min. Read once here — a later edit never mutates a
-    // running session; it applies to the next Recording Session only.
-    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    // Read the segmentation + frame-rate settings at start time (Story 17.5 +
+    // 19.5, FR-72): the registry getters default + clamp/normalize, so a fresh
+    // install starts with the authored 500 MB / 30 min / 30 fps. Read once here
+    // — a later edit never mutates a running session; it applies to the next
+    // Recording Session only.
     let segment_mb =
         keeper_core::registry::get_recording_segment_mb(&data_dir).map_err(to_ipc_error)?;
     let duration_cap_minutes = keeper_core::registry::get_recording_duration_cap_minutes(&data_dir)
         .map_err(to_ipc_error)?;
+    let fps = keeper_core::registry::get_recording_fps(&data_dir).map_err(to_ipc_error)?;
     let params = SessionParams {
         // Seeding `screen-0000.mp4` lets 17.1's `nextSegmentPath` produce
         // `screen-0001.mp4`, … inside the folder with no Swift change.
@@ -3532,6 +3576,9 @@ pub async fn recording_start(
         segment_mb,
         // Minutes → seconds for the sidecar's `maxSegmentSeconds` (30 → 1800).
         max_segment_seconds: u32::from(duration_cap_minutes) * 60,
+        // Story 19.5: the persisted frame rate (already normalized to {30, 60}
+        // by the registry read) rides the wire as the always-present `fps`.
+        fps,
     };
     let status = Arc::new(Mutex::new(RecordingStatusVm {
         state: RecordingUiState::Preflight,
@@ -3868,11 +3915,62 @@ pub fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatusVm,
     Ok(recording_snapshot(&state))
 }
 
-/// Read the effective segmentation settings from `keeper.db` (Story 17.5,
-/// FR-72). Both surfaces (Settings → Recording and the pre-record "Segmenting"
-/// card) hydrate their shared store from this. The registry getters default
-/// (500 MB / 30 min) and clamp defensively, so the VM is always in the authored
-/// bounds. Failures funnel through [`to_ipc_error`].
+/// Resolve the EFFECTIVE recording destination folder (Story 19.5): the
+/// persisted user choice when one exists, otherwise the default
+/// `dirs::video_dir()/keeper` (falling back to `<data_dir>/keeper` where Movies
+/// is absent). Resolution lives in the SHELL because `dirs::video_dir()` is a
+/// platform probe keeper-core must not hold — the UI always receives a concrete
+/// folder, and "unset vs default" ambiguity never reaches the frontend.
+fn effective_destination_dir(data_dir: &Path) -> Result<PathBuf, IpcError> {
+    let stored =
+        keeper_core::registry::get_recording_destination_dir(data_dir).map_err(to_ipc_error)?;
+    Ok(resolve_destination_dir(stored, data_dir))
+}
+
+/// Resolve the effective destination folder from the (already-fetched) persisted
+/// value. Only an ABSOLUTE persisted path is honored; a relative value (e.g. a
+/// hand-edited or corrupted `recording.destination_dir` row) is rejected in
+/// favor of the default, so the VM's "always a concrete absolute folder"
+/// guarantee holds and no session is ever created under keeper's cwd. Pure so
+/// the invariant is unit-tested without a registry/tempdir.
+fn resolve_destination_dir(stored: Option<String>, data_dir: &Path) -> PathBuf {
+    if let Some(dir) = stored {
+        let path = PathBuf::from(dir);
+        if path.is_absolute() {
+            return path;
+        }
+    }
+    dirs::video_dir()
+        .unwrap_or_else(|| data_dir.to_path_buf())
+        .join("keeper")
+}
+
+/// Probe whether the destination folder is actually writable (Story 19.5) with
+/// a real probe-file write+remove — more reliable than metadata permissions on
+/// macOS (ACLs, read-only volumes, sandboxing). The probe name is unique per
+/// attempt (pid + nanos) so a crash mid-probe cannot leave a recognizable stray
+/// file, and no two probes ever collide. Best-effort cleanup.
+fn destination_writable(directory: &Path) -> bool {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = directory.join(format!(
+        ".keeper-write-probe-{}-{nanos}",
+        std::process::id()
+    ));
+    let writable = std::fs::write(&probe, b"keeper").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    writable
+}
+
+/// Read the effective recording settings from `keeper.db` (Story 17.5 + 19.5,
+/// FR-72). All settings surfaces (Settings → Recording and the pre-record setup
+/// cards) hydrate their shared store from this. The registry getters default
+/// (500 MB / 30 min / 30 fps) and clamp/normalize defensively, and the
+/// destination is resolved to the EFFECTIVE folder (the persisted choice or the
+/// `~/Movies/keeper` default), so the VM always carries concrete, in-bounds
+/// values. Failures funnel through [`to_ipc_error`].
 #[tauri::command]
 pub fn recording_settings_get(state: State<'_, AppState>) -> Result<RecordingSettingsVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
@@ -3881,15 +3979,21 @@ pub fn recording_settings_get(state: State<'_, AppState>) -> Result<RecordingSet
             .map_err(to_ipc_error)?,
         duration_cap_minutes: keeper_core::registry::get_recording_duration_cap_minutes(&data_dir)
             .map_err(to_ipc_error)?,
+        destination_dir: effective_destination_dir(&data_dir)?
+            .to_string_lossy()
+            .into_owned(),
+        fps: keeper_core::registry::get_recording_fps(&data_dir).map_err(to_ipc_error)?,
     })
 }
 
-/// Persist the segmentation settings (Story 17.5, FR-72): clamp to the authored
-/// bounds (segment `100..=5000` MB, duration cap `1..=600` min — clamp, not
-/// reject), write both into the `settings` k/v table, and return the effective
-/// (re-read) VM so the UI never displays an unsaved value. A running session is
-/// never mutated — `recording_start` re-reads at start, so edits apply to the
-/// next Recording Session only. Failures funnel through [`to_ipc_error`].
+/// Persist the recording settings (Story 17.5 + 19.5, FR-72): clamp/normalize
+/// to the authored bounds (segment `100..=5000` MB, duration cap `1..=600` min,
+/// fps {30, 60} — clamp, not reject), write all four into the `settings` k/v
+/// table, and return the effective (re-read) VM so the UI never displays an
+/// unsaved value. The destination is persisted verbatim — it is validated at
+/// Start time by the pre-flight, not here. A running session is never mutated —
+/// `recording_start` re-reads at start, so edits apply to the next Recording
+/// Session only. Failures funnel through [`to_ipc_error`].
 #[tauri::command]
 pub fn recording_settings_set(
     state: State<'_, AppState>,
@@ -3903,6 +4007,9 @@ pub fn recording_settings_set(
         settings.duration_cap_minutes,
     )
     .map_err(to_ipc_error)?;
+    keeper_core::registry::set_recording_destination_dir(&data_dir, &settings.destination_dir)
+        .map_err(to_ipc_error)?;
+    keeper_core::registry::set_recording_fps(&data_dir, settings.fps).map_err(to_ipc_error)?;
     recording_settings_get(state)
 }
 
@@ -4651,6 +4758,25 @@ mod tests {
     #[test]
     fn now_ms_is_positive() {
         assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn resolve_destination_dir_honors_absolute_and_falls_back_otherwise() {
+        // Story 19.5: an absolute persisted folder is honored verbatim.
+        let data_dir = Path::new("/var/keeper-data");
+        assert_eq!(
+            resolve_destination_dir(Some("/Users/x/Recordings".to_owned()), data_dir),
+            PathBuf::from("/Users/x/Recordings")
+        );
+        // A relative (hand-edited/corrupt) value is rejected → an absolute
+        // default, keeping the "always a concrete absolute folder" invariant.
+        let relative = resolve_destination_dir(Some("relative/path".to_owned()), data_dir);
+        assert!(relative.is_absolute());
+        assert!(relative.ends_with("keeper"));
+        // Unset resolves to the same absolute default.
+        let unset = resolve_destination_dir(None, data_dir);
+        assert!(unset.is_absolute());
+        assert!(unset.ends_with("keeper"));
     }
 
     #[test]
