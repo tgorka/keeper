@@ -1,0 +1,116 @@
+src/components/layout/recording-pane.tsx
+  s_bb1423f8a6899e::t_850542342286b5 202-224
+  s_bb1423f8a6899e::t_a09c1e3df5c185 61-64
+  s_bb1423f8a6899e::t_a859372cff4994 22,24
+src/components/settings/recording-settings-controls.tsx
+  s_bb1423f8a6899e::t_71d8fbc80642e6 88-89,92-93
+src-tauri/crates/keeper-core/src/recording.rs
+  s_bb1423f8a6899e::t_c7ba72e8d97301 2215-2240,2244-2299
+  s_bb1423f8a6899e::t_c1b94bd70f76a1 2241-2243
+  s_bb1423f8a6899e::t_6f6436e69e5abd 548-549,551-557,564
+  s_bb1423f8a6899e::t_051feca96941fd 456
+  s_bb1423f8a6899e::t_9f6109282e6dfa 28
+  s_bb1423f8a6899e::t_e02d6d3a991bac 411-415,418-455
+  s_bb1423f8a6899e::t_d208601ec22b4e 2061,2081,2107,2135,2199
+  s_bb1423f8a6899e::t_cd69ac89db02bf 2019,2031
+  s_bb1423f8a6899e::t_2b6c9928791c42 542-545
+  s_bb1423f8a6899e::t_5ffdd6f1515a77 2655
+src-tauri/crates/keeper/Cargo.toml
+  s_bb1423f8a6899e::t_83ac17d8e23760 40-44
+src/components/layout/recording-pane.test.tsx
+  s_bb1423f8a6899e::t_6fa06ff946da53 23-32,36-39
+  s_bb1423f8a6899e::t_0ae81e510bdb68 50-52,58
+  s_bb1423f8a6899e::t_80efdb40fa03de 172-184
+  s_bb1423f8a6899e::t_e1453d539449d2 49
+  s_bb1423f8a6899e::t_b0301ee1cce55e 40-41
+src/components/recording/recording-destination-controls.test.tsx
+  s_bb1423f8a6899e::t_7e92b9b389885b 1-60,63-126
+  s_bb1423f8a6899e::t_f626547dfce06c 61-62
+tools/keeper-rec/Sources/keeper-rec/main.swift
+  s_bb1423f8a6899e::t_4174984053dd4b 117-119
+  s_bb1423f8a6899e::t_688b21e4236fbc 392-396,403
+src/components/settings/settings-dialog.test.tsx
+  s_bb1423f8a6899e::t_47a69c13a35a1c 22-32
+  s_bb1423f8a6899e::t_0c4e2a02a5b96e 68-72
+  s_bb1423f8a6899e::t_84fd6d0b438618 667-679
+_bmad-output/implementation-artifacts/spec-19-5-destination-folder-chooser-and-fps-advanced-control.md
+  s_bb1423f8a6899e::t_77d13a697dca7c 78-93
+  s_bb1423f8a6899e::t_0b3f0c051ee292 107-118
+  s_bb1423f8a6899e::t_97252756fb3d48 6
+  s_bb1423f8a6899e::t_058b98ba19be08 9
+  s_bb1423f8a6899e::t_8ae767dd6b7dcf 1-5,7-8,10-77,94-106,119-141
+  s_bb1423f8a6899e::t_cd3af0b0772c57 142-175
+src-tauri/crates/keeper-core/src/registry.rs
+  s_bb1423f8a6899e::t_c1b94bd70f76a1 2028-2031,2033-2036
+  s_bb1423f8a6899e::t_d422273a9f1111 845-917
+  s_bb1423f8a6899e::t_0a04e681e3d6a9 2011-2027,2032,2037-2086
+src-tauri/crates/keeper-core/src/error.rs
+  s_bb1423f8a6899e::t_c1b94bd70f76a1 499-501
+  s_bb1423f8a6899e::t_9bd140aaaab949 474-498,502-529
+tools/keeper-rec/Tests/keeper-recTests/FrameRateTests.swift
+  s_bb1423f8a6899e::t_fec22a4161aee5 1-29
+src/components/recording/recording-destination-controls.tsx
+  s_bb1423f8a6899e::t_be9f730018ddec 1-99
+tools/keeper-rec/Sources/keeper-rec/Capture.swift
+  s_bb1423f8a6899e::t_06c366d5e69342 305
+  s_bb1423f8a6899e::t_e045d89d860c47 343-345
+  s_bb1423f8a6899e::t_45c79a21bb7e06 262
+  s_bb1423f8a6899e::t_6392cd745e08f5 282
+  s_bb1423f8a6899e::t_166c1c4c01e13d 193-195,201
+tools/keeper-rec/Sources/keeper-rec/FrameRate.swift
+  s_bb1423f8a6899e::t_072ca2a633c265 1-23
+src-tauri/crates/keeper/src/ipc.rs
+  s_bb1423f8a6899e::t_9daa729daa75cd 3958-3961
+  s_bb1423f8a6899e::t_a5055be6741c35 3551-3555,3560
+  s_bb1423f8a6899e::t_5ab467bdfb7c97 23-24
+  s_bb1423f8a6899e::t_3295b5feabe6e5 3950-3952,3954-3957
+  s_bb1423f8a6899e::t_acfa6b26a02e22 3579-3581
+  s_bb1423f8a6899e::t_0231043f0d10e2 29-32
+  s_bb1423f8a6899e::t_cd2877dda66559 4763
+  s_bb1423f8a6899e::t_7aee33fb52c279 4764-4781
+  s_bb1423f8a6899e::t_ade14cce67cc11 1088-1095
+  s_bb1423f8a6899e::t_c182edaba283df 3483-3520
+  s_bb1423f8a6899e::t_ed1ac18e6dc71a 1096-1101
+  s_bb1423f8a6899e::t_6f6482924302e0 3925-3941,3943-3945
+  s_bb1423f8a6899e::t_63f86f4f9bf302 3918-3924,3942,3946-3949,3953,3962-3973,3982-3985,3989-3996,4010-4012
+src/lib/stores/recording-settings.ts
+  s_bb1423f8a6899e::t_a805f57ceb981b 39-43
+src/components/settings/recording-settings-controls.test.tsx
+  s_bb1423f8a6899e::t_e6070adcab2047 21-28,56,91,139
+  s_bb1423f8a6899e::t_d108f8d32ab341 72,79-83,98
+src/components/settings/settings-dialog.tsx
+  s_bb1423f8a6899e::t_02693a6238a3e3 3-4
+  s_bb1423f8a6899e::t_65e6c70c62ee18 982-985,987,990-998,1012,1014
+src/components/recording/recording-advanced-controls.test.tsx
+  s_bb1423f8a6899e::t_977fdeedbc1f45 1-76,80-100
+  s_bb1423f8a6899e::t_d55c80f788fa80 77-79
+src-tauri/crates/keeper-core/src/vm.rs
+  s_bb1423f8a6899e::t_f1781ca88b6cf1 2829-2838,2849-2856
+src-tauri/Cargo.lock
+  s_bb1423f8a6899e::t_276ee6674461fb 1779-1788,2954
+src-tauri/Cargo.toml
+  s_bb1423f8a6899e::t_6a40eeff62c37b 86-89
+  s_bb1423f8a6899e::t_316a83f019e2a5 84-85
+src/lib/ipc/gen/RecordingSettingsVm.ts
+  s_bb1423f8a6899e::t_53cad89ab5bab8 4-8,10-13,25-37
+src/components/recording/recording-advanced-controls.tsx
+  s_bb1423f8a6899e::t_7a8113568a38bc 1-113
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_bb1423f8a6899e::t_0c8c9a52b127c7 197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "f5d8830c246b60db66802b004b24ad09662a81c5",
+  "prompts": {},
+  "sessions": {
+    "s_bb1423f8a6899e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "511270bd-028f-4ad3-8006-4d90e50a8de0",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
