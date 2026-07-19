@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-19-1-application-window-picker-scshareablecontent-live-list.md
+  s_3acb88a7328b5d::t_7586c04d42114a 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "2d99ab3f31a72298d1b68fcf7c0ad572f9fcd746",
+  "prompts": {},
+  "sessions": {
+    "s_3acb88a7328b5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7ed1970d-c16c-47f2-a78b-fcdd0e9aa535",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
