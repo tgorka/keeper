@@ -1,0 +1,134 @@
+src/hooks/use-recording-session.ts
+  s_d4dab82fe2e54c::t_e1683d9f87358b 141-149
+  s_d4dab82fe2e54c::t_dca83c24dd4299 150-165,167-169
+  s_d4dab82fe2e54c::t_a0fe3f6342b23e 67-75
+src/lib/stores/recording-mic.test.ts
+  s_d4dab82fe2e54c::t_7083f48fcee2a0 1-63
+src/lib/ipc/client.ts
+  s_d4dab82fe2e54c::t_efeec37f515892 1738,1740-1741
+  s_d4dab82fe2e54c::t_c34a3f5c2476ae 112
+  s_d4dab82fe2e54c::t_9761cf5bb98882 1719-1732
+  s_d4dab82fe2e54c::t_b4d83b87a3160a 1700-1701,1707-1709,1713-1714
+  s_d4dab82fe2e54c::t_f61069864560c1 1718
+  s_d4dab82fe2e54c::t_61751aa2d26041 160
+tools/keeper-rec/Sources/keeper-rec/Capture.swift
+  s_d4dab82fe2e54c::t_59f5aaab8847f4 90-92
+  s_d4dab82fe2e54c::t_6e23a762858f49 226-227
+  s_d4dab82fe2e54c::t_c319394c8f6648 264-267,269-270,276-278
+  s_d4dab82fe2e54c::t_7a67e9c882e977 341,632-640
+  s_d4dab82fe2e54c::t_5ec03319a267ea 246-247
+  s_d4dab82fe2e54c::t_a3a124f58c2021 10-11
+  s_d4dab82fe2e54c::t_349a28041d2d93 586
+  s_d4dab82fe2e54c::t_cdc15b038153d0 113-121
+  s_d4dab82fe2e54c::t_d8a21f7879f495 310-322,329-340
+  s_d4dab82fe2e54c::t_387b4266543393 67-71,77,82
+  s_d4dab82fe2e54c::t_78d4667628aaa1 670
+  s_d4dab82fe2e54c::t_13963ab6abaecb 157-159,165-166
+  s_d4dab82fe2e54c::t_fdd1e90f7886a5 757-762
+  s_d4dab82fe2e54c::t_f1a6d540d3bdeb 413-435,443-504
+_bmad-output/implementation-artifacts/spec-19-3-microphone-picker-and-separate-track.md
+  s_d4dab82fe2e54c::t_f3b703bbfa4b94 9
+  s_d4dab82fe2e54c::t_aed7962c380e33 102-122
+  s_d4dab82fe2e54c::t_7ae89e77daecbc 1-4,7-8,10-79,94-101,123-154
+  s_d4dab82fe2e54c::t_2db4c54d860e8f 80-93
+  s_d4dab82fe2e54c::t_e6e93e5a2c9b33 155-184
+  s_d4dab82fe2e54c::t_ad4eb74fdd02cd 5
+  s_d4dab82fe2e54c::t_bab062675cbf95 6
+src/components/recording/recording-audio-controls.test.tsx
+  s_d4dab82fe2e54c::t_d744419ef143f9 1-21,23-31,35-37,83-130,158-203
+  s_d4dab82fe2e54c::t_1dad35f5c6fa92 131-157
+src/components/recording/recording-source-picker.test.tsx
+  s_d4dab82fe2e54c::t_e413f79d967130 19
+  s_d4dab82fe2e54c::t_118229275813f2 55-56
+  s_d4dab82fe2e54c::t_fed70dcb8bec9c 90-107
+tools/keeper-rec/Sources/keeper-rec/main.swift
+  s_d4dab82fe2e54c::t_8ea9a0301d358f 123-127
+  s_d4dab82fe2e54c::t_c07c6950d51c58 66-79,91-92,97
+  s_d4dab82fe2e54c::t_35ad9592725e9b 327-341
+  s_d4dab82fe2e54c::t_e9b0b6b555d29b 373-378
+  s_d4dab82fe2e54c::t_c852315f49ec9d 394
+  s_d4dab82fe2e54c::t_57996599a56c0b 249-273,278
+  s_d4dab82fe2e54c::t_5e5b6430b2db6d 14-18
+  s_d4dab82fe2e54c::t_3ef60e492e3442 25
+src-tauri/crates/keeper-core/src/recording.rs
+  s_d4dab82fe2e54c::t_137e68700418cc 455-464
+  s_d4dab82fe2e54c::t_d53c5a6bf03046 1705-1708,1712
+  s_d4dab82fe2e54c::t_67280f8b2a1bfd 1773-1848,1851-1883
+  s_d4dab82fe2e54c::t_0ee00100698120 604-608
+  s_d4dab82fe2e54c::t_300ea80fe4de25 2249-2258
+  s_d4dab82fe2e54c::t_1b410131fd9dd9 364-373
+  s_d4dab82fe2e54c::t_e8bc78259c36fd 418-422
+  s_d4dab82fe2e54c::t_71097adfc9afc4 1764
+  s_d4dab82fe2e54c::t_44890d9390553b 1898
+  s_d4dab82fe2e54c::t_98465a1569bce7 2268
+  s_d4dab82fe2e54c::t_8a6e78e30bc607 602-603,609-619
+  s_d4dab82fe2e54c::t_c03a634dfc1259 1849-1850
+  s_d4dab82fe2e54c::t_501a7561096526 385-395
+  s_d4dab82fe2e54c::t_b389641c250988 1223-1230
+  s_d4dab82fe2e54c::t_23153823c5ded8 1724
+src-tauri/crates/keeper/src/ipc.rs
+  s_d4dab82fe2e54c::t_e79d2ff063a6f6 3500-3502
+  s_d4dab82fe2e54c::t_fda86494f53601 3321-3342
+  s_d4dab82fe2e54c::t_f0224dcdd8da7b 3435-3436,3441-3447,3449-3450
+  s_d4dab82fe2e54c::t_3fc1da20488085 3529-3531
+  s_d4dab82fe2e54c::t_79e12cdd396992 29
+  s_d4dab82fe2e54c::t_64f9b5a94ed306 3448
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_d4dab82fe2e54c::t_e357409a8b312c 1038-1047
+src/components/recording/recording-audio-controls.tsx
+  s_d4dab82fe2e54c::t_5eb506a81188ee 42
+  s_d4dab82fe2e54c::t_cb09bbd70790dd 2-3,5-11,13-24,28-34,36,38-41,43-44,64-96,99-106,112-113,116-119,122,132-133,154-206
+  s_d4dab82fe2e54c::t_9028a663095a2f 26
+  s_d4dab82fe2e54c::t_c13639c5273e16 107-110,114-115,120-121,123-131
+  s_d4dab82fe2e54c::t_908ad2d2cca9d3 111
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_d4dab82fe2e54c::t_b2f2e0e3284ced 195
+src/lib/ipc/client.test.ts
+  s_d4dab82fe2e54c::t_cf2d0c883121bf 13-14
+  s_d4dab82fe2e54c::t_44b35246dd1f7d 248-288
+src/lib/stores/recording-mic.ts
+  s_d4dab82fe2e54c::t_8ee751e79638af 1-72
+src/components/layout/recording-pane.tsx
+  s_d4dab82fe2e54c::t_2da5f56f47d46b 99-106
+  s_d4dab82fe2e54c::t_22f94fe9dba547 35
+src-tauri/crates/keeper/Info.plist
+  s_d4dab82fe2e54c::t_626e10129617ac 13-19
+src/components/recording/recording-source-picker.tsx
+  s_d4dab82fe2e54c::t_ffffb6f25ef07f 26
+  s_d4dab82fe2e54c::t_3dc69ea74df98b 112-114
+  s_d4dab82fe2e54c::t_364229b84de9dd 59-65
+  s_d4dab82fe2e54c::t_26351d0fe4e097 246-247,250
+src-tauri/crates/keeper/src/recorder.rs
+  s_d4dab82fe2e54c::t_d5f2b2fd98ffc4 347-352
+  s_d4dab82fe2e54c::t_68a5212014a422 89-93
+  s_d4dab82fe2e54c::t_dacafdb84d03d7 535-539
+  s_d4dab82fe2e54c::t_95661329c0df6e 779-819
+  s_d4dab82fe2e54c::t_765cdbd900be5a 32-34,38
+  s_d4dab82fe2e54c::t_200568098ec7e5 343-346,353-370
+  s_d4dab82fe2e54c::t_a85e682ecf33f0 583-588
+  s_d4dab82fe2e54c::t_b81d5dc50cac8c 105-114
+src/components/layout/recording-pane.test.tsx
+  s_d4dab82fe2e54c::t_bddf3a5a9fe626 11-12
+  s_d4dab82fe2e54c::t_328212dc9343f9 37
+  s_d4dab82fe2e54c::t_e57a1f36a0ff2a 116-117
+  s_d4dab82fe2e54c::t_acf7722ad824a9 59
+  s_d4dab82fe2e54c::t_cb83bb0e74d4ce 250-251,256,271-288
+src-tauri/crates/keeper/src/lib.rs
+  s_d4dab82fe2e54c::t_f54ab3b9a927d4 365
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "1c47444044823dba4d18902138f5b4c05c8fe696",
+  "prompts": {},
+  "sessions": {
+    "s_d4dab82fe2e54c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "df58ff35-37a7-4282-af97-c404e8d0f294",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
