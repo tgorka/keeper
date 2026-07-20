@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // AVAssetWriter-based fixture sessions for the NFR-22 gapless-concat gate
-// (Story 17.4, AD-38): real fMP4 `screen-####.mp4` segments + a
+// (Story 17.4, AD-38): real fMP4 `screen-####.mov` segments + a
 // `manifest.json` shape-compatible with the Rust `SessionManifest`, generated
 // on the runner — no ScreenCaptureKit, no display, no signing, no committed
 // binary media.
@@ -76,7 +76,7 @@ func writeFixtureSegment(
 ) async throws {
     let width = 64
     let height = 64
-    let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+    let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
     writer.movieFragmentInterval = CMTime(seconds: 4, preferredTimescale: 600)
 
     let input = AVAssetWriterInput(
@@ -217,7 +217,7 @@ func makeFixtureSession(
     frameRate: Double = 30,
     basePTS: Double = 1000.0,
     defect: (boundary: Int, kind: BoundaryDefect)? = nil,
-    fileName: (Int) -> String = { String(format: "screen-%04d.mp4", $0) },
+    fileName: (Int) -> String = { String(format: "screen-%04d.mov", $0) },
     manifestOrder: [Int]? = nil,
     nullBoundsForIndex: Int? = nil
 ) async throws -> [FixtureSegment] {
@@ -322,7 +322,7 @@ func makeDualTrackSession(
     var start = basePTS
     for index in 0..<segmentCount {
         let end = start + Double(framesPerSegment - 1) * period
-        let screenFile = String(format: "screen-%04d.mp4", index)
+        let screenFile = String(format: "screen-%04d.mov", index)
         try await writeFixtureSegment(
             at: folder.appendingPathComponent(screenFile),
             firstPTS: start, frames: framesPerSegment, frameRate: frameRate)
@@ -337,7 +337,7 @@ func makeDualTrackSession(
             let cameraFrames = framesPerSegment - warmupFrames
             let cameraFileStart = cameraStart + Double(warmupFrames) * period
             let cameraEnd = cameraFileStart + Double(cameraFrames - 1) * period
-            let cameraFile = String(format: "camera-%04d.mp4", index)
+            let cameraFile = String(format: "camera-%04d.mov", index)
             try await writeFixtureSegment(
                 at: folder.appendingPathComponent(cameraFile),
                 firstPTS: cameraFileStart, frames: cameraFrames, frameRate: frameRate)

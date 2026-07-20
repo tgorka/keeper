@@ -666,7 +666,7 @@ pub struct MicSelection {
 /// data; no platform token (the device id is an opaque string the sidecar
 /// resolves against its own enumeration, falling back to the system default
 /// camera when the id vanished). The sidecar then records the camera as its
-/// own separate `camera-####.mp4` per segment — never a track inside
+/// own separate `camera-####.mov` per segment — never a track inside
 /// `screen-####`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraSelection {
@@ -686,7 +686,7 @@ pub struct CameraSelection {
 /// keeper's own process audio excluded — FR-69).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionParams {
-    /// Absolute path of the `.mp4` file to write.
+    /// Absolute path of the `.mov` file to write.
     pub output_path: String,
     /// The macOS display id to capture, or `None` for the main display. Ignored
     /// when `application` is `Some` (an application target wins).
@@ -705,7 +705,7 @@ pub struct SessionParams {
     /// The camera selection (Story 20.1, FR-70), or `None` when the webcam
     /// source is off (the default). When `Some`, the wire carries
     /// `cameraEnabled:true` (+ `cameraDeviceId` when a specific device is
-    /// picked) and the sidecar writes a separate `camera-####.mp4` per
+    /// picked) and the sidecar writes a separate `camera-####.mov` per
     /// segment beside `screen-####`.
     pub camera: Option<CameraSelection>,
     /// Segment size in decimal MB before a gapless rotation (Story 17.5,
@@ -1042,7 +1042,7 @@ pub fn verify_protocol_version(reported: u32) -> Result<(), CoreError> {
 
 // --- Session folder, manifest.json & segment ledger (Story 17.2, FR-71, AD-33) --
 //
-// The per-session folder `keeper-rec <local ts>/` holds the `screen-####.mp4`
+// The per-session folder `keeper-rec <local ts>/` holds the `screen-####.mov`
 // segments plus an atomically-written `manifest.json` an external reader (or
 // keeper's own 17.3 recovery) can always parse consistently. Everything here is
 // `std::fs` + serde only — firewall-clean (no shell, no Apple framework, no
@@ -1055,13 +1055,13 @@ pub fn verify_protocol_version(reported: u32) -> Result<(), CoreError> {
 /// The `manifest.json` schema version (Story 17.2).
 pub const MANIFEST_VERSION: u32 = 1;
 
-/// Screen-track segment files are named `screen-####.mp4`. The terminal
+/// Screen-track segment files are named `screen-####.mov`. The terminal
 /// reconcile ingests only the session's own stem prefixes (this one and
-/// [`CAMERA_SEGMENT_STEM_PREFIX`], Story 20.1), so a stray `*.mp4` (a user
+/// [`CAMERA_SEGMENT_STEM_PREFIX`], Story 20.1), so a stray `*.mov` (a user
 /// drop) with a trailing digit run never pollutes the authoritative ledger.
 const SEGMENT_STEM_PREFIX: &str = "screen-";
 
-/// Camera-track segment files are named `camera-####.mp4` (Story 20.1,
+/// Camera-track segment files are named `camera-####.mov` (Story 20.1,
 /// FR-70/FR-73): the optional webcam's own separate per-segment file, sharing
 /// the session folder and the segment index space with `screen-####` —
 /// disambiguated in the ledger by `track`, never by index alone.
@@ -1109,7 +1109,7 @@ pub struct SegmentEntry {
     /// The zero-based segment index (from `segmentClosed` live, or the
     /// filename's trailing numeric run at reconcile).
     pub index: u32,
-    /// The segment file's basename, e.g. `"screen-0003.mp4"`.
+    /// The segment file's basename, e.g. `"screen-0003.mov"`.
     pub file: String,
     /// The segment size in bytes. The terminal reconcile always takes this from
     /// `fs::metadata` — disk is authoritative, never a stale event-fed value.
@@ -1183,7 +1183,7 @@ pub struct SessionDevices {
     pub system_audio: bool,
     /// Whether a microphone track is recorded (live since Story 19.3).
     pub microphone: bool,
-    /// Whether the separate `camera-####.mp4` camera files are recorded
+    /// Whether the separate `camera-####.mov` camera files are recorded
     /// (live since Story 20.1; `false` while the Webcam switch is off).
     pub camera: bool,
 }
@@ -1282,7 +1282,7 @@ impl SessionManifest {
     /// `track == "screen"`, so a camera-track segment (Story 20.1) never inflates
     /// the count and, in a rotation, screen == camera so screen is authoritative.
     /// Read straight off the manifest, which the terminal
-    /// [`Self::reconcile_from_dir`] rebuilds from the on-disk `.mp4` files
+    /// [`Self::reconcile_from_dir`] rebuilds from the on-disk `.mov` files
     /// (including the final never-closed segment) — never the live
     /// `segments_closed` rotation counter, which is 0 for a single-segment
     /// session and track-agnostic.
@@ -1320,7 +1320,7 @@ impl SessionManifest {
         Ok(())
     }
 
-    /// Rebuild the segment ledger **entirely from the on-disk `.mp4` files** —
+    /// Rebuild the segment ledger **entirely from the on-disk `.mov` files** —
     /// run at *every* terminal (`finalized`, `recovered`, `failed`) before the
     /// final write. Disk is authoritative: the event-fed list is discarded, the
     /// index comes from each stem's trailing numeric run
@@ -1338,7 +1338,7 @@ impl SessionManifest {
     /// truth for everything disk can observe (`index`/`file`/`bytes`/`track`),
     /// but the host clock is the truth for time: the muxer rebases every
     /// segment file's own timeline to 0, so the original capture-clock
-    /// `pts_start`/`pts_end` can NEVER be recovered from the `.mp4` files.
+    /// `pts_start`/`pts_end` can NEVER be recovered from the `.mov` files.
     /// Each rebuilt entry therefore inherits the bounds the event-fed ledger
     /// already recorded for its `(track, index)` pair (`None` — persisted as
     /// `null` — when no prior entry exists: the final segment, a DW-992
@@ -1372,20 +1372,20 @@ impl SessionManifest {
                 tracing::warn!("manifest reconcile: skipping non-UTF-8 file name");
                 continue;
             };
-            let is_mp4 = path
+            let is_mov = path
                 .extension()
                 .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
-            if !is_mp4 {
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"));
+            if !is_mov {
                 continue;
             }
             let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                tracing::warn!("manifest reconcile: skipping .mp4 with a non-UTF-8 stem");
+                tracing::warn!("manifest reconcile: skipping .mov with a non-UTF-8 stem");
                 continue;
             };
-            // Only this session's own `screen-####.mp4` / `camera-####.mp4`
+            // Only this session's own `screen-####.mov` / `camera-####.mov`
             // segments (Story 20.1) are authoritative ledger entries — a stray
-            // `*.mp4` with a trailing digit run must not pollute the ledger or
+            // `*.mov` with a trailing digit run must not pollute the ledger or
             // collide on `(track, index)`. The stem prefix names the track.
             let track = if stem.starts_with(SEGMENT_STEM_PREFIX) {
                 "screen"
@@ -1410,7 +1410,7 @@ impl SessionManifest {
                 }
             };
             if !metadata.is_file() {
-                tracing::warn!("manifest reconcile: skipping non-file .mp4 entry");
+                tracing::warn!("manifest reconcile: skipping non-file .mov entry");
                 continue;
             }
             let (pts_start, pts_end) = known_bounds
@@ -1463,7 +1463,7 @@ impl SessionManifest {
 /// holds a `manifest.json`, [`SessionManifest::load`] it; when its `status` is
 /// still [`ManifestStatus::Recording`] AND its `version` is within
 /// [`MANIFEST_VERSION`] AND `is_active` reports the folder inactive, rebuild
-/// the segment ledger from the on-disk `.mp4` files
+/// the segment ledger from the on-disk `.mov` files
 /// ([`SessionManifest::reconcile_from_dir`] — disk is authoritative, the stale
 /// event-fed list is discarded, never a bare status flip), mark the manifest
 /// [`ManifestStatus::Recovered`], and atomically rewrite ONLY `manifest.json`
@@ -1638,14 +1638,14 @@ pub fn segment_index_from_stem(stem: &str) -> Option<u32> {
     stem[run_start..].parse().ok()
 }
 
-/// Sum the on-disk byte sizes of this session's own `screen-####.mp4` segment
+/// Sum the on-disk byte sizes of this session's own `screen-####.mov` segment
 /// files in `folder` (Story 18.1) — the live figure behind the tray's
 /// elapsed/segment/size line.
 ///
 /// Applies the exact ownership rule of [`SessionManifest::reconcile_from_dir`]
 /// ([`SEGMENT_STEM_PREFIX`] plus a trailing numeric run), so the growing tray
 /// figure always matches what the eventual terminal manifest will report: a
-/// stray `*.mp4` (a user drop, a future `camera-####.mp4`), `manifest.json`,
+/// stray `*.mov` (a user drop, a future `camera-####.mov`), `manifest.json`,
 /// and directories never count. Best-effort and total — a missing/unreadable
 /// folder or entry contributes 0, never an error, never a panic (the figure is
 /// a convenience readout, not a ledger).
@@ -1656,11 +1656,11 @@ pub fn session_bytes_on_disk(folder: &Path) -> u64 {
     let mut total: u64 = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_mp4 = path
+        let is_mov = path
             .extension()
             .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
-        if !is_mp4 {
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"));
+        if !is_mov {
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -1683,12 +1683,12 @@ pub fn session_bytes_on_disk(folder: &Path) -> u64 {
 }
 
 /// The on-disk length of this session's **current** (open) segment — the
-/// highest-index `screen-####.mp4` file in `folder` (Story 18.3) — the numerator
+/// highest-index `screen-####.mov` file in `folder` (Story 18.3) — the numerator
 /// behind the in-app segment meter.
 ///
 /// Applies the exact ownership rule of [`session_bytes_on_disk`]
-/// ([`SEGMENT_STEM_PREFIX`] plus a trailing numeric run), so a stray `*.mp4`, a
-/// future `camera-####.mp4`, `manifest.json`, and directories are ignored.
+/// ([`SEGMENT_STEM_PREFIX`] plus a trailing numeric run), so a stray `*.mov`, a
+/// future `camera-####.mov`, `manifest.json`, and directories are ignored.
 /// Whereas [`session_bytes_on_disk`] sums *all* segments (the total size line),
 /// this returns only the length of the highest-index one — the segment capture
 /// is actively writing — so the figure naturally falls back toward ~0 at each
@@ -1702,11 +1702,11 @@ pub fn current_segment_bytes_on_disk(folder: &Path) -> u64 {
     let mut current: Option<(u32, u64)> = None;
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_mp4 = path
+        let is_mov = path
             .extension()
             .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
-        if !is_mp4 {
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"));
+        if !is_mov {
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -2258,12 +2258,12 @@ mod tests {
         // host-clock `ptsStart`/`ptsEnd` bounds) parses into the enriched
         // event carrying the segment-ledger data, and the state machine still
         // bumps its counter without a state change.
-        let line = r#"{"event":"segmentClosed","index":2,"path":"/rec/keeper/screen-0002.mp4","bytes":123,"track":"screen","ptsStart":1000.5,"ptsEnd":1030.25}"#;
+        let line = r#"{"event":"segmentClosed","index":2,"path":"/rec/keeper/screen-0002.mov","bytes":123,"track":"screen","ptsStart":1000.5,"ptsEnd":1030.25}"#;
         assert_eq!(
             parse_event(line),
             Some(RecordingEvent::SegmentClosed {
                 index: 2,
-                path: Some("/rec/keeper/screen-0002.mp4".to_owned()),
+                path: Some("/rec/keeper/screen-0002.mov".to_owned()),
                 bytes: Some(123),
                 track: Some("screen".to_owned()),
                 pts_start: Some(1000.5),
@@ -2470,7 +2470,7 @@ mod tests {
         // Story 17.5 (FR-72): every `start` always carries the configured
         // segment size and duration cap (in seconds) alongside the 16.6 fields.
         let params = SessionParams {
-            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
             display_id: Some(7),
             application: None,
             system_audio: true,
@@ -2485,7 +2485,7 @@ mod tests {
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
         assert_eq!(wire["id"], 4);
         assert_eq!(wire["method"], "startRecording");
-        assert_eq!(wire["params"]["path"], "/tmp/keeper-rec/screen-0000.mp4");
+        assert_eq!(wire["params"]["path"], "/tmp/keeper-rec/screen-0000.mov");
         assert_eq!(wire["params"]["systemAudio"], true);
         assert_eq!(wire["params"]["displayId"], 7);
         assert_eq!(wire["params"]["segmentMB"], 800);
@@ -2513,7 +2513,7 @@ mod tests {
         // no audio track (16.6). The default-`true` case is covered by
         // `start_recording_request_carries_the_segmentation_params` above.
         let params = SessionParams {
-            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
             display_id: None,
             application: None,
             system_audio: false,
@@ -2534,7 +2534,7 @@ mod tests {
         // `micEnabled`/`micDeviceId` key at all — the 16.6/19.2 wire stays
         // byte-for-byte unchanged, and the sidecar adds no mic track.
         let params = SessionParams {
-            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
             display_id: None,
             application: None,
             system_audio: true,
@@ -2561,7 +2561,7 @@ mod tests {
         // Story 19.3: the mic on with the system default input — `micEnabled:
         // true` and NO `micDeviceId` (its absence means the default device).
         let params = SessionParams {
-            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
             display_id: None,
             application: None,
             system_audio: true,
@@ -2588,7 +2588,7 @@ mod tests {
         // Story 19.3: a specific device picked in the Audio card threads its
         // opaque unique id through as `micDeviceId`.
         let params = SessionParams {
-            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
             display_id: None,
             application: None,
             system_audio: false,
@@ -2652,7 +2652,7 @@ mod tests {
         // pre-20.1 wire stays byte-for-byte unchanged, and the sidecar
         // writes no camera file and touches no Camera-TCC.
         let params = SessionParams {
-            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
             display_id: None,
             application: None,
             system_audio: true,
@@ -2680,7 +2680,7 @@ mod tests {
         // `cameraEnabled: true` and NO `cameraDeviceId` (its absence means
         // the default device, the mic-wire precedent).
         let params = SessionParams {
-            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
             display_id: None,
             application: None,
             system_audio: true,
@@ -2708,7 +2708,7 @@ mod tests {
         // opaque unique id through as `cameraDeviceId` — and the camera is
         // independent of the mic (both sources on, distinct keys).
         let params = SessionParams {
-            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
             display_id: None,
             application: None,
             system_audio: false,
@@ -2774,7 +2774,7 @@ mod tests {
         // and OMITS `displayId` (even when a display id is also set), so the
         // sidecar builds the exclusionary app-scoped filter.
         let params = SessionParams {
-            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
             // A stray display id must be ignored once an app target is present.
             display_id: Some(7),
             application: Some(ApplicationTarget {
@@ -2810,7 +2810,7 @@ mod tests {
         // PROTOCOL_VERSION stays 1.
         for fps in [30u32, 60] {
             let params = SessionParams {
-                output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+                output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
                 display_id: None,
                 application: None,
                 system_audio: true,
@@ -3450,7 +3450,7 @@ mod tests {
     /// Canned params for the fake port (never touch the filesystem).
     fn test_params() -> SessionParams {
         SessionParams {
-            output_path: "/tmp/keeper-test.mp4".to_owned(),
+            output_path: "/tmp/keeper-test.mov".to_owned(),
             display_id: None,
             application: None,
             system_audio: true,
@@ -3748,7 +3748,7 @@ mod tests {
     fn write_is_atomic_temp_then_rename_and_stays_parseable() {
         let folder = fresh_temp_dir("atomic");
         let mut manifest = test_manifest(folder.clone());
-        manifest.record_segment(screen_entry(0, "screen-0000.mp4", 123));
+        manifest.record_segment(screen_entry(0, "screen-0000.mov", 123));
         manifest.write().expect("atomic rewrite");
         assert!(
             !folder.join(".manifest.json.tmp").exists(),
@@ -3758,7 +3758,7 @@ mod tests {
         let parsed: SessionManifest = serde_json::from_str(&raw).expect("always parseable");
         assert_eq!(
             parsed.segments,
-            vec![screen_entry(0, "screen-0000.mp4", 123)]
+            vec![screen_entry(0, "screen-0000.mov", 123)]
         );
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -3780,20 +3780,20 @@ mod tests {
     fn reconcile_rebuilds_from_disk_backfills_and_overrides_stale_bytes() {
         let folder = fresh_temp_dir("reconcile");
         let mut manifest = test_manifest(folder.clone());
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("segment 0");
-        std::fs::write(folder.join("screen-0001.mp4"), vec![0u8; 20]).expect("segment 1");
-        std::fs::write(folder.join("screen-0002.mp4"), vec![0u8; 30]).expect("final segment");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 10]).expect("segment 0");
+        std::fs::write(folder.join("screen-0001.mov"), vec![0u8; 20]).expect("segment 1");
+        std::fs::write(folder.join("screen-0002.mov"), vec![0u8; 30]).expect("final segment");
         // Event-fed live view: segment 0 landed with a stale zero size, segment
         // 1's `segmentClosed` was suppressed by a mid-rotation stop (DW-992),
         // and segment 2 is the final segment (never gets a `segmentClosed`).
-        manifest.record_segment(screen_entry(0, "screen-0000.mp4", 0));
+        manifest.record_segment(screen_entry(0, "screen-0000.mov", 0));
         manifest.reconcile_from_dir().expect("terminal reconcile");
         assert_eq!(
             manifest.segments,
             vec![
-                screen_entry(0, "screen-0000.mp4", 10), // disk bytes override the stale 0
-                screen_entry(1, "screen-0001.mp4", 20), // DW-992 backfill
-                screen_entry(2, "screen-0002.mp4", 30), // final segment included
+                screen_entry(0, "screen-0000.mov", 10), // disk bytes override the stale 0
+                screen_entry(1, "screen-0001.mov", 20), // DW-992 backfill
+                screen_entry(2, "screen-0002.mov", 30), // final segment included
             ]
         );
         let _ = std::fs::remove_dir_all(&folder);
@@ -3809,20 +3809,20 @@ mod tests {
         // `segmentClosed`).
         let folder = fresh_temp_dir("bounds");
         let mut manifest = test_manifest(folder.clone());
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("segment 0");
-        std::fs::write(folder.join("screen-0001.mp4"), vec![0u8; 20]).expect("segment 1");
-        std::fs::write(folder.join("screen-0002.mp4"), vec![0u8; 30]).expect("final segment");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 10]).expect("segment 0");
+        std::fs::write(folder.join("screen-0001.mov"), vec![0u8; 20]).expect("segment 1");
+        std::fs::write(folder.join("screen-0002.mov"), vec![0u8; 30]).expect("final segment");
         // Event-fed view: bounds present, but segment 0's bytes are stale.
         manifest.record_segment(screen_entry_with_bounds(
             0,
-            "screen-0000.mp4",
+            "screen-0000.mov",
             0,
             1000.0,
             1029.75,
         ));
         manifest.record_segment(screen_entry_with_bounds(
             1,
-            "screen-0001.mp4",
+            "screen-0001.mov",
             20,
             1029.8,
             1059.5,
@@ -3832,10 +3832,10 @@ mod tests {
             manifest.segments,
             vec![
                 // Disk bytes win; the event-fed host-clock bounds survive.
-                screen_entry_with_bounds(0, "screen-0000.mp4", 10, 1000.0, 1029.75),
-                screen_entry_with_bounds(1, "screen-0001.mp4", 20, 1029.8, 1059.5),
+                screen_entry_with_bounds(0, "screen-0000.mov", 10, 1000.0, 1029.75),
+                screen_entry_with_bounds(1, "screen-0001.mov", 20, 1029.8, 1059.5),
                 // No prior entry → bounds honestly null, never invented.
-                screen_entry(2, "screen-0002.mp4", 30),
+                screen_entry(2, "screen-0002.mov", 30),
             ]
         );
         let _ = std::fs::remove_dir_all(&folder);
@@ -3846,12 +3846,12 @@ mod tests {
         // Missing bounds are persisted as explicit `null` (the spec's "recorded
         // as null" — no skip_serializing_if), and a pre-17.4 manifest without
         // the fields still deserializes (tolerant recovery paths).
-        let json = serde_json::to_value(screen_entry(0, "screen-0000.mp4", 10)).expect("serialize");
+        let json = serde_json::to_value(screen_entry(0, "screen-0000.mov", 10)).expect("serialize");
         assert!(json["ptsStart"].is_null(), "absent ptsStart must be null");
         assert!(json["ptsEnd"].is_null(), "absent ptsEnd must be null");
         let json = serde_json::to_value(screen_entry_with_bounds(
             1,
-            "screen-0001.mp4",
+            "screen-0001.mov",
             20,
             1000.0,
             1029.75,
@@ -3861,26 +3861,26 @@ mod tests {
         assert_eq!(json["ptsEnd"], 1029.75);
         // Pre-17.4 wire shape (no bounds fields at all) → None, never an error.
         let old: SegmentEntry = serde_json::from_str(
-            r#"{"index":3,"file":"screen-0003.mp4","bytes":7,"track":"screen"}"#,
+            r#"{"index":3,"file":"screen-0003.mov","bytes":7,"track":"screen"}"#,
         )
         .expect("pre-17.4 entry deserializes");
-        assert_eq!(old, screen_entry(3, "screen-0003.mp4", 7));
+        assert_eq!(old, screen_entry(3, "screen-0003.mov", 7));
     }
 
     #[test]
     fn reconcile_ingests_both_tracks_and_skips_strays_deterministically() {
         let folder = fresh_temp_dir("strays");
         let mut manifest = test_manifest(folder.clone());
-        std::fs::write(folder.join("screen-0002.mp4"), vec![0u8; 5]).expect("segment 2");
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 4]).expect("segment 0");
+        std::fs::write(folder.join("screen-0002.mov"), vec![0u8; 5]).expect("segment 2");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 4]).expect("segment 0");
         // Story 20.1 (FR-73): a camera segment is this session's own track
         // now — ingested with `track:"camera"`, never treated as a stray.
-        std::fs::write(folder.join("camera-0000.mp4"), vec![0u8; 6]).expect("camera segment 0");
+        std::fs::write(folder.join("camera-0000.mov"), vec![0u8; 6]).expect("camera segment 0");
         // Strays that must NOT enter the authoritative ledger:
-        std::fs::write(folder.join("extra-0001.mp4"), vec![0u8; 6]).expect("wrong prefix");
-        std::fs::write(folder.join("notes.mp4"), vec![0u8; 7]).expect("no numeric run");
+        std::fs::write(folder.join("extra-0001.mov"), vec![0u8; 6]).expect("wrong prefix");
+        std::fs::write(folder.join("notes.mov"), vec![0u8; 7]).expect("no numeric run");
         std::fs::write(folder.join("cover.png"), vec![0u8; 8]).expect("non-mp4");
-        std::fs::create_dir(folder.join("screen-0009.mp4")).expect("dir masquerading as segment");
+        std::fs::create_dir(folder.join("screen-0009.mov")).expect("dir masquerading as segment");
         manifest
             .reconcile_from_dir()
             .expect("strays are skipped, never aborting");
@@ -3893,11 +3893,11 @@ mod tests {
             entries,
             vec![
                 // (index, file) sort: camera-0000 < screen-0000 at index 0.
-                ("camera-0000.mp4", "camera"),
-                ("screen-0000.mp4", "screen"),
-                ("screen-0002.mp4", "screen"),
+                ("camera-0000.mov", "camera"),
+                ("screen-0000.mov", "screen"),
+                ("screen-0002.mov", "screen"),
             ],
-            "screen-####.mp4 and camera-####.mp4 enter the ledger disambiguated by track, \
+            "screen-####.mov and camera-####.mov enter the ledger disambiguated by track, \
              sorted by (index, file); wrong-prefix / no-run / non-mp4 / directory entries \
              are skipped"
         );
@@ -3920,15 +3920,15 @@ mod tests {
         // an index-only key would let one track's bounds clobber the other's.
         let folder = fresh_temp_dir("dual-track");
         let mut manifest = test_manifest(folder.clone());
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("screen 0");
-        std::fs::write(folder.join("camera-0000.mp4"), vec![0u8; 20]).expect("camera 0");
-        std::fs::write(folder.join("screen-0001.mp4"), vec![0u8; 30]).expect("screen final");
-        std::fs::write(folder.join("camera-0001.mp4"), vec![0u8; 40]).expect("camera final");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 10]).expect("screen 0");
+        std::fs::write(folder.join("camera-0000.mov"), vec![0u8; 20]).expect("camera 0");
+        std::fs::write(folder.join("screen-0001.mov"), vec![0u8; 30]).expect("screen final");
+        std::fs::write(folder.join("camera-0001.mov"), vec![0u8; 40]).expect("camera final");
         // Event-fed view: DIFFERENT bounds per track at the same index (the
         // camera anchors a hair after the screen — the real capture shape).
         manifest.record_segment(screen_entry_with_bounds(
             0,
-            "screen-0000.mp4",
+            "screen-0000.mov",
             10,
             1000.0,
             1029.75,
@@ -3936,7 +3936,7 @@ mod tests {
         manifest.record_segment(SegmentEntry {
             pts_start: Some(1000.02),
             pts_end: Some(1029.77),
-            ..camera_entry(0, "camera-0000.mp4", 20)
+            ..camera_entry(0, "camera-0000.mov", 20)
         });
         manifest.reconcile_from_dir().expect("terminal reconcile");
         assert_eq!(
@@ -3946,13 +3946,13 @@ mod tests {
                 SegmentEntry {
                     pts_start: Some(1000.02),
                     pts_end: Some(1029.77),
-                    ..camera_entry(0, "camera-0000.mp4", 20)
+                    ..camera_entry(0, "camera-0000.mov", 20)
                 },
-                screen_entry_with_bounds(0, "screen-0000.mp4", 10, 1000.0, 1029.75),
+                screen_entry_with_bounds(0, "screen-0000.mov", 10, 1000.0, 1029.75),
                 // Final segments never got a segmentClosed → honest null
                 // bounds per track, no cross-track inheritance.
-                camera_entry(1, "camera-0001.mp4", 40),
-                screen_entry(1, "screen-0001.mp4", 30),
+                camera_entry(1, "camera-0001.mov", 40),
+                screen_entry(1, "screen-0001.mov", 30),
             ],
             "both tracks ingest into ONE ledger, bounds preserved per (track, index)"
         );
@@ -3967,12 +3967,12 @@ mod tests {
         // fabricate a host-clock claim the screen never made.
         let folder = fresh_temp_dir("no-cross-leak");
         let mut manifest = test_manifest(folder.clone());
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("screen 0");
-        std::fs::write(folder.join("camera-0000.mp4"), vec![0u8; 20]).expect("camera 0");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 10]).expect("screen 0");
+        std::fs::write(folder.join("camera-0000.mov"), vec![0u8; 20]).expect("camera 0");
         manifest.record_segment(SegmentEntry {
             pts_start: Some(2000.0),
             pts_end: Some(2030.0),
-            ..camera_entry(0, "camera-0000.mp4", 20)
+            ..camera_entry(0, "camera-0000.mov", 20)
         });
         manifest.reconcile_from_dir().expect("terminal reconcile");
         assert_eq!(
@@ -3981,9 +3981,9 @@ mod tests {
                 SegmentEntry {
                     pts_start: Some(2000.0),
                     pts_end: Some(2030.0),
-                    ..camera_entry(0, "camera-0000.mp4", 20)
+                    ..camera_entry(0, "camera-0000.mov", 20)
                 },
-                screen_entry(0, "screen-0000.mp4", 10),
+                screen_entry(0, "screen-0000.mov", 10),
             ],
             "bounds keyed on (track, index): the screen twin stays null"
         );
@@ -3999,7 +3999,7 @@ mod tests {
         // has exactly one screen segment on disk and the card must say "1".
         let folder = fresh_temp_dir("summary-single");
         let mut manifest = test_manifest(folder.clone());
-        manifest.record_segment(screen_entry(0, "screen-0000.mp4", 1_000));
+        manifest.record_segment(screen_entry(0, "screen-0000.mov", 1_000));
         assert_eq!(manifest.screen_segment_count(), 1);
         assert_eq!(manifest.total_bytes(), 1_000);
         let _ = std::fs::remove_dir_all(&folder);
@@ -4012,10 +4012,10 @@ mod tests {
         // "{size}" sums the on-disk bytes of every segment, both tracks.
         let folder = fresh_temp_dir("summary-dual");
         let mut manifest = test_manifest(folder.clone());
-        manifest.record_segment(screen_entry(0, "screen-0000.mp4", 10));
-        manifest.record_segment(camera_entry(0, "camera-0000.mp4", 20));
-        manifest.record_segment(screen_entry(1, "screen-0001.mp4", 30));
-        manifest.record_segment(camera_entry(1, "camera-0001.mp4", 40));
+        manifest.record_segment(screen_entry(0, "screen-0000.mov", 10));
+        manifest.record_segment(camera_entry(0, "camera-0000.mov", 20));
+        manifest.record_segment(screen_entry(1, "screen-0001.mov", 30));
+        manifest.record_segment(camera_entry(1, "camera-0001.mov", 40));
         assert_eq!(
             manifest.screen_segment_count(),
             2,
@@ -4035,13 +4035,13 @@ mod tests {
     fn session_bytes_sums_this_sessions_segments_only() {
         let folder = fresh_temp_dir("bytes");
         std::fs::create_dir_all(&folder).expect("session folder");
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("segment 0");
-        std::fs::write(folder.join("screen-0001.mp4"), vec![0u8; 20]).expect("segment 1");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 10]).expect("segment 0");
+        std::fs::write(folder.join("screen-0001.mov"), vec![0u8; 20]).expect("segment 1");
         // Foreign files that must NOT count (same ownership rule as reconcile):
         std::fs::write(folder.join("manifest.json"), b"{}").expect("manifest");
-        std::fs::write(folder.join("camera-0000.mp4"), vec![0u8; 40]).expect("future track prefix");
-        std::fs::write(folder.join("notes.mp4"), vec![0u8; 50]).expect("no numeric run");
-        std::fs::create_dir(folder.join("screen-0009.mp4")).expect("dir masquerading as segment");
+        std::fs::write(folder.join("camera-0000.mov"), vec![0u8; 40]).expect("future track prefix");
+        std::fs::write(folder.join("notes.mov"), vec![0u8; 50]).expect("no numeric run");
+        std::fs::create_dir(folder.join("screen-0009.mov")).expect("dir masquerading as segment");
         assert_eq!(session_bytes_on_disk(&folder), 30);
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -4062,9 +4062,9 @@ mod tests {
         // — the tray figure grows live, never waiting for `segmentClosed`.
         let folder = fresh_temp_dir("bytes-growing");
         std::fs::create_dir_all(&folder).expect("session folder");
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("first flush");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 10]).expect("first flush");
         assert_eq!(session_bytes_on_disk(&folder), 10);
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 25]).expect("more bytes flushed");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 25]).expect("more bytes flushed");
         assert_eq!(session_bytes_on_disk(&folder), 25);
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -4074,7 +4074,7 @@ mod tests {
     #[test]
     fn current_segment_bytes_is_zero_for_no_segments() {
         // Missing folder, then an empty one, then one holding only foreign files
-        // — every case yields 0 (no `screen-####.mp4` to measure).
+        // — every case yields 0 (no `screen-####.mov` to measure).
         let folder = fresh_temp_dir("current-none");
         assert_eq!(
             current_segment_bytes_on_disk(&folder),
@@ -4094,35 +4094,35 @@ mod tests {
     fn current_segment_bytes_reports_a_single_growing_segment() {
         let folder = fresh_temp_dir("current-growing");
         std::fs::create_dir_all(&folder).expect("session folder");
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 123]).expect("segment 0");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 123]).expect("segment 0");
         assert_eq!(current_segment_bytes_on_disk(&folder), 123);
         let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]
     fn current_segment_bytes_reads_the_highest_index_after_rotation() {
-        // Post-rotation: a full `screen-0000.mp4` plus a fresh `screen-0001.mp4`
+        // Post-rotation: a full `screen-0000.mov` plus a fresh `screen-0001.mov`
         // — the meter tracks the highest index (the open segment), not the total.
         let folder = fresh_temp_dir("current-rotated");
         std::fs::create_dir_all(&folder).expect("session folder");
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 500]).expect("closed segment");
-        std::fs::write(folder.join("screen-0001.mp4"), vec![0u8; 40]).expect("open segment");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 500]).expect("closed segment");
+        std::fs::write(folder.join("screen-0001.mov"), vec![0u8; 40]).expect("open segment");
         assert_eq!(current_segment_bytes_on_disk(&folder), 40);
         let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]
     fn current_segment_bytes_ignores_foreign_files() {
-        // Same ownership rule as `session_bytes_on_disk`: only `screen-####.mp4`
-        // is measured; a `camera-####.mp4` (higher trailing run), a `manifest.json`,
-        // a no-run `.mp4`, and a directory masquerading as a segment are ignored.
+        // Same ownership rule as `session_bytes_on_disk`: only `screen-####.mov`
+        // is measured; a `camera-####.mov` (higher trailing run), a `manifest.json`,
+        // a no-run `.mov`, and a directory masquerading as a segment are ignored.
         let folder = fresh_temp_dir("current-foreign");
         std::fs::create_dir_all(&folder).expect("session folder");
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 77]).expect("real segment");
-        std::fs::write(folder.join("camera-0009.mp4"), vec![0u8; 40]).expect("foreign track");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 77]).expect("real segment");
+        std::fs::write(folder.join("camera-0009.mov"), vec![0u8; 40]).expect("foreign track");
         std::fs::write(folder.join("manifest.json"), b"{}").expect("manifest");
-        std::fs::write(folder.join("notes.mp4"), vec![0u8; 50]).expect("no numeric run");
-        std::fs::create_dir(folder.join("screen-0009.mp4")).expect("dir masquerading as segment");
+        std::fs::write(folder.join("notes.mov"), vec![0u8; 50]).expect("no numeric run");
+        std::fs::create_dir(folder.join("screen-0009.mov")).expect("dir masquerading as segment");
         assert_eq!(current_segment_bytes_on_disk(&folder), 77);
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -4132,18 +4132,18 @@ mod tests {
     fn reconcile_skips_an_unreadable_entry_without_aborting() {
         let folder = fresh_temp_dir("unreadable");
         let mut manifest = test_manifest(folder.clone());
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 9]).expect("healthy segment");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 9]).expect("healthy segment");
         // A dangling symlink: `fs::metadata` (which follows links) fails on it,
         // so the entry must be skipped — one bad entry never fails the
         // terminal write.
-        std::os::unix::fs::symlink(folder.join("gone.mp4"), folder.join("screen-0001.mp4"))
+        std::os::unix::fs::symlink(folder.join("gone.mov"), folder.join("screen-0001.mov"))
             .expect("dangling symlink");
         manifest
             .reconcile_from_dir()
             .expect("one unreadable entry must not abort the reconcile");
         assert_eq!(
             manifest.segments,
-            vec![screen_entry(0, "screen-0000.mp4", 9)]
+            vec![screen_entry(0, "screen-0000.mov", 9)]
         );
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -4160,8 +4160,8 @@ mod tests {
         ] {
             let folder = fresh_temp_dir(&format!("terminal-{wire}"));
             let mut manifest = test_manifest(folder.clone());
-            std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 11]).expect("segment 0");
-            std::fs::write(folder.join("screen-0001.mp4"), vec![0u8; 22]).expect("final segment");
+            std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 11]).expect("segment 0");
+            std::fs::write(folder.join("screen-0001.mov"), vec![0u8; 22]).expect("final segment");
             manifest.reconcile_from_dir().expect("terminal reconcile");
             manifest.set_status(ManifestStatus::from_state(state));
             manifest.write().expect("terminal write");
@@ -4171,9 +4171,9 @@ mod tests {
             assert_eq!(value["status"], wire, "terminal {wire} persists its status");
             let segments = value["segments"].as_array().expect("segments array");
             assert_eq!(segments.len(), 2, "terminal {wire} lists every segment");
-            assert_eq!(segments[0]["file"], "screen-0000.mp4");
+            assert_eq!(segments[0]["file"], "screen-0000.mov");
             assert_eq!(segments[0]["bytes"], 11);
-            assert_eq!(segments[1]["file"], "screen-0001.mp4");
+            assert_eq!(segments[1]["file"], "screen-0001.mov");
             assert_eq!(segments[1]["bytes"], 22);
             let _ = std::fs::remove_dir_all(&folder);
         }
@@ -4188,7 +4188,7 @@ mod tests {
     }
 
     /// Build a session folder holding a manifest at `status` plus
-    /// `segment_count` dummy `screen-####.mp4` files (each with a distinct,
+    /// `segment_count` dummy `screen-####.mov` files (each with a distinct,
     /// non-zero byte length so byte-identity is observable), and return the
     /// folder. The manifest's event-fed segment list deliberately misses the
     /// FINAL segment (which emits no `segmentClosed`) and carries a stale byte
@@ -4206,7 +4206,7 @@ mod tests {
             // Distinct, non-zero lengths (10, 20, 30, …) so a stray remux or a
             // stale event-fed size is caught by the byte assertions.
             let bytes = vec![index as u8; ((index + 1) * 10) as usize];
-            std::fs::write(folder.join(format!("screen-{index:04}.mp4")), bytes)
+            std::fs::write(folder.join(format!("screen-{index:04}.mov")), bytes)
                 .expect("dummy segment");
         }
         let manifest = SessionManifest {
@@ -4219,7 +4219,7 @@ mod tests {
             // (no `segmentClosed` for the final one), each with a stale
             // 1-byte size a disk rebuild must repair.
             segments: (0..segment_count.saturating_sub(1))
-                .map(|index| screen_entry(index, &format!("screen-{index:04}.mp4"), 1))
+                .map(|index| screen_entry(index, &format!("screen-{index:04}.mov"), 1))
                 .collect(),
             folder: folder.clone(),
         };
@@ -4231,7 +4231,7 @@ mod tests {
     fn load_round_trips_a_written_manifest_and_rebinds_the_folder() {
         let folder = fresh_temp_dir("load");
         let mut original = test_manifest(folder.clone());
-        original.record_segment(screen_entry(0, "screen-0000.mp4", 42));
+        original.record_segment(screen_entry(0, "screen-0000.mov", 42));
         original.write().expect("write manifest");
 
         let loaded = SessionManifest::load(&folder).expect("load round-trip");
@@ -4286,9 +4286,9 @@ mod tests {
         assert_eq!(
             reloaded.segments,
             vec![
-                screen_entry(0, "screen-0000.mp4", 10),
-                screen_entry(1, "screen-0001.mp4", 20),
-                screen_entry(2, "screen-0002.mp4", 30),
+                screen_entry(0, "screen-0000.mov", 10),
+                screen_entry(1, "screen-0001.mov", 20),
+                screen_entry(2, "screen-0002.mov", 30),
             ]
         );
         let _ = std::fs::remove_dir_all(&base);
@@ -4322,7 +4322,7 @@ mod tests {
         // Capture every segment file's bytes before recovery.
         let before: Vec<(std::path::PathBuf, Vec<u8>)> = (0..3)
             .map(|index| {
-                let path = folder.join(format!("screen-{index:04}.mp4"));
+                let path = folder.join(format!("screen-{index:04}.mov"));
                 let bytes = std::fs::read(&path).expect("read segment before");
                 (path, bytes)
             })
@@ -4450,7 +4450,7 @@ mod tests {
         let base = fresh_temp_dir("recover-newer");
         let folder = base.join("keeper-rec future");
         std::fs::create_dir_all(&folder).expect("folder");
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("segment");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 10]).expect("segment");
         // A `recording` manifest whose schema version is newer than we understand.
         let manifest = SessionManifest {
             version: MANIFEST_VERSION + 1,

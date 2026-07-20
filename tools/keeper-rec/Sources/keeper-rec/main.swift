@@ -135,7 +135,7 @@ private func capabilitiesResult() -> [String: Any] {
             // the whole floor either way, so the flag never leaks the split.
             "microphone": true,
             // Camera capture is live (Story 20.1, FR-70, AD-37): a separate
-            // `camera-####.mp4` per segment from a second in-process
+            // `camera-####.mov` per segment from a second in-process
             // AVAssetWriter, supported on the whole macOS 13+ floor.
             "camera": true,
         ],
@@ -430,7 +430,7 @@ while let line = readLine(strippingNewline: true) {
         // Story 20.1: the optional webcam leg — off unless explicitly enabled
         // (absent `cameraEnabled` means off, preserving the pre-20.1 wire);
         // `cameraDeviceId` nil = the system default camera. The camera is
-        // written as its own separate `camera-####.mp4` file per segment,
+        // written as its own separate `camera-####.mov` file per segment,
         // never a track inside `screen-####` (FR-70, AD-37).
         let cameraEnabled = (params?["cameraEnabled"] as? Bool) ?? false
         let cameraDeviceId = params?["cameraDeviceId"] as? String

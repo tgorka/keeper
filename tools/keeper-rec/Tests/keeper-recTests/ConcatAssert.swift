@@ -7,7 +7,7 @@
 // Why the boundary check reads the MANIFEST, not the files: the capture
 // engine's `startSession(atSourceTime:)` rebases every segment file's own
 // media timeline to 0 with no edit list, so a gapless and a gapped session
-// read back bit-identically from the `.mp4`s. The host-clock boundary truth
+// read back bit-identically from the `.mov`s. The host-clock boundary truth
 // exists only at capture time; Story 17.4's 17.1/17.2 amendment has the
 // sidecar report each segment's original capture-clock `ptsStart`/`ptsEnd` on
 // `segmentClosed` and the manifest persist them. The gate therefore asserts:

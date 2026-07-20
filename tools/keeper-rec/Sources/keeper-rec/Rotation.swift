@@ -72,11 +72,11 @@ struct RotationPolicy: Equatable {
 /// Derive segment N+1's path from segment N's (Story 17.1).
 ///
 /// The trailing decimal run of the filename's stem is incremented with its
-/// zero-padding width preserved (`…/screen-0000.mp4` → `…/screen-0001.mp4`,
-/// `…/screen-9999.mp4` → `…/screen-10000.mp4` — the width grows rather than
+/// zero-padding width preserved (`…/screen-0000.mov` → `…/screen-0001.mov`,
+/// `…/screen-9999.mov` → `…/screen-10000.mov` — the width grows rather than
 /// wrap). A stem with no trailing numeric run (or one too long to represent)
-/// gets `-0001` inserted before the extension (`…/screen.mp4` →
-/// `…/screen-0001.mp4`). POSIX paths only (macOS); pure string logic, the
+/// gets `-0001` inserted before the extension (`…/screen.mov` →
+/// `…/screen-0001.mov`). POSIX paths only (macOS); pure string logic, the
 /// filesystem is never touched.
 func nextSegmentPath(from path: String) -> String {
     // Split directory / filename on the last "/" (directory keeps the slash).

@@ -20,7 +20,7 @@ import Foundation
 /// the signal names one), and the id of the device actually feeding the camera
 /// file (best-effort; `nil` when unknown). Camera loss is **non-fatal by
 /// contract**: the decision only ever yields a sticky warning — the engine
-/// then finalizes the current `camera-####.mp4` early (which simply ends
+/// then finalizes the current `camera-####.mov` early (which simply ends
 /// there; no black-fill, no fallback re-feed — unlike the mic, a talking-head
 /// track from a *different* camera would be a silent lie) while the screen
 /// recording continues. Never an `error` event, never a process exit.

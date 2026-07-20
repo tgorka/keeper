@@ -11,10 +11,10 @@
 // optional, separate AAC microphone track — Story 19.3, never premixed; ~4 s
 // fragments via `movieFragmentInterval`) so a mid-session kill loses at most
 // the last fragment; a clean `finishWriting` finalizes each segment's `moov`
-// into an ordinary playable `.mp4`.
+// into an ordinary playable `.mov`.
 //
 // The optional webcam (Story 20.1, FR-70) is a SECOND, separate file per
-// segment — `camera-####.mp4` from a dedicated AVCaptureSession + video-only
+// segment — `camera-####.mov` from a dedicated AVCaptureSession + video-only
 // AVAssetWriter, host-clock anchored and cut at the screen's rotation
 // boundaries (screen is the rotation master; the camera never runs its own
 // RotationPolicy), never a track inside `screen-####`, never composited.
@@ -143,6 +143,16 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// The repeating silence-fill timer on `mediaQueue` (Story 19.4), armed on
     /// the first loss and cancelled at stop.
     private var silenceTimer: DispatchSourceTimer?
+    /// The last complete SCK video frame, retained for the idle heartbeat
+    /// (Story 20.5 soak fix) — re-appended with a fresh PTS when the screen
+    /// goes static and SCK stops delivering.
+    private var lastVideoFrame: CMSampleBuffer?
+    /// Host uptime of the last video append (real or heartbeat), on `mediaQueue`.
+    private var lastVideoAppendUptime: Double = 0
+    /// PTS of the last video append (real or heartbeat), on `mediaQueue`.
+    private var lastVideoPTS = CMTime.invalid
+    /// The 1 s idle-heartbeat timer on `mediaQueue` (Story 20.5 soak fix).
+    private var heartbeatTimer: DispatchSourceTimer?
     /// The mic track's written tail — the next acceptable mic PTS (Story
     /// 19.4). Real samples and silence-fill both advance it; `appendMicSample`
     /// trims any sample landing below it (a late buffer from a dying device, a
@@ -164,7 +174,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     // MARK: - Webcam state (Story 20.1, FR-70, AD-37)
 
     /// Whether the camera source is enabled (Story 20.1) — the session then
-    /// writes a SECOND, separate `camera-####.mp4` file per segment from a
+    /// writes a SECOND, separate `camera-####.mov` file per segment from a
     /// dedicated video-only writer, host-clock anchored and cut at the
     /// screen's rotation boundaries. Never a track inside `screen-####`.
     private var wantsCamera = false
@@ -181,7 +191,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// at its first host-clock sample PTS (`startSession(atSourceTime:)`).
     private var cameraSessionStarted = false
     /// Set on `mediaQueue` when the camera is lost (Story 20.1) — terminal
-    /// for the session's camera leg: the current `camera-####.mp4` finalizes
+    /// for the session's camera leg: the current `camera-####.mov` finalizes
     /// early and no later segment carries a camera file (no black-fill, no
     /// fallback re-feed — the intent contract).
     private var cameraLost = false
@@ -217,7 +227,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// removal at stop is cheap and final, the mic precedent).
     private var cameraSessionRuntimeObserver: NSObjectProtocol?
     /// The session folder (with trailing slash) derived from the host-supplied
-    /// screen path — `camera-####.mp4` basenames ride beside it.
+    /// screen path — `camera-####.mov` basenames ride beside it.
     private var sessionDirectory = ""
 
     /// Set on `mediaQueue` when the writer session has been anchored at the
@@ -263,7 +273,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// display (`applicationPid == nil && displayId == nil`). `micEnabled`
     /// (Story 19.3) adds the microphone as its own, unmixed AAC track
     /// (`micDeviceId` nil = the system default input). `cameraEnabled`
-    /// (Story 20.1) adds the webcam as its own separate `camera-####.mp4`
+    /// (Story 20.1) adds the webcam as its own separate `camera-####.mov`
     /// file per segment (`cameraDeviceId` nil = the system default camera;
     /// a vanished picked id falls back to the default, never an abort).
     /// Rotating segments per `segmentMB` / `maxSegmentSeconds`. `fps`
@@ -381,7 +391,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// parallel audio-only `AVCaptureSession` on 13–14 — same writer either way,
     /// invisible to the user and to the capability flag. `cameraEnabled`
     /// (Story 20.1, FR-70) stands up the SEPARATE camera leg: a dedicated
-    /// `AVCaptureSession` + video-only writer producing `camera-####.mp4`
+    /// `AVCaptureSession` + video-only writer producing `camera-####.mov`
     /// beside each screen segment — never a track inside `screen-####`, never
     /// composited (no PiP/self-view).
     private func beginCapture(
@@ -472,7 +482,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         }
 
         // Story 20.1 (FR-70): the separate camera leg — a dedicated
-        // AVCaptureSession + video-only writer producing `camera-0000.mp4`
+        // AVCaptureSession + video-only writer producing `camera-0000.mov`
         // beside the host-supplied screen basename. Seeded here so segment 0's
         // camera writer exists before the first sample can arrive.
         wantsCamera = cameraEnabled
@@ -494,7 +504,27 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             // Capture is live (FR-68); the extra `path` names the output file
             // (the host's tolerant parser keeps or drops it freely).
             emitEvent(["event": "state", "state": "recording", "path": path])
+            // Arm the idle heartbeat (Story 20.5 soak fix): a 1 s tick on the
+            // media queue that re-appends the last frame whenever the screen
+            // goes static and SCK stops delivering.
+            self.mediaQueue.async { self.armHeartbeat() }
         }
+    }
+
+    /// The heartbeat cadence: one frame period at the 30 fps floor. Dense in
+    /// wall-clock time on purpose — see `heartbeatTick`.
+    private static let heartbeatInterval = 1.0 / 30.0
+
+    /// Arm the frame-rate idle-heartbeat timer on `mediaQueue` (Story 20.5).
+    private func armHeartbeat() {
+        guard heartbeatTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: mediaQueue)
+        timer.schedule(
+            deadline: .now() + Self.heartbeatInterval, repeating: Self.heartbeatInterval,
+            leeway: .milliseconds(5))
+        timer.setEventHandler { [weak self] in self?.heartbeatTick() }
+        timer.resume()
+        heartbeatTimer = timer
     }
 
     /// Build one segment's writer stack (fragmented MP4, H.264 + optional AAC)
@@ -507,10 +537,10 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         // Fragmented MP4 (~4 s fragments, AD-37): size is observable live and a
         // mid-segment kill loses at most the last fragment. `finishWriting`
-        // writes the final `moov`, defragmenting into an ordinary playable mp4.
+        // writes the final `moov`, defragmenting into an ordinary playable file.
         writer.movieFragmentInterval = CMTime(seconds: 4, preferredTimescale: 600)
 
         let videoInput = AVAssetWriterInput(
@@ -865,11 +895,11 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
 
     // MARK: - Webcam as a separate synchronized file (Story 20.1, FR-70)
 
-    /// The `camera-####.mp4` path for segment `index`, beside the
+    /// The `camera-####.mov` path for segment `index`, beside the
     /// host-supplied screen basename in the same session folder. Same-index
     /// pairing with `screen-####` is the alignment contract (NFR-22).
     private func cameraSegmentPath(index: Int) -> String {
-        sessionDirectory + String(format: "camera-%04d.mp4", index)
+        sessionDirectory + String(format: "camera-%04d.mov", index)
     }
 
     /// Stand up the camera leg (Story 20.1): resolve the device (a picked
@@ -895,7 +925,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             device.activeFormat.formatDescription)
         cameraPixelWidth = max(2, Int(dimensions.width))
         cameraPixelHeight = max(2, Int(dimensions.height))
-        // `camera-####.mp4` rides beside the host-supplied screen basename.
+        // `camera-####.mov` rides beside the host-supplied screen basename.
         if let slash = screenPath.lastIndex(of: "/") {
             sessionDirectory = String(screenPath[...slash])
         } else {
@@ -949,7 +979,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         let url = URL(fileURLWithPath: path)
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         // Same ~4 s fragment cadence as the screen writer (AD-37): a
         // mid-session kill loses at most the last fragment of either file.
         writer.movieFragmentInterval = CMTime(seconds: 4, preferredTimescale: 600)
@@ -1152,7 +1182,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// device disconnect, a camera-session runtime error, or
     /// `simulateCameraRemoval` (identical path for all three). NEVER emits
     /// `error` and never exits: camera loss is non-fatal — the screen (and
-    /// audio) keep rolling, the current `camera-####.mp4` finalizes early
+    /// audio) keep rolling, the current `camera-####.mov` finalizes early
     /// (no black-fill), and the host renders the sticky `cameraLost` warning.
     private func handleCameraLost(removedDeviceId: String?) {
         guard !stopping, !cameraLost else { return }
@@ -1192,7 +1222,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// {track:"camera"}` reports the host-clock bounds it accumulated. A
     /// writer without a REAL appended frame — un-anchored OR anchored at the
     /// boundary but frameless — is cancelled and its file dropped: a
-    /// zero-frame `camera-####.mp4` would be unplayable noise in the ledger.
+    /// zero-frame `camera-####.mov` would be unplayable noise in the ledger.
     private func finalizeCameraEarly() {
         if let session = cameraSession {
             cameraSession = nil
@@ -1312,6 +1342,14 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         // same-index screen/camera segments share this one boundary.
         rotateCameraAtScreenBoundary(keyframePTS: keyframePTS, nextIndex: retiring.index + 1)
 
+        // Close the retiring writer's media timeline EXPLICITLY at the cut
+        // (Story 20.5 soak fix). Without `endSession` a rotation after an idle
+        // tail — SCK delivers no frames while the screen is static, so the
+        // retiring writer's last sample can be tens of seconds older than the
+        // cut — fails `finishWriting` with -11800/-16341 (the fragmented
+        // writer cannot infer a session end across the sample gap). The stop
+        // path never hit this because `stopCapture` quiesces delivery first.
+        retiring.writer.endSession(atSourceTime: keyframePTS)
         retiring.videoInput.markAsFinished()
         retiring.audioInput?.markAsFinished()
         retiring.micInput?.markAsFinished()
@@ -1319,6 +1357,17 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         retiring.writer.finishWriting { [self] in
             mediaQueue.async { [self] in
                 guard retiring.writer.status == .completed else {
+                    // TEMP-DIAG (20.5 soak debugging): persist the FULL failure
+                    // context beside the segment — the UI banner truncates it.
+                    let diag = """
+                        status=\(retiring.writer.status.rawValue)
+                        error=\(retiring.writer.error.map(String.init(describing:)) ?? "nil")
+                        segment=\(retiring.path)
+                        """
+                    try? diag.write(
+                        toFile: (retiring.path as NSString).deletingLastPathComponent
+                            + "/finalize-error.txt",
+                        atomically: true, encoding: .utf8)
                     emitEvent([
                         "event": "error",
                         "message":
@@ -1355,7 +1404,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     }
 
     /// Stop cleanly: emit `stopping`, stop the stream, finish the current
-    /// writer (which finalizes its `moov` — an ordinary playable `.mp4`), wait
+    /// writer (which finalizes its `moov` — an ordinary playable `.mov`), wait
     /// for any in-flight retired-writer finalize, emit `finalized`, and exit.
     /// Safe to call once; later samples are dropped via `stopping`.
     func stop() {
@@ -1411,6 +1460,9 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             // Story 19.4: the silence-fill has nothing more to pad.
             self.silenceTimer?.cancel()
             self.silenceTimer = nil
+            // Story 20.5: the idle heartbeat has nothing more to keep warm.
+            self.heartbeatTimer?.cancel()
+            self.heartbeatTimer = nil
         }
         stream.stopCapture { _ in
             // A stop error is irrelevant here — finalize whatever was written.
@@ -1429,7 +1481,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             self.current?.writer.cancelWriting()
             // Story 20.1: the screen never anchored, so the camera never
             // appended either — cancel its empty writer and drop the file so
-            // a no-frames stop leaves no orphan `camera-0000.mp4` behind.
+            // a no-frames stop leaves no orphan `camera-0000.mov` behind.
             if let camera = currentCamera {
                 currentCamera = nil
                 camera.writer.cancelWriting()
@@ -1484,6 +1536,96 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         }
     }
 
+    /// The shared video ingest path (real SCK frames AND heartbeat re-appends):
+    /// the rotation decision at every frame, the append, and the per-segment
+    /// PTS-bound bookkeeping. Runs on `mediaQueue`.
+    ///
+    /// SCStream delivers raw (unencoded) frames, so every complete frame is a
+    /// valid keyframe cut point: the next writer's H.264 encoder opens its
+    /// stream with an IDR keyframe, making the new segment self-decodable from
+    /// sample one — hence `isKeyframe: true` in the policy check.
+    private func ingestVideoFrame(
+        _ sampleBuffer: CMSampleBuffer, pts: CMTime, into current: SegmentWriter
+    ) {
+        // Monotonic guard (Story 20.5): heartbeat PTSes are advanced by wall
+        // deltas while real SCK frames carry capture-clock stamps — a real
+        // frame delivered one frame-lag late can land marginally BEHIND the
+        // last heartbeat. A non-increasing PTS poisons the muxer; drop the
+        // sample instead (the heartbeat already carried the timeline forward,
+        // and `lastVideoFrame` was refreshed above so the next heartbeat shows
+        // the new content).
+        if lastVideoPTS.isValid, CMTimeCompare(pts, lastVideoPTS) <= 0 {
+            return
+        }
+        if !rotationInFlight {
+            let elapsed = CMTimeSubtract(pts, segmentStartPTS).seconds
+            if policy.shouldRotate(
+                observedBytes: onDiskBytes(atPath: current.path),
+                elapsedSeconds: elapsed.isFinite ? elapsed : 0,
+                isKeyframe: true,
+                isFirstFrameOfSegment: !segmentHasVideo)
+            {
+                rotate(at: pts, keyframe: sampleBuffer, retiring: current)
+                return
+            }
+        }
+        if current.videoInput.isReadyForMoreMediaData {
+            current.videoInput.append(sampleBuffer)
+            segmentHasVideo = true
+            lastVideoAppendUptime = ProcessInfo.processInfo.systemUptime
+            lastVideoPTS = pts
+            // Track the segment's appended-video PTS bounds in original
+            // capture-clock seconds (Story 17.4, NFR-22) — the muxer is
+            // about to rebase the file timeline, so this is the only
+            // moment the host-clock bounds can be observed. Only a numeric
+            // PTS is recorded: a non-numeric CMTime's `.seconds` is NaN,
+            // and a NaN in the `segmentClosed` payload would make
+            // JSONSerialization throw and silently drop the whole event
+            // line (index and all), not just the bound.
+            if pts.isNumeric {
+                let seconds = pts.seconds
+                if segmentFirstVideoPTS == nil { segmentFirstVideoPTS = seconds }
+                segmentLastVideoPTS = seconds
+            }
+        }
+    }
+
+    /// One idle-heartbeat tick (Story 20.5 soak fix), on `mediaQueue`: when no
+    /// video frame arrived within a frame period (static screen — SCK delivers
+    /// nothing), re-append the last complete frame with a fresh host-clock PTS.
+    ///
+    /// The heartbeat MUST keep the writer wall-clock-DENSE, not merely alive:
+    /// on macOS 26 the fragmented (`movieFragmentInterval`) writer is
+    /// permanently poisoned by wall-clock-slow sample delivery — a later
+    /// `finishWriting` fails -11800/-16341 even after healthy traffic resumes.
+    /// Empirically bisected (Story 20.5): sparse-PTS-delivered-fast is fine,
+    /// paced 1–5 fps delivery is fatal, dense ~30 fps is healthy; without
+    /// fragments the failure vanishes. Full-rate re-appends also keep
+    /// fragments flushing through idle (a mid-idle kill loses at most one
+    /// fragment, AD-37) and give every duration-cap rotation a fresh sample
+    /// to cut against. Runs the SAME ingest path as a real frame, so the
+    /// rotation policy fires on heartbeats too.
+    private func heartbeatTick() {
+        guard !stopping, sessionStarted, let current, let frame = lastVideoFrame else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let sinceLast = now - lastVideoAppendUptime
+        guard sinceLast >= Self.heartbeatInterval else { return }
+        // Advance the PTS by the true wall gap on the same clock basis the
+        // stream's own PTSes use (host uptime), staying monotonic.
+        let pts = CMTimeAdd(
+            lastVideoPTS, CMTime(seconds: sinceLast, preferredTimescale: 1_000_000_000))
+        var timing = CMSampleTimingInfo(
+            duration: .invalid, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+        var retimed: CMSampleBuffer?
+        guard
+            CMSampleBufferCreateCopyWithNewTiming(
+                allocator: kCFAllocatorDefault, sampleBuffer: frame, sampleTimingEntryCount: 1,
+                sampleTimingArray: &timing, sampleBufferOut: &retimed) == noErr,
+            let retimed
+        else { return }
+        ingestVideoFrame(retimed, pts: pts, into: current)
+    }
+
     // MARK: - SCStreamOutput (on mediaQueue)
 
     func stream(
@@ -1512,40 +1654,13 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 // rebased on every rotation, so the camera reads this field).
                 sessionAnchorPTS = pts
             }
-            // Rotation decision at every complete frame. SCStream delivers raw
-            // (unencoded) frames, so every complete frame is a valid keyframe
-            // cut point: the next writer's H.264 encoder opens its stream with
-            // an IDR keyframe, making the new segment self-decodable from
-            // sample one — hence `isKeyframe: true` here.
-            if !rotationInFlight {
-                let elapsed = CMTimeSubtract(pts, segmentStartPTS).seconds
-                if policy.shouldRotate(
-                    observedBytes: onDiskBytes(atPath: current.path),
-                    elapsedSeconds: elapsed.isFinite ? elapsed : 0,
-                    isKeyframe: true,
-                    isFirstFrameOfSegment: !segmentHasVideo)
-                {
-                    rotate(at: pts, keyframe: sampleBuffer, retiring: current)
-                    return
-                }
-            }
-            if current.videoInput.isReadyForMoreMediaData {
-                current.videoInput.append(sampleBuffer)
-                segmentHasVideo = true
-                // Track the segment's appended-video PTS bounds in original
-                // capture-clock seconds (Story 17.4, NFR-22) — the muxer is
-                // about to rebase the file timeline, so this is the only
-                // moment the host-clock bounds can be observed. Only a numeric
-                // PTS is recorded: a non-numeric CMTime's `.seconds` is NaN,
-                // and a NaN in the `segmentClosed` payload would make
-                // JSONSerialization throw and silently drop the whole event
-                // line (index and all), not just the bound.
-                if pts.isNumeric {
-                    let seconds = pts.seconds
-                    if segmentFirstVideoPTS == nil { segmentFirstVideoPTS = seconds }
-                    segmentLastVideoPTS = seconds
-                }
-            }
+            // Remember the frame for the idle heartbeat (Story 20.5 soak fix):
+            // a static screen makes SCK stop delivering, and a starved writer
+            // neither flushes fragments (crash-safety hole — a kill would lose
+            // the whole idle stretch, not one fragment) nor survives a rotation
+            // finalize (-11800/-16341). The heartbeat re-appends this frame.
+            lastVideoFrame = sampleBuffer
+            ingestVideoFrame(sampleBuffer, pts: pts, into: current)
         case .audio:
             // Audio before the session anchor is dropped (the anchor is video).
             guard sessionStarted, let audioInput = current.audioInput,

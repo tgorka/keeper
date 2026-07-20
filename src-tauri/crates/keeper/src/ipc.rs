@@ -4009,7 +4009,7 @@ fn resolve_capture_target(
 /// `manifest.json`, spawn the driver task (fresh `keeper-rec` child; NDJSON
 /// events fold through the platform-free session machine into the polled status
 /// snapshot AND the segment ledger), and return the initial snapshot. The
-/// sidecar writes `screen-0000.mp4` (then `screen-0001.mp4`, … on rotation)
+/// sidecar writes `screen-0000.mov` (then `screen-0001.mov`, … on rotation)
 /// inside the folder. A still-live prior session is an honest error — never two
 /// capture children. Pre-spawn folder/manifest failures funnel through
 /// [`to_ipc_error`] (no session task exists yet); a mid-session manifest-write
@@ -4177,7 +4177,7 @@ pub async fn recording_start(
             // this session captures a microphone track.
             microphone: mic_on,
             // Story 20.1: the camera leg is live — whether this session
-            // writes the separate `camera-####.mp4` files.
+            // writes the separate `camera-####.mov` files.
             camera: camera_on,
         },
     )
@@ -4194,10 +4194,10 @@ pub async fn recording_start(
         .map_err(to_ipc_error)?;
     let fps = keeper_core::registry::get_recording_fps(&data_dir).map_err(to_ipc_error)?;
     let params = SessionParams {
-        // Seeding `screen-0000.mp4` lets 17.1's `nextSegmentPath` produce
-        // `screen-0001.mp4`, … inside the folder with no Swift change.
+        // Seeding `screen-0000.mov` lets 17.1's `nextSegmentPath` produce
+        // `screen-0001.mov`, … inside the folder with no Swift change.
         output_path: folder
-            .join("screen-0000.mp4")
+            .join("screen-0000.mov")
             .to_string_lossy()
             .into_owned(),
         // Story 19.1: an application target wins; otherwise the selected display
@@ -5855,7 +5855,7 @@ mod tests {
     }
 
     /// Write a session folder under `base` with a manifest of the given `status`
-    /// and one 100-byte `screen-0000.mp4` reconciled into the ledger.
+    /// and one 100-byte `screen-0000.mov` reconciled into the ledger.
     fn write_session(base: &Path, name: &str, status: ManifestStatus) -> PathBuf {
         let folder = base.join(name);
         let mut manifest = SessionManifest::create(
@@ -5868,7 +5868,7 @@ mod tests {
             },
         )
         .expect("create session folder + manifest");
-        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 100]).expect("segment");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 100]).expect("segment");
         manifest.reconcile_from_dir().expect("reconcile");
         manifest.set_status(status);
         manifest.write().expect("write manifest");

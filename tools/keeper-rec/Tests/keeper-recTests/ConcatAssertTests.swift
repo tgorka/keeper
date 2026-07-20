@@ -79,7 +79,7 @@ final class ConcatAssertTests: XCTestCase {
     func testDiscoveryFollowsManifestIndexOrderNotFilesystemOrder() async throws {
         let dir = try TempSessionDir(label: "order")
         // index 0 → "seg-c", 1 → "seg-b", 2 → "seg-a"; manifest array [2,0,1].
-        let names = ["seg-c.mp4", "seg-b.mp4", "seg-a.mp4"]
+        let names = ["seg-c.mov", "seg-b.mov", "seg-a.mov"]
         try await makeFixtureSession(
             in: dir.url, fileName: { names[$0] }, manifestOrder: [2, 0, 1])
         let segments = try sessionSegments(inFolder: dir.url)
@@ -103,7 +103,7 @@ final class ConcatAssertTests: XCTestCase {
         }
     }
 
-    /// Row: empty / unreadable segment — a zero-byte `screen-0001.mp4` yields
+    /// Row: empty / unreadable segment — a zero-byte `screen-0001.mov` yields
     /// no readable video, which must throw a clear error naming the segment.
     func testEmptySegmentFailsClearly() async throws {
         let dir = try TempSessionDir(label: "empty")

@@ -108,25 +108,25 @@ final class RotationTests: XCTestCase {
     /// increments, padding width preserved.
     func testNumericRunIncrementsWithZeroPadding() {
         XCTAssertEqual(
-            nextSegmentPath(from: "/rec/keeper/screen-0000.mp4"),
-            "/rec/keeper/screen-0001.mp4")
+            nextSegmentPath(from: "/rec/keeper/screen-0000.mov"),
+            "/rec/keeper/screen-0001.mov")
         XCTAssertEqual(
-            nextSegmentPath(from: "/rec/keeper/screen-0041.mp4"),
-            "/rec/keeper/screen-0042.mp4")
+            nextSegmentPath(from: "/rec/keeper/screen-0041.mov"),
+            "/rec/keeper/screen-0042.mov")
         XCTAssertEqual(
-            nextSegmentPath(from: "/rec/keeper/screen-0009.mp4"),
-            "/rec/keeper/screen-0010.mp4")
+            nextSegmentPath(from: "/rec/keeper/screen-0009.mov"),
+            "/rec/keeper/screen-0010.mov")
     }
 
     /// The padding width grows past its last representable value rather than
     /// wrapping back to zero.
     func testNumericRunWidthGrowsWhenExhausted() {
-        XCTAssertEqual(nextSegmentPath(from: "/rec/screen-9999.mp4"), "/rec/screen-10000.mp4")
+        XCTAssertEqual(nextSegmentPath(from: "/rec/screen-9999.mov"), "/rec/screen-10000.mov")
     }
 
     /// Row: no numeric run → `-0001` inserted before the extension.
     func testNoNumericRunInsertsSuffixBeforeExtension() {
-        XCTAssertEqual(nextSegmentPath(from: "/rec/screen.mp4"), "/rec/screen-0001.mp4")
+        XCTAssertEqual(nextSegmentPath(from: "/rec/screen.mov"), "/rec/screen-0001.mov")
     }
 
     /// A filename without an extension still derives (suffix appended / run
@@ -138,22 +138,22 @@ final class RotationTests: XCTestCase {
 
     /// A bare filename (no directory component) keeps working.
     func testBareFilenameWithoutDirectory() {
-        XCTAssertEqual(nextSegmentPath(from: "screen-0000.mp4"), "screen-0001.mp4")
+        XCTAssertEqual(nextSegmentPath(from: "screen-0000.mov"), "screen-0001.mov")
     }
 
     /// Only the TRAILING numeric run increments — earlier digit groups (e.g. a
     /// local-time-stamped filename) are untouched.
     func testTimestampedStemIncrementsTrailingRunOnly() {
         XCTAssertEqual(
-            nextSegmentPath(from: "/rec/2026-07-17 10-30-00.mp4"),
-            "/rec/2026-07-17 10-30-01.mp4")
+            nextSegmentPath(from: "/rec/2026-07-17 10-30-00.mov"),
+            "/rec/2026-07-17 10-30-01.mov")
     }
 
     /// A trailing run too long to represent as a UInt64 falls back to the
     /// suffix-insert path instead of crashing or wrapping.
     func testOverlongNumericRunFallsBackToSuffix() {
         XCTAssertEqual(
-            nextSegmentPath(from: "/rec/screen-99999999999999999999.mp4"),
-            "/rec/screen-99999999999999999999-0001.mp4")
+            nextSegmentPath(from: "/rec/screen-99999999999999999999.mov"),
+            "/rec/screen-99999999999999999999-0001.mov")
     }
 }

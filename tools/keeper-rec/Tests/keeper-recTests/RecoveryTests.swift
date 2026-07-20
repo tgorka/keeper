@@ -20,7 +20,7 @@
 // — asserted to actually drop bytes (`cut < fileSize`), so the "fewer frames
 // than the clean control" assertion can never false-green on a no-op cut.
 //
-// On-disk shape of an abandoned fragmented .mp4 (observed, load-bearing for
+// On-disk shape of an abandoned fragmented .mov (observed, load-bearing for
 // the cut): `ftyp`, then the FIRST ~4 s fragment as `mdat`+`moov`, then each
 // subsequent complete fragment as `mdat`+`moof`, then a growing tail `mdat`
 // holding samples no `moof` indexes yet — the un-flushed tail a crash drops.
@@ -65,7 +65,7 @@ private func topLevelBoxes(in data: Data) -> [TopLevelBox] {
     return boxes
 }
 
-/// Write a fragmented `.mp4` the way Capture.swift's real writers do (H.264,
+/// Write a fragmented `.mov` the way Capture.swift's real writers do (H.264,
 /// 64×64, ~4 s `movieFragmentInterval`, host-clock `startSession` anchor) and
 /// ABANDON it: no `markAsFinished`, no `finishWriting` — the on-disk bytes
 /// are whatever fragments the writer flushed before the "crash", exactly the
@@ -85,7 +85,7 @@ private func abandonedFragmentedSegmentBytes(
 ) async throws -> Data {
     let width = 64
     let height = 64
-    let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+    let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
     writer.movieFragmentInterval = CMTime(seconds: 4, preferredTimescale: 600)
 
     let input = AVAssetWriterInput(
@@ -218,13 +218,13 @@ final class RecoveryTests: XCTestCase {
 
         // The crash-shape snapshot: abandoned (never finalized), settled and
         // proven stable before the copy.
-        let crashURL = dir.url.appendingPathComponent("screen-crash.mp4")
+        let crashURL = dir.url.appendingPathComponent("screen-crash.mov")
         let snapshot = try await abandonedFragmentedSegmentBytes(
             at: crashURL, frames: frames, frameRate: frameRate)
 
         // The clean positive control: the SAME content, cleanly finalized —
         // the frame-count ceiling the truncated file must stay under.
-        let controlURL = dir.url.appendingPathComponent("screen-control.mp4")
+        let controlURL = dir.url.appendingPathComponent("screen-control.mov")
         try await writeFixtureSegment(
             at: controlURL, firstPTS: 1000.0, frames: frames, frameRate: frameRate)
         let controlPTS = try await SegmentTimeline.videoPTS(of: controlURL, segmentIndex: 0)
@@ -251,7 +251,7 @@ final class RecoveryTests: XCTestCase {
             "the truncation must drop real bytes — a no-op cut voids the test")
         XCTAssertGreaterThan(cut, 0, "the cut must leave the leading fragments intact")
 
-        let truncatedURL = dir.url.appendingPathComponent("screen-truncated.mp4")
+        let truncatedURL = dir.url.appendingPathComponent("screen-truncated.mov")
         try snapshot.prefix(cut).write(to: truncatedURL)
 
         // The truncated crash file still opens and decodes: strictly-monotonic
