@@ -524,7 +524,9 @@ pub enum DestinationRejection {
 
 /// Format a byte count as a short decimal-GB figure for user-facing rejection
 /// messages ("1.5 GB"). One decimal place; secret-free (a number, never a path).
-fn format_gb(bytes: u64) -> String {
+/// `pub(crate)` since Story 18.5: the live disk-guard's warn copy names the
+/// probed free space with the same formatting the pre-start rejection uses.
+pub(crate) fn format_gb(bytes: u64) -> String {
     let gb = bytes as f64 / 1_000_000_000.0;
     format!("{gb:.1} GB")
 }

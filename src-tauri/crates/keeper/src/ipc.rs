@@ -26,10 +26,11 @@ use keeper_core::error::{
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::recording::{
-    current_segment_bytes_on_disk, evaluate_destination, resolve_screen_recording_access,
-    session_bytes_on_disk, session_folder_name, ApplicationTarget, CaptureTarget, ManifestStatus,
-    MicSelection, Recorder, RecordingEvent, RecordingSession, SegmentEntry, SessionDevices,
-    SessionManifest, SessionParams, SessionState, RECORDING_MIN_FREE_BYTES,
+    current_segment_bytes_on_disk, evaluate_destination, plan_disk_guard_action,
+    resolve_screen_recording_access, session_bytes_on_disk, session_folder_name, ApplicationTarget,
+    CaptureTarget, DiskGuardAction, DiskGuardLatch, ManifestStatus, MicSelection, Recorder,
+    RecordingEvent, RecordingSession, SegmentEntry, SessionDevices, SessionManifest, SessionParams,
+    SessionState, RECORDING_MIN_FREE_BYTES, RECORDING_WARN_FREE_BYTES,
 };
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
@@ -142,6 +143,12 @@ pub struct RecordingRun {
     /// Session-captured so a mid-session settings edit (which applies to the next
     /// session) never skews a running meter.
     segment_cap_mb: u32,
+    /// The resolved destination folder this session records into (Story 18.5),
+    /// captured from `effective_destination_dir` at `recording_start` — the
+    /// volume the live disk-space guard probes on its ~1 Hz tick. Session-
+    /// captured for the same reason as the cap: a mid-session settings edit
+    /// must never repoint a running guard at a different volume.
+    destination_dir: PathBuf,
 }
 
 /// Lock an optional-slot mutex, recovering a poisoned lock instead of propagating —
@@ -3472,6 +3479,53 @@ fn fail_recording_snapshot(
     }
 }
 
+/// How often the live disk-space guard probes the destination volume while a
+/// recording session is live (Story 18.5): ~1 Hz — the same cadence as the tray
+/// tick, fast enough that a warn/stop lands within about a second of the
+/// threshold crossing, slow enough that the `statvfs` probe is free.
+const DISK_GUARD_POLL: Duration = Duration::from_secs(1);
+
+/// Execute one planned disk-guard action against the shared status snapshot
+/// (Story 18.5): the shell-side executor for [`plan_disk_guard_action`]'s
+/// verdict. `Warn`/`Stop` set the sticky `warning` (last-write-wins, the 19.4
+/// model — the tray ⚠ line and banner amber render it on their next tick/poll)
+/// under the snapshot lock, then post exactly one native notification through
+/// the 18.4 warning entry (bypasses DND / per-Network mute) AFTER the lock is
+/// released — a slow notifier must never stall the snapshot readers. `Stop`
+/// additionally fires `request_stop` — in production the idempotent
+/// [`stop_active_recording`] trigger, so the session runs the normal graceful
+/// finalize path (`Stopping` → `Finalized`, never a `Failed` fault).
+///
+/// Notify-once is owned by the caller's [`DiskGuardLatch`]: each distinct
+/// action arrives here at most once per session, and `None` (healthy band,
+/// latched repeat, or failed probe read as plenty) is a strict no-op. The stop
+/// trigger is a closure so this executor unit-tests without an `AppState`.
+fn apply_disk_guard_action(
+    status: &Mutex<RecordingStatusVm>,
+    platform: &dyn Platform,
+    action: DiskGuardAction,
+    request_stop: impl FnOnce(),
+) {
+    let (message, stop) = match action {
+        DiskGuardAction::None => return,
+        DiskGuardAction::Warn { message } => (message, false),
+        DiskGuardAction::Stop { message } => (message, true),
+    };
+    {
+        let mut snapshot = status_lock(status);
+        snapshot.warning = Some(message.clone());
+    }
+    // Distinct notification copy per leg: the warning entry asserts "the
+    // recording is still running" (true for a warn, a lie for the stop), so the
+    // hard-floor stop uses the dedicated `notify_recording_stopped` entry.
+    if stop {
+        keeper_core::notify::notify_recording_stopped(platform, &message);
+        request_stop();
+    } else {
+        keeper_core::notify::notify_recording_warning(platform, &message);
+    }
+}
+
 /// Acknowledge (dismiss) a settled recording session's outcome (Story 18.4): a
 /// **terminal** slot (`finalized`/`recovered`/`failed`) is cleared back to the
 /// idle snapshot — dropping `error`/`warning`, which releases the held error
@@ -3560,6 +3614,7 @@ fn resolve_capture_target(
 /// single-child start-guard keys off the snapshot).
 #[tauri::command]
 pub async fn recording_start(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     target: Option<RecordingTargetVm>,
     system_audio: Option<bool>,
@@ -3835,6 +3890,62 @@ pub async fn recording_start(
         }
     });
 
+    // Story 18.5: the live disk-space guard. A ~1 Hz task probes the
+    // destination volume's free space (the same `fs4` probe as the pre-start
+    // gate, fail-open on error) while THIS session is live, lets the pure core
+    // policy plan at most one warn and one graceful stop per session, and
+    // executes via `apply_disk_guard_action`. Measurement and execution live
+    // here in the shell; thresholds, latching, and copy live in keeper-core
+    // (AD-33/AD-39).
+    let guard_status = status.clone();
+    let guard_platform = state.platform.clone();
+    let guard_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        use tauri::Manager;
+        let mut latch = DiskGuardLatch::default();
+        loop {
+            tokio::time::sleep(DISK_GUARD_POLL).await;
+            // The guard lives exactly as long as its session: exit once the
+            // run slot was cleared (acknowledge) or replaced by a newer
+            // session (Arc identity — a fresh session runs its OWN guard with
+            // a fresh latch), re-reading the session-captured volume each tick.
+            let directory = {
+                let app_state = guard_app.state::<AppState>();
+                let slot = slot_lock(&app_state.recording_run);
+                match slot.as_ref() {
+                    Some(run) if Arc::ptr_eq(&run.status, &guard_status) => {
+                        run.destination_dir.clone()
+                    }
+                    _ => return,
+                }
+            };
+            // ... or once the session reached a terminal state: a finalized/
+            // failed session must never warn, and the post-stop latch already
+            // guarantees the floor leg cannot re-fire while finalizing.
+            if status_lock(&guard_status).state.is_terminal() {
+                return;
+            }
+            // Fail-open probe (the pre-start idiom): an errored `statvfs`
+            // reads as "plenty" — never a warn or stop on a broken probe.
+            let free_bytes = fs4::available_space(&directory).unwrap_or_else(|e| {
+                tracing::debug!("recording disk guard: free-space probe failed (fail-open): {e}");
+                u64::MAX
+            });
+            let action = plan_disk_guard_action(
+                free_bytes,
+                RECORDING_WARN_FREE_BYTES,
+                RECORDING_MIN_FREE_BYTES,
+                &mut latch,
+            );
+            apply_disk_guard_action(&guard_status, guard_platform.as_ref(), action, || {
+                // The identical idempotent trigger the tray Stop / ⌘Q use —
+                // the session finalizes on the normal graceful path, and a
+                // racing user stop simply finds the one-shot already taken.
+                stop_active_recording(&guard_app.state::<AppState>());
+            });
+        }
+    });
+
     let snapshot = status_lock(&status).clone();
     *guard = Some(RecordingRun {
         stop_tx: Some(stop_tx),
@@ -3843,6 +3954,9 @@ pub async fn recording_start(
         // The meter denominator, captured from this session's settings read
         // (Story 18.3) — never re-read from the mutable store while live.
         segment_cap_mb: segment_mb,
+        // The volume the disk guard probes (Story 18.5) — the resolved
+        // destination the pre-start gate just validated.
+        destination_dir: directory,
     });
     Ok(snapshot)
 }
@@ -5235,6 +5349,7 @@ mod tests {
             status: Arc::new(Mutex::new(snapshot)),
             driver: None,
             segment_cap_mb: 500,
+            destination_dir: PathBuf::from("/tmp/keeper-ipc-test"),
         }))
     }
 
@@ -5278,6 +5393,206 @@ mod tests {
         let slot: Mutex<Option<RecordingRun>> = Mutex::new(None);
         assert!(!acknowledge_recording_slot(&slot));
         assert!(slot_lock(&slot).is_none());
+    }
+
+    // --- Story 18.5: live disk-space guard (executor + pre-start gate) ------
+
+    /// One simulated guard tick at the authored thresholds: plan from the
+    /// injected `free_bytes` (never a real disk fill), then execute against the
+    /// snapshot exactly as the ~1 Hz guard task does — counting stop requests.
+    fn disk_guard_tick(
+        free_bytes: u64,
+        latch: &mut DiskGuardLatch,
+        status: &Mutex<RecordingStatusVm>,
+        platform: &CapturingPlatform,
+        stop_requests: &std::cell::Cell<u32>,
+    ) {
+        let action = plan_disk_guard_action(
+            free_bytes,
+            RECORDING_WARN_FREE_BYTES,
+            RECORDING_MIN_FREE_BYTES,
+            latch,
+        );
+        apply_disk_guard_action(status, platform, action, || {
+            stop_requests.set(stop_requests.get() + 1);
+        });
+    }
+
+    /// A live `Recording` snapshot for the guard-executor tests.
+    fn recording_status() -> Mutex<RecordingStatusVm> {
+        let mut snapshot = RecordingStatusVm::idle();
+        snapshot.state = RecordingUiState::Recording;
+        Mutex::new(snapshot)
+    }
+
+    /// Story 18.5 warn leg: a warn-band tick sets the sticky `warning` (the
+    /// tray ⚠ line and banner amber render it) and posts exactly one
+    /// notification; a second tick still in the warn band re-notifies nothing
+    /// and never requests a stop — recording continues.
+    #[test]
+    fn disk_guard_warn_sets_sticky_warning_and_notifies_once() {
+        let platform = CapturingPlatform::new();
+        let status = recording_status();
+        let stops = std::cell::Cell::new(0u32);
+        let mut latch = DiskGuardLatch::default();
+
+        disk_guard_tick(
+            RECORDING_WARN_FREE_BYTES - 1,
+            &mut latch,
+            &status,
+            &platform,
+            &stops,
+        );
+        {
+            let snapshot = status_lock(&status);
+            assert_eq!(snapshot.state, RecordingUiState::Recording, "still live");
+            let warning = snapshot.warning.as_deref().expect("sticky warning set");
+            assert!(warning.starts_with("Low disk space — "), "{warning}");
+            assert!(warning.ends_with(" free"), "{warning}");
+        }
+        let calls = platform.calls();
+        assert_eq!(calls.len(), 1, "one notification on warn onset");
+        assert_eq!(calls[0].0, "Recording warning");
+        assert!(calls[0].1.contains("Low disk space"), "{}", calls[0].1);
+        assert_eq!(stops.get(), 0, "a warn never stops the recording");
+
+        // Warn-sticky: the same band next tick plans `None` — no re-notify.
+        disk_guard_tick(
+            RECORDING_WARN_FREE_BYTES - 2,
+            &mut latch,
+            &status,
+            &platform,
+            &stops,
+        );
+        assert_eq!(platform.calls().len(), 1, "sticky warn never re-fires");
+        assert_eq!(stops.get(), 0);
+    }
+
+    /// Story 18.5 hard-floor leg: after a warn already fired, the floor
+    /// crossing still notifies (two distinct events), sets the stop reason as
+    /// the sticky warning, and requests the graceful stop exactly once — later
+    /// floor-band ticks re-issue nothing.
+    #[test]
+    fn disk_guard_stop_after_warn_notifies_and_requests_stop_once() {
+        let platform = CapturingPlatform::new();
+        let status = recording_status();
+        let stops = std::cell::Cell::new(0u32);
+        let mut latch = DiskGuardLatch::default();
+
+        disk_guard_tick(
+            RECORDING_WARN_FREE_BYTES - 1,
+            &mut latch,
+            &status,
+            &platform,
+            &stops,
+        );
+        disk_guard_tick(
+            RECORDING_MIN_FREE_BYTES - 1,
+            &mut latch,
+            &status,
+            &platform,
+            &stops,
+        );
+        assert_eq!(
+            status_lock(&status).warning.as_deref(),
+            Some("Recording stopped — low disk"),
+            "the stop reason rides the sticky warning (last-write-wins)"
+        );
+        let calls = platform.calls();
+        assert_eq!(calls.len(), 2, "warn onset + stop: one notification EACH");
+        // The warn leg is the "still running" warning entry...
+        assert_eq!(calls[0].0, "Recording warning");
+        assert!(calls[0].1.contains("the recording is still running"));
+        // ...but the stop leg uses the dedicated stopped entry: correct title,
+        // and NEVER the self-contradicting "still running" suffix (F1).
+        assert_eq!(calls[1].0, "Recording stopped");
+        assert_eq!(calls[1].1, "Recording stopped — low disk");
+        assert!(
+            !calls[1].1.contains("still running"),
+            "a stop notification must never claim the recording is still running"
+        );
+        assert_eq!(stops.get(), 1, "exactly one graceful stop request");
+
+        // Post-stop: the guard never re-issues the stop nor re-notifies.
+        disk_guard_tick(0, &mut latch, &status, &platform, &stops);
+        assert_eq!(platform.calls().len(), 2);
+        assert_eq!(stops.get(), 1, "the stop is never re-issued");
+    }
+
+    /// Story 18.5 sudden drop: plunging from healthy straight below the floor
+    /// in one tick emits the Stop only (the warn is skipped) — one
+    /// notification, one stop request.
+    #[test]
+    fn disk_guard_sudden_drop_stops_without_a_warn() {
+        let platform = CapturingPlatform::new();
+        let status = recording_status();
+        let stops = std::cell::Cell::new(0u32);
+        let mut latch = DiskGuardLatch::default();
+
+        disk_guard_tick(u64::MAX, &mut latch, &status, &platform, &stops);
+        disk_guard_tick(
+            RECORDING_MIN_FREE_BYTES - 1,
+            &mut latch,
+            &status,
+            &platform,
+            &stops,
+        );
+        let calls = platform.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "stop only — the warn is skipped, not queued"
+        );
+        assert_eq!(calls[0].0, "Recording stopped");
+        assert_eq!(calls[0].1, "Recording stopped — low disk");
+        assert!(
+            !calls[0].1.contains("still running"),
+            "a stop notification must never claim the recording is still running"
+        );
+        assert_eq!(stops.get(), 1);
+    }
+
+    /// Story 18.5 fail-open: a failed probe is reported as `u64::MAX` (plenty)
+    /// — the tick is a strict no-op: no warning, no notification, no stop.
+    #[test]
+    fn disk_guard_failed_probe_is_a_noop() {
+        let platform = CapturingPlatform::new();
+        let status = recording_status();
+        let stops = std::cell::Cell::new(0u32);
+        let mut latch = DiskGuardLatch::default();
+
+        disk_guard_tick(u64::MAX, &mut latch, &status, &platform, &stops);
+        assert_eq!(
+            status_lock(&status).warning,
+            None,
+            "no warning on fail-open"
+        );
+        assert!(platform.calls().is_empty(), "no notification on fail-open");
+        assert_eq!(stops.get(), 0, "no stop on fail-open");
+    }
+
+    /// Story 18.5 pre-start gate: the exact decision + error mapping
+    /// `recording_start` runs rejects a Start when the probed free space is
+    /// below the hard floor — with the actionable free-space reason, before
+    /// any capture begins (retriable: free space and press Start again).
+    #[test]
+    fn pre_start_gate_rejects_simulated_low_free_space() {
+        let reason = evaluate_destination(
+            true,
+            true,
+            RECORDING_MIN_FREE_BYTES - 1,
+            RECORDING_MIN_FREE_BYTES,
+        )
+        .expect_err("below the floor must reject the Start");
+        let error = to_ipc_error(CoreError::Recording(RecordingError::DestinationInvalid {
+            reason,
+        }));
+        assert!(
+            error.message.contains("not enough free space"),
+            "names the free-space reason: {}",
+            error.message
+        );
+        assert!(error.retriable, "the user can free space and retry");
     }
 
     /// Story 18.2 (paused clock): a sidecar that finalizes inside the bound

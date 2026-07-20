@@ -492,6 +492,28 @@ pub fn notify_recording_warning(platform: &dyn Platform, message: &str) {
     }
 }
 
+/// Post the Story 18.5 recording-**stopped** native notification for the live
+/// disk guard's graceful hard-floor stop (`free < RECORDING_MIN_FREE_BYTES`).
+///
+/// A distinct entry from [`notify_recording_warning`] on purpose: the warning
+/// copy asserts "the recording is still running", which would flatly contradict
+/// a message announcing that the recording just stopped. This one carries the
+/// stop reason verbatim (the core-owned copy, e.g. "Recording stopped — low
+/// disk") with no such suffix. Same suppression policy as the fault/warning
+/// legs: bypasses DND and per-Network mute by consulting no [`NotifyConfig`],
+/// same [`NotifyTarget::None`] coarse target, same swallowed-failure posture.
+pub fn notify_recording_stopped(platform: &dyn Platform, reason: &str) {
+    let title = "Recording stopped".to_owned();
+    let body = reason.to_owned();
+    if let Err(e) = platform.notify(&title, &body, &NotifyTarget::None) {
+        // Best-effort: a notifier failure never blocks the recording driver.
+        tracing::warn!(
+            error = %e,
+            "notify: could not post recording-stopped notification; swallowing"
+        );
+    }
+}
+
 /// Current wall-clock time in milliseconds since the Unix epoch (UTC), used as the
 /// backlog baseline captured at handler registration. Saturates rather than panicking.
 fn now_ms() -> u64 {
@@ -1429,6 +1451,48 @@ mod tests {
             )]
         );
         assert_eq!(platform.targets(), vec![NotifyTarget::None]);
+    }
+
+    #[test]
+    fn recording_stopped_posts_reason_verbatim_without_still_running() {
+        // Story 18.5 hard-floor stop: a DISTINCT entry from the warning leg —
+        // the reason rides verbatim, and the "the recording is still running"
+        // suffix that would contradict a stop is absent.
+        let platform = CapturingPlatform::new();
+        notify_recording_stopped(&platform, "Recording stopped — low disk");
+        assert_eq!(
+            platform.calls(),
+            vec![(
+                "Recording stopped".to_owned(),
+                "Recording stopped — low disk".to_owned(),
+            )]
+        );
+        assert!(!platform.calls()[0].1.contains("still running"));
+        assert_eq!(platform.targets(), vec![NotifyTarget::None]);
+    }
+
+    #[test]
+    fn recording_stopped_bypasses_dnd_and_network_mute() {
+        // The graceful stop-and-finalize alert is a loss-risk event, not chat
+        // noise: it consults no NotifyConfig, so the harshest suppression state
+        // (DND + every Network muted) never silences it.
+        let platform = CapturingPlatform::new();
+        let mut seed = HashSet::new();
+        seed.insert("Signal".to_owned());
+        let config = NotifyConfig::with_state(true, true, seed);
+        assert!(config.dnd_enabled());
+        assert!(config.is_network_muted("Signal"));
+        notify_recording_stopped(&platform, "Recording stopped — low disk");
+        assert_eq!(platform.calls().len(), 1);
+    }
+
+    #[test]
+    fn recording_stopped_swallows_notifier_failure() {
+        // A notifier failure (or an unset port on a headless build) never panics
+        // or blocks the recording driver.
+        let platform = CapturingPlatform::failing();
+        notify_recording_stopped(&platform, "Recording stopped — low disk");
+        assert!(platform.calls().is_empty());
     }
 
     #[test]

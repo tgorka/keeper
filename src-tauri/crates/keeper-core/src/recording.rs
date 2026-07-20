@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{CoreError, DestinationRejection, RecordingError};
+use crate::error::{format_gb, CoreError, DestinationRejection, RecordingError};
 use crate::vm::{
     RecordingCapabilitiesVm, RecordingSourcesVm, ScreenRecordingAccess, TccPermission,
 };
@@ -422,10 +422,20 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The shared disk-guard hard floor in bytes (Story 19.5; 2 GiB): the minimum
 /// free space the destination volume must have for a Recording Session to
-/// start. Story 18.5's *live* during-recording guard (warn at 10 GB, graceful
-/// stop-and-finalize at this floor) will consume the same constant — 19.5
-/// provides only the pre-Start leg via [`evaluate_destination`].
+/// start. Story 18.5's *live* during-recording guard consumes the same constant
+/// — a probe below this floor while recording triggers the graceful
+/// stop-and-finalize leg of [`plan_disk_guard_action`]; the pre-Start leg stays
+/// [`evaluate_destination`]. An authored default — product-owner sign-off at
+/// phase release (PRD §14.7), changeable in this one edit; never a settings row.
 pub const RECORDING_MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The live disk-guard warn threshold in bytes (Story 18.5; 10 GiB, same binary
+/// idiom as the 2 GiB [`RECORDING_MIN_FREE_BYTES`] floor): free space below this
+/// while recording raises the persistent low-disk warning (tray ⚠ line, banner
+/// amber, one native notification) without interrupting capture. An authored
+/// default — product-owner sign-off at phase release (PRD §14.7), changeable in
+/// this one edit; never a settings row.
+pub const RECORDING_WARN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Decide whether the destination folder can host a Recording Session (Story
 /// 19.5, AD-33) from already-probed facts — pure and platform-free, so the
@@ -457,6 +467,129 @@ pub fn evaluate_destination(
         });
     }
     Ok(())
+}
+
+// --- Live disk-space guard policy (Story 18.5, AD-33/AD-39) --------------------
+//
+// The during-recording twin of `evaluate_destination`: pure, platform-free
+// policy over an already-probed free-space figure. The SHELL measures (the same
+// `fs4::available_space` probe the pre-start gate uses, on a ~1 Hz tick while a
+// session is live) and executes the returned action; core alone owns the
+// thresholds, the warn/floor decision, the one-shot latching, and the
+// user-facing copy — so the whole guard unit-tests by injecting a simulated
+// `free_bytes`, never by filling a real disk.
+
+/// The instantaneous band a probed free-space figure falls into (Story 18.5):
+/// the stateless half of the live disk guard. `free < floor` ⇒ [`Stop`],
+/// `floor ≤ free < warn` ⇒ [`Warn`], else [`Ok`] — boundaries deliberately
+/// mirror [`evaluate_destination`]'s `<` guard (exactly the floor still warns
+/// rather than stops; exactly the warn threshold is still Ok).
+///
+/// [`Stop`]: DiskGuardDecision::Stop
+/// [`Warn`]: DiskGuardDecision::Warn
+/// [`Ok`]: DiskGuardDecision::Ok
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskGuardDecision {
+    /// Free space is comfortably above the warn threshold — no action.
+    Ok,
+    /// Free space is below the warn threshold but at or above the hard floor —
+    /// warn and keep recording.
+    Warn,
+    /// Free space is below the hard floor — gracefully stop-and-finalize.
+    Stop,
+}
+
+/// Classify a probed free-space figure against the guard thresholds (Story
+/// 18.5). Pure and stateless; the once-per-event latching lives one layer up in
+/// [`plan_disk_guard_action`]. A failed probe must be reported by the shell as
+/// `u64::MAX` ("plenty", fail-open) — never as 0, which would read as a full
+/// volume and force a spurious stop.
+pub fn evaluate_disk_guard(
+    free_bytes: u64,
+    warn_bytes: u64,
+    floor_bytes: u64,
+) -> DiskGuardDecision {
+    if free_bytes < floor_bytes {
+        DiskGuardDecision::Stop
+    } else if free_bytes < warn_bytes {
+        DiskGuardDecision::Warn
+    } else {
+        DiskGuardDecision::Ok
+    }
+}
+
+/// The per-session one-shot memory of the live disk guard (Story 18.5): which
+/// of the two distinct events already fired. Fresh (`Default`) at every session
+/// start; owned by the shell's guard task alongside its probe loop.
+///
+/// Deliberately never resets when space recovers: the sticky warning stays (the
+/// 19.4 model — ending/acknowledging the session clears it) and the stop is
+/// never re-issued.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskGuardLatch {
+    /// The warn-onset event already fired (warning raised + one notification).
+    pub warned: bool,
+    /// The hard-floor stop already fired (graceful stop requested + one
+    /// notification). Once set, every later tick plans [`DiskGuardAction::None`].
+    pub stopped: bool,
+}
+
+/// What the shell must execute for one guard tick (Story 18.5): nothing, raise
+/// the persistent low-disk warning once, or gracefully stop-and-finalize once.
+/// Carries the exact user-facing copy so the shell never words anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiskGuardAction {
+    /// Nothing to do this tick (healthy band, repeat of an already-latched
+    /// event, or post-stop).
+    None,
+    /// Raise the sticky low-disk warning (tray ⚠ line + banner amber) and post
+    /// one native notification. Recording continues.
+    Warn {
+        /// The user-facing warning copy, naming the probed free space.
+        message: String,
+    },
+    /// Request the graceful stop (the same idempotent trigger as the user's
+    /// Stop — `Stopping` → `Finalized`, never a `Failed` fault), set the sticky
+    /// reason, and post one native notification.
+    Stop {
+        /// The user-facing stop-reason copy.
+        message: String,
+    },
+}
+
+/// Plan the shell's action for one guard tick from a probed (or simulated)
+/// free-space figure (Story 18.5): the latched layer over
+/// [`evaluate_disk_guard`]. Each distinct event is returned **at most once per
+/// session** — the warn onset once, the hard-floor stop once *even if a warn
+/// already fired* (two distinct events; a user who ignored the warn must still
+/// be pinged by the stop) — and a session that plunges straight past both
+/// thresholds in one tick plans only the Stop. After the stop fired, every
+/// tick plans [`DiskGuardAction::None`], whatever the band: the stop is never
+/// re-issued and a recovered volume never resurrects the guard mid-session.
+pub fn plan_disk_guard_action(
+    free_bytes: u64,
+    warn_bytes: u64,
+    floor_bytes: u64,
+    latch: &mut DiskGuardLatch,
+) -> DiskGuardAction {
+    if latch.stopped {
+        return DiskGuardAction::None;
+    }
+    match evaluate_disk_guard(free_bytes, warn_bytes, floor_bytes) {
+        DiskGuardDecision::Stop => {
+            latch.stopped = true;
+            DiskGuardAction::Stop {
+                message: "Recording stopped — low disk".to_owned(),
+            }
+        }
+        DiskGuardDecision::Warn if !latch.warned => {
+            latch.warned = true;
+            DiskGuardAction::Warn {
+                message: format!("Low disk space — {} free", format_gb(free_bytes)),
+            }
+        }
+        DiskGuardDecision::Warn | DiskGuardDecision::Ok => DiskGuardAction::None,
+    }
 }
 
 /// Build the one-line `getCapabilities` request (no trailing newline — the shell
@@ -2307,6 +2440,139 @@ mod tests {
             RECORDING_MIN_FREE_BYTES
         )
         .is_ok());
+    }
+
+    // --- Story 18.5: live disk-guard policy (simulated free-space signal) ---
+
+    /// Shorthand: plan one guard tick at the authored thresholds.
+    fn plan(free_bytes: u64, latch: &mut DiskGuardLatch) -> DiskGuardAction {
+        plan_disk_guard_action(
+            free_bytes,
+            RECORDING_WARN_FREE_BYTES,
+            RECORDING_MIN_FREE_BYTES,
+            latch,
+        )
+    }
+
+    #[test]
+    fn evaluate_disk_guard_classifies_the_bands_and_exact_boundaries() {
+        // The whole guard is exercised by injecting simulated `free_bytes` —
+        // never by filling a real disk.
+        let warn = RECORDING_WARN_FREE_BYTES;
+        let floor = RECORDING_MIN_FREE_BYTES;
+        // Healthy band: at or above the warn threshold.
+        assert_eq!(
+            evaluate_disk_guard(u64::MAX, warn, floor),
+            DiskGuardDecision::Ok
+        );
+        assert_eq!(
+            evaluate_disk_guard(warn + 1, warn, floor),
+            DiskGuardDecision::Ok
+        );
+        // Exactly the warn threshold is still Ok — the guard is `<`, not `<=`
+        // (mirrors `evaluate_destination`'s floor boundary).
+        assert_eq!(
+            evaluate_disk_guard(warn, warn, floor),
+            DiskGuardDecision::Ok
+        );
+        // Warn band: below warn, at or above the floor.
+        assert_eq!(
+            evaluate_disk_guard(warn - 1, warn, floor),
+            DiskGuardDecision::Warn
+        );
+        // Exactly the floor still warns rather than stops.
+        assert_eq!(
+            evaluate_disk_guard(floor, warn, floor),
+            DiskGuardDecision::Warn
+        );
+        // Stop band: below the floor.
+        assert_eq!(
+            evaluate_disk_guard(floor - 1, warn, floor),
+            DiskGuardDecision::Stop
+        );
+        assert_eq!(evaluate_disk_guard(0, warn, floor), DiskGuardDecision::Stop);
+    }
+
+    #[test]
+    fn plan_disk_guard_warn_fires_once_with_the_free_space_copy() {
+        let mut latch = DiskGuardLatch::default();
+        // 9 GiB free: inside the warn band. The copy names the probed figure
+        // in decimal GB (the pre-start rejection's formatting).
+        let free = 9 * 1024 * 1024 * 1024;
+        assert_eq!(
+            plan(free, &mut latch),
+            DiskGuardAction::Warn {
+                message: "Low disk space — 9.7 GB free".to_owned(),
+            }
+        );
+        assert!(latch.warned);
+        assert!(!latch.stopped);
+        // Warn-sticky: later ticks still in the warn band plan nothing more —
+        // the sticky warning persists on the snapshot; no repeat notification.
+        assert_eq!(plan(free, &mut latch), DiskGuardAction::None);
+        assert_eq!(plan(free - 1024, &mut latch), DiskGuardAction::None);
+    }
+
+    #[test]
+    fn plan_disk_guard_warn_then_stop_yields_each_event_exactly_once() {
+        let mut latch = DiskGuardLatch::default();
+        assert!(matches!(
+            plan(RECORDING_WARN_FREE_BYTES - 1, &mut latch),
+            DiskGuardAction::Warn { .. }
+        ));
+        // The hard-floor stop is a DISTINCT event: it still fires even though
+        // a warn already did — a user who ignored the warn is still pinged.
+        assert_eq!(
+            plan(RECORDING_MIN_FREE_BYTES - 1, &mut latch),
+            DiskGuardAction::Stop {
+                message: "Recording stopped — low disk".to_owned(),
+            }
+        );
+        assert!(latch.stopped);
+        // Post-stop: always None, never a re-issued stop.
+        assert_eq!(
+            plan(RECORDING_MIN_FREE_BYTES - 1, &mut latch),
+            DiskGuardAction::None
+        );
+    }
+
+    #[test]
+    fn plan_disk_guard_sudden_drop_plans_the_stop_only() {
+        // A plunge straight past both thresholds in one tick emits only the
+        // Stop — the warn is skipped, not queued.
+        let mut latch = DiskGuardLatch::default();
+        assert!(matches!(
+            plan(RECORDING_MIN_FREE_BYTES - 1, &mut latch),
+            DiskGuardAction::Stop { .. }
+        ));
+        assert!(!latch.warned, "the skipped warn is never latched");
+        assert_eq!(plan(0, &mut latch), DiskGuardAction::None);
+    }
+
+    #[test]
+    fn plan_disk_guard_post_stop_is_always_none_whatever_the_band() {
+        // Once stopped, even a recovered volume (back in the warn or healthy
+        // band) never resurrects the guard mid-session.
+        let mut latch = DiskGuardLatch {
+            warned: false,
+            stopped: true,
+        };
+        assert_eq!(plan(0, &mut latch), DiskGuardAction::None);
+        assert_eq!(
+            plan(RECORDING_WARN_FREE_BYTES - 1, &mut latch),
+            DiskGuardAction::None
+        );
+        assert_eq!(plan(u64::MAX, &mut latch), DiskGuardAction::None);
+        assert!(!latch.warned, "post-stop ticks never latch a late warn");
+    }
+
+    #[test]
+    fn plan_disk_guard_failed_probe_reads_as_plenty() {
+        // Fail-open: the shell reports a probe error as `u64::MAX`, which the
+        // policy classifies as healthy — never a warn or stop on a failed stat.
+        let mut latch = DiskGuardLatch::default();
+        assert_eq!(plan(u64::MAX, &mut latch), DiskGuardAction::None);
+        assert_eq!(latch, DiskGuardLatch::default());
     }
 
     #[test]
