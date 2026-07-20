@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-20-1-optional-webcam-as-a-separate-synchronized-file.md
+  s_5d7f50022249a7::t_ad8fa47269d3aa 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "e7145ee4493ee758a2966deb59fb1c7b5f286845",
+  "prompts": {},
+  "sessions": {
+    "s_5d7f50022249a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ecb5bf94-009a-4f03-9bb7-63668880a0a0",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
