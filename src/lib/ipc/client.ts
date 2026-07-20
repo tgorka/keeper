@@ -1765,6 +1765,19 @@ export async function recordingStatus(): Promise<RecordingStatusVm> {
 }
 
 /**
+ * Acknowledge (dismiss) a settled recording session's outcome (Story 18.4): a
+ * terminal session (finalized / recovered / failed) is cleared back to idle --
+ * dropping `error`/`warning`, which releases the held tray error rendering and
+ * hides the banner error variant -- while a LIVE session is a strict no-op
+ * (acknowledge never silently stops a recording). Resolves the fresh snapshot
+ * either way (the idle default after a clear; the untouched live snapshot on
+ * the no-op).
+ */
+export async function recordingAcknowledge(): Promise<RecordingStatusVm> {
+  return await invoke<RecordingStatusVm>("recording_acknowledge");
+}
+
+/**
  * Read the effective segmentation settings (Story 17.5, FR-72) — the segment
  * size (MB) and duration-cap fallback (minutes) persisted in the Rust `settings`
  * k/v table. The Rust getters default (500 MB / 30 min) and clamp defensively,

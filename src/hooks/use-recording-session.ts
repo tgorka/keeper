@@ -18,7 +18,12 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RecordingStatusVm, RecordingTargetVm } from "@/lib/ipc/client";
-import { recordingStart, recordingStatus, recordingStop } from "@/lib/ipc/client";
+import {
+  recordingAcknowledge,
+  recordingStart,
+  recordingStatus,
+  recordingStop,
+} from "@/lib/ipc/client";
 
 /** The states with a session worth polling (anything non-terminal, non-idle). */
 const LIVE_STATES: ReadonlyArray<RecordingStatusVm["state"]> = [
@@ -77,6 +82,11 @@ export interface UseRecordingSession {
   ) => Promise<void>;
   /** Request the graceful stop-and-finalize (idempotent). */
   stop: () => Promise<void>;
+  /** Acknowledge (dismiss) a terminal session's outcome via
+   * `recording_acknowledge` (Story 18.4): Rust clears a terminal slot back to
+   * idle (error/warning dropped — the tray hold releases too) and the returned
+   * snapshot is adopted; a live session is a Rust-side no-op. */
+  acknowledge: () => Promise<void>;
 }
 
 export function useRecordingSession(): UseRecordingSession {
@@ -175,5 +185,19 @@ export function useRecordingSession(): UseRecordingSession {
     await recordingStop().catch(() => {});
   }, []);
 
-  return { status, elapsed, start, stop };
+  // Dismiss a terminal outcome (Story 18.4): Rust owns the clear (terminal →
+  // idle; live → no-op) and the returned authoritative snapshot is adopted. A
+  // failed IPC round-trip keeps the current snapshot — never an invented reset.
+  const acknowledge = useCallback(async () => {
+    try {
+      const vm = await recordingAcknowledge();
+      if (mounted.current) {
+        setStatus(vm);
+      }
+    } catch {
+      // Best-effort: keep the honest failed snapshot; the user can retry.
+    }
+  }, []);
+
+  return { status, elapsed, start, stop, acknowledge };
 }

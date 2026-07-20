@@ -377,6 +377,11 @@ pub fn parse_event(line: &str) -> Option<RecordingEvent> {
             let message = obj
                 .get("message")
                 .and_then(serde_json::Value::as_str)
+                // A present-but-blank message is as useless as an absent one:
+                // filter it so the loud-failure triad (tray/notification/banner,
+                // Story 18.4) always names a reason, never "Recording failed — ".
+                // Mirrors the `warning` arm's blank-filter above.
+                .filter(|message| !message.trim().is_empty())
                 .unwrap_or("keeper-rec reported an unspecified error")
                 .to_owned();
             Some(RecordingEvent::Failed { message })
@@ -1893,16 +1898,23 @@ mod tests {
 
     #[test]
     fn parse_error_without_message_still_fails_never_swallows() {
-        // A failure report with a missing/mistyped `message` must NOT be dropped — it
-        // surfaces a `Failed` with a fallback so the session still reaches its terminal.
+        // A failure report with a missing/mistyped/blank `message` must NOT be dropped —
+        // it surfaces a `Failed` with a NON-BLANK fallback so the session still reaches
+        // its terminal AND the Story 18.4 loud-failure triad (tray/notification/banner)
+        // always names a reason, never a reasonless "Recording failed — ".
         for line in [
             r#"{"event":"error"}"#,
             r#"{"event":"error","message":42}"#,
             r#"{"event":"error","message":{"nested":true}}"#,
+            r#"{"event":"error","message":""}"#,
+            r#"{"event":"error","message":"   "}"#,
         ] {
+            let Some(RecordingEvent::Failed { message }) = parse_event(line) else {
+                panic!("error line {line:?} must surface a Failed, never None");
+            };
             assert!(
-                matches!(parse_event(line), Some(RecordingEvent::Failed { .. })),
-                "error line {line:?} must surface a Failed, never None"
+                !message.trim().is_empty(),
+                "error line {line:?} must carry a non-blank reason for the triad"
             );
         }
     }

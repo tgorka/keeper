@@ -368,6 +368,7 @@ pub fn run() {
             ipc::recording_start,
             ipc::recording_stop,
             ipc::recording_status,
+            ipc::recording_acknowledge,
             ipc::recording_settings_get,
             ipc::recording_settings_set
         ]);

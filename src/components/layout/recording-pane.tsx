@@ -73,7 +73,7 @@ const SETUP_CARDS: readonly string[] = [
 
 export function RecordingPane() {
   const { permission, request, openSettings } = useRecordingPermission();
-  const { status, elapsed, start, stop } = useRecordingSession();
+  const { status, elapsed, start, stop, acknowledge } = useRecordingSession();
   const live = isLiveRecording(status);
 
   return (
@@ -120,23 +120,36 @@ export function RecordingPane() {
               {FINALIZED_NOTE_PREFIX} <span className="font-mono">{status.outputPath}</span>
             </p>
           )}
-          {status.state === "failed" && (
-            <p className="text-held text-xs" role="alert">
-              Recording failed: {status.error ?? "unknown error"}
-            </p>
-          )}
+          {/* The failed note lives in the banner's error variant now (Story
+              18.4) — a single failure surface, mirroring 18.3's header→banner
+              consolidation. */}
         </div>
       </header>
 
       {/* The in-app active-recording banner + segment meter (Story 18.3):
           pinned between the header and the scrolling body, persistent while
-          live, and a pure renderer of the enriched Rust snapshot. It renders
-          `null` on any terminal/idle state. */}
+          live, and a pure renderer of the enriched Rust snapshot. Story 18.4:
+          on `failed` + `error` it renders the filled recording-red error
+          variant with Restart (re-invokes Start with the current capture
+          selections) and Dismiss (→ `recording_acknowledge`); it renders `null`
+          on any other terminal/idle state. */}
       <ActiveRecordingBanner
         status={status}
         elapsed={elapsed}
         onStop={() => {
           void stop();
+        }}
+        onRestart={() => {
+          // Story 18.4 Restart: re-invoke Start with the CURRENT capture
+          // selections, read from the same module-level stores the Start button
+          // uses. Reading the stores (not a per-mount hook ref) keeps Restart
+          // honest across a view remount — closing/reopening the Recording view
+          // resets the hook's local state but never the stores, so Restart can
+          // never silently revert a chosen app/mic/display to the defaults.
+          void start(selectedRecordingTarget(), systemAudioEnabled(), micEnabled(), micDeviceId());
+        }}
+        onDismiss={() => {
+          void acknowledge();
         }}
       />
 

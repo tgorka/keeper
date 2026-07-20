@@ -3372,6 +3372,127 @@ fn status_lock(status: &Mutex<RecordingStatusVm>) -> std::sync::MutexGuard<'_, R
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Fold one sidecar [`RecordingEvent`] through the platform-free machine into the
+/// shared status snapshot, and fire the Story 18.4 loud-failure/warning native
+/// notification **exactly on onset** — the driver sink's testable core (the
+/// closure in [`recording_start`] adds only the manifest/ledger side effects).
+///
+/// Returns whether the machine accepted the event (`apply` succeeded); a rejected
+/// event (e.g. a second `Failed` against an already-terminal machine) changes
+/// nothing and notifies nothing — that terminal-state rejection IS the sink-side
+/// half of the notify-once dedup.
+///
+/// Onset detection happens under the snapshot lock (compare-then-set): the
+/// notification fires only when `error` / `warning` transitions `None → Some`.
+/// A sticky warning that repeats (last-write-wins message update, Story 19.4)
+/// updates the text but never re-fires. The `platform.notify` call itself runs
+/// AFTER the lock is released — a slow/blocking notifier must never stall the
+/// snapshot readers (tray tick, status poll, quit finalize).
+fn fold_recording_event(
+    machine: &mut RecordingSession,
+    status: &Mutex<RecordingStatusVm>,
+    platform: &dyn Platform,
+    event: RecordingEvent,
+) -> bool {
+    let failure = match &event {
+        RecordingEvent::Failed { message } => Some(message.clone()),
+        _ => None,
+    };
+    // Story 19.4: a non-fatal warning (e.g. mic hot-unplug) is sticky on the
+    // shared snapshot — last-write-wins message, never cleared back to `None`
+    // mid-session, and NOT gated on `state == failed` (the session stays live;
+    // the tray + banner render the warning beside the normal recording state).
+    let warning = match &event {
+        RecordingEvent::Warning { message, .. } => Some(message.clone()),
+        _ => None,
+    };
+    let started = matches!(event, RecordingEvent::CaptureStarted);
+    if machine.apply(event).is_err() {
+        return false;
+    }
+    let (fault_onset, warning_onset) = {
+        let mut snapshot = status_lock(status);
+        snapshot.state = recording_ui_state(machine.state());
+        snapshot.segments_closed = machine.segments_closed();
+        if started && snapshot.started_at_epoch_ms.is_none() {
+            snapshot.started_at_epoch_ms = Some(epoch_ms_now());
+        }
+        let fault_onset = failure.and_then(|message| {
+            let onset = snapshot.error.is_none();
+            snapshot.error = Some(message.clone());
+            onset.then_some(message)
+        });
+        let warning_onset = warning.and_then(|message| {
+            let onset = snapshot.warning.is_none();
+            snapshot.warning = Some(message.clone());
+            onset.then_some(message)
+        });
+        (fault_onset, warning_onset)
+    };
+    // The triad's native-notification leg (Story 18.4), outside the lock:
+    // exactly once per fault onset, exactly once per warning onset. Bypasses
+    // DND / per-Network mute inside the entry itself (see keeper-core::notify).
+    if let Some(reason) = fault_onset {
+        keeper_core::notify::notify_recording_fault(platform, &reason);
+    }
+    if let Some(message) = warning_onset {
+        keeper_core::notify::notify_recording_warning(platform, &message);
+    }
+    true
+}
+
+/// Surface a `run_session` **task failure** (spawn fault, non-zero exit,
+/// unsupported) that did not already arrive as a terminal sidecar event: flip the
+/// snapshot to an honest `Failed` + `error` and fire the Story 18.4 fault
+/// notification on onset — the [`recording_start`] driver's fallback leg.
+///
+/// Guarded on not-already-terminal: a session the sink already settled
+/// (`Finalized`/`Recovered`/`Failed`) is left untouched, so a fault that surfaced
+/// through the event path never double-notifies here (the sink set `error` under
+/// this same mutex; the guard + the `None → Some` onset rule make the pair fire
+/// exactly once between them). The notify call runs after the lock is released.
+fn fail_recording_snapshot(
+    status: &Mutex<RecordingStatusVm>,
+    platform: &dyn Platform,
+    message: String,
+) {
+    let fault_onset = {
+        let mut snapshot = status_lock(status);
+        if snapshot.state.is_live() || snapshot.state == RecordingUiState::Idle {
+            snapshot.state = RecordingUiState::Failed;
+            let onset = snapshot.error.is_none();
+            snapshot.error = Some(message.clone());
+            onset.then_some(message)
+        } else {
+            None
+        }
+    };
+    if let Some(reason) = fault_onset {
+        keeper_core::notify::notify_recording_fault(platform, &reason);
+    }
+}
+
+/// Acknowledge (dismiss) a settled recording session's outcome (Story 18.4): a
+/// **terminal** slot (`finalized`/`recovered`/`failed`) is cleared back to the
+/// idle snapshot — dropping `error`/`warning`, which releases the held error
+/// tray/banner surfaces on the next tick/poll — while a **live** slot is left
+/// strictly untouched (acknowledge must never be a silent stop). Returns whether
+/// the slot was cleared. Shared by the [`recording_acknowledge`] command and the
+/// tray's **Dismiss Error** item.
+pub(crate) fn acknowledge_recording_slot(slot: &Mutex<Option<RecordingRun>>) -> bool {
+    let mut guard = slot_lock(slot);
+    let terminal = guard
+        .as_ref()
+        .is_some_and(|run| status_lock(&run.status).state.is_terminal());
+    if terminal {
+        // Dropping the run drops the spent stop trigger and (detached) driver
+        // handle of a session that already reached its terminal state — the
+        // next `recording_snapshot` read is the honest idle default.
+        *guard = None;
+    }
+    terminal
+}
+
 /// The current Unix epoch in milliseconds (0 on a pre-1970 clock — never a panic).
 /// `pub(crate)` since Story 18.1: the tray's status line derives elapsed from the
 /// same clock the driver task stamps `started_at_epoch_ms` with.
@@ -3601,6 +3722,10 @@ pub async fn recording_start(
 
     let recorder = state.recorder.clone();
     let task_status = status.clone();
+    // The platform port rides into the driver task for the Story 18.4 triad's
+    // native-notification leg: the sink and the run-failure fallback both
+    // dispatch through it on an `error`/`warning` onset.
+    let task_platform = state.platform.clone();
     // The handle is stored into the run slot below (Story 18.2): aborting it is
     // the quit kill-timeout's force-kill lever (see `RecordingRun::driver`).
     let driver = tauri::async_runtime::spawn(async move {
@@ -3613,21 +3738,8 @@ pub async fn recording_start(
         // every event across an hours-long recording. Non-fatal either way.
         let mut manifest_write_warned = false;
         let sink_status = task_status.clone();
+        let sink_platform = task_platform.clone();
         let sink = Box::new(move |event: RecordingEvent| {
-            let failure = match &event {
-                RecordingEvent::Failed { message } => Some(message.clone()),
-                _ => None,
-            };
-            // Story 19.4: a non-fatal warning (e.g. mic hot-unplug) is sticky
-            // on the shared snapshot — last-write-wins message, never cleared
-            // back to `None` mid-session, and NOT gated on `state == failed`
-            // (the session stays live; the tray + banner render the warning
-            // beside the normal recording state).
-            let warning = match &event {
-                RecordingEvent::Warning { message, .. } => Some(message.clone()),
-                _ => None,
-            };
-            let started = matches!(event, RecordingEvent::CaptureStarted);
             // Capture the ledger entry before `apply` consumes the event: the
             // basename comes from the sidecar-reported path (synthesized from
             // the index when absent); `bytes`/`track` degrade to 0/"screen".
@@ -3660,21 +3772,9 @@ pub async fn recording_start(
                 }),
                 _ => None,
             };
-            if machine.apply(event).is_ok() {
-                {
-                    let mut snapshot = status_lock(&sink_status);
-                    snapshot.state = recording_ui_state(machine.state());
-                    snapshot.segments_closed = machine.segments_closed();
-                    if started && snapshot.started_at_epoch_ms.is_none() {
-                        snapshot.started_at_epoch_ms = Some(epoch_ms_now());
-                    }
-                    if let Some(message) = failure {
-                        snapshot.error = Some(message);
-                    }
-                    if let Some(message) = warning {
-                        snapshot.warning = Some(message);
-                    }
-                }
+            // Machine + snapshot fold, plus the Story 18.4 onset-deduped fault/
+            // warning notification (see `fold_recording_event`).
+            if fold_recording_event(&mut machine, &sink_status, sink_platform.as_ref(), event) {
                 // Segment ledger + manifest (Story 17.2). Best-effort by
                 // design: a mid-session write/reconcile failure is LOGGED ONLY
                 // — it must never change `machine` state or force the snapshot
@@ -3727,18 +3827,11 @@ pub async fn recording_start(
             .await;
 
         // A run failure (spawn fault, non-zero exit, unsupported) that did not
-        // already surface as a terminal event becomes an honest failed snapshot.
+        // already surface as a terminal event becomes an honest failed snapshot —
+        // with the Story 18.4 fault notification fired on onset (deduped against
+        // the sink path inside `fail_recording_snapshot`).
         if let Err(error) = outcome {
-            let mut snapshot = status_lock(&task_status);
-            if !matches!(
-                snapshot.state,
-                RecordingUiState::Finalized
-                    | RecordingUiState::Recovered
-                    | RecordingUiState::Failed
-            ) {
-                snapshot.state = RecordingUiState::Failed;
-                snapshot.error = Some(error.to_string());
-            }
+            fail_recording_snapshot(&task_status, task_platform.as_ref(), error.to_string());
         }
     });
 
@@ -3913,6 +4006,27 @@ pub fn recording_stop(state: State<'_, AppState>) -> Result<(), IpcError> {
 #[tauri::command]
 pub fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatusVm, IpcError> {
     Ok(recording_snapshot(&state))
+}
+
+/// Acknowledge (dismiss) a settled recording session's outcome (Story 18.4): a
+/// terminal session (`finalized`/`recovered`/`failed`) is cleared back to idle —
+/// dropping `error`/`warning` so the held tray error rendering restores/drops on
+/// the next ~1 Hz tick and the banner error variant hides — while a **live**
+/// session is a strict no-op (never a silent stop). Returns the fresh snapshot
+/// either way (the idle default after a clear; the untouched live snapshot on
+/// the no-op). Shared with the tray's **Dismiss Error** item via
+/// [`acknowledge_recording`].
+#[tauri::command]
+pub fn recording_acknowledge(state: State<'_, AppState>) -> Result<RecordingStatusVm, IpcError> {
+    Ok(acknowledge_recording(&state))
+}
+
+/// The [`recording_acknowledge`] core, shared with the tray (Story 18.4): clear
+/// a terminal slot ([`acknowledge_recording_slot`]) and return the resulting
+/// authoritative snapshot.
+pub(crate) fn acknowledge_recording(state: &AppState) -> RecordingStatusVm {
+    acknowledge_recording_slot(&state.recording_run);
+    recording_snapshot(state)
 }
 
 /// Resolve the EFFECTIVE recording destination folder (Story 19.5): the
@@ -4822,6 +4936,348 @@ mod tests {
         let mut snapshot = RecordingStatusVm::idle();
         snapshot.state = RecordingUiState::Stopping;
         Arc::new(Mutex::new(snapshot))
+    }
+
+    // --- Story 18.4: loud-failure triad (fold / fallback / acknowledge) -----
+
+    /// A capturing [`Platform`] double recording every `(title, body)` posted
+    /// through `notify`, so the triad's notification leg is assertable without
+    /// an OS notifier (mirrors `keeper-core::notify`'s test double).
+    struct CapturingPlatform {
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl CapturingPlatform {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().expect("lock calls").clone()
+        }
+    }
+
+    impl Platform for CapturingPlatform {
+        fn data_dir(&self) -> Result<PathBuf, CoreError> {
+            Ok(PathBuf::from("/tmp/keeper-ipc-test"))
+        }
+        fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn keychain_get(&self, _key: &str) -> Result<Option<String>, CoreError> {
+            Ok(None)
+        }
+        fn keychain_delete(&self, _key: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn open_url(&self, _url: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn notify(&self, title: &str, body: &str, _target: &NotifyTarget) -> Result<(), CoreError> {
+            self.calls
+                .lock()
+                .expect("lock calls")
+                .push((title.to_owned(), body.to_owned()));
+            Ok(())
+        }
+        fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
+            Err(CoreError::Unsupported("sidecar unused in tests".to_owned()))
+        }
+        fn exclude_from_backup(&self, _path: &Path) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    /// A fresh live-fold harness: machine + shared snapshot, driven to the
+    /// `Recording` state through the real `fold_recording_event` path.
+    fn live_fold_harness(
+        platform: &CapturingPlatform,
+    ) -> (RecordingSession, Mutex<RecordingStatusVm>) {
+        let mut machine = RecordingSession::new();
+        let status = Mutex::new({
+            let mut snapshot = RecordingStatusVm::idle();
+            snapshot.state = RecordingUiState::Preflight;
+            snapshot
+        });
+        assert!(fold_recording_event(
+            &mut machine,
+            &status,
+            platform,
+            RecordingEvent::PreflightStarted,
+        ));
+        assert!(fold_recording_event(
+            &mut machine,
+            &status,
+            platform,
+            RecordingEvent::CaptureStarted,
+        ));
+        assert!(platform.calls().is_empty(), "no notification while healthy");
+        (machine, status)
+    }
+
+    /// Story 18.4 induced-fault legs (recorder-kill / writer-stall /
+    /// device-loss): each synthetic sidecar `error` event drives the machine to
+    /// terminal `Failed`, sets the honest `error` on the snapshot, and fires the
+    /// fault notification exactly once — the automatable half of the triad (the
+    /// tray/banner legs render this same snapshot; see tray/banner tests).
+    #[test]
+    fn induced_fault_legs_fail_the_snapshot_and_notify_once() {
+        for reason in [
+            "keeper-rec exited unexpectedly",       // recorder-kill
+            "writer stalled — no samples appended", // writer-stall
+            "capture device lost",                  // device-loss
+        ] {
+            let platform = CapturingPlatform::new();
+            let (mut machine, status) = live_fold_harness(&platform);
+            assert!(fold_recording_event(
+                &mut machine,
+                &status,
+                &platform,
+                RecordingEvent::Failed {
+                    message: reason.to_owned(),
+                },
+            ));
+            let snapshot = status_lock(&status).clone();
+            assert_eq!(snapshot.state, RecordingUiState::Failed, "{reason}");
+            assert_eq!(snapshot.error.as_deref(), Some(reason), "{reason}");
+            let calls = platform.calls();
+            assert_eq!(calls.len(), 1, "exactly one notification for {reason}");
+            assert_eq!(calls[0].0, "Recording failed");
+            assert!(calls[0].1.contains(reason), "body names the reason");
+        }
+    }
+
+    /// A second `Failed` event against the already-terminal machine is rejected
+    /// by `apply` — the snapshot keeps the first honest message and NO second
+    /// notification fires (the sink half of the notify-once dedup).
+    #[test]
+    fn second_failed_event_neither_overwrites_nor_renotifies() {
+        let platform = CapturingPlatform::new();
+        let (mut machine, status) = live_fold_harness(&platform);
+        assert!(fold_recording_event(
+            &mut machine,
+            &status,
+            &platform,
+            RecordingEvent::Failed {
+                message: "keeper-rec exited unexpectedly".to_owned(),
+            },
+        ));
+        assert!(!fold_recording_event(
+            &mut machine,
+            &status,
+            &platform,
+            RecordingEvent::Failed {
+                message: "a different, later message".to_owned(),
+            },
+        ));
+        let snapshot = status_lock(&status).clone();
+        assert_eq!(snapshot.state, RecordingUiState::Failed);
+        assert_eq!(
+            snapshot.error.as_deref(),
+            Some("keeper-rec exited unexpectedly")
+        );
+        assert_eq!(platform.calls().len(), 1, "no double notification");
+    }
+
+    /// Warning onset (Story 19.4 leg closed by 18.4): the FIRST sticky warning
+    /// notifies once; a repeat while `warning` is already `Some` updates the
+    /// last-write-wins message but never re-fires.
+    #[test]
+    fn warning_onset_notifies_once_and_sticky_repeat_never_refires() {
+        let platform = CapturingPlatform::new();
+        let (mut machine, status) = live_fold_harness(&platform);
+        assert!(fold_recording_event(
+            &mut machine,
+            &status,
+            &platform,
+            RecordingEvent::Warning {
+                code: "micLost".to_owned(),
+                message: "microphone disconnected — using system default input".to_owned(),
+            },
+        ));
+        {
+            let snapshot = status_lock(&status);
+            assert_eq!(snapshot.state, RecordingUiState::Recording, "still live");
+            assert_eq!(
+                snapshot.warning.as_deref(),
+                Some("microphone disconnected — using system default input")
+            );
+        }
+        let calls = platform.calls();
+        assert_eq!(calls.len(), 1, "one notification on warning onset");
+        assert_eq!(calls[0].0, "Recording warning");
+
+        // A later warning updates the sticky message (last-write-wins) but the
+        // slot is already `Some` — no second notification.
+        assert!(fold_recording_event(
+            &mut machine,
+            &status,
+            &platform,
+            RecordingEvent::Warning {
+                code: "micLost".to_owned(),
+                message: "microphone disconnected — no microphone input".to_owned(),
+            },
+        ));
+        assert_eq!(
+            status_lock(&status).warning.as_deref(),
+            Some("microphone disconnected — no microphone input")
+        );
+        assert_eq!(platform.calls().len(), 1, "sticky repeat never re-fires");
+    }
+
+    /// A warning then a fault fire one notification EACH (independent onsets) —
+    /// and the sticky warning survives on the failed snapshot.
+    #[test]
+    fn warning_then_fault_notify_independently() {
+        let platform = CapturingPlatform::new();
+        let (mut machine, status) = live_fold_harness(&platform);
+        assert!(fold_recording_event(
+            &mut machine,
+            &status,
+            &platform,
+            RecordingEvent::Warning {
+                code: "micLost".to_owned(),
+                message: "microphone disconnected".to_owned(),
+            },
+        ));
+        assert!(fold_recording_event(
+            &mut machine,
+            &status,
+            &platform,
+            RecordingEvent::Failed {
+                message: "capture device lost".to_owned(),
+            },
+        ));
+        let snapshot = status_lock(&status).clone();
+        assert_eq!(snapshot.state, RecordingUiState::Failed);
+        assert_eq!(snapshot.error.as_deref(), Some("capture device lost"));
+        assert_eq!(snapshot.warning.as_deref(), Some("microphone disconnected"));
+        let calls = platform.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "Recording warning");
+        assert_eq!(calls[1].0, "Recording failed");
+    }
+
+    /// The run_session-Err fallback (`fail_recording_snapshot`): a live snapshot
+    /// flips to `Failed` + `error` with exactly one notification.
+    #[test]
+    fn run_error_fallback_fails_live_snapshot_and_notifies_once() {
+        let platform = CapturingPlatform::new();
+        let status = {
+            let mut snapshot = RecordingStatusVm::idle();
+            snapshot.state = RecordingUiState::Recording;
+            Mutex::new(snapshot)
+        };
+        fail_recording_snapshot(&status, &platform, "keeper-rec could not spawn".to_owned());
+        let snapshot = status_lock(&status).clone();
+        assert_eq!(snapshot.state, RecordingUiState::Failed);
+        assert_eq!(
+            snapshot.error.as_deref(),
+            Some("keeper-rec could not spawn")
+        );
+        assert_eq!(platform.calls().len(), 1);
+    }
+
+    /// The fallback is guarded on not-already-terminal: after the sink already
+    /// settled the session (event-path `Failed`, notification fired), the
+    /// fallback leaves the snapshot untouched and never double-notifies — the
+    /// fault-via-both-paths dedup of the I/O matrix.
+    #[test]
+    fn run_error_fallback_never_double_notifies_after_sink_failure() {
+        let platform = CapturingPlatform::new();
+        let (mut machine, status) = live_fold_harness(&platform);
+        assert!(fold_recording_event(
+            &mut machine,
+            &status,
+            &platform,
+            RecordingEvent::Failed {
+                message: "keeper-rec exited unexpectedly".to_owned(),
+            },
+        ));
+        fail_recording_snapshot(
+            &status,
+            &platform,
+            "keeper-rec exited with a non-zero status".to_owned(),
+        );
+        let snapshot = status_lock(&status).clone();
+        assert_eq!(
+            snapshot.error.as_deref(),
+            Some("keeper-rec exited unexpectedly"),
+            "the event-path message is kept"
+        );
+        assert_eq!(platform.calls().len(), 1, "one notification total");
+
+        // A clean terminal (`Finalized`) is equally protected from the fallback.
+        let finalized = {
+            let mut snapshot = RecordingStatusVm::idle();
+            snapshot.state = RecordingUiState::Finalized;
+            Mutex::new(snapshot)
+        };
+        fail_recording_snapshot(&finalized, &platform, "late task error".to_owned());
+        let snapshot = status_lock(&finalized).clone();
+        assert_eq!(snapshot.state, RecordingUiState::Finalized);
+        assert_eq!(snapshot.error, None);
+        assert_eq!(platform.calls().len(), 1, "still one notification total");
+    }
+
+    /// A test-only run slot in the given state (no stop trigger, no driver —
+    /// exactly what a settled/synthetic session holds).
+    fn run_slot_in(state: RecordingUiState, error: Option<&str>) -> Mutex<Option<RecordingRun>> {
+        let mut snapshot = RecordingStatusVm::idle();
+        snapshot.state = state;
+        snapshot.error = error.map(str::to_owned);
+        Mutex::new(Some(RecordingRun {
+            stop_tx: None,
+            status: Arc::new(Mutex::new(snapshot)),
+            driver: None,
+            segment_cap_mb: 500,
+        }))
+    }
+
+    /// Story 18.4: acknowledging a terminal (failed) session clears the slot —
+    /// the next snapshot read is the honest idle default (error/warning gone),
+    /// which is what releases the held tray/banner error surfaces.
+    #[test]
+    fn acknowledge_clears_a_terminal_slot() {
+        for state in [
+            RecordingUiState::Failed,
+            RecordingUiState::Finalized,
+            RecordingUiState::Recovered,
+        ] {
+            let slot = run_slot_in(state, Some("keeper-rec exited unexpectedly"));
+            assert!(acknowledge_recording_slot(&slot), "{state:?}");
+            assert!(slot_lock(&slot).is_none(), "{state:?} slot cleared");
+        }
+    }
+
+    /// Story 18.4: acknowledging a LIVE session is a strict no-op — the slot,
+    /// its state, and its snapshot are untouched (never a silent stop).
+    #[test]
+    fn acknowledge_is_a_noop_on_a_live_slot() {
+        for state in [
+            RecordingUiState::Preflight,
+            RecordingUiState::Recording,
+            RecordingUiState::Rotating,
+            RecordingUiState::Stopping,
+        ] {
+            let slot = run_slot_in(state, None);
+            assert!(!acknowledge_recording_slot(&slot), "{state:?}");
+            let guard = slot_lock(&slot);
+            let run = guard.as_ref().expect("slot retained");
+            assert_eq!(status_lock(&run.status).state, state, "state untouched");
+        }
+    }
+
+    /// Acknowledge with no session at all is a quiet no-op (idempotent dismiss).
+    #[test]
+    fn acknowledge_with_empty_slot_is_a_noop() {
+        let slot: Mutex<Option<RecordingRun>> = Mutex::new(None);
+        assert!(!acknowledge_recording_slot(&slot));
+        assert!(slot_lock(&slot).is_none());
     }
 
     /// Story 18.2 (paused clock): a sidecar that finalizes inside the bound

@@ -50,11 +50,26 @@ const STOP_ID: &str = "tray-stop-recording";
 const OPEN_FOLDER_ID: &str = "tray-open-recordings-folder";
 /// The menu item id for the disabled elapsed/segment/size line (Story 18.1).
 const STATUS_ID: &str = "tray-recording-status";
+/// The menu item id for "Show Recording" in the error-hold menu (Story 18.4):
+/// raises + focuses the main window, where the Recording view's banner carries
+/// the one-click Restart (the tray never restarts a session itself).
+const SHOW_RECORDING_ID: &str = "tray-show-recording";
+/// The menu item id for "Dismiss Error" in the error-hold menu (Story 18.4):
+/// acknowledges the terminal failed session back to idle, releasing the hold.
+const DISMISS_ERROR_ID: &str = "tray-dismiss-error";
 
 /// The bundled record-dot menu-bar icon shown while a recording is live (Story
 /// 18.1). Decoded per transition via [`Image::from_bytes`] (the `image-png`
 /// tauri feature) — a decode failure just keeps the current icon.
 const RECORDING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-recording.png");
+
+/// The bundled recording-red **filled** error badge shown while a failed session
+/// holds the tray (Story 18.4): the same recording-red as the record dot but a
+/// filled circle carrying a white exclamation mark, so the fault reads at a
+/// glance and stays visually distinct from the plain record dot. Same base
+/// dimensions as [`RECORDING_ICON_PNG`]; decoded per transition via
+/// [`Image::from_bytes`] — a decode failure just keeps the current icon.
+const ERROR_ICON_PNG: &[u8] = include_bytes!("../icons/tray-error.png");
 
 /// The live tray, if menu-bar presence is currently on. `None` means no tray is
 /// shown (the default). Guarded by a `Mutex` since the Settings toggle command,
@@ -68,6 +83,11 @@ struct TrayState {
     /// `set_text` — no menu rebuild, no flicker, an open menu stays open; the
     /// whole menu is swapped only on an idle↔recording transition.
     status_item: Option<MenuItem<Wry>>,
+    /// Whether the Story 18.4 error-hold rendering (error badge + failed-reason
+    /// menu) is currently installed. Mutually exclusive with `status_item`; the
+    /// error line is static (the terminal `error` never changes), so the tick
+    /// only needs this flag to avoid rebuilding the menu every second.
+    error_rendered: bool,
 }
 
 /// The single tray slot (see [`TrayState`]).
@@ -123,6 +143,15 @@ fn stop_recording(app: &AppHandle) {
     crate::ipc::stop_active_recording(&state);
 }
 
+/// Dismiss the held recording error from the tray (Story 18.4): the identical
+/// acknowledge the `recording_acknowledge` command runs — a terminal failed
+/// session clears back to idle (a live session is a strict no-op), and the next
+/// ~1 Hz tick then restores/drops the tray per the 18.2 lifecycle.
+fn dismiss_recording_error(app: &AppHandle) {
+    let state = app.state::<crate::ipc::AppState>();
+    let _ = crate::ipc::acknowledge_recording(&state);
+}
+
 /// Reveal the current session folder (`output_path`) in the OS file manager
 /// (Story 18.1), via the same opener plugin as the export "Reveal in Finder".
 /// Best-effort: no session folder or a reveal failure is logged, never a panic.
@@ -166,6 +195,33 @@ fn build_idle_menu(app: &AppHandle) -> Option<Menu<Wry>> {
     }
 }
 
+/// Build the error-hold tray menu (Story 18.4): the disabled
+/// `Recording failed — <reason>` line, then **Show Recording** (raises the
+/// window, where the banner's one-click Restart lives), **Open Recordings
+/// Folder**, and **Dismiss Error** (→ acknowledge), then Quit. The line is
+/// static — a terminal `error` never changes — so no held item is returned.
+fn build_error_menu(app: &AppHandle, line: &str) -> Option<Menu<Wry>> {
+    let status = menu_item(app, STATUS_ID, line, false)?;
+    let show_recording = menu_item(app, SHOW_RECORDING_ID, "Show Recording", true)?;
+    let open = menu_item(app, OPEN_FOLDER_ID, "Open Recordings Folder", true)?;
+    let dismiss = menu_item(app, DISMISS_ERROR_ID, "Dismiss Error", true)?;
+    let quit = menu_item(app, QUIT_ID, "Quit", true)?;
+    let menu = MenuBuilder::new(app)
+        .item(&status)
+        .separator()
+        .items(&[&show_recording, &open, &dismiss])
+        .separator()
+        .items(&[&quit])
+        .build();
+    match menu {
+        Ok(menu) => Some(menu),
+        Err(error) => {
+            tracing::warn!(%error, "tray: could not build error tray menu");
+            None
+        }
+    }
+}
+
 /// Build the recording tray menu (Story 18.1): the disabled status `line`, then
 /// Stop Recording + Open Recordings Folder, then the idle Show/Quit pair.
 /// Returns the menu together with the held status item so the ~1 Hz tick can
@@ -204,10 +260,13 @@ fn build_tray(app: &AppHandle) -> Option<TrayIcon> {
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            SHOW_ID => show_main_window(app),
+            // Story 18.4: "Show Recording" raises the same main window (the
+            // Recording view's banner carries the one-click Restart there).
+            SHOW_ID | SHOW_RECORDING_ID => show_main_window(app),
             QUIT_ID => app.exit(0),
             STOP_ID => stop_recording(app),
             OPEN_FOLDER_ID => open_recordings_folder(app),
+            DISMISS_ERROR_ID => dismiss_recording_error(app),
             _ => {}
         });
     // Reuse the bundled default window icon so the tray needs no separate asset.
@@ -240,6 +299,7 @@ pub fn set_tray_presence(app: &AppHandle, enabled: bool) {
         *guard = tray.map(|icon| TrayState {
             icon,
             status_item: None,
+            error_rendered: false,
         });
     } else {
         // Dropping the handle removes the tray icon.
@@ -252,10 +312,14 @@ pub fn set_tray_presence(app: &AppHandle, enabled: bool) {
 /// matching GUI side effect best-effort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PresenceAction {
-    /// Live recording, no tray: force-build the tray (and mark it ours).
+    /// Live recording (or a failed+error hold) with no tray: force-build the
+    /// tray (and mark it ours); the render then follows the snapshot.
     ForcePresent,
     /// Live recording, tray present: Story 18.1's recording render/refresh.
     RenderRecording,
+    /// `Failed` with an `error`, tray present (Story 18.4): hold the tray in
+    /// the error rendering — badge + reason line — instead of dropping it.
+    RenderError,
     /// Terminal/idle and *we* forced the tray: drop it (restore prior config).
     DropTray,
     /// Terminal/idle, user-owned tray: Story 18.1's idle restore.
@@ -265,15 +329,32 @@ enum PresenceAction {
 }
 
 /// Decide this tick's presence action from the authoritative snapshot state
-/// plus the current slot/forced flags (Story 18.2). Pure — the unit-testable
-/// seam between the recording state machine and the GUI side effects. A live
-/// state with an absent slot force-builds regardless of `forced` (a forced
-/// tray that vanished mid-recording self-heals the same way); a terminal/idle
-/// state drops the slot only when *we* created it.
-fn decide_presence(state: RecordingUiState, present: bool, forced: bool) -> PresenceAction {
+/// (+ whether it carries a fault `error`) plus the current slot/forced flags
+/// (Story 18.2 + 18.4). Pure — the unit-testable seam between the recording
+/// state machine and the GUI side effects. A live state with an absent slot
+/// force-builds regardless of `forced` (a forced tray that vanished
+/// mid-recording self-heals the same way); `Failed` **with an error** is the
+/// Story 18.4 error-hold: the tray must NOT drop the instant the fault happens
+/// — it renders the error badge + reason (force-building if somehow absent)
+/// until the fault clears (acknowledge → idle, or a restart back to live), at
+/// which point the ordinary 18.2 restore/drop below runs. Every other
+/// terminal/idle state drops the slot only when *we* created it.
+fn decide_presence(
+    state: RecordingUiState,
+    has_error: bool,
+    present: bool,
+    forced: bool,
+) -> PresenceAction {
     if state.is_live() {
         if present {
             PresenceAction::RenderRecording
+        } else {
+            PresenceAction::ForcePresent
+        }
+    } else if state == RecordingUiState::Failed && has_error {
+        // Story 18.4: hold-in-error — never drop/restore while failed+error.
+        if present {
+            PresenceAction::RenderError
         } else {
             PresenceAction::ForcePresent
         }
@@ -305,19 +386,29 @@ fn decide_presence(state: RecordingUiState, present: bool, forced: bool) -> Pres
 /// status item is stored back under a fresh lock, checked against the tray id
 /// in case the slot was rebuilt meanwhile.
 pub fn apply_recording_state(app: &AppHandle, snapshot: &RecordingStatusVm) {
-    let (tray, status_item) = {
+    let (tray, status_item, error_rendered) = {
         let guard = tray_guard();
         match guard.as_ref() {
-            Some(state) => (Some(state.icon.clone()), state.status_item.clone()),
-            None => (None, None),
+            Some(state) => (
+                Some(state.icon.clone()),
+                state.status_item.clone(),
+                state.error_rendered,
+            ),
+            None => (None, None, false),
         }
     };
     let forced = FORCED_PRESENCE.load(Ordering::Relaxed);
-    match decide_presence(snapshot.state, tray.is_some(), forced) {
+    let has_error = snapshot.error.is_some();
+    match decide_presence(snapshot.state, has_error, tray.is_some(), forced) {
         PresenceAction::ForcePresent => force_present(app, snapshot),
         PresenceAction::RenderRecording => {
             if let Some(tray) = tray {
                 render_recording(app, &tray, status_item, snapshot);
+            }
+        }
+        PresenceAction::RenderError => {
+            if let Some(tray) = tray {
+                render_error(app, &tray, error_rendered, snapshot);
             }
         }
         PresenceAction::DropTray => {
@@ -345,9 +436,10 @@ pub fn apply_recording_state(app: &AppHandle, snapshot: &RecordingStatusVm) {
             drop(dropped);
         }
         PresenceAction::RestoreIdle => {
-            // Only an installed recording menu needs restoring — an idle tray
-            // in a terminal state is already in its prior configuration.
-            if let (Some(tray), true) = (tray, status_item.is_some()) {
+            // Only an installed recording or error-hold menu needs restoring —
+            // an idle tray in a terminal state is already in its prior
+            // configuration.
+            if let (Some(tray), true) = (tray, status_item.is_some() || error_rendered) {
                 restore_idle(app, &tray);
             }
         }
@@ -372,6 +464,7 @@ fn force_present(app: &AppHandle, snapshot: &RecordingStatusVm) {
             *guard = Some(TrayState {
                 icon: icon.clone(),
                 status_item: None,
+                error_rendered: false,
             });
             FORCED_PRESENCE.store(true, Ordering::Relaxed);
             true
@@ -385,7 +478,14 @@ fn force_present(app: &AppHandle, snapshot: &RecordingStatusVm) {
         // transient duplicate menu-bar item (outside the lock).
         return;
     }
-    render_recording(app, &icon, None, snapshot);
+    // Render this tick's state onto the fresh tray: the error-hold rendering
+    // for a failed+error snapshot (Story 18.4 — e.g. the tray vanished in the
+    // same instant the fault landed), else the recording rendering (18.1).
+    if snapshot.state == RecordingUiState::Failed && snapshot.error.is_some() {
+        render_error(app, &icon, false, snapshot);
+    } else {
+        render_recording(app, &icon, None, snapshot);
+    }
 }
 
 /// Render the recording state onto a present tray (Story 18.1): on the
@@ -424,7 +524,44 @@ fn render_recording(
         tracing::warn!(%error, "tray: could not install the recording menu");
         return;
     }
-    store_status_item(tray.id(), Some(status));
+    store_rendered_mode(tray.id(), Some(status), false);
+}
+
+/// Hold a present tray in the Story 18.4 error rendering: on the transition
+/// (any prior rendering → error) swap in the filled recording-red error badge
+/// and the error menu — the disabled `Recording failed — <reason>` line plus
+/// Show Recording / Open Recordings Folder / Dismiss Error. Later ticks with
+/// the rendering already installed do nothing (the terminal reason is static).
+/// Best-effort like every tray mutation: a badge decode/set failure keeps the
+/// current icon; a menu build/install failure leaves the flag unset so the
+/// next ~1 Hz tick retries the transition.
+fn render_error(
+    app: &AppHandle,
+    tray: &TrayIcon,
+    error_rendered: bool,
+    snapshot: &RecordingStatusVm,
+) {
+    if error_rendered {
+        // Already holding in error — nothing changes until acknowledge/restart.
+        return;
+    }
+    let reason = snapshot.error.as_deref().unwrap_or("unknown error");
+    match Image::from_bytes(ERROR_ICON_PNG) {
+        Ok(icon) => {
+            if let Err(error) = tray.set_icon(Some(icon)) {
+                tracing::warn!(%error, "tray: could not set the error badge icon");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "tray: could not decode the error badge icon"),
+    }
+    let Some(menu) = build_error_menu(app, &format_error_line(reason)) else {
+        return;
+    };
+    if let Err(error) = tray.set_menu(Some(menu)) {
+        tracing::warn!(%error, "tray: could not install the error tray menu");
+        return;
+    }
+    store_rendered_mode(tray.id(), None, true);
 }
 
 /// Restore a user-owned tray to the idle rendering after a recording ended
@@ -446,17 +583,20 @@ fn restore_idle(app: &AppHandle, tray: &TrayIcon) {
     if let Err(error) = tray.set_icon(app.default_window_icon().cloned()) {
         tracing::warn!(%error, "tray: could not restore the idle icon");
     }
-    store_status_item(tray.id(), None);
+    store_rendered_mode(tray.id(), None, false);
 }
 
-/// Store the recording status-line item (or clear it) back into the tray slot —
-/// unless the slot was rebuilt (toggle off→on) while the menu was installed
-/// lock-free, in which case the fresh tray's own state wins.
-fn store_status_item(tray_id: &TrayIconId, item: Option<MenuItem<Wry>>) {
+/// Store the rendered-mode flags — the recording status-line item and the
+/// error-hold flag (mutually exclusive; both cleared on an idle restore) —
+/// back into the tray slot, unless the slot was rebuilt (toggle off→on) while
+/// the menu was installed lock-free, in which case the fresh tray's own state
+/// wins.
+fn store_rendered_mode(tray_id: &TrayIconId, item: Option<MenuItem<Wry>>, error_rendered: bool) {
     let mut guard = tray_guard();
     if let Some(state) = guard.as_mut() {
         if state.icon.id() == tray_id {
             state.status_item = item;
+            state.error_rendered = error_rendered;
         }
     }
 }
@@ -495,6 +635,13 @@ fn status_line(snapshot: &RecordingStatusVm) -> String {
         Some(message) => format_warning_line(&base, message),
         None => base,
     }
+}
+
+/// Compose the disabled error-hold status line (Story 18.4), naming the honest
+/// terminal reason: `"keeper-rec exited"` → `Recording failed — keeper-rec
+/// exited`. Pure.
+fn format_error_line(reason: &str) -> String {
+    format!("Recording failed — {reason}")
 }
 
 /// Mark a status line with the sticky, non-dismissible session warning (Story
@@ -555,42 +702,125 @@ mod tests {
     /// forced combination — live+absent force-builds (even with a stale forced
     /// flag: self-healing), live+present renders (18.1), terminal+present drops
     /// only a forced tray (else the 18.1 idle restore), terminal+absent no-ops.
+    /// Story 18.4 carves exactly one exception out of the terminal rows:
+    /// `Failed` **with an error** holds (see the dedicated test below); here
+    /// every terminal row runs with `has_error = false`, and a live state with
+    /// a (stale/irrelevant) error still renders live.
     #[test]
     fn decide_presence_covers_the_io_matrix() {
         use PresenceAction::*;
         use RecordingUiState::*;
         for state in [Preflight, Recording, Rotating, Stopping] {
-            assert_eq!(
-                decide_presence(state, false, false),
-                ForcePresent,
-                "{state:?}"
-            );
-            assert_eq!(
-                decide_presence(state, false, true),
-                ForcePresent,
-                "{state:?}"
-            );
-            assert_eq!(
-                decide_presence(state, true, false),
-                RenderRecording,
-                "{state:?}"
-            );
-            assert_eq!(
-                decide_presence(state, true, true),
-                RenderRecording,
-                "{state:?}"
-            );
+            for has_error in [false, true] {
+                assert_eq!(
+                    decide_presence(state, has_error, false, false),
+                    ForcePresent,
+                    "{state:?} err={has_error}"
+                );
+                assert_eq!(
+                    decide_presence(state, has_error, false, true),
+                    ForcePresent,
+                    "{state:?} err={has_error}"
+                );
+                assert_eq!(
+                    decide_presence(state, has_error, true, false),
+                    RenderRecording,
+                    "{state:?} err={has_error}"
+                );
+                assert_eq!(
+                    decide_presence(state, has_error, true, true),
+                    RenderRecording,
+                    "{state:?} err={has_error}"
+                );
+            }
         }
         for state in [Idle, Finalized, Recovered, Failed] {
-            assert_eq!(decide_presence(state, true, true), DropTray, "{state:?}");
             assert_eq!(
-                decide_presence(state, true, false),
+                decide_presence(state, false, true, true),
+                DropTray,
+                "{state:?}"
+            );
+            assert_eq!(
+                decide_presence(state, false, true, false),
                 RestoreIdle,
                 "{state:?}"
             );
-            assert_eq!(decide_presence(state, false, false), Noop, "{state:?}");
-            assert_eq!(decide_presence(state, false, true), Noop, "{state:?}");
+            assert_eq!(
+                decide_presence(state, false, false, false),
+                Noop,
+                "{state:?}"
+            );
+            assert_eq!(
+                decide_presence(state, false, false, true),
+                Noop,
+                "{state:?}"
+            );
         }
+    }
+
+    /// Story 18.4: `Failed` + `error` is the hold-in-error state — the tray
+    /// NEVER drops or restores while the fault is unacknowledged, regardless
+    /// of who created the tray (forced or user-owned); an absent slot even
+    /// force-builds so the fault cannot be invisible.
+    #[test]
+    fn decide_presence_holds_the_tray_on_failed_with_error() {
+        use PresenceAction::*;
+        use RecordingUiState::Failed;
+        assert_eq!(decide_presence(Failed, true, true, false), RenderError);
+        assert_eq!(decide_presence(Failed, true, true, true), RenderError);
+        assert_eq!(decide_presence(Failed, true, false, false), ForcePresent);
+        assert_eq!(decide_presence(Failed, true, false, true), ForcePresent);
+    }
+
+    /// Story 18.4: the non-failed terminals never hold, even with a (stale)
+    /// error on the snapshot — only `Failed`+`error` is the hold state, so
+    /// Finalized/Recovered/Idle restore/drop exactly as before (18.1/18.2).
+    #[test]
+    fn decide_presence_non_failed_terminals_never_hold_even_with_error() {
+        use PresenceAction::*;
+        use RecordingUiState::*;
+        for state in [Idle, Finalized, Recovered] {
+            assert_eq!(
+                decide_presence(state, true, true, true),
+                DropTray,
+                "{state:?}"
+            );
+            assert_eq!(
+                decide_presence(state, true, true, false),
+                RestoreIdle,
+                "{state:?}"
+            );
+            assert_eq!(
+                decide_presence(state, true, false, false),
+                Noop,
+                "{state:?}"
+            );
+        }
+        // Failed WITHOUT an error (defensive: no reason to hold on) follows the
+        // ordinary terminal path too.
+        assert_eq!(decide_presence(Failed, false, true, true), DropTray);
+        assert_eq!(decide_presence(Failed, false, true, false), RestoreIdle);
+    }
+
+    /// Story 18.4: the bundled error badge is a valid PNG that decodes through
+    /// the same `Image::from_bytes` path the tick uses, at the record-dot's
+    /// base dimensions — and it is not byte-identical to the record dot (the
+    /// two states must be distinguishable at a glance).
+    #[test]
+    fn error_badge_asset_decodes_at_the_record_dot_dimensions() {
+        let error = Image::from_bytes(ERROR_ICON_PNG).expect("tray-error.png decodes");
+        let recording = Image::from_bytes(RECORDING_ICON_PNG).expect("tray-recording.png decodes");
+        assert_eq!(error.width(), recording.width());
+        assert_eq!(error.height(), recording.height());
+        assert_ne!(ERROR_ICON_PNG, RECORDING_ICON_PNG);
+    }
+
+    #[test]
+    fn format_error_line_names_the_reason() {
+        assert_eq!(
+            format_error_line("keeper-rec exited unexpectedly"),
+            "Recording failed — keeper-rec exited unexpectedly"
+        );
     }
 
     #[test]

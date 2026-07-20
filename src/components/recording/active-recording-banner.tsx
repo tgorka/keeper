@@ -14,11 +14,20 @@
  * non-fatal session warning — e.g. a microphone hot-unplug), the left edge
  * turns amber and a persistent, non-dismissible warning line renders under the
  * live row. It never auto-clears — the Rust snapshot owns the slot (reset only
- * when a new session starts) and this stays a pure renderer of it. The full
- * loud-failure triad (native notification leg) remains Story 18.4.
+ * when a new session starts) and this stays a pure renderer of it.
  *
- * Chrome: a recording-red 3px left edge, a reduced-motion-aware record dot,
- * "Recording", a monospace `elapsed · segment · size` line, and a
+ * The error variant (Story 18.4 — the in-app leg of the loud-failure triad):
+ * exactly when `state === "failed" && error !== null` the banner renders a
+ * **filled** recording-red variant naming the honest reason (`role="alert"` —
+ * announced assertively as a loss-risk event) with a destructive-outline
+ * **Restart recording** action (replays the captured start params) and a
+ * neutral **Dismiss** (→ `recording_acknowledge`). Recording-red stays on the
+ * banner fill/edge and the steady dot only — never on the buttons, which keep
+ * the destructive/neutral variants (the two reds stay distinct). Any other
+ * terminal/idle state (or failed without an error) renders `null`.
+ *
+ * Chrome (live): a recording-red 3px left edge, a reduced-motion-aware record
+ * dot, "Recording", a monospace `elapsed · segment · size` line, and a
  * destructive-styled Stop button (never recording-red — the two reds stay
  * distinct). Below sits the segment meter: a bar filling toward the
  * session-captured cap, captioned `segment N · used / cap MB`, hidden when the
@@ -27,7 +36,8 @@
  * Accessibility: recording state is announced **assertively** via a dedicated
  * `sr-only` live region keyed on state + segment (so it fires on
  * start/stop/rotation, never once per second); the ticking mono line is kept out
- * of any live region. Stop is an explicit focusable button — `Esc` never stops.
+ * of any live region. Stop/Restart/Dismiss are explicit focusable buttons —
+ * `Esc` never stops or restarts a recording (no key handler exists here).
  */
 import { Button } from "@/components/ui/button";
 import { isLiveRecording } from "@/hooks/use-recording-session";
@@ -42,6 +52,12 @@ export const BANNER_STOP_LABEL = "Stop";
 /** The label shown on the Stop button while a graceful stop is in flight. */
 export const BANNER_STOPPING_LABEL = "Stopping…";
 
+/** The error variant's one-click restart label (Story 18.4, recording voice). */
+export const BANNER_RESTART_LABEL = "Restart recording";
+
+/** The error variant's dismiss (acknowledge) label (Story 18.4). */
+export const BANNER_DISMISS_LABEL = "Dismiss";
+
 export interface ActiveRecordingBannerProps {
   /** The live session snapshot (the enriched Rust-owned view model). */
   status: RecordingStatusVm;
@@ -49,17 +65,72 @@ export interface ActiveRecordingBannerProps {
   elapsed: string | null;
   /** Fire the idempotent graceful stop-and-finalize (identical to the tray's Stop). */
   onStop: () => void;
+  /** Replay the failed session's captured start params (Story 18.4 Restart). */
+  onRestart: () => void;
+  /** Acknowledge the failed session back to idle (Story 18.4 Dismiss). */
+  onDismiss: () => void;
 }
 
 /** One decimal megabyte, in bytes — the meter denominator's unit (`10^6`). */
 const BYTES_PER_MB = 1_000_000;
 
-export function ActiveRecordingBanner({ status, elapsed, onStop }: ActiveRecordingBannerProps) {
+export function ActiveRecordingBanner({
+  status,
+  elapsed,
+  onStop,
+  onRestart,
+  onDismiss,
+}: ActiveRecordingBannerProps) {
   const reducedMotion = useReducedMotion();
 
-  // Render nothing on any terminal/idle state — the banner is a live-only
-  // surface (the mic-loss warning, Story 19.4, is a live-session state too;
-  // terminal error surfaces are Story 18.4).
+  // The error variant (Story 18.4) renders exactly when the Rust snapshot says
+  // `failed` WITH an honest reason — a pure projection of `state` + `error`,
+  // never a TS-invented fault state.
+  if (status.state === "failed" && status.error !== null) {
+    return (
+      <div
+        data-slot="active-recording-banner"
+        data-variant="error"
+        className="shrink-0 border-l-[3px] border-recording-red bg-recording-red/15 px-6 py-3"
+      >
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex min-w-0 items-center gap-3">
+            {/* The error dot: recording-red (reserved for dot/edge/fill) and
+                ALWAYS steady — a failed session never pulses, reduced motion
+                or not. */}
+            <span
+              aria-hidden="true"
+              data-testid="recording-error-dot"
+              className="size-2.5 shrink-0 rounded-full bg-recording-red"
+            />
+            {/* The honest reason, announced assertively as a loss-risk event
+                (role="alert") — the single failed-note surface (the pane
+                header note moved here, mirroring 18.3's consolidation). */}
+            <p role="alert" data-testid="recording-error" className="min-w-0 truncate text-sm">
+              <span className="font-medium">Recording failed</span>
+              <span className="text-muted-foreground"> — {status.error}</span>
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            {/* Destructive-outline Restart + neutral Dismiss: recording-red is
+                NEVER on buttons, and the destructive red stays the distinct
+                app-wide destructive token. Explicit focusable controls — Esc
+                never restarts or dismisses. */}
+            <Button type="button" variant="destructive" onClick={onRestart}>
+              {BANNER_RESTART_LABEL}
+            </Button>
+            <Button type="button" variant="outline" onClick={onDismiss}>
+              {BANNER_DISMISS_LABEL}
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Render nothing on any other terminal/idle state — the banner is otherwise
+  // a live-only surface (the mic-loss warning, Story 19.4, is a live-session
+  // state too).
   if (!isLiveRecording(status)) {
     return null;
   }

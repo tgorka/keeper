@@ -434,6 +434,64 @@ pub fn notify_bridge_disconnected(
     }
 }
 
+/// Post the Story 18.4 recording-fault native notification — one leg of the
+/// loud-failure triad (tray error badge + this notification + in-app banner).
+///
+/// The single entry point the shell's recording driver calls on a fault **onset**
+/// (the snapshot's `error` transitioning `None → Some`); the caller owns the
+/// exactly-once dedup. The copy names the honest reason and points at the app,
+/// where the banner's one-click **Restart recording** lives (the desktop
+/// `tauri-plugin-notification` backend has no per-notification action buttons —
+/// Epic 11).
+///
+/// Suppression policy: **none**. Unlike message notifications (full
+/// [`should_notify`] gating) and even [`notify_bridge_disconnected`] (which still
+/// honors global DND), a recording fault bypasses global Do-Not-Disturb *and*
+/// per-Network mute entirely — it is a local loss-risk event and a mandated triad
+/// leg, not chat noise; the tray + banner legs fire regardless, so silencing this
+/// leg would only desynchronize the triad. By construction this function consults
+/// no [`NotifyConfig`] at all, so no future gate can creep in silently. The
+/// message-notification pipeline ([`dispatch`]/[`should_notify`]) is untouched.
+///
+/// The click-through target is [`NotifyTarget::None`] — coarse activation
+/// summons/focuses the window, where the Recording view's banner carries the
+/// Restart action. A notifier failure (or an unset port on a headless build) is
+/// logged at `warn` and swallowed — it must never block the recording driver.
+pub fn notify_recording_fault(platform: &dyn Platform, reason: &str) {
+    let title = "Recording failed".to_owned();
+    let body = format!("{reason} — open keeper to restart the recording.");
+    if let Err(e) = platform.notify(&title, &body, &NotifyTarget::None) {
+        // Best-effort: a notifier failure never blocks the recording driver.
+        tracing::warn!(
+            error = %e,
+            "notify: could not post recording-fault notification; swallowing"
+        );
+    }
+}
+
+/// Post the Story 18.4 recording-**warning** native notification (closing Story
+/// 19.4's deferred native-notification leg for non-fatal sticky warnings, e.g. a
+/// microphone hot-unplug).
+///
+/// Called by the shell's recording driver on a warning **onset** only (the
+/// snapshot's `warning` transitioning `None → Some`); a sticky warning that
+/// merely repeats/updates never re-fires (the caller owns the dedup). The copy
+/// says the recording continues — a warning is not a fault. Same suppression
+/// policy as [`notify_recording_fault`]: bypasses DND and per-Network mute by
+/// consulting no [`NotifyConfig`]; same [`NotifyTarget::None`] coarse target;
+/// same swallowed-failure posture.
+pub fn notify_recording_warning(platform: &dyn Platform, message: &str) {
+    let title = "Recording warning".to_owned();
+    let body = format!("{message} — the recording is still running.");
+    if let Err(e) = platform.notify(&title, &body, &NotifyTarget::None) {
+        // Best-effort: a notifier failure never blocks the recording driver.
+        tracing::warn!(
+            error = %e,
+            "notify: could not post recording-warning notification; swallowing"
+        );
+    }
+}
+
 /// Current wall-clock time in milliseconds since the Unix epoch (UTC), used as the
 /// backlog baseline captured at handler registration. Saturates rather than panicking.
 fn now_ms() -> u64 {
@@ -1339,6 +1397,88 @@ mod tests {
         let platform = CapturingPlatform::failing();
         let config = NotifyConfig::new(true);
         notify_bridge_disconnected(&platform, &config, "acct-1", "signal", "Signal");
+        assert!(platform.calls().is_empty());
+    }
+
+    // ── Story 18.4: recording-fault / recording-warning notify entry points ─────
+    #[test]
+    fn recording_fault_posts_reason_copy_and_no_target() {
+        let platform = CapturingPlatform::new();
+        notify_recording_fault(&platform, "keeper-rec exited unexpectedly");
+        assert_eq!(
+            platform.calls(),
+            vec![(
+                "Recording failed".to_owned(),
+                "keeper-rec exited unexpectedly — open keeper to restart the recording.".to_owned(),
+            )]
+        );
+        // Coarse activation only: the banner owns the one-click Restart.
+        assert_eq!(platform.targets(), vec![NotifyTarget::None]);
+    }
+
+    #[test]
+    fn recording_warning_posts_still_running_copy_and_no_target() {
+        let platform = CapturingPlatform::new();
+        notify_recording_warning(&platform, "microphone disconnected — no microphone input");
+        assert_eq!(
+            platform.calls(),
+            vec![(
+                "Recording warning".to_owned(),
+                "microphone disconnected — no microphone input — the recording is still running."
+                    .to_owned(),
+            )]
+        );
+        assert_eq!(platform.targets(), vec![NotifyTarget::None]);
+    }
+
+    #[test]
+    fn recording_fault_bypasses_dnd_and_network_mute() {
+        // Global DND on AND every plausible Network muted: the recording fault/
+        // warning legs still post — they are loss-risk events, not chat noise.
+        // The entries take no NotifyConfig by construction, so this asserts the
+        // bypass holds even with the harshest suppression state configured.
+        let platform = CapturingPlatform::new();
+        let mut seed = HashSet::new();
+        seed.insert("Signal".to_owned());
+        let config = NotifyConfig::with_state(true, true, seed);
+        assert!(config.dnd_enabled());
+        assert!(config.is_network_muted("Signal"));
+        notify_recording_fault(&platform, "writer stalled");
+        notify_recording_warning(&platform, "microphone disconnected");
+        assert_eq!(platform.calls().len(), 2);
+    }
+
+    #[test]
+    fn recording_fault_does_not_touch_message_gating() {
+        // The message pipeline's should_notify verdicts are unchanged by the
+        // recording entries existing: DND still silences a chat message even
+        // right after a recording fault posted.
+        let platform = CapturingPlatform::new();
+        let config = NotifyConfig::new(true);
+        config.set_dnd_enabled(true);
+        notify_recording_fault(&platform, "capture device lost");
+        assert_eq!(platform.calls().len(), 1, "the fault posted despite DND");
+        dispatch(
+            &platform,
+            &config,
+            "acct",
+            "!room:example.org",
+            50,
+            &ctx_gated(100, true, false),
+        );
+        assert_eq!(
+            platform.calls().len(),
+            1,
+            "the DND-gated chat message still did not post"
+        );
+    }
+
+    #[test]
+    fn recording_notify_swallows_notifier_failure() {
+        // A notifier failure (or an unset port) never panics or blocks the driver.
+        let platform = CapturingPlatform::failing();
+        notify_recording_fault(&platform, "keeper-rec exited unexpectedly");
+        notify_recording_warning(&platform, "microphone disconnected");
         assert!(platform.calls().is_empty());
     }
 
