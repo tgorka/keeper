@@ -1,0 +1,25 @@
+tools/keeper-rec/Sources/keeper-rec/Capture.swift
+  s_9c56e8525015d3::t_64102f4d27745d 1106-1116
+_bmad-output/implementation-artifacts/spec-20-1-optional-webcam-as-a-separate-synchronized-file.md
+  s_9c56e8525015d3::t_7d3d99fe90f4c5 147-155
+  s_9c56e8525015d3::t_e6ef642294f3d6 191-193
+  s_9c56e8525015d3::t_b5c4ac995f8f51 9
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_9c56e8525015d3::t_85de3da94c5989 1060-1062
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "6bae0895c16378dd7b8247e7de1d26575e44d6b0",
+  "prompts": {},
+  "sessions": {
+    "s_9c56e8525015d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c27eba0a-49f1-4964-a208-57792a08436d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
