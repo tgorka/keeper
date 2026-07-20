@@ -46,14 +46,16 @@ final class TempSessionDir {
 }
 
 /// One fixture segment as planned and as written into the manifest: the
-/// manifest `index`, file basename, and host-clock PTS bounds (`nil` bounds
-/// are written as JSON `null`, mirroring a real capture's final segment /
-/// older-sidecar entries).
+/// manifest `index`, file basename, host-clock PTS bounds (`nil` bounds are
+/// written as JSON `null`, mirroring a real capture's final segment /
+/// older-sidecar entries), and — since Story 20.1 — the `track` it belongs
+/// to (`"screen"` by default; `"camera"` for the dual-track fixtures).
 struct FixtureSegment {
     let index: Int
     let file: String
     let ptsStart: Double?
     let ptsEnd: Double?
+    var track: String = "screen"
 }
 
 /// Which discontinuity to inject at one boundary (the negative controls).
@@ -182,17 +184,18 @@ func writeFixtureManifest(
             "index": segment.index,
             "file": segment.file,
             "bytes": bytes ?? 0,
-            "track": "screen",
+            "track": segment.track,
             "ptsStart": segment.ptsStart.map { $0 as Any } ?? NSNull(),
             "ptsEnd": segment.ptsEnd.map { $0 as Any } ?? NSNull(),
         ]
     }
+    let hasCamera = segments.contains { $0.track == "camera" }
     let manifest: [String: Any] = [
         "version": 1,
         "session": folder.lastPathComponent,
         "status": "finalized",
         "captureTarget": ["kind": "display", "displayId": NSNull()],
-        "devices": ["systemAudio": true, "microphone": false, "camera": false],
+        "devices": ["systemAudio": true, "microphone": false, "camera": hasCamera],
         "segments": entries,
     ]
     let data = try JSONSerialization.data(
@@ -277,4 +280,78 @@ func makeSessionWithOverlap(
     try await makeFixtureSession(
         in: folder, segmentCount: segments, framesPerSegment: framesPerSegment,
         frameRate: frameRate, defect: (boundary: boundary, kind: .overlap))
+}
+
+/// Generate a dual-track fixture session (Story 20.1, FR-70): `screen-####` +
+/// `camera-####` pairs on ONE host-clock timeline, both tracks cut at the
+/// same segment boundaries — the capture engine's screen-master rotation
+/// mirrored in fixture form. One manifest lists both tracks disambiguated by
+/// `track`, exactly as the Rust `SessionManifest` persists a real dual-track
+/// session. Negative-control knobs:
+///
+/// - `cameraSkewSeconds` at `skewIndex`: that camera segment starts skewed
+///   from its screen twin — file AND manifest `ptsStart` both shifted, the
+///   pre-fix engine's "report the camera's own first frame" shape (beyond one
+///   frame period → an alignment violation);
+/// - `cameraWarmupFrames` (> 0): segment 0's camera FILE starts that many
+///   frame periods after the shared anchor (the real camera warm-up shape),
+///   while its manifest `ptsStart` still reports the ANCHOR — the fixed
+///   engine's segment-0 semantics; `ptsEnd` stays the last real frame;
+/// - `nullCameraBoundsForIndex`: that camera segment's manifest bounds are
+///   written null (unverifiable → `missingBounds`);
+/// - `dropCameraIndex`: no camera counterpart is written for that index
+///   (a lost camera's tail — `missingBounds` for the unpaired screen entry).
+///
+/// Returns the planned segments per track (manifest `index` order).
+@discardableResult
+func makeDualTrackSession(
+    in folder: URL,
+    segmentCount: Int = 3,
+    framesPerSegment: Int = 8,
+    frameRate: Double = 30,
+    basePTS: Double = 1000.0,
+    cameraSkewSeconds: Double = 0,
+    skewIndex: Int? = nil,
+    cameraWarmupFrames: Int = 0,
+    nullCameraBoundsForIndex: Int? = nil,
+    dropCameraIndex: Int? = nil
+) async throws -> (screen: [FixtureSegment], camera: [FixtureSegment]) {
+    let period = 1.0 / frameRate
+    var screen: [FixtureSegment] = []
+    var camera: [FixtureSegment] = []
+    var start = basePTS
+    for index in 0..<segmentCount {
+        let end = start + Double(framesPerSegment - 1) * period
+        let screenFile = String(format: "screen-%04d.mp4", index)
+        try await writeFixtureSegment(
+            at: folder.appendingPathComponent(screenFile),
+            firstPTS: start, frames: framesPerSegment, frameRate: frameRate)
+        screen.append(
+            FixtureSegment(index: index, file: screenFile, ptsStart: start, ptsEnd: end))
+        if dropCameraIndex != index {
+            let cameraStart = start + (skewIndex == index ? cameraSkewSeconds : 0)
+            // Segment-0 warm-up (the fixed-engine shape): the file's first
+            // REAL frame lands `cameraWarmupFrames·P` after the anchor, but
+            // the manifest still reports the anchor as `ptsStart`.
+            let warmupFrames = index == 0 ? min(cameraWarmupFrames, framesPerSegment - 1) : 0
+            let cameraFrames = framesPerSegment - warmupFrames
+            let cameraFileStart = cameraStart + Double(warmupFrames) * period
+            let cameraEnd = cameraFileStart + Double(cameraFrames - 1) * period
+            let cameraFile = String(format: "camera-%04d.mp4", index)
+            try await writeFixtureSegment(
+                at: folder.appendingPathComponent(cameraFile),
+                firstPTS: cameraFileStart, frames: cameraFrames, frameRate: frameRate)
+            let nullBounds = nullCameraBoundsForIndex == index
+            camera.append(
+                FixtureSegment(
+                    index: index, file: cameraFile,
+                    ptsStart: nullBounds ? nil : cameraStart,
+                    ptsEnd: nullBounds ? nil : cameraEnd,
+                    track: "camera"))
+        }
+        // The next boundary: gapless on the screen-master timeline.
+        start = end + period
+    }
+    try writeFixtureManifest(inFolder: folder, segments: screen + camera)
+    return (screen: screen, camera: camera)
 }

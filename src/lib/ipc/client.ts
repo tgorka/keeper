@@ -1699,6 +1699,8 @@ export async function recordingStart(
   systemAudio?: boolean,
   micEnabled?: boolean,
   micDeviceId?: string | null,
+  cameraEnabled?: boolean,
+  cameraDeviceId?: string | null,
 ): Promise<RecordingStatusVm> {
   // Story 19.1: the picker's selected source/target (a display or an
   // application). Omitted (`undefined`) preserves the 16.6 main-display default.
@@ -1707,11 +1709,17 @@ export async function recordingStart(
   // Story 19.3: the Audio card's ephemeral mic selection. Omitted preserves the
   // mic-off default (`microphone_enabled.unwrap_or(false)` in Rust);
   // `microphoneDeviceId` null = the system default input.
+  // Story 20.1: the Webcam card's ephemeral camera selection. Omitted
+  // preserves the camera-off default (`camera_enabled.unwrap_or(false)` in
+  // Rust — no camera file, no Camera-TCC touch); `cameraDeviceId` null = the
+  // system default camera.
   return await invoke<RecordingStatusVm>("recording_start", {
     target: target ?? null,
     systemAudio: systemAudio ?? null,
     microphoneEnabled: micEnabled ?? null,
     microphoneDeviceId: micDeviceId ?? null,
+    cameraEnabled: cameraEnabled ?? null,
+    cameraDeviceId: cameraDeviceId ?? null,
   });
 }
 
@@ -1728,6 +1736,22 @@ export async function recordingStart(
  */
 export async function requestMicrophonePermission(): Promise<TccPermission> {
   return await invoke<TccPermission>("request_microphone_permission");
+}
+
+/**
+ * Request camera access (Story 20.1, FR-70, AD-36). The Rust command runs the
+ * sidecar `requestCamera` round-trip (`AVCaptureDevice.requestAccess` for
+ * `.video` in the child sidecar — the OS posts its one real prompt per app
+ * lifetime where the state is undetermined, attributed to keeper via
+ * `NSCameraUsageDescription`) and resolves the authoritative post-request
+ * {@link TccPermission} tri-state. Called **only** when the user enables the
+ * Webcam switch — never preemptively, never on render; a denial never blocks
+ * Start (the mic precedent). Rejects with the {@link IpcError} envelope on a
+ * sidecar failure — the caller swallows it to a no-claim caption rather than
+ * crashing.
+ */
+export async function requestCameraPermission(): Promise<TccPermission> {
+  return await invoke<TccPermission>("request_camera_permission");
 }
 
 /**

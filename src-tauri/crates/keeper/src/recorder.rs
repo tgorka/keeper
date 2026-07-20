@@ -29,7 +29,8 @@ use keeper_core::platform::Platform;
 #[cfg(desktop)]
 use keeper_core::recording::{
     capabilities_request, list_sources_request, parse_capabilities_result, parse_event,
-    parse_request_microphone_result, parse_request_screen_recording_result, parse_sources_result,
+    parse_request_camera_result, parse_request_microphone_result,
+    parse_request_screen_recording_result, parse_sources_result, request_camera_request,
     request_microphone_request, request_screen_recording_request, response_id,
     response_protocol_version, start_recording_request, stop_recording_request,
     verify_protocol_version, RecordingEvent, SessionParams,
@@ -90,6 +91,11 @@ const STOP_RECORDING_REQUEST_ID: u64 = 5;
 /// (Story 19.3).
 #[cfg(desktop)]
 const REQUEST_MICROPHONE_REQUEST_ID: u64 = 6;
+
+/// The fixed correlation id for the one-shot `requestCamera` round-trip
+/// (Story 20.1).
+#[cfg(desktop)]
+const REQUEST_CAMERA_REQUEST_ID: u64 = 7;
 
 /// The bound on one permission pre-flight round-trip against the sidecar (Story
 /// 16.5; closes the deferred unbounded-`request_response` spinner risk). The
@@ -368,6 +374,34 @@ async fn fetch_request_microphone(
     parse_request_microphone_result(&line).map_err(CoreError::Recording)
 }
 
+/// The `requestCamera` round-trip against the sidecar at `path` (Story 20.1,
+/// FR-70, AD-36): the sidecar calls `AVCaptureDevice.requestAccess(for:
+/// .video)` (TCC attributes the request to keeper because the sidecar is
+/// keeper's own child process; the usage string is keeper's
+/// `NSCameraUsageDescription`) and answers `{status}` — the authoritative
+/// post-request tri-state, reported only once the user has answered the
+/// prompt (or immediately when the state was already decided). Bounded by
+/// `timeout` — the trait method reuses the [`MIC_PROMPT_TIMEOUT`] human-scale
+/// bound, because the answer legitimately waits on a human. Split from the
+/// trait method so the fake-executable harness can drive the real body.
+#[cfg(desktop)]
+async fn fetch_request_camera(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<TccPermission, CoreError> {
+    let line = bounded(
+        "requestCamera",
+        timeout,
+        request_response(
+            path,
+            &request_camera_request(REQUEST_CAMERA_REQUEST_ID),
+            REQUEST_CAMERA_REQUEST_ID,
+        ),
+    )
+    .await?;
+    parse_request_camera_result(&line).map_err(CoreError::Recording)
+}
+
 /// The desktop (macOS) [`Recorder`](keeper_core::recording::Recorder) impl (Story
 /// 16.2, AD-24). `is_available` is simply whether the `keeper-rec` sidecar resolves;
 /// `run_session` spawns it via `tokio::process` on the resolved path — no
@@ -537,6 +571,13 @@ impl keeper_core::recording::Recorder for DesktopRecorder {
         let path = self.platform.sidecar_path(KEEPER_REC_SIDECAR_NAME)?;
         fetch_request_microphone(&path, MIC_PROMPT_TIMEOUT).await
     }
+
+    async fn request_camera(&self) -> Result<TccPermission, CoreError> {
+        let path = self.platform.sidecar_path(KEEPER_REC_SIDECAR_NAME)?;
+        // The camera prompt is the same human-scale wait as the mic's —
+        // reuse the one 120 s bound (Story 20.1).
+        fetch_request_camera(&path, MIC_PROMPT_TIMEOUT).await
+    }
 }
 
 /// The iOS [`Recorder`](keeper_core::recording::Recorder) impl (Story 16.2, AD-27).
@@ -582,6 +623,12 @@ impl keeper_core::recording::Recorder for IosRecorder {
     }
 
     async fn request_microphone(&self) -> Result<TccPermission, CoreError> {
+        Err(CoreError::Unsupported(
+            "recording is not available on iOS".to_owned(),
+        ))
+    }
+
+    async fn request_camera(&self) -> Result<TccPermission, CoreError> {
         Err(CoreError::Unsupported(
             "recording is not available on iOS".to_owned(),
         ))
@@ -814,6 +861,48 @@ mod tests {
                     if m.contains("requestMicrophone")
             ),
             "expected a timeout SidecarFailed naming requestMicrophone, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_request_camera_round_trips_the_fake_sidecar() {
+        // Story 20.1: the real `fetch_request_camera` body against a fake
+        // sidecar echoing the id-correlated `{status}` result — every
+        // tri-state (the requestMicrophone harness, id 7).
+        for status in ["granted", "denied", "notDetermined"] {
+            let response = format!(r#"{{"id":7,"result":{{"status":"{status}"}}}}"#);
+            let script = format!("#!/bin/sh\nread line\necho '{response}'\n");
+            let sidecar = FakeSidecar::write(&format!("request-camera-{status}"), &script);
+            let outcome = fetch_request_camera(sidecar.path(), PREFLIGHT_TIMEOUT)
+                .await
+                .expect("requestCamera must round-trip");
+            let expected = match status {
+                "granted" => TccPermission::Granted,
+                "denied" => TccPermission::Denied,
+                _ => TccPermission::NotDetermined,
+            };
+            assert_eq!(outcome, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hung_request_camera_resolves_a_clean_timeout_error() {
+        // Story 20.1: even with the generous human-scale prompt bound in
+        // production, a wedged sidecar must resolve a clean SidecarFailed —
+        // exercised here with a short test-only bound.
+        let script = "#!/bin/sh\nread line\nsleep 30\n";
+        let bound = std::time::Duration::from_millis(200);
+        let sidecar = FakeSidecar::write("hang-camera", script);
+        let err = fetch_request_camera(sidecar.path(), bound)
+            .await
+            .expect_err("a hung requestCamera must time out");
+        assert!(
+            matches!(
+                &err,
+                CoreError::Recording(keeper_core::error::RecordingError::SidecarFailed(m))
+                    if m.contains("requestCamera")
+            ),
+            "expected a timeout SidecarFailed naming requestCamera, got {err:?}"
         );
     }
 

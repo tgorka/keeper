@@ -5,9 +5,9 @@ import type { RecordingDisplayVm } from "./RecordingDisplayVm";
 
 /**
  * The `listSources` result (Story 16.4, AD-34): everything the sidecar can
- * currently offer as a capture source. In this story `displays` is real;
- * `applications`/`microphones`/`cameras` are shape-complete but empty
- * (SCK/AVFoundation enumeration is 16.6/19; the source-picker UI is Epic 19).
+ * currently offer as a capture source — real displays (CoreGraphics), real
+ * applications (SCShareableContent, Story 19.1), real microphones (Story
+ * 19.3) and real cameras (Story 20.1) via AVFoundation.
  */
 export type RecordingSourcesVm = { 
 /**
@@ -15,14 +15,15 @@ export type RecordingSourcesVm = {
  */
 displays: Array<RecordingDisplayVm>, 
 /**
- * Recordable applications (empty until SCK enumeration lands).
+ * Recordable applications (real since Story 19.1).
  */
 applications: Array<RecordingApplicationVm>, 
 /**
- * Microphone devices (empty until AVFoundation enumeration lands).
+ * Microphone devices (real since Story 19.3).
  */
 microphones: Array<RecordingDeviceVm>, 
 /**
- * Camera devices (empty until AVFoundation enumeration lands).
+ * Camera devices (real since Story 20.1) — a flat name list for the
+ * Webcam card's picker.
  */
 cameras: Array<RecordingDeviceVm>, };

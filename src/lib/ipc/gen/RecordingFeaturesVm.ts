@@ -11,10 +11,12 @@ export type RecordingFeaturesVm = {
  */
 systemAudio: boolean, 
 /**
- * Whether microphone capture is supported (false until AVFoundation lands, 16.6).
+ * Whether microphone capture is supported (live since Story 19.3).
  */
 microphone: boolean, 
 /**
- * Whether camera/webcam capture is supported (false until AVFoundation lands, 20.x).
+ * Whether camera/webcam capture is supported (live since Story 20.1 — a
+ * separate `camera-####.mp4` per segment, never a track inside the
+ * screen file).
  */
 camera: boolean, };

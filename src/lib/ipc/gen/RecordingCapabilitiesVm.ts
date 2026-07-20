@@ -31,10 +31,12 @@ features: RecordingFeaturesVm,
  */
 screenRecording: TccPermission, 
 /**
- * The Microphone TCC state (provisional `NotDetermined` until 16.6).
+ * The Microphone TCC state — the real, non-prompting AVFoundation
+ * tri-state (Story 19.3).
  */
 microphone: TccPermission, 
 /**
- * The Camera TCC state (provisional `NotDetermined` until 16.6/20.x).
+ * The Camera TCC state — the real, non-prompting AVFoundation tri-state
+ * (Story 20.1).
  */
 camera: TccPermission, };

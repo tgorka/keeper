@@ -2,8 +2,10 @@
 
 /**
  * One recordable audio/video device (microphone or camera) reported by
- * `listSources` (Story 16.4). Shape-locked now; real enumeration needs
- * AVFoundation and lands with 16.6/19 — until then the lists are empty.
+ * `listSources` (Story 16.4): a flat `{id, name}` row — the `localizedName`
+ * already distinguishes built-in / external / Continuity devices, so there
+ * is deliberately no device-class field. Microphones enumerate live since
+ * Story 19.3, cameras since Story 20.1.
  */
 export type RecordingDeviceVm = { 
 /**

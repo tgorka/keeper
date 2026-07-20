@@ -64,31 +64,38 @@ struct SessionSegment {
 }
 
 /// The manifest slice the harness needs (the Rust `SessionManifest` writes
-/// camelCase; unknown fields are ignored by `JSONDecoder`).
+/// camelCase; unknown fields are ignored by `JSONDecoder`). `track` is read
+/// tolerantly (Story 20.1: a dual-track manifest carries `"screen"` and
+/// `"camera"` entries; an older manifest without the field reads as screen).
 private struct ManifestDocument: Decodable {
     struct Segment: Decodable {
         let index: Int
         let file: String
         let ptsStart: Double?
         let ptsEnd: Double?
+        let track: String?
     }
     let segments: [Segment]
 }
 
-/// Decode `<folder>/manifest.json` and return the session's segments ordered
-/// by manifest `index` (NOT filesystem order), each with its manifest PTS
-/// bounds. A missing or unparseable manifest throws — a surfaced test error.
-func sessionSegments(inFolder folder: URL) throws -> [SessionSegment] {
+/// Decode `<folder>/manifest.json` once — shared by the all-segments and
+/// per-track readers. A missing or unparseable manifest throws.
+private func manifestDocument(inFolder folder: URL) throws -> ManifestDocument {
     let manifestURL = folder.appendingPathComponent("manifest.json")
-    let document: ManifestDocument
     do {
         let data = try Data(contentsOf: manifestURL)
-        document = try JSONDecoder().decode(ManifestDocument.self, from: data)
+        return try JSONDecoder().decode(ManifestDocument.self, from: data)
     } catch {
         throw ConcatHarnessError.manifestUnreadable(
             folder: folder.path, underlying: String(describing: error))
     }
-    return document.segments
+}
+
+/// Map manifest entries into `SessionSegment`s ordered by manifest `index`.
+private func orderedSegments(
+    _ entries: [ManifestDocument.Segment], inFolder folder: URL
+) -> [SessionSegment] {
+    entries
         .sorted { $0.index < $1.index }
         .map { segment in
             SessionSegment(
@@ -97,6 +104,23 @@ func sessionSegments(inFolder folder: URL) throws -> [SessionSegment] {
                 ptsStart: segment.ptsStart,
                 ptsEnd: segment.ptsEnd)
         }
+}
+
+/// Decode `<folder>/manifest.json` and return the session's segments ordered
+/// by manifest `index` (NOT filesystem order), each with its manifest PTS
+/// bounds. A missing or unparseable manifest throws — a surfaced test error.
+func sessionSegments(inFolder folder: URL) throws -> [SessionSegment] {
+    orderedSegments(try manifestDocument(inFolder: folder).segments, inFolder: folder)
+}
+
+/// The per-track reader (Story 20.1): only the segments whose manifest
+/// `track` matches (an absent `track` reads as `"screen"` — pre-20.1
+/// manifests carried the field implicitly). The gapless gate runs per track;
+/// the alignment gate pairs the two lists by index.
+func sessionSegments(inFolder folder: URL, track: String) throws -> [SessionSegment] {
+    let entries = try manifestDocument(inFolder: folder).segments
+        .filter { ($0.track ?? "screen") == track }
+    return orderedSegments(entries, inFolder: folder)
 }
 
 /// The segment file URLs ordered by manifest `index` — the harness runs
@@ -253,24 +277,25 @@ func assertGaplessConcat(
     }
 }
 
-/// The Epic-20 screen↔camera alignment hook (FR-70): for every screen/camera
-/// segment pair sharing a manifest `index`, the first-frame host-clock PTS
-/// must agree within one frame period. Implemented and ready; exercised once
-/// Story 20.1 supplies `camera-####` fixtures (until then the calling test is
-/// skipped). Returns the violations (misaligned pairs as `gap`, unverifiable
-/// bounds as `missingBounds`, an index with no camera counterpart as
-/// `missingBounds` too) so 20.1 can wire negative controls the same way.
-@discardableResult
-func assertScreenCameraAlignedWithinOneFrame(
+/// The Epic-20 screen↔camera alignment core (FR-70, Story 20.1): for every
+/// screen/camera segment pair sharing a manifest `index`, the first-frame
+/// host-clock PTS must agree within one frame period. Pure — returns the
+/// violations (misaligned pairs as `gap` carrying the measured skew,
+/// unverifiable bounds as `missingBounds`, an index with no camera
+/// counterpart as `missingBounds` too) so the negative controls can assert a
+/// non-empty set without fighting `XCTFail` (the `gaplessConcatViolations`
+/// split, mirrored).
+func screenCameraAlignmentViolations(
     screen: [SessionSegment], camera: [SessionSegment], frameRate: Double,
-    file: StaticString = #filePath, line: UInt = #line
+    epsilon: Double = 1e-6
 ) -> [ConcatViolation] {
     precondition(frameRate > 0, "frameRate must be positive, got \(frameRate)")
     let period = 1.0 / frameRate
     // Tolerant of a duplicate manifest index (keep the first) rather than
-    // trapping — a malformed 20.1 camera manifest must surface as a gate
+    // trapping — a malformed camera manifest must surface as a gate
     // violation, never a fatalError in the harness.
-    let cameraByIndex = Dictionary(camera.map { ($0.index, $0) }, uniquingKeysWith: { first, _ in first })
+    let cameraByIndex = Dictionary(
+        camera.map { ($0.index, $0) }, uniquingKeysWith: { first, _ in first })
     var violations: [ConcatViolation] = []
     for screenSegment in screen {
         guard let cameraSegment = cameraByIndex[screenSegment.index],
@@ -285,11 +310,25 @@ func assertScreenCameraAlignedWithinOneFrame(
         let skew = cameraStart - screenStart
         // `+ epsilon` absorbs float noise only, mirroring the concat gate's
         // boundary tolerance — a skew within one frame period is aligned.
-        if abs(skew) > period + 1e-6 {
+        if abs(skew) > period + epsilon {
             violations.append(
                 ConcatViolation(boundary: screenSegment.index, kind: .gap, seconds: skew))
         }
     }
+    return violations
+}
+
+/// The thin XCTest-facing alignment wrapper: runs the pure core and
+/// `XCTFail`s once per violation naming the segment index and the measured
+/// skew. Positive tests call this; negative controls call
+/// `screenCameraAlignmentViolations` directly.
+@discardableResult
+func assertScreenCameraAlignedWithinOneFrame(
+    screen: [SessionSegment], camera: [SessionSegment], frameRate: Double,
+    file: StaticString = #filePath, line: UInt = #line
+) -> [ConcatViolation] {
+    let violations = screenCameraAlignmentViolations(
+        screen: screen, camera: camera, frameRate: frameRate)
     for violation in violations {
         XCTFail("FR-70 screen↔camera alignment: \(violation)", file: file, line: line)
     }

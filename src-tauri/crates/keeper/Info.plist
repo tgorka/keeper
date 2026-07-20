@@ -17,5 +17,12 @@
 	-->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>keeper records your microphone only when you enable it for a recording. Everything is saved locally on this Mac. Nothing uploads.</string>
+	<!--
+	  Story 20.1 (FR-70, AD-36): the Camera TCC usage string shown when keeper
+	  (via its keeper-rec child sidecar) requests access — lazily, only when the
+	  user enables the webcam source. Same honest local-only framing.
+	-->
+	<key>NSCameraUsageDescription</key>
+	<string>keeper records your camera only when you enable it for a recording. Everything is saved locally on this Mac. Nothing uploads.</string>
 </dict>
 </plist>

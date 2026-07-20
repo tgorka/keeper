@@ -11,11 +11,11 @@
 // - getCapabilities: protocol-version handshake + macOS version + feature flags
 //   + per-TCC permission states. `screenRecording` is real (CoreGraphics
 //   preflight — non-prompting, and authoritative because THIS process is the
-//   one that will capture); `microphone` is real too (AVFoundation, Story
-//   19.3); `camera` stays provisional "notDetermined" until 20.x.
+//   one that will capture); `microphone` (Story 19.3) and `camera` (Story
+//   20.1) are the real, non-prompting AVFoundation tri-states.
 // - listSources: real active displays via CoreGraphics, real applications via
-//   SCShareableContent (19.1), real microphones via AVFoundation (19.3);
-//   cameras stay an empty array until 20.x.
+//   SCShareableContent (19.1), real microphones (19.3) and real cameras
+//   (20.1) via AVFoundation.
 //
 // Cap #1722: macOS 15+ silently rejects ad-hoc-signed ScreenCaptureKit — real
 // capture builds need an Apple Development certificate (a DevEx requirement, not
@@ -95,7 +95,9 @@ private func permissionsPayload() -> [String: Any] {
     return [
         "screenRecording": screenRecording,
         "microphone": avPermissionString(for: .audio),
-        "camera": "notDetermined",
+        // Real since Story 20.1 (FR-70): the same non-prompting AVFoundation
+        // tri-state as the microphone, for the `.video` media type.
+        "camera": avPermissionString(for: .video),
     ]
 }
 
@@ -117,6 +119,11 @@ private func capabilitiesResult() -> [String: Any] {
         // Story 19.5 added the additive `fps` field to `startRecording`
         // (always emitted by the host, decoded best-effort here with a default
         // of 30) — per the same additive precedent the version stays 1.
+        // Story 20.1 added the additive `cameraEnabled`/`cameraDeviceId`
+        // startRecording fields (absent = camera off, preserving the pre-20.1
+        // wire), the `requestCamera` / `simulateCameraRemoval` methods, and
+        // the camera `segmentClosed{track:"camera"}` lines — all additive, so
+        // the version stays 1.
         "protocolVersion": 1,
         "macos": macos,
         "features": [
@@ -127,8 +134,10 @@ private func capabilitiesResult() -> [String: Any] {
             // macOS 15+, a parallel AVCaptureSession on 13–14 — supported on
             // the whole floor either way, so the flag never leaks the split.
             "microphone": true,
-            // Camera capture is not built yet (20.x).
-            "camera": false,
+            // Camera capture is live (Story 20.1, FR-70, AD-37): a separate
+            // `camera-####.mp4` per segment from a second in-process
+            // AVAssetWriter, supported on the whole macOS 13+ floor.
+            "camera": true,
         ],
         "permissions": permissionsPayload(),
     ]
@@ -269,17 +278,41 @@ private func listMicrophones() -> [[String: Any]] {
     }
 }
 
-/// The `listSources` result (Story 16.4 → 19.3): real displays (CoreGraphics),
-/// real applications (SCShareableContent), and real microphones (AVFoundation).
-/// Cameras stay deferred as an empty array — the shape is the locked contract;
-/// Epic 20 lands them. `async` because application enumeration awaits shareable
+/// Enumerate the video-input devices via `AVCaptureDevice.DiscoverySession`
+/// (Story 20.1, FR-70): real cameras as flat `{id, name}` rows for the Webcam
+/// card's device picker ("System default camera" is the picker's own first
+/// row — the host never needs a device id for the default). No device-class
+/// grouping on purpose: `localizedName` already distinguishes built-in /
+/// external / Continuity Camera. The macOS-14 type-name split is handled
+/// per-availability (the `listMicrophones` precedent): `.external` and the
+/// explicit `.continuityCamera` type exist on 14+ only — on 13 a Continuity
+/// Camera still enumerates through the legacy `.externalUnknown` type, so no
+/// device class is lost. A host with no camera degrades to an empty list —
+/// honest, never a crash.
+private func listCameras() -> [[String: Any]] {
+    let deviceTypes: [AVCaptureDevice.DeviceType]
+    if #available(macOS 14.0, *) {
+        deviceTypes = [.builtInWideAngleCamera, .external, .continuityCamera, .deskViewCamera]
+    } else {
+        deviceTypes = [.builtInWideAngleCamera, .externalUnknown, .deskViewCamera]
+    }
+    let discovery = AVCaptureDevice.DiscoverySession(
+        deviceTypes: deviceTypes, mediaType: .video, position: .unspecified)
+    return discovery.devices.map { device in
+        ["id": device.uniqueID, "name": device.localizedName]
+    }
+}
+
+/// The `listSources` result (Story 16.4 → 20.1): real displays (CoreGraphics),
+/// real applications (SCShareableContent), real microphones and real cameras
+/// (AVFoundation). `async` because application enumeration awaits shareable
 /// content.
 private func sourcesResult() async -> [String: Any] {
     return [
         "displays": listDisplays(),
         "applications": await listApplications(),
         "microphones": listMicrophones(),
-        "cameras": [] as [[String: Any]],
+        "cameras": listCameras(),
     ]
 }
 
@@ -342,6 +375,21 @@ while let line = readLine(strippingNewline: true) {
             _ = writeLine(["id": id, "result": ["status": avPermissionString(for: .audio)]])
         }
         continue
+    case "requestCamera":
+        // Story 20.1 (FR-70, AD-36): ask TCC for camera access — the host
+        // only ever sends this lazily, when the user enables the Webcam
+        // switch (never preemptively; the mic precedent verbatim). Where the
+        // state is undetermined the OS posts its one real prompt per app
+        // lifetime (attributed to keeper — this sidecar is keeper's child
+        // process; the usage string is keeper's NSCameraUsageDescription) and
+        // `requestAccess` resolves once the user answers; an already-decided
+        // state resolves immediately with no prompt. The reply carries the
+        // authoritative post-request tri-state.
+        Task {
+            _ = await AVCaptureDevice.requestAccess(for: .video)
+            _ = writeLine(["id": id, "result": ["status": avPermissionString(for: .video)]])
+        }
+        continue
     case "startRecording":
         // Story 16.6: begin the one capture session this process can host.
         // Progress flows as NDJSON *events* (preflight → recording → … ), not
@@ -379,6 +427,13 @@ while let line = readLine(strippingNewline: true) {
         // written as its own AAC track, never premixed (AD-36).
         let micEnabled = (params?["micEnabled"] as? Bool) ?? false
         let micDeviceId = params?["micDeviceId"] as? String
+        // Story 20.1: the optional webcam leg — off unless explicitly enabled
+        // (absent `cameraEnabled` means off, preserving the pre-20.1 wire);
+        // `cameraDeviceId` nil = the system default camera. The camera is
+        // written as its own separate `camera-####.mp4` file per segment,
+        // never a track inside `screen-####` (FR-70, AD-37).
+        let cameraEnabled = (params?["cameraEnabled"] as? Bool) ?? false
+        let cameraDeviceId = params?["cameraDeviceId"] as? String
         // Story 17.1: optional segmenting knobs, additive to the v1 protocol
         // (Story 17.5 later feeds configured values from keeper.db). Missing
         // fields fall back to the authored defaults; non-positive values are
@@ -400,6 +455,7 @@ while let line = readLine(strippingNewline: true) {
             path: path, displayId: displayId, applicationPid: applicationPid,
             applicationBundleId: applicationBundleId, systemAudio: systemAudio,
             micEnabled: micEnabled, micDeviceId: micDeviceId,
+            cameraEnabled: cameraEnabled, cameraDeviceId: cameraDeviceId,
             segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds, fps: fps)
         continue
     case "simulateMicRemoval":
@@ -412,6 +468,17 @@ while let line = readLine(strippingNewline: true) {
         response = ["id": id, "result": ["simulated": captureEngine.isActive]]
         _ = writeLine(response)
         captureEngine.simulateMicRemoval()
+        continue
+    case "simulateCameraRemoval":
+        // Story 20.1: drive the IDENTICAL camera-loss branch a real hardware
+        // unplug (a Continuity Camera walking away) takes —
+        // `CaptureEngine.handleCameraLost` → `CameraHealth.decide` →
+        // non-fatal `cameraLost` warning + early camera-file finalize. A
+        // test/simulation hook only, the `simulateMicRemoval` twin: with no
+        // active session (or a camera-off one) it is a clean no-op.
+        response = ["id": id, "result": ["simulated": captureEngine.isActive]]
+        _ = writeLine(response)
+        captureEngine.simulateCameraRemoval()
         continue
     case "stop":
         // Story 16.6: stop-and-finalize. The engine emits `stopping` /

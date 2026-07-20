@@ -28,9 +28,9 @@ use keeper_core::platform::Platform;
 use keeper_core::recording::{
     current_segment_bytes_on_disk, evaluate_destination, plan_disk_guard_action,
     resolve_screen_recording_access, session_bytes_on_disk, session_folder_name, ApplicationTarget,
-    CaptureTarget, DiskGuardAction, DiskGuardLatch, ManifestStatus, MicSelection, Recorder,
-    RecordingEvent, RecordingSession, SegmentEntry, SessionDevices, SessionManifest, SessionParams,
-    SessionState, RECORDING_MIN_FREE_BYTES, RECORDING_WARN_FREE_BYTES,
+    CameraSelection, CaptureTarget, DiskGuardAction, DiskGuardLatch, ManifestStatus, MicSelection,
+    Recorder, RecordingEvent, RecordingSession, SegmentEntry, SessionDevices, SessionManifest,
+    SessionParams, SessionState, RECORDING_MIN_FREE_BYTES, RECORDING_WARN_FREE_BYTES,
 };
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
@@ -3357,6 +3357,23 @@ pub async fn request_microphone_permission(
         .map_err(to_ipc_error)
 }
 
+/// Request camera access through the sidecar (Story 20.1, FR-70, AD-36):
+/// runs the `requestCamera` round-trip (`AVCaptureDevice.requestAccess(for:
+/// .video)` in the child sidecar, so TCC shows keeper's own usage string —
+/// `NSCameraUsageDescription` in keeper's Info.plist — and the OS posts its
+/// one real prompt per app lifetime where allowed) and resolves the
+/// authoritative post-request [`TccPermission`] tri-state. Called lazily —
+/// only when the user enables the Webcam switch, never preemptively. A denial
+/// is surfaced as an honest inline caption on the card and never blocks Start
+/// (the mic precedent; the rich per-source pre-flight rows are Story 20.2).
+/// Failures (sidecar unavailable / hung / iOS) funnel through [`to_ipc_error`].
+#[tauri::command]
+pub async fn request_camera_permission(
+    state: State<'_, AppState>,
+) -> Result<TccPermission, IpcError> {
+    state.recorder.request_camera().await.map_err(to_ipc_error)
+}
+
 /// Project a [`SessionState`] into the UI-facing [`RecordingUiState`] (Story 16.6).
 fn recording_ui_state(state: SessionState) -> RecordingUiState {
     match state {
@@ -3612,6 +3629,11 @@ fn resolve_capture_target(
 /// [`to_ipc_error`] (no session task exists yet); a mid-session manifest-write
 /// failure is logged only and never flips the live session to `failed` (the
 /// single-child start-guard keys off the snapshot).
+// Each parameter IS a named `invoke` payload key — the wire contract the
+// frontend `recordingStart` emits (Story 19.1/19.2/19.3/20.1 accreted one
+// optional source selection each). Grouping them into a struct would change
+// the wire to appease the lint (the registry.rs/notify.rs precedent).
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn recording_start(
     app: tauri::AppHandle,
@@ -3620,6 +3642,8 @@ pub async fn recording_start(
     system_audio: Option<bool>,
     microphone_enabled: Option<bool>,
     microphone_device_id: Option<String>,
+    camera_enabled: Option<bool>,
+    camera_device_id: Option<String>,
 ) -> Result<RecordingStatusVm, IpcError> {
     // Story 19.2: the Audio card's ephemeral per-session toggle. `None` (no
     // explicit choice reached the command) preserves the 16.6 default-on path.
@@ -3633,6 +3657,16 @@ pub async fn recording_start(
     let mic_on = microphone_enabled.unwrap_or(false);
     let microphone = mic_on.then_some(MicSelection {
         device_id: microphone_device_id,
+    });
+    // Story 20.1: the Webcam card's ephemeral camera selection, resolved by
+    // the identical rule — off unless explicitly enabled, device id `None` →
+    // the system default camera. The one resolved flag feeds BOTH the sidecar
+    // wire (`SessionParams.camera`) and the manifest (`SessionDevices.camera`),
+    // so an off session honestly records `devices.camera = false`, writes no
+    // `camera-####` file, and touches no Camera-TCC.
+    let camera_on = camera_enabled.unwrap_or(false);
+    let camera = camera_on.then_some(CameraSelection {
+        device_id: camera_device_id,
     });
     // Story 19.1: map the picker's selected target into the manifest capture
     // target + the sidecar's video-target params. `None` (no picker selection)
@@ -3719,7 +3753,9 @@ pub async fn recording_start(
             // Story 19.3: the mic leg is live — the manifest records whether
             // this session captures a microphone track.
             microphone: mic_on,
-            camera: false,
+            // Story 20.1: the camera leg is live — whether this session
+            // writes the separate `camera-####.mp4` files.
+            camera: camera_on,
         },
     )
     .map_err(|e| to_ipc_error(e.into()))?;
@@ -3749,6 +3785,9 @@ pub async fn recording_start(
         // Story 19.3: `Some` only when the mic source is enabled — the wire
         // then carries `micEnabled` (+ `micDeviceId` for a specific device).
         microphone,
+        // Story 20.1: `Some` only when the webcam is enabled — the wire then
+        // carries `cameraEnabled` (+ `cameraDeviceId` for a specific device).
+        camera,
         segment_mb,
         // Minutes → seconds for the sidecar's `maxSegmentSeconds` (30 → 1800).
         max_segment_seconds: u32::from(duration_cap_minutes) * 60,
@@ -3797,9 +3836,11 @@ pub async fn recording_start(
         let sink = Box::new(move |event: RecordingEvent| {
             // Capture the ledger entry before `apply` consumes the event: the
             // basename comes from the sidecar-reported path (synthesized from
-            // the index when absent); `bytes`/`track` degrade to 0/"screen".
-            // This is only the LIVE view — the terminal reconcile rebuilds the
-            // list authoritatively from disk.
+            // the track + index when absent — a `track:"camera"` line without
+            // a path must never fabricate a `screen-####` name, Story 20.1);
+            // `bytes`/`track` degrade to 0/"screen". This is only the LIVE
+            // view — the terminal reconcile rebuilds the list authoritatively
+            // from disk.
             let segment = match &event {
                 RecordingEvent::SegmentClosed {
                     index,
@@ -3815,7 +3856,14 @@ pub async fn recording_start(
                         .and_then(|p| Path::new(p).file_name())
                         .and_then(|name| name.to_str())
                         .map(str::to_owned)
-                        .unwrap_or_else(|| format!("screen-{index:04}.mp4")),
+                        .unwrap_or_else(|| {
+                            let stem = if track.as_deref() == Some("camera") {
+                                "camera"
+                            } else {
+                                "screen"
+                            };
+                            format!("{stem}-{index:04}.mp4")
+                        }),
                     bytes: bytes.unwrap_or(0),
                     track: track.clone().unwrap_or_else(|| "screen".to_owned()),
                     // Story 17.4 (NFR-22): the host-clock PTS bounds exist only

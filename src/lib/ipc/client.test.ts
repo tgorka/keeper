@@ -11,6 +11,7 @@ import {
   notifyGetPreviewEnabled,
   notifySetPreviewEnabled,
   recordingStart,
+  requestCameraPermission,
   requestMicrophonePermission,
   setNetworkFilter,
   setSpaceFilter,
@@ -255,6 +256,8 @@ describe("recordingStart / requestMicrophonePermission (Story 19.3)", () => {
       systemAudio: null,
       microphoneEnabled: null,
       microphoneDeviceId: null,
+      cameraEnabled: null,
+      cameraDeviceId: null,
     });
   });
 
@@ -266,6 +269,8 @@ describe("recordingStart / requestMicrophonePermission (Story 19.3)", () => {
       systemAudio: false,
       microphoneEnabled: true,
       microphoneDeviceId: "X",
+      cameraEnabled: null,
+      cameraDeviceId: null,
     });
   });
 
@@ -277,6 +282,8 @@ describe("recordingStart / requestMicrophonePermission (Story 19.3)", () => {
       systemAudio: true,
       microphoneEnabled: true,
       microphoneDeviceId: null,
+      cameraEnabled: null,
+      cameraDeviceId: null,
     });
   });
 
@@ -284,5 +291,39 @@ describe("recordingStart / requestMicrophonePermission (Story 19.3)", () => {
     invokeMock.mockResolvedValueOnce("denied");
     await expect(requestMicrophonePermission()).resolves.toBe("denied");
     expect(invokeMock).toHaveBeenCalledWith("request_microphone_permission", undefined);
+  });
+});
+
+describe("recordingStart camera args / requestCameraPermission (Story 20.1)", () => {
+  it("recordingStart threads the camera selection through as cameraEnabled/DeviceId", async () => {
+    invokeMock.mockResolvedValueOnce({ state: "preflight" });
+    await recordingStart(undefined, true, false, null, true, "CAM");
+    expect(invokeMock).toHaveBeenCalledWith("recording_start", {
+      target: null,
+      systemAudio: true,
+      microphoneEnabled: false,
+      microphoneDeviceId: null,
+      cameraEnabled: true,
+      cameraDeviceId: "CAM",
+    });
+  });
+
+  it("recordingStart maps a null camera id (system default camera) verbatim", async () => {
+    invokeMock.mockResolvedValueOnce({ state: "preflight" });
+    await recordingStart(undefined, true, false, null, true, null);
+    expect(invokeMock).toHaveBeenCalledWith("recording_start", {
+      target: null,
+      systemAudio: true,
+      microphoneEnabled: false,
+      microphoneDeviceId: null,
+      cameraEnabled: true,
+      cameraDeviceId: null,
+    });
+  });
+
+  it("requestCameraPermission resolves the sidecar-reported tri-state", async () => {
+    invokeMock.mockResolvedValueOnce("denied");
+    await expect(requestCameraPermission()).resolves.toBe("denied");
+    expect(invokeMock).toHaveBeenCalledWith("request_camera_permission", undefined);
   });
 });

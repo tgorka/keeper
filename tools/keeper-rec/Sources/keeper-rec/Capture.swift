@@ -13,6 +13,14 @@
 // the last fragment; a clean `finishWriting` finalizes each segment's `moov`
 // into an ordinary playable `.mp4`.
 //
+// The optional webcam (Story 20.1, FR-70) is a SECOND, separate file per
+// segment — `camera-####.mp4` from a dedicated AVCaptureSession + video-only
+// AVAssetWriter, host-clock anchored and cut at the screen's rotation
+// boundaries (screen is the rotation master; the camera never runs its own
+// RotationPolicy), never a track inside `screen-####`, never composited.
+// Camera loss mid-recording is non-fatal: a sticky `cameraLost` warning, an
+// early camera-file finalize, and the screen keeps rolling.
+//
 // Rotation (Story 17.1): when the current segment's **observed on-disk** size
 // reaches the byte budget — or the duration-cap fallback fires first — the
 // engine starts the next writer at the current complete frame's PTS, hands
@@ -90,7 +98,7 @@ private final class SegmentWriter {
 /// The single capture session this process can run (one session per sidecar
 /// spawn — AD-34; the host spawns a fresh `keeper-rec` per recording).
 final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
-    AVCaptureAudioDataOutputSampleBufferDelegate
+    AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureVideoDataOutputSampleBufferDelegate
 {
     /// The one serial queue owning all writer state: SCStream delivers both
     /// output types here, and rotation/stop/finalize run here too.
@@ -153,6 +161,65 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// stop with the rest.
     private var micSessionRuntimeObserver: NSObjectProtocol?
 
+    // MARK: - Webcam state (Story 20.1, FR-70, AD-37)
+
+    /// Whether the camera source is enabled (Story 20.1) — the session then
+    /// writes a SECOND, separate `camera-####.mp4` file per segment from a
+    /// dedicated video-only writer, host-clock anchored and cut at the
+    /// screen's rotation boundaries. Never a track inside `screen-####`.
+    private var wantsCamera = false
+    /// The camera `AVCaptureSession` (Story 20.1): an `AVCaptureVideoDataOutput`
+    /// delivering on the same serial `mediaQueue` as every other sample —
+    /// writer state stays queue-confined, no locks. `nil` while the camera is
+    /// off or after a loss finalized the camera file early.
+    private var cameraSession: AVCaptureSession?
+    /// The camera writer currently receiving samples (video-only; the
+    /// `SegmentWriter` audio/mic inputs stay nil). Swapped in lockstep with
+    /// the SCREEN rotation — the camera never runs its own RotationPolicy.
+    private var currentCamera: SegmentWriter?
+    /// Set on `mediaQueue` once the camera writer session has been anchored
+    /// at its first host-clock sample PTS (`startSession(atSourceTime:)`).
+    private var cameraSessionStarted = false
+    /// Set on `mediaQueue` when the camera is lost (Story 20.1) — terminal
+    /// for the session's camera leg: the current `camera-####.mp4` finalizes
+    /// early and no later segment carries a camera file (no black-fill, no
+    /// fallback re-feed — the intent contract).
+    private var cameraLost = false
+    /// Best-effort uniqueID of the device feeding the camera file — feeds
+    /// `CameraHealth.decide` so an unrelated device's removal never raises a
+    /// false warning.
+    private var activeCameraDeviceId: String?
+    /// The camera's native pixel size (from the resolved device's active
+    /// format), seeding every camera segment writer.
+    private var cameraPixelWidth = 2
+    private var cameraPixelHeight = 2
+    /// The current camera segment's reported PTS bounds in original
+    /// capture-clock seconds — `ptsStart`/`ptsEnd` on the camera
+    /// `segmentClosed`, paired by index against the screen segment's bounds
+    /// (the NFR-22 alignment gate). `ptsStart` is the SHARED screen
+    /// anchor/boundary PTS, recorded when the camera segment is anchored —
+    /// BEFORE any camera frame arrives — so a camera warming up seconds after
+    /// the screen (or lagging a rotation cut) never shifts the reported
+    /// boundary. `ptsEnd` is the last REAL appended camera frame.
+    private var cameraSegmentFirstVideoPTS: Double?
+    private var cameraSegmentLastVideoPTS: Double?
+    /// Whether the current camera segment has received a REAL appended frame
+    /// (the screen's `segmentHasVideo` twin). Deliberately distinct from
+    /// `cameraSegmentFirstVideoPTS`, which is set at anchor time before any
+    /// frame — the empty-vs-nonempty decision must never confuse "anchored"
+    /// with "has content": a zero-frame camera file is dropped, never
+    /// finalized (the concat reader throws `noVideoFrames` on it).
+    private var cameraSegmentHasVideo = false
+    /// Camera device-removal observer tokens, removed at stop so no late
+    /// signal fires into a winding-down engine.
+    private var cameraObservers: [NSObjectProtocol] = []
+    /// The camera `AVCaptureSession`'s runtime-error observer (kept apart so
+    /// removal at stop is cheap and final, the mic precedent).
+    private var cameraSessionRuntimeObserver: NSObjectProtocol?
+    /// The session folder (with trailing slash) derived from the host-supplied
+    /// screen path — `camera-####.mp4` basenames ride beside it.
+    private var sessionDirectory = ""
+
     /// Set on `mediaQueue` when the writer session has been anchored at the
     /// first complete video frame's PTS.
     private var sessionStarted = false
@@ -161,6 +228,12 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// PTS of the current segment's anchor frame — the elapsed-time base for
     /// the duration-cap fallback. Host-clock timeline, shared by all segments.
     private var segmentStartPTS = CMTime.invalid
+    /// The SESSION's anchor PTS — the first complete screen frame, set once
+    /// when `sessionStarted` flips true and never overwritten (unlike
+    /// `segmentStartPTS`, which every rotation rebases). The camera's
+    /// segment-0 `ptsStart` reports THIS shared boundary even when the camera
+    /// warms up seconds later (NFR-22 same-index alignment).
+    private var sessionAnchorPTS: CMTime?
     /// Whether the current segment has received a video frame yet (feeds the
     /// policy's `isFirstFrameOfSegment` guard — never rotate a just-opened
     /// segment, even under a tiny budget).
@@ -189,15 +262,20 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// that app's windows land in the file), a specific `displayId`, or the main
     /// display (`applicationPid == nil && displayId == nil`). `micEnabled`
     /// (Story 19.3) adds the microphone as its own, unmixed AAC track
-    /// (`micDeviceId` nil = the system default input). Rotating segments
-    /// per `segmentMB` / `maxSegmentSeconds`. `fps` (Story 19.5) selects the
-    /// capture frame rate, normalized to {30, 60} before it reaches the stream
-    /// configuration. Emits `preflight` immediately, then
-    /// `recording` (with the path) once frames are flowing, or a single honest
-    /// `error` line on any failure — including a vanished application pid.
+    /// (`micDeviceId` nil = the system default input). `cameraEnabled`
+    /// (Story 20.1) adds the webcam as its own separate `camera-####.mp4`
+    /// file per segment (`cameraDeviceId` nil = the system default camera;
+    /// a vanished picked id falls back to the default, never an abort).
+    /// Rotating segments per `segmentMB` / `maxSegmentSeconds`. `fps`
+    /// (Story 19.5) selects the capture frame rate, normalized to {30, 60}
+    /// before it reaches the stream configuration. Emits `preflight`
+    /// immediately, then `recording` (with the path) once frames are flowing,
+    /// or a single honest `error` line on any failure — including a vanished
+    /// application pid.
     func start(
         path: String, displayId: UInt32?, applicationPid: Int32?, applicationBundleId: String?,
         systemAudio: Bool, micEnabled: Bool, micDeviceId: String?,
+        cameraEnabled: Bool, cameraDeviceId: String?,
         segmentMB: Int, maxSegmentSeconds: Int, fps: Int
     ) {
         isActive = true
@@ -259,7 +337,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                     try self.beginCapture(
                         display: display, application: app, path: path,
                         systemAudio: systemAudio, micEnabled: micEnabled,
-                        micDeviceId: micDeviceId, fps: fps)
+                        micDeviceId: micDeviceId, cameraEnabled: cameraEnabled,
+                        cameraDeviceId: cameraDeviceId, fps: fps)
                     return
                 }
 
@@ -279,7 +358,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 }
                 try self.beginCapture(
                     display: display, application: nil, path: path, systemAudio: systemAudio,
-                    micEnabled: micEnabled, micDeviceId: micDeviceId, fps: fps)
+                    micEnabled: micEnabled, micDeviceId: micDeviceId,
+                    cameraEnabled: cameraEnabled, cameraDeviceId: cameraDeviceId, fps: fps)
             } catch {
                 emitEvent([
                     "event": "error",
@@ -299,10 +379,15 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// `micEnabled` (Story 19.3, AD-36) adds the second, unmixed mic AAC track:
     /// in-stream `captureMicrophone` + the `.microphone` output on macOS 15+, a
     /// parallel audio-only `AVCaptureSession` on 13–14 — same writer either way,
-    /// invisible to the user and to the capability flag.
+    /// invisible to the user and to the capability flag. `cameraEnabled`
+    /// (Story 20.1, FR-70) stands up the SEPARATE camera leg: a dedicated
+    /// `AVCaptureSession` + video-only writer producing `camera-####.mp4`
+    /// beside each screen segment — never a track inside `screen-####`, never
+    /// composited (no PiP/self-view).
     private func beginCapture(
         display: SCDisplay, application: SCRunningApplication?, path: String, systemAudio: Bool,
-        micEnabled: Bool, micDeviceId: String?, fps: Int
+        micEnabled: Bool, micDeviceId: String?, cameraEnabled: Bool, cameraDeviceId: String?,
+        fps: Int
     ) throws {
         // Capture at the display's true pixel size (SCDisplay reports points).
         pixelWidth = max(2, CGDisplayPixelsWide(display.displayID))
@@ -384,6 +469,15 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 // `micInput`. User-invisible: same writer, same second track.
                 try startMicCaptureSession(deviceId: micDeviceId)
             }
+        }
+
+        // Story 20.1 (FR-70): the separate camera leg — a dedicated
+        // AVCaptureSession + video-only writer producing `camera-0000.mp4`
+        // beside the host-supplied screen basename. Seeded here so segment 0's
+        // camera writer exists before the first sample can arrive.
+        wantsCamera = cameraEnabled
+        if cameraEnabled {
+            try setupCamera(deviceId: cameraDeviceId, screenPath: path)
         }
 
         self.current = first
@@ -752,13 +846,388 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         return sampleBuffer
     }
 
-    // MARK: - AVCaptureAudioDataOutputSampleBufferDelegate (on mediaQueue, macOS 13–14)
+    // MARK: - AVCapture(Audio|Video)DataOutputSampleBufferDelegate (on mediaQueue)
 
+    /// The two AVCapture data-output delegate protocols share this one
+    /// selector: the mic's `AVCaptureAudioDataOutput` (macOS 13–14 path +
+    /// the 19.4 fallback feed) and the camera's `AVCaptureVideoDataOutput`
+    /// (Story 20.1) both deliver here — dispatch on the output type.
     func captureOutput(
         _ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        appendMicSample(sampleBuffer)
+        if output is AVCaptureVideoDataOutput {
+            appendCameraSample(sampleBuffer)
+        } else {
+            appendMicSample(sampleBuffer)
+        }
+    }
+
+    // MARK: - Webcam as a separate synchronized file (Story 20.1, FR-70)
+
+    /// The `camera-####.mp4` path for segment `index`, beside the
+    /// host-supplied screen basename in the same session folder. Same-index
+    /// pairing with `screen-####` is the alignment contract (NFR-22).
+    private func cameraSegmentPath(index: Int) -> String {
+        sessionDirectory + String(format: "camera-%04d.mp4", index)
+    }
+
+    /// Stand up the camera leg (Story 20.1): resolve the device (a picked
+    /// uniqueID that vanished falls back to the system default camera — the
+    /// I/O-matrix contract, never an abort; NO camera at all is an honest
+    /// start failure, the mic precedent), read its native pixel size, build
+    /// segment 0's video-only writer, and attach an `AVCaptureVideoDataOutput`
+    /// delivering on `mediaQueue`. A throw here surfaces as the caller's
+    /// single honest `error` event — never a hung recording.
+    private func setupCamera(deviceId: String?, screenPath: String) throws {
+        let device: AVCaptureDevice?
+        if let deviceId {
+            device = AVCaptureDevice(uniqueID: deviceId) ?? AVCaptureDevice.default(for: .video)
+        } else {
+            device = AVCaptureDevice.default(for: .video)
+        }
+        guard let device else {
+            throw CaptureError("the selected camera is not available")
+        }
+        // The camera file is encoded at the device's native active-format
+        // size — the camera never inherits the display's dimensions.
+        let dimensions = CMVideoFormatDescriptionGetDimensions(
+            device.activeFormat.formatDescription)
+        cameraPixelWidth = max(2, Int(dimensions.width))
+        cameraPixelHeight = max(2, Int(dimensions.height))
+        // `camera-####.mp4` rides beside the host-supplied screen basename.
+        if let slash = screenPath.lastIndex(of: "/") {
+            sessionDirectory = String(screenPath[...slash])
+        } else {
+            sessionDirectory = ""
+        }
+        // The identity `CameraHealth.decide` matches removals against.
+        activeCameraDeviceId = device.uniqueID
+
+        let session = AVCaptureSession()
+        let input = try AVCaptureDeviceInput(device: device)
+        guard session.canAddInput(input) else {
+            throw CaptureError("could not open the camera input")
+        }
+        session.addInput(input)
+        let output = AVCaptureVideoDataOutput()
+        output.setSampleBufferDelegate(self, queue: mediaQueue)
+        guard session.canAddOutput(output) else {
+            throw CaptureError("could not attach the camera output")
+        }
+        session.addOutput(output)
+        cameraSession = session
+        currentCamera = try makeCameraSegmentWriter(index: 0)
+        installCameraDisconnectObserver()
+        // A yanked camera on this path can surface as a *session runtime
+        // error* rather than a device disconnect — route it into the same
+        // non-fatal camera-loss branch. Never `error`/exit: camera-only loss
+        // must not kill the session (the 19.4 mic precedent).
+        cameraSessionRuntimeObserver = NotificationCenter.default.addObserver(
+            forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.mediaQueue.async {
+                self.handleCameraLost(removedDeviceId: self.activeCameraDeviceId)
+            }
+        }
+        // `startRunning` blocks while the session spins up — keep it off the
+        // request loop and `mediaQueue`. Camera samples arriving before the
+        // screen anchor are dropped by the append guard, like every other
+        // non-video source.
+        DispatchQueue.global(qos: .userInitiated).async {
+            session.startRunning()
+        }
+    }
+
+    /// Build one camera segment's video-only writer (fragmented MP4, H.264 at
+    /// the device's native size) and start it writing — the `SegmentWriter`
+    /// stack with the audio/mic inputs nil. Called for segment 0 from
+    /// `setupCamera` and for each screen-driven rotation on `mediaQueue`.
+    private func makeCameraSegmentWriter(index: Int) throws -> SegmentWriter {
+        let path = cameraSegmentPath(index: index)
+        let url = URL(fileURLWithPath: path)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        // Same ~4 s fragment cadence as the screen writer (AD-37): a
+        // mid-session kill loses at most the last fragment of either file.
+        writer.movieFragmentInterval = CMTime(seconds: 4, preferredTimescale: 600)
+        let videoInput = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: cameraPixelWidth,
+                AVVideoHeightKey: cameraPixelHeight,
+                AVVideoCompressionPropertiesKey: [
+                    // A webcam-sized H.264 stream, not the display's budget.
+                    AVVideoAverageBitRateKey: 4_000_000,
+                    AVVideoExpectedSourceFrameRateKey: 30,
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                ],
+            ])
+        videoInput.expectsMediaDataInRealTime = true
+        guard writer.canAdd(videoInput) else {
+            throw CaptureError("could not add the camera H.264 video track")
+        }
+        writer.add(videoInput)
+        guard writer.startWriting() else {
+            throw CaptureError(
+                "could not start the camera writer: \(writer.error.map(String.init(describing:)) ?? "unknown")"
+            )
+        }
+        return SegmentWriter(
+            writer: writer, videoInput: videoInput, audioInput: nil, micInput: nil,
+            path: path, index: index)
+    }
+
+    /// Append one camera sample to the current camera segment (Story 20.1) —
+    /// on `mediaQueue`. Mirrors the mic guard: samples before the SCREEN
+    /// anchor (or after stop / after a camera loss) are dropped. The camera
+    /// writer is anchored at the SHARED screen session anchor, not its own
+    /// first frame — `SCStream` and `AVCaptureSession` both stamp against
+    /// `CMClockGetHostTimeClock`, so the two files share one timeline, and
+    /// reporting the shared anchor as `ptsStart` keeps segment 0's same-index
+    /// starts within one frame even when the camera warms up seconds after
+    /// the screen (the NFR-22 alignment gate).
+    private func appendCameraSample(_ sampleBuffer: CMSampleBuffer) {
+        guard sampleBuffer.isValid, !stopping, !cameraLost, sessionStarted,
+            let camera = currentCamera
+        else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if !cameraSessionStarted {
+            // Anchor at the screen's session anchor, not this (possibly
+            // warm-up-delayed) camera frame: appending at `pts` ≥ the anchor
+            // is valid (pre-anchor camera samples were dropped above), and
+            // the reported `ptsStart` must be the shared boundary or segment
+            // 0 would be misaligned by the whole camera warm-up.
+            let anchor = sessionAnchorPTS ?? pts
+            camera.writer.startSession(atSourceTime: anchor)
+            cameraSessionStarted = true
+            if anchor.isNumeric { cameraSegmentFirstVideoPTS = anchor.seconds }
+        }
+        guard camera.videoInput.isReadyForMoreMediaData else { return }
+        camera.videoInput.append(sampleBuffer)
+        cameraSegmentHasVideo = true
+        // Track the last REAL appended PTS (`ptsEnd`) in original
+        // capture-clock seconds — the muxer rebases the file's own timeline
+        // to 0, so the host-clock bounds exist only here (Story 17.4 rule).
+        // `ptsStart` was fixed at anchor time and is never overwritten; the
+        // first numeric frame only backfills it when the anchor itself was
+        // non-numeric (a NaN would break the segment's JSON event line).
+        if pts.isNumeric {
+            let seconds = pts.seconds
+            if cameraSegmentFirstVideoPTS == nil { cameraSegmentFirstVideoPTS = seconds }
+            cameraSegmentLastVideoPTS = seconds
+        }
+    }
+
+    /// Cut the camera writer at the screen's rotation keyframe PTS — called
+    /// from `rotate(...)` inside the SAME `mediaQueue` critical section, so
+    /// same-index `screen-####`/`camera-####` files share one boundary. The
+    /// screen is the rotation master (AD-37); the camera never rotates on its
+    /// own byte budget. Every camera-only failure here is NON-FATAL: the
+    /// camera leg ends early with a `cameraLost` warning while the screen
+    /// rotation proceeds untouched.
+    private func rotateCameraAtScreenBoundary(keyframePTS: CMTime, nextIndex: Int) {
+        guard wantsCamera, !cameraLost, let retiring = currentCamera else { return }
+        // A camera segment that received no REAL frame cannot be finalized —
+        // retire it empty (drop the file) and advance to the new index so
+        // same-index pairing holds once frames flow. The replacement is
+        // anchored at the shared boundary right away (and marked started, so
+        // a later append never lands in an unstarted writer) — its reported
+        // `ptsStart` is the boundary, like every rotated segment's.
+        guard cameraSessionStarted, cameraSegmentHasVideo else {
+            retiring.writer.cancelWriting()
+            try? FileManager.default.removeItem(atPath: retiring.path)
+            currentCamera = nil
+            do {
+                let next = try makeCameraSegmentWriter(index: nextIndex)
+                next.writer.startSession(atSourceTime: keyframePTS)
+                cameraSessionStarted = true
+                cameraSegmentFirstVideoPTS = keyframePTS.isNumeric ? keyframePTS.seconds : nil
+                cameraSegmentLastVideoPTS = nil
+                cameraSegmentHasVideo = false
+                currentCamera = next
+            } catch {
+                failCameraNonFatally(
+                    message: "camera segment rotation failed — the camera file ends here; "
+                        + "screen recording continues")
+            }
+            return
+        }
+        let next: SegmentWriter
+        do {
+            next = try makeCameraSegmentWriter(index: nextIndex)
+        } catch {
+            failCameraNonFatally(
+                message: "camera segment rotation failed — the camera file ends here; "
+                    + "screen recording continues")
+            return
+        }
+        // The retiring camera segment's host-clock PTS bounds — read here,
+        // before the swap resets them (the Story 17.4 screen rule).
+        let retiringPTSStart = cameraSegmentFirstVideoPTS
+        let retiringPTSEnd = cameraSegmentLastVideoPTS
+        // The new camera file opens at the SAME screen keyframe boundary PTS,
+        // and the BOUNDARY is its reported `ptsStart` — not the next camera
+        // frame, which may lag or drop at the cut — keeping same-index starts
+        // within one frame period (the NFR-22 alignment gate). A non-numeric
+        // cut PTS leaves the bound nil rather than seeding a NaN (the screen
+        // rotation's rule); the first numeric frame then backfills it.
+        next.writer.startSession(atSourceTime: keyframePTS)
+        currentCamera = next
+        cameraSegmentFirstVideoPTS = keyframePTS.isNumeric ? keyframePTS.seconds : nil
+        cameraSegmentLastVideoPTS = nil
+        cameraSegmentHasVideo = false
+        retiring.videoInput.markAsFinished()
+        finalizeGroup.enter()
+        retiring.writer.finishWriting { [self] in
+            mediaQueue.async { [self] in
+                if retiring.writer.status == .completed {
+                    // While stopping, the host is in `Stopping` — a
+                    // segmentClosed now would be an illegal transition; the
+                    // stop path owns all remaining signalling.
+                    if !stopping {
+                        var closed: [String: Any] = [
+                            "event": "segmentClosed",
+                            "index": retiring.index,
+                            "path": retiring.path,
+                            "bytes": onDiskBytes(atPath: retiring.path),
+                            "track": "camera",
+                        ]
+                        if let retiringPTSStart { closed["ptsStart"] = retiringPTSStart }
+                        if let retiringPTSEnd { closed["ptsEnd"] = retiringPTSEnd }
+                        emitEvent(closed)
+                    }
+                } else if !stopping {
+                    // A camera-only finalize failure is non-fatal by contract
+                    // — warn, never `error`, never exit (screen owns the
+                    // session's fate). It is terminal for the CAMERA leg,
+                    // though: by the time this retiring-writer completion runs
+                    // the replacement writer is already live, so route through
+                    // `failCameraNonFatally` to stop and drop it too. Otherwise
+                    // the sticky `cameraLost` warning ("the camera file ends
+                    // here") would fire while later camera segments keep
+                    // recording — a lie. This mirrors every other camera-fault
+                    // path (device loss, rotation-writer creation failure).
+                    failCameraNonFatally(
+                        message: "camera segment finalize failed — the camera file ends here; "
+                            + "screen recording continues")
+                }
+                finalizeGroup.leave()
+            }
+        }
+    }
+
+    /// Drive the identical camera-loss branch a real hardware unplug takes —
+    /// the NDJSON-RPC test hook (`simulateCameraRemoval`). With no active
+    /// session this is a clean no-op; with a camera-off session
+    /// `CameraHealth.decide` makes it a no-op on `mediaQueue`.
+    func simulateCameraRemoval() {
+        guard isActive else { return }
+        mediaQueue.async { [self] in
+            handleCameraLost(removedDeviceId: activeCameraDeviceId)
+        }
+    }
+
+    /// Observe device disconnects for the camera-loss path — the notification
+    /// fires for every `AVCaptureDevice`, so non-video devices are filtered
+    /// here; whether THIS removal matters is `CameraHealth.decide`'s call
+    /// (the same pure branch the simulated removal drives).
+    private func installCameraDisconnectObserver() {
+        let token = NotificationCenter.default.addObserver(
+            forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: nil
+        ) { [weak self] note in
+            guard let self,
+                let device = note.object as? AVCaptureDevice, device.hasMediaType(.video)
+            else { return }
+            let removedId = device.uniqueID
+            self.mediaQueue.async { self.handleCameraLost(removedDeviceId: removedId) }
+        }
+        cameraObservers.append(token)
+    }
+
+    /// The one camera-loss branch (Story 20.1) — on `mediaQueue`, fed by a
+    /// device disconnect, a camera-session runtime error, or
+    /// `simulateCameraRemoval` (identical path for all three). NEVER emits
+    /// `error` and never exits: camera loss is non-fatal — the screen (and
+    /// audio) keep rolling, the current `camera-####.mp4` finalizes early
+    /// (no black-fill), and the host renders the sticky `cameraLost` warning.
+    private func handleCameraLost(removedDeviceId: String?) {
+        guard !stopping, !cameraLost else { return }
+        let decision = CameraHealth.decide(
+            cameraEnabled: wantsCamera,
+            removedDeviceId: removedDeviceId,
+            activeDeviceId: activeCameraDeviceId)
+        guard decision.shouldWarn else { return }
+        emitEvent([
+            "event": "warning",
+            "code": decision.code,
+            "message": decision.message,
+        ])
+        cameraLost = true
+        finalizeCameraEarly()
+    }
+
+    /// Non-fatal camera fault with an honest, cause-specific message (a
+    /// rotation writer failure rather than a device removal): same warning
+    /// code, same early finalize — the wire consumer sees one `cameraLost`
+    /// surface either way.
+    private func failCameraNonFatally(message: String) {
+        guard !cameraLost else { return }
+        cameraLost = true
+        emitEvent([
+            "event": "warning",
+            "code": CameraHealth.warningCode,
+            "message": message,
+        ])
+        finalizeCameraEarly()
+    }
+
+    /// Finalize the current camera file early (Story 20.1) — on `mediaQueue`.
+    /// The camera leg ends here for the session: the capture session winds
+    /// down (off the media queue — `stopRunning` blocks), the writer's `moov`
+    /// is written so the partial file stays playable, and its `segmentClosed
+    /// {track:"camera"}` reports the host-clock bounds it accumulated. A
+    /// writer without a REAL appended frame — un-anchored OR anchored at the
+    /// boundary but frameless — is cancelled and its file dropped: a
+    /// zero-frame `camera-####.mp4` would be unplayable noise in the ledger.
+    private func finalizeCameraEarly() {
+        if let session = cameraSession {
+            cameraSession = nil
+            DispatchQueue.global(qos: .userInitiated).async { session.stopRunning() }
+        }
+        guard let camera = currentCamera else { return }
+        currentCamera = nil
+        guard cameraSessionStarted, camera.writer.status == .writing,
+            cameraSegmentHasVideo
+        else {
+            camera.writer.cancelWriting()
+            try? FileManager.default.removeItem(atPath: camera.path)
+            return
+        }
+        let ptsStart = cameraSegmentFirstVideoPTS
+        let ptsEnd = cameraSegmentLastVideoPTS
+        camera.videoInput.markAsFinished()
+        finalizeGroup.enter()
+        camera.writer.finishWriting { [self] in
+            mediaQueue.async { [self] in
+                if camera.writer.status == .completed, !stopping {
+                    var closed: [String: Any] = [
+                        "event": "segmentClosed",
+                        "index": camera.index,
+                        "path": camera.path,
+                        "bytes": onDiskBytes(atPath: camera.path),
+                        "track": "camera",
+                    ]
+                    if let ptsStart { closed["ptsStart"] = ptsStart }
+                    if let ptsEnd { closed["ptsEnd"] = ptsEnd }
+                    emitEvent(closed)
+                }
+                finalizeGroup.leave()
+            }
+        }
     }
 
     /// The observed **on-disk** size of `path` in bytes (0 when unreadable).
@@ -838,6 +1307,11 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         segmentFirstVideoPTS = keyframePTS.isNumeric ? keyframePTS.seconds : nil
         segmentLastVideoPTS = segmentFirstVideoPTS
 
+        // Story 20.1 (FR-70): cut the camera writer at the SAME keyframe PTS
+        // in the same critical section — the screen is the rotation master;
+        // same-index screen/camera segments share this one boundary.
+        rotateCameraAtScreenBoundary(keyframePTS: keyframePTS, nextIndex: retiring.index + 1)
+
         retiring.videoInput.markAsFinished()
         retiring.audioInput?.markAsFinished()
         retiring.micInput?.markAsFinished()
@@ -909,6 +1383,24 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             // later path can touch a wound-down session.
             self.micSession = nil
         }
+        // Story 20.1: the camera teardown mirrors the mic's — observers gone
+        // first (a removal during teardown must not fire the camera-loss path
+        // into a winding-down engine), then the session wound down off the
+        // media queue. Late camera samples are dropped by `stopping`.
+        for token in cameraObservers {
+            NotificationCenter.default.removeObserver(token)
+        }
+        cameraObservers.removeAll()
+        if let token = cameraSessionRuntimeObserver {
+            NotificationCenter.default.removeObserver(token)
+            cameraSessionRuntimeObserver = nil
+        }
+        if let cameraSession {
+            DispatchQueue.global(qos: .userInitiated).async {
+                cameraSession.stopRunning()
+            }
+            self.cameraSession = nil
+        }
         guard let stream else {
             // Stop before capture ever started: nothing to finalize.
             emitEvent(["event": "error", "message": "stop before capture started"])
@@ -935,11 +1427,40 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     private func finishAndExit() {
         guard let current, sessionStarted, current.writer.status == .writing else {
             self.current?.writer.cancelWriting()
+            // Story 20.1: the screen never anchored, so the camera never
+            // appended either — cancel its empty writer and drop the file so
+            // a no-frames stop leaves no orphan `camera-0000.mp4` behind.
+            if let camera = currentCamera {
+                currentCamera = nil
+                camera.writer.cancelWriting()
+                try? FileManager.default.removeItem(atPath: camera.path)
+            }
             emitEvent([
                 "event": "error",
                 "message": "no frames were captured before stop",
             ])
             exit(0)
+        }
+        // Story 20.1: finalize the camera's FINAL segment alongside the
+        // screen's — like the screen's final segment it emits no
+        // `segmentClosed` (the host is Stopping; the terminal disk reconcile
+        // lists it with honest null bounds). A camera writer without a REAL
+        // appended frame (anchored at the boundary or not) is cancelled and
+        // its file dropped instead — never finalized into a zero-frame file.
+        // A camera already finalized early (loss) left `currentCamera` nil —
+        // nothing to do.
+        if let camera = currentCamera {
+            currentCamera = nil
+            if cameraSessionStarted, camera.writer.status == .writing,
+                cameraSegmentHasVideo
+            {
+                camera.videoInput.markAsFinished()
+                finalizeGroup.enter()
+                camera.writer.finishWriting { self.finalizeGroup.leave() }
+            } else {
+                camera.writer.cancelWriting()
+                try? FileManager.default.removeItem(atPath: camera.path)
+            }
         }
         current.videoInput.markAsFinished()
         current.audioInput?.markAsFinished()
@@ -986,6 +1507,10 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 current.writer.startSession(atSourceTime: pts)
                 sessionStarted = true
                 segmentStartPTS = pts
+                // The write-once session anchor: the camera's segment-0
+                // boundary (`segmentStartPTS` holds the same value now but is
+                // rebased on every rotation, so the camera reads this field).
+                sessionAnchorPTS = pts
             }
             // Rotation decision at every complete frame. SCStream delivers raw
             // (unencoded) frames, so every complete frame is a valid keyframe

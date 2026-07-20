@@ -418,6 +418,12 @@ pub fn parse_event(line: &str) -> Option<RecordingEvent> {
 /// `startRecording` (like `segmentMB`), decoded best-effort by the sidecar with
 /// a default of 30 when absent — per the same additive precedent the version
 /// stays 1.
+///
+/// Story 20.1 added the additive `cameraEnabled`/`cameraDeviceId`
+/// `startRecording` fields (absent = camera off, preserving the pre-20.1
+/// wire), the `requestCamera` method, and `segmentClosed{track:"camera"}`
+/// lines (the `track` field existed since 17.1) — per the same additive
+/// precedent the version stays 1.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The shared disk-guard hard floor in bytes (Story 19.5; 2 GiB): the minimum
@@ -622,6 +628,16 @@ pub fn request_microphone_request(id: u64) -> String {
     serde_json::json!({ "id": id, "method": "requestMicrophone" }).to_string()
 }
 
+/// Build the one-line `requestCamera` request (Story 20.1, FR-70, AD-36; no
+/// trailing newline — the shell port owns line framing). Wire shape:
+/// `{"id":<id>,"method":"requestCamera"}`. Only ever sent lazily — when the
+/// user enables the Webcam switch, never preemptively (the 19.3 mic
+/// precedent verbatim). Additive to the v1 protocol — keeper and keeper-rec
+/// ship in lockstep, so [`PROTOCOL_VERSION`] is unchanged.
+pub fn request_camera_request(id: u64) -> String {
+    serde_json::json!({ "id": id, "method": "requestCamera" }).to_string()
+}
+
 /// A single-application capture target (Story 19.1) — the running process id and
 /// bundle identifier the sidecar re-resolves live against `SCShareableContent` at
 /// Start. Pure data; no platform token.
@@ -641,6 +657,20 @@ pub struct ApplicationTarget {
 pub struct MicSelection {
     /// The selected input device's unique id, or `None` for the system default
     /// input.
+    pub device_id: Option<String>,
+}
+
+/// The camera selection of one capture session (Story 20.1, FR-70, AD-37) —
+/// present on [`SessionParams`] only when the webcam source is enabled. Pure
+/// data; no platform token (the device id is an opaque string the sidecar
+/// resolves against its own enumeration, falling back to the system default
+/// camera when the id vanished). The sidecar then records the camera as its
+/// own separate `camera-####.mp4` per segment — never a track inside
+/// `screen-####`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraSelection {
+    /// The selected camera's unique id, or `None` for the system default
+    /// camera.
     pub device_id: Option<String>,
 }
 
@@ -671,6 +701,12 @@ pub struct SessionParams {
     /// `micEnabled:true` (+ `micDeviceId` when a specific device is picked)
     /// and the sidecar writes the mic as its own, unmixed AAC track.
     pub microphone: Option<MicSelection>,
+    /// The camera selection (Story 20.1, FR-70), or `None` when the webcam
+    /// source is off (the default). When `Some`, the wire carries
+    /// `cameraEnabled:true` (+ `cameraDeviceId` when a specific device is
+    /// picked) and the sidecar writes a separate `camera-####.mp4` per
+    /// segment beside `screen-####`.
+    pub camera: Option<CameraSelection>,
     /// Segment size in decimal MB before a gapless rotation (Story 17.5,
     /// FR-72); the sidecar's `segmentMB`.
     pub segment_mb: u32,
@@ -719,6 +755,16 @@ pub fn start_recording_request(id: u64, params: &SessionParams) -> String {
         wire["micEnabled"] = true.into();
         if let Some(device_id) = &microphone.device_id {
             wire["micDeviceId"] = device_id.clone().into();
+        }
+    }
+    // The webcam source (Story 20.1): additive fields, absent entirely while
+    // the camera is off so the pre-20.1 wire stays byte-for-byte unchanged.
+    // `cameraDeviceId` is emitted only for a specific device — its absence
+    // with `cameraEnabled:true` means the system default camera.
+    if let Some(camera) = &params.camera {
+        wire["cameraEnabled"] = true.into();
+        if let Some(device_id) = &camera.device_id {
+            wire["cameraDeviceId"] = device_id.clone().into();
         }
     }
     serde_json::json!({ "id": id, "method": "startRecording", "params": wire }).to_string()
@@ -876,6 +922,22 @@ pub fn parse_request_microphone_result(line: &str) -> Result<TccPermission, Reco
         .map_err(|e| protocol_error(format!("requestMicrophone: unrecognized status: {e}")))
 }
 
+/// Parse the id-correlated `requestCamera` response line (Story 20.1, FR-70,
+/// AD-36) into the sidecar-reported post-request TCC state (`result.status`)
+/// — the `parse_request_microphone_result` twin for the `.video` media type.
+/// A sidecar `error` answer and any malformed / missing field surface as
+/// [`RecordingError::Protocol`] — never a panic.
+pub fn parse_request_camera_result(line: &str) -> Result<TccPermission, RecordingError> {
+    let result = response_result(line, "requestCamera")?;
+    let raw = result
+        .as_object()
+        .and_then(|obj| obj.get("status"))
+        .cloned()
+        .ok_or_else(|| protocol_error("requestCamera: missing status"))?;
+    serde_json::from_value(raw)
+        .map_err(|e| protocol_error(format!("requestCamera: unrecognized status: {e}")))
+}
+
 /// Lift the sidecar's two-valued Screen Recording preflight into the honest
 /// tri-state (Story 16.5, FR-67, AD-36) — pure and total, unit-tested without a
 /// Mac.
@@ -950,11 +1012,17 @@ pub fn verify_protocol_version(reported: u32) -> Result<(), CoreError> {
 /// The `manifest.json` schema version (Story 17.2).
 pub const MANIFEST_VERSION: u32 = 1;
 
-/// Segment files this session owns are named `screen-####.mp4`. The terminal
-/// reconcile ingests only this stem prefix, so a stray `*.mp4` (a user drop, or a
-/// future Epic 20 `camera-####.mp4` sharing the folder) with a trailing digit run
-/// never pollutes the authoritative screen-track ledger.
+/// Screen-track segment files are named `screen-####.mp4`. The terminal
+/// reconcile ingests only the session's own stem prefixes (this one and
+/// [`CAMERA_SEGMENT_STEM_PREFIX`], Story 20.1), so a stray `*.mp4` (a user
+/// drop) with a trailing digit run never pollutes the authoritative ledger.
 const SEGMENT_STEM_PREFIX: &str = "screen-";
+
+/// Camera-track segment files are named `camera-####.mp4` (Story 20.1,
+/// FR-70/FR-73): the optional webcam's own separate per-segment file, sharing
+/// the session folder and the segment index space with `screen-####` —
+/// disambiguated in the ledger by `track`, never by index alone.
+const CAMERA_SEGMENT_STEM_PREFIX: &str = "camera-";
 
 /// The persisted `status` of a session manifest (Story 17.2). Lowercase on the
 /// wire: `"recording" | "finalized" | "recovered" | "failed"`.
@@ -1064,16 +1132,16 @@ impl CaptureTarget {
     }
 }
 
-/// Which device tracks the session records (Story 17.2). `microphone`/`camera`
-/// stay constant `false` until Epic 19/20.
+/// Which device tracks the session records (Story 17.2 → 20.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionDevices {
     /// Whether the system-audio AAC track is recorded.
     pub system_audio: bool,
-    /// Whether a microphone track is recorded (constant `false` in Epic 17).
+    /// Whether a microphone track is recorded (live since Story 19.3).
     pub microphone: bool,
-    /// Whether a camera track is recorded (constant `false` in Epic 17).
+    /// Whether the separate `camera-####.mp4` camera files are recorded
+    /// (live since Story 20.1; `false` while the Webcam switch is off).
     pub camera: bool,
 }
 
@@ -1206,19 +1274,24 @@ impl SessionManifest {
     /// segment file's own timeline to 0, so the original capture-clock
     /// `pts_start`/`pts_end` can NEVER be recovered from the `.mp4` files.
     /// Each rebuilt entry therefore inherits the bounds the event-fed ledger
-    /// already recorded for its index (`None` — persisted as `null` — when no
-    /// prior entry exists: the final segment, a DW-992 backfill, an older
-    /// sidecar).
+    /// already recorded for its `(track, index)` pair (`None` — persisted as
+    /// `null` — when no prior entry exists: the final segment, a DW-992
+    /// backfill, an older sidecar). Since Story 20.1 both `screen-####` and
+    /// `camera-####` files are ingested into the ONE segments vec,
+    /// disambiguated by `track` (FR-73).
     pub fn reconcile_from_dir(&mut self) -> Result<(), RecordingError> {
         let entries =
             std::fs::read_dir(&self.folder).map_err(|e| manifest_io("read session folder", &e))?;
-        // Snapshot the only-capture-time-known bounds by index before the
-        // event-fed list is discarded.
-        let known_bounds: std::collections::HashMap<u32, (Option<f64>, Option<f64>)> = self
-            .segments
-            .iter()
-            .map(|s| (s.index, (s.pts_start, s.pts_end)))
-            .collect();
+        // Snapshot the only-capture-time-known bounds by (track, index)
+        // before the event-fed list is discarded. Keyed on the PAIR (Story
+        // 20.1, FR-73): `screen-0000` and `camera-0000` share an index by
+        // design, so an index-only key would let one track's bounds clobber
+        // the other's.
+        let known_bounds: std::collections::HashMap<(String, u32), (Option<f64>, Option<f64>)> =
+            self.segments
+                .iter()
+                .map(|s| ((s.track.clone(), s.index), (s.pts_start, s.pts_end)))
+                .collect();
         let mut segments: Vec<SegmentEntry> = Vec::new();
         for entry in entries {
             let entry = match entry {
@@ -1244,15 +1317,20 @@ impl SessionManifest {
                 tracing::warn!("manifest reconcile: skipping .mp4 with a non-UTF-8 stem");
                 continue;
             };
-            // Only this session's own `screen-####.mp4` segments are authoritative
-            // ledger entries — a stray `*.mp4` with a trailing digit run must not
-            // pollute the screen-track list or collide on `index`.
-            if !stem.starts_with(SEGMENT_STEM_PREFIX) {
+            // Only this session's own `screen-####.mp4` / `camera-####.mp4`
+            // segments (Story 20.1) are authoritative ledger entries — a stray
+            // `*.mp4` with a trailing digit run must not pollute the ledger or
+            // collide on `(track, index)`. The stem prefix names the track.
+            let track = if stem.starts_with(SEGMENT_STEM_PREFIX) {
+                "screen"
+            } else if stem.starts_with(CAMERA_SEGMENT_STEM_PREFIX) {
+                "camera"
+            } else {
                 continue;
-            }
+            };
             let Some(index) = segment_index_from_stem(stem) else {
                 tracing::warn!(
-                    "manifest reconcile: skipping screen-* file without a segment index"
+                    "manifest reconcile: skipping segment-prefixed file without a segment index"
                 );
                 continue;
             };
@@ -1269,12 +1347,15 @@ impl SessionManifest {
                 tracing::warn!("manifest reconcile: skipping non-file .mp4 entry");
                 continue;
             }
-            let (pts_start, pts_end) = known_bounds.get(&index).copied().unwrap_or((None, None));
+            let (pts_start, pts_end) = known_bounds
+                .get(&(track.to_owned(), index))
+                .copied()
+                .unwrap_or((None, None));
             segments.push(SegmentEntry {
                 index,
                 file: file.to_owned(),
                 bytes: metadata.len(),
-                track: "screen".to_owned(),
+                track: track.to_owned(),
                 pts_start,
                 pts_end,
             });
@@ -1487,6 +1568,15 @@ pub trait Recorder {
     /// enables the mic source, never preemptively. Same error surface as
     /// [`Recorder::get_capabilities`].
     fn request_microphone(&self) -> impl Future<Output = Result<TccPermission, CoreError>> + Send;
+
+    /// Run the `requestCamera` round-trip (Story 20.1, FR-70, AD-36): ask
+    /// the sidecar to request camera access (the OS shows its one real
+    /// prompt where allowed) and resolve the reported post-request
+    /// [`TccPermission`] tri-state. Only ever called lazily — when the user
+    /// enables the Webcam switch, never preemptively; a denial never blocks
+    /// Start (the mic precedent). Same error surface as
+    /// [`Recorder::get_capabilities`].
+    fn request_camera(&self) -> impl Future<Output = Result<TccPermission, CoreError>> + Send;
 }
 
 /// Drive one recording session to its terminal [`SessionState`] (Story 16.2).
@@ -2143,10 +2233,15 @@ mod tests {
             request_microphone_request(6),
             r#"{"id":6,"method":"requestMicrophone"}"#
         );
+        assert_eq!(
+            request_camera_request(7),
+            r#"{"id":7,"method":"requestCamera"}"#
+        );
         // No line framing inside the request — the shell port owns the newline.
         assert!(!capabilities_request(7).contains('\n'));
         assert!(!request_screen_recording_request(7).contains('\n'));
         assert!(!request_microphone_request(7).contains('\n'));
+        assert!(!request_camera_request(7).contains('\n'));
     }
 
     #[test]
@@ -2159,6 +2254,7 @@ mod tests {
             application: None,
             system_audio: true,
             microphone: None,
+            camera: None,
             segment_mb: 800,
             max_segment_seconds: 2700,
             fps: 30,
@@ -2201,6 +2297,7 @@ mod tests {
             application: None,
             system_audio: false,
             microphone: None,
+            camera: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
@@ -2221,6 +2318,7 @@ mod tests {
             application: None,
             system_audio: true,
             microphone: None,
+            camera: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
@@ -2247,6 +2345,7 @@ mod tests {
             application: None,
             system_audio: true,
             microphone: Some(MicSelection { device_id: None }),
+            camera: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
@@ -2275,6 +2374,7 @@ mod tests {
             microphone: Some(MicSelection {
                 device_id: Some("X".to_owned()),
             }),
+            camera: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
@@ -2325,6 +2425,129 @@ mod tests {
     }
 
     #[test]
+    fn start_recording_request_omits_camera_fields_while_off() {
+        // Story 20.1: a camera-off session (`camera: None`, the default)
+        // carries NO `cameraEnabled`/`cameraDeviceId` key at all — the
+        // pre-20.1 wire stays byte-for-byte unchanged, and the sidecar
+        // writes no camera file and touches no Camera-TCC.
+        let params = SessionParams {
+            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            display_id: None,
+            application: None,
+            system_audio: true,
+            microphone: None,
+            camera: None,
+            segment_mb: 500,
+            max_segment_seconds: 1800,
+            fps: 30,
+        };
+        let line = start_recording_request(14, &params);
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
+        assert!(
+            wire["params"].get("cameraEnabled").is_none(),
+            "a camera-off session must not carry cameraEnabled"
+        );
+        assert!(
+            wire["params"].get("cameraDeviceId").is_none(),
+            "a camera-off session must not carry cameraDeviceId"
+        );
+    }
+
+    #[test]
+    fn start_recording_request_carries_camera_enabled_with_default_device() {
+        // Story 20.1: the webcam on with the system default camera —
+        // `cameraEnabled: true` and NO `cameraDeviceId` (its absence means
+        // the default device, the mic-wire precedent).
+        let params = SessionParams {
+            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            display_id: None,
+            application: None,
+            system_audio: true,
+            microphone: None,
+            camera: Some(CameraSelection { device_id: None }),
+            segment_mb: 500,
+            max_segment_seconds: 1800,
+            fps: 30,
+        };
+        let line = start_recording_request(15, &params);
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
+        assert_eq!(wire["params"]["cameraEnabled"], true);
+        assert!(
+            wire["params"].get("cameraDeviceId").is_none(),
+            "the system default camera must omit cameraDeviceId"
+        );
+        // The earlier fields ride along unchanged.
+        assert_eq!(wire["params"]["systemAudio"], true);
+        assert_eq!(wire["params"]["segmentMB"], 500);
+    }
+
+    #[test]
+    fn start_recording_request_carries_camera_device_id_and_mic_together() {
+        // Story 20.1: a specific camera picked on the Webcam card threads its
+        // opaque unique id through as `cameraDeviceId` — and the camera is
+        // independent of the mic (both sources on, distinct keys).
+        let params = SessionParams {
+            output_path: "/tmp/keeper-rec/screen-0000.mp4".to_owned(),
+            display_id: None,
+            application: None,
+            system_audio: false,
+            microphone: Some(MicSelection {
+                device_id: Some("MIC".to_owned()),
+            }),
+            camera: Some(CameraSelection {
+                device_id: Some("CAM".to_owned()),
+            }),
+            segment_mb: 500,
+            max_segment_seconds: 1800,
+            fps: 30,
+        };
+        let line = start_recording_request(16, &params);
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
+        assert_eq!(wire["params"]["cameraEnabled"], true);
+        assert_eq!(wire["params"]["cameraDeviceId"], "CAM");
+        assert_eq!(wire["params"]["micEnabled"], true);
+        assert_eq!(wire["params"]["micDeviceId"], "MIC");
+        assert_eq!(wire["params"]["systemAudio"], false);
+    }
+
+    #[test]
+    fn parse_request_camera_result_maps_every_status() {
+        // Story 20.1: the sidecar's post-request video-permission tri-state
+        // maps onto `TccPermission` verbatim (the requestMicrophone twin).
+        for (status, expected) in [
+            ("granted", TccPermission::Granted),
+            ("denied", TccPermission::Denied),
+            ("notDetermined", TccPermission::NotDetermined),
+        ] {
+            let line = format!(r#"{{"id":7,"result":{{"status":"{status}"}}}}"#);
+            assert_eq!(
+                parse_request_camera_result(&line).expect("status parses"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn parse_request_camera_result_surfaces_faults() {
+        // A sidecar `error` answer, a missing status, and an unknown status
+        // string all surface as `Protocol` — never a panic.
+        for line in [
+            r#"{"id":7,"error":{"code":"unknownMethod","message":"unknown method"}}"#,
+            r#"{"id":7,"result":{}}"#,
+            r#"{"id":7,"result":{"status":"maybe"}}"#,
+            "not json",
+        ] {
+            assert!(
+                matches!(
+                    parse_request_camera_result(line),
+                    Err(RecordingError::Protocol(_))
+                ),
+                "line {line:?} must surface a Protocol fault"
+            );
+        }
+    }
+
+    #[test]
     fn start_recording_request_app_target_wins_over_display() {
         // Story 19.1: an application target emits `applicationPid`+`bundleId`
         // and OMITS `displayId` (even when a display id is also set), so the
@@ -2339,6 +2562,7 @@ mod tests {
             }),
             system_audio: true,
             microphone: None,
+            camera: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
@@ -2370,6 +2594,7 @@ mod tests {
                 application: None,
                 system_audio: true,
                 microphone: None,
+                camera: None,
                 segment_mb: 500,
                 max_segment_seconds: 1800,
                 fps,
@@ -2918,6 +3143,16 @@ mod tests {
             // Canned grant — the fake port answers the wire, it never fakes TCC.
             Ok(TccPermission::Granted)
         }
+
+        async fn request_camera(&self) -> Result<TccPermission, CoreError> {
+            if !self.available {
+                return Err(CoreError::Unsupported(
+                    "keeper-rec is not available".to_owned(),
+                ));
+            }
+            // Canned grant — the fake port answers the wire, it never fakes TCC.
+            Ok(TccPermission::Granted)
+        }
     }
 
     /// Canned params for the fake port (never touch the filesystem).
@@ -2928,6 +3163,7 @@ mod tests {
             application: None,
             system_audio: true,
             microphone: None,
+            camera: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
@@ -3040,6 +3276,10 @@ mod tests {
             .request_screen_recording()
             .await
             .expect("canned grant outcome"));
+        assert_eq!(
+            recorder.request_camera().await.expect("canned tri-state"),
+            TccPermission::Granted
+        );
 
         let unavailable = FakeRecorder::new(false, vec![]);
         assert!(matches!(
@@ -3052,6 +3292,10 @@ mod tests {
         ));
         assert!(matches!(
             unavailable.request_screen_recording().await,
+            Err(CoreError::Unsupported(_))
+        ));
+        assert!(matches!(
+            unavailable.request_camera().await,
             Err(CoreError::Unsupported(_))
         ));
     }
@@ -3332,26 +3576,124 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_ingests_only_screen_segments_and_sorts_deterministically() {
+    fn reconcile_ingests_both_tracks_and_skips_strays_deterministically() {
         let folder = fresh_temp_dir("strays");
         let mut manifest = test_manifest(folder.clone());
         std::fs::write(folder.join("screen-0002.mp4"), vec![0u8; 5]).expect("segment 2");
         std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 4]).expect("segment 0");
-        // Strays that must NOT enter the authoritative screen-track ledger:
+        // Story 20.1 (FR-73): a camera segment is this session's own track
+        // now — ingested with `track:"camera"`, never treated as a stray.
+        std::fs::write(folder.join("camera-0000.mp4"), vec![0u8; 6]).expect("camera segment 0");
+        // Strays that must NOT enter the authoritative ledger:
         std::fs::write(folder.join("extra-0001.mp4"), vec![0u8; 6]).expect("wrong prefix");
-        std::fs::write(folder.join("camera-0000.mp4"), vec![0u8; 6]).expect("future track prefix");
         std::fs::write(folder.join("notes.mp4"), vec![0u8; 7]).expect("no numeric run");
         std::fs::write(folder.join("cover.png"), vec![0u8; 8]).expect("non-mp4");
         std::fs::create_dir(folder.join("screen-0009.mp4")).expect("dir masquerading as segment");
         manifest
             .reconcile_from_dir()
             .expect("strays are skipped, never aborting");
-        let names: Vec<&str> = manifest.segments.iter().map(|s| s.file.as_str()).collect();
+        let entries: Vec<(&str, &str)> = manifest
+            .segments
+            .iter()
+            .map(|s| (s.file.as_str(), s.track.as_str()))
+            .collect();
         assert_eq!(
-            names,
-            vec!["screen-0000.mp4", "screen-0002.mp4"],
-            "only screen-####.mp4 segments enter the ledger, sorted by (index, file); \
-             wrong-prefix / no-run / non-mp4 / directory entries are skipped"
+            entries,
+            vec![
+                // (index, file) sort: camera-0000 < screen-0000 at index 0.
+                ("camera-0000.mp4", "camera"),
+                ("screen-0000.mp4", "screen"),
+                ("screen-0002.mp4", "screen"),
+            ],
+            "screen-####.mp4 and camera-####.mp4 enter the ledger disambiguated by track, \
+             sorted by (index, file); wrong-prefix / no-run / non-mp4 / directory entries \
+             are skipped"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Shorthand for a camera-track ledger entry (Story 20.1).
+    fn camera_entry(index: u32, file: &str, bytes: u64) -> SegmentEntry {
+        SegmentEntry {
+            track: "camera".to_owned(),
+            ..screen_entry(index, file, bytes)
+        }
+    }
+
+    #[test]
+    fn reconcile_dual_track_keeps_bounds_per_track_index_without_clobber() {
+        // Story 20.1 (FR-73), the one real core hazard: `screen-0000` and
+        // `camera-0000` share index 0 by design, so the reconcile snapshot
+        // must key the capture-time PTS bounds on the (track, index) PAIR —
+        // an index-only key would let one track's bounds clobber the other's.
+        let folder = fresh_temp_dir("dual-track");
+        let mut manifest = test_manifest(folder.clone());
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("screen 0");
+        std::fs::write(folder.join("camera-0000.mp4"), vec![0u8; 20]).expect("camera 0");
+        std::fs::write(folder.join("screen-0001.mp4"), vec![0u8; 30]).expect("screen final");
+        std::fs::write(folder.join("camera-0001.mp4"), vec![0u8; 40]).expect("camera final");
+        // Event-fed view: DIFFERENT bounds per track at the same index (the
+        // camera anchors a hair after the screen — the real capture shape).
+        manifest.record_segment(screen_entry_with_bounds(
+            0,
+            "screen-0000.mp4",
+            10,
+            1000.0,
+            1029.75,
+        ));
+        manifest.record_segment(SegmentEntry {
+            pts_start: Some(1000.02),
+            pts_end: Some(1029.77),
+            ..camera_entry(0, "camera-0000.mp4", 20)
+        });
+        manifest.reconcile_from_dir().expect("terminal reconcile");
+        assert_eq!(
+            manifest.segments,
+            vec![
+                // (index, file) order: camera before screen at each index.
+                SegmentEntry {
+                    pts_start: Some(1000.02),
+                    pts_end: Some(1029.77),
+                    ..camera_entry(0, "camera-0000.mp4", 20)
+                },
+                screen_entry_with_bounds(0, "screen-0000.mp4", 10, 1000.0, 1029.75),
+                // Final segments never got a segmentClosed → honest null
+                // bounds per track, no cross-track inheritance.
+                camera_entry(1, "camera-0001.mp4", 40),
+                screen_entry(1, "screen-0001.mp4", 30),
+            ],
+            "both tracks ingest into ONE ledger, bounds preserved per (track, index)"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn reconcile_camera_only_bounds_never_leak_onto_screen() {
+        // The clobber regression in its sharpest form: only the CAMERA entry
+        // at index 0 carries event-fed bounds. The rebuilt screen-0000 entry
+        // must stay honestly null — inheriting the camera's bounds would
+        // fabricate a host-clock claim the screen never made.
+        let folder = fresh_temp_dir("no-cross-leak");
+        let mut manifest = test_manifest(folder.clone());
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("screen 0");
+        std::fs::write(folder.join("camera-0000.mp4"), vec![0u8; 20]).expect("camera 0");
+        manifest.record_segment(SegmentEntry {
+            pts_start: Some(2000.0),
+            pts_end: Some(2030.0),
+            ..camera_entry(0, "camera-0000.mp4", 20)
+        });
+        manifest.reconcile_from_dir().expect("terminal reconcile");
+        assert_eq!(
+            manifest.segments,
+            vec![
+                SegmentEntry {
+                    pts_start: Some(2000.0),
+                    pts_end: Some(2030.0),
+                    ..camera_entry(0, "camera-0000.mp4", 20)
+                },
+                screen_entry(0, "screen-0000.mp4", 10),
+            ],
+            "bounds keyed on (track, index): the screen twin stays null"
         );
         let _ = std::fs::remove_dir_all(&folder);
     }

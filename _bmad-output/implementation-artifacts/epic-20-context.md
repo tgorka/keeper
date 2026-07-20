@@ -1,0 +1,56 @@
+# Epic 20 Context: Webcam & Polish — Ship the Phase
+
+<!-- Generated from planning artifacts. Regenerate with compile-epic-context if planning docs change. -->
+
+## Goal
+
+Epic 20 closes the macOS Screen Recording phase (Epics 16–20) and gates its release. It adds the last capture source — an optional webcam recorded as its own separately-synchronized file — plus the Microphone/Camera permission pre-flight rows, the end-of-session completion card and startup recovery notice, palette actions with an optional global Start/Stop hotkey, and the capability-gating and zero-egress audits that prove recording is desktop-macOS-only and provably local. It then measures the reliability envelope (4 h soak, CPU/memory) on real hardware, writes `docs/recording.md`, and runs the SM-9/SM-10 phase acceptance with retrospective inputs. This is where "records for hours without falling over, never leaks, never loses silently" stops being a claim and becomes signed-off evidence.
+
+## Stories
+
+- Story 20.1: Optional Webcam as a Separate Synchronized File
+- Story 20.2: Microphone & Camera TCC Pre-flight Rows
+- Story 20.3: Completion / Reveal-in-Finder & Startup Recovery Notice
+- Story 20.4: Palette Actions, Global Hotkey, Capability-Gating & Zero-Egress Audit
+- Story 20.5: Reliability Envelope — 4 h Soak & CPU/Memory Verification
+- Story 20.6: SM-9 / SM-10 Phase Acceptance, docs/recording.md & Retrospective Inputs
+
+## Requirements & Constraints
+
+- **Webcam is optional and never burned in.** Default off. When enabled it records `camera-####.mp4` in the same session folder from a second in-sidecar writer, host-clock anchored and rotated at the *same* segment boundaries as `screen-####`, so any two same-index segments played side by side stay aligned within one video frame at the configured fps. Webcam off produces no camera files and touches no Camera permission. Camera loss mid-recording never aborts the screen recording — it continues with a warning. No picture-in-picture and no self-view bubble this phase (copy may note macOS 14+ can composite the camera via the system presenter overlay — an OS behavior, not a keeper feature).
+- **Permission pre-flight is honest and live.** The pre-flight tracks three TCC classes distinctly (Screen Recording, Microphone, Camera). Mic/Camera rows appear only when those sources are enabled, are live-detected at render (never optimistically cached), are requested via the system prompt only on enable (never preemptively), and deep-link to the exact System Settings pane where only manual granting remains. Start is disabled naming the blocking permission until all required grants are green. Usage strings (`NSMicrophoneUsageDescription`, `NSCameraUsageDescription`) must be present in keeper's bundle Info.plist.
+- **Completion and recovery are the same card shape.** On Stop: a completion card "Saved N segments · {size}" + the session-folder path in mono + a primary Reveal in Finder — no preview, trim, or share. An interrupted (recovered) session surfaces once, "A recording was interrupted; N segments were saved," with a warning-tinted edge, linking the folder; recovered files play as-is with no remux.
+- **Reachability without new verbs.** Palette actions ("Start recording", "Stop recording", "Open recordings folder") register only behind the recording capability flag. An optional configurable global Start/Stop hotkey (unset by default) is assignable in Settings → Shortcuts with conflict detection. Stop is always one click from the tray. No single-key verbs on this surface and `Esc` does not stop a recording — stopping is always explicit.
+- **Capability-gating audit.** A test confirms no recording surface (sidebar, Settings, palette, tray) renders on macOS < 13.0 or iOS — absent, not disabled.
+- **Zero-egress audit.** A full record → stop → recover cycle contacts no new hosts; the per-release egress inventory diff for the phase is empty. No upload, share-link, transcription, or cloud affordance exists anywhere in the recording UI.
+- **Reliability envelope (authored bars, owner-confirmed before gating).** A 4 h continuous capture (1080p-class, 30 fps, system audio + mic) completes with zero recorder crashes, writer stalls, or A/V desync and no unbounded memory growth; sample-buffer queues stay bounded with a drop-oldest-video policy (audio never dropped), and sustained dropping raises a warning. Performance envelope: adds < 100% of one core average CPU and < 400 MB combined RSS (sidecar + keeper), with messaging bars NFR-1–NFR-4 still holding while recording. Segment handover is gapless: keyframe cuts, continuous host-clock PTS, concat monotonic within one frame, screen↔camera aligned within one frame — an automated concatenate-and-assert test gates release.
+- **Phase acceptance (SM-9 / SM-10).** SM-9: on a Development-signed macOS 13+ build, pre-flight → full-screen and app-scoped recording with system audio + mic (+ webcam as a separate file) → size-based segment rotation into the chosen folder with a valid manifest → induced crash recovers. SM-10: the soak is green, the induced-failure matrix (recorder kill, mic unplug, disk floor, permission revoke) surfaces loudly in 100% of tests with already-written segments intact, zero silent recording-loss incidents in dogfooding, and the egress diff is empty.
+- **Docs one-to-one with the app.** `docs/recording.md` covers the dev-signing requirement (Apple Development certificate; macOS 15+ ad-hoc SCK rejection, Cap #1722), the monthly re-auth nag for non-picker SCK, the untouched macOS purple capture pill, and the disk-guard / segment-size / folder defaults — matching the in-app disclosures exactly, honest, and free of any credentials or signing material.
+
+## Technical Decisions
+
+- **Platform split holds.** `keeper-core::recording` owns the session state machine, manifest schema, segment ledger, folder validation, and recovery reconciliation — no Tauri and no Apple API. All capture and process work lives behind a `Recorder` Platform-style port in the `keeper` shell; the macOS impl spawns the `keeper-rec` Swift sidecar, every non-macOS impl returns `Unsupported`. Core never holds a process handle.
+- **Second writer, same rotation.** The camera track comes from a second in-sidecar AVAssetWriter, host-clock anchored and rotated at the same size-based boundaries as the screen writer — the dual-writer gapless rotation lives entirely in `keeper-rec`. `keeper-core` records `camera-####.mp4` in the ledger/manifest only; no PiP compositing.
+- **Capability flag is the single gate.** `CapabilitiesVm.recording` is true only on desktop macOS ≥ 13.0 (system-audio floor); iOS never (no child processes). Every recording surface renders only when the flag is on. The frontend never sniffs userAgent or build flags. The internal macOS 15+ in-stream-mic branch lives entirely inside `keeper-rec`.
+- **TCC attribution and quirks.** The sidecar is spawned (never a LaunchAgent) so TCC attributes it to keeper as the responsible process. Disclose honestly: relaunch-after-grant, and the macOS 15+ monthly re-auth nag for non-picker SCK. Revocation mid-recording is a loud failure with written segments intact.
+- **Tray and loud-failure pipeline (extend existing).** The tray gains recording states (idle → recording → warning/error), a ~1 Hz disabled elapsed/segment/size line, Stop Recording, and Open Recordings Folder. Recording temporarily forces tray presence even when the opt-in tray toggle is off and restores the exact prior state at stop. Quit-while-recording warns → sends stop → flushes → kill-timeout guard, never orphaning the recorder. Every fault is loud: tray error + native notification within 5 s via the existing notification pipeline, offering one-click restart; every session reaches finalized | recovered | failed.
+- **Disk-guard policy ownership.** Buffer-bounding, drop policy, and rotation correctness live in `keeper-rec`; the disk-guard policy (pre-start free-space validation, warn threshold, hard-floor stop-and-finalize) lives in `keeper-core::recording`, driven by free-space on the sidecar's state events.
+- **Build/sign.** `keeper-rec` is a SwiftPM package outside the Cargo workspace, Apache-2.0, Apple system frameworks only (no ffmpeg — cargo-deny untouched), shipped as a codesigned `externalBin`. Local builds exercising recording require an Apple Development certificate. Authored bars are owner-sign-off items at phase release, not architecture blockers; the CI concat-assert + perf harness is the gate once confirmed.
+
+## UX & Interaction Patterns
+
+- **Recording is a utility, not a conversation** — a single non-chat surface (no timeline, no composer) centered in a single column, flipping in place: pre-record setup (Card stack: Source, Audio, Webcam, Destination, Segmenting, collapsed Advanced/fps) → active recording (active-recording banner + source summary + segment meter) → completion/recovery card.
+- **Webcam control:** a Switch (default off) revealing a camera device-picker (built-in / external / Continuity Camera); copy "records to a separate file, synced to the screen," plus the presenter-overlay note; no self-view, no PiP.
+- **Recording red is the live-capture color only** — it appears solely on the record dot and the active-recording banner / tray record badge while capture runs (and carries the loud error banner when faulted). It is warmer/brighter than destructive red so "on" never reads as "delete"; the two never share a surface. Never on buttons, text, hovers, or decoration. The recovery notice reuses the completion card shape with a warning (`bridge-degraded`)-tinted edge instead.
+- **Persistent, never toast-only.** The active-recording banner is the in-app twin of the tray; warning (mic unplug, low disk) and error (recorder exit, writer stall, permission revoked, disk floor) variants are persistent loud-failure surfaces with "Restart recording."
+- **Accessibility.** Every recording flow completes keyboard-only and mirrors into the native menu bar. VoiceOver carries live state; start/stop and every fault announce assertively (loss-risk events). Elapsed time announces on demand and on state change, not once per second. `Esc` never stops a recording.
+
+## Cross-Story Dependencies
+
+- 20.1 (Webcam) depends on Epic 17 (rotation/manifest) and Epic 19 (device-picker pattern); it populates the Story 17.4 screen↔camera alignment assertion.
+- 20.2 (Pre-flight rows) depends on the 16.5 pre-flight mechanism, 19.3 (mic), and 20.1 (camera).
+- 20.3 (Completion/recovery) depends on Epic 17 (recovery/ledger), 16.6 (stop path), and 18.1 (tray restore).
+- 20.4 (Palette/hotkey/audits) depends on 16.3, Epic 18, and Epic 19.
+- 20.5 (Reliability envelope) depends on Epics 17, 18, 19 and 20.1; **human-in-the-loop** — a 4 h capture on reference Apple Silicon with an Apple Development-signed build; the automation loop defers it to the coordinator.
+- 20.6 (Phase acceptance) depends on all of 20.1–20.5 plus Epics 16–19 complete; **human-in-the-loop** — a physical Mac, Development-signed build, real TCC grants including a live mid-record permission-revoke, and real device churn; also defer-to-coordinator.
+- Epic exit / phase acceptance: SM-9 green on dev-signed hardware; SM-10 reliability bars met; `docs/recording.md` current; authored bars owner-confirmed; retrospective inputs on file.

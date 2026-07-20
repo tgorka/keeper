@@ -27,6 +27,7 @@ import {
   SCREEN_RECORDING_PERMISSION_NAME,
 } from "@/components/recording/recording-permission-row";
 import { RecordingSourcePicker } from "@/components/recording/recording-source-picker";
+import { RecordingWebcamControls } from "@/components/recording/recording-webcam-controls";
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -36,6 +37,7 @@ import { isLiveRecording, useRecordingSession } from "@/hooks/use-recording-sess
 import { systemAudioEnabled } from "@/lib/stores/recording-audio";
 import { micDeviceId, micEnabled } from "@/lib/stores/recording-mic";
 import { selectedRecordingTarget } from "@/lib/stores/recording-source";
+import { cameraDeviceId, webcamEnabled } from "@/lib/stores/recording-webcam";
 
 /** Honest local-only subtitle (recording voice: sentence case, no exclamation
  * marks). Recording adds zero network destinations. */
@@ -58,10 +60,10 @@ const PLACEHOLDER_COPY = "Configured in a later update.";
 
 /** The setup cards this shell reserves. "Source" (Story 19.1 — the live
  * application/window/display picker), "Audio" (Story 19.2 — the system-audio
- * toggle), "Segmenting" (Story 17.5, FR-72 — the shared segment-size +
+ * toggle), "Webcam" (Story 20.1, FR-70 — the separate-file camera switch +
+ * picker), "Segmenting" (Story 17.5, FR-72 — the shared segment-size +
  * duration-cap control), "Destination" and "Advanced" (Story 19.5 — the folder
- * chooser and the collapsed fps group) are live; "Webcam" is a later-story
- * surface (20.x). */
+ * chooser and the collapsed fps group) are all live. */
 const SETUP_CARDS: readonly string[] = [
   "Source",
   "Audio",
@@ -101,11 +103,16 @@ export function RecordingPane() {
                 // (default on) read imperatively at click time.
                 // Story 19.3: thread the Audio card's mic selection (default
                 // off; device null = system default input) the same way.
+                // Story 20.1: thread the Webcam card's camera selection
+                // (default off; device null = system default camera) the
+                // same way — off ships no camera fields at all.
                 void start(
                   selectedRecordingTarget(),
                   systemAudioEnabled(),
                   micEnabled(),
                   micDeviceId(),
+                  webcamEnabled(),
+                  cameraDeviceId(),
                 );
               }}
             >
@@ -145,8 +152,16 @@ export function RecordingPane() {
           // uses. Reading the stores (not a per-mount hook ref) keeps Restart
           // honest across a view remount — closing/reopening the Recording view
           // resets the hook's local state but never the stores, so Restart can
-          // never silently revert a chosen app/mic/display to the defaults.
-          void start(selectedRecordingTarget(), systemAudioEnabled(), micEnabled(), micDeviceId());
+          // never silently revert a chosen app/mic/webcam/display to the
+          // defaults.
+          void start(
+            selectedRecordingTarget(),
+            systemAudioEnabled(),
+            micEnabled(),
+            micDeviceId(),
+            webcamEnabled(),
+            cameraDeviceId(),
+          );
         }}
         onDismiss={() => {
           void acknowledge();
@@ -198,6 +213,19 @@ export function RecordingPane() {
                 </CardHeader>
                 <CardContent>
                   <RecordingAudioControls active={!live} />
+                </CardContent>
+              </Card>
+            ) : title === "Webcam" ? (
+              // The live Webcam card (Story 20.1, FR-70): the separate-file
+              // camera Switch (default off) + the flat camera picker; the
+              // lazy Camera-TCC request fires only on enable. `active`
+              // freezes pre-Start reconciliation while a session is live.
+              <Card key={title} size="sm">
+                <CardHeader>
+                  <CardTitle>{title}</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <RecordingWebcamControls active={!live} />
                 </CardContent>
               </Card>
             ) : title === "Segmenting" ? (

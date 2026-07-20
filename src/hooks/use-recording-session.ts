@@ -72,13 +72,17 @@ export interface UseRecordingSession {
   /** Start the session for the selected capture target (Story 19.1) — a display
    * or an application; omit for the main-display default (no-op while live) —
    * the Audio card's system-audio toggle (Story 19.2); omit for the
-   * default-on path — and the Audio card's mic selection (Story 19.3); omit
-   * for the mic-off default (`micDeviceId` null = system default input). */
+   * default-on path — the Audio card's mic selection (Story 19.3); omit
+   * for the mic-off default (`micDeviceId` null = system default input) —
+   * and the Webcam card's camera selection (Story 20.1); omit for the
+   * camera-off default (`cameraDeviceId` null = system default camera). */
   start: (
     target?: RecordingTargetVm,
     systemAudio?: boolean,
     micEnabled?: boolean,
     micDeviceId?: string | null,
+    cameraEnabled?: boolean,
+    cameraDeviceId?: string | null,
   ) => Promise<void>;
   /** Request the graceful stop-and-finalize (idempotent). */
   stop: () => Promise<void>;
@@ -156,9 +160,18 @@ export function useRecordingSession(): UseRecordingSession {
       systemAudio?: boolean,
       micEnabled?: boolean,
       micDeviceId?: string | null,
+      cameraEnabled?: boolean,
+      cameraDeviceId?: string | null,
     ) => {
       try {
-        const vm = await recordingStart(target, systemAudio, micEnabled, micDeviceId);
+        const vm = await recordingStart(
+          target,
+          systemAudio,
+          micEnabled,
+          micDeviceId,
+          cameraEnabled,
+          cameraDeviceId,
+        );
         if (mounted.current) {
           setStatus(vm);
         }

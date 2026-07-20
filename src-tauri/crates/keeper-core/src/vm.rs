@@ -2524,9 +2524,11 @@ pub enum TccPermission {
 pub struct RecordingFeaturesVm {
     /// Whether system-audio capture is supported (true on the macOS 13+ sidecar).
     pub system_audio: bool,
-    /// Whether microphone capture is supported (false until AVFoundation lands, 16.6).
+    /// Whether microphone capture is supported (live since Story 19.3).
     pub microphone: bool,
-    /// Whether camera/webcam capture is supported (false until AVFoundation lands, 20.x).
+    /// Whether camera/webcam capture is supported (live since Story 20.1 — a
+    /// separate `camera-####.mp4` per segment, never a track inside the
+    /// screen file).
     pub camera: bool,
 }
 
@@ -2551,9 +2553,11 @@ pub struct RecordingCapabilitiesVm {
     /// preflight — `Granted` or `NotDetermined` only (the preflight cannot confirm
     /// an explicit `Denied`; 16.5's live pre-flight resolves the full tri-state).
     pub screen_recording: TccPermission,
-    /// The Microphone TCC state (provisional `NotDetermined` until 16.6).
+    /// The Microphone TCC state — the real, non-prompting AVFoundation
+    /// tri-state (Story 19.3).
     pub microphone: TccPermission,
-    /// The Camera TCC state (provisional `NotDetermined` until 16.6/20.x).
+    /// The Camera TCC state — the real, non-prompting AVFoundation tri-state
+    /// (Story 20.1).
     pub camera: TccPermission,
 }
 
@@ -2595,8 +2599,10 @@ pub struct RecordingApplicationVm {
 }
 
 /// One recordable audio/video device (microphone or camera) reported by
-/// `listSources` (Story 16.4). Shape-locked now; real enumeration needs
-/// AVFoundation and lands with 16.6/19 — until then the lists are empty.
+/// `listSources` (Story 16.4): a flat `{id, name}` row — the `localizedName`
+/// already distinguishes built-in / external / Continuity devices, so there
+/// is deliberately no device-class field. Microphones enumerate live since
+/// Story 19.3, cameras since Story 20.1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -2608,20 +2614,21 @@ pub struct RecordingDeviceVm {
 }
 
 /// The `listSources` result (Story 16.4, AD-34): everything the sidecar can
-/// currently offer as a capture source. In this story `displays` is real;
-/// `applications`/`microphones`/`cameras` are shape-complete but empty
-/// (SCK/AVFoundation enumeration is 16.6/19; the source-picker UI is Epic 19).
+/// currently offer as a capture source — real displays (CoreGraphics), real
+/// applications (SCShareableContent, Story 19.1), real microphones (Story
+/// 19.3) and real cameras (Story 20.1) via AVFoundation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct RecordingSourcesVm {
     /// The active displays (real, from the sidecar's display enumeration).
     pub displays: Vec<RecordingDisplayVm>,
-    /// Recordable applications (empty until SCK enumeration lands).
+    /// Recordable applications (real since Story 19.1).
     pub applications: Vec<RecordingApplicationVm>,
-    /// Microphone devices (empty until AVFoundation enumeration lands).
+    /// Microphone devices (real since Story 19.3).
     pub microphones: Vec<RecordingDeviceVm>,
-    /// Camera devices (empty until AVFoundation enumeration lands).
+    /// Camera devices (real since Story 20.1) — a flat name list for the
+    /// Webcam card's picker.
     pub cameras: Vec<RecordingDeviceVm>,
 }
 

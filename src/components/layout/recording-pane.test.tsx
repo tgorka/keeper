@@ -12,6 +12,8 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingAcknowledge: vi.fn(),
   // The Audio card's mic Switch fires this lazily on enable (Story 19.3).
   requestMicrophonePermission: vi.fn(() => Promise.resolve("granted")),
+  // The Webcam card's Switch fires this lazily on enable (Story 20.1).
+  requestCameraPermission: vi.fn(() => Promise.resolve("granted")),
   // The "Source" card mounts the live picker (Story 19.1), which polls this.
   // A real main display keeps the default (main-display) selection available.
   listRecordingSources: vi.fn(() =>
@@ -66,6 +68,7 @@ import {
   OPEN_SETTINGS_LABEL,
   REQUEST_PERMISSION_LABEL,
 } from "@/components/recording/recording-permission-row";
+import { WEBCAM_SWITCH_TESTID } from "@/components/recording/recording-webcam-controls";
 import {
   DURATION_CAP_LABEL,
   SEGMENT_SIZE_LABEL,
@@ -83,6 +86,7 @@ import {
 import { resetRecordingAudioForTest } from "@/lib/stores/recording-audio";
 import { resetRecordingMicForTest, setMicEnabled } from "@/lib/stores/recording-mic";
 import { resetRecordingSourceForTest, selectRecordingTarget } from "@/lib/stores/recording-source";
+import { resetRecordingWebcamForTest, setWebcamEnabled } from "@/lib/stores/recording-webcam";
 
 const mockFetch = vi.mocked(recordingPermission);
 const mockRequest = vi.mocked(requestScreenRecordingPermission);
@@ -145,6 +149,8 @@ afterEach(() => {
   resetRecordingAudioForTest();
   // Restore the default-off mic selection between tests (Story 19.3).
   resetRecordingMicForTest();
+  // Restore the default-off webcam selection between tests (Story 20.1).
+  resetRecordingWebcamForTest();
   vi.clearAllMocks();
 });
 
@@ -291,12 +297,13 @@ describe("RecordingPane", () => {
     render(<RecordingPane />);
 
     // Default on: the first arg is the default target, the second `true`; the
-    // mic defaults off (Story 19.3): `false` + `null` (system default input).
+    // mic defaults off (Story 19.3): `false` + `null` (system default input);
+    // the webcam defaults off too (Story 20.1): `false` + `null`.
     const startButton = await screen.findByRole("button", { name: START_RECORDING_LABEL });
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, false, null);
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, false, null, false, null);
   });
 
   it("Start carries an off system-audio toggle through to recording_start", async () => {
@@ -311,7 +318,7 @@ describe("RecordingPane", () => {
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), false, false, null);
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), false, false, null, false, null);
   });
 
   it("Start threads an enabled mic through to recording_start (Story 19.3)", async () => {
@@ -328,7 +335,25 @@ describe("RecordingPane", () => {
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, true, null);
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, true, null, false, null);
+  });
+
+  it("Start threads an enabled webcam through to recording_start (Story 20.1)", async () => {
+    mockFetch.mockResolvedValue(GRANTED);
+    render(<RecordingPane />);
+
+    // Enable the webcam on the Webcam card (this also fires the lazy camera
+    // permission request — mocked granted); the device stays the system
+    // default camera (null).
+    const webcamToggle = await screen.findByTestId(WEBCAM_SWITCH_TESTID);
+    fireEvent.click(webcamToggle);
+    expect(webcamToggle).toHaveAttribute("aria-checked", "true");
+
+    const startButton = screen.getByRole("button", { name: START_RECORDING_LABEL });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    fireEvent.click(startButton);
+    await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, false, null, true, null);
   });
 
   it("Stop requests the graceful stop", async () => {
@@ -418,14 +443,15 @@ describe("RecordingPane", () => {
   it("Restart uses the current store selection even across a view remount (Story 18.4)", async () => {
     // The regression this guards: a fault, then the user leaves and reopens the
     // Recording view (the hook remounts, its local state resets) and clicks
-    // Restart. Restart must record the user's chosen source + mic — read live
-    // from the remount-surviving stores — never silently revert to the
-    // main-display / mic-off defaults.
+    // Restart. Restart must record the user's chosen source + mic + webcam —
+    // read live from the remount-surviving stores — never silently revert to
+    // the main-display / mic-off / webcam-off defaults.
     mockFetch.mockResolvedValue(GRANTED);
     // A non-default selection sitting in the stores (they outlive a remount).
     const chosenTarget = { kind: "display", displayId: 2 } as const;
     selectRecordingTarget(chosenTarget);
     setMicEnabled(true);
+    setWebcamEnabled(true);
     // The remounted view adopts the ALREADY-failed session from Rust — no Start
     // ran this mount, so a per-mount arg ref would have nothing to replay.
     mockStatus.mockResolvedValue({
@@ -437,9 +463,10 @@ describe("RecordingPane", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: BANNER_RESTART_LABEL }));
 
-    // The chosen display + mic-on reach recording_start — not the defaults.
+    // The chosen display + mic-on + webcam-on reach recording_start — not
+    // the defaults.
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(chosenTarget, true, true, null);
+    expect(mockStart).toHaveBeenLastCalledWith(chosenTarget, true, true, null, true, null);
   });
 
   it("Dismiss acknowledges the failed session back to idle (Story 18.4)", async () => {
