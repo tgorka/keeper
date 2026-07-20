@@ -48,6 +48,9 @@ import {
   notificationPermissionState,
   notifyGetPreviewEnabled,
   notifySetPreviewEnabled,
+  recordingHotkeyClear,
+  recordingHotkeyGet,
+  recordingHotkeySet,
   setHonorRemoteDeletions,
   setUndoSendWindow,
   undoSendWindow,
@@ -843,6 +846,9 @@ const HOTKEY_PERMISSION_SENTENCE =
  * never derived in TS.
  */
 function ShortcutsSection({ open }: { open: boolean }) {
+  // The optional Start/Stop Recording hotkey row (Story 20.4) exists only where
+  // recording does (desktop macOS ≥ 13): absent — never disabled — elsewhere.
+  const recording = useCapabilitiesStore((s) => s.capabilities.recording);
   // `undefined` = still loading; otherwise the resolved binding VM.
   const [hotkey, setHotkey] = useState<HotkeyVm | undefined>(undefined);
   // Whether the capture control is armed and listening for the next chord.
@@ -975,7 +981,172 @@ function ShortcutsSection({ open }: { open: boolean }) {
           {error}
         </p>
       )}
+      {recording && <RecordingShortcutRow open={open} />}
     </div>
+  );
+}
+
+/** The honest copy when an ASSIGNED recording hotkey is not registered with the
+ * OS (`active === false` while a chord is set) — Story 20.4, FR-50. Never shown
+ * for the unset default (nothing is supposed to be registered then). */
+const RECORDING_HOTKEY_PERMISSION_SENTENCE =
+  "The recording hotkey isn't registered with macOS right now. Another app may already own this shortcut, or keeper may need permission — check System Settings → Privacy & Security (Accessibility) and Keyboard shortcuts, then reassign it below.";
+
+/** The unset-state label for the recording hotkey row (Story 20.4): the binding
+ * ships unset — no chord is registered until the user assigns one. */
+const RECORDING_HOTKEY_NOT_SET_LABEL = "Not set";
+
+/**
+ * The "Start / stop recording" row inside Settings → Shortcuts (Story 20.4,
+ * FR-50) — rendered only when the `recording` capability is on (absent, never
+ * disabled, elsewhere). A second, independent OS-global binding: unset by
+ * default ("Not set"), assigned by capturing the next chord
+ * ({@link acceleratorFromEvent} → {@link recordingHotkeySet}, so a bare
+ * single key can never bind — UX-DR29), and cleared back to unset via
+ * {@link recordingHotkeyClear}. Reuses the summon row's conflict / inactive /
+ * error note rendering; the VM (including the cross-summon clash warning) is
+ * rendered as-is, never derived in TS.
+ */
+function RecordingShortcutRow({ open }: { open: boolean }) {
+  // `undefined` = still loading; otherwise the resolved binding VM.
+  const [hotkey, setHotkey] = useState<HotkeyVm | undefined>(undefined);
+  // Whether the capture control is armed and listening for the next chord.
+  const [capturing, setCapturing] = useState(false);
+  // The last reassignment/clear error (OS refused / persist failed), or `null`.
+  const [error, setError] = useState<string | null>(null);
+  const writeId = useRef(0);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    setHotkey(undefined);
+    setCapturing(false);
+    setError(null);
+    let cancelled = false;
+    void recordingHotkeyGet()
+      .then((vm) => {
+        if (!cancelled) {
+          setHotkey(vm);
+        }
+      })
+      .catch(() => {
+        // On a read failure leave the row in its loading state rather than
+        // asserting a (possibly wrong) binding.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  // Adopt the VM a write resolved with, or surface the error without losing the
+  // previous binding (the Rust command restored it — mirroring the summon row).
+  const applyWrite = (write: Promise<HotkeyVm>) => {
+    writeId.current += 1;
+    const id = writeId.current;
+    setError(null);
+    void write
+      .then((vm) => {
+        if (id === writeId.current) {
+          setHotkey(vm);
+        }
+      })
+      .catch((raw: unknown) => {
+        if (id !== writeId.current) {
+          return;
+        }
+        const message =
+          typeof raw === "object" && raw !== null && "message" in raw
+            ? String((raw as { message: unknown }).message)
+            : "Could not set that shortcut.";
+        setError(message);
+      });
+  };
+
+  // While capturing, translate the next complete chord into an accelerator and
+  // assign it. A bare modifier or modifier-less key yields `null` and keeps
+  // capturing (no single-key verb can ever bind); Escape cancels.
+  const onCaptureKeyDown = (event: React.KeyboardEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === "Escape") {
+      setCapturing(false);
+      return;
+    }
+    const accelerator = acceleratorFromEvent(event.nativeEvent);
+    if (accelerator === null) {
+      return;
+    }
+    setCapturing(false);
+    applyWrite(recordingHotkeySet(accelerator));
+  };
+
+  const unset = hotkey !== undefined && hotkey.accelerator === "";
+
+  return (
+    <>
+      <div className="flex items-center justify-between gap-2">
+        <Label>Start / stop recording</Label>
+        <div className="flex items-center gap-2">
+          {capturing ? (
+            <button
+              type="button"
+              // biome-ignore lint/a11y/noAutofocus: capture is an explicit user action; the field must receive the next keystroke immediately.
+              autoFocus
+              aria-label="Press a shortcut for Start / stop recording (Esc to cancel)"
+              onKeyDown={onCaptureKeyDown}
+              onBlur={() => setCapturing(false)}
+              className="rounded-sm border border-ring px-2 py-0.5 text-muted-foreground text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Press a shortcut… (Esc to cancel)
+            </button>
+          ) : unset ? (
+            <span className="text-muted-foreground text-xs">{RECORDING_HOTKEY_NOT_SET_LABEL}</span>
+          ) : (
+            <Kbd aria-label={hotkey === undefined ? "Loading shortcut" : hotkey.accelerator}>
+              {hotkey === undefined ? "…" : formatAccelerator(hotkey.accelerator)}
+            </Kbd>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            aria-label="Change recording shortcut"
+            disabled={hotkey === undefined || capturing}
+            onClick={() => {
+              setError(null);
+              setCapturing(true);
+            }}
+          >
+            Change…
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={hotkey === undefined || unset || capturing}
+            onClick={() => applyWrite(recordingHotkeyClear())}
+          >
+            Clear
+          </Button>
+        </div>
+      </div>
+      {hotkey?.conflict != null && (
+        <p className="text-held text-xs" role="status">
+          {hotkey.conflict}
+        </p>
+      )}
+      {hotkey !== undefined && !unset && !hotkey.active && (
+        <p className="text-held text-xs" role="status">
+          {RECORDING_HOTKEY_PERMISSION_SENTENCE}
+        </p>
+      )}
+      {error !== null && (
+        <p className="text-held text-xs" role="alert">
+          {error}
+        </p>
+      )}
+    </>
   );
 }
 

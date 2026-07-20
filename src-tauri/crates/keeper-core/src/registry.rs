@@ -777,6 +777,30 @@ pub fn set_global_hotkey(data_dir: &Path, accelerator: &str) -> Result<(), CoreE
     set_setting(data_dir, HOTKEY_GLOBAL_KEY, accelerator)
 }
 
+/// The `settings` key holding the optional OS-global Start/Stop Recording hotkey
+/// accelerator (Story 20.4, FR-50). A **second, independent** binding — it never
+/// touches the summon binding's `hotkey.global` key. Stored as an opaque
+/// accelerator string; absent ⇒ the empty string = **unset** (the shell registers
+/// nothing). `keeper-core` never parses it — parsing/registration live only in
+/// the `keeper` shell crate (core stays Tauri-free).
+const HOTKEY_RECORDING_KEY: &str = "hotkey.recording";
+
+/// Read the OS-global Start/Stop Recording hotkey accelerator (Story 20.4).
+/// Absent ⇒ the empty string, meaning **unset by default** — unlike the summon
+/// hotkey there is no shipped default chord. Stored in the `settings` k/v table
+/// under `hotkey.recording`; the value is opaque to core.
+pub fn get_recording_hotkey(data_dir: &Path) -> Result<String, CoreError> {
+    Ok(get_setting(data_dir, HOTKEY_RECORDING_KEY)?.unwrap_or_default())
+}
+
+/// Write the OS-global Start/Stop Recording hotkey accelerator (Story 20.4).
+/// Persists the opaque accelerator string under `hotkey.recording`; the empty
+/// string persists "unset" (the shell's clear path). The shell validates +
+/// registers with the OS *before* calling this; core only stores it.
+pub fn set_recording_hotkey(data_dir: &Path, accelerator: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, HOTKEY_RECORDING_KEY, accelerator)
+}
+
 /// The `settings` key holding the Undo-Send window in whole seconds (Story 8.3).
 /// Stored as a decimal string; absent / unparsable ⇒ the default of 10 s.
 const UNDO_SEND_WINDOW_KEY: &str = "undo_send.window";
@@ -1768,6 +1792,35 @@ mod tests {
         set_global_hotkey(&dir, DEFAULT_GLOBAL_HOTKEY).expect("reset hotkey");
         assert_eq!(
             get_global_hotkey(&dir).expect("get reset hotkey"),
+            DEFAULT_GLOBAL_HOTKEY
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recording_hotkey_defaults_unset_and_round_trips() {
+        let dir = temp_dir();
+        // Absent setting reads the empty string — unset by default (Story 20.4),
+        // never the summon default chord.
+        assert_eq!(get_recording_hotkey(&dir).expect("get absent hotkey"), "");
+        // Set then read back an opaque accelerator string (core never parses it).
+        set_recording_hotkey(&dir, "Control+Alt+R").expect("set hotkey");
+        assert_eq!(
+            get_recording_hotkey(&dir).expect("get set hotkey"),
+            "Control+Alt+R"
+        );
+        // Overwrite replaces the stored accelerator.
+        set_recording_hotkey(&dir, "Control+Shift+R").expect("overwrite hotkey");
+        assert_eq!(
+            get_recording_hotkey(&dir).expect("get overwritten hotkey"),
+            "Control+Shift+R"
+        );
+        // Persisting the empty string clears the binding back to unset.
+        set_recording_hotkey(&dir, "").expect("clear hotkey");
+        assert_eq!(get_recording_hotkey(&dir).expect("get cleared hotkey"), "");
+        // The independent summon binding is untouched throughout.
+        assert_eq!(
+            get_global_hotkey(&dir).expect("summon binding untouched"),
             DEFAULT_GLOBAL_HOTKEY
         );
         let _ = std::fs::remove_dir_all(&dir);

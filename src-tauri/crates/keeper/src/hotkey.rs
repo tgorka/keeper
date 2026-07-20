@@ -18,6 +18,12 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, S
 /// `use-global-hotkey` hook listens for it to switch to Inbox + focus the chat list.
 pub const HOTKEY_EVENT: &str = "keeper://global-hotkey-activated";
 
+/// The event emitted when the optional Start/Stop Recording hotkey is pressed
+/// (Story 20.4, FR-50). The frontend `use-recording-hotkey` hook listens for it
+/// and toggles capture (`toggleRecording()`) — the press never touches the main
+/// window, unlike the summon hotkey.
+pub const RECORDING_HOTKEY_EVENT: &str = "keeper://recording-hotkey-toggled";
+
 /// The shipped default accelerator, mirroring [`keeper_core::registry::DEFAULT_GLOBAL_HOTKEY`].
 pub const DEFAULT_HOTKEY: &str = keeper_core::registry::DEFAULT_GLOBAL_HOTKEY;
 
@@ -74,6 +80,87 @@ pub(crate) fn on_shortcut_event<R: Runtime>(
 ) {
     if event.state == ShortcutState::Pressed {
         toggle_main_window(app);
+    }
+}
+
+/// The Start/Stop Recording global-shortcut press handler (Story 20.4): emit
+/// [`RECORDING_HOTKEY_EVENT`] on `Pressed`. It deliberately does **not** toggle
+/// the main window — the webview runs even while hidden, so the event reaches
+/// the `use-recording-hotkey` hook regardless, and capture toggles without
+/// raising keeper. Named (not an inline closure) so startup
+/// [`install_recording`] and the register/restore paths in
+/// `recording_hotkey_set` share one definition and cannot silently diverge.
+pub(crate) fn on_recording_shortcut_event<R: Runtime>(
+    app: &AppHandle<R>,
+    _shortcut: &Shortcut,
+    event: ShortcutEvent,
+) {
+    if event.state == ShortcutState::Pressed {
+        if let Err(error) = app.emit(RECORDING_HOTKEY_EVENT, ()) {
+            tracing::warn!(%error, "hotkey: could not emit recording-hotkey-toggled event");
+        }
+    }
+}
+
+/// The pure register-or-nothing decision for the recording hotkey (Story 20.4):
+/// the empty string is the **unset** default (register nothing — there is no
+/// shipped default chord, unlike the summon hotkey), anything else must parse.
+/// `None` for unset *or* malformed; [`install_recording`] tells the two apart
+/// for logging. Factored out so the decision is unit-testable without an app.
+pub(crate) fn recording_shortcut(accelerator: &str) -> Option<Shortcut> {
+    if accelerator.is_empty() {
+        return None;
+    }
+    parse(accelerator)
+}
+
+/// Register the persisted Start/Stop Recording accelerator with the OS at
+/// startup (Story 20.4, FR-50). Reads `hotkey.recording` (absent/empty ⇒ unset:
+/// register **nothing**), parses it, and attaches the
+/// [`on_recording_shortcut_event`] press handler. Best-effort exactly like
+/// [`install`]: a read, parse, or OS-registration failure is logged via
+/// `tracing` and leaves the app running without a recording hotkey
+/// (`recording_hotkey_get().active` then reports `false`). Never panics.
+pub fn install_recording<R: Runtime>(app: &AppHandle<R>) {
+    let data_dir = match app.state::<crate::ipc::AppState>().platform.data_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(%error, "hotkey: could not resolve data dir; recording hotkey inactive");
+            return;
+        }
+    };
+    let accelerator = match keeper_core::registry::get_recording_hotkey(&data_dir) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "hotkey: could not read stored recording accelerator; recording hotkey inactive"
+            );
+            return;
+        }
+    };
+    let Some(shortcut) = recording_shortcut(&accelerator) else {
+        if accelerator.is_empty() {
+            // Unset (the shipped default): nothing to register — not a failure.
+            tracing::debug!("hotkey: recording hotkey unset; registering nothing");
+        } else {
+            tracing::warn!(
+                accelerator,
+                "hotkey: stored recording accelerator is malformed; recording hotkey inactive"
+            );
+        }
+        return;
+    };
+    match app
+        .global_shortcut()
+        .on_shortcut(shortcut, on_recording_shortcut_event)
+    {
+        Ok(()) => {
+            tracing::info!(accelerator, "hotkey: registered global recording shortcut");
+        }
+        Err(error) => {
+            tracing::warn!(%error, accelerator, "hotkey: OS refused to register recording shortcut");
+        }
     }
 }
 
@@ -190,6 +277,21 @@ mod tests {
         assert!(known_conflict("Control+Space").is_some(), "input source");
         // Case-insensitive: a differently-cased spelling still warns.
         assert!(known_conflict("meta+space").is_some());
+    }
+
+    #[test]
+    fn recording_shortcut_unset_registers_nothing_and_valid_parses() {
+        // The empty string is the unset default (Story 20.4): nothing registers.
+        assert!(
+            recording_shortcut("").is_none(),
+            "unset (empty) must register nothing"
+        );
+        // A valid chord parses into a registrable shortcut.
+        assert!(recording_shortcut("Control+Alt+R").is_some());
+        assert!(recording_shortcut("Control+Shift+F9").is_some());
+        // Malformed input also registers nothing (logged as a warning upstream).
+        assert!(recording_shortcut("Foo+").is_none());
+        assert!(recording_shortcut("NotAKey").is_none());
     }
 
     #[test]

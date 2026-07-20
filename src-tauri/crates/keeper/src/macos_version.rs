@@ -37,6 +37,16 @@ fn macos_product_version() -> Option<u32> {
     parse_macos_major(stdout.trim())
 }
 
+/// The pure version-floor decision (Story 16.3, audited by Story 20.4, AD-35):
+/// recording requires a *known* macOS major ≥ 13 (the system-audio floor). A
+/// failed/unknown probe (`None`) is `false` — safe-hide, never an optimistic
+/// claim. Factored out of [`recording_supported`] so the floor is unit-tested
+/// without a Mac (and without the memoizing `OnceLock`).
+#[cfg(any(target_os = "macos", test))]
+fn supports_recording(major: Option<u32>) -> bool {
+    matches!(major, Some(major) if major >= 13)
+}
+
 /// Whether screen recording is supported on this platform (Story 16.3).
 ///
 /// `true` only on desktop macOS ≥ 13.0; `false` on older macOS, every non-macOS
@@ -47,15 +57,15 @@ fn macos_product_version() -> Option<u32> {
 #[cfg(target_os = "macos")]
 pub fn recording_supported() -> bool {
     static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| match macos_product_version() {
-        Some(major) => major >= 13,
+    *SUPPORTED.get_or_init(|| {
+        let major = macos_product_version();
         // A failed probe safe-hides recording, but that decision is memoized for
         // the process lifetime — log it so an unexpected hide (vs a genuine
         // pre-13 machine) is observable rather than silent.
-        None => {
+        if major.is_none() {
             tracing::warn!("macOS version probe failed; hiding recording capability (safe-hide)");
-            false
         }
+        supports_recording(major)
     })
 }
 
@@ -67,7 +77,7 @@ pub fn recording_supported() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_macos_major;
+    use super::{parse_macos_major, supports_recording};
 
     #[test]
     fn parses_the_major_component() {
@@ -82,5 +92,30 @@ mod tests {
     fn malformed_input_is_none() {
         assert_eq!(parse_macos_major(""), None);
         assert_eq!(parse_macos_major("abc"), None);
+    }
+
+    /// The capability-gating audit's version floor (Story 20.4, FR-66, AD-35):
+    /// `recording_supported()`'s decision is `false` below macOS 13 and on any
+    /// unknown probe — the `CapabilitiesVm.recording` flag every recording
+    /// surface gates on can never claim support it does not have.
+    #[test]
+    fn recording_floor_is_macos_13() {
+        // Below the floor (including legacy 10.x naming) ⇒ unsupported.
+        assert!(!supports_recording(parse_macos_major("12.7")));
+        assert!(!supports_recording(parse_macos_major("10.16")));
+        // A failed/unreadable probe safe-hides.
+        assert!(!supports_recording(None));
+        assert!(!supports_recording(parse_macos_major("abc")));
+        // At and above the floor ⇒ supported.
+        assert!(supports_recording(parse_macos_major("13.0.1")));
+        assert!(supports_recording(parse_macos_major("14.5")));
+    }
+
+    /// Non-macOS builds (every non-macOS desktop and iOS) compile the constant
+    /// `false` arm — recording is never advertised off macOS.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn recording_unsupported_off_macos() {
+        assert!(!super::recording_supported());
     }
 }

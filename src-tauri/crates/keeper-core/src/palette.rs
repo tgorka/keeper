@@ -446,6 +446,51 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             requires_recording: true,
             toggle_group: None,
         },
+        // --- Recording verbs (Story 20.4, FR-48): capability-gated exactly like
+        // `open-recording` — `requires_recording: true` drops them from every
+        // surface (palette, cheat sheet, native menu) when recording is off
+        // (desktop macOS ≥ 13.0 only). Palette-only (`shortcut: None`): no
+        // single-key verb exists on this surface (UX-DR29). Built inline so the
+        // shared `action` closure keeps `requires_recording: false`.
+        PaletteActionVm {
+            id: "recording-start".to_owned(),
+            title: "Start Recording".to_owned(),
+            category: "Recording".to_owned(),
+            keywords: ["record", "capture", "screen", "begin", "go live"]
+                .iter()
+                .map(|k| (*k).to_owned())
+                .collect(),
+            shortcut: None,
+            requires_open_chat: false,
+            requires_recording: true,
+            toggle_group: None,
+        },
+        PaletteActionVm {
+            id: "recording-stop".to_owned(),
+            title: "Stop Recording".to_owned(),
+            category: "Recording".to_owned(),
+            keywords: ["record", "capture", "end", "finish", "finalize"]
+                .iter()
+                .map(|k| (*k).to_owned())
+                .collect(),
+            shortcut: None,
+            requires_open_chat: false,
+            requires_recording: true,
+            toggle_group: None,
+        },
+        PaletteActionVm {
+            id: "recording-open-folder".to_owned(),
+            title: "Open Recordings Folder".to_owned(),
+            category: "Recording".to_owned(),
+            keywords: ["record", "reveal", "finder", "destination", "files"]
+                .iter()
+                .map(|k| (*k).to_owned())
+                .collect(),
+            shortcut: None,
+            requires_open_chat: false,
+            requires_recording: true,
+            toggle_group: None,
+        },
         // --- Global actions (dialogs / commands) ---
         action(
             "new-chat",
@@ -621,6 +666,10 @@ const CATEGORY_ORDER: &[&str] = &[
     "Archive",
     "Accounts",
     "Privacy",
+    // The capability-gated recording verbs (Story 20.4); the whole category
+    // vanishes with the `recording` flag off, so its position only matters on
+    // desktop macOS ≥ 13.
+    "Recording",
     "Chat",
 ];
 
@@ -900,49 +949,92 @@ mod tests {
         assert!(!results.actions.is_empty());
     }
 
+    /// Every `requires_recording` action the registry ships — `open-recording`
+    /// (Story 16.3) plus the three recording verbs (Story 20.4, FR-48/FR-66).
+    const RECORDING_ACTION_IDS: [&str; 4] = [
+        "open-recording",
+        "recording-start",
+        "recording-stop",
+        "recording-open-folder",
+    ];
+
     #[test]
     fn open_recording_present_iff_recording_capability_on() {
-        // Story 16.3: the `open-recording` action appears in the palette exactly
-        // when the recording capability is on, across both query modes and the
-        // registry projection (cheat sheet + native menu).
+        // Story 16.3 + 20.4: every recording action appears in the palette
+        // exactly when the recording capability is on, across both query modes
+        // and the registry projection (cheat sheet + native menu) — absent, not
+        // disabled, when the capability is off (FR-66, AD-35).
         let index = sample_index();
 
         // Action mode, empty needle → the whole (ungated) registry: recording on
-        // includes the action, recording off drops it.
+        // includes each action, recording off drops each.
         let on = index.query("", PaletteMode::Action, false, true);
-        assert!(
-            on.actions.iter().any(|a| a.id == "open-recording"),
-            "open-recording present when recording is on"
-        );
         let off = index.query("", PaletteMode::Action, false, false);
-        assert!(
-            !off.actions.iter().any(|a| a.id == "open-recording"),
-            "open-recording absent when recording is off"
-        );
+        for id in RECORDING_ACTION_IDS {
+            assert!(
+                on.actions.iter().any(|a| a.id == id),
+                "{id} present when recording is on"
+            );
+            assert!(
+                !off.actions.iter().any(|a| a.id == id),
+                "{id} absent when recording is off"
+            );
+        }
 
-        // A direct query for the action honors the same gate.
-        let queried_on = index.query("recording", PaletteMode::Action, false, true);
-        assert!(queried_on.actions.iter().any(|a| a.id == "open-recording"));
-        let queried_off = index.query("recording", PaletteMode::Action, false, false);
-        assert!(!queried_off.actions.iter().any(|a| a.id == "open-recording"));
+        // A direct query honors the same gate for every recording action
+        // ("record" fuzzy-matches all four titles/keywords).
+        let queried_on = index.query("record", PaletteMode::Action, false, true);
+        let queried_off = index.query("record", PaletteMode::Action, false, false);
+        for id in RECORDING_ACTION_IDS {
+            assert!(
+                queried_on.actions.iter().any(|a| a.id == id),
+                "{id} matches a direct query when recording is on"
+            );
+            assert!(
+                !queried_off.actions.iter().any(|a| a.id == id),
+                "{id} never surfaces on a query when recording is off"
+            );
+        }
 
-        // The registry projection (both discovery surfaces) gates it too.
-        let nav_on = registry_sections(true)
-            .into_iter()
-            .find(|s| s.category == "Navigation")
-            .expect("Navigation section present");
-        assert!(
-            nav_on.items.iter().any(|i| i.id == "open-recording"),
-            "registry projection includes open-recording when recording is on"
+        // The registry projection (both discovery surfaces) gates them too:
+        // `open-recording` lives in Navigation, the verbs in their own
+        // Recording section — present with the flag on…
+        let sections_on = registry_sections(true);
+        let all_on: Vec<&str> = sections_on
+            .iter()
+            .flat_map(|s| s.items.iter().map(|i| i.id.as_str()))
+            .collect();
+        for id in RECORDING_ACTION_IDS {
+            assert!(
+                all_on.contains(&id),
+                "registry projection includes {id} when recording is on"
+            );
+        }
+        let recording_section = sections_on
+            .iter()
+            .find(|s| s.category == "Recording")
+            .expect("Recording section present when recording is on");
+        assert_eq!(
+            recording_section.items.len(),
+            3,
+            "the three recording verbs share the Recording section"
         );
-        let nav_off = registry_sections(false)
-            .into_iter()
-            .find(|s| s.category == "Navigation")
-            .expect("Navigation section present");
+        // …and the whole category (plus the Navigation entry) vanishes off.
+        let sections_off = registry_sections(false);
         assert!(
-            !nav_off.items.iter().any(|i| i.id == "open-recording"),
-            "registry projection omits open-recording when recording is off"
+            !sections_off.iter().any(|s| s.category == "Recording"),
+            "no Recording section when recording is off"
         );
+        let all_off: Vec<&str> = sections_off
+            .iter()
+            .flat_map(|s| s.items.iter().map(|i| i.id.as_str()))
+            .collect();
+        for id in RECORDING_ACTION_IDS {
+            assert!(
+                !all_off.contains(&id),
+                "registry projection omits {id} when recording is off"
+            );
+        }
     }
 
     #[test]

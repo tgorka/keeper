@@ -16,6 +16,10 @@ mod menu;
 mod recorder;
 #[cfg(desktop)]
 mod tray;
+// The zero-egress source-scan audit over the `keeper-rec` sidecar's Swift
+// sources (Story 20.4, FR-76) — test-only; it ships no code.
+#[cfg(test)]
+mod zero_egress;
 
 #[cfg(desktop)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -126,6 +130,14 @@ pub fn run() {
             // failure leaves the app running with `hotkey_get().active = false`.
             #[cfg(desktop)]
             hotkey::install(app.handle());
+
+            // Register the optional OS-global Start/Stop Recording hotkey (Story
+            // 20.4): a SECOND, independent binding under `hotkey.recording` —
+            // unset by default (nothing registers), and its press handler emits
+            // `keeper://recording-hotkey-toggled` instead of toggling the window.
+            // Best-effort exactly like the summon install above.
+            #[cfg(desktop)]
+            hotkey::install_recording(app.handle());
 
             // Store the app handle for the desktop notifier port (Story 10.1) so
             // `Platform::notify` can post native notifications from the sync loop, and
@@ -307,6 +319,10 @@ pub fn run() {
             ipc::set_undo_send_window,
             ipc::hotkey_get,
             ipc::hotkey_set,
+            ipc::recording_hotkey_get,
+            ipc::recording_hotkey_set,
+            ipc::recording_hotkey_clear,
+            ipc::recording_reveal_folder,
             ipc::cancel_held_send,
             ipc::subscribe_outbox,
             ipc::unsubscribe_outbox,

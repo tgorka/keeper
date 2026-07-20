@@ -31,6 +31,17 @@ talks to the bridge — so a bridge adds no distinct client egress. The homeserv
 covers it. keeper never contacts a per-bridge host directly, and the egress list never fabricates
 one.
 
+## Screen recording adds no egress
+
+Screen recording (the macOS recording phase, Epics 16–20) is fully local: the `keeper-rec`
+capture sidecar and the recording UI contact **no network host**, and there is no upload,
+share-link, transcription, or cloud affordance anywhere in the recording feature — recordings
+only ever land in the local destination folder. The per-release egress inventory diff for the
+recording phase is therefore empty. Like the update endpoint, this is enforced by tests:
+source-scan audits fail the build if a network API ever appears in the sidecar's Swift sources
+(`keeper_rec_sidecar_sources_are_network_free` in the `keeper` crate) or an egress affordance
+in the recording frontend (`zero-egress.test.ts`).
+
 ## The no-telemetry invariant
 
 keeper has **no telemetry, analytics, or crash reporting** — and no opt-in scaffolding for any of

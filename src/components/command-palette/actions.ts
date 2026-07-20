@@ -25,11 +25,13 @@ import {
   markRoomRead,
   markRoomUnread,
   pinRoom,
+  recordingRevealFolder,
   syncNow,
   unarchiveRoom,
   unfavoriteRoom,
   unpinRoom,
 } from "@/lib/ipc/client";
+import { startRecordingWithCurrentSelections, stopRecording } from "@/lib/recording-control";
 import { addAccountStore } from "@/lib/stores/add-account";
 import { exportStore } from "@/lib/stores/export";
 import { newChatStore } from "@/lib/stores/new-chat";
@@ -61,6 +63,30 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
   // `recording` capability in Rust, so it only reaches this dispatch when recording
   // is available (desktop macOS ≥ 13.0).
   "open-recording": () => primaryViewStore.getState().setView("recording"),
+
+  // --- Recording verbs (Story 20.4, FR-48) --- registry-gated on the
+  // `recording` capability in Rust (dropped, not disabled, when off), and
+  // routed through the SAME shared recording-control module the global
+  // recording hotkey uses, so palette and hotkey provably behave identically.
+  "recording-start": async () => {
+    // Land on the Recording surface first (the banner/meter renders there),
+    // then start with the CURRENT capture selections read from the
+    // module-level stores — never a silent revert to defaults.
+    primaryViewStore.getState().setView("recording");
+    await startRecordingWithCurrentSelections();
+  },
+  // Idempotent in Rust: a stop with no live session is a no-op, never an error.
+  "recording-stop": () => stopRecording(),
+  // Reveal the effective destination folder (or its nearest existing ancestor
+  // before the first session creates it). A reveal failure is a funnelled
+  // IpcError — log it, never crash the palette.
+  "recording-open-folder": async () => {
+    try {
+      await recordingRevealFolder();
+    } catch (error) {
+      console.warn("command-palette: could not reveal the recordings folder", error);
+    }
+  },
 
   // --- Global actions (dialogs / commands) ---
   "new-chat": () => newChatStore.getState().open(),

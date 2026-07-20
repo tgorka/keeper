@@ -47,6 +47,31 @@ vi.mock("@/lib/ipc/client", () => ({
       conflict: null,
     }),
   ),
+  // The optional Start/Stop Recording hotkey (Story 20.4): unset by default.
+  recordingHotkeyGet: vi.fn(() =>
+    Promise.resolve({
+      accelerator: "",
+      isDefault: true,
+      active: false,
+      conflict: null,
+    }),
+  ),
+  recordingHotkeySet: vi.fn(() =>
+    Promise.resolve({
+      accelerator: "Control+Alt+R",
+      isDefault: false,
+      active: true,
+      conflict: null,
+    }),
+  ),
+  recordingHotkeyClear: vi.fn(() =>
+    Promise.resolve({
+      accelerator: "",
+      isDefault: true,
+      active: false,
+      conflict: null,
+    }),
+  ),
   egressList: vi.fn(() => Promise.resolve([])),
   verificationCancel: vi.fn(() => Promise.resolve()),
   iosSyncDisclosureShownGet: vi.fn(() => Promise.resolve(true)),
@@ -95,6 +120,9 @@ import {
   notificationPermissionState,
   notifyGetPreviewEnabled,
   notifySetPreviewEnabled,
+  recordingHotkeyClear,
+  recordingHotkeyGet,
+  recordingHotkeySet,
   setHonorRemoteDeletions,
   setUndoSendWindow,
   undoSendWindow,
@@ -113,6 +141,9 @@ const mockUndoGet = vi.mocked(undoSendWindow);
 const mockUndoSet = vi.mocked(setUndoSendWindow);
 const mockHotkeyGet = vi.mocked(hotkeyGet);
 const mockHotkeySet = vi.mocked(hotkeySet);
+const mockRecordingHotkeyGet = vi.mocked(recordingHotkeyGet);
+const mockRecordingHotkeySet = vi.mocked(recordingHotkeySet);
+const mockRecordingHotkeyClear = vi.mocked(recordingHotkeyClear);
 const mockNotifyGet = vi.mocked(notifyGetPreviewEnabled);
 const mockNotifySet = vi.mocked(notifySetPreviewEnabled);
 const mockLaunchGet = vi.mocked(launchAtLoginGet);
@@ -125,6 +156,15 @@ const DEFAULT_HOTKEY_VM: HotkeyVm = {
   accelerator: "Control+Alt+Space",
   isDefault: true,
   active: true,
+  conflict: null,
+};
+
+/** The recording hotkey's shipped default: unset (Story 20.4) — nothing is
+ * registered, and `active: false` is the honest expected state, not an error. */
+const UNSET_RECORDING_HOTKEY_VM: HotkeyVm = {
+  accelerator: "",
+  isDefault: true,
+  active: false,
   conflict: null,
 };
 
@@ -167,6 +207,17 @@ describe("SettingsDialog", () => {
     mockHotkeySet.mockClear();
     mockHotkeyGet.mockResolvedValue(DEFAULT_HOTKEY_VM);
     mockHotkeySet.mockResolvedValue(DEFAULT_HOTKEY_VM);
+    mockRecordingHotkeyGet.mockClear();
+    mockRecordingHotkeySet.mockClear();
+    mockRecordingHotkeyClear.mockClear();
+    mockRecordingHotkeyGet.mockResolvedValue(UNSET_RECORDING_HOTKEY_VM);
+    mockRecordingHotkeySet.mockResolvedValue({
+      accelerator: "Control+Alt+R",
+      isDefault: false,
+      active: true,
+      conflict: null,
+    });
+    mockRecordingHotkeyClear.mockResolvedValue(UNSET_RECORDING_HOTKEY_VM);
     mockNotifyGet.mockClear();
     mockNotifySet.mockClear();
     mockNotifyGet.mockResolvedValue(true);
@@ -512,6 +563,77 @@ describe("SettingsDialog", () => {
     await waitFor(() => {
       expect(mockHotkeySet).toHaveBeenCalledWith("Control+Alt+Space");
     });
+  });
+
+  // ── Recording hotkey row (Story 20.4) ──────────────────────────────────────
+  it("hides the Start / stop recording row when the recording capability is off", async () => {
+    mockPosture.mockResolvedValue(false);
+    // The default desktop tier ships recording: false — the row must be absent
+    // (not disabled), while the summon row still renders.
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText("Summon keeper")).toBeInTheDocument();
+    expect(screen.queryByText("Start / stop recording")).not.toBeInTheDocument();
+    expect(mockRecordingHotkeyGet).not.toHaveBeenCalled();
+  });
+
+  it("shows the unset recording hotkey as 'Not set' and assigns a captured chord", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_CAPABILITIES, recording: true });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    // Unset by default: the row renders with "Not set" and a disabled Clear.
+    expect(await screen.findByText("Start / stop recording")).toBeInTheDocument();
+    expect(await screen.findByText("Not set")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Clear" })).toBeDisabled();
+
+    // Capture ⌃⌥R and assign it via recordingHotkeySet.
+    fireEvent.click(screen.getByRole("button", { name: "Change recording shortcut" }));
+    const capture = await screen.findByRole("button", {
+      name: "Press a shortcut for Start / stop recording (Esc to cancel)",
+    });
+    fireEvent.keyDown(capture, { code: "KeyR", key: "r", ctrlKey: true, altKey: true });
+
+    await waitFor(() => {
+      expect(mockRecordingHotkeySet).toHaveBeenCalledWith("Control+Alt+R");
+    });
+    // The new binding renders as glyphs and Clear becomes available.
+    expect(await screen.findByText("⌃⌥R")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear" })).toBeEnabled();
+  });
+
+  it("clears the recording hotkey back to 'Not set' via recordingHotkeyClear", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_CAPABILITIES, recording: true });
+    mockRecordingHotkeyGet.mockResolvedValue({
+      accelerator: "Control+Alt+R",
+      isDefault: false,
+      active: true,
+      conflict: null,
+    });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText("⌃⌥R")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+
+    await waitFor(() => {
+      expect(mockRecordingHotkeyClear).toHaveBeenCalledTimes(1);
+    });
+    expect(await screen.findByText("Not set")).toBeInTheDocument();
+  });
+
+  it("surfaces the cross-summon conflict warning on the recording row", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_CAPABILITIES, recording: true });
+    mockRecordingHotkeyGet.mockResolvedValue({
+      accelerator: "Control+Alt+Space",
+      isDefault: false,
+      active: false,
+      conflict: "Conflicts with the Summon keeper hotkey.",
+    });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText("Conflicts with the Summon keeper hotkey.")).toBeInTheDocument();
   });
 
   // ── Capability gating (Story 13.7) ─────────────────────────────────────────

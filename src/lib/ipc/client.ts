@@ -1191,6 +1191,49 @@ export async function hotkeySet(accelerator: string): Promise<HotkeyVm> {
 }
 
 /**
+ * Read the optional OS-global Start/Stop Recording hotkey binding (Story 20.4,
+ * FR-50) — a second, independent binding stored under `hotkey.recording`.
+ * Absent = the empty accelerator, meaning **unset by default** (`isDefault:
+ * true`, nothing registered). `conflict` carries the curated system-shortcut
+ * warning or a clash with the summon binding. Rejects with the
+ * {@link IpcError} envelope on a registry failure.
+ */
+export async function recordingHotkeyGet(): Promise<HotkeyVm> {
+  return await invoke<HotkeyVm>("recording_hotkey_get");
+}
+
+/**
+ * Assign the OS-global Start/Stop Recording hotkey (Story 20.4, FR-50) with the
+ * summon hotkey's validate → register → persist → rollback discipline. An empty
+ * accelerator is rejected (clearing is {@link recordingHotkeyClear}); a
+ * malformed accelerator or an OS refusal keeps the previous binding and rejects
+ * with the {@link IpcError} envelope (nothing is persisted).
+ */
+export async function recordingHotkeySet(accelerator: string): Promise<HotkeyVm> {
+  return await invoke<HotkeyVm>("recording_hotkey_set", { accelerator });
+}
+
+/**
+ * Clear the OS-global Start/Stop Recording hotkey back to unset (Story 20.4):
+ * unregisters the current binding and persists the empty accelerator. Resolves
+ * with the unset {@link HotkeyVm} (`accelerator: ""`, `active: false`).
+ */
+export async function recordingHotkeyClear(): Promise<HotkeyVm> {
+  return await invoke<HotkeyVm>("recording_hotkey_clear");
+}
+
+/**
+ * Reveal the effective recordings destination folder in the OS file manager
+ * (Story 20.4, FR-48) — the palette "Open Recordings Folder" verb. Rust
+ * resolves the same effective destination `recording_start` uses and reveals
+ * it, or its nearest existing ancestor when the folder has not been created
+ * yet. Rejects with the {@link IpcError} envelope on a reveal failure.
+ */
+export async function recordingRevealFolder(): Promise<void> {
+  await invoke<void>("recording_reveal_folder");
+}
+
+/**
  * Cancel a held send by its `id` (Story 8.3, FR-46): deletes the durable `outbox`
  * row, persists its body as the Chat's Draft, and resolves with the restored body so
  * the composer can restore it. Performs **zero** network dispatch. Cancel of an

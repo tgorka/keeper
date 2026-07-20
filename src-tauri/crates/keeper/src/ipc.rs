@@ -2367,6 +2367,267 @@ pub fn hotkey_set(accelerator: String) -> Result<HotkeyVm, IpcError> {
     )))
 }
 
+/// The soft conflict warning shown against the recording accelerator (Story
+/// 20.4): the curated macOS system-shortcut list (`known_conflict`) plus one
+/// cross-check — a non-empty recording chord equal to the summon binding warns
+/// (the OS refusing the duplicate registration is the hard signal; this is the
+/// honest soft one). Pure over the two accelerator strings.
+#[cfg(desktop)]
+fn recording_hotkey_conflict(accelerator: &str, summon: &str) -> Option<String> {
+    crate::hotkey::known_conflict(accelerator).or_else(|| {
+        // Case-insensitive like `known_conflict`: `control+alt+space` and
+        // `Control+Alt+Space` are the same binding to the OS, so the soft clash
+        // warning must fire regardless of how the two accelerators are spelled.
+        (!accelerator.is_empty() && accelerator.eq_ignore_ascii_case(summon))
+            .then(|| "Conflicts with the Summon keeper hotkey.".to_owned())
+    })
+}
+
+/// Validate a recording accelerator before touching registration (Story 20.4):
+/// the empty string is rejected — clearing is a separate command
+/// (`recording_hotkey_clear`), never an empty `set` — and anything else must
+/// parse. Factored out of [`recording_hotkey_set`] so the reject paths are
+/// unit-testable without an app handle.
+#[cfg(desktop)]
+fn validate_recording_hotkey(
+    accelerator: &str,
+) -> Result<tauri_plugin_global_shortcut::Shortcut, IpcError> {
+    if accelerator.is_empty() {
+        return Err(to_ipc_error(CoreError::Internal(
+            "an empty accelerator cannot be assigned; use recording_hotkey_clear to unset"
+                .to_owned(),
+        )));
+    }
+    crate::hotkey::parse(accelerator).ok_or_else(|| {
+        to_ipc_error(CoreError::Internal(format!(
+            "invalid accelerator: {accelerator}"
+        )))
+    })
+}
+
+/// Build the [`HotkeyVm`] for the recording binding (Story 20.4): `isDefault`
+/// = the empty (unset-by-default) string, `active` = a non-empty accelerator
+/// that both parses AND is currently registered with the OS, and the soft
+/// `conflict` from [`recording_hotkey_conflict`] (curated system shortcuts +
+/// the cross-summon clash). Reuses the summon [`HotkeyVm`] shape.
+#[cfg(desktop)]
+fn recording_hotkey_vm(app: &tauri::AppHandle, accelerator: String, summon: &str) -> HotkeyVm {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let is_default = accelerator.is_empty();
+    let active = !accelerator.is_empty()
+        && crate::hotkey::parse(&accelerator)
+            .map(|shortcut| app.global_shortcut().is_registered(shortcut))
+            .unwrap_or(false);
+    let conflict = recording_hotkey_conflict(&accelerator, summon);
+    HotkeyVm {
+        accelerator,
+        is_default,
+        active,
+        conflict,
+    }
+}
+
+/// Read the optional OS-global Start/Stop Recording hotkey binding (Story 20.4,
+/// FR-50). Returns the persisted accelerator (absent ⇒ the empty string =
+/// **unset**, the shipped default), whether it is unset (`isDefault`), whether it
+/// is currently registered with the OS (`active`), and any soft conflict warning
+/// including a clash with the summon binding. Failures funnel through
+/// [`to_ipc_error`].
+#[cfg(desktop)]
+#[tauri::command]
+pub fn recording_hotkey_get(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<HotkeyVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let accelerator =
+        keeper_core::registry::get_recording_hotkey(&data_dir).map_err(to_ipc_error)?;
+    let summon = keeper_core::registry::get_global_hotkey(&data_dir).map_err(to_ipc_error)?;
+    Ok(recording_hotkey_vm(&app, accelerator, &summon))
+}
+
+/// Mobile stub for [`recording_hotkey_get`]: there is no OS-global hotkey (and
+/// no recording) on iOS — an honest `Unsupported` through `to_ipc_error`. The
+/// `recording` capability is reported `false`, so the row never renders.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn recording_hotkey_get() -> Result<HotkeyVm, IpcError> {
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the OS-global recording hotkey is desktop-only".to_owned(),
+    )))
+}
+
+/// Assign the OS-global Start/Stop Recording hotkey (Story 20.4, FR-50),
+/// mirroring [`hotkey_set`]'s exact validate → unregister-old → register-new →
+/// persist → rollback-on-any-failure discipline for the **independent**
+/// `hotkey.recording` binding (the summon binding is never touched). An empty
+/// accelerator is rejected — clearing is [`recording_hotkey_clear`]. A malformed
+/// accelerator is rejected before registration; if the OS refuses the new
+/// registration — or accepts it but persisting fails — the previous binding is
+/// restored and nothing is persisted. Logs carry accelerator strings only.
+#[cfg(desktop)]
+#[tauri::command]
+pub fn recording_hotkey_set(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    accelerator: String,
+) -> Result<HotkeyVm, IpcError> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+
+    // Validate before touching registration (empty and malformed → reject).
+    let new_shortcut = validate_recording_hotkey(&accelerator)?;
+
+    let previous = keeper_core::registry::get_recording_hotkey(&data_dir).map_err(to_ipc_error)?;
+    let summon = keeper_core::registry::get_global_hotkey(&data_dir).map_err(to_ipc_error)?;
+    let gs = app.global_shortcut();
+
+    // Unregister the currently-bound recording accelerator (best-effort — it may
+    // already be gone if startup registration failed, or be unset entirely).
+    if let Some(prev_shortcut) = crate::hotkey::recording_shortcut(&previous) {
+        if gs.is_registered(prev_shortcut) {
+            if let Err(error) = gs.unregister(prev_shortcut) {
+                tracing::warn!(%error, accelerator = %previous, "hotkey: could not unregister old recording binding");
+            }
+        }
+    }
+
+    // Register the new accelerator with the recording press handler. A hard
+    // failure restores the OLD binding and returns Err — nothing is persisted.
+    if let Err(error) = gs.on_shortcut(new_shortcut, crate::hotkey::on_recording_shortcut_event) {
+        tracing::warn!(%error, accelerator, "hotkey: OS refused to register recording binding; restoring previous");
+        if let Some(prev_shortcut) = crate::hotkey::recording_shortcut(&previous) {
+            if let Err(restore_error) =
+                gs.on_shortcut(prev_shortcut, crate::hotkey::on_recording_shortcut_event)
+            {
+                tracing::warn!(%restore_error, accelerator = %previous, "hotkey: could not restore previous recording binding after a failed reassignment");
+            }
+        }
+        return Err(to_ipc_error(CoreError::Internal(format!(
+            "the system refused to register {accelerator}: {error}"
+        ))));
+    }
+
+    // Only persist an accelerator the OS accepted; on a persist failure roll the
+    // registration back to `previous` so the live OS state and the stored value
+    // never diverge (the same discipline as `hotkey_set`).
+    if let Err(error) = keeper_core::registry::set_recording_hotkey(&data_dir, &accelerator) {
+        tracing::warn!(%error, accelerator, "hotkey: could not persist recording binding; rolling back to previous");
+        if gs.is_registered(new_shortcut) {
+            if let Err(unreg_error) = gs.unregister(new_shortcut) {
+                tracing::warn!(%unreg_error, accelerator, "hotkey: could not unregister recording binding during rollback");
+            }
+        }
+        if let Some(prev_shortcut) = crate::hotkey::recording_shortcut(&previous) {
+            if let Err(restore_error) =
+                gs.on_shortcut(prev_shortcut, crate::hotkey::on_recording_shortcut_event)
+            {
+                tracing::warn!(%restore_error, accelerator = %previous, "hotkey: could not restore previous recording binding after a failed persist");
+            }
+        }
+        return Err(to_ipc_error(error));
+    }
+    Ok(recording_hotkey_vm(&app, accelerator, &summon))
+}
+
+/// Mobile stub for [`recording_hotkey_set`]: desktop-only — an honest
+/// `Unsupported`. Nothing is validated, registered, or persisted.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn recording_hotkey_set(accelerator: String) -> Result<HotkeyVm, IpcError> {
+    let _ = accelerator;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the OS-global recording hotkey is desktop-only".to_owned(),
+    )))
+}
+
+/// Clear the OS-global Start/Stop Recording hotkey back to unset (Story 20.4):
+/// unregister the current recording binding (best-effort — it may never have
+/// registered) and persist the empty string. The returned VM reports the unset
+/// state (`accelerator: ""`, `isDefault: true`, `active: false`). A persist
+/// failure funnels through [`to_ipc_error`].
+#[cfg(desktop)]
+#[tauri::command]
+pub fn recording_hotkey_clear(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<HotkeyVm, IpcError> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let previous = keeper_core::registry::get_recording_hotkey(&data_dir).map_err(to_ipc_error)?;
+    let summon = keeper_core::registry::get_global_hotkey(&data_dir).map_err(to_ipc_error)?;
+    let gs = app.global_shortcut();
+    if let Some(prev_shortcut) = crate::hotkey::recording_shortcut(&previous) {
+        if gs.is_registered(prev_shortcut) {
+            if let Err(error) = gs.unregister(prev_shortcut) {
+                tracing::warn!(%error, accelerator = %previous, "hotkey: could not unregister recording binding on clear");
+            }
+        }
+    }
+    keeper_core::registry::set_recording_hotkey(&data_dir, "").map_err(to_ipc_error)?;
+    Ok(recording_hotkey_vm(&app, String::new(), &summon))
+}
+
+/// Mobile stub for [`recording_hotkey_clear`]: desktop-only — an honest
+/// `Unsupported`. Nothing is unregistered or persisted.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn recording_hotkey_clear() -> Result<HotkeyVm, IpcError> {
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the OS-global recording hotkey is desktop-only".to_owned(),
+    )))
+}
+
+/// The nearest existing ancestor of `path`, including `path` itself (Story
+/// 20.4): the palette's "Open Recordings Folder" reveals the effective
+/// destination even before the first session ever created it — falling back up
+/// the tree (ultimately to `/`, which always exists) rather than erroring on a
+/// not-yet-created folder. Pure over the filesystem probe.
+#[cfg(desktop)]
+fn nearest_existing_ancestor(path: &Path) -> PathBuf {
+    // Require a real directory, not merely an existing path: `reveal_item_in_dir`
+    // expects a folder, so an ancestor that resolves to a regular file (a
+    // misconfigured destination nested under a file) must be skipped in favour of
+    // the first true directory above it. Root always exists as a directory, so
+    // `find` succeeds in practice; the fallback keeps the fn total.
+    path.ancestors()
+        .find(|candidate| candidate.is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// Reveal the **effective** recordings destination folder in the OS file
+/// manager (Story 20.4, FR-48) — the palette "Open Recordings Folder" verb.
+/// Resolves the same [`effective_destination_dir`] source of truth
+/// `recording_start` uses (persisted choice or the `~/Movies/keeper` default)
+/// and reveals it — or its nearest existing ancestor when the folder has not
+/// been created yet — via the opener plugin (the same
+/// `reveal_item_in_dir` seam as [`reveal_path`] and the tray). A reveal failure
+/// maps to a funnelled [`IpcError`], never a panic.
+#[cfg(desktop)]
+#[tauri::command]
+pub fn recording_reveal_folder(state: State<'_, AppState>) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let destination = effective_destination_dir(&data_dir)?;
+    let target = nearest_existing_ancestor(&destination);
+    tauri_plugin_opener::reveal_item_in_dir(&target).map_err(|e| {
+        to_ipc_error(CoreError::Internal(format!(
+            "could not reveal the recordings folder: {e}"
+        )))
+    })
+}
+
+/// Mobile stub for [`recording_reveal_folder`]: there is no user-visible file
+/// manager (and no recording) on iOS — an honest `Unsupported` through
+/// [`to_ipc_error`].
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn recording_reveal_folder() -> Result<(), IpcError> {
+    Err(to_ipc_error(CoreError::Unsupported(
+        "revealing the recordings folder is desktop-only".to_owned(),
+    )))
+}
+
 /// Cancel a held send by its `id` (Story 8.3): delete the `outbox` row, persist its
 /// body as the Chat's Draft, and return the restored body so the composer can restore
 /// it. Performs **zero** network dispatch. Cancel of an already-dispatched/absent row
@@ -5445,6 +5706,100 @@ mod tests {
         let unset = resolve_destination_dir(None, data_dir);
         assert!(unset.is_absolute());
         assert!(unset.ends_with("keeper"));
+    }
+
+    // --- recording hotkey commands (Story 20.4) -----------------------------
+    //
+    // The OS-registration legs of `recording_hotkey_set`/`_clear` need a live
+    // `AppHandle` + global-shortcut plugin (mirroring `hotkey_set`, which has the
+    // same seam); the command *decisions* — validation, persistence semantics,
+    // conflict detection, reveal-target resolution — are factored pure and
+    // covered here over temp dirs.
+
+    #[test]
+    fn recording_hotkey_registry_set_get_round_trip_and_clear_to_unset() {
+        let dir = scan_temp_dir("rec-hotkey");
+        // Absent ⇒ the unset default the commands report as `isDefault`.
+        assert_eq!(
+            keeper_core::registry::get_recording_hotkey(&dir).expect("get absent"),
+            ""
+        );
+        // The set command's persistence leg: set → get round-trips.
+        keeper_core::registry::set_recording_hotkey(&dir, "Control+Alt+R").expect("set");
+        assert_eq!(
+            keeper_core::registry::get_recording_hotkey(&dir).expect("get set"),
+            "Control+Alt+R"
+        );
+        // The clear command's persistence leg: persist "" → unset again.
+        keeper_core::registry::set_recording_hotkey(&dir, "").expect("clear");
+        assert_eq!(
+            keeper_core::registry::get_recording_hotkey(&dir).expect("get cleared"),
+            ""
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_recording_accelerator_is_rejected_by_set_validation() {
+        // Clearing is a separate command — an empty `set` must be rejected
+        // before any registration is touched.
+        assert!(validate_recording_hotkey("").is_err(), "empty is rejected");
+        assert!(
+            validate_recording_hotkey("Foo+").is_err(),
+            "malformed is rejected"
+        );
+        assert!(
+            validate_recording_hotkey("Control+Alt+R").is_ok(),
+            "a valid chord passes validation"
+        );
+    }
+
+    #[test]
+    fn recording_hotkey_conflict_surfaces_summon_clash_and_curated_shortcuts() {
+        // A non-empty chord equal to the summon binding warns (the cross-check).
+        assert_eq!(
+            recording_hotkey_conflict("Control+Alt+Space", "Control+Alt+Space"),
+            Some("Conflicts with the Summon keeper hotkey.".to_owned())
+        );
+        // The unset (empty) binding never claims a summon clash — even against
+        // a hypothetically-empty summon value.
+        assert_eq!(recording_hotkey_conflict("", ""), None);
+        // A distinct chord is conflict-free.
+        assert_eq!(
+            recording_hotkey_conflict("Control+Alt+R", "Control+Alt+Space"),
+            None
+        );
+        // A summon clash is caught case-insensitively (same binding to the OS).
+        assert_eq!(
+            recording_hotkey_conflict("control+alt+space", "Control+Alt+Space"),
+            Some("Conflicts with the Summon keeper hotkey.".to_owned())
+        );
+        // The curated system-shortcut list still applies (reused `known_conflict`).
+        assert!(
+            recording_hotkey_conflict("Super+Space", "Control+Alt+Space")
+                .is_some_and(|warning| warning.contains("Spotlight")),
+            "curated Spotlight warning surfaces"
+        );
+    }
+
+    #[test]
+    fn reveal_resolves_to_the_nearest_existing_ancestor() {
+        let base = scan_temp_dir("reveal");
+        // An existing folder reveals itself.
+        assert_eq!(nearest_existing_ancestor(&base), base);
+        // A not-yet-created destination resolves up to its nearest existing
+        // ancestor — one and several levels deep.
+        assert_eq!(nearest_existing_ancestor(&base.join("keeper")), base);
+        assert_eq!(
+            nearest_existing_ancestor(&base.join("missing/deeper/keeper")),
+            base
+        );
+        // A regular file is NOT a valid reveal ancestor: a destination nested
+        // under a file skips the file and resolves to the first real directory.
+        let file = base.join("not-a-dir");
+        std::fs::write(&file, b"x").expect("write temp file");
+        assert_eq!(nearest_existing_ancestor(&file.join("keeper")), base);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

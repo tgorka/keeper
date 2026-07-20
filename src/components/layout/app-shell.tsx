@@ -29,6 +29,7 @@ import { useKeyBackupStatuses } from "@/hooks/use-key-backup-statuses";
 import { useMenuActions } from "@/hooks/use-menu-actions";
 import { useNewChatShortcut } from "@/hooks/use-new-chat-shortcut";
 import { useQuickSwitcher } from "@/hooks/use-quick-switcher";
+import { useRecordingHotkey } from "@/hooks/use-recording-hotkey";
 import { useRecordingShortcut } from "@/hooks/use-recording-shortcut";
 import { useSearchShortcuts } from "@/hooks/use-search-shortcuts";
 import { useShellLayout } from "@/hooks/use-shell-layout";
@@ -84,6 +85,10 @@ export function AppShell() {
   // Listen for the OS-global summon hotkey (Story 9.4): a raise switches to Inbox and
   // moves keyboard focus into the chat list via the focus-request nonce store.
   useGlobalHotkey();
+  // Listen for the optional OS-global Start/Stop Recording hotkey (Story 20.4):
+  // a press toggles capture through the shared recording-control module. The
+  // hook self-gates on the `recording` capability (inert everywhere else).
+  useRecordingHotkey();
   // Which primary view the shell renders. "bridges" and "approval" each replace the
   // chat-list + conversation cluster with a full-surface pane (Story 6.1 / 7.3).
   const primaryView = usePrimaryView();
