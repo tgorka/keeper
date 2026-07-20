@@ -1,0 +1,29 @@
+_bmad-output/implementation-artifacts/bmad-dev-auto-result-20-5-reliability-envelope-4-h-soak-and-cpu-memory-verification.md
+  s_59fa1c6bbf932d::t_38a9dab6c9298a 1-70
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_8a8bc6b6bf6017::t_6a2d19b7082ddd 204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "3c60d8c3750b90070c3a78703d157166748bf488",
+  "prompts": {},
+  "sessions": {
+    "s_59fa1c6bbf932d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fdc83c65-c899-4a60-a9ba-700385fe7228",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
