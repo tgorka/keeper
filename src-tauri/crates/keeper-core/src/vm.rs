@@ -2828,6 +2828,30 @@ pub struct RecordingStatusVm {
     pub segment_cap_mb: u32,
 }
 
+/// The read-only end-of-session summary the completion / recovery cards render
+/// (Story 20.3, FR-71/FR-73). Derived on demand from a session's authoritative
+/// on-disk `manifest.json` (never the live `RecordingStatusVm` snapshot): the
+/// screen-track segment count backs "Saved N segments", the total on-disk bytes
+/// back "{size}", and the folder path backs the mono line + Reveal in Finder.
+///
+/// Not a live-poll VM and not `ts_rs`-exported — the frontend declares the twin
+/// `RecordingSummaryVm` type in `client.ts`; this struct only fixes the camelCase
+/// wire shape the summary/list commands return.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingSummaryVm {
+    /// The session **folder** path (holding the `screen-####.mp4` segments) —
+    /// the mono line and the Reveal-in-Finder target.
+    pub session_folder: String,
+    /// The number of screen-track segments the session saved ("Saved N
+    /// segments") — never the track-agnostic live `segments_closed` counter.
+    pub screen_segment_count: u32,
+    /// The total on-disk bytes across every segment (screen + camera) — the
+    /// card's `{size}` line. Emitted as `number` (a byte count sits far inside
+    /// `Number.MAX_SAFE_INTEGER`).
+    pub total_bytes: u64,
+}
+
 impl RecordingStatusVm {
     /// The boot/default snapshot: no session yet.
     pub fn idle() -> Self {

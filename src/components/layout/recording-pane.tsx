@@ -19,6 +19,8 @@
  * UX-DR29 — centers its content at content-max-width (`mx-auto w-full
  * max-w-[720px]`, the conversation-pane realization) rather than going full-bleed.
  */
+import { useEffect } from "react";
+import { RecordingSummaryCard } from "@/components/layout/recording-summary-card";
 import { ActiveRecordingBanner } from "@/components/recording/active-recording-banner";
 import { RecordingAdvancedControls } from "@/components/recording/recording-advanced-controls";
 import { RecordingAudioControls } from "@/components/recording/recording-audio-controls";
@@ -38,8 +40,10 @@ import { RecordingSettingsControls } from "@/components/settings/recording-setti
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useRecordedSessionSummary } from "@/hooks/use-recorded-session-summary";
 import { useRecordingPermission } from "@/hooks/use-recording-permission";
 import { isLiveRecording, useRecordingSession } from "@/hooks/use-recording-session";
+import { useRecoveredSessions } from "@/hooks/use-recovered-sessions";
 import type { RecordingPermissionVm } from "@/lib/ipc/client";
 import { systemAudioEnabled } from "@/lib/stores/recording-audio";
 import { micDeviceId, micEnabled } from "@/lib/stores/recording-mic";
@@ -55,9 +59,6 @@ export const START_RECORDING_LABEL = "Start recording";
 
 /** The live-session stop affordance's label (recording voice). */
 export const STOP_RECORDING_LABEL = "Stop";
-
-/** The finalized-outcome note prefix (the saved file's path follows). */
-export const FINALIZED_NOTE_PREFIX = "Saved to";
 
 /**
  * The highest-priority blocking permission's name (Story 20.2, FR-67): Screen
@@ -113,6 +114,27 @@ export function RecordingPane() {
   } = useRecordingPermission();
   const { status, elapsed, start, stop, acknowledge } = useRecordingSession();
   const live = isLiveRecording(status);
+  // The completion (finalized) and in-app recovery (recovered) terminals both
+  // render the summary card from the on-disk manifest for the session folder
+  // (Story 20.3): fetch it once the terminal settles with a folder.
+  const isCompletionTerminal = status.state === "finalized" || status.state === "recovered";
+  const terminalSummary = useRecordedSessionSummary(
+    status.outputPath,
+    isCompletionTerminal && status.outputPath !== null,
+  );
+  // Cross-restart / prior-run orphan notices (Story 20.3): scan disk for
+  // unacknowledged `recovered` sessions on the idle/pre-record surface. Re-scan
+  // after a session finalizes so a fresh salvage surfaces without a remount.
+  const {
+    sessions: recoveredSessions,
+    refresh: refreshRecovered,
+    acknowledge: acknowledgeRecovered,
+  } = useRecoveredSessions();
+  useEffect(() => {
+    if (status.state === "finalized" || status.state === "recovered") {
+      refreshRecovered();
+    }
+  }, [status.state, refreshRecovered]);
   // The disabled-Start note names the highest-priority blocker (Story 20.2):
   // Screen Recording → Microphone → Camera. Both this name and `can_start` are
   // projected from the same three-leg VM, so today they always agree; the
@@ -167,11 +189,9 @@ export function RecordingPane() {
           {blockedBy !== null && !live && (
             <p className="text-muted-foreground text-xs">{startBlockedNote(blockedBy)}</p>
           )}
-          {status.state === "finalized" && status.outputPath !== null && (
-            <p className="text-muted-foreground text-xs" role="status">
-              {FINALIZED_NOTE_PREFIX} <span className="font-mono">{status.outputPath}</span>
-            </p>
-          )}
+          {/* The finalized outcome moved from a header one-liner (Story 16.6)
+              into the completion Card in the scrolling body below (Story 20.3):
+              segment count · size, the folder in mono, and Reveal in Finder. */}
           {/* The failed note lives in the banner's error variant now (Story
               18.4) — a single failure surface, mirroring 18.3's header→banner
               consolidation. */}
@@ -217,6 +237,41 @@ export function RecordingPane() {
         {/* Centered single column at content-max-width (UX-DR29), not a full-bleed
             body — unlike the Bridges pane. */}
         <div className="mx-auto flex w-full max-w-[720px] flex-col gap-6 p-6">
+          {/* The completion / in-app-recovery card (Story 20.3, FR-71/FR-73):
+              a finalized session renders the plain completion card; the in-app
+              `recovered` terminal renders the same shape with a warning edge.
+              N/size come from the on-disk manifest (never `segmentsClosed`);
+              the card degrades to folder + Reveal when the summary is
+              unavailable. */}
+          {isCompletionTerminal && status.outputPath !== null && (
+            <RecordingSummaryCard
+              variant={status.state === "recovered" ? "recovered" : "completion"}
+              sessionFolder={status.outputPath}
+              screenSegmentCount={terminalSummary?.screenSegmentCount ?? null}
+              totalBytes={terminalSummary?.totalBytes ?? null}
+            />
+          )}
+          {/* Cross-restart / prior-run orphan notices (Story 20.3, FR-73): one
+              warning-edged recovery card per unacknowledged `recovered` session
+              on disk, each independently dismissable (dismiss latches the
+              one-time notice). Hidden entirely while a session is live, and the
+              current in-app `recovered` terminal (already shown above) is
+              filtered out so a just-salvaged session never double-renders. */}
+          {!live &&
+            recoveredSessions
+              .filter((session) => session.sessionFolder !== status.outputPath)
+              .map((session) => (
+                <RecordingSummaryCard
+                  key={session.sessionFolder}
+                  variant="recovered"
+                  sessionFolder={session.sessionFolder}
+                  screenSegmentCount={session.screenSegmentCount}
+                  totalBytes={session.totalBytes}
+                  onDismiss={() => {
+                    acknowledgeRecovered(session.sessionFolder);
+                  }}
+                />
+              ))}
           {/* The permission pre-flight (Story 16.5; mic/camera rows Story 20.2)
               sits above the setup cards: live-detected at render, re-detected
               on focus/return and on every enabled-source change. The Microphone

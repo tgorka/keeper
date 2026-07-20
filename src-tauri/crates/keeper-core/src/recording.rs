@@ -1277,6 +1277,29 @@ impl SessionManifest {
         self.status = status;
     }
 
+    /// The number of **screen-track** segments in the ledger (Story 20.3, FR-71)
+    /// — the authoritative "Saved N segments" count. Filters `segments` to
+    /// `track == "screen"`, so a camera-track segment (Story 20.1) never inflates
+    /// the count and, in a rotation, screen == camera so screen is authoritative.
+    /// Read straight off the manifest, which the terminal
+    /// [`Self::reconcile_from_dir`] rebuilds from the on-disk `.mp4` files
+    /// (including the final never-closed segment) — never the live
+    /// `segments_closed` rotation counter, which is 0 for a single-segment
+    /// session and track-agnostic.
+    pub fn screen_segment_count(&self) -> u32 {
+        self.segments
+            .iter()
+            .filter(|segment| segment.track == "screen")
+            .count() as u32
+    }
+
+    /// The total on-disk bytes across **all** segments (Story 20.3) — screen and
+    /// camera tracks summed — for the completion/recovery card's `{size}` line.
+    /// The manifest's `bytes` are `fs::metadata`-authoritative at every terminal.
+    pub fn total_bytes(&self) -> u64 {
+        self.segments.iter().map(|segment| segment.bytes).sum()
+    }
+
     /// Atomically (re)write `manifest.json`: serialize, write the sibling
     /// `.manifest.json.tmp` in the **same** folder, then `fs::rename` it over
     /// `manifest.json` (same-directory rename → atomic on APFS). An external
@@ -3963,6 +3986,45 @@ mod tests {
                 screen_entry(0, "screen-0000.mp4", 10),
             ],
             "bounds keyed on (track, index): the screen twin stays null"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    // --- completion/recovery summary accessors (Story 20.3) -----------------
+
+    #[test]
+    fn screen_segment_count_counts_one_for_a_single_segment_session() {
+        // The one case the live `segments_closed` rotation counter gets wrong
+        // (it reports 0 — no rotation ever closed): a single-segment session
+        // has exactly one screen segment on disk and the card must say "1".
+        let folder = fresh_temp_dir("summary-single");
+        let mut manifest = test_manifest(folder.clone());
+        manifest.record_segment(screen_entry(0, "screen-0000.mp4", 1_000));
+        assert_eq!(manifest.screen_segment_count(), 1);
+        assert_eq!(manifest.total_bytes(), 1_000);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn summary_counts_only_screen_segments_but_sums_bytes_across_tracks() {
+        // A screen+camera session (Story 20.1): two screen segments and two
+        // camera segments. "N segments" counts the screen track only (2), yet
+        // "{size}" sums the on-disk bytes of every segment, both tracks.
+        let folder = fresh_temp_dir("summary-dual");
+        let mut manifest = test_manifest(folder.clone());
+        manifest.record_segment(screen_entry(0, "screen-0000.mp4", 10));
+        manifest.record_segment(camera_entry(0, "camera-0000.mp4", 20));
+        manifest.record_segment(screen_entry(1, "screen-0001.mp4", 30));
+        manifest.record_segment(camera_entry(1, "camera-0001.mp4", 40));
+        assert_eq!(
+            manifest.screen_segment_count(),
+            2,
+            "camera segments excluded"
+        );
+        assert_eq!(
+            manifest.total_bytes(),
+            100,
+            "bytes summed across both tracks"
         );
         let _ = std::fs::remove_dir_all(&folder);
     }

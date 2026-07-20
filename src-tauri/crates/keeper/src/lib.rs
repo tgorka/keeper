@@ -391,7 +391,10 @@ pub fn run() {
             ipc::recording_status,
             ipc::recording_acknowledge,
             ipc::recording_settings_get,
-            ipc::recording_settings_set
+            ipc::recording_settings_set,
+            ipc::recording_session_summary,
+            ipc::recovered_sessions_list,
+            ipc::recovered_session_acknowledge
         ]);
     // Window-close (⌘W / red button) hides the main window instead of destroying it
     // (Story 10.3, FR-53): the process keeps every account's `SyncService` and the

@@ -38,6 +38,18 @@ vi.mock("@/lib/ipc/client", () => ({
     }),
   ),
   recordingSettingsSet: vi.fn((vm: unknown) => Promise.resolve(vm)),
+  // The completion / recovery cards (Story 20.3): the summary fetch, the
+  // cross-restart recovery scan, the acknowledgement latch, and Reveal.
+  recordingSessionSummary: vi.fn(() =>
+    Promise.resolve({
+      sessionFolder: "/Users/alice/Movies/keeper/keeper-rec test.mp4",
+      screenSegmentCount: 3,
+      totalBytes: 412_000_000,
+    }),
+  ),
+  recoveredSessionsList: vi.fn(() => Promise.resolve([])),
+  recoveredSessionAcknowledge: vi.fn(() => Promise.resolve()),
+  revealPath: vi.fn(() => Promise.resolve()),
 }));
 
 // The Destination card's folder chooser (Story 19.5) opens the OS-native
@@ -47,12 +59,15 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 }));
 
 import {
-  FINALIZED_NOTE_PREFIX,
   RecordingPane,
   START_RECORDING_LABEL,
   STOP_RECORDING_LABEL,
   startBlockedNote,
 } from "@/components/layout/recording-pane";
+import {
+  RECOVERY_DISMISS_LABEL,
+  REVEAL_IN_FINDER_LABEL,
+} from "@/components/layout/recording-summary-card";
 import {
   BANNER_DISMISS_LABEL,
   BANNER_RESTART_LABEL,
@@ -89,13 +104,18 @@ import {
   openScreenRecordingSettings,
   recordingAcknowledge,
   recordingPermission,
+  recordingSessionSummary,
   recordingStart,
   recordingStatus,
   recordingStop,
+  recoveredSessionAcknowledge,
+  recoveredSessionsList,
   requestCameraPermission,
   requestMicrophonePermission,
   requestScreenRecordingPermission,
+  revealPath,
 } from "@/lib/ipc/client";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { resetRecordingAudioForTest } from "@/lib/stores/recording-audio";
 import { resetRecordingMicForTest, setMicEnabled } from "@/lib/stores/recording-mic";
 import { resetRecordingSourceForTest, selectRecordingTarget } from "@/lib/stores/recording-source";
@@ -111,7 +131,11 @@ const mockRequestCamera = vi.mocked(requestCameraPermission);
 const mockStart = vi.mocked(recordingStart);
 const mockStop = vi.mocked(recordingStop);
 const mockStatus = vi.mocked(recordingStatus);
+const mockSummary = vi.mocked(recordingSessionSummary);
 const mockAcknowledge = vi.mocked(recordingAcknowledge);
+const mockRecoveredList = vi.mocked(recoveredSessionsList);
+const mockRecoveredAck = vi.mocked(recoveredSessionAcknowledge);
+const mockReveal = vi.mocked(revealPath);
 
 const IDLE_STATUS: RecordingStatusVm = {
   state: "idle",
@@ -171,6 +195,22 @@ beforeEach(() => {
   mockStatus.mockResolvedValue(IDLE_STATUS);
   mockAcknowledge.mockReset();
   mockAcknowledge.mockResolvedValue(IDLE_STATUS);
+  mockSummary.mockReset();
+  mockSummary.mockResolvedValue({
+    sessionFolder: RECORDING_STATUS.outputPath ?? "",
+    screenSegmentCount: 3,
+    totalBytes: 412_000_000,
+  });
+  mockRecoveredList.mockReset();
+  mockRecoveredList.mockResolvedValue([]);
+  mockRecoveredAck.mockReset();
+  mockRecoveredAck.mockResolvedValue(undefined);
+  mockReveal.mockReset();
+  mockReveal.mockResolvedValue(undefined);
+  // Reveal is capability-gated (Story 20.3): default ON for the base cases.
+  capabilitiesStore
+    .getState()
+    .applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true, revealInFileManager: true });
 });
 
 afterEach(() => {
@@ -183,6 +223,8 @@ afterEach(() => {
   resetRecordingMicForTest();
   // Restore the default-off webcam selection between tests (Story 20.1).
   resetRecordingWebcamForTest();
+  // Restore the safe-default capabilities between tests (Story 20.3).
+  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
   vi.clearAllMocks();
 });
 
@@ -580,7 +622,7 @@ describe("RecordingPane", () => {
     await waitFor(() => expect(mockStop).toHaveBeenCalledTimes(1));
   });
 
-  it("a finalized session renders the saved-file note with the path", async () => {
+  it("a finalized session renders the completion card with count, size, path, and Reveal", async () => {
     mockFetch.mockResolvedValue(GRANTED);
     mockStatus.mockResolvedValue({
       ...RECORDING_STATUS,
@@ -588,10 +630,76 @@ describe("RecordingPane", () => {
     });
     render(<RecordingPane />);
 
-    expect(await screen.findByText(new RegExp(FINALIZED_NOTE_PREFIX))).toBeInTheDocument();
+    // The completion card renders the manifest-authoritative count · size.
+    expect(await screen.findByText(/Saved 3 segments · 412 MB/)).toBeInTheDocument();
     expect(screen.getByText(RECORDING_STATUS.outputPath ?? "")).toBeInTheDocument();
+    // Reveal in Finder opens the folder (capability on).
+    fireEvent.click(screen.getByRole("button", { name: REVEAL_IN_FINDER_LABEL }));
+    await waitFor(() => expect(mockReveal).toHaveBeenCalledWith(RECORDING_STATUS.outputPath));
     // Back to the Start affordance (a terminal state is not live).
     expect(screen.getByRole("button", { name: START_RECORDING_LABEL })).toBeInTheDocument();
+  });
+
+  it("degrades the completion card to folder + Reveal (no '0 segments · 0 MB') when the summary fetch fails", async () => {
+    mockFetch.mockResolvedValue(GRANTED);
+    mockStatus.mockResolvedValue({
+      ...RECORDING_STATUS,
+      state: "finalized",
+    });
+    mockSummary.mockRejectedValue(new Error("manifest load failed"));
+    render(<RecordingPane />);
+
+    // Honest degrade: the outcome headline + folder + Reveal, never a fabricated
+    // "Saved 0 segments · 0 MB" for a session that really did save.
+    expect(await screen.findByText("Recording saved")).toBeInTheDocument();
+    expect(screen.queryByText(/0 segments/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/0 MB/)).not.toBeInTheDocument();
+    expect(screen.getByText(RECORDING_STATUS.outputPath ?? "")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: REVEAL_IN_FINDER_LABEL })).toBeInTheDocument();
+  });
+
+  it("hides Reveal in Finder on the completion card when the capability is off", async () => {
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true, revealInFileManager: false });
+    mockFetch.mockResolvedValue(GRANTED);
+    mockStatus.mockResolvedValue({
+      ...RECORDING_STATUS,
+      state: "finalized",
+    });
+    render(<RecordingPane />);
+
+    expect(await screen.findByText(/Saved 3 segments · 412 MB/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: REVEAL_IN_FINDER_LABEL })).not.toBeInTheDocument();
+  });
+
+  it("surfaces an unacknowledged recovered session as a warning card and dismisses it", async () => {
+    mockFetch.mockResolvedValue(GRANTED);
+    mockStatus.mockResolvedValue(IDLE_STATUS);
+    mockRecoveredList.mockResolvedValue([
+      {
+        sessionFolder: "/Users/alice/Movies/keeper/keeper-rec recovered",
+        screenSegmentCount: 2,
+        totalBytes: 200_000_000,
+      },
+    ]);
+    render(<RecordingPane />);
+
+    const card = await screen.findByText(/A recording was interrupted; 2 segments were saved/);
+    // The bridge-degraded warning edge (the bridge-card recipe).
+    const cardRoot = card.closest("[data-slot='card']");
+    expect(cardRoot?.className).toContain("border-bridge-degraded/50");
+
+    fireEvent.click(screen.getByRole("button", { name: RECOVERY_DISMISS_LABEL }));
+    // Latched in the Rust seen-set + removed from the surface.
+    await waitFor(() =>
+      expect(mockRecoveredAck).toHaveBeenCalledWith(
+        "/Users/alice/Movies/keeper/keeper-rec recovered",
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText(/A recording was interrupted/)).not.toBeInTheDocument(),
+    );
   });
 
   it("a failed start surfaces the banner error variant (not a header note)", async () => {

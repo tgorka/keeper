@@ -519,6 +519,59 @@ pub fn set_ios_sync_disclosure_shown(data_dir: &Path) -> Result<(), CoreError> {
     set_setting(data_dir, UI_IOS_SYNC_DISCLOSURE_SHOWN_KEY, "1")
 }
 
+/// The `settings` key holding the recovered-session acknowledgement seen-set
+/// (Story 20.3, FR-73). A JSON array of session-folder **basenames** — every
+/// crash-recovered session the user has already been shown-and-dismissed. Absent
+/// ⇒ nothing acknowledged yet. Mirrors the one-time
+/// [`UI_IOS_SYNC_DISCLOSURE_SHOWN_KEY`] latch, but keyed as a set so multiple
+/// distinct recovered sessions each surface exactly once without overloading the
+/// wire-stable manifest `status`.
+const UI_RECOVERED_SESSIONS_ACKNOWLEDGED_KEY: &str = "ui.recovered_sessions_acknowledged";
+
+/// Read the acknowledged recovered-session basenames (Story 20.3, FR-73). Absent
+/// / unparseable ⇒ empty (nothing acknowledged — every recovered session is
+/// still due to surface). Stored as a JSON array in the `settings` k/v table
+/// under `ui.recovered_sessions_acknowledged`. The recovery-list scan filters
+/// these out so each session shows exactly once across restarts.
+pub fn get_recovered_sessions_acknowledged(data_dir: &Path) -> Result<Vec<String>, CoreError> {
+    match get_setting(data_dir, UI_RECOVERED_SESSIONS_ACKNOWLEDGED_KEY)? {
+        Some(raw) => match serde_json::from_str::<Vec<String>>(&raw) {
+            Ok(acknowledged) => Ok(acknowledged),
+            // A corrupt/legacy value must not silently evaporate the whole
+            // seen-set (which would re-surface every recovered notice) without
+            // a trace — log and degrade to "nothing acknowledged".
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "recovered-sessions acknowledgement set is malformed; treating as empty"
+                );
+                Ok(Vec::new())
+            }
+        },
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Latch a recovered session's folder basename into the acknowledgement seen-set
+/// (Story 20.3, FR-73). Idempotent: a basename already present is a no-op (the
+/// stored array never accumulates duplicates), and the write is one-way — an
+/// acknowledged session never re-surfaces. Reads the current set, adds `session`
+/// if absent, and persists the JSON array back under
+/// `ui.recovered_sessions_acknowledged`.
+pub fn add_recovered_session_acknowledged(data_dir: &Path, session: &str) -> Result<(), CoreError> {
+    let mut acknowledged = get_recovered_sessions_acknowledged(data_dir)?;
+    if acknowledged.iter().any(|entry| entry == session) {
+        return Ok(());
+    }
+    acknowledged.push(session.to_owned());
+    let json = serde_json::to_string(&acknowledged).map_err(|e| {
+        CoreError::Internal(format!(
+            "could not serialize acknowledged recovered sessions: {e}"
+        ))
+    })?;
+    set_setting(data_dir, UI_RECOVERED_SESSIONS_ACKNOWLEDGED_KEY, &json)
+}
+
 /// The `settings` key holding the opt-in menu-bar (tray) presence toggle (Story 10.3).
 /// Stored as `"1"`/`"0"`; absent = off (no tray by default).
 const SYSTEM_MENU_BAR_PRESENCE_KEY: &str = "system.menu_bar_presence";
@@ -2218,6 +2271,54 @@ mod tests {
         assert!(get_ios_sync_disclosure_shown(&dir).expect("read back"));
         set_ios_sync_disclosure_shown(&dir).expect("re-latch");
         assert!(get_ios_sync_disclosure_shown(&dir).expect("read after re-latch"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovered_sessions_acknowledged_round_trips_and_is_idempotent() {
+        let dir = temp_dir();
+        // Absent ⇒ nothing acknowledged (every recovered session still due).
+        assert!(get_recovered_sessions_acknowledged(&dir)
+            .expect("read default")
+            .is_empty());
+        // Latching one basename persists and reads back.
+        add_recovered_session_acknowledged(&dir, "keeper-rec a").expect("ack a");
+        assert_eq!(
+            get_recovered_sessions_acknowledged(&dir).expect("read a"),
+            vec!["keeper-rec a".to_owned()]
+        );
+        // A distinct session adds a second entry (a set of many).
+        add_recovered_session_acknowledged(&dir, "keeper-rec b").expect("ack b");
+        assert_eq!(
+            get_recovered_sessions_acknowledged(&dir).expect("read a+b"),
+            vec!["keeper-rec a".to_owned(), "keeper-rec b".to_owned()]
+        );
+        // Re-acknowledging an already-present basename is a no-op (no dup).
+        add_recovered_session_acknowledged(&dir, "keeper-rec a").expect("re-ack a");
+        assert_eq!(
+            get_recovered_sessions_acknowledged(&dir).expect("read after re-ack"),
+            vec!["keeper-rec a".to_owned(), "keeper-rec b".to_owned()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovered_sessions_acknowledged_degrades_to_empty_on_corrupt_value() {
+        let dir = temp_dir();
+        // A corrupt/legacy stored value (not a JSON string array) must not error
+        // — it degrades to "nothing acknowledged" (and logs a warning) so a
+        // later `add_` can re-establish the set rather than propagating.
+        set_setting(&dir, UI_RECOVERED_SESSIONS_ACKNOWLEDGED_KEY, "{not-json")
+            .expect("seed corrupt");
+        assert!(get_recovered_sessions_acknowledged(&dir)
+            .expect("corrupt value reads as empty, not an error")
+            .is_empty());
+        // Recovery from the corrupt state: a fresh latch persists and reads back.
+        add_recovered_session_acknowledged(&dir, "keeper-rec c").expect("ack after corrupt");
+        assert_eq!(
+            get_recovered_sessions_acknowledged(&dir).expect("read after recovery"),
+            vec!["keeper-rec c".to_owned()]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

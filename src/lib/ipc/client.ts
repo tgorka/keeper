@@ -1844,6 +1844,61 @@ export async function recordingAcknowledge(): Promise<RecordingStatusVm> {
 }
 
 /**
+ * The read-only end-of-session summary the completion / recovery cards render
+ * (Story 20.3, FR-71/FR-73) — the TypeScript twin of the Rust
+ * `keeper_core::vm::RecordingSummaryVm`. Derived from a session's authoritative
+ * on-disk `manifest.json`, never the live {@link RecordingStatusVm} snapshot:
+ * `screenSegmentCount` backs "Saved N segments", `totalBytes` backs "{size}",
+ * and `sessionFolder` backs the mono line + Reveal in Finder.
+ */
+export interface RecordingSummaryVm {
+  /** The session folder path — the mono line and the Reveal-in-Finder target. */
+  sessionFolder: string;
+  /** The number of screen-track segments the session saved (never the
+   * track-agnostic live `segmentsClosed` counter). */
+  screenSegmentCount: number;
+  /** The total on-disk bytes across every segment (screen + camera). */
+  totalBytes: number;
+}
+
+/**
+ * Summarize one session folder for the completion / in-app-recovered card
+ * (Story 20.3, FR-71): the Rust core loads `folder/manifest.json` and returns
+ * the manifest-authoritative `{screenSegmentCount, totalBytes, sessionFolder}` —
+ * the honest "Saved N segments · {size}" figures, never the live rotation
+ * counter. `folder` is the session **folder** (`status.outputPath`). Rejects
+ * with the {@link IpcError} envelope on a manifest load failure — the card then
+ * falls back to folder + Reveal, omitting count/size.
+ */
+export async function recordingSessionSummary(folder: string): Promise<RecordingSummaryVm> {
+  return await invoke<RecordingSummaryVm>("recording_session_summary", { folder });
+}
+
+/**
+ * List the crash-recovered sessions still needing a one-time notice (Story 20.3,
+ * FR-73). The Rust core scans the effective recordings destination for
+ * `manifest.json` with `status:"recovered"` whose folder basename is NOT in the
+ * persisted acknowledgement seen-set, deterministically sorted. Best-effort: a
+ * missing destination dir resolves an empty array; a per-entry failure is
+ * skipped, never thrown. Resolves an array (empty when nothing is due).
+ */
+export async function recoveredSessionsList(): Promise<RecordingSummaryVm[]> {
+  return await invoke<RecordingSummaryVm[]>("recovered_sessions_list");
+}
+
+/**
+ * Acknowledge (dismiss) a surfaced recovery card (Story 20.3, FR-73): the Rust
+ * core latches the session folder's basename into the persisted seen-set so
+ * {@link recoveredSessionsList} never surfaces it again on a later scan/restart.
+ * A one-way, idempotent, best-effort registry write. `folder` is the session
+ * folder path. Rejects with the {@link IpcError} envelope only on a write
+ * failure (the card may then reappear next scan).
+ */
+export async function recoveredSessionAcknowledge(folder: string): Promise<void> {
+  await invoke<void>("recovered_session_acknowledge", { folder });
+}
+
+/**
  * Read the effective segmentation settings (Story 17.5, FR-72) — the segment
  * size (MB) and duration-cap fallback (minutes) persisted in the Rust `settings`
  * k/v table. The Rust getters default (500 MB / 30 min) and clamp defensively,

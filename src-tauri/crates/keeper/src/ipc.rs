@@ -42,9 +42,9 @@ use keeper_core::vm::{
     IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
     NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
     PaletteResultsVm, PingVm, Provider, RecordingPermissionVm, RecordingSettingsVm,
-    RecordingSourcesVm, RecordingStatusVm, RecordingTargetVm, RecordingUiState, RemoteDraftVm,
-    ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm, SearchHitVm,
-    SpacesSnapshot, TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
+    RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState,
+    RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm,
+    SearchHitVm, SpacesSnapshot, TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use tauri::ipc::Channel;
 use tauri::State;
@@ -4437,6 +4437,182 @@ pub(crate) fn recover_orphaned_recordings(state: &AppState) {
     }
 }
 
+/// Map a loaded [`SessionManifest`] to the read-only [`RecordingSummaryVm`] the
+/// completion / recovery cards render (Story 20.3): the session folder path plus
+/// the manifest-authoritative screen-segment count and total on-disk bytes.
+#[cfg(desktop)]
+fn manifest_summary(folder: &Path, manifest: &SessionManifest) -> RecordingSummaryVm {
+    RecordingSummaryVm {
+        session_folder: folder.to_string_lossy().into_owned(),
+        screen_segment_count: manifest.screen_segment_count(),
+        total_bytes: manifest.total_bytes(),
+    }
+}
+
+/// Summarize one session folder for the completion / in-app-recovered card
+/// (Story 20.3, FR-71): load `folder/manifest.json` and return the
+/// manifest-authoritative `{screenSegmentCount, totalBytes, sessionFolder}` — the
+/// honest "Saved N segments · {size}" figures, never the live `segments_closed`
+/// rotation counter. A manifest load failure surfaces as an [`IpcError`] so the
+/// card can still fall back to folder + Reveal (the frontend omits count/size).
+#[cfg(desktop)]
+#[tauri::command]
+pub fn recording_session_summary(folder: String) -> Result<RecordingSummaryVm, IpcError> {
+    let path = PathBuf::from(&folder);
+    let manifest = SessionManifest::load(&path).map_err(|e| to_ipc_error(e.into()))?;
+    Ok(manifest_summary(&path, &manifest))
+}
+
+/// Mobile stub for [`recording_session_summary`] (Story 20.3): recording is a
+/// desktop-only surface — an honest `Unsupported` (`retriable: false`).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn recording_session_summary(folder: String) -> Result<RecordingSummaryVm, IpcError> {
+    let _ = folder;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "recording session summaries are desktop-only".to_owned(),
+    )))
+}
+
+/// List the crash-recovered sessions that still need surfacing (Story 20.3,
+/// FR-73): scan the effective recordings destination's immediate subdirectories
+/// for a `manifest.json` with `status == Recovered` whose folder basename is NOT
+/// in the persisted acknowledgement seen-set, map each to a
+/// [`RecordingSummaryVm`], and return them in a deterministic (basename) order.
+///
+/// Disk is the single source of truth — this re-derives the recovered set from
+/// the on-disk `recovered` manifests Story 17.3 wrote (it also catches orphans
+/// from prior app runs that the in-memory recovery list never held). Best-effort
+/// and total: a missing/unreadable destination dir → `[]`; a per-entry load /
+/// non-directory / non-recovered / acknowledged entry is skipped (logged), never
+/// aborting the scan or propagating an error.
+#[cfg(desktop)]
+#[tauri::command]
+pub fn recovered_sessions_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<RecordingSummaryVm>, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let base = effective_destination_dir(&data_dir)?;
+    let acknowledged = keeper_core::registry::get_recovered_sessions_acknowledged(&data_dir)
+        .map_err(to_ipc_error)?;
+    Ok(scan_recovered_sessions(&base, &acknowledged))
+}
+
+/// The pure, best-effort recovery scan behind [`recovered_sessions_list`] (Story
+/// 20.3): walk `base`'s immediate subdirectories, keep every folder whose
+/// `manifest.json` is `status == Recovered` and whose basename is not in
+/// `acknowledged`, map each to a [`RecordingSummaryVm`], and return them sorted
+/// by basename. Total and best-effort — a missing/unreadable base is `[]`, and
+/// any per-entry failure is logged and skipped, never aborting the scan.
+/// Extracted from the command so it is unit-testable over a temp dir without an
+/// `AppState`/registry.
+#[cfg(desktop)]
+fn scan_recovered_sessions(base: &Path, acknowledged: &[String]) -> Vec<RecordingSummaryVm> {
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            tracing::warn!(%error, "recovered-sessions scan: could not read the destination dir");
+            return Vec::new();
+        }
+    };
+
+    let mut summaries: Vec<RecordingSummaryVm> = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "recovered-sessions scan: skipping unreadable dir entry");
+                continue;
+            }
+        };
+        // Only real directories are session folders (a `DirEntry` file type does
+        // not follow symlinks) — mirror the recovery pass's ownership rule.
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::warn!(%error, "recovered-sessions scan: skipping entry with no file type");
+                continue;
+            }
+        }
+        let folder = entry.path();
+        let Some(basename) = folder.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if acknowledged.iter().any(|seen| seen == basename) {
+            continue;
+        }
+        let manifest = match SessionManifest::load(&folder) {
+            Ok(manifest) => manifest,
+            // No/unreadable/malformed manifest is not a recovered session here.
+            Err(error) => {
+                tracing::debug!(%error, "recovered-sessions scan: skipping folder without a loadable manifest");
+                continue;
+            }
+        };
+        if manifest.status != ManifestStatus::Recovered {
+            continue;
+        }
+        summaries.push(manifest_summary(&folder, &manifest));
+    }
+    // Deterministic order across `read_dir` platforms: by folder basename.
+    summaries.sort_by(|a, b| a.session_folder.cmp(&b.session_folder));
+    summaries
+}
+
+/// Mobile stub for [`recovered_sessions_list`] (Story 20.3): recording is a
+/// desktop-only surface — an honest empty list (no recovery on mobile).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn recovered_sessions_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<RecordingSummaryVm>, IpcError> {
+    let _ = state;
+    Ok(Vec::new())
+}
+
+/// Acknowledge (dismiss) a surfaced recovery card (Story 20.3, FR-73): latch the
+/// session folder's **basename** into the persisted acknowledgement seen-set so
+/// [`recovered_sessions_list`] never surfaces it again on a later scan/restart. A
+/// one-way, idempotent, best-effort registry write — a failed write may let the
+/// card reappear next scan, but never throws mid-dismiss.
+#[cfg(desktop)]
+#[tauri::command]
+pub fn recovered_session_acknowledge(
+    state: State<'_, AppState>,
+    folder: String,
+) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    // The seen-set is keyed on the folder basename (what `scan_recovered_sessions`
+    // compares). A path with no final component (trailing slash / root-like) has
+    // no basename to latch — skip rather than store a full path the scan's
+    // basename comparison would never match (which would re-surface the card).
+    let Some(basename) = Path::new(&folder)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        tracing::warn!(folder = %folder, "acknowledge recovered session: no basename; skipping latch");
+        return Ok(());
+    };
+    keeper_core::registry::add_recovered_session_acknowledged(&data_dir, basename)
+        .map_err(to_ipc_error)
+}
+
+/// Mobile stub for [`recovered_session_acknowledge`] (Story 20.3): recording is a
+/// desktop-only surface — an honest `Unsupported` (`retriable: false`).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn recovered_session_acknowledge(
+    state: State<'_, AppState>,
+    folder: String,
+) -> Result<(), IpcError> {
+    let _ = (state, folder);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "recovered-session acknowledgement is desktop-only".to_owned(),
+    )))
+}
+
 /// Probe whether the destination folder is actually writable (Story 19.5) with
 /// a real probe-file write+remove — more reliable than metadata permissions on
 /// macOS (ACLs, read-only volumes, sandboxing). The probe name is unique per
@@ -5307,6 +5483,99 @@ mod tests {
         assert_eq!(target, CaptureTarget::display(None));
         assert_eq!(display_id, None);
         assert_eq!(application, None);
+    }
+
+    // --- recovered-sessions scan (Story 20.3) -------------------------------
+
+    /// A unique, empty scratch dir under the OS temp root for a scan test.
+    fn scan_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("keeper-scan-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scan temp dir");
+        dir
+    }
+
+    /// Write a session folder under `base` with a manifest of the given `status`
+    /// and one 100-byte `screen-0000.mp4` reconciled into the ledger.
+    fn write_session(base: &Path, name: &str, status: ManifestStatus) -> PathBuf {
+        let folder = base.join(name);
+        let mut manifest = SessionManifest::create(
+            folder.clone(),
+            CaptureTarget::display(None),
+            SessionDevices {
+                system_audio: true,
+                microphone: false,
+                camera: false,
+            },
+        )
+        .expect("create session folder + manifest");
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 100]).expect("segment");
+        manifest.reconcile_from_dir().expect("reconcile");
+        manifest.set_status(status);
+        manifest.write().expect("write manifest");
+        folder
+    }
+
+    #[test]
+    fn scan_lists_recovered_excludes_acknowledged_and_non_recovered() {
+        let base = scan_temp_dir("list");
+        write_session(&base, "keeper-rec recovered-a", ManifestStatus::Recovered);
+        write_session(&base, "keeper-rec recovered-b", ManifestStatus::Recovered);
+        // A clean finalize is a terminal but NOT a recovery — never surfaced.
+        write_session(&base, "keeper-rec finalized", ManifestStatus::Finalized);
+        // A still-recording (or non-session) folder is likewise excluded.
+        write_session(&base, "keeper-rec live", ManifestStatus::Recording);
+        // A folder with no manifest is silently skipped (best-effort).
+        std::fs::create_dir_all(base.join("keeper-rec stray")).expect("stray");
+
+        // Nothing acknowledged yet: both recovered sessions surface, sorted.
+        let listed = scan_recovered_sessions(&base, &[]);
+        let names: Vec<_> = listed
+            .iter()
+            .map(|s| s.session_folder.rsplit('/').next().unwrap_or("").to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "keeper-rec recovered-a".to_owned(),
+                "keeper-rec recovered-b".to_owned()
+            ]
+        );
+        // Summary figures come from the manifest: 1 screen segment, 100 bytes.
+        assert_eq!(listed[0].screen_segment_count, 1);
+        assert_eq!(listed[0].total_bytes, 100);
+
+        // Acknowledging one basename excludes exactly it on the next scan.
+        let acked = vec!["keeper-rec recovered-a".to_owned()];
+        let after = scan_recovered_sessions(&base, &acked);
+        assert_eq!(after.len(), 1);
+        assert!(after[0].session_folder.ends_with("keeper-rec recovered-b"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_missing_destination_dir_is_empty() {
+        let base = scan_temp_dir("missing");
+        let missing = base.join("does-not-exist");
+        assert!(scan_recovered_sessions(&missing, &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn session_summary_reports_manifest_authoritative_figures() {
+        let base = scan_temp_dir("summary");
+        let folder = write_session(&base, "keeper-rec summary", ManifestStatus::Finalized);
+        let summary =
+            recording_session_summary(folder.to_string_lossy().into_owned()).expect("summary");
+        assert!(summary.session_folder.ends_with("keeper-rec summary"));
+        assert_eq!(summary.screen_segment_count, 1);
+        assert_eq!(summary.total_bytes, 100);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A `Stopping` snapshot for the quit-finalize tests (Story 18.2).
