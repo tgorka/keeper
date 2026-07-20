@@ -216,6 +216,24 @@ pub fn run() {
                 });
             }
 
+            // Startup recovery of orphaned segments (Story 17.3, FR-73, AD-37).
+            // A recorder/keeper/power crash leaves a session's `manifest.json`
+            // frozen at `status:"recording"`; this best-effort pass reconciles
+            // each such session from its on-disk segments and marks it
+            // `recovered` (remux-free) — the durable signal Story 20.3 reads.
+            // It runs on a detached thread (like the notification-permission
+            // request above) so a slow/large recordings volume NEVER stalls
+            // boot; `AppState`'s live-folder reservation + recovery-scan lock
+            // make it safe against a concurrent `recording_start` even
+            // seconds after boot. A failure is logged only, never fatal.
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let state = handle.state::<ipc::AppState>();
+                    ipc::recover_orphaned_recordings(state.inner());
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

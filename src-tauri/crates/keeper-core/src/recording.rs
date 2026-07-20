@@ -1409,6 +1409,161 @@ impl SessionManifest {
         self.segments = segments;
         Ok(())
     }
+
+    /// Load a session's `manifest.json` from `folder` (Story 17.3). Read
+    /// `folder/manifest.json`, deserialize it, and re-bind the runtime-only
+    /// `#[serde(skip)]` folder field to `folder` (the persisted manifest never
+    /// carries an absolute path — the caller supplies it, so a subsequent
+    /// [`Self::reconcile_from_dir`]/[`Self::write`] operates on the right
+    /// path). Any fs read or parse failure surfaces as a secret-free
+    /// [`RecordingError::ManifestIo`] (the message names the failing operation
+    /// only — never the folder path or any captured-media path), mirroring the
+    /// write-side discipline.
+    pub fn load(folder: &Path) -> Result<Self, RecordingError> {
+        let raw = std::fs::read_to_string(folder.join("manifest.json"))
+            .map_err(|e| manifest_io("read session manifest", &e))?;
+        let mut manifest: Self = serde_json::from_str(&raw)
+            .map_err(|e| RecordingError::ManifestIo(format!("parse session manifest: {e}")))?;
+        manifest.folder = folder.to_path_buf();
+        Ok(manifest)
+    }
+}
+
+/// Scan `base_dir` for crash-orphaned sessions and recover each one (Story
+/// 17.3, FR-73, AD-37) — a platform-free, disk-authoritative, best-effort
+/// recovery pass. Returns the folders it marked `recovered` (sorted, so the
+/// list is deterministic across `read_dir` orders and platforms).
+///
+/// For each immediate subdirectory of `base_dir` — **symlinked entries are
+/// skipped** via the `DirEntry` file type (which does not follow symlinks), so
+/// recovery never rewrites a manifest outside the destination tree — that
+/// holds a `manifest.json`, [`SessionManifest::load`] it; when its `status` is
+/// still [`ManifestStatus::Recording`] AND its `version` is within
+/// [`MANIFEST_VERSION`] AND `is_active` reports the folder inactive, rebuild
+/// the segment ledger from the on-disk `.mp4` files
+/// ([`SessionManifest::reconcile_from_dir`] — disk is authoritative, the stale
+/// event-fed list is discarded, never a bare status flip), mark the manifest
+/// [`ManifestStatus::Recovered`], and atomically rewrite ONLY `manifest.json`
+/// ([`SessionManifest::write`] — no segment file is ever opened for write, so
+/// recovery is remux-free).
+///
+/// **The live-session guard.** An on-disk `status:"recording"` cannot by
+/// itself distinguish a crashed orphan from a session that is *currently*
+/// recording (a live session persists `recording` for its whole duration), so
+/// the shell passes `is_active` — a predicate over its reserved-live-folder
+/// set. It is consulted **immediately before** the salvage write, and a
+/// reserved folder is skipped untouched: recovery must never rewrite an active
+/// session's manifest to `recovered` mid-capture. A bare `&dyn Fn` keeps this
+/// module firewall-clean — no shell or Apple types cross the seam.
+///
+/// Best-effort and total: a missing `base_dir` is "no recordings yet" (silent
+/// empty list); an unreadable `base_dir` is logged and yields an empty list;
+/// an entry that is not a session dir, is symlinked, has no/unreadable/
+/// malformed manifest, is not `recording`, is a newer schema version, is
+/// reserved live, or whose per-folder reconcile/write fails is skipped (logged
+/// via `tracing`) — one bad entry NEVER aborts the scan, and the pass never
+/// propagates an error or panics. Because a recovered manifest is no longer
+/// `recording`, a second run is a no-op (idempotent).
+///
+/// Firewall-clean: `std::fs` + serde + the bare predicate only — no shell, no
+/// Apple framework, no process API (enforced by
+/// `tests::dependency_firewall_holds`).
+pub fn recover_orphaned_sessions(
+    base_dir: &Path,
+    is_active: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(base_dir) {
+        Ok(entries) => entries,
+        // A missing base dir means "no recordings yet" — not even worth a warn.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            tracing::warn!(%error, "recovery: could not read the recordings base dir (non-fatal)");
+            return Vec::new();
+        }
+    };
+    let mut recovered = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "recovery: skipping unreadable base-dir entry");
+                continue;
+            }
+        };
+        // `DirEntry::file_type` does not follow symlinks (and costs no extra
+        // syscall on the platforms keeper ships on): a symlinked entry — which
+        // `is_dir()`-style probes would follow — must never be recovered, or
+        // the pass would rewrite a manifest OUTSIDE the destination tree.
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                tracing::warn!(%error, "recovery: skipping entry with unreadable file type");
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            tracing::debug!("recovery: skipping symlinked base-dir entry");
+            continue;
+        }
+        // Only immediate real subdirectories are session folders; a loose file
+        // is a stray, never a session.
+        if !file_type.is_dir() {
+            continue;
+        }
+        let folder = entry.path();
+        // A subdirectory without a `manifest.json` is not a session folder
+        // (`load` backstops a real session whose probe races with a warn).
+        if !folder.join("manifest.json").is_file() {
+            continue;
+        }
+        let mut manifest = match SessionManifest::load(&folder) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                // Unreadable / malformed manifest — skip this folder, never
+                // abort the scan of its siblings.
+                tracing::warn!(%error, "recovery: skipping folder with an unreadable manifest");
+                continue;
+            }
+        };
+        // Only a still-`recording` manifest can be orphaned; a terminal
+        // (`finalized`/`recovered`/`failed`) session is read once and left
+        // untouched — this is what makes recovery idempotent.
+        if manifest.status != ManifestStatus::Recording {
+            continue;
+        }
+        // Never rewrite an unknown future schema.
+        if manifest.version > MANIFEST_VERSION {
+            tracing::warn!(
+                version = manifest.version,
+                "recovery: skipping newer-schema manifest"
+            );
+            continue;
+        }
+        // The live-session guard, consulted IMMEDIATELY before the salvage: a
+        // folder the shell has reserved belongs to a session that is live (or
+        // mid-start, or still landing its terminal write) — skip it untouched.
+        // A genuinely-crashed orphan is never reserved and still salvages.
+        if is_active(&folder) {
+            tracing::debug!("recovery: skipping reserved live session folder");
+            continue;
+        }
+        // Rebuild the ledger from disk (remux-free — only `manifest.json` is
+        // written), mark recovered, atomically rewrite.
+        if let Err(error) = manifest.reconcile_from_dir() {
+            tracing::warn!(%error, "recovery: skipping folder whose segment dir could not be read");
+            continue;
+        }
+        manifest.set_status(ManifestStatus::Recovered);
+        if let Err(error) = manifest.write() {
+            tracing::warn!(%error, "recovery: skipping folder whose manifest could not be rewritten");
+            continue;
+        }
+        recovered.push(folder);
+    }
+    // `read_dir` order is filesystem-defined; sort so the recovered list is
+    // deterministic across runs and platforms.
+    recovered.sort();
+    recovered
 }
 
 /// Derive the fs-safe session folder basename `keeper-rec <local ts>` from the
@@ -3960,6 +4115,442 @@ mod tests {
             assert_eq!(segments[1]["bytes"], 22);
             let _ = std::fs::remove_dir_all(&folder);
         }
+    }
+
+    // --- startup recovery of orphaned segments (Story 17.3) ----------------
+
+    /// An `is_active` predicate reporting every folder inactive — the shape of
+    /// a scan with no live recording session (the common case).
+    fn no_folder_is_active(_folder: &std::path::Path) -> bool {
+        false
+    }
+
+    /// Build a session folder holding a manifest at `status` plus
+    /// `segment_count` dummy `screen-####.mp4` files (each with a distinct,
+    /// non-zero byte length so byte-identity is observable), and return the
+    /// folder. The manifest's event-fed segment list deliberately misses the
+    /// FINAL segment (which emits no `segmentClosed`) and carries a stale byte
+    /// figure for the ones it has — exercising recovery's disk-authoritative
+    /// rebuild (the final segment surfaces; sizes are repaired).
+    fn stale_session(
+        base: &std::path::Path,
+        name: &str,
+        status: ManifestStatus,
+        segment_count: u32,
+    ) -> std::path::PathBuf {
+        let folder = base.join(name);
+        std::fs::create_dir_all(&folder).expect("session folder");
+        for index in 0..segment_count {
+            // Distinct, non-zero lengths (10, 20, 30, …) so a stray remux or a
+            // stale event-fed size is caught by the byte assertions.
+            let bytes = vec![index as u8; ((index + 1) * 10) as usize];
+            std::fs::write(folder.join(format!("screen-{index:04}.mp4")), bytes)
+                .expect("dummy segment");
+        }
+        let manifest = SessionManifest {
+            version: MANIFEST_VERSION,
+            session: name.to_owned(),
+            status,
+            capture_target: CaptureTarget::display(None),
+            devices: test_devices(),
+            // The event-fed view a crash freezes: every segment but the last
+            // (no `segmentClosed` for the final one), each with a stale
+            // 1-byte size a disk rebuild must repair.
+            segments: (0..segment_count.saturating_sub(1))
+                .map(|index| screen_entry(index, &format!("screen-{index:04}.mp4"), 1))
+                .collect(),
+            folder: folder.clone(),
+        };
+        manifest.write().expect("write stale manifest");
+        folder
+    }
+
+    #[test]
+    fn load_round_trips_a_written_manifest_and_rebinds_the_folder() {
+        let folder = fresh_temp_dir("load");
+        let mut original = test_manifest(folder.clone());
+        original.record_segment(screen_entry(0, "screen-0000.mp4", 42));
+        original.write().expect("write manifest");
+
+        let loaded = SessionManifest::load(&folder).expect("load round-trip");
+        assert_eq!(loaded.version, original.version);
+        assert_eq!(loaded.session, original.session);
+        assert_eq!(loaded.status, ManifestStatus::Recording);
+        assert_eq!(loaded.capture_target, original.capture_target);
+        assert_eq!(loaded.devices, original.devices);
+        assert_eq!(loaded.segments, original.segments);
+        // The runtime-only folder field is re-bound from the argument, not the
+        // (never-persisted) serialized value.
+        assert_eq!(loaded.folder(), folder.as_path());
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn load_surfaces_a_secret_free_error_on_a_malformed_manifest() {
+        let folder = fresh_temp_dir("load-bad");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("manifest.json"), b"{ not json").expect("bad manifest");
+        let err = SessionManifest::load(&folder).expect_err("malformed manifest must error");
+        match err {
+            RecordingError::ManifestIo(message) => assert!(
+                !message.contains(folder.to_string_lossy().as_ref()),
+                "the error must not embed the folder path, got: {message}"
+            ),
+            other => panic!("expected ManifestIo, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn recover_marks_a_stale_recording_session_and_rebuilds_the_ledger() {
+        let base = fresh_temp_dir("recover-base");
+        // A stale `recording` session with three on-disk segments; the ledger
+        // misses the final one (no `segmentClosed`) and carries stale sizes.
+        let folder = stale_session(
+            &base,
+            "keeper-rec 2026-07-17 14.00.00",
+            ManifestStatus::Recording,
+            3,
+        );
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert_eq!(recovered, vec![folder.clone()]);
+
+        // The manifest is now `recovered`, with the ledger rebuilt from disk:
+        // the final/suppressed segment surfaced, real byte sizes, sorted by
+        // (index, file).
+        let reloaded = SessionManifest::load(&folder).expect("reload recovered manifest");
+        assert_eq!(reloaded.status, ManifestStatus::Recovered);
+        assert_eq!(
+            reloaded.segments,
+            vec![
+                screen_entry(0, "screen-0000.mp4", 10),
+                screen_entry(1, "screen-0001.mp4", 20),
+                screen_entry(2, "screen-0002.mp4", 30),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_handles_a_session_that_crashed_before_the_first_segment() {
+        let base = fresh_temp_dir("recover-empty");
+        let folder = stale_session(
+            &base,
+            "keeper-rec no-segments",
+            ManifestStatus::Recording,
+            0,
+        );
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert_eq!(recovered, vec![folder.clone()]);
+        let reloaded = SessionManifest::load(&folder).expect("reload");
+        assert_eq!(reloaded.status, ManifestStatus::Recovered);
+        assert!(
+            reloaded.segments.is_empty(),
+            "no segments on disk ⇒ an honest empty ledger"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_never_remuxes_segment_files_are_byte_identical() {
+        let base = fresh_temp_dir("recover-noremux");
+        let folder = stale_session(&base, "keeper-rec noremux", ManifestStatus::Recording, 3);
+        // Capture every segment file's bytes before recovery.
+        let before: Vec<(std::path::PathBuf, Vec<u8>)> = (0..3)
+            .map(|index| {
+                let path = folder.join(format!("screen-{index:04}.mp4"));
+                let bytes = std::fs::read(&path).expect("read segment before");
+                (path, bytes)
+            })
+            .collect();
+
+        recover_orphaned_sessions(&base, &no_folder_is_active);
+
+        // Every segment file is byte-for-byte unchanged — only `manifest.json`
+        // may have been rewritten.
+        for (path, expected) in &before {
+            let after = std::fs::read(path).expect("read segment after");
+            assert_eq!(
+                &after, expected,
+                "segment {path:?} must be byte-identical after recovery (no remux)"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_leaves_terminal_sessions_byte_untouched_and_idempotent() {
+        for status in [
+            ManifestStatus::Finalized,
+            ManifestStatus::Recovered,
+            ManifestStatus::Failed,
+        ] {
+            let base = fresh_temp_dir(&format!("recover-terminal-{status:?}"));
+            let folder = stale_session(&base, "keeper-rec terminal", status, 2);
+            let before =
+                std::fs::read(folder.join("manifest.json")).expect("manifest bytes before");
+
+            let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+            assert!(
+                recovered.is_empty(),
+                "a {status:?} session must not be recovered"
+            );
+            // The terminal manifest is left byte-for-byte as-is: no status
+            // flip, no reconcile, no rewrite.
+            let after = std::fs::read(folder.join("manifest.json")).expect("manifest bytes after");
+            assert_eq!(
+                after, before,
+                "a {status:?} manifest must be byte-untouched"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    #[test]
+    fn recover_returns_empty_for_a_missing_base_dir() {
+        let base = fresh_temp_dir("recover-missing");
+        // `base` is a fresh path that does not exist.
+        assert!(!base.exists());
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert!(recovered.is_empty(), "a missing base dir is a silent no-op");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recover_returns_empty_for_an_unreadable_base_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = fresh_temp_dir("recover-unreadable-base");
+        stale_session(&base, "keeper-rec hidden", ManifestStatus::Recording, 1);
+        // Revoke every permission on the base so `read_dir` itself fails.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod base 000");
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert!(
+            recovered.is_empty(),
+            "an unreadable base dir must warn and yield an empty list"
+        );
+
+        // Restore so cleanup (and the leftover-dir sweep) can remove the tree.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod base 755");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_skips_a_malformed_manifest_without_aborting_a_sibling() {
+        let base = fresh_temp_dir("recover-malformed");
+        // A folder with a malformed manifest, and a sibling valid stale session.
+        let bad = base.join("keeper-rec broken");
+        std::fs::create_dir_all(&bad).expect("bad folder");
+        std::fs::write(bad.join("manifest.json"), b"{ not json at all").expect("bad manifest");
+        let good = stale_session(&base, "keeper-rec good", ManifestStatus::Recording, 2);
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert_eq!(
+            recovered,
+            vec![good.clone()],
+            "the malformed sibling must be skipped"
+        );
+        // The good session was recovered; the corrupt manifest is untouched.
+        assert_eq!(
+            SessionManifest::load(&good).expect("reload good").status,
+            ManifestStatus::Recovered
+        );
+        assert_eq!(
+            std::fs::read(bad.join("manifest.json")).expect("corrupt manifest bytes"),
+            b"{ not json at all",
+            "a corrupt manifest must be left byte-untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_skips_stray_non_session_entries() {
+        let base = fresh_temp_dir("recover-strays");
+        std::fs::create_dir_all(&base).expect("base");
+        // A loose file (not a directory).
+        std::fs::write(base.join("loose.txt"), b"stray").expect("loose file");
+        // A subdirectory without a manifest.
+        std::fs::create_dir(base.join("no-manifest")).expect("empty subdir");
+        // A valid stale session that must still be recovered.
+        let good = stale_session(&base, "keeper-rec real", ManifestStatus::Recording, 1);
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert_eq!(recovered, vec![good], "only the real session is recovered");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_skips_a_newer_schema_version() {
+        let base = fresh_temp_dir("recover-newer");
+        let folder = base.join("keeper-rec future");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("screen-0000.mp4"), vec![0u8; 10]).expect("segment");
+        // A `recording` manifest whose schema version is newer than we understand.
+        let manifest = SessionManifest {
+            version: MANIFEST_VERSION + 1,
+            session: "keeper-rec future".to_owned(),
+            status: ManifestStatus::Recording,
+            capture_target: CaptureTarget::display(None),
+            devices: test_devices(),
+            segments: Vec::new(),
+            folder: folder.clone(),
+        };
+        manifest.write().expect("write newer manifest");
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert!(
+            recovered.is_empty(),
+            "a newer-schema manifest must never be rewritten"
+        );
+        // Its status is left untouched.
+        let reloaded = SessionManifest::load(&folder).expect("reload");
+        assert_eq!(reloaded.status, ManifestStatus::Recording);
+        assert_eq!(reloaded.version, MANIFEST_VERSION + 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_is_idempotent_a_second_run_is_a_no_op() {
+        let base = fresh_temp_dir("recover-idempotent");
+        stale_session(&base, "keeper-rec once", ManifestStatus::Recording, 2);
+
+        let first = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert_eq!(first.len(), 1, "the first run recovers the stale session");
+        let second = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert!(
+            second.is_empty(),
+            "the second run finds no `recording` manifest — a no-op"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_salvages_multiple_orphans_in_deterministic_folder_order() {
+        let base = fresh_temp_dir("recover-order");
+        // Create sessions out of lexicographic order; recovery must salvage
+        // every one and return them folder-sorted regardless of `read_dir`
+        // order.
+        let noon = stale_session(
+            &base,
+            "keeper-rec 2026-07-17 12.00.00",
+            ManifestStatus::Recording,
+            1,
+        );
+        let morning = stale_session(
+            &base,
+            "keeper-rec 2026-07-17 09.00.00",
+            ManifestStatus::Recording,
+            1,
+        );
+        let evening = stale_session(
+            &base,
+            "keeper-rec 2026-07-17 15.00.00",
+            ManifestStatus::Recording,
+            1,
+        );
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert_eq!(recovered, vec![morning, noon, evening]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recover_isolates_a_per_folder_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = fresh_temp_dir("recover-write-fail");
+        // Two stale sessions; `wedged`'s folder is read-only so recovery's
+        // atomic `write` (which creates `.manifest.json.tmp` inside it) fails.
+        let wedged = stale_session(&base, "keeper-rec a-wedged", ManifestStatus::Recording, 1);
+        let good = stale_session(&base, "keeper-rec b-good", ManifestStatus::Recording, 1);
+        std::fs::set_permissions(&wedged, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod wedged 555");
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert_eq!(
+            recovered,
+            vec![good.clone()],
+            "the wedged folder's write failure must not stop its sibling"
+        );
+        assert_eq!(
+            SessionManifest::load(&good).expect("reload good").status,
+            ManifestStatus::Recovered
+        );
+        // The wedged folder's manifest still reads `recording` (the write
+        // never landed) — the next pass will retry it.
+        assert_eq!(
+            SessionManifest::load(&wedged)
+                .expect("reload wedged")
+                .status,
+            ManifestStatus::Recording
+        );
+
+        std::fs::set_permissions(&wedged, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod wedged 755");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_leaves_a_reserved_live_folder_byte_untouched_and_unreturned() {
+        let base = fresh_temp_dir("recover-live-guard");
+        // Two `recording` sessions: `live` stands in for a session the shell
+        // has reserved (live, mid-start, or still landing its terminal write);
+        // `orphan` is a genuine prior crash.
+        let live = stale_session(&base, "keeper-rec live", ManifestStatus::Recording, 2);
+        let orphan = stale_session(&base, "keeper-rec orphan", ManifestStatus::Recording, 1);
+        let live_before = std::fs::read(live.join("manifest.json")).expect("live bytes before");
+
+        let live_guard = live.clone();
+        let is_active = move |folder: &std::path::Path| folder == live_guard;
+        let recovered = recover_orphaned_sessions(&base, &is_active);
+
+        // Only the orphan is recovered; the reserved live folder is never
+        // reconciled, never rewritten, never returned.
+        assert_eq!(
+            recovered,
+            vec![orphan],
+            "the reserved live folder must not be recovered"
+        );
+        let live_after = std::fs::read(live.join("manifest.json")).expect("live bytes after");
+        assert_eq!(
+            live_after, live_before,
+            "the reserved live folder's manifest must be byte-for-byte untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recover_skips_a_symlinked_base_dir_entry() {
+        let base = fresh_temp_dir("recover-symlink");
+        std::fs::create_dir_all(&base).expect("base");
+        // A real stale `recording` session living OUTSIDE the base dir,
+        // reachable only through a symlink inside it.
+        let outside = fresh_temp_dir("recover-symlink-target");
+        std::fs::create_dir_all(&outside).expect("outside base");
+        let target = stale_session(&outside, "keeper-rec outside", ManifestStatus::Recording, 1);
+        std::os::unix::fs::symlink(&target, base.join("keeper-rec linked"))
+            .expect("symlink into base");
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert!(
+            recovered.is_empty(),
+            "a symlinked entry must be skipped, never followed"
+        );
+        // The out-of-tree session was never touched.
+        assert_eq!(
+            SessionManifest::load(&target)
+                .expect("reload target")
+                .status,
+            ManifestStatus::Recording,
+            "recovery must never rewrite a manifest outside the destination tree"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     // --- dependency firewall (AD-33) ---------------------------------------

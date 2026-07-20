@@ -7,7 +7,7 @@
 //! single Rust lifecycle entry point is self-contained. No business logic lives
 //! in either module — commands delegate to `keeper-core`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -27,11 +27,11 @@ use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::recording::{
     current_segment_bytes_on_disk, evaluate_destination, plan_disk_guard_action,
-    resolve_recording_permission, resolve_screen_recording_access, resolve_source_access,
-    session_bytes_on_disk, session_folder_name, ApplicationTarget, CameraSelection, CaptureTarget,
-    DiskGuardAction, DiskGuardLatch, ManifestStatus, MicSelection, Recorder, RecordingEvent,
-    RecordingSession, SegmentEntry, SessionDevices, SessionManifest, SessionParams, SessionState,
-    RECORDING_MIN_FREE_BYTES, RECORDING_WARN_FREE_BYTES,
+    recover_orphaned_sessions, resolve_recording_permission, resolve_screen_recording_access,
+    resolve_source_access, session_bytes_on_disk, session_folder_name, ApplicationTarget,
+    CameraSelection, CaptureTarget, DiskGuardAction, DiskGuardLatch, ManifestStatus, MicSelection,
+    Recorder, RecordingEvent, RecordingSession, SegmentEntry, SessionDevices, SessionManifest,
+    SessionParams, SessionState, RECORDING_MIN_FREE_BYTES, RECORDING_WARN_FREE_BYTES,
 };
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
@@ -121,6 +121,25 @@ pub struct AppState {
     /// session stays in the slot (its outcome is what `recording_status`
     /// reports) until the next start replaces it.
     pub recording_run: Mutex<Option<RecordingRun>>,
+    /// The folders of live (or starting) recording sessions (Story 17.3): the
+    /// live-session guard behind the orphan-recovery pass's `is_active`
+    /// predicate. `recording_start` reserves its unique session folder here
+    /// BEFORE `SessionManifest::create` (closing the create-before-
+    /// `RecordingRun`-install window) and the [`LiveFolderReservation`] RAII
+    /// guard removes it on every exit path — an early start error, the driver
+    /// task's end after any terminal, and the quit kill-timeout's task abort.
+    /// An on-disk `status:"recording"` cannot by itself distinguish a crashed
+    /// orphan from a live session, so recovery skips any folder found in this
+    /// set. `Arc`'d so the guard can ride into the `'static` driver task.
+    pub reserved_recording_folders: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Serializes the two orphan-recovery call sites (Story 17.3) — the
+    /// detached startup pass and the pre-record pass — so two scans never
+    /// reconcile+`write` the same folder concurrently (`SessionManifest::
+    /// write` uses a fixed `.manifest.json.tmp` name per folder; concurrent
+    /// renames could interleave). Held around the whole scan; disjoint from
+    /// the reserved-set lock, which the `is_active` predicate takes only
+    /// briefly inside a scan (a consistent scan → set order, so no deadlock).
+    pub recovery_scan: Mutex<()>,
 }
 
 /// The live half of one recording session (Story 16.6, AD-33): the shell owns
@@ -175,6 +194,50 @@ pub(crate) fn slot_get<T: Clone>(slot: &Mutex<Option<T>>) -> Option<T> {
 /// Take (consume) the current value of an optional slot (poison-recovering).
 pub(crate) fn slot_take<T>(slot: &Mutex<Option<T>>) -> Option<T> {
     slot_lock(slot).take()
+}
+
+/// Lock any plain-data mutex, recovering a poisoned lock instead of propagating
+/// — the [`slot_lock`] discipline for the non-`Option` slots (the reserved
+/// live-folder set, the recovery-scan serializer): no invariant a mid-write
+/// panic could break, and a best-effort recovery concern must never panic the
+/// app.
+fn plain_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// RAII reservation of one live session folder in
+/// [`AppState::reserved_recording_folders`] (Story 17.3): taken in
+/// `recording_start` BEFORE `SessionManifest::create` — so the folder is
+/// reserved for the ENTIRE span it could be live, including the
+/// create→`RecordingRun`-install window — and released by `Drop` on every exit
+/// path: a `?` early-return after reserving, the driver task's end after any
+/// terminal (the guard rides into the task), and the quit kill-timeout's
+/// `abort()` (dropping the `run_session` future drops the guard). While
+/// reserved, the orphan-recovery pass's `is_active` predicate reports the
+/// folder live and skips it untouched.
+struct LiveFolderReservation {
+    reserved: Arc<Mutex<HashSet<PathBuf>>>,
+    folder: PathBuf,
+}
+
+impl LiveFolderReservation {
+    /// Insert `folder` into the reserved set and return the releasing guard.
+    fn reserve(reserved: &Arc<Mutex<HashSet<PathBuf>>>, folder: PathBuf) -> Self {
+        plain_lock(reserved).insert(folder.clone());
+        Self {
+            reserved: reserved.clone(),
+            folder,
+        }
+    }
+}
+
+impl Drop for LiveFolderReservation {
+    fn drop(&mut self) {
+        plain_lock(&self.reserved).remove(&self.folder);
+    }
 }
 
 /// The two registry maps, held under a single lock so target-reservation and
@@ -357,6 +420,8 @@ impl AppState {
             recorder,
             recording_permission_requested: AtomicBool::new(false),
             recording_run: Mutex::new(None),
+            reserved_recording_folders: Arc::new(Mutex::new(HashSet::new())),
+            recovery_scan: Mutex::new(()),
         }
     }
 }
@@ -3734,6 +3799,39 @@ pub async fn recording_start(
     // cleanly at the sidecar (an honest `error` → `Failed`), never here.
     let (capture_target, target_display_id, application) = resolve_capture_target(target);
 
+    // Settings/destination are resolved BEFORE the `recording_run` start-guard so
+    // the pre-record recovery scan below runs OUTSIDE that slot lock. `data_dir`
+    // and `directory` are pure reads (no session side effect); the destination
+    // create/probe/free-space gate still runs under the guard further down. Read
+    // once, at Start time — never re-read mid-session (AD-25): a mid-session edit
+    // persists and mirrors both surfaces but only affects the next Recording
+    // Session.
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let directory = effective_destination_dir(&data_dir)?;
+    // Best-effort pre-record recovery of any session a prior crash left stale
+    // (Story 17.3, FR-73, AD-37): reconcile every orphaned `recording` manifest
+    // under the recovery-scan lock (serialized against the detached startup pass
+    // — both `write` the same fixed `.manifest.json.tmp` per folder); the
+    // `is_active` predicate skips any reserved live folder. This runs BEFORE the
+    // `recording_run` start-guard is acquired, so its O(session-folders) blocking
+    // `read_dir`/`stat` scan never stalls stop/quit/tray, which contend on that
+    // slot (recording_snapshot's invariant: the slot is never held across
+    // blocking `read_dir`/`stat`). The new session's own folder does not exist
+    // yet, so the scan cannot see it; a recovery failure is logged in the core
+    // pass and must NEVER fail the start.
+    {
+        let _scan = plain_lock(&state.recovery_scan);
+        let is_active =
+            |folder: &Path| plain_lock(&state.reserved_recording_folders).contains(folder);
+        let recovered = recover_orphaned_sessions(&directory, &is_active);
+        if !recovered.is_empty() {
+            tracing::info!(
+                count = recovered.len(),
+                "pre-record recovery marked orphaned session(s) recovered"
+            );
+        }
+    }
+
     let mut guard = slot_lock(&state.recording_run);
     if let Some(run) = guard.as_ref() {
         let live = !matches!(
@@ -3750,10 +3848,6 @@ pub async fn recording_start(
         }
     }
 
-    // Settings are read from the registry once, at Start time — never re-read
-    // mid-session (AD-25): a mid-session edit persists and mirrors both
-    // surfaces but only affects the next Recording Session.
-    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     // The destination pre-flight gate (Story 19.5, AD-33): the user-chosen (or
     // default `~/Movies/keeper`) folder is probed shell-side — exists-or-
     // creatable via `create_dir_all`, writable via a real probe-file
@@ -3762,7 +3856,6 @@ pub async fn recording_start(
     // decides. A rejection blocks HERE, before the collision-suffix loop /
     // `SessionManifest::create` / any sidecar spawn: no session folder is
     // created and no capture begins.
-    let directory = effective_destination_dir(&data_dir)?;
     let creatable_or_exists = std::fs::create_dir_all(&directory).is_ok() && directory.is_dir();
     let writable = creatable_or_exists && destination_writable(&directory);
     // An exists-but-unprobeable volume must not block capture on a broken
@@ -3802,6 +3895,15 @@ pub async fn recording_start(
         folder = directory.join(format!("{base_name} ({suffix})"));
         suffix = suffix.saturating_add(1);
     }
+    // Reserve the unique session folder BEFORE `SessionManifest::create`
+    // (Story 17.3): from this line until the driver task ends, the orphan-
+    // recovery pass sees this folder as live and never rewrites its manifest —
+    // closing the create-before-`RecordingRun`-install window a detached
+    // startup scan could otherwise race. The RAII guard unreserves on every
+    // exit path: a `?` early-return below, the driver task's end, or the quit
+    // kill-timeout's task abort.
+    let reservation =
+        LiveFolderReservation::reserve(&state.reserved_recording_folders, folder.clone());
     // Create the folder + the initial `recording` manifest. This synchronous
     // pre-spawn failure is a legitimate command error — no session task exists
     // yet, so surfacing it cannot desync any start-guard.
@@ -3996,6 +4098,15 @@ pub async fn recording_start(
         if let Err(error) = outcome {
             fail_recording_snapshot(&task_status, task_platform.as_ref(), error.to_string());
         }
+
+        // The session can no longer write anything: release the live-folder
+        // reservation (Story 17.3), so a later recovery pass may salvage this
+        // folder if its manifest never reached a terminal status (a mid-
+        // session write fault). Held to HERE — not the terminal event — so
+        // the terminal reconcile+write in the sink above always completes
+        // before the folder becomes recoverable. An aborted driver (quit
+        // kill-timeout) drops the future, which drops this guard the same way.
+        drop(reservation);
     });
 
     // Story 18.5: the live disk-space guard. A ~1 Hz task probes the
@@ -4279,6 +4390,51 @@ fn resolve_destination_dir(stored: Option<String>, data_dir: &Path) -> PathBuf {
     dirs::video_dir()
         .unwrap_or_else(|| data_dir.to_path_buf())
         .join("keeper")
+}
+
+/// The startup orphan-recovery pass (Story 17.3, FR-73, AD-37): derive the
+/// current EFFECTIVE recordings destination (the same
+/// [`effective_destination_dir`] source of truth `recording_start` uses) and
+/// run the core `recover_orphaned_sessions` scan over it, marking every
+/// crash-orphaned `recording` manifest `recovered` on disk — the durable
+/// signal Story 20.3's notice consumes. Best-effort end to end: any failure is
+/// logged and swallowed, never fatal (this runs on a detached boot thread —
+/// see `lib.rs` `setup`).
+///
+/// Safe against a concurrent `recording_start` (the detached thread can still
+/// be walking a slow volume after the user clicked Record): the scan holds the
+/// [`AppState::recovery_scan`] mutex (serializing it against the pre-record
+/// pass) and passes the SAME `is_active` predicate over
+/// [`AppState::reserved_recording_folders`], so a folder a starting/live
+/// session has reserved is skipped untouched — a live session's manifest is
+/// never rewritten to `recovered` mid-capture.
+pub(crate) fn recover_orphaned_recordings(state: &AppState) {
+    let data_dir = match state.platform.data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            tracing::warn!(%error, "startup recovery: could not resolve the data dir (non-fatal)");
+            return;
+        }
+    };
+    let base = match effective_destination_dir(&data_dir) {
+        Ok(base) => base,
+        Err(error) => {
+            tracing::warn!(
+                error = %error.message,
+                "startup recovery: could not resolve the destination dir (non-fatal)"
+            );
+            return;
+        }
+    };
+    let _scan = plain_lock(&state.recovery_scan);
+    let is_active = |folder: &Path| plain_lock(&state.reserved_recording_folders).contains(folder);
+    let recovered = recover_orphaned_sessions(&base, &is_active);
+    if !recovered.is_empty() {
+        tracing::info!(
+            count = recovered.len(),
+            "startup recovery marked orphaned session(s) recovered"
+        );
+    }
 }
 
 /// Probe whether the destination folder is actually writable (Story 19.5) with
