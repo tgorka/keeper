@@ -1,0 +1,93 @@
+src/components/command-palette/actions.ts
+  s_afee56bf86d78a::t_135fa5532524a7 67-90
+  s_afee56bf86d78a::t_92a72384bb8b41 28,34
+src/lib/recording-control.ts
+  s_afee56bf86d78a::t_657f29fb572e06 1-78
+src/hooks/use-recording-hotkey.test.ts
+  s_afee56bf86d78a::t_fb5d139611a028 1-85
+src/lib/recording-control.test.ts
+  s_afee56bf86d78a::t_47055b66d54fef 1-129
+src/lib/ipc/client.ts
+  s_afee56bf86d78a::t_8de163b6c222a8 1193-1235
+src-tauri/crates/keeper/src/macos_version.rs
+  s_afee56bf86d78a::t_3809f249f2e729 40-49,60-61,65,68
+  s_afee56bf86d78a::t_b8c50844721d99 80,96-120
+src-tauri/crates/keeper-core/src/registry.rs
+  s_afee56bf86d78a::t_793e86833a5922 1800
+  s_afee56bf86d78a::t_8bd91843f9316f 1801-1828
+  s_afee56bf86d78a::t_5e8cc8995d99eb 780-803
+src-tauri/crates/keeper-core/src/palette.rs
+  s_afee56bf86d78a::t_58fe78ff13382c 952-960,963-966,970,973-982,984-1020,1022-1023,1025-1026,1028-1037
+  s_afee56bf86d78a::t_412666656ee799 669-672
+  s_afee56bf86d78a::t_a8a11f739fe2a7 449-493
+src/components/settings/settings-dialog.tsx
+  s_afee56bf86d78a::t_07507e32e5f270 51-53
+  s_afee56bf86d78a::t_88a4caa554f851 849-851
+  s_afee56bf86d78a::t_2efa6a9fbfbccf 984,989-1149
+  s_afee56bf86d78a::t_eb6b85c1a7bc3b 1150-1152
+src-tauri/crates/keeper/src/ipc.rs
+  s_afee56bf86d78a::t_7434162ed46bdc 2588-2592,2594
+  s_afee56bf86d78a::t_aa308c99143fb7 2370-2377,2382-2587,2593,2595-2630
+  s_afee56bf86d78a::t_265f8a50f9a4c6 5797-5801
+  s_afee56bf86d78a::t_e49a292ecca568 5711-5771,5777-5796,5802-5804
+  s_afee56bf86d78a::t_115d1f7c1d9016 2378-2381
+  s_afee56bf86d78a::t_a3598f1f92418a 5772-5776
+src/components/layout/app-shell.tsx
+  s_afee56bf86d78a::t_186c5bffcaf5c3 32
+  s_afee56bf86d78a::t_71c4447f4393f4 88-91
+src/components/command-palette/actions.test.ts
+  s_afee56bf86d78a::t_c756d5f3d4c7e8 1-76
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_afee56bf86d78a::t_050010086cb144 203
+src/components/recording/zero-egress.test.ts
+  s_afee56bf86d78a::t_126354a24ce675 32-46,49,53-58
+  s_afee56bf86d78a::t_fcca1e144453cd 1-31,47-48,50-52,59-101
+docs/egress.md
+  s_afee56bf86d78a::t_2f80400a07f604 34-44
+src/hooks/use-recording-hotkey.ts
+  s_afee56bf86d78a::t_0a858e9189395a 1-58
+src-tauri/crates/keeper/src/zero_egress.rs
+  s_afee56bf86d78a::t_0281cc82b9d074 62-63
+  s_afee56bf86d78a::t_eb41271f13aa5f 1-61,64-90
+src/components/settings/settings-dialog.test.tsx
+  s_afee56bf86d78a::t_e4036d4741248f 144-146
+  s_afee56bf86d78a::t_c17fecf0c89b3e 123-125
+  s_afee56bf86d78a::t_f0b5b0332d78c4 568-635,637-638
+  s_afee56bf86d78a::t_0a71cea5f1a4a3 636
+  s_afee56bf86d78a::t_a847ad894daa58 162-170
+  s_afee56bf86d78a::t_ec0d9b2af00288 210-220
+  s_afee56bf86d78a::t_8aab95c5a0efc3 50-74
+src-tauri/crates/keeper/src/hotkey.rs
+  s_afee56bf86d78a::t_9058d44418b00a 21-26
+  s_afee56bf86d78a::t_e6658995b74c33 282
+  s_afee56bf86d78a::t_4484b2f27f275e 283-296
+  s_afee56bf86d78a::t_430bc934636f79 86-166
+_bmad-output/implementation-artifacts/spec-20-4-palette-actions-global-hotkey-capability-gating-and-zero-egress-audit.md
+  s_afee56bf86d78a::t_ade0e97e5942aa 1-4,9-84,98-105,124-140
+  s_afee56bf86d78a::t_53f2142c341cc1 85-97
+  s_afee56bf86d78a::t_deb84bfc41de6c 6
+  s_afee56bf86d78a::t_7b843bce41b45e 8
+  s_afee56bf86d78a::t_8d155eed40758c 141-180
+  s_afee56bf86d78a::t_68982a34a53962 5,7
+  s_afee56bf86d78a::t_53e865dee701eb 106-123
+src-tauri/crates/keeper/src/lib.rs
+  s_afee56bf86d78a::t_fe25fb8e530c02 19-22
+  s_afee56bf86d78a::t_1d956a06e726c8 322-325
+  s_afee56bf86d78a::t_8cd2ff3b15f6b5 134-141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "b266c98407da2de3f1565a756c8db4d9af70b2e6",
+  "prompts": {},
+  "sessions": {
+    "s_afee56bf86d78a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bacde019-2c4a-42aa-9659-19c945babaa6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
