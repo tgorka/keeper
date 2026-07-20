@@ -1,0 +1,111 @@
+src/components/recording/recording-webcam-controls.tsx
+  s_b9b3782c979726::t_dc25acfe6a32c2 146-153
+  s_b9b3782c979726::t_8129d0e69635f5 91-96,99-102
+  s_b9b3782c979726::t_5406428298acbc 12-14
+  s_b9b3782c979726::t_d4b6a00aa2c12f 137-139
+  s_b9b3782c979726::t_13b7d3aa507ab9 68-70,72-73
+src-tauri/crates/keeper/src/ipc.rs
+  s_b9b3782c979726::t_84f0e82c0d92cf 3249-3261,3265-3266,3274-3278
+  s_b9b3782c979726::t_6bc6dda605695c 3320-3325,3342-3345
+  s_b9b3782c979726::t_ff3ab5cd9686d6 31-34
+  s_b9b3782c979726::t_e989c1e3d23c68 3425-3429
+  s_b9b3782c979726::t_38308b522686b0 3288-3291,3295-3296
+  s_b9b3782c979726::t_f907bf82aeac22 3326-3341
+  s_b9b3782c979726::t_8a384ca62795a6 3364-3395
+  s_b9b3782c979726::t_9d4f99572136e9 3402-3407
+  s_b9b3782c979726::t_d8cc6f8a281208 30
+src/lib/ipc/gen/RecordingPermissionVm.ts
+  s_b9b3782c979726::t_d1e70ed2b1a0fa 5-6,8-16,24-35
+src/components/recording/recording-permission-row.test.tsx
+  s_b9b3782c979726::t_fd0034cef7208d 6-7,9-10,16,20-26,31,33,82-116,119-125
+src/hooks/use-recording-permission.ts
+  s_b9b3782c979726::t_ff9ea94e55f696 72-78,118
+  s_b9b3782c979726::t_22642e8fb0e97d 33
+  s_b9b3782c979726::t_a76b323643604c 202
+  s_b9b3782c979726::t_dd45c620f3d2af 36
+  s_b9b3782c979726::t_af62796a888f7c 91-97,99-100,102
+  s_b9b3782c979726::t_804c2b038a3d4b 2-3,5-6,8-16,19-20,25-26,29-30,41-42,46-47,58-65,79-80,83-88,108,130-151,158-164,205-214
+  s_b9b3782c979726::t_b83f09ebdf2d09 34-35,37
+  s_b9b3782c979726::t_29654e4f85a0d9 171-172,191-201,203
+  s_b9b3782c979726::t_3b71f79b3a8fd6 165,204
+src/components/layout/recording-pane.tsx
+  s_b9b3782c979726::t_26d3d8586c597f 62-79,81-83
+  s_b9b3782c979726::t_d461d1b292e662 301
+  s_b9b3782c979726::t_9f03d65f6fbab2 43
+  s_b9b3782c979726::t_92d2581bab9b35 167-168
+  s_b9b3782c979726::t_e01b6f4685d2cc 104-111,113,116
+  s_b9b3782c979726::t_7652023725f585 8-12
+  s_b9b3782c979726::t_520a4d6e3f1f38 288
+  s_b9b3782c979726::t_5fb277cde32cec 27-30,32
+  s_b9b3782c979726::t_3648caeaba0de1 112,117-124
+  s_b9b3782c979726::t_da6cfd8bd96463 220-225,230,232,234,240-261
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_b9b3782c979726::t_6610bf9f89405b 1063-1066
+src/components/recording/recording-permission-row.tsx
+  s_b9b3782c979726::t_7123b7b2eb5d37 2-3,5-10,20,23-28,42,52-74,76-78,80-81,84,89,91,96,99,121-129
+src/components/recording/recording-audio-controls.tsx
+  s_b9b3782c979726::t_8f7e0b6e77f278 163-170
+  s_b9b3782c979726::t_ed0988c8f3879e 82-84,86-87
+  s_b9b3782c979726::t_5c46bcb6d342f6 105-110,113-116
+  s_b9b3782c979726::t_411099c416ca9c 20-21
+src/hooks/use-recording-permission.test.tsx
+  s_b9b3782c979726::t_a23c9ac1110618 8-12,21-22,25-26,29-30,35-58,77-84,88-91,99,101-102,106-107,136-171,180-187,191,196,198-200,204-209,225-280,329-341
+  s_b9b3782c979726::t_01487d51aa2db6 342
+src-tauri/crates/keeper-core/src/recording.rs
+  s_b9b3782c979726::t_761f38e06a038a 2904-2922,2929-2955,2959-2974
+  s_b9b3782c979726::t_4c74e449c3eeb4 969-1010
+  s_b9b3782c979726::t_d27fe6dedcebb1 30-31
+  s_b9b3782c979726::t_ff3ab5cd9686d6 2923-2928,2956-2958
+src/components/recording/recording-webcam-controls.test.tsx
+  s_b9b3782c979726::t_963caf1af05a01 86,93-94
+src-tauri/crates/keeper-core/src/vm.rs
+  s_b9b3782c979726::t_88de6d4eb46569 2693-2704,2711-2718
+src/components/recording/recording-audio-controls.test.tsx
+  s_b9b3782c979726::t_249b727eae389d 125,132-133
+src/lib/ipc/client.ts
+  s_b9b3782c979726::t_15f82ed69969cd 1789-1793
+  s_b9b3782c979726::t_1ac1a069090eb2 1649-1666,1676-1689,1703-1724
+  s_b9b3782c979726::t_78b9c6a1e658ae 1772-1774
+  s_b9b3782c979726::t_6be6e75e836525 1725
+src-tauri/crates/keeper/src/lib.rs
+  s_b9b3782c979726::t_8fe053c96dc62a 368-369
+_bmad-output/implementation-artifacts/spec-20-2-microphone-and-camera-tcc-pre-flight-rows.md
+  s_b9b3782c979726::t_5df42af9b2ce56 123-139
+  s_b9b3782c979726::t_2d6e2d02d5d12a 5
+  s_b9b3782c979726::t_9120fda47cfeba 140-176
+  s_b9b3782c979726::t_b14e248c7a982f 92
+  s_b9b3782c979726::t_c99536be20bad2 82-91
+  s_b9b3782c979726::t_83a465395dca80 1-4,7,9-81,93-122
+  s_b9b3782c979726::t_064594b859daa0 6
+  s_b9b3782c979726::t_8bc9eec1387ffd 8
+src/components/layout/recording-pane.test.tsx
+  s_b9b3782c979726::t_6b565d4b369b7e 140-157
+  s_b9b3782c979726::t_43b6b99395a18e 249-251
+  s_b9b3782c979726::t_70f8db2fe8acb3 450-452
+  s_b9b3782c979726::t_8b8611c41ced08 456-490
+  s_b9b3782c979726::t_0389925634ad6a 1
+  s_b9b3782c979726::t_f2d32772b43199 8-10
+  s_b9b3782c979726::t_f6d8bd0ae2c51e 107-110
+  s_b9b3782c979726::t_ae284edffeebe8 71-74,76,78
+  s_b9b3782c979726::t_0050c9c6c8c400 54
+  s_b9b3782c979726::t_e1554637d5331b 87-88,95-96
+  s_b9b3782c979726::t_d825fe57218e4a 312-353,369-449,453-455
+  s_b9b3782c979726::t_708463072c844d 261-263
+  s_b9b3782c979726::t_8a1933d630782b 354-368
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "3e5b304636a8392d5c589f9d3dcecd0053307900",
+  "prompts": {},
+  "sessions": {
+    "s_b9b3782c979726": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fb8762dd-17f2-441b-a5e9-e2f00004d0d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
