@@ -1,0 +1,87 @@
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_6e3727b001829e::t_4fed75e301886c 181
+src-tauri/crates/keeper-core/src/recording.rs
+  s_6e3727b001829e::t_491ed022ee07fa 1412-1470,1475-1566
+  s_6e3727b001829e::t_6943bebb5c4bd4 1471-1474,4238-4243,4382,4486-4488,4546-4548
+  s_6e3727b001829e::t_a877e2b516b867 4120-4237,4244-4381,4383-4485,4489-4545,4549-4555
+tools/keeper-rec/Tests/keeper-recTests/RecoveryTests.swift
+  s_6e3727b001829e::t_c7e540442da782 1-12,27-35,37-71,83,85-159,163,166,173,175-176,178,183,186,188,192,197-205,207-212,217-218,221-222,224-234,241-244,246-247,249-276,282-284,286-288
+  s_6e3727b001829e::t_51444ead63464d 13-26,36,72-82,84,160-162,164-165,167-172,174,177,179-182,184-185,187,189-191,193-196,206,213-216,219-220,223,235-240,245,248,277-281,285
+src-tauri/crates/keeper/src/lib.rs
+  s_6e3727b001829e::t_3d33c36dcb22c2 219-236
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_6e3727b001829e::t_708ef73c10b720 1067-1070
+src-tauri/crates/keeper/src/ipc.rs
+  s_6e3727b001829e::t_393e65c9c9d0a4 30-34
+  s_6e3727b001829e::t_daa663f1c5a5e0 3898-3904
+  s_6e3727b001829e::t_6943bebb5c4bd4 3905-3906
+  s_6e3727b001829e::t_1bec5693fd0192 124-142
+  s_6e3727b001829e::t_7ab9cf210596be 199-242
+  s_6e3727b001829e::t_106fa66da3cdd4 423-424
+  s_6e3727b001829e::t_db487a5848e384 3802-3834
+  s_6e3727b001829e::t_c0333b248f2d16 10
+  s_6e3727b001829e::t_2c642fff2b4943 4395-4439
+  s_6e3727b001829e::t_dc9db8d2238d45 4101-4109
+_bmad-output/implementation-artifacts/spec-17-3-startup-recovery-of-orphaned-segments.md
+  s_3ef3be9c7c11f3::t_8bc7fd55df9710 188
+  s_fb2fce13b17016::t_0b085f647aaa59 8
+  s_6e3727b001829e::t_67e19b29918640 111-121
+  s_6e3727b001829e::t_af5238ff0a10f8 7
+  s_6e3727b001829e::t_9bfb71647c9971 169-187,189-195,197-199
+  s_6e3727b001829e::t_76398d1175e6cb 77
+  s_3ef3be9c7c11f3::t_dd054506e72c6a 196
+  s_6e3727b001829e::t_c1f59a8ef30abd 146-154
+  s_6e3727b001829e::t_6a3ec158809453 79
+  s_6e3727b001829e::t_ea63017ba0e421 59-63
+  s_6e3727b001829e::t_2f1119ed0c6f98 11
+  s_6e3727b001829e::t_331175c4d784c2 5
+  s_6e3727b001829e::t_57bb220cb25f43 82-110
+  s_6e3727b001829e::t_a90230101ec952 68-72
+  s_6e3727b001829e::t_38652cc3d61315 158
+  s_6e3727b001829e::t_4bb56146d5950d 6
+  s_3ef3be9c7c11f3::t_57020894238056 9
+  s_6e3727b001829e::t_972977b49c18ae 1-4,10,12-58,64-67,73-76,78,80-81,132-145,155-157,159-168
+  s_3ef3be9c7c11f3::t_170d5a8137f3a0 122-131
+_bmad-output/implementation-artifacts/bmad-dev-auto-result-20-3-completion-reveal-in-finder-and-startup-recovery-notice.md
+  s_8a8bc6b6bf6017::t_78d0e6a2078019 1-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "b26d399e38fba3c347d7800014f4d784715a9324",
+  "prompts": {},
+  "sessions": {
+    "s_3ef3be9c7c11f3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "66932d94-feb6-4a6b-95da-86dd0f438102",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_6e3727b001829e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e57aeb97-bb25-4613-a60b-2fc4f1aab5d1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_fb2fce13b17016": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7f33090c-2e8b-440b-834c-50dc6145aaed",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
