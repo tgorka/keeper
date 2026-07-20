@@ -1646,17 +1646,24 @@ export async function iosOpenAppSettings(): Promise<void> {
 }
 
 /**
- * Resolve the live Screen Recording permission pre-flight (Story 16.5, FR-67,
- * AD-36). The Rust command probes the `keeper-rec` sidecar's non-prompting
- * preflight (a fresh child process per call — live detection, never a cached
- * grant, bounded by a shell timeout so a wedged sidecar resolves a clean error)
- * and lifts it into the honest tri-state {@link RecordingPermissionVm}. Called at
- * Recording-view render and re-called on focus/return. Rejects with the
- * {@link IpcError} envelope on a sidecar failure — callers swallow to a safe
- * default (Start disabled) rather than surfacing a spinner.
+ * Resolve the live recording permission pre-flight (Story 16.5, FR-67, AD-36;
+ * mic/camera legs Story 20.2). The Rust command probes the `keeper-rec`
+ * sidecar's non-prompting `getCapabilities` (a fresh child process per call —
+ * live detection, never a cached grant, bounded by a shell timeout so a wedged
+ * sidecar resolves a clean error) and resolves all three legs from that one
+ * probe into the honest {@link RecordingPermissionVm}: the Screen Recording
+ * tri-state plus a Microphone/Camera leg for each source the caller reports
+ * enabled (`micEnabled`/`cameraEnabled` — a disabled source's leg is `null`,
+ * renders no row, and never gates Start). Called at Recording-view render and
+ * re-called on focus/return and on every enabled-source change. Rejects with
+ * the {@link IpcError} envelope on a sidecar failure — callers swallow to a
+ * safe default (Start disabled) rather than surfacing a spinner.
  */
-export async function recordingPermission(): Promise<RecordingPermissionVm> {
-  return await invoke<RecordingPermissionVm>("recording_permission");
+export async function recordingPermission(
+  micEnabled: boolean,
+  cameraEnabled: boolean,
+): Promise<RecordingPermissionVm> {
+  return await invoke<RecordingPermissionVm>("recording_permission", { micEnabled, cameraEnabled });
 }
 
 /**
@@ -1666,11 +1673,20 @@ export async function recordingPermission(): Promise<RecordingPermissionVm> {
  * posts its one real prompt per app lifetime where allowed; a prior denial shows
  * no prompt at all), and resolves the re-resolved {@link RecordingPermissionVm}:
  * granted unlocks Start; not granted resolves denied-with-fix-path so the row
- * offers the System Settings deep link. Rejects with the {@link IpcError}
- * envelope on a sidecar failure — callers swallow to a safe default.
+ * offers the System Settings deep link. Story 20.2: `micEnabled`/`cameraEnabled`
+ * carry the enabled sources so the returned VM keeps their legs resolved (from
+ * a non-prompting `getCapabilities` probe) — never blanking an enabled row.
+ * Rejects with the {@link IpcError} envelope on a sidecar failure — callers
+ * swallow to a safe default.
  */
-export async function requestScreenRecordingPermission(): Promise<RecordingPermissionVm> {
-  return await invoke<RecordingPermissionVm>("request_screen_recording_permission");
+export async function requestScreenRecordingPermission(
+  micEnabled: boolean,
+  cameraEnabled: boolean,
+): Promise<RecordingPermissionVm> {
+  return await invoke<RecordingPermissionVm>("request_screen_recording_permission", {
+    micEnabled,
+    cameraEnabled,
+  });
 }
 
 /**
@@ -1682,6 +1698,29 @@ export async function requestScreenRecordingPermission(): Promise<RecordingPermi
  */
 export async function openScreenRecordingSettings(): Promise<void> {
   await invoke<void>("open_screen_recording_settings");
+}
+
+/**
+ * Open the macOS System Settings pane for Microphone (Story 20.2, FR-67) — the
+ * Microphone pre-flight row's fix path for a denied grant, where re-prompting
+ * is impossible. Routes the `x-apple.systempreferences:…Privacy_Microphone`
+ * deep link through the Rust opener (`Platform::open_url`) so it bypasses the
+ * opener JS default scope. Never re-prompts. Best-effort — callers swallow
+ * rejection.
+ */
+export async function openMicrophoneSettings(): Promise<void> {
+  await invoke<void>("open_microphone_settings");
+}
+
+/**
+ * Open the macOS System Settings pane for Camera (Story 20.2, FR-67) — the
+ * Camera pre-flight row's fix path for a denied grant, where re-prompting is
+ * impossible. Routes the `x-apple.systempreferences:…Privacy_Camera` deep link
+ * through the Rust opener (`Platform::open_url`) so it bypasses the opener JS
+ * default scope. Never re-prompts. Best-effort — callers swallow rejection.
+ */
+export async function openCameraSettings(): Promise<void> {
+  await invoke<void>("open_camera_settings");
 }
 
 /**
@@ -1730,7 +1769,9 @@ export async function recordingStart(
  * where the state is undetermined, attributed to keeper via
  * `NSMicrophoneUsageDescription`) and resolves the authoritative post-request
  * {@link TccPermission} tri-state. Called **only** when the user enables the
- * mic source on the Audio card — never preemptively, never on render. Rejects
+ * mic source on the Audio card or hits the Microphone pre-flight row's
+ * "Request permission" (Story 20.2) — never preemptively, never on render.
+ * Since Story 20.2 an enabled mic that is not granted blocks Start. Rejects
  * with the {@link IpcError} envelope on a sidecar failure — the caller
  * swallows it to a no-claim caption rather than crashing.
  */
@@ -1745,10 +1786,11 @@ export async function requestMicrophonePermission(): Promise<TccPermission> {
  * lifetime where the state is undetermined, attributed to keeper via
  * `NSCameraUsageDescription`) and resolves the authoritative post-request
  * {@link TccPermission} tri-state. Called **only** when the user enables the
- * Webcam switch — never preemptively, never on render; a denial never blocks
- * Start (the mic precedent). Rejects with the {@link IpcError} envelope on a
- * sidecar failure — the caller swallows it to a no-claim caption rather than
- * crashing.
+ * Webcam switch or hits the Camera pre-flight row's "Request permission"
+ * (Story 20.2) — never preemptively, never on render. Since Story 20.2 an
+ * enabled webcam that is not granted blocks Start. Rejects with the
+ * {@link IpcError} envelope on a sidecar failure — the caller swallows it to
+ * a no-claim caption rather than crashing.
  */
 export async function requestCameraPermission(): Promise<TccPermission> {
   return await invoke<TccPermission>("request_camera_permission");

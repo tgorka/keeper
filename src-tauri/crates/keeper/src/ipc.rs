@@ -27,10 +27,11 @@ use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::recording::{
     current_segment_bytes_on_disk, evaluate_destination, plan_disk_guard_action,
-    resolve_screen_recording_access, session_bytes_on_disk, session_folder_name, ApplicationTarget,
-    CameraSelection, CaptureTarget, DiskGuardAction, DiskGuardLatch, ManifestStatus, MicSelection,
-    Recorder, RecordingEvent, RecordingSession, SegmentEntry, SessionDevices, SessionManifest,
-    SessionParams, SessionState, RECORDING_MIN_FREE_BYTES, RECORDING_WARN_FREE_BYTES,
+    resolve_recording_permission, resolve_screen_recording_access, resolve_source_access,
+    session_bytes_on_disk, session_folder_name, ApplicationTarget, CameraSelection, CaptureTarget,
+    DiskGuardAction, DiskGuardLatch, ManifestStatus, MicSelection, Recorder, RecordingEvent,
+    RecordingSession, SegmentEntry, SessionDevices, SessionManifest, SessionParams, SessionState,
+    RECORDING_MIN_FREE_BYTES, RECORDING_WARN_FREE_BYTES,
 };
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
@@ -3245,28 +3246,24 @@ pub fn ios_open_app_settings(state: State<'_, AppState>) -> Result<(), IpcError>
         .map_err(to_ipc_error)
 }
 
-/// Project a resolved Screen Recording tri-state into the [`RecordingPermissionVm`]
-/// the Recording view renders (Story 16.5, FR-67). `can_start` is `true` only when
-/// the grant is green — Screen Recording is the sole required permission this epic.
-fn recording_permission_vm(access: ScreenRecordingAccess) -> RecordingPermissionVm {
-    RecordingPermissionVm {
-        screen_recording: access,
-        can_start: access == ScreenRecordingAccess::Granted,
-    }
-}
-
-/// Resolve the live Screen Recording permission pre-flight (Story 16.5, FR-67,
-/// AD-36). Runs the sidecar `getCapabilities` probe (a fresh child `keeper-rec`
-/// per call — live detection, never a cached grant; bounded by the shell's
-/// pre-flight timeout so a wedged sidecar resolves a clean error) and lifts the
-/// two-valued preflight into the honest tri-state with the session
-/// "already requested" flag via the pure core resolver. Called at Recording-view
-/// render and re-called on every focus/return. Failures (sidecar unavailable /
-/// hung / iOS) funnel through [`to_ipc_error`]; the frontend swallows them to a
-/// safe default (Start disabled) — never a crash, never an infinite spinner.
+/// Resolve the live recording permission pre-flight (Story 16.5, FR-67, AD-36;
+/// mic/camera legs Story 20.2). Runs the sidecar `getCapabilities` probe (a
+/// fresh child `keeper-rec` per call — live detection, never a cached grant;
+/// bounded by the shell's pre-flight timeout so a wedged sidecar resolves a
+/// clean error) and resolves all three legs from that ONE probe (no new sidecar
+/// RPC, `PROTOCOL_VERSION` stays 1): screen via the two-valued preflight lifted
+/// with the session "already requested" flag, mic/camera via the direct
+/// AVFoundation tri-state mapping — each `Some` only when the frontend reports
+/// that source enabled. The probe never prompts. Called at Recording-view
+/// render and re-called on every focus/return and enabled-source change.
+/// Failures (sidecar unavailable / hung / iOS) funnel through [`to_ipc_error`];
+/// the frontend swallows them to a safe default (Start disabled, no row claimed
+/// granted) — never a crash, never an infinite spinner.
 #[tauri::command]
 pub async fn recording_permission(
     state: State<'_, AppState>,
+    mic_enabled: bool,
+    camera_enabled: bool,
 ) -> Result<RecordingPermissionVm, IpcError> {
     let capabilities = state
         .recorder
@@ -3274,10 +3271,11 @@ pub async fn recording_permission(
         .await
         .map_err(to_ipc_error)?;
     let requested = state.recording_permission_requested.load(Ordering::Relaxed);
-    Ok(recording_permission_vm(resolve_screen_recording_access(
-        capabilities.screen_recording,
-        requested,
-    )))
+    Ok(resolve_recording_permission(
+        resolve_screen_recording_access(capabilities.screen_recording, requested),
+        mic_enabled.then(|| resolve_source_access(capabilities.microphone)),
+        camera_enabled.then(|| resolve_source_access(capabilities.camera)),
+    ))
 }
 
 /// Request Screen Recording access through the sidecar (Story 16.5, FR-67,
@@ -3287,10 +3285,15 @@ pub async fn recording_permission(
 /// real prompt per app lifetime where allowed), and re-resolves the tri-state
 /// from the reported outcome: granted ⇒ Start unlocks; not granted (a prior
 /// denial shows no prompt at all) ⇒ denied-with-fix-path, and the row offers the
-/// System Settings deep link. Failures funnel through [`to_ipc_error`].
+/// System Settings deep link. Story 20.2: the returned VM carries the mic/camera
+/// legs too (resolved from a `getCapabilities` probe when a source is enabled),
+/// so the adopted result never blanks an enabled source's row or its Start gate.
+/// Failures funnel through [`to_ipc_error`].
 #[tauri::command]
 pub async fn request_screen_recording_permission(
     state: State<'_, AppState>,
+    mic_enabled: bool,
+    camera_enabled: bool,
 ) -> Result<RecordingPermissionVm, IpcError> {
     let granted = state
         .recorder
@@ -3314,9 +3317,32 @@ pub async fn request_screen_recording_permission(
     } else {
         TccPermission::NotDetermined
     };
-    Ok(recording_permission_vm(resolve_screen_recording_access(
-        preflight, true,
-    )))
+    let screen = resolve_screen_recording_access(preflight, true);
+    // The mic/camera legs (Story 20.2) come from a `getCapabilities` probe —
+    // the `requestScreenRecording` round-trip reports only the screen outcome.
+    // Probed (non-prompting) only when a source is actually enabled; with both
+    // sources off this keeps the 16.5 single-round-trip path unchanged.
+    let (microphone, camera) = if mic_enabled || camera_enabled {
+        match state.recorder.get_capabilities().await {
+            Ok(capabilities) => (
+                mic_enabled.then(|| resolve_source_access(capabilities.microphone)),
+                camera_enabled.then(|| resolve_source_access(capabilities.camera)),
+            ),
+            // The screen request already succeeded and its "already requested"
+            // flag is latched; a failed leg probe must not discard that grant by
+            // propagating the error and collapsing the whole request to the safe
+            // default. Degrade the unconfirmed enabled legs to `NotYetRequested`
+            // (Start stays honestly blocked on them, never falsely unlocked) — a
+            // later live probe (focus/return or the enable re-sync) resolves them.
+            Err(_) => (
+                mic_enabled.then_some(ScreenRecordingAccess::NotYetRequested),
+                camera_enabled.then_some(ScreenRecordingAccess::NotYetRequested),
+            ),
+        }
+    } else {
+        (None, None)
+    };
+    Ok(resolve_recording_permission(screen, microphone, camera))
 }
 
 /// Open the macOS System Settings pane for Screen Recording (Story 16.5, FR-67)
@@ -3335,17 +3361,50 @@ pub fn open_screen_recording_settings(state: State<'_, AppState>) -> Result<(), 
         .map_err(to_ipc_error)
 }
 
+/// Open the macOS System Settings pane for Microphone (Story 20.2, FR-67) —
+/// the Microphone row's fix path for a denied grant, where re-prompting is
+/// impossible. Mirrors [`open_screen_recording_settings`]: the deep link goes
+/// through the Rust opener (`Platform::open_url`) so it bypasses the opener JS
+/// default scope. Never re-prompts. Failures funnel through [`to_ipc_error`]
+/// but the caller treats this best-effort (swallows rejection).
+#[tauri::command]
+pub fn open_microphone_settings(state: State<'_, AppState>) -> Result<(), IpcError> {
+    const MICROPHONE_SETTINGS_URL: &str =
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+    state
+        .platform
+        .open_url(MICROPHONE_SETTINGS_URL)
+        .map_err(to_ipc_error)
+}
+
+/// Open the macOS System Settings pane for Camera (Story 20.2, FR-67) — the
+/// Camera row's fix path for a denied grant, where re-prompting is impossible.
+/// Mirrors [`open_screen_recording_settings`]: the deep link goes through the
+/// Rust opener (`Platform::open_url`) so it bypasses the opener JS default
+/// scope. Never re-prompts. Failures funnel through [`to_ipc_error`] but the
+/// caller treats this best-effort (swallows rejection).
+#[tauri::command]
+pub fn open_camera_settings(state: State<'_, AppState>) -> Result<(), IpcError> {
+    const CAMERA_SETTINGS_URL: &str =
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera";
+    state
+        .platform
+        .open_url(CAMERA_SETTINGS_URL)
+        .map_err(to_ipc_error)
+}
+
 /// Request microphone access through the sidecar (Story 19.3, FR-69, AD-36):
 /// runs the `requestMicrophone` round-trip (`AVCaptureDevice.requestAccess(for:
 /// .audio)` in the child sidecar, so TCC shows keeper's own usage string —
 /// `NSMicrophoneUsageDescription` in keeper's Info.plist — and the OS posts its
 /// one real prompt per app lifetime where allowed) and resolves the authoritative
 /// post-request [`TccPermission`] tri-state. Called lazily — only when the user
-/// enables the mic source on the Audio card, never preemptively (the setup
-/// surface renders without probing; FR-69). A denial is surfaced as an honest
-/// inline caption on the card, never a blocker — the rich per-source pre-flight
-/// rows are Story 20.2. Failures (sidecar unavailable / hung / iOS) funnel
-/// through [`to_ipc_error`].
+/// enables the mic source on the Audio card or hits the Microphone pre-flight
+/// row's "Request permission" (Story 20.2), never preemptively (the setup
+/// surface renders without probing; FR-69). Since Story 20.2 an enabled mic
+/// that is not granted blocks Start — the pre-flight row surfaces the honest
+/// tri-state and the fix path. Failures (sidecar unavailable / hung / iOS)
+/// funnel through [`to_ipc_error`].
 #[tauri::command]
 pub async fn request_microphone_permission(
     state: State<'_, AppState>,
@@ -3363,10 +3422,11 @@ pub async fn request_microphone_permission(
 /// `NSCameraUsageDescription` in keeper's Info.plist — and the OS posts its
 /// one real prompt per app lifetime where allowed) and resolves the
 /// authoritative post-request [`TccPermission`] tri-state. Called lazily —
-/// only when the user enables the Webcam switch, never preemptively. A denial
-/// is surfaced as an honest inline caption on the card and never blocks Start
-/// (the mic precedent; the rich per-source pre-flight rows are Story 20.2).
-/// Failures (sidecar unavailable / hung / iOS) funnel through [`to_ipc_error`].
+/// only when the user enables the Webcam switch or hits the Camera pre-flight
+/// row's "Request permission" (Story 20.2), never preemptively. Since Story
+/// 20.2 an enabled webcam that is not granted blocks Start — the pre-flight
+/// row surfaces the honest tri-state and the fix path. Failures (sidecar
+/// unavailable / hung / iOS) funnel through [`to_ipc_error`].
 #[tauri::command]
 pub async fn request_camera_permission(
     state: State<'_, AppState>,

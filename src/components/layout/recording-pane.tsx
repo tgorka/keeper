@@ -5,10 +5,11 @@
  * A single non-chat utility surface living beside Bridges and Settings — no chat
  * list, no timeline, no composer, no live capture state (deferred to 16.6).
  * Story 16.5 adds the honest Screen Recording permission pre-flight above the
- * setup cards: a Permissions card hosting the live-detected tri-state row
- * (re-detected on focus/return via {@link useRecordingPermission}) and a Start
- * button gated on the grant — disabled with the blocking permission named until
- * it is green. Start's click is an inert placeholder; capture wiring is 16.6.
+ * setup cards: a Permissions card hosting the live-detected tri-state rows
+ * (re-detected on focus/return via {@link useRecordingPermission}; Story 20.2
+ * adds the Microphone/Camera rows, present only while that source is enabled)
+ * and a Start button gated on the grants — disabled with the highest-priority
+ * blocking permission named until every required grant is green.
  * The whole surface is capability-gated at the app-shell / sidebar level so it
  * renders only when `recording` is on (desktop macOS ≥ 13.0), never a dead
  * affordance.
@@ -23,7 +24,12 @@ import { RecordingAdvancedControls } from "@/components/recording/recording-adva
 import { RecordingAudioControls } from "@/components/recording/recording-audio-controls";
 import { RecordingDestinationControls } from "@/components/recording/recording-destination-controls";
 import {
+  CAMERA_PERMISSION_NAME,
+  CAMERA_ROW_NOTE,
+  MICROPHONE_PERMISSION_NAME,
+  MICROPHONE_ROW_NOTE,
   RecordingPermissionRow,
+  SCREEN_RECORDING_NOTES,
   SCREEN_RECORDING_PERMISSION_NAME,
 } from "@/components/recording/recording-permission-row";
 import { RecordingSourcePicker } from "@/components/recording/recording-source-picker";
@@ -34,6 +40,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useRecordingPermission } from "@/hooks/use-recording-permission";
 import { isLiveRecording, useRecordingSession } from "@/hooks/use-recording-session";
+import type { RecordingPermissionVm } from "@/lib/ipc/client";
 import { systemAudioEnabled } from "@/lib/stores/recording-audio";
 import { micDeviceId, micEnabled } from "@/lib/stores/recording-mic";
 import { selectedRecordingTarget } from "@/lib/stores/recording-source";
@@ -52,8 +59,28 @@ export const STOP_RECORDING_LABEL = "Stop";
 /** The finalized-outcome note prefix (the saved file's path follows). */
 export const FINALIZED_NOTE_PREFIX = "Saved to";
 
+/**
+ * The highest-priority blocking permission's name (Story 20.2, FR-67): Screen
+ * Recording → Microphone → Camera. A source leg blocks only while enabled
+ * (`Some`/non-null) and not granted; `null` when nothing blocks.
+ */
+export function blockingPermissionName(permission: RecordingPermissionVm): string | null {
+  if (permission.screenRecording !== "granted") {
+    return SCREEN_RECORDING_PERMISSION_NAME;
+  }
+  if (permission.microphone != null && permission.microphone !== "granted") {
+    return MICROPHONE_PERMISSION_NAME;
+  }
+  if (permission.camera != null && permission.camera !== "granted") {
+    return CAMERA_PERMISSION_NAME;
+  }
+  return null;
+}
+
 /** Names the blocking permission while Start is disabled (FR-67). */
-export const START_BLOCKED_NOTE = `Start needs the ${SCREEN_RECORDING_PERMISSION_NAME} permission.`;
+export function startBlockedNote(permissionName: string): string {
+  return `Start needs the ${permissionName} permission.`;
+}
 
 /** Placeholder copy for each not-yet-built setup card (recording voice). */
 const PLACEHOLDER_COPY = "Configured in a later update.";
@@ -74,9 +101,27 @@ const SETUP_CARDS: readonly string[] = [
 ];
 
 export function RecordingPane() {
-  const { permission, request, openSettings } = useRecordingPermission();
+  const {
+    permission,
+    request,
+    openSettings,
+    requestMicrophone,
+    openMicrophoneSettings,
+    requestCamera,
+    openCameraSettings,
+    refresh,
+  } = useRecordingPermission();
   const { status, elapsed, start, stop, acknowledge } = useRecordingSession();
   const live = isLiveRecording(status);
+  // The disabled-Start note names the highest-priority blocker (Story 20.2):
+  // Screen Recording → Microphone → Camera. Both this name and `can_start` are
+  // projected from the same three-leg VM, so today they always agree; the
+  // `?? SCREEN_RECORDING_PERMISSION_NAME` fallback guarantees a disabled Start is
+  // never left with no note (Screen Recording is always required) should the two
+  // ever drift — Start must always tell the user what to fix.
+  const blockedBy = permission.canStart
+    ? null
+    : (blockingPermissionName(permission) ?? SCREEN_RECORDING_PERMISSION_NAME);
 
   return (
     <section
@@ -119,8 +164,8 @@ export function RecordingPane() {
               {START_RECORDING_LABEL}
             </Button>
           )}
-          {!permission.canStart && !live && (
-            <p className="text-muted-foreground text-xs">{START_BLOCKED_NOTE}</p>
+          {blockedBy !== null && !live && (
+            <p className="text-muted-foreground text-xs">{startBlockedNote(blockedBy)}</p>
           )}
           {status.state === "finalized" && status.outputPath !== null && (
             <p className="text-muted-foreground text-xs" role="status">
@@ -172,20 +217,48 @@ export function RecordingPane() {
         {/* Centered single column at content-max-width (UX-DR29), not a full-bleed
             body — unlike the Bridges pane. */}
         <div className="mx-auto flex w-full max-w-[720px] flex-col gap-6 p-6">
-          {/* The permission pre-flight (Story 16.5) sits above the setup cards:
-              live-detected at render, re-detected on focus/return. */}
+          {/* The permission pre-flight (Story 16.5; mic/camera rows Story 20.2)
+              sits above the setup cards: live-detected at render, re-detected
+              on focus/return and on every enabled-source change. The Microphone
+              and Camera rows render only while that source is enabled (their
+              VM legs are non-null) — an absent row is a disabled source, never
+              a hidden blocker. */}
           <Card size="sm">
             <CardHeader>
               <CardTitle>Permissions</CardTitle>
             </CardHeader>
-            <CardContent>
+            <CardContent className="flex flex-col gap-5">
               <RecordingPermissionRow
+                name={SCREEN_RECORDING_PERMISSION_NAME}
                 access={permission.screenRecording}
+                notes={SCREEN_RECORDING_NOTES}
                 onRequest={() => {
                   void request();
                 }}
                 onOpenSettings={openSettings}
               />
+              {permission.microphone != null && (
+                <RecordingPermissionRow
+                  name={MICROPHONE_PERMISSION_NAME}
+                  access={permission.microphone}
+                  notes={[MICROPHONE_ROW_NOTE]}
+                  onRequest={() => {
+                    void requestMicrophone();
+                  }}
+                  onOpenSettings={openMicrophoneSettings}
+                />
+              )}
+              {permission.camera != null && (
+                <RecordingPermissionRow
+                  name={CAMERA_PERMISSION_NAME}
+                  access={permission.camera}
+                  notes={[CAMERA_ROW_NOTE]}
+                  onRequest={() => {
+                    void requestCamera();
+                  }}
+                  onOpenSettings={openCameraSettings}
+                />
+              )}
             </CardContent>
           </Card>
 
@@ -212,7 +285,7 @@ export function RecordingPane() {
                   <CardTitle>{title}</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <RecordingAudioControls active={!live} />
+                  <RecordingAudioControls active={!live} onPermissionSettled={refresh} />
                 </CardContent>
               </Card>
             ) : title === "Webcam" ? (
@@ -225,7 +298,7 @@ export function RecordingPane() {
                   <CardTitle>{title}</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <RecordingWebcamControls active={!live} />
+                  <RecordingWebcamControls active={!live} onPermissionSettled={refresh} />
                 </CardContent>
               </Card>
             ) : title === "Segmenting" ? (

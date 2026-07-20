@@ -17,7 +17,8 @@
  * for the lazy microphone permission request (`request_microphone_permission`
  * — never requested preemptively, never on render), and the outcome surfaces
  * as an honest inline caption: granted → the voice records as its own track;
- * denied → the mic track will be silent, with the System Settings fix path.
+ * denied → Start is blocked while the mic stays enabled (Story 20.2 — the
+ * pre-flight row names it), with the System Settings fix path.
  *
  * Both rows are bound to ephemeral stores ({@link recording-audio.ts},
  * {@link recording-mic.ts}) — per-session, never persisted, never mirrored
@@ -78,11 +79,12 @@ export const MIC_DEFAULT_DEVICE_LABEL = "System default input";
 export const MIC_PERMISSION_GRANTED_NOTE =
   "Microphone access is granted. Your voice records as its own track.";
 
-/** The honest denied caption — the fix path is System Settings (re-prompting
- * is impossible once denied; the rich pre-flight rows are Story 20.2). */
+/** The honest denied caption — an enabled mic that is not granted blocks
+ * Start (Story 20.2; the pre-flight row names it), and the fix path is System
+ * Settings (re-prompting is impossible once denied). */
 export const MIC_PERMISSION_DENIED_NOTE =
-  "Microphone access is denied. The mic track will be silent — allow keeper under " +
-  "System Settings → Privacy & Security → Microphone.";
+  "Microphone access is denied. Recording can't start while the microphone is on — allow " +
+  "keeper under System Settings → Privacy & Security → Microphone, or turn the microphone off.";
 
 /** Test id for the mic switch control. */
 export const MIC_SWITCH_TESTID = "mic-switch";
@@ -100,9 +102,18 @@ export interface RecordingAudioControlsProps {
    * `false` while a session is live, freezing pre-Start reconciliation so a
    * mounted-but-inactive card never rewrites the user's mic selection. */
   active?: boolean;
+  /** Fired once the enable-triggered microphone permission request has settled
+   * (Story 20.2). The pre-flight surface passes its `refresh` here so the
+   * Microphone pre-flight row and the Start gate re-probe the live grant the
+   * moment the OS prompt is answered — rather than waiting on an incidental
+   * window focus/return event. A no-op when omitted. */
+  onPermissionSettled?: () => void;
 }
 
-export function RecordingAudioControls({ active = true }: RecordingAudioControlsProps = {}) {
+export function RecordingAudioControls({
+  active = true,
+  onPermissionSettled,
+}: RecordingAudioControlsProps = {}) {
   const enabled = useSystemAudioEnabled();
   const micOn = useMicEnabled();
   const deviceId = useMicDeviceId();
@@ -149,6 +160,14 @@ export function RecordingAudioControls({ active = true }: RecordingAudioControls
         })
         .catch(() => {
           if (requestId === micRequestSeq.current) setMicPermission(null);
+        })
+        .finally(() => {
+          // Re-probe the pre-flight now the OS prompt has resolved (Story 20.2):
+          // the enable-time probe read `NotDetermined` while the prompt was on
+          // screen, so the Microphone row + Start would otherwise stay stale
+          // until an unrelated focus event. Fired regardless of the generation
+          // guard — a live re-probe is idempotent and always reflects the truth.
+          onPermissionSettled?.();
         });
     } else {
       // Disabling drops any prior outcome; the next enable re-requests fresh.

@@ -1,10 +1,13 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
   recordingPermission: vi.fn(),
   requestScreenRecordingPermission: vi.fn(),
   openScreenRecordingSettings: vi.fn(),
+  // The mic/camera pre-flight rows' deep links (Story 20.2).
+  openMicrophoneSettings: vi.fn(() => Promise.resolve()),
+  openCameraSettings: vi.fn(() => Promise.resolve()),
   recordingStart: vi.fn(),
   recordingStop: vi.fn(),
   recordingStatus: vi.fn(),
@@ -46,9 +49,9 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 import {
   FINALIZED_NOTE_PREFIX,
   RecordingPane,
-  START_BLOCKED_NOTE,
   START_RECORDING_LABEL,
   STOP_RECORDING_LABEL,
+  startBlockedNote,
 } from "@/components/layout/recording-pane";
 import {
   BANNER_DISMISS_LABEL,
@@ -65,8 +68,14 @@ import {
 } from "@/components/recording/recording-audio-controls";
 import { DESTINATION_PATH_TESTID } from "@/components/recording/recording-destination-controls";
 import {
+  CAMERA_PERMISSION_NAME,
+  CAMERA_ROW_NOTE,
+  MICROPHONE_PERMISSION_NAME,
+  MICROPHONE_ROW_NOTE,
   OPEN_SETTINGS_LABEL,
+  permissionRowTestId,
   REQUEST_PERMISSION_LABEL,
+  SCREEN_RECORDING_PERMISSION_NAME,
 } from "@/components/recording/recording-permission-row";
 import { WEBCAM_SWITCH_TESTID } from "@/components/recording/recording-webcam-controls";
 import {
@@ -75,12 +84,16 @@ import {
 } from "@/components/settings/recording-settings-controls";
 import type { RecordingPermissionVm, RecordingStatusVm } from "@/lib/ipc/client";
 import {
+  openCameraSettings,
+  openMicrophoneSettings,
   openScreenRecordingSettings,
   recordingAcknowledge,
   recordingPermission,
   recordingStart,
   recordingStatus,
   recordingStop,
+  requestCameraPermission,
+  requestMicrophonePermission,
   requestScreenRecordingPermission,
 } from "@/lib/ipc/client";
 import { resetRecordingAudioForTest } from "@/lib/stores/recording-audio";
@@ -91,6 +104,10 @@ import { resetRecordingWebcamForTest, setWebcamEnabled } from "@/lib/stores/reco
 const mockFetch = vi.mocked(recordingPermission);
 const mockRequest = vi.mocked(requestScreenRecordingPermission);
 const mockOpenSettings = vi.mocked(openScreenRecordingSettings);
+const mockOpenMicSettings = vi.mocked(openMicrophoneSettings);
+const mockOpenCameraSettings = vi.mocked(openCameraSettings);
+const mockRequestMic = vi.mocked(requestMicrophonePermission);
+const mockRequestCamera = vi.mocked(requestCameraPermission);
 const mockStart = vi.mocked(recordingStart);
 const mockStop = vi.mocked(recordingStop);
 const mockStatus = vi.mocked(recordingStatus);
@@ -120,9 +137,24 @@ const RECORDING_STATUS: RecordingStatusVm = {
   segmentCapMb: 500,
 };
 
-const GRANTED: RecordingPermissionVm = { screenRecording: "granted", canStart: true };
-const NOT_YET: RecordingPermissionVm = { screenRecording: "notYetRequested", canStart: false };
-const DENIED: RecordingPermissionVm = { screenRecording: "denied", canStart: false };
+const GRANTED: RecordingPermissionVm = {
+  screenRecording: "granted",
+  microphone: null,
+  camera: null,
+  canStart: true,
+};
+const NOT_YET: RecordingPermissionVm = {
+  screenRecording: "notYetRequested",
+  microphone: null,
+  camera: null,
+  canStart: false,
+};
+const DENIED: RecordingPermissionVm = {
+  screenRecording: "denied",
+  microphone: null,
+  camera: null,
+  canStart: false,
+};
 
 beforeEach(() => {
   mockFetch.mockReset();
@@ -214,7 +246,9 @@ describe("RecordingPane", () => {
       expect(screen.getByRole("button", { name: REQUEST_PERMISSION_LABEL })).toBeInTheDocument(),
     );
     expect(screen.getByRole("button", { name: START_RECORDING_LABEL })).toBeDisabled();
-    expect(screen.getByText(START_BLOCKED_NOTE)).toBeInTheDocument();
+    expect(
+      screen.getByText(startBlockedNote(SCREEN_RECORDING_PERMISSION_NAME)),
+    ).toBeInTheDocument();
   });
 
   it("enables Start (and drops the blocking note) once granted", async () => {
@@ -224,7 +258,9 @@ describe("RecordingPane", () => {
     await waitFor(() =>
       expect(screen.getByRole("button", { name: START_RECORDING_LABEL })).toBeEnabled(),
     );
-    expect(screen.queryByText(START_BLOCKED_NOTE)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(startBlockedNote(SCREEN_RECORDING_PERMISSION_NAME)),
+    ).not.toBeInTheDocument();
     // Granted needs no action affordance.
     expect(
       screen.queryByRole("button", { name: REQUEST_PERMISSION_LABEL }),
@@ -271,6 +307,185 @@ describe("RecordingPane", () => {
     expect(
       await screen.findByRole("button", { name: REQUEST_PERMISSION_LABEL }),
     ).toBeInTheDocument();
+  });
+
+  // --- Microphone / Camera pre-flight rows (Story 20.2) --------------------
+
+  it("renders no Microphone or Camera permission row while both sources are off", async () => {
+    render(<RecordingPane />);
+
+    await waitFor(() => expect(mockFetch).toHaveBeenCalled());
+    expect(screen.getByTestId(permissionRowTestId(SCREEN_RECORDING_PERMISSION_NAME))).toBeVisible();
+    expect(
+      screen.queryByTestId(permissionRowTestId(MICROPHONE_PERMISSION_NAME)),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId(permissionRowTestId(CAMERA_PERMISSION_NAME)),
+    ).not.toBeInTheDocument();
+    // Both sources off → the probe reports both legs disabled.
+    expect(mockFetch).toHaveBeenLastCalledWith(false, false);
+  });
+
+  it("an enabled+denied mic renders its row, blocks Start, and names Microphone", async () => {
+    setMicEnabled(true);
+    mockFetch.mockResolvedValue({
+      screenRecording: "granted",
+      microphone: "denied",
+      camera: null,
+      canStart: false,
+    });
+    render(<RecordingPane />);
+
+    const micRow = await screen.findByTestId(permissionRowTestId(MICROPHONE_PERMISSION_NAME));
+    expect(within(micRow).getByText(MICROPHONE_ROW_NOTE)).toBeInTheDocument();
+    expect(mockFetch).toHaveBeenLastCalledWith(true, false);
+    // Denied → the deep link goes to the Microphone pane.
+    fireEvent.click(within(micRow).getByRole("button", { name: OPEN_SETTINGS_LABEL }));
+    await waitFor(() => expect(mockOpenMicSettings).toHaveBeenCalledTimes(1));
+    // Start is disabled and the note names the mic (screen is green).
+    expect(screen.getByRole("button", { name: START_RECORDING_LABEL })).toBeDisabled();
+    expect(screen.getByText(startBlockedNote(MICROPHONE_PERMISSION_NAME))).toBeInTheDocument();
+    // No Camera row — the webcam stayed off.
+    expect(
+      screen.queryByTestId(permissionRowTestId(CAMERA_PERMISSION_NAME)),
+    ).not.toBeInTheDocument();
+  });
+
+  it("an enabled+denied camera deep-links to the Camera pane (Story 20.2)", async () => {
+    setWebcamEnabled(true);
+    mockFetch.mockResolvedValue({
+      screenRecording: "granted",
+      microphone: null,
+      camera: "denied",
+      canStart: false,
+    });
+    render(<RecordingPane />);
+
+    const cameraRow = await screen.findByTestId(permissionRowTestId(CAMERA_PERMISSION_NAME));
+    fireEvent.click(within(cameraRow).getByRole("button", { name: OPEN_SETTINGS_LABEL }));
+    await waitFor(() => expect(mockOpenCameraSettings).toHaveBeenCalledTimes(1));
+  });
+
+  it("an enabled+not-requested camera renders its row with the request action and names Camera", async () => {
+    setWebcamEnabled(true);
+    mockFetch.mockResolvedValue({
+      screenRecording: "granted",
+      microphone: null,
+      camera: "notYetRequested",
+      canStart: false,
+    });
+    render(<RecordingPane />);
+
+    const cameraRow = await screen.findByTestId(permissionRowTestId(CAMERA_PERMISSION_NAME));
+    expect(within(cameraRow).getByText(CAMERA_ROW_NOTE)).toBeInTheDocument();
+    expect(mockFetch).toHaveBeenLastCalledWith(false, true);
+    // The camera is the last (and only) blocker: Start names Camera.
+    expect(screen.getByRole("button", { name: START_RECORDING_LABEL })).toBeDisabled();
+    expect(screen.getByText(startBlockedNote(CAMERA_PERMISSION_NAME))).toBeInTheDocument();
+
+    // The row's explicit request action fires the existing camera request
+    // command, then re-probes live (mocked granted here).
+    mockFetch.mockResolvedValue({ ...GRANTED, camera: "granted" });
+    fireEvent.click(within(cameraRow).getByRole("button", { name: REQUEST_PERMISSION_LABEL }));
+    await waitFor(() => expect(mockRequestCamera).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: START_RECORDING_LABEL })).toBeEnabled(),
+    );
+  });
+
+  it("the Microphone row's request action fires the mic request then re-probes (Story 20.2)", async () => {
+    setMicEnabled(true);
+    mockFetch.mockResolvedValue({
+      screenRecording: "granted",
+      microphone: "notYetRequested",
+      camera: null,
+      canStart: false,
+    });
+    render(<RecordingPane />);
+
+    const micRow = await screen.findByTestId(permissionRowTestId(MICROPHONE_PERMISSION_NAME));
+    mockFetch.mockResolvedValue({ ...GRANTED, microphone: "granted" });
+    fireEvent.click(within(micRow).getByRole("button", { name: REQUEST_PERMISSION_LABEL }));
+
+    await waitFor(() => expect(mockRequestMic).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: START_RECORDING_LABEL })).toBeEnabled(),
+    );
+  });
+
+  it("Screen Recording outranks source legs in the blocked-Start note", async () => {
+    // Screen denied while the enabled mic is granted: the note must name the
+    // highest-priority blocker — Screen Recording, never the mic.
+    setMicEnabled(true);
+    mockFetch.mockResolvedValue({
+      screenRecording: "denied",
+      microphone: "granted",
+      camera: null,
+      canStart: false,
+    });
+    render(<RecordingPane />);
+
+    await screen.findByTestId(permissionRowTestId(MICROPHONE_PERMISSION_NAME));
+    expect(
+      screen.getByText(startBlockedNote(SCREEN_RECORDING_PERMISSION_NAME)),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(startBlockedNote(MICROPHONE_PERMISSION_NAME)),
+    ).not.toBeInTheDocument();
+  });
+
+  it("toggling the mic on re-probes and mounts the Microphone row live (Story 20.2)", async () => {
+    render(<RecordingPane />);
+    await waitFor(() => expect(mockFetch).toHaveBeenCalled());
+    expect(
+      screen.queryByTestId(permissionRowTestId(MICROPHONE_PERMISSION_NAME)),
+    ).not.toBeInTheDocument();
+
+    // Enabling the mic on the Audio card fires the lazy request (mocked
+    // granted) AND flips the store — the permission hook re-probes with the
+    // mic flag and the row appears without any focus/return round-trip.
+    mockFetch.mockResolvedValue({ ...GRANTED, microphone: "granted" });
+    fireEvent.click(await screen.findByTestId(MIC_SWITCH_TESTID));
+
+    expect(
+      await screen.findByTestId(permissionRowTestId(MICROPHONE_PERMISSION_NAME)),
+    ).toBeVisible();
+    expect(mockFetch).toHaveBeenLastCalledWith(true, false);
+  });
+
+  it("re-probes after the OS prompt resolves so Start reflects the grant with no focus event (Story 20.2)", async () => {
+    render(<RecordingPane />);
+    await waitFor(() => expect(mockFetch).toHaveBeenCalled());
+
+    // Model the real ordering the enable triggers: the enable-time probe (fired
+    // the instant the store flips) reads the mic as not-yet-requested because the
+    // OS prompt is still on screen; only once the prompt resolves does the
+    // post-prompt re-sync probe read the grant. No focus/visibility event fires
+    // in this test — the row + Start must still end up granted, proving the
+    // re-sync is wired to the prompt's resolution, not an incidental refocus.
+    mockFetch.mockReset();
+    mockFetch
+      .mockResolvedValueOnce({
+        screenRecording: "granted",
+        microphone: "notYetRequested",
+        camera: null,
+        canStart: false,
+      })
+      .mockResolvedValue({ ...GRANTED, microphone: "granted" });
+    mockRequestMic.mockResolvedValue("granted");
+
+    fireEvent.click(await screen.findByTestId(MIC_SWITCH_TESTID));
+
+    await screen.findByTestId(permissionRowTestId(MICROPHONE_PERMISSION_NAME));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: START_RECORDING_LABEL })).toBeEnabled(),
+    );
+    // Both post-enable probes carried the mic flag on — never a stale mic-off arg
+    // from a captured closure (the regression this re-sync path guards against).
+    expect(mockFetch.mock.calls.length).toBeGreaterThanOrEqual(2);
+    for (const call of mockFetch.mock.calls) {
+      expect(call).toEqual([true, false]);
+    }
   });
 
   // --- Live session (Story 16.6) ------------------------------------------

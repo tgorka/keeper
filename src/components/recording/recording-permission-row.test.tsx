@@ -3,21 +3,34 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   ACCESS_LABEL,
+  CAMERA_PERMISSION_NAME,
+  CAMERA_ROW_NOTE,
   DEV_BUILD_NOTE,
+  MICROPHONE_PERMISSION_NAME,
+  MICROPHONE_ROW_NOTE,
   MONTHLY_RECONFIRM_NOTE,
   OPEN_SETTINGS_LABEL,
   RELAUNCH_NOTE,
   REQUEST_PERMISSION_LABEL,
   RecordingPermissionRow,
+  SCREEN_RECORDING_NOTES,
   SCREEN_RECORDING_PERMISSION_NAME,
 } from "@/components/recording/recording-permission-row";
 
-function renderRow(access: "granted" | "notYetRequested" | "denied") {
+function renderRow(
+  access: "granted" | "notYetRequested" | "denied",
+  {
+    name = SCREEN_RECORDING_PERMISSION_NAME,
+    notes = SCREEN_RECORDING_NOTES,
+  }: { name?: string; notes?: readonly string[] } = {},
+) {
   const onRequest = vi.fn();
   const onOpenSettings = vi.fn();
   render(
     <RecordingPermissionRow
+      name={name}
       access={access}
+      notes={notes}
       onRequest={onRequest}
       onOpenSettings={onOpenSettings}
     />,
@@ -66,9 +79,50 @@ describe("RecordingPermissionRow", () => {
     expect(screen.getByText(DEV_BUILD_NOTE)).toBeInTheDocument();
   });
 
+  // --- The generalized Microphone / Camera rows (Story 20.2) ---------------
+
+  it("renders the Microphone row with its own honest note-line", () => {
+    renderRow("granted", { name: MICROPHONE_PERMISSION_NAME, notes: [MICROPHONE_ROW_NOTE] });
+
+    expect(screen.getByText(MICROPHONE_PERMISSION_NAME)).toBeInTheDocument();
+    expect(screen.getByText(MICROPHONE_ROW_NOTE)).toBeInTheDocument();
+    // The screen quirks belong to the screen row only.
+    expect(screen.queryByText(RELAUNCH_NOTE)).not.toBeInTheDocument();
+    expect(screen.getByText(ACCESS_LABEL.granted)).toBeInTheDocument();
+  });
+
+  it("a not-yet-requested Microphone row dispatches its request action", () => {
+    const { onRequest } = renderRow("notYetRequested", {
+      name: MICROPHONE_PERMISSION_NAME,
+      notes: [MICROPHONE_ROW_NOTE],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: REQUEST_PERMISSION_LABEL }));
+    expect(onRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("a denied Camera row offers the deep link and states its note", () => {
+    const { onOpenSettings } = renderRow("denied", {
+      name: CAMERA_PERMISSION_NAME,
+      notes: [CAMERA_ROW_NOTE],
+    });
+
+    expect(screen.getByText(CAMERA_PERMISSION_NAME)).toBeInTheDocument();
+    expect(screen.getByText(CAMERA_ROW_NOTE)).toBeInTheDocument();
+    expect(screen.getByText(ACCESS_LABEL.denied)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: OPEN_SETTINGS_LABEL }));
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+  });
+
   it("never uses the recording-red token (reserved for the 16.6 live dot)", () => {
     const { container } = render(
-      <RecordingPermissionRow access="denied" onRequest={vi.fn()} onOpenSettings={vi.fn()} />,
+      <RecordingPermissionRow
+        name={CAMERA_PERMISSION_NAME}
+        access="denied"
+        notes={[CAMERA_ROW_NOTE]}
+        onRequest={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
     );
     expect(container.innerHTML).not.toContain("recording-red");
   });

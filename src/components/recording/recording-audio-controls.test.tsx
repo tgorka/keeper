@@ -122,14 +122,15 @@ describe("RecordingAudioControls", () => {
     expect(screen.queryByText(MIC_OFF_NOTE)).not.toBeInTheDocument();
   });
 
-  it("a denied permission surfaces the honest denied caption (mic track silent)", async () => {
+  it("a denied permission surfaces the honest denied caption (Start blocked, fix path named)", async () => {
     mockRequestMic.mockResolvedValue("denied");
     render(<RecordingAudioControls />);
 
     fireEvent.click(screen.getByTestId(MIC_SWITCH_TESTID));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(MIC_PERMISSION_DENIED_NOTE);
-    // The toggle stays on — the session records honestly (silent mic track).
+    // The toggle stays on — Start is blocked upstream by the pre-flight
+    // (Story 20.2) until the grant lands or the mic is turned back off.
     expect(micEnabled()).toBe(true);
   });
 

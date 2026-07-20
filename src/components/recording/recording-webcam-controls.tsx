@@ -9,8 +9,9 @@
  * Switch is the one trigger for the lazy camera permission request
  * (`request_camera_permission` — never requested preemptively, never on
  * render), and the outcome surfaces as an honest inline caption: granted →
- * the camera records to its own file; denied → the camera file will be
- * missing, with the System Settings fix path. A denial never blocks Start.
+ * the camera records to its own file; denied → Start is blocked while the
+ * webcam stays enabled (Story 20.2 — the pre-flight row names it), with the
+ * System Settings fix path.
  *
  * The copy is honest about the shape: the webcam records to a **separate
  * file, synced to the screen** — no picture-in-picture, no self-view bubble,
@@ -64,12 +65,12 @@ export const CAMERA_DEFAULT_DEVICE_LABEL = "System default camera";
 export const CAMERA_PERMISSION_GRANTED_NOTE =
   "Camera access is granted. Your camera records to its own file.";
 
-/** The honest denied caption — the fix path is System Settings (re-prompting
- * is impossible once denied; the rich pre-flight rows are Story 20.2). A
- * denial never blocks Start — the session records without a camera file. */
+/** The honest denied caption — an enabled webcam that is not granted blocks
+ * Start (Story 20.2; the pre-flight row names it), and the fix path is System
+ * Settings (re-prompting is impossible once denied). */
 export const CAMERA_PERMISSION_DENIED_NOTE =
-  "Camera access is denied. The recording will have no camera file — allow keeper under " +
-  "System Settings → Privacy & Security → Camera.";
+  "Camera access is denied. Recording can't start while the webcam is on — allow keeper " +
+  "under System Settings → Privacy & Security → Camera, or turn the webcam off.";
 
 /** Test id for the webcam switch control. */
 export const WEBCAM_SWITCH_TESTID = "webcam-switch";
@@ -87,9 +88,18 @@ export interface RecordingWebcamControlsProps {
    * `false` while a session is live, freezing pre-Start reconciliation so a
    * mounted-but-inactive card never rewrites the user's camera selection. */
   active?: boolean;
+  /** Fired once the enable-triggered camera permission request has settled
+   * (Story 20.2). The pre-flight surface passes its `refresh` here so the Camera
+   * pre-flight row and the Start gate re-probe the live grant the moment the OS
+   * prompt is answered — rather than waiting on an incidental window focus/return
+   * event. A no-op when omitted. */
+  onPermissionSettled?: () => void;
 }
 
-export function RecordingWebcamControls({ active = true }: RecordingWebcamControlsProps = {}) {
+export function RecordingWebcamControls({
+  active = true,
+  onPermissionSettled,
+}: RecordingWebcamControlsProps = {}) {
   const webcamOn = useWebcamEnabled();
   const deviceId = useCameraDeviceId();
   const sources = useRecordingSources();
@@ -124,16 +134,23 @@ export function RecordingWebcamControls({ active = true }: RecordingWebcamContro
     if (checked) {
       // The lazy-permission hinge (FR-70, AD-36): enabling the source is the
       // ONE trigger for the camera permission request — exactly once per
-      // enable, never preemptively, never at Start (a denial never blocks
-      // Start either). A sidecar failure makes no claim either way (no
-      // caption) rather than crashing. The generation guard drops any
-      // resolution that a newer toggle has already superseded.
+      // enable, never preemptively, never at Start. A sidecar failure makes
+      // no claim either way (no caption) rather than crashing. The generation
+      // guard drops any resolution that a newer toggle has already superseded.
       void requestCameraPermission()
         .then((status) => {
           if (requestId === cameraRequestSeq.current) setCameraPermission(status);
         })
         .catch(() => {
           if (requestId === cameraRequestSeq.current) setCameraPermission(null);
+        })
+        .finally(() => {
+          // Re-probe the pre-flight now the OS prompt has resolved (Story 20.2):
+          // the enable-time probe read `NotDetermined` while the prompt was on
+          // screen, so the Camera row + Start would otherwise stay stale until an
+          // unrelated focus event. Fired regardless of the generation guard — a
+          // live re-probe is idempotent and always reflects the truth.
+          onPermissionSettled?.();
         });
     } else {
       // Disabling drops any prior outcome; the next enable re-requests fresh.

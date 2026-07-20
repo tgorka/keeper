@@ -83,15 +83,15 @@ describe("RecordingWebcamControls", () => {
     expect(screen.getByText(WEBCAM_DISCLOSURE)).toBeInTheDocument();
   });
 
-  it("a denied permission surfaces the honest denied caption without blocking anything", async () => {
+  it("a denied permission surfaces the honest denied caption (Start blocked, fix path named)", async () => {
     mockRequestCamera.mockResolvedValue("denied");
     render(<RecordingWebcamControls />);
 
     fireEvent.click(screen.getByTestId(WEBCAM_SWITCH_TESTID));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(CAMERA_PERMISSION_DENIED_NOTE);
-    // The toggle stays on — the session records honestly (no camera file);
-    // Start is never gated on the camera grant (the mic precedent).
+    // The toggle stays on — Start is blocked upstream by the pre-flight
+    // (Story 20.2) until the grant lands or the webcam is turned back off.
     expect(webcamEnabled()).toBe(true);
   });
 

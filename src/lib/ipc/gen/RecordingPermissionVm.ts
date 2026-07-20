@@ -2,13 +2,18 @@
 import type { ScreenRecordingAccess } from "./ScreenRecordingAccess";
 
 /**
- * The screen-recording permission pre-flight result the Recording view renders
- * (Story 16.5, FR-67, AD-36).
+ * The recording permission pre-flight result the Recording view renders
+ * (Story 16.5, FR-67, AD-36; mic/camera legs Story 20.2).
  *
- * Live-detected through the `Recorder` port on every fetch (render and
- * focus/return re-detection) — never cached. `can_start` is the single Start
- * gate: `true` only when every required permission (Screen Recording alone in
- * this epic) is granted.
+ * Live-detected through the `Recorder` port on every fetch (render,
+ * focus/return re-detection, and every enabled-source change) — never cached.
+ * All three legs resolve from the *same* `getCapabilities` probe: screen via
+ * `keeper_core::recording::resolve_screen_recording_access` (the two-valued
+ * preflight lifted with the session flag), mic/camera via
+ * `keeper_core::recording::resolve_source_access` (the AVFoundation tri-state
+ * mapped directly, no flag needed). `can_start` is the single Start gate:
+ * `true` only when every required permission — Screen Recording plus each
+ * *enabled* source leg — is granted.
  */
 export type RecordingPermissionVm = { 
 /**
@@ -16,6 +21,17 @@ export type RecordingPermissionVm = {
  */
 screenRecording: ScreenRecordingAccess, 
 /**
- * Whether Start may be enabled (`true` only when the grant is green).
+ * The Microphone leg (Story 20.2) — `Some` iff the mic source is enabled;
+ * `None` (disabled) renders no row and never gates Start.
+ */
+microphone: ScreenRecordingAccess | null, 
+/**
+ * The Camera leg (Story 20.2) — `Some` iff the webcam is enabled;
+ * `None` (disabled) renders no row and never gates Start.
+ */
+camera: ScreenRecordingAccess | null, 
+/**
+ * Whether Start may be enabled (`true` only when every required grant is
+ * green).
  */
 canStart: boolean, };

@@ -365,6 +365,8 @@ pub fn run() {
             ipc::request_microphone_permission,
             ipc::request_camera_permission,
             ipc::open_screen_recording_settings,
+            ipc::open_microphone_settings,
+            ipc::open_camera_settings,
             ipc::recording_list_sources,
             ipc::recording_start,
             ipc::recording_stop,

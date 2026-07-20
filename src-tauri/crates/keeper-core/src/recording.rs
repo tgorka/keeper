@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{format_gb, CoreError, DestinationRejection, RecordingError};
 use crate::vm::{
-    RecordingCapabilitiesVm, RecordingSourcesVm, ScreenRecordingAccess, TccPermission,
+    RecordingCapabilitiesVm, RecordingPermissionVm, RecordingSourcesVm, ScreenRecordingAccess,
+    TccPermission,
 };
 
 /// The states a screen-recording session walks through (Story 16.2, AD-33).
@@ -962,6 +963,48 @@ pub fn resolve_screen_recording_access(
         (TccPermission::Denied, _) => ScreenRecordingAccess::Denied,
         (TccPermission::NotDetermined, false) => ScreenRecordingAccess::NotYetRequested,
         (TccPermission::NotDetermined, true) => ScreenRecordingAccess::Denied,
+    }
+}
+
+/// Map a live mic/camera TCC state onto the shared pre-flight tri-state
+/// (Story 20.2, FR-67, AD-36) — pure and total, unit-tested without a Mac.
+///
+/// Unlike screen (whose non-prompting preflight is two-valued and needs the
+/// session "already requested" flag to tell a denial from a never-asked state),
+/// `AVCaptureDevice.authorizationStatus` is a true tri-state, so the mapping is
+/// direct and needs no persisted flag: `Granted → Granted`, `Denied → Denied`,
+/// `NotDetermined → NotYetRequested` (the OS prompt is still available).
+pub fn resolve_source_access(tcc: TccPermission) -> ScreenRecordingAccess {
+    match tcc {
+        TccPermission::Granted => ScreenRecordingAccess::Granted,
+        TccPermission::Denied => ScreenRecordingAccess::Denied,
+        TccPermission::NotDetermined => ScreenRecordingAccess::NotYetRequested,
+    }
+}
+
+/// Resolve the full pre-flight [`RecordingPermissionVm`] over the three
+/// permission legs (Story 20.2, FR-67, AD-36) — the single, pure Start gate.
+///
+/// `microphone`/`camera` are `Some` iff that source is enabled (a disabled
+/// leg is `None`, renders no row, and never gates Start). `can_start` is
+/// `true` only when Screen Recording is `Granted` **and** every enabled leg
+/// is `Granted` — an enabled source whose permission is not granted is a
+/// blocking permission.
+pub fn resolve_recording_permission(
+    screen_recording: ScreenRecordingAccess,
+    microphone: Option<ScreenRecordingAccess>,
+    camera: Option<ScreenRecordingAccess>,
+) -> RecordingPermissionVm {
+    fn leg_green(leg: Option<ScreenRecordingAccess>) -> bool {
+        leg.is_none_or(|access| access == ScreenRecordingAccess::Granted)
+    }
+    RecordingPermissionVm {
+        screen_recording,
+        microphone,
+        camera,
+        can_start: screen_recording == ScreenRecordingAccess::Granted
+            && leg_green(microphone)
+            && leg_green(camera),
     }
 }
 
@@ -2855,6 +2898,77 @@ mod tests {
         assert_eq!(
             resolve_screen_recording_access(P::NotDetermined, true),
             A::Denied
+        );
+    }
+
+    // --- Mic/Camera pre-flight legs (Story 20.2) ------------------------------
+
+    #[test]
+    fn resolve_source_access_maps_the_av_tristate_directly() {
+        use ScreenRecordingAccess as A;
+        use TccPermission as P;
+        // A true tri-state needs no session flag: the mapping is direct.
+        assert_eq!(resolve_source_access(P::Granted), A::Granted);
+        assert_eq!(resolve_source_access(P::Denied), A::Denied);
+        // Not determined ⇒ the OS prompt is still available.
+        assert_eq!(resolve_source_access(P::NotDetermined), A::NotYetRequested);
+    }
+
+    #[test]
+    fn resolve_recording_permission_gates_can_start_over_every_leg_combination() {
+        use ScreenRecordingAccess as A;
+        // The full matrix: screen × mic leg × camera leg, where each source leg
+        // is None (disabled) or one of the three enabled states. can_start iff
+        // screen is Granted and every enabled leg is Granted.
+        let legs = [
+            None,
+            Some(A::Granted),
+            Some(A::NotYetRequested),
+            Some(A::Denied),
+        ];
+        for screen in [A::Granted, A::NotYetRequested, A::Denied] {
+            for microphone in legs {
+                for camera in legs {
+                    let vm = resolve_recording_permission(screen, microphone, camera);
+                    // The legs pass through untouched (the rows render them).
+                    assert_eq!(vm.screen_recording, screen);
+                    assert_eq!(vm.microphone, microphone);
+                    assert_eq!(vm.camera, camera);
+                    let expected = screen == A::Granted
+                        && microphone.unwrap_or(A::Granted) == A::Granted
+                        && camera.unwrap_or(A::Granted) == A::Granted;
+                    assert_eq!(
+                        vm.can_start, expected,
+                        "screen={screen:?} mic={microphone:?} camera={camera:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_recording_permission_blocker_scenarios_match_the_io_matrix() {
+        use ScreenRecordingAccess as A;
+        // Both sources disabled: screen alone decides (the 16.5 behavior).
+        assert!(resolve_recording_permission(A::Granted, None, None).can_start);
+        // An enabled-but-not-granted mic blocks Start (denied or not requested).
+        assert!(!resolve_recording_permission(A::Granted, Some(A::Denied), None).can_start);
+        assert!(
+            !resolve_recording_permission(A::Granted, Some(A::NotYetRequested), None).can_start
+        );
+        // An enabled-but-denied camera blocks Start even with screen+mic green
+        // (the frontend names Camera — the lowest-priority blocker last).
+        assert!(
+            !resolve_recording_permission(A::Granted, Some(A::Granted), Some(A::Denied)).can_start
+        );
+        // Screen denied blocks regardless of green source legs (the frontend
+        // names Screen Recording first — highest priority).
+        assert!(
+            !resolve_recording_permission(A::Denied, Some(A::Granted), Some(A::Granted)).can_start
+        );
+        // All three green: Start unlocks.
+        assert!(
+            resolve_recording_permission(A::Granted, Some(A::Granted), Some(A::Granted)).can_start
         );
     }
 
