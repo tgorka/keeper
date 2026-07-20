@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/epic-17-context.md
+  s_8a8bc6b6bf6017::t_4e0427c5c495bb 48-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "69ac7f85808fe7b4f142eecdad936ed253bd4269",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
