@@ -1,0 +1,97 @@
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_59a2fcbbc23a67::t_154beaaaf20b5a 189
+src/components/layout/recording-pane.tsx
+  s_59a2fcbbc23a67::t_328f236e561959 123-125,131-132,142,150-153
+  s_59a2fcbbc23a67::t_8813fc0c8f5125 143-148
+  s_59a2fcbbc23a67::t_60e78d932d5b29 76
+  s_59a2fcbbc23a67::t_606ff3bd9bf5bd 133-135
+  s_59a2fcbbc23a67::t_94e1d3f76c013f 149
+src/hooks/use-recording-session.ts
+  s_59a2fcbbc23a67::t_71288ef8945b82 202
+  s_59a2fcbbc23a67::t_a8ac4bd305381d 188-201
+  s_59a2fcbbc23a67::t_99dc8d14275400 21-26
+  s_59a2fcbbc23a67::t_e318e4c726abe5 85-89
+src/lib/ipc/client.ts
+  s_59a2fcbbc23a67::t_27fba6d9a9187a 1767
+  s_59a2fcbbc23a67::t_3c5c099903af80 1768-1779
+src/hooks/use-recording-session.test.ts
+  s_59a2fcbbc23a67::t_b31acaede31b03 58
+  s_59a2fcbbc23a67::t_e0d92f94c4b5e2 1-10,12-57,59-86
+  s_59a2fcbbc23a67::t_b21c38d289dc0c 11
+src-tauri/crates/keeper-core/src/notify.rs
+  s_59a2fcbbc23a67::t_e9956db7a5524f 1412
+  s_59a2fcbbc23a67::t_660eba8a7ca042 437-494
+  s_59a2fcbbc23a67::t_aeab1fc6dfdb24 1403-1411,1413-1484
+_bmad-output/implementation-artifacts/spec-18-4-loud-failure-triad-tray-error-notification-banner.md
+  s_59a2fcbbc23a67::t_c5d97b26ed41d8 6
+  s_59a2fcbbc23a67::t_d530625effb793 101
+  s_59a2fcbbc23a67::t_0c0a7bc2819631 5
+  s_59a2fcbbc23a67::t_779abb001d0188 114-151
+  s_59a2fcbbc23a67::t_7da0e924993856 78-84
+  s_59a2fcbbc23a67::t_132e52cd8f9034 85
+  s_59a2fcbbc23a67::t_85c16f9fd110cd 1-4,8-77,86-100,102-113
+  s_59a2fcbbc23a67::t_c50e70445ae484 7
+src-tauri/crates/keeper/src/lib.rs
+  s_59a2fcbbc23a67::t_4a33842a97838e 371
+src/components/layout/recording-pane.test.tsx
+  s_59a2fcbbc23a67::t_b19642c1c12773 11-12,51-54,76,93,136-137,357-359,369-386,389,391-400,404-406,411,416-417,445-458,460
+  s_59a2fcbbc23a67::t_12b1232dd67d28 418-444,461
+  s_59a2fcbbc23a67::t_a07847a4e50934 84
+  s_59a2fcbbc23a67::t_94e1d3f76c013f 85
+  s_59a2fcbbc23a67::t_b21c38d289dc0c 415,459
+  s_59a2fcbbc23a67::t_d798279efa30ae 407-410
+  s_59a2fcbbc23a67::t_22c10b96c729f6 390
+  s_59a2fcbbc23a67::t_a7770390a09b4f 414
+  s_59a2fcbbc23a67::t_6341049a33ebd3 401-403,412-413
+src-tauri/crates/keeper/src/ipc.rs
+  s_59a2fcbbc23a67::t_6cf377643ae410 4011-4031
+  s_59a2fcbbc23a67::t_e9956db7a5524f 3777,5030,5032,5178-5181
+  s_59a2fcbbc23a67::t_dbbb8d33e90d67 4941-5029,5031,5033-5177,5182-5282
+  s_59a2fcbbc23a67::t_5dae848fc4f10b 3830-3832,3834
+  s_59a2fcbbc23a67::t_a7b52f192ea0ba 3725-3728,3741,3775-3776
+  s_59a2fcbbc23a67::t_80bd4a573269d2 3375-3495
+src/components/recording/active-recording-banner.tsx
+  s_59a2fcbbc23a67::t_59be215665500a 77-83,86-133
+  s_59a2fcbbc23a67::t_09f09a6bfac46d 17,19-30,39-40,55-60,68-71
+src-tauri/crates/keeper/src/tray.rs
+  s_59a2fcbbc23a67::t_9420637f4022f6 586,589-594,599
+  s_59a2fcbbc23a67::t_3810fc0b8c9b09 640-646
+  s_59a2fcbbc23a67::t_e577cc54e9d6ad 53-59,66-72
+  s_59a2fcbbc23a67::t_a8c4528dcc244c 439-442
+  s_59a2fcbbc23a67::t_dad4198a25f3dd 360,412-413,705-708,714-737,739-740,744-745,749-750,754-755,759-782,789,799-823
+  s_59a2fcbbc23a67::t_a7190f7e460c72 467,481-488
+  s_59a2fcbbc23a67::t_d945333b908a0f 146-154
+  s_59a2fcbbc23a67::t_d94a471bc6542b 315-316,320-322,332-347,354-357
+  s_59a2fcbbc23a67::t_34fe9640d8e3f0 73,358-359
+  s_59a2fcbbc23a67::t_7d4c68d36ff1e8 263-265,269
+  s_59a2fcbbc23a67::t_c3f720a886d4b8 527-564
+  s_59a2fcbbc23a67::t_cec0e77393949e 86-90
+  s_59a2fcbbc23a67::t_4e283c62d3fb23 389,392-397,401-402,409-411
+  s_59a2fcbbc23a67::t_e9956db7a5524f 783-787,793-797
+  s_59a2fcbbc23a67::t_127f07de67bfe7 198-224
+  s_59a2fcbbc23a67::t_bfc2f7fd5121ea 302
+src/components/recording/active-recording-banner.test.tsx
+  s_59a2fcbbc23a67::t_40e0af14adca64 5-6
+  s_59a2fcbbc23a67::t_b21c38d289dc0c 80-86,96-102,347
+  s_59a2fcbbc23a67::t_9edce966b7d944 247-346,348-349
+  s_59a2fcbbc23a67::t_bcffe74a9e56f0 52-53,55-64,186-187,203-209,227-228,237-238,357-358
+src-tauri/crates/keeper-core/src/recording.rs
+  s_59a2fcbbc23a67::t_a1e45e37b351ef 380-384
+  s_59a2fcbbc23a67::t_322d00ef5ad8fe 1901-1904,1909-1910,1912-1914,1916-1917
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "13e4c77a5bd897c7d3bfca791c7236376714cf00",
+  "prompts": {},
+  "sessions": {
+    "s_59a2fcbbc23a67": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b73d4922-c7e3-4262-aca4-17fa7a98cae7",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
