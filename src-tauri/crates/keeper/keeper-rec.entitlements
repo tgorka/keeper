@@ -1,11 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Minimal hardened-runtime entitlements for the keeper-rec capture sidecar.
-  An empty dict is sufficient: Screen Recording and microphone access are
-  TCC-gated at runtime, not entitlement-gated. Capture-specific entitlements
-  (if any) are revisited when real capture lands in Story 16.6.
+  Hardened-runtime entitlements for the keeper-rec capture sidecar (and the
+  keeper app bundle — TCC evaluates the RESPONSIBLE process's entitlements too).
+
+  Under the hardened runtime, device capture is entitlement-gated on top of the
+  TCC grant (verified empirically on macOS 26, story 20.5: tccd logs
+  "Prompting policy for hardened runtime; service kTCCServiceMicrophone
+  requires entitlement com.apple.security.device.audio-input but it is
+  missing" and refuses to even post the prompt):
+
+  - audio-input — the microphone track (Story 19.3).
+  - camera      — the webcam file (Story 20.1).
+
+  Screen Recording has no such entitlement; it stays purely TCC-gated.
 -->
 <plist version="1.0">
-<dict/>
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<key>com.apple.security.device.camera</key>
+	<true/>
+</dict>
 </plist>
