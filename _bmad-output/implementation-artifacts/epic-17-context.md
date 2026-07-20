@@ -45,3 +45,20 @@ Epic 17 turns the single-file recording skeleton (Epic 16) into hours-long, cras
 - **Within the epic:** 17.1 (rotation) is the base. 17.2 (folder/manifest/ledger) depends on 17.1's `segmentClosed`/`state` events. 17.3 (recovery) depends on 17.2's manifest. 17.4 (concat gate) depends on 17.1 + 17.2. 17.5 (settings) depends on 17.1 + 17.2.
 - **Upstream:** the whole epic builds on Epic 16 (single-file capture, sidecar, `Recorder` port, session state machine seed).
 - **Downstream:** Epic 18 consumes segment info for the tray/banner live line and owns the live loud-failure notification. Epic 20 owns the once-per-session recovery notice UI and populates the webcam (`camera-####`) alignment hook the concat harness leaves open. Epic 19 owns the destination folder chooser UI.
+
+## Coordinator guidance for the 17-3 retry (2026-07-18)
+
+The first 17-3 attempt was deferred by review-budget non-convergence. The
+reviewer's four concrete findings are recorded in `deferred-work.md` (entries
+sourced from spec-17-1/17-2/17-3) — the retry spec MUST fold them in up front:
+
+1. Salvage runs `SessionManifest::reconcile_from_dir` (authoritative rebuild
+   from on-disk `.mp4`s), never a mere status flip to `recovered`.
+2. The 17.1 stop-during-rotation `segmentClosed` suppression means an event-fed
+   ledger can miss a fully-written segment — reconcile-from-disk covers it.
+3. `recording_base_dir`: lazy fallback (`unwrap_or_else`), not eager
+   `unwrap_or(platform.data_dir()?)`.
+4. Keep the pre-record recovery scan bounded / off the hot path where cheap.
+
+Story 20.3 (completion + recovery notice) is blocked on this story — its FR-73
+leg consumes the `recovered` manifests this story produces.
