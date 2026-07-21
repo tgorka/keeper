@@ -59,9 +59,15 @@ const SHOW_RECORDING_ID: &str = "tray-show-recording";
 const DISMISS_ERROR_ID: &str = "tray-dismiss-error";
 
 /// The bundled record-dot menu-bar icon shown while a recording is live (Story
-/// 18.1). Decoded per transition via [`Image::from_bytes`] (the `image-png`
-/// tauri feature) — a decode failure just keeps the current icon.
-const RECORDING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-recording.png");
+/// 18.1; template rendering Story 21.4). Decoded per transition via
+/// [`Image::from_bytes`] (the `image-png` tauri feature) — a decode failure
+/// just keeps the current icon.
+///
+/// All three tray glyphs are macOS TEMPLATE images (monochrome black + alpha):
+/// the menu bar colors them white/black per appearance and highlights them
+/// natively, so states must read from glyph SHAPE — ring = idle, filled dot in
+/// a ring = recording, disc with a punched-out exclamation = error.
+const RECORDING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-recording-template.png");
 
 /// The bundled recording-red **filled** error badge shown while a failed session
 /// holds the tray (Story 18.4): the same recording-red as the record dot but a
@@ -69,7 +75,11 @@ const RECORDING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-recording.png");
 /// glance and stays visually distinct from the plain record dot. Same base
 /// dimensions as [`RECORDING_ICON_PNG`]; decoded per transition via
 /// [`Image::from_bytes`] — a decode failure just keeps the current icon.
-const ERROR_ICON_PNG: &[u8] = include_bytes!("../icons/tray-error.png");
+const ERROR_ICON_PNG: &[u8] = include_bytes!("../icons/tray-error-template.png");
+
+/// The idle (presence-only) template glyph — an outline ring. Replaces the
+/// colored app icon so the menu bar stays native (Story 21.4).
+const IDLE_ICON_PNG: &[u8] = include_bytes!("../icons/tray-idle-template.png");
 
 /// The live tray, if menu-bar presence is currently on. `None` means no tray is
 /// shown (the default). Guarded by a `Mutex` since the Settings toggle command,
@@ -269,9 +279,18 @@ fn build_tray(app: &AppHandle) -> Option<TrayIcon> {
             DISMISS_ERROR_ID => dismiss_recording_error(app),
             _ => {}
         });
-    // Reuse the bundled default window icon so the tray needs no separate asset.
-    if let Some(icon) = app.default_window_icon().cloned() {
-        builder = builder.icon(icon);
+    // The idle template ring (Story 21.4): monochrome + alpha, flagged as a
+    // template so macOS renders it white/black per menu-bar appearance like
+    // every native icon. A decode failure falls back to the app icon.
+    match Image::from_bytes(IDLE_ICON_PNG) {
+        Ok(icon) => {
+            builder = builder.icon(icon).icon_as_template(true);
+        }
+        Err(_) => {
+            if let Some(icon) = app.default_window_icon().cloned() {
+                builder = builder.icon(icon);
+            }
+        }
     }
     match builder.build(app) {
         Ok(tray) => Some(tray),
@@ -509,9 +528,12 @@ fn render_recording(
     // idle → recording transition: record-dot icon + recording menu.
     match Image::from_bytes(RECORDING_ICON_PNG) {
         Ok(icon) => {
+            // macOS `isTemplate` is a property of the IMAGE — re-assert it on
+            // every swap or the glyph falls back to plain-alpha rendering.
             if let Err(error) = tray.set_icon(Some(icon)) {
                 tracing::warn!(%error, "tray: could not set the record-dot icon");
             }
+            let _ = tray.set_icon_as_template(true);
         }
         Err(error) => tracing::warn!(%error, "tray: could not decode the record-dot icon"),
     }
@@ -548,9 +570,12 @@ fn render_error(
     let reason = snapshot.error.as_deref().unwrap_or("unknown error");
     match Image::from_bytes(ERROR_ICON_PNG) {
         Ok(icon) => {
+            // macOS `isTemplate` is a property of the IMAGE — re-assert it on
+            // every swap or the glyph falls back to plain-alpha rendering.
             if let Err(error) = tray.set_icon(Some(icon)) {
                 tracing::warn!(%error, "tray: could not set the error badge icon");
             }
+            let _ = tray.set_icon_as_template(true);
         }
         Err(error) => tracing::warn!(%error, "tray: could not decode the error badge icon"),
     }
@@ -580,9 +605,11 @@ fn restore_idle(app: &AppHandle, tray: &TrayIcon) {
         return;
     }
     // The icon is cosmetic — a failure here does not desync the flag/menu.
-    if let Err(error) = tray.set_icon(app.default_window_icon().cloned()) {
+    let idle = Image::from_bytes(IDLE_ICON_PNG).ok();
+    if let Err(error) = tray.set_icon(idle) {
         tracing::warn!(%error, "tray: could not restore the idle icon");
     }
+    let _ = tray.set_icon_as_template(true);
     store_rendered_mode(tray.id(), None, false);
 }
 
