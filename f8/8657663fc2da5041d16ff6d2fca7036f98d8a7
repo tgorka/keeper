@@ -1,0 +1,59 @@
+src/components/settings/settings-dialog.test.tsx
+  s_8a8bc6b6bf6017::t_55e19a9e6a52f9 31-32
+src-tauri/crates/keeper-core/src/recording.rs
+  s_8a8bc6b6bf6017::t_3f9d0480d0478f 2850-2851
+  s_8a8bc6b6bf6017::t_2c4c366d343dc6 2492-2493,2537-2538,2560-2561,2589-2590,2620-2621,2684-2685,2714-2715,2748-2749,2816-2817,3492-3493
+  s_8a8bc6b6bf6017::t_f13540e5a88bed 721-727,747-749
+src-tauri/crates/keeper/src/ipc.rs
+  s_8a8bc6b6bf6017::t_3f9d0480d0478f 4196-4200
+  s_8a8bc6b6bf6017::t_de92a756a40002 4225-4226,4922-4924,4952-4954
+src/components/settings/recording-settings-controls.test.tsx
+  s_8a8bc6b6bf6017::t_a4df719da6e362 28-29
+tools/keeper-rec/Tests/keeper-recTests/ConcatAssertTests.swift
+  s_8a8bc6b6bf6017::t_722b5b182ca39e 32-42
+src/components/recording/recording-advanced-controls.tsx
+  s_8a8bc6b6bf6017::t_cf2484aa80b4fc 2-3,27,29,49-73,97-119,159-204
+src-tauri/crates/keeper-core/src/registry.rs
+  s_8a8bc6b6bf6017::t_341cc8ea3fab36 995-1068
+  s_8a8bc6b6bf6017::t_077f8540aa9dba 1069-1072
+src/components/recording/recording-destination-controls.test.tsx
+  s_8a8bc6b6bf6017::t_a4df719da6e362 34-35
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_8a8bc6b6bf6017::t_f1c24934bb6c22 210
+  s_8a8bc6b6bf6017::t_7a45df92ac5d52 207-208
+src/lib/stores/recording-settings.ts
+  s_8a8bc6b6bf6017::t_55409b2060b333 45-50
+tools/keeper-rec/Tests/keeper-recTests/FixtureSegments.swift
+  s_8a8bc6b6bf6017::t_4758074261e749 223-224,256-257,261
+  s_8a8bc6b6bf6017::t_722b5b182ca39e 75-76,86
+  s_8a8bc6b6bf6017::t_792a52cfdb75d6 234
+src-tauri/crates/keeper-core/src/vm.rs
+  s_8a8bc6b6bf6017::t_f13540e5a88bed 2900-2907
+tools/keeper-rec/Sources/keeper-rec/main.swift
+  s_8a8bc6b6bf6017::t_1ca00a07e05679 452-456,464-465
+src/components/recording/recording-advanced-controls.test.tsx
+  s_8a8bc6b6bf6017::t_a4df719da6e362 28-29
+tools/keeper-rec/Sources/keeper-rec/Capture.swift
+  s_8a8bc6b6bf6017::t_16644f3461c36d 372-373,394-395,450,452-457,600
+  s_8a8bc6b6bf6017::t_a10491d5e929db 138-140,308-309,312
+  s_8a8bc6b6bf6017::t_37731390b690c1 62-77,1030-1033
+  s_8a8bc6b6bf6017::t_8c43b47febd711 420-446
+src/lib/ipc/gen/RecordingSettingsVm.ts
+  s_8a8bc6b6bf6017::t_a232086cd7a061 37-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "f88657663fc2da5041d16ff6d2fca7036f98d8a7",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
