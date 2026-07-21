@@ -1,0 +1,21 @@
+_bmad-output/implementation-artifacts/bmad-dev-auto-result-20-6-sm-9-sm-10-phase-acceptance-docs-recording-md-and-retrospective-inputs.md
+  s_8a8bc6b6bf6017::t_f0057728c1ffbe 2,22-25,36-41
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_8a8bc6b6bf6017::t_121be03ec21e7a 205
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "9e2dff570f70d10baf6422c570dd893216356fdb",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
