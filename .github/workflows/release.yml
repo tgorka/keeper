@@ -145,7 +145,12 @@ jobs:
           # but that only affects real capture, not this bundling/handshake stub.
           bun run rec:build
           REC_BIN="src-tauri/crates/keeper/binaries/keeper-rec-aarch64-apple-darwin"
-          codesign --force --options runtime -s - "$REC_BIN"
+          # Entitlements are REQUIRED under the hardened runtime even ad-hoc:
+          # without audio-input/camera TCC refuses to even post the mic/camera
+          # prompts (found live on macOS 26, story 20.5/20.6).
+          codesign --force --options runtime \
+            --entitlements src-tauri/crates/keeper/keeper-rec.entitlements \
+            -s - "$REC_BIN"
           if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
             bun run tauri build --config src-tauri/crates/keeper/tauri.conf.json --target aarch64-apple-darwin --bundles app
           else
@@ -153,7 +158,11 @@ jobs:
           fi
           BUNDLE="src-tauri/target/aarch64-apple-darwin/release/bundle/macos"
           APP="$BUNDLE/keeper.app"
-          codesign --verify "$APP" 2>/dev/null || codesign --force --deep -s - "$APP"
+          # Re-assert the app seal WITH entitlements (tauri signs with them via
+          # bundle.macOS.entitlements; this is belt-and-braces for older caches).
+          codesign --force --options runtime \
+            --entitlements src-tauri/crates/keeper/keeper-rec.entitlements \
+            -s - "$APP"
           VERSION="${GITHUB_REF_NAME#v}"
           hdiutil create -volname "keeper" -srcfolder "$APP" -ov -format UDZO "keeper_${VERSION}_aarch64.dmg"
           ditto -c -k --keepParent "$APP" "keeper_${VERSION}_aarch64_app.zip"
