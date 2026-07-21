@@ -2850,6 +2850,9 @@ pub struct RecordingSummaryVm {
     /// card's `{size}` line. Emitted as `number` (a byte count sits far inside
     /// `Number.MAX_SAFE_INTEGER`).
     pub total_bytes: u64,
+    /// The user session title when one was set (Story 21.5) — rendered above
+    /// the folder path on the completion card and the recovery notice.
+    pub title: Option<String>,
 }
 
 impl RecordingStatusVm {

@@ -39,6 +39,9 @@ export interface RecordingSummaryCardProps {
   variant: RecordingSummaryVariant;
   /** The session folder path (mono line + Reveal-in-Finder / bytes fallback). */
   sessionFolder: string;
+  /** The user session title when one was set (Story 21.5) — rendered as the
+   * card's first line; omitted otherwise. */
+  title?: string | null;
   /** The manifest-authoritative screen-segment count ("Saved N segments"), or
    * `null` when the summary is unavailable (still loading / manifest load
    * failed) — the card then omits the figures rather than fabricating a zero. */
@@ -85,6 +88,7 @@ function summaryLine(
 export function RecordingSummaryCard({
   variant,
   sessionFolder,
+  title = null,
   screenSegmentCount,
   totalBytes,
   onDismiss,
@@ -99,6 +103,7 @@ export function RecordingSummaryCard({
       className={cn(recovered && "border-bridge-degraded/50 text-bridge-degraded ring-0 border")}
     >
       <CardContent className="flex flex-col gap-3">
+        {title !== null && title !== "" && <p className="font-medium text-sm">{title}</p>}
         <p className="text-sm">{summaryLine(variant, screenSegmentCount, totalBytes)}</p>
         <p className="break-all font-mono text-muted-foreground text-xs">{sessionFolder}</p>
         <div className="flex items-center gap-2">

@@ -1783,6 +1783,7 @@ export async function recordingStart(
   micDeviceId?: string | null,
   cameraEnabled?: boolean,
   cameraDeviceId?: string | null,
+  meta?: { title?: string; participants?: string; note?: string },
 ): Promise<RecordingStatusVm> {
   // Story 19.1: the picker's selected source/target (a display or an
   // application). Omitted (`undefined`) preserves the 16.6 main-display default.
@@ -1802,6 +1803,11 @@ export async function recordingStart(
     microphoneDeviceId: micDeviceId ?? null,
     cameraEnabled: cameraEnabled ?? null,
     cameraDeviceId: cameraDeviceId ?? null,
+    // Story 21.5: optional session metadata — absent fields ship as null and
+    // land only in the local session manifest (zero egress).
+    metaTitle: meta?.title ?? null,
+    metaParticipants: meta?.participants ?? null,
+    metaNote: meta?.note ?? null,
   });
 }
 
@@ -1900,6 +1906,8 @@ export interface RecordingSummaryVm {
   /** The number of screen-track segments the session saved (never the
    * track-agnostic live `segmentsClosed` counter). */
   screenSegmentCount: number;
+  /** The user session title when one was set (Story 21.5), else null. */
+  title: string | null;
   /** The total on-disk bytes across every segment (screen + camera). */
   totalBytes: number;
 }

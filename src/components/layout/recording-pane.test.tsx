@@ -44,6 +44,7 @@ vi.mock("@/lib/ipc/client", () => ({
     Promise.resolve({
       sessionFolder: "/Users/alice/Movies/keeper/keeper-rec test.mp4",
       screenSegmentCount: 3,
+      title: null,
       totalBytes: 412_000_000,
     }),
   ),
@@ -199,6 +200,7 @@ beforeEach(() => {
   mockSummary.mockResolvedValue({
     sessionFolder: RECORDING_STATUS.outputPath ?? "",
     screenSegmentCount: 3,
+    title: null,
     totalBytes: 412_000_000,
   });
   mockRecoveredList.mockReset();
@@ -560,7 +562,11 @@ describe("RecordingPane", () => {
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, false, null, false, null);
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, false, null, false, null, {
+      title: undefined,
+      participants: undefined,
+      note: undefined,
+    });
   });
 
   it("Start carries an off system-audio toggle through to recording_start", async () => {
@@ -575,7 +581,11 @@ describe("RecordingPane", () => {
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), false, false, null, false, null);
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), false, false, null, false, null, {
+      title: undefined,
+      participants: undefined,
+      note: undefined,
+    });
   });
 
   it("Start threads an enabled mic through to recording_start (Story 19.3)", async () => {
@@ -592,7 +602,11 @@ describe("RecordingPane", () => {
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, true, null, false, null);
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, true, null, false, null, {
+      title: undefined,
+      participants: undefined,
+      note: undefined,
+    });
   });
 
   it("Start threads an enabled webcam through to recording_start (Story 20.1)", async () => {
@@ -610,7 +624,11 @@ describe("RecordingPane", () => {
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, false, null, true, null);
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, false, null, true, null, {
+      title: undefined,
+      participants: undefined,
+      note: undefined,
+    });
   });
 
   it("Stop requests the graceful stop", async () => {
@@ -680,6 +698,7 @@ describe("RecordingPane", () => {
       {
         sessionFolder: "/Users/alice/Movies/keeper/keeper-rec recovered",
         screenSegmentCount: 2,
+        title: null,
         totalBytes: 200_000_000,
       },
     ]);
@@ -789,7 +808,11 @@ describe("RecordingPane", () => {
     // The chosen display + mic-on + webcam-on reach recording_start — not
     // the defaults.
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(chosenTarget, true, true, null, true, null);
+    expect(mockStart).toHaveBeenLastCalledWith(chosenTarget, true, true, null, true, null, {
+      title: undefined,
+      participants: undefined,
+      note: undefined,
+    });
   });
 
   it("Dismiss acknowledges the failed session back to idle (Story 18.4)", async () => {

@@ -1222,9 +1222,37 @@ pub struct SessionManifest {
     /// The segment ledger — a live event-fed view during recording, rebuilt
     /// authoritatively from disk at every terminal.
     pub segments: Vec<SegmentEntry>,
+    /// Optional user-supplied session metadata (Story 21.5): who/what this
+    /// recording is about. Local-only — never uploaded anywhere.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub meta: Option<SessionMeta>,
+    /// Wall-clock session start, ISO-8601 with UTC offset (Story 21.5).
+    /// Host-clock PTS bounds stay authoritative for continuity; this is the
+    /// human-facing "when". Absent in pre-21.5 manifests (tolerated on read).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub started_at: Option<String>,
+    /// Wall-clock session end, written at every terminal reconcile.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ended_at: Option<String>,
     /// The absolute session folder path (runtime-only, never serialized).
     #[serde(skip)]
     folder: PathBuf,
+}
+
+/// Optional user-supplied session metadata (Story 21.5): all fields free-text
+/// and optional; absent fields are omitted from the serialized manifest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMeta {
+    /// A human title for the session (also drives the folder name host-side).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub title: Option<String>,
+    /// Who the conversation/recording is with.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub participants: Option<String>,
+    /// Which program/session this is (free-form note).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
 }
 
 /// Build a secret-free [`RecordingError::ManifestIo`]: the failing operation name
@@ -1245,6 +1273,19 @@ impl SessionManifest {
         capture_target: CaptureTarget,
         devices: SessionDevices,
     ) -> Result<Self, RecordingError> {
+        Self::create_with_meta(folder, capture_target, devices, None, None)
+    }
+
+    /// [`Self::create`] plus the optional user meta and the wall-clock start
+    /// stamp (Story 21.5). `started_at` is host-supplied (ISO-8601 with
+    /// offset) so this platform-free module never touches a clock.
+    pub fn create_with_meta(
+        folder: PathBuf,
+        capture_target: CaptureTarget,
+        devices: SessionDevices,
+        meta: Option<SessionMeta>,
+        started_at: Option<String>,
+    ) -> Result<Self, RecordingError> {
         if let Some(parent) = folder.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| manifest_io("create session base directory", &e))?;
@@ -1263,10 +1304,20 @@ impl SessionManifest {
             capture_target,
             devices,
             segments: Vec::new(),
+            meta,
+            started_at,
+            ended_at: None,
             folder,
         };
         manifest.write()?;
         Ok(manifest)
+    }
+
+    /// Stamp the wall-clock session end (Story 21.5) — the caller supplies the
+    /// ISO-8601 instant and then [`Self::write`]s (typically alongside the
+    /// terminal status + reconcile).
+    pub fn set_ended_at(&mut self, ended_at: String) {
+        self.ended_at = Some(ended_at);
     }
 
     /// The absolute session folder path this manifest lives in.
@@ -4253,6 +4304,9 @@ mod tests {
             segments: (0..segment_count.saturating_sub(1))
                 .map(|index| screen_entry(index, &format!("screen-{index:04}.mov"), 1))
                 .collect(),
+            meta: None,
+            started_at: None,
+            ended_at: None,
             folder: folder.clone(),
         };
         manifest.write().expect("write stale manifest");
@@ -4491,6 +4545,9 @@ mod tests {
             capture_target: CaptureTarget::display(None),
             devices: test_devices(),
             segments: Vec::new(),
+            meta: None,
+            started_at: None,
+            ended_at: None,
             folder: folder.clone(),
         };
         manifest.write().expect("write newer manifest");

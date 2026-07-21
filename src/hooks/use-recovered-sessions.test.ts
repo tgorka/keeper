@@ -17,11 +17,13 @@ const mockAck = vi.mocked(recoveredSessionAcknowledge);
 const SESSION_A: RecordingSummaryVm = {
   sessionFolder: "/Users/alice/Movies/keeper/keeper-rec a",
   screenSegmentCount: 2,
+  title: null,
   totalBytes: 200_000_000,
 };
 const SESSION_B: RecordingSummaryVm = {
   sessionFolder: "/Users/alice/Movies/keeper/keeper-rec b",
   screenSegmentCount: 1,
+  title: null,
   totalBytes: 50_000_000,
 };
 

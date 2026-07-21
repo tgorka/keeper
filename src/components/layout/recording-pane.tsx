@@ -25,6 +25,7 @@ import { ActiveRecordingBanner } from "@/components/recording/active-recording-b
 import { RecordingAdvancedControls } from "@/components/recording/recording-advanced-controls";
 import { RecordingAudioControls } from "@/components/recording/recording-audio-controls";
 import { RecordingDestinationControls } from "@/components/recording/recording-destination-controls";
+import { RecordingMetaCard } from "@/components/recording/recording-meta-card";
 import {
   CAMERA_PERMISSION_NAME,
   CAMERA_ROW_NOTE,
@@ -46,6 +47,7 @@ import { isLiveRecording, useRecordingSession } from "@/hooks/use-recording-sess
 import { useRecoveredSessions } from "@/hooks/use-recovered-sessions";
 import type { RecordingPermissionVm } from "@/lib/ipc/client";
 import { systemAudioEnabled } from "@/lib/stores/recording-audio";
+import { consumeRecordingMeta } from "@/lib/stores/recording-meta";
 import { micDeviceId, micEnabled } from "@/lib/stores/recording-mic";
 import { selectedRecordingTarget } from "@/lib/stores/recording-source";
 import { cameraDeviceId, webcamEnabled } from "@/lib/stores/recording-webcam";
@@ -180,6 +182,9 @@ export function RecordingPane() {
                   micDeviceId(),
                   webcamEnabled(),
                   cameraDeviceId(),
+                  // Story 21.5: consume the Next-session fields (clears the
+                  // form; an untouched form ships no meta at all).
+                  consumeRecordingMeta(),
                 );
               }}
             >
@@ -226,6 +231,7 @@ export function RecordingPane() {
             micDeviceId(),
             webcamEnabled(),
             cameraDeviceId(),
+            consumeRecordingMeta(),
           );
         }}
         onDismiss={() => {
@@ -247,6 +253,7 @@ export function RecordingPane() {
             <RecordingSummaryCard
               variant={status.state === "recovered" ? "recovered" : "completion"}
               sessionFolder={status.outputPath}
+              title={terminalSummary?.title ?? null}
               screenSegmentCount={terminalSummary?.screenSegmentCount ?? null}
               totalBytes={terminalSummary?.totalBytes ?? null}
             />
@@ -265,6 +272,7 @@ export function RecordingPane() {
                   key={session.sessionFolder}
                   variant="recovered"
                   sessionFolder={session.sessionFolder}
+                  title={session.title}
                   screenSegmentCount={session.screenSegmentCount}
                   totalBytes={session.totalBytes}
                   onDismiss={() => {
@@ -272,6 +280,10 @@ export function RecordingPane() {
                   }}
                 />
               ))}
+          {/* The Next-session metadata card (Story 21.5): optional Title /
+              Participants / Note for the NEXT session, consumed (and cleared)
+              by Start into the local manifest; "Use previous" re-fills. */}
+          <RecordingMetaCard />
           {/* The permission pre-flight (Story 16.5; mic/camera rows Story 20.2)
               sits above the setup cards: live-detected at render, re-detected
               on focus/return and on every enabled-source change. The Microphone

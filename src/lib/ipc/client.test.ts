@@ -258,6 +258,9 @@ describe("recordingStart / requestMicrophonePermission (Story 19.3)", () => {
       microphoneDeviceId: null,
       cameraEnabled: null,
       cameraDeviceId: null,
+      metaTitle: null,
+      metaParticipants: null,
+      metaNote: null,
     });
   });
 
@@ -271,6 +274,9 @@ describe("recordingStart / requestMicrophonePermission (Story 19.3)", () => {
       microphoneDeviceId: "X",
       cameraEnabled: null,
       cameraDeviceId: null,
+      metaTitle: null,
+      metaParticipants: null,
+      metaNote: null,
     });
   });
 
@@ -284,6 +290,9 @@ describe("recordingStart / requestMicrophonePermission (Story 19.3)", () => {
       microphoneDeviceId: null,
       cameraEnabled: null,
       cameraDeviceId: null,
+      metaTitle: null,
+      metaParticipants: null,
+      metaNote: null,
     });
   });
 
@@ -305,6 +314,9 @@ describe("recordingStart camera args / requestCameraPermission (Story 20.1)", ()
       microphoneDeviceId: null,
       cameraEnabled: true,
       cameraDeviceId: "CAM",
+      metaTitle: null,
+      metaParticipants: null,
+      metaNote: null,
     });
   });
 
@@ -318,6 +330,9 @@ describe("recordingStart camera args / requestCameraPermission (Story 20.1)", ()
       microphoneDeviceId: null,
       cameraEnabled: true,
       cameraDeviceId: null,
+      metaTitle: null,
+      metaParticipants: null,
+      metaNote: null,
     });
   });
 

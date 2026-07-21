@@ -4020,7 +4020,35 @@ fn resolve_capture_target(
 // optional source selection each). Grouping them into a struct would change
 // the wire to appease the lint (the registry.rs/notify.rs precedent).
 #[allow(clippy::too_many_arguments)]
+/// Sanitize a user session title into a filesystem-safe folder prefix (Story
+/// 21.5): strips path separators/colons/NULs and control characters, collapses
+/// whitespace, keeps Unicode, and caps the length so the full folder name stays
+/// well under filesystem limits. May return an empty string (caller falls back
+/// to the classic name).
+fn sanitize_session_title(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '\0' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .chars()
+        .take(80)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 #[tauri::command]
+// The command mirrors the wire: each optional capture selection + the three
+// optional meta fields arrive as separate IPC args (Tauri flattens the invoke
+// payload) — grouping them into a struct here would only add a second shape
+// for the same data.
+#[allow(clippy::too_many_arguments)]
 pub async fn recording_start(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -4030,6 +4058,9 @@ pub async fn recording_start(
     microphone_device_id: Option<String>,
     camera_enabled: Option<bool>,
     camera_device_id: Option<String>,
+    meta_title: Option<String>,
+    meta_participants: Option<String>,
+    meta_note: Option<String>,
 ) -> Result<RecordingStatusVm, IpcError> {
     // Story 19.2: the Audio card's ephemeral per-session toggle. `None` (no
     // explicit choice reached the command) preserves the 16.6 default-on path.
@@ -4145,7 +4176,18 @@ pub async fn recording_start(
     // The shell supplies the local timestamp (core is time-agnostic); the core
     // derives + validates the fs-safe folder basename (Story 17.2).
     let local_ts = chrono::Local::now().format("%Y-%m-%d %H.%M.%S").to_string();
-    let base_name = session_folder_name(&local_ts).map_err(|e| to_ipc_error(e.into()))?;
+    // Story 21.5: an optional user title prefixes the folder name (sanitized:
+    // path-hostile characters stripped, Unicode kept, length-capped); absent or
+    // emptied-by-sanitization titles keep the classic `keeper-rec <ts>` name.
+    let title_trimmed = meta_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(sanitize_session_title);
+    let base_name = match title_trimmed.as_deref().filter(|t| !t.is_empty()) {
+        Some(title) => format!("{title} {local_ts}"),
+        None => session_folder_name(&local_ts).map_err(|e| to_ipc_error(e.into()))?,
+    };
     // The session folder must be UNIQUE — a same-second sequential restart must
     // never reuse (and cross-write) the prior session's folder. Disambiguate
     // with ` (2)`, ` (3)`, … until a fresh name is found; `SessionManifest::
@@ -4168,7 +4210,18 @@ pub async fn recording_start(
     // Create the folder + the initial `recording` manifest. This synchronous
     // pre-spawn failure is a legitimate command error — no session task exists
     // yet, so surfacing it cannot desync any start-guard.
-    let manifest = SessionManifest::create(
+    // Story 21.5: optional session meta + the wall-clock start stamp
+    // (ISO-8601 with offset; the host owns clocks — core stays time-agnostic).
+    let session_meta = {
+        let clean = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        let meta = keeper_core::recording::SessionMeta {
+            title: clean(meta_title.clone()),
+            participants: clean(meta_participants),
+            note: clean(meta_note),
+        };
+        (meta.title.is_some() || meta.participants.is_some() || meta.note.is_some()).then_some(meta)
+    };
+    let manifest = SessionManifest::create_with_meta(
         folder.clone(),
         capture_target,
         SessionDevices {
@@ -4180,6 +4233,8 @@ pub async fn recording_start(
             // writes the separate `camera-####.mov` files.
             camera: camera_on,
         },
+        session_meta,
+        Some(chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
     )
     .map_err(|e| to_ipc_error(e.into()))?;
 
@@ -4323,6 +4378,11 @@ pub async fn recording_start(
                     machine.state(),
                     SessionState::Finalized | SessionState::Recovered | SessionState::Failed
                 ) {
+                    // Story 21.5: the wall-clock end stamp rides the terminal
+                    // manifest write (ISO-8601 with offset, host-owned clock).
+                    manifest.set_ended_at(
+                        chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+                    );
                     // EVERY terminal rebuilds the segment list from disk —
                     // disk is authoritative (final segment, DW-992 backfill,
                     // real sizes) — before the final write.
@@ -4714,6 +4774,9 @@ fn manifest_summary(folder: &Path, manifest: &SessionManifest) -> RecordingSumma
         session_folder: folder.to_string_lossy().into_owned(),
         screen_segment_count: manifest.screen_segment_count(),
         total_bytes: manifest.total_bytes(),
+        // Story 21.5: surface the user title (when set) to the completion card
+        // and the recovery notice.
+        title: manifest.meta.as_ref().and_then(|m| m.title.clone()),
     }
 }
 
