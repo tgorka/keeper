@@ -992,6 +992,84 @@ pub fn set_recording_fps(data_dir: &Path, fps: u32) -> Result<(), CoreError> {
     )
 }
 
+/// The `settings` key holding the recording video codec (Story 21.1). Stored
+/// as `"h264"` / `"hevc"`; absent / anything else ⇒ the default of `"h264"`.
+/// Passed to the `keeper-rec` sidecar as the additive `codec` param on start.
+const RECORDING_CODEC_KEY: &str = "recording.codec";
+
+/// The maximum-compatibility default codec (Story 21.1).
+pub const RECORDING_CODEC_DEFAULT: &str = "h264";
+
+/// The opt-in hardware-efficient codec (Story 21.1; VideoToolbox hardware
+/// encode on Apple Silicon).
+pub const RECORDING_CODEC_HEVC: &str = "hevc";
+
+/// Normalize a codec string to the legal set {"h264", "hevc"}: anything that is
+/// not exactly `"hevc"` becomes the `"h264"` default (the sidecar normalizes
+/// again defensively with the identical rule).
+pub fn normalize_recording_codec(codec: &str) -> &'static str {
+    if codec == RECORDING_CODEC_HEVC {
+        RECORDING_CODEC_HEVC
+    } else {
+        RECORDING_CODEC_DEFAULT
+    }
+}
+
+/// Read the recording codec (Story 21.1). Absent / unrecognized ⇒ `"h264"`.
+pub fn get_recording_codec(data_dir: &Path) -> Result<String, CoreError> {
+    let raw = get_setting(data_dir, RECORDING_CODEC_KEY)?;
+    Ok(normalize_recording_codec(raw.as_deref().unwrap_or(RECORDING_CODEC_DEFAULT)).to_owned())
+}
+
+/// Write the recording codec (Story 21.1), normalized to {"h264", "hevc"}.
+/// Applies to the next Recording Session only.
+pub fn set_recording_codec(data_dir: &Path, codec: &str) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        RECORDING_CODEC_KEY,
+        normalize_recording_codec(codec),
+    )
+}
+
+/// The `settings` key holding the capture scale percent (Story 21.2). Stored as
+/// a decimal string; absent / unparsable / out-of-set ⇒ the default of 100.
+/// Passed to the sidecar as the additive `scalePercent` start param.
+const RECORDING_SCALE_KEY: &str = "recording.scale_percent";
+
+/// The full-resolution default capture scale (Story 21.2).
+pub const RECORDING_SCALE_DEFAULT: u32 = 100;
+
+/// Normalize a capture scale to the legal set {100, 75, 50}: anything else
+/// becomes the 100 default (the sidecar normalizes again defensively and also
+/// rounds the scaled dimensions to even pixels for the encoder).
+pub fn normalize_recording_scale(percent: u32) -> u32 {
+    match percent {
+        75 => 75,
+        50 => 50,
+        _ => RECORDING_SCALE_DEFAULT,
+    }
+}
+
+/// Read the capture scale percent (Story 21.2). Absent / unparsable ⇒ 100.
+pub fn get_recording_scale_percent(data_dir: &Path) -> Result<u32, CoreError> {
+    let raw = get_setting(data_dir, RECORDING_SCALE_KEY)?;
+    let percent = raw
+        .as_deref()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(RECORDING_SCALE_DEFAULT);
+    Ok(normalize_recording_scale(percent))
+}
+
+/// Write the capture scale percent (Story 21.2), normalized to {100, 75, 50}.
+/// Applies to the next Recording Session only.
+pub fn set_recording_scale_percent(data_dir: &Path, percent: u32) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        RECORDING_SCALE_KEY,
+        &normalize_recording_scale(percent).to_string(),
+    )
+}
+
 /// A single held-send row from the `outbox` table (Story 8.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRow {

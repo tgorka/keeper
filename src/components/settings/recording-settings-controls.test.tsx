@@ -25,6 +25,8 @@ const DEFAULTS: RecordingSettingsVm = {
   // carry them along unchanged.
   destinationDir: "/Users/alice/Movies/keeper",
   fps: 30,
+  codec: "h264",
+  scalePercent: 100,
 };
 
 beforeEach(() => {

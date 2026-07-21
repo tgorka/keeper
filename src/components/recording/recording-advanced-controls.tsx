@@ -1,5 +1,6 @@
 /**
- * The collapsed Advanced group (Story 19.5, Epic 19): the fps control.
+ * The collapsed Advanced group (Story 19.5 + 21.1/21.2): fps, codec, and
+ * capture-scale controls.
  *
  * A HAND-ROLLED disclosure (Button + `useState` + conditional render) — app
  * code, not a shadcn `ui/` component, and no new dependency — collapsed by
@@ -23,7 +24,9 @@ import {
 import {
   applyRecordingSettings,
   ensureRecordingSettingsHydrated,
+  RECORDING_CODEC_ALLOWED,
   RECORDING_FPS_ALLOWED,
+  RECORDING_SCALE_ALLOWED,
   recordingSettingsStore,
   useRecordingSettings,
 } from "@/lib/stores/recording-settings";
@@ -42,6 +45,31 @@ export const ADVANCED_TOGGLE_TESTID = "recording-advanced-toggle";
 
 /** Test id for the fps Select trigger. */
 export const FPS_SELECT_TESTID = "recording-fps-select";
+
+/** The codec field label (Story 21.1; recording voice). */
+export const CODEC_LABEL = "Video codec";
+
+/** Honest per-codec display labels (compatibility vs size trade-off). */
+export const CODEC_OPTION_LABELS: Record<string, string> = {
+  h264: "H.264 (compatible)",
+  hevc: "HEVC (smaller files)",
+};
+
+/** Test id for the codec Select trigger. */
+export const CODEC_SELECT_TESTID = "recording-codec-select";
+
+/** The capture-scale field label (Story 21.2; recording voice). */
+export const SCALE_LABEL = "Capture resolution";
+
+/** Honest per-scale display labels. */
+export const SCALE_OPTION_LABELS: Record<number, string> = {
+  100: "Full (100%)",
+  75: "3/4 (75%)",
+  50: "Half (50%)",
+};
+
+/** Test id for the scale Select trigger. */
+export const SCALE_SELECT_TESTID = "recording-scale-select";
 
 export function RecordingAdvancedControls() {
   const settings = useRecordingSettings();
@@ -64,6 +92,29 @@ export function RecordingAdvancedControls() {
       return;
     }
     void applyRecordingSettings({ ...live, fps });
+  };
+
+  /** Persist a picked codec via the shared optimistic-mirror store. */
+  const commitCodec = (value: string) => {
+    const live = recordingSettingsStore.getState().settings;
+    if (live === null || !RECORDING_CODEC_ALLOWED.includes(value) || value === live.codec) {
+      return;
+    }
+    void applyRecordingSettings({ ...live, codec: value });
+  };
+
+  /** Persist a picked capture scale via the shared optimistic-mirror store. */
+  const commitScale = (value: string) => {
+    const live = recordingSettingsStore.getState().settings;
+    const scalePercent = Number(value);
+    if (
+      live === null ||
+      !RECORDING_SCALE_ALLOWED.includes(scalePercent) ||
+      scalePercent === live.scalePercent
+    ) {
+      return;
+    }
+    void applyRecordingSettings({ ...live, scalePercent });
   };
 
   return (
@@ -100,6 +151,52 @@ export function RecordingAdvancedControls() {
                 {RECORDING_FPS_ALLOWED.map((fps) => (
                   <SelectItem key={fps} value={String(fps)}>
                     {fps}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <Label id="recording-codec-label">{CODEC_LABEL}</Label>
+            <Select
+              value={settings === null ? undefined : settings.codec}
+              onValueChange={commitCodec}
+              disabled={settings === null}
+            >
+              <SelectTrigger
+                className="w-48"
+                data-testid={CODEC_SELECT_TESTID}
+                aria-labelledby="recording-codec-label"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {RECORDING_CODEC_ALLOWED.map((codec) => (
+                  <SelectItem key={codec} value={codec}>
+                    {CODEC_OPTION_LABELS[codec] ?? codec}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <Label id="recording-scale-label">{SCALE_LABEL}</Label>
+            <Select
+              value={settings === null ? undefined : String(settings.scalePercent)}
+              onValueChange={commitScale}
+              disabled={settings === null}
+            >
+              <SelectTrigger
+                className="w-40"
+                data-testid={SCALE_SELECT_TESTID}
+                aria-labelledby="recording-scale-label"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {RECORDING_SCALE_ALLOWED.map((scale) => (
+                  <SelectItem key={scale} value={String(scale)}>
+                    {SCALE_OPTION_LABELS[scale] ?? `${scale}%`}
                   </SelectItem>
                 ))}
               </SelectContent>

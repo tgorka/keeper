@@ -42,6 +42,12 @@ export const RECORDING_FPS_DEFAULT = 30;
  * anything else is normalized to the default backend-side). */
 export const RECORDING_FPS_ALLOWED: readonly number[] = [30, 60];
 
+/** The legal codec set (Story 21.1) — mirror of the Rust normalization. */
+export const RECORDING_CODEC_ALLOWED: readonly string[] = ["h264", "hevc"];
+
+/** The legal capture-scale set (Story 21.2) — mirror of the Rust normalization. */
+export const RECORDING_SCALE_ALLOWED: readonly number[] = [100, 75, 50];
+
 export interface RecordingSettingsState {
   /**
    * The last-observed effective VM, or `null` before the first hydration

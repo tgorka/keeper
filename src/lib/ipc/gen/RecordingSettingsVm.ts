@@ -34,4 +34,16 @@ destinationDir: string,
  * Capture frame rate (Story 19.5): 30 (default) or 60, normalized on
  * read/write; the sidecar's `fps`.
  */
-fps: number, };
+fps: number, 
+/**
+ * Video codec (Story 21.1): `"h264"` (maximum-compatibility default) or
+ * `"hevc"` (VideoToolbox hardware encode on Apple Silicon; markedly
+ * smaller files). Normalized on read/write; the sidecar's `codec`.
+ */
+codec: string, 
+/**
+ * Capture scale percent (Story 21.2): 100 (default), 75, or 50 of the
+ * native pixel resolution, normalized on read/write; the sidecar's
+ * `scalePercent` (dimensions rounded to even pixels Swift-side).
+ */
+scalePercent: number, };

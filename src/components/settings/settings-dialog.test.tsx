@@ -28,6 +28,8 @@ vi.mock("@/lib/ipc/client", () => ({
       durationCapMinutes: 30,
       destinationDir: "/Users/alice/Movies/keeper",
       fps: 30,
+      codec: "h264",
+      scalePercent: 100,
     }),
   ),
   recordingSettingsSet: vi.fn((vm: unknown) => Promise.resolve(vm)),

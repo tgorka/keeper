@@ -2897,6 +2897,14 @@ pub struct RecordingSettingsVm {
     /// Capture frame rate (Story 19.5): 30 (default) or 60, normalized on
     /// read/write; the sidecar's `fps`.
     pub fps: u32,
+    /// Video codec (Story 21.1): `"h264"` (maximum-compatibility default) or
+    /// `"hevc"` (VideoToolbox hardware encode on Apple Silicon; markedly
+    /// smaller files). Normalized on read/write; the sidecar's `codec`.
+    pub codec: String,
+    /// Capture scale percent (Story 21.2): 100 (default), 75, or 50 of the
+    /// native pixel resolution, normalized on read/write; the sidecar's
+    /// `scalePercent` (dimensions rounded to even pixels Swift-side).
+    pub scale_percent: u32,
 }
 
 #[cfg(test)]

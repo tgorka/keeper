@@ -718,6 +718,13 @@ pub struct SessionParams {
     /// by the registry read; the sidecar's `fps` (normalized again defensively
     /// Swift-side, so a bad value can never reach `SCStreamConfiguration`).
     pub fps: u32,
+    /// Video codec (Story 21.1): `"h264"` or `"hevc"`, already normalized by
+    /// the registry read; the sidecar's additive `codec` param (absent ⇒
+    /// h264 — older wire preserved; normalized again Swift-side).
+    pub codec: String,
+    /// Capture scale percent (Story 21.2): 100/75/50, already normalized; the
+    /// sidecar's additive `scalePercent` param (absent ⇒ 100).
+    pub scale_percent: u32,
 }
 
 /// Build the one-line `startRecording` request (Story 16.6 + 17.5 + 19.5; no
@@ -737,6 +744,9 @@ pub fn start_recording_request(id: u64, params: &SessionParams) -> String {
         "segmentMB": params.segment_mb,
         "maxSegmentSeconds": params.max_segment_seconds,
         "fps": params.fps,
+        // Additive (Story 21.1/21.2): absent ⇒ h264 / 100 on older sidecars.
+        "codec": params.codec,
+        "scalePercent": params.scale_percent,
     });
     // An application target wins (Story 19.1): emit `applicationPid`+`bundleId`
     // and omit `displayId` entirely, so the sidecar builds an app-scoped filter.
@@ -2479,6 +2489,8 @@ mod tests {
             segment_mb: 800,
             max_segment_seconds: 2700,
             fps: 30,
+            codec: "h264".to_owned(),
+            scale_percent: 100,
         };
         let line = start_recording_request(4, &params);
         assert!(!line.contains('\n'), "the shell port owns line framing");
@@ -2522,6 +2534,8 @@ mod tests {
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
+            codec: "h264".to_owned(),
+            scale_percent: 100,
         };
         let line = start_recording_request(6, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2543,6 +2557,8 @@ mod tests {
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
+            codec: "h264".to_owned(),
+            scale_percent: 100,
         };
         let line = start_recording_request(10, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2570,6 +2586,8 @@ mod tests {
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
+            codec: "h264".to_owned(),
+            scale_percent: 100,
         };
         let line = start_recording_request(11, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2599,6 +2617,8 @@ mod tests {
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
+            codec: "h264".to_owned(),
+            scale_percent: 100,
         };
         let line = start_recording_request(12, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2661,6 +2681,8 @@ mod tests {
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
+            codec: "h264".to_owned(),
+            scale_percent: 100,
         };
         let line = start_recording_request(14, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2689,6 +2711,8 @@ mod tests {
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
+            codec: "h264".to_owned(),
+            scale_percent: 100,
         };
         let line = start_recording_request(15, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2721,6 +2745,8 @@ mod tests {
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
+            codec: "h264".to_owned(),
+            scale_percent: 100,
         };
         let line = start_recording_request(16, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2787,6 +2813,8 @@ mod tests {
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
+            codec: "h264".to_owned(),
+            scale_percent: 100,
         };
         let line = start_recording_request(9, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2819,6 +2847,8 @@ mod tests {
                 segment_mb: 500,
                 max_segment_seconds: 1800,
                 fps,
+                codec: "h264".to_owned(),
+                scale_percent: 100,
             };
             let line = start_recording_request(13, &params);
             let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -3459,6 +3489,8 @@ mod tests {
             segment_mb: 500,
             max_segment_seconds: 1800,
             fps: 30,
+            codec: "h264".to_owned(),
+            scale_percent: 100,
         }
     }
 

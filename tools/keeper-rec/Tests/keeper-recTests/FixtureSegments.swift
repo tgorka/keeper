@@ -72,7 +72,8 @@ enum BoundaryDefect {
 /// `firstPTS + i·P` on the host-clock timeline (which the muxer then rebases
 /// to 0 in the file, like the real capture engine).
 func writeFixtureSegment(
-    at url: URL, firstPTS: Double, frames: Int, frameRate: Double
+    at url: URL, firstPTS: Double, frames: Int, frameRate: Double,
+    codec: AVVideoCodecType = .h264
 ) async throws {
     let width = 64
     let height = 64
@@ -82,7 +83,7 @@ func writeFixtureSegment(
     let input = AVAssetWriterInput(
         mediaType: .video,
         outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoCodecKey: codec,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
             AVVideoCompressionPropertiesKey: [
@@ -219,7 +220,8 @@ func makeFixtureSession(
     defect: (boundary: Int, kind: BoundaryDefect)? = nil,
     fileName: (Int) -> String = { String(format: "screen-%04d.mov", $0) },
     manifestOrder: [Int]? = nil,
-    nullBoundsForIndex: Int? = nil
+    nullBoundsForIndex: Int? = nil,
+    codec: AVVideoCodecType = .h264
 ) async throws -> [FixtureSegment] {
     let period = 1.0 / frameRate
     var segments: [FixtureSegment] = []
@@ -229,7 +231,7 @@ func makeFixtureSession(
         let file = fileName(index)
         try await writeFixtureSegment(
             at: folder.appendingPathComponent(file),
-            firstPTS: start, frames: framesPerSegment, frameRate: frameRate)
+            firstPTS: start, frames: framesPerSegment, frameRate: frameRate, codec: codec)
         let nullBounds = nullBoundsForIndex == index
         segments.append(
             FixtureSegment(
@@ -251,11 +253,12 @@ func makeFixtureSession(
 /// A faithful gapless session (`ptsStart(k+1) = ptsEnd(k) + P` at every cut).
 @discardableResult
 func makeGaplessSession(
-    in folder: URL, segments: Int = 3, framesPerSegment: Int = 8, frameRate: Double = 30
+    in folder: URL, segments: Int = 3, framesPerSegment: Int = 8, frameRate: Double = 30,
+    codec: AVVideoCodecType = .h264
 ) async throws -> [FixtureSegment] {
     try await makeFixtureSession(
         in: folder, segmentCount: segments, framesPerSegment: framesPerSegment,
-        frameRate: frameRate)
+        frameRate: frameRate, codec: codec)
 }
 
 /// Negative control: a 4-frame gap at `boundary` (default: between segments

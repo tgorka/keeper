@@ -29,6 +29,17 @@ final class ConcatAssertTests: XCTestCase {
         try await assertGaplessConcat(inFolder: dir.url, frameRate: frameRate)
     }
 
+    /// Row (Story 21.1): the SAME gapless assertion holds for HEVC segments —
+    /// the concat gate is codec-agnostic and both shipped codecs stay gapless.
+    func testGaplessHevcSessionPasses() async throws {
+        let dir = try TempSessionDir(label: "gapless-hevc")
+        try await makeGaplessSession(in: dir.url, codec: .hevc)
+        let violations = try await gaplessConcatViolations(
+            segments: sessionSegments(inFolder: dir.url), frameRate: frameRate)
+        XCTAssertEqual(violations, [], "a faithful HEVC handover must produce zero violations")
+        try await assertGaplessConcat(inFolder: dir.url, frameRate: frameRate)
+    }
+
     /// Row: gap at a boundary — segment 2 starts 4·P after segment 1's last
     /// frame → exactly one `gap` violation naming boundary 1→2 with the
     /// measured excess (`delta − P = 3·P`).

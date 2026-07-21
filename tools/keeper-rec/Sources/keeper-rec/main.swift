@@ -449,6 +449,11 @@ while let line = readLine(strippingNewline: true) {
         // an older host stays compatible. The engine normalizes to {30, 60}
         // via `normalizeFps` before it reaches SCStreamConfiguration.
         let fps = (params?["fps"] as? NSNumber)?.intValue ?? 30
+        // Story 21.1/21.2: additive codec + capture scale — absent on an older
+        // host wire ⇒ the h264 / 100% defaults; normalized defensively here.
+        let codec = normalizeCodec((params?["codec"] as? String) ?? "h264")
+        let scalePercent = normalizeScalePercent(
+            (params?["scalePercent"] as? NSNumber)?.intValue ?? 100)
         response = ["id": id, "result": ["starting": true]]
         _ = writeLine(response)
         captureEngine.start(
@@ -456,7 +461,8 @@ while let line = readLine(strippingNewline: true) {
             applicationBundleId: applicationBundleId, systemAudio: systemAudio,
             micEnabled: micEnabled, micDeviceId: micDeviceId,
             cameraEnabled: cameraEnabled, cameraDeviceId: cameraDeviceId,
-            segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds, fps: fps)
+            segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds, fps: fps,
+            codec: codec, scalePercent: scalePercent)
         continue
     case "simulateMicRemoval":
         // Story 19.4: drive the IDENTICAL mic-loss branch a real hardware

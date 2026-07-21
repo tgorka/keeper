@@ -59,6 +59,22 @@ import CoreMedia
 import Foundation
 import ScreenCaptureKit
 
+/// Normalize the capture scale to the legal set {100, 75, 50} (Story 21.2) —
+/// identical rule to the host registry, applied again defensively.
+func normalizeScalePercent(_ percent: Int) -> Int {
+    switch percent {
+    case 75: return 75
+    case 50: return 50
+    default: return 100
+    }
+}
+
+/// Normalize the codec to {"h264", "hevc"} (Story 21.1) — identical rule to
+/// the host registry, applied again defensively.
+func normalizeCodec(_ codec: String) -> String {
+    codec == "hevc" ? "hevc" : "h264"
+}
+
 /// A capture failure with a human-readable, non-secret message.
 struct CaptureError: Error, CustomStringConvertible {
     let message: String
@@ -119,6 +135,9 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     // every rotation target (same display, same tracks, every segment).
     private var pixelWidth = 2
     private var pixelHeight = 2
+    /// Video codec for every writer this session (Story 21.1): "hevc" or the
+    /// "h264" default — normalized in main.swift before start.
+    private var codec = "h264"
     private var wantsAudio = false
     /// Whether the mic source is enabled (Story 19.3) — every segment writer
     /// then carries the second, unmixed mic AAC track.
@@ -286,9 +305,11 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         path: String, displayId: UInt32?, applicationPid: Int32?, applicationBundleId: String?,
         systemAudio: Bool, micEnabled: Bool, micDeviceId: String?,
         cameraEnabled: Bool, cameraDeviceId: String?,
-        segmentMB: Int, maxSegmentSeconds: Int, fps: Int
+        segmentMB: Int, maxSegmentSeconds: Int, fps: Int,
+        codec: String, scalePercent: Int
     ) {
         isActive = true
+        self.codec = codec
         policy = RotationPolicy(segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds)
         emitEvent(["event": "state", "state": "preflight"])
         Task {
@@ -348,7 +369,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                         display: display, application: app, path: path,
                         systemAudio: systemAudio, micEnabled: micEnabled,
                         micDeviceId: micDeviceId, cameraEnabled: cameraEnabled,
-                        cameraDeviceId: cameraDeviceId, fps: fps)
+                        cameraDeviceId: cameraDeviceId, fps: fps,
+                        scalePercent: scalePercent)
                     return
                 }
 
@@ -369,7 +391,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 try self.beginCapture(
                     display: display, application: nil, path: path, systemAudio: systemAudio,
                     micEnabled: micEnabled, micDeviceId: micDeviceId,
-                    cameraEnabled: cameraEnabled, cameraDeviceId: cameraDeviceId, fps: fps)
+                    cameraEnabled: cameraEnabled, cameraDeviceId: cameraDeviceId, fps: fps,
+                    scalePercent: scalePercent)
             } catch {
                 emitEvent([
                     "event": "error",
@@ -394,14 +417,44 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// `AVCaptureSession` + video-only writer producing `camera-####.mov`
     /// beside each screen segment — never a track inside `screen-####`, never
     /// composited (no PiP/self-view).
+    /// The shared video-track output settings (Story 21.1): H.264 (High
+    /// auto-level, maximum compatibility) or HEVC (VideoToolbox hardware
+    /// encode on Apple Silicon; the OS picks the encoder — no software
+    /// fallback knob). Same average-bit-rate budget either way — HEVC then
+    /// simply lands markedly smaller/cleaner.
+    private func videoOutputSettings(width: Int, height: Int, bitRate: Int = 10_000_000)
+        -> [String: Any]
+    {
+        var compression: [String: Any] = [
+            AVVideoAverageBitRateKey: bitRate,
+            AVVideoExpectedSourceFrameRateKey: 30,
+        ]
+        let codecType: AVVideoCodecType
+        if codec == "hevc" {
+            codecType = .hevc
+        } else {
+            codecType = .h264
+            compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
+        }
+        return [
+            AVVideoCodecKey: codecType,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: compression,
+        ]
+    }
+
     private func beginCapture(
         display: SCDisplay, application: SCRunningApplication?, path: String, systemAudio: Bool,
         micEnabled: Bool, micDeviceId: String?, cameraEnabled: Bool, cameraDeviceId: String?,
-        fps: Int
+        fps: Int, scalePercent: Int
     ) throws {
-        // Capture at the display's true pixel size (SCDisplay reports points).
-        pixelWidth = max(2, CGDisplayPixelsWide(display.displayID))
-        pixelHeight = max(2, CGDisplayPixelsHigh(display.displayID))
+        // Capture at the display's true pixel size (SCDisplay reports points),
+        // scaled by the normalized capture scale (Story 21.2) and rounded DOWN
+        // to even pixels — hardware encoders reject odd dimensions.
+        let scale = normalizeScalePercent(scalePercent)
+        pixelWidth = max(2, CGDisplayPixelsWide(display.displayID) * scale / 100) & ~1
+        pixelHeight = max(2, CGDisplayPixelsHigh(display.displayID) * scale / 100) & ~1
         wantsAudio = systemAudio
         // Seed BEFORE `makeSegmentWriter` — segment 0's writer must already
         // carry the mic input when the mic source is enabled.
@@ -544,18 +597,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         writer.movieFragmentInterval = CMTime(seconds: 4, preferredTimescale: 600)
 
         let videoInput = AVAssetWriterInput(
-            mediaType: .video,
-            outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: pixelWidth,
-                AVVideoHeightKey: pixelHeight,
-                AVVideoCompressionPropertiesKey: [
-                    // Generous for a full retina display; H.264 High auto-level.
-                    AVVideoAverageBitRateKey: 10_000_000,
-                    AVVideoExpectedSourceFrameRateKey: 30,
-                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-                ],
-            ])
+            mediaType: .video, outputSettings: videoOutputSettings(width: pixelWidth, height: pixelHeight))
         videoInput.expectsMediaDataInRealTime = true
         guard writer.canAdd(videoInput) else {
             throw CaptureError("could not add the H.264 video track")
@@ -985,17 +1027,10 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         writer.movieFragmentInterval = CMTime(seconds: 4, preferredTimescale: 600)
         let videoInput = AVAssetWriterInput(
             mediaType: .video,
-            outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: cameraPixelWidth,
-                AVVideoHeightKey: cameraPixelHeight,
-                AVVideoCompressionPropertiesKey: [
-                    // A webcam-sized H.264 stream, not the display's budget.
-                    AVVideoAverageBitRateKey: 4_000_000,
-                    AVVideoExpectedSourceFrameRateKey: 30,
-                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-                ],
-            ])
+            outputSettings: videoOutputSettings(
+                width: cameraPixelWidth, height: cameraPixelHeight,
+                // A webcam-sized stream, not the display's budget.
+                bitRate: 4_000_000))
         videoInput.expectsMediaDataInRealTime = true
         guard writer.canAdd(videoInput) else {
             throw CaptureError("could not add the camera H.264 video track")

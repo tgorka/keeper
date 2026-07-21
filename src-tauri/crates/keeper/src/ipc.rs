@@ -4193,6 +4193,11 @@ pub async fn recording_start(
     let duration_cap_minutes = keeper_core::registry::get_recording_duration_cap_minutes(&data_dir)
         .map_err(to_ipc_error)?;
     let fps = keeper_core::registry::get_recording_fps(&data_dir).map_err(to_ipc_error)?;
+    // Story 21.1/21.2: codec + capture scale, normalized by the registry reads,
+    // carried as additive wire params (absent ⇒ h264 / 100 on older sidecars).
+    let codec = keeper_core::registry::get_recording_codec(&data_dir).map_err(to_ipc_error)?;
+    let scale_percent =
+        keeper_core::registry::get_recording_scale_percent(&data_dir).map_err(to_ipc_error)?;
     let params = SessionParams {
         // Seeding `screen-0000.mov` lets 17.1's `nextSegmentPath` produce
         // `screen-0001.mov`, … inside the folder with no Swift change.
@@ -4217,6 +4222,8 @@ pub async fn recording_start(
         // Story 19.5: the persisted frame rate (already normalized to {30, 60}
         // by the registry read) rides the wire as the always-present `fps`.
         fps,
+        codec,
+        scale_percent,
     };
     let status = Arc::new(Mutex::new(RecordingStatusVm {
         state: RecordingUiState::Preflight,
@@ -4912,6 +4919,9 @@ pub fn recording_settings_get(state: State<'_, AppState>) -> Result<RecordingSet
             .to_string_lossy()
             .into_owned(),
         fps: keeper_core::registry::get_recording_fps(&data_dir).map_err(to_ipc_error)?,
+        codec: keeper_core::registry::get_recording_codec(&data_dir).map_err(to_ipc_error)?,
+        scale_percent: keeper_core::registry::get_recording_scale_percent(&data_dir)
+            .map_err(to_ipc_error)?,
     })
 }
 
@@ -4939,6 +4949,9 @@ pub fn recording_settings_set(
     keeper_core::registry::set_recording_destination_dir(&data_dir, &settings.destination_dir)
         .map_err(to_ipc_error)?;
     keeper_core::registry::set_recording_fps(&data_dir, settings.fps).map_err(to_ipc_error)?;
+    keeper_core::registry::set_recording_codec(&data_dir, &settings.codec).map_err(to_ipc_error)?;
+    keeper_core::registry::set_recording_scale_percent(&data_dir, settings.scale_percent)
+        .map_err(to_ipc_error)?;
     recording_settings_get(state)
 }
 
