@@ -2947,7 +2947,7 @@ dependencies = [
 
 [[package]]
 name = "keeper"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -2980,7 +2980,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "futures-util",
  "matrix-sdk",
