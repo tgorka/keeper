@@ -3069,6 +3069,156 @@ So that recording ships on evidence and the retrospective has its inputs.
 
 **Epic 20 exit / phase acceptance:** SM-9 green on dev-signed hardware; SM-10 reliability bars met; docs/recording.md current; authored bars owner-confirmed; retrospective inputs on file.
 
+
+## Epic 21: Recording Ergonomics — Codec, Scale, Audio-Only, Template Tray, Session Metadata
+
+Owner-requested increment after the v0.2.0 release (2026-07-21): quality/size
+control (HEVC + resolution scaling), audio-only capture for calls, macOS-native
+template tray icons, and pre-session naming/metadata with wall-clock times in
+the manifest. Builds strictly on the shipped Epics 16-20 chain; the sidecar
+protocol stays v1 (all wire changes additive, per the 16.5/16.6/17.4 precedent).
+
+### Story 21.1: Codec Choice — H.264 / HEVC (Hardware-Accelerated)
+
+As a user,
+I want to pick the video codec, including HEVC,
+So that long recordings are markedly smaller with Apple Silicon hardware encoding.
+
+**Requirements:** extends FR-68/AD-37 (format), NFR-21 (envelope)
+**Dependencies:** Epics 16-20 shipped
+
+**Acceptance Criteria:**
+
+**Given** the Settings -> Recording section and the Recording view's Advanced card
+**When** the user picks the codec (H.264 default | HEVC)
+**Then** the choice persists in the Rust settings registry, applies to the next
+Recording Session (same "Applies to the next Recording Session." idiom as the
+existing knobs), and the sidecar's `startRecording` gains an additive `codec`
+param (`"h264"` default when absent — older wire preserved); segments and the
+camera file encode with `AVVideoCodecType.hevc` when selected, via
+VideoToolbox hardware encode on Apple Silicon (no software-encode fallback
+configuration — the OS picks the encoder), staying fragmented QuickTime .mov,
+gapless-rotation semantics unchanged (the 17.4 CI gate runs for BOTH codecs).
+
+**Given** an HEVC recording
+**Then** the files play in QuickTime on the recording Mac, and docs/recording.md
+gains an honest compatibility note (HEVC needs macOS 10.13+/modern players;
+H.264 stays the maximum-compatibility default).
+
+### Story 21.2: Resolution Scaling — 100% / 75% / 50%
+
+As a user,
+I want to record at a fraction of the native resolution,
+So that file size and encode cost drop when full pixel density is not needed.
+
+**Requirements:** extends FR-68, NFR-21
+**Dependencies:** 21.1 (shared Advanced-card layout)
+
+**Acceptance Criteria:**
+
+**Given** the Advanced card and Settings -> Recording
+**When** the user picks the capture scale (Full 100% default | 75% | 50%)
+**Then** the choice persists, applies to the next Session, and the sidecar
+scales `SCStreamConfiguration.width/height` (and the display-scoped filter
+math) by the factor, rounding to even pixel dimensions (encoder requirement);
+the manifest records the effective pixel dimensions per session; app-scoped
+capture scales identically.
+
+**Given** any scale
+**Then** rotation, the NFR-22 gapless gate, and the idle heartbeat behave
+identically (the heartbeat re-appends the scaled frame — no full-res leak).
+
+### Story 21.3: Audio-Only Recording — No Video Track
+
+As a user,
+I want an audio-only session (system audio and/or microphone, no video),
+So that recording a call does not cost video encode, screen pixels, or size.
+
+**Requirements:** extends FR-69; AD-33/AD-37 (session/manifest shapes hold)
+**Dependencies:** Epics 16-20 shipped
+
+**Acceptance Criteria:**
+
+**Given** a new "Audio only" toggle in the Source card (exclusive with display/
+app targets; Screen Recording permission NOT required when on — the pre-flight
+gates on the mic/system-audio needs only)
+**When** the user starts an audio-only session
+**Then** the sidecar records `audio-####.m4a` segments (AAC; system audio
+and/or mic as separate tracks exactly like the video path) with NO SCStream
+video output and no video track; rotation triggers on the same byte/duration
+budgets; the manifest marks `captureTarget: {kind: "audioOnly"}` and the
+segment ledger tracks the audio files; the banner/tray show the session
+without a segment-pixel meter (elapsed + size only).
+
+**Given** system audio in an audio-only session
+**Then** SCStream runs audio-only capture (video output not attached) OR, when
+only the microphone is enabled, no SCStream at all (AVCapture mic path alone)
+— whichever the implementation needs, the Screen Recording TCC is only
+demanded when system audio is actually on (SCK requires it for system audio;
+the pre-flight row says so honestly).
+
+**Given** a finished audio-only session
+**Then** the files play in Music/QuickTime, and the recovery path (17.3)
+salvages interrupted audio sessions identically.
+
+### Story 21.4: Template (White) Tray Icons — Native Menu-Bar Look
+
+As a user,
+I want keeper's menu-bar icons to render like every other macOS icon,
+So that the tray looks native (white/adaptive), not a colored sticker.
+
+**Requirements:** refines FR-53/Epic 18 tray surfaces; UX-DR (tray)
+**Dependencies:** Epic 18 shipped
+
+**Acceptance Criteria:**
+
+**Given** every tray state (idle presence, recording, error)
+**When** rendered in the menu bar
+**Then** the icons are macOS TEMPLATE images (monochrome with alpha,
+`set_icon_as_template(true)`), so macOS colors them white/black per menu-bar
+appearance and highlights them natively; the recording state stays visually
+distinct via glyph shape (e.g. filled record dot vs outline), NOT via color;
+the error state uses an exclamation-badged glyph. Dark menu bar, light menu
+bar, and reduced-transparency all render correctly (manual device check).
+
+**Given** the loud-failure triad (18.4)
+**Then** its behavior is unchanged — only the icon rendering becomes template.
+
+### Story 21.5: Session Naming & Metadata — Title, Participants, Notes, Times
+
+As a user,
+I want to name the next recording and attach meta information,
+So that sessions are identifiable later (who the call was with, which program).
+
+**Requirements:** extends FR-71 (manifest), AD-33
+**Dependencies:** Epics 16-20 shipped
+
+**Acceptance Criteria:**
+
+**Given** a new "Next session" card in the Recording view (above Source)
+**When** the user fills optional fields — Title, Participants (free text),
+Program/Session note — and starts recording
+**Then** the session folder is named `<sanitized title> <local ts>/` (title
+absent -> the existing `keeper-rec <local ts>/`; sanitization strips
+path-hostile characters, keeps Unicode), and `manifest.json` gains a `meta`
+object `{title, participants, note}` (absent fields omitted) — the fields
+clear after Start (they described THAT session) but the last values are
+offered as quick re-fill.
+
+**Given** every session (with or without meta)
+**Then** the manifest records wall-clock times: `startedAt` and `endedAt` as
+ISO-8601 local timestamps with offset, alongside the existing host-clock PTS
+bounds (which stay authoritative for continuity); the completion card and
+recovery notice render the title when present.
+
+**Given** the meta fields
+**Then** nothing uploads anywhere (zero egress unchanged); values live only in
+the local manifest.
+
+**Epic 21 exit:** all five stories demo-able on hardware; check:all green;
+docs/recording.md updated for codec/scale/audio-only/meta; NFR-21 spot-check
+(HEVC + 50% scale should not exceed the H.264 baseline envelope).
+
 ## Post-MVP — Not Storied (Flagged Only)
 
 Per PRD §5/§6.2 these are explicitly out of MVP; no stories exist for them and none may be smuggled in:
