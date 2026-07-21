@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 story: '20.6'
 slug: '20-6-sm-9-sm-10-phase-acceptance-docs-recording-md-and-retrospective-inputs'
 resolution: coordinator (human-in-the-loop hand-off, as planned)
@@ -19,8 +19,10 @@ resolution: coordinator (human-in-the-loop hand-off, as planned)
       orphaned 52 MB segment playable, next launch reconciled the manifest
       `recording → recovered` and showed the recovery notice with
       Reveal in Finder.
-- [ ] App-scoped recording + webcam separate file — PENDING (one live run;
-      needs the first camera TCC prompt).
+- [x] App-scoped recording + webcam separate file — live run 2026-07-20
+      19:18: captureTarget `com.apple.finder` (honest scoping note shown),
+      separate `camera-0000.mov` (35 MB) beside `screen-0000.mov`, both in the
+      ledger, session finalized, camera file opens in QuickTime.
 
 ## SM-10 reliability
 
@@ -31,8 +33,12 @@ resolution: coordinator (human-in-the-loop hand-off, as planned)
         real disk fill; completion card "Saved 1 segment · 184 MB")
       - mic unplug → covered at unit/simulation level (19.4 suite; no physical
         external mic available on the reference machine) — honest partial
-      - permission revoke mid-record → PENDING (needs a live System Settings
-        toggle)
+      - permission revoke mid-record → live run 2026-07-20 19:26: macOS 26
+        enforces the revoke at the NEXT stream start, not against the live
+        session — the in-flight recording continued and finalized cleanly
+        (zero loss, 176 MB intact), and the pre-flight re-detected the revoke
+        immediately after (Start disabled, "needs the Screen Recording
+        permission"). Loud + honest; no silent-loss path exists.
 - [x] Zero silent recording-loss incidents during phase dogfooding (all losses
       were loud; the two pre-fix soak failures surfaced via the triad).
 - [x] NFR-11 egress diff for the phase is empty — automated zero-egress audit
