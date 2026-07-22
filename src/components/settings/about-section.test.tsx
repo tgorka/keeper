@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
   egressList: vi.fn(() => Promise.resolve([])),
+  debugModeGet: vi.fn(() => Promise.resolve(false)),
+  debugModeSet: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("@tauri-apps/api/app", () => ({
   getVersion: vi.fn(() => Promise.resolve("0.0.0-test")),
@@ -319,5 +321,16 @@ describe("AboutSection capability gating (Story 13.7)", () => {
     expect(screen.queryByText("Software updates")).not.toBeInTheDocument();
     // …but the iOS-only disclosure must NOT flash before the mirror resolves.
     expect(screen.queryByText("On this iPhone")).not.toBeInTheDocument();
+  });
+
+  it("renders the Debug mode toggle off by default and persists a flip (Story 22.5)", async () => {
+    const { debugModeGet, debugModeSet } = await import("@/lib/ipc/client");
+    render(<AboutSection open />);
+    await waitFor(() => expect(vi.mocked(debugModeGet)).toHaveBeenCalled());
+    const toggle = await screen.findByLabelText("Debug mode");
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(vi.mocked(debugModeSet)).toHaveBeenCalledWith(true));
+    expect(toggle).toBeChecked();
   });
 });

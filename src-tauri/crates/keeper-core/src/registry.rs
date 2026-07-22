@@ -593,6 +593,20 @@ pub fn set_menu_bar_presence(data_dir: &Path, enabled: bool) -> Result<(), CoreE
     )
 }
 
+/// The debug-mode toggle's settings key (Story 22.5).
+const DEBUG_MODE_KEY: &str = "debug.mode";
+
+/// Read the debug-mode toggle (Story 22.5, FR-79). Absent / anything-but-`"1"` ⇒
+/// `false` (off by default — on-disk event/error logs are strictly opt-in).
+pub fn get_debug_mode(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, DEBUG_MODE_KEY)?.as_deref() == Some("1"))
+}
+
+/// Write the debug-mode toggle (Story 22.5, FR-79).
+pub fn set_debug_mode(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(data_dir, DEBUG_MODE_KEY, if enabled { "1" } else { "0" })
+}
+
 /// List every muted Network label (Story 10.2, FR-52). Returns the `network_id`
 /// (display-label) of each present row; an empty vector means no Network is muted.
 /// Sorted ascending for determinism. Keeper-local — Matrix has no Network concept.
@@ -2451,6 +2465,18 @@ mod tests {
             get_recovered_sessions_acknowledged(&dir).expect("read after recovery"),
             vec!["keeper-rec c".to_owned()]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn debug_mode_defaults_off_and_round_trips() {
+        let dir = temp_dir();
+        // Absent ⇒ off (on-disk logs are opt-in).
+        assert!(!get_debug_mode(&dir).expect("read default"));
+        set_debug_mode(&dir, true).expect("enable");
+        assert!(get_debug_mode(&dir).expect("read back on"));
+        set_debug_mode(&dir, false).expect("disable");
+        assert!(!get_debug_mode(&dir).expect("read back off"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

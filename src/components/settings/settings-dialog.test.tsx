@@ -75,6 +75,8 @@ vi.mock("@/lib/ipc/client", () => ({
     }),
   ),
   egressList: vi.fn(() => Promise.resolve([])),
+  debugModeGet: vi.fn(() => Promise.resolve(false)),
+  debugModeSet: vi.fn(() => Promise.resolve()),
   verificationCancel: vi.fn(() => Promise.resolve()),
   iosSyncDisclosureShownGet: vi.fn(() => Promise.resolve(true)),
   iosSyncDisclosureShownSet: vi.fn(() => Promise.resolve()),

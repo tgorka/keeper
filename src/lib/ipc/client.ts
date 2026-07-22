@@ -2023,6 +2023,20 @@ export async function launchAtLoginSet(enabled: boolean): Promise<void> {
  * `system.menu_bar_presence` setting; off by default. Rejects with the {@link IpcError}
  * envelope on a registry failure.
  */
+/** Read the live debug-mode toggle (Story 22.5, FR-79). */
+export async function debugModeGet(): Promise<boolean> {
+  return invoke<boolean>("debug_mode_get");
+}
+
+/**
+ * Set the debug-mode toggle (Story 22.5, FR-79): persists `debug.mode` and
+ * flips on-disk logging live — the app log (~/Library/Logs/keeper/keeper.log)
+ * and the per-session events.log beside each manifest.
+ */
+export async function debugModeSet(enabled: boolean): Promise<void> {
+  await invoke("debug_mode_set", { enabled });
+}
+
 export async function menuBarPresenceGet(): Promise<boolean> {
   return await invoke<boolean>("menu_bar_presence_get");
 }

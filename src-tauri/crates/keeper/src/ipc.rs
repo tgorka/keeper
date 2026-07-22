@@ -4362,6 +4362,13 @@ pub async fn recording_start(
         let sink_status = task_status.clone();
         let sink_platform = task_platform.clone();
         let sink = Box::new(move |event: RecordingEvent| {
+            // Story 22.5: while debug mode is on, every sidecar event lands as
+            // one timestamped line in the session's `events.log` (beside
+            // `manifest.json`) — the raw stream a bug report needs. Gated and
+            // best-effort inside the helper; zero cost while off.
+            if crate::debug_log::enabled() {
+                crate::debug_log::session_event(manifest.folder(), &format!("{event:?}"));
+            }
             // Capture the ledger entry before `apply` consumes the event: the
             // basename comes from the sidecar-reported path (synthesized from
             // the track + index when absent — a `track:"camera"` line without
@@ -5134,6 +5141,26 @@ pub fn launch_at_login_set(enabled: bool) -> Result<(), IpcError> {
     Err(to_ipc_error(CoreError::Unsupported(
         "launch-at-login is desktop-only".to_owned(),
     )))
+}
+
+/// Read the debug-mode toggle (Story 22.5, FR-79) — the LIVE gate, which `init`
+/// seeded from the persisted setting and `debug_mode_set` keeps in sync, so the
+/// UI always shows what logging is actually doing right now.
+#[tauri::command]
+pub fn debug_mode_get() -> Result<bool, IpcError> {
+    Ok(crate::debug_log::enabled())
+}
+
+/// Set the debug-mode toggle (Story 22.5, FR-79): persist `debug.mode` first
+/// (durable-before-applied, the settings pattern), then flip the live gate —
+/// applies immediately to both the app log and any in-flight session's
+/// `events.log`, no restart. Errors funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn debug_mode_set(state: State<'_, AppState>, enabled: bool) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::set_debug_mode(&data_dir, enabled).map_err(to_ipc_error)?;
+    crate::debug_log::set_enabled(enabled);
+    Ok(())
 }
 
 /// Read the menu-bar (tray) presence toggle (Story 10.3, FR-53). Reads the persisted

@@ -5,6 +5,7 @@
 // default type-layout recursion depth; raise it as matrix-sdk recommends.
 #![recursion_limit = "256"]
 
+mod debug_log;
 #[cfg(desktop)]
 mod hotkey;
 mod ipc;
@@ -101,6 +102,13 @@ pub fn run() {
             // flow by the `state` query param (Story 2.2). An unmatched / spurious
             // callback is ignored inside `resolve`. The registry lives in the
             // managed `AppState` and is cloned into the `'static` handler.
+            // Install the tracing subscriber + seed the debug-mode gate from
+            // the persisted setting (Story 22.5) — first, so every later setup
+            // step's tracing lands in the (gated) app log too.
+            if let Ok(data_dir) = app.state::<ipc::AppState>().platform.data_dir() {
+                debug_log::init(&data_dir);
+            }
+
             let flows = app.state::<ipc::AppState>().oauth_flows.clone();
             app.deep_link().on_open_url(move |event| {
                 for url in event.urls() {
@@ -394,6 +402,8 @@ pub fn run() {
             ipc::launch_at_login_set,
             ipc::menu_bar_presence_get,
             ipc::menu_bar_presence_set,
+            ipc::debug_mode_get,
+            ipc::debug_mode_set,
             ipc::recording_permission,
             ipc::request_screen_recording_permission,
             ipc::request_microphone_permission,
