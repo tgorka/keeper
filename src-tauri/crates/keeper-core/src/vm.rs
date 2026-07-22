@@ -2663,6 +2663,9 @@ pub enum RecordingTargetVm {
         /// The application's bundle identifier (for the manifest + disclosure).
         bundle_id: String,
     },
+    /// Audio-only session (Story 21.3): system audio and/or the microphone —
+    /// no video track, no screen pixels, `audio-####.m4a` segments.
+    AudioOnly,
 }
 
 /// The honest Screen Recording tri-state the permission pre-flight resolves

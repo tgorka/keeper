@@ -114,8 +114,10 @@ describe("RecordingSourcePicker", () => {
     // The main display is the default selection; arrow-navigate off it. Radix
     // drives keyboard selection through the group's `onValueChange`, never a row
     // `onClick`, so this only updates the store when that channel is wired.
-    radios[0].focus();
-    fireEvent.keyDown(radios[0], { key: "ArrowDown" });
+    // Row 0 is the Audio-only row (Story 21.3); the main display sits at
+    // index 1 as the default selection — arrow-navigate off IT.
+    radios[1].focus();
+    fireEvent.keyDown(radios[1], { key: "ArrowDown" });
     await waitFor(() =>
       expect(selectedRecordingTarget()).not.toEqual({ kind: "display", displayId: null }),
     );

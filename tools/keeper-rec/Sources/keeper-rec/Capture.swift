@@ -88,7 +88,8 @@ struct CaptureError: Error, CustomStringConvertible {
 /// capture is live.
 private final class SegmentWriter {
     let writer: AVAssetWriter
-    let videoInput: AVAssetWriterInput
+    /// `nil` for an audio-only session's writers (Story 21.3).
+    let videoInput: AVAssetWriterInput?
     let audioInput: AVAssetWriterInput?
     /// The microphone's own AAC track (Story 19.3, AD-36) — a second, unmixed
     /// audio input beside the system-audio one, present only when the mic
@@ -99,7 +100,7 @@ private final class SegmentWriter {
     let index: Int
 
     init(
-        writer: AVAssetWriter, videoInput: AVAssetWriterInput,
+        writer: AVAssetWriter, videoInput: AVAssetWriterInput?,
         audioInput: AVAssetWriterInput?, micInput: AVAssetWriterInput?, path: String, index: Int
     ) {
         self.writer = writer
@@ -286,6 +287,10 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// Whether `start` was called (main-thread only; gates the EOF-as-stop path).
     private(set) var isActive = false
 
+    /// Audio-only session (Story 21.3): no SCStream video output, no video
+    /// track — `audio-####.m4a` segments carry system audio and/or the mic.
+    private var audioOnly = false
+
     /// Begin capturing to `path` (Story 17.1). The video target is one of
     /// (Story 19.1): a specific `applicationPid` (app-scoped, exclusionary — only
     /// that app's windows land in the file), a specific `displayId`, or the main
@@ -306,14 +311,26 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         systemAudio: Bool, micEnabled: Bool, micDeviceId: String?,
         cameraEnabled: Bool, cameraDeviceId: String?,
         segmentMB: Int, maxSegmentSeconds: Int, fps: Int,
-        codec: String, scalePercent: Int
+        codec: String, scalePercent: Int, audioOnly: Bool
     ) {
         isActive = true
         self.codec = codec
+        self.audioOnly = audioOnly
         policy = RotationPolicy(segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds)
         emitEvent(["event": "state", "state": "preflight"])
         Task {
             do {
+                // Story 21.3: an audio-only session with NO system audio needs
+                // no SCStream at all — the mic AVCapture path alone drives the
+                // writer, so the Screen Recording TCC is never demanded.
+                if audioOnly && !systemAudio {
+                    guard micEnabled else {
+                        throw CaptureError(
+                            "an audio-only session needs system audio or the microphone")
+                    }
+                    try self.beginAudioOnlyMicSession(path: path, micDeviceId: micDeviceId)
+                    return
+                }
                 // Shareable-content enumeration is the real TCC/SCK gate: an
                 // ungranted or (macOS 15+) ad-hoc-rejected process fails HERE,
                 // which surfaces as the honest error event below (Cap #1722).
@@ -516,7 +533,12 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         }
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: mediaQueue)
+        // Story 21.3: an audio-only session NEVER attaches the `.screen`
+        // output — SCStream runs audio-only over the same filter, no video
+        // samples, no video encode, no video track in the file.
+        if !audioOnly {
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: mediaQueue)
+        }
         if systemAudio {
             try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: mediaQueue)
         }
@@ -555,8 +577,12 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 exit(0)
             }
             // Capture is live (FR-68); the extra `path` names the output file
-            // (the host's tolerant parser keeps or drops it freely).
-            emitEvent(["event": "state", "state": "recording", "path": path])
+            // (the host's tolerant parser keeps or drops it freely). In an
+            // audio-only session (21.3) the FIRST ANCHORED AUDIO SAMPLE emits
+            // this instead — the honest moment audio actually flows.
+            if !self.audioOnly {
+                emitEvent(["event": "state", "state": "recording", "path": path])
+            }
             // Arm the idle heartbeat (Story 20.5 soak fix): a 1 s tick on the
             // media queue that re-appends the last frame whenever the screen
             // goes static and SCK stops delivering.
@@ -585,24 +611,157 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// each rotation target on `mediaQueue`. A failure (e.g. a non-writable
     /// directory) throws — the callers surface it as a single `error` event and
     /// a clean exit.
+    /// Story 21.3 — ingest one SYSTEM-audio buffer in an audio-only session:
+    /// anchors the writer session at the first sample, drives the byte/duration
+    /// rotation (audio buffers are all sync samples — any boundary cuts), and
+    /// tracks the segment's capture-clock bounds like the video path does.
+    private func ingestAudioOnlySample(_ sampleBuffer: CMSampleBuffer, into current: SegmentWriter)
+    {
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if !sessionStarted {
+            current.writer.startSession(atSourceTime: pts)
+            sessionStarted = true
+            segmentStartPTS = pts
+            emitEvent(["event": "state", "state": "recording", "path": current.path])
+        }
+        if !rotationInFlight {
+            let elapsed = CMTimeSubtract(pts, segmentStartPTS).seconds
+            if policy.shouldRotate(
+                observedBytes: onDiskBytes(atPath: current.path),
+                elapsedSeconds: elapsed.isFinite ? elapsed : 0,
+                isKeyframe: true,
+                isFirstFrameOfSegment: !segmentHasVideo)
+            {
+                rotateAudio(at: pts, retiring: current)
+                // The trigger buffer opens the NEW segment (self.current after
+                // the cut) — fall through so no sample is lost at the cut.
+            }
+        }
+        guard let target = self.current, let audioInput = target.audioInput,
+            audioInput.isReadyForMoreMediaData
+        else { return }
+        audioInput.append(sampleBuffer)
+        // In audio mode `segmentHasVideo` means "segment has samples" and the
+        // (video-named) bounds fields carry AUDIO capture-clock bounds.
+        segmentHasVideo = true
+        if pts.isNumeric {
+            if segmentFirstVideoPTS == nil { segmentFirstVideoPTS = pts.seconds }
+            segmentLastVideoPTS = pts.seconds
+        }
+    }
+
+    /// Story 21.3 — the audio-only rotation: open segment N+1's `.m4a` writer
+    /// anchored at the cut PTS, swap it in, retire N (endSession → finish →
+    /// `segmentClosed{track:"audio", ptsStart, ptsEnd}` → `recording`). Audio
+    /// samples are all sync frames, so any buffer boundary is a legal cut.
+    private func rotateAudio(at cutPTS: CMTime, retiring: SegmentWriter) {
+        rotationInFlight = true
+        emitEvent(["event": "state", "state": "rotating"])
+        let next: SegmentWriter
+        do {
+            next = try makeSegmentWriter(
+                path: nextSegmentPath(from: retiring.path), index: retiring.index + 1)
+        } catch {
+            emitEvent([
+                "event": "error",
+                "message": "audio segment rotation failed: \(String(describing: error))",
+            ])
+            exit(0)
+        }
+        next.writer.startSession(atSourceTime: cutPTS)
+        let retiringPTSStart = segmentFirstVideoPTS
+        let retiringPTSEnd = segmentLastVideoPTS
+        current = next
+        segmentStartPTS = cutPTS
+        segmentHasVideo = false
+        segmentFirstVideoPTS = nil
+        segmentLastVideoPTS = nil
+        // Mic continuity across the cut (mirrors the video path).
+        if micPTSLowerBound.isNumeric, CMTimeCompare(cutPTS, micPTSLowerBound) > 0 {
+            micPTSLowerBound = cutPTS
+        }
+
+        retiring.writer.endSession(atSourceTime: cutPTS)
+        retiring.audioInput?.markAsFinished()
+        retiring.micInput?.markAsFinished()
+        finalizeGroup.enter()
+        retiring.writer.finishWriting { [self] in
+            mediaQueue.async { [self] in
+                guard retiring.writer.status == .completed else {
+                    emitEvent([
+                        "event": "error",
+                        "message":
+                            "audio segment finalize failed: \(retiring.writer.error.map(String.init(describing:)) ?? "unknown")",
+                    ])
+                    exit(0)
+                }
+                rotationInFlight = false
+                if !stopping {
+                    var closed: [String: Any] = [
+                        "event": "segmentClosed",
+                        "index": retiring.index,
+                        "path": retiring.path,
+                        "bytes": onDiskBytes(atPath: retiring.path),
+                        "track": "audio",
+                    ]
+                    if let retiringPTSStart { closed["ptsStart"] = retiringPTSStart }
+                    if let retiringPTSEnd { closed["ptsEnd"] = retiringPTSEnd }
+                    emitEvent(closed)
+                    emitEvent(["event": "state", "state": "recording", "path": next.path])
+                }
+                finalizeGroup.leave()
+            }
+        }
+    }
+
+    /// Story 21.3 — the microphone-only session: NO SCStream at all (the
+    /// Screen Recording TCC is never demanded); the 13-14-style parallel
+    /// `AVCaptureSession` mic path alone feeds the writer, and the session
+    /// anchors on the first mic sample via `appendMicSample`'s audio-only leg.
+    private func beginAudioOnlyMicSession(path: String, micDeviceId: String?) throws {
+        wantsAudio = false
+        wantsMic = true
+        activeMicDeviceId = micDeviceId ?? AVCaptureDevice.default(for: .audio)?.uniqueID
+        installMicDisconnectObserver()
+        let first = try makeSegmentWriter(path: path, index: 0)
+        guard first.writer.startWriting() || first.writer.status == .writing else {
+            throw CaptureError("could not start the audio writer")
+        }
+        mediaQueue.async { [self] in current = first }
+        try startMicCaptureSession(deviceId: micDeviceId)
+        // `recording` is emitted by the first anchored mic sample (the honest
+        // moment audio is actually flowing), not here.
+    }
+
     private func makeSegmentWriter(path: String, index: Int) throws -> SegmentWriter {
         let url = URL(fileURLWithPath: path)
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        // Story 21.3: audio-only segments are MPEG-4 audio (`.m4a`) — they
+        // play in Music/QuickTime; video sessions stay QuickTime `.mov` (the
+        // macOS 26 fragmented-.mp4 muxer bug is video-cadence-driven, and the
+        // audio tracks are wall-clock dense by construction — SCK emits
+        // silence buffers continuously and the mic path silence-fills).
+        let writer = try AVAssetWriter(outputURL: url, fileType: audioOnly ? .m4a : .mov)
         // Fragmented MP4 (~4 s fragments, AD-37): size is observable live and a
         // mid-segment kill loses at most the last fragment. `finishWriting`
         // writes the final `moov`, defragmenting into an ordinary playable file.
         writer.movieFragmentInterval = CMTime(seconds: 4, preferredTimescale: 600)
 
-        let videoInput = AVAssetWriterInput(
-            mediaType: .video, outputSettings: videoOutputSettings(width: pixelWidth, height: pixelHeight))
-        videoInput.expectsMediaDataInRealTime = true
-        guard writer.canAdd(videoInput) else {
-            throw CaptureError("could not add the H.264 video track")
+        // Story 21.3: an audio-only segment carries NO video track at all.
+        var videoInput: AVAssetWriterInput?
+        if !audioOnly {
+            let input = AVAssetWriterInput(
+                mediaType: .video,
+                outputSettings: videoOutputSettings(width: pixelWidth, height: pixelHeight))
+            input.expectsMediaDataInRealTime = true
+            guard writer.canAdd(input) else {
+                throw CaptureError("could not add the video track")
+            }
+            writer.add(input)
+            videoInput = input
         }
-        writer.add(videoInput)
 
         var audioInput: AVAssetWriterInput?
         if wantsAudio {
@@ -724,10 +883,40 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// dropped, and the mic simply follows `current`, splitting at the same
     /// rotation handover boundary as system audio.
     private func appendMicSample(_ sampleBuffer: CMSampleBuffer) {
-        guard sampleBuffer.isValid, !stopping, sessionStarted,
+        guard sampleBuffer.isValid, !stopping else { return }
+        let anchorPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        // Story 21.3: in an audio-only session the mic may be the ONLY source
+        // (no SCStream at all) — the first mic sample then anchors the writer
+        // session, and (when system audio is off) mic samples drive the
+        // byte/duration rotation.
+        if audioOnly, let target = current {
+            if !sessionStarted {
+                target.writer.startSession(atSourceTime: anchorPTS)
+                sessionStarted = true
+                segmentStartPTS = anchorPTS
+                segmentHasVideo = true
+                emitEvent(["event": "state", "state": "recording", "path": target.path])
+            }
+            if !wantsAudio, !rotationInFlight {
+                let elapsed = CMTimeSubtract(anchorPTS, segmentStartPTS).seconds
+                if policy.shouldRotate(
+                    observedBytes: onDiskBytes(atPath: target.path),
+                    elapsedSeconds: elapsed.isFinite ? elapsed : 0,
+                    isKeyframe: true,
+                    isFirstFrameOfSegment: false)
+                {
+                    rotateAudio(at: anchorPTS, retiring: target)
+                }
+            }
+            if anchorPTS.isNumeric {
+                if segmentFirstVideoPTS == nil { segmentFirstVideoPTS = anchorPTS.seconds }
+                segmentLastVideoPTS = anchorPTS.seconds
+            }
+        }
+        guard sessionStarted,
             let micInput = current?.micInput, micInput.isReadyForMoreMediaData
         else { return }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let pts = anchorPTS
         // Lower-bound PTS trim (Story 19.4): real samples, silence-fill, and a
         // fallback source all share the one written-tail cursor — a sample
         // landing below it (a late buffer from a dying device, a fallback
@@ -1071,8 +1260,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             cameraSessionStarted = true
             if anchor.isNumeric { cameraSegmentFirstVideoPTS = anchor.seconds }
         }
-        guard camera.videoInput.isReadyForMoreMediaData else { return }
-        camera.videoInput.append(sampleBuffer)
+        guard camera.videoInput?.isReadyForMoreMediaData == true else { return }
+        camera.videoInput?.append(sampleBuffer)
         cameraSegmentHasVideo = true
         // Track the last REAL appended PTS (`ptsEnd`) in original
         // capture-clock seconds — the muxer rebases the file's own timeline
@@ -1145,7 +1334,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         cameraSegmentFirstVideoPTS = keyframePTS.isNumeric ? keyframePTS.seconds : nil
         cameraSegmentLastVideoPTS = nil
         cameraSegmentHasVideo = false
-        retiring.videoInput.markAsFinished()
+        retiring.videoInput?.markAsFinished()
         finalizeGroup.enter()
         retiring.writer.finishWriting { [self] in
             mediaQueue.async { [self] in
@@ -1274,7 +1463,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         }
         let ptsStart = cameraSegmentFirstVideoPTS
         let ptsEnd = cameraSegmentLastVideoPTS
-        camera.videoInput.markAsFinished()
+        camera.videoInput?.markAsFinished()
         finalizeGroup.enter()
         camera.writer.finishWriting { [self] in
             mediaQueue.async { [self] in
@@ -1356,14 +1545,14 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         // independently-playable invariant, AD-37). A freshly `startWriting`+
         // `startSession`'d real-time input is ready immediately; if it somehow is
         // not, fail loudly rather than silently produce a corrupt segment.
-        guard next.videoInput.isReadyForMoreMediaData else {
+        guard next.videoInput?.isReadyForMoreMediaData == true else {
             emitEvent([
                 "event": "error",
                 "message": "rotation writer was not ready for the cut keyframe",
             ])
             exit(0)
         }
-        next.videoInput.append(sampleBuffer)
+        next.videoInput?.append(sampleBuffer)
         segmentHasVideo = true
         // The new segment opens on the cut keyframe: its first AND (so far)
         // last appended video PTS is the cut PTS itself. A non-numeric cut
@@ -1385,7 +1574,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         // writer cannot infer a session end across the sample gap). The stop
         // path never hit this because `stopCapture` quiesces delivery first.
         retiring.writer.endSession(atSourceTime: keyframePTS)
-        retiring.videoInput.markAsFinished()
+        retiring.videoInput?.markAsFinished()
         retiring.audioInput?.markAsFinished()
         retiring.micInput?.markAsFinished()
         finalizeGroup.enter()
@@ -1541,7 +1730,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             if cameraSessionStarted, camera.writer.status == .writing,
                 cameraSegmentHasVideo
             {
-                camera.videoInput.markAsFinished()
+                camera.videoInput?.markAsFinished()
                 finalizeGroup.enter()
                 camera.writer.finishWriting { self.finalizeGroup.leave() }
             } else {
@@ -1549,7 +1738,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 try? FileManager.default.removeItem(atPath: camera.path)
             }
         }
-        current.videoInput.markAsFinished()
+        current.videoInput?.markAsFinished()
         current.audioInput?.markAsFinished()
         current.micInput?.markAsFinished()
         finalizeGroup.enter()
@@ -1604,8 +1793,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 return
             }
         }
-        if current.videoInput.isReadyForMoreMediaData {
-            current.videoInput.append(sampleBuffer)
+        if current.videoInput?.isReadyForMoreMediaData == true {
+            current.videoInput?.append(sampleBuffer)
             segmentHasVideo = true
             lastVideoAppendUptime = ProcessInfo.processInfo.systemUptime
             lastVideoPTS = pts
@@ -1697,7 +1886,14 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             lastVideoFrame = sampleBuffer
             ingestVideoFrame(sampleBuffer, pts: pts, into: current)
         case .audio:
-            // Audio before the session anchor is dropped (the anchor is video).
+            // Story 21.3: in an audio-only session the AUDIO stream anchors the
+            // writer session and drives the byte/duration rotation (there are
+            // no video samples at all). In a video session, audio before the
+            // video anchor is still dropped (the anchor stays video).
+            if audioOnly {
+                ingestAudioOnlySample(sampleBuffer, into: current)
+                return
+            }
             guard sessionStarted, let audioInput = current.audioInput,
                 audioInput.isReadyForMoreMediaData
             else {

@@ -23,4 +23,4 @@ pid: number,
 /**
  * The application's bundle identifier (for the manifest + disclosure).
  */
-bundleId: string, };
+bundleId: string, } | { "kind": "audioOnly" };

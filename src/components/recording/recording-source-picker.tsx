@@ -19,7 +19,7 @@
  * has vanished from the polled list is marked unavailable (Start against it fails
  * cleanly at the sidecar; the selection is never silently swapped).
  */
-import { AppWindow, Monitor } from "lucide-react";
+import { AppWindow, AudioLines, Monitor } from "lucide-react";
 import { type ReactNode, useEffect } from "react";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import type { RecordingTargetVm } from "@/lib/ipc/client";
@@ -39,6 +39,18 @@ import { cn } from "@/lib/utils";
 
 /** The section headers (recording voice). */
 export const DISPLAYS_HEADING = "Displays";
+
+/** The audio-only section heading (Story 21.3; recording voice). */
+export const AUDIO_ONLY_HEADING = "Audio only";
+
+/** The audio-only row label (Story 21.3). */
+export const AUDIO_ONLY_LABEL = "Audio only (no video)";
+
+/** Honest audio-only disclosure (Story 21.3): what lands on disk and which
+ * permissions are actually needed. */
+export const AUDIO_ONLY_NOTE =
+  "No video is recorded — system audio and/or the microphone are saved as audio-####.m4a " +
+  "files. Screen Recording permission is only needed while system audio is on.";
 export const APPLICATIONS_HEADING = "Applications";
 
 /** The main-display row label (the default target). */
@@ -67,6 +79,9 @@ export function appScopeDisclosure(appName: string, systemAudioOn: boolean): str
 
 /** Encode a target as a stable RadioGroup value string. */
 function targetValue(target: RecordingTargetVm): string {
+  if (target.kind === "audioOnly") {
+    return "audioOnly";
+  }
   return target.kind === "display"
     ? `display:${target.displayId ?? "main"}`
     : `application:${target.pid}`;
@@ -161,6 +176,9 @@ export function RecordingSourcePicker({ active = true }: { active?: boolean }) {
       const app = applications.find((candidate) => candidate.pid === pid);
       return app ? { kind: "application", pid, bundleId: app.bundleId } : null;
     }
+    if (value === "audioOnly") {
+      return { kind: "audioOnly" };
+    }
     return null;
   };
 
@@ -185,9 +203,24 @@ export function RecordingSourcePicker({ active = true }: { active?: boolean }) {
         }}
         aria-label="Recording source"
       >
-        {/* Displays first. The main display is always individually selectable
+        {/* Audio only first (Story 21.3): exclusive with every video target —
+            no video track, no screen pixels; system audio and/or the mic land
+            in audio-####.m4a segments. */}
+        <p className="font-medium text-muted-foreground text-xs">{AUDIO_ONLY_HEADING}</p>
+        <SourceRow
+          target={{ kind: "audioOnly" }}
+          name={AUDIO_ONLY_LABEL}
+          glyph={<AudioLines className="size-4" aria-hidden="true" />}
+          selected={selected.kind === "audioOnly"}
+          onSelect={() => select({ kind: "audioOnly" })}
+        />
+        {selected.kind === "audioOnly" && (
+          <p className="px-2 text-muted-foreground text-xs">{AUDIO_ONLY_NOTE}</p>
+        )}
+
+        {/* Displays next. The main display is always individually selectable
             (the default); each enumerated display is its own row. */}
-        <p className="font-medium text-muted-foreground text-xs">{DISPLAYS_HEADING}</p>
+        <p className="mt-2 font-medium text-muted-foreground text-xs">{DISPLAYS_HEADING}</p>
         <SourceRow
           target={{ kind: "display", displayId: null }}
           name={MAIN_DISPLAY_LABEL}

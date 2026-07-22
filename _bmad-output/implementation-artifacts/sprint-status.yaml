@@ -206,6 +206,6 @@ development_status:
   epic-20-retrospective: optional
   21-1-codec-choice-h264-hevc-hardware-accelerated: done
   21-2-resolution-scaling-100-75-50: done
-  21-3-audio-only-recording-no-video-track: backlog
+  21-3-audio-only-recording-no-video-track: done
   21-4-template-white-tray-icons-native-menu-bar-look: done
   21-5-session-naming-and-metadata-title-participants-notes-times: done

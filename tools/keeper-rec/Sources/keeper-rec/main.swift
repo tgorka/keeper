@@ -454,6 +454,8 @@ while let line = readLine(strippingNewline: true) {
         let codec = normalizeCodec((params?["codec"] as? String) ?? "h264")
         let scalePercent = normalizeScalePercent(
             (params?["scalePercent"] as? NSNumber)?.intValue ?? 100)
+        // Story 21.3: additive — absent ⇒ the classic video session.
+        let audioOnly = (params?["audioOnly"] as? Bool) ?? false
         response = ["id": id, "result": ["starting": true]]
         _ = writeLine(response)
         captureEngine.start(
@@ -462,7 +464,7 @@ while let line = readLine(strippingNewline: true) {
             micEnabled: micEnabled, micDeviceId: micDeviceId,
             cameraEnabled: cameraEnabled, cameraDeviceId: cameraDeviceId,
             segmentMB: segmentMB, maxSegmentSeconds: maxSegmentSeconds, fps: fps,
-            codec: codec, scalePercent: scalePercent)
+            codec: codec, scalePercent: scalePercent, audioOnly: audioOnly)
         continue
     case "simulateMicRemoval":
         // Story 19.4: drive the IDENTICAL mic-loss branch a real hardware

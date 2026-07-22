@@ -50,7 +50,8 @@ export function isSameTarget(a: RecordingTargetVm, b: RecordingTargetVm): boolea
   if (a.kind === "application" && b.kind === "application") {
     return a.pid === b.pid && a.bundleId === b.bundleId;
   }
-  return false;
+  // Story 21.3: the audio-only target has no parameters — kind equality is it.
+  return a.kind === "audioOnly" && b.kind === "audioOnly";
 }
 
 /**
@@ -65,6 +66,10 @@ export function isSelectionAvailable(
   sources: RecordingSourcesVm | null,
 ): boolean {
   if (sources === null) {
+    return true;
+  }
+  // Story 21.3: audio-only never depends on the enumerated video sources.
+  if (selected.kind === "audioOnly") {
     return true;
   }
   if (selected.kind === "display") {

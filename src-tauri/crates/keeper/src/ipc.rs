@@ -3989,17 +3989,21 @@ pub async fn recording_list_sources(
 /// unchanged 16.6 path).
 fn resolve_capture_target(
     target: Option<RecordingTargetVm>,
-) -> (CaptureTarget, Option<u32>, Option<ApplicationTarget>) {
+) -> (CaptureTarget, Option<u32>, Option<ApplicationTarget>, bool) {
     match target {
         Some(RecordingTargetVm::Application { pid, bundle_id }) => (
             CaptureTarget::application(bundle_id.clone(), pid),
             None,
             Some(ApplicationTarget { pid, bundle_id }),
+            false,
         ),
         Some(RecordingTargetVm::Display { display_id }) => {
-            (CaptureTarget::display(display_id), display_id, None)
+            (CaptureTarget::display(display_id), display_id, None, false)
         }
-        None => (CaptureTarget::display(None), None, None),
+        // Story 21.3: no video target at all — the sidecar records
+        // `audio-####.m4a` (system audio and/or mic) with no SCStream video.
+        Some(RecordingTargetVm::AudioOnly) => (CaptureTarget::audio_only(), None, None, true),
+        None => (CaptureTarget::display(None), None, None, false),
     }
 }
 
@@ -4089,7 +4093,8 @@ pub async fn recording_start(
     // target + the sidecar's video-target params. `None` (no picker selection)
     // preserves the 16.6 main-display default. A vanished application fails
     // cleanly at the sidecar (an honest `error` → `Failed`), never here.
-    let (capture_target, target_display_id, application) = resolve_capture_target(target);
+    let (capture_target, target_display_id, application, audio_only) =
+        resolve_capture_target(target);
 
     // Settings/destination are resolved BEFORE the `recording_run` start-guard so
     // the pre-record recovery scan below runs OUTSIDE that slot lock. `data_dir`
@@ -4257,7 +4262,14 @@ pub async fn recording_start(
         // Seeding `screen-0000.mov` lets 17.1's `nextSegmentPath` produce
         // `screen-0001.mov`, … inside the folder with no Swift change.
         output_path: folder
-            .join("screen-0000.mov")
+            // Story 21.3: an audio-only session seeds `audio-0000.m4a`; the
+            // classic video session keeps `screen-0000.mov` (17.1's
+            // `nextSegmentPath` then numbers rotations either way).
+            .join(if audio_only {
+                "audio-0000.m4a"
+            } else {
+                "screen-0000.mov"
+            })
             .to_string_lossy()
             .into_owned(),
         // Story 19.1: an application target wins; otherwise the selected display
@@ -4279,6 +4291,7 @@ pub async fn recording_start(
         fps,
         codec,
         scale_percent,
+        audio_only,
     };
     let status = Arc::new(Mutex::new(RecordingStatusVm {
         state: RecordingUiState::Preflight,
@@ -5882,7 +5895,7 @@ mod tests {
     fn resolve_capture_target_maps_each_kind() {
         // Story 19.1: an application target maps to an application manifest
         // CaptureTarget, no display id, and the sidecar ApplicationTarget.
-        let (target, display_id, application) =
+        let (target, display_id, application, _audio_only) =
             resolve_capture_target(Some(RecordingTargetVm::Application {
                 pid: 501,
                 bundle_id: "com.apple.Safari".to_owned(),
@@ -5901,7 +5914,7 @@ mod tests {
         );
 
         // A specific display maps to a display target carrying that id.
-        let (target, display_id, application) =
+        let (target, display_id, application, _audio_only) =
             resolve_capture_target(Some(RecordingTargetVm::Display {
                 display_id: Some(7),
             }));
@@ -5910,7 +5923,7 @@ mod tests {
         assert_eq!(application, None);
 
         // No selection preserves the 16.6 main-display default.
-        let (target, display_id, application) = resolve_capture_target(None);
+        let (target, display_id, application, _audio_only) = resolve_capture_target(None);
         assert_eq!(target, CaptureTarget::display(None));
         assert_eq!(display_id, None);
         assert_eq!(application, None);

@@ -725,6 +725,10 @@ pub struct SessionParams {
     /// Capture scale percent (Story 21.2): 100/75/50, already normalized; the
     /// sidecar's additive `scalePercent` param (absent ⇒ 100).
     pub scale_percent: u32,
+    /// Audio-only session (Story 21.3): no SCStream video output, no video
+    /// track — `audio-####.m4a` segments. The sidecar's additive `audioOnly`
+    /// param (absent ⇒ false, the classic video path).
+    pub audio_only: bool,
 }
 
 /// Build the one-line `startRecording` request (Story 16.6 + 17.5 + 19.5; no
@@ -747,6 +751,8 @@ pub fn start_recording_request(id: u64, params: &SessionParams) -> String {
         // Additive (Story 21.1/21.2): absent ⇒ h264 / 100 on older sidecars.
         "codec": params.codec,
         "scalePercent": params.scale_percent,
+        // Additive (Story 21.3): absent ⇒ the classic video session.
+        "audioOnly": params.audio_only,
     });
     // An application target wins (Story 19.1): emit `applicationPid`+`bundleId`
     // and omit `displayId` entirely, so the sidecar builds an app-scoped filter.
@@ -1077,6 +1083,9 @@ const SEGMENT_STEM_PREFIX: &str = "screen-";
 /// disambiguated in the ledger by `track`, never by index alone.
 const CAMERA_SEGMENT_STEM_PREFIX: &str = "camera-";
 
+/// Audio-only-track segment files are named `audio-####.m4a` (Story 21.3).
+const AUDIO_SEGMENT_STEM_PREFIX: &str = "audio-";
+
 /// The persisted `status` of a session manifest (Story 17.2). Lowercase on the
 /// wire: `"recording" | "finalized" | "recovered" | "failed"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1181,6 +1190,17 @@ impl CaptureTarget {
             display_id: None,
             bundle_id: Some(bundle_id),
             pid: Some(pid),
+        }
+    }
+
+    /// An audio-only capture target (Story 21.3): no video track at all —
+    /// system audio and/or the microphone into `audio-####.m4a` segments.
+    pub fn audio_only() -> Self {
+        Self {
+            kind: "audioOnly".to_owned(),
+            display_id: None,
+            bundle_id: None,
+            pid: None,
         }
     }
 }
@@ -1433,11 +1453,13 @@ impl SessionManifest {
                 tracing::warn!("manifest reconcile: skipping non-UTF-8 file name");
                 continue;
             };
-            let is_mov = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"));
-            if !is_mov {
+            let is_segment_file =
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("mov") || ext.eq_ignore_ascii_case("m4a")
+                    });
+            if !is_segment_file {
                 continue;
             }
             let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -1452,6 +1474,10 @@ impl SessionManifest {
                 "screen"
             } else if stem.starts_with(CAMERA_SEGMENT_STEM_PREFIX) {
                 "camera"
+            } else if stem.starts_with(AUDIO_SEGMENT_STEM_PREFIX) {
+                // Story 21.3: audio-only sessions ledger their `audio-####.m4a`
+                // files as their own track.
+                "audio"
             } else {
                 continue;
             };
@@ -1727,7 +1753,9 @@ pub fn session_bytes_on_disk(folder: &Path) -> u64 {
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        if !stem.starts_with(SEGMENT_STEM_PREFIX) || segment_index_from_stem(stem).is_none() {
+        let is_session_stem =
+            stem.starts_with(SEGMENT_STEM_PREFIX) || stem.starts_with(AUDIO_SEGMENT_STEM_PREFIX);
+        if !is_session_stem || segment_index_from_stem(stem).is_none() {
             continue;
         }
         // `fs::metadata` (follows symlinks) — the real file's current length; a
@@ -1773,7 +1801,7 @@ pub fn current_segment_bytes_on_disk(folder: &Path) -> u64 {
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        if !stem.starts_with(SEGMENT_STEM_PREFIX) {
+        if !(stem.starts_with(SEGMENT_STEM_PREFIX) || stem.starts_with(AUDIO_SEGMENT_STEM_PREFIX)) {
             continue;
         }
         let Some(index) = segment_index_from_stem(stem) else {
@@ -2542,6 +2570,7 @@ mod tests {
             fps: 30,
             codec: "h264".to_owned(),
             scale_percent: 100,
+            audio_only: false,
         };
         let line = start_recording_request(4, &params);
         assert!(!line.contains('\n'), "the shell port owns line framing");
@@ -2587,6 +2616,7 @@ mod tests {
             fps: 30,
             codec: "h264".to_owned(),
             scale_percent: 100,
+            audio_only: false,
         };
         let line = start_recording_request(6, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2610,6 +2640,7 @@ mod tests {
             fps: 30,
             codec: "h264".to_owned(),
             scale_percent: 100,
+            audio_only: false,
         };
         let line = start_recording_request(10, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2639,6 +2670,7 @@ mod tests {
             fps: 30,
             codec: "h264".to_owned(),
             scale_percent: 100,
+            audio_only: false,
         };
         let line = start_recording_request(11, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2670,6 +2702,7 @@ mod tests {
             fps: 30,
             codec: "h264".to_owned(),
             scale_percent: 100,
+            audio_only: false,
         };
         let line = start_recording_request(12, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2734,6 +2767,7 @@ mod tests {
             fps: 30,
             codec: "h264".to_owned(),
             scale_percent: 100,
+            audio_only: false,
         };
         let line = start_recording_request(14, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2764,6 +2798,7 @@ mod tests {
             fps: 30,
             codec: "h264".to_owned(),
             scale_percent: 100,
+            audio_only: false,
         };
         let line = start_recording_request(15, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2798,6 +2833,7 @@ mod tests {
             fps: 30,
             codec: "h264".to_owned(),
             scale_percent: 100,
+            audio_only: false,
         };
         let line = start_recording_request(16, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2866,6 +2902,7 @@ mod tests {
             fps: 30,
             codec: "h264".to_owned(),
             scale_percent: 100,
+            audio_only: false,
         };
         let line = start_recording_request(9, &params);
         let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -2900,6 +2937,7 @@ mod tests {
                 fps,
                 codec: "h264".to_owned(),
                 scale_percent: 100,
+                audio_only: false,
             };
             let line = start_recording_request(13, &params);
             let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
@@ -3542,6 +3580,7 @@ mod tests {
             fps: 30,
             codec: "h264".to_owned(),
             scale_percent: 100,
+            audio_only: false,
         }
     }
 

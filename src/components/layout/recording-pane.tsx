@@ -46,10 +46,10 @@ import { useRecordingPermission } from "@/hooks/use-recording-permission";
 import { isLiveRecording, useRecordingSession } from "@/hooks/use-recording-session";
 import { useRecoveredSessions } from "@/hooks/use-recovered-sessions";
 import type { RecordingPermissionVm } from "@/lib/ipc/client";
-import { systemAudioEnabled } from "@/lib/stores/recording-audio";
+import { systemAudioEnabled, useSystemAudioEnabled } from "@/lib/stores/recording-audio";
 import { consumeRecordingMeta } from "@/lib/stores/recording-meta";
-import { micDeviceId, micEnabled } from "@/lib/stores/recording-mic";
-import { selectedRecordingTarget } from "@/lib/stores/recording-source";
+import { micDeviceId, micEnabled, useMicEnabled } from "@/lib/stores/recording-mic";
+import { selectedRecordingTarget, useSelectedRecordingTarget } from "@/lib/stores/recording-source";
 import { cameraDeviceId, webcamEnabled } from "@/lib/stores/recording-webcam";
 
 /** Honest local-only subtitle (recording voice: sentence case, no exclamation
@@ -143,9 +143,31 @@ export function RecordingPane() {
   // `?? SCREEN_RECORDING_PERMISSION_NAME` fallback guarantees a disabled Start is
   // never left with no note (Screen Recording is always required) should the two
   // ever drift — Start must always tell the user what to fix.
-  const blockedBy = permission.canStart
+  // Story 21.3: an audio-only session re-derives the gate from the legs the
+  // MODE actually needs — Screen Recording only while system audio is on, the
+  // mic leg only while the mic is on; a mic-only session never demands the
+  // screen grant at all. Video sessions keep the Rust-aggregated `canStart`.
+  const audioOnlySelected = useSelectedRecordingTarget().kind === "audioOnly";
+  const audioOnlySystemAudio = useSystemAudioEnabled();
+  const audioOnlyMic = useMicEnabled();
+  let effectiveCanStart = permission.canStart;
+  let blockedBy = permission.canStart
     ? null
     : (blockingPermissionName(permission) ?? SCREEN_RECORDING_PERMISSION_NAME);
+  if (audioOnlySelected) {
+    const screenOk = !audioOnlySystemAudio || permission.screenRecording === "granted";
+    const micOk =
+      !audioOnlyMic || permission.microphone == null || permission.microphone === "granted";
+    const anySource = audioOnlySystemAudio || audioOnlyMic;
+    effectiveCanStart = screenOk && micOk && anySource;
+    blockedBy = effectiveCanStart
+      ? null
+      : !anySource
+        ? null
+        : !screenOk
+          ? SCREEN_RECORDING_PERMISSION_NAME
+          : MICROPHONE_PERMISSION_NAME;
+  }
 
   return (
     <section
@@ -164,7 +186,7 @@ export function RecordingPane() {
           {!live && (
             <Button
               type="button"
-              disabled={!permission.canStart}
+              disabled={!effectiveCanStart}
               onClick={() => {
                 // Story 19.1: start the session for the picker's selected target
                 // (a display or an application; the main display by default).
