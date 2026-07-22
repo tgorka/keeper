@@ -593,6 +593,61 @@ pub fn set_menu_bar_presence(data_dir: &Path, enabled: bool) -> Result<(), CoreE
     )
 }
 
+/// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
+/// `keeper.db` in the data dir.
+pub const CONFIG_FILE_NAME: &str = "config.json";
+
+/// Import `config.json` from the data dir over the settings table (Story 22.6,
+/// FR-80) — the file wins, enabling hand-edited / version-controlled setups.
+///
+/// Format: one flat JSON object; string, number, and boolean values only.
+/// Booleans map to the registry's `"1"`/`"0"` convention, numbers to their
+/// decimal text; every key is imported verbatim into the k/v table, and the
+/// existing typed getters keep clamping/normalizing on read, so an out-of-range
+/// hand-edit degrades to the documented default rather than misbehaving.
+///
+/// Returns the imported keys (empty when the file is absent — the normal
+/// case). A malformed file or a non-scalar value is an `Err` — the caller
+/// reports it loudly and skips the import; it must never abort startup.
+pub fn import_config_file(data_dir: &Path) -> Result<Vec<String>, CoreError> {
+    let path = data_dir.join(CONFIG_FILE_NAME);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(CoreError::Internal(format!(
+                "could not read {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| CoreError::Internal(format!("malformed {}: {error}", path.display())))?;
+    let object = parsed.as_object().ok_or_else(|| {
+        CoreError::Internal(format!(
+            "malformed {}: expected one flat JSON object",
+            path.display()
+        ))
+    })?;
+    let mut imported = Vec::with_capacity(object.len());
+    for (key, value) in object {
+        let text = match value {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Bool(flag) => (if *flag { "1" } else { "0" }).to_owned(),
+            serde_json::Value::Number(number) => number.to_string(),
+            _ => {
+                return Err(CoreError::Internal(format!(
+                    "malformed {}: key {key:?} must be a string, number, or boolean",
+                    path.display()
+                )));
+            }
+        };
+        set_setting(data_dir, key, &text)?;
+        imported.push(key.clone());
+    }
+    Ok(imported)
+}
+
 /// The debug-mode toggle's settings key (Story 22.5).
 const DEBUG_MODE_KEY: &str = "debug.mode";
 
@@ -2465,6 +2520,46 @@ mod tests {
             get_recovered_sessions_acknowledged(&dir).expect("read after recovery"),
             vec!["keeper-rec c".to_owned()]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_file_import_wins_over_settings_and_reports_malformed_loudly() {
+        let dir = temp_dir();
+        // Absent file ⇒ clean no-op (the normal case).
+        assert!(
+            import_config_file(&dir).expect("absent is fine").is_empty(),
+            "absent config.json imports nothing"
+        );
+        // Pre-existing setting…
+        set_recording_codec(&dir, "h264").expect("seed codec");
+        set_debug_mode(&dir, false).expect("seed debug");
+        // …is overridden by the file (file wins), with bool/number mapping.
+        std::fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            r#"{"recording.codec":"hevc","recording.scale_percent":50,"debug.mode":true}"#,
+        )
+        .expect("write config");
+        let mut imported = import_config_file(&dir).expect("import");
+        imported.sort();
+        assert_eq!(
+            imported,
+            vec!["debug.mode", "recording.codec", "recording.scale_percent"]
+        );
+        assert_eq!(get_recording_codec(&dir).expect("codec"), "hevc");
+        assert_eq!(get_recording_scale_percent(&dir).expect("scale"), 50);
+        assert!(get_debug_mode(&dir).expect("debug"));
+        // Malformed JSON ⇒ a loud Err, and the prior imports stay intact.
+        std::fs::write(dir.join(CONFIG_FILE_NAME), "{not json").expect("write bad");
+        assert!(import_config_file(&dir).is_err(), "malformed is an Err");
+        assert_eq!(get_recording_codec(&dir).expect("codec intact"), "hevc");
+        // A nested value is rejected too (flat scalars only).
+        std::fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            r#"{"recording":{"codec":"h264"}}"#,
+        )
+        .expect("write nested");
+        assert!(import_config_file(&dir).is_err(), "non-scalar is an Err");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

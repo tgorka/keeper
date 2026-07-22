@@ -102,11 +102,24 @@ pub fn run() {
             // flow by the `state` query param (Story 2.2). An unmatched / spurious
             // callback is ignored inside `resolve`. The registry lives in the
             // managed `AppState` and is cloned into the `'static` handler.
-            // Install the tracing subscriber + seed the debug-mode gate from
-            // the persisted setting (Story 22.5) — first, so every later setup
-            // step's tracing lands in the (gated) app log too.
+            // Boot-time config import + logging init (Stories 22.5/22.6),
+            // first among the setup steps. Order matters: `config.json` is
+            // imported over the settings table BEFORE `debug_log::init` seeds
+            // the debug gate, so a hand-edited `"debug.mode": true` applies to
+            // this very boot; the import outcome is logged AFTER init so the
+            // subscriber exists to carry it (loudly, for the malformed case).
             if let Ok(data_dir) = app.state::<ipc::AppState>().platform.data_dir() {
+                let imported = keeper_core::registry::import_config_file(&data_dir);
                 debug_log::init(&data_dir);
+                match imported {
+                    Ok(keys) if keys.is_empty() => {}
+                    Ok(keys) => {
+                        tracing::info!(?keys, "config.json: imported overrides into settings");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "config.json: import failed; file skipped");
+                    }
+                }
             }
 
             let flows = app.state::<ipc::AppState>().oauth_flows.clone();
