@@ -65,6 +65,7 @@ func normalizeScalePercent(_ percent: Int) -> Int {
     switch percent {
     case 75: return 75
     case 50: return 50
+    case 25: return 25
     default: return 100
     }
 }

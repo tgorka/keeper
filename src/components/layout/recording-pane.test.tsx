@@ -21,7 +21,9 @@ vi.mock("@/lib/ipc/client", () => ({
   // A real main display keeps the default (main-display) selection available.
   listRecordingSources: vi.fn(() =>
     Promise.resolve({
-      displays: [{ id: 1, width: 3456, height: 2234, isMain: true }],
+      displays: [
+        { id: 1, width: 3456, height: 2234, isMain: true, pixelWidth: 3456, pixelHeight: 2234 },
+      ],
       applications: [],
       microphones: [],
       cameras: [],

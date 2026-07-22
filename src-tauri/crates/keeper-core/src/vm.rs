@@ -2575,6 +2575,13 @@ pub struct RecordingDisplayVm {
     pub height: u32,
     /// Whether this is the main display (menu-bar display).
     pub is_main: bool,
+    /// The display's true pixel width (Story 22.1; additive — 0 when an older
+    /// sidecar omits it). Backs the live effective-resolution hint.
+    #[serde(default)]
+    pub pixel_width: u32,
+    /// The display's true pixel height (Story 22.1; additive — 0 when absent).
+    #[serde(default)]
+    pub pixel_height: u32,
 }
 
 /// One recordable application reported by `listSources` (Story 16.4/19.1). Real

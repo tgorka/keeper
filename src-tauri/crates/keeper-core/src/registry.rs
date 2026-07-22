@@ -1039,13 +1039,14 @@ const RECORDING_SCALE_KEY: &str = "recording.scale_percent";
 /// The full-resolution default capture scale (Story 21.2).
 pub const RECORDING_SCALE_DEFAULT: u32 = 100;
 
-/// Normalize a capture scale to the legal set {100, 75, 50}: anything else
-/// becomes the 100 default (the sidecar normalizes again defensively and also
-/// rounds the scaled dimensions to even pixels for the encoder).
+/// Normalize a capture scale to the legal set {100, 75, 50, 25} (Story 22.1):
+/// anything else becomes the 100 default (the sidecar normalizes again
+/// defensively and also rounds the scaled dimensions to even pixels).
 pub fn normalize_recording_scale(percent: u32) -> u32 {
     match percent {
         75 => 75,
         50 => 50,
+        25 => 25,
         _ => RECORDING_SCALE_DEFAULT,
     }
 }

@@ -161,6 +161,11 @@ private func listDisplays() -> [[String: Any]] {
             "width": CGDisplayPixelsWide(id),
             "height": CGDisplayPixelsHigh(id),
             "isMain": CGDisplayIsMain(id) != 0,
+            // Story 22.1 (additive): the true pixel size backing the UI's
+            // live effective-resolution hint. Same source the capture engine
+            // scales from, so the hint always matches the file.
+            "pixelWidth": CGDisplayPixelsWide(id),
+            "pixelHeight": CGDisplayPixelsHigh(id),
         ]
     }
 }

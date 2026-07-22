@@ -46,7 +46,7 @@ export const RECORDING_FPS_ALLOWED: readonly number[] = [30, 60];
 export const RECORDING_CODEC_ALLOWED: readonly string[] = ["h264", "hevc"];
 
 /** The legal capture-scale set (Story 21.2) — mirror of the Rust normalization. */
-export const RECORDING_SCALE_ALLOWED: readonly number[] = [100, 75, 50];
+export const RECORDING_SCALE_ALLOWED: readonly number[] = [100, 75, 50, 25];
 
 export interface RecordingSettingsState {
   /**

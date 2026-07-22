@@ -3492,6 +3492,8 @@ mod tests {
                 width: 3456,
                 height: 2234,
                 is_main: true,
+                pixel_width: 3456,
+                pixel_height: 2234,
             }],
             applications: vec![],
             microphones: vec![],
