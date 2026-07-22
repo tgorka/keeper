@@ -4065,6 +4065,8 @@ pub async fn recording_start(
     meta_title: Option<String>,
     meta_participants: Option<String>,
     meta_note: Option<String>,
+    meta_tags: Option<Vec<String>>,
+    meta_custom: Option<Vec<keeper_core::recording::SessionMetaField>>,
 ) -> Result<RecordingStatusVm, IpcError> {
     // Story 19.2: the Audio card's ephemeral per-session toggle. `None` (no
     // explicit choice reached the command) preserves the 16.6 default-on path.
@@ -4219,12 +4221,40 @@ pub async fn recording_start(
     // (ISO-8601 with offset; the host owns clocks — core stays time-agnostic).
     let session_meta = {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        // Story 22.3: tags (blank entries dropped) + custom name/value pairs
+        // (rows with a blank NAME dropped; blank values are legal).
+        let tags = meta_tags
+            .map(|list| {
+                list.into_iter()
+                    .map(|t| t.trim().to_owned())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|list| !list.is_empty());
+        let custom = meta_custom
+            .map(|list| {
+                list.into_iter()
+                    .filter(|f| !f.name.trim().is_empty())
+                    .map(|f| keeper_core::recording::SessionMetaField {
+                        name: f.name.trim().to_owned(),
+                        value: f.value.trim().to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|list| !list.is_empty());
         let meta = keeper_core::recording::SessionMeta {
             title: clean(meta_title.clone()),
             participants: clean(meta_participants),
             note: clean(meta_note),
+            tags,
+            custom,
         };
-        (meta.title.is_some() || meta.participants.is_some() || meta.note.is_some()).then_some(meta)
+        (meta.title.is_some()
+            || meta.participants.is_some()
+            || meta.note.is_some()
+            || meta.tags.is_some()
+            || meta.custom.is_some())
+        .then_some(meta)
     };
     let manifest = SessionManifest::create_with_meta(
         folder.clone(),

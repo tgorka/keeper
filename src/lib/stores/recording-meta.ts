@@ -10,6 +10,13 @@
  */
 import { create } from "zustand";
 
+export interface RecordingMetaCustomRow {
+  /** The field's user-chosen name. */
+  name: string;
+  /** The field's value. */
+  value: string;
+}
+
 export interface RecordingMetaFields {
   /** Optional human title (also drives the session folder name). */
   title: string;
@@ -17,9 +24,19 @@ export interface RecordingMetaFields {
   participants: string;
   /** Optional program/session note. */
   note: string;
+  /** Comma-separated tags (Story 22.3) — split/trimmed on consume. */
+  tags: string;
+  /** Repeatable custom name/value rows (Story 22.3). */
+  custom: RecordingMetaCustomRow[];
 }
 
-const EMPTY: RecordingMetaFields = { title: "", participants: "", note: "" };
+const EMPTY: RecordingMetaFields = {
+  title: "",
+  participants: "",
+  note: "",
+  tags: "",
+  custom: [],
+};
 
 interface RecordingMetaState {
   /** The fields describing the NEXT session (cleared by `consume`). */
@@ -43,7 +60,11 @@ export const recordingMetaStore = create<RecordingMetaState>((set, get) => ({
   consume: () => {
     const taken = get().fields;
     const hasAny =
-      taken.title.trim() !== "" || taken.participants.trim() !== "" || taken.note.trim() !== "";
+      taken.title.trim() !== "" ||
+      taken.participants.trim() !== "" ||
+      taken.note.trim() !== "" ||
+      taken.tags.trim() !== "" ||
+      taken.custom.some((row) => row.name.trim() !== "");
     set({ fields: EMPTY, last: hasAny ? taken : get().last });
     return taken;
   },
@@ -64,15 +85,26 @@ export function consumeRecordingMeta(): {
   title?: string;
   participants?: string;
   note?: string;
+  tags?: string[];
+  custom?: RecordingMetaCustomRow[];
 } {
   const taken = recordingMetaStore.getState().consume();
   const clean = (value: string) => {
     const trimmed = value.trim();
     return trimmed === "" ? undefined : trimmed;
   };
+  const tags = taken.tags
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter((tag) => tag !== "");
+  const custom = taken.custom
+    .map((row) => ({ name: row.name.trim(), value: row.value.trim() }))
+    .filter((row) => row.name !== "");
   return {
     title: clean(taken.title),
     participants: clean(taken.participants),
     note: clean(taken.note),
+    tags: tags.length > 0 ? tags : undefined,
+    custom: custom.length > 0 ? custom : undefined,
   };
 }

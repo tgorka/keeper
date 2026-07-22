@@ -83,7 +83,13 @@ export interface UseRecordingSession {
     micDeviceId?: string | null,
     cameraEnabled?: boolean,
     cameraDeviceId?: string | null,
-    meta?: { title?: string; participants?: string; note?: string },
+    meta?: {
+      title?: string;
+      participants?: string;
+      note?: string;
+      tags?: string[];
+      custom?: { name: string; value: string }[];
+    },
   ) => Promise<void>;
   /** Request the graceful stop-and-finalize (idempotent). */
   stop: () => Promise<void>;
@@ -163,7 +169,13 @@ export function useRecordingSession(): UseRecordingSession {
       micDeviceId?: string | null,
       cameraEnabled?: boolean,
       cameraDeviceId?: string | null,
-      meta?: { title?: string; participants?: string; note?: string },
+      meta?: {
+        title?: string;
+        participants?: string;
+        note?: string;
+        tags?: string[];
+        custom?: { name: string; value: string }[];
+      },
     ) => {
       try {
         const vm = await recordingStart(

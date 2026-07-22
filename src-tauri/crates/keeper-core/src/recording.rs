@@ -1273,6 +1273,22 @@ pub struct SessionMeta {
     /// Which program/session this is (free-form note).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub note: Option<String>,
+    /// Free-form tags (Story 22.3) — comma-separated in the UI, a list here.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tags: Option<Vec<String>>,
+    /// Repeatable custom name/value pairs (Story 22.3).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub custom: Option<Vec<SessionMetaField>>,
+}
+
+/// One custom name/value metadata pair (Story 22.3) — both free text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMetaField {
+    /// The field's user-chosen name.
+    pub name: String,
+    /// The field's value.
+    pub value: String,
 }
 
 /// Build a secret-free [`RecordingError::ManifestIo`]: the failing operation name

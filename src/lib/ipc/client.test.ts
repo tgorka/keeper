@@ -261,6 +261,8 @@ describe("recordingStart / requestMicrophonePermission (Story 19.3)", () => {
       metaTitle: null,
       metaParticipants: null,
       metaNote: null,
+      metaTags: null,
+      metaCustom: null,
     });
   });
 
@@ -277,6 +279,8 @@ describe("recordingStart / requestMicrophonePermission (Story 19.3)", () => {
       metaTitle: null,
       metaParticipants: null,
       metaNote: null,
+      metaTags: null,
+      metaCustom: null,
     });
   });
 
@@ -293,6 +297,8 @@ describe("recordingStart / requestMicrophonePermission (Story 19.3)", () => {
       metaTitle: null,
       metaParticipants: null,
       metaNote: null,
+      metaTags: null,
+      metaCustom: null,
     });
   });
 
@@ -317,6 +323,8 @@ describe("recordingStart camera args / requestCameraPermission (Story 20.1)", ()
       metaTitle: null,
       metaParticipants: null,
       metaNote: null,
+      metaTags: null,
+      metaCustom: null,
     });
   });
 
@@ -333,6 +341,8 @@ describe("recordingStart camera args / requestCameraPermission (Story 20.1)", ()
       metaTitle: null,
       metaParticipants: null,
       metaNote: null,
+      metaTags: null,
+      metaCustom: null,
     });
   });
 

@@ -1783,7 +1783,13 @@ export async function recordingStart(
   micDeviceId?: string | null,
   cameraEnabled?: boolean,
   cameraDeviceId?: string | null,
-  meta?: { title?: string; participants?: string; note?: string },
+  meta?: {
+    title?: string;
+    participants?: string;
+    note?: string;
+    tags?: string[];
+    custom?: { name: string; value: string }[];
+  },
 ): Promise<RecordingStatusVm> {
   // Story 19.1: the picker's selected source/target (a display or an
   // application). Omitted (`undefined`) preserves the 16.6 main-display default.
@@ -1808,6 +1814,8 @@ export async function recordingStart(
     metaTitle: meta?.title ?? null,
     metaParticipants: meta?.participants ?? null,
     metaNote: meta?.note ?? null,
+    metaTags: meta?.tags ?? null,
+    metaCustom: meta?.custom ?? null,
   });
 }
 
