@@ -19,7 +19,7 @@
  * has vanished from the polled list is marked unavailable (Start against it fails
  * cleanly at the sidecar; the selection is never silently swapped).
  */
-import { AppWindow, AudioLines, Monitor } from "lucide-react";
+import { AppWindow, AudioLines, LoaderCircle, Monitor } from "lucide-react";
 import { type ReactNode, useEffect } from "react";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import type { RecordingTargetVm } from "@/lib/ipc/client";
@@ -183,13 +183,17 @@ export function RecordingSourcePicker({ active = true }: { active?: boolean }) {
   };
 
   return (
-    <div className="flex flex-col gap-4" data-testid={SOURCE_PICKER_TESTID}>
-      <div className="flex items-center justify-between">
-        <span className="sr-only">Recording source</span>
+    <div className="relative flex flex-col gap-4" data-testid={SOURCE_PICKER_TESTID}>
+      {/* Story 22.2: the refresh indicator is a FIXED-SIZE spinner slot — it
+          appears/disappears without adding a text line, so the ~3 s poll never
+          reflows the card (the old "Refreshing…" line flickered the layout). */}
+      <div className="absolute top-4 right-4 flex size-4 items-center justify-center">
         {refreshing && (
-          <span className="text-muted-foreground text-xs" role="status">
-            {REFRESHING_LABEL}
-          </span>
+          <LoaderCircle
+            className="size-4 animate-spin text-muted-foreground"
+            role="status"
+            aria-label={REFRESHING_LABEL}
+          />
         )}
       </div>
 

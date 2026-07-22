@@ -4065,6 +4065,8 @@ pub async fn recording_start(
     meta_title: Option<String>,
     meta_participants: Option<String>,
     meta_note: Option<String>,
+    meta_tags: Option<Vec<String>>,
+    meta_custom: Option<Vec<keeper_core::recording::SessionMetaField>>,
 ) -> Result<RecordingStatusVm, IpcError> {
     // Story 19.2: the Audio card's ephemeral per-session toggle. `None` (no
     // explicit choice reached the command) preserves the 16.6 default-on path.
@@ -4219,12 +4221,40 @@ pub async fn recording_start(
     // (ISO-8601 with offset; the host owns clocks — core stays time-agnostic).
     let session_meta = {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        // Story 22.3: tags (blank entries dropped) + custom name/value pairs
+        // (rows with a blank NAME dropped; blank values are legal).
+        let tags = meta_tags
+            .map(|list| {
+                list.into_iter()
+                    .map(|t| t.trim().to_owned())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|list| !list.is_empty());
+        let custom = meta_custom
+            .map(|list| {
+                list.into_iter()
+                    .filter(|f| !f.name.trim().is_empty())
+                    .map(|f| keeper_core::recording::SessionMetaField {
+                        name: f.name.trim().to_owned(),
+                        value: f.value.trim().to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|list| !list.is_empty());
         let meta = keeper_core::recording::SessionMeta {
             title: clean(meta_title.clone()),
             participants: clean(meta_participants),
             note: clean(meta_note),
+            tags,
+            custom,
         };
-        (meta.title.is_some() || meta.participants.is_some() || meta.note.is_some()).then_some(meta)
+        (meta.title.is_some()
+            || meta.participants.is_some()
+            || meta.note.is_some()
+            || meta.tags.is_some()
+            || meta.custom.is_some())
+        .then_some(meta)
     };
     let manifest = SessionManifest::create_with_meta(
         folder.clone(),
@@ -4332,6 +4362,13 @@ pub async fn recording_start(
         let sink_status = task_status.clone();
         let sink_platform = task_platform.clone();
         let sink = Box::new(move |event: RecordingEvent| {
+            // Story 22.5: while debug mode is on, every sidecar event lands as
+            // one timestamped line in the session's `events.log` (beside
+            // `manifest.json`) — the raw stream a bug report needs. Gated and
+            // best-effort inside the helper; zero cost while off.
+            if crate::debug_log::enabled() {
+                crate::debug_log::session_event(manifest.folder(), &format!("{event:?}"));
+            }
             // Capture the ledger entry before `apply` consumes the event: the
             // basename comes from the sidecar-reported path (synthesized from
             // the track + index when absent — a `track:"camera"` line without
@@ -5104,6 +5141,26 @@ pub fn launch_at_login_set(enabled: bool) -> Result<(), IpcError> {
     Err(to_ipc_error(CoreError::Unsupported(
         "launch-at-login is desktop-only".to_owned(),
     )))
+}
+
+/// Read the debug-mode toggle (Story 22.5, FR-79) — the LIVE gate, which `init`
+/// seeded from the persisted setting and `debug_mode_set` keeps in sync, so the
+/// UI always shows what logging is actually doing right now.
+#[tauri::command]
+pub fn debug_mode_get() -> Result<bool, IpcError> {
+    Ok(crate::debug_log::enabled())
+}
+
+/// Set the debug-mode toggle (Story 22.5, FR-79): persist `debug.mode` first
+/// (durable-before-applied, the settings pattern), then flip the live gate —
+/// applies immediately to both the app log and any in-flight session's
+/// `events.log`, no restart. Errors funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn debug_mode_set(state: State<'_, AppState>, enabled: bool) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::set_debug_mode(&data_dir, enabled).map_err(to_ipc_error)?;
+    crate::debug_log::set_enabled(enabled);
+    Ok(())
 }
 
 /// Read the menu-bar (tray) presence toggle (Story 10.3, FR-53). Reads the persisted

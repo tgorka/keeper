@@ -8,6 +8,7 @@
  * Everything stays local (manifest only — zero egress); leaving the card empty
  * changes nothing about the classic session naming.
  */
+import { Plus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -21,6 +22,12 @@ export const META_CARD_TITLE = "Next session";
 export const META_TITLE_LABEL = "Title";
 export const META_PARTICIPANTS_LABEL = "Participants";
 export const META_NOTE_LABEL = "Program / session note";
+
+/** The tags field label (Story 22.3; comma-separated). */
+export const META_TAGS_LABEL = "Tags";
+
+/** The add-custom-field affordance's label (Story 22.3). */
+export const META_ADD_FIELD_LABEL = "Add field";
 
 /** The one-click re-fill affordance's label. */
 export const META_REFILL_LABEL = "Use previous";
@@ -75,6 +82,78 @@ export function RecordingMetaCard() {
             onChange={(event) => setFields({ note: event.target.value })}
           />
         </div>
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="recording-meta-tags">{META_TAGS_LABEL}</Label>
+          <Input
+            id="recording-meta-tags"
+            value={fields.tags}
+            placeholder="e.g. standup, q3, demo (comma-separated)"
+            onChange={(event) => setFields({ tags: event.target.value })}
+          />
+        </div>
+        {/* Story 22.3: repeatable custom name/value rows. Rows with a blank
+            name are dropped on Start; the X removes a row immediately. */}
+        {fields.custom.map((row, index) => (
+          <div
+            // Index keying is safe: rows are positional edit slots, never
+            // reordered.
+            // biome-ignore lint/suspicious/noArrayIndexKey: positional slots
+            key={index}
+            className="flex items-end gap-2"
+          >
+            <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+              <Label htmlFor={`recording-meta-custom-name-${index}`}>Name</Label>
+              <Input
+                id={`recording-meta-custom-name-${index}`}
+                value={row.name}
+                placeholder="e.g. Ticket"
+                onChange={(event) => {
+                  const custom = fields.custom.map((r, i) =>
+                    i === index ? { ...r, name: event.target.value } : r,
+                  );
+                  setFields({ custom });
+                }}
+              />
+            </div>
+            <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+              <Label htmlFor={`recording-meta-custom-value-${index}`}>Value</Label>
+              <Input
+                id={`recording-meta-custom-value-${index}`}
+                value={row.value}
+                placeholder="e.g. KPR-123"
+                onChange={(event) => {
+                  const custom = fields.custom.map((r, i) =>
+                    i === index ? { ...r, value: event.target.value } : r,
+                  );
+                  setFields({ custom });
+                }}
+              />
+            </div>
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              aria-label={`Remove field ${index + 1}`}
+              onClick={() => {
+                setFields({ custom: fields.custom.filter((_, i) => i !== index) });
+              }}
+            >
+              <X className="size-4" aria-hidden="true" />
+            </Button>
+          </div>
+        ))}
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          className="w-fit gap-1"
+          onClick={() => {
+            setFields({ custom: [...fields.custom, { name: "", value: "" }] });
+          }}
+        >
+          <Plus className="size-4" aria-hidden="true" />
+          {META_ADD_FIELD_LABEL}
+        </Button>
         <p className="text-muted-foreground text-xs">{META_LOCAL_NOTE}</p>
       </CardContent>
     </Card>

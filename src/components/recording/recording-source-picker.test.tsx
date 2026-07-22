@@ -27,8 +27,8 @@ const mockList = vi.mocked(listRecordingSources);
 
 const SOURCES: RecordingSourcesVm = {
   displays: [
-    { id: 1, width: 3456, height: 2234, isMain: true },
-    { id: 2, width: 1920, height: 1080, isMain: false },
+    { id: 1, width: 3456, height: 2234, isMain: true, pixelWidth: 3456, pixelHeight: 2234 },
+    { id: 2, width: 1920, height: 1080, isMain: false, pixelWidth: 1920, pixelHeight: 1080 },
   ],
   applications: [
     { bundleId: "com.apple.Safari", name: "Safari", pid: 501, icon: "data:image/png;base64,AA==" },
@@ -39,7 +39,9 @@ const SOURCES: RecordingSourcesVm = {
 };
 
 const EMPTY: RecordingSourcesVm = {
-  displays: [{ id: 1, width: 3456, height: 2234, isMain: true }],
+  displays: [
+    { id: 1, width: 3456, height: 2234, isMain: true, pixelWidth: 3456, pixelHeight: 2234 },
+  ],
   applications: [],
   microphones: [],
   cameras: [],

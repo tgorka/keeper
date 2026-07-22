@@ -3278,3 +3278,46 @@ Screen Recording phase (PRD §14.4 + spine Deferred) — explicitly out of this 
 
 
 
+
+## Epic 22: Recording Ergonomics II — Precision, Metadata Depth & Debuggability
+
+User-requested follow-ups (2026-07-21): quarter-scale capture with a live
+effective-resolution hint, flicker-free source refresh, richer session
+metadata (tags + custom fields), the mic as a separate track in the webcam
+file, a debug mode with on-disk event logs, and file-based config overrides.
+Out of scope with honest verdicts: AV1 encode (no VideoToolbox encoder on
+Apple Silicon through M4; AVFoundation exposes no AV1 writer codec),
+per-output-device audio capture (needs Core Audio taps — deferred-work), and
+hiding the macOS capture indicator (system-owned by design — documented).
+
+### Story 22.1: Quarter Scale & Live Effective-Resolution Hint
+Scale set becomes {100, 75, 50, 25}; `listSources` displays gain additive
+`pixelWidth`/`pixelHeight`; the Advanced scale row shows the selected
+target's effective output resolution live (e.g. "2880×1800 → 720×450").
+
+### Story 22.2: Flicker-Free Source Refresh Indicator
+The "Refreshing…" text line (layout shift on every ~3 s poll) becomes a small
+spinner beside the Source heading — no reflow, no flicker.
+
+### Story 22.3: Session Tags & Custom Metadata Fields
+The Next-session card gains a Tags input (comma-separated → `meta.tags[]`)
+and repeatable custom Name/Value rows (`meta.custom[]`); manifest-local only,
+rendered nowhere else yet (browsing is future work).
+
+### Story 22.4: Microphone Track in the Webcam File
+When both the webcam and the mic are on, `camera-####.mov` carries the mic as
+its own separate AAC track (same never-premixed rule), split at the same
+rotation boundaries; the screen file's mic track is unchanged.
+
+### Story 22.5: Debug Mode — Event & Error Logs on Disk
+A Settings → Advanced "Debug logging" toggle: every sidecar NDJSON event,
+state transition, warning and error of a session appends to
+`<session folder>/events.log`, and app-level tracing mirrors to
+`~/Library/Logs/keeper/keeper.log` while enabled. Off by default; logs are
+local, secret-free, and named in docs.
+
+### Story 22.6: File-Based Config Overrides
+`config.json` beside `keeper.db` (data dir): read at startup, its keys are
+imported over the settings table (file wins), enabling hand-edited /
+version-controlled setups; the path and key list are documented in
+docs/recording.md. Malformed files are reported loudly and skipped.

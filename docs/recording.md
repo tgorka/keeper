@@ -15,7 +15,11 @@ egress-diff gate in CI), has no telemetry, and writes only where you point it.
   premixed with system audio; editors can separate them, stock players play
   them together). Pick a device or use the system default input.
 - **Webcam** (optional) — your camera, recorded to a **separate file**
-  (`camera-####.mov`), synced to the screen segments by a shared clock.
+  (`camera-####.mov`), synced to the screen segments by a shared clock. When
+  the microphone is on, the camera file also carries the mic as its **own
+  separate track** (never premixed), so a webcam clip is self-contained.
+- **Audio only** — pick "Audio only (no video)" as the source to record just
+  system audio and/or the microphone into `audio-####.m4a` segments.
 
 ## Where recordings go
 
@@ -39,6 +43,70 @@ an interrupted session is salvaged on the next launch ("A recording was
 interrupted" — with **Reveal in Finder**).
 
 Recordings that end cleanly show "Saved N segments" with the session path.
+
+Before Start you can optionally describe the **next session** — title (also
+names the folder), participants, a program/session note, comma-separated
+tags, and free-form name/value fields. Everything lands in `manifest.json`
+only (local, zero egress), together with wall-clock start/end times.
+
+## Debug mode (Settings → About)
+
+Off by default. While on, keeper writes:
+
+- `~/Library/Logs/keeper/keeper.log` — app-level logs (errors, warnings,
+  lifecycle), also visible in Console.app.
+- `<session folder>/events.log` — one timestamped line per recording event,
+  beside `manifest.json`.
+
+The toggle applies live (no restart), and log writes are best-effort — they
+never affect a running capture. For a bug report, zip the session folder:
+media, manifest, and event log travel together.
+
+## `config.json` — file-based overrides
+
+For development and scripted setups, keeper imports an optional flat JSON
+file over its settings table at every startup (**file wins**):
+
+```
+~/Library/Application Support/keeper/config.json   (beside keeper.db)
+```
+
+Example:
+
+```json
+{
+  "recording.codec": "hevc",
+  "recording.scale_percent": 50,
+  "recording.fps": 60,
+  "recording.segment_mb": 250,
+  "recording.duration_cap_minutes": 15,
+  "recording.destination_dir": "/Users/you/Movies/keeper-dev",
+  "debug.mode": true
+}
+```
+
+Rules: one flat object; string, number, or boolean values only (booleans map
+to the registry's `"1"`/`"0"` convention). Keys import verbatim into the
+settings table, and the typed getters keep clamping/normalizing on read, so
+an out-of-range hand-edit degrades to its documented default. A malformed
+file is reported loudly in the app log and skipped — startup never aborts
+over it. The import runs before the debug-mode gate is seeded, so
+`"debug.mode": true` applies to that same boot.
+
+Known recording keys: `recording.codec` (`h264` | `hevc`),
+`recording.scale_percent` (`100` | `75` | `50` | `25`), `recording.fps`
+(`30` | `60`), `recording.segment_mb` (100–5000),
+`recording.duration_cap_minutes` (1–600), `recording.destination_dir`
+(absolute path), `debug.mode` (bool).
+
+## Out of scope (honest verdicts)
+
+- **AV1 encoding** — Apple Silicon has no AV1 hardware encoder and
+  AVFoundation exposes no AV1 writer codec; H.264/HEVC are the options.
+- **Per-app audio-output capture picker** — needs Core Audio process taps;
+  deferred.
+- **Hiding the macOS menu-bar capture indicator** — the pill is drawn and
+  owned by macOS itself as a privacy affordance; no app can disable it.
 
 ## Permissions (macOS)
 

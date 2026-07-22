@@ -21,6 +21,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import type { RecordingSourcesVm, RecordingTargetVm } from "@/lib/ipc/client";
 import {
   applyRecordingSettings,
   ensureRecordingSettingsHydrated,
@@ -30,6 +31,7 @@ import {
   recordingSettingsStore,
   useRecordingSettings,
 } from "@/lib/stores/recording-settings";
+import { useRecordingSources, useSelectedRecordingTarget } from "@/lib/stores/recording-source";
 
 /** The disclosure toggle's label (recording voice: sentence case). */
 export const ADVANCED_DISCLOSURE_LABEL = "Advanced options";
@@ -66,13 +68,55 @@ export const SCALE_OPTION_LABELS: Record<number, string> = {
   100: "Full (100%)",
   75: "3/4 (75%)",
   50: "Half (50%)",
+  25: "1/4 (25%)",
 };
+
+/** Round a scaled dimension DOWN to even pixels — mirrors the sidecar rule. */
+function scaledEven(size: number, percent: number): number {
+  return Math.max(2, Math.floor((size * percent) / 100) & ~1);
+}
+
+/** The live effective-resolution hint (Story 22.1): the selected display's
+ * true pixel size → the scaled output size (even-rounded like the encoder).
+ * Null when it cannot be honestly computed (audio-only, no enumeration yet,
+ * or an older sidecar without pixel dims). App-scoped capture renders on the
+ * main display's canvas, so it uses the main display's dims. */
+export function effectiveResolutionHint(
+  target: RecordingTargetVm,
+  sources: RecordingSourcesVm | null,
+  scalePercent: number,
+): string | null {
+  if (target.kind === "audioOnly" || sources === null) {
+    return null;
+  }
+  const display =
+    target.kind === "display" && target.displayId !== null
+      ? sources.displays.find((d) => d.id === target.displayId)
+      : sources.displays.find((d) => d.isMain);
+  if (display === undefined || display.pixelWidth === 0 || display.pixelHeight === 0) {
+    return null;
+  }
+  const w = scaledEven(display.pixelWidth, scalePercent);
+  const h = scaledEven(display.pixelHeight, scalePercent);
+  if (scalePercent === 100) {
+    return `${display.pixelWidth}×${display.pixelHeight}`;
+  }
+  return `${display.pixelWidth}×${display.pixelHeight} → ${w}×${h}`;
+}
 
 /** Test id for the scale Select trigger. */
 export const SCALE_SELECT_TESTID = "recording-scale-select";
 
 export function RecordingAdvancedControls() {
   const settings = useRecordingSettings();
+  // Story 22.1: the live effective-resolution hint tracks the picker's
+  // selected target and the enumerated displays' true pixel dims.
+  const selectedTarget = useSelectedRecordingTarget();
+  const sources = useRecordingSources();
+  const resolutionHint =
+    settings === null
+      ? null
+      : effectiveResolutionHint(selectedTarget, sources, settings.scalePercent);
   // Collapsed by default on every mount — fps is deliberately tucked away.
   const [expanded, setExpanded] = useState(false);
   // Lazy shared hydration: whichever surface mounts first triggers the one
@@ -202,6 +246,11 @@ export function RecordingAdvancedControls() {
               </SelectContent>
             </Select>
           </div>
+          {resolutionHint !== null && (
+            <p className="text-muted-foreground text-xs" data-testid="recording-resolution-hint">
+              Output resolution: <span className="font-mono">{resolutionHint}</span>
+            </p>
+          )}
           <p className="text-muted-foreground">{FPS_NEXT_SESSION_NOTE}</p>
         </div>
       )}

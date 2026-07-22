@@ -20,4 +20,13 @@ height: number,
 /**
  * Whether this is the main display (menu-bar display).
  */
-isMain: boolean, };
+isMain: boolean, 
+/**
+ * The display's true pixel width (Story 22.1; additive — 0 when an older
+ * sidecar omits it). Backs the live effective-resolution hint.
+ */
+pixelWidth: number, 
+/**
+ * The display's true pixel height (Story 22.1; additive — 0 when absent).
+ */
+pixelHeight: number, };

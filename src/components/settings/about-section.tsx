@@ -4,7 +4,9 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { type MouseEvent, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { type EgressEndpointVm, egressList } from "@/lib/ipc/client";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { debugModeGet, debugModeSet, type EgressEndpointVm, egressList } from "@/lib/ipc/client";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 
 /**
@@ -27,6 +29,13 @@ const UPDATE_HONESTY_SENTENCE =
 
 /** The docs page opened from the "On this iPhone" disclosure (Story 13.7). */
 const IOS_DOCS_URL = "https://github.com/tgorka/keeper/blob/main/docs/ios.md";
+
+/**
+ * The honest debug-mode disclosure (Story 22.5, FR-79): names exactly what
+ * lands on disk and where, and that it is local-only. Off by default.
+ */
+export const DEBUG_MODE_SENTENCE =
+  "Writes app logs to ~/Library/Logs/keeper/keeper.log and a per-recording events.log beside each session's manifest. Local files only — nothing is uploaded.";
 
 /**
  * The four honesty lines of the reduced-platform (phone tier) "On this iPhone"
@@ -112,6 +121,9 @@ export function AboutSection({ open }: { open: boolean }) {
   // rather than guessing).
   const [appVersion, setAppVersion] = useState<string | null | undefined>(undefined);
   const [update, setUpdate] = useState<UpdateState>({ kind: "idle" });
+  // Debug-mode toggle (Story 22.5): `undefined` = still loading.
+  const [debugMode, setDebugMode] = useState<boolean | undefined>(undefined);
+  const debugWriteId = useRef(0);
   // The detected-but-not-yet-installed update, held between the two clicks. Not state:
   // it is not rendered, only consumed by the install step.
   const pendingUpdate = useRef<Update | null>(null);
@@ -149,6 +161,18 @@ export function AboutSection({ open }: { open: boolean }) {
         // No Tauri runtime / read failure: render an honest "unknown", never a guess.
         if (!cancelled) {
           setAppVersion(null);
+        }
+      });
+    void debugModeGet()
+      .then((value) => {
+        if (!cancelled) {
+          setDebugMode(value);
+        }
+      })
+      .catch(() => {
+        // A read failure renders the honest default (off) rather than a stuck spinner.
+        if (!cancelled) {
+          setDebugMode(false);
         }
       });
     void egressList()
@@ -220,6 +244,20 @@ export function AboutSection({ open }: { open: boolean }) {
   };
 
   const busy = update.kind === "checking" || update.kind === "downloading";
+
+  // Optimistic toggle with revert-on-failure (the settings-pane pattern): never
+  // display a state that was not actually saved.
+  const onDebugModeChange = (next: boolean) => {
+    debugWriteId.current += 1;
+    const id = debugWriteId.current;
+    const prev = debugMode ?? false;
+    setDebugMode(next);
+    void debugModeSet(next).catch(() => {
+      if (id === debugWriteId.current) {
+        setDebugMode(prev);
+      }
+    });
+  };
 
   return (
     <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
@@ -307,6 +345,19 @@ export function AboutSection({ open }: { open: boolean }) {
           <p className="text-muted-foreground text-xs">{UPDATE_HONESTY_SENTENCE}</p>
         </div>
       )}
+
+      <div className="mt-1 flex flex-col gap-1.5">
+        <div className="flex items-center justify-between gap-2">
+          <Label htmlFor="debug-mode">Debug mode</Label>
+          <Switch
+            id="debug-mode"
+            checked={debugMode ?? false}
+            disabled={debugMode === undefined}
+            onCheckedChange={onDebugModeChange}
+          />
+        </div>
+        <p className="text-muted-foreground text-xs">{DEBUG_MODE_SENTENCE}</p>
+      </div>
 
       {reducedPlatform && (
         <div className="mt-1 flex flex-col gap-1.5">

@@ -209,3 +209,9 @@ development_status:
   21-3-audio-only-recording-no-video-track: done
   21-4-template-white-tray-icons-native-menu-bar-look: done
   21-5-session-naming-and-metadata-title-participants-notes-times: done
+  22-1-quarter-scale-and-live-resolution-hint: done
+  22-2-flicker-free-source-refresh-indicator: done
+  22-3-session-tags-and-custom-metadata-fields: done
+  22-4-microphone-track-in-the-webcam-file: done
+  22-5-debug-mode-event-and-error-logs-on-disk: done
+  22-6-file-based-config-overrides: done
