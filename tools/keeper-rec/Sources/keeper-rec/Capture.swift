@@ -927,6 +927,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             return
         }
         micInput.append(sampleBuffer)
+        appendMicToCamera(sampleBuffer)
         // A real mic sample flowing again ends the lost span — the
         // silence-fill (which only pads while `micLost`) yields to it.
         micLost = false
@@ -934,6 +935,20 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             let duration = CMSampleBufferGetDuration(sampleBuffer)
             micPTSLowerBound = duration.isNumeric ? CMTimeAdd(pts, duration) : pts
         }
+    }
+
+    /// Mirror one mic sample into the camera file's own mic track (Story
+    /// 22.4) — on `mediaQueue`. The SAME `CMSampleBuffer` may feed two
+    /// different writers' inputs; only the append targets differ. Guards
+    /// mirror the camera-video path: nothing lands before the camera writer's
+    /// session is started (append-before-startSession is illegal) or after a
+    /// camera loss finalized the file. The screen-side `micPTSLowerBound`
+    /// trim already ran in the caller, so ordering holds here too.
+    private func appendMicToCamera(_ sampleBuffer: CMSampleBuffer) {
+        guard cameraSessionStarted, !cameraLost,
+            let mic = currentCamera?.micInput, mic.isReadyForMoreMediaData
+        else { return }
+        mic.append(sampleBuffer)
     }
 
     // MARK: - Microphone hot-unplug resilience (Story 19.4)
@@ -1063,6 +1078,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             return
         }
         micInput.append(buffer)
+        appendMicToCamera(buffer)
         micPTSLowerBound = CMTimeAdd(
             cursor, CMTime(value: CMTimeValue(frames), timescale: sampleRate))
     }
@@ -1221,6 +1237,25 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 width: cameraPixelWidth, height: cameraPixelHeight,
                 // A webcam-sized stream, not the display's budget.
                 bitRate: 4_000_000))
+        // Story 22.4: when the mic source is on, the camera file carries the
+        // mic as its OWN separate AAC track too (never premixed) — a webcam
+        // clip is then self-contained for talking-head use.
+        var cameraMicInput: AVAssetWriterInput?
+        if wantsMic {
+            let mic = AVAssetWriterInput(
+                mediaType: .audio,
+                outputSettings: [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVSampleRateKey: 48_000,
+                    AVNumberOfChannelsKey: 2,
+                    AVEncoderBitRateKey: 192_000,
+                ])
+            mic.expectsMediaDataInRealTime = true
+            if writer.canAdd(mic) {
+                writer.add(mic)
+                cameraMicInput = mic
+            }
+        }
         videoInput.expectsMediaDataInRealTime = true
         guard writer.canAdd(videoInput) else {
             throw CaptureError("could not add the camera H.264 video track")
@@ -1232,7 +1267,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             )
         }
         return SegmentWriter(
-            writer: writer, videoInput: videoInput, audioInput: nil, micInput: nil,
+            writer: writer, videoInput: videoInput, audioInput: nil, micInput: cameraMicInput,
             path: path, index: index)
     }
 
@@ -1336,6 +1371,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         cameraSegmentLastVideoPTS = nil
         cameraSegmentHasVideo = false
         retiring.videoInput?.markAsFinished()
+        retiring.micInput?.markAsFinished()
         finalizeGroup.enter()
         retiring.writer.finishWriting { [self] in
             mediaQueue.async { [self] in
@@ -1465,6 +1501,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         let ptsStart = cameraSegmentFirstVideoPTS
         let ptsEnd = cameraSegmentLastVideoPTS
         camera.videoInput?.markAsFinished()
+        camera.micInput?.markAsFinished()
         finalizeGroup.enter()
         camera.writer.finishWriting { [self] in
             mediaQueue.async { [self] in
@@ -1732,6 +1769,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 cameraSegmentHasVideo
             {
                 camera.videoInput?.markAsFinished()
+                camera.micInput?.markAsFinished()
                 finalizeGroup.enter()
                 camera.writer.finishWriting { self.finalizeGroup.leave() }
             } else {
