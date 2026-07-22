@@ -37,6 +37,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      # tauri-build's `externalBin` resource check aborts the keeper build
+      # script when `binaries/keeper-rec-aarch64-apple-darwin` is absent, so
+      # clippy/nextest need the real sidecar staged first (same script the
+      # release workflow uses; includes its own smoke test).
+      - run: bash scripts/build-keeper-rec.sh
       - run: cargo fmt --check
         working-directory: src-tauri
       - run: cargo clippy --all-targets -- -D warnings
