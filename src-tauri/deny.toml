@@ -31,7 +31,20 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 [bans]
 multiple-versions = "allow"
 # AGPL/GPL code must never be linked into the client.
-deny = []
+#
+# The allow-list above is exhaustive, so an honestly-declared GPL crate already
+# fails. These two entries exist because the allow-list is NOT sufficient for
+# them: `git2` and `libgit2-sys` declare "MIT OR Apache-2.0" in their Cargo
+# metadata while vendoring libgit2, whose actual COPYING is GPL-2.0 with a
+# linking exception. cargo-deny reads the metadata, so the check would go green
+# while GPLv2 C code linked into keeper. The folder-sync engine (AD-41) is
+# built on gitoxide (MIT OR Apache-2.0) precisely to avoid this, and shells out
+# to the `git` binary for the four operations gitoxide does not implement —
+# invoking a program is not linking, so the firewall holds.
+deny = [
+  { crate = "git2", reason = "vendors GPL-2.0-with-linking-exception libgit2 while declaring MIT/Apache — use gix (AD-41)" },
+  { crate = "libgit2-sys", reason = "GPL-2.0-with-linking-exception C, mis-declared as MIT/Apache in crate metadata" },
+]
 
 [advisories]
 yanked = "warn"

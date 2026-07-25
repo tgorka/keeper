@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keeper-core", "crates/keeper"]
+members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd"]
 
 [workspace.package]
 version = "0.3.0"
@@ -49,7 +49,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ts-rs = "12"
 # Async runtime + observability
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util"] }
+# `fs` was added for the folder-sync phase: the LFS transfer path streams
+# multi-GB objects off disk inside an async body, and `std::fs` there would
+# block the reactor for every chunk (AD-46, NFR-23).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
@@ -114,3 +117,77 @@ objc2-user-notifications = { version = "0.3", features = ["UNUserNotificationCen
 # Account registry + opaque account ids (both already present transitively via matrix-sdk).
 ulid = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
+
+# ---------------------------------------------------------------------------
+# Folder Sync phase (Epics 23–31, AD-40 … AD-53). Consumed by `keeper-sync`
+# (the engine) and `keeper-syncd` (the standalone Linux daemon). None of these
+# may ever appear in `keeper-core`'s tree — `bun run check:core-sync-free`
+# enforces that mechanically.
+# ---------------------------------------------------------------------------
+# gitoxide: clone, fetch, checkout, status, index, objects, commits,
+# .gitattributes/filters, progress and interruption (AD-41). `default-features
+# = false` keeps the tree lean, but a hash feature is MANDATORY — omitting
+# `sha1` fails the build inside gix-hash with non-exhaustive-match errors.
+# `blocking-http-transport-reqwest-rust-tls` resolves onto the same reqwest
+# 0.13 the Beeper client already uses, so no second TLS stack is linked.
+# Push, worktree mutation, sparse-checkout patterns and gc are NOT implemented
+# upstream and are not planned (issue #306 closed NOT_PLANNED 2026-07-22);
+# those four shell out to the `git` binary via `keeper_sync::git::cli`.
+# MIT OR Apache-2.0 — passes `cargo deny check`.
+gix = { version = "0.86", default-features = false, features = [
+    "sha1",
+    "blocking-http-transport-reqwest-rust-tls",
+    "credentials",
+    "attributes",
+    "worktree-mutation",
+    "status",
+    "index",
+    "dirwalk",
+    "excludes",
+    "revision",
+    "blob-diff",
+    "parallel",
+    "progress-tree",
+    "tracing",
+] }
+# Filesystem watching for sync watch mode (Story 26.2). inotify on Linux —
+# including IN_CLOSE_WRITE, which shortens the quiescence window — FSEvents on
+# macOS, and a PollWatcher fallback for network/FUSE mounts. CC0-1.0, which is
+# on the deny.toml allow-list.
+notify = "8"
+# Event debouncing + rename correlation on top of `notify` (Story 26.2).
+# MIT OR Apache-2.0 — passes `cargo deny check`.
+notify-debouncer-full = "0.7"
+# Tier-0 name/shape exclusion for the completeness gate (Story 26.1): one
+# compiled glob set for the industry partial-download/lock-file conventions
+# plus per-profile excludes. `Unlicense OR MIT` — the MIT arm satisfies the
+# firewall. Already resolved in the lock transitively.
+globset = "0.4"
+# Content verification (Stories 25.1, 25.3, 26.5): SHA-256 for LFS object OIDs
+# and verify-on-read. Already resolved in the lock transitively via
+# vodozemac/matrix-sdk, so a direct dep pulls no new crate version. Hardware
+# SHA-NI / ARMv8-SHA2 is selected at runtime through `cpufeatures`; the `asm`
+# feature is deliberately NOT enabled (it would add a C build).
+sha2 = "0.10"
+hex = "0.4"
+# Atomic staging for LFS objects, index writes and the volume marker
+# (tmp-then-rename, the recording manifest precedent). Already in the lock.
+# MIT OR Apache-2.0.
+tempfile = "3"
+# CLI argument parsing for `keeper-syncd` only (Story 30.1). Not linked into
+# the Tauri app. MIT OR Apache-2.0 — passes `cargo deny check`.
+clap = { version = "4", features = ["derive", "env"] }
+# `keeper-syncd`'s on-disk profile configuration (Story 30.2). MIT OR
+# Apache-2.0 — passes `cargo deny check`.
+toml = "0.9"
+# Exact-length streaming request bodies for LFS uploads (Story 25.3). This is
+# not optional sugar: `reqwest::Body::wrap_stream` and `Body::from(File)` both
+# yield an unknown-size body and therefore `Transfer-Encoding: chunked`, which
+# pre-signed S3 PUTs (Forgejo's SERVE_DIRECT mode) reject. The fix is
+# `Body::wrap` over an `http_body::Body` whose `size_hint()` is
+# `SizeHint::with_exact(size)`, so `RequestBuilder` sets a real
+# `Content-Length` — without ever buffering the object. Both crates are
+# already resolved in Cargo.lock as reqwest's own dependencies, so this adds
+# no new crate to the tree. MIT (http-body) / MIT (bytes).
+http-body = "1"
+bytes = "1"

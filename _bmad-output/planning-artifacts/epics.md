@@ -3337,11 +3337,11 @@ Spine increment **AD-40 … AD-53**.
 
 The route is locked by the research and must not be re-argued in a story:
 
-- **`gix 0.86` does everything except four things.** Push is *not implemented
+- **`gix 0.86` does everything except five things.** Push is *not implemented
   and not planned* upstream (issue #306 closed `NOT_PLANNED` 2026-07-22).
-  Worktree mutation, sparse-checkout patterns and `gc` are likewise absent.
-  Those four shell out to the **`git` binary**, which is a declared hard
-  runtime prerequisite. `git2`/`libgit2-sys` is **banned** — it declares
+  Worktree mutation, sparse-checkout patterns, `gc` and `merge` are likewise
+  absent. Those five shell out to the **`git` binary**, which is a declared
+  hard runtime prerequisite. `git2`/`libgit2-sys` is **banned** — it declares
   MIT/Apache while vendoring GPL-2.0 C, so `cargo deny` cannot catch it.
 - **LFS is mandatory above a size threshold**, because gitoxide has *no
   streaming object read* (a 3 GB blob is a 3 GB allocation) and `gix-lfs` is an
@@ -3446,7 +3446,7 @@ the existing exhaustive egress unit tests are extended, not weakened.
 ## Epic 24: The Git Engine — Clone, Fetch, Checkout, Commit, Push
 
 The engine proper (AD-41). Read and write halves are deliberately asymmetric:
-gitoxide owns everything it can do well, and exactly four operations go through
+gitoxide owns everything it can do well, and exactly five operations go through
 one audited shim.
 
 ### Story 24.1: Repository Lifecycle — Open & Clone with the Two Mandatory Overrides
@@ -3479,11 +3479,12 @@ produce entries, low-level index mutation (`dangerously_push_entry`,
 byte-identical to git's for the same tree; `git status` is clean afterwards;
 `git fsck` passes.
 
-### Story 24.5: The `git_cli` Shim — Push, Worktree, Sparse, gc
+### Story 24.5: The `git_cli` Shim — Push, Worktree, Sparse, gc, Merge
 **One module**, typed subcommand enum, argument vectors (never a shell
 string), timeout-bounded, stdout/stderr captured and classified into
 `SyncError`. Covers `push`, `worktree add|remove|prune`,
-`sparse-checkout init|set|reapply`, `gc`. AC: a convention test asserts no
+`sparse-checkout init|set|reapply`, `gc`, and `merge` (`--ff-only` for the
+fast-forward case, `-X theirs` after conflict copies exist). AC: a convention test asserts no
 other module in the workspace spawns `git`; a non-zero exit is always
 classified, never swallowed; no argument can be injected through a profile
 name or path.

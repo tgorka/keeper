@@ -1,0 +1,42 @@
+[package]
+name = "keeper-sync"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+description = "Git-protocol folder synchronization engine for keeper (AD-40 … AD-53)"
+
+# AD-40: this crate is deliberately BOTH `tauri`-free and `keeper-core`-free.
+#  * tauri-free  — so `keeper-syncd` can link it on a headless server.
+#  * core-free   — so the standalone daemon never inherits matrix-sdk, and so
+#                  the iOS build never inherits gitoxide.
+# `bun run check:core-sync-free` asserts the reverse edge (keeper-core must
+# never name gix or keeper-sync).
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { workspace = true }
+ulid = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }
+gix = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+globset = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
+# Exact-Content-Length streaming bodies for LFS uploads — see the workspace
+# manifest for why `wrap_stream` cannot be used. Adds no new crate.
+http-body = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

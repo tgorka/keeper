@@ -1,0 +1,44 @@
+[package]
+name = "keeper-syncd"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+description = "Standalone Linux folder-sync daemon over the keeper-sync engine (AD-52)"
+
+[[bin]]
+name = "keeper-syncd"
+path = "src/main.rs"
+
+# AD-52 / AD-40 — the rule that gives this crate its reason to exist:
+# `keeper-sync` is the ONLY first-party dependency. Never `keeper` (which is
+# tauri, a webview and a tray) and never `keeper-core` (which is matrix-sdk).
+# A headless server runs the same sync engine as the app, byte for byte, with
+# none of the app linked in; the moment either edge is added, this crate stops
+# being installable on a box with no display and the "same engine, no app"
+# promise becomes a second, divergent implementation.
+[dependencies]
+keeper-sync = { path = "../keeper-sync" }
+# `env` backs `--config` reading KEEPER_SYNCD_CONFIG, so a systemd unit can set
+# the path without an ExecStart argument.
+clap = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `signal` is enabled on top of the workspace feature set: SIGTERM is the
+# systemd stop path, and AD-52 requires it to be a bounded graceful finalize
+# rather than a kill.
+tokio = { workspace = true, features = ["signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+# `keeper-syncd add` mints a profile id, and AD-42 makes that id a ULID. Same
+# workspace catalog entry the engine already uses, so no new crate is resolved.
+ulid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
