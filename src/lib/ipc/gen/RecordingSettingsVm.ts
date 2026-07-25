@@ -9,7 +9,7 @@
  *
  * All settings surfaces (Settings → Recording and the pre-record setup cards)
  * render exactly this VM. The setter command normalizes (segment `100..=5000`
- * MB, duration cap `1..=600` min, fps {30, 60}) and returns the effective VM,
+ * MB, duration cap `1..=600` min, fps {10, 15, 30, 60}) and returns the effective VM,
  * so the UI never displays an unsaved value. Read again at every
  * `recording_start` — edits apply to the next Recording Session only.
  */
@@ -31,8 +31,8 @@ durationCapMinutes: number,
  */
 destinationDir: string, 
 /**
- * Capture frame rate (Story 19.5): 30 (default) or 60, normalized on
- * read/write; the sidecar's `fps`.
+ * Capture frame rate (Story 19.5): 10, 15, 30 (default), or 60,
+ * normalized on read/write; the sidecar's `fps`.
  */
 fps: number, 
 /**

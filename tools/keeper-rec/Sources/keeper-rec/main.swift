@@ -451,7 +451,7 @@ while let line = readLine(strippingNewline: true) {
             ?? RotationPolicy.defaultMaxSegmentSeconds
         // Story 19.5: the capture frame rate — additive like `segmentMB`, the
         // host always emits it, but decode best-effort with the 30 default so
-        // an older host stays compatible. The engine normalizes to {30, 60}
+        // an older host stays compatible. The engine normalizes to {10, 15, 30, 60}
         // via `normalizeFps` before it reaches SCStreamConfiguration.
         let fps = (params?["fps"] as? NSNumber)?.intValue ?? 30
         // Story 21.1/21.2: additive codec + capture scale — absent on an older
