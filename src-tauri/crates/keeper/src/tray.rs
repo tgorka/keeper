@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use keeper_core::vm::{RecordingStatusVm, RecordingUiState};
+use keeper_sync::progress::TraySyncState;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::{TrayIcon, TrayIconBuilder, TrayIconId};
@@ -82,6 +83,25 @@ const ERROR_ICON_PNG: &[u8] = include_bytes!("../icons/tray-error-template.png")
 /// Replaces the colored app icon so the menu bar stays native (Story 21.4).
 const IDLE_ICON_PNG: &[u8] = include_bytes!("../icons/tray-idle-template.png");
 
+/// The folder-sync glyph set (Story 29.2, AD-51), generated from the idle mark
+/// by `scripts/gen-tray-sync-icons.ts` so the brand outline is identical and
+/// only the interior differs.
+///
+/// Template images again: the menu bar recolours them, so **state must read
+/// from SHAPE, never colour**. Armed is a static cycle; the four frames are a
+/// ring whose gap walks a quarter turn per tick, which is what reads as motion
+/// at the tray's 1 Hz refresh where a pulse or fade would just look like
+/// flicker.
+const SYNC_ARMED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-template.png");
+const SYNC_FRAME_PNGS: [&[u8]; 4] = [
+    include_bytes!("../icons/tray-sync-1-template.png"),
+    include_bytes!("../icons/tray-sync-2-template.png"),
+    include_bytes!("../icons/tray-sync-3-template.png"),
+    include_bytes!("../icons/tray-sync-4-template.png"),
+];
+const SYNC_PAUSED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-paused-template.png");
+const SYNC_WARNING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-warning-template.png");
+
 /// The live tray, if menu-bar presence is currently on. `None` means no tray is
 /// shown (the default). Guarded by a `Mutex` since the Settings toggle command,
 /// startup, and the ~1 Hz recording tick all touch it.
@@ -99,6 +119,14 @@ struct TrayState {
     /// error line is static (the terminal `error` never changes), so the tick
     /// only needs this flag to avoid rebuilding the menu every second.
     error_rendered: bool,
+    /// The disabled folder-sync status line, when the sync menu is installed
+    /// (Story 29.3). Held for the same reason as `status_item`: each tick
+    /// refreshes it with `set_text` rather than rebuilding the menu, so an open
+    /// menu stays open and nothing flickers.
+    ///
+    /// Mutually exclusive with the recording rendering — recording owns the
+    /// tray whenever it is live or holding an error, and sync waits.
+    sync_item: Option<MenuItem<Wry>>,
 }
 
 /// The single tray slot (see [`TrayState`]).
@@ -320,6 +348,7 @@ pub fn set_tray_presence(app: &AppHandle, enabled: bool) {
             icon,
             status_item: None,
             error_rendered: false,
+            sync_item: None,
         });
     } else {
         // Dropping the handle removes the tray icon.
@@ -485,6 +514,7 @@ fn force_present(app: &AppHandle, snapshot: &RecordingStatusVm) {
                 icon: icon.clone(),
                 status_item: None,
                 error_rendered: false,
+                sync_item: None,
             });
             FORCED_PRESENCE.store(true, Ordering::Relaxed);
             true
@@ -914,5 +944,203 @@ mod tests {
             "⚠ Starting… — microphone disconnected — no microphone input"
         );
         assert!(snapshot.state.is_live(), "mic loss is still live/present");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Folder sync (Stories 29.2 / 29.3, AD-51)
+// ---------------------------------------------------------------------------
+
+/// The sync menu's disabled status line.
+const SYNC_STATUS_ID: &str = "tray-sync-status";
+
+/// Pick this tick's sync glyph.
+///
+/// Pure so the precedence is testable without a tray: **warning outranks
+/// activity outranks paused outranks armed**, because a problem must never be
+/// hidden by something else happening to be busy. `frame` is advanced by the
+/// caller's tick and only matters while active.
+fn sync_glyph(state: TraySyncState, frame: u8) -> Option<&'static [u8]> {
+    match state {
+        TraySyncState::Absent => None,
+        TraySyncState::Warning => Some(SYNC_WARNING_ICON_PNG),
+        TraySyncState::Active => Some(SYNC_FRAME_PNGS[(frame as usize) % SYNC_FRAME_PNGS.len()]),
+        TraySyncState::Paused => Some(SYNC_PAUSED_ICON_PNG),
+        TraySyncState::Armed => Some(SYNC_ARMED_ICON_PNG),
+    }
+}
+
+/// Build the sync tray menu: a disabled status line, then Show and Quit.
+fn build_sync_menu(app: &AppHandle, line: &str) -> Option<(Menu<Wry>, MenuItem<Wry>)> {
+    let status = menu_item(app, SYNC_STATUS_ID, line, false)?;
+    let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
+    let quit = menu_item(app, QUIT_ID, "Quit", true)?;
+    match MenuBuilder::new(app)
+        .items(&[&status, &show, &quit])
+        .build()
+    {
+        Ok(menu) => Some((menu, status)),
+        Err(error) => {
+            tracing::warn!(%error, "tray: could not build the sync menu");
+            None
+        }
+    }
+}
+
+/// Render the tray from the folder-sync snapshot (Stories 29.2 / 29.3).
+///
+/// Called by the same ~1 Hz tick that drives recording, immediately after it.
+/// Two rules keep the two subsystems from fighting over one icon:
+///
+/// 1. **Recording always wins.** If a recording status line or the error hold
+///    is installed, this returns immediately. A capture in progress is the more
+///    urgent thing to show, and it is the one that forced the tray into
+///    existence in the first place.
+/// 2. **Sync never forces presence.** Unlike a live recording (Story 18.2),
+///    sync renders only into a tray the user already opted into. Silently
+///    summoning a menu-bar item because a background folder started syncing
+///    would be a surprise, and the in-app surfaces carry the same information.
+///
+/// Follows `apply_recording_state`'s lock discipline exactly: handles are
+/// cloned out, every `TrayIcon`/`MenuItem` call runs lock-free (each blocks on
+/// an internal main-thread dispatch), and the held item is stored back under a
+/// fresh lock checked against the tray id.
+pub fn apply_sync_state(app: &AppHandle, state: TraySyncState, line: &str, frame: u8) {
+    let (tray, sync_item, recording_owns) = {
+        let guard = tray_guard();
+        match guard.as_ref() {
+            Some(tray_state) => (
+                Some(tray_state.icon.clone()),
+                tray_state.sync_item.clone(),
+                tray_state.status_item.is_some() || tray_state.error_rendered,
+            ),
+            None => (None, None, false),
+        }
+    };
+    let Some(tray) = tray else {
+        return;
+    };
+    if recording_owns {
+        return;
+    }
+
+    let Some(glyph) = sync_glyph(state, frame) else {
+        // No profiles at all: leave the plain idle tray exactly as it was, and
+        // tear down a sync menu if one is still installed.
+        if sync_item.is_some() {
+            restore_idle(app, &tray);
+            store_sync_item(tray.id(), None);
+        }
+        return;
+    };
+
+    match sync_item {
+        // Steady state: refresh the text only. No menu rebuild, no flicker, and
+        // an open menu stays open.
+        Some(item) => {
+            if let Err(error) = item.set_text(line) {
+                tracing::warn!(%error, "tray: could not refresh the sync status line");
+            }
+            store_sync_item(tray.id(), Some(item));
+        }
+        // First sync tick since the tray went idle: install the menu once.
+        None => {
+            let Some((menu, item)) = build_sync_menu(app, line) else {
+                return;
+            };
+            if let Err(error) = tray.set_menu(Some(menu)) {
+                tracing::warn!(%error, "tray: could not install the sync menu");
+                return;
+            }
+            store_sync_item(tray.id(), Some(item));
+        }
+    }
+
+    // The icon is cosmetic — a decode or set failure keeps the current glyph
+    // rather than desyncing the menu that was just installed.
+    if let Ok(image) = Image::from_bytes(glyph) {
+        if let Err(error) = tray.set_icon(Some(image)) {
+            tracing::warn!(%error, "tray: could not set the sync icon");
+        }
+        let _ = tray.set_icon_as_template(true);
+    }
+}
+
+/// Store the held sync line back into the slot, unless the slot was rebuilt
+/// (presence toggled off→on) while the menu was installed lock-free — in which
+/// case the fresh tray's own state wins.
+fn store_sync_item(tray_id: &TrayIconId, item: Option<MenuItem<Wry>>) {
+    let mut guard = tray_guard();
+    if let Some(state) = guard.as_mut() {
+        if state.icon.id() == tray_id {
+            state.sync_item = item;
+        }
+    }
+}
+
+#[cfg(test)]
+mod sync_tray_tests {
+    use super::*;
+
+    #[test]
+    fn a_warning_glyph_is_never_masked_by_activity_or_pause() {
+        // The precedence that matters: a user must not miss a problem because
+        // some other profile happens to be transferring.
+        assert_eq!(
+            sync_glyph(TraySyncState::Warning, 0).map(<[u8]>::len),
+            Some(SYNC_WARNING_ICON_PNG.len())
+        );
+        assert_eq!(
+            sync_glyph(TraySyncState::Paused, 0).map(<[u8]>::len),
+            Some(SYNC_PAUSED_ICON_PNG.len())
+        );
+    }
+
+    #[test]
+    fn no_profiles_means_no_sync_glyph_at_all() {
+        // Absent must leave the plain idle tray alone rather than claiming it.
+        assert!(sync_glyph(TraySyncState::Absent, 0).is_none());
+    }
+
+    #[test]
+    fn activity_frames_cycle_and_never_index_out_of_bounds() {
+        // `frame` comes from a free-running tick counter, so it must wrap
+        // safely for every u8 rather than panicking once a minute.
+        for frame in 0u8..=255 {
+            assert!(sync_glyph(TraySyncState::Active, frame).is_some());
+        }
+        let first = sync_glyph(TraySyncState::Active, 0).expect("frame 0");
+        let wrapped = sync_glyph(TraySyncState::Active, 4).expect("frame 4");
+        assert_eq!(
+            first.len(),
+            wrapped.len(),
+            "the cycle repeats every four frames"
+        );
+        let second = sync_glyph(TraySyncState::Active, 1).expect("frame 1");
+        assert_ne!(
+            first.len(),
+            second.len(),
+            "consecutive frames must differ, or the ring does not appear to move"
+        );
+    }
+
+    #[test]
+    fn every_glyph_decodes_at_the_same_size_as_the_idle_mark() {
+        // A differently-sized template would jump in the menu bar on every
+        // state change.
+        let idle = Image::from_bytes(IDLE_ICON_PNG).expect("idle decodes");
+        for bytes in [
+            SYNC_ARMED_ICON_PNG,
+            SYNC_PAUSED_ICON_PNG,
+            SYNC_WARNING_ICON_PNG,
+            SYNC_FRAME_PNGS[0],
+            SYNC_FRAME_PNGS[1],
+            SYNC_FRAME_PNGS[2],
+            SYNC_FRAME_PNGS[3],
+        ] {
+            let image = Image::from_bytes(bytes).expect("sync glyph decodes");
+            assert_eq!(image.width(), idle.width());
+            assert_eq!(image.height(), idle.height());
+        }
     }
 }

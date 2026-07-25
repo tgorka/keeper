@@ -14,6 +14,7 @@ import {
   NO_BACKGROUND_SYNC_SENTENCE,
 } from "@/components/settings/no-background-sync-disclosure";
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
+import { SyncSection } from "@/components/settings/sync-section";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -96,6 +97,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   // Screen recording is a desktop-macOS-≥13 capability (Story 16.3); render the
   // Recording section only where it exists — never a dead settings surface.
   const recording = useCapabilitiesStore((s) => s.capabilities.recording);
+  // Folder sync needs a usable `git` binary (Epic 29, AD-41); render the Sync
+  // section only where the capability reports one — never a dead affordance.
+  const sync = useCapabilitiesStore((s) => s.capabilities.sync);
   // Whether this is the capability-reduced (phone) tier — drives the Archive
   // backup-exclusion line below, the "On this iPhone" list in About, and hides the
   // desktop "Background & dock" section (Story 14.2).
@@ -177,6 +181,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           {/* The Recording section is desktop-macOS-≥13 only (Story 16.3): absent on
               every platform that cannot record, never a dead affordance. */}
           {recording && <RecordingSection open={open} />}
+          {/* Folder sync needs a usable `git` (Epic 29): absent on every machine
+              that has none, never a section whose every button would reject. */}
+          {sync && <SyncSection open={open} />}
           <EncryptionSection />
           <SetupSection onOpenChange={onOpenChange} />
           <AboutSection open={open} />

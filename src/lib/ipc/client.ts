@@ -112,6 +112,7 @@ export type { SpaceVm } from "./gen/SpaceVm";
 export type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
 export type { SyncProfileReq } from "./gen/SyncProfileReq";
 export type { SyncProfileVm } from "./gen/SyncProfileVm";
+export type { SyncProgressVm } from "./gen/SyncProgressVm";
 export type { SyncStatusVm } from "./gen/SyncStatusVm";
 export type { TccPermission } from "./gen/TccPermission";
 export type { TimelineBatch } from "./gen/TimelineBatch";
@@ -164,6 +165,7 @@ import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
 import type { SyncProfileReq } from "./gen/SyncProfileReq";
 import type { SyncProfileVm } from "./gen/SyncProfileVm";
+import type { SyncProgressVm } from "./gen/SyncProgressVm";
 import type { SyncStatusVm } from "./gen/SyncStatusVm";
 import type { TccPermission } from "./gen/TccPermission";
 import type { TimelineBatch } from "./gen/TimelineBatch";
@@ -2469,4 +2471,36 @@ export async function syncFolderNow(id: string): Promise<SyncOutcomeVm> {
  */
 export async function syncVerify(id: string): Promise<string[]> {
   return await invoke<string[]>("sync_verify", { id });
+}
+
+/**
+ * Stream sync progress, resolving the subscription id.
+ *
+ * Complements {@link syncStatuses} rather than replacing it: this gives a
+ * subscribed window sub-second detail, while the polled snapshot is what lets
+ * the tray render correctly with no webview subscribed at all.
+ *
+ * The subscription cleans itself up when the channel closes, so a reload cannot
+ * accumulate dead sinks -- but call {@link syncUnsubscribeProgress} on unmount
+ * anyway so the engine stops composing events nobody reads.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function syncSubscribeProgress(
+  onProgress: (event: SyncProgressVm) => void,
+): Promise<number> {
+  const channel = new Channel<SyncProgressVm>();
+  // Armed before invoking: the ordering is load-bearing, exactly as in
+  // `subscribe()` above -- an event emitted between invoke and assignment
+  // would otherwise be dropped.
+  channel.onmessage = onProgress;
+  return await invoke<number>("sync_subscribe_progress", { channel });
+}
+
+/**
+ * Stop a progress subscription. Unsubscribing an unknown id is a no-op, so a
+ * double-unsubscribe from a racing unmount is safe.
+ */
+export async function syncUnsubscribeProgress(id: number): Promise<void> {
+  await invoke<void>("sync_unsubscribe_progress", { id });
 }

@@ -178,6 +178,15 @@ pub fn engine(platform: Arc<dyn Platform>) -> SyncResult<Arc<Engine>> {
     Ok(built)
 }
 
+/// The engine **only if it has already been built**.
+///
+/// For callers that must not pay for construction — the ~1 Hz tray tick above
+/// all, which cannot afford to open a database, and must not create one as a
+/// side effect of painting an icon.
+pub fn engine_if_open() -> Option<Arc<Engine>> {
+    slot().as_ref().map(Arc::clone)
+}
+
 /// Whether folder sync can run here — the `CapabilitiesVm.sync` answer.
 ///
 /// Deliberately cheap and side-effect-free: it asks whether a `git` binary

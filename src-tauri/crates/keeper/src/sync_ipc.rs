@@ -435,6 +435,126 @@ pub async fn sync_verify(
         .collect())
 }
 
+/// One streamed progress update (Story 29.1, AD-51).
+///
+/// Streaming exists alongside the polled [`SyncStatusVm`] rather than replacing
+/// it: a subscribed window gets sub-second detail, while the tray keeps
+/// rendering correctly with no webview subscribed at all.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncProgressVm {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub phase: String,
+    #[ts(type = "number")]
+    pub files_done: u64,
+    #[ts(type = "number | null")]
+    pub files_total: Option<u64>,
+    #[ts(type = "number")]
+    pub bytes_done: u64,
+    #[ts(type = "number | null")]
+    pub bytes_total: Option<u64>,
+    /// Repository-relative path of the item in flight, never an absolute one:
+    /// absolute paths leak home-directory names into logs and screenshots.
+    pub current: Option<String>,
+    /// Completion in [0,1], or `null` when the total is not yet known and the
+    /// UI must render an indeterminate meter rather than invent a denominator.
+    #[ts(type = "number | null")]
+    pub fraction: Option<f64>,
+}
+
+/// Stream sync progress until the channel closes.
+///
+/// Returns a subscription id. The engine drops a sink as soon as it returns
+/// `false`, which `Channel::send` does once the webview is gone — so a closed
+/// window unsubscribes itself and a reload cannot accumulate dead sinks.
+#[tauri::command]
+pub async fn sync_subscribe_progress(
+    state: tauri::State<'_, AppState>,
+    channel: tauri::ipc::Channel<SyncProgressVm>,
+) -> Result<u64, IpcError> {
+    let engine = engine_of(&state)?;
+    let id = engine.subscribe(Box::new(move |event| {
+        let vm = SyncProgressVm {
+            profile_id: event.profile_id.clone(),
+            profile_name: event.profile_name.clone(),
+            phase: phase_str(event.phase).to_owned(),
+            files_done: event.files_done,
+            files_total: event.files_total,
+            bytes_done: event.bytes_done,
+            bytes_total: event.bytes_total,
+            current: event.current.clone(),
+            fraction: event.fraction(),
+        };
+        channel.send(vm).is_ok()
+    }));
+    Ok(id)
+}
+
+/// Stop a progress subscription. Unsubscribing an unknown id is a no-op, so a
+/// double-unsubscribe from a racing unmount is not an error.
+#[tauri::command]
+pub async fn sync_unsubscribe_progress(
+    state: tauri::State<'_, AppState>,
+    id: u64,
+) -> Result<(), IpcError> {
+    let engine = engine_of(&state)?;
+    engine.unsubscribe(id);
+    Ok(())
+}
+
+/// The tray's view of folder sync: one composed state and one line.
+///
+/// Called by the ~1 Hz tray tick, so it is deliberately cheap and total:
+/// the engine is only consulted if it already exists (building it opens a
+/// database, which a UI tick must never do), and any failure degrades to
+/// "nothing to show" rather than propagating. A tray that stops repainting
+/// because sync had a bad second would be a worse bug than a missing glyph.
+///
+/// The line is composed in Rust by `keeper_sync::progress::status_line`, the
+/// same function the window renders, so the two can never word a state
+/// differently.
+pub fn tray_snapshot(app: &tauri::AppHandle) -> (keeper_sync::progress::TraySyncState, String) {
+    use keeper_sync::progress::{status_line, tray_state, TraySyncState};
+    use tauri::Manager as _;
+
+    let Some(engine) = crate::sync::engine_if_open() else {
+        return (TraySyncState::Absent, String::new());
+    };
+    // Touching AppState only to keep the signature uniform with the recording
+    // snapshot; the engine is process-wide and needs nothing from it.
+    let _ = app.try_state::<AppState>();
+
+    let Ok(statuses) = engine.statuses() else {
+        return (TraySyncState::Absent, String::new());
+    };
+    let state = tray_state(&statuses);
+    if state == TraySyncState::Absent {
+        return (state, String::new());
+    }
+
+    // With several profiles the tray has room for one line, so it shows the
+    // most urgent: the one whose state the composed glyph is actually
+    // reporting. Ties break on name for stability — a line that reshuffles
+    // every tick is unreadable.
+    let mut ranked: Vec<&keeper_sync::progress::SyncStatus> = statuses.iter().collect();
+    ranked.sort_by_key(|s| {
+        let urgency = if s.error.is_some() || s.warning.is_some() || s.state.is_warning() {
+            0
+        } else if s.state.is_active() || s.phase.is_active() {
+            1
+        } else if matches!(s.state, keeper_sync::ProfileState::Paused) {
+            2
+        } else {
+            3
+        };
+        (urgency, s.profile_name.clone())
+    });
+    let line = ranked.first().map(|s| status_line(s)).unwrap_or_default();
+    (state, line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

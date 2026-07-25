@@ -1271,6 +1271,15 @@ pub fn capabilities() -> Result<CapabilitiesVm, IpcError> {
     })
 }
 
+/// The tray's folder-sync snapshot, re-exported so the ~1 Hz tick reaches it
+/// the same way it reaches [`recording_snapshot`].
+#[cfg(desktop)]
+pub fn sync_tray_snapshot(
+    app: &tauri::AppHandle,
+) -> (keeper_sync::progress::TraySyncState, String) {
+    crate::sync_ipc::tray_snapshot(app)
+}
+
 /// Whether folder sync can run on this machine.
 ///
 /// Split out so the iOS build — which has no `crate::sync` module at all — still
