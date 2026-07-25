@@ -154,18 +154,41 @@ describe("useWebviewGuard", () => {
 
   it("fails safe: when the attempt flag cannot be durably recorded, it does not reload", () => {
     hydrateReducedTier();
-    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-      throw new Error("quota exceeded");
+    // jsdom's `sessionStorage` is a Proxy, so `vi.spyOn(Storage.prototype, …)`
+    // is never actually invoked: storage kept working, the guard reloaded as it
+    // should have, and this assertion failed. Replacing the whole object is the
+    // only interception point that works here.
+    const original = Object.getOwnPropertyDescriptor(window, "sessionStorage");
+    const refusing: Storage = {
+      length: 0,
+      clear: () => {},
+      getItem: () => null,
+      key: () => null,
+      removeItem: () => {},
+      setItem: () => {
+        throw new Error("quota exceeded");
+      },
+    };
+    Object.defineProperty(window, "sessionStorage", {
+      configurable: true,
+      value: refusing,
     });
-    renderHook(() => useWebviewGuard());
-    fireFrame();
 
-    setVisibility("hidden");
-    setVisibility("visible");
-    elapseBlankWindow();
+    try {
+      renderHook(() => useWebviewGuard());
+      fireFrame();
 
-    // A recoverable blank beats an unguarded reload loop.
-    expect(mockReload).not.toHaveBeenCalled();
+      setVisibility("hidden");
+      setVisibility("visible");
+      elapseBlankWindow();
+
+      // A recoverable blank beats an unguarded reload loop.
+      expect(mockReload).not.toHaveBeenCalled();
+    } finally {
+      if (original) {
+        Object.defineProperty(window, "sessionStorage", original);
+      }
+    }
   });
 
   it("healthy probe: a serviced frame never reloads and clears the stored flag", () => {
