@@ -235,13 +235,13 @@ development_status:
   24-6-applying-remote-changes-fast-forward-checkout: done
   24-7-divergence-without-prompts-conflict-copies: done
   epic-24-retrospective: optional
-  epic-25: in-progress
+  epic-25: done
   25-1-lfs-pointer-and-content-addressed-store: done
   25-2-endpoint-derivation-and-the-batch-api-client: done
   25-3-the-basic-transfer-adapter-resumable-down-verified-both-ways: done
-  25-4-in-process-gitattributes-filtering-and-automatic-tracking: backlog
-  25-5-path-filtered-lfs-fetch: backlog
-  25-6-end-to-end-verification-and-the-verify-operation: in-progress
+  25-4-in-process-gitattributes-filtering-and-automatic-tracking: done
+  25-5-path-filtered-lfs-fetch: done
+  25-6-end-to-end-verification-and-the-verify-operation: done
   epic-25-retrospective: optional
   epic-26: done
   26-1-tier-0-name-and-shape-exclusion: done
@@ -299,13 +299,14 @@ development_status:
 # absence pausing without ever propagating a deletion, and SIGTERM performing a
 # bounded graceful finalize.
 #
+# LFS IS NOW WIRED AND VERIFIED END TO END (epic 25): a 12 MiB file commits as a
+# 133-byte pointer with the real bytes left in the worktree, uploads to an LFS
+# server byte-identically, and a second peer clones, downloads and materializes
+# it byte-identically. keeper also registers itself as the repository's
+# clean/smudge filter, so plain `git status`, `git checkout` and `git commit`
+# inside a synced folder all agree with keeper.
+#
 # BUILT AND UNIT-TESTED BUT NOT YET REACHABLE AT RUNTIME:
-#   25-4 / 25-5 — the LFS client (pointer, store, endpoint, batch, basic
-#   transfer; 62 tests) is complete, but nothing in the commit path yet routes
-#   an oversized file through it. `WorkKind::LfsUpload`/`LfsDownload` execute
-#   correctly when enqueued; no code enqueues them. Wiring this needs the
-#   in-process attribute filter (AD-46) so `gix::status` does not report every
-#   pointer-backed file as permanently modified. This is the top remaining item.
 #   28-2 / 28-4 — `GitCli::worktree_add/remove/prune` exist and are tested; the
 #   engine does not yet create lanes, and `do_open_pr` records and surfaces the
 #   pushed branch rather than calling the Forgejo API.

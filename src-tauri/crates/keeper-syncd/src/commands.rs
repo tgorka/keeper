@@ -31,6 +31,8 @@ use serde::Serialize;
 
 use keeper_sync::engine::Engine;
 use keeper_sync::git::cli as git_cli;
+use keeper_sync::lfs::pointer::{Pointer, MAX_POINTER_BYTES};
+use keeper_sync::lfs::store::LfsStore;
 use keeper_sync::profile::LfsMode;
 use keeper_sync::progress::status_line;
 use keeper_sync::provenance::SyncSource;
@@ -236,6 +238,38 @@ pub enum Command {
         #[arg(long, short = 'n', value_name = "N", default_value_t = 200)]
         lines: usize,
     },
+    /// git clean/smudge filter for LFS content. Invoked by git, not by hand.
+    ///
+    /// Registered as `filter.lfs.clean` / `filter.lfs.smudge` in each managed
+    /// repository so that plain `git` in a synced folder agrees with keeper
+    /// about what an LFS-tracked file contains. Without it `git status` reports
+    /// every such file as modified the moment it re-reads content, because the
+    /// blob is a pointer and the worktree is not.
+    #[command(hide = true)]
+    Lfs {
+        #[command(subcommand)]
+        direction: LfsDirection,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LfsDirection {
+    /// stdin = worktree bytes, stdout = pointer.
+    Clean {
+        /// The path git is filtering, supplied as `%f`. Advisory only.
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+        /// Repository the object store belongs to.
+        #[arg(long, value_name = "DIR")]
+        repo: PathBuf,
+    },
+    /// stdin = pointer, stdout = worktree bytes.
+    Smudge {
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        repo: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -394,6 +428,9 @@ pub async fn run(
     match cli.command {
         Command::Init { force } => cmd_init(&printer, &config_path, &platform, force),
         Command::Logs { lines } => cmd_logs(&printer, &platform, lines),
+        // Runs inside a `git` invocation: it must write ONLY object bytes to
+        // stdout, so it bypasses the printer entirely.
+        Command::Lfs { direction } => cmd_lfs_filter(direction),
         Command::Doctor => cmd_doctor(&printer, &platform, &config_path, config),
         Command::Add(args) => {
             let engine = engine_for(&platform, config)?;
@@ -1487,6 +1524,84 @@ fn status_line_state(state: ProfileState) -> &'static str {
         ProfileState::Paused => "paused",
         ProfileState::NeedsAttention => "needs attention",
     }
+}
+
+/// Run one clean or smudge pass for git.
+///
+/// This is the seam that makes a keeper-managed folder behave correctly under
+/// plain `git`. It writes **only** object bytes to stdout — never a log line,
+/// never a status message — because git treats everything it emits as file
+/// content.
+///
+/// Both directions stream in bounded chunks. A multi-gigabyte smudge must never
+/// be buffered, which is the entire reason LFS exists here (AD-46).
+fn cmd_lfs_filter(direction: LfsDirection) -> Result<(), CliError> {
+    use std::io::{Read, Write};
+
+    let (repo, smudging) = match &direction {
+        LfsDirection::Clean { repo, .. } => (repo.clone(), false),
+        LfsDirection::Smudge { repo, .. } => (repo.clone(), true),
+    };
+    let store = LfsStore::in_git_dir(repo.join(".git"));
+    store.ensure_layout()?;
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+
+    if smudging {
+        // The pointer is under 1 KiB by specification, so reading it whole is
+        // bounded. Anything larger is not a pointer and passes straight
+        // through — the same tolerance git-lfs shows.
+        let mut buffer = Vec::with_capacity(MAX_POINTER_BYTES);
+        // `take` by mutable reference: the lock must stay usable for the
+        // pass-through branch below, which streams the remainder.
+        Read::by_ref(&mut input)
+            .take(MAX_POINTER_BYTES as u64 + 1)
+            .read_to_end(&mut buffer)
+            .map_err(|err| SyncError::io("read smudge input", &repo, err))?;
+
+        let resolved = Pointer::parse(&buffer)
+            .filter(|p| store.contains(&p.oid, p.size))
+            .map(|p| store.object_path(&p.oid));
+
+        match resolved {
+            Some(path) => {
+                let mut object = std::fs::File::open(&path)
+                    .map_err(|err| SyncError::io("open lfs object", &path, err))?;
+                std::io::copy(&mut object, &mut output)
+                    .map_err(|err| SyncError::io("stream lfs object", &path, err))?;
+            }
+            // Not a pointer, or an object we do not hold yet. Passing the bytes
+            // through unchanged is what git-lfs does, and it keeps a partial
+            // fetch usable instead of failing the checkout.
+            None => {
+                output
+                    .write_all(&buffer)
+                    .map_err(|err| SyncError::io("pass through pointer", &repo, err))?;
+                std::io::copy(&mut input, &mut output)
+                    .map_err(|err| SyncError::io("pass through remainder", &repo, err))?;
+            }
+        }
+        output
+            .flush()
+            .map_err(|err| SyncError::io("flush smudge output", &repo, err))?;
+        return Ok(());
+    }
+
+    // Clean: worktree bytes in, pointer out. The content is hashed straight
+    // into the object store as it streams, so the object is already present by
+    // the time the pointer is emitted.
+    let (oid, size) = store.insert_streaming(&mut input)?;
+    let pointer = Pointer::new(oid, size);
+    output
+        .write_all(pointer.render().as_bytes())
+        .map_err(|err| SyncError::io("write pointer", &repo, err))?;
+    output
+        .flush()
+        .map_err(|err| SyncError::io("flush clean output", &repo, err))?;
+    Ok(())
 }
 
 #[cfg(test)]

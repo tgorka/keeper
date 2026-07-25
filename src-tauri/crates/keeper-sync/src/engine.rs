@@ -90,6 +90,13 @@ pub struct Engine {
     gates: Mutex<HashMap<String, StabilityGate>>,
     /// Profiles with an operation in flight (the one-per-profile rule).
     busy: Mutex<HashMap<String, ()>>,
+    /// Absolute path to the binary git should invoke as the `lfs` filter.
+    ///
+    /// `None` when the running executable cannot be resolved — the filter is an
+    /// interoperability convenience for humans using plain `git`, never a
+    /// correctness requirement for keeper itself, so a missing path degrades
+    /// rather than fails.
+    filter_program: Option<PathBuf>,
     sinks: Mutex<Vec<(u64, ProgressSink)>>,
     next_sink: AtomicU64,
     interrupt: Arc<AtomicBool>,
@@ -137,6 +144,9 @@ impl Engine {
             status: Mutex::new(HashMap::new()),
             gates: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
+            // `current_exe` is the daemon in a CLI run and the app binary in a
+            // desktop run; both understand `lfs clean|smudge`.
+            filter_program: std::env::current_exe().ok(),
             sinks: Mutex::new(Vec::new()),
             next_sink: AtomicU64::new(1),
             interrupt: Arc::new(AtomicBool::new(false)),
@@ -408,6 +418,17 @@ impl Engine {
             None => return Ok(()),
         };
 
+        self.drain_journal(profile).await
+    }
+
+    /// Execute every journal unit that is ready for this profile.
+    ///
+    /// Shared by the supervisor and by `sync_once`: a one-shot sync that
+    /// committed a pointer but never ran the LFS transfer it queued would leave
+    /// the remote holding a pointer to content it does not have.
+    ///
+    /// The caller owns the profile reservation.
+    async fn drain_journal(&self, profile: &SyncProfile) -> Result<()> {
         let now = self.platform.now_ms();
         let claimed = self.with_db(|conn| db::claim_ready(conn, &profile.id, now, CLAIM_LIMIT))?;
         if claimed.is_empty() {
@@ -586,7 +607,7 @@ impl Engine {
         let git_dir = profile.local_path.join(".git");
         if git_dir.exists() {
             let repo = git::repo::open(&profile.local_path, trust_full)?;
-            git::repo::enforce_local_config(&repo)?;
+            git::repo::enforce_local_config_with_filter(&repo, self.filter_program.as_deref())?;
             return Ok(repo);
         }
         tracing::info!(
@@ -963,6 +984,16 @@ impl Engine {
                     StabilityVerdict::Stable => {
                         if is_new {
                             new_paths.push(rela.clone());
+                        } else if let Some(indexed) = lfs::stage::indexed_pointer(&repo, rela) {
+                            // An LFS-tracked path. git re-reads content for any
+                            // entry whose mtime is not older than the index
+                            // ("racily clean"), so right after staging it will
+                            // report the worktree bytes as differing from the
+                            // pointer blob. That is not an edit, and
+                            // re-committing it would loop forever.
+                            if !lfs::stage::is_false_modification(&indexed, &absolute) {
+                                changed_paths.push(rela.clone());
+                            }
                         } else {
                             changed_paths.push(rela.clone());
                         }
@@ -1023,10 +1054,58 @@ impl Engine {
         )
         .with_tags(profile.tags.clone());
 
-        if let Some(id) =
-            git::commit::stage_and_commit(&repo, staged, &provenance, &profile.name, &author)?
-        {
-            tracing::info!(profile = profile.name, commit = %id, files = staged.len(), "committed");
+        // Route anything over the threshold into LFS BEFORE the commit: the
+        // blob written for those paths is the pointer, while the index entry
+        // keeps the worktree file's stat so status stays clean (AD-46).
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        let candidates: Vec<PathBuf> = staged
+            .added
+            .iter()
+            .chain(staged.modified.iter())
+            .cloned()
+            .collect();
+        let staging = lfs::stage::prepare(profile, &store, &candidates)?;
+
+        // A changed `.gitattributes` must land in the SAME commit as the files
+        // it governs, or a peer cloning that commit would not know the pointers
+        // are pointers.
+        let mut staged = staged.clone();
+        if staging.attributes_changed {
+            let attributes = PathBuf::from(".gitattributes");
+            if !staged.added.contains(&attributes) && !staged.modified.contains(&attributes) {
+                staged.added.push(attributes);
+            }
+        }
+
+        let Some(id) = git::commit::stage_and_commit(
+            &repo,
+            &staged,
+            &provenance,
+            &profile.name,
+            &author,
+            &staging.substitutions,
+        )?
+        else {
+            return Ok(());
+        };
+        tracing::info!(
+            profile = profile.name,
+            commit = %id,
+            files = staged.len(),
+            lfs = staging.uploads.len(),
+            "committed"
+        );
+
+        // Only now, with the pointer durably committed, is an upload worth
+        // journaling: a crash before this point loses nothing, and a crash
+        // after it re-drives the transfer.
+        let now = self.platform.now_ms();
+        for object in &staging.uploads {
+            let unit = WorkKind::LfsUpload {
+                oid: object.oid.clone(),
+                size: object.size,
+            };
+            self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now).map(drop))?;
         }
         Ok(())
     }
@@ -1043,7 +1122,21 @@ impl Engine {
         }
         self.publish(self.progress(profile, SyncPhase::TransferringLfs));
 
-        let endpoint = lfs::endpoint::derive(&profile.remote_url)?;
+        // `.lfsconfig` at the repository root overrides the derived endpoint —
+        // the documented precedence, and the shape a self-hosted LFS server
+        // beside a non-HTTP git remote actually takes.
+        let lfsconfig = match std::fs::read_to_string(profile.local_path.join(".lfsconfig")) {
+            Ok(text) => Some(text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(SyncError::io(
+                    "read .lfsconfig",
+                    profile.local_path.join(".lfsconfig"),
+                    err,
+                ));
+            }
+        };
+        let endpoint = lfs::endpoint::resolve(&profile.remote_url, lfsconfig.as_deref(), "origin")?;
         let auth = self
             .platform
             .secret_get(&profile.secret_key())?
@@ -1075,6 +1168,73 @@ impl Engine {
                 tracing::warn!(oid, error = %err, "lfs transfer failed");
                 return Err(err);
             }
+        }
+
+        if !upload {
+            // The object is in the store; the worktree still holds the pointer
+            // that was checked out. Replacing it is what makes a peer's clone
+            // contain real bytes rather than a text stub.
+            self.materialize_pending(profile, &store)?;
+        }
+        Ok(())
+    }
+
+    /// Replace every checked-out pointer whose object is already local.
+    ///
+    /// Runs after a download and after applying remote changes. Objects that
+    /// are not in the store yet are queued for transfer instead — so a partial
+    /// fetch materializes what it can and returns for the rest.
+    fn materialize_pending(
+        &self,
+        profile: &SyncProfile,
+        store: &lfs::store::LfsStore,
+    ) -> Result<()> {
+        if profile.lfs_mode == LfsMode::Disabled {
+            return Ok(());
+        }
+        let repo = self.open_repo(profile)?;
+        let tracked = git::repo::tracked_paths(&repo)?;
+        let pending = lfs::stage::pending_smudges(&profile.local_path, &tracked)?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let now = self.platform.now_ms();
+        let mut materialized = 0usize;
+        for smudge in &pending {
+            if store.contains(&smudge.pointer.oid, smudge.pointer.size) {
+                // Pointer-only mode leaves excluded content as a pointer on
+                // purpose; it is the only lever that reduces LFS traffic,
+                // because git-lfs is entirely sparse-checkout-unaware.
+                if profile.lfs_mode == LfsMode::PointerOnly {
+                    continue;
+                }
+                lfs::stage::materialize(store, &profile.local_path, smudge)?;
+                materialized += 1;
+                continue;
+            }
+            if profile.lfs_mode == LfsMode::PointerOnly {
+                continue;
+            }
+            let unit = WorkKind::LfsDownload {
+                oid: smudge.pointer.oid.clone(),
+                size: smudge.pointer.size,
+            };
+            self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now).map(drop))?;
+        }
+        if materialized > 0 {
+            tracing::info!(
+                profile = profile.name,
+                materialized,
+                "materialized LFS content"
+            );
+            // The worktree files just changed size, so the index entries carry
+            // the pointer's stat and status would call every one of them
+            // modified. Re-stat them against the real files.
+            git::repo::refresh_index_stat(
+                &repo,
+                &pending.iter().map(|s| s.path.clone()).collect::<Vec<_>>(),
+            )?;
         }
         Ok(())
     }
@@ -1135,11 +1295,23 @@ impl Engine {
         if profile.direction.pulls() {
             self.do_pull(&profile).await?;
             outcome.pulled = true;
+            // Whatever the apply checked out may include pointers. Materialize
+            // what is already local and queue the rest, BEFORE the push leg —
+            // otherwise the scan would see a pointer-sized file where the index
+            // records the full length and call it an edit.
+            let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+            self.materialize_pending(&profile, &store)?;
         }
         if profile.direction.pushes() {
             self.do_push(&profile).await?;
             outcome.pushed = true;
         }
+
+        // Commit may have queued LFS transfers. A one-shot sync that returned
+        // here would leave the remote holding a pointer to content it does not
+        // have, so the queue is drained before this call is allowed to claim
+        // success.
+        self.drain_journal(&profile).await?;
 
         self.set_state(&profile.id, ProfileState::Watching);
         self.publish(self.progress(&profile, SyncPhase::Idle));
@@ -1233,6 +1405,12 @@ impl Engine {
     /// Queue the work a profile needs, based on what the tree looks like now.
     fn scan_and_enqueue(&self, profile: &SyncProfile) -> Result<()> {
         let now = self.platform.now_ms();
+        // A pointer left in the worktree by an earlier apply is work too, and
+        // the supervisor is the only thing that will notice it.
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        if let Err(err) = self.materialize_pending(profile, &store) {
+            tracing::warn!(profile = profile.name, error = %err, "could not materialize LFS content");
+        }
         if profile.direction.pulls() {
             self.with_db(|conn| {
                 db::enqueue_unique(conn, &profile.id, &WorkKind::Pull, now, now).map(drop)

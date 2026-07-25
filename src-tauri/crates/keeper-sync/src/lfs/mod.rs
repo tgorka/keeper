@@ -81,4 +81,5 @@ pub mod basic;
 pub mod batch;
 pub mod endpoint;
 pub mod pointer;
+pub mod stage;
 pub mod store;

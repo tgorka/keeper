@@ -258,6 +258,20 @@ the `Content-Range` total is computed incorrectly, so only the start byte is
 trusted; and range offsets are parsed as 32-bit, so resume above 2 GiB falls
 back to a restart.
 
+### Working in the folder with plain `git`
+
+keeper registers itself as the repository's `lfs` clean/smudge filter
+(`filter.lfs.clean` / `filter.lfs.smudge` in `.git/config`). That is what lets
+you use ordinary `git` inside a synced folder: `git status` stays clean,
+`git checkout` restores real content rather than pointer text, and a commit you
+make by hand stores a pointer and files the object into keeper's store, exactly
+as keeper's own commits do.
+
+The filter is registered as **not required**, deliberately. If the keeper binary
+moves, git still works — checkouts simply yield pointer files, which is
+recoverable. A required filter would instead hard-fail every git command in the
+repository.
+
 `lfsMode = pointerOnly` leaves excluded paths as pointer files. This is the only
 lever that reduces LFS traffic — sparse checkout does **not**, because git-lfs is
 entirely sparse-checkout-unaware.
@@ -411,14 +425,11 @@ Linux).
 ## 15. Current implementation status
 
 This document describes the designed behaviour. As of 2026-07-25 the engine and
-the `keeper-syncd` daemon implement and verify §§1–7, §9, §10 and §12 against
-real git remotes. Three parts are not yet reachable at runtime:
+the `keeper-syncd` daemon implement and verify §§1–10 and §12 against real git
+remotes, including a full LFS round trip (upload, peer clone, download,
+materialize) against a local LFS server. Two parts are not yet reachable at
+runtime:
 
-- **§8 large files.** The LFS client is written and unit-tested, but nothing in
-  the commit path routes an oversized file through it yet, so LFS does not
-  engage. Files above the threshold are currently committed as ordinary git
-  blobs — which is exactly what §8 says must not happen for multi-gigabyte
-  content. Do not point a profile at large binaries until this lands.
 - **§7 review lanes.** The worktree commands exist; the engine does not yet
   create a lane or open a pull request. A `pushOnly` profile still pushes
   correctly, it just pushes its own branch rather than a generated lane.

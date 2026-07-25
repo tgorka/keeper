@@ -108,6 +108,47 @@ impl LfsStore {
             .unwrap_or(false)
     }
 
+    /// Hash `reader` into the store and publish it under the digest it turns
+    /// out to have.
+    ///
+    /// The clean direction: staging a worktree file, where the OID is the
+    /// *result* rather than an expectation, so [`LfsStore::insert_verified`]
+    /// cannot be used. Returns `(oid, bytes)`. Streams in bounded chunks and
+    /// never holds the object in memory — which is the reason LFS exists here
+    /// at all (AD-46).
+    pub fn insert_streaming(&self, mut reader: impl Read) -> Result<(String, u64)> {
+        self.ensure_layout()?;
+
+        let tmp_dir = self.tmp_dir();
+        let mut staged = tempfile::NamedTempFile::new_in(&tmp_dir)
+            .map_err(|err| SyncError::io("create lfs temp file", &tmp_dir, err))?;
+
+        let mut hasher = Sha256::new();
+        let mut written: u64 = 0;
+        let mut buf = vec![0u8; HASH_CHUNK_BYTES];
+        loop {
+            let read = reader
+                .read(&mut buf)
+                .map_err(|err| SyncError::io("read lfs source", staged.path(), err))?;
+            if read == 0 {
+                break;
+            }
+            let chunk = &buf[..read];
+            hasher.update(chunk);
+            staged
+                .write_all(chunk)
+                .map_err(|err| SyncError::io("write lfs temp file", staged.path(), err))?;
+            written += read as u64;
+        }
+        staged
+            .flush()
+            .map_err(|err| SyncError::io("flush lfs temp file", staged.path(), err))?;
+
+        let oid = hex::encode(hasher.finalize());
+        self.publish(staged, &oid, written)?;
+        Ok((oid, written))
+    }
+
     /// Hash `reader` into the store, verifying it against `oid` before it
     /// becomes visible.
     ///

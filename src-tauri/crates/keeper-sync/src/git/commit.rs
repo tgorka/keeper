@@ -27,7 +27,11 @@
 //! A 3 GB file committed here would be a 3 GB allocation and a permanently
 //! bloated repository.
 
-use std::{collections::BTreeSet, fmt::Write as _, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    path::PathBuf,
+};
 
 use gix::{
     bstr::BString,
@@ -85,6 +89,7 @@ pub fn stage_and_commit(
     provenance: &Provenance,
     profile_name: &str,
     author: &gix::actor::Signature,
+    substitutions: &BTreeMap<PathBuf, Vec<u8>>,
 ) -> Result<Option<gix::hash::ObjectId>> {
     if changes.is_empty() {
         return Ok(None);
@@ -117,14 +122,25 @@ pub fn stage_and_commit(
                 Vec::from(gix::path::into_bstr(target).into_owned()),
             )
         } else if metadata.is_file() {
-            let bytes = std::fs::read(&absolute)
-                .map_err(|source| SyncError::io("read staged file", absolute.clone(), source))?;
             let mode = if metadata.is_executable() {
                 Mode::FILE_EXECUTABLE
             } else {
                 Mode::FILE
             };
-            (mode, bytes)
+            match substitutions.get(rela) {
+                // An LFS-tracked path: the blob is the ~130-byte pointer while
+                // the worktree keeps the real bytes. The entry's stat below is
+                // still taken from the WORKTREE file, which is what makes
+                // `gix::status` (and `git status`) call it unchanged without
+                // reading gigabytes back — exactly how git+LFS itself works.
+                Some(pointer) => (mode, pointer.clone()),
+                None => {
+                    let bytes = std::fs::read(&absolute).map_err(|source| {
+                        SyncError::io("read staged file", absolute.clone(), source)
+                    })?;
+                    (mode, bytes)
+                }
+            }
         } else {
             // A fifo, socket or device has no meaning on a peer's filesystem;
             // this is one of the few conditions a human has to resolve.
@@ -460,6 +476,12 @@ fn write_tree(
 
 #[cfg(test)]
 mod tests {
+    /// No LFS substitution: the blob written is the worktree content, which is
+    /// what every test here except the pointer ones expects.
+    fn no_lfs() -> BTreeMap<PathBuf, Vec<u8>> {
+        BTreeMap::new()
+    }
+
     use super::*;
     use crate::provenance::SyncSource;
 
@@ -506,7 +528,15 @@ mod tests {
             std::fs::write(&path, content).expect("write");
             changes.added.push(PathBuf::from(name));
         }
-        stage_and_commit(repo, &changes, &provenance(), "docs", &signature()).expect("commit")
+        stage_and_commit(
+            repo,
+            &changes,
+            &provenance(),
+            "docs",
+            &signature(),
+            &no_lfs(),
+        )
+        .expect("commit")
     }
 
     #[test]
@@ -519,6 +549,7 @@ mod tests {
             &provenance(),
             "docs",
             &signature(),
+            &no_lfs(),
         )
         .expect("no error");
         assert_eq!(got, None);
@@ -579,8 +610,15 @@ mod tests {
             modified: vec![PathBuf::from("a.txt")],
             ..StagedChange::default()
         };
-        let got =
-            stage_and_commit(&repo, &again, &provenance(), "docs", &signature()).expect("no error");
+        let got = stage_and_commit(
+            &repo,
+            &again,
+            &provenance(),
+            "docs",
+            &signature(),
+            &no_lfs(),
+        )
+        .expect("no error");
         assert_eq!(got, None, "an unchanged file must not create a commit");
     }
 
@@ -596,9 +634,16 @@ mod tests {
             deleted: vec![PathBuf::from("b.txt")],
             ..StagedChange::default()
         };
-        stage_and_commit(&repo, &removal, &provenance(), "docs", &signature())
-            .expect("commit")
-            .expect("a deletion is a change");
+        stage_and_commit(
+            &repo,
+            &removal,
+            &provenance(),
+            "docs",
+            &signature(),
+            &no_lfs(),
+        )
+        .expect("commit")
+        .expect("a deletion is a change");
 
         let tree = repo.head_commit().expect("head").tree().expect("tree");
         assert!(tree

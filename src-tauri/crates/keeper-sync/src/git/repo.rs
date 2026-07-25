@@ -89,6 +89,30 @@ pub fn clone(
 /// hard-failure this prevents. Idempotent: an existing value is overwritten
 /// rather than appended, so repeated calls do not grow the file.
 pub fn enforce_local_config(repo: &gix::Repository) -> Result<()> {
+    enforce_local_config_with_filter(repo, None)
+}
+
+/// As [`enforce_local_config`], additionally registering keeper as the `lfs`
+/// clean/smudge filter when `filter_program` is given.
+///
+/// Registering the filter is what lets a human use plain `git` inside a synced
+/// folder. Without it, the blob is a pointer while the worktree holds the real
+/// bytes, so the moment git re-reads content — which it does whenever its stat
+/// cache misses — it reports every LFS-tracked file as modified. keeper itself
+/// tolerates that, but nobody running `git status` by hand should have to.
+///
+/// Single-invocation `clean`/`smudge` rather than the long-running
+/// `filter.lfs.process` protocol: both git and gitoxide support it, it is far
+/// less machinery, and the per-call cost only lands when git's stat cache
+/// already missed.
+///
+/// `required` is deliberately left false. A worktree whose keeper binary has
+/// moved must still be checkout-able — it would just get pointers, which is
+/// recoverable, where a required filter would hard-fail every git command.
+pub fn enforce_local_config_with_filter(
+    repo: &gix::Repository,
+    filter_program: Option<&Path>,
+) -> Result<()> {
     let path = repo.git_dir().join("config");
     let mut config =
         gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
@@ -96,6 +120,28 @@ pub fn enforce_local_config(repo: &gix::Repository) -> Result<()> {
     config
         .set_raw_value("index.sparse", "false")
         .map_err(|err| SyncError::Git(format!("could not set index.sparse: {err}")))?;
+
+    if let Some(program) = filter_program {
+        let workdir = workdir(repo)?;
+        // `%f` is git's placeholder for the path being filtered. The program
+        // path is quoted because a user's install directory may contain spaces,
+        // and git splits this value on whitespace.
+        let quoted = program.display().to_string();
+        let clean = format!("\"{quoted}\" lfs clean --repo \"{}\" %f", workdir.display());
+        let smudge = format!(
+            "\"{quoted}\" lfs smudge --repo \"{}\" %f",
+            workdir.display()
+        );
+        config
+            .set_raw_value("filter.lfs.clean", clean.as_str())
+            .map_err(|err| SyncError::Git(format!("could not set filter.lfs.clean: {err}")))?;
+        config
+            .set_raw_value("filter.lfs.smudge", smudge.as_str())
+            .map_err(|err| SyncError::Git(format!("could not set filter.lfs.smudge: {err}")))?;
+        config
+            .set_raw_value("filter.lfs.required", "false")
+            .map_err(|err| SyncError::Git(format!("could not set filter.lfs.required: {err}")))?;
+    }
 
     let parent = path
         .parent()
@@ -283,6 +329,74 @@ fn cancelled_or(interrupt: &AtomicBool, otherwise: impl FnOnce() -> SyncError) -
     }
 }
 
+/// Every path the index tracks, repository-relative.
+///
+/// Used to find checked-out LFS pointers that still need materializing: only a
+/// tracked path can hold one, so this bounds that scan to the index rather than
+/// walking the whole worktree.
+pub fn tracked_paths(repo: &gix::Repository) -> Result<Vec<PathBuf>> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|err| SyncError::Git(format!("could not read the index: {err}")))?;
+    Ok(index
+        .entries()
+        .iter()
+        .map(|entry| PathBuf::from(entry.path(&index).to_string()))
+        .collect())
+}
+
+/// Re-stat `paths` and write the refreshed index.
+///
+/// Materializing an LFS object replaces a ~130-byte pointer with the real file,
+/// so the entry's cached stat no longer describes what is on disk and `status`
+/// would report every one of them as modified. Refreshing the stat — while
+/// leaving the pointer blob as the entry's object — restores the invariant the
+/// whole design rests on: pointer blob, worktree stat, clean status.
+pub fn refresh_index_stat(repo: &gix::Repository, paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let workdir = workdir(repo)?;
+    let shared = repo
+        .index_or_empty()
+        .map_err(|err| SyncError::Git(format!("could not read the index: {err}")))?;
+    let mut index: gix::index::File = (**shared).clone();
+
+    let wanted: std::collections::BTreeSet<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+
+    let mut touched = false;
+    for idx in 0..index.entries().len() {
+        let key = {
+            let state = &*index;
+            let entry = &state.entries()[idx];
+            entry.path(state).to_string()
+        };
+        if !wanted.contains(&key) {
+            continue;
+        }
+        let absolute = workdir.join(&key);
+        let Ok(metadata) = gix::index::fs::Metadata::from_path_no_follow(&absolute) else {
+            continue;
+        };
+        // A pre-epoch timestamp is the only failure mode, and an all-zero stat
+        // simply makes the entry racily clean so the next status re-reads it.
+        if let Ok(stat) = gix::index::entry::Stat::from_fs(&metadata) {
+            index.entries_mut()[idx].stat = stat;
+            touched = true;
+        }
+    }
+    if !touched {
+        return Ok(());
+    }
+    index
+        .write(gix::index::write::Options::default())
+        .map_err(|err| SyncError::Git(format!("could not write the index: {err}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,9 +427,16 @@ mod tests {
             added: vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")],
             ..StagedChange::default()
         };
-        stage_and_commit(&repo, &changes, &provenance(), "fixture", &signature())
-            .expect("commit")
-            .expect("a non-empty commit");
+        stage_and_commit(
+            &repo,
+            &changes,
+            &provenance(),
+            "fixture",
+            &signature(),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("commit")
+        .expect("a non-empty commit");
         // Re-open so the index snapshot is read fresh from disk, exactly as a
         // supervisor would on its next pass.
         let repo = open(dir.path(), true).expect("reopen");
