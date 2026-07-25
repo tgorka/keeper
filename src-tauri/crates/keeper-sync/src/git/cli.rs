@@ -178,6 +178,42 @@ impl GitCli {
         Ok(out.trim().to_owned())
     }
 
+    /// Is `ancestor` reachable from `descendant`?
+    ///
+    /// This is what separates the three shapes a fetch can leave behind, which
+    /// a single "can fast-forward" boolean cannot: local behind (apply),
+    /// local ahead (nothing to apply, just push), and genuinely diverged
+    /// (conflict copies). Conflating "ahead" with "diverged" makes the engine
+    /// merge-loop against a remote it is simply ahead of.
+    ///
+    /// `git merge-base --is-ancestor` answers with its exit status: 0 yes,
+    /// 1 no. Only 1 is a real "no" — any other failure is propagated.
+    pub fn is_ancestor(&self, repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+        // Exit 1 is this command's ANSWER, not a failure, so it must not go
+        // through the warn-logging path — the supervisor asks on every tick and
+        // would otherwise fill the log with warnings about nothing.
+        let args = is_ancestor_args(ancestor, descendant)?;
+        let output = capture(&self.program, Some(repo), &args)?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => {
+                let raw = String::from_utf8_lossy(&output.stderr);
+                let stderr = truncate(&scrub_userinfo(&raw), STDERR_CAP);
+                tracing::warn!(
+                    subcommand = "merge-base --is-ancestor",
+                    %stderr,
+                    "git subcommand failed"
+                );
+                Err(SyncError::GitCommand {
+                    subcommand: "merge-base --is-ancestor",
+                    code: output.status.code().unwrap_or(-1),
+                    stderr,
+                })
+            }
+        }
+    }
+
     /// Paths that differ between two commits, repository-relative.
     pub fn diff_names(&self, repo: &Path, from: &str, to: &str) -> Result<Vec<PathBuf>> {
         let out = self.run("diff --name-only", repo, &diff_names_args(from, to)?)?;
@@ -445,6 +481,16 @@ fn merge_theirs_args(reference: &str, message: &str) -> Result<Vec<String>> {
 /// `git merge-base <a> <b>` argument vector.
 fn merge_base_args(a: &str, b: &str) -> Result<Vec<String>> {
     Ok(vec!["merge-base".to_owned(), safe_ref(a)?, safe_ref(b)?])
+}
+
+/// `git merge-base --is-ancestor <a> <b>` argument vector.
+fn is_ancestor_args(ancestor: &str, descendant: &str) -> Result<Vec<String>> {
+    Ok(vec![
+        "merge-base".to_owned(),
+        "--is-ancestor".to_owned(),
+        safe_ref(ancestor)?,
+        safe_ref(descendant)?,
+    ])
 }
 
 /// `git diff --name-only <from> <to>` argument vector.

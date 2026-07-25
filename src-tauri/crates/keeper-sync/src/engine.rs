@@ -684,6 +684,26 @@ impl Engine {
         let git = self.git.clone();
         let repo_path = profile.local_path.clone();
 
+        // A fetch leaves one of three shapes behind, and `fast_forward` alone
+        // cannot tell them apart: it is false both when we are AHEAD of the
+        // remote and when the histories genuinely diverged. Treating "ahead" as
+        // "diverged" makes the supervisor merge-loop every tick against a
+        // remote it is simply ahead of, and never push. Ask about ancestry.
+        {
+            let git = git.clone();
+            let path = repo_path.clone();
+            let reference = tracking.clone();
+            let ahead =
+                tokio::task::spawn_blocking(move || git.is_ancestor(&path, &reference, "HEAD"))
+                    .await
+                    .map_err(|err| SyncError::Journal(format!("ancestry task failed: {err}")))??;
+            if ahead {
+                // Nothing to apply — we hold every commit the remote has, plus
+                // our own. The push leg publishes them.
+                return Ok(());
+            }
+        }
+
         if outcome.fast_forward {
             let reference = tracking.clone();
             let path = repo_path.clone();
@@ -825,6 +845,63 @@ impl Engine {
         Ok(())
     }
 
+    /// Turn collapsed untracked entries into the regular files they contain.
+    ///
+    /// A path that is already a file passes through. A directory is walked
+    /// recursively; `.git` is never descended into, and symlinked directories
+    /// are not followed (a symlink is staged as its target by the commit path,
+    /// and following one could walk out of the profile entirely, or in circles).
+    fn expand_untracked(root: &Path, entries: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        let mut out = Vec::with_capacity(entries.len());
+        let mut stack: Vec<PathBuf> = Vec::new();
+        for rela in entries {
+            // `.git` is skipped at the top level too, not only as a child. gix
+            // does not report it as untracked and tier 0 excludes it anyway,
+            // but walking a repository's own object store would be a very
+            // expensive way to discover that.
+            if rela.components().any(|c| c.as_os_str() == ".git") {
+                continue;
+            }
+            let absolute = root.join(rela);
+            let metadata = match std::fs::symlink_metadata(&absolute) {
+                Ok(metadata) => metadata,
+                // Vanished between the walk and here: an ordinary outcome.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(SyncError::io("stat untracked entry", absolute, err)),
+            };
+            if metadata.is_dir() {
+                stack.push(rela.clone());
+            } else {
+                out.push(rela.clone());
+            }
+        }
+        while let Some(dir) = stack.pop() {
+            let absolute = root.join(&dir);
+            let listing = match std::fs::read_dir(&absolute) {
+                Ok(listing) => listing,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(SyncError::io("read untracked directory", absolute, err)),
+            };
+            for entry in listing.flatten() {
+                let name = entry.file_name();
+                if name == ".git" {
+                    continue;
+                }
+                let child = dir.join(&name);
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => stack.push(child),
+                    Ok(_) => out.push(child),
+                    // Unreadable type: skip it rather than fail the whole scan.
+                    Err(err) => {
+                        tracing::debug!(path = %child.display(), error = %err, "skipping unreadable entry");
+                    }
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// Walk the working tree and keep only what the completeness gate passes.
     ///
     /// Blocking, and deliberately synchronous: it is pure filesystem work with
@@ -861,14 +938,27 @@ impl Engine {
         // simultaneous `&mut` borrows of one field would not compile.
         let mut new_paths: Vec<PathBuf> = Vec::new();
         let mut changed_paths: Vec<PathBuf> = Vec::new();
+        // gitoxide's dirwalk reports untracked content with `CollapseDirectory`,
+        // so a brand-new folder arrives as ONE entry naming the directory. The
+        // commit path can only stage regular files and symlinks, so a collapsed
+        // entry has to be expanded here — otherwise every new subdirectory
+        // raises "only regular files and symlinks can be synchronized" forever
+        // and nothing inside it ever syncs.
+        let untracked = Self::expand_untracked(&profile.local_path, &status.untracked)?;
         let groups: [(&Vec<PathBuf>, bool); 3] = [
             (&status.added, true),
-            (&status.untracked, true),
+            (&untracked, true),
             (&status.modified, false),
         ];
+        // Everything the gate is legitimately allowed to remember this round.
+        // Anything else it still holds is stale and must be pruned, or the
+        // durable cache grows entries that can never resolve.
+        let mut observed: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::with_capacity(untracked.len() + status.modified.len());
         for (paths, is_new) in groups {
             for rela in paths {
                 let absolute = profile.local_path.join(rela);
+                observed.insert(absolute.clone());
                 match gate.is_stable(&absolute, now) {
                     StabilityVerdict::Stable => {
                         if is_new {
@@ -904,6 +994,7 @@ impl Engine {
         // restarting it. The export happens while the gate lock is held and
         // the write is a short synchronous transaction, so nothing is awaited
         // in between.
+        gate.retain(&observed);
         let pending = gate.export();
         drop(gates);
         self.with_db(|conn| db::save_file_state(conn, &profile.id, &pending))?;
@@ -1120,6 +1211,25 @@ impl Engine {
         Ok(report)
     }
 
+    /// Does the local branch hold commits the remote-tracking ref does not?
+    ///
+    /// Answered from the local clone alone — no network — so it is safe to ask
+    /// on every tick, including while offline. A missing tracking ref (nothing
+    /// fetched yet) counts as "unpushed": there is provably nothing on the
+    /// remote side to compare against.
+    fn has_unpushed_commits(&self, profile: &SyncProfile) -> Result<bool> {
+        let tracking = format!("refs/remotes/origin/{}", profile.branch);
+        match self.git.is_ancestor(&profile.local_path, "HEAD", &tracking) {
+            Ok(contained) => Ok(!contained),
+            // An unborn branch or an absent tracking ref makes the question
+            // unanswerable rather than false. That is not a failure: let the
+            // push leg decide, since it is a no-op when there is genuinely
+            // nothing to send.
+            Err(SyncError::GitCommand { .. }) => Ok(false),
+            Err(other) => Err(other),
+        }
+    }
+
     /// Queue the work a profile needs, based on what the tree looks like now.
     fn scan_and_enqueue(&self, profile: &SyncProfile) -> Result<()> {
         let now = self.platform.now_ms();
@@ -1129,8 +1239,14 @@ impl Engine {
             })?;
         }
         if profile.direction.pushes() {
+            // A push is needed when the tree has settled changes to commit OR
+            // when commits already exist that the remote has not seen. Only
+            // checking the former stranded work permanently: once a change was
+            // committed the tree went clean, no push was ever queued, and the
+            // local branch sat ahead of the remote forever.
             let staged = self.collect_stable_changes(profile)?;
-            if !staged.is_empty() {
+            let unpushed = staged.is_empty() && self.has_unpushed_commits(profile)?;
+            if !staged.is_empty() || unpushed {
                 self.with_db(|conn| {
                     db::enqueue_unique(conn, &profile.id, &WorkKind::Push, now, now).map(drop)
                 })?;
@@ -1223,6 +1339,51 @@ mod tests {
             dir.join("work"),
             "https://git.invalid/x/y.git",
         )
+    }
+
+    #[test]
+    fn collapsed_untracked_directories_expand_into_their_files() {
+        // gitoxide reports a brand-new folder as ONE entry naming the
+        // directory. Staging that directly fails with "only regular files and
+        // symlinks can be synchronized", and nothing inside it ever syncs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub/deeper")).expect("mkdir");
+        std::fs::create_dir_all(root.join(".git/objects")).expect("mkdir .git");
+        std::fs::write(root.join("top.txt"), b"x").expect("write");
+        std::fs::write(root.join("sub/a.txt"), b"x").expect("write");
+        std::fs::write(root.join("sub/deeper/b.txt"), b"x").expect("write");
+        std::fs::write(root.join(".git/objects/pack"), b"x").expect("write");
+
+        let expanded = Engine::expand_untracked(
+            root,
+            &[
+                PathBuf::from("top.txt"),
+                PathBuf::from("sub"),
+                PathBuf::from(".git"),
+            ],
+        )
+        .expect("expand");
+
+        assert_eq!(
+            expanded,
+            vec![
+                PathBuf::from("sub/a.txt"),
+                PathBuf::from("sub/deeper/b.txt"),
+                PathBuf::from("top.txt"),
+            ],
+            "directories expand recursively, .git is never descended into"
+        );
+    }
+
+    #[test]
+    fn expanding_tolerates_an_entry_that_vanished() {
+        // The walk and the expansion are not atomic; a deleted file in between
+        // is an ordinary outcome, not an error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expanded =
+            Engine::expand_untracked(dir.path(), &[PathBuf::from("gone.txt")]).expect("expand");
+        assert!(expanded.is_empty());
     }
 
     #[test]

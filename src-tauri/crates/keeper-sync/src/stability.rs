@@ -405,6 +405,18 @@ impl StabilityGate {
         self.entries.len()
     }
 
+    /// Drop every tracked entry whose path is not in `keep`.
+    ///
+    /// Without this the map only ever grows: a path that stops being a
+    /// candidate — it settled under a different name, it was deleted, or it was
+    /// a collapsed directory entry that is now expanded into its files — would
+    /// otherwise be re-imported from the durable cache on every run and never
+    /// resolve.
+    pub fn retain(&mut self, keep: &std::collections::HashSet<PathBuf>) {
+        self.entries.retain(|path, _| keep.contains(path));
+        self.pending_close_write.retain(|path| keep.contains(path));
+    }
+
     /// Export every mid-episode entry so it can be persisted.
     ///
     /// Without this the gate is process-local, and a one-shot `sync --once`
@@ -1195,5 +1207,28 @@ mod tests {
         // Nothing holds an advisory lock on a file we just created; a veto here
         // would mean the parser is matching the wrong inode or device.
         assert!(!open_writer_veto(&path, &s));
+    }
+
+    #[test]
+    fn retain_prunes_entries_that_are_no_longer_candidates() {
+        // Without pruning the durable cache only grows: a collapsed directory
+        // entry, or a path that was deleted, would be re-imported on every run
+        // and could never resolve.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let kept = root.join("kept.txt");
+        let dropped = root.join("dropped.txt");
+        std::fs::write(&kept, b"a").expect("write");
+        std::fs::write(&dropped, b"b").expect("write");
+
+        let mut gate = StabilityGate::new(root, ExcludeSet::new(&[]).expect("excludes"), 5_000);
+        gate.is_stable(&kept, 1_000);
+        gate.is_stable(&dropped, 1_000);
+        assert_eq!(gate.tracked(), 2);
+
+        let keep: std::collections::HashSet<PathBuf> = [kept.clone()].into_iter().collect();
+        gate.retain(&keep);
+        assert_eq!(gate.tracked(), 1);
+        assert!(gate.export().iter().all(|(path, _)| *path == kept));
     }
 }
