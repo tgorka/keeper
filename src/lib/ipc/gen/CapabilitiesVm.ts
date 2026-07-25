@@ -49,4 +49,13 @@ revealInFileManager: boolean,
  * every non-macOS desktop, and iOS. Computed in the shell from a runtime
  * OS-version probe, keeping `keeper-core` free of `cfg(target_os)` (AD-26).
  */
-recording: boolean, };
+recording: boolean, 
+/**
+ * Folder sync (Story 23.5, AD-41/AD-51) can run here: `true` only on
+ * desktop **with a usable `git` binary**, which is why this is a runtime
+ * probe rather than a `cfg!`. gitoxide implements neither push, nor
+ * worktree mutation, nor sparse patterns, nor merge, so without `git` the
+ * engine cannot be constructed at all — and every sync surface stays
+ * absent rather than failing when pressed (AD-27, "no dead buttons").
+ */
+sync: boolean, };

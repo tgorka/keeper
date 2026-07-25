@@ -1263,7 +1263,27 @@ pub fn capabilities() -> Result<CapabilitiesVm, IpcError> {
         // OS-version probe in the shell adapter (AD-35), not a bare `cfg!(desktop)`.
         // Any detection failure defaults to `false` (safe-hide).
         recording: crate::macos_version::recording_supported(),
+        // Folder sync (Story 23.5, AD-41/AD-51) needs a `git` binary, which is
+        // a runtime fact rather than a build one: the answer is a PATH probe,
+        // and a machine without git gets no sync surface at all rather than
+        // buttons that fail when pressed.
+        sync: sync_available(),
     })
+}
+
+/// Whether folder sync can run on this machine.
+///
+/// Split out so the iOS build — which has no `crate::sync` module at all — still
+/// compiles: the capability is simply false there.
+fn sync_available() -> bool {
+    #[cfg(desktop)]
+    {
+        crate::sync::is_available()
+    }
+    #[cfg(not(desktop))]
+    {
+        false
+    }
 }
 
 /// Return the data-driven bridge catalog (Story 6.1, FR-42). A one-shot read of

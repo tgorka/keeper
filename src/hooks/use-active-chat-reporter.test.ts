@@ -22,6 +22,7 @@ const DESKTOP_CAPABILITIES = {
   bridgeSidecar: true,
   revealInFileManager: true,
   recording: false,
+  sync: false,
 };
 
 describe("useActiveChatReporter", () => {

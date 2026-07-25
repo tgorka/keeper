@@ -16,6 +16,10 @@ mod media_protocol;
 mod menu;
 mod recorder;
 #[cfg(desktop)]
+mod sync;
+#[cfg(desktop)]
+mod sync_ipc;
+#[cfg(desktop)]
 mod tray;
 // The zero-egress source-scan audit over the `keeper-rec` sidecar's Swift
 // sources (Story 20.4, FR-76) — test-only; it ships no code.
@@ -435,6 +439,19 @@ pub fn run() {
             ipc::recovered_sessions_list,
             ipc::recovered_session_acknowledge
         ]);
+    // Folder sync is desktop-only (Epic 29), so its commands are registered in
+    // a second pass rather than cfg-gated inside the list — `generate_handler!`
+    // takes a flat literal and cannot hold a conditional entry.
+    #[cfg(desktop)]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        sync_ipc::sync_profiles,
+        sync_ipc::sync_statuses,
+        sync_ipc::sync_profile_save,
+        sync_ipc::sync_profile_remove,
+        sync_ipc::sync_profile_set_enabled,
+        sync_ipc::sync_folder_now,
+        sync_ipc::sync_verify
+    ]);
     // Window-close (⌘W / red button) hides the main window instead of destroying it
     // (Story 10.3, FR-53): the process keeps every account's `SyncService` and the
     // notification pipeline alive so background behavior is byte-for-byte identical to

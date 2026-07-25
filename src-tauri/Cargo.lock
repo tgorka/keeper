@@ -4192,6 +4192,7 @@ dependencies = [
  "dirs 6.0.0",
  "fs4",
  "keeper-core",
+ "keeper-sync",
  "keyring",
  "objc2",
  "objc2-foundation",

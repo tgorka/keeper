@@ -109,6 +109,10 @@ export type { SearchHitVm } from "./gen/SearchHitVm";
 export type { SendState } from "./gen/SendState";
 export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 export type { SpaceVm } from "./gen/SpaceVm";
+export type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
+export type { SyncProfileReq } from "./gen/SyncProfileReq";
+export type { SyncProfileVm } from "./gen/SyncProfileVm";
+export type { SyncStatusVm } from "./gen/SyncStatusVm";
 export type { TccPermission } from "./gen/TccPermission";
 export type { TimelineBatch } from "./gen/TimelineBatch";
 export type { TimelineItemVm } from "./gen/TimelineItemVm";
@@ -157,6 +161,10 @@ import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { SearchFilterVm } from "./gen/SearchFilterVm";
 import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
+import type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
+import type { SyncProfileReq } from "./gen/SyncProfileReq";
+import type { SyncProfileVm } from "./gen/SyncProfileVm";
+import type { SyncStatusVm } from "./gen/SyncStatusVm";
 import type { TccPermission } from "./gen/TccPermission";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
@@ -2366,4 +2374,99 @@ export async function listenNotifyNavigate(
   return await listen<NotifyTarget>(NOTIFY_NAVIGATE_EVENT, (event) => {
     onNavigate(event.payload);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Folder sync (Epic 29, FR-77..FR-93)
+//
+// Every one of these rejects with `unsupported` when the machine has no usable
+// `git` (AD-41), which is why the UI gates on `CapabilitiesVm.sync` and hides
+// the surface entirely rather than offering an action that cannot work.
+// ---------------------------------------------------------------------------
+
+/**
+ * List every configured sync profile.
+ *
+ * Crosses IPC: profile configuration only -- never a credential, which lives in
+ * the OS keychain and is referenced by an opaque key the frontend never sees.
+ *
+ * Rejects with: `unsupported` (no usable git), `internal`.
+ */
+export async function syncProfiles(): Promise<SyncProfileVm[]> {
+  return await invoke<SyncProfileVm[]>("sync_profiles");
+}
+
+/**
+ * Read a status snapshot for every profile -- what the sync pane renders and
+ * what the tray line is composed from.
+ *
+ * Polled rather than streamed on purpose: the tray must render correctly when
+ * no webview is subscribed at all.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function syncStatuses(): Promise<SyncStatusVm[]> {
+  return await invoke<SyncStatusVm[]>("sync_statuses");
+}
+
+/**
+ * Create or update a profile, resolving the stored result.
+ *
+ * Omit `id` to create. The request is validated in Rust before it reaches the
+ * engine, so an impossible profile (a relative path, a bidirectional review
+ * lane) rejects here rather than half-applying.
+ *
+ * Rejects with: `unsupported`, `internal` (validation, naming the bad value).
+ */
+export async function syncProfileSave(req: SyncProfileReq): Promise<SyncProfileVm> {
+  return await invoke<SyncProfileVm>("sync_profile_save", { req });
+}
+
+/**
+ * Forget a profile.
+ *
+ * Configuration only: the folder and its git repository are left on disk
+ * exactly as they are. Removing a profile never deletes content.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function syncProfileRemove(id: string): Promise<void> {
+  await invoke<void>("sync_profile_remove", { id });
+}
+
+/**
+ * Pause or resume a profile, resolving its resulting status.
+ *
+ * A paused profile keeps its journal: resuming re-drives whatever was queued
+ * rather than starting over.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile).
+ */
+export async function syncProfileSetEnabled(id: string, enabled: boolean): Promise<SyncStatusVm> {
+  return await invoke<SyncStatusVm>("sync_profile_set_enabled", { id, enabled });
+}
+
+/**
+ * Sync one profile now, ignoring its schedule.
+ *
+ * Named for the folder, not the app: `syncNow` is the Matrix sync kick and the
+ * two must never be confused.
+ *
+ * Rejects with: `unsupported`, `serverUnreachable` (retriable),
+ * `invalidCredentials`, `internal`.
+ */
+export async function syncFolderNow(id: string): Promise<SyncOutcomeVm> {
+  return await invoke<SyncOutcomeVm>("sync_folder_now", { id });
+}
+
+/**
+ * Re-verify a profile's stored content against its recorded digests.
+ *
+ * Resolves the list of problems found, each as `"<path>: <reason>"`. An empty
+ * array means everything checked out.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function syncVerify(id: string): Promise<string[]> {
+  return await invoke<string[]>("sync_verify", { id });
 }

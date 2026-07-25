@@ -73,6 +73,7 @@ const DESKTOP_CAPABILITIES = {
   bridgeSidecar: true,
   revealInFileManager: true,
   recording: false,
+  sync: false,
 };
 
 function account(id: string, userId: string, hue = 0, provider: Provider = "password"): AccountVm {
