@@ -103,6 +103,16 @@ pub fn clone(
     Ok(repo)
 }
 
+/// The identity written into a managed repository that has none.
+///
+/// Deliberately not a person: it appears only in reflogs on hosts where no git
+/// identity was ever configured, and claiming to be a human there would be a
+/// lie. Commits keeper makes carry the real device signature instead.
+const IDENTITY_NAME: &str = "keeper";
+/// `.invalid` is reserved by RFC 2606 and can never be a deliverable address,
+/// which is the honest way to say "no mailbox".
+const IDENTITY_EMAIL: &str = "keeper@keeper.invalid";
+
 /// Write `index.sparse=false` into the repository's own `.git/config`.
 ///
 /// Mandatory for every managed repository — see the module docs for the
@@ -140,6 +150,28 @@ pub fn enforce_local_config_with_filter(
     config
         .set_raw_value("index.sparse", "false")
         .map_err(|err| SyncError::Git(format!("could not set index.sparse: {err}")))?;
+
+    // A fetch writes a reflog entry for the remote-tracking ref it moves, and
+    // gitoxide refuses to write one without a committer identity. On a host
+    // where nobody ever ran `git config --global user.email` — a fresh server
+    // or container, which is precisely where a sync daemon gets installed —
+    // every fetch fails with "reflog messages need a committer which isn't
+    // set", long after the clone appeared to succeed.
+    //
+    // keeper's own commits are unaffected: they carry an explicit signature
+    // built from the profile and device. This is only so git's local
+    // bookkeeping has a name to write.
+    //
+    // Only filled when nothing else supplies one. A human's real identity,
+    // from any scope, must keep winning inside a folder they also use by hand.
+    if repo.committer().is_none() {
+        config
+            .set_raw_value("user.name", IDENTITY_NAME)
+            .map_err(|err| SyncError::Git(format!("could not set user.name: {err}")))?;
+        config
+            .set_raw_value("user.email", IDENTITY_EMAIL)
+            .map_err(|err| SyncError::Git(format!("could not set user.email: {err}")))?;
+    }
 
     if let Some(program) = filter_program {
         let workdir = workdir(repo)?;

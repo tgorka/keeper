@@ -126,7 +126,7 @@ pub fn fetch(
 
     let mut connection = remote
         .connect(gix::remote::Direction::Fetch)
-        .map_err(|err| classify(&err.to_string(), &host, interrupt))?;
+        .map_err(|err| classify(&flatten(&err), &host, interrupt))?;
 
     if let Some(credential) = credential {
         // Owned clones because the callback must be `'static`: gix keeps it for
@@ -163,10 +163,10 @@ pub fn fetch(
         gix::remote::ref_map::Options::default(),
     ) {
         Ok(prepared) => prepared,
-        Err(err) if mentions_an_empty_advertisement(&err.to_string()) => {
+        Err(err) if mentions_an_empty_advertisement(&flatten(&err)) => {
             return nothing_to_pull();
         }
-        Err(err) => return Err(classify(&err.to_string(), &host, interrupt)),
+        Err(err) => return Err(classify(&flatten(&err), &host, interrupt)),
     };
     let prepared = match options.shallow {
         Some(depth) => prepared.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth)),
@@ -175,10 +175,10 @@ pub fn fetch(
 
     let outcome = match prepared.receive(FlatProgress::root(Arc::clone(progress)), interrupt) {
         Ok(outcome) => outcome,
-        Err(err) if mentions_an_empty_advertisement(&err.to_string()) => {
+        Err(err) if mentions_an_empty_advertisement(&flatten(&err)) => {
             return nothing_to_pull();
         }
-        Err(err) => return Err(classify(&err.to_string(), &host, interrupt)),
+        Err(err) => return Err(classify(&flatten(&err), &host, interrupt)),
     };
 
     summarize(repo, &outcome)
@@ -223,6 +223,29 @@ fn static_credential(
             Ok(None)
         }
     }
+}
+
+/// Flatten an error and everything that caused it into one line.
+///
+/// gitoxide's outer messages are frequently the least informative part of the
+/// failure — "Failed to update references to their new position" says nothing
+/// about *which* ref or *why*, and the actual reason lives two or three
+/// `source()` hops down. Reporting only the top frame turns a diagnosable
+/// problem into a guess, so the whole chain is kept.
+fn flatten(err: &dyn std::error::Error) -> String {
+    let mut message = err.to_string();
+    let mut cause = err.source();
+    while let Some(current) = cause {
+        let text = current.to_string();
+        // gix repeats the parent's wording in some variants; adding it twice
+        // makes the line longer without making it clearer.
+        if !message.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        cause = current.source();
+    }
+    message
 }
 
 /// Turn a gitoxide transport error into the engine's taxonomy.

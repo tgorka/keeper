@@ -38,7 +38,7 @@ use crate::lfs;
 use crate::platform::SyncPlatform;
 use crate::profile::{LfsMode, ProfileState, SyncDirection, SyncLane, SyncProfile};
 use crate::progress::{ProgressSink, SyncPhase, SyncProgress, SyncStatus};
-use crate::provenance::{Provenance, SyncSource};
+use crate::provenance::{commit_message, Provenance, SyncSource};
 use crate::stability::{StabilityGate, StabilityVerdict};
 use crate::volume::{self, VolumeStatus};
 
@@ -840,8 +840,27 @@ impl Engine {
         let device = self.device.label.clone();
         let stamp = conflict_stamp(self.platform.now_ms());
         let profile_for_task = profile.clone();
+        // A merge is a sync action like any other, and until now it was the one
+        // commit in the history that said nothing about who made it. "Which
+        // machine resolved this divergence" is exactly the question provenance
+        // exists to answer.
+        let provenance = Provenance::new(
+            &profile.name,
+            &self.device.label,
+            &self.device.id,
+            self.platform.host_label(),
+            SyncSource::Watch,
+        )
+        .with_tags(profile.tags.clone());
         let conflicts = tokio::task::spawn_blocking(move || {
-            Self::converge_with_conflict_copies(&git, &profile_for_task, &tracking, &stamp, &device)
+            Self::converge_with_conflict_copies(
+                &git,
+                &profile_for_task,
+                &tracking,
+                &stamp,
+                &device,
+                &provenance,
+            )
         })
         .await
         .map_err(|err| SyncError::Journal(format!("converge task failed: {err}")))??;
@@ -876,6 +895,7 @@ impl Engine {
         tracking: &str,
         stamp: &str,
         device: &str,
+        provenance: &Provenance,
     ) -> Result<Vec<String>> {
         let repo_path = &profile.local_path;
         let base = git.merge_base(repo_path, "HEAD", tracking)?;
@@ -916,7 +936,11 @@ impl Engine {
         git.merge_theirs(
             repo_path,
             tracking,
-            &format!("sync({}): merge remote changes", profile.name),
+            &commit_message(
+                &format!("sync({}): merge remote changes", profile.name),
+                "",
+                provenance,
+            ),
         )?;
         Ok(copied)
     }
@@ -1707,6 +1731,27 @@ fn display_relative(root: &Path, path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_merge_commit_carries_the_same_provenance_as_any_other() {
+        // The merge used to be the one commit in the history that said nothing
+        // about which machine made it - the exact question provenance exists to
+        // answer, missed precisely where two machines disagreed.
+        let provenance = Provenance::new(
+            "media",
+            "electra",
+            "01KYDKP6SN2HR4SJBJ9JTBVC2Z",
+            "electra",
+            SyncSource::Watch,
+        );
+        let message = commit_message("sync(media): merge remote changes", "", &provenance);
+
+        assert!(message.starts_with("sync(media): merge remote changes\n"));
+        let parsed = Provenance::parse(&message).expect("a merge commit is attributable");
+        assert_eq!(parsed.device_label, "electra");
+        assert_eq!(parsed.device_id, "01KYDKP6SN2HR4SJBJ9JTBVC2Z");
+        assert_eq!(parsed.profile, "media");
+    }
+
     use super::*;
     use crate::platform::TestPlatform;
 

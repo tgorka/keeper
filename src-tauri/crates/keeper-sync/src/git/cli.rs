@@ -515,7 +515,13 @@ fn merge_theirs_args(reference: &str, message: &str) -> Result<Vec<String>> {
         "-X".to_owned(),
         "theirs".to_owned(),
         "-m".to_owned(),
-        message.replace(['\r', '\n'], " "),
+        // Passed verbatim, newlines and all. The message is a single argv
+        // element handed to git without a shell, so a newline cannot start
+        // another argument - and flattening it would fold the provenance
+        // trailer block onto the subject line, where git stops recognising it
+        // as trailers at all. Carriage returns still go: they would survive
+        // into the stored message and show up as stray ^M.
+        message.replace('\r', ""),
         safe_ref(reference)?,
     ])
 }
@@ -801,6 +807,34 @@ fn repo_label(repo: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_merge_message_keeps_the_blank_line_its_trailers_depend_on() {
+        // git only recognises a trailer block in the LAST paragraph. Flattening
+        // the message put Keeper-Device on the subject line, where
+        // `git log --format=%(trailers:...)` returns nothing and the merge
+        // becomes the one unattributable commit in the history.
+        let message = "sync(media): merge remote changes\n\nKeeper-Profile: media\nKeeper-Device: electra (01K)\n";
+        let args = merge_theirs_args("refs/remotes/origin/main", message).expect("args");
+        let rendered = &args[args.iter().position(|a| a == "-m").expect("has -m") + 1];
+
+        assert!(
+            rendered.contains("\n\nKeeper-Profile:"),
+            "got: {rendered:?}"
+        );
+        assert_eq!(rendered, message);
+    }
+
+    #[test]
+    fn a_carriage_return_never_reaches_the_stored_message() {
+        // A CRLF-authored profile name would otherwise leave stray ^M in every
+        // merge commit.
+        let args = merge_theirs_args("refs/heads/main", "subject\r\n\r\nKeeper-Profile: x\r\n")
+            .expect("args");
+        let rendered = &args[args.iter().position(|a| a == "-m").expect("has -m") + 1];
+        assert!(!rendered.contains('\r'));
+        assert!(rendered.contains("\n\nKeeper-Profile: x"));
+    }
+
     use super::*;
 
     #[test]
