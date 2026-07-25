@@ -253,6 +253,16 @@ pub fn status_line(status: &SyncStatus) -> String {
             }
             line
         }
+        // "up to date" is only honest when nothing is waiting. A queued unit
+        // means work has been accepted but not yet published, and reporting
+        // that as up to date is how a user comes to believe a file reached the
+        // server when it did not.
+        _ if status.pending > 0 => {
+            format!(
+                "{} — {} waiting to sync",
+                status.profile_name, status.pending
+            )
+        }
         _ => format!("{} — up to date", status.profile_name),
     }
 }
@@ -355,6 +365,19 @@ mod tests {
             status_line(&s),
             "Transferring tgdrive — 42/310 files · 1.2 GB of 4.7 GB"
         );
+    }
+
+    #[test]
+    fn a_profile_with_queued_work_is_never_reported_as_up_to_date() {
+        // Saying "up to date (1 queued)" is how a user comes to believe a file
+        // reached the server when it is still sitting in the journal.
+        let mut s = status("tgdrive");
+        s.state = ProfileState::Idle;
+        s.pending = 3;
+        assert_eq!(status_line(&s), "tgdrive — 3 waiting to sync");
+
+        s.pending = 0;
+        assert_eq!(status_line(&s), "tgdrive — up to date");
     }
 
     #[test]
