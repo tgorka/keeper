@@ -28,6 +28,7 @@
     "verify:ios-ipa": "bun run scripts/verify-ios-ipa.ts",
     "check": "bun run lint && bun run typecheck && bun run test && bun run check:core-tauri-free && bun run check:core-sync-free && bun run check:syncd-lean",
     "check:rust": "cargo fmt --manifest-path src-tauri/Cargo.toml --all --check && cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings",
+    "check:rust:macos": "bash scripts/check-macos.sh",
     "check:all": "bun run check && bun run check:rust && bun run test:rust && bun run bindings:check && bun run check:licenses",
     "prepare": "lefthook install"
   },
