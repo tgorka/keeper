@@ -23,6 +23,22 @@ keeper contacts, and it is enforced in two ways:
 | **`github.com/tgorka/keeper/releases/...`** (the signed-update `latest.json` endpoint) | Always (an update check) | Signed auto-updates (NFR-12). Downloads are cryptographically verified against keeper's minisign public key before installing. |
 | **`*.githubusercontent.com`** (GitHub's release-asset CDN) | Only while downloading an update the user chose to install | GitHub serves release files (the update binary) from its content-delivery network, which the `github.com` release URL redirects to. Disclosed so the egress list is exhaustive, not just the check endpoint. |
 
+### The folder-sync daemon
+
+`keeper-syncd` is a separate binary with its own, smaller list. It is not part of the app's
+live egress view, because the app does not run it — so it is disclosed here instead.
+
+| Destination | When | Why |
+| --- | --- | --- |
+| **Each sync profile's git remote** (e.g. `https://forgejo.example.org/…`, `ssh://host/…`) | Every sync tick for an enabled profile | The whole point: fetch, push and LFS transfer. One entry per configured profile; a profile pointing at a local path or a pendrive reaches no network at all. |
+| **`api.github.com/repos/tgorka/keeper/releases/latest`** | On `keeper-syncd doctor`, and on `keeper-syncd update` | The version check. Read-only, unauthenticated, and it never installs anything by itself. |
+| **`*.githubusercontent.com`** | Only during `keeper-syncd update`, after you ran it | Where GitHub actually serves the release binary and its `.sha256`. |
+
+Unlike the app, the daemon's update is **verified by checksum, not by signature**: it compares
+the download against the `.sha256` published beside it. That authenticates the transfer, not the
+publisher — a weaker guarantee than the app's minisign check, stated plainly rather than implied
+to be equivalent.
+
 ## Bridges add no distinct egress
 
 Bridges (WhatsApp, Telegram, Signal, …) are Matrix **appservices** that run **server-side**,

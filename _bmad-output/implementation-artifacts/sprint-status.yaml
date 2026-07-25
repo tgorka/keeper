@@ -323,7 +323,28 @@ development_status:
 # (onset-deduped notifications) is the remainder: the engine already raises
 # them once per onset through the platform port, but the desktop notifier is
 # not yet asserted end to end.
-#   31-5 — DONE for real. A bare repo on hesperia synced from electra over
+#   31-5 — DONE across THREE machines and two OSes. A bare repo on delectra
+#   (Ubuntu 25.10, x86_64) with electra (Linux container) and hesperia
+#   (macOS 26.5, arm64) both joining over ssh://, all three writing the SAME
+#   filename with different content at the same moment. Result: three surviving
+#   files — the winner plus one conflict copy per losing device, each named
+#   after the device that made it — byte-identical on every peer, no prompt,
+#   nothing lost. Merges are now attributable too.
+#
+#   That run found four defects that no single-machine test could:
+#     * an empty remote could not be cloned (the "sync to the repo I just
+#       created in the forge" case), nor fetched from;
+#     * a first pass with every file still inside the settle window pushed
+#       anyway and failed with "src refspec main does not match any";
+#     * a host with no `git config --global user.email` — the state of a fresh
+#       server, which is where a sync daemon gets installed — could clone but
+#       never fetch again, because gitoxide will not write a reflog without a
+#       committer. This is also the pendrive/local-path transport.
+#     * merge commits carried no provenance, and could not have: the merge
+#       message was flattened to one line, folding the trailer block onto the
+#       subject where git stops parsing it.
+#
+#   Earlier two-host coverage: a bare repo on hesperia synced from electra over
 #   ssh:// (gix's ssh transport), both machines editing the same file
 #   concurrently, converging to byte-identical trees with the loser preserved
 #   as a conflict copy named after the device that made it. Running on macOS

@@ -388,6 +388,52 @@ resumably rather than being killed mid-write.
 Exit codes: `0` success, `1` operational failure, `2` configuration error,
 `3` missing prerequisite (no usable git).
 
+### Installing, and keeping it current
+
+Releases carry a prebuilt binary per target, so a server does not need a Rust
+toolchain:
+
+```
+keeper-syncd-x86_64-unknown-linux-gnu          # + .sha256
+keeper-syncd-aarch64-apple-darwin              # + .sha256
+```
+
+```
+curl -fLO https://github.com/tgorka/keeper/releases/latest/download/keeper-syncd-x86_64-unknown-linux-gnu
+curl -fLO https://github.com/tgorka/keeper/releases/latest/download/keeper-syncd-x86_64-unknown-linux-gnu.sha256
+sha256sum -c keeper-syncd-x86_64-unknown-linux-gnu.sha256
+install -m 0755 keeper-syncd-x86_64-unknown-linux-gnu ~/.local/bin/keeper-syncd
+```
+
+After that the daemon updates itself on request:
+
+```
+keeper-syncd update --check    # report what is available, change nothing
+keeper-syncd update            # download, verify the checksum, replace the binary
+```
+
+`doctor` also reports an available version, as a **warning that never fails the
+run** — a machine that could not reach GitHub is not a machine that is out of
+date, and saying otherwise would make `doctor` lie in exactly the situation
+where you need it to be honest.
+
+**It never installs by itself.** The daemon holds a durable journal and can be
+mid-push at any moment; swapping its binary on a timer is how a routine release
+becomes a corrupted transfer. The install is also not a restart: the file is
+replaced through a rename, and the running process keeps its old inode until
+you restart it. `update` says so rather than leaving you to assume.
+
+Integrity is a **checksum, not a signature**. The download is hashed while it
+streams and refused on mismatch, so a truncated or substituted asset never
+reaches disk — but that authenticates the transfer, not the publisher. The
+desktop app's updater verifies a minisign signature and is the stronger of the
+two. If you need publisher authentication on a server, build from source or
+verify the release yourself.
+
+If the release for your platform is missing, `update` says which asset it looked
+for instead of failing vaguely; only `linux-x86_64` and `macos-aarch64` are
+published today.
+
 ---
 
 ## 13. Making a folder visible to agents
@@ -505,6 +551,18 @@ Steady-state cost is dominated by one `lstat` per file, so a folder that is not
 changing is cheap to keep watched.
 
 ## 18. Deliberate limitations
+
+- **The daemon's update is checksum-verified, not signature-verified.** It
+  proves the bytes arrived intact from the URL it asked; it does not prove who
+  published them. The desktop app verifies a minisign signature and is the
+  stronger of the two. Closing the gap means shipping a signing key to a
+  binary that is frequently the only thing installed on a machine, which is a
+  decision worth making deliberately rather than by default.
+- **Only `linux-x86_64` and `macos-aarch64` binaries are published.** Other
+  targets build from source. `update` names the asset it looked for rather than
+  failing vaguely.
+- **`update` never runs on a timer, and never restarts the daemon.** Both are
+  deliberate; see §12.
 
 1. **No content merge.** Divergent text files produce conflict copies, not a
    three-way merge.
