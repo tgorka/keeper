@@ -12,6 +12,7 @@
     "rec:test": "bash scripts/test-keeper-rec.sh",
     "tauri:dev": "bun run rec:build && tauri dev --config src-tauri/crates/keeper/tauri.conf.json",
     "tauri:build": "bun run rec:build && tauri build --config src-tauri/crates/keeper/tauri.conf.json",
+    "tauri:build:signed": "bash scripts/build-macos-signed.sh",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",

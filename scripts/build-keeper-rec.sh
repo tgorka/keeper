@@ -43,6 +43,19 @@ mkdir -p "$DEST_DIR"
 cp "$PRODUCT" "$DEST"
 chmod +x "$DEST"
 
+# Codesign the sidecar when a signing identity is available (mirrors the
+# release workflow's signed path). This is what makes a macOS TCC grant survive
+# a rebuild: an ad-hoc signature's designated requirement is a bare cdhash, so
+# every rebuild looks like a different app to TCC and Screen Recording
+# re-prompts forever. With no identity set the binary stays ad-hoc — CI's
+# unsigned path and non-recording dev work are unaffected.
+if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+  echo "==> Codesigning keeper-rec with: $APPLE_SIGNING_IDENTITY"
+  codesign --force --options runtime \
+    --entitlements src-tauri/crates/keeper/keeper-rec.entitlements \
+    --sign "$APPLE_SIGNING_IDENTITY" "$DEST"
+fi
+
 # Smoke check: prove the stdin→stdout contract holds before we ship it as a
 # build input. Delegated to a standalone script so it can also be run alone.
 bash "$SCRIPT_DIR/smoke-keeper-rec.sh" "$DEST"

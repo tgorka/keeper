@@ -143,6 +143,46 @@ Known recording keys: `recording.codec` (`h264` | `hevc`),
   grant is given manually, but **every ad-hoc rebuild invalidates the TCC
   grant** (the grant keys on the code signature) — a stable certificate makes
   the grant survive rebuilds.
+- Use `bun run tauri:build:signed` for any local build you intend to *install*
+  and record with; add `-- --install` to replace `/Applications/keeper.app` in
+  place. It resolves a codesigning identity (`$APPLE_SIGNING_IDENTITY`, or the
+  single one in your keychain), signs the sidecar and the bundle, and then
+  **fails the build** if the result is still ad-hoc. Run it from Terminal.app:
+  codesign cannot reach the login keychain over SSH
+  (`errSecInternalComponent`).
+
+  ### The "infinite Screen Recording prompt" loop
+
+  Symptom: macOS keeps asking for Screen Recording no matter how often you
+  approve it, Privacy & Security shows one or more checked `keeper` rows, and
+  the only thing that helps is removing the row with `-` and re-adding the app
+  by hand — until the next build.
+
+  Cause: TCC stores the grant against the app's *designated requirement*. An
+  ad-hoc, linker-signed bundle has a bare `cdhash` requirement — the hash of
+  that exact binary — so **every rebuild is a different app** to TCC. The old
+  row survives by path, matches nothing, and a new row is added beside it.
+  Compare:
+
+  ```
+  # ad-hoc (bun run tauri:build, no identity) — churns on every rebuild
+  designated => cdhash H"407771706becc059eb9ff4cf73d9699e210429d3"
+
+  # certificate-signed (bun run tauri:build:signed) — stable forever
+  designated => identifier "dev.tgorka.keeper" and anchor apple generic
+                and certificate leaf[subject.CN] = "Apple Development: ..."
+  ```
+
+  Fix: build signed, then clear the accumulated stale rows **once** —
+  the scripted equivalent of the manual `-`:
+
+  ```sh
+  tccutil reset ScreenCapture dev.tgorka.keeper
+  ```
+
+  Start a recording, approve the prompt once, and the grant persists across
+  every later rebuild. `SCStreamErrorDomain Code=-3801` is the error you get
+  while the grant is missing or stale.
 - The hardened runtime needs the `com.apple.security.device.audio-input` and
   `com.apple.security.device.camera` entitlements
   (`src-tauri/crates/keeper/keeper-rec.entitlements`) or TCC will refuse to
