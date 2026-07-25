@@ -217,51 +217,51 @@ development_status:
   22-6-file-based-config-overrides: done
 
   # Phase 4 — Folder Sync (Epics 23–31, added 2026-07-25)
-  epic-23: backlog
-  23-1-keeper-sync-crate-workspace-wiring-and-license-firewall: backlog
-  23-2-syncplatform-port-and-syncerror-taxonomy: backlog
-  23-3-sync-db-profiles-work-journal-and-file-state-cache: backlog
-  23-4-device-identity-and-provenance-trailer-composer: backlog
-  23-5-git-binary-probe-and-capabilities-sync-flag: backlog
-  23-6-structured-logging-and-the-xdg-log-path-branch: backlog
+  epic-23: in-progress
+  23-1-keeper-sync-crate-workspace-wiring-and-license-firewall: done
+  23-2-syncplatform-port-and-syncerror-taxonomy: done
+  23-3-sync-db-profiles-work-journal-and-file-state-cache: done
+  23-4-device-identity-and-provenance-trailer-composer: done
+  23-5-git-binary-probe-and-capabilities-sync-flag: done
+  23-6-structured-logging-and-the-xdg-log-path-branch: in-progress
   23-7-egress-disclosure-for-git-remotes: backlog
   epic-23-retrospective: optional
-  epic-24: backlog
-  24-1-repository-lifecycle-open-and-clone-with-mandatory-overrides: backlog
-  24-2-credentials-through-the-port-not-a-subprocess: backlog
-  24-3-fetch-shallow-progress-reporting-interruptible: backlog
-  24-4-working-tree-to-index-to-commit: backlog
-  24-5-the-git-cli-shim-push-worktree-sparse-gc: backlog
-  24-6-applying-remote-changes-fast-forward-checkout: backlog
-  24-7-divergence-without-prompts-conflict-copies: backlog
+  epic-24: done
+  24-1-repository-lifecycle-open-and-clone-with-mandatory-overrides: done
+  24-2-credentials-through-the-port-not-a-subprocess: done
+  24-3-fetch-shallow-progress-reporting-interruptible: done
+  24-4-working-tree-to-index-to-commit: done
+  24-5-the-git-cli-shim-push-worktree-sparse-gc: done
+  24-6-applying-remote-changes-fast-forward-checkout: done
+  24-7-divergence-without-prompts-conflict-copies: done
   epic-24-retrospective: optional
-  epic-25: backlog
-  25-1-lfs-pointer-and-content-addressed-store: backlog
-  25-2-endpoint-derivation-and-the-batch-api-client: backlog
-  25-3-the-basic-transfer-adapter-resumable-down-verified-both-ways: backlog
+  epic-25: in-progress
+  25-1-lfs-pointer-and-content-addressed-store: done
+  25-2-endpoint-derivation-and-the-batch-api-client: done
+  25-3-the-basic-transfer-adapter-resumable-down-verified-both-ways: done
   25-4-in-process-gitattributes-filtering-and-automatic-tracking: backlog
   25-5-path-filtered-lfs-fetch: backlog
-  25-6-end-to-end-verification-and-the-verify-operation: backlog
+  25-6-end-to-end-verification-and-the-verify-operation: in-progress
   epic-25-retrospective: optional
-  epic-26: backlog
-  26-1-tier-0-name-and-shape-exclusion: backlog
-  26-2-the-watcher-events-debounce-rescan-and-self-echo-suppression: backlog
-  26-3-tier-2-the-quiescence-gate: backlog
-  26-4-tier-3-the-linux-open-writer-veto: backlog
-  26-5-tier-4-verify-on-read-and-the-sf-dataless-guard: backlog
-  26-6-the-scheduler-journal-supervisor-backoff-and-offline: backlog
+  epic-26: done
+  26-1-tier-0-name-and-shape-exclusion: done
+  26-2-the-watcher-events-debounce-rescan-and-self-echo-suppression: done
+  26-3-tier-2-the-quiescence-gate: done
+  26-4-tier-3-the-linux-open-writer-veto: done
+  26-5-tier-4-verify-on-read-and-the-sf-dataless-guard: done
+  26-6-the-scheduler-journal-supervisor-backoff-and-offline: done
   epic-26-retrospective: optional
-  epic-27: backlog
-  27-1-concurrent-multi-profile-supervision: backlog
-  27-2-sparse-profiles-subpath-selection: backlog
-  27-3-removable-volume-identity: backlog
-  27-4-absence-semantics-pause-never-delete-resume: backlog
-  27-5-profile-import-export-and-config-json-overrides: backlog
+  epic-27: in-progress
+  27-1-concurrent-multi-profile-supervision: done
+  27-2-sparse-profiles-subpath-selection: in-progress
+  27-3-removable-volume-identity: done
+  27-4-absence-semantics-pause-never-delete-resume: done
+  27-5-profile-import-export-and-config-json-overrides: done
   epic-27-retrospective: optional
-  epic-28: backlog
-  28-1-provenance-on-every-change: backlog
+  epic-28: in-progress
+  28-1-provenance-on-every-change: done
   28-2-worktree-lanes-create-list-prune: backlog
-  28-3-one-way-lanes-push-only-never-force: backlog
+  28-3-one-way-lanes-push-only-never-force: in-progress
   28-4-pull-request-handoff-to-a-human: backlog
   epic-28-retrospective: optional
   epic-29: backlog
@@ -272,18 +272,51 @@ development_status:
   29-5-in-app-progress-and-the-warning-banner: backlog
   29-6-notifications-exactly-once-on-onset: backlog
   epic-29-retrospective: optional
-  epic-30: backlog
-  30-1-the-bin-crate-and-its-syncplatform: backlog
-  30-2-toml-configuration-to-syncprofile: backlog
-  30-3-core-subcommands: backlog
-  30-4-verify-doctor-logs-and-headless-secrets: backlog
-  30-5-systemd-unit-graceful-shutdown-and-packaging: backlog
+  epic-30: done
+  30-1-the-bin-crate-and-its-syncplatform: done
+  30-2-toml-configuration-to-syncprofile: done
+  30-3-core-subcommands: done
+  30-4-verify-doctor-logs-and-headless-secrets: done
+  30-5-systemd-unit-graceful-shutdown-and-packaging: done
   epic-30-retrospective: optional
-  epic-31: backlog
+  epic-31: in-progress
   31-1-scale-envelope-100000-files: backlog
-  31-2-durability-matrix-kill9-unplug-network-loss: backlog
+  31-2-durability-matrix-kill9-unplug-network-loss: in-progress
   31-3-large-blob-memory-ceiling: backlog
-  31-4-live-forgejo-integration: backlog
+  31-4-live-forgejo-integration: in-progress
   31-5-cross-host-field-test: backlog
-  31-6-docs-sync-md-and-phase-acceptance: backlog
+  31-6-docs-sync-md-and-phase-acceptance: done
   epic-31-retrospective: optional
+
+# Phase 4 state as of 2026-07-25 — what is actually true, not what was planned.
+#
+# VERIFIED LIVE against real git remotes (a local bare repo, plus the makistack
+# Forgejo instance for the HTTP transport): clone, commit with provenance
+# trailers, push, fetch + fast-forward apply, divergence converging into
+# conflict copies with no prompt, the four-tier completeness gate holding and
+# releasing files, watch mode syncing a deeply nested new directory while
+# excluding a Chrome .crdownload and an Office ~$ lock file, removable-media
+# absence pausing without ever propagating a deletion, and SIGTERM performing a
+# bounded graceful finalize.
+#
+# BUILT AND UNIT-TESTED BUT NOT YET REACHABLE AT RUNTIME:
+#   25-4 / 25-5 — the LFS client (pointer, store, endpoint, batch, basic
+#   transfer; 62 tests) is complete, but nothing in the commit path yet routes
+#   an oversized file through it. `WorkKind::LfsUpload`/`LfsDownload` execute
+#   correctly when enqueued; no code enqueues them. Wiring this needs the
+#   in-process attribute filter (AD-46) so `gix::status` does not report every
+#   pointer-backed file as permanently modified. This is the top remaining item.
+#   28-2 / 28-4 — `GitCli::worktree_add/remove/prune` exist and are tested; the
+#   engine does not yet create lanes, and `do_open_pr` records and surfaces the
+#   pushed branch rather than calling the Forgejo API.
+#
+# NOT STARTED — blocked on an environment, not on a decision:
+#   epic-29 (app surfaces) — the `keeper` shell crate cannot be compiled in the
+#   development container (no GTK/glib system libraries, no sudo), so no IPC,
+#   tray or settings code could be compile-verified. The pure parts it depends
+#   on ARE done and tested inside keeper-sync: `progress::tray_state`,
+#   `status_line`, and the view models. The tray glyph set is generated and
+#   committed.
+#   31-1 / 31-3 / 31-5 — scale, large-blob and cross-host runs. `delectra` was
+#   unreachable for the whole session and `hesperia` went offline partway
+#   through, so neither named test host could be used.

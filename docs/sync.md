@@ -408,7 +408,25 @@ Linux).
 
 ---
 
-## 15. Deliberate limitations
+## 15. Current implementation status
+
+This document describes the designed behaviour. As of 2026-07-25 the engine and
+the `keeper-syncd` daemon implement and verify §§1–7, §9, §10 and §12 against
+real git remotes. Three parts are not yet reachable at runtime:
+
+- **§8 large files.** The LFS client is written and unit-tested, but nothing in
+  the commit path routes an oversized file through it yet, so LFS does not
+  engage. Files above the threshold are currently committed as ordinary git
+  blobs — which is exactly what §8 says must not happen for multi-gigabyte
+  content. Do not point a profile at large binaries until this lands.
+- **§7 review lanes.** The worktree commands exist; the engine does not yet
+  create a lane or open a pull request. A `pushOnly` profile still pushes
+  correctly, it just pushes its own branch rather than a generated lane.
+- **§11 progress and warnings.** These are engine-side and correct — the tray
+  decision, the status line and the warning onset logic are implemented and
+  tested — but the desktop app surfaces that render them are not wired up.
+
+## 16. Deliberate limitations
 
 1. **No content merge.** Divergent text files produce conflict copies, not a
    three-way merge.
