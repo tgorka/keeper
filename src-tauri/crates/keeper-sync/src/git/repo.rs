@@ -23,9 +23,18 @@ use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, SystemTime},
 };
 
 use crate::error::{Result, SyncError};
+
+/// How long an `index.lock` must sit untouched before it is debris.
+///
+/// git writes an index in well under a second, and keeper's own staging of a
+/// six-figure file count still finishes far inside this window. The threshold
+/// is not tuned for speed — it is deliberately far longer than any real write,
+/// so the only locks it ever removes are ones nobody is holding.
+const STALE_INDEX_LOCK: Duration = Duration::from_secs(60);
 
 /// Open a managed repository.
 ///
@@ -37,7 +46,69 @@ pub fn open(path: &Path, trust_full: bool) -> Result<gix::Repository> {
     if trust_full {
         options = options.with(gix::sec::Trust::Full);
     }
-    gix::open_opts(path, options).map_err(|err| SyncError::Git(format!("open failed: {err}")))
+    let repo = gix::open_opts(path, options)
+        .map_err(|err| SyncError::Git(format!("open failed: {err}")))?;
+    release_stale_index_lock(repo.git_dir());
+    Ok(repo)
+}
+
+/// Remove an `index.lock` left behind by a process that was killed.
+///
+/// A `SIGKILL` during an index write — a crash, an OOM kill, a machine losing
+/// power — leaves the lock on disk with nobody holding it. git then refuses
+/// every subsequent index write, so without this the profile never syncs again
+/// and the cure is a human finding and deleting a file they have no reason to
+/// know exists. That is exactly the unattended-recovery failure NFR-24 forbids.
+///
+/// A *fresh* lock is left strictly alone: it most likely belongs to a `git`
+/// command the user is running by hand in the same folder, and stealing it
+/// would corrupt their index to fix a problem that does not exist. The caller
+/// sees the ordinary lock error instead, which is transient and retried.
+///
+/// Best-effort by design. If the removal races another process, or the clock
+/// went backwards, the sync continues and fails on its own terms rather than
+/// turning a cleanup into a hard error.
+fn release_stale_index_lock(git_dir: &Path) {
+    release_index_lock_older_than(git_dir, STALE_INDEX_LOCK);
+}
+
+/// The rule itself, with the threshold passed in so a test can exercise both
+/// sides of the decision without manipulating file timestamps.
+fn release_index_lock_older_than(git_dir: &Path, threshold: Duration) {
+    let lock = git_dir.join("index.lock");
+    let Ok(metadata) = std::fs::metadata(&lock) else {
+        return;
+    };
+    if !metadata.is_file() {
+        return;
+    }
+    // A modified time in the future means the clock moved, not that the lock is
+    // new. Leaving it alone is the conservative reading.
+    let Some(age) = metadata
+        .modified()
+        .ok()
+        .and_then(|at| SystemTime::now().duration_since(at).ok())
+    else {
+        return;
+    };
+    if age < threshold {
+        return;
+    }
+    match std::fs::remove_file(&lock) {
+        // Logged, never silent: a repository that keeps needing this is a
+        // machine that keeps dying mid-write, and that is worth seeing.
+        Ok(()) => tracing::warn!(
+            lock = %lock.display(),
+            age_s = age.as_secs(),
+            "released an index lock left behind by a killed run"
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(
+            lock = %lock.display(),
+            error = %err,
+            "could not release a stale index lock"
+        ),
+    }
 }
 
 /// Does this clone failure mean the remote simply has no commits yet?
@@ -519,6 +590,34 @@ pub fn refresh_index_stat(repo: &gix::Repository, paths: &[PathBuf]) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stale_index_lock_is_released_but_a_fresh_one_is_left_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path();
+        let lock = git_dir.join("index.lock");
+        std::fs::write(&lock, b"").expect("write the lock");
+
+        // A lock young enough that a live `git` command could still be holding
+        // it. Stealing that would corrupt the user's index to fix a problem
+        // nobody has.
+        release_index_lock_older_than(git_dir, Duration::from_secs(3600));
+        assert!(lock.exists(), "a lock somebody may still hold must survive");
+
+        // The same file, judged against a threshold it is older than: debris
+        // from a killed run, and the only thing standing between this profile
+        // and never syncing again.
+        release_index_lock_older_than(git_dir, Duration::ZERO);
+        assert!(!lock.exists(), "a lock nobody holds must be released");
+    }
+
+    #[test]
+    fn releasing_a_lock_that_was_never_there_is_not_an_error() {
+        // Every repository open runs this, and the overwhelmingly common case
+        // is that there is no lock at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        release_stale_index_lock(dir.path());
+    }
+
     #[test]
     fn an_empty_remote_is_told_apart_from_a_real_failure() {
         // The narrowness is the point: misreading an auth failure as "empty"

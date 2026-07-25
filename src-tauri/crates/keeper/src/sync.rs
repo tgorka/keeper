@@ -199,6 +199,7 @@ pub fn is_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keeper_core::error::CoreError;
 
     #[test]
     fn a_host_label_is_always_produced_and_is_a_short_name() {
@@ -232,5 +233,145 @@ mod tests {
     #[test]
     fn availability_tracks_the_git_probe() {
         assert_eq!(is_available(), cfg!(desktop) && find_git().is_some());
+    }
+
+    // --- Story 29.6: the desktop end of "notify exactly once, on onset" -----
+    //
+    // The engine's half (at most one raise per `None -> Some` onset) is covered
+    // by `a_warning_notifies_once_per_onset_not_once_per_tick` in `keeper-sync`.
+    // What follows covers the leg the engine cannot see: that the onset the
+    // engine raised actually reaches the OS notifier, once, unaltered, and with
+    // the loud-failure posture AD-39 requires.
+
+    /// A capturing [`Platform`] double recording every `(title, body, target)`
+    /// posted through `notify` (mirrors `keeper-core::notify`'s test double).
+    ///
+    /// Unlike that one, the failing variant records the attempt *before*
+    /// erroring: the swallow contract is "attempted once and logged", and a
+    /// double that recorded nothing could not tell that apart from a shell that
+    /// never called the notifier at all.
+    struct CapturingPlatform {
+        calls: Mutex<Vec<(String, String, NotifyTarget)>>,
+        fail: bool,
+    }
+
+    impl CapturingPlatform {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail: false,
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail: true,
+            }
+        }
+        /// The `(title, body)` of every posted notification (the target is
+        /// asserted separately via [`CapturingPlatform::targets`]).
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls
+                .lock()
+                .expect("lock calls")
+                .iter()
+                .map(|(title, body, _)| (title.clone(), body.clone()))
+                .collect()
+        }
+        /// The click-through [`NotifyTarget`] of every posted notification.
+        fn targets(&self) -> Vec<NotifyTarget> {
+            self.calls
+                .lock()
+                .expect("lock calls")
+                .iter()
+                .map(|(_, _, target)| target.clone())
+                .collect()
+        }
+    }
+
+    impl Platform for CapturingPlatform {
+        fn data_dir(&self) -> Result<PathBuf, CoreError> {
+            Ok(PathBuf::from("/tmp/keeper-sync-test"))
+        }
+        fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn keychain_get(&self, _key: &str) -> Result<Option<String>, CoreError> {
+            Ok(None)
+        }
+        fn keychain_delete(&self, _key: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn open_url(&self, _url: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
+            self.calls.lock().expect("lock calls").push((
+                title.to_owned(),
+                body.to_owned(),
+                target.clone(),
+            ));
+            if self.fail {
+                return Err(CoreError::Unsupported("notify failed in test".to_owned()));
+            }
+            Ok(())
+        }
+        fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
+            Err(CoreError::Unsupported("sidecar unused in tests".to_owned()))
+        }
+        fn exclude_from_backup(&self, _path: &Path) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    /// The exact shape `Engine::warn` posts on a warning onset.
+    const ONSET_TITLE: &str = "Sync — Notes";
+    const ONSET_BODY: &str = "Push rejected — the remote moved ahead.";
+
+    #[test]
+    fn a_warning_onset_reaches_the_notifier_exactly_once_and_unaltered() {
+        let notifier = Arc::new(CapturingPlatform::new());
+        let shell = ShellSyncPlatform::new(notifier.clone());
+
+        shell.notify(ONSET_TITLE, ONSET_BODY);
+
+        // The engine already owns "how often"; the shell must neither drop the
+        // onset nor turn one raise into two, and the copy the user reads is the
+        // engine's, not a re-worded one.
+        assert_eq!(
+            notifier.calls(),
+            vec![(ONSET_TITLE.to_owned(), ONSET_BODY.to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_warning_onset_is_posted_untargeted_as_a_loud_failure() {
+        let notifier = Arc::new(CapturingPlatform::new());
+        let shell = ShellSyncPlatform::new(notifier.clone());
+
+        shell.notify(ONSET_TITLE, ONSET_BODY);
+
+        // AD-39: a stalled sync is a loud failure, posted on the same
+        // untargeted path as recording faults rather than routed through a
+        // click-through target that would make it a quiet, dismissible nudge.
+        assert_eq!(notifier.targets(), vec![NotifyTarget::None]);
+    }
+
+    #[test]
+    fn a_notifier_that_fails_does_not_fail_the_sync() {
+        let notifier = Arc::new(CapturingPlatform::failing());
+        let shell = ShellSyncPlatform::new(notifier.clone());
+
+        shell.notify(ONSET_TITLE, ONSET_BODY);
+        shell.notify(ONSET_TITLE, ONSET_BODY);
+
+        // Best-effort by contract: a machine with no working notifier still
+        // syncs — neither call may panic or unwind. Each raise is attempted
+        // exactly once (a failure is logged, never retried into a duplicate)
+        // and a first failure must not latch the path shut for the next one.
+        assert_eq!(notifier.calls().len(), 2);
     }
 }

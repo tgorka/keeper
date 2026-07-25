@@ -72,6 +72,14 @@ const CLAIM_LIMIT: u32 = 16;
 /// How often the supervisor wakes when nothing else prompts it.
 const TICK_MS: u64 = 1_000;
 
+/// How many consecutive transient failures before a profile stops calling
+/// itself healthy.
+///
+/// Low enough that a genuinely stuck profile surfaces within a few ticks,
+/// high enough that a single blip - a momentarily locked file, an EINTR -
+/// never raises a notification for something that fixed itself.
+const TRANSIENT_FAILURES_BEFORE_WARNING: u32 = 3;
+
 pub struct Engine {
     platform: Arc<dyn SyncPlatform>,
     /// Single connection behind a mutex. `sync.db` is small and every access is
@@ -90,6 +98,13 @@ pub struct Engine {
     gates: Mutex<HashMap<String, StabilityGate>>,
     /// Profiles with an operation in flight (the one-per-profile rule).
     busy: Mutex<HashMap<String, ()>>,
+    /// Consecutive transient failures per profile.
+    ///
+    /// A transient error is retried and, on its own, is not worth alarming
+    /// anyone about. A transient error that never stops recurring is a profile
+    /// that has silently stopped syncing, and reporting that one as healthy is
+    /// the dishonesty this counter exists to prevent. Reset by any success.
+    transient_failures: Mutex<HashMap<String, u32>>,
     /// Absolute path to the binary git should invoke as the `lfs` filter.
     ///
     /// `None` when the running executable cannot be resolved — the filter is an
@@ -144,6 +159,7 @@ impl Engine {
             status: Mutex::new(HashMap::new()),
             gates: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
+            transient_failures: Mutex::new(HashMap::new()),
             // `current_exe` is the daemon in a CLI run and the app binary in a
             // desktop run; both understand `lfs clean|smudge`.
             filter_program: std::env::current_exe().ok(),
@@ -397,8 +413,11 @@ impl Engine {
             if !profile.enabled {
                 continue;
             }
-            if let Err(err) = self.tick_profile(&profile).await {
-                self.record_failure(&profile, &err);
+            match self.tick_profile(&profile).await {
+                Ok(()) => {
+                    Self::lock(&self.transient_failures).remove(&profile.id);
+                }
+                Err(err) => self.record_failure(&profile, &err),
             }
         }
         Ok(())
@@ -491,6 +510,24 @@ impl Engine {
             }
             Retriability::Transient => {
                 tracing::warn!(profile = profile.name, error = %err, "sync retrying");
+                // One failure is noise; a run of them is a profile that has
+                // stopped syncing while still reporting itself healthy. Past
+                // the threshold it says so, through the same sticky
+                // once-per-onset channel every other warning uses - and any
+                // success clears both the count and the warning.
+                let consecutive = {
+                    let mut counts = Self::lock(&self.transient_failures);
+                    let counter = counts.entry(profile.id.clone()).or_insert(0);
+                    *counter = counter.saturating_add(1);
+                    *counter
+                };
+                if consecutive >= TRANSIENT_FAILURES_BEFORE_WARNING {
+                    self.warn(
+                        &profile.id,
+                        &profile.name,
+                        format!("sync has failed {consecutive} times in a row: {err}"),
+                    );
+                }
             }
             Retriability::Permanent => {
                 self.set_state(&profile.id, ProfileState::NeedsAttention);
@@ -1731,6 +1768,48 @@ fn display_relative(root: &Path, path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_run_of_transient_failures_stops_calling_the_profile_healthy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        // A single blip must stay quiet: it is retried, and warning about
+        // something that fixes itself trains people to ignore warnings.
+        let err = SyncError::Git("could not write the index".to_owned());
+        engine.record_failure(&p, &err);
+        let snapshot = engine.status(&p.id).expect("a status");
+        assert!(
+            snapshot.warning.is_none(),
+            "one retriable failure is not worth alarming anyone about"
+        );
+
+        // A run of them is a profile that has silently stopped syncing.
+        for _ in 1..TRANSIENT_FAILURES_BEFORE_WARNING {
+            engine.record_failure(&p, &err);
+        }
+        let snapshot = engine.status(&p.id).expect("a status");
+        let warning = snapshot
+            .warning
+            .expect("a profile that keeps failing must say so");
+        assert!(
+            warning.contains("could not write the index"),
+            "the warning must name the actual cause, got: {warning}"
+        );
+
+        // And it must be exactly one notification, not one per tick.
+        let notifications = platform
+            .notifications
+            .lock()
+            .map(|n| n.len())
+            .unwrap_or_default();
+        assert_eq!(notifications, 1, "a sustained failure notifies once");
+    }
+
     #[test]
     fn a_merge_commit_carries_the_same_provenance_as_any_other() {
         // The merge used to be the one commit in the history that said nothing
