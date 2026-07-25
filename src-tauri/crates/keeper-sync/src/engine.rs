@@ -659,17 +659,38 @@ impl Engine {
             git::repo::enforce_local_config_with_filter(&repo, self.filter_program.as_deref())?;
             return Ok(repo);
         }
-        tracing::info!(
-            profile = profile.name,
-            "cloning remote for a new sync profile"
-        );
-        let repo = git::repo::clone(
-            &profile.remote_url,
-            &profile.local_path,
-            &profile.branch,
-            None,
-            &self.interrupt,
-        )?;
+
+        // Cloning refuses a non-empty destination — and "sync this folder I
+        // already have" is the ordinary case, not an edge one. So a directory
+        // with content in it is ADOPTED instead: the repository is initialized
+        // in place and the remote attached, after which the normal flow commits
+        // the existing files as a root commit and the divergence path (AD-43)
+        // reconciles them with whatever the remote already holds. Nothing is
+        // overwritten and nothing is deleted to make this work.
+        let empty = std::fs::read_dir(&profile.local_path)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true);
+
+        let repo = if empty {
+            tracing::info!(
+                profile = profile.name,
+                "cloning remote for a new sync profile"
+            );
+            git::repo::clone(
+                &profile.remote_url,
+                &profile.local_path,
+                &profile.branch,
+                None,
+                &self.interrupt,
+            )?
+        } else {
+            tracing::info!(
+                profile = profile.name,
+                "adopting an existing folder: initializing a repository in place"
+            );
+            git::repo::adopt(&profile.local_path, &profile.remote_url, &profile.branch)?
+        };
+        git::repo::enforce_local_config_with_filter(&repo, self.filter_program.as_deref())?;
         if !profile.subpaths.is_empty() {
             self.git
                 .sparse_set(&profile.local_path, &profile.subpaths)?;

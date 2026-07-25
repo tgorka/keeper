@@ -329,6 +329,74 @@ fn cancelled_or(interrupt: &AtomicBool, otherwise: impl FnOnce() -> SyncError) -
     }
 }
 
+/// Initialize a repository inside a folder that already has content, and point
+/// it at `remote_url`.
+///
+/// gitoxide's clone refuses a non-empty destination, which would make the most
+/// ordinary request there is — "keep this folder I already have in sync" —
+/// impossible. Adoption sidesteps that without touching a single existing file:
+/// the repository is created empty around the content, the remote is attached,
+/// and the caller's normal flow then commits what is there and reconciles it
+/// with the remote through the usual divergence path.
+///
+/// `branch` becomes the initial HEAD, so the first commit lands where the
+/// profile expects rather than on whatever the local git default happens to be.
+pub fn adopt(root: &Path, remote_url: &str, branch: &str) -> Result<gix::Repository> {
+    let repo = gix::init(root)
+        .map_err(|err| SyncError::Git(format!("could not initialize {}: {err}", root.display())))?;
+
+    // Point HEAD at the profile's branch before anything is committed. An
+    // unborn branch is a plain symbolic ref, so this is just a file write.
+    let head = format!("refs/heads/{branch}");
+    repo.edit_reference(gix::refs::transaction::RefEdit {
+        change: gix::refs::transaction::Change::Update {
+            log: gix::refs::transaction::LogChange::default(),
+            expected: gix::refs::transaction::PreviousValue::Any,
+            new: gix::refs::Target::Symbolic(
+                gix::refs::FullName::try_from(head.as_str())
+                    .map_err(|err| SyncError::Config(format!("invalid branch name: {err}")))?,
+            ),
+        },
+        name: gix::refs::FullName::try_from("HEAD")
+            .map_err(|err| SyncError::Git(format!("HEAD is not a valid ref name: {err}")))?,
+        deref: false,
+    })
+    .map_err(|err| SyncError::Git(format!("could not set HEAD: {err}")))?;
+
+    let config_path = repo.git_dir().join("config");
+    let mut config =
+        gix::config::File::from_path_no_includes(config_path.clone(), gix::config::Source::Local)
+            .map_err(|err| {
+            SyncError::Git(format!("could not read {}: {err}", config_path.display()))
+        })?;
+    config
+        .set_raw_value_by("remote", Some("origin".into()), "url", remote_url)
+        .map_err(|err| SyncError::Git(format!("could not set remote.origin.url: {err}")))?;
+    config
+        .set_raw_value_by(
+            "remote",
+            Some("origin".into()),
+            "fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        )
+        .map_err(|err| SyncError::Git(format!("could not set remote.origin.fetch: {err}")))?;
+
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| SyncError::Config(format!("{} has no parent", config_path.display())))?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|source| SyncError::io("stage .git/config", parent.to_path_buf(), source))?;
+    config
+        .write_to(&mut staged)
+        .map_err(|source| SyncError::io("write .git/config", config_path.clone(), source))?;
+    staged
+        .persist(&config_path)
+        .map_err(|err| SyncError::io("replace .git/config", config_path.clone(), err.error))?;
+
+    // Reopen so the handle sees the remote and HEAD just written.
+    open(root, false)
+}
+
 /// Every path the index tracks, repository-relative.
 ///
 /// Used to find checked-out LFS pointers that still need materializing: only a

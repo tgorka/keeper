@@ -505,6 +505,11 @@ fn merge_theirs_args(reference: &str, message: &str) -> Result<Vec<String>> {
         "merge".to_owned(),
         "--no-edit".to_owned(),
         "--quiet".to_owned(),
+        // Adopting an existing folder gives the local side its own root
+        // commit, so reconciling it with the remote is a merge of unrelated
+        // histories. git refuses that by default as a safety net against a
+        // mistyped remote; here it is the expected shape.
+        "--allow-unrelated-histories".to_owned(),
         "-s".to_owned(),
         "ort".to_owned(),
         "-X".to_owned(),

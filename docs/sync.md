@@ -49,6 +49,14 @@ is **absent rather than broken**, and the app says exactly what to install.
 
 ## 2. Concepts
 
+### Adopting a folder you already have
+
+Pointing a profile at an **existing, non-empty** folder is the ordinary case and
+works: keeper initializes a repository in place, attaches the remote, commits
+what is there, and reconciles it with whatever the remote already holds through
+the normal conflict path (§5). Nothing is overwritten and nothing is deleted to
+make that happen. An empty folder is cloned into instead.
+
 ### Profiles
 
 A **profile** binds one local folder to one repository. It is the unit of
@@ -434,7 +442,26 @@ not yet reachable at runtime:
   decision, the status line and the warning onset logic are implemented and
   tested — but the desktop app surfaces that render them are not wired up.
 
-## 16. Deliberate limitations
+## 16. Measured envelopes
+
+Measured on a release build, Linux, AMD Ryzen AI 9 HX PRO 370, local disk, with
+a `file://` remote so the numbers reflect the engine rather than a network.
+
+| Scenario | Result |
+| --- | --- |
+| 100 000 files / 393 MB — first pass (scan, gate, commit, push) | 19.9 s, peak RSS 69.6 MiB |
+| 100 000 files — steady state, nothing changed | 0.76 s, peak RSS 60.7 MiB |
+| 2 GiB single file — adopt, clean to a pointer, store | 1.8 s, **peak RSS 17.5 MiB** |
+
+The last row is the one that matters for the design: a 2 GiB object is handled
+in about 17 MiB of memory, roughly a 120:1 ratio. That is the difference between
+LFS streaming the content and gitoxide buffering it, and it is why §8 makes LFS
+mandatory rather than optional.
+
+Steady-state cost is dominated by one `lstat` per file, so a folder that is not
+changing is cheap to keep watched.
+
+## 17. Deliberate limitations
 
 1. **No content merge.** Divergent text files produce conflict copies, not a
    three-way merge.

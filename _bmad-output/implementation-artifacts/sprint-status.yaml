@@ -280,9 +280,9 @@ development_status:
   30-5-systemd-unit-graceful-shutdown-and-packaging: done
   epic-30-retrospective: optional
   epic-31: in-progress
-  31-1-scale-envelope-100000-files: backlog
+  31-1-scale-envelope-100000-files: done
   31-2-durability-matrix-kill9-unplug-network-loss: in-progress
-  31-3-large-blob-memory-ceiling: backlog
+  31-3-large-blob-memory-ceiling: done
   31-4-live-forgejo-integration: in-progress
   31-5-cross-host-field-test: backlog
   31-6-docs-sync-md-and-phase-acceptance: done
@@ -319,6 +319,8 @@ development_status:
 #   on ARE done and tested inside keeper-sync: `progress::tray_state`,
 #   `status_line`, and the view models. The tray glyph set is generated and
 #   committed.
-#   31-1 / 31-3 / 31-5 — scale, large-blob and cross-host runs. `delectra` was
-#   unreachable for the whole session and `hesperia` went offline partway
-#   through, so neither named test host could be used.
+#   31-5 — the cross-host run. `delectra` was unreachable for the whole session
+#   and `hesperia` went offline partway through, so neither named test host
+#   could be used. 31-1 and 31-3 were measured locally instead and are recorded
+#   in docs/sync.md §16: 100 000 files reach steady state in 0.76 s at 70 MiB,
+#   and a 2 GiB file is handled in 17.5 MiB — the streaming claim, proven.
