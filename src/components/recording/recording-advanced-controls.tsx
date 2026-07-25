@@ -5,7 +5,7 @@
  * A HAND-ROLLED disclosure (Button + `useState` + conditional render) — app
  * code, not a shadcn `ui/` component, and no new dependency — collapsed by
  * default so the frame rate stays out of the way. Expanding reveals an fps
- * `Select` offering exactly {30, 60} (30 the default), bound to the shared
+ * `Select` offering exactly {10, 15, 30, 60} (30 the default), bound to the shared
  * `recording-settings` mirror store so the setup card and Settings → Recording
  * stay in lockstep. Edits persist immediately and apply to the next Recording
  * Session only — the sidecar reads fps once at Start.

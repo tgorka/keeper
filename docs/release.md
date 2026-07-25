@@ -106,12 +106,20 @@ the app bundle** in the release workflow:
 Locally, `bun run rec:build` is chained into `bun run tauri:dev` and `bun run tauri:build`, so the
 sidecar is always freshly built into `binaries/` before Tauri consults `externalBin` (the built
 binary is git-ignored, never committed). The CI `--no-bundle` build inherits the same chain.
+`scripts/build-keeper-rec.sh` also codesigns the sidecar when `APPLE_SIGNING_IDENTITY` is exported,
+which is how the local signed path reuses the same chain.
 
 > **Dev-signing reality (DevEx, not a product blocker).** Local builds that exercise **real
 > recording** need an **Apple Development certificate**, because macOS 15+ silently rejects
 > ScreenCaptureKit for ad-hoc-signed binaries (Cap #1722). This affects only the live-capture
 > path (Story 16.6, human-in-the-loop on real hardware); the `getCapabilities` handshake stub and
 > the bundling/signing wiring build and run fine without a certificate.
+>
+> Use **`bun run tauri:build:signed`** (optionally `-- --install`) for a local build you will
+> install and record with. An ad-hoc bundle's designated requirement is a bare `cdhash`, so every
+> rebuild invalidates the macOS TCC grant and Screen Recording re-prompts forever; the signed
+> script produces an identity-based requirement instead and fails loudly if it cannot. See
+> [recording.md](recording.md#for-developers-dev-builds).
 
 ## How to cut a release
 

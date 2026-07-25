@@ -302,7 +302,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// file per segment (`cameraDeviceId` nil = the system default camera;
     /// a vanished picked id falls back to the default, never an abort).
     /// Rotating segments per `segmentMB` / `maxSegmentSeconds`. `fps`
-    /// (Story 19.5) selects the capture frame rate, normalized to {30, 60}
+    /// (Story 19.5) selects the capture frame rate, normalized to {10, 15, 30, 60}
     /// before it reaches the stream configuration. Emits `preflight`
     /// immediately, then `recording` (with the path) once frames are flowing,
     /// or a single honest `error` line on any failure — including a vanished
@@ -507,7 +507,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         config.width = pixelWidth
         config.height = pixelHeight
         // Story 19.5: the selected frame rate, re-normalized defensively to
-        // {30, 60} so a bad wire value can never yield a degenerate timescale.
+        // {10, 15, 30, 60} so a bad wire value can never yield a degenerate timescale.
         config.minimumFrameInterval = CMTime(value: 1, timescale: Int32(normalizeFps(fps)))
         config.showsCursor = true
         config.queueDepth = 8

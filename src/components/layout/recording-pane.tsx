@@ -415,7 +415,7 @@ export function RecordingPane() {
                 </CardContent>
               </Card>
             ) : title === "Advanced" ? (
-              // The collapsed Advanced group (Story 19.5): fps 30/60 behind a
+              // The collapsed Advanced group (Story 19.5): fps 10/15/30/60 behind a
               // hand-rolled disclosure, shared with Settings → Recording.
               <Card key={title} size="sm">
                 <CardHeader>

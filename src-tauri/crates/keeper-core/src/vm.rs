@@ -2890,7 +2890,7 @@ impl RecordingStatusVm {
 ///
 /// All settings surfaces (Settings → Recording and the pre-record setup cards)
 /// render exactly this VM. The setter command normalizes (segment `100..=5000`
-/// MB, duration cap `1..=600` min, fps {30, 60}) and returns the effective VM,
+/// MB, duration cap `1..=600` min, fps {10, 15, 30, 60}) and returns the effective VM,
 /// so the UI never displays an unsaved value. Read again at every
 /// `recording_start` — edits apply to the next Recording Session only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -2907,8 +2907,8 @@ pub struct RecordingSettingsVm {
     /// (`~/Movies/keeper`, falling back to the app data dir). Always a concrete
     /// absolute path — the "unset vs default" ambiguity never reaches the UI.
     pub destination_dir: String,
-    /// Capture frame rate (Story 19.5): 30 (default) or 60, normalized on
-    /// read/write; the sidecar's `fps`.
+    /// Capture frame rate (Story 19.5): 10, 15, 30 (default), or 60,
+    /// normalized on read/write; the sidecar's `fps`.
     pub fps: u32,
     /// Video codec (Story 21.1): `"h264"` (maximum-compatibility default) or
     /// `"hevc"` (VideoToolbox hardware encode on Apple Silicon; markedly

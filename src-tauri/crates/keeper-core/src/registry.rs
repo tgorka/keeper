@@ -1021,25 +1021,25 @@ const RECORDING_FPS_KEY: &str = "recording.fps";
 /// `normalizeFps` fallback matches).
 pub const RECORDING_FPS_DEFAULT: u32 = 30;
 
-/// The only non-default legal recording frame rate (the collapsed Advanced
-/// control offers exactly {30, 60}).
-pub const RECORDING_FPS_ALTERNATE: u32 = 60;
+/// The legal recording frame rates (the collapsed Advanced control offers
+/// exactly {10, 15, 30, 60}; 30 stays the authored default).
+pub const RECORDING_FPS_ALLOWED: [u32; 4] = [10, 15, 30, 60];
 
-/// Normalize a frame-rate value to the legal set {30, 60}: anything that is not
-/// exactly 60 becomes the default of 30 — a corrupted persisted value can never
-/// surface as a degenerate `timescale` downstream (the sidecar normalizes again
-/// defensively with the identical rule).
+/// Normalize a frame-rate value to the legal set {10, 15, 30, 60}: anything
+/// out of the set becomes the default of 30 — a corrupted persisted value can
+/// never surface as a degenerate `timescale` downstream (the sidecar
+/// normalizes again defensively with the identical rule).
 pub fn normalize_recording_fps(fps: u32) -> u32 {
-    if fps == RECORDING_FPS_ALTERNATE {
-        RECORDING_FPS_ALTERNATE
+    if RECORDING_FPS_ALLOWED.contains(&fps) {
+        fps
     } else {
         RECORDING_FPS_DEFAULT
     }
 }
 
 /// Read the recording frame rate (Story 19.5). Absent / unparsable ⇒ the
-/// default of 30; a stored value is normalized to {30, 60} defensively (a
-/// hand-edited row can never surface out of the set). Stored in the `settings`
+/// default of 30; a stored value is normalized to {10, 15, 30, 60} defensively
+/// (a hand-edited row can never surface out of the set). Stored in the `settings`
 /// k/v table under `recording.fps`.
 pub fn get_recording_fps(data_dir: &Path) -> Result<u32, CoreError> {
     let raw = get_setting(data_dir, RECORDING_FPS_KEY)?;
@@ -1050,7 +1050,8 @@ pub fn get_recording_fps(data_dir: &Path) -> Result<u32, CoreError> {
     Ok(normalize_recording_fps(fps))
 }
 
-/// Write the recording frame rate (Story 19.5), normalizing to {30, 60} before
+/// Write the recording frame rate (Story 19.5), normalizing to {10, 15, 30, 60}
+/// before
 /// persisting a decimal string under `recording.fps`. Applies to the next
 /// Recording Session only — a running session's params are read once at start.
 pub fn set_recording_fps(data_dir: &Path, fps: u32) -> Result<(), CoreError> {
@@ -2299,9 +2300,11 @@ mod tests {
             get_recording_fps(&dir).expect("get default"),
             RECORDING_FPS_DEFAULT
         );
-        // Round-trip the only non-default legal value.
-        set_recording_fps(&dir, 60).expect("set 60");
-        assert_eq!(get_recording_fps(&dir).expect("get 60"), 60);
+        // Round-trip every non-default legal value.
+        for legal in [10_u32, 15, 60] {
+            set_recording_fps(&dir, legal).expect("set legal fps");
+            assert_eq!(get_recording_fps(&dir).expect("get legal fps"), legal);
+        }
         // An out-of-set value normalizes to 30 on write.
         set_recording_fps(&dir, 45).expect("set 45");
         assert_eq!(
@@ -2330,10 +2333,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_recording_fps_maps_everything_but_60_to_30() {
-        assert_eq!(normalize_recording_fps(30), 30);
-        assert_eq!(normalize_recording_fps(60), 60);
-        for out_of_set in [0, 1, 29, 31, 45, 59, 61, 120, u32::MAX] {
+    fn normalize_recording_fps_maps_out_of_set_to_30() {
+        for legal in RECORDING_FPS_ALLOWED {
+            assert_eq!(normalize_recording_fps(legal), legal);
+        }
+        for out_of_set in [0, 1, 9, 11, 14, 16, 29, 31, 45, 59, 61, 120, u32::MAX] {
             assert_eq!(normalize_recording_fps(out_of_set), 30);
         }
     }

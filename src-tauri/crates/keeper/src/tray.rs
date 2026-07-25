@@ -63,22 +63,23 @@ const DISMISS_ERROR_ID: &str = "tray-dismiss-error";
 /// [`Image::from_bytes`] (the `image-png` tauri feature) — a decode failure
 /// just keeps the current icon.
 ///
-/// All three tray glyphs are macOS TEMPLATE images (monochrome black + alpha):
-/// the menu bar colors them white/black per appearance and highlights them
-/// natively, so states must read from glyph SHAPE — ring = idle, filled dot in
-/// a ring = recording, disc with a punched-out exclamation = error.
+/// All three tray glyphs are macOS TEMPLATE images (monochrome black + alpha,
+/// the brand speech-bubble mark from the app icon): the menu bar colors them
+/// white/black per appearance and highlights them natively, so states must
+/// read from glyph SHAPE — bubble outline = idle, filled dot in the bubble =
+/// recording, filled bubble with a punched-out exclamation = error.
 const RECORDING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-recording-template.png");
 
-/// The bundled recording-red **filled** error badge shown while a failed session
-/// holds the tray (Story 18.4): the same recording-red as the record dot but a
-/// filled circle carrying a white exclamation mark, so the fault reads at a
-/// glance and stays visually distinct from the plain record dot. Same base
-/// dimensions as [`RECORDING_ICON_PNG`]; decoded per transition via
-/// [`Image::from_bytes`] — a decode failure just keeps the current icon.
+/// The bundled error badge shown while a failed session holds the tray (Story
+/// 18.4): the filled brand bubble carrying a punched-out exclamation mark, so
+/// the fault reads at a glance and stays visually distinct from the plain
+/// record dot. Same base dimensions as [`RECORDING_ICON_PNG`]; decoded per
+/// transition via [`Image::from_bytes`] — a decode failure just keeps the
+/// current icon.
 const ERROR_ICON_PNG: &[u8] = include_bytes!("../icons/tray-error-template.png");
 
-/// The idle (presence-only) template glyph — an outline ring. Replaces the
-/// colored app icon so the menu bar stays native (Story 21.4).
+/// The idle (presence-only) template glyph — the brand speech-bubble outline.
+/// Replaces the colored app icon so the menu bar stays native (Story 21.4).
 const IDLE_ICON_PNG: &[u8] = include_bytes!("../icons/tray-idle-template.png");
 
 /// The live tray, if menu-bar presence is currently on. `None` means no tray is

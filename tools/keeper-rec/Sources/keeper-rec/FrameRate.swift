@@ -12,12 +12,12 @@
 
 import Foundation
 
-/// Normalize a wire-level `fps` value to the legal set {30, 60} (Story 19.5):
-/// anything that is not exactly 60 becomes the default of 30. The host's
-/// registry read normalizes with the identical rule, but the sidecar
+/// Normalize a wire-level `fps` value to the legal set {10, 15, 30, 60}
+/// (Story 19.5): anything out of the set becomes the default of 30. The
+/// host's registry read normalizes with the identical rule, but the sidecar
 /// re-normalizes defensively so a corrupted or hostile wire value can never
 /// produce a degenerate (zero/negative/absurd) `CMTime` timescale — the
 /// sidecar must always capture sanely, never crash or stall on a bad knob.
 func normalizeFps(_ fps: Int) -> Int {
-    fps == 60 ? 60 : 30
+    [10, 15, 30, 60].contains(fps) ? fps : 30
 }

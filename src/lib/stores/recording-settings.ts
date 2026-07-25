@@ -40,7 +40,7 @@ export const RECORDING_DURATION_CAP_MINUTES_MAX = 600;
 export const RECORDING_FPS_DEFAULT = 30;
 /** The only legal frame rates (Story 19.5; mirrors the Rust normalize set —
  * anything else is normalized to the default backend-side). */
-export const RECORDING_FPS_ALLOWED: readonly number[] = [30, 60];
+export const RECORDING_FPS_ALLOWED: readonly number[] = [10, 15, 30, 60];
 
 /** The legal codec set (Story 21.1) — mirror of the Rust normalization. */
 export const RECORDING_CODEC_ALLOWED: readonly string[] = ["h264", "hevc"];

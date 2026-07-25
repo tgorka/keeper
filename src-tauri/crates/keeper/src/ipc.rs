@@ -4316,8 +4316,9 @@ pub async fn recording_start(
         segment_mb,
         // Minutes → seconds for the sidecar's `maxSegmentSeconds` (30 → 1800).
         max_segment_seconds: u32::from(duration_cap_minutes) * 60,
-        // Story 19.5: the persisted frame rate (already normalized to {30, 60}
-        // by the registry read) rides the wire as the always-present `fps`.
+        // Story 19.5: the persisted frame rate (already normalized to
+        // {10, 15, 30, 60} by the registry read) rides the wire as the
+        // always-present `fps`.
         fps,
         codec,
         scale_percent,
@@ -5040,7 +5041,7 @@ pub fn recording_settings_get(state: State<'_, AppState>) -> Result<RecordingSet
 
 /// Persist the recording settings (Story 17.5 + 19.5, FR-72): clamp/normalize
 /// to the authored bounds (segment `100..=5000` MB, duration cap `1..=600` min,
-/// fps {30, 60} — clamp, not reject), write all four into the `settings` k/v
+/// fps {10, 15, 30, 60} — clamp, not reject), write all four into the `settings` k/v
 /// table, and return the effective (re-read) VM so the UI never displays an
 /// unsaved value. The destination is persisted verbatim — it is validated at
 /// Start time by the pre-flight, not here. A running session is never mutated —

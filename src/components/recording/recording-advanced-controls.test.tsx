@@ -65,7 +65,7 @@ describe("RecordingAdvancedControls", () => {
     expect(screen.queryByTestId(FPS_SELECT_TESTID)).not.toBeInTheDocument();
   });
 
-  it("offers exactly 30 and 60 and persists a picked 60", async () => {
+  it("offers exactly 10, 15, 30 and 60 and persists a picked 60", async () => {
     render(<RecordingAdvancedControls />);
     fireEvent.click(screen.getByTestId(ADVANCED_TOGGLE_TESTID));
     await waitFor(() => expect(screen.getByTestId(FPS_SELECT_TESTID)).toBeEnabled());
@@ -73,7 +73,7 @@ describe("RecordingAdvancedControls", () => {
     // Open the Radix select via keyboard (jsdom has no real pointer stack).
     fireEvent.keyDown(screen.getByTestId(FPS_SELECT_TESTID), { key: "Enter" });
     const options = await screen.findAllByRole("option");
-    expect(options.map((o) => o.textContent)).toEqual(["30", "60"]);
+    expect(options.map((o) => o.textContent)).toEqual(["10", "15", "30", "60"]);
 
     const sixty = await screen.findByRole("option", { name: "60" });
     // Radix SelectItem commits on Enter/Space keydown (jsdom has no real
