@@ -390,7 +390,50 @@ Exit codes: `0` success, `1` operational failure, `2` configuration error,
 
 ---
 
-## 13. Security posture
+## 13. Making a folder visible to agents
+
+The reason to run `keeper-syncd` on a dev box or a container rather than the
+desktop app: an autonomous agent working in that environment sees a plain
+directory, kept in step with a repository, with no application running.
+
+```bash
+cargo build --release -p keeper-syncd
+install -m 0755 src-tauri/target/release/keeper-syncd ~/.local/bin/
+
+keeper-syncd init
+keeper-syncd add --name agent-data \
+  --path ~/agent-data \
+  --remote https://forgejo.example.com/dev/agent-data.git \
+  --branch main
+keeper-syncd doctor          # confirms git, paths, watcher limits, disk
+keeper-syncd watch           # or run it under the systemd unit
+```
+
+Credentials never go in the config. Supply one of:
+
+```bash
+export KEEPER_SYNC_SECRET_SYNC_<PROFILE-ID>_CREDENTIAL='<token>'
+# or, for a long-running daemon:
+install -m 0600 /dev/stdin ~/.config/keeper-sync/secrets/sync-<profile-id>-credential <<< '<token>'
+```
+
+A secret file that is group- or world-readable is **refused**, not warned about.
+
+Agents then read and write `~/agent-data` as an ordinary directory. Everything
+in this document still applies to it: only complete files are committed (§4),
+divergence produces conflict copies rather than prompts (§5), large files go
+through LFS (§8), every change carries provenance naming the host (§9), and an
+offline period queues work rather than losing it (§10).
+
+Two things worth setting deliberately for an agent workspace:
+
+- **`direction`**. A bot that proposes rather than commits wants
+  `--direction pushOnly --lane worktree`, which publishes to a generated branch
+  and opens a pull request instead of touching the base branch (§7).
+- **`excludes`**. Agent tooling leaves scratch files around. The built-in tier-0
+  set covers editor and download conventions but not your build outputs.
+
+## 14. Security posture
 
 - Credentials live in the OS keychain (or, headless, a `0600` file) and are
   injected through gitoxide's programmatic credential callback — no helper
@@ -405,7 +448,7 @@ Exit codes: `0` success, `1` operational failure, `2` configuration error,
 
 ---
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 **`doctor` first.** It reports git's presence and version, each profile's path
 and writability, removable-volume presence, inotify limits, journal depth and
@@ -430,7 +473,7 @@ Linux).
 
 ---
 
-## 15. Current implementation status
+## 16. Current implementation status
 
 This document describes the designed behaviour. As of 2026-07-25 the engine and
 the `keeper-syncd` daemon implement and verify §§1–10 and §12 against real git
@@ -442,7 +485,7 @@ not yet reachable at runtime:
   decision, the status line and the warning onset logic are implemented and
   tested — but the desktop app surfaces that render them are not wired up.
 
-## 16. Measured envelopes
+## 17. Measured envelopes
 
 Measured on a release build, Linux, AMD Ryzen AI 9 HX PRO 370, local disk, with
 a `file://` remote so the numbers reflect the engine rather than a network.
@@ -461,7 +504,7 @@ mandatory rather than optional.
 Steady-state cost is dominated by one `lstat` per file, so a folder that is not
 changing is cheap to keep watched.
 
-## 17. Deliberate limitations
+## 18. Deliberate limitations
 
 1. **No content merge.** Divergent text files produce conflict copies, not a
    three-way merge.

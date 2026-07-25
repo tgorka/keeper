@@ -223,7 +223,7 @@ development_status:
   23-3-sync-db-profiles-work-journal-and-file-state-cache: done
   23-4-device-identity-and-provenance-trailer-composer: done
   23-5-git-binary-probe-and-capabilities-sync-flag: done
-  23-6-structured-logging-and-the-xdg-log-path-branch: in-progress
+  23-6-structured-logging-and-the-xdg-log-path-branch: done
   23-7-egress-disclosure-for-git-remotes: backlog
   epic-23-retrospective: optional
   epic-24: done
@@ -264,12 +264,12 @@ development_status:
   28-3-one-way-lanes-push-only-never-force: done
   28-4-pull-request-handoff-to-a-human: done
   epic-28-retrospective: optional
-  epic-29: backlog
-  29-1-sync-view-models-commands-and-progress-streaming: backlog
-  29-2-tray-sync-glyphs-and-one-composed-tray-decision: backlog
-  29-3-tray-status-line-and-menu-actions: backlog
-  29-4-settings-sync-profiles-add-and-edit: backlog
-  29-5-in-app-progress-and-the-warning-banner: backlog
+  epic-29: in-progress
+  29-1-sync-view-models-commands-and-progress-streaming: done
+  29-2-tray-sync-glyphs-and-one-composed-tray-decision: done
+  29-3-tray-status-line-and-menu-actions: done
+  29-4-settings-sync-profiles-add-and-edit: done
+  29-5-in-app-progress-and-the-warning-banner: done
   29-6-notifications-exactly-once-on-onset: backlog
   epic-29-retrospective: optional
   epic-30: done
@@ -284,7 +284,7 @@ development_status:
   31-2-durability-matrix-kill9-unplug-network-loss: in-progress
   31-3-large-blob-memory-ceiling: done
   31-4-live-forgejo-integration: in-progress
-  31-5-cross-host-field-test: in-progress
+  31-5-cross-host-field-test: done
   31-6-docs-sync-md-and-phase-acceptance: done
   epic-31-retrospective: optional
 
@@ -312,14 +312,25 @@ development_status:
 # hands off by calling the Forgejo pull-request API, degrading to an actionable
 # notice naming the branch when there is no token or no forge behind the remote.
 #
-# NOT STARTED — blocked on an environment, not on a decision:
-#   epic-29 (app surfaces) — the `keeper` shell crate cannot be compiled in the
-#   development container (no GTK/glib system libraries, no sudo), so no IPC,
-#   tray or settings code could be compile-verified. The pure parts it depends
-#   on ARE done and tested inside keeper-sync: `progress::tray_state`,
-#   `status_line`, and the view models. The tray glyph set is generated and
-#   committed.
-#   31-5 — the cross-host run, PARTIALLY covered. Two independent peers (own
+# EPIC 29 IS NOW LIVE AND VERIFIED. hesperia came back, and the keeper shell
+# builds on macOS once the Swift keeper-rec sidecar exists — so the whole
+# surface could finally be compile-verified: capability flag, nine commands,
+# the Channel<SyncProgressVm> stream, seven tray glyphs composed so recording
+# always wins the icon and sync never forces presence, and a capability-gated
+# Settings section. `bun run check:rust:macos` now runs the REAL workspace gate
+# (fmt + clippy -D warnings + tests) on that host, and the pre-push hook lints
+# every crate that can build locally while naming the one it cannot. 29.6
+# (onset-deduped notifications) is the remainder: the engine already raises
+# them once per onset through the platform port, but the desktop notifier is
+# not yet asserted end to end.
+#   31-5 — DONE for real. A bare repo on hesperia synced from electra over
+#   ssh:// (gix's ssh transport), both machines editing the same file
+#   concurrently, converging to byte-identical trees with the loser preserved
+#   as a conflict copy named after the device that made it. Running on macOS
+#   also exposed a bug no Linux test could: provenance read `unknown-host`
+#   there, because macOS has neither /etc/hostname nor $HOSTNAME.
+#
+#   Earlier local coverage, kept for the record: Two independent peers (own
 #   config, own database, own device identity) were driven against one remote
 #   locally: concurrent edits to the same file converged to byte-identical trees
 #   on both, provenance attributed each change to the device that made it, and
