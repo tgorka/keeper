@@ -140,22 +140,58 @@ pub fn fetch(
         connection.set_credentials(move |action| static_credential(&username, &secret, action));
     }
 
-    let prepared = connection
-        .prepare_fetch(
-            FlatProgress::root(Arc::clone(progress)),
-            gix::remote::ref_map::Options::default(),
-        )
-        .map_err(|err| classify(&err.to_string(), &host, interrupt))?;
+    // A repository created in the forge and not yet pushed to advertises zero
+    // refs. gitoxide surfaces that as a refspec-match failure, and it can come
+    // from either stage depending on the transport — so both are folded into
+    // one empty outcome rather than guessing which. There is genuinely nothing
+    // to pull; the push that follows is what creates the branch.
+    //
+    // `local_id` is still read: an adopted folder has commits of its own, and
+    // the caller decides what to do with them.
+    let nothing_to_pull = || -> Result<FetchOutcome> {
+        Ok(FetchOutcome {
+            remote_ref: None,
+            remote_id: None,
+            local_id: super::repo::head_commit_id(repo)?,
+            fast_forward: false,
+            received_pack: false,
+        })
+    };
+
+    let prepared = match connection.prepare_fetch(
+        FlatProgress::root(Arc::clone(progress)),
+        gix::remote::ref_map::Options::default(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(err) if mentions_an_empty_advertisement(&err.to_string()) => {
+            return nothing_to_pull();
+        }
+        Err(err) => return Err(classify(&err.to_string(), &host, interrupt)),
+    };
     let prepared = match options.shallow {
         Some(depth) => prepared.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth)),
         None => prepared,
     };
 
-    let outcome = prepared
-        .receive(FlatProgress::root(Arc::clone(progress)), interrupt)
-        .map_err(|err| classify(&err.to_string(), &host, interrupt))?;
+    let outcome = match prepared.receive(FlatProgress::root(Arc::clone(progress)), interrupt) {
+        Ok(outcome) => outcome,
+        Err(err) if mentions_an_empty_advertisement(&err.to_string()) => {
+            return nothing_to_pull();
+        }
+        Err(err) => return Err(classify(&err.to_string(), &host, interrupt)),
+    };
 
     summarize(repo, &outcome)
+}
+
+/// Did this failure mean the remote advertised no refs at all?
+///
+/// A refspec matching nothing has two very different causes: the branch does
+/// not exist on an otherwise-populated remote (a real problem worth surfacing),
+/// or the remote is brand new and holds nothing yet (routine). Only the second
+/// is tolerated, and the count in gitoxide's message is what separates them.
+fn mentions_an_empty_advertisement(text: &str) -> bool {
+    text.contains("matched any of the 0 refs")
 }
 
 /// Answer gitoxide's credential requests from a secret we already hold.
@@ -405,6 +441,21 @@ impl gix::progress::NestedProgress for FlatProgress {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_empty_remote_is_told_apart_from_a_missing_branch() {
+        // The ref COUNT is the whole distinction: a populated remote that has
+        // no such branch is a real problem and must keep surfacing as one.
+        assert!(mentions_an_empty_advertisement(
+            "None of the refspec(s) +refs/heads/main:refs/remotes/origin/main \
+             matched any of the 0 refs on the remote"
+        ));
+        assert!(!mentions_an_empty_advertisement(
+            "None of the refspec(s) +refs/heads/nope:refs/remotes/origin/nope \
+             matched any of the 7 refs on the remote"
+        ));
+        assert!(!mentions_an_empty_advertisement("connection reset by peer"));
+    }
+
     use super::*;
     use gix::progress::{Count as _, NestedProgress as _, Progress as _};
     use std::path::Path;

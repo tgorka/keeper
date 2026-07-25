@@ -20,6 +20,14 @@ path = "src/main.rs"
 # promise becomes a second, divergent implementation.
 [dependencies]
 keeper-sync = { path = "../keeper-sync" }
+# Self-update (checking GitHub releases, downloading and verifying an asset).
+# `blocking` is deliberate: `update` is a one-shot command and dragging an async
+# runtime into a single request would be more machinery than it deserves. rustls
+# only, matching the rest of the tree — no second TLS stack.
+reqwest = { workspace = true, features = ["blocking"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
 # `env` backs `--config` reading KEEPER_SYNCD_CONFIG, so a systemd unit can set
 # the path without an ExecStart argument.
 clap = { workspace = true }

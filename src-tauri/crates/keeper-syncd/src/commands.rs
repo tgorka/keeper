@@ -44,6 +44,7 @@ use keeper_sync::{
 
 use crate::config::{self, DaemonConfig};
 use crate::platform::LinuxPlatform;
+use crate::update;
 
 /// Everything went as asked.
 pub const EXIT_OK: u8 = 0;
@@ -238,6 +239,16 @@ pub enum Command {
         #[arg(long, short = 'n', value_name = "N", default_value_t = 200)]
         lines: usize,
     },
+    /// Check for a newer release, and optionally install it.
+    ///
+    /// Never runs on a timer. A sync daemon holds a durable journal and can be
+    /// mid-push at any moment; replacing its binary unattended is how a routine
+    /// release becomes a corrupted transfer.
+    Update {
+        /// Only report what is available; change nothing.
+        #[arg(long)]
+        check: bool,
+    },
     /// git clean/smudge filter for LFS content. Invoked by git, not by hand.
     ///
     /// Registered as `filter.lfs.clean` / `filter.lfs.smudge` in each managed
@@ -430,6 +441,7 @@ pub async fn run(
         Command::Logs { lines } => cmd_logs(&printer, &platform, lines),
         // Runs inside a `git` invocation: it must write ONLY object bytes to
         // stdout, so it bypasses the printer entirely.
+        Command::Update { check } => cmd_update(&printer, check),
         Command::Lfs { direction } => cmd_lfs_filter(direction),
         Command::Doctor => cmd_doctor(&printer, &platform, &config_path, config),
         Command::Add(args) => {
@@ -1092,6 +1104,34 @@ fn cmd_doctor(
     // git first: without it nothing else matters (AD-41).
     let git_missing = check_git(platform, &mut checks);
 
+    // A version check is a network call, so it is a WARN at worst and never
+    // affects the exit code: `doctor` reporting a machine as broken because
+    // GitHub was unreachable would be actively misleading.
+    checks.push(match update::check(env!("CARGO_PKG_VERSION")) {
+        Ok(Some(available)) => Check::new(
+            "version",
+            CheckStatus::Warn,
+            format!(
+                "keeper-syncd {} is available (running {}); run `keeper-syncd update`",
+                available.version,
+                env!("CARGO_PKG_VERSION")
+            ),
+        ),
+        Ok(None) => Check::new(
+            "version",
+            CheckStatus::Ok,
+            format!(
+                "keeper-syncd {} is the latest release",
+                env!("CARGO_PKG_VERSION")
+            ),
+        ),
+        Err(err) => Check::new(
+            "version",
+            CheckStatus::Warn,
+            format!("could not check for updates: {err}"),
+        ),
+    });
+
     let profiles = match &config {
         Ok(config) => {
             checks.push(Check::new(
@@ -1524,6 +1564,38 @@ fn status_line_state(state: ProfileState) -> &'static str {
         ProfileState::Paused => "paused",
         ProfileState::NeedsAttention => "needs attention",
     }
+}
+
+/// Report, and optionally install, a newer release.
+fn cmd_update(printer: &Printer, check_only: bool) -> Result<(), CliError> {
+    let current = env!("CARGO_PKG_VERSION");
+    let Some(available) = update::check(current)? else {
+        printer.line(format!("keeper-syncd {current} is the latest release"));
+        return Ok(());
+    };
+    if check_only {
+        printer.line(format!(
+            "keeper-syncd {} is available (running {current}); run `keeper-syncd update` to install it",
+            available.version
+        ));
+        return Ok(());
+    }
+
+    // Replace the binary that is actually running, resolved rather than assumed:
+    // a symlinked install must update the target, not the link's directory.
+    let destination = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map_err(|err| SyncError::io("resolve the running binary", ".", err))?;
+    let installed = update::apply(&available, &destination)?;
+    printer.line(format!(
+        "installed keeper-syncd {} to {}",
+        available.version,
+        installed.display()
+    ));
+    // Said plainly because it is easy to assume otherwise: the running process
+    // keeps its old inode and goes on running the previous build.
+    printer.line("restart the daemon to run it (`systemctl --user restart keeper-syncd`)");
+    Ok(())
 }
 
 /// Run one clean or smudge pass for git.

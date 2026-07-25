@@ -21,6 +21,7 @@
 mod commands;
 mod config;
 mod platform;
+mod update;
 
 use std::path::Path;
 use std::process::ExitCode;

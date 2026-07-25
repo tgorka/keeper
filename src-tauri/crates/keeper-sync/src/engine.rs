@@ -676,13 +676,38 @@ impl Engine {
                 profile = profile.name,
                 "cloning remote for a new sync profile"
             );
-            git::repo::clone(
+            match git::repo::clone(
                 &profile.remote_url,
                 &profile.local_path,
                 &profile.branch,
                 None,
                 &self.interrupt,
-            )?
+            ) {
+                Ok(repo) => repo,
+                // A repository freshly created in the forge has no commits, so
+                // there is nothing to clone and gitoxide says so. That is the
+                // start of a normal life, not a failure: initialize in place
+                // and let the first push create the branch. Any other error
+                // still propagates untouched.
+                Err(err) if git::repo::is_empty_remote(&err) => {
+                    tracing::info!(
+                        profile = profile.name,
+                        branch = profile.branch,
+                        "remote has no commits yet: initializing and pushing the first one"
+                    );
+                    // Clone can leave a partial `.git` behind before it fails.
+                    // Adoption must start from a clean slate, and only the
+                    // metadata is removed - never the user's files.
+                    let partial = profile.local_path.join(".git");
+                    if partial.exists() {
+                        std::fs::remove_dir_all(&partial).map_err(|err| {
+                            SyncError::io("clear the partial clone", &partial, err)
+                        })?;
+                    }
+                    git::repo::adopt(&profile.local_path, &profile.remote_url, &profile.branch)?
+                }
+                Err(err) => return Err(err),
+            }
         } else {
             tracing::info!(
                 profile = profile.name,
@@ -921,6 +946,22 @@ impl Engine {
             return Ok(());
         }
         self.commit_local(profile)?;
+
+        // A folder whose files are all still inside the settle window has no
+        // commits yet, and neither does a fresh profile on an empty remote.
+        // git rejects a push with no matching source ref as a hard error, so
+        // the honest answer is to publish nothing this tick and let the next
+        // one - after the files settle - do the work.
+        let repo = self.open_repo(profile)?;
+        if git::repo::head_commit_id(&repo)?.is_none() {
+            tracing::debug!(
+                profile = profile.name,
+                "nothing committed yet, so there is nothing to push"
+            );
+            return Ok(());
+        }
+        drop(repo);
+
         self.publish(self.progress(profile, SyncPhase::Pushing));
 
         let git = self.git.clone();

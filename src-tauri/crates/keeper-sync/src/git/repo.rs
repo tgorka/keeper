@@ -40,6 +40,26 @@ pub fn open(path: &Path, trust_full: bool) -> Result<gix::Repository> {
     gix::open_opts(path, options).map_err(|err| SyncError::Git(format!("open failed: {err}")))
 }
 
+/// Does this clone failure mean the remote simply has no commits yet?
+///
+/// Pointing keeper at a repository that was just created in the forge is one
+/// of the most ordinary things a user can do, and gitoxide reports it the same
+/// way it reports a genuinely missing branch: a fetch that matched no ref.
+/// There is no typed variant to match on, so the message is classified here,
+/// once, next to the call that produces it — rather than letting a string
+/// comparison leak into the engine.
+///
+/// Deliberately narrow. An auth failure, an unreachable host or a bad URL must
+/// keep surfacing as itself; treating those as "empty remote" would silently
+/// create an unrelated local history and push it somewhere unintended.
+pub fn is_empty_remote(err: &SyncError) -> bool {
+    let SyncError::Git(message) = err else {
+        return false;
+    };
+    message.contains("didn't have any ref that matched")
+        || message.contains("did not have any ref that matched")
+}
+
 /// Clone `url` into `dest` on `branch`.
 ///
 /// `index.sparse=false` is applied as an in-memory override for the clone
@@ -467,6 +487,25 @@ pub fn refresh_index_stat(repo: &gix::Repository, paths: &[PathBuf]) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_empty_remote_is_told_apart_from_a_real_failure() {
+        // The narrowness is the point: misreading an auth failure as "empty"
+        // would initialize an unrelated history and push it somewhere it does
+        // not belong.
+        assert!(is_empty_remote(&SyncError::Git(
+            "clone failed: The remote didn't have any ref that matched 'main'".into()
+        )));
+        assert!(!is_empty_remote(&SyncError::Git(
+            "clone failed: Credentials provided for \"ssh://host/r.git\" were not accepted".into()
+        )));
+        assert!(!is_empty_remote(&SyncError::Git(
+            "clone failed: could not connect to host".into()
+        )));
+        assert!(!is_empty_remote(&SyncError::Config(
+            "invalid remote URL".into()
+        )));
+    }
+
     use super::*;
     use crate::{
         git::commit::{stage_and_commit, StagedChange},

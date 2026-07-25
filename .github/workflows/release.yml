@@ -251,3 +251,85 @@ jobs:
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # keeper-syncd, the standalone folder-sync daemon (AD-52).
+  #
+  # A separate job from the macOS app on purpose: the daemon is Linux-first, is
+  # deliberately NOT bundled into the app, and must not be gated on Apple
+  # signing secrets. Without this the binary was never published at all, so
+  # `keeper-syncd update` had nothing to find and installing it meant building
+  # from source on every host.
+  #
+  # Each artifact ships a .sha256 sidecar. `keeper-syncd update` refuses an
+  # asset whose checksum is missing or does not match, so the sidecar is not
+  # decoration — it is the only integrity guarantee that path has. (The app's
+  # updater verifies a minisign signature instead; the difference is documented
+  # in docs/sync.md rather than glossed over.)
+  # -------------------------------------------------------------------------
+  syncd:
+    name: keeper-syncd (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One target failing must not withhold the others: a Linux box should
+      # still get its binary if the macOS runner is having a bad day.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Keyed per target so the two runners never share a cache entry.
+          key: syncd-${{ matrix.target }}
+          workspaces: src-tauri
+
+      # -p keeper-syncd only. The workspace also holds the Tauri shell, which
+      # needs GTK on Linux and the Swift sidecar on macOS; neither is required
+      # to build the daemon, and pulling them in would make this job fail for
+      # reasons that have nothing to do with it.
+      - name: Build
+        working-directory: src-tauri
+        run: cargo build --release -p keeper-syncd --target ${{ matrix.target }}
+
+      - name: Package with a checksum
+        working-directory: src-tauri
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BIN="target/$TARGET/release/keeper-syncd"
+          test -x "$BIN" || { echo "::error::$BIN was not produced"; exit 1; }
+          OUT="keeper-syncd-$TARGET"
+          cp "$BIN" "$OUT"
+          # Bare "<hex>  <name>" so `keeper-syncd update` can take the first
+          # field, and `shasum -c` still works by hand.
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$OUT" > "$OUT.sha256"
+          else
+            shasum -a 256 "$OUT" > "$OUT.sha256"
+          fi
+          echo "published $(cat "$OUT.sha256")"
+
+      - name: Attach to the release
+        working-directory: src-tauri
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ matrix.target }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # --clobber so re-running a release replaces the asset instead of
+          # failing on a name collision.
+          gh release upload "$REF" \
+            "keeper-syncd-$TARGET" "keeper-syncd-$TARGET.sha256" \
+            --clobber
