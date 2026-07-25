@@ -178,6 +178,43 @@ impl GitCli {
         Ok(out.trim().to_owned())
     }
 
+    /// Check out `branch`, creating it at the current HEAD if it is new.
+    ///
+    /// The lane primitive (AD-50): a bot writes on a generated branch so the
+    /// base branch is never touched and a human's review is never bypassed.
+    /// gitoxide implements no `switch`/`checkout` workflow, so this is the
+    /// shim's job.
+    pub fn ensure_branch(&self, repo: &Path, branch: &str) -> Result<()> {
+        let exists = self
+            .run("rev-parse --verify", repo, &rev_parse_verify_args(branch)?)
+            .is_ok();
+        let args = switch_args(branch, !exists)?;
+        self.run("switch", repo, &args).map(drop)
+    }
+
+    /// The branch HEAD currently points at, or `None` when detached.
+    pub fn current_branch(&self, repo: &Path) -> Result<Option<String>> {
+        let out = self.run(
+            "symbolic-ref",
+            repo,
+            &[
+                "symbolic-ref".to_owned(),
+                "--quiet".to_owned(),
+                "--short".to_owned(),
+                "HEAD".to_owned(),
+            ],
+        );
+        match out {
+            Ok(text) => {
+                let name = text.trim().to_owned();
+                Ok((!name.is_empty()).then_some(name))
+            }
+            // A detached HEAD exits non-zero with no message; not a failure.
+            Err(SyncError::GitCommand { .. }) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
     /// Is `ancestor` reachable from `descendant`?
     ///
     /// This is what separates the three shapes a fetch can leave behind, which
@@ -481,6 +518,26 @@ fn merge_theirs_args(reference: &str, message: &str) -> Result<Vec<String>> {
 /// `git merge-base <a> <b>` argument vector.
 fn merge_base_args(a: &str, b: &str) -> Result<Vec<String>> {
     Ok(vec!["merge-base".to_owned(), safe_ref(a)?, safe_ref(b)?])
+}
+
+/// `git rev-parse --verify <ref>` argument vector.
+fn rev_parse_verify_args(reference: &str) -> Result<Vec<String>> {
+    Ok(vec![
+        "rev-parse".to_owned(),
+        "--verify".to_owned(),
+        "--quiet".to_owned(),
+        format!("refs/heads/{}", safe_ref(reference)?),
+    ])
+}
+
+/// `git switch [-c] <branch>` argument vector.
+fn switch_args(branch: &str, create: bool) -> Result<Vec<String>> {
+    let mut args = vec!["switch".to_owned(), "--quiet".to_owned()];
+    if create {
+        args.push("-c".to_owned());
+    }
+    args.push(safe_ref(branch)?);
+    Ok(args)
 }
 
 /// `git merge-base --is-ancestor <a> <b>` argument vector.

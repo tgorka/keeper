@@ -427,12 +427,9 @@ Linux).
 This document describes the designed behaviour. As of 2026-07-25 the engine and
 the `keeper-syncd` daemon implement and verify §§1–10 and §12 against real git
 remotes, including a full LFS round trip (upload, peer clone, download,
-materialize) against a local LFS server. Two parts are not yet reachable at
-runtime:
+materialize) against a local LFS server and the review-lane airlock. One part is
+not yet reachable at runtime:
 
-- **§7 review lanes.** The worktree commands exist; the engine does not yet
-  create a lane or open a pull request. A `pushOnly` profile still pushes
-  correctly, it just pushes its own branch rather than a generated lane.
 - **§11 progress and warnings.** These are engine-side and correct — the tray
   decision, the status line and the warning onset logic are implemented and
   tested — but the desktop app surfaces that render them are not wired up.

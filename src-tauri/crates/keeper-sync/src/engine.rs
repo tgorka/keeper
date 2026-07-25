@@ -586,6 +586,54 @@ impl Engine {
         }
     }
 
+    /// The branch a review lane publishes on (AD-50).
+    ///
+    /// Stable per profile rather than per run: a long-lived bot folder should
+    /// accumulate onto one branch behind one pull request, not strew a new
+    /// branch across the remote every time the supervisor ticks. The profile id
+    /// keeps it unique, and the `keeper/` prefix keeps it unmistakable.
+    fn lane_branch(profile: &SyncProfile) -> String {
+        let slug: String = profile
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("keeper/{}/{}", slug.trim_matches('-'), profile.id)
+    }
+
+    /// The branch this profile writes on: its own for a lane, the tracked
+    /// branch otherwise.
+    fn working_branch(profile: &SyncProfile) -> String {
+        if profile.lane == SyncLane::Worktree {
+            Self::lane_branch(profile)
+        } else {
+            profile.branch.clone()
+        }
+    }
+
+    /// Put a lane profile on its own branch before anything is committed.
+    ///
+    /// Idempotent, and deliberately never touches the base branch: that is the
+    /// entire guarantee a lane exists to make.
+    fn ensure_lane(&self, profile: &SyncProfile) -> Result<()> {
+        if profile.lane != SyncLane::Worktree {
+            return Ok(());
+        }
+        let branch = Self::lane_branch(profile);
+        let current = self.git.current_branch(&profile.local_path)?;
+        if current.as_deref() == Some(branch.as_str()) {
+            return Ok(());
+        }
+        tracing::info!(profile = profile.name, %branch, "switching the review lane onto its branch");
+        self.git.ensure_branch(&profile.local_path, &branch)
+    }
+
     /// Materialize the profile's repository if it does not exist yet, without
     /// keeping the handle.
     ///
@@ -593,7 +641,8 @@ impl Engine {
     /// `gix::Repository` — which is neither `Send` nor cheap to hold — never
     /// spans an await point.
     fn ensure_repo(&self, profile: &SyncProfile) -> Result<()> {
-        self.open_repo(profile).map(drop)
+        self.open_repo(profile)?;
+        self.ensure_lane(profile)
     }
 
     /// Open the profile's repository, cloning it if the folder is not one yet.
@@ -855,10 +904,25 @@ impl Engine {
 
         let git = self.git.clone();
         let repo_path = profile.local_path.clone();
-        let refspec = format!("refs/heads/{0}:refs/heads/{0}", profile.branch);
+        // A lane publishes ONLY its own branch. The base branch is never in
+        // the refspec, so pushing over a human's work is impossible by
+        // construction rather than by care (AD-50).
+        let working = Self::working_branch(profile);
+        let refspec = format!("refs/heads/{working}:refs/heads/{working}");
         tokio::task::spawn_blocking(move || git.push(&repo_path, "origin", &refspec))
             .await
             .map_err(|err| SyncError::Journal(format!("push task failed: {err}")))??;
+
+        if profile.lane == SyncLane::Worktree {
+            // The branch is on the remote now, which is the durable artifact.
+            // Opening the pull request is a separate journaled unit so a
+            // failure there can never discard the push.
+            let now = self.platform.now_ms();
+            let unit = WorkKind::OpenPullRequest {
+                branch: Self::lane_branch(profile),
+            };
+            self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now).map(drop))?;
+        }
 
         if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
             snapshot.last_sync_ms = Some(self.platform.now_ms());
@@ -1239,19 +1303,100 @@ impl Engine {
         Ok(())
     }
 
+    /// Hand a pushed lane to a human as a pull request (Story 28.4, AD-50).
+    ///
+    /// This is the one place in the engine where a human decision is the
+    /// *point* rather than a failure, so the posture inverts: the pushed branch
+    /// is the durable artifact and must survive whatever happens here. A
+    /// missing token, an unreachable API or an already-open request all resolve
+    /// to an actionable notice naming the branch — never a rollback, never a
+    /// retry storm.
     async fn do_open_pr(&self, profile: &SyncProfile, branch: &str) -> Result<()> {
-        // The pushed branch is the durable artifact; a failure to open the pull
-        // request must never discard it (AD-50). So this reports an actionable
-        // notice rather than rolling anything back.
-        tracing::info!(
-            profile = profile.name,
-            branch,
-            "lane pushed; pull request pending"
+        let Some(target) = forge_api_target(&profile.remote_url) else {
+            self.warn(
+                &profile.id,
+                &profile.name,
+                format!("branch {branch} is pushed and waiting for review"),
+            );
+            return Ok(());
+        };
+        let Some(token) = self.platform.secret_get(&profile.secret_key())? else {
+            // Without a credential we cannot call the API, and prompting is not
+            // this engine's job. Say exactly what is waiting, and where.
+            self.warn(
+                &profile.id,
+                &profile.name,
+                format!(
+                    "branch {branch} is pushed; open a pull request at {}",
+                    target.base
+                ),
+            );
+            return Ok(());
+        };
+
+        let url = format!(
+            "{}/api/v1/repos/{}/{}/pulls",
+            target.base, target.owner, target.repo
         );
+        let body = serde_json::json!({
+            "head": branch,
+            "base": profile.branch,
+            "title": format!("{}: changes from {}", profile.name, self.device.label),
+            "body": format!(
+                "Opened by keeper-sync for profile `{}` on `{}`.",
+                profile.name, self.device.label
+            ),
+        });
+        let response = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("token {token}"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| SyncError::Network {
+                host: target.host.clone(),
+                reason: err.to_string(),
+            })?;
+
+        let status = response.status();
+        if status.is_success() {
+            let number = response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("number").and_then(serde_json::Value::as_i64));
+            tracing::info!(
+                profile = profile.name,
+                branch,
+                ?number,
+                "opened a pull request"
+            );
+            self.warn(
+                &profile.id,
+                &profile.name,
+                match number {
+                    Some(n) => format!("pull request #{n} is open for review"),
+                    None => format!("a pull request is open for {branch}"),
+                },
+            );
+            return Ok(());
+        }
+        // 409 is how Forgejo answers when a request for this head already
+        // exists, which from the lane's point of view is success: a human
+        // already has it.
+        if status.as_u16() == 409 {
+            tracing::debug!(
+                profile = profile.name,
+                branch,
+                "a pull request is already open"
+            );
+            return Ok(());
+        }
         self.warn(
             &profile.id,
             &profile.name,
-            format!("branch {branch} is pushed and waiting for review"),
+            format!("branch {branch} is pushed, but opening a pull request failed ({status})"),
         );
         Ok(())
     }
@@ -1517,6 +1662,56 @@ mod tests {
             dir.join("work"),
             "https://git.invalid/x/y.git",
         )
+    }
+
+    #[test]
+    fn forge_api_targets_are_derived_from_both_remote_shapes() {
+        let https = forge_api_target("https://forgejo.example.com/dev/notes.git").expect("https");
+        assert_eq!(https.base, "https://forgejo.example.com");
+        assert_eq!(
+            (https.owner.as_str(), https.repo.as_str()),
+            ("dev", "notes")
+        );
+
+        // scp-style is not a URL and has to be split by hand.
+        let scp = forge_api_target("git@forgejo.example.com:dev/notes.git").expect("scp");
+        assert_eq!(scp.base, "https://forgejo.example.com");
+        assert_eq!((scp.owner.as_str(), scp.repo.as_str()), ("dev", "notes"));
+
+        // A token in the URL must never be rebuilt into the API base.
+        let userinfo =
+            forge_api_target("https://tok3n:x@forgejo.example.com/dev/notes").expect("userinfo");
+        assert_eq!(userinfo.base, "https://forgejo.example.com");
+        assert!(!userinfo.base.contains("tok3n"));
+
+        // Nothing to open a pull request against.
+        assert!(forge_api_target("/srv/git/notes.git").is_none());
+        assert!(forge_api_target("file:///srv/git/notes.git").is_none());
+        assert!(forge_api_target("https://host/onlyowner").is_none());
+    }
+
+    #[test]
+    fn a_lane_branch_is_stable_unique_and_never_the_base_branch() {
+        let mut p = SyncProfile::new("01JABC", "Agent Drafts!", "/w", "https://git.invalid/r.git");
+        p.direction = SyncDirection::PushOnly;
+        p.lane = SyncLane::Worktree;
+
+        let branch = Engine::lane_branch(&p);
+        assert_eq!(
+            branch, "keeper/Agent-Drafts/01JABC",
+            "punctuation is folded and edges trimmed"
+        );
+        assert_ne!(
+            branch, p.branch,
+            "a lane must never publish on the base branch"
+        );
+        assert_eq!(branch, Engine::lane_branch(&p), "stable across calls");
+        assert_eq!(Engine::working_branch(&p), branch);
+
+        // A normal profile writes on the branch it tracks.
+        p.lane = SyncLane::Main;
+        p.direction = SyncDirection::Bidirectional;
+        assert_eq!(Engine::working_branch(&p), p.branch);
     }
 
     #[test]
@@ -1871,4 +2066,68 @@ mod tests {
             "work interrupted by a restart must come back"
         );
     }
+}
+
+/// Where a git remote's forge API lives, when the URL says enough to tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForgeTarget {
+    /// API root, e.g. `https://forgejo.example.com`.
+    base: String,
+    host: String,
+    owner: String,
+    repo: String,
+}
+
+/// Derive the forge API target from a git remote URL.
+///
+/// Handles the two shapes a Forgejo remote actually takes — `https://host/o/r`
+/// and scp-style `git@host:o/r.git`, the latter of which is deliberately NOT a
+/// valid URL and has to be split by hand. A `file://` or local-path remote has
+/// no forge behind it and yields `None`, which the caller treats as "say the
+/// branch is waiting" rather than as an error.
+fn forge_api_target(remote_url: &str) -> Option<ForgeTarget> {
+    let trimmed = remote_url.trim().trim_end_matches('/');
+    let (scheme_host, path) = if let Some(rest) = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+    {
+        let secure = trimmed.starts_with("https://");
+        let (host, path) = rest.split_once('/')?;
+        // Strip any userinfo: a token embedded in the URL must never be
+        // rebuilt into the API base and logged.
+        let host = host.rsplit('@').next()?;
+        (
+            format!("{}://{host}", if secure { "https" } else { "http" }),
+            path.to_owned(),
+        )
+    } else if let Some((user_host, path)) = trimmed.split_once(':') {
+        // scp-style. Reject anything that looks like a scheme we did not
+        // handle, and anything without a host.
+        if user_host.contains('/') || path.starts_with('/') {
+            return None;
+        }
+        let host = user_host.rsplit('@').next()?;
+        if host.is_empty() {
+            return None;
+        }
+        (format!("https://{host}"), path.to_owned())
+    } else {
+        return None;
+    };
+
+    let path = path.trim_end_matches(".git");
+    let (owner, repo) = path.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    let host = scheme_host
+        .split_once("://")
+        .map(|(_, h)| h.to_owned())
+        .unwrap_or_else(|| scheme_host.clone());
+    Some(ForgeTarget {
+        base: scheme_host,
+        host,
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
+    })
 }

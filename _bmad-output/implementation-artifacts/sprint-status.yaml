@@ -258,11 +258,11 @@ development_status:
   27-4-absence-semantics-pause-never-delete-resume: done
   27-5-profile-import-export-and-config-json-overrides: done
   epic-27-retrospective: optional
-  epic-28: in-progress
+  epic-28: done
   28-1-provenance-on-every-change: done
-  28-2-worktree-lanes-create-list-prune: backlog
-  28-3-one-way-lanes-push-only-never-force: in-progress
-  28-4-pull-request-handoff-to-a-human: backlog
+  28-2-worktree-lanes-create-list-prune: done
+  28-3-one-way-lanes-push-only-never-force: done
+  28-4-pull-request-handoff-to-a-human: done
   epic-28-retrospective: optional
   epic-29: backlog
   29-1-sync-view-models-commands-and-progress-streaming: backlog
@@ -306,10 +306,11 @@ development_status:
 # clean/smudge filter, so plain `git status`, `git checkout` and `git commit`
 # inside a synced folder all agree with keeper.
 #
-# BUILT AND UNIT-TESTED BUT NOT YET REACHABLE AT RUNTIME:
-#   28-2 / 28-4 — `GitCli::worktree_add/remove/prune` exist and are tested; the
-#   engine does not yet create lanes, and `do_open_pr` records and surfaces the
-#   pushed branch rather than calling the Forgejo API.
+# REVIEW LANES ARE WIRED AND VERIFIED (epic 28): a pushOnly+worktree profile
+# publishes only `keeper/<profile>/<id>` — verified live that the bot's draft
+# reached the lane branch while `main` stayed byte-for-byte untouched — and
+# hands off by calling the Forgejo pull-request API, degrading to an actionable
+# notice naming the branch when there is no token or no forge behind the remote.
 #
 # NOT STARTED — blocked on an environment, not on a decision:
 #   epic-29 (app surfaces) — the `keeper` shell crate cannot be compiled in the
