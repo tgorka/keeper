@@ -245,10 +245,28 @@ fn host_label_from(etc_hostname: Option<String>, env_hostname: Option<String>) -
 }
 
 fn read_host_label() -> String {
+    // `/etc/hostname` is the persistent, container-visible answer on Linux and
+    // `HOSTNAME` is a shell convenience, but macOS has NEITHER — a daemon there
+    // stamped every commit with "unknown-host", which defeats the whole point
+    // of provenance identifying the machine. `hostname(1)` is POSIX and present
+    // on both, so it is the last resort before giving up.
     host_label_from(
         std::fs::read_to_string("/etc/hostname").ok(),
-        std::env::var("HOSTNAME").ok(),
+        std::env::var("HOSTNAME").ok().or_else(hostname_command),
     )
+}
+
+/// Ask `hostname(1)`. `None` when the binary is missing or says nothing.
+fn hostname_command() -> Option<String> {
+    let output = std::process::Command::new("hostname").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&output.stdout);
+    // macOS answers with the Bonjour name (`macbookpro.lan`); the leading
+    // label is the useful part and keeps a commit trailer short.
+    let short = name.trim().split('.').next().unwrap_or_default().trim();
+    (!short.is_empty()).then(|| short.to_owned())
 }
 
 impl SyncPlatform for LinuxPlatform {
@@ -432,6 +450,21 @@ mod tests {
         assert_eq!(
             xdg_dir(Some(OsString::from("relative/cfg")), home, ".config"),
             PathBuf::from("/home/dev/.config/keeper-sync")
+        );
+    }
+
+    #[test]
+    fn a_real_hostname_is_resolvable_on_this_machine() {
+        // Regression: on macOS neither /etc/hostname nor $HOSTNAME exists, so
+        // the daemon stamped every commit with "unknown-host" and provenance
+        // identified nothing at all. Whatever platform this runs on must yield
+        // a usable name.
+        let label = read_host_label();
+        assert_ne!(label, "unknown-host", "the host must be identifiable here");
+        assert!(!label.is_empty());
+        assert!(
+            !label.contains('.'),
+            "the short label is used, got {label:?}"
         );
     }
 
