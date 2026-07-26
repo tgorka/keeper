@@ -232,12 +232,20 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           ASSETS=("keeper_${VERSION}_aarch64.dmg" "keeper_${VERSION}_aarch64_app.zip")
           [ -f latest.json ] && ASSETS+=("keeper_${VERSION}_aarch64.app.tar.gz" "keeper_${VERSION}_aarch64.app.tar.gz.sig" "latest.json")
-          gh release create "$GITHUB_REF_NAME" \
-            --draft \
-            --title "keeper $GITHUB_REF_NAME (unsigned build)" \
-            --notes "Unsigned (ad-hoc) macOS build — first launch requires right-click → Open. In-app auto-update is enabled via signed updater artifacts. Add Apple signing secrets per docs/release.md for notarized releases." \
-            "${ASSETS[@]}" \
-          || gh release upload "$GITHUB_REF_NAME" "${ASSETS[@]}" --clobber
+          # `gh release create` does NOT fail when a DRAFT already exists for this
+          # tag — a draft carries no tag server-side, so GitHub happily opens a
+          # second, untagged one and the assets land where nobody looks. That is
+          # exactly what v0.4.2 did. Ask first, and only create when there is
+          # genuinely nothing to upload into; this also makes a re-run idempotent.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${ASSETS[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --title "keeper $GITHUB_REF_NAME (unsigned build)" \
+              --notes "Unsigned (ad-hoc) macOS build — first launch requires right-click → Open. In-app auto-update is enabled via signed updater artifacts. Add Apple signing secrets per docs/release.md for notarized releases." \
+              "${ASSETS[@]}"
+          fi
 
       # Per-release egress diff note (Story 11.2, NFR-11, AD-23): docs/egress.md is the
       # canonical, diffable egress surface. Diff it against the previous tag into the job
@@ -291,6 +299,13 @@ jobs:
   # `keeper-syncd update` had nothing to find and installing it meant building
   # from source on every host.
   #
+  # `needs: release` + `if: always()` orders it after the app job WITHOUT making
+  # it depend on that job succeeding: a failed or skipped app build still
+  # publishes the daemon. The ordering is what matters — when both jobs opened
+  # the release themselves, the fast one (this) won and the app's assets went
+  # into a SECOND, untagged draft, because GitHub does not key a draft by tag.
+  # Running after the app job means exactly one creator at any moment.
+  #
   # Each artifact ships a .sha256 sidecar. `keeper-syncd update` refuses an
   # asset whose checksum is missing or does not match, so the sidecar is not
   # decoration — it is the only integrity guarantee that path has. (The app's
@@ -299,6 +314,8 @@ jobs:
   # -------------------------------------------------------------------------
   syncd:
     name: keeper-syncd (${{ matrix.target }})
+    needs: release
+    if: always()
     runs-on: ${{ matrix.runner }}
     strategy:
       # One target failing must not withhold the others: a Linux box should
@@ -358,17 +375,15 @@ jobs:
           REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # This job is deliberately NOT gated on the macOS `release` job (it must
-          # not wait on, or be blocked by, Apple signing) — and it builds in ~3
-          # minutes against that job's ~15, so it normally gets here BEFORE the
-          # release exists and `gh release upload` fails with "release not found".
-          # Create the draft if absent instead of racing: whichever job arrives
-          # first opens it, the others reuse it. A concurrent create loses
-          # harmlessly (the `||` swallows it) and the upload below still lands;
-          # the app job's own create is already `--clobber`/fallback tolerant.
+          # This job runs after the app job (`needs` + `if: always()`), so the
+          # release it uploads into normally already exists. It still opens one
+          # when absent — the app job can have failed before publishing, and a
+          # Linux box should get its daemon regardless — which is safe here only
+          # because the ordering guarantees no second creator is running: two
+          # concurrent creators produce two drafts, not one shared release.
           if ! gh release view "$REF" >/dev/null 2>&1; then
             gh release create "$REF" --draft --title "keeper $REF" \
-              --notes "Release assets are still uploading." || true
+              --notes "Release assets are still uploading."
           fi
           # --clobber so re-running a release replaces the asset instead of
           # failing on a name collision.
