@@ -133,8 +133,7 @@ origin: migrated from legacy ledger (spec-3-2-device-verification-emoji-sas-and-
 location: keeper-core verification::run_producer
 reason: `verification::run_producer` registers a `ToDeviceKeyVerificationRequestEvent` handler and only forwards flow ids from events observed after registration; it does not poll `client.encryption()` for already-pending verification requests on startup. In practice the always-on `useVerification` subscriber (mounted in `app-shell`) is live for the whole session, so a request that arrives while keeper is running is caught; the gap is only a request landing in the narrow window before the handler attaches, and verification requests self-expire (~10 min). Fix later by enumerating existing pending requests when the producer starts and seeding them into the flow channel.
 status: open
-
-### DW-18: Signing out the account that owns an open verification modal tears down its subscription but never resets the verification store, so the modal is stranded open on a now-removed account and a subsequent `close()` fires `verificationCancel` against a dead account.
+blocked: 2026-07-25 — NOT IMPLEMENTABLE as prescribed. matrix-sdk 0.18 `Encryption` exposes only flow-id-keyed `get_verification_request(user_id, flow_id)`; there is no API to enumerate pending verification requests, so the startup-enumeration fix cannot be written. Needs either an upstream API or a different design.### DW-18: Signing out the account that owns an open verification modal tears down its subscription but never resets the verification store, so the modal is stranded open on a now-removed account and a subsequent `close()` fires `verificationCancel` against a dead account.
 
 origin: migrated from legacy ledger (spec-3-2-device-verification-emoji-sas-and-qr.md), 2026-07-06
 location: src/hooks/use-verification.ts
@@ -204,8 +203,7 @@ origin: migrated from legacy ledger (spec-3-5-reactions.md), 2026-07-06
 location: src-tauri/crates/keeper-core/src/send.rs + account.rs (toggle_reaction)
 reason: `src-tauri/crates/keeper-core/src/send.rs` `toggle_reaction` and `src-tauri/crates/keeper-core/src/account.rs` `toggle_reaction` — the Rust tests added by Story 3.5 cover the pure `aggregate_reactions` helper and the FR-41 source-scan guard, but no test constructs the resolve/dispatch failure. This mirrors the pre-existing coverage shape of `submit_reply`/`submit_edit`/`retry` (also lacking behavioral error tests) because a `matrix_sdk_ui::Timeline` has no lightweight constructor for unit tests; closing it needs shared timeline test-harness infrastructure (a fixture room/timeline) rather than an in-diff patch, and the same fixture would retro-cover the sibling send methods.
 status: open
-
-### DW-28: Received audio in an unsupported codec (e.g. Ogg/Opus voice notes, which WKWebView on macOS does not decode natively) renders empty `<audio controls>` forever — the element fires neither `onLoadedMetadata` nor `onError` on a codec-unsupported stall, so no retry/fallback surfaces and AC3 ("received audio plays back inline") silently fails for those clips.
+blocked: 2026-07-25 — no test harness exists. keeper-core has NO [dev-dependencies] section at all (no wiremock, no matrix-sdk-test, no mock-sync), so the behavioural test this entry asks for has nothing to run against. Unblocking is a harness decision, not a bug fix.### DW-28: Received audio in an unsupported codec (e.g. Ogg/Opus voice notes, which WKWebView on macOS does not decode natively) renders empty `<audio controls>` forever — the element fires neither `onLoadedMetadata` nor `onError` on a codec-unsupported stall, so no retry/fallback surfaces and AC3 ("received audio plays back inline") silently fails for those clips.
 
 origin: migrated from legacy ledger (spec-3-6-receive-media-thumbnails-protocol-streaming-preview.md), 2026-07-06
 location: src/components/chat/media-attachment.tsx
@@ -726,7 +724,7 @@ location: keeper-core/src/vm.rs (DockBadgeMode::from_registry_str) / registry.rs
 reason: `keeper-core/src/vm.rs` `DockBadgeMode::from_registry_str` returns `All` for any non-`{all,mentions,off}` string, and `registry::get_dock_badge_mode` folds absent/unknown into the `All` default; the next `set` overwrites the original value. This mirrors the established "absent → default" registry pattern (`get_notify_previews` etc.), so it is not a story regression and no current AC is affected, but a newer schema value (e.g. a future combined mode) would be silently coerced to "badge everything" rather than preserved or logged. A one-line `tracing::warn!` on the unrecognized value would make the coercion observable; forward-compat of settings was out of scope here.
 status: open
 
-### DW-99: Exact-message / exact-re-login deep landing on a notification click is deferred to Epic 11. Under the Option B MVP scope, a notification click summons+focuses the window and lands only on a coarse view (Message → Inbox, Bridge → Bridges) driven by the app-side "last notification target" recorded at dispatch; it never lands on the exact Chat/Account/message or auto-opens the specific Bridge's re-login sheet.
+### DW-99: Exact-message / exact-re-login deep landing on a notification click is deferred to a click-capable notifier backend (owner UNASSIGNED — the original 'Epic 11' pointer was wrong: Epic 11 is Packaging, Release & Quality Gates). Under the Option B MVP scope, a notification click summons+focuses the window and lands only on a coarse view (Message → Inbox, Bridge → Bridges) driven by the app-side "last notification target" recorded at dispatch; it never lands on the exact Chat/Account/message or auto-opens the specific Bridge's re-login sheet.
 
 origin: migrated from legacy ledger (spec-10-4-click-through-and-bridge-health-alerts.md), 2026-07-06
 location: keeper-core/src/notify.rs + keeper/src/ipc.rs (record_last_notify_target)
@@ -784,15 +782,14 @@ status: open
 origin: spec-12-1-ios-project-init-and-repo-integration.md, 2026-07-11
 location: rust-toolchain.toml (targets) + src-tauri/crates/keeper/gen/apple/project.yml (x86_64 Externals / EXCLUDED_ARCHS references)
 reason: The generated `project.yml` references `x86_64` Externals paths and `EXCLUDED_ARCHS[sdk=iphoneos*] = x86_64`, but the pinned Rust targets are Apple-Silicon-only. On an Apple-Silicon dev box (the current environment) this is a non-issue; on an Intel Mac the Simulator core build would need `x86_64-apple-ios`. Out of scope for 12.1 (Simulator boot is 12.2's exit criterion, and CI runs on Apple-Silicon macos-latest), surfaced incidentally by adversarial review. Revisit alongside the 12.2 Simulator seam or 12.5 iOS CI if Intel-host support is required.
-status: open
-
-### DW-107: The generated `ExportOptions.plist` hard-codes `method = debugging` (a development/debug export, not distribution) with no `teamID`/`signingStyle`.
+status: closed 2026-07-25
+resolution: Won't fix. The premise holds (x86_64-apple-ios is unpinned) but acting on it contradicts the project's recorded Apple-Silicon-only posture; pinning an Intel Simulator target would advertise support that is deliberately not offered.### DW-107: The generated `ExportOptions.plist` hard-codes `method = debugging` (a development/debug export, not distribution) with no `teamID`/`signingStyle`.
 
 origin: spec-12-1-ios-project-init-and-repo-integration.md, 2026-07-11
 location: src-tauri/crates/keeper/gen/apple/ExportOptions.plist
 reason: Correct and intentional for 12.1's unsigned, dev-only init scope (no signing secrets committed; device signing is via the `APPLE_DEVELOPMENT_TEAM` env var documented in docs/ios.md). It becomes relevant only for a later signed-distribution/TestFlight release story (Epic 12 device/release work), which must override the export method and inject the team at archive/export time rather than committing it. Deferred as a forward pointer for that release story, not a 12.1 defect.
-status: open
-
+status: closed 2026-07-25
+resolution: Won't fix. The premise holds (ExportOptions.plist hard-codes method=debugging with no teamID) but a distribution export contradicts the recorded free-signing / no-TestFlight posture. Revisit only if paid distribution is adopted.
 ### DW-108: On the phone tier (<768px), the sidebar-hosted surfaces are unreachable and `PhoneShell` ignores `primaryView` — Settings, the account switcher, the offline pill (UX-DR18), and the Archive/Bridges/Approval view navigation have no phone affordance, and setting `primaryView` to `bridges`/`approval` (via ⌘3/⌘4 or a native menu) leaves the phone stack showing the chat list with no feedback.
 
 origin: spec-13-1-phone-layout-tier-and-navigation-stack.md, 2026-07-11
@@ -805,15 +802,14 @@ status: open
 origin: spec-13-1-phone-layout-tier-and-navigation-stack.md, 2026-07-11
 location: src/components/layout/phone-shell.tsx:47 (level = detailOpen && selected ? 2 : ...) + src/lib/stores/rooms.ts (selectRoom/requestFocus never touch detailStore)
 reason: The lifted `detailStore.open` is a global flag not scoped to the selected room (this mirrors the pre-existing desktop behavior, where detail-open also persisted across room switches). Through the 13.1 phone surface the bad state is not reachable: in-stack navigation changes rooms only via the back control (level 2 → closeDetail closes detail; level 1 → selectRoom(null) runs with detail already closed), and the deep-link primitive (`requestFocus`) is not yet wired to any phone trigger (notifications deferred; phone Search is Story 13.4). The only way to observe it today is a desktop→phone resize with the detail panel open, which lands on Detail showing the current room — acceptable. Deferred rather than patched because a correct reset needs a product decision on per-room detail semantics that Story 13.2 (which builds the identity-tap "push Detail" affordance, the phone's replacement for ⌘I) is the natural owner of; a phone-scoped effect that closes detail on `selected` change is the likely fix. Revisit with Story 13.2.
-status: open
-
-### DW-110: The phone navigation stack has no keyboard/assistive-tech focus management — pushing/popping a level moves no focus, the covered lower levels stay in the tab order and accessibility tree (not `inert`/`aria-hidden`), and the back control provides no focus-return or Escape-key handler.
+status: done 2026-07-25
+resolution: Verified already fixed by Story 13.2 — phone-shell.tsx's header comment names this entry, and the selection path now resets detail. Closed by sweep triage, no code written.### DW-110: The phone navigation stack has no keyboard/assistive-tech focus management — pushing/popping a level moves no focus, the covered lower levels stay in the tab order and accessibility tree (not `inert`/`aria-hidden`), and the back control provides no focus-return or Escape-key handler.
 
 origin: spec-13-1-phone-layout-tier-and-navigation-stack.md, 2026-07-11
 location: src/components/layout/phone-shell.tsx (opaque absolute overlays without inert/aria-hidden; BackControl with no focus-return; no Escape handler)
 reason: Story 13.1 ships a deliberately minimal, mouse/touch-accessible back control (documented in the PhoneShell header comment) and explicitly defers header chrome and focus rules to Story 13.2, whose acceptance criteria own exactly this behavior (UX-DR28: "every push moves focus to the new level's header, back button first in swipe order; every pop returns focus to the pushing element; the escape gesture triggers back at every level"). The reachable gap today is that a keyboard/AT user on a <768px webview can Tab "behind" the visible level into the covered Inbox, and Detail→Room back drops focus to `<body>` (a regression from the desktop `closeDetail` toggle-focus-return that this path replaces). Deferred to 13.2 rather than half-implemented here because 13.2 reworks this exact region (52px phone-header, chevron, transitions, edge-swipe) and will apply `inert`/`aria-hidden` to covered levels and full push/pop focus management as first-class ACs. Revisit with Story 13.2.
-status: open
-
+status: done 2026-07-25
+resolution: Verified already fixed by Story 13.2 — the phone stack now manages focus, marks covered levels inert and handles Escape. Closed by sweep triage, no code written.
 ### DW-111: The `open-search` palette action, reachable from the phone Search "Actions" scope, routes to the desktop `searchStore`/`SearchOverlay` (a centered dialog) instead of the phone full-screen Search surface — running it on iPhone opens a desktop-style centered search dialog rather than the native phone surface.
 
 origin: spec-13-4-merged-full-screen-search-surface.md, 2026-07-11

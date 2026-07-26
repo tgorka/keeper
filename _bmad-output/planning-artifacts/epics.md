@@ -258,7 +258,8 @@ Screen Recording increment (EXPERIENCE.md `Screen Recording (macOS — Phase 3)`
 | FR-38–FR-41 | Epic 7 | Drafts + Approval Pane + invariant |
 | FR-42–FR-47 | Epic 8 | Incognito + undo-send + post-dispatch delete |
 | FR-48–FR-50 | Epic 9 | Palette, keyboard, global hotkey |
-| FR-51–FR-54 | Epic 10 | Notifications + background |
+| FR-51–FR-53 | Epic 10 | Notifications + background |
+| FR-54 | Epic 10, **partially** | Story 10.4 shipped the coarse Option B landing (window summon + Inbox/Bridges view). Exact Chat/Account/message landing is NOT built and no epic currently owns it — see DW-99/DW-100. |
 | FR-28 | Epic 6 (detection/UI) + Epic 10 (native notification leg) | Split is deliberate: pipeline exists only in E10 |
 | FR-44 | Epic 8 (UI) with data file from Story 6.1 | Same data structure as risk tiers |
 | NFR-10 | Epic 2 (Story 2.6) | SDK-store passphrase choice per AD-22 |
@@ -1774,6 +1775,15 @@ So that acting on a notification is one click, never a hunt.
 **Given** a message notification for Account B's Chat while Account A's Chat is open
 **When** clicked
 **Then** keeper restores/summons the window and switches to the exact Chat and Account with the relevant message in view, within the interaction-latency bar (FR-54, NFR-4) — payload `(account_id, room_id, event_id)` (AD-18).
+
+> **As built (amended):** this AC was descoped during implementation and is only
+> partially met. The shipped Option B behaviour summons the window and lands on a
+> coarse view (Message → Inbox, Bridge → Bridges), driven by an app-side
+> "last notification target" recorded at dispatch — it does not land on the exact
+> Chat, Account or message, and does not auto-open a Bridge's re-login sheet.
+> The remainder needs a click-capable notifier backend and is tracked as DW-99
+> and DW-100. Recording it here because the story is marked done and the
+> unqualified AC above would otherwise read as delivered.
 
 **Given** a Bridge Session drop (from Story 6.5's state machine)
 **When** it occurs

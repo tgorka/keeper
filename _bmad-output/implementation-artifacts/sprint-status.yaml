@@ -290,6 +290,17 @@ development_status:
 
 # Phase 4 state as of 2026-07-25 — what is actually true, not what was planned.
 #
+# NOTE on the Forgejo claim below (added 2026-07-25): story 31-4 is NOT done.
+#   Its AC demands clone + bidirectional sync + LFS round trip + sparse profile
+#   + lane + PR against the makistack instance. What the line below actually
+#   attests is narrower: the HTTP transport. The LFS evidence elsewhere in this
+#   file says "an LFS server", not Forgejo. The instance at 192.168.86.20:3000
+#   is reachable and has HTTP git + LFS enabled, but self-registration is
+#   disabled and no credential for it exists on any dev host, so the remaining
+#   legs could not be run. Unblocking needs one Forgejo access token supplied
+#   out of band. Recorded rather than left implied, because the sentence below
+#   reads broader than the evidence behind it.
+#
 # VERIFIED LIVE against real git remotes (a local bare repo, plus the makistack
 # Forgejo instance for the HTTP transport): clone, commit with provenance
 # trailers, push, fetch + fast-forward apply, divergence converging into
