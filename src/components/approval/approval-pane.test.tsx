@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApprovalDraftVm } from "@/lib/ipc/client";
 
@@ -46,6 +46,10 @@ function draft(overrides: Partial<ApprovalDraftVm> = {}): ApprovalDraftVm {
     ...overrides,
   };
 }
+
+/** The staleness banner copy, restated verbatim so a silent copy change fails here. */
+const STALE_REFRESH_TEXT =
+  "Showing last-known drafts — couldn't refresh just now, so these may be out of date.";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -141,6 +145,37 @@ describe("ApprovalPane empty state", () => {
     fireEvent.click(screen.getByRole("button", { name: /retry/i }));
     expect(await screen.findByText("Room One")).toBeInTheDocument();
     expect(screen.queryByText("Couldn't load pending drafts.")).not.toBeInTheDocument();
+  });
+
+  // A refresh failure over a populated pane used to be entirely silent: the rows
+  // froze at their last snapshot while reading as current. The banner says so.
+  it("warns that a populated list is last-known when a refresh fails, without hiding the rows", async () => {
+    listPendingDrafts.mockResolvedValue([draft({ roomId: "!r1:x", displayName: "Room One" })]);
+    render(<ApprovalPane />);
+    expect(await screen.findByText("Room One")).toBeInTheDocument();
+    expect(screen.queryByText(STALE_REFRESH_TEXT)).not.toBeInTheDocument();
+
+    // A presence change re-queries; this one rejects.
+    listPendingDrafts.mockRejectedValue(new Error("ipc blip"));
+    act(() => draftsStore.getState().mark("a1", "!r9:x", true));
+
+    expect(await screen.findByText(STALE_REFRESH_TEXT)).toBeInTheDocument();
+    // The rows stay: they are the last authoritative snapshot, not wrong.
+    expect(screen.getByText("Room One")).toBeInTheDocument();
+    // Non-blocking — the empty-state retry affordance belongs to the empty branch only.
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+
+    // A subsequent successful refresh retracts the warning.
+    listPendingDrafts.mockResolvedValue([draft({ roomId: "!r1:x", displayName: "Room One" })]);
+    act(() => draftsStore.getState().mark("a1", "!r9:x", false));
+    await waitFor(() => expect(screen.queryByText(STALE_REFRESH_TEXT)).not.toBeInTheDocument());
+  });
+
+  it("shows the load-failure affordance, not the staleness banner, when the failed pane is empty", async () => {
+    listPendingDrafts.mockRejectedValue(new Error("ipc down"));
+    render(<ApprovalPane />);
+    expect(await screen.findByText("Couldn't load pending drafts.")).toBeInTheDocument();
+    expect(screen.queryByText(STALE_REFRESH_TEXT)).not.toBeInTheDocument();
   });
 });
 

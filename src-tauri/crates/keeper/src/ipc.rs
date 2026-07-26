@@ -78,7 +78,8 @@ pub struct AppState {
     /// In-flight Beeper email-code login registry (Story 2.3). Holds the
     /// intermediate login-request id between `beeper_request_code` and
     /// `login_beeper` (keyed by email) so it never crosses IPC; `cancel_beeper`
-    /// clears it. All `api.beeper.com` HTTP is confined to `keeper-core`.
+    /// drops one email's entry. All `api.beeper.com` HTTP is confined to
+    /// `keeper-core`.
     pub beeper_flows: Arc<BeeperFlowRegistry>,
     /// Live archive-export jobs (Story 5.5). Maps each `exportId` to its shared
     /// `Arc<AtomicBool>` cancel flag: `export_start` registers a flag before
@@ -1687,12 +1688,13 @@ pub async fn login_beeper(
         .map_err(to_ipc_error)
 }
 
-/// Cancel any in-progress Beeper login flow(s) (Story 2.3). Clears the registry
-/// so no pending request id lingers; nothing is persisted. Idempotent — with no
-/// pending flow it is a no-op.
+/// Cancel the in-progress Beeper login flow for `email` (Story 2.3). Drops that
+/// flow's pending request id so no residue lingers; other in-flight Beeper
+/// logins are untouched and nothing is persisted. Idempotent — with no pending
+/// flow for `email` it is a no-op.
 #[tauri::command]
-pub fn cancel_beeper(state: State<'_, AppState>) -> Result<(), IpcError> {
-    state.beeper_flows.cancel_all();
+pub fn cancel_beeper(state: State<'_, AppState>, email: String) -> Result<(), IpcError> {
+    state.beeper_flows.cancel(&email);
     Ok(())
 }
 

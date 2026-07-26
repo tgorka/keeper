@@ -43,7 +43,7 @@ const EMPTY_DISCOVERY: BridgeDiscoveryVm = { homeserver: "example.org", networks
 const TWO_NETWORK_DISCOVERY: BridgeDiscoveryVm = {
   homeserver: "example.org",
   networks: [
-    { networkId: "matrix", status: "loggedIn" },
+    { networkId: "matrix", status: "notLoggedIn" },
     { networkId: "instagram", status: "notLoggedIn" },
   ],
 };
@@ -126,8 +126,8 @@ describe("BridgesPane", () => {
     accountsStore.getState().hydrateAll([alice, bob]);
     renderPane();
 
-    // Two accounts × two discovered networks = four cards. Matrix is "Connect",
-    // Instagram (volatile) is "Set up".
+    // Two accounts × two discovered networks = four cards. Matrix (not logged in)
+    // is "Connect", Instagram (volatile) is "Set up".
     await waitFor(() => {
       expect(screen.getAllByRole("button", { name: "Connect Matrix" })).toHaveLength(2);
     });
@@ -160,7 +160,7 @@ describe("BridgesPane", () => {
     bridgeDiscover.mockResolvedValue({
       homeserver: "example.org",
       networks: [
-        { networkId: "matrix", status: "loggedIn" },
+        { networkId: "matrix", status: "notLoggedIn" },
         { networkId: "bogusnet", status: "configured" },
       ],
     });

@@ -463,12 +463,13 @@ export async function loginBeeper(email: string, code: string): Promise<AccountV
 }
 
 /**
- * Cancel any in-progress Beeper login flow (Story 2.3). The Rust core clears the
- * registry so no pending request id lingers; nothing is persisted. Idempotent —
- * a no-op when no flow is pending.
+ * Cancel the in-progress Beeper login flow for `email` (Story 2.3). The Rust core
+ * drops that flow's pending request id so nothing lingers; other in-flight Beeper
+ * logins keep running and nothing is persisted. Idempotent — a no-op when no flow
+ * is pending for `email`.
  */
-export async function cancelBeeper(): Promise<void> {
-  await invoke<void>("cancel_beeper");
+export async function cancelBeeper(email: string): Promise<void> {
+  await invoke<void>("cancel_beeper", { email });
 }
 
 /**

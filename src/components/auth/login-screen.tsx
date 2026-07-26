@@ -382,12 +382,18 @@ function BeeperTab({ addMode, addAccount, onDone }: TabProps) {
   // Guards the disclosure acknowledgment so a rapid double-click can't fire
   // `addAccount`/`onDone` twice before the surrounding UI tears down.
   const acknowledgedRef = useRef(false);
-  // On unmount mid-flow (overlay dismissed, tab switched away), clear any pending
-  // Beeper request id in the backend registry so no residue lingers.
+  // The exact email whose flow the backend registry holds. Kept in a ref because
+  // the input can be edited after the code was requested, and the cancel must
+  // name the flow that was actually started, not whatever is typed at unmount.
+  const flowEmailRef = useRef("");
+  // On unmount mid-flow (overlay dismissed, tab switched away), clear this tab's
+  // own pending Beeper request id in the backend registry so no residue lingers.
+  // Scoped to `flowEmailRef` so a concurrent add-account flow for another email
+  // keeps its stored request id.
   useEffect(
     () => () => {
       if (pendingRef.current || flowStartedRef.current) {
-        void cancelBeeper().catch(() => {
+        void cancelBeeper(flowEmailRef.current).catch(() => {
           // Best-effort: an abandoned flow leaves only an in-memory entry.
         });
       }
@@ -403,6 +409,7 @@ function BeeperTab({ addMode, addAccount, onDone }: TabProps) {
       setMissingFields(true);
       return;
     }
+    flowEmailRef.current = trimmedEmail;
     setPending(true);
     try {
       await beeperRequestCode(trimmedEmail);

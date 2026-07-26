@@ -238,12 +238,15 @@ struct AccountHandle {
     /// completion), so no `Timeline` (and its SDK tasks) leaks (AD-19). The
     /// room-list subscription registers nothing here.
     timelines: OpenTimelines,
-    /// Flow-id sender into the account's live verification producer (Story 3.2),
-    /// present iff a verification subscription is active. `verification_start`
-    /// requests a self-verification and forwards its new flow id here so the
-    /// producer picks it up and drives it. Set on subscribe, cleared on
-    /// unsubscribe/shutdown.
-    verification_flow_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    /// Flow-id inlet into the account's live verification producer (Story 3.2),
+    /// occupied iff a verification subscription is active. `verification_start`
+    /// requests a self-verification and forwards its new flow id through it so
+    /// the producer picks it up and drives it. Installed on subscribe, tagged
+    /// with the installing subscription id; released on unsubscribe or natural
+    /// completion, but only by the subscription that installed it — an
+    /// overlapping resubscribe supersedes the sender, and the superseded
+    /// subscription's teardown then leaves the live producer's inlet alone.
+    verification_flow_tx: Arc<verification::FlowSlot>,
     /// Live native-bridge-login sessions (Story 6.3), keyed by `session_id`. Each
     /// holds the driver task + the input sender `submit_bridge_login` pushes into.
     /// Cancelled/aborted on `cancel_bridge_login`, on natural completion (the
@@ -812,7 +815,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        verification_flow_tx: Arc::new(Mutex::new(None)),
+                        verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
                         outbox_tx,
@@ -1149,7 +1152,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        verification_flow_tx: Arc::new(Mutex::new(None)),
+                        verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
                         outbox_tx,
@@ -1246,7 +1249,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        verification_flow_tx: Arc::new(Mutex::new(None)),
+                        verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
                         outbox_tx,
@@ -1404,7 +1407,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        verification_flow_tx: Arc::new(Mutex::new(None)),
+                        verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
                         outbox_tx,
@@ -1528,7 +1531,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        verification_flow_tx: Arc::new(Mutex::new(None)),
+                        verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
                         outbox_tx,
@@ -1651,7 +1654,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        verification_flow_tx: Arc::new(Mutex::new(None)),
+                        verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
                         outbox_tx,
@@ -1818,7 +1821,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        verification_flow_tx: Arc::new(Mutex::new(None)),
+                        verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
                         outbox_tx,
@@ -1839,11 +1842,13 @@ impl AccountManager {
         };
 
         // The producer drains this channel for keeper-started flow ids; the sender
-        // is stored on the handle for `verification_start`.
+        // is installed on the handle's `FlowSlot` for `verification_start`, tagged
+        // with this subscription's id so only this subscription can release it —
+        // an overlapping resubscribe supersedes the sender, and the superseded
+        // teardown must then leave the surviving producer's inlet alone.
         let (flow_tx, flow_rx) = mpsc::unbounded_channel::<String>();
-        *flow_tx_slot.lock().await = Some(flow_tx);
-
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        flow_tx_slot.install(subscription_id, flow_tx).await;
         let account_id_owned = account_id.to_owned();
         let span = tracing::info_span!("verification_producer", account_id = %account_id);
         let reaper_subs = subs_arc.clone();
@@ -1855,7 +1860,7 @@ impl AccountManager {
                 // and clears the flow sender so a later `verification_start` fails
                 // fast rather than pushing into a dead producer.
                 reaper_subs.lock().await.remove(&subscription_id);
-                *reaper_flow_tx.lock().await = None;
+                reaper_flow_tx.release(subscription_id).await;
             }
             .instrument(span),
         );
@@ -1868,7 +1873,7 @@ impl AccountManager {
                 }
                 None => {
                     task.abort();
-                    *flow_tx_slot.lock().await = None;
+                    flow_tx_slot.release(subscription_id).await;
                     if did_activate {
                         return Err(AccountError::SyncStart(
                             "account removed during subscribe".to_owned(),
@@ -1883,13 +1888,14 @@ impl AccountManager {
     }
 
     /// Abort exactly the verification producer task for `subscription_id` and
-    /// clear the account's flow sender. Other account state is untouched.
-    /// Idempotent.
+    /// release the flow sender *it* installed — a sender installed by a newer
+    /// overlapping subscription belongs to a live producer and is left in place.
+    /// Other account state is untouched. Idempotent.
     pub async fn unsubscribe_verification(&self, account_id: &str, subscription_id: u64) {
         {
             let accounts = self.accounts.lock().await;
             if let Some(handle) = accounts.get(account_id) {
-                *handle.verification_flow_tx.lock().await = None;
+                handle.verification_flow_tx.release(subscription_id).await;
             }
         }
         if self.abort_subscription(account_id, subscription_id).await {
@@ -1978,7 +1984,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
-                    verification_flow_tx: Arc::new(Mutex::new(None)),
+                    verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                     login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     outbox_scheduler,
                     outbox_tx,
@@ -2581,7 +2587,7 @@ impl AccountManager {
         let sender = {
             let accounts = self.accounts.lock().await;
             match accounts.get(account_id) {
-                Some(handle) => handle.verification_flow_tx.lock().await.clone(),
+                Some(handle) => handle.verification_flow_tx.sender().await,
                 None => None,
             }
         };
@@ -2884,7 +2890,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        verification_flow_tx: Arc::new(Mutex::new(None)),
+                        verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
                         outbox_tx,
@@ -4027,14 +4033,16 @@ impl AccountManager {
     /// map into the merger so the Pins window re-emits in the new order. Refs not
     /// currently pinned are written anyway (upsert) so the frontend's authoritative
     /// order always wins; the registry is left contiguous and consistent.
+    ///
+    /// The rewrite goes through [`registry::reorder_pins`], which does the whole
+    /// `0..n` sequence in one transaction — a failure partway through rolls back to
+    /// the previous order rather than persisting a half-rewritten one.
     pub async fn reorder_pins(
         &self,
         data_dir: &Path,
         order: &[(String, String)],
     ) -> Result<(), CoreError> {
-        for (index, (account_id, room_id)) in order.iter().enumerate() {
-            registry::set_pin(data_dir, account_id, room_id, index as i64)?;
-        }
+        registry::reorder_pins(data_dir, order)?;
         self.reload_pins(data_dir).await?;
         tracing::debug!(count = order.len(), "pins reordered");
         Ok(())

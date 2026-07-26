@@ -48,6 +48,10 @@ import { cn } from "@/lib/utils";
 const EMPTY_STATE_TEXT =
   "Nothing waiting. Drafts you write stay here until you approve them — nothing sends without you.";
 
+/** Shown above a populated list whose refresh failed — the rows may be stale. */
+const STALE_REFRESH_TEXT =
+  "Showing last-known drafts — couldn't refresh just now, so these may be out of date.";
+
 /** A stable composite key for one draft row (`` `${accountId} ${roomId}` ``). */
 function rowKey(accountId: string, roomId: string): string {
   return `${accountId} ${roomId}`;
@@ -257,43 +261,56 @@ export function ApprovalPane() {
             <p className="max-w-md text-center text-muted-foreground text-sm">{EMPTY_STATE_TEXT}</p>
           </div>
         ) : (
-          <ul className="flex flex-col gap-6 p-6">
-            {groups.map((group, groupIndex) => (
-              <li key={group.accountId}>
-                <h2
-                  className="mb-2 flex items-center gap-2 font-medium text-muted-foreground text-xs uppercase tracking-wide"
-                  style={{ color: accountHueVar(group.hueIndex) }}
-                >
-                  <span
-                    aria-hidden="true"
-                    className="inline-block size-2 rounded-full"
-                    style={{ backgroundColor: accountHueVar(group.hueIndex) }}
-                  />
-                  {group.accountUserId}
-                </h2>
-                <ul className="flex flex-col overflow-hidden rounded-md border border-border">
-                  {group.drafts.map((draft, index) => (
-                    <ApprovalRow
-                      key={rowKey(draft.accountId, draft.roomId)}
-                      draft={draft}
-                      editing={editingKey === rowKey(draft.accountId, draft.roomId)}
-                      // Roving tabindex: only the very first row in the whole pane
-                      // (first row of the first group) is tab-reachable — a single
-                      // tab stop for the list, not one per account group.
-                      tabbable={groupIndex === 0 && index === 0}
-                      onEnterEdit={() => setEditingKey(rowKey(draft.accountId, draft.roomId))}
-                      onCancelEdit={() => setEditingKey(null)}
-                      onSaveEdit={(next) => onSaveEdit(draft, next)}
-                      onApprove={() => {
-                        void onApprove(draft);
-                      }}
-                      onDiscard={() => onDiscard(draft)}
+          <>
+            {queryFailed ? (
+              // A refresh failure over a populated pane must not read as "current":
+              // the rows stay (they are the last authoritative snapshot) but say so.
+              // Non-focusable by design — the pane keeps a single roving tab stop.
+              <p
+                role="status"
+                className="border-border border-b bg-muted/40 px-6 py-2 text-muted-foreground text-xs"
+              >
+                {STALE_REFRESH_TEXT}
+              </p>
+            ) : null}
+            <ul className="flex flex-col gap-6 p-6">
+              {groups.map((group, groupIndex) => (
+                <li key={group.accountId}>
+                  <h2
+                    className="mb-2 flex items-center gap-2 font-medium text-muted-foreground text-xs uppercase tracking-wide"
+                    style={{ color: accountHueVar(group.hueIndex) }}
+                  >
+                    <span
+                      aria-hidden="true"
+                      className="inline-block size-2 rounded-full"
+                      style={{ backgroundColor: accountHueVar(group.hueIndex) }}
                     />
-                  ))}
-                </ul>
-              </li>
-            ))}
-          </ul>
+                    {group.accountUserId}
+                  </h2>
+                  <ul className="flex flex-col overflow-hidden rounded-md border border-border">
+                    {group.drafts.map((draft, index) => (
+                      <ApprovalRow
+                        key={rowKey(draft.accountId, draft.roomId)}
+                        draft={draft}
+                        editing={editingKey === rowKey(draft.accountId, draft.roomId)}
+                        // Roving tabindex: only the very first row in the whole pane
+                        // (first row of the first group) is tab-reachable — a single
+                        // tab stop for the list, not one per account group.
+                        tabbable={groupIndex === 0 && index === 0}
+                        onEnterEdit={() => setEditingKey(rowKey(draft.accountId, draft.roomId))}
+                        onCancelEdit={() => setEditingKey(null)}
+                        onSaveEdit={(next) => onSaveEdit(draft, next)}
+                        onApprove={() => {
+                          void onApprove(draft);
+                        }}
+                        onDiscard={() => onDiscard(draft)}
+                      />
+                    ))}
+                  </ul>
+                </li>
+              ))}
+            </ul>
+          </>
         )}
       </ScrollArea>
     </section>

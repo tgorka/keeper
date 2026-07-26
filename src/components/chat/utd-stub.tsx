@@ -8,6 +8,11 @@
  * interactive verify flow lands in 3.2). When room keys arrive the SDK re-maps
  * the item to a decrypted {@link MessageBubble} via a `Set` diff, so this stub is
  * transient.
+ *
+ * Not a live region: a `reset` batch can render many historical UTD rows at once,
+ * and each would announce itself. Overrides the `Alert` primitive's default
+ * assertive `role="alert"` with the static `note` role, per the
+ * `history-boundary.tsx` precedent that only transient states are announced.
  */
 import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -18,7 +23,7 @@ export const UTD_STUB_TEXT = "Can't decrypt yet — verify this device or restor
 
 export function UtdStub() {
   return (
-    <Alert role="status" className="my-3">
+    <Alert role="note" className="my-3">
       <AlertDescription>{UTD_STUB_TEXT}</AlertDescription>
       <AlertAction>
         <Button

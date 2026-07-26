@@ -24,6 +24,42 @@ fn db_path(data_dir: &Path) -> PathBuf {
 /// Total number of hues on the per-account hue wheel (0..8).
 pub const HUE_WHEEL_SIZE: u8 = 8;
 
+/// How long a contended `keeper.db` writer waits for the write lock before
+/// giving up. WAL serializes writers, and the debounced draft save now writes at
+/// typing cadence alongside pin/settings/account writes; without a busy timeout a
+/// contended write returns `SQLITE_BUSY` instantly and the fire-and-forget draft
+/// save swallows it, losing the draft. Mirrors the `archive.db` timeout.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The maximum length (in characters) of a stored composer draft body. A draft is
+/// rewritten in full on every debounce flush, so an uncapped multi-megabyte paste
+/// turns each keystroke into a multi-megabyte row rewrite and grows `keeper.db`
+/// without bound. The cap sits well above any body a homeserver would accept as a
+/// single event (Matrix caps an event at 64 KiB, and 16,384 characters stay under
+/// that even at four bytes per codepoint), so it never clips a sendable message.
+pub const MAX_DRAFT_BODY_CHARS: usize = 16_384;
+
+/// Appended to a draft body clipped at [`MAX_DRAFT_BODY_CHARS`] so the stored
+/// draft admits what happened. The user reads this back in the composer (and in
+/// the approval pane) instead of being handed a partial body presented as whole.
+pub const DRAFT_TRUNCATION_MARKER: &str =
+    "\n\n[keeper: draft clipped here — the text past the length cap was not saved]";
+
+/// Clip `body` to [`MAX_DRAFT_BODY_CHARS`] characters, appending
+/// [`DRAFT_TRUNCATION_MARKER`] when (and only when) it actually clipped. Cuts on a
+/// `char` boundary, so a multi-byte grapheme is never split mid-byte.
+fn cap_draft_body(body: &str) -> std::borrow::Cow<'_, str> {
+    // A byte length within the char cap guarantees the char count is too (bytes ≥
+    // chars), so the common short draft skips the O(n) `chars().count()` scan on
+    // the per-keystroke save path.
+    if body.len() <= MAX_DRAFT_BODY_CHARS || body.chars().count() <= MAX_DRAFT_BODY_CHARS {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut capped: String = body.chars().take(MAX_DRAFT_BODY_CHARS).collect();
+    capped.push_str(DRAFT_TRUNCATION_MARKER);
+    std::borrow::Cow::Owned(capped)
+}
+
 /// Open `keeper.db` in WAL mode, ensuring the data dir and `accounts` schema
 /// exist. Every call is idempotent (`CREATE TABLE IF NOT EXISTS`).
 ///
@@ -39,6 +75,11 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
     })?;
     let conn = Connection::open(db_path(data_dir))
         .map_err(|e| CoreError::Internal(format!("could not open keeper.db: {e}")))?;
+    // Wait on a briefly-held write lock rather than erroring immediately: WAL
+    // serializes writers, and every caller here opens its own short-lived
+    // connection, so concurrent draft/pin/settings writes contend routinely.
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|e| CoreError::Internal(format!("could not set busy timeout: {e}")))?;
     // WAL for crash resilience (NFR-8). `pragma_update` runs the PRAGMA.
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| CoreError::Internal(format!("could not set WAL mode: {e}")))?;
@@ -194,6 +235,44 @@ pub fn set_pin(
     Ok(())
 }
 
+/// Rewrite the whole pin order to exactly `order` — `order[i]` gets `sort_order`
+/// `i` — in ONE connection and ONE `BEGIN IMMEDIATE` transaction (Story 4.3).
+///
+/// Each ref is upserted exactly as [`set_pin`] does, so a ref that is not yet
+/// pinned is inserted and the caller's order always wins. The difference is
+/// atomicity: N independent `set_pin` calls each commit on their own, so a
+/// failure (or a process kill) partway through leaves the persisted sequence
+/// half-rewritten — duplicated or gapped `sort_order` values that no longer
+/// describe any order the user asked for. Here the rewrite commits as a unit or
+/// rolls back entirely, leaving the previous order intact.
+pub fn reorder_pins(data_dir: &Path, order: &[(String, String)]) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| CoreError::Internal(format!("could not begin pin reorder: {e}")))?;
+    let rewrite = (|| {
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO pins(account_id, room_id, sort_order) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(account_id, room_id) DO UPDATE SET sort_order = excluded.sort_order",
+            )
+            .map_err(|e| CoreError::Internal(format!("could not prepare pin reorder: {e}")))?;
+        for (index, (account_id, room_id)) in order.iter().enumerate() {
+            stmt.execute(rusqlite::params![account_id, room_id, index as i64])
+                .map_err(|e| CoreError::Internal(format!("could not write pin: {e}")))?;
+        }
+        Ok::<(), CoreError>(())
+    })();
+    match rewrite {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|e| CoreError::Internal(format!("could not commit pin reorder: {e}"))),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// Remove the pin for `(account_id, room_id)` if present (Story 4.3). Idempotent —
 /// unpinning an unpinned room is not an error.
 pub fn remove_pin(data_dir: &Path, account_id: &str, room_id: &str) -> Result<(), CoreError> {
@@ -235,6 +314,11 @@ pub fn get_pins(data_dir: &Path) -> Result<Vec<(String, String, i64)>, CoreError
 /// `updated_ts` (Story 7.1). Idempotent per key: a repeated save overwrites the stored
 /// body. Drafts are keeper-local pre-send state (no Matrix representation, no
 /// cross-device mirror). The body is never logged.
+///
+/// The body is clipped to [`MAX_DRAFT_BODY_CHARS`] before the upsert, so a
+/// multi-megabyte paste cannot turn every debounce flush into a multi-megabyte row
+/// rewrite. A clipped body carries [`DRAFT_TRUNCATION_MARKER`], so what the user
+/// reads back never claims to be the whole draft.
 pub fn set_draft(
     data_dir: &Path,
     account_id: &str,
@@ -242,12 +326,13 @@ pub fn set_draft(
     body: &str,
     updated_ts: i64,
 ) -> Result<(), CoreError> {
+    let body = cap_draft_body(body);
     let conn = open(data_dir)?;
     conn.execute(
         "INSERT INTO drafts(account_id, room_id, body, updated_ts) VALUES (?1, ?2, ?3, ?4) \
          ON CONFLICT(account_id, room_id) DO UPDATE SET \
             body = excluded.body, updated_ts = excluded.updated_ts",
-        rusqlite::params![account_id, room_id, body, updated_ts],
+        rusqlite::params![account_id, room_id, body.as_ref(), updated_ts],
     )
     .map_err(|e| CoreError::Internal(format!("could not write draft: {e}")))?;
     Ok(())
@@ -1825,6 +1910,76 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["!r3".to_owned(), "!r2".to_owned()]);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reorder_pins_rewrites_every_position_to_the_given_contiguous_sequence() {
+        let dir = temp_dir();
+        set_pin(&dir, "acctA", "!r1", 7).expect("pin r1");
+        set_pin(&dir, "acctB", "!r2", 3).expect("pin r2");
+
+        // The caller's order is authoritative — including a ref that is not pinned
+        // yet (upserted, like `set_pin`) — and lands as contiguous 0..n.
+        reorder_pins(
+            &dir,
+            &[
+                ("acctB".to_owned(), "!r2".to_owned()),
+                ("acctA".to_owned(), "!r3".to_owned()),
+                ("acctA".to_owned(), "!r1".to_owned()),
+            ],
+        )
+        .expect("reorder");
+        assert_eq!(
+            get_pins(&dir).expect("list after reorder"),
+            vec![
+                ("acctB".to_owned(), "!r2".to_owned(), 0),
+                ("acctA".to_owned(), "!r3".to_owned(), 1),
+                ("acctA".to_owned(), "!r1".to_owned(), 2),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reorder_that_fails_partway_leaves_no_position_rewritten() {
+        let dir = temp_dir();
+        set_pin(&dir, "acctA", "!r1", 0).expect("pin r1");
+        set_pin(&dir, "acctA", "!r2", 1).expect("pin r2");
+
+        // Abort the rewrite on its middle row, standing in for the disk error or
+        // kill this transaction exists for: the first row is already written by
+        // then, so a sequence that committed row-by-row would strand `!r2` at 0
+        // next to `!r1` at 0 — a duplicated order describing nothing the user asked
+        // for. `!r3` is not pinned yet, so the abort lands on a plain INSERT.
+        let conn = open(&dir).expect("open to arm the failure");
+        conn.execute_batch(
+            "CREATE TRIGGER reorder_fails BEFORE INSERT ON pins WHEN NEW.room_id = '!r3' \
+             BEGIN SELECT RAISE(ABORT, 'injected reorder failure'); END",
+        )
+        .expect("arm the failure");
+        drop(conn);
+
+        let outcome = reorder_pins(
+            &dir,
+            &[
+                ("acctA".to_owned(), "!r2".to_owned()),
+                ("acctA".to_owned(), "!r3".to_owned()),
+                ("acctA".to_owned(), "!r1".to_owned()),
+            ],
+        );
+        assert!(
+            outcome.is_err(),
+            "a rewrite that could not complete must be reported, never swallowed"
+        );
+        assert_eq!(
+            get_pins(&dir).expect("list after the failed reorder"),
+            vec![
+                ("acctA".to_owned(), "!r1".to_owned(), 0),
+                ("acctA".to_owned(), "!r2".to_owned(), 1),
+            ],
+            "the previous order must survive whole — no half-applied positions"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
