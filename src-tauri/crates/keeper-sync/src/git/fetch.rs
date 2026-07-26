@@ -574,7 +574,16 @@ mod tests {
         }
 
         point_at_remote(local_dir.path(), remote_dir.path());
-        // Re-open so the configured remote is visible.
+        // Configure the local repository the way a managed one actually is. The
+        // fetch below moves a remote-tracking ref, which writes a reflog entry,
+        // and gitoxide refuses to write one without a committer. Going through
+        // the production helper means these tests no longer silently depend on
+        // the host having a global git identity — a CI runner has none, so the
+        // fetch failed there while passing on every developer machine — and it
+        // puts the identity fallback itself under test.
+        let configured = gix::open(local_dir.path()).expect("reopen");
+        crate::git::repo::enforce_local_config(&configured).expect("managed config");
+        // Re-open so both the configured remote and the identity are visible.
         let local = gix::open(local_dir.path()).expect("reopen");
         Fixture {
             _remote_dir: remote_dir,

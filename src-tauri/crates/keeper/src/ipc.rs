@@ -6792,6 +6792,34 @@ mod tests {
         );
     }
 
+    /// The shipped app's version is whatever `tauri.conf.json` says — the bundle's
+    /// `CFBundleShortVersionString` and the updater's version comparison both come
+    /// from it, NOT from Cargo or npm metadata. So a release that bumps the crate
+    /// and `package.json` but forgets this file publishes artifacts named for the
+    /// new version containing an app that still reports the old one, and the
+    /// updater then offers that "new" version to a machine that just installed it,
+    /// forever. Exactly that shipped as v0.4.0. Pin the three together here.
+    #[test]
+    fn app_version_matches_crate_and_package_manifests() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri.conf.json parses as JSON");
+        let app = conf["version"].as_str().expect("tauri.conf.json version");
+        assert_eq!(
+            app,
+            env!("CARGO_PKG_VERSION"),
+            "tauri.conf.json version must match the crate version — the bundle and the \
+             updater read the former, release asset names the latter"
+        );
+
+        let pkg: serde_json::Value = serde_json::from_str(include_str!("../../../../package.json"))
+            .expect("package.json parses as JSON");
+        let pkg = pkg["version"].as_str().expect("package.json version");
+        assert_eq!(
+            app, pkg,
+            "package.json version must match the shipped app version"
+        );
+    }
+
     #[test]
     fn unsupported_core_error_maps_to_unsupported_code() {
         let ipc = to_ipc_error(CoreError::Unsupported("nope".to_owned()));
