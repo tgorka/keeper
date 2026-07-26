@@ -502,6 +502,11 @@ describe("RecordingPane", () => {
   it("re-probes after the OS prompt resolves so Start reflects the grant with no focus event (Story 20.2)", async () => {
     render(<RecordingPane />);
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
+    // Wait for the mount probe to RESOLVE, not merely to have been called: the row
+    // only renders once it has. Left in flight, it lands after the reset below,
+    // eats the queued once-value, and records a mic-off call inside the post-enable
+    // window the final assertion walks — a load-dependent flake, not a real defect.
+    await screen.findByTestId(permissionRowTestId(SCREEN_RECORDING_PERMISSION_NAME));
 
     // Model the real ordering the enable triggers: the enable-time probe (fired
     // the instant the store flips) reads the mic as not-yet-requested because the
