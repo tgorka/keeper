@@ -16,7 +16,7 @@ vi.mock("@/lib/ipc/client", () => ({
   cancelOidc: (...args: []) => cancelOidc(...args),
   beeperRequestCode: (...args: [string]) => beeperRequestCode(...args),
   loginBeeper: (...args: [string, string]) => loginBeeper(...args),
-  cancelBeeper: (...args: []) => cancelBeeper(...args),
+  cancelBeeper: (...args: [string]) => cancelBeeper(...args),
 }));
 
 // Mock the opener plugin so external links route through a spy instead of Tauri.
@@ -500,7 +500,7 @@ describe("LoginScreen", () => {
     // Unmount while the login is still pending.
     unmount();
     await waitFor(() => {
-      expect(cancelBeeper).toHaveBeenCalledTimes(1);
+      expect(cancelBeeper).toHaveBeenCalledExactlyOnceWith("alice@beeper.com");
     });
   });
 
@@ -517,7 +517,7 @@ describe("LoginScreen", () => {
     await screen.findByLabelText("Login code");
     unmount();
     await waitFor(() => {
-      expect(cancelBeeper).toHaveBeenCalledTimes(1);
+      expect(cancelBeeper).toHaveBeenCalledExactlyOnceWith("alice@beeper.com");
     });
   });
 });

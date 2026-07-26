@@ -156,10 +156,11 @@ impl BeeperFlowRegistry {
         super::add_account(platform, BEEPER_HOMESERVER, &provider).await
     }
 
-    /// Clear every pending flow (the `cancel_beeper` command). Leaves zero
-    /// residue: an abandoned flow's stored request id is dropped.
-    pub fn cancel_all(&self) {
-        self.lock().clear();
+    /// Drop the pending flow for exactly `email` (the `cancel_beeper` command).
+    /// Leaves zero residue for that flow while other in-flight logins keep their
+    /// stored request ids. Idempotent — an unknown email is a no-op.
+    pub fn cancel(&self, email: &str) {
+        self.lock().remove(email);
     }
 
     /// POST a JSON body to a Beeper API path with the public bearer, returning the
@@ -356,19 +357,29 @@ mod tests {
     }
 
     #[test]
-    fn cancel_all_clears_pending() {
+    fn cancel_drops_only_the_named_flow_and_leaves_others_pending() {
         let registry = BeeperFlowRegistry::new();
         registry.store("a@beeper.com", "r1".to_owned());
         registry.store("b@beeper.com", "r2".to_owned());
-        registry.cancel_all();
+
+        registry.cancel("a@beeper.com");
+
         assert!(matches!(
             registry.take("a@beeper.com"),
             Err(AuthError::BeeperUnavailable(_))
         ));
-        assert!(matches!(
-            registry.take("b@beeper.com"),
-            Err(AuthError::BeeperUnavailable(_))
-        ));
+        assert_eq!(
+            registry.take("b@beeper.com").expect("b still pending"),
+            "r2"
+        );
+    }
+
+    #[test]
+    fn cancel_of_an_unknown_email_is_a_no_op() {
+        let registry = BeeperFlowRegistry::new();
+        registry.store("a@beeper.com", "r1".to_owned());
+        registry.cancel("nobody@beeper.com");
+        assert_eq!(registry.take("a@beeper.com").expect("untouched"), "r1");
     }
 
     #[test]

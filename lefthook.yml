@@ -27,6 +27,25 @@ pre-push:
       run: bunx tsc --noEmit
     - name: clippy
       root: src-tauri/
-      run: PATH="$HOME/.cargo/bin:$PATH" cargo clippy --all-targets -- -D warnings
+      # The `keeper` shell crate needs GTK/glib development packages to build
+      # on Linux. Where they are absent (a headless container, no root to
+      # install them) the build dies inside glib-sys before any of our code is
+      # compiled, and a hook that always fails is a hook everyone bypasses.
+      #
+      # So: lint the whole workspace where that is possible, and otherwise lint
+      # every crate that CAN build here while saying plainly which one was not
+      # covered and how to cover it. `bun run check:rust:macos` runs the real
+      # workspace gate on a macOS host, and CI builds the shell on macOS too.
+      run: |
+        export PATH="$HOME/.cargo/bin:$PATH"
+        if pkg-config --exists glib-2.0 2>/dev/null; then
+          cargo clippy --workspace --all-targets -- -D warnings
+        else
+          echo "note: glib-2.0 is absent, so the tauri shell cannot be built here."
+          echo "note: linting keeper-core, keeper-sync and keeper-syncd only."
+          echo "note: run 'bun run check:rust:macos' to gate the shell before merging."
+          cargo clippy -p keeper-core -p keeper-sync -p keeper-syncd \
+            --all-targets -- -D warnings
+        fi
     - name: frontend-tests
       run: bun run test

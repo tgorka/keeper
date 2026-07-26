@@ -34,7 +34,7 @@ use matrix_sdk::encryption::verification::{
 };
 use matrix_sdk::ruma::events::key::verification::request::ToDeviceKeyVerificationRequestEvent;
 use matrix_sdk::Client;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::error::{CoreError, VerificationError};
 use crate::vm::{SasEmojiVm, VerificationFlowVm, VerificationPhase};
@@ -43,6 +43,52 @@ use crate::vm::{SasEmojiVm, VerificationFlowVm, VerificationPhase};
 /// Tauri `Channel::send`; tests capture into a vector. Returns `true` if the
 /// snapshot was delivered, `false` if the channel is closed (the producer stops).
 pub type VerificationSink = Box<dyn Fn(VerificationFlowVm) -> bool + Send + Sync>;
+
+/// An account's flow-id inlet into its live verification producer, tagged with
+/// the subscription id that installed it.
+///
+/// Two `subscribe_verification` calls can overlap for one account (a StrictMode
+/// double-mount, or a rapid account-set change): the second install supersedes
+/// the first, and the first subscription's teardown must then leave the live
+/// sender alone. Clearing it unconditionally would leave the surviving producer
+/// running but unreachable, so a keeper-started verification would fail with "no
+/// active verification subscription" while a perfectly good producer waits for
+/// the flow id. The id tag is the whole point of the type: only the subscription
+/// that installed a sender can release it, and the field is private to this
+/// module so no call site can nil it behind that rule.
+#[derive(Default)]
+pub struct FlowSlot {
+    installed: Mutex<Option<(u64, mpsc::UnboundedSender<String>)>>,
+}
+
+impl FlowSlot {
+    /// Install `sender` as the account's inlet, superseding any earlier one.
+    pub async fn install(&self, subscription_id: u64, sender: mpsc::UnboundedSender<String>) {
+        *self.installed.lock().await = Some((subscription_id, sender));
+    }
+
+    /// Release the sender `subscription_id` installed. A sender installed by a
+    /// later subscription belongs to a live producer and is left untouched.
+    pub async fn release(&self, subscription_id: u64) {
+        let mut installed = self.installed.lock().await;
+        if installed
+            .as_ref()
+            .is_some_and(|(id, _)| *id == subscription_id)
+        {
+            *installed = None;
+        }
+    }
+
+    /// The live producer's inlet, or `None` when no verification subscription is
+    /// active for the account.
+    pub async fn sender(&self) -> Option<mpsc::UnboundedSender<String>> {
+        self.installed
+            .lock()
+            .await
+            .as_ref()
+            .map(|(_, tx)| tx.clone())
+    }
+}
 
 /// Resolve the own-user identity and request an interactive self-verification,
 /// returning the new flow id (Story 3.2, FR-14). The caller feeds this flow id

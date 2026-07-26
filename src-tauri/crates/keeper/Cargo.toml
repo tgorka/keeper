@@ -64,6 +64,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # them. Cargo target tables only understand real target cfgs (never tauri-build's
 # injected `desktop`/`mobile`), hence the explicit target_os list.
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+# Folder sync (Epic 29, AD-40). Desktop only: gitoxide plus a filesystem
+# watcher have no place in the iOS bundle, and `CapabilitiesVm.sync` is false
+# there anyway. The engine is tauri-free, so this edge goes one way only.
+keeper-sync = { path = "../keeper-sync" }
 # The desktop-only `tray-icon` tauri feature backing the opt-in menu-bar presence
 # (Story 10.3, FR-53) plus `image-png`, which unlocks `Image::from_bytes` for the
 # bundled record-dot tray icon (Story 18.1). Merges into the base `tauri` dep on

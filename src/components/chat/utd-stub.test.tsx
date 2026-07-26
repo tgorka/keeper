@@ -24,4 +24,11 @@ describe("UtdStub", () => {
     fireEvent.click(screen.getByRole("button", { name: "Verify" }));
     expect(settingsUiStore.getState().settingsOpen).toBe(true);
   });
+
+  it("is not an aria-live region, so a batch of historical UTD rows is not announced", () => {
+    render(<UtdStub />);
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("note")).toHaveTextContent(UTD_STUB_TEXT);
+  });
 });

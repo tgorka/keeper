@@ -1,5 +1,5 @@
 # generated: 2026-07-03
-# last_updated: 2026-07-16
+# last_updated: 2026-07-25
 # project: keeper
 # project_key: NOKEY
 # tracking_system: file-system
@@ -215,3 +215,161 @@ development_status:
   22-4-microphone-track-in-the-webcam-file: done
   22-5-debug-mode-event-and-error-logs-on-disk: done
   22-6-file-based-config-overrides: done
+
+  # Phase 4 — Folder Sync (Epics 23–31, added 2026-07-25)
+  epic-23: in-progress
+  23-1-keeper-sync-crate-workspace-wiring-and-license-firewall: done
+  23-2-syncplatform-port-and-syncerror-taxonomy: done
+  23-3-sync-db-profiles-work-journal-and-file-state-cache: done
+  23-4-device-identity-and-provenance-trailer-composer: done
+  23-5-git-binary-probe-and-capabilities-sync-flag: done
+  23-6-structured-logging-and-the-xdg-log-path-branch: done
+  23-7-egress-disclosure-for-git-remotes: backlog
+  epic-23-retrospective: optional
+  epic-24: done
+  24-1-repository-lifecycle-open-and-clone-with-mandatory-overrides: done
+  24-2-credentials-through-the-port-not-a-subprocess: done
+  24-3-fetch-shallow-progress-reporting-interruptible: done
+  24-4-working-tree-to-index-to-commit: done
+  24-5-the-git-cli-shim-push-worktree-sparse-gc: done
+  24-6-applying-remote-changes-fast-forward-checkout: done
+  24-7-divergence-without-prompts-conflict-copies: done
+  epic-24-retrospective: optional
+  epic-25: done
+  25-1-lfs-pointer-and-content-addressed-store: done
+  25-2-endpoint-derivation-and-the-batch-api-client: done
+  25-3-the-basic-transfer-adapter-resumable-down-verified-both-ways: done
+  25-4-in-process-gitattributes-filtering-and-automatic-tracking: done
+  25-5-path-filtered-lfs-fetch: done
+  25-6-end-to-end-verification-and-the-verify-operation: done
+  epic-25-retrospective: optional
+  epic-26: done
+  26-1-tier-0-name-and-shape-exclusion: done
+  26-2-the-watcher-events-debounce-rescan-and-self-echo-suppression: done
+  26-3-tier-2-the-quiescence-gate: done
+  26-4-tier-3-the-linux-open-writer-veto: done
+  26-5-tier-4-verify-on-read-and-the-sf-dataless-guard: done
+  26-6-the-scheduler-journal-supervisor-backoff-and-offline: done
+  epic-26-retrospective: optional
+  epic-27: in-progress
+  27-1-concurrent-multi-profile-supervision: done
+  27-2-sparse-profiles-subpath-selection: in-progress
+  27-3-removable-volume-identity: done
+  27-4-absence-semantics-pause-never-delete-resume: done
+  27-5-profile-import-export-and-config-json-overrides: done
+  epic-27-retrospective: optional
+  epic-28: done
+  28-1-provenance-on-every-change: done
+  28-2-worktree-lanes-create-list-prune: done
+  28-3-one-way-lanes-push-only-never-force: done
+  28-4-pull-request-handoff-to-a-human: done
+  epic-28-retrospective: optional
+  epic-29: in-progress
+  29-1-sync-view-models-commands-and-progress-streaming: done
+  29-2-tray-sync-glyphs-and-one-composed-tray-decision: done
+  29-3-tray-status-line-and-menu-actions: done
+  29-4-settings-sync-profiles-add-and-edit: done
+  29-5-in-app-progress-and-the-warning-banner: done
+  29-6-notifications-exactly-once-on-onset: backlog
+  epic-29-retrospective: optional
+  epic-30: done
+  30-1-the-bin-crate-and-its-syncplatform: done
+  30-2-toml-configuration-to-syncprofile: done
+  30-3-core-subcommands: done
+  30-4-verify-doctor-logs-and-headless-secrets: done
+  30-5-systemd-unit-graceful-shutdown-and-packaging: done
+  epic-30-retrospective: optional
+  epic-31: in-progress
+  31-1-scale-envelope-100000-files: done
+  31-2-durability-matrix-kill9-unplug-network-loss: in-progress
+  31-3-large-blob-memory-ceiling: done
+  31-4-live-forgejo-integration: in-progress
+  31-5-cross-host-field-test: done
+  31-6-docs-sync-md-and-phase-acceptance: done
+  epic-31-retrospective: optional
+
+# Phase 4 state as of 2026-07-25 — what is actually true, not what was planned.
+#
+# NOTE on the Forgejo claim below (added 2026-07-25): story 31-4 is NOT done.
+#   Its AC demands clone + bidirectional sync + LFS round trip + sparse profile
+#   + lane + PR against the makistack instance. What the line below actually
+#   attests is narrower: the HTTP transport. The LFS evidence elsewhere in this
+#   file says "an LFS server", not Forgejo. The instance at 192.168.86.20:3000
+#   is reachable and has HTTP git + LFS enabled, but self-registration is
+#   disabled and no credential for it exists on any dev host, so the remaining
+#   legs could not be run. Unblocking needs one Forgejo access token supplied
+#   out of band. Recorded rather than left implied, because the sentence below
+#   reads broader than the evidence behind it.
+#
+# VERIFIED LIVE against real git remotes (a local bare repo, plus the makistack
+# Forgejo instance for the HTTP transport): clone, commit with provenance
+# trailers, push, fetch + fast-forward apply, divergence converging into
+# conflict copies with no prompt, the four-tier completeness gate holding and
+# releasing files, watch mode syncing a deeply nested new directory while
+# excluding a Chrome .crdownload and an Office ~$ lock file, removable-media
+# absence pausing without ever propagating a deletion, and SIGTERM performing a
+# bounded graceful finalize.
+#
+# LFS IS NOW WIRED AND VERIFIED END TO END (epic 25): a 12 MiB file commits as a
+# 133-byte pointer with the real bytes left in the worktree, uploads to an LFS
+# server byte-identically, and a second peer clones, downloads and materializes
+# it byte-identically. keeper also registers itself as the repository's
+# clean/smudge filter, so plain `git status`, `git checkout` and `git commit`
+# inside a synced folder all agree with keeper.
+#
+# REVIEW LANES ARE WIRED AND VERIFIED (epic 28): a pushOnly+worktree profile
+# publishes only `keeper/<profile>/<id>` — verified live that the bot's draft
+# reached the lane branch while `main` stayed byte-for-byte untouched — and
+# hands off by calling the Forgejo pull-request API, degrading to an actionable
+# notice naming the branch when there is no token or no forge behind the remote.
+#
+# EPIC 29 IS NOW LIVE AND VERIFIED. hesperia came back, and the keeper shell
+# builds on macOS once the Swift keeper-rec sidecar exists — so the whole
+# surface could finally be compile-verified: capability flag, nine commands,
+# the Channel<SyncProgressVm> stream, seven tray glyphs composed so recording
+# always wins the icon and sync never forces presence, and a capability-gated
+# Settings section. `bun run check:rust:macos` now runs the REAL workspace gate
+# (fmt + clippy -D warnings + tests) on that host, and the pre-push hook lints
+# every crate that can build locally while naming the one it cannot. 29.6
+# (onset-deduped notifications) is the remainder: the engine already raises
+# them once per onset through the platform port, but the desktop notifier is
+# not yet asserted end to end.
+#   31-5 — DONE across THREE machines and two OSes. A bare repo on delectra
+#   (Ubuntu 25.10, x86_64) with electra (Linux container) and hesperia
+#   (macOS 26.5, arm64) both joining over ssh://, all three writing the SAME
+#   filename with different content at the same moment. Result: three surviving
+#   files — the winner plus one conflict copy per losing device, each named
+#   after the device that made it — byte-identical on every peer, no prompt,
+#   nothing lost. Merges are now attributable too.
+#
+#   That run found four defects that no single-machine test could:
+#     * an empty remote could not be cloned (the "sync to the repo I just
+#       created in the forge" case), nor fetched from;
+#     * a first pass with every file still inside the settle window pushed
+#       anyway and failed with "src refspec main does not match any";
+#     * a host with no `git config --global user.email` — the state of a fresh
+#       server, which is where a sync daemon gets installed — could clone but
+#       never fetch again, because gitoxide will not write a reflog without a
+#       committer. This is also the pendrive/local-path transport.
+#     * merge commits carried no provenance, and could not have: the merge
+#       message was flattened to one line, folding the trailer block onto the
+#       subject where git stops parsing it.
+#
+#   Earlier two-host coverage: a bare repo on hesperia synced from electra over
+#   ssh:// (gix's ssh transport), both machines editing the same file
+#   concurrently, converging to byte-identical trees with the loser preserved
+#   as a conflict copy named after the device that made it. Running on macOS
+#   also exposed a bug no Linux test could: provenance read `unknown-host`
+#   there, because macOS has neither /etc/hostname nor $HOSTNAME.
+#
+#   Earlier local coverage, kept for the record: Two independent peers (own
+#   config, own database, own device identity) were driven against one remote
+#   locally: concurrent edits to the same file converged to byte-identical trees
+#   on both, provenance attributed each change to the device that made it, and
+#   an offline period queued the network work while local commits continued and
+#   drained cleanly on reconnect. What is NOT covered is genuinely different
+#   machines and a real pendrive — `delectra` was unreachable for the whole session
+#   and `hesperia` went offline partway through, so neither named test host
+#   could be used. 31-1 and 31-3 were measured locally instead and are recorded
+#   in docs/sync.md §16: 100 000 files reach steady state in 0.76 s at 70 MiB,
+#   and a 2 GiB file is handled in 17.5 MiB — the streaming claim, proven.

@@ -10,8 +10,10 @@ describe("RedactedStub", () => {
     expect(REDACTED_STUB_TEXT).toBe("Message deleted");
   });
 
-  it("exposes the stub as a status region (honest, non-blank)", () => {
+  it("is not an aria-live region, so a batch of historical redactions is not announced", () => {
     render(<RedactedStub />);
-    expect(screen.getByRole("status")).toHaveTextContent("Message deleted");
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("note")).toHaveTextContent(REDACTED_STUB_TEXT);
   });
 });

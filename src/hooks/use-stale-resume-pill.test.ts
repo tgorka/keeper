@@ -18,6 +18,7 @@ const DESKTOP_CAPABILITIES = {
   bridgeSidecar: true,
   revealInFileManager: true,
   recording: false,
+  sync: false,
 };
 
 function setVisibility(state: "hidden" | "visible"): void {

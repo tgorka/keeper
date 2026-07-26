@@ -97,6 +97,14 @@ describe("BridgeCard", () => {
     expect(screen.getByText("Low risk")).toBeInTheDocument();
   });
 
+  // DW-66: a Network already discovered `loggedIn` has nothing left to connect —
+  // offering "Connect"/"Set up" would tell the user to redo what they already did.
+  it("offers no Connect/Set up action for a loggedIn network (Manage is the affordance)", () => {
+    renderCard(network(), "loggedIn");
+    expect(screen.queryByRole("button", { name: /Connect|Set up|Re-link/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Manage Matrix" })).toBeInTheDocument();
+  });
+
   it("renders the discovery status word for each status", () => {
     const { rerender } = renderCard(network(), "loggedIn");
     expect(screen.getByText("Connected")).toBeInTheDocument();

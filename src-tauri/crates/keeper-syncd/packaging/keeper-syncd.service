@@ -1,0 +1,75 @@
+# keeper-syncd — systemd **user** unit (Epic 30, AD-52).
+#
+# A user unit, not a system one, and that is not a packaging convenience: this
+# daemon synchronizes the user's own files with the user's own git credentials.
+# Running it as root would mean a service account writing into someone's home
+# and holding their token.
+#
+# Install:
+#   install -Dm755 target/release/keeper-syncd ~/.local/bin/keeper-syncd
+#   install -Dm644 keeper-syncd.service ~/.config/systemd/user/keeper-syncd.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now keeper-syncd
+#   systemctl --user status keeper-syncd
+#
+# To keep syncing after logout:  loginctl enable-linger $USER
+#
+# Credentials never belong in this file — anything in Environment= is visible to
+# `systemctl show`. Use a 0600 file under ~/.config/keeper-sync/secrets/, or an
+# EnvironmentFile= that is itself 0600 (AD-53).
+
+[Unit]
+Description=keeper folder synchronization daemon
+Documentation=https://github.com/tgorka/keeper
+# Ordering only, and advisory in a user manager: network-online.target belongs
+# to the system manager, so a user unit cannot pull it in. Deliberately not a
+# Requires= — AD-49 makes offline the normal case, so the daemon starting before
+# the network is fine: work is journaled and retried with backoff, never lost.
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/keeper-syncd watch
+
+Restart=on-failure
+RestartSec=10
+# Exit 2 is a configuration error and exit 3 is a missing prerequisite (no git).
+# Neither is fixed by trying again, so restarting on them would only produce a
+# loop that buries the one log line explaining what to fix.
+RestartPreventExitStatus=2 3
+
+# The stop contract. `keeper-syncd watch` handles SIGTERM as a *bounded graceful
+# finalize* — the same 10 s bound the desktop app uses on quit — so an in-flight
+# push is aborted resumably (its journal row survives and is re-driven) instead
+# of being killed mid-write. TimeoutStopSec must exceed that bound plus the 2 s
+# abort-join, or systemd's SIGKILL would arrive first and defeat the whole
+# mechanism. 20 s leaves headroom without hanging a shutdown.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# --- Hardening -------------------------------------------------------------
+# Deliberately minimal. Each line below is safe for a process whose entire job
+# is reading and writing the user's files and talking to a git remote.
+
+# The daemon and the `git` binary it invokes never need to gain privileges;
+# this also makes setuid binaries anywhere in the tree unusable from here.
+NoNewPrivileges=yes
+
+# A private /tmp namespace. Safe because nothing here stages through /tmp: the
+# volume marker, the LFS objects and the config are all written to a temp file
+# in their own destination directory and renamed into place.
+PrivateTmp=yes
+
+# NOT SET, on purpose:
+#   ProtectHome=  — it would hide the very directories this daemon synchronizes.
+#   ProtectSystem=strict / ReadOnlyPaths= — a profile may legitimately point at
+#     any path the user can write, so an allow-list here would silently break
+#     configurations that are perfectly valid.
+#   PrivateNetwork= — fetch, push and LFS transfers are the point.
+# Further namespacing (ProtectKernelTunables, RestrictAddressFamilies, …) needs
+# unprivileged user namespaces, which are unavailable on some distributions and
+# would turn a hardening nicety into a daemon that refuses to start.
+
+[Install]
+WantedBy=default.target

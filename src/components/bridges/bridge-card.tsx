@@ -4,14 +4,18 @@
  * Renders one discovered Network for one Account: the glyph avatar, the Network
  * name, the data-driven risk-tier {@link Badge}, the discovery status word + dot
  * (Connected / Action needed / Not set up, from the `status` prop), a separate
- * placeholder live-health dot (real health is Story 6.5), and a primary action. All
- * risk/badge/ack copy comes from the backend catalog {@link BridgeNetworkVm} — nothing
- * is hardcoded here; the status word comes from the discovery {@link BridgeStatus} via
- * the shared {@link BRIDGE_STATUS_LABEL} map. When the tier `requiresAck` (volatile /
+ * placeholder live-health dot (real health is Story 6.5), and — only when there is
+ * something left to do — a primary action. All risk/badge/ack copy comes from the
+ * backend catalog {@link BridgeNetworkVm} — nothing is hardcoded here; the status
+ * word comes from the discovery {@link BridgeStatus} via the shared
+ * {@link BRIDGE_STATUS_LABEL} map. When the tier `requiresAck` (volatile /
  * conditional), the action opens an {@link AlertDialog} showing the tier badge + the
  * backend `ackCopy` and gates on an explicit confirm; otherwise it proceeds directly.
  * Proceeding (post-ack) opens the native login {@link BridgeLoginSheet} (Story 6.3),
- * which drives the provisioning login state machine natively.
+ * which drives the provisioning login state machine natively. A Network already
+ * discovered as `loggedIn` offers no Connect/Set up action at all (the Manage menu is
+ * its affordance); a `loggedIn` session whose live health went `disconnected` offers
+ * Re-link instead.
  */
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
@@ -116,6 +120,12 @@ export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
   // Data-driven action label: an ack-gated (volatile / conditional) Network is
   // "Set up"; a directly-connectable one is "Connect".
   const actionLabel = network.requiresAck ? "Set up" : "Connect";
+
+  // A Network whose discovery status is already `loggedIn` has nothing left to
+  // connect — offering "Connect"/"Set up" would tell the user to redo what they have
+  // already done. Its affordance is the Manage menu. The one exception is a live
+  // session that has gone disconnected: its Re-link action is the way back in.
+  const offersAction = showRedEdge || status !== "loggedIn";
 
   // Proceed (post-ack, or directly for a non-gated Network): close any gate and
   // open the native login Sheet, which drives the provisioning login (Story 6.3).
@@ -236,15 +246,17 @@ export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
           className="size-2 shrink-0 rounded-full bg-muted-foreground/30"
         />
       )}
-      <Button
-        type="button"
-        size="sm"
-        variant={showRedEdge ? "default" : "outline"}
-        onClick={onAction}
-        aria-label={`${liveHealth === "disconnected" ? "Re-link" : actionLabel} ${network.name}`}
-      >
-        {liveHealth === "disconnected" ? "Re-link" : actionLabel}
-      </Button>
+      {offersAction && (
+        <Button
+          type="button"
+          size="sm"
+          variant={showRedEdge ? "default" : "outline"}
+          onClick={onAction}
+          aria-label={`${showRedEdge ? "Re-link" : actionLabel} ${network.name}`}
+        >
+          {showRedEdge ? "Re-link" : actionLabel}
+        </Button>
+      )}
 
       {/* Manage menu (UX-DR19): for now its only item is the manual escape hatch to
           the raw Bridge Bot chat; Re-link / Log out / View sessions arrive with

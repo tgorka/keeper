@@ -717,11 +717,49 @@ describe("Composer persistent drafts (Story 7.1)", () => {
 
     // The persistent draft is pre-send state: an edit must not persist the edit body
     // nor delete the stored draft row.
-    expect(saveDraft).not.toHaveBeenCalled();
+    expect(saveDraft).not.toHaveBeenCalledWith(ACCT, ROOM, "old message body v2");
     expect(clearDraft).not.toHaveBeenCalled();
     // After the edit sends, the pre-edit real draft returns to the composer.
     await waitFor(() => expect(textarea.value).toBe("real draft"));
     expect(draftsStore.getState().keys.has(`${ACCT} ${ROOM}`)).toBe(true);
+  });
+
+  it("persists a pre-edit draft that was still inside the debounce window when the edit was sent", async () => {
+    vi.useFakeTimers();
+    try {
+      const onSend = vi.fn().mockResolvedValue(undefined);
+      const { rerender } = render(
+        <Composer accountId={ACCT} roomId={ROOM} onSend={onSend} pending={null} />,
+      );
+      const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+      // Type, then enter edit before the ~200 ms debounce fires: the draft has not
+      // reached keeper.db, and entering edit cancels the queued save.
+      fireEvent.change(textarea, { target: { value: "unflushed draft" } });
+      vi.advanceTimersByTime(100);
+      expect(saveDraft).not.toHaveBeenCalled();
+
+      rerender(
+        <Composer
+          accountId={ACCT}
+          roomId={ROOM}
+          onSend={onSend}
+          pending={{ mode: "edit", targetKey: "k9" }}
+          editPrefill="old message body"
+        />,
+      );
+      expect(textarea.value).toBe("old message body");
+      fireEvent.change(textarea, { target: { value: "old message body v2" } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await vi.runAllTimersAsync();
+
+      // The composer shows the pre-edit draft again, and the stored row now matches it
+      // — a relaunch would not resurrect a staler body.
+      expect(textarea.value).toBe("unflushed draft");
+      expect(saveDraft).toHaveBeenCalledWith(ACCT, ROOM, "unflushed draft");
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
   });
 });
 

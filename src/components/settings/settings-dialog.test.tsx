@@ -80,6 +80,15 @@ vi.mock("@/lib/ipc/client", () => ({
   verificationCancel: vi.fn(() => Promise.resolve()),
   iosSyncDisclosureShownGet: vi.fn(() => Promise.resolve(true)),
   iosSyncDisclosureShownSet: vi.fn(() => Promise.resolve()),
+  // Folder sync (Epic 29): only read when the `sync` capability is on, which
+  // the default desktop tier below leaves off.
+  syncProfiles: vi.fn(() => Promise.resolve([])),
+  syncStatuses: vi.fn(() => Promise.resolve([])),
+  syncProfileSave: vi.fn(),
+  syncProfileRemove: vi.fn(),
+  syncProfileSetEnabled: vi.fn(),
+  syncFolderNow: vi.fn(),
+  syncVerify: vi.fn(),
 }));
 
 // The About section (mounted by the dialog) imports the updater/process plugins
@@ -110,6 +119,7 @@ import {
   NO_BACKGROUND_SYNC_SENTENCE,
 } from "@/components/settings/no-background-sync-disclosure";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
+import { SYNC_SECTION_SENTENCE, SYNC_SECTION_TITLE } from "@/components/settings/sync-section";
 import type { AccountVm } from "@/lib/ipc/client";
 import {
   dockBadgeModeSet,
@@ -129,12 +139,14 @@ import {
   recordingHotkeySet,
   setHonorRemoteDeletions,
   setUndoSendWindow,
+  syncProfiles,
   undoSendWindow,
 } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
 import { keyBackupStore } from "@/lib/stores/key-backup";
+import { resetSyncStoreForTest } from "@/lib/stores/sync";
 import { verificationStore } from "@/lib/stores/verification";
 import { wizardStore } from "@/lib/stores/wizard";
 
@@ -155,6 +167,7 @@ const mockMenuBarGet = vi.mocked(menuBarPresenceGet);
 const mockPermissionState = vi.mocked(notificationPermissionState);
 const mockOpenAppSettings = vi.mocked(iosOpenAppSettings);
 const mockBadgeModeSet = vi.mocked(dockBadgeModeSet);
+const mockSyncProfiles = vi.mocked(syncProfiles);
 
 const DEFAULT_HOTKEY_VM: HotkeyVm = {
   accelerator: "Control+Alt+Space",
@@ -184,6 +197,7 @@ const DESKTOP_CAPABILITIES = {
   bridgeSidecar: true,
   revealInFileManager: true,
   recording: false,
+  sync: false,
 };
 
 function account(id: string): AccountVm {
@@ -250,6 +264,7 @@ describe("SettingsDialog", () => {
     keyBackupStore.getState().reset();
     verificationStore.setState({ flow: null, modalOpen: false, activeAccountId: null });
     capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+    resetSyncStoreForTest();
   });
 
   it("shows the honest archive.db/keeper.db + FileVault copy when open", async () => {
@@ -803,5 +818,28 @@ describe("SettingsDialog", () => {
       "aria-expanded",
       "false",
     );
+  });
+
+  // ── Sync section (Epic 29, Story 29.4) ─────────────────────────────────────
+  it("does not render the Sync section at all when the sync capability is off", async () => {
+    mockPosture.mockResolvedValue(false);
+    // beforeEach hydrated the desktop tier with sync: false — a machine with no
+    // usable git gets no sync UI, not a disabled one.
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    await screen.findByText(STORAGE_HONESTY_SENTENCE);
+
+    expect(screen.queryByText(SYNC_SECTION_TITLE)).not.toBeInTheDocument();
+    expect(screen.queryByText(SYNC_SECTION_SENTENCE)).not.toBeInTheDocument();
+    expect(mockSyncProfiles).not.toHaveBeenCalled();
+  });
+
+  it("renders the Sync section when the sync capability is on", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_CAPABILITIES, sync: true });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(SYNC_SECTION_TITLE)).toBeInTheDocument();
+    expect(screen.getByText(SYNC_SECTION_SENTENCE)).toBeInTheDocument();
+    await waitFor(() => expect(mockSyncProfiles).toHaveBeenCalled());
   });
 });

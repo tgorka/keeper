@@ -30,6 +30,7 @@ export const DEFAULT_CAPABILITIES: CapabilitiesVm = Object.freeze({
   bridgeSidecar: false,
   revealInFileManager: false,
   recording: false,
+  sync: false,
 });
 
 export interface CapabilitiesState {

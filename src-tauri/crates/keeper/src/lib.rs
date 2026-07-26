@@ -16,6 +16,10 @@ mod media_protocol;
 mod menu;
 mod recorder;
 #[cfg(desktop)]
+mod sync;
+#[cfg(desktop)]
+mod sync_ipc;
+#[cfg(desktop)]
 mod tray;
 // The zero-egress source-scan audit over the `keeper-rec` sidecar's Swift
 // sources (Story 20.4, FR-76) — test-only; it ships no code.
@@ -208,6 +212,7 @@ pub fn run() {
                     // A stalled main thread must not queue a burst of catch-up
                     // renders afterwards.
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut frame: u8 = 0;
                     loop {
                         tick.tick().await;
                         let snapshot = {
@@ -215,6 +220,15 @@ pub fn run() {
                             ipc::recording_snapshot(&state)
                         };
                         tray::apply_recording_state(&handle, &snapshot);
+                        // Sync renders straight after recording and only into
+                        // the gap it leaves: `apply_sync_state` returns
+                        // immediately while a recording line or error hold is
+                        // installed, so the two never fight over one icon.
+                        // `frame` free-runs and wraps; the glyph lookup is
+                        // modulo, so a u8 rollover is a cycle, not a panic.
+                        frame = frame.wrapping_add(1);
+                        let (sync_state, sync_line) = ipc::sync_tray_snapshot(&handle);
+                        tray::apply_sync_state(&handle, sync_state, &sync_line, frame);
                     }
                 });
             }
@@ -435,6 +449,21 @@ pub fn run() {
             ipc::recovered_sessions_list,
             ipc::recovered_session_acknowledge
         ]);
+    // Folder sync is desktop-only (Epic 29), so its commands are registered in
+    // a second pass rather than cfg-gated inside the list — `generate_handler!`
+    // takes a flat literal and cannot hold a conditional entry.
+    #[cfg(desktop)]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        sync_ipc::sync_profiles,
+        sync_ipc::sync_statuses,
+        sync_ipc::sync_profile_save,
+        sync_ipc::sync_profile_remove,
+        sync_ipc::sync_profile_set_enabled,
+        sync_ipc::sync_folder_now,
+        sync_ipc::sync_verify,
+        sync_ipc::sync_subscribe_progress,
+        sync_ipc::sync_unsubscribe_progress
+    ]);
     // Window-close (⌘W / red button) hides the main window instead of destroying it
     // (Story 10.3, FR-53): the process keeps every account's `SyncService` and the
     // notification pipeline alive so background behavior is byte-for-byte identical to

@@ -78,7 +78,8 @@ pub struct AppState {
     /// In-flight Beeper email-code login registry (Story 2.3). Holds the
     /// intermediate login-request id between `beeper_request_code` and
     /// `login_beeper` (keyed by email) so it never crosses IPC; `cancel_beeper`
-    /// clears it. All `api.beeper.com` HTTP is confined to `keeper-core`.
+    /// drops one email's entry. All `api.beeper.com` HTTP is confined to
+    /// `keeper-core`.
     pub beeper_flows: Arc<BeeperFlowRegistry>,
     /// Live archive-export jobs (Story 5.5). Maps each `exportId` to its shared
     /// `Arc<AtomicBool>` cancel flag: `export_start` registers a flag before
@@ -1263,7 +1264,36 @@ pub fn capabilities() -> Result<CapabilitiesVm, IpcError> {
         // OS-version probe in the shell adapter (AD-35), not a bare `cfg!(desktop)`.
         // Any detection failure defaults to `false` (safe-hide).
         recording: crate::macos_version::recording_supported(),
+        // Folder sync (Story 23.5, AD-41/AD-51) needs a `git` binary, which is
+        // a runtime fact rather than a build one: the answer is a PATH probe,
+        // and a machine without git gets no sync surface at all rather than
+        // buttons that fail when pressed.
+        sync: sync_available(),
     })
+}
+
+/// The tray's folder-sync snapshot, re-exported so the ~1 Hz tick reaches it
+/// the same way it reaches [`recording_snapshot`].
+#[cfg(desktop)]
+pub fn sync_tray_snapshot(
+    app: &tauri::AppHandle,
+) -> (keeper_sync::progress::TraySyncState, String) {
+    crate::sync_ipc::tray_snapshot(app)
+}
+
+/// Whether folder sync can run on this machine.
+///
+/// Split out so the iOS build — which has no `crate::sync` module at all — still
+/// compiles: the capability is simply false there.
+fn sync_available() -> bool {
+    #[cfg(desktop)]
+    {
+        crate::sync::is_available()
+    }
+    #[cfg(not(desktop))]
+    {
+        false
+    }
 }
 
 /// Return the data-driven bridge catalog (Story 6.1, FR-42). A one-shot read of
@@ -1658,12 +1688,13 @@ pub async fn login_beeper(
         .map_err(to_ipc_error)
 }
 
-/// Cancel any in-progress Beeper login flow(s) (Story 2.3). Clears the registry
-/// so no pending request id lingers; nothing is persisted. Idempotent — with no
-/// pending flow it is a no-op.
+/// Cancel the in-progress Beeper login flow for `email` (Story 2.3). Drops that
+/// flow's pending request id so no residue lingers; other in-flight Beeper
+/// logins are untouched and nothing is persisted. Idempotent — with no pending
+/// flow for `email` it is a no-op.
 #[tauri::command]
-pub fn cancel_beeper(state: State<'_, AppState>) -> Result<(), IpcError> {
-    state.beeper_flows.cancel_all();
+pub fn cancel_beeper(state: State<'_, AppState>, email: String) -> Result<(), IpcError> {
+    state.beeper_flows.cancel(&email);
     Ok(())
 }
 
@@ -6758,6 +6789,34 @@ mod tests {
             "EGRESS_UPDATE_ENDPOINT ({EGRESS_UPDATE_ENDPOINT}) must appear in \
              tauri.conf.json plugins.updater.endpoints ({endpoints:?}) — keep the egress \
              list and the updater config in sync"
+        );
+    }
+
+    /// The shipped app's version is whatever `tauri.conf.json` says — the bundle's
+    /// `CFBundleShortVersionString` and the updater's version comparison both come
+    /// from it, NOT from Cargo or npm metadata. So a release that bumps the crate
+    /// and `package.json` but forgets this file publishes artifacts named for the
+    /// new version containing an app that still reports the old one, and the
+    /// updater then offers that "new" version to a machine that just installed it,
+    /// forever. Exactly that shipped as v0.4.0. Pin the three together here.
+    #[test]
+    fn app_version_matches_crate_and_package_manifests() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri.conf.json parses as JSON");
+        let app = conf["version"].as_str().expect("tauri.conf.json version");
+        assert_eq!(
+            app,
+            env!("CARGO_PKG_VERSION"),
+            "tauri.conf.json version must match the crate version — the bundle and the \
+             updater read the former, release asset names the latter"
+        );
+
+        let pkg: serde_json::Value = serde_json::from_str(include_str!("../../../../package.json"))
+            .expect("package.json parses as JSON");
+        let pkg = pkg["version"].as_str().expect("package.json version");
+        assert_eq!(
+            app, pkg,
+            "package.json version must match the shipped app version"
         );
     }
 

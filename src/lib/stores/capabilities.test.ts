@@ -15,6 +15,7 @@ const desktopCapabilities: CapabilitiesVm = {
   bridgeSidecar: true,
   revealInFileManager: true,
   recording: true,
+  sync: true,
 };
 
 afterEach(() => {
@@ -34,6 +35,7 @@ describe("capabilitiesStore", () => {
       bridgeSidecar: false,
       revealInFileManager: false,
       recording: false,
+      sync: false,
     });
   });
 

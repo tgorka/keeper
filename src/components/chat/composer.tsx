@@ -5,15 +5,19 @@
  * a send {@link Button}. Enter sends; ⇧Enter inserts a newline; a whitespace-only
  * body never dispatches. The draft lives in local `useState` (no IPC round-trip
  * on keystroke, so input stays under one frame) and is cleared on a successful
- * send. This component owns no IPC knowledge for the send path — the parent wires
- * `onSend` (which routes to reply / edit / text based on `pending`).
+ * send. The parent wires `onSend` (which routes to reply / edit / text based on
+ * `pending`); the only IPC detail the composer reads back is the rejected
+ * {@link IpcError}'s `retriable` flag, which decides whether the inline failure copy
+ * may honestly suggest retrying.
  *
  * The draft is **durable** per `(accountId, roomId)` (Story 7.1, AD-15): on mount it
  * is restored from `keeper.db` (unless entering edit mode, whose prefill wins), and
  * each keystroke schedules a ~200 ms debounced, fire-and-forget `saveDraft`
  * (trimmed-empty → `clearDraft`) plus a `draftsStore` marker update — never a
  * synchronous IPC write on the keystroke path. The pending save is flushed on unmount
- * (room switch), and the row + marker are cleared on a successful send.
+ * (room switch), and the row + marker are cleared on a successful reply/text send. An
+ * edit-send instead re-queues the restored pre-edit draft, so the stored row keeps
+ * tracking the composer even when the edit cancelled a still-debounced keystroke.
  *
  * When `pending` is set, a context banner renders above the textarea (the quoted
  * sender/preview for a reply, "Editing your message" for an edit) with a cancel
@@ -37,6 +41,7 @@ import { useShellLayout } from "@/hooks/use-shell-layout";
 import {
   clearDraft,
   clearDraftMirror,
+  type IpcError,
   loadDraft,
   loadRemoteDraft,
   mirrorDraft,
@@ -166,7 +171,12 @@ export function Composer({
 }: ComposerProps) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
-  const [error, setError] = useState(false);
+  // The surfaced send failure, or `null`. `terminal` is an `IpcError` with
+  // `retriable: false` — a reply/edit target that vanished or can no longer be
+  // edited (`SendError::TargetNotFound | NotEditable`). Telling that user to check
+  // their connection and try again would be a lie: no retry can ever succeed, so
+  // the two cases get distinct copy (AD-21 honesty, Story 3.4).
+  const [error, setError] = useState<"retriable" | "terminal" | null>(null);
   // Phone-tier composer deltas (Story 13.5, UX-DR25): ≥44pt send/attach targets,
   // a 5-line autogrow cap, and Enter→newline (send is button-only on phone —
   // WKWebView cannot reliably distinguish a hardware keyboard, so the touch
@@ -405,7 +415,7 @@ export function Composer({
       prefilledFor.current = editTargetKey;
       preEditDraft.current = draftRef.current;
       setDraft(editPrefill ?? "");
-      setError(false);
+      setError(null);
       // Entering edit establishes the composer text (the edit body); a late draft
       // restore must not overwrite it, even if the prefill body is empty. (Story 7.1)
       restoreConsumed.current = true;
@@ -470,7 +480,7 @@ export function Composer({
     }
     restoreConsumed.current = true;
     setDraft(body);
-    setError(false);
+    setError(null);
     scheduleDraftSave(body);
   }, [restoreNonce, scheduleDraftSave]);
 
@@ -608,7 +618,7 @@ export function Composer({
     // Sending stops typing (Story 3.9): clear the notice once as the message goes.
     stopTyping();
     setSending(true);
-    setError(false);
+    setError(null);
     try {
       if (dispatchAttachments && onSendAttachments != null) {
         // A caption maps to a single media event, so it rides only when exactly
@@ -632,22 +642,33 @@ export function Composer({
           // Editing an existing message leaves the persistent draft untouched: restore
           // the pre-edit composer text (the real draft) and keep the stored row/marker.
           setDraft(preEditDraft.current);
+          // Re-queue that text for persistence: entering edit may have cancelled a
+          // still-debounced keystroke (the queued save is dropped above before dispatch),
+          // so without this a pre-edit draft typed within the ~200 ms window would be
+          // restored on screen but never reach `keeper.db` — a relaunch would show the
+          // staler stored body. The stored row must track the restored composer (Story 7.1).
+          scheduleDraftSave(preEditDraft.current);
         } else {
           setDraft("");
           clearPersistedDraft();
         }
       }
-    } catch {
-      // Enqueue-time failure produces no timeline echo to fall back on, so
-      // surface an honest inline error (AD-21) and keep the draft/tray so the
-      // user can resend. Async delivery failures instead show as the message's
-      // Failed send-state caption. Re-persist the retained draft (the queued save was
-      // cancelled above) so a failed non-edit send stays durable across relaunch. An
-      // edit never touched the stored draft, so there is nothing to re-persist.
-      // Read the live draft via `draftRef` (not the `draft` closure captured at send
-      // time): if the user retyped during the in-flight send, the composer now shows
-      // that newer text, and persisting the stale pre-send body would diverge from it.
-      setError(true);
+    } catch (raw) {
+      // Enqueue-time failure produces no timeline echo to fall back on, so surface an
+      // honest inline error (AD-21) and keep the draft/tray so the user can resend.
+      // Async delivery failures instead show as the message's Failed send-state caption.
+      // A non-retriable envelope (a reply/edit target that vanished or can no longer be
+      // edited) gets terminal copy: the generic "check your connection and try again"
+      // would send the user chasing a retry that can never succeed. Anything that is not
+      // a recognisable envelope is treated as retriable — the weaker, safer claim.
+      const err = raw as IpcError | null | undefined;
+      setError(err?.retriable === false ? "terminal" : "retriable");
+      // Re-persist the retained draft (the queued save was cancelled above) so a failed
+      // non-edit send stays durable across relaunch. An edit never touched the stored
+      // draft, so there is nothing to re-persist. Read the live draft via `draftRef`
+      // (not the `draft` closure captured at send time): if the user retyped during the
+      // in-flight send, the composer now shows that newer text, and persisting the stale
+      // pre-send body would diverge from it.
       if (!wasEdit) {
         scheduleDraftSave(draftRef.current);
       }
@@ -862,8 +883,8 @@ export function Composer({
             // The user has typed into this composer; a late mount restore must not
             // clobber their input (even after they clear it back to empty). (Story 7.1)
             restoreConsumed.current = true;
-            if (error) {
-              setError(false);
+            if (error !== null) {
+              setError(null);
             }
             // Reconcile the conflict chip against the typed text (Story 7.2): dismiss it
             // once the local text matches the offered remote (nothing to adopt).
@@ -915,9 +936,11 @@ export function Composer({
           {pending?.mode === "edit" ? "Save" : "Send"}
         </Button>
       </div>
-      {error && (
+      {error !== null && (
         <p role="alert" className="text-destructive text-xs">
-          Couldn't send. Check your connection and try again.
+          {error === "terminal"
+            ? "Couldn't send. That message can no longer be edited or replied to."
+            : "Couldn't send. Check your connection and try again."}
         </p>
       )}
     </div>

@@ -73,7 +73,8 @@ decision: 2026-07-06 Carve out OAuth revocation — On sign-out of a StoredSessi
 origin: migrated from legacy ledger (spec-2-3-beeper-email-code-login.md), 2026-07-06
 location: keeper-core BeeperFlowRegistry::cancel_all / cancel_beeper command
 reason: The registry is a single process-wide `Mutex<HashMap<email, request_id>>` and `cancel_beeper` calls `cancel_all()` (per this story's Code Map, which specified "cancel_beeper() … clears registry"). Today there is no trigger: the login/add-account surface is a single `LoginScreen` instance driving one Beeper flow at a time, so `cancel_all` and a per-email cancel are indistinguishable — by-design and correct for Story 2.3. It becomes a real defect only when Story 2.5 (Account Switcher and Per-Account State) enables managing/adding multiple accounts concurrently: user starts a Beeper flow for `alice@`, reaches the code step, opens a second add-account overlay for `bob@`, then cancels the `bob@` overlay → its unmount fires `cancel_beeper` → `cancel_all` wipes `alice@`'s request id, and `alice@` can no longer verify (`take` returns `BeeperUnavailable`) despite nothing being wrong. Mirrors OIDC's `cancel_all` breadth, but worse because the Beeper request id persists across two independent IPC calls rather than inside one guarded `authenticate` future. Fix in Story 2.5: give the registry a per-email `cancel(email)` and have each `BeeperTab` cancel only its own email; keep `cancel_all` only if a genuine cancel-everything caller exists.
-status: open
+status: done 2026-07-26
+resolution: resolved by sweep wave 1. `BeeperFlowRegistry::cancel_all` replaced by per-email `cancel(email)` (auth/beeper.rs); the `cancel_beeper` command + `cancelBeeper(email)` IPC now name the flow, and `BeeperTab` tracks the started flow's email in `flowEmailRef` so unmount cancels exactly its own flow. Tests: cancel drops only the named flow; unknown email is a no-op.
 
 ### DW-10: A Beeper account is identified only by its resolved homeserver host being `matrix.beeper.com` (`isBeeperAccount`), which couples the coverage-disclosure gating to Beeper's `.well-known` continuing to resolve to that host — a durable account-kind/provider tag would make the identity robust.
 
@@ -133,8 +134,7 @@ origin: migrated from legacy ledger (spec-3-2-device-verification-emoji-sas-and-
 location: keeper-core verification::run_producer
 reason: `verification::run_producer` registers a `ToDeviceKeyVerificationRequestEvent` handler and only forwards flow ids from events observed after registration; it does not poll `client.encryption()` for already-pending verification requests on startup. In practice the always-on `useVerification` subscriber (mounted in `app-shell`) is live for the whole session, so a request that arrives while keeper is running is caught; the gap is only a request landing in the narrow window before the handler attaches, and verification requests self-expire (~10 min). Fix later by enumerating existing pending requests when the producer starts and seeding them into the flow channel.
 status: open
-
-### DW-18: Signing out the account that owns an open verification modal tears down its subscription but never resets the verification store, so the modal is stranded open on a now-removed account and a subsequent `close()` fires `verificationCancel` against a dead account.
+blocked: 2026-07-25 — NOT IMPLEMENTABLE as prescribed. matrix-sdk 0.18 `Encryption` exposes only flow-id-keyed `get_verification_request(user_id, flow_id)`; there is no API to enumerate pending verification requests, so the startup-enumeration fix cannot be written. Needs either an upstream API or a different design.### DW-18: Signing out the account that owns an open verification modal tears down its subscription but never resets the verification store, so the modal is stranded open on a now-removed account and a subsequent `close()` fires `verificationCancel` against a dead account.
 
 origin: migrated from legacy ledger (spec-3-2-device-verification-emoji-sas-and-qr.md), 2026-07-06
 location: src/hooks/use-verification.ts
@@ -154,7 +154,8 @@ decision: 2026-07-06 Leave honest waiting screen — Keep the current honest-but
 origin: migrated from legacy ledger (spec-3-2-device-verification-emoji-sas-and-qr.md), 2026-07-06
 location: src-tauri/crates/keeper-core/src/account.rs (subscribe_verification/unsubscribe_verification)
 reason: `subscribe_verification` (`account.rs`) does `*flow_tx_slot.lock().await = Some(flow_tx)` on every call, overwriting any prior sender, and `unsubscribe_verification` does `*handle.verification_flow_tx.lock().await = None` unconditionally before aborting its own `subscription_id`. Sequence: subscribe#1 (flow_tx=A) → subscribe#2 (flow_tx=B, producer#1 still running with its to-device handler) → unsubscribe#1 nils flow_tx → producer#2 alive but `verification_start` finds `None` and errors. Two live producers also each register a `ToDeviceKeyVerificationRequestEvent` handler transiently. Primarily a dev-StrictMode / rapid-resubscribe concern (production mounts the always-on subscriber once); it is a verification-specific twist on the subscription-lifecycle races already deferred for connection/encryption-status (Stories 2.1/2.5/3.1), but those don't carry a per-account sender slot. Not a trivial one-line patch — needs a generation token or ref-count so a stale unsubscribe can't nil a newer producer's sender, ideally folded into the shared subscription-lifecycle cleanup. Fix: tie the `flow_tx` slot to its `subscription_id` (only clear it if the slot still belongs to the unsubscribing id), and/or abort a prior producer when re-subscribing the same account. See [[DW-14]], [[DW-16]].
-status: open
+status: done 2026-07-26
+resolution: resolved by sweep wave 1. New `verification::FlowSlot` (verification.rs) tags the installed flow sender with the installing subscription id; `subscribe_verification` installs tagged, and `unsubscribe_verification`/the natural-completion reaper/the spawn-gap abort all `release(subscription_id)` — a release only clears the sender its own subscription installed, so an overlapping resubscribe's surviving producer keeps its inlet and keeper-started verification no longer strands.
 
 ### DW-21: An incoming request's auto-open/auto-accept seam gates only on `!store.modalOpen`, so if the producer emits a second `requested` snapshot (e.g. `Created` then `Requested`, both mapped to `requested`) in the instant after the user pressed Esc to dismiss the just-opened modal, the second batch re-passes the gate, re-opens the modal the user dismissed, and fires a second `verificationAccept` on a cancelling flow.
 
@@ -189,7 +190,8 @@ status: open
 origin: migrated from legacy ledger (spec-3-4-replies-and-edits.md), 2026-07-06
 location: src/components/chat/composer.tsx
 reason: `src/components/chat/composer.tsx` catches the rejected send into a boolean `error` and renders a fixed message, ignoring the `IpcError.retriable` flag the Rust `to_ipc_error` sets (`SendError::TargetNotFound | NotEditable → (SendFailed, false)`). Low frequency (own text messages are normally editable; a target vanishing mid-edit is rare) and partially pre-existing (the same generic copy predates 3.4 for `sendText`). A correct fix threads the `IpcError` (code/retriable) into the composer to show a distinct, non-retry message — a slightly larger change than an in-diff patch, worth a focused pass across the composer's error handling.
-status: open
+status: done 2026-07-26
+resolution: resolved by sweep wave 1. `composer.tsx` now reads the rejected `IpcError.retriable` flag: `retriable: false` (TargetNotFound/NotEditable) renders terminal copy ("That message can no longer be edited or replied to.") instead of the connection-retry copy; unrecognisable rejections stay retriable (the weaker, safer claim).
 
 ### DW-26: The timeline producer's `event_id → unique_id` `ReplyIndex` is never pruned on `Remove`/`PopFront`/`PopBack`/`Truncate`, so a reply whose original was removed from the loaded timeline still resolves `in_reply_to_key: Some(<stale key>)` and renders a clickable quote that silently no-ops on click, instead of the spec's honest "original not loaded → not clickable".
 
@@ -204,8 +206,7 @@ origin: migrated from legacy ledger (spec-3-5-reactions.md), 2026-07-06
 location: src-tauri/crates/keeper-core/src/send.rs + account.rs (toggle_reaction)
 reason: `src-tauri/crates/keeper-core/src/send.rs` `toggle_reaction` and `src-tauri/crates/keeper-core/src/account.rs` `toggle_reaction` — the Rust tests added by Story 3.5 cover the pure `aggregate_reactions` helper and the FR-41 source-scan guard, but no test constructs the resolve/dispatch failure. This mirrors the pre-existing coverage shape of `submit_reply`/`submit_edit`/`retry` (also lacking behavioral error tests) because a `matrix_sdk_ui::Timeline` has no lightweight constructor for unit tests; closing it needs shared timeline test-harness infrastructure (a fixture room/timeline) rather than an in-diff patch, and the same fixture would retro-cover the sibling send methods.
 status: open
-
-### DW-28: Received audio in an unsupported codec (e.g. Ogg/Opus voice notes, which WKWebView on macOS does not decode natively) renders empty `<audio controls>` forever — the element fires neither `onLoadedMetadata` nor `onError` on a codec-unsupported stall, so no retry/fallback surfaces and AC3 ("received audio plays back inline") silently fails for those clips.
+blocked: 2026-07-25 — no test harness exists. keeper-core has NO [dev-dependencies] section at all (no wiremock, no matrix-sdk-test, no mock-sync), so the behavioural test this entry asks for has nothing to run against. Unblocking is a harness decision, not a bug fix.### DW-28: Received audio in an unsupported codec (e.g. Ogg/Opus voice notes, which WKWebView on macOS does not decode natively) renders empty `<audio controls>` forever — the element fires neither `onLoadedMetadata` nor `onError` on a codec-unsupported stall, so no retry/fallback surfaces and AC3 ("received audio plays back inline") silently fails for those clips.
 
 origin: migrated from legacy ledger (spec-3-6-receive-media-thumbnails-protocol-streaming-preview.md), 2026-07-06
 location: src/components/chat/media-attachment.tsx
@@ -249,7 +250,8 @@ status: open
 origin: migrated from legacy ledger (spec-3-8-delete-for-everyone-redaction.md), 2026-07-06
 location: src/components/.../redacted-stub.tsx + utd-stub.tsx
 reason: `redacted-stub.tsx` and `utd-stub.tsx` both wrap an `Alert role="status"`; for static historical content in a `reset`/`append` batch this floods the live region. Cross-cutting (both stubs); a fix should drop the live role for non-transient stub rows while keeping honest inline text, and be applied consistently to UTD and redacted stubs.
-status: open
+status: done 2026-07-26
+resolution: resolved by sweep wave 1. `RedactedStub` and `UtdStub` now render `role="note"` (static) instead of the live `role="status"`, per the history-boundary precedent that only transient states are announced; tests assert neither status nor alert roles exist.
 
 ### DW-34: The new `mark_room_read` (transient-timeline receipt + marked-unread clear) and `mark_room_unread` (`set_unread_flag`) SDK paths have no Rust test coverage — only the pure `room_unread_state` helper is unit-tested; the actual receipt/flag round-trips are unverified.
 
@@ -270,7 +272,8 @@ status: open
 origin: migrated from legacy ledger (spec-4-3-pins.md), 2026-07-06
 location: keeper-core account.rs (reorder_pins) / registry.rs (set_pin)
 reason: `reorder_pins` (`account.rs`) loops `registry::set_pin(data_dir, …, index)`; `set_pin` opens its own `Connection` and commits independently (`registry.rs`). Low probability (a fast local SQLite loop) and self-healing on the next full reorder, and the `emit` tie-break now makes any transient duplicate order deterministic for display. A clean fix is a single multi-row upsert or an explicit transaction in one `registry::reorder_pins` call; deferred because it needs a new transactional registry API rather than the current per-call pattern.
-status: open
+status: done 2026-07-26
+resolution: resolved by sweep wave 1. New `registry::reorder_pins` rewrites the whole 0..n sequence in ONE connection + `BEGIN IMMEDIATE` transaction (commit-or-rollback); `AccountManager::reorder_pins` routes through it. Test injects a mid-rewrite failure via trigger and asserts the previous order survives whole.
 
 ### DW-37: The Pins strip offers no keyboard-accessible way to reorder pins — reordering is native HTML5 pointer drag only.
 
@@ -488,7 +491,8 @@ status: open
 origin: migrated from legacy ledger (spec-6-8-first-run-wizard.md), 2026-07-06
 location: src/components/.../bridge-card.tsx + bridges.ts
 reason: `BridgeCard`'s action label is driven only by `network.requiresAck` and `liveHealth === "disconnected"` (bridge-card.tsx), never by the discovery `status` prop, and `BRIDGE_STATUS_LABEL.configured === "Not set up"` (bridges.ts). Pre-existing 6.1/6.2 behavior shared with the Bridges pane; surfaced (not caused) by story 6.8 reusing the card in the wizard.
-status: open
+status: done 2026-07-26
+resolution: resolved by sweep wave 1. `BridgeCard` gates its action on `offersAction = showRedEdge || status !== "loggedIn"` — a Network already discovered `loggedIn` offers no Connect/Set up button (the Manage menu is its affordance); a loggedIn session whose live health went disconnected still offers Re-link.
 
 ### DW-67: Every draft CRUD op (`set_draft`/`get_draft`/`delete_draft`/`list_drafts`) opens a fresh SQLite connection that re-runs all `CREATE TABLE IF NOT EXISTS` + `PRAGMA table_info` column probes; the debounced keystroke save now pays this per-op schema-ensure at typing cadence, hotter than the `pins` precedent it mirrors.
 
@@ -502,7 +506,8 @@ status: open
 origin: migrated from legacy ledger (spec-7-1-persistent-per-chat-drafts.md), 2026-07-06
 location: src/components/chat/composer.tsx (send)
 reason: `composer.tsx` `send()` clears `draftSaveTimer` + nulls `pendingDraft` before dispatch (correct for reply/text to avoid a save/clear reorder). For `wasEdit`, it then `setDraft(preEditDraft.current)` — restoring the text on screen — but never re-persists it, so a pre-edit keystroke that was still inside the debounce when edit was entered was cancelled without ever reaching the DB. Narrow (requires entering edit <200 ms after typing) and only affects relaunch durability of the pre-edit draft, not the visible composer; a `scheduleDraftSave(preEditDraft.current)` after an edit-send would reconcile the row.
-status: open
+status: done 2026-07-26
+resolution: resolved by sweep wave 1. `composer.tsx` `send()` on the edit path now calls `scheduleDraftSave(preEditDraft.current)` after restoring the pre-edit text, so a draft typed inside the debounce window when edit was entered reaches keeper.db; test covers the unflushed-draft-then-edit-send sequence.
 
 ### DW-69: The `temp_dir()` registry-test helper derives its unique path from `process::id()` + a nanosecond `SystemTime` stamp, which can collide across parallel test threads in the same process, letting two tests share a data dir and intermittently fail (observed once as a transient `drafts_crud_roundtrip_and_upsert` failure that passed on re-run).
 
@@ -524,14 +529,16 @@ decision: 2026-07-06 Serialize writes (attended) — Serialize per-(account,room
 origin: migrated from legacy ledger (spec-7-1-persistent-per-chat-drafts.md), 2026-07-06
 location: keeper-core registry.rs (open)
 reason: `registry.rs` `open()` runs `pragma_update(journal_mode, WAL)` and nothing else — no `busy_timeout`, no `synchronous` tuning. WAL serializes writers; without a busy timeout a contended `set_draft` returns `SQLITE_BUSY` instantly rather than waiting, and the fire-and-forget path (`composer.tsx` `flushDraft`) swallows it. Pre-existing registry-wide omission (all callers share `open()`), surfaced — not caused — by drafts landing on the hottest write path. A `PRAGMA busy_timeout` in `open()` would let contended writers wait instead of losing data.
-status: open
+status: done 2026-07-26
+resolution: resolved by sweep wave 1. `registry::open` now sets a 5 s `busy_timeout` (BUSY_TIMEOUT const) so a contended writer waits for the WAL write lock instead of failing `SQLITE_BUSY` and silently dropping a fire-and-forget draft save.
 
 ### DW-72: `set_draft` / the `drafts.body TEXT NOT NULL` column impose no length cap, so a multi-megabyte paste into the composer is shipped verbatim across IPC and rewritten into keeper.db on every ~200 ms debounce flush, an O(n) write on the path the design promised to keep cheap, and unbounded row growth bloats keeper.db.
 
 origin: migrated from legacy ledger (spec-7-1-persistent-per-chat-drafts.md), 2026-07-06
 location: keeper ipc.rs (set_draft) + keeper-core registry.rs (set_draft/schema)
 reason: `ipc.rs` `set_draft` and `registry.rs` `set_draft`/schema store `body` verbatim with no size guard; `composer.tsx` `scheduleDraftSave` re-sends the whole body each flush. A user pasting a large document pays a full-body IPC + row rewrite per debounce tick and grows keeper.db without bound. A body length cap (truncate-or-reject) before the upsert would bound both.
-status: open
+status: done 2026-07-26
+resolution: resolved by sweep wave 1. `registry::set_draft` clips the body to `MAX_DRAFT_BODY_CHARS` (16,384 chars — above any single sendable Matrix event) via `cap_draft_body`, appending `DRAFT_TRUNCATION_MARKER` so a clipped draft admits it; bounds both the per-flush row rewrite and keeper.db growth.
 
 ### DW-73: Unsent draft bodies — the user's private message *content* — are stored as plaintext `TEXT` in keeper.db, a more sensitive class than the metadata (`pins`) precedent the design mirrors; the app otherwise treats at-rest data as sensitive (tokens in Keychain, an `sdk_encryption` posture), so plaintext message content on disk deserves a conscious documented security decision.
 
@@ -568,14 +575,16 @@ status: open
 origin: migrated from legacy ledger (spec-7-3-approval-pane.md), 2026-07-06
 location: src/components/approval/approval-pane.tsx
 reason: `src/components/approval/approval-pane.tsx` `requery.catch` sets `queryFailed`, and the Retry/error affordance is gated on `isEmpty`; when rows are non-empty a failed refresh leaves the list frozen with no staleness indicator (the empty+failed case is correctly handled by the P6 affordance). Low consequence — the shown rows are the last authoritative snapshot, not wrong — and the list re-queries on any presence-key change, so it self-heals in normal flow. Deferred rather than patched this pass to keep the re-derived story's code churn minimal; a small non-blocking "showing last-known drafts — couldn't refresh" banner when `queryFailed && !isEmpty` would close it.
-status: open
+status: done 2026-07-26
+resolution: resolved by sweep wave 1. `approval-pane.tsx` renders a non-blocking `role="status"` staleness banner ("Showing last-known drafts — couldn't refresh just now…") when `queryFailed && !isEmpty`, keeping the rows; a later successful refresh retracts it. Empty+failed keeps the existing retry affordance. Tests cover both branches.
 
 ### DW-78: The header Incognito chip is a one-way binary toggle — once clicked it writes an explicit per-Chat override, and there is no UI affordance to clear that override back to "inherit", so the chat permanently stops following later global/account changes.
 
 origin: migrated from legacy ledger (spec-8-1-incognito-read-receipts-with-scoped-policy.md), 2026-07-06
 location: src/components/layout/conversation-pane.tsx (ConversationIncognitoChip)
 reason: `src/components/layout/conversation-pane.tsx` `ConversationIncognitoChip` writes `incognitoSetChat(accountId, roomId, !vm.effective)` (an explicit `true`/`false`), and the chip only renders while effective — there is no per-chat "inherit" control (unlike the account menu's tri-state submenu). The story's AC only requires the chip to "toggle the per-Chat scope", which is satisfied; a tri-state per-chat control (e.g. a chip context menu or long-press) is a UX-completeness follow-up beyond this story. Backend precedence and storage already support clearing to inherit (`incognito_set_chat` accepts `Option<bool>`), so this is a frontend-only affordance gap.
-status: open
+status: done 2026-07-26
+resolution: resolved by sweep wave 1. `ConversationIncognitoChip` is now tri-state: while an explicit per-Chat override exists (`vm.chat !== null`) both branches offer "Follow the account/global setting", which writes `incognitoSetChat(..., null)` so the chat resumes inheriting; hidden while already inheriting. Tests assert null (not false) is written.
 
 ### DW-79: matrix-sdk emits an *implicit public* read receipt as a side effect of sending a message, outside the `signals` sole-gate, so a user with Incognito effective who *sends* a message in the chat still leaks a public read position that Incognito cannot suppress.
 
@@ -726,7 +735,7 @@ location: keeper-core/src/vm.rs (DockBadgeMode::from_registry_str) / registry.rs
 reason: `keeper-core/src/vm.rs` `DockBadgeMode::from_registry_str` returns `All` for any non-`{all,mentions,off}` string, and `registry::get_dock_badge_mode` folds absent/unknown into the `All` default; the next `set` overwrites the original value. This mirrors the established "absent → default" registry pattern (`get_notify_previews` etc.), so it is not a story regression and no current AC is affected, but a newer schema value (e.g. a future combined mode) would be silently coerced to "badge everything" rather than preserved or logged. A one-line `tracing::warn!` on the unrecognized value would make the coercion observable; forward-compat of settings was out of scope here.
 status: open
 
-### DW-99: Exact-message / exact-re-login deep landing on a notification click is deferred to Epic 11. Under the Option B MVP scope, a notification click summons+focuses the window and lands only on a coarse view (Message → Inbox, Bridge → Bridges) driven by the app-side "last notification target" recorded at dispatch; it never lands on the exact Chat/Account/message or auto-opens the specific Bridge's re-login sheet.
+### DW-99: Exact-message / exact-re-login deep landing on a notification click is deferred to a click-capable notifier backend (owner UNASSIGNED — the original 'Epic 11' pointer was wrong: Epic 11 is Packaging, Release & Quality Gates). Under the Option B MVP scope, a notification click summons+focuses the window and lands only on a coarse view (Message → Inbox, Bridge → Bridges) driven by the app-side "last notification target" recorded at dispatch; it never lands on the exact Chat/Account/message or auto-opens the specific Bridge's re-login sheet.
 
 origin: migrated from legacy ledger (spec-10-4-click-through-and-bridge-health-alerts.md), 2026-07-06
 location: keeper-core/src/notify.rs + keeper/src/ipc.rs (record_last_notify_target)
@@ -784,15 +793,14 @@ status: open
 origin: spec-12-1-ios-project-init-and-repo-integration.md, 2026-07-11
 location: rust-toolchain.toml (targets) + src-tauri/crates/keeper/gen/apple/project.yml (x86_64 Externals / EXCLUDED_ARCHS references)
 reason: The generated `project.yml` references `x86_64` Externals paths and `EXCLUDED_ARCHS[sdk=iphoneos*] = x86_64`, but the pinned Rust targets are Apple-Silicon-only. On an Apple-Silicon dev box (the current environment) this is a non-issue; on an Intel Mac the Simulator core build would need `x86_64-apple-ios`. Out of scope for 12.1 (Simulator boot is 12.2's exit criterion, and CI runs on Apple-Silicon macos-latest), surfaced incidentally by adversarial review. Revisit alongside the 12.2 Simulator seam or 12.5 iOS CI if Intel-host support is required.
-status: open
-
-### DW-107: The generated `ExportOptions.plist` hard-codes `method = debugging` (a development/debug export, not distribution) with no `teamID`/`signingStyle`.
+status: closed 2026-07-25
+resolution: Won't fix. The premise holds (x86_64-apple-ios is unpinned) but acting on it contradicts the project's recorded Apple-Silicon-only posture; pinning an Intel Simulator target would advertise support that is deliberately not offered.### DW-107: The generated `ExportOptions.plist` hard-codes `method = debugging` (a development/debug export, not distribution) with no `teamID`/`signingStyle`.
 
 origin: spec-12-1-ios-project-init-and-repo-integration.md, 2026-07-11
 location: src-tauri/crates/keeper/gen/apple/ExportOptions.plist
 reason: Correct and intentional for 12.1's unsigned, dev-only init scope (no signing secrets committed; device signing is via the `APPLE_DEVELOPMENT_TEAM` env var documented in docs/ios.md). It becomes relevant only for a later signed-distribution/TestFlight release story (Epic 12 device/release work), which must override the export method and inject the team at archive/export time rather than committing it. Deferred as a forward pointer for that release story, not a 12.1 defect.
-status: open
-
+status: closed 2026-07-25
+resolution: Won't fix. The premise holds (ExportOptions.plist hard-codes method=debugging with no teamID) but a distribution export contradicts the recorded free-signing / no-TestFlight posture. Revisit only if paid distribution is adopted.
 ### DW-108: On the phone tier (<768px), the sidebar-hosted surfaces are unreachable and `PhoneShell` ignores `primaryView` — Settings, the account switcher, the offline pill (UX-DR18), and the Archive/Bridges/Approval view navigation have no phone affordance, and setting `primaryView` to `bridges`/`approval` (via ⌘3/⌘4 or a native menu) leaves the phone stack showing the chat list with no feedback.
 
 origin: spec-13-1-phone-layout-tier-and-navigation-stack.md, 2026-07-11
@@ -805,15 +813,14 @@ status: open
 origin: spec-13-1-phone-layout-tier-and-navigation-stack.md, 2026-07-11
 location: src/components/layout/phone-shell.tsx:47 (level = detailOpen && selected ? 2 : ...) + src/lib/stores/rooms.ts (selectRoom/requestFocus never touch detailStore)
 reason: The lifted `detailStore.open` is a global flag not scoped to the selected room (this mirrors the pre-existing desktop behavior, where detail-open also persisted across room switches). Through the 13.1 phone surface the bad state is not reachable: in-stack navigation changes rooms only via the back control (level 2 → closeDetail closes detail; level 1 → selectRoom(null) runs with detail already closed), and the deep-link primitive (`requestFocus`) is not yet wired to any phone trigger (notifications deferred; phone Search is Story 13.4). The only way to observe it today is a desktop→phone resize with the detail panel open, which lands on Detail showing the current room — acceptable. Deferred rather than patched because a correct reset needs a product decision on per-room detail semantics that Story 13.2 (which builds the identity-tap "push Detail" affordance, the phone's replacement for ⌘I) is the natural owner of; a phone-scoped effect that closes detail on `selected` change is the likely fix. Revisit with Story 13.2.
-status: open
-
-### DW-110: The phone navigation stack has no keyboard/assistive-tech focus management — pushing/popping a level moves no focus, the covered lower levels stay in the tab order and accessibility tree (not `inert`/`aria-hidden`), and the back control provides no focus-return or Escape-key handler.
+status: done 2026-07-25
+resolution: Verified already fixed by Story 13.2 — phone-shell.tsx's header comment names this entry, and the selection path now resets detail. Closed by sweep triage, no code written.### DW-110: The phone navigation stack has no keyboard/assistive-tech focus management — pushing/popping a level moves no focus, the covered lower levels stay in the tab order and accessibility tree (not `inert`/`aria-hidden`), and the back control provides no focus-return or Escape-key handler.
 
 origin: spec-13-1-phone-layout-tier-and-navigation-stack.md, 2026-07-11
 location: src/components/layout/phone-shell.tsx (opaque absolute overlays without inert/aria-hidden; BackControl with no focus-return; no Escape handler)
 reason: Story 13.1 ships a deliberately minimal, mouse/touch-accessible back control (documented in the PhoneShell header comment) and explicitly defers header chrome and focus rules to Story 13.2, whose acceptance criteria own exactly this behavior (UX-DR28: "every push moves focus to the new level's header, back button first in swipe order; every pop returns focus to the pushing element; the escape gesture triggers back at every level"). The reachable gap today is that a keyboard/AT user on a <768px webview can Tab "behind" the visible level into the covered Inbox, and Detail→Room back drops focus to `<body>` (a regression from the desktop `closeDetail` toggle-focus-return that this path replaces). Deferred to 13.2 rather than half-implemented here because 13.2 reworks this exact region (52px phone-header, chevron, transitions, edge-swipe) and will apply `inert`/`aria-hidden` to covered levels and full push/pop focus management as first-class ACs. Revisit with Story 13.2.
-status: open
-
+status: done 2026-07-25
+resolution: Verified already fixed by Story 13.2 — the phone stack now manages focus, marks covered levels inert and handles Escape. Closed by sweep triage, no code written.
 ### DW-111: The `open-search` palette action, reachable from the phone Search "Actions" scope, routes to the desktop `searchStore`/`SearchOverlay` (a centered dialog) instead of the phone full-screen Search surface — running it on iPhone opens a desktop-style centered search dialog rather than the native phone surface.
 
 origin: spec-13-4-merged-full-screen-search-surface.md, 2026-07-11

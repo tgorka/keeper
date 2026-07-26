@@ -303,6 +303,9 @@ export function incognitoChipLabel(source: IncognitoVm["source"]): string {
  * the user enable per-Chat Incognito; the coupling caveat surfaces inline in that
  * enable affordance too (FR-44: the caveat at toggle time). All caveat copy comes from
  * Rust ({@link useCouplingCaveats}); precedence is never re-resolved on the frontend.
+ * The per-Chat scope is tri-state, matching the `Option<bool>` the IPC carries: while
+ * an explicit override exists (`vm.chat !== null`), either branch also offers "Follow
+ * the account/global setting", which writes `null` so the chat resumes inheriting.
  * Exported so the phone stack's `PhoneHeader` (Story 13.2) reuses the identical chip.
  */
 export function ConversationIncognitoChip({
@@ -326,14 +329,32 @@ export function ConversationIncognitoChip({
   const effective = vm.effective;
   const label = incognitoChipLabel(vm.source);
 
-  // Enable/disable the per-Chat scope, then re-read the authoritative VM. Best-effort:
-  // a write failure is swallowed (never an unhandled rejection); the mirror keeps its
+  // Write the per-Chat scope (`true`/`false` to override, `null` to clear back to
+  // inheriting account/global), then re-read the authoritative VM. Best-effort: a
+  // write failure is swallowed (never an unhandled rejection); the mirror keeps its
   // last-observed state and the next read reconciles.
-  const setChat = (enabled: boolean) => {
+  const setChat = (enabled: boolean | null) => {
     void incognitoSetChat(accountId, roomId, enabled)
       .then(() => refreshIncognito(accountId, roomId))
       .catch(() => {});
   };
+
+  // Clearing only means something while an explicit per-Chat override exists; with
+  // `vm.chat === null` the chat already follows account/global.
+  const followSetting =
+    vm.chat === null ? null : (
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        onClick={() => {
+          setChat(null);
+          setOpen(false);
+        }}
+      >
+        Follow the account/global setting
+      </Button>
+    );
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -392,6 +413,7 @@ export function ConversationIncognitoChip({
             >
               Turn Incognito off for this chat
             </Button>
+            {followSetting}
             {/* Every coupling caveat for the open room's Network — each rendered
                 verbatim from Rust on its own line ({@link useCouplingCaveats} returns
                 all matches, not just the first). */}
@@ -407,6 +429,7 @@ export function ConversationIncognitoChip({
             <Button type="button" variant="secondary" size="sm" onClick={() => setChat(true)}>
               Turn Incognito on for this chat
             </Button>
+            {followSetting}
             {caveats.map((caveat) => (
               <p key={caveat.text} className="text-muted-foreground text-xs">
                 {caveat.text}

@@ -1824,6 +1824,60 @@ describe("ConversationPane — Incognito control (Story 8.2)", () => {
       expect(incognitoSetChat).toHaveBeenCalledWith(account.accountId, "!room:example.org", true),
     );
   });
+
+  // The per-Chat scope is tri-state (the IPC carries `Option<bool>`): clearing an
+  // override must write `null` so the chat resumes following account/global — writing
+  // `false` would pin it off forever and silently ignore later account changes.
+  it("clears an explicit per-chat override by writing null rather than false", async () => {
+    couplingCaveats.mockResolvedValue([]);
+    renderWithRoom(null, incognitoVm({ effective: true, source: "chat", chat: true }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Incognito — this chat overrides account" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Follow the account/global setting" }),
+    );
+    await waitFor(() =>
+      expect(incognitoSetChat).toHaveBeenCalledWith(account.accountId, "!room:example.org", null),
+    );
+    expect(incognitoSetChat).not.toHaveBeenCalledWith(
+      account.accountId,
+      "!room:example.org",
+      false,
+    );
+  });
+
+  it("offers the follow-the-setting item for an explicit off override and hides it while already inheriting", async () => {
+    couplingCaveats.mockResolvedValue([]);
+    // Explicitly off for this chat while the account says on — the override is what
+    // makes the chip read off, so the off branch needs the clear affordance too.
+    const { rerender } = renderWithRoom(
+      null,
+      incognitoVm({ effective: false, source: "chat", account: true, chat: false }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Incognito — off for this chat" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Follow the account/global setting" }),
+    );
+    await waitFor(() =>
+      expect(incognitoSetChat).toHaveBeenCalledWith(account.accountId, "!room:example.org", null),
+    );
+
+    // With no per-Chat override there is nothing to clear, so the item is absent.
+    incognitoStore
+      .getState()
+      .applyVm(
+        account.accountId,
+        "!room:example.org",
+        incognitoVm({ source: "account", account: true, chat: null }),
+      );
+    rerender(<ConversationPane {...noopProps()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Incognito — account" }));
+    expect(await screen.findByRole("button", { name: "Mark read publicly" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Follow the account/global setting" }),
+    ).not.toBeInTheDocument();
+  });
 });
 
 describe("ConversationPane — safe areas & keyboard-avoiding composer (Story 13.5)", () => {

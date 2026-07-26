@@ -8,12 +8,13 @@ inputDocuments:
   - _bmad-output/planning-artifacts/ux-designs/ux-keeper-2026-07-03/EXPERIENCE.md
   - _bmad-output/planning-artifacts/research-ios-2026-07-09.md
   - _bmad-output/planning-artifacts/research-recording-2026-07-16.md
+  - _bmad-output/planning-artifacts/research-sync-2026-07-25.md
   - docs/project-context.md
 generated: 2026-07-03
-updated: 2026-07-16 (Screen Recording phase — Epics 16–20 appended)
+updated: 2026-07-25 (Folder Sync phase — Epics 23–31 appended)
 mode: headless
-storyCount: 116
-epicCount: 20
+storyCount: 174
+epicCount: 31
 ---
 
 # keeper - Epic Breakdown
@@ -257,7 +258,8 @@ Screen Recording increment (EXPERIENCE.md `Screen Recording (macOS — Phase 3)`
 | FR-38–FR-41 | Epic 7 | Drafts + Approval Pane + invariant |
 | FR-42–FR-47 | Epic 8 | Incognito + undo-send + post-dispatch delete |
 | FR-48–FR-50 | Epic 9 | Palette, keyboard, global hotkey |
-| FR-51–FR-54 | Epic 10 | Notifications + background |
+| FR-51–FR-53 | Epic 10 | Notifications + background |
+| FR-54 | Epic 10, **partially** | Story 10.4 shipped the coarse Option B landing (window summon + Inbox/Bridges view). Exact Chat/Account/message landing is NOT built and no epic currently owns it — see DW-99/DW-100. |
 | FR-28 | Epic 6 (detection/UI) + Epic 10 (native notification leg) | Split is deliberate: pipeline exists only in E10 |
 | FR-44 | Epic 8 (UI) with data file from Story 6.1 | Same data structure as risk tiers |
 | NFR-10 | Epic 2 (Story 2.6) | SDK-store passphrase choice per AD-22 |
@@ -1773,6 +1775,15 @@ So that acting on a notification is one click, never a hunt.
 **Given** a message notification for Account B's Chat while Account A's Chat is open
 **When** clicked
 **Then** keeper restores/summons the window and switches to the exact Chat and Account with the relevant message in view, within the interaction-latency bar (FR-54, NFR-4) — payload `(account_id, room_id, event_id)` (AD-18).
+
+> **As built (amended):** this AC was descoped during implementation and is only
+> partially met. The shipped Option B behaviour summons the window and lands on a
+> coarse view (Message → Inbox, Bridge → Bridges), driven by an app-side
+> "last notification target" recorded at dispatch — it does not land on the exact
+> Chat, Account or message, and does not auto-open a Bridge's re-login sheet.
+> The remainder needs a click-capable notifier backend and is tracked as DW-99
+> and DW-100. Recording it here because the story is marked done and the
+> unqualified AC above would otherwise read as delivered.
 
 **Given** a Bridge Session drop (from Story 6.5's state machine)
 **When** it occurs
@@ -3321,3 +3332,506 @@ local, secret-free, and named in docs.
 imported over the settings table (file wins), enabling hand-edited /
 version-controlled setups; the path and key list are documented in
 docs/recording.md. Malformed files are reported loudly and skipped.
+
+---
+
+# Phase 4 — Folder Sync (appended 2026-07-25)
+
+Owner-requested phase: synchronize a local folder with a server over the **git
+protocol**, built on **gitoxide**, with git-LFS, worktrees, sparse checkout,
+multi-repo profiles, removable media, offline tolerance, tray progress,
+end-to-end checksums, provenance tagging, and a standalone Linux CLI. Inputs:
+`research-sync-2026-07-25.md` (capability matrix, Forgejo quirks and the
+four-tier stability gate are **adopted, not relitigated**) and the Architecture
+Spine increment **AD-40 … AD-53**.
+
+The route is locked by the research and must not be re-argued in a story:
+
+- **`gix 0.86` does everything except five things.** Push is *not implemented
+  and not planned* upstream (issue #306 closed `NOT_PLANNED` 2026-07-22).
+  Worktree mutation, sparse-checkout patterns, `gc` and `merge` are likewise
+  absent. Those five shell out to the **`git` binary**, which is a declared
+  hard runtime prerequisite. `git2`/`libgit2-sys` is **banned** — it declares
+  MIT/Apache while vendoring GPL-2.0 C, so `cargo deny` cannot catch it.
+- **LFS is mandatory above a size threshold**, because gitoxide has *no
+  streaming object read* (a 3 GB blob is a 3 GB allocation) and `gix-lfs` is an
+  empty `0.0.0` stub. The LFS client is first-party.
+- **No tier of the completeness gate is a proof except verify-on-read.**
+  curl and wget write final filenames from byte 0, so name exclusion cannot be
+  sufficient; macOS has no close-write event in any API available to us.
+- **An absent pendrive is never a deletion.**
+
+## Requirements Inventory — Phase 4
+
+### Functional Requirements
+
+- FR-77: Synchronize a local folder with a remote git repository over the git protocol, in both directions, without manual git commands
+- FR-78: Multiple independent sync profiles, each binding one folder to one repo (and optionally one subpath), running concurrently
+- FR-79: Watch mode — filesystem changes sync automatically; per-profile direction (bidirectional | push-only | pull-only)
+- FR-80: Git LFS support — large and binary content is tracked, transferred and verified as LFS objects, tracked automatically above a threshold
+- FR-81: Sparse checkout — a profile may sync only selected subpaths of a repository
+- FR-82: Worktree lanes — one-way push to a generated branch plus a pull request, so an autonomous agent's changes reach a human for approval
+- FR-83: Removable-media profiles — a detached volume pauses cleanly, never propagates deletions, and resumes on re-attachment
+- FR-84: Only complete files are synchronized — a partially written or actively downloading file is held until it settles
+- FR-85: Every synchronized byte is checksum-verified end to end, in both directions
+- FR-86: Provenance — every synchronized change records which profile, device, user, origin and source produced it, plus user-configured tags
+- FR-87: Progress is visible — a tray glyph signals activity and a status line reports counts and bytes; in-app surfaces stream detailed progress
+- FR-88: Warnings and actionable notices are surfaced without blocking (rename required, conflict created, quota exceeded, credentials rejected)
+- FR-89: Convergence never requires a user prompt — conflicts produce conflict copies with both revisions preserved
+- FR-90: Offline tolerance — local git always works; network work is queued durably and re-driven when connectivity returns
+- FR-91: All sync activity is logged through the structured logging system, secret-free
+- FR-92: A standalone Linux CLI/daemon runs the same engine with no application installed
+- FR-93: Credentials live in the OS keychain and are never written to config, logs or commits; every remote is a disclosed egress destination
+
+### Non-Functional Requirements
+
+- NFR-23: Scale — a 100 000-file / 50 GB profile reaches steady state with bounded memory; multi-GB blobs stream and are never fully buffered
+- NFR-24: Reliability — no data loss under `kill -9`, unplug or network loss at any point; every unit is journaled before attempt and re-driven after
+- NFR-25: Responsiveness — a settled change is committed within the quiescence window plus one tick; no sync operation blocks the UI thread or the Matrix sync loop
+- NFR-26: Security — no credential or file content in logs, config, commits or errors; no `unsafe` in either new crate
+
+## Epic 23: Sync Foundation — Crate, Profiles, Journal & Capability
+
+The load-bearing seam. Creates `keeper-sync` as a workspace member that is
+**both `tauri`-free and `keeper-core`-free** (AD-40), so the standalone daemon
+never inherits matrix-sdk and the iOS build never inherits gitoxide. Everything
+later in the phase depends on this epic and nothing in it requires a network.
+
+### Story 23.1: `keeper-sync` Crate, Workspace Wiring & License Firewall
+New member `src-tauri/crates/keeper-sync` with `[lints] workspace = true`; all
+new dependencies declared in the root `[workspace.dependencies]` with the
+house-style justification + license comment. `deny.toml` gains an explicit
+`[bans].deny` entry for `git2` and `libgit2-sys` with a comment recording *why*
+a green `cargo deny` is not sufficient there. A `check:core-sync-free` script
+joins `check:core-tauri-free`, asserting `cargo tree -p keeper-core` names
+neither `gix` nor `keeper-sync`. AC: workspace builds; `cargo deny check`
+passes; both firewall scripts fail loudly when deliberately violated.
+
+### Story 23.2: `SyncPlatform` Port & `SyncError` Taxonomy
+The port (`data_dir`, `secret_get/set/delete`, `notify`, `now_ms`,
+`free_space`, `git_program`) with an in-crate fake for tests, and a
+`thiserror` `SyncError` enum whose variants are the actionable classes the UI
+must distinguish (`GitMissing`, `Network`, `Auth`, `Conflict`,
+`InvalidPathForRemote`, `MediaAbsent`, `Integrity`, `Quota`, `Journal`, `Io`).
+The shell maps it into the existing `IpcError` envelope by extending the single
+`to_ipc_error` funnel (AD-21) with new `IpcErrorCode` variants. AC: no message
+carries a credential or file content; the mapping match is exhaustive.
+
+### Story 23.3: `sync.db` — Profiles, Work Journal & File-State Cache
+A third SQLite database beside `keeper.db`/`archive.db`, WAL, idempotent
+schema creation and additive `ensure_*_column` migrations, behind **one
+serialized writer task** (the `ArchiveWriter::spawn` precedent, runtime-agnostic
+so construction works outside async). Tables: `profiles`, `journal`,
+`file_state`, `devices`. AC: a `Connection` is never held across an `.await`;
+journal units survive process restart; round-trip tests for every table.
+
+### Story 23.4: Device Identity & Provenance Trailer Composer
+A per-installation device ULID + human label minted once into `sync.db`; a pure
+composer that renders the AD-44 trailer block and a matching parser that reads
+it back out of a commit message. AC: trailers round-trip; the default author
+address is a non-routable `…@<device-id>.keeper.invalid`; no real email leaks
+without explicit profile configuration.
+
+### Story 23.5: `git` Binary Probe & `CapabilitiesVm.sync`
+Probe `git --version` (and its `sparse-checkout --cone` floor, git ≥ 2.42)
+through `SyncPlatform::git_program`, cached with invalidation; expose
+`CapabilitiesVm.sync`. When git is absent or too old the flag is false, every
+sync surface is absent (no dead buttons, AD-27), and the reason is an
+actionable notice naming the required version. AC: capability false on a PATH
+without git; the app starts and behaves normally with sync unavailable.
+
+### Story 23.6: Structured Logging & the XDG Log Path Branch
+All sync activity logs through `tracing` into the existing gated `debug_log`
+sink; `app_log_path()` gains a non-macOS branch (`$XDG_STATE_HOME/keeper/`)
+because it is macOS-only today and the daemon runs on Linux. Per-profile spans
+carry the profile id. AC: a log-scan test asserts no credential-shaped token
+and no file content ever reaches a log line.
+
+### Story 23.7: Egress Disclosure for Git Remotes
+`EgressKind::GitRemote` plus a `compute_egress` branch so Settings → About
+enumerates each profile's remote host, computed from the live profile set.
+AC: adding a profile changes the disclosed set; removing it removes the entry;
+the existing exhaustive egress unit tests are extended, not weakened.
+
+## Epic 24: The Git Engine — Clone, Fetch, Checkout, Commit, Push
+
+The engine proper (AD-41). Read and write halves are deliberately asymmetric:
+gitoxide owns everything it can do well, and exactly five operations go through
+one audited shim.
+
+### Story 24.1: Repository Lifecycle — Open & Clone with the Two Mandatory Overrides
+`gix::prepare_clone` → `fetch_then_checkout` → `main_worktree`, with
+**`index.sparse=false`** forced in-memory *and* written to `.git/config`
+(otherwise `gix::status` hard-fails with `TreeIndexDiff(IsSparse)`), and
+opening via `gix::open_opts` with an explicit trust decision. AC: a repo git
+created with `git sparse-checkout` is readable by `gix::status`; a fixture
+reproducing the sparse-index failure is fixed by the override.
+
+### Story 24.2: Credentials Through the Port, Not a Subprocess
+`Connection::set_credentials` fed from `SyncPlatform::secret_*`; HTTP Basic and
+bearer-via-`http.extraHeader`; SSH remotes delegate entirely to the external
+`ssh` binary. AC: no credential helper process is spawned; a rejected
+credential produces `SyncError::Auth` with an actionable message and never a
+retry storm.
+
+### Story 24.3: Fetch — Shallow, Progress-Reporting, Interruptible
+Incremental fetch with refspecs, `Shallow::DepthAtRemote` for first clone of a
+large history, `NestedProgress` mapped onto the engine's progress events, and
+the `should_interrupt` `AtomicBool` wired to cancellation. Blocking HTTP runs
+on `spawn_blocking`. AC: cancelling mid-fetch leaves a usable repository;
+progress reaches the sink at a coalesced rate, not per object.
+
+### Story 24.4: Working Tree → Index → Commit
+`gix::status` to detect change, `filter::Pipeline::worktree_file_to_object` to
+produce entries, low-level index mutation (`dangerously_push_entry`,
+`remove_entries`, `sort_entries`) then `gix_index::File::write`, then
+`commit_as` with the AD-44 trailers. AC: a commit created by gix is
+byte-identical to git's for the same tree; `git status` is clean afterwards;
+`git fsck` passes.
+
+### Story 24.5: The `git_cli` Shim — Push, Worktree, Sparse, gc, Merge
+**One module**, typed subcommand enum, argument vectors (never a shell
+string), timeout-bounded, stdout/stderr captured and classified into
+`SyncError`. Covers `push`, `worktree add|remove|prune`,
+`sparse-checkout init|set|reapply`, `gc`, and `merge` (`--ff-only` for the
+fast-forward case, `-X theirs` after conflict copies exist). AC: a convention test asserts no
+other module in the workspace spawns `git`; a non-zero exit is always
+classified, never swallowed; no argument can be injected through a profile
+name or path.
+
+### Story 24.6: Applying Remote Changes — Fast-Forward Checkout
+Fetch, determine fast-forwardability, check out, honour `SKIP_WORKTREE`, and
+update the journal only after the worktree matches the target tree. AC: an
+interrupted checkout is re-driven to completion; a locally modified file is
+never silently overwritten (it routes to Story 24.7).
+
+### Story 24.7: Divergence Without Prompts — Conflict Copies
+The AD-43 policy: remote wins the canonical path, the local revision is
+preserved as `<stem>.sync-conflict-<UTC>-<device>.<ext>` and committed as an
+ordinary file; modification beats deletion; every conflict raises a
+non-blocking warning naming both paths. AC: a two-sided edit converges on both
+peers to the same pair of files with no prompt and no data loss; a
+delete-vs-modify race keeps the modification.
+
+## Epic 25: Content Integrity & Git LFS
+
+First-party LFS (AD-46), because gitoxide has none and multi-GB blobs must
+never enter the ODB.
+
+### Story 25.1: LFS Pointer & Content-Addressed Store
+Pointer parse/encode honouring the exact spec (UTF-8, `version` first,
+remaining keys sorted, < 1024 bytes, unique encoding, unknown keys preserved,
+empty file is its own pointer) with a `canonical` passthrough so re-encoding
+never churns a blob hash; CAS at `.git/lfs/objects/aa/bb/<oid>` with `.part`
+staging, atomic rename and a pre-existing target treated as success. AC:
+round-trip fidelity on canonical and legacy-version pointers; a concurrent
+writer race resolves without corruption.
+
+### Story 25.2: Endpoint Derivation & the Batch API Client
+`remote.<name>.lfsurl` > `lfs.url` > `.lfsconfig` > derived (`.git/info/lfs`),
+including scp-style and `ssh://` → `https://` mapping; `POST /objects/batch`
+with the LFS media type **first** in `Accept` (Forgejo returns 415 otherwise);
+the full error-status table incl. 401 re-auth-once, 413 halve-batch, 429
+`Retry-After`. AC: table-driven tests for every derivation row and every
+documented status code.
+
+### Story 25.3: The `basic` Transfer Adapter — Resumable Down, Verified Both Ways
+Download: `.part` staging, prefix-hash to find the resume offset, `Range`
+capped below 2^31 (Forgejo parses offsets as 32-bit), accept resume only on
+`206` **with a matching `Content-Range` start byte** (Forgejo's complete-length
+is wrong — validate the start only), `200` means the range was ignored, `416`
+means restart. Upload: single non-resumable `PUT` with an **exact
+`Content-Length`** via a custom `http_body::Body` whose `size_hint` is exact
+(`wrap_stream` would force chunked and break pre-signed S3 PUTs), then the
+`verify` action. Both directions stream and hash in one pass and compare the
+SHA-256 OID **and** the byte count. AC: a truncated response fails with
+`Integrity`, deletes the `.part` and does not resume from it; an interrupted
+download resumes.
+
+### Story 25.4: In-Process `.gitattributes` Filtering & Automatic Tracking
+Resolve attributes with `gix-attributes` from the **tree being synced**, not
+the worktree (a sparse or partial clone may not have `.gitattributes` on disk);
+substitute pointer↔object in the engine's own loop rather than registering an
+external `filter.lfs.process` driver; automatically add tracking rules above
+the per-profile threshold (default 4 MiB) and commit them with provenance. AC:
+a 5 GiB file commits as a pointer with bounded RSS; the generated
+`.gitattributes` is stable and idempotent.
+
+### Story 25.5: Path-Filtered LFS Fetch
+The `fetchinclude`/`fetchexclude` idiom applied to the profile's `subpaths[]`,
+with a *pointer-only* mode that leaves excluded paths as pointers. Necessary
+because git-lfs is sparse-checkout-unaware — sparse checkout alone does not
+reduce LFS traffic. AC: a partial profile downloads only its subpaths' objects,
+measured by transferred bytes.
+
+### Story 25.6: End-to-End Verification & the `verify` Operation
+A profile-wide verification pass: every tracked file's content hash, every LFS
+object's OID and size, and the index/worktree agreement, reported as a
+structured result. AC: a deliberately corrupted stored object is detected and
+reported with its path; verification is incremental and interruptible.
+
+## Epic 26: Watch, Stability Gate & Scheduling
+
+The four-tier gate (AD-45) and the supervisor that makes offline the normal
+case (AD-49).
+
+### Story 26.1: Tier 0 — Name & Shape Exclusion
+One compiled `globset` from the industry list plus per-profile excludes plus
+our own `.keeper.*.tmp` staging prefix, including the **`**/*.download/**`
+directory-subtree** rule for Safari's package-directory downloads. Excluded
+paths are invisible, not pending. AC: table-driven tests over the full
+convention list; a `.crdownload` never reaches the journal.
+
+### Story 26.2: The Watcher — Events, Debounce, Rescan & Self-Echo Suppression
+`notify` + `notify-debouncer-full`; Linux `IN_CLOSE_WRITE` recognized as a fast
+path; a periodic full rescan because `IN_Q_OVERFLOW` / `MustScanSubDirs`
+silently drop events; suppression of our own writes; a `PollWatcher` fallback
+for network/FUSE mounts and unowned macOS trees. One watcher instance per
+profile (the host's `max_user_instances` is 128). AC: a dropped-event scenario
+still converges via rescan; our own checkout does not trigger a commit loop.
+
+### Story 26.3: Tier 2 — The Quiescence Gate
+`(size, mtime_ns, ctime_ns, ino)` stable across two samples ≥ `W` apart **and**
+`now − mtime ≥ W`; `W` = 1 s after a Linux close-write, 5 s default, 10 s on
+removable/network media, 60 s hard ceiling that forces an attempt; a
+future-mtime escape hatch so a skewed clock cannot wedge a file forever. State
+lives in `file_state`. AC: a file written in slow chunks is held then released;
+a file with an mtime an hour in the future is not held.
+
+### Story 26.4: Tier 3 — The Linux Open-Writer Veto
+`/proc/locks` matched on `st_dev`/`st_ino` (measured ~0.01 ms, always on), and
+an optional `/proc/*/fd` + `fdinfo` access-mode scan for candidates above a
+size floor. **macOS has no tier 3** and the docs must say so — `lsof` is too
+slow, `libproc` needs root, EndpointSecurity needs an Apple-granted
+entitlement. AC: a file held open `O_WRONLY` by another process is vetoed on
+Linux; the veto is skipped, not faked, on macOS.
+
+### Story 26.5: Tier 4 — Verify-on-Read & the `SF_DATALESS` Guard
+`fstat` the open fd before and after, stream-hash while transferring, and
+requeue as a **soft** error if size or mtime moved — never a user-facing
+failure. On macOS every candidate is `lstat`ed and skipped when
+`st_flags & SF_DATALESS` is set, because opening a dataless file silently
+materializes it and would drag an entire iCloud Drive through the engine. AC: a
+file modified mid-read is requeued, not committed; a simulated dataless file is
+skipped with a warning.
+
+### Story 26.6: The Scheduler — Journal Supervisor, Backoff & Offline
+A per-profile supervisor on a `tokio::time::interval` with
+`MissedTickBehavior::Delay` re-reading the journal each tick and dispatching
+units whose `not_before_ms` has elapsed (including those elapsed while the app
+was down); the repo's first **exponential backoff with jitter** utility, unit
+tested against a paused tokio clock; connectivity observed from transfer
+outcomes, never polled. Suspend/resume reuses the wall-clock
+`should_restart_sync` gate. AC: with the network down, local commits continue
+and network units accumulate; on restore they drain in order without a thundering
+herd.
+
+## Epic 27: Multi-Repo Profiles, Sparse Checkout & Removable Media
+
+### Story 27.1: Concurrent Multi-Profile Supervision
+N profiles running concurrently, one active operation each behind an RAII
+reservation, independent failure domains, and a global concurrency cap. AC: a
+failing profile never stalls another; shutdown finalizes all profiles under one
+bound.
+
+### Story 27.2: Sparse Profiles — Subpath Selection
+`git sparse-checkout set --cone` through the shim, `index.sparse=false`
+enforced, the same `subpaths[]` reused as the LFS path filter. AC: a profile
+scoped to one directory materializes only that directory and `gix::status`
+reports clean.
+
+### Story 27.3: Removable Volume Identity
+A `.keeper-sync/volume.json` marker (volume ULID, label, profile ids, schema
+version) written at the mount root and matched by content, not path, so a
+re-mount at a different mountpoint is still the same volume. Repos on removable
+media are opened with **`Trust::Full`** after the marker verifies the media,
+because the default `Trust::Reduced` on a non-owned directory **silently drops
+repo-local `filter.*` config** and the LFS clean filter would never run. AC: a
+volume re-mounted at a new path is recognized; a foreign volume is not adopted.
+
+### Story 27.4: Absence Semantics — Pause, Never Delete, Resume
+`Paused (media absent)` as a first-class state: watcher torn down, journal
+retained, **no deletion staged, committed or pushed**, and the reason stated in
+the UI. Mid-transfer unmount aborts as retryable rather than truncating.
+Deletions from a removable profile are honoured only with the volume present
+and the marker verified. AC: unplugging a pendrive mid-sync propagates no
+deletion to the remote; re-attaching resumes from the journal.
+
+### Story 27.5: Profile Import/Export & `config.json` Overrides
+Profiles round-trip to a portable TOML/JSON representation under the `sync.*`
+namespace, importable by both the app (via the existing boot-time
+`config.json` import) and the daemon. AC: a profile table copied between the
+app and the daemon produces identical behaviour; a malformed override is
+reported loudly and skipped, never partially applied.
+
+## Epic 28: Provenance, Worktree Lanes & PR Handoff
+
+### Story 28.1: Provenance on Every Change
+The AD-44 trailer block on every engine-authored commit plus per-profile
+`Keeper-Tag:` lines; generated stable subjects; parse-back for the UI so "where
+did this come from" is answerable offline. AC: every commit the engine creates
+carries a complete trailer block; a hand-made commit without one is tolerated.
+
+### Story 28.2: Worktree Lanes — Create, List, Prune
+Linked worktrees on generated `keeper/<profile>/<ulid>` branches via the shim
+(gitoxide's worktree API is read-only), listed through `repo.worktrees()`,
+pruned when the lane closes. AC: a lane is created, used and pruned without
+touching the base worktree; an orphaned lane is recovered at startup.
+
+### Story 28.3: One-Way Lanes — Push-Only, Never Force
+`direction = push_only` with `lane = worktree`: the engine commits with
+`Keeper-Source: bot` and pushes the lane branch only — never the base branch,
+**never a force-push**. A lane whose remote branch diverged stops and warns.
+AC: an attempt to force-push is impossible by construction; base-branch refs
+are never in the push refspec.
+
+### Story 28.4: Pull-Request Handoff to a Human
+Open a PR against the Forgejo API for a pushed lane, record its number and URL
+in the journal, and surface it. This is the one place where a human decision is
+the point rather than a failure. AC: the PR exists and is linked to the lane;
+a failure to open one leaves the pushed branch intact and raises an actionable
+notice rather than losing the work.
+
+## Epic 29: App Surfaces — IPC, Tray Progress, Settings & Warnings
+
+### Story 29.1: Sync View Models, Commands & Progress Streaming
+`SyncProfileVm`, `SyncStatusVm`, `SyncProgressVm`, `SyncPhase` (ts-rs
+exported); one-shot commands for profile CRUD and manual sync; a
+`Channel<SyncProgressVm>` stream (the `export_start` precedent) plus a polled
+snapshot so the tray renders with no webview subscribed. Every command
+registered in the single `generate_handler!`. AC: bindings regenerate clean;
+`bun run bindings:check` passes.
+
+### Story 29.2: Tray Sync Glyphs & One Composed Tray Decision
+A monochrome+alpha template PNG set distinguished by **shape, not colour**:
+sync-armed, four rotating arc frames advanced by the existing ~1 Hz tick,
+paused/media-absent, and warning. A single pure `decide_tray_state` composes
+recording and sync so the two subsystems can never fight over the icon. AC:
+the pure decision function is exhaustively unit-tested; recording still wins
+where it must; the icon never flickers on a no-op tick.
+
+### Story 29.3: Tray Status Line & Menu Actions
+The held `status_item` refreshed with `set_text` (no menu rebuild, no flicker,
+an open menu stays open): `"Syncing tgdrive — 42/310 files · 1.2 GB of 4.7 GB"`.
+Menu gains Sync Now, Pause Sync, and Open Folder. AC: an open menu survives a
+tick; the line is correct for idle, syncing, paused and warning states.
+
+### Story 29.4: Settings → Sync — Profiles, Add & Edit
+A new capability-gated section following the existing section pattern: profile
+list with per-profile state, folder picker (the recording-destination
+precedent), remote URL, direction, subpaths, LFS threshold, removable flag, and
+the optimistic-write-with-revert idiom bound to a Rust-clamped effective VM.
+AC: controls are disabled until hydrated; a rejected write reverts to the last
+confirmed value.
+
+### Story 29.5: In-App Progress & the Warning Banner
+A sync pane/banner projecting the Rust VM: a `role="progressbar"` meter with
+`aria-valuetext`, a sticky amber non-dismissible `role="alert"` warning line,
+and an actionable variant with an inline button for the notices that genuinely
+need a human. **No toasts for connectivity or any persistent condition.** AC:
+announcements are keyed on state, not the per-second tick; the banner survives
+a view remount because the session lives in Rust.
+
+### Story 29.6: Notifications — Exactly Once, On Onset
+Native notification on each `None→Some` warning onset, bypassing DND like the
+other loud failures, with no duplicate on subsequent ticks. AC: a sustained
+warning notifies once; a cleared-then-recurring warning notifies again.
+
+## Epic 30: `keeper-syncd` — Standalone Linux CLI & Daemon
+
+### Story 30.1: The Bin Crate & Its `SyncPlatform`
+`crates/keeper-syncd` with `clap` argument parsing and an XDG `SyncPlatform`
+implementation (`$XDG_CONFIG_HOME/keeper-sync/config.toml`,
+`$XDG_DATA_HOME/keeper-sync/sync.db`, `$XDG_STATE_HOME/keeper-sync/`). Depends
+on `keeper-sync` only — never on `keeper` or `keeper-core`. AC: builds and runs
+on Linux with no Tauri in its dependency tree (asserted by a `cargo tree` gate).
+
+### Story 30.2: TOML Configuration ↔ `SyncProfile`
+A TOML schema mapping 1:1 onto `SyncProfile` so a profile moves between the app
+and the daemon by copying a table; unknown keys are reported, not ignored;
+malformed config fails loudly at startup. AC: the same profile produces
+identical engine behaviour in both hosts.
+
+### Story 30.3: Core Subcommands
+`add`, `list`, `status`, `sync [--once]`, `watch`, `pause`, `resume` — the
+engine's verbs, with machine-readable (`--json`) and human output. AC:
+`sync --once` is idempotent and exits non-zero only on real failure; `watch`
+runs indefinitely and is the daemon's entry point.
+
+### Story 30.4: `verify`, `doctor`, `logs` & Headless Secrets
+`verify` runs Story 25.6; `doctor` reports git version, LFS reachability,
+watcher limits, disk space and profile health; `logs` tails the structured log.
+Secrets come from the OS keyring or, headless, from a `0600` file or an
+environment variable — never from a config file that could be committed. AC:
+`doctor` on a machine without git explains exactly what to install; a
+world-readable secret file is refused.
+
+### Story 30.5: systemd Unit, Graceful Shutdown & Packaging
+A user unit (`Restart=on-failure`), `SIGTERM` handled as a bounded graceful
+finalize identical to the app's quit path, and a documented
+`cargo build -p keeper-syncd --release` install path. The daemon is **not**
+bundled into the macOS app. AC: `systemctl --user` start/stop leaves no
+half-applied unit in the journal; a SIGTERM mid-push aborts resumably.
+
+## Epic 31: Scale, Reliability & Field Validation
+
+### Story 31.1: Scale Envelope — 100 000 Files
+A generated-corpus harness measuring initial scan, steady-state watch cost and
+memory across a 100 000-file / 50 GB profile. AC: bounded RSS; scan cost
+dominated by one `lstat` per file; results recorded in `docs/sync.md`.
+
+### Story 31.2: Durability Matrix — kill -9, Unplug, Network Loss
+A fault-injection matrix asserting NFR-24 at every stage boundary: mid-stage,
+mid-commit, mid-push, mid-LFS-upload, mid-checkout. AC: every cell either
+completes or resumes cleanly; no cell loses a byte or leaves a corrupt index.
+
+### Story 31.3: Large-Blob Memory Ceiling
+A multi-GB single-file profile asserting the LFS path never materializes the
+object in memory in either direction. AC: peak RSS stays under a stated ceiling
+while transferring a file far larger than it.
+
+### Story 31.4: Live Forgejo Integration
+End-to-end against the makistack Forgejo instance: clone, bidirectional sync,
+LFS round trip, sparse profile, lane + PR. Exercises the real quirk list
+(`Accept` ordering, `Content-Range`, absent `expires_in`). AC: a real
+repository round-trips with byte-identical content and verified checksums.
+
+### Story 31.5: Cross-Host Field Test
+The same profiles driven from Linux and macOS hosts against one remote,
+including a removable-media detach/attach cycle and an offline period. AC: both
+hosts converge; no conflict storm; provenance identifies each host correctly.
+**Human-in-the-loop:** requires physical hosts and a real pendrive.
+
+### Story 31.6: `docs/sync.md` & Phase Acceptance
+The durable operator document: architecture summary, the `git` prerequisite,
+profile configuration, the completeness gate and its macOS tier-3 gap, LFS
+behaviour, removable-media semantics, the CLI reference, troubleshooting, and
+the measured envelopes. Plus phase acceptance against FR-77–FR-93 /
+NFR-23–NFR-26. AC: every FR in the phase maps to a shipped story; every
+documented limitation is honest.
+
+## Phase 4 Validation Summary
+
+- **FR coverage:** FR-77–FR-93 all mapped. Split FRs have every leg assigned —
+  FR-80 (pointer/store 25.1, wire 25.2/25.3, tracking 25.4, path filter 25.5),
+  FR-84 (tiers 26.1/26.2/26.3/26.4/26.5), FR-85 (transfer verify 25.3,
+  profile verify 25.6, read verify 26.5), FR-87 (VMs 29.1, glyphs 29.2, line
+  29.3, in-app 29.5), FR-90 (scheduler 26.6, offline field test 31.5),
+  FR-92 (30.1–30.5), FR-93 (credentials 24.2/30.4, egress 23.7).
+- **NFR coverage:** NFR-23 measured in 31.1/31.3; NFR-24 engineered in 23.3 and
+  gated by the 31.2 fault matrix; NFR-25 designed into 26.3/26.6 and asserted in
+  29.5; NFR-26 enforced by the 23.6 log-scan test, the 23.2 taxonomy rule and
+  the workspace `unsafe_code = "deny"` lint.
+- **Architecture compliance:** AD-40 lands in 23.1/23.2; AD-41 in 24.1/24.5;
+  AD-42 in 23.3; AD-43 in 24.7; AD-44 in 23.4/28.1; AD-45 across 26.1–26.5;
+  AD-46 across 25.1–25.5; AD-47 in 24.1/27.2; AD-48 in 27.3/27.4; AD-49 in 26.6;
+  AD-50 in 28.2–28.4; AD-51 in 29.1–29.6; AD-52 in 30.1–30.5; AD-53 in 23.7/24.2.
+- **Dependencies:** Epic 23 gates everything. Epics 24 and 26 may proceed in
+  parallel after it; Epic 25 needs 24.4; Epic 27 needs 24 + 26; Epic 28 needs
+  24.5; Epic 29 needs 23.5 and one working profile; Epic 30 needs the engine
+  complete; Epic 31 closes the phase.
+- **Human-in-the-loop:** exactly one story (31.5) requires physical hosts and a
+  real removable volume; everything else is implementable with fixtures, a local
+  bare repository, a stub LFS server and the makistack Forgejo instance.
+- **Sizing:** 52 stories across Epics 23–31 (7 + 7 + 6 + 6 + 5 + 4 + 6 + 5 + 6),
+  each scoped to a single dev session; total 174 stories across 31 epics.
