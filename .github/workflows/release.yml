@@ -328,6 +328,18 @@ jobs:
           REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # This job is deliberately NOT gated on the macOS `release` job (it must
+          # not wait on, or be blocked by, Apple signing) — and it builds in ~3
+          # minutes against that job's ~15, so it normally gets here BEFORE the
+          # release exists and `gh release upload` fails with "release not found".
+          # Create the draft if absent instead of racing: whichever job arrives
+          # first opens it, the others reuse it. A concurrent create loses
+          # harmlessly (the `||` swallows it) and the upload below still lands;
+          # the app job's own create is already `--clobber`/fallback tolerant.
+          if ! gh release view "$REF" >/dev/null 2>&1; then
+            gh release create "$REF" --draft --title "keeper $REF" \
+              --notes "Release assets are still uploading." || true
+          fi
           # --clobber so re-running a release replaces the asset instead of
           # failing on a name collision.
           gh release upload "$REF" \
