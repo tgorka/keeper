@@ -23,6 +23,23 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The tag names the version, but the app's real version lives in
+      # tauri.conf.json and nothing reconciled the two: v0.4.0 published assets
+      # named 0.4.0 wrapping an app that reported 0.3.0, so every updater check
+      # re-offered an update the machine had already installed. Fail here, in
+      # seconds, rather than 16 minutes into a build that can only ship a lie.
+      - name: Tag must match the app version
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          conf=$(python3 -c "import json; print(json.load(open('src-tauri/crates/keeper/tauri.conf.json'))['version'])")
+          if [ "${REF#v}" != "$conf" ]; then
+            echo "::error::tag $REF disagrees with tauri.conf.json version $conf — bump the manifests or fix the tag"
+            exit 1
+          fi
+          echo "tag $REF matches the app version"
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -163,6 +180,19 @@ jobs:
           codesign --force --options runtime \
             --entitlements src-tauri/crates/keeper/keeper-rec.entitlements \
             -s - "$APP"
+          # `hdiutil` needs room for a whole second copy of the app, and by this
+          # point the runner's disk is nearly full: the cached registry plus this
+          # workspace's Rust intermediates dominate a macOS runner's ~14 GB. Both
+          # v0.4.1 attempts died here with "hdiutil: create failed - No space left
+          # on device" AFTER a clean 16-minute build — the bundle was fine, only
+          # the packaging had nowhere to go. Compilation is finished and the .app
+          # is already bundled, so the object files that got us here are dead
+          # weight; `bundle/` is a sibling of these and is untouched.
+          BUILT="src-tauri/target/aarch64-apple-darwin/release"
+          rm -rf "$BUILT/deps" "$BUILT/build" "$BUILT/incremental" \
+                 src-tauri/target/release/deps src-tauri/target/release/build \
+                 src-tauri/target/release/incremental
+          df -h / | tail -1
           VERSION="${GITHUB_REF_NAME#v}"
           hdiutil create -volname "keeper" -srcfolder "$APP" -ov -format UDZO "keeper_${VERSION}_aarch64.dmg"
           ditto -c -k --keepParent "$APP" "keeper_${VERSION}_aarch64_app.zip"
