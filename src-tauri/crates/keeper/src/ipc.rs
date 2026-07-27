@@ -6792,6 +6792,30 @@ mod tests {
         );
     }
 
+    /// Tauri's `invoke_handler` ASSIGNS the handler it is given
+    /// (`self.invoke_handler = Box::new(handler)`) — it does not accumulate. A
+    /// second registration therefore silently discards every command the first
+    /// one carried, and nothing warns: the build is clean, the app launches, and
+    /// each discarded command answers "Command <name> not found" at runtime.
+    ///
+    /// v0.4.0-v0.4.2 shipped exactly that. Folder sync's desktop-only commands
+    /// were registered in a second pass (because `generate_handler!` takes a flat
+    /// literal that cannot hold a `#[cfg]` entry), leaving the desktop build with
+    /// nine reachable commands and no account restore, no capability probe, no
+    /// recording and no bridges. Platform-conditional command sets must be spliced
+    /// into the single list — see `keeper_with_commands!` in `lib.rs`.
+    #[test]
+    fn exactly_one_invoke_handler_is_registered() {
+        let src = include_str!("lib.rs");
+        let registrations = src.matches(".invoke_handler(").count();
+        assert_eq!(
+            registrations, 1,
+            "lib.rs registers the IPC handler {registrations} times; every call after \
+             the first discards the commands registered before it, so all but the last \
+             list becomes unreachable at runtime"
+        );
+    }
+
     /// The shipped app's version is whatever `tauri.conf.json` says — the bundle's
     /// `CFBundleShortVersionString` and the updater's version comparison both come
     /// from it, NOT from Cargo or npm metadata. So a release that bumps the crate
