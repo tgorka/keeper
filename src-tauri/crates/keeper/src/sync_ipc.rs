@@ -420,7 +420,13 @@ pub async fn sync_folder_now(
     })
 }
 
-/// Re-verify a profile's stored content against its recorded digests.
+/// Re-read a profile's tracked files and report the ones that failed.
+///
+/// NOT a digest comparison — keeper records no per-file hash (`file_state` has
+/// no digest column). Each file is read and fails only if it changed under the
+/// read (a torn read), and each LFS pointer's object must be present at its
+/// recorded size. Worth having, but the earlier "against its recorded digests"
+/// wording described a check that does not exist.
 #[tauri::command]
 pub async fn sync_verify(
     state: tauri::State<'_, AppState>,

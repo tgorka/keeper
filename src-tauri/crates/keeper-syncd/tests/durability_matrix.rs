@@ -208,11 +208,45 @@ impl Peer {
         assert_files_intact(&self.work, expected, &context);
     }
 
-    /// Drive the profile to a settled state the way the daemon would.
-    fn sync_to_completion(&self) {
-        for _ in 0..6 {
-            let _ = self.daemon(&["sync", "--once"]).status();
+    /// Drive the profile to a settled state the way the daemon would, keeping
+    /// what each pass said.
+    ///
+    /// The output matters because this helper feeds a convergence assertion. It
+    /// used to discard the exit status, so "the daemon converged" and "every
+    /// pass failed" were indistinguishable and a failure read only as
+    /// `left: 0, right: 12` — true, useless, and impossible to act on from a CI
+    /// log. Returning the last failing pass's stderr means the next failure
+    /// names its own cause (a stale `index.lock` after a kill -9, say).
+    fn sync_to_completion(&self) -> String {
+        let mut last_failure = String::new();
+        for pass in 0..6 {
+            // `daemon()` nulls both streams for the spawn-and-kill path; undo that
+            // here or `output()` faithfully captures the nothing it was told to
+            // produce, which is what made the first version of this diagnostic
+            // report an empty reason.
+            let out = self
+                .daemon(&["sync", "--once"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+            match out {
+                Ok(out) if !out.status.success() => {
+                    // Both streams: the daemon reports a failure through its
+                    // tracing subscriber (stderr) AND its printer (stdout), and
+                    // which one carries the text depends on the mode, so a
+                    // helper that reads only one can still come back empty.
+                    last_failure = format!(
+                        "pass {pass} exited {}: stderr={:?} stdout={:?}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).trim(),
+                        String::from_utf8_lossy(&out.stdout).trim()
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => last_failure = format!("pass {pass} could not run: {err}"),
+            }
         }
+        last_failure
     }
 
     fn remote_files(&self) -> Vec<String> {
@@ -306,13 +340,15 @@ fn a_kill_at_any_instant_costs_no_data_and_corrupts_no_index() {
 
         // Recovery is the other half of the contract: "did not corrupt" is
         // worth nothing if the profile can never make progress again.
-        peer.sync_to_completion();
+        let trouble = peer.sync_to_completion();
         let published = peer.remote_files();
         assert_eq!(
             published.len(),
             40,
-            "after a kill at {at:?} the profile must still converge; published: {}",
-            published.len()
+            "after a kill at {at:?} the profile must still converge; published: {}; \
+             last failing pass: {}",
+            published.len(),
+            if trouble.is_empty() { "none" } else { &trouble }
         );
     }
 
@@ -349,11 +385,13 @@ fn a_kill_during_a_large_object_transfer_leaves_the_object_recoverable() {
     peer.kill_sync_after(at);
     peer.assert_intact(&expected, at);
 
-    peer.sync_to_completion();
+    let trouble = peer.sync_to_completion();
     let published = peer.remote_files();
     assert!(
         published.iter().any(|p| p == "big.bin"),
-        "the large object must still reach the remote after a mid-transfer kill; published: {published:?}"
+        "the large object must still reach the remote after a mid-transfer kill; \
+         published: {published:?}; last failing pass: {}",
+        if trouble.is_empty() { "none" } else { &trouble }
     );
 }
 
@@ -381,11 +419,12 @@ fn a_kill_leaves_no_committed_work_unpublished_forever() {
         }
     }
 
-    peer.sync_to_completion();
+    let trouble = peer.sync_to_completion();
     assert_eq!(
         peer.remote_files().len(),
         12,
-        "everything committed locally must end up published"
+        "everything committed locally must end up published; last failing pass: {}",
+        if trouble.is_empty() { "none" } else { &trouble }
     );
     // Reported rather than asserted: whether a kill lands in that exact window
     // is a race, and a test that failed because it did not is a flaky test, not

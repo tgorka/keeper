@@ -78,8 +78,16 @@ export const SYNC_REMOVE_LABEL = "Remove";
 /** The needs-attention alert's inline action: re-check the folder's contents. */
 export const SYNC_VERIFY_LABEL = "Check files";
 
-/** The all-clear line after a check that found nothing wrong. */
-export const SYNC_VERIFY_CLEAN_SENTENCE = "Every file matched its recorded digest.";
+/**
+ * The all-clear line after a check that found nothing wrong.
+ *
+ * Says what the check actually did. keeper records no per-file digest — the
+ * pass reads every file (failing only if it changes under the read) and
+ * confirms each large-file object is present at its recorded size. Claiming
+ * "matched its recorded digest" described a comparison that never happens.
+ */
+export const SYNC_VERIFY_CLEAN_SENTENCE =
+  "Every file read cleanly, and every large file's stored copy is present.";
 
 /** Used only if Rust flagged attention without naming a reason. */
 export const SYNC_ATTENTION_FALLBACK_SENTENCE =

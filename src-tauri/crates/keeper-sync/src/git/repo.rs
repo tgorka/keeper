@@ -520,6 +520,65 @@ pub fn adopt(root: &Path, remote_url: &str, branch: &str) -> Result<gix::Reposit
     open(root, false)
 }
 
+/// Make sure a managed repository still has the `origin` its profile syncs with,
+/// restoring it when it is gone. Returns whether it had to repair one.
+///
+/// [`adopt`] writes the remote right after `gix::init`, but those are two
+/// separate filesystem steps. A process killed between them — SIGKILL, power
+/// loss, an OOM kill during the very first sync — leaves a `.git` with no
+/// remote at all. Every later run then takes the "repository already exists"
+/// branch, never calls `adopt` again, and fails permanently with `remote
+/// "origin" is not usable: The remote named "origin" did not exist`. The folder
+/// looks synced, the commits are there, and nothing will ever be published
+/// again: precisely the unpublished-forever loss NFR-24 forbids. Found by the
+/// durability matrix, which reproduces it whenever the kill lands in that
+/// window.
+///
+/// Repairs only a MISSING remote. One that exists but points somewhere else is
+/// left exactly as it is: keeper shares these folders with plain `git`, so a
+/// remote a human deliberately re-pointed is theirs, not a value keeper owns
+/// the way it owns `index.sparse`.
+pub fn ensure_remote(repo: &gix::Repository, remote_url: &str) -> Result<bool> {
+    let config_path = repo.git_dir().join("config");
+    let mut config =
+        gix::config::File::from_path_no_includes(config_path.clone(), gix::config::Source::Local)
+            .map_err(|err| {
+            SyncError::Git(format!("could not read {}: {err}", config_path.display()))
+        })?;
+    let present = config
+        .raw_value_by("remote", Some("origin".into()), "url")
+        .map(|url| !url.is_empty())
+        .unwrap_or(false);
+    if present {
+        return Ok(false);
+    }
+
+    config
+        .set_raw_value_by("remote", Some("origin".into()), "url", remote_url)
+        .map_err(|err| SyncError::Git(format!("could not restore remote.origin.url: {err}")))?;
+    config
+        .set_raw_value_by(
+            "remote",
+            Some("origin".into()),
+            "fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        )
+        .map_err(|err| SyncError::Git(format!("could not restore remote.origin.fetch: {err}")))?;
+
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| SyncError::Config(format!("{} has no parent", config_path.display())))?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|source| SyncError::io("stage .git/config", parent.to_path_buf(), source))?;
+    config
+        .write_to(&mut staged)
+        .map_err(|source| SyncError::io("write .git/config", config_path.clone(), source))?;
+    staged
+        .persist(&config_path)
+        .map_err(|err| SyncError::io("replace .git/config", config_path.clone(), err.error))?;
+    Ok(true)
+}
+
 /// Every path the index tracks, repository-relative.
 ///
 /// Used to find checked-out LFS pointers that still need materializing: only a
@@ -642,6 +701,55 @@ mod tests {
         git::commit::{stage_and_commit, StagedChange},
         provenance::{Provenance, SyncSource},
     };
+
+    /// The durability hole this closes: `adopt` inits the repository and writes
+    /// the remote as two separate steps, so a kill in between leaves a `.git`
+    /// with no `origin` — and because `.git` then exists, `adopt` never runs
+    /// again and every later sync dies with "the remote named origin did not
+    /// exist". Reproduced by the durability matrix under load.
+    #[test]
+    fn a_repository_left_without_its_remote_is_repaired_on_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Exactly the half-initialized state a kill leaves: init ran, the config
+        // write did not.
+        let repo = gix::init(dir.path()).expect("init");
+
+        assert!(
+            ensure_remote(&repo, "https://example.org/x.git").expect("repair"),
+            "a repository with no origin must be repaired"
+        );
+        let repo = open(dir.path(), false).expect("reopen");
+        let url = repo
+            .config_snapshot()
+            .string("remote.origin.url")
+            .expect("origin url");
+        assert_eq!(url.to_string(), "https://example.org/x.git");
+
+        assert!(
+            !ensure_remote(&repo, "https://example.org/x.git").expect("second call"),
+            "repair must be idempotent — a present remote is not rewritten"
+        );
+    }
+
+    /// keeper shares these folders with plain `git`. A remote the human
+    /// re-pointed on purpose is theirs, and silently restoring the profile's URL
+    /// over it would be a surprise, not a repair.
+    #[test]
+    fn a_remote_pointing_elsewhere_is_left_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = adopt(dir.path(), "https://example.org/original.git", "main").expect("adopt");
+
+        assert!(
+            !ensure_remote(&repo, "https://example.org/profile.git").expect("no repair"),
+            "an existing remote must not be rewritten"
+        );
+        let repo = open(dir.path(), false).expect("reopen");
+        let url = repo
+            .config_snapshot()
+            .string("remote.origin.url")
+            .expect("origin url");
+        assert_eq!(url.to_string(), "https://example.org/original.git");
+    }
 
     fn signature() -> gix::actor::Signature {
         gix::actor::Signature {

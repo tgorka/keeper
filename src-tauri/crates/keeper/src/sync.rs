@@ -187,6 +187,68 @@ pub fn engine_if_open() -> Option<Arc<Engine>> {
     slot().as_ref().map(Arc::clone)
 }
 
+/// The live supervisor's stop signal, if one is running.
+///
+/// Holding the sender here (rather than in `AppState`) keeps the whole
+/// supervisor lifecycle in the module that owns the engine, and makes
+/// [`start_supervisor`] idempotent: a second call sees an occupied slot and
+/// returns instead of racing a second loop against the same journal.
+static SUPERVISOR: LazyLock<Mutex<Option<tokio::sync::watch::Sender<bool>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Start the 1 Hz sync supervisor for this process (Epic 26/29).
+///
+/// Without this the app has no background sync at all: the engine exists, the
+/// journal fills, and nothing drains it until the user presses "Sync now" —
+/// which is how v0.4.x shipped. `keeper-syncd` has always driven the same loop
+/// (its `run_supervisor`); this is the app doing the equivalent so a configured
+/// folder converges without a separate daemon installed.
+///
+/// Best-effort and quiet by design. A machine with no `git` has no sync
+/// capability and therefore no surface to feed, so a failed engine build is a
+/// debug line, not a warning — exactly the honesty rule the capability handshake
+/// already follows. Idempotent; safe to call before any profile exists (the
+/// tick is a no-op then).
+pub fn start_supervisor(platform: Arc<dyn Platform>) {
+    let mut guard = supervisor_slot();
+    if guard.is_some() {
+        return;
+    }
+    let engine = match engine(platform) {
+        Ok(engine) => engine,
+        Err(err) => {
+            tracing::debug!(%err, "sync: no supervisor (engine unavailable)");
+            return;
+        }
+    };
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    *guard = Some(stop_tx);
+    drop(guard);
+    tauri::async_runtime::spawn(async move {
+        if let Err(err) = engine.run(stop_rx).await {
+            tracing::warn!(%err, "sync: supervisor stopped");
+        }
+    });
+}
+
+/// Signal the supervisor to finish its current unit and stop.
+///
+/// Called on the quit path. The engine's own shutdown is what makes an
+/// in-flight push *abort resumably* — its journal row survives and is re-driven
+/// next launch — so skipping this would kill a transfer mid-write instead.
+/// A closed receiver (supervisor already gone) is not an error.
+pub fn stop_supervisor() {
+    if let Some(stop_tx) = supervisor_slot().take() {
+        let _ = stop_tx.send(true);
+    }
+}
+
+fn supervisor_slot() -> MutexGuard<'static, Option<tokio::sync::watch::Sender<bool>>> {
+    SUPERVISOR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Whether folder sync can run here — the `CapabilitiesVm.sync` answer.
 ///
 /// Deliberately cheap and side-effect-free: it asks whether a `git` binary
