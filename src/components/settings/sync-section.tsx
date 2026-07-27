@@ -40,6 +40,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
+// The credential pair is called straight from the form rather than through the
+// mirror store: neither write changes anything the store mirrors, and there is
+// no read side to keep in sync — nothing can report what a keychain holds.
+import { syncClearCredential, syncSetCredential } from "@/lib/ipc/client";
 import {
   ensureSyncHydrated,
   isSyncStatusActive,
@@ -118,6 +122,46 @@ export const SYNC_LFS_THRESHOLD_LABEL = "Track files at or above (MB)";
 export const SYNC_REMOVABLE_LABEL = "This folder is on removable or network storage";
 export const SYNC_REMOVABLE_NOTE =
   "keeper waits longer for writes to settle there, because those volumes report changes late.";
+
+/**
+ * The advanced knobs (Story 32.7, AD-S8). Every one of these was already
+ * carried by `SyncProfileReq` and hardcoded away by this form; a knob that
+ * does nothing (`pollIntervalMs`) was deleted in Rust rather than exposed here.
+ */
+export const SYNC_SETTLE_LABEL = "Wait for writes to stop (seconds)";
+export const SYNC_SETTLE_NOTE =
+  "How long a file must go untouched before keeper copies it. Left empty, keeper picks the wait itself.";
+export const SYNC_EXCLUDES_LABEL = "Skip these files";
+export const SYNC_EXCLUDES_NOTE =
+  "Comma-separated patterns, for example *.tmp, .DS_Store. Left empty, keeper syncs everything in the folder.";
+export const SYNC_SUBPATHS_LABEL = "Sync only these folders";
+export const SYNC_SUBPATHS_NOTE =
+  "Comma-separated paths inside the folder. Left empty, keeper syncs the whole folder.";
+export const SYNC_TAGS_LABEL = "Tags";
+export const SYNC_TAGS_NOTE =
+  "Comma-separated. Each tag is written into the message of every commit keeper makes for this folder.";
+export const SYNC_AUTHOR_LABEL = "Commit author";
+export const SYNC_AUTHOR_NOTE =
+  "Name <email>, an address, or just a name. Left empty, commits are authored by this device.";
+
+/**
+ * The access-token field (Story 32.7, AD-S7). The token is written to the OS
+ * keychain after the profile is saved — it needs the new profile's id — and
+ * there is deliberately no command that reads one back, which the note says
+ * plainly rather than leaving the user to wonder where it went.
+ */
+export const SYNC_TOKEN_LABEL = "Access token";
+export const SYNC_TOKEN_NOTE =
+  "Used to authenticate with the remote. keeper stores it in the system keychain when the folder is added and never shows it again — there is no way to read a stored token back out.";
+export const SYNC_TOKEN_STORED_LABEL = "Access token stored in the keychain.";
+export const SYNC_TOKEN_CLEAR_LABEL = "Clear token";
+
+/**
+ * Reported when the profile was created but the keychain write was not. Two
+ * writes, two outcomes: saying "add failed" here would send the user back to a
+ * form that can now only reject as a duplicate.
+ */
+export const SYNC_TOKEN_FAILED_PREFIX = "The folder was added, but the token was not stored: ";
 export const SYNC_ADD_SUBMIT_LABEL = "Add folder";
 
 /** Test id for the form's chosen-folder display (a read-only truncated path). */
@@ -375,6 +419,21 @@ interface SyncFormValues {
   /** The LFS threshold in MB; empty defers to the Rust default. */
   lfsThresholdMb: string;
   removable: boolean;
+  /** The settle window in seconds; empty defers to the Rust default. */
+  settleSeconds: string;
+  /** Comma-separated patterns; empty excludes nothing. */
+  excludes: string;
+  /** Comma-separated paths inside the folder; empty syncs all of it. */
+  subpaths: string;
+  /** Comma-separated commit tags; empty adds no tag trailers. */
+  tags: string;
+  /** The commit-author override; empty keeps the device identity. */
+  authorOverride: string;
+  /**
+   * The access token, held only until the profile is saved and the keychain
+   * write goes through. Never read back from anywhere.
+   */
+  token: string;
 }
 
 const EMPTY_FORM: SyncFormValues = {
@@ -386,7 +445,25 @@ const EMPTY_FORM: SyncFormValues = {
   lfsMode: "materialize",
   lfsThresholdMb: String(SYNC_DEFAULT_LFS_THRESHOLD_BYTES / 1024 / 1024),
   removable: false,
+  settleSeconds: "",
+  excludes: "",
+  subpaths: "",
+  tags: "",
+  authorOverride: "",
+  token: "",
 };
+
+/**
+ * Split one comma-separated advanced field into the string list Rust expects,
+ * dropping blanks so a trailing comma or a stray space never reaches the engine
+ * as an empty pattern that matches everything.
+ */
+function splitSyncList(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
+}
 
 /**
  * Create a profile. A rejected save keeps every typed value and shows the
@@ -398,6 +475,13 @@ function AddSyncProfileForm({ disabled }: { disabled: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * The profile whose token was just written, if any. The only acknowledgement
+   * the user will ever get that the keychain took it — and the only moment the
+   * form holds an id to clear it with, since nothing can read a stored token
+   * back to offer this later.
+   */
+  const [storedToken, setStoredToken] = useState<{ id: string; name: string } | null>(null);
   const fieldId = useId();
 
   /** Open the OS-native directory picker; a cancellation writes nothing. */
@@ -418,30 +502,71 @@ function AddSyncProfileForm({ disabled }: { disabled: boolean }) {
     event.preventDefault();
     setSaving(true);
     setError(null);
-    // An empty or unusable threshold defers to the Rust default rather than
-    // sending a number nobody asked for.
+    // The acknowledgement belongs to the folder that was just added, so a
+    // second add never leaves the previous one's Clear button pointing at it.
+    setStoredToken(null);
+    // An empty or unusable threshold / settle window defers to the Rust
+    // default rather than sending a number nobody asked for.
     const thresholdMb = Number.parseFloat(form.lfsThresholdMb);
+    const settleSeconds = Number.parseFloat(form.settleSeconds);
+    const author = form.authorOverride.trim();
+    const { token } = form;
     try {
-      await saveSyncProfile({
+      const saved = await saveSyncProfile({
         id: null,
         name: form.name.trim(),
         localPath: form.localPath,
         remoteUrl: form.remoteUrl.trim(),
         branch: form.branch.trim(),
         direction: form.direction,
+        // The other lane (`worktree`) is an agent airlock Rust accepts only
+        // together with `pushOnly`, so it stays a syncd-config affordance
+        // rather than a control that can be combined into a rejected profile.
         lane: SYNC_DEFAULT_LANE,
-        subpaths: [],
-        excludes: [],
+        subpaths: splitSyncList(form.subpaths),
+        excludes: splitSyncList(form.excludes),
         removable: form.removable,
         lfsMode: form.lfsMode,
         lfsThresholdBytes:
           Number.isFinite(thresholdMb) && thresholdMb > 0
             ? Math.round(thresholdMb * 1024 * 1024)
             : null,
-        settleMs: null,
-        tags: [],
+        settleMs:
+          Number.isFinite(settleSeconds) && settleSeconds > 0
+            ? Math.round(settleSeconds * 1000)
+            : null,
+        tags: splitSyncList(form.tags),
+        // `null` keeps the device identity; an empty string would *clear* an
+        // override, which is meaningless on a profile being created.
+        authorOverride: author === "" ? null : author,
       });
       setForm(EMPTY_FORM);
+      if (token !== "") {
+        // A second write, because the keychain entry is keyed by the id the
+        // save just minted. Its failure is reported as its own thing: the
+        // folder exists by now, and "add failed" would be a lie that sends the
+        // user back to a form that would only reject as a duplicate.
+        try {
+          await syncSetCredential(saved.id, token);
+          setStoredToken({ id: saved.id, name: saved.name });
+        } catch (raw) {
+          setError(`${SYNC_TOKEN_FAILED_PREFIX}${syncErrorMessage(raw)}`);
+        }
+      }
+    } catch (raw) {
+      setError(syncErrorMessage(raw));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /** Forget a just-stored token. The only undo there is — nothing reads one back. */
+  const clearToken = async (id: string) => {
+    setSaving(true);
+    setError(null);
+    try {
+      await syncClearCredential(id);
+      setStoredToken(null);
     } catch (raw) {
       setError(syncErrorMessage(raw));
     } finally {
@@ -604,6 +729,104 @@ function AddSyncProfileForm({ disabled }: { disabled: boolean }) {
             />
           </div>
           <p className="text-muted-foreground text-xs">{SYNC_REMOVABLE_NOTE}</p>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-settle`}>{SYNC_SETTLE_LABEL}</Label>
+            <Input
+              id={`${fieldId}-settle`}
+              type="number"
+              min={0}
+              className="w-24"
+              value={form.settleSeconds}
+              disabled={disabled || saving}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, settleSeconds: event.target.value }))
+              }
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{SYNC_SETTLE_NOTE}</p>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-excludes`}>{SYNC_EXCLUDES_LABEL}</Label>
+            <Input
+              id={`${fieldId}-excludes`}
+              className="w-56"
+              value={form.excludes}
+              disabled={disabled || saving}
+              onChange={(event) => setForm((live) => ({ ...live, excludes: event.target.value }))}
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{SYNC_EXCLUDES_NOTE}</p>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-subpaths`}>{SYNC_SUBPATHS_LABEL}</Label>
+            <Input
+              id={`${fieldId}-subpaths`}
+              className="w-56"
+              value={form.subpaths}
+              disabled={disabled || saving}
+              onChange={(event) => setForm((live) => ({ ...live, subpaths: event.target.value }))}
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{SYNC_SUBPATHS_NOTE}</p>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-tags`}>{SYNC_TAGS_LABEL}</Label>
+            <Input
+              id={`${fieldId}-tags`}
+              className="w-56"
+              value={form.tags}
+              disabled={disabled || saving}
+              onChange={(event) => setForm((live) => ({ ...live, tags: event.target.value }))}
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{SYNC_TAGS_NOTE}</p>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-author`}>{SYNC_AUTHOR_LABEL}</Label>
+            <Input
+              id={`${fieldId}-author`}
+              className="w-56"
+              value={form.authorOverride}
+              disabled={disabled || saving}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, authorOverride: event.target.value }))
+              }
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{SYNC_AUTHOR_NOTE}</p>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-token`}>{SYNC_TOKEN_LABEL}</Label>
+            {/* A write-only field: typed here, handed to the keychain once the
+                profile has an id, and never rendered back — there is no command
+                that could fill it in. */}
+            <Input
+              id={`${fieldId}-token`}
+              type="password"
+              autoComplete="off"
+              className="w-56"
+              value={form.token}
+              disabled={disabled || saving}
+              onChange={(event) => setForm((live) => ({ ...live, token: event.target.value }))}
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{SYNC_TOKEN_NOTE}</p>
+        </div>
+      )}
+      {/* Outside the disclosure on purpose: this is the acknowledgement for an
+          action that already happened, and it would be invisible collapsed. */}
+      {storedToken !== null && (
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-muted-foreground text-xs">
+            {SYNC_TOKEN_STORED_LABEL} ({storedToken.name})
+          </p>
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            className="shrink-0"
+            disabled={saving}
+            onClick={() => {
+              void clearToken(storedToken.id);
+            }}
+          >
+            {SYNC_TOKEN_CLEAR_LABEL}
+          </Button>
         </div>
       )}
       {error !== null && <p className="text-destructive text-xs">{error}</p>}

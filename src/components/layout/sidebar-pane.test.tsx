@@ -290,6 +290,52 @@ describe("SidebarPane recording entry (Story 16.3)", () => {
   });
 });
 
+describe("SidebarPane sync entry (Story 32.5)", () => {
+  it("hides the Sync entry when the sync capability is off (the default)", () => {
+    renderSidebar();
+    expect(screen.queryByRole("button", { name: "Sync" })).not.toBeInTheDocument();
+  });
+
+  it("shows the Sync entry only when the sync capability is on", () => {
+    // A machine with no usable `git` gets no sync UI at all (AD-41), never a
+    // button whose every command would reject as unsupported.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    renderSidebar();
+    expect(screen.getByRole("button", { name: "Sync" })).toBeInTheDocument();
+  });
+
+  it("switches the primary view to sync when the Sync entry is clicked", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    renderSidebar();
+    expect(primaryViewStore.getState().view).toBe("inbox");
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync" }));
+
+    expect(primaryViewStore.getState().view).toBe("sync");
+    expect(screen.getByRole("button", { name: "Sync" })).toHaveAttribute("aria-current", "page");
+  });
+
+  it("keeps both gated entries independent, in order, before Settings", () => {
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true, sync: true });
+    renderSidebar();
+
+    const labels = screen
+      .getAllByRole("button")
+      .map((button) => button.textContent)
+      .filter((label) => label === "Recording" || label === "Sync" || label === "Settings");
+    expect(labels).toEqual(["Recording", "Sync", "Settings"]);
+  });
+
+  it("names the Sync entry on the collapsed rail through its tooltip trigger", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    renderSidebar(true);
+    // Collapsed, the label survives only as the accessible name.
+    expect(screen.getByRole("button", { name: "Sync" })).toBeInTheDocument();
+  });
+});
+
 describe("SidebarPane settings", () => {
   it("opens the Settings dialog when the Settings button is clicked", async () => {
     renderSidebar();
