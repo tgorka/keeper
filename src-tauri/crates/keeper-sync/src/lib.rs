@@ -50,7 +50,10 @@ pub mod stability;
 pub mod volume;
 pub mod watch;
 
-pub use engine::{Engine, SyncOutcome, VerifyReport};
+pub use db::{ActivityKind, ActivityRow};
+pub use engine::{
+    Engine, ParkedUnit, PendingFile, PendingReason, ProblemReport, SyncOutcome, VerifyReport,
+};
 pub use error::{Result, SyncError};
 pub use platform::SyncPlatform;
 pub use profile::{ProfileState, SyncDirection, SyncLane, SyncProfile};

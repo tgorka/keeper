@@ -9,6 +9,11 @@ vi.mock("@/lib/ipc/client", () => ({
   syncProfileSetEnabled: vi.fn(),
   syncFolderNow: vi.fn(),
   syncVerify: vi.fn(),
+  // The Advanced disclosure's access-token field (Story 32.7) writes straight
+  // through to the keychain pair; there is no read side to mock, because no
+  // command reports what a keychain holds.
+  syncSetCredential: vi.fn(),
+  syncClearCredential: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -18,8 +23,11 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import {
   SYNC_ADD_SUBMIT_LABEL,
+  SYNC_ADVANCED_TOGGLE_TESTID,
   SYNC_ATTENTION_FALLBACK_SENTENCE,
+  SYNC_AUTHOR_LABEL,
   SYNC_CHOOSE_FOLDER_LABEL,
+  SYNC_EXCLUDES_LABEL,
   SYNC_FORM_PATH_TESTID,
   SYNC_NAME_LABEL,
   SYNC_NO_PROFILES_SENTENCE,
@@ -32,17 +40,26 @@ import {
   SYNC_REMOVE_CONFIRM_SENTENCE,
   SYNC_REMOVE_LABEL,
   SYNC_RESUME_LABEL,
+  SYNC_SETTLE_LABEL,
+  SYNC_SUBPATHS_LABEL,
+  SYNC_TAGS_LABEL,
+  SYNC_TOKEN_CLEAR_LABEL,
+  SYNC_TOKEN_FAILED_PREFIX,
+  SYNC_TOKEN_LABEL,
+  SYNC_TOKEN_STORED_LABEL,
   SYNC_VERIFY_LABEL,
   SyncSection,
   syncRemoteHost,
 } from "@/components/settings/sync-section";
 import type { SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
 import {
+  syncClearCredential,
   syncFolderNow,
   syncProfileRemove,
   syncProfileSave,
   syncProfileSetEnabled,
   syncProfiles,
+  syncSetCredential,
   syncStatuses,
   syncVerify,
 } from "@/lib/ipc/client";
@@ -55,6 +72,8 @@ const mockRemove = vi.mocked(syncProfileRemove);
 const mockSetEnabled = vi.mocked(syncProfileSetEnabled);
 const mockFolderNow = vi.mocked(syncFolderNow);
 const mockVerify = vi.mocked(syncVerify);
+const mockSetCredential = vi.mocked(syncSetCredential);
+const mockClearCredential = vi.mocked(syncClearCredential);
 const mockPicker = vi.mocked(openFolder);
 
 /** The exact line Rust composes — the UI must render it character for character. */
@@ -77,6 +96,7 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     lfsThresholdBytes: 4 * 1024 * 1024,
     settleMs: 5000,
     tags: [],
+    authorOverride: null,
     enabled: true,
     ...over,
   };
@@ -355,6 +375,9 @@ describe("SyncSection add-profile form", () => {
 
     fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
 
+    // An untouched Advanced disclosure still sends the defaults it always did:
+    // the new knobs (Story 32.7) are absent-by-default, not opinions the form
+    // now imposes on every folder.
     await waitFor(() =>
       expect(mockSave).toHaveBeenCalledWith({
         id: null,
@@ -371,8 +394,11 @@ describe("SyncSection add-profile form", () => {
         lfsThresholdBytes: 4 * 1024 * 1024,
         settleMs: null,
         tags: [],
+        authorOverride: null,
       }),
     );
+    // Nothing was typed into the token field, so the keychain was left alone.
+    expect(mockSetCredential).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.getByLabelText(SYNC_NAME_LABEL)).toHaveValue(""));
   });
 
@@ -416,6 +442,109 @@ describe("SyncSection add-profile form", () => {
       "git@github.com:alice/half-typed",
     );
     expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("relative/path");
+  });
+});
+
+describe("SyncSection advanced options (Story 32.7)", () => {
+  /** Fill the three required fields and open the Advanced disclosure. */
+  async function openAdvanced() {
+    mockPicker.mockResolvedValue("/Users/alice/notes");
+    mockSave.mockResolvedValue(profileVm({ id: "p2", name: "notes" }));
+    render(<SyncSection open />);
+    await screen.findByText(RUST_LINE);
+
+    fireEvent.change(screen.getByLabelText(SYNC_NAME_LABEL), { target: { value: "notes" } });
+    fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
+      target: { value: "git@github.com:alice/notes.git" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL }));
+    await waitFor(() =>
+      expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("/Users/alice/notes"),
+    );
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+  }
+
+  it("sends every advanced value as typed instead of hardcoding it away", async () => {
+    await openAdvanced();
+
+    fireEvent.change(screen.getByLabelText(SYNC_SETTLE_LABEL), { target: { value: "12" } });
+    fireEvent.change(screen.getByLabelText(SYNC_EXCLUDES_LABEL), {
+      target: { value: "*.tmp, .DS_Store" },
+    });
+    fireEvent.change(screen.getByLabelText(SYNC_SUBPATHS_LABEL), {
+      // The trailing comma must not reach Rust as an empty subpath.
+      target: { value: "notes, drafts," },
+    });
+    fireEvent.change(screen.getByLabelText(SYNC_TAGS_LABEL), { target: { value: "drive" } });
+    fireEvent.change(screen.getByLabelText(SYNC_AUTHOR_LABEL), {
+      target: { value: "Alice <alice@example.org>" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // Seconds in the field, milliseconds on the wire.
+          settleMs: 12_000,
+          excludes: ["*.tmp", ".DS_Store"],
+          subpaths: ["notes", "drafts"],
+          tags: ["drive"],
+          authorOverride: "Alice <alice@example.org>",
+        }),
+      ),
+    );
+  });
+
+  it("stores a typed token against the saved profile and never renders it back", async () => {
+    mockSetCredential.mockResolvedValue(undefined);
+    await openAdvanced();
+
+    const token = screen.getByLabelText(SYNC_TOKEN_LABEL);
+    // Write-only in the literal sense: the browser must not echo it either.
+    expect(token).toHaveAttribute("type", "password");
+    fireEvent.change(token, { target: { value: "ghp_secret" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    // Keyed by the id the save minted, which is why it is a second write.
+    await waitFor(() => expect(mockSetCredential).toHaveBeenCalledWith("p2", "ghp_secret"));
+    // The acknowledgement says a token is held; it never shows which.
+    expect(await screen.findByText(new RegExp(SYNC_TOKEN_STORED_LABEL))).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("ghp_secret")).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("ghp_secret");
+  });
+
+  it("clears a stored token through the keychain, not by blanking a field", async () => {
+    mockSetCredential.mockResolvedValue(undefined);
+    mockClearCredential.mockResolvedValue(undefined);
+    await openAdvanced();
+
+    fireEvent.change(screen.getByLabelText(SYNC_TOKEN_LABEL), { target: { value: "ghp_secret" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    const clear = await screen.findByRole("button", { name: SYNC_TOKEN_CLEAR_LABEL });
+
+    fireEvent.click(clear);
+
+    await waitFor(() => expect(mockClearCredential).toHaveBeenCalledWith("p2"));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: SYNC_TOKEN_CLEAR_LABEL }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("says the folder was added when only the keychain write failed", async () => {
+    mockSetCredential.mockRejectedValue({ code: "internal", message: "keychain refused" });
+    await openAdvanced();
+
+    fireEvent.change(screen.getByLabelText(SYNC_TOKEN_LABEL), { target: { value: "ghp_secret" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    // Two writes, two outcomes: the profile exists, so "add failed" would be a
+    // lie that sends the user back to a form that can only reject as a duplicate.
+    expect(
+      await screen.findByText(`${SYNC_TOKEN_FAILED_PREFIX}keychain refused`),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText(SYNC_NAME_LABEL)).toHaveValue(""));
   });
 });
 

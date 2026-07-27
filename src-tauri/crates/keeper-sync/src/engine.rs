@@ -24,20 +24,22 @@
 //!   exactly like a user deleting every file in it (AD-48).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 
 use crate::backoff::{jitter_sample, Backoff};
-use crate::db::{self, DeviceIdentity, WorkKind, WorkState};
+use crate::db::{self, ActivityKind, ActivityRow, DeviceIdentity, WorkKind, WorkState};
 use crate::error::{Result, Retriability, SyncError};
 use crate::git::{self, cli::GitCli};
 use crate::lfs;
 use crate::platform::SyncPlatform;
 use crate::profile::{LfsMode, ProfileState, SyncDirection, SyncLane, SyncProfile};
-use crate::progress::{ProgressSink, SyncPhase, SyncProgress, SyncStatus};
+use crate::progress::{ProgressSink, SyncPhase, SyncProgress, SyncStatus, TransferTally};
 use crate::provenance::{commit_message, Provenance, SyncSource};
 use crate::stability::{StabilityGate, StabilityVerdict};
 use crate::volume::{self, VolumeStatus};
@@ -50,6 +52,15 @@ pub struct SyncOutcome {
     pub pushed: bool,
     pub pulled: bool,
     pub files_changed: u64,
+    /// Bytes this run moved over the network: the pack a fetch received plus
+    /// every LFS object transferred, including the ones drained from the
+    /// journal after the push leg.
+    ///
+    /// The LFS half is exact. The fetch half is gitoxide's own transfer
+    /// counter, which `git::fetch` flattens without its unit, so on a pack
+    /// dominated by object bookkeeping rather than payload it is an estimate.
+    /// An estimate of the dominant term beats omitting the pack entirely,
+    /// which for a text repository would report nearly every sync as zero.
     pub bytes: u64,
     /// Conflict copies created during this run, as repository-relative paths.
     pub conflicts: Vec<String>,
@@ -61,6 +72,77 @@ pub struct VerifyReport {
     pub checked: u64,
     /// `(path, reason)` for everything that failed.
     pub bad: Vec<(String, String)>,
+}
+
+/// Why a path is not synced yet (Story 32.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Internally tagged, like `WorkKind`: the UI reads this as a discriminated
+// union, and `kind` rather than `reason` keeps it from nesting as
+// `reason.reason` inside a `PendingFile`.
+//
+// `rename_all` on an enum renames the VARIANTS only — `rename_all_fields` is
+// what reaches the payload of a struct variant, and without it `since_ms`
+// would cross the boundary as snake_case while every neighbouring field is
+// camelCase.
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+pub enum PendingReason {
+    /// Held by the completeness gate: the bytes are still moving, or the last
+    /// observation is not yet old enough to prove they stopped. `since_ms` is
+    /// when this waiting episode began, so a UI can say how long it has been.
+    Settling { since_ms: i64 },
+    /// On disk and git has never heard of it.
+    Untracked,
+    /// Tracked, and its content or mode differs from the index.
+    Modified,
+    /// Staged as new, not yet committed.
+    Added,
+    /// Tracked and no longer on disk.
+    Deleted,
+}
+
+/// One path the folder is waiting on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingFile {
+    /// Repository-relative.
+    pub path: String,
+    pub reason: PendingReason,
+}
+
+/// A unit of work the engine has given up on, as a human needs to see it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParkedUnit {
+    pub id: i64,
+    /// The journal's own discriminant (`push`, `lfsUpload`, …) rather than a
+    /// re-serialized payload, so a unit parked *for* an unreadable payload is
+    /// still describable.
+    pub kind: String,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+}
+
+/// Everything currently wrong with one profile (Story 32.2).
+///
+/// Assembled on demand from three sources that each already know a piece of
+/// the truth, rather than maintained as a fourth copy that could disagree with
+/// them (AD-S3).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProblemReport {
+    /// Sticky warning from the live status snapshot.
+    pub warning: Option<String>,
+    /// Terminal error from the live status snapshot.
+    pub error: Option<String>,
+    /// Stopped work, which [`db::pending_count`] deliberately excludes and
+    /// which therefore has no other surface at all.
+    pub parked: Vec<ParkedUnit>,
+    /// Conflict copies still sitting in the working tree, repository-relative.
+    pub conflicts: Vec<String>,
 }
 
 /// Units claimed from the journal per profile per tick.
@@ -115,6 +197,16 @@ pub struct Engine {
     sinks: Mutex<Vec<(u64, ProgressSink)>>,
     next_sink: AtomicU64,
     interrupt: Arc<AtomicBool>,
+    /// Bytes moved over the network per profile, monotonic for the life of the
+    /// process.
+    ///
+    /// A running total rather than a per-operation one because the work that
+    /// moves bytes is reached through call paths that share no return value: a
+    /// fetch inside [`Engine::do_pull`], an LFS unit drained from the journal
+    /// by [`Engine::drain_journal`] long after its enqueuer returned.
+    /// [`Engine::sync_once`] reads this before and after its run and reports
+    /// the difference, which is exactly "what this run moved".
+    transferred: Mutex<HashMap<String, u64>>,
 }
 
 impl Engine {
@@ -166,6 +258,7 @@ impl Engine {
             sinks: Mutex::new(Vec::new()),
             next_sink: AtomicU64::new(1),
             interrupt: Arc::new(AtomicBool::new(false)),
+            transferred: Mutex::new(HashMap::new()),
         };
         engine.seed_status()?;
         Ok(engine)
@@ -614,7 +707,9 @@ impl Engine {
 
     async fn execute(&self, profile: &SyncProfile, kind: &WorkKind) -> Result<()> {
         match kind {
-            WorkKind::Pull => self.do_pull(profile).await,
+            // The conflict copies are already recorded and warned about;
+            // a journaled pull has no caller to hand them back to.
+            WorkKind::Pull => self.do_pull(profile).await.map(drop),
             WorkKind::Push => self.do_push(profile).await,
             WorkKind::LfsDownload { oid, size } => self.do_lfs(profile, oid, *size, false).await,
             WorkKind::LfsUpload { oid, size } => self.do_lfs(profile, oid, *size, true).await,
@@ -782,9 +877,16 @@ impl Engine {
         }))
     }
 
-    async fn do_pull(&self, profile: &SyncProfile) -> Result<()> {
+    /// Fetch and apply, returning the conflict copies the apply had to write.
+    ///
+    /// The paths are repository-relative and are the *copies*, never the
+    /// canonical files. They are returned rather than only counted because
+    /// they are the one thing a merge leaves behind that the user has to act
+    /// on, and the working tree stops naming them as soon as they are
+    /// committed.
+    async fn do_pull(&self, profile: &SyncProfile) -> Result<Vec<String>> {
         if !profile.direction.pulls() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // The very first sync of a profile has no working tree yet, so the
         // repository has to be materialized before anything can fetch into it.
@@ -807,24 +909,60 @@ impl Engine {
         let removable = profile.removable;
         let branch = profile.branch.clone();
 
-        let outcome = tokio::task::spawn_blocking(move || -> Result<git::fetch::FetchOutcome> {
+        // gitoxide's progress tree is the only place a fetch's volume is
+        // observable, and it is throttled to one call per 100 ms per node
+        // (`git::fetch::REPORT_INTERVAL_MS`). The callback has to be `'static`
+        // to cross into `spawn_blocking`, so it cannot borrow the engine to
+        // publish for itself; a channel carries the numbers back out. Before
+        // this the callback was a no-op, which is why the bar never moved.
+        let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+        let fetching = tokio::task::spawn_blocking(move || -> Result<git::fetch::FetchOutcome> {
             let repo = git::repo::open(&repo_path, removable)?;
             let options = git::fetch::FetchOptions {
                 shallow: None,
                 refspecs: vec![format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")],
             };
-            let noop: git::fetch::TransferProgress = Arc::new(|_, _| {});
+            let report: git::fetch::TransferProgress = Arc::new(move |done, total| {
+                // A closed receiver means the publisher gave up first; the
+                // fetch is journaled work and carries on regardless.
+                let _ = report_tx.send((done, total));
+            });
             git::fetch::fetch(
                 &repo,
                 "origin",
                 &options,
                 credential.as_ref(),
-                &noop,
+                &report,
                 &interrupt,
             )
-        })
-        .await
-        .map_err(|err| SyncError::Journal(format!("fetch task failed: {err}")))??;
+        });
+
+        // Every node of the tree keeps its OWN counter, so the reported figures
+        // are not cumulative across phases. The live bar tracks whichever phase
+        // is running — that is `git::fetch`'s documented design — while the
+        // high-water mark is the honest answer to "how much did this move".
+        let mut fetched = 0u64;
+        let outcome = self
+            .publish_while(
+                &profile,
+                SyncPhase::Fetching,
+                report_rx,
+                |event, (done, total)| {
+                    fetched = fetched.max(done);
+                    event.bytes_done = done;
+                    event.bytes_total = (total > 0).then_some(total);
+                },
+                fetching,
+            )
+            .await
+            .map_err(|err| SyncError::Journal(format!("fetch task failed: {err}")))??;
+
+        // Only a pack is transferred content. Without a pack the counters
+        // observed above are negotiation and ref-advertisement bookkeeping, and
+        // charging those as bytes moved would report traffic for a no-op fetch.
+        if outcome.received_pack {
+            self.add_transferred(&profile.id, fetched);
+        }
 
         // Whether a pack arrived says nothing about whether the working tree is
         // up to date: a re-fetch after an interrupted run transfers nothing and
@@ -832,10 +970,10 @@ impl Engine {
         // is that the two refs differ.
         let Some(remote_id) = outcome.remote_id else {
             // The remote has no such branch yet — a brand-new repository.
-            return Ok(());
+            return Ok(Vec::new());
         };
         if outcome.local_id == Some(remote_id) {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // A fetch only moves `refs/remotes/origin/<branch>`; without an apply
@@ -863,16 +1001,19 @@ impl Engine {
             if ahead {
                 // Nothing to apply — we hold every commit the remote has, plus
                 // our own. The push leg publishes them.
-                return Ok(());
+                return Ok(Vec::new());
             }
         }
 
         if outcome.fast_forward {
             let reference = tracking.clone();
             let path = repo_path.clone();
-            return tokio::task::spawn_blocking(move || git.merge_ff_only(&path, &reference))
+            tokio::task::spawn_blocking(move || git.merge_ff_only(&path, &reference))
                 .await
-                .map_err(|err| SyncError::Journal(format!("merge task failed: {err}")))?;
+                .map_err(|err| SyncError::Journal(format!("merge task failed: {err}")))??;
+            // A fast-forward takes the remote's history wholesale: nothing was
+            // contested, so nothing was copied aside.
+            return Ok(Vec::new());
         }
 
         // Diverged. A one-way lane stops here because a human deciding is the
@@ -925,8 +1066,17 @@ impl Engine {
                     conflicts.len()
                 ),
             );
+            // Until now the warning counted the copies and nothing named them,
+            // so the one artifact the user has to deal with was unfindable
+            // once the notification was dismissed.
+            let rows: Vec<(ActivityKind, String)> = conflicts
+                .iter()
+                .map(|path| (ActivityKind::Conflict, path.clone()))
+                .collect();
+            let now = self.platform.now_ms();
+            self.with_db(|conn| db::record_activity(conn, &profile.id, now, &rows))?;
         }
-        Ok(())
+        Ok(conflicts)
     }
 
     /// Converge a diverged branch without asking anyone (AD-43).
@@ -1006,9 +1156,22 @@ impl Engine {
         if staged.is_empty() {
             return Ok(0);
         }
-        self.publish(self.progress(profile, SyncPhase::Committing));
         let count = staged.len() as u64;
+        // The staged set is the one place in the engine where a file count is
+        // known before the work happens, which makes it the only place
+        // `fraction()` can mean anything for the commit and push legs.
+        let mut event = self.progress(profile, SyncPhase::Committing);
+        event.files_total = Some(count);
+        event.current = Self::first_staged(&staged);
+        self.publish(event);
         self.commit(profile, &staged)?;
+        // The commit is durable, so every staged path landed. Reporting it
+        // leaves the bar full rather than stranded mid-way when the phase
+        // changes underneath it.
+        let mut event = self.progress(profile, SyncPhase::Committing);
+        event.files_total = Some(count);
+        event.files_done = count;
+        self.publish(event);
         Ok(count)
     }
 
@@ -1016,7 +1179,7 @@ impl Engine {
         if !profile.direction.pushes() {
             return Ok(());
         }
-        self.commit_local(profile)?;
+        let count = self.commit_local(profile)?;
 
         // A folder whose files are all still inside the settle window has no
         // commits yet, and neither does a fresh profile on an empty remote.
@@ -1033,7 +1196,13 @@ impl Engine {
         }
         drop(repo);
 
-        self.publish(self.progress(profile, SyncPhase::Pushing));
+        // A push with nothing freshly committed is republishing commits whose
+        // file count is not known without diffing the remote, and spending a
+        // git invocation on a denominator is not worth it: `None` renders an
+        // indeterminate meter, which is the truth.
+        let mut event = self.progress(profile, SyncPhase::Pushing);
+        event.files_total = (count > 0).then_some(count);
+        self.publish(event);
 
         let git = self.git.clone();
         let repo_path = profile.local_path.clone();
@@ -1045,6 +1214,13 @@ impl Engine {
         tokio::task::spawn_blocking(move || git.push(&repo_path, "origin", &refspec))
             .await
             .map_err(|err| SyncError::Journal(format!("push task failed: {err}")))??;
+
+        if count > 0 {
+            let mut event = self.progress(profile, SyncPhase::Pushing);
+            event.files_total = Some(count);
+            event.files_done = count;
+            self.publish(event);
+        }
 
         if profile.lane == SyncLane::Worktree {
             // The branch is on the remote now, which is the durable artifact.
@@ -1293,6 +1469,16 @@ impl Engine {
             "committed"
         );
 
+        // The commit is proven to exist, so this is the first moment an
+        // activity row can honestly claim it. Recording in `commit_local`
+        // instead would also cover the `stage_and_commit` → `None` case, where
+        // every staged path turned out byte-identical to `HEAD` and nothing
+        // was committed at all.
+        //
+        // `staged` is the local, `.gitattributes`-augmented copy on purpose:
+        // it is exactly the set of paths this commit changed.
+        self.record_commit_activity(profile, &staged)?;
+
         // Only now, with the pointer durably committed, is an upload worth
         // journaling: a crash before this point loses nothing, and a crash
         // after it re-drives the transfer.
@@ -1305,6 +1491,37 @@ impl Engine {
             self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now).map(drop))?;
         }
         Ok(())
+    }
+
+    /// Write the recently-synced entries one commit produced (Story 32.1).
+    ///
+    /// The commit path is the only place that knows *which* paths moved:
+    /// `commit_local` reduces the whole `StagedChange` to a count, and by the
+    /// time the push leg runs the working tree is clean again and the
+    /// information is gone. Recording here is what turns "3 files synced" into
+    /// a list a user can actually recognise their work in.
+    ///
+    /// Only ever called once a commit object exists.
+    fn record_commit_activity(
+        &self,
+        profile: &SyncProfile,
+        staged: &git::commit::StagedChange,
+    ) -> Result<()> {
+        let mut rows: Vec<(ActivityKind, String)> = Vec::with_capacity(staged.len());
+        let buckets = [
+            (ActivityKind::Added, &staged.added),
+            (ActivityKind::Modified, &staged.modified),
+            (ActivityKind::Deleted, &staged.deleted),
+        ];
+        for (kind, paths) in buckets {
+            for path in paths {
+                // Repository-relative already — `StagedChange` holds nothing
+                // else — so this never leaks a home directory into the UI.
+                rows.push((kind, path.to_string_lossy().into_owned()));
+            }
+        }
+        let now = self.platform.now_ms();
+        self.with_db(|conn| db::record_activity(conn, &profile.id, now, &rows))
     }
 
     async fn do_lfs(
@@ -1350,16 +1567,47 @@ impl Engine {
 
         let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
         store.ensure_layout()?;
-        let transfer = Arc::new(lfs::basic::BasicTransfer::new(
-            self.http.clone(),
-            store.clone(),
-        ));
+        // Without a sink `Reporter::emit` returns immediately and every byte
+        // counter for the largest files in the profile stays at zero. The sink
+        // must be `'static` — it is cloned into the `JoinSet` that runs up to
+        // `DEFAULT_CONCURRENT_TRANSFERS` objects — so it hands events back over
+        // a channel rather than touching the engine directly.
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let transfer = Arc::new(
+            lfs::basic::BasicTransfer::new(self.http.clone(), store.clone()).with_sink(Box::new(
+                move |event| {
+                    // `false` detaches the reporter for good, so this says
+                    // "stop" only once the receiver is genuinely gone.
+                    event_tx.send(event).is_ok()
+                },
+            )),
+        );
 
-        let results = if upload {
-            Arc::clone(&transfer).upload_all(specs, auth).await
-        } else {
-            Arc::clone(&transfer).download_all(specs, auth).await
+        let mut tally = TransferTally::default();
+        let transferring = async {
+            if upload {
+                Arc::clone(&transfer).upload_all(specs, auth).await
+            } else {
+                Arc::clone(&transfer).download_all(specs, auth).await
+            }
         };
+        let results = self
+            .publish_while(
+                profile,
+                SyncPhase::TransferringLfs,
+                event_rx,
+                |event, transfer_event| {
+                    tally.fold(&transfer_event);
+                    tally.apply(event);
+                },
+                transferring,
+            )
+            .await;
+
+        // Recorded before the failure check: bytes that crossed the wire before
+        // an object failed still crossed it, and a resumed retry will not send
+        // them again.
+        self.add_transferred(&profile.id, tally.bytes_done());
         for (oid, result) in results {
             if let Err(err) = result {
                 tracing::warn!(oid, error = %err, "lfs transfer failed");
@@ -1555,6 +1803,9 @@ impl Engine {
             source = source.as_str(),
             "sync requested"
         );
+        // Read before any work: `bytes` is what THIS run moved, and the counter
+        // it is read from is process-lifetime cumulative.
+        let transferred_before = self.transferred_bytes(&profile.id);
         let mut outcome = SyncOutcome::default();
 
         // Order is load-bearing: commit, then pull, then push.
@@ -1571,7 +1822,7 @@ impl Engine {
         }
 
         if profile.direction.pulls() {
-            self.do_pull(&profile).await?;
+            outcome.conflicts = self.do_pull(&profile).await?;
             outcome.pulled = true;
             // Whatever the apply checked out may include pointers. Materialize
             // what is already local and queue the rest, BEFORE the push leg —
@@ -1590,6 +1841,9 @@ impl Engine {
         // have, so the queue is drained before this call is allowed to claim
         // success.
         self.drain_journal(&profile).await?;
+        outcome.bytes = self
+            .transferred_bytes(&profile.id)
+            .saturating_sub(transferred_before);
 
         self.set_state(&profile.id, ProfileState::Watching);
         self.publish(self.progress(&profile, SyncPhase::Idle));
@@ -1661,6 +1915,175 @@ impl Engine {
         Ok(report)
     }
 
+    // -----------------------------------------------------------------------
+    // Visibility (Stories 32.1, 32.2)
+    //
+    // Three questions a user asks about a folder that syncs itself: what has
+    // it just done, what is it about to do, and what has gone wrong. Only the
+    // first is stored — the other two are derived on demand from the state
+    // that already decides the engine's behaviour, so a visible answer can
+    // never drift from the real one (AD-S3).
+    // -----------------------------------------------------------------------
+
+    /// The most recent files this profile synced, newest first (Story 32.1).
+    pub async fn activity(&self, profile_id: &str, limit: usize) -> Result<Vec<ActivityRow>> {
+        self.with_db(|conn| db::list_activity(conn, profile_id, limit))
+    }
+
+    /// Everything this profile has not synced yet, and why (Story 32.2).
+    ///
+    /// Computed, never stored. A stored pending list would be a second answer
+    /// to a question git and the completeness gate already answer, and the two
+    /// would disagree the moment a file changed while the app was closed.
+    ///
+    /// The two sources overlap on purpose: a path can be dirty *and* still
+    /// inside its settle window, and [`PendingReason::Settling`] wins there
+    /// because it is the reason the file is not moving. Saying "modified"
+    /// about a file the engine is deliberately holding would make the user
+    /// think sync was broken.
+    pub async fn pending(&self, profile_id: &str) -> Result<Vec<PendingFile>> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
+            return Err(SyncError::Config(format!(
+                "no such sync profile: {profile_id}"
+            )));
+        };
+
+        // Settling paths are absolute in `file_state` (that is what the gate
+        // samples), and everything the user sees must be repository-relative.
+        let settling = self.with_db(|conn| db::load_file_state(conn, profile_id))?;
+        let mut out: Vec<PendingFile> = Vec::with_capacity(settling.len());
+        let mut named: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(settling.len());
+        for (path, entry) in settling {
+            let relative = path
+                .strip_prefix(&profile.local_path)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            if named.insert(relative.clone()) {
+                out.push(PendingFile {
+                    path: relative,
+                    reason: PendingReason::Settling {
+                        since_ms: entry.pending_since_ms,
+                    },
+                });
+            }
+        }
+
+        // A folder that is not a repository yet has nothing git can classify,
+        // and materializing one is a clone — far too much for a poll. The
+        // first sync adopts it and the next call is complete.
+        if profile.local_path.join(".git").exists() {
+            let repo_path = profile.local_path.clone();
+            let removable = profile.removable;
+            // The status walk and the untracked expansion are both blocking
+            // filesystem work on a tree that may hold a hundred thousand
+            // files; running them on the async runtime would stall every other
+            // profile while a UI poll finished.
+            let (status, untracked) = tokio::task::spawn_blocking(
+                move || -> Result<(git::repo::RepoStatus, Vec<PathBuf>)> {
+                    let repo = git::repo::open(&repo_path, removable)?;
+                    let status = git::repo::status_paths(&repo)?;
+                    // gitoxide collapses a brand-new folder into one entry
+                    // naming the directory; listing that would tell the user
+                    // "sub/" is waiting instead of the files they created.
+                    let untracked = Self::expand_untracked(&repo_path, &status.untracked)?;
+                    Ok((status, untracked))
+                },
+            )
+            .await
+            .map_err(|err| SyncError::Journal(format!("pending scan task failed: {err}")))??;
+
+            let buckets: [(&Vec<PathBuf>, PendingReason); 4] = [
+                (&status.added, PendingReason::Added),
+                (&status.modified, PendingReason::Modified),
+                (&status.deleted, PendingReason::Deleted),
+                (&untracked, PendingReason::Untracked),
+            ];
+            for (paths, reason) in buckets {
+                for rela in paths {
+                    let relative = rela.to_string_lossy().into_owned();
+                    // Already named as settling, or reported by two status
+                    // buckets at once (staged as added, then edited again).
+                    if named.insert(relative.clone()) {
+                        out.push(PendingFile {
+                            path: relative,
+                            reason: reason.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    /// Everything currently wrong with this profile (Story 32.2).
+    pub async fn problems(&self, profile_id: &str) -> Result<ProblemReport> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
+            return Err(SyncError::Config(format!(
+                "no such sync profile: {profile_id}"
+            )));
+        };
+        let snapshot = Self::lock(&self.status).get(profile_id).cloned();
+
+        let parked = self
+            .with_db(|conn| db::list_parked(conn, profile_id))?
+            .into_iter()
+            .map(|row| ParkedUnit {
+                id: row.id,
+                kind: row.kind,
+                attempts: row.attempts,
+                last_error: row.last_error,
+            })
+            .collect();
+
+        // A conflict copy the user has already dealt with — merged by hand and
+        // deleted, or simply thrown away — is resolved, and keeping it on a
+        // problems list would make the list impossible to ever clear. The file
+        // still being on disk IS the open-problem condition.
+        let recent = self.with_db(|conn| db::list_activity(conn, profile_id, db::ACTIVITY_CAP))?;
+        let root = profile.local_path.clone();
+        let conflicts = tokio::task::spawn_blocking(move || {
+            recent
+                .into_iter()
+                .filter(|row| row.kind == ActivityKind::Conflict)
+                .filter(|row| root.join(&row.path).exists())
+                .map(|row| row.path)
+                .collect::<Vec<String>>()
+        })
+        .await
+        .map_err(|err| SyncError::Journal(format!("conflict scan task failed: {err}")))?;
+
+        Ok(ProblemReport {
+            warning: snapshot.as_ref().and_then(|s| s.warning.clone()),
+            error: snapshot.and_then(|s| s.error),
+            parked,
+            conflicts,
+        })
+    }
+
+    /// Put one parked unit back in the queue (Story 32.2).
+    ///
+    /// Scoped to the profile that owns it, so a caller holding one profile's
+    /// id can never re-drive another's work. Refusing loudly rather than
+    /// silently succeeding matters: a UI that showed "retrying" for a unit
+    /// nothing was done to would be lying.
+    pub async fn retry_parked(&self, profile_id: &str, unit_id: i64) -> Result<()> {
+        let moved = self.with_db(|conn| db::unpark(conn, profile_id, unit_id))?;
+        if !moved {
+            return Err(SyncError::Config(format!(
+                "work item {unit_id} is not parked work belonging to {profile_id}"
+            )));
+        }
+        // The unit is claimable again, so the profile is no longer stopped on
+        // it — reflect that in the count the tray polls rather than waiting for
+        // the next tick to notice.
+        self.refresh_pending(profile_id);
+        Ok(())
+    }
+
     /// Does the local branch hold commits the remote-tracking ref does not?
     ///
     /// Answered from the local clone alone — no network — so it is safe to ask
@@ -1710,6 +2133,97 @@ impl Engine {
         }
         self.refresh_pending(&profile.id);
         Ok(())
+    }
+
+    /// The first staged path, for the progress detail line.
+    ///
+    /// Repository-relative by construction: `StagedChange` holds nothing else,
+    /// and an absolute path here would leak home directory names into logs and
+    /// screenshots.
+    fn first_staged(staged: &git::commit::StagedChange) -> Option<String> {
+        staged
+            .added
+            .iter()
+            .chain(staged.modified.iter())
+            .chain(staged.deleted.iter())
+            .next()
+            .map(|path| path.to_string_lossy().into_owned())
+    }
+
+    /// Add to a profile's cumulative transferred-byte counter.
+    fn add_transferred(&self, profile_id: &str, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let mut totals = Self::lock(&self.transferred);
+        let total = totals.entry(profile_id.to_owned()).or_insert(0);
+        *total = total.saturating_add(bytes);
+    }
+
+    fn transferred_bytes(&self, profile_id: &str) -> u64 {
+        Self::lock(&self.transferred)
+            .get(profile_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Publish `phase` progress from `events` while `work` runs, then return
+    /// its result.
+    ///
+    /// Both producers that can actually measure transfer volume — gitoxide's
+    /// progress tree and the LFS transfer sink — live behind a `'static`
+    /// boundary (`spawn_blocking`, and a `JoinSet` inside `BasicTransfer`), so
+    /// neither can borrow the engine to publish for itself. A channel is the
+    /// cheapest bridge that does not force `Engine` into an `Arc`.
+    ///
+    /// Everything already queued is drained before a single snapshot goes out.
+    /// Each producer is throttled at source (100 ms per node in `git::fetch`,
+    /// `DEFAULT_PROGRESS_INTERVAL` per object in `lfs::basic`), but eight
+    /// concurrent objects still tick independently against a tray that
+    /// repaints at ~1 Hz; draining first turns that burst into one publish
+    /// instead of eight.
+    async fn publish_while<T, E, F>(
+        &self,
+        profile: &SyncProfile,
+        phase: SyncPhase,
+        mut events: tokio::sync::mpsc::UnboundedReceiver<E>,
+        mut fold: impl FnMut(&mut SyncProgress, E),
+        work: F,
+    ) -> T
+    where
+        F: Future<Output = T>,
+    {
+        let mut event = self.progress(profile, phase);
+        tokio::pin!(work);
+        loop {
+            tokio::select! {
+                outcome = &mut work => {
+                    // The terminal events — the `Completed` that retires an
+                    // object's last bytes — are still queued when the work
+                    // future resolves, because the producer emits them on its
+                    // way out. Returning without them leaves the final frame
+                    // reporting less than actually transferred.
+                    let mut trailing = false;
+                    while let Ok(next) = events.try_recv() {
+                        fold(&mut event, next);
+                        trailing = true;
+                    }
+                    if trailing {
+                        self.publish(event);
+                    }
+                    return outcome;
+                }
+                // A `None` from the channel disables this branch rather than
+                // spinning: the producer finished, and `work` is still pending.
+                Some(first) = events.recv() => {
+                    fold(&mut event, first);
+                    while let Ok(next) = events.try_recv() {
+                        fold(&mut event, next);
+                    }
+                    self.publish(event.clone());
+                }
+            }
+        }
     }
 
     fn progress(&self, profile: &SyncProfile, phase: SyncPhase) -> SyncProgress {
@@ -2260,6 +2774,668 @@ mod tests {
             claimed.len(),
             1,
             "work interrupted by a restart must come back"
+        );
+    }
+
+    /// A profile whose folder exists and can be adopted in place, so the
+    /// commit path runs for real against a local repository with no remote
+    /// reachable — adoption is `git init` plus a remote config, never network.
+    fn adoptable(dir: &Path) -> SyncProfile {
+        let p = profile(dir);
+        std::fs::create_dir_all(&p.local_path).expect("work dir");
+        p
+    }
+
+    /// Drive the commit path to the point where the gate lets a file through.
+    ///
+    /// The gate needs two identical observations a settle window apart, so one
+    /// pass only opens the episode. Returns how many paths the commit carried.
+    fn commit_after_settling(engine: &Engine, platform: &TestPlatform, p: &SyncProfile) -> u64 {
+        engine
+            .commit_local(p)
+            .expect("first pass opens the episode");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        engine.commit_local(p).expect("second pass commits")
+    }
+
+    #[tokio::test]
+    async fn a_commit_records_exactly_the_paths_it_carried() {
+        // `commit_local` reduces a whole `StagedChange` to a count and the
+        // working tree goes clean immediately afterwards, so this is the only
+        // moment the individual paths still exist anywhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("a.txt"), b"one").expect("write");
+        std::fs::write(p.local_path.join("b.txt"), b"two").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        engine.commit_local(&p).expect("first pass");
+        assert!(
+            engine
+                .activity(&p.id, 10)
+                .await
+                .expect("activity")
+                .is_empty(),
+            "nothing may be recorded before a commit exists"
+        );
+
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(engine.commit_local(&p).expect("commit"), 2);
+
+        let rows = engine.activity(&p.id, 10).await.expect("activity");
+        let mut seen: Vec<(ActivityKind, String)> =
+            rows.iter().map(|r| (r.kind, r.path.clone())).collect();
+        seen.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            seen,
+            vec![
+                (ActivityKind::Added, "a.txt".to_owned()),
+                (ActivityKind::Added, "b.txt".to_owned()),
+            ],
+            "exactly the committed paths, repository-relative, as additions"
+        );
+        assert!(
+            rows.iter().all(|r| r.ts_ms == platform.now_ms()),
+            "the timestamp comes from the platform clock, not the wall clock"
+        );
+
+        // A second round: one path edited, one removed. Both must be reported
+        // as what they were, not as another addition.
+        //
+        // They land in two commits, not one: a deletion has no file left to
+        // sample, so the gate does not apply to it and it goes out at once,
+        // while the edit has to serve a fresh settle window.
+        std::fs::write(p.local_path.join("a.txt"), b"one edited").expect("edit");
+        std::fs::remove_file(p.local_path.join("b.txt")).expect("remove");
+        assert_eq!(engine.commit_local(&p).expect("removal"), 1);
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(engine.commit_local(&p).expect("edit"), 1);
+
+        let rows = engine.activity(&p.id, 10).await.expect("activity");
+        let mut latest: Vec<(ActivityKind, String)> = rows
+            .iter()
+            .take(2)
+            .map(|r| (r.kind, r.path.clone()))
+            .collect();
+        latest.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            latest,
+            vec![
+                (ActivityKind::Modified, "a.txt".to_owned()),
+                (ActivityKind::Deleted, "b.txt".to_owned()),
+            ],
+            "newest first, and each path carries the kind that actually happened"
+        );
+        assert_eq!(rows.len(), 4, "earlier entries are kept, not replaced");
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_turned_out_empty_records_nothing() {
+        // `stage_and_commit` returns `None` when every staged path is
+        // byte-identical to `HEAD`. An activity row there would claim a commit
+        // that does not exist.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("a.txt"), b"one").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        let before = engine.activity(&p.id, 10).await.expect("activity").len();
+
+        // Rewrite the identical bytes: the scan sees a changed stat, the commit
+        // machinery sees no change at all.
+        std::fs::write(p.local_path.join("a.txt"), b"one").expect("rewrite");
+        commit_after_settling(&engine, &platform, &p);
+
+        assert_eq!(
+            engine.activity(&p.id, 10).await.expect("activity").len(),
+            before,
+            "no commit, no activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_inside_its_settle_window_is_pending_as_settling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("held.txt"), b"still writing").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        // One pass opens the quiescence episode and persists it to `file_state`.
+        let opened_at = platform.now_ms();
+        engine.commit_local(&p).expect("scan");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        assert_eq!(
+            pending,
+            vec![PendingFile {
+                path: "held.txt".to_owned(),
+                reason: PendingReason::Settling {
+                    since_ms: opened_at
+                },
+            }],
+            "a held file reports why it is held and since when — not `untracked`, \
+             which would read as sync being broken"
+        );
+
+        // Once it settles and lands, it is not pending at all any more.
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(engine.commit_local(&p).expect("commit"), 1);
+        assert!(engine.pending(&p.id).await.expect("pending").is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_names_the_files_in_a_new_folder_not_the_folder() {
+        // gitoxide collapses untracked content into one entry naming the
+        // directory; listing that would tell the user "sub" is waiting.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::create_dir_all(p.local_path.join("sub/deeper")).expect("mkdir");
+        std::fs::write(p.local_path.join("sub/deeper/x.txt"), b"x").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        engine.ensure_repo(&p).expect("adopt");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        assert_eq!(
+            pending,
+            vec![PendingFile {
+                path: "sub/deeper/x.txt".to_owned(),
+                reason: PendingReason::Untracked,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_refuses_an_unknown_profile_rather_than_answering_nothing() {
+        // "No such profile" and "nothing pending" are very different answers.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        assert!(engine.pending("nope").await.is_err());
+        assert!(engine.problems("nope").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_conflict_copy_is_a_problem_only_while_it_is_still_on_disk() {
+        // A copy the user already merged by hand and deleted is resolved, and
+        // a problems list that could never be cleared is a list people learn
+        // to ignore.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        // Exactly what `do_pull` writes when the apply has to preserve a local
+        // revision beside the remote's.
+        let copy = "notes.sync-conflict-20250725-120000-test-host.md";
+        std::fs::write(p.local_path.join(copy), b"my revision").expect("write copy");
+        engine
+            .with_db(|conn| {
+                db::record_activity(
+                    conn,
+                    &p.id,
+                    platform.now_ms(),
+                    &[(ActivityKind::Conflict, copy.to_owned())],
+                )
+            })
+            .expect("record");
+
+        let report = engine.problems(&p.id).await.expect("problems");
+        assert_eq!(report.conflicts, vec![copy.to_owned()]);
+
+        std::fs::remove_file(p.local_path.join(copy)).expect("resolve it");
+        let report = engine.problems(&p.id).await.expect("problems");
+        assert!(
+            report.conflicts.is_empty(),
+            "a conflict copy the user dealt with is not a problem any more"
+        );
+        // The history of it happening survives; only the open problem clears.
+        let rows = engine.activity(&p.id, 10).await.expect("activity");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ActivityKind::Conflict);
+    }
+
+    #[tokio::test]
+    async fn problems_surfaces_parked_work_that_the_pending_count_hides() {
+        // Parked units are deliberately excluded from `pending_count`, so
+        // without this they have no surface at all: the profile looks idle
+        // while its work sits stopped forever.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let id = engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &WorkKind::Push, 0, 0))
+            .expect("enqueue");
+        engine
+            .reschedule_after(
+                &p,
+                id,
+                1,
+                &SyncError::Auth {
+                    host: "git.invalid".to_owned(),
+                },
+            )
+            .expect("park");
+
+        assert_eq!(engine.status(&p.id).expect("status").pending, 0);
+        let report = engine.problems(&p.id).await.expect("problems");
+        assert_eq!(report.parked.len(), 1);
+        assert_eq!(report.parked[0].id, id);
+        assert_eq!(report.parked[0].kind, "push");
+        assert!(
+            report.parked[0]
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("git.invalid")),
+            "a parked unit must say why it stopped, got: {:?}",
+            report.parked[0].last_error
+        );
+        assert_eq!(report.error, engine.status(&p.id).expect("status").error);
+    }
+
+    #[tokio::test]
+    async fn retrying_parked_work_requeues_it_and_never_crosses_profiles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let id = engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &WorkKind::Push, 0, 0))
+            .expect("enqueue");
+        engine
+            .with_db(|conn| db::claim_ready(conn, &p.id, 0, 10))
+            .expect("claim");
+        engine
+            .with_db(|conn| db::reschedule(conn, id, WorkState::Parked, i64::MAX, Some("no auth")))
+            .expect("park");
+
+        // Holding another profile's id must never be enough to re-drive this.
+        assert!(
+            engine.retry_parked("01JOTHERPROFILE", id).await.is_err(),
+            "one profile must never retry another's work"
+        );
+        assert_eq!(
+            engine.problems(&p.id).await.expect("problems").parked.len(),
+            1,
+            "the refused retry must not have moved anything"
+        );
+
+        engine.retry_parked(&p.id, id).await.expect("retry");
+        assert!(engine
+            .problems(&p.id)
+            .await
+            .expect("problems")
+            .parked
+            .is_empty());
+        let claimed = engine
+            .with_db(|conn| db::claim_ready(conn, &p.id, 0, 10))
+            .expect("claim");
+        assert_eq!(
+            claimed.len(),
+            1,
+            "`not_before_ms` is cleared, so the retry is ready now rather than \
+             at the parked unit's old deadline"
+        );
+        assert_eq!(engine.status(&p.id).expect("status").pending, 1);
+
+        // A unit that is not parked is refused loudly: a UI that showed
+        // "retrying" for a unit nothing happened to would be lying.
+        assert!(engine.retry_parked(&p.id, id).await.is_err());
+    }
+
+    #[test]
+    fn the_visibility_types_cross_the_ipc_boundary_as_camel_case() {
+        // These are rendered directly by the webview, so the field spelling is
+        // a contract, not an implementation detail. `PendingReason` is
+        // internally tagged so it arrives as a discriminated union rather than
+        // as `reason.reason`.
+        let pending = PendingFile {
+            path: "notes/a.md".to_owned(),
+            reason: PendingReason::Settling { since_ms: 42 },
+        };
+        assert_eq!(
+            serde_json::to_string(&pending).expect("serialize"),
+            r#"{"path":"notes/a.md","reason":{"kind":"settling","sinceMs":42}}"#
+        );
+
+        let report = ProblemReport {
+            warning: None,
+            error: Some("boom".to_owned()),
+            parked: vec![ParkedUnit {
+                id: 7,
+                kind: "lfsUpload".to_owned(),
+                attempts: 3,
+                last_error: Some("401".to_owned()),
+            }],
+            conflicts: vec!["a.sync-conflict-x.md".to_owned()],
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(json.contains(r#""lastError":"401""#), "got: {json}");
+        assert!(json.contains(r#""attempts":3"#), "got: {json}");
+
+        let row = ActivityRow {
+            ts_ms: 1,
+            kind: ActivityKind::Conflict,
+            path: "a.md".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_string(&row).expect("serialize"),
+            r#"{"tsMs":1,"kind":"conflict","path":"a.md"}"#
+        );
+    }
+
+    /// Everything published while `body` runs, in order.
+    fn recording(engine: &Engine) -> Arc<Mutex<Vec<SyncProgress>>> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+        log
+    }
+
+    #[tokio::test]
+    async fn a_transfer_sink_turns_events_into_a_rising_byte_count() {
+        // Before this the sink was never installed, so `Reporter::emit`
+        // returned immediately and every byte counter the tray reads stayed at
+        // zero for the whole of the largest transfers in the product.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let published = recording(&engine);
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Byte-for-byte the sink `do_lfs` installs on `BasicTransfer`.
+        let sink: lfs::basic::TransferSink = Box::new(move |event| event_tx.send(event).is_ok());
+        let script = vec![
+            lfs::basic::TransferEvent::Started {
+                oid: "a".to_owned(),
+                size: 1_000,
+            },
+            lfs::basic::TransferEvent::Started {
+                oid: "b".to_owned(),
+                size: 3_000,
+            },
+            lfs::basic::TransferEvent::Progress {
+                oid: "a".to_owned(),
+                bytes_done: 400,
+            },
+            lfs::basic::TransferEvent::Progress {
+                oid: "b".to_owned(),
+                bytes_done: 1_500,
+            },
+            lfs::basic::TransferEvent::Progress {
+                oid: "a".to_owned(),
+                bytes_done: 900,
+            },
+            lfs::basic::TransferEvent::Completed {
+                oid: "a".to_owned(),
+            },
+            // b dies part-way: its 1500 bytes really moved and its 3000 was
+            // really queued, so neither figure may be rewritten.
+            lfs::basic::TransferEvent::Failed {
+                oid: "b".to_owned(),
+                code: "network",
+                error: "connection reset".to_owned(),
+            },
+        ];
+
+        let mut tally = TransferTally::default();
+        let transferring = async {
+            for event in script {
+                assert!(sink(event), "the receiver is alive for the whole run");
+                // Let the publisher observe each event separately; a real
+                // transfer arrives over milliseconds, not in one poll.
+                tokio::task::yield_now().await;
+            }
+        };
+        engine
+            .publish_while(
+                &p,
+                SyncPhase::TransferringLfs,
+                event_rx,
+                |event, transfer_event| {
+                    tally.fold(&transfer_event);
+                    tally.apply(event);
+                },
+                transferring,
+            )
+            .await;
+
+        let published = Engine::lock(&published).clone();
+        assert!(
+            !published.is_empty(),
+            "the sink must have produced at least one progress event"
+        );
+        // The denominator GROWS: `download_all` announces objects as it starts
+        // them, so a bar drawn from the first frame must survive the second one
+        // widening it. What must never happen is either figure shrinking.
+        let mut previous_done = 0;
+        let mut previous_total = 0;
+        for event in &published {
+            assert_eq!(event.phase, SyncPhase::TransferringLfs);
+            let total = event
+                .bytes_total
+                .expect("a started object gives the bar a denominator");
+            assert!(
+                total >= previous_total,
+                "the denominator shrank: {previous_total} -> {total}"
+            );
+            assert!(
+                event.bytes_done >= previous_done,
+                "the byte count walked backwards: {previous_done} -> {}",
+                event.bytes_done
+            );
+            assert!(
+                event.bytes_done <= total,
+                "{} of {total} is not a fraction",
+                event.bytes_done
+            );
+            assert!(
+                event.fraction().is_some(),
+                "a known total must make the bar determinate"
+            );
+            previous_done = event.bytes_done;
+            previous_total = total;
+        }
+        assert!(
+            published.iter().any(|event| event.bytes_done > 0),
+            "a run that moved bytes must publish at least one non-zero frame"
+        );
+
+        // 1000 for the object that completed, 1500 for the one that failed
+        // part-way: consistent, and short of full exactly because it failed.
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.bytes_done, 2_500);
+        assert_eq!(snapshot.bytes_total, Some(4_000));
+        assert_eq!(snapshot.state, ProfileState::Syncing);
+        assert_eq!(tally.bytes_done(), 2_500);
+    }
+
+    #[tokio::test]
+    async fn a_dead_subscriber_never_stalls_a_transfer() {
+        // The sink answers `false` once the receiver is gone, which detaches
+        // the reporter for good. The transfer is journaled work and must run to
+        // completion regardless of who is watching.
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink: lfs::basic::TransferSink = Box::new(move |event| event_tx.send(event).is_ok());
+        drop(event_rx);
+        assert!(!sink(lfs::basic::TransferEvent::Completed {
+            oid: "a".to_owned()
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_commit_publishes_a_file_count_the_bar_can_use() {
+        // `fraction()` returned `None` for every phase before this, so the
+        // commit and push legs rendered as an indeterminate spinner even though
+        // the staged set is known exactly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("a.txt"), b"one").expect("write");
+        std::fs::write(p.local_path.join("b.txt"), b"two").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        let published = recording(&engine);
+
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 2);
+
+        let committing: Vec<SyncProgress> = Engine::lock(&published)
+            .iter()
+            .filter(|event| event.phase == SyncPhase::Committing)
+            .cloned()
+            .collect();
+        assert_eq!(
+            committing.len(),
+            2,
+            "one publish entering the commit and one on its completion"
+        );
+        assert_eq!(committing[0].files_total, Some(2));
+        assert_eq!(committing[0].files_done, 0);
+        assert_eq!(committing[0].fraction(), Some(0.0));
+        assert_eq!(
+            committing[0].current.as_deref(),
+            Some("a.txt"),
+            "the detail line names a repository-relative path, never an absolute one"
+        );
+        assert_eq!(committing[1].files_done, 2);
+        assert_eq!(committing[1].fraction(), Some(1.0));
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.files_total, Some(2));
+        assert_eq!(snapshot.files_done, 2);
+    }
+
+    /// Advance a bare repository's `main` by one commit holding `content`.
+    ///
+    /// Written with gix plumbing rather than a second engine because the point
+    /// is only that the remote moved: the local side is what is under test.
+    fn advance_remote(remote_dir: &Path, file: &str, content: &str) {
+        let remote = gix::open(remote_dir).expect("open bare remote");
+        let tip = remote
+            .find_reference("refs/heads/main")
+            .expect("the pushed branch")
+            .id()
+            .detach();
+        let blob = remote
+            .write_blob(content.as_bytes())
+            .expect("blob")
+            .detach();
+        let tree = gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Blob.into(),
+                filename: file.into(),
+                oid: blob,
+            }],
+        };
+        let tree = remote.write_object(&tree).expect("tree").detach();
+        let mut buf = gix::date::parse::TimeBuf::default();
+        let author = gix::actor::Signature {
+            name: "Peer".into(),
+            email: "peer@keeper.invalid".into(),
+            time: gix::date::Time::new(1_700_000_000, 0),
+        };
+        let author = author.to_ref(&mut buf);
+        remote
+            .commit_as(author, author, "refs/heads/main", content, tree, vec![tip])
+            .expect("advance the remote");
+    }
+
+    #[tokio::test]
+    async fn a_sync_reports_the_conflict_copies_its_converge_made() {
+        // AD-43 keeps both revisions, and the caller has to be able to say so:
+        // a copy nobody is told about is a file the user will never find.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.remote_url = remote_dir.path().to_string_lossy().into_owned();
+        engine.upsert_profile(&p).expect("upsert");
+
+        // A shared root, published to the remote so both sides have an ancestor
+        // for `merge-base` to find.
+        std::fs::write(p.local_path.join("notes.md"), b"root").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("publish the shared root to the local bare remote");
+
+        // Both sides now edit the same path. This is the only shape that
+        // produces a conflict copy rather than a clean merge.
+        advance_remote(remote_dir.path(), "notes.md", "theirs");
+        platform.advance_ms(1_000);
+        std::fs::write(p.local_path.join("notes.md"), b"ours").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        let outcome = engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("converge");
+        assert_eq!(
+            outcome.conflicts.len(),
+            1,
+            "the one contested path must be reported, got {:?}",
+            outcome.conflicts
+        );
+        let copy = &outcome.conflicts[0];
+        assert!(
+            copy.starts_with("notes.sync-conflict-"),
+            "the reported path must be the copy, not the original: {copy}"
+        );
+        let preserved = std::fs::read(p.local_path.join(copy)).expect("the copy is on disk");
+        assert_eq!(
+            preserved, b"ours",
+            "the copy holds the local revision the merge gave away"
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("notes.md")).expect("canonical path"),
+            b"theirs",
+            "the remote keeps the canonical name (AD-43)"
+        );
+        // The same run proves the fetch counter is wired: `bytes` was declared
+        // and never assigned, so every sync reported zero traffic no matter how
+        // much it moved.
+        assert!(
+            outcome.bytes > 0,
+            "a run that received a pack must report the bytes it moved, got {}",
+            outcome.bytes
         );
     }
 }

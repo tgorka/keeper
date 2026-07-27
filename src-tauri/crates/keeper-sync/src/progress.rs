@@ -10,8 +10,12 @@
 //! means "stop producing". The Tauri shell wraps `Channel::send(..).is_ok()`;
 //! `keeper-syncd` writes log lines; tests push into a `Vec`.
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
+use crate::lfs::basic::TransferEvent;
 use crate::profile::ProfileState;
 
 /// A sink for progress events. `false` stops the producer.
@@ -38,9 +42,18 @@ pub enum SyncPhase {
 }
 
 impl SyncPhase {
-    /// Whether this phase should animate the tray glyph.
+    /// Whether this phase is doing anything at all.
     pub fn is_active(self) -> bool {
         !matches!(self, Self::Idle)
+    }
+
+    /// Whether bytes are actually crossing the network in this phase.
+    ///
+    /// Split out from [`Self::is_active`] because the tray animates only for
+    /// real movement: a scan or a commit is work too, but animating over it
+    /// promises a transfer that is not happening.
+    pub fn is_transferring(self) -> bool {
+        matches!(self, Self::Fetching | Self::TransferringLfs)
     }
 
     /// Short human label for the tray status line.
@@ -106,6 +119,114 @@ impl SyncProgress {
     }
 }
 
+/// One object's contribution to a transfer's byte totals.
+#[derive(Debug, Clone, Copy, Default)]
+struct ObjectBytes {
+    /// Size announced by [`TransferEvent::Started`].
+    size: u64,
+    /// High-water mark of what this object has reported moving.
+    done: u64,
+}
+
+/// Byte totals folded from a stream of [`TransferEvent`]s.
+///
+/// Exists because the raw stream cannot be read as a total.
+/// [`TransferEvent::Progress`] carries each object's OWN cumulative count while
+/// up to `lfs::basic::DEFAULT_CONCURRENT_TRANSFERS` objects interleave: adding
+/// the reported numbers re-counts the same bytes on every tick, and taking the
+/// latest one alone makes the figure sawtooth as objects take turns. Keeping
+/// one entry per oid and summing the *deltas* is the only reduction that is
+/// both correct and monotonic.
+///
+/// Monotonic is a requirement, not a preference: `BasicTransfer` retries an
+/// object in place, and a retry that cannot resume restarts that object's
+/// counter at zero. A bar that walks backwards reads as a bug, so each object
+/// contributes its high-water mark rather than its last report.
+///
+/// [`TransferEvent::Progress`]: crate::lfs::basic::TransferEvent::Progress
+#[derive(Debug, Default, Clone)]
+pub struct TransferTally {
+    objects: HashMap<String, ObjectBytes>,
+    total: u64,
+    done: u64,
+}
+
+impl TransferTally {
+    /// Sum of every announced size, or `None` when nothing has started yet.
+    ///
+    /// `None` rather than `Some(0)`: a zero denominator is indeterminate, and
+    /// the UI must draw a spinner rather than an empty bar.
+    pub fn bytes_total(&self) -> Option<u64> {
+        (self.total > 0).then_some(self.total)
+    }
+
+    /// Bytes moved so far across every object in this transfer.
+    pub fn bytes_done(&self) -> u64 {
+        self.done
+    }
+
+    /// Fold one transfer event into the totals.
+    pub fn fold(&mut self, event: &TransferEvent) {
+        match event {
+            TransferEvent::Started { oid, size } => {
+                // A second `Started` for one oid is a re-driven journal unit,
+                // not new work. Counting its size again would inflate the
+                // denominator and strand the bar short of full forever.
+                if let Entry::Vacant(slot) = self.objects.entry(oid.clone()) {
+                    slot.insert(ObjectBytes {
+                        size: *size,
+                        done: 0,
+                    });
+                    self.total = self.total.saturating_add(*size);
+                }
+            }
+            TransferEvent::Progress { oid, bytes_done } => self.advance(oid, *bytes_done),
+            TransferEvent::Completed { oid } => {
+                // The last `Progress` before completion is usually swallowed by
+                // the coalescer, and an object smaller than one chunk may never
+                // emit one at all, so completion is what actually retires an
+                // object's remaining bytes.
+                if let Some(size) = self.objects.get(oid).map(|object| object.size) {
+                    self.advance(oid, size);
+                }
+            }
+            // A failure deliberately changes nothing. The announced size stays
+            // in the denominator because that work was real and shrinking it
+            // would jump the bar forward; the partial count stays in the
+            // numerator because those bytes did move and removing them would
+            // jump it backwards. The remainder is simply never made up, which
+            // is exactly what a failed transfer looks like.
+            TransferEvent::Failed { .. } => {}
+        }
+    }
+
+    /// Stamp the byte totals onto a progress event.
+    pub fn apply(&self, progress: &mut SyncProgress) {
+        progress.bytes_done = self.done;
+        progress.bytes_total = self.bytes_total();
+    }
+
+    /// Raise one object's high-water mark, capped at its announced size.
+    fn advance(&mut self, oid: &str, reported: u64) {
+        let Some(object) = self.objects.get_mut(oid) else {
+            // No `Started` for this oid, so there is no denominator to charge
+            // it against; counting it anyway would push `bytes_done` past
+            // `bytes_total` and drive `fraction` to a permanent 1.0.
+            return;
+        };
+        let capped = if object.size > 0 {
+            reported.min(object.size)
+        } else {
+            reported
+        };
+        if capped <= object.done {
+            return;
+        }
+        self.done = self.done.saturating_add(capped - object.done);
+        object.done = capped;
+    }
+}
+
 /// The polled snapshot the tray and any late-subscribing view read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,15 +274,23 @@ impl SyncStatus {
 ///
 /// A pure reduction so the icon decision is unit-testable and so two profiles
 /// can never fight over the glyph (AD-51). The precedence is deliberate:
-/// **problems outrank activity outrank calm** — a user must never miss a
-/// warning because something else happened to be syncing.
+/// **problems outrank transfers outrank activity outrank calm** — a user must
+/// never miss a warning because something else happened to be syncing, and a
+/// profile that is merely scanning must never claim the animation that means
+/// "bytes are moving right now".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraySyncState {
     /// No profiles configured — the sync glyph is absent entirely.
     Absent,
     /// Configured and healthy, nothing in flight.
     Armed,
-    /// At least one profile actively transferring.
+    /// At least one profile is moving bytes over the network — a fetch, or an
+    /// LFS transfer. Ranked above `Active` because when both are happening the
+    /// user is waiting on the wire, and that is the thing worth animating.
+    Transferring,
+    /// At least one profile is working with nothing on the wire: a scan, a
+    /// merge, a commit, a verify. Kept distinct from `Transferring` so the tray
+    /// animates only when there is real movement to animate.
     Active,
     /// Nothing wrong, but at least one profile cannot proceed (paused, or its
     /// volume is detached).
@@ -176,11 +305,15 @@ pub fn tray_state(statuses: &[SyncStatus]) -> TraySyncState {
         return TraySyncState::Absent;
     }
     let mut has_warning = false;
+    let mut has_transfer = false;
     let mut has_active = false;
     let mut has_paused = false;
     for s in statuses {
         if s.error.is_some() || s.warning.is_some() || s.state.is_warning() {
             has_warning = true;
+        }
+        if s.phase.is_transferring() {
+            has_transfer = true;
         }
         if s.state.is_active() || s.phase.is_active() {
             has_active = true;
@@ -190,8 +323,12 @@ pub fn tray_state(statuses: &[SyncStatus]) -> TraySyncState {
         }
     }
     // Warning first: a problem must never be masked by concurrent activity.
+    // Transfers next: of two busy profiles, the one on the wire is the one the
+    // user is actually waiting for.
     if has_warning {
         TraySyncState::Warning
+    } else if has_transfer {
+        TraySyncState::Transferring
     } else if has_active {
         TraySyncState::Active
     } else if has_paused {
@@ -292,11 +429,49 @@ mod tests {
 
     #[test]
     fn activity_outranks_paused() {
+        // Committing is work with nothing on the wire, which is exactly what
+        // separates `Active` from `Transferring`.
         let mut busy = status("a");
-        busy.phase = SyncPhase::Fetching;
+        busy.phase = SyncPhase::Committing;
         let mut paused = status("b");
         paused.state = ProfileState::Paused;
         assert_eq!(tray_state(&[busy, paused]), TraySyncState::Active);
+    }
+
+    #[test]
+    fn a_transfer_outranks_other_activity_but_never_a_warning() {
+        // Of two busy profiles the one on the wire wins: it is the one the user
+        // is waiting for, and it is the only one an animation does not lie
+        // about.
+        let mut scanning = status("a");
+        scanning.phase = SyncPhase::Scanning;
+        let mut fetching = status("b");
+        fetching.phase = SyncPhase::Fetching;
+        assert_eq!(
+            tray_state(&[scanning.clone(), fetching.clone()]),
+            TraySyncState::Transferring
+        );
+
+        let mut lfs = status("c");
+        lfs.phase = SyncPhase::TransferringLfs;
+        assert_eq!(
+            tray_state(std::slice::from_ref(&lfs)),
+            TraySyncState::Transferring
+        );
+
+        // A problem still masks everything, transfers included.
+        let mut broken = status("d");
+        broken.warning = Some("rename required".into());
+        assert_eq!(tray_state(&[fetching, broken]), TraySyncState::Warning);
+    }
+
+    #[test]
+    fn a_transfer_outranks_a_paused_sibling() {
+        let mut fetching = status("a");
+        fetching.phase = SyncPhase::TransferringLfs;
+        let mut paused = status("b");
+        paused.state = ProfileState::Paused;
+        assert_eq!(tray_state(&[fetching, paused]), TraySyncState::Transferring);
     }
 
     #[test]
@@ -342,6 +517,133 @@ mod tests {
         p.bytes_total = Some(0);
         p.files_total = Some(0);
         assert_eq!(p.fraction(), None);
+    }
+
+    fn started(oid: &str, size: u64) -> TransferEvent {
+        TransferEvent::Started {
+            oid: oid.to_owned(),
+            size,
+        }
+    }
+
+    #[test]
+    fn interleaved_objects_never_double_count_and_never_go_backwards() {
+        // Two concurrent objects each reporting their OWN cumulative count is
+        // the shape `download_all` produces with up to eight in flight. Adding
+        // the raw numbers would re-count on every tick; taking the latest one
+        // would sawtooth between them.
+        let mut tally = TransferTally::default();
+        tally.fold(&started("a", 1_000));
+        tally.fold(&started("b", 3_000));
+        assert_eq!(tally.bytes_total(), Some(4_000));
+
+        let script = [
+            TransferEvent::Progress {
+                oid: "a".to_owned(),
+                bytes_done: 400,
+            },
+            TransferEvent::Progress {
+                oid: "b".to_owned(),
+                bytes_done: 1_500,
+            },
+            TransferEvent::Progress {
+                oid: "a".to_owned(),
+                bytes_done: 900,
+            },
+            // A retry that could not resume restarts this object's counter.
+            // The high-water mark is what keeps the bar from walking backwards.
+            TransferEvent::Progress {
+                oid: "b".to_owned(),
+                bytes_done: 0,
+            },
+            TransferEvent::Progress {
+                oid: "b".to_owned(),
+                bytes_done: 2_000,
+            },
+        ];
+        let mut previous = 0;
+        for event in &script {
+            tally.fold(event);
+            assert!(
+                tally.bytes_done() >= previous,
+                "{event:?} moved the total backwards: {previous} -> {}",
+                tally.bytes_done()
+            );
+            previous = tally.bytes_done();
+        }
+        assert_eq!(tally.bytes_done(), 2_900, "900 of a plus 2000 of b");
+
+        // Completion retires whatever the coalescer swallowed.
+        tally.fold(&TransferEvent::Completed {
+            oid: "a".to_owned(),
+        });
+        assert_eq!(tally.bytes_done(), 3_000);
+
+        let mut progress = SyncProgress::idle("id", "n");
+        tally.apply(&mut progress);
+        assert_eq!(progress.bytes_total, Some(4_000));
+        assert_eq!(progress.fraction(), Some(0.75));
+    }
+
+    #[test]
+    fn a_failure_leaves_the_totals_consistent() {
+        let mut tally = TransferTally::default();
+        tally.fold(&started("a", 1_000));
+        tally.fold(&started("b", 1_000));
+        tally.fold(&TransferEvent::Progress {
+            oid: "b".to_owned(),
+            bytes_done: 250,
+        });
+        tally.fold(&TransferEvent::Failed {
+            oid: "b".to_owned(),
+            code: "network",
+            error: "connection reset".to_owned(),
+        });
+
+        // The denominator keeps the failed object: that work was real, and
+        // dropping it would jump the bar forward on a failure. The numerator
+        // keeps its partial bytes: they did move, and dropping them would jump
+        // the bar backwards.
+        assert_eq!(tally.bytes_total(), Some(2_000));
+        assert_eq!(tally.bytes_done(), 250);
+
+        tally.fold(&TransferEvent::Completed {
+            oid: "a".to_owned(),
+        });
+        assert_eq!(tally.bytes_done(), 1_250);
+        let mut progress = SyncProgress::idle("id", "n");
+        tally.apply(&mut progress);
+        assert!(
+            progress.bytes_done <= progress.bytes_total.unwrap_or(0),
+            "a failure must never push the numerator past the denominator"
+        );
+        assert_eq!(progress.fraction(), Some(0.625));
+    }
+
+    #[test]
+    fn a_re_driven_unit_does_not_inflate_the_denominator() {
+        // The journal re-drives a unit after a crash, so the same oid can be
+        // announced twice in one run. Counting its size twice would strand the
+        // bar permanently short of full.
+        let mut tally = TransferTally::default();
+        tally.fold(&started("a", 500));
+        tally.fold(&started("a", 500));
+        assert_eq!(tally.bytes_total(), Some(500));
+
+        // An `AlreadyPresent` upload completes without ever starting: nothing
+        // was announced and nothing moved, so it must not be charged.
+        tally.fold(&TransferEvent::Completed {
+            oid: "never-started".to_owned(),
+        });
+        assert_eq!(tally.bytes_done(), 0);
+        assert_eq!(tally.bytes_total(), Some(500));
+
+        // Nothing has started at all: indeterminate, not "0 of 0".
+        let empty = TransferTally::default();
+        assert_eq!(empty.bytes_total(), None);
+        let mut progress = SyncProgress::idle("id", "n");
+        empty.apply(&mut progress);
+        assert_eq!(progress.fraction(), None);
     }
 
     #[test]

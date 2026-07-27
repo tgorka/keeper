@@ -109,7 +109,11 @@ export type { SearchHitVm } from "./gen/SearchHitVm";
 export type { SendState } from "./gen/SendState";
 export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 export type { SpaceVm } from "./gen/SpaceVm";
+export type { SyncActivityVm } from "./gen/SyncActivityVm";
 export type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
+export type { SyncParkedVm } from "./gen/SyncParkedVm";
+export type { SyncPendingVm } from "./gen/SyncPendingVm";
+export type { SyncProblemsVm } from "./gen/SyncProblemsVm";
 export type { SyncProfileReq } from "./gen/SyncProfileReq";
 export type { SyncProfileVm } from "./gen/SyncProfileVm";
 export type { SyncProgressVm } from "./gen/SyncProgressVm";
@@ -162,7 +166,10 @@ import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { SearchFilterVm } from "./gen/SearchFilterVm";
 import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
+import type { SyncActivityVm } from "./gen/SyncActivityVm";
 import type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
+import type { SyncPendingVm } from "./gen/SyncPendingVm";
+import type { SyncProblemsVm } from "./gen/SyncProblemsVm";
 import type { SyncProfileReq } from "./gen/SyncProfileReq";
 import type { SyncProfileVm } from "./gen/SyncProfileVm";
 import type { SyncProgressVm } from "./gen/SyncProgressVm";
@@ -2472,6 +2479,88 @@ export async function syncFolderNow(id: string): Promise<SyncOutcomeVm> {
  */
 export async function syncVerify(id: string): Promise<string[]> {
   return await invoke<string[]>("sync_verify", { id });
+}
+
+/**
+ * Read the newest recorded activity for a profile -- what sync has actually
+ * done to which files, newest first.
+ *
+ * Crosses IPC: a repo-relative path, a kind and a timestamp per row, and
+ * nothing else -- never file contents. The engine keeps only the newest rows
+ * per profile, so this is recent history rather than an audit log; `limit`
+ * narrows it further and defaults to whatever the engine considers a page.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile).
+ */
+export async function syncActivity(id: string, limit?: number): Promise<SyncActivityVm[]> {
+  return await invoke<SyncActivityVm[]>("sync_activity", { id, limit });
+}
+
+/**
+ * Read what a profile has seen but not yet carried.
+ *
+ * Computed at query time from the worktree and the quiescence gate rather than
+ * stored, so it cannot disagree with what the next tick will do. A `settling`
+ * row carries `sinceMs` (when the quiet window began) -- render it as how long
+ * keeper has been waiting, never as a countdown: every new write restarts the
+ * window, so a finish time would be a guess.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile). A rejection is
+ * not an empty list -- an unknown profile rejects rather than reporting calm.
+ */
+export async function syncPending(id: string): Promise<SyncPendingVm[]> {
+  return await invoke<SyncPendingVm[]>("sync_pending", { id });
+}
+
+/**
+ * Read everything currently wrong with a profile: the live warning/error, the
+ * journal units that failed permanently, and the conflict copies still on disk.
+ *
+ * A list rather than one string, so a single success cannot clear seven
+ * distinct conditions. Conflict entries leave on their own once the user
+ * deletes the copy they no longer need.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile).
+ */
+export async function syncProblems(id: string): Promise<SyncProblemsVm> {
+  return await invoke<SyncProblemsVm>("sync_problems", { id });
+}
+
+/**
+ * Return one parked journal unit to the pending queue.
+ *
+ * `unitId` is the `id` of a {@link SyncParkedVm} read from
+ * {@link syncProblems}: parking is per unit of work, so retrying one failed
+ * push never re-drives the rest.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile or unit).
+ */
+export async function syncRetryParked(id: string, unitId: number): Promise<void> {
+  await invoke<void>("sync_retry_parked", { id, unitId });
+}
+
+/**
+ * Store an access token for a profile in the OS keychain.
+ *
+ * The token goes straight to the keychain under a key derived from the profile
+ * id -- never into the config file, never into `sync.db`, and never back out:
+ * there is deliberately no command that reads a stored credential, so a caller
+ * can write one or clear one and nothing else.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile, keychain refusal).
+ */
+export async function syncSetCredential(id: string, token: string): Promise<void> {
+  await invoke<void>("sync_set_credential", { id, token });
+}
+
+/**
+ * Forget a profile's stored access token. Clearing a profile that has none is
+ * a no-op, so this is safe to offer whether or not one was ever set.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function syncClearCredential(id: string): Promise<void> {
+  await invoke<void>("sync_clear_credential", { id });
 }
 
 /**

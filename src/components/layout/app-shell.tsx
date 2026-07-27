@@ -11,6 +11,7 @@ import { DetailPanel } from "@/components/layout/detail-panel";
 import { PhoneShell } from "@/components/layout/phone-shell";
 import { RecordingPane } from "@/components/layout/recording-pane";
 import { SidebarPane } from "@/components/layout/sidebar-pane";
+import { SyncPane } from "@/components/layout/sync-pane";
 import { VerifyBanner } from "@/components/layout/verify-banner";
 import { SearchOverlay } from "@/components/search/search-overlay";
 import { DeviceVerificationDialog } from "@/components/settings/device-verification-dialog";
@@ -110,6 +111,9 @@ export function AppShell() {
   // Recording view renders only when the flag is on, so a stale "recording"
   // primary-view can never show the pane on a platform that cannot record.
   const recording = useCapabilitiesStore((s) => s.capabilities.recording);
+  // Folder sync needs a usable `git` (Story 32.5, AD-41): same rule, so a stale
+  // "sync" primary-view can never show the pane where sync cannot run.
+  const sync = useCapabilitiesStore((s) => s.capabilities.sync);
 
   const closeDetail = useCallback(() => {
     storeCloseDetail();
@@ -147,6 +151,8 @@ export function AppShell() {
               <SidebarPane collapsed={sidebarCollapsed} />
               {recording && primaryView === "recording" ? (
                 <RecordingPane />
+              ) : sync && primaryView === "sync" ? (
+                <SyncPane />
               ) : primaryView === "bridges" ? (
                 <BridgesPane />
               ) : primaryView === "approval" ? (

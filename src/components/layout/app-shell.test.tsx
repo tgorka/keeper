@@ -127,4 +127,24 @@ describe("AppShell", () => {
 
     expect(screen.queryByRole("region", { name: "Recording" })).not.toBeInTheDocument();
   });
+
+  // ── Sync view (Story 32.5) ─────────────────────────────────────────────────
+  it("renders the Sync pane for the sync view when the capability is on", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    primaryViewStore.getState().setView("sync");
+    render(<AppShell />);
+
+    expect(screen.getByRole("region", { name: "Sync" })).toBeInTheDocument();
+    expect(screen.queryByText("Select a conversation to start reading.")).not.toBeInTheDocument();
+  });
+
+  it("does not render the Sync pane when the sync capability is off", () => {
+    // A stale "sync" primary-view must never show the pane on a machine with no
+    // usable `git`, where every command behind it rejects as unsupported.
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: true });
+    primaryViewStore.getState().setView("sync");
+    render(<AppShell />);
+
+    expect(screen.queryByRole("region", { name: "Sync" })).not.toBeInTheDocument();
+  });
 });

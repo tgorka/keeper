@@ -187,6 +187,17 @@ pub fn engine_if_open() -> Option<Arc<Engine>> {
     slot().as_ref().map(Arc::clone)
 }
 
+/// The engine's platform port over the shell's [`Platform`], for the callers
+/// that need the port itself rather than the engine.
+///
+/// Only the credential commands use this: a token is something the engine
+/// exclusively *reads* (`secret_get`, three call sites), so writing one has no
+/// engine-side entry point and would otherwise require inventing an
+/// `Engine::set_credential` that the engine has no use for.
+pub fn sync_platform(platform: Arc<dyn Platform>) -> ShellSyncPlatform {
+    ShellSyncPlatform::new(platform)
+}
+
 /// The live supervisor's stop signal, if one is running.
 ///
 /// Holding the sender here (rather than in `AppState`) keeps the whole

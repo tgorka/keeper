@@ -13,14 +13,35 @@
 use std::sync::Arc;
 
 use keeper_core::vm::{IpcError, IpcErrorCode};
+use keeper_sync::engine::PendingReason;
 use keeper_sync::profile::{LfsMode, ProfileState, SyncDirection, SyncLane};
 use keeper_sync::progress::{SyncPhase, SyncStatus};
 use keeper_sync::provenance::SyncSource;
-use keeper_sync::{SyncError, SyncProfile};
+use keeper_sync::{ActivityKind, SyncError, SyncPlatform, SyncProfile};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::ipc::AppState;
+
+/// Rows returned when a caller does not say how many it wants.
+const ACTIVITY_LIMIT_DEFAULT: u32 = 100;
+/// The ceiling on one activity read. The engine trims each profile to
+/// `db::ACTIVITY_CAP`, so asking for more can only return the same rows.
+const ACTIVITY_LIMIT_MAX: u32 = 500;
+
+/// The wire spelling of an activity kind.
+///
+/// Written out rather than derived from serde so the wire contract is visible
+/// at the boundary and cannot change under a rename, matching `state_str` and
+/// `phase_str` below.
+fn activity_kind_str(kind: ActivityKind) -> &'static str {
+    match kind {
+        ActivityKind::Added => "added",
+        ActivityKind::Modified => "modified",
+        ActivityKind::Deleted => "deleted",
+        ActivityKind::Conflict => "conflict",
+    }
+}
 
 /// One configured folder↔repository binding, as the UI sees it.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -43,6 +64,10 @@ pub struct SyncProfileVm {
     #[ts(type = "number")]
     pub settle_ms: u64,
     pub tags: Vec<String>,
+    /// Overrides the commit author, in any of `Name <email>`, a bare address,
+    /// or a bare display name. `None` keeps the device identity and its
+    /// non-routable `sync@<device-id>.keeper.invalid` address.
+    pub author_override: Option<String>,
     pub enabled: bool,
 }
 
@@ -63,6 +88,7 @@ impl From<&SyncProfile> for SyncProfileVm {
             lfs_threshold_bytes: p.lfs_threshold_bytes,
             settle_ms: p.settle_ms,
             tags: p.tags.clone(),
+            author_override: p.author_override.clone(),
             enabled: p.enabled,
         }
     }
@@ -138,6 +164,63 @@ pub struct SyncOutcomeVm {
     pub conflicts: Vec<String>,
 }
 
+/// One recorded thing sync did to one file.
+///
+/// Paths are repo-relative and the row carries nothing else — never contents,
+/// never a second copy of anything. The engine trims each profile to its newest
+/// `ACTIVITY_CAP` rows, so this list is recent history, not an audit log.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncActivityVm {
+    #[ts(type = "number")]
+    pub ts_ms: i64,
+    /// `added` | `modified` | `deleted` | `conflict`.
+    pub kind: String,
+    pub path: String,
+}
+
+/// One file sync has seen but not yet carried.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPendingVm {
+    pub path: String,
+    /// `settling` | `untracked` | `modified` | `added` | `deleted`.
+    pub reason: String,
+    /// When the quiescence episode began, for `settling` only. The UI renders
+    /// it as "waiting for writes to stop", not as a countdown: the window
+    /// restarts on every write, so a promised finish time would be a guess.
+    #[ts(type = "number | null")]
+    pub since_ms: Option<i64>,
+}
+
+/// A unit of work that failed permanently and stopped being retried.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncParkedVm {
+    #[ts(type = "number")]
+    pub id: i64,
+    pub kind: String,
+    #[ts(type = "number")]
+    pub attempts: u32,
+    pub last_error: Option<String>,
+}
+
+/// Everything currently wrong with one profile.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncProblemsVm {
+    pub warning: Option<String>,
+    pub error: Option<String>,
+    pub parked: Vec<SyncParkedVm>,
+    /// Conflict copies still on disk. A copy the user has already dealt with
+    /// and deleted is resolved, so it leaves this list on its own.
+    pub conflicts: Vec<String>,
+}
+
 /// Fields a caller may set when creating or updating a profile.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -164,6 +247,11 @@ pub struct SyncProfileReq {
     pub settle_ms: Option<u64>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Absent leaves whatever the stored profile already has, so a caller that
+    /// does not know about this field cannot erase it. An explicit empty string
+    /// clears the override back to the device identity.
+    #[serde(default)]
+    pub author_override: Option<String>,
 }
 
 /// Mint an opaque, sortable, collision-free profile id.
@@ -275,7 +363,16 @@ pub fn sync_ipc_error(err: &SyncError) -> IpcError {
     }
 }
 
-fn parse_req(req: &SyncProfileReq) -> Result<SyncProfile, IpcError> {
+/// Build the profile to store from a request, carrying forward everything the
+/// request cannot express.
+///
+/// `prior` is the stored profile when this is an update. It matters because
+/// `db::upsert_profile` replaces the whole JSON row, so any field this function
+/// leaves at its constructor default is silently ERASED on save. That is not
+/// hypothetical: before `prior` existed, saving an edit to a paused profile
+/// reset `enabled` to `true` and quietly resumed syncing a folder the user had
+/// deliberately stopped, and wiped any `author_override` set through the daemon.
+fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncProfile, IpcError> {
     let direction = match req.direction.as_str() {
         "bidirectional" => SyncDirection::Bidirectional,
         "pushOnly" => SyncDirection::PushOnly,
@@ -326,6 +423,19 @@ fn parse_req(req: &SyncProfileReq) -> Result<SyncProfile, IpcError> {
         profile.settle_ms = ms;
     }
     profile.tags = req.tags.clone();
+    // Fields the request cannot carry survive from the stored profile, because
+    // the upsert replaces the whole row. `enabled` is only ever moved by the
+    // explicit pause/resume command; an edit must not resume a paused folder.
+    if let Some(prior) = prior {
+        profile.enabled = prior.enabled;
+        profile.author_override = prior.author_override.clone();
+    }
+    // An explicit value overrides; an explicit empty string clears back to the
+    // device identity, which is how the form offers "use the default".
+    if let Some(author) = req.author_override.as_ref() {
+        let trimmed = author.trim();
+        profile.author_override = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    }
     // Validate here so a bad profile is rejected at the edge with an actionable
     // message rather than deep inside the engine.
     profile.validate().map_err(|err| sync_ipc_error(&err))?;
@@ -363,7 +473,17 @@ pub async fn sync_profile_save(
     req: SyncProfileReq,
 ) -> Result<SyncProfileVm, IpcError> {
     let engine = engine_of(&state)?;
-    let profile = parse_req(&req)?;
+    // Read the stored profile first so the edit merges onto it rather than
+    // replacing it: the upsert writes the whole row (see `parse_req`).
+    let prior = match req.id.as_deref() {
+        Some(id) => engine
+            .list_profiles()
+            .map_err(|e| sync_ipc_error(&e))?
+            .into_iter()
+            .find(|p| p.id == id),
+        None => None,
+    };
+    let profile = parse_req(&req, prior.as_ref())?;
     engine
         .upsert_profile(&profile)
         .map_err(|e| sync_ipc_error(&e))?;
@@ -418,6 +538,157 @@ pub async fn sync_folder_now(
         files_changed: outcome.files_changed,
         conflicts: outcome.conflicts,
     })
+}
+
+/// What sync has done to this folder's files lately, newest first.
+#[tauri::command]
+pub async fn sync_activity(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    limit: Option<u32>,
+) -> Result<Vec<SyncActivityVm>, IpcError> {
+    let engine = engine_of(&state)?;
+    // A caller asking for everything gets the engine's own cap rather than an
+    // unbounded read: the table is already trimmed to it, so a larger number
+    // could only ever return the same rows.
+    let limit = limit
+        .unwrap_or(ACTIVITY_LIMIT_DEFAULT)
+        .min(ACTIVITY_LIMIT_MAX) as usize;
+    let rows = engine
+        .activity(&id, limit)
+        .await
+        .map_err(|e| sync_ipc_error(&e))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| SyncActivityVm {
+            ts_ms: row.ts_ms,
+            kind: activity_kind_str(row.kind).to_owned(),
+            path: row.path,
+        })
+        .collect())
+}
+
+/// What this folder is waiting to carry, and why.
+#[tauri::command]
+pub async fn sync_pending(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<Vec<SyncPendingVm>, IpcError> {
+    let engine = engine_of(&state)?;
+    let files = engine.pending(&id).await.map_err(|e| sync_ipc_error(&e))?;
+    Ok(files
+        .into_iter()
+        .map(|file| {
+            let (reason, since_ms) = match file.reason {
+                PendingReason::Settling { since_ms } => ("settling", Some(since_ms)),
+                PendingReason::Untracked => ("untracked", None),
+                PendingReason::Modified => ("modified", None),
+                PendingReason::Added => ("added", None),
+                PendingReason::Deleted => ("deleted", None),
+            };
+            SyncPendingVm {
+                path: file.path,
+                reason: reason.to_owned(),
+                since_ms,
+            }
+        })
+        .collect())
+}
+
+/// Everything currently wrong with this folder.
+#[tauri::command]
+pub async fn sync_problems(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<SyncProblemsVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let report = engine.problems(&id).await.map_err(|e| sync_ipc_error(&e))?;
+    Ok(SyncProblemsVm {
+        warning: report.warning,
+        error: report.error,
+        parked: report
+            .parked
+            .into_iter()
+            .map(|unit| SyncParkedVm {
+                id: unit.id,
+                kind: unit.kind,
+                attempts: unit.attempts,
+                last_error: unit.last_error,
+            })
+            .collect(),
+        conflicts: report.conflicts,
+    })
+}
+
+/// Put a parked unit back in the queue.
+///
+/// Parked means the engine gave up: a permanent error, or a payload it could
+/// not read. Nothing retries it on its own, which is exactly why it needs a
+/// button — before this, such a unit sat in the journal invisible and inert.
+#[tauri::command]
+pub async fn sync_retry_parked(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    unit_id: i64,
+) -> Result<(), IpcError> {
+    let engine = engine_of(&state)?;
+    engine
+        .retry_parked(&id, unit_id)
+        .await
+        .map_err(|e| sync_ipc_error(&e))
+}
+
+/// Store the access token a private remote needs, in the OS keychain.
+///
+/// This closes a real hole rather than adding a convenience: `SyncPlatform`
+/// has had `secret_set`/`secret_delete` since Story 24.2 and the engine calls
+/// NEITHER, so until now a profile pointing at a private remote could not be
+/// authenticated from the app at all — the only ways in were a daemon env var
+/// or a 0600 file placed by hand. The secret goes to the keychain under the
+/// profile's own `sync/<id>/credential` key and is never written where the
+/// engine's own persistence can see it (never `sync.db`, never a config file),
+/// which is the port's stated contract.
+///
+/// Write-only by design: there is no command that reads a token back out. The
+/// form can replace it or clear it, and that is the whole surface.
+#[tauri::command]
+pub async fn sync_set_credential(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    token: String,
+) -> Result<(), IpcError> {
+    let profile = profile_by_id(&state, &id)?;
+    let platform = crate::sync::sync_platform(Arc::clone(&state.platform));
+    platform
+        .secret_set(&profile.secret_key(), &token)
+        .map_err(|err| sync_ipc_error(&err))
+}
+
+/// Forget a profile's stored token. Idempotent — clearing an absent secret is
+/// not an error, because the user's intent ("there should be no token here") is
+/// already satisfied.
+#[tauri::command]
+pub async fn sync_clear_credential(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), IpcError> {
+    let profile = profile_by_id(&state, &id)?;
+    let platform = crate::sync::sync_platform(Arc::clone(&state.platform));
+    platform
+        .secret_delete(&profile.secret_key())
+        .map_err(|err| sync_ipc_error(&err))
+}
+
+/// Resolve a profile by id, or report it as a config error naming the id.
+fn profile_by_id(state: &AppState, id: &str) -> Result<keeper_sync::SyncProfile, IpcError> {
+    let engine =
+        crate::sync::engine(Arc::clone(&state.platform)).map_err(|e| sync_ipc_error(&e))?;
+    engine
+        .list_profiles()
+        .map_err(|e| sync_ipc_error(&e))?
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| sync_ipc_error(&SyncError::Config(format!("no such sync profile: {id}"))))
 }
 
 /// Re-read a profile's tracked files and report the ones that failed.
@@ -581,9 +852,67 @@ mod tests {
             lfs_threshold_bytes: None,
             settle_ms: None,
             tags: vec![],
+            author_override: None,
         }
     }
 
+    /// The bug this guards: `db::upsert_profile` replaces the whole JSON row,
+    /// and `parse_req` rebuilds the profile from a request that carries neither
+    /// `enabled` nor `author_override`. Editing a PAUSED folder therefore
+    /// resumed it — keeper quietly restarting sync on a folder the user had
+    /// deliberately stopped — and erased an author override set through the
+    /// daemon. Nothing in the UI hinted at either.
+    #[test]
+    fn editing_a_profile_keeps_what_the_request_cannot_carry() {
+        let mut prior = parse_req(&req(), None).expect("valid");
+        prior.enabled = false;
+        prior.author_override = Some("Ada <ada@example.org>".into());
+
+        let mut edit = req();
+        edit.id = Some(prior.id.clone());
+        edit.name = "renamed".into();
+        let merged = parse_req(&edit, Some(&prior)).expect("valid");
+
+        assert_eq!(merged.name, "renamed", "the edit still applies");
+        assert!(!merged.enabled, "an edit must not resume a paused folder");
+        assert_eq!(
+            merged.author_override.as_deref(),
+            Some("Ada <ada@example.org>"),
+            "an edit must not erase an override it cannot express"
+        );
+    }
+
+    #[test]
+    fn an_explicit_author_override_is_set_and_an_empty_one_clears_it() {
+        let prior = {
+            let mut p = parse_req(&req(), None).expect("valid");
+            p.author_override = Some("Ada <ada@example.org>".into());
+            p
+        };
+
+        let mut set = req();
+        set.author_override = Some("  Grace <grace@example.org>  ".into());
+        assert_eq!(
+            parse_req(&set, Some(&prior))
+                .expect("valid")
+                .author_override
+                .as_deref(),
+            Some("Grace <grace@example.org>"),
+            "an explicit value wins and is trimmed"
+        );
+
+        // "Use the device identity" is expressible: the form sends an empty
+        // string, which is different from omitting the field entirely.
+        let mut cleared = req();
+        cleared.author_override = Some("   ".into());
+        assert_eq!(
+            parse_req(&cleared, Some(&prior))
+                .expect("valid")
+                .author_override,
+            None,
+            "an empty override falls back to the device identity"
+        );
+    }
     #[test]
     fn minted_ids_are_unique_sortable_and_shaped_like_a_ulid() {
         let ids: std::collections::BTreeSet<String> = (0..500).map(|_| new_profile_id()).collect();
@@ -605,7 +934,7 @@ mod tests {
 
     #[test]
     fn a_request_round_trips_into_a_profile_and_back_into_a_view_model() {
-        let parsed = parse_req(&req()).expect("valid");
+        let parsed = parse_req(&req(), None).expect("valid");
         assert!(!parsed.id.is_empty(), "a new profile is given an id");
         let vm = SyncProfileVm::from(&parsed);
         assert_eq!(vm.direction, "bidirectional");
@@ -629,7 +958,7 @@ mod tests {
                 "lane" => r.lane = value.into(),
                 _ => r.lfs_mode = value.into(),
             }
-            let err = parse_req(&r).expect_err("must reject");
+            let err = parse_req(&r, None).expect_err("must reject");
             assert_eq!(err.code, IpcErrorCode::Internal);
             assert!(err.message.contains(value), "message names the bad value");
         }
@@ -639,7 +968,7 @@ mod tests {
     fn an_invalid_profile_is_refused_before_it_reaches_the_engine() {
         let mut r = req();
         r.local_path = "relative/path".into();
-        assert!(parse_req(&r).is_err());
+        assert!(parse_req(&r, None).is_err());
     }
 
     #[test]
@@ -647,11 +976,11 @@ mod tests {
         let mut r = req();
         r.lane = "worktree".into();
         assert!(
-            parse_req(&r).is_err(),
+            parse_req(&r, None).is_err(),
             "a bidirectional lane would leak the airlock"
         );
         r.direction = "pushOnly".into();
-        assert!(parse_req(&r).is_ok());
+        assert!(parse_req(&r, None).is_ok());
     }
 
     #[test]

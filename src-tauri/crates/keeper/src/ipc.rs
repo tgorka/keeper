@@ -5195,6 +5195,31 @@ pub fn debug_mode_set(state: State<'_, AppState>, enabled: bool) -> Result<(), I
     Ok(())
 }
 
+/// The tail of the app log, for the in-app diagnostics surface.
+///
+/// Reads a file the app already writes rather than starting a second stream:
+/// warnings and errors are always recorded there (`debug_log`), and everything
+/// else joins them while debug mode is on. Returns oldest line first so a
+/// viewer can append without reversing.
+///
+/// No path argument, deliberately: this reads keeper's own log or nothing. A
+/// command that took a path would be a file-read primitive handed to the
+/// webview, which is a different and much larger thing to be responsible for.
+#[tauri::command]
+pub fn debug_log_tail(lines: Option<u32>) -> Result<Vec<String>, IpcError> {
+    const DEFAULT_LINES: u32 = 200;
+    const MAX_LINES: u32 = 2_000;
+    let lines = lines.unwrap_or(DEFAULT_LINES).min(MAX_LINES) as usize;
+    Ok(crate::debug_log::tail(lines))
+}
+
+/// Where that log lives, so the surface can offer "reveal in Finder" and a bug
+/// report can name the file.
+#[tauri::command]
+pub fn debug_log_path() -> Result<String, IpcError> {
+    Ok(crate::debug_log::app_log_path().display().to_string())
+}
+
 /// Read the menu-bar (tray) presence toggle (Story 10.3, FR-53). Reads the persisted
 /// `system.menu_bar_presence` setting (default off). Errors funnel through
 /// [`to_ipc_error`].

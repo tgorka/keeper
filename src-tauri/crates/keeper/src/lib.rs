@@ -463,6 +463,8 @@ pub fn run() {
                 ipc::menu_bar_presence_set,
                 ipc::debug_mode_get,
                 ipc::debug_mode_set,
+                ipc::debug_log_tail,
+                ipc::debug_log_path,
                 ipc::recording_permission,
                 ipc::request_screen_recording_permission,
                 ipc::request_microphone_permission,
@@ -500,6 +502,12 @@ pub fn run() {
         sync_ipc::sync_verify,
         sync_ipc::sync_subscribe_progress,
         sync_ipc::sync_unsubscribe_progress,
+        sync_ipc::sync_activity,
+        sync_ipc::sync_pending,
+        sync_ipc::sync_problems,
+        sync_ipc::sync_retry_parked,
+        sync_ipc::sync_set_credential,
+        sync_ipc::sync_clear_credential,
     );
     #[cfg(not(desktop))]
     let builder = keeper_with_commands!(builder);

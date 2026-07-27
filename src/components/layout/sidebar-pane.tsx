@@ -1,4 +1,13 @@
-import { Archive, Inbox, MessageSquare, Radio, Settings, Video, WifiOff } from "lucide-react";
+import {
+  Archive,
+  FolderSync,
+  Inbox,
+  MessageSquare,
+  Radio,
+  Settings,
+  Video,
+  WifiOff,
+} from "lucide-react";
 import { useState } from "react";
 import { AccountFooter } from "@/components/layout/account-footer";
 import { NetworksGroup } from "@/components/layout/networks-group";
@@ -20,8 +29,9 @@ interface SidebarView {
 }
 
 /** The always-present nav entries, in order. The capability-gated Recording entry
- * (Story 16.3) is spliced in before Settings only when the `recording` capability
- * is on — never a dead ⌘5 button on platforms that cannot record (AD-27). */
+ * (Story 16.3) and Sync entry (Story 32.5) are spliced in before Settings only
+ * when their capability is on — never a dead button on a platform that cannot
+ * record (AD-27) or a machine with no usable `git` (AD-41). */
 const BASE_VIEWS: SidebarView[] = [
   { label: "Chats", icon: MessageSquare },
   { label: "Archive", icon: Archive },
@@ -31,6 +41,9 @@ const BASE_VIEWS: SidebarView[] = [
 
 /** The capability-gated Recording nav entry (Story 16.3). */
 const RECORDING_VIEW: SidebarView = { label: "Recording", icon: Video };
+
+/** The capability-gated Sync nav entry (Story 32.5, AD-S1). */
+const SYNC_VIEW: SidebarView = { label: "Sync", icon: FolderSync };
 
 /** Settings sits last, after every primary-view entry. */
 const SETTINGS_VIEW: SidebarView = { label: "Settings", icon: Settings };
@@ -70,10 +83,16 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
   // Screen recording is a desktop-macOS-≥13 capability (Story 16.3): the Recording
   // nav entry (and its ⌘5) is present only when the flag is on, never a dead button.
   const recording = useCapabilitiesStore((s) => s.capabilities.recording);
-  // Splice the gated Recording entry in before Settings only when supported.
-  const views: SidebarView[] = recording
-    ? [...BASE_VIEWS, RECORDING_VIEW, SETTINGS_VIEW]
-    : [...BASE_VIEWS, SETTINGS_VIEW];
+  // Folder sync needs a usable `git` (Story 32.5, AD-41): the Sync nav entry is
+  // present only when the flag is on, for the same reason.
+  const sync = useCapabilitiesStore((s) => s.capabilities.sync);
+  // Splice the gated entries in before Settings, each only when supported.
+  const views: SidebarView[] = [
+    ...BASE_VIEWS,
+    ...(recording ? [RECORDING_VIEW] : []),
+    ...(sync ? [SYNC_VIEW] : []),
+    SETTINGS_VIEW,
+  ];
 
   return (
     <nav
@@ -88,8 +107,8 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
       <ul className={cn("flex flex-col gap-1 p-2", collapsed && "items-center")}>
         {views.map((view) => {
           const Icon = view.icon;
-          // "Chats", "Archive", "Bridges", and "Recording" switch the primary view;
-          // Settings opens the dialog.
+          // "Chats", "Archive", "Bridges", "Recording", and "Sync" switch the
+          // primary view; Settings opens the dialog.
           const onClick =
             view.label === "Settings"
               ? () => setSettingsOpen(true)
@@ -103,15 +122,18 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                       ? () => primaryViewStore.getState().setView("bridges")
                       : view.label === "Recording"
                         ? () => primaryViewStore.getState().setView("recording")
-                        : undefined;
+                        : view.label === "Sync"
+                          ? () => primaryViewStore.getState().setView("sync")
+                          : undefined;
           // Reflect the active primary view on the Chats/Archive/Approvals/Bridges/
-          // Recording entries.
+          // Recording/Sync entries.
           const active =
             (view.label === "Chats" && primaryView === "inbox") ||
             (view.label === "Archive" && primaryView === "archive") ||
             (view.label === "Approvals" && primaryView === "approval") ||
             (view.label === "Bridges" && primaryView === "bridges") ||
-            (view.label === "Recording" && primaryView === "recording");
+            (view.label === "Recording" && primaryView === "recording") ||
+            (view.label === "Sync" && primaryView === "sync");
           // The Bridges entry carries the worst-state health roll-up dot (Story
           // 6.1): shown only when at least one bridge reports non-null health.
           const healthDot =

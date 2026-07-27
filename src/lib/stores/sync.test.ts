@@ -60,6 +60,7 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     lfsThresholdBytes: 4 * 1024 * 1024,
     settleMs: 5000,
     tags: [],
+    authorOverride: null,
     enabled: true,
     ...over,
   };
@@ -190,6 +191,7 @@ describe("actions", () => {
       lfsThresholdBytes: null,
       settleMs: null,
       tags: [],
+      authorOverride: null,
     });
 
     expect(result).toEqual(saved);
@@ -216,6 +218,7 @@ describe("actions", () => {
         lfsThresholdBytes: null,
         settleMs: null,
         tags: [],
+        authorOverride: null,
       }),
     ).rejects.toMatchObject({ message: "local path must be absolute" });
     // A rejected write is the caller's to surface; it is not a read failure.

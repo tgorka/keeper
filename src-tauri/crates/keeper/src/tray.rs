@@ -957,14 +957,25 @@ const SYNC_STATUS_ID: &str = "tray-sync-status";
 /// Pick this tick's sync glyph.
 ///
 /// Pure so the precedence is testable without a tray: **warning outranks
-/// activity outranks paused outranks armed**, because a problem must never be
-/// hidden by something else happening to be busy. `frame` is advanced by the
-/// caller's tick and only matters while active.
+/// transferring outranks activity outranks paused outranks armed**, because a
+/// problem must never be hidden by something else happening to be busy.
+/// `frame` is advanced by the caller's tick and only matters while animating.
+///
+/// Motion is reserved for bytes actually moving. `Transferring` (fetching or an
+/// LFS transfer) animates; `Active` — scanning, committing, pushing a small
+/// change — holds the first frame still. That distinction is the whole point of
+/// glancing at the menu bar: a folder mid-upload looks different from one doing
+/// bookkeeping, without either being mistaken for idle. No new asset: the still
+/// frame is the animation's own, so the two states are visibly the same glyph
+/// in the same weight, differing only in movement.
 fn sync_glyph(state: TraySyncState, frame: u8) -> Option<&'static [u8]> {
     match state {
         TraySyncState::Absent => None,
         TraySyncState::Warning => Some(SYNC_WARNING_ICON_PNG),
-        TraySyncState::Active => Some(SYNC_FRAME_PNGS[(frame as usize) % SYNC_FRAME_PNGS.len()]),
+        TraySyncState::Transferring => {
+            Some(SYNC_FRAME_PNGS[(frame as usize) % SYNC_FRAME_PNGS.len()])
+        }
+        TraySyncState::Active => Some(SYNC_FRAME_PNGS[0]),
         TraySyncState::Paused => Some(SYNC_PAUSED_ICON_PNG),
         TraySyncState::Armed => Some(SYNC_ARMED_ICON_PNG),
     }
@@ -1103,24 +1114,42 @@ mod sync_tray_tests {
     }
 
     #[test]
-    fn activity_frames_cycle_and_never_index_out_of_bounds() {
+    fn transfer_frames_cycle_and_never_index_out_of_bounds() {
         // `frame` comes from a free-running tick counter, so it must wrap
         // safely for every u8 rather than panicking once a minute.
         for frame in 0u8..=255 {
-            assert!(sync_glyph(TraySyncState::Active, frame).is_some());
+            assert!(sync_glyph(TraySyncState::Transferring, frame).is_some());
         }
-        let first = sync_glyph(TraySyncState::Active, 0).expect("frame 0");
-        let wrapped = sync_glyph(TraySyncState::Active, 4).expect("frame 4");
+        let first = sync_glyph(TraySyncState::Transferring, 0).expect("frame 0");
+        let wrapped = sync_glyph(TraySyncState::Transferring, 4).expect("frame 4");
         assert_eq!(
             first.len(),
             wrapped.len(),
             "the cycle repeats every four frames"
         );
-        let second = sync_glyph(TraySyncState::Active, 1).expect("frame 1");
+        let second = sync_glyph(TraySyncState::Transferring, 1).expect("frame 1");
         assert_ne!(
             first.len(),
             second.len(),
             "consecutive frames must differ, or the ring does not appear to move"
+        );
+    }
+
+    #[test]
+    fn working_holds_still_so_only_moving_bytes_animate() {
+        // The glance-value of the menu bar depends on motion meaning one thing.
+        // Scanning or committing is work, not transfer, and must not look like
+        // an upload — but it must still differ from armed, or "busy" and "idle"
+        // become the same picture.
+        let a = sync_glyph(TraySyncState::Active, 0).expect("frame 0");
+        let b = sync_glyph(TraySyncState::Active, 1).expect("frame 1");
+        let c = sync_glyph(TraySyncState::Active, 200).expect("late frame");
+        assert_eq!(a.len(), b.len(), "working must not animate");
+        assert_eq!(a.len(), c.len(), "working must not animate");
+        assert_ne!(
+            a.len(),
+            SYNC_ARMED_ICON_PNG.len(),
+            "working must still be distinguishable from armed"
         );
     }
 
