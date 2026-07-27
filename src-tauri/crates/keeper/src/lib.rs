@@ -281,6 +281,20 @@ pub fn run() {
                 });
             }
 
+            // Drive folder sync (Epics 26/29). Until this existed the app built
+            // the engine but never ran its loop, so a folder configured in
+            // Settings sat still until someone pressed "Sync now" and no remote
+            // change ever arrived on its own — continuous sync existed only in
+            // `keeper-syncd`. Started after the state is managed so the platform
+            // port is live; a machine without git has no sync capability and the
+            // call returns quietly. Stopped on the quit path so an in-flight push
+            // aborts resumably rather than mid-write.
+            #[cfg(desktop)]
+            {
+                let state = app.state::<ipc::AppState>();
+                sync::start_supervisor(std::sync::Arc::clone(&state.platform));
+            }
+
             Ok(())
         });
 
@@ -565,6 +579,12 @@ pub fn run() {
                     // `kill_on_drop`) if it hangs. Bounded — quit is never stuck.
                     ipc::finalize_recording_for_quit(&state);
                 }
+                // Ask the sync supervisor to stop before the account teardown
+                // below: the engine finishes the unit it holds and leaves its
+                // journal row intact, so an interrupted push is re-driven next
+                // launch instead of being killed mid-write.
+                #[cfg(desktop)]
+                sync::stop_supervisor();
                 // A short, bounded graceful shutdown: `shutdown_all` awaits each
                 // account's `sync.stop()`. Bounding it keeps quit responsive even if a
                 // network teardown hangs.
