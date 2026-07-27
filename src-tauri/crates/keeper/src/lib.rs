@@ -500,6 +500,12 @@ pub fn run() {
         sync_ipc::sync_verify,
         sync_ipc::sync_subscribe_progress,
         sync_ipc::sync_unsubscribe_progress,
+        sync_ipc::sync_activity,
+        sync_ipc::sync_pending,
+        sync_ipc::sync_problems,
+        sync_ipc::sync_retry_parked,
+        sync_ipc::sync_set_credential,
+        sync_ipc::sync_clear_credential,
     );
     #[cfg(not(desktop))]
     let builder = keeper_with_commands!(builder);
