@@ -694,6 +694,16 @@ impl Engine {
         if git_dir.exists() {
             let repo = git::repo::open(&profile.local_path, trust_full)?;
             git::repo::enforce_local_config_with_filter(&repo, self.filter_program.as_deref())?;
+            // A kill between `gix::init` and the config write in `adopt` leaves a
+            // repository with no remote, and this branch — taken from then on,
+            // because `.git` exists — would otherwise fail every future sync with
+            // "the remote named origin did not exist". Restore it instead.
+            if git::repo::ensure_remote(&repo, &profile.remote_url)? {
+                tracing::warn!(
+                    profile = %profile.id,
+                    "sync: restored the missing origin remote (interrupted setup)"
+                );
+            }
             return Ok(repo);
         }
 
