@@ -298,9 +298,9 @@ pub fn run() {
     // conditional part out of the literal without ever reassigning the handler.
     // `exactly_one_invoke_handler_is_registered` (ipc.rs) fails the build if a
     // second registration is ever added back.
-    macro_rules! keeper_invoke_handler {
-        ($($extra:path),* $(,)?) => {
-            tauri::generate_handler![
+    macro_rules! keeper_with_commands {
+        ($builder:expr $(, $extra:path)* $(,)?) => {
+            $builder.invoke_handler(tauri::generate_handler![
                 $($extra,)*
                 ipc::app_ping,
                 ipc::capabilities,
@@ -466,14 +466,17 @@ pub fn run() {
                 ipc::recording_session_summary,
                 ipc::recovered_sessions_list,
                 ipc::recovered_session_acknowledge
-            ]
+            ])
         };
     }
 
-    // The platform picks its command set; the registration below happens exactly
-    // once, whichever branch compiled.
+    // The macro takes the builder because `generate_handler!` is generic over the
+    // runtime: bound to a bare `let` it has nothing to infer `R` from (E0282).
+    // Passing the builder through also keeps the registration itself inside the
+    // macro, so it is written once no matter how many platform branches exist.
     #[cfg(desktop)]
-    let handler = keeper_invoke_handler![
+    let builder = keeper_with_commands!(
+        builder,
         sync_ipc::sync_profiles,
         sync_ipc::sync_statuses,
         sync_ipc::sync_profile_save,
@@ -483,10 +486,9 @@ pub fn run() {
         sync_ipc::sync_verify,
         sync_ipc::sync_subscribe_progress,
         sync_ipc::sync_unsubscribe_progress,
-    ];
+    );
     #[cfg(not(desktop))]
-    let handler = keeper_invoke_handler![];
-    let builder = builder.invoke_handler(handler);
+    let builder = keeper_with_commands!(builder);
     // Window-close (⌘W / red button) hides the main window instead of destroying it
     // (Story 10.3, FR-53): the process keeps every account's `SyncService` and the
     // notification pipeline alive so background behavior is byte-for-byte identical to

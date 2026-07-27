@@ -6803,7 +6803,7 @@ mod tests {
     /// literal that cannot hold a `#[cfg]` entry), leaving the desktop build with
     /// nine reachable commands and no account restore, no capability probe, no
     /// recording and no bridges. Platform-conditional command sets must be spliced
-    /// into the single list — see `keeper_invoke_handler!` in `lib.rs`.
+    /// into the single list — see `keeper_with_commands!` in `lib.rs`.
     #[test]
     fn exactly_one_invoke_handler_is_registered() {
         let src = include_str!("lib.rs");
