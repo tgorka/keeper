@@ -852,9 +852,67 @@ mod tests {
             lfs_threshold_bytes: None,
             settle_ms: None,
             tags: vec![],
+            author_override: None,
         }
     }
 
+    /// The bug this guards: `db::upsert_profile` replaces the whole JSON row,
+    /// and `parse_req` rebuilds the profile from a request that carries neither
+    /// `enabled` nor `author_override`. Editing a PAUSED folder therefore
+    /// resumed it — keeper quietly restarting sync on a folder the user had
+    /// deliberately stopped — and erased an author override set through the
+    /// daemon. Nothing in the UI hinted at either.
+    #[test]
+    fn editing_a_profile_keeps_what_the_request_cannot_carry() {
+        let mut prior = parse_req(&req(), None).expect("valid");
+        prior.enabled = false;
+        prior.author_override = Some("Ada <ada@example.org>".into());
+
+        let mut edit = req();
+        edit.id = Some(prior.id.clone());
+        edit.name = "renamed".into();
+        let merged = parse_req(&edit, Some(&prior)).expect("valid");
+
+        assert_eq!(merged.name, "renamed", "the edit still applies");
+        assert!(!merged.enabled, "an edit must not resume a paused folder");
+        assert_eq!(
+            merged.author_override.as_deref(),
+            Some("Ada <ada@example.org>"),
+            "an edit must not erase an override it cannot express"
+        );
+    }
+
+    #[test]
+    fn an_explicit_author_override_is_set_and_an_empty_one_clears_it() {
+        let prior = {
+            let mut p = parse_req(&req(), None).expect("valid");
+            p.author_override = Some("Ada <ada@example.org>".into());
+            p
+        };
+
+        let mut set = req();
+        set.author_override = Some("  Grace <grace@example.org>  ".into());
+        assert_eq!(
+            parse_req(&set, Some(&prior))
+                .expect("valid")
+                .author_override
+                .as_deref(),
+            Some("Grace <grace@example.org>"),
+            "an explicit value wins and is trimmed"
+        );
+
+        // "Use the device identity" is expressible: the form sends an empty
+        // string, which is different from omitting the field entirely.
+        let mut cleared = req();
+        cleared.author_override = Some("   ".into());
+        assert_eq!(
+            parse_req(&cleared, Some(&prior))
+                .expect("valid")
+                .author_override,
+            None,
+            "an empty override falls back to the device identity"
+        );
+    }
     #[test]
     fn minted_ids_are_unique_sortable_and_shaped_like_a_ulid() {
         let ids: std::collections::BTreeSet<String> = (0..500).map(|_| new_profile_id()).collect();
@@ -876,7 +934,7 @@ mod tests {
 
     #[test]
     fn a_request_round_trips_into_a_profile_and_back_into_a_view_model() {
-        let parsed = parse_req(&req()).expect("valid");
+        let parsed = parse_req(&req(), None).expect("valid");
         assert!(!parsed.id.is_empty(), "a new profile is given an id");
         let vm = SyncProfileVm::from(&parsed);
         assert_eq!(vm.direction, "bidirectional");
@@ -900,7 +958,7 @@ mod tests {
                 "lane" => r.lane = value.into(),
                 _ => r.lfs_mode = value.into(),
             }
-            let err = parse_req(&r).expect_err("must reject");
+            let err = parse_req(&r, None).expect_err("must reject");
             assert_eq!(err.code, IpcErrorCode::Internal);
             assert!(err.message.contains(value), "message names the bad value");
         }
@@ -910,7 +968,7 @@ mod tests {
     fn an_invalid_profile_is_refused_before_it_reaches_the_engine() {
         let mut r = req();
         r.local_path = "relative/path".into();
-        assert!(parse_req(&r).is_err());
+        assert!(parse_req(&r, None).is_err());
     }
 
     #[test]
@@ -918,11 +976,11 @@ mod tests {
         let mut r = req();
         r.lane = "worktree".into();
         assert!(
-            parse_req(&r).is_err(),
+            parse_req(&r, None).is_err(),
             "a bidirectional lane would leak the airlock"
         );
         r.direction = "pushOnly".into();
-        assert!(parse_req(&r).is_ok());
+        assert!(parse_req(&r, None).is_ok());
     }
 
     #[test]
