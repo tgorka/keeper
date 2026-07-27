@@ -463,6 +463,8 @@ pub fn run() {
                 ipc::menu_bar_presence_set,
                 ipc::debug_mode_get,
                 ipc::debug_mode_set,
+                ipc::debug_log_tail,
+                ipc::debug_log_path,
                 ipc::recording_permission,
                 ipc::request_screen_recording_permission,
                 ipc::request_microphone_permission,

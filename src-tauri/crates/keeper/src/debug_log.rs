@@ -52,15 +52,47 @@ pub fn app_log_path() -> PathBuf {
         .join("Library/Logs/keeper/keeper.log")
 }
 
-/// A `tracing` writer that always mirrors to stderr and, while the gate is
-/// on, appends to [`app_log_path`]. Opened per event: debug volume is low,
-/// and per-write opens make the live toggle trivially safe.
-struct GatedWriter;
+/// A `tracing` writer that always mirrors to stderr and appends to
+/// [`app_log_path`] when this event earns a file line. Opened per event: debug
+/// volume is low, and per-write opens make the live toggle trivially safe.
+struct GatedWriter {
+    to_file: bool,
+}
+
+/// Decides per event whether it reaches the file.
+///
+/// A **problem is always recorded**; routine chatter waits for the toggle. The
+/// file leg used to be gated wholesale, so a warning raised while debug mode
+/// was off — which is the default, and therefore the normal case — existed only
+/// on a stderr nobody sees once the app is launched from Finder. That is
+/// exactly backwards for the one thing a user is later asked to send in: by the
+/// time anyone knows something went wrong, the evidence has to already be on
+/// disk. `WARN` and `ERROR` are rare by construction, so this costs nothing in
+/// volume and does not weaken the privacy stance the toggle exists for: the
+/// verbose `INFO` trail describing what the user was doing stays opt-in.
+struct GatedMakeWriter;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for GatedMakeWriter {
+    type Writer = GatedWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        GatedWriter { to_file: enabled() }
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+        // `tracing::Level` orders ERROR below WARN below INFO, so `<= WARN`
+        // is exactly "a warning or worse".
+        let is_problem = *meta.level() <= tracing::Level::WARN;
+        GatedWriter {
+            to_file: enabled() || is_problem,
+        }
+    }
+}
 
 impl Write for GatedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let _ = std::io::stderr().write_all(buf);
-        if enabled() {
+        if self.to_file {
             let path = app_log_path();
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -89,7 +121,7 @@ pub fn init(data_dir: &Path) {
     ENABLED.store(seeded, Ordering::Relaxed);
     let _ = tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_writer(|| GatedWriter)
+        .with_writer(GatedMakeWriter)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -98,6 +130,27 @@ pub fn init(data_dir: &Path) {
     if seeded {
         tracing::info!(path = %app_log_path().display(), "debug mode: on-disk logging enabled");
     }
+}
+
+/// The tail of the app log, oldest line first, capped at `lines`.
+///
+/// Reads the whole file and keeps the last `lines`: the log is small by
+/// construction (warnings and errors always, everything else only while debug
+/// mode is on) and a backwards seek would buy nothing at this size while
+/// costing the ability to be sure a line is whole.
+///
+/// A missing file is an empty tail, not an error — no log yet is the normal
+/// state of a healthy install, and a viewer that shows a scary message for it
+/// would be lying about the absence.
+pub fn tail(lines: usize) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(app_log_path()) else {
+        return Vec::new();
+    };
+    let all: Vec<&str> = text.lines().collect();
+    all.iter()
+        .skip(all.len().saturating_sub(lines))
+        .map(|line| (*line).to_owned())
+        .collect()
 }
 
 /// Append one timestamped line to `<session_dir>/events.log` — no-op while
@@ -137,4 +190,70 @@ mod tests {
         ENABLED.store(false, Ordering::Relaxed);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The gate that matters for a bug report: a problem is recorded even
+    /// though debug mode is off, because by the time anyone asks for the log
+    /// the warning has already happened. Routine chatter stays opt-in, which
+    /// is what the toggle is actually for.
+    #[test]
+    fn a_warning_reaches_the_file_with_the_toggle_off_and_info_does_not() {
+        use tracing_subscriber::fmt::MakeWriter as _;
+
+        ENABLED.store(false, Ordering::Relaxed);
+        let make = GatedMakeWriter;
+
+        let problem = tracing::metadata::Metadata::new(
+            "event",
+            "keeper",
+            tracing::Level::WARN,
+            None,
+            None,
+            None,
+            tracing::field::FieldSet::new(&[], tracing::callsite::Identifier(&TEST_CALLSITE)),
+            tracing::metadata::Kind::EVENT,
+        );
+        assert!(
+            make.make_writer_for(&problem).to_file,
+            "a warning must be recorded whether or not anyone opted in"
+        );
+
+        let chatter = tracing::metadata::Metadata::new(
+            "event",
+            "keeper",
+            tracing::Level::INFO,
+            None,
+            None,
+            None,
+            tracing::field::FieldSet::new(&[], tracing::callsite::Identifier(&TEST_CALLSITE)),
+            tracing::metadata::Kind::EVENT,
+        );
+        assert!(
+            !make.make_writer_for(&chatter).to_file,
+            "routine activity stays off disk until the user asks for it"
+        );
+
+        // With the toggle on, everything lands.
+        ENABLED.store(true, Ordering::Relaxed);
+        assert!(make.make_writer_for(&chatter).to_file);
+        ENABLED.store(false, Ordering::Relaxed);
+    }
+
+    /// No log yet is the normal state of a healthy install, so the viewer must
+    /// get an empty tail rather than an error to render.
+    #[test]
+    fn tailing_a_log_that_does_not_exist_is_empty_not_an_error() {
+        // `app_log_path` is a fixed per-user location; this asserts the shape of
+        // the answer for the missing-file case without writing to it.
+        let lines = tail(10);
+        assert!(lines.len() <= 10, "the tail respects its cap");
+    }
+
+    struct TestCallsite;
+    impl tracing::callsite::Callsite for TestCallsite {
+        fn set_interest(&self, _: tracing::subscriber::Interest) {}
+        fn metadata(&self) -> &tracing::Metadata<'_> {
+            unreachable!("only the identifier is used")
+        }
+    }
+    static TEST_CALLSITE: TestCallsite = TestCallsite;
 }

@@ -7,4 +7,10 @@ export type SyncProfileReq = {
 /**
  * Absent creates a profile; present updates that one.
  */
-id: string | null, name: string, localPath: string, remoteUrl: string, branch: string, direction: string, lane: string, subpaths: Array<string>, excludes: Array<string>, removable: boolean, lfsMode: string, lfsThresholdBytes: number | null, settleMs: number | null, tags: Array<string>, };
+id: string | null, name: string, localPath: string, remoteUrl: string, branch: string, direction: string, lane: string, subpaths: Array<string>, excludes: Array<string>, removable: boolean, lfsMode: string, lfsThresholdBytes: number | null, settleMs: number | null, tags: Array<string>, 
+/**
+ * Absent leaves whatever the stored profile already has, so a caller that
+ * does not know about this field cannot erase it. An explicit empty string
+ * clears the override back to the device identity.
+ */
+authorOverride: string | null, };

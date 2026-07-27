@@ -3,4 +3,10 @@
 /**
  * One configured folder↔repository binding, as the UI sees it.
  */
-export type SyncProfileVm = { id: string, name: string, localPath: string, remoteUrl: string, branch: string, direction: string, lane: string, subpaths: Array<string>, excludes: Array<string>, removable: boolean, lfsMode: string, lfsThresholdBytes: number, settleMs: number, tags: Array<string>, enabled: boolean, };
+export type SyncProfileVm = { id: string, name: string, localPath: string, remoteUrl: string, branch: string, direction: string, lane: string, subpaths: Array<string>, excludes: Array<string>, removable: boolean, lfsMode: string, lfsThresholdBytes: number, settleMs: number, tags: Array<string>, 
+/**
+ * Overrides the commit author, in any of `Name <email>`, a bare address,
+ * or a bare display name. `None` keeps the device identity and its
+ * non-routable `sync@<device-id>.keeper.invalid` address.
+ */
+authorOverride: string | null, enabled: boolean, };
