@@ -18,17 +18,18 @@ vi.mock("@/lib/ipc/client", () => ({
   // The progress stream, the only source of in-flight counters.
   syncSubscribeProgress: vi.fn(),
   syncUnsubscribeProgress: vi.fn(),
-  // Reached only through the Settings section this pane borrows its labels from.
+  // The shared add-folder form's keychain pair (Story 32.7).
   syncSetCredential: vi.fn(),
   syncClearCredential: vi.fn(),
 }));
 
-// The Settings section (whose action labels this pane reuses) opens the native
-// directory picker; mock it so mounting never reaches Tauri.
+// The shared add-folder form opens the native directory picker; mock it so
+// mounting never reaches Tauri.
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(() => Promise.resolve(null)),
 }));
 
+import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import {
   formatSyncWaited,
   SYNC_ACTIVITY_EMPTY_SENTENCE,
@@ -54,6 +55,17 @@ import {
   SYNC_PROGRESS_LABEL,
   SYNC_RESUME_LABEL,
 } from "@/components/settings/sync-section";
+import {
+  SYNC_ADD_SUBMIT_LABEL,
+  SYNC_ADD_TITLE,
+  SYNC_ADVANCED_TOGGLE_TESTID,
+  SYNC_CHOOSE_FOLDER_LABEL,
+  SYNC_FORM_PATH_TESTID,
+  SYNC_NAME_LABEL,
+  SYNC_REMOTE_URL_LABEL,
+  SYNC_TOKEN_FAILED_PREFIX,
+  SYNC_TOKEN_LABEL,
+} from "@/components/sync/add-folder-form";
 import type {
   SyncActivityVm,
   SyncPendingVm,
@@ -67,9 +79,11 @@ import {
   syncFolderNow,
   syncPending,
   syncProblems,
+  syncProfileSave,
   syncProfileSetEnabled,
   syncProfiles,
   syncRetryParked,
+  syncSetCredential,
   syncStatuses,
   syncSubscribeProgress,
   syncUnsubscribeProgress,
@@ -91,6 +105,9 @@ const mockFolderNow = vi.mocked(syncFolderNow);
 const mockSetEnabled = vi.mocked(syncProfileSetEnabled);
 const mockSubscribe = vi.mocked(syncSubscribeProgress);
 const mockUnsubscribe = vi.mocked(syncUnsubscribeProgress);
+const mockSave = vi.mocked(syncProfileSave);
+const mockPicker = vi.mocked(openFolder);
+const mockSetCredential = vi.mocked(syncSetCredential);
 
 /** The exact line Rust composes — the pane must render it character for character. */
 const RUST_LINE = "tgdrive — 3 waiting to sync";
@@ -306,6 +323,122 @@ describe("SyncPane profile list", () => {
     render(<SyncPane />);
 
     expect(await screen.findByText(SYNC_PANE_EMPTY_SENTENCE)).toBeInTheDocument();
+  });
+});
+
+describe("SyncPane add a folder", () => {
+  /** Fill the three fields the submit button waits on. */
+  async function fillRequired() {
+    // Once, so the module-level "cancelled" default is what every other test
+    // still mounts against.
+    mockPicker.mockResolvedValueOnce("/Users/alice/notes");
+    fireEvent.change(screen.getByLabelText(SYNC_NAME_LABEL), { target: { value: "notes" } });
+    fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
+      target: { value: "git@github.com:alice/notes.git" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL }));
+    await waitFor(() =>
+      expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("/Users/alice/notes"),
+    );
+  }
+
+  /** The mirror re-read `saveSyncProfile` runs, now carrying the new folder. */
+  function mirrorAfterAdd() {
+    const added = profileVm({ id: "p2", name: "notes" });
+    mockSave.mockResolvedValue(added);
+    mockProfiles.mockResolvedValue([added]);
+    mockStatuses.mockResolvedValue([statusVm({ profileId: "p2", profileName: "notes" })]);
+  }
+
+  it("offers the form itself when nothing is configured, instead of naming Settings", async () => {
+    mockProfiles.mockResolvedValue([]);
+    mockStatuses.mockResolvedValue([]);
+    render(<SyncPane />);
+
+    expect(await screen.findByText(SYNC_PANE_EMPTY_SENTENCE)).toBeInTheDocument();
+    // The first thing a new user can do here is the thing they came for.
+    expect(screen.getByRole("form", { name: SYNC_ADD_TITLE })).toBeInTheDocument();
+    // No folders, so nothing to reveal: the form is the empty state.
+    expect(screen.queryByRole("button", { name: SYNC_ADD_TITLE })).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("Settings");
+  });
+
+  it("shows the added folder without waiting for a poll", async () => {
+    mockProfiles.mockResolvedValue([]);
+    mockStatuses.mockResolvedValue([]);
+    render(<SyncPane />);
+    await screen.findByRole("form", { name: SYNC_ADD_TITLE });
+
+    await fillRequired();
+    mirrorAfterAdd();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalled());
+    // The save re-reads the mirror, so the card is here now — not up to a poll
+    // interval later — and its lists are read for the same reason.
+    expect(await screen.findByText("notes")).toBeInTheDocument();
+    await waitFor(() => expect(mockActivity).toHaveBeenCalledWith("p2", expect.any(Number)));
+  });
+
+  it("keeps the form behind the header action once a folder exists, and closes it after an add", async () => {
+    await renderPane();
+
+    // A permanently expanded form above a populated list would be noise.
+    expect(screen.queryByRole("form", { name: SYNC_ADD_TITLE })).not.toBeInTheDocument();
+    const action = screen.getByRole("button", { name: SYNC_ADD_TITLE });
+    expect(action).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(action);
+    expect(screen.getByRole("form", { name: SYNC_ADD_TITLE })).toBeInTheDocument();
+    expect(action).toHaveAttribute("aria-expanded", "true");
+
+    await fillRequired();
+    mirrorAfterAdd();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(screen.queryByRole("form", { name: SYNC_ADD_TITLE })).not.toBeInTheDocument(),
+    );
+    expect(await screen.findByText("notes")).toBeInTheDocument();
+  });
+
+  it("keeps a rejected add on screen with every typed value", async () => {
+    await renderPane();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_TITLE }));
+    await fillRequired();
+    mockSave.mockRejectedValue({ code: "internal", message: "remote is not reachable" });
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    expect(await screen.findByText("remote is not reachable")).toBeInTheDocument();
+    // Closing the disclosure here would destroy the only place the message is
+    // shown, along with the remote URL that has to be corrected.
+    expect(screen.getByRole("form", { name: SYNC_ADD_TITLE })).toBeInTheDocument();
+    expect(screen.getByLabelText(SYNC_REMOTE_URL_LABEL)).toHaveValue(
+      "git@github.com:alice/notes.git",
+    );
+  });
+
+  it("keeps a failed token write on screen across the flip from empty to populated", async () => {
+    mockProfiles.mockResolvedValue([]);
+    mockStatuses.mockResolvedValue([]);
+    mockSetCredential.mockRejectedValue({ code: "internal", message: "keychain refused" });
+    render(<SyncPane />);
+    await screen.findByRole("form", { name: SYNC_ADD_TITLE });
+
+    await fillRequired();
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    fireEvent.change(screen.getByLabelText(SYNC_TOKEN_LABEL), { target: { value: "ghp_secret" } });
+    mirrorAfterAdd();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    // The add turns this surface from empty to populated, which is exactly the
+    // moment the empty state's form would vanish — taking with it the only
+    // report that the folder exists but its token does not.
+    expect(
+      await screen.findByText(`${SYNC_TOKEN_FAILED_PREFIX}keychain refused`),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("notes")).toBeInTheDocument();
   });
 });
 

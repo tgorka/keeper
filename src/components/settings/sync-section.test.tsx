@@ -14,6 +14,13 @@ vi.mock("@/lib/ipc/client", () => ({
   // command reports what a keychain holds.
   syncSetCredential: vi.fn(),
   syncClearCredential: vi.fn(),
+  // A successful add re-reads the new folder's three detail lists so the Sync
+  // view is not blank for a poll interval — the same add path runs from here.
+  syncActivity: vi.fn(() => Promise.resolve([])),
+  syncPending: vi.fn(() => Promise.resolve([])),
+  syncProblems: vi.fn(() =>
+    Promise.resolve({ warning: null, error: null, parked: [], conflicts: [] }),
+  ),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -22,24 +29,29 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import {
-  SYNC_ADD_SUBMIT_LABEL,
-  SYNC_ADVANCED_TOGGLE_TESTID,
   SYNC_ATTENTION_FALLBACK_SENTENCE,
-  SYNC_AUTHOR_LABEL,
-  SYNC_CHOOSE_FOLDER_LABEL,
-  SYNC_EXCLUDES_LABEL,
-  SYNC_FORM_PATH_TESTID,
-  SYNC_NAME_LABEL,
   SYNC_NO_PROFILES_SENTENCE,
   SYNC_NOW_LABEL,
   SYNC_PAUSE_LABEL,
   SYNC_PROGRESS_LABEL,
-  SYNC_REMOTE_URL_LABEL,
   SYNC_REMOVE_CANCEL_LABEL,
   SYNC_REMOVE_CONFIRM_LABEL,
   SYNC_REMOVE_CONFIRM_SENTENCE,
   SYNC_REMOVE_LABEL,
   SYNC_RESUME_LABEL,
+  SYNC_VERIFY_LABEL,
+  SyncSection,
+  syncRemoteHost,
+} from "@/components/settings/sync-section";
+import {
+  SYNC_ADD_SUBMIT_LABEL,
+  SYNC_ADVANCED_TOGGLE_TESTID,
+  SYNC_AUTHOR_LABEL,
+  SYNC_CHOOSE_FOLDER_LABEL,
+  SYNC_EXCLUDES_LABEL,
+  SYNC_FORM_PATH_TESTID,
+  SYNC_NAME_LABEL,
+  SYNC_REMOTE_URL_LABEL,
   SYNC_SETTLE_LABEL,
   SYNC_SUBPATHS_LABEL,
   SYNC_TAGS_LABEL,
@@ -47,10 +59,7 @@ import {
   SYNC_TOKEN_FAILED_PREFIX,
   SYNC_TOKEN_LABEL,
   SYNC_TOKEN_STORED_LABEL,
-  SYNC_VERIFY_LABEL,
-  SyncSection,
-  syncRemoteHost,
-} from "@/components/settings/sync-section";
+} from "@/components/sync/add-folder-form";
 import type { SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
 import {
   syncClearCredential,
@@ -64,6 +73,7 @@ import {
   syncVerify,
 } from "@/lib/ipc/client";
 import { resetSyncStoreForTest } from "@/lib/stores/sync";
+import { resetSyncDetailStoreForTest } from "@/lib/stores/sync-detail";
 
 const mockProfiles = vi.mocked(syncProfiles);
 const mockStatuses = vi.mocked(syncStatuses);
@@ -124,6 +134,7 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
 
 beforeEach(() => {
   resetSyncStoreForTest();
+  resetSyncDetailStoreForTest();
   mockProfiles.mockResolvedValue([profileVm()]);
   mockStatuses.mockResolvedValue([statusVm()]);
   mockPicker.mockResolvedValue(null);

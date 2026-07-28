@@ -1,5 +1,6 @@
 /**
- * The Sync primary view (Epic 32, Story 32.5, AD-S1..AD-S6).
+ * The Sync primary view (Epic 32, Story 32.5, AD-S1..AD-S6; Epic 33,
+ * Story 33.4).
  *
  * Folder sync worked long before it could be watched: Settings could name a
  * profile's state but never a *file*. This pane answers the three questions a
@@ -9,8 +10,12 @@
  * progress, the row actions), then Activity, Pending, and a Problems section
  * that exists only while something is wrong.
  *
- * Settings keeps profile *configuration* (AD-S1); this view owns activity,
- * state and problems, and never offers Remove.
+ * Settings keeps profile *configuration* (AD-S1) — editing, pausing, removing.
+ * This view owns activity, state and problems, and never offers Remove. The
+ * one configuration act it does offer is the first one: adding a folder, via
+ * the shared {@link AddFolderForm} (AD-C7). Until Story 33.4 the empty state
+ * named Settings and stopped there, which meant a new user's Sync view could
+ * only tell them to leave it.
  *
  * Two rules carried over from the Settings section, because they are the whole
  * reason this surface can be trusted:
@@ -37,6 +42,7 @@ import {
   SYNC_RESUME_LABEL,
   syncRemoteHost,
 } from "@/components/settings/sync-section";
+import { AddFolderForm, SYNC_ADD_TITLE } from "@/components/sync/add-folder-form";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -78,9 +84,13 @@ export const SYNC_PANE_SUBTITLE =
 /** Shown while the profile list has never been read. Unknown, not empty. */
 export const SYNC_PANE_LOADING_SENTENCE = "Loading folders…";
 
-/** Shown once the mirror has loaded and there is genuinely nothing configured. */
+/**
+ * Shown once the mirror has loaded and there is genuinely nothing configured.
+ * Says what the form beneath it is for; it never points at another surface,
+ * because this one can do the thing.
+ */
 export const SYNC_PANE_EMPTY_SENTENCE =
-  "No folders are set up to sync yet. Add one in Settings → Sync.";
+  "No folders are set up to sync yet. Point keeper at a folder and the git remote to sync it with.";
 
 /** Section titles. */
 export const SYNC_ACTIVITY_TITLE = "Activity";
@@ -223,6 +233,13 @@ export function SyncPane() {
   const profiles = useSyncStore((state) => state.profiles);
   const statuses = useSyncStore((state) => state.statuses);
   const readError = useSyncStore((state) => state.error);
+  /**
+   * Whether the add form is held open independently of the empty state. The
+   * header action toggles it; an add that leaves the form with something to
+   * show sets it, which is what keeps that message alive across the flip from
+   * empty to populated.
+   */
+  const [adding, setAdding] = useState(false);
 
   // Three lifetimes, all torn down together: the shared profile/status mirror
   // poll, the modest per-profile detail poll, and the progress stream that is
@@ -239,14 +256,48 @@ export function SyncPane() {
     };
   }, []);
 
+  const empty = profiles !== null && profiles.length === 0;
+
+  /**
+   * Nothing configured → open the add form and leave it open. The one thing
+   * worth doing here with no folders set up is set one up, so this surface
+   * offers it rather than naming another one that would.
+   *
+   * Opening the *same* disclosure rather than rendering a second copy is the
+   * point: the add that fills this list flips `empty` false mid-flight, and a
+   * form conditioned on `empty` would unmount before it could report a
+   * keychain failure or hand over the Clear button that undoes a stored token.
+   */
+  useEffect(() => {
+    if (empty) {
+      setAdding(true);
+    }
+  }, [empty]);
+
+  const showAddForm = profiles !== null && adding;
+
   return (
     <section
       aria-label="Sync"
       className="flex min-w-0 flex-1 flex-col border-border border-r bg-background"
     >
-      <header className="shrink-0 border-border border-b px-6 py-4">
-        <h1 className="font-heading font-medium text-lg">Sync</h1>
-        <p className="text-muted-foreground text-sm">{SYNC_PANE_SUBTITLE}</p>
+      <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
+        <div className="min-w-0">
+          <h1 className="font-heading font-medium text-lg">Sync</h1>
+          <p className="text-muted-foreground text-sm">{SYNC_PANE_SUBTITLE}</p>
+        </div>
+        {profiles !== null && !empty && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            aria-expanded={adding}
+            onClick={() => setAdding((shown) => !shown)}
+          >
+            {SYNC_ADD_TITLE}
+          </Button>
+        )}
       </header>
 
       <ScrollArea className="min-h-0 flex-1">
@@ -260,15 +311,22 @@ export function SyncPane() {
           )}
           {/* Only claim "nothing configured" once a read has actually landed —
               before that the list is unknown, not empty. */}
-          {profiles === null ? (
+          {profiles === null && (
             <p className="text-muted-foreground text-sm">{SYNC_PANE_LOADING_SENTENCE}</p>
-          ) : profiles.length === 0 ? (
-            <p className="text-muted-foreground text-sm">{SYNC_PANE_EMPTY_SENTENCE}</p>
-          ) : (
-            profiles.map((profile) => (
-              <SyncProfileCard key={profile.id} profile={profile} status={statuses[profile.id]} />
-            ))
           )}
+          {empty && <p className="text-muted-foreground text-sm">{SYNC_PANE_EMPTY_SENTENCE}</p>}
+          {/* Whether it arrived as the empty state or from the header action,
+              this is the one add form; see `showAddForm` above for why. */}
+          {showAddForm && (
+            <Card size="sm">
+              <CardContent>
+                <AddFolderForm onAdded={(_profile, settled) => setAdding(!settled)} />
+              </CardContent>
+            </Card>
+          )}
+          {profiles?.map((profile) => (
+            <SyncProfileCard key={profile.id} profile={profile} status={statuses[profile.id]} />
+          ))}
         </div>
       </ScrollArea>
     </section>
