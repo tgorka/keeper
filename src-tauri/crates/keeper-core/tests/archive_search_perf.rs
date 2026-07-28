@@ -221,8 +221,10 @@ fn search_p95_under_200ms_at_120k_events() {
     // meets the budget the number was written for.
     let scale = (scan.as_secs_f64() / REFERENCE_SCAN.as_secs_f64()).max(1.0);
     let allowed = BUDGET.mul_f64(scale);
-    // Always printed, pass or fail: a gate whose verdict depends on the machine
-    // has to say which machine it measured.
+    // A gate whose verdict depends on the machine has to say which machine it
+    // measured. The assert below repeats it, because CI runs under nextest,
+    // which swallows a passing test's stdout — this line is for the human
+    // running it with `--no-capture`; the failure message is for CI.
     println!(
         "search p95 {p95:?} (max {max:?}, n={}); scan {scan:?} vs reference \
          {REFERENCE_SCAN:?} => {scale:.2}x, budget {BUDGET:?} -> {allowed:?}",
