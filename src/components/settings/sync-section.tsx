@@ -2,12 +2,14 @@
  * Settings → Sync section (Epic 29, Stories 29.4 + 29.5, FR-77..FR-93).
  *
  * Lists every configured folder↔repository binding with the status line Rust
- * composed for it, and lets a folder be synced now, paused, resumed or
- * removed. Adding one is the shared {@link AddFolderForm} (Story 33.4), which
- * the Sync view renders too — the form carries rules Rust enforces, and two
- * copies of it would drift. The whole section is capability-gated at its call
- * site (`CapabilitiesVm.sync`): a machine with no usable `git` gets no sync UI
- * at all, never a disabled or failing one.
+ * composed for it, and lets a folder be synced now, paused, resumed, edited or
+ * removed. Both adding and editing are the shared {@link AddFolderForm} (Story
+ * 33.4) in its two modes, which the Sync view renders too — the form carries
+ * rules Rust enforces, and two copies of it would drift. This is the surface
+ * that removes a folder, so it is also the surface where "I typed the remote
+ * wrong" used to mean removing it and starting over. The whole section is
+ * capability-gated at its call site (`CapabilitiesVm.sync`): a machine with no
+ * usable `git` gets no sync UI at all, never a disabled or failing one.
  *
  * Two rules this surface exists to honor:
  *   - `SyncStatusVm.line` is rendered verbatim. It is composed in Rust so the
@@ -16,7 +18,7 @@
  *     in it stay on disk, and the confirmation says so in those words.
  */
 import { useEffect, useState } from "react";
-import { AddFolderForm, SYNC_ADD_TITLE } from "@/components/sync/add-folder-form";
+import { AddFolderForm, SYNC_ADD_TITLE, SYNC_EDIT_TITLE } from "@/components/sync/add-folder-form";
 import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -159,6 +161,11 @@ function SyncProfileRow({
   const [actionError, setActionError] = useState<string | null>(null);
   const [problems, setProblems] = useState<string[] | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  /**
+   * Whether this row's configuration is open for editing. Per row, because the
+   * form it reveals is about this folder and nothing else.
+   */
+  const [editing, setEditing] = useState(false);
 
   /** Run a row action with the shared busy/error lifecycle. */
   const run = async (action: () => Promise<void>) => {
@@ -217,6 +224,16 @@ function SyncProfileRow({
             }}
           >
             {profile.enabled ? SYNC_PAUSE_LABEL : SYNC_RESUME_LABEL}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            aria-expanded={editing}
+            disabled={busy}
+            onClick={() => setEditing((shown) => !shown)}
+          >
+            {SYNC_EDIT_TITLE}
           </Button>
           <Button
             type="button"
@@ -284,6 +301,18 @@ function SyncProfileRow({
           </ul>
         ))}
       {actionError !== null && <p className="text-destructive text-xs">{actionError}</p>}
+      {/* Under everything the row reports about the folder, so opening it never
+          pushes a live warning off the top. Mounted fresh on each open, so it
+          seeds from the profile as it is now; `settled` false leaves it
+          standing over a keychain failure nothing else here would report. */}
+      {editing && (
+        <AddFolderForm
+          className="mt-1 border-border border-t pt-2"
+          profile={profile}
+          onSaved={(_saved, settled) => setEditing(!settled)}
+          onCancel={() => setEditing(false)}
+        />
+      )}
       <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
