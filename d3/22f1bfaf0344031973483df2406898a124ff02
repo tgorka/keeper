@@ -1,0 +1,75 @@
+src-tauri/crates/keeper-sync/src/git/cli.rs
+  s_8c61bd1567dfe8::t_d73fffab0db427 402-407,409-415
+  s_8c61bd1567dfe8::t_10cca7ea21afc3 461-478
+  s_8c61bd1567dfe8::t_aa3318cfc74610 791,958,1021-1036
+  s_8c61bd1567dfe8::t_26094712a74c3f 309-328
+  s_8c61bd1567dfe8::t_cf84e6780e4fe5 271,364
+  s_8c61bd1567dfe8::t_9887e4cedc1863 800-808
+  s_8c61bd1567dfe8::t_16ad06fc687943 130-143
+  s_8c61bd1567dfe8::t_d1c14a2b6ffecb 38-62
+  s_8c61bd1567dfe8::t_9e38c07f170317 129
+  s_8c61bd1567dfe8::t_2bcf6c8de30640 809-816
+  s_8c61bd1567dfe8::t_a812a4b19d7870 959-1020,1037-1038
+src-tauri/crates/keeper/src/sync_ipc.rs
+  s_8c61bd1567dfe8::t_db5a9e9529ae53 432-437
+src-tauri/crates/keeper-sync/src/git/repo.rs
+  s_8c61bd1567dfe8::t_bc32a9cdd37242 1002
+  s_8c61bd1567dfe8::t_e4e8b2690d069e 504-508,510-514
+  s_8c61bd1567dfe8::t_876b98e1125dc4 30
+  s_8c61bd1567dfe8::t_e15a060658cdac 509
+  s_8c61bd1567dfe8::t_578c7d2005bc8c 135,141-152,160,165,173-181,190-194
+  s_8c61bd1567dfe8::t_e9e4f7ddceaf1b 182-186
+  s_8c61bd1567dfe8::t_f3925c0126af4c 187-189,198
+src-tauri/crates/keeper-sync/src/profile.rs
+  s_8c61bd1567dfe8::t_364dcfd1e93bab 217
+  s_8c61bd1567dfe8::t_3dcd609598a07c 153-166
+src-tauri/crates/keeper-syncd/src/commands.rs
+  s_8c61bd1567dfe8::t_ba3e5e9778e6e9 513-523
+src-tauri/crates/keeper-syncd/src/config.rs
+  s_8c61bd1567dfe8::t_3396027e450e43 369-373
+  s_8c61bd1567dfe8::t_642c2e6b2bcc6d 374
+src-tauri/crates/keeper-sync/src/git/fetch.rs
+  s_8c61bd1567dfe8::t_ec299adff87ebd 129,169,181,256-261,269
+  s_8c61bd1567dfe8::t_e14b2fb84aae33 698,714,723
+  s_8c61bd1567dfe8::t_8f72f0998f7d11 206,235
+  s_8c61bd1567dfe8::t_f3925c0126af4c 679-684
+src-tauri/crates/keeper-syncd/tests/durability_matrix.rs
+  s_8c61bd1567dfe8::t_68ea1d25776c27 173,177-186
+src-tauri/crates/keeper-sync/src/volume.rs
+  s_8c61bd1567dfe8::t_9cc824919ed799 672,677-695
+  s_8c61bd1567dfe8::t_afb2e9728d2048 282-296,303-361
+  s_8c61bd1567dfe8::t_2d48806eb9fcab 660-671,673-676,696
+  s_8c61bd1567dfe8::t_6cfc10436e555e 297-302
+src/components/sync/add-folder-form.tsx
+  s_8c61bd1567dfe8::t_955f5ce3ec27e6 78-79
+  s_8c61bd1567dfe8::t_42b6eff2acee91 77
+docs/sync.md
+  s_8c61bd1567dfe8::t_6fb501bd58d79a 207-225
+  s_8c61bd1567dfe8::t_e365b1b131dda2 539-541
+  s_8c61bd1567dfe8::t_a7e3181c77998e 76
+  s_8c61bd1567dfe8::t_1a83e178d4603e 504-515
+src-tauri/crates/keeper-sync/src/engine.rs
+  s_8c61bd1567dfe8::t_2faaddf3f6cb9f 715-736
+  s_8c61bd1567dfe8::t_f2ec2a2f7021a6 920
+  s_8c61bd1567dfe8::t_fa3f1ad0bf51f3 702-714,737-785
+  s_8c61bd1567dfe8::t_eb009abc8532ed 2741-2843
+  s_8c61bd1567dfe8::t_0c4f7b86508cc9 658-669
+  s_8c61bd1567dfe8::t_00998875b857f8 1309-1314
+  s_8c61bd1567dfe8::t_cfa0ab6683e2bf 45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "d322f1bfaf0344031973483df2406898a124ff02",
+  "prompts": {},
+  "sessions": {
+    "s_8c61bd1567dfe8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "75177171-6ac0-4125-b8ff-1da20fdb8c28",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
