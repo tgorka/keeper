@@ -110,6 +110,47 @@ fn time_search(conn: &Connection, filter: &SearchFilter, honor: bool) -> Duratio
     std::hint::black_box(hits.len());
     elapsed
 }
+/// Time the yardstick: one full scan of the corpus, aggregating a value the
+/// planner cannot serve from an index.
+///
+/// This touches the same subsystem as the queries under test — the same pages,
+/// the same SQLite, the same disk — but none of the code the gate is guarding,
+/// so it measures the MACHINE and nothing else.
+fn time_scan(conn: &Connection) -> Duration {
+    let start = Instant::now();
+    let (rows, bytes): (i64, i64) = conn
+        .query_row("SELECT COUNT(*), SUM(LENGTH(body)) FROM events", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .expect("scan");
+    let elapsed = start.elapsed();
+    std::hint::black_box((rows, bytes));
+    elapsed
+}
+
+/// The yardstick's median on reference hardware.
+///
+/// The budget below is a promise about what a person experiences, so it cannot
+/// simply be raised until CI stops complaining — that would trade a real
+/// guarantee for a quiet pipeline. But an absolute wall-clock assertion on a
+/// shared runner is not measuring keeper at all: the same commit passed at
+/// 150 ms and failed at 266 ms on consecutive runs of identical code, because
+/// GitHub's macOS runners are shared and several times slower than the machine
+/// the number was set on. Scaling the budget by how much slower THIS box is
+/// keeps the gate honest in both directions: a regression still fails
+/// everywhere, and a slow neighbour no longer fails a clean commit.
+///
+/// Measured on the machine the 200 ms budget was set on and is checked against
+/// by hand — an M1 MacBook Pro (macOS 26.5, `cargo nextest`, dev profile, the
+/// same unoptimised build CI runs). Four runs of five scans each gave medians
+/// of 31.7, 31.7, 32.7 and 34.0 ms, with search p95 landing at 123–126 ms:
+/// a machine matching the reference gets the unscaled 200 ms and passes with
+/// room to spare, which is what makes the gate worth having.
+///
+/// Re-measure it the same way if the reference machine changes — do not nudge
+/// it to make a red run go green, because lowering it hands slack to every
+/// machine including this one.
+const REFERENCE_SCAN: Duration = Duration::from_millis(32);
 
 #[test]
 fn search_p95_under_200ms_at_120k_events() {
@@ -169,9 +210,29 @@ fn search_p95_under_200ms_at_120k_events() {
     let p95_index = ((samples.len() as f64) * 0.95).ceil() as usize - 1;
     let p95 = samples[p95_index.min(samples.len() - 1)];
     let max = *samples.last().expect("samples non-empty");
+
+    // Five scans, median taken: one scan can be ambushed by a neighbour on a
+    // shared runner, and a yardstick that jitters would hand out slack at
+    // random.
+    let mut scans: Vec<Duration> = (0..5).map(|_| time_scan(&conn)).collect();
+    scans.sort();
+    let scan = scans[scans.len() / 2];
+    // Floored at 1: hardware faster than the reference earns no slack, it just
+    // meets the budget the number was written for.
+    let scale = (scan.as_secs_f64() / REFERENCE_SCAN.as_secs_f64()).max(1.0);
+    let allowed = BUDGET.mul_f64(scale);
+    // Always printed, pass or fail: a gate whose verdict depends on the machine
+    // has to say which machine it measured.
+    println!(
+        "search p95 {p95:?} (max {max:?}, n={}); scan {scan:?} vs reference \
+         {REFERENCE_SCAN:?} => {scale:.2}x, budget {BUDGET:?} -> {allowed:?}",
+        samples.len()
+    );
     assert!(
-        p95 < BUDGET,
-        "search p95 {p95:?} exceeded the {BUDGET:?} budget (max {max:?}, n={})",
+        p95 < allowed,
+        "search p95 {p95:?} exceeded the {allowed:?} budget for this machine \
+         ({BUDGET:?} x {scale:.2}, from a {scan:?} scan against a \
+         {REFERENCE_SCAN:?} reference; max {max:?}, n={})",
         samples.len()
     );
     let _ = std::fs::remove_dir_all(&dir);
