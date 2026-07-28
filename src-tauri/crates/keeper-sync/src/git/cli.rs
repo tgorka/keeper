@@ -35,6 +35,31 @@ use std::{
 };
 
 use crate::error::{Result, SyncError};
+use crate::git::fetch::Credential;
+
+/// Environment variables the credential helper below reads the secret from.
+///
+/// The environment, not the argument vector: `ps` shows every process's argv to
+/// any user on the box, and a push runs for as long as the transfer takes. The
+/// helper *string* is argv — it names these variables and carries no secret.
+const CREDENTIAL_USERNAME_ENV: &str = "KEEPER_SYNC_CREDENTIAL_USERNAME";
+const CREDENTIAL_SECRET_ENV: &str = "KEEPER_SYNC_CREDENTIAL_SECRET";
+
+/// A `credential.helper` that answers from [`CREDENTIAL_USERNAME_ENV`] and
+/// [`CREDENTIAL_SECRET_ENV`], and from nothing else.
+///
+/// `if`/`fi` rather than `test … && printf …`: a helper whose last command
+/// fails exits non-zero, and git treats that as a broken helper rather than as
+/// "no answer for this action". Only `get` is answered — `store` and `erase`
+/// return successfully having done nothing, because the OS keychain owns the
+/// secret's lifecycle and letting git approve a copy into another store is the
+/// very leak this exists to close (the same reasoning as
+/// [`super::fetch::static_credential`]).
+const CREDENTIAL_HELPER: &str = concat!(
+    "!f() { if test \"$1\" = get; then printf '%s\\n' ",
+    "\"username=$KEEPER_SYNC_CREDENTIAL_USERNAME\" ",
+    "\"password=$KEEPER_SYNC_CREDENTIAL_SECRET\"; fi; }; f"
+);
 
 /// Oldest `git` that can serve this engine.
 ///
@@ -101,8 +126,21 @@ impl GitCli {
     /// must never overwrite review feedback a human already pushed. The arg
     /// builder still knows how to spell `--force` so the test can prove the
     /// public path does not use it.
-    pub fn push(&self, repo: &Path, remote: &str, refspec: &str) -> Result<()> {
-        self.run("push", repo, &push_args(remote, refspec, false))
+    ///
+    /// `credential` is the profile's own secret. It is the *only* one this push
+    /// may use: the inherited `credential.helper` chain is cleared either way,
+    /// so a profile with no credential fails as unauthenticated instead of
+    /// quietly pushing as whichever account the OS git store holds for that
+    /// host. See [`super::repo::clone`] for what that silent substitution looks
+    /// like from the outside.
+    pub fn push(
+        &self,
+        repo: &Path,
+        remote: &str,
+        refspec: &str,
+        credential: Option<&Credential>,
+    ) -> Result<()> {
+        self.run_as("push", repo, &push_args(remote, refspec, false), credential)
             .map(drop)
     }
 
@@ -230,7 +268,7 @@ impl GitCli {
         // through the warn-logging path — the supervisor asks on every tick and
         // would otherwise fill the log with warnings about nothing.
         let args = is_ancestor_args(ancestor, descendant)?;
-        let output = capture(&self.program, Some(repo), &args)?;
+        let output = capture(&self.program, Some(repo), &args, None)?;
         match output.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -268,7 +306,26 @@ impl GitCli {
     /// so it can never carry interpolated user data. `args` is the complete
     /// argument vector — there is no shell anywhere in this path.
     fn run(&self, subcommand: &'static str, repo: &Path, args: &[String]) -> Result<String> {
-        let output = capture(&self.program, Some(repo), args)?;
+        self.run_as(subcommand, repo, args, None)
+    }
+
+    /// [`Self::run`], with a credential for the commands that talk to a remote.
+    fn run_as(
+        &self,
+        subcommand: &'static str,
+        repo: &Path,
+        args: &[String],
+        credential: Option<&Credential>,
+    ) -> Result<String> {
+        // `-c` settings have to precede the subcommand, so the vector is built
+        // here rather than in the per-command arg builders — which stay pure
+        // and testable.
+        let args: Vec<String> = credential_config_args(credential)
+            .into_iter()
+            .chain(args.iter().cloned())
+            .collect();
+        let args = args.as_slice();
+        let output = capture(&self.program, Some(repo), args, credential)?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if output.status.success() {
             return Ok(stdout);
@@ -304,7 +361,7 @@ impl GitCli {
 /// here", and collapsing them keeps `doctor` down to one branch.
 pub fn version(program: &Path) -> Result<(u32, u32)> {
     let args = [String::from("--version")];
-    let output = capture(program, None, &args)?;
+    let output = capture(program, None, &args, None)?;
     let text = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         return Err(SyncError::GitMissing {
@@ -342,8 +399,20 @@ fn clears_floor(major: u32, minor: u32) -> bool {
 /// The one place a process is created.
 ///
 /// Environment hardening lives here so no call site can forget it.
-fn capture(program: &Path, cwd: Option<&Path>, args: &[String]) -> Result<Output> {
+fn capture(
+    program: &Path,
+    cwd: Option<&Path>,
+    args: &[String],
+    credential: Option<&Credential>,
+) -> Result<Output> {
     let mut command = Command::new(program);
+    if let Some(credential) = credential {
+        // Read back only by `CREDENTIAL_HELPER`, which git spawns as a child of
+        // this process and which therefore inherits them.
+        command
+            .env(CREDENTIAL_USERNAME_ENV, &credential.username)
+            .env(CREDENTIAL_SECRET_ENV, &credential.secret);
+    }
     command
         .args(args)
         // No terminal, no askpass, no GUI prompt: a private remote must fail
@@ -389,6 +458,24 @@ fn capture(program: &Path, cwd: Option<&Path>, args: &[String]) -> Result<Output
 /// `--` ends option parsing so a remote name or refspec that begins with `-`
 /// becomes a positional argument instead of a flag. `--porcelain` gives a
 /// stable machine-readable report of what each ref did.
+/// The `-c` settings that decide which credential a remote-touching `git` may
+/// use, prepended to every invocation.
+///
+/// The empty `credential.helper` comes first and is not optional: git treats an
+/// empty value as "reset the list", so this drops whatever the user's global,
+/// system and repository config chained on — `osxkeychain`, a manager, a cache.
+/// Leaving those in place is what lets a push authenticate as an unrelated
+/// account that happens to be stored for the same host, which fails per
+/// repository depending on that account's access and never says why.
+fn credential_config_args(credential: Option<&Credential>) -> Vec<String> {
+    let mut args = vec!["-c".to_owned(), "credential.helper=".to_owned()];
+    if credential.is_some() {
+        args.push("-c".to_owned());
+        args.push(format!("credential.helper={CREDENTIAL_HELPER}"));
+    }
+    args
+}
+
 fn push_args(remote: &str, refspec: &str, force: bool) -> Vec<String> {
     let mut args = vec!["push".to_owned(), "--porcelain".to_owned()];
     if force {
@@ -701,7 +788,7 @@ pub(crate) fn classify_message(
 ) -> Option<SyncError> {
     let lower = text.to_ascii_lowercase();
 
-    const AUTH: [&str; 8] = [
+    const AUTH: [&str; 12] = [
         "authentication failed",
         "could not read username",
         "could not read password",
@@ -710,6 +797,23 @@ pub(crate) fn classify_message(
         "permission denied (publickey",
         "403 forbidden",
         "the requested url returned error: 403",
+        // gitoxide's HTTP transport turns a 401 into an `io::Error` and reports
+        // it as "An IO error occurred when talking to the server" — wording
+        // that matches the NETWORK family far better than the truth. Only the
+        // status in the wrapped cause tells them apart, and without these two
+        // needles a rejected credential is classified `Git`, which is
+        // `Transient`: the profile then retries a credential that will never
+        // start working, forever.
+        "received http status 401",
+        "received http status 403",
+        // With the helper chain cleared (see `credential_config_args`) a
+        // profile that has no credential of its own reaches gitoxide's built-in
+        // prompt, which then fails on the missing tty. "Failed to open terminal
+        // at /dev/tty" is the last line of that story and matches nothing here;
+        // the first line is the whole of it, and it is an auth problem, not a
+        // retryable one.
+        "failed to obtain credentials",
+        "couldn't obtain username",
     ];
     if AUTH.iter().any(|needle| lower.contains(needle)) {
         return Some(SyncError::Auth {
@@ -849,6 +953,87 @@ mod tests {
                 "refs/heads/main:refs/heads/main"
             ]
         );
+    }
+
+    #[test]
+    fn the_inherited_credential_helper_chain_is_always_cleared() {
+        // Without the reset, git falls through to the user's own helpers and a
+        // push authenticates as whatever account the OS store holds for that
+        // host — which fails per repository, depending on that account's
+        // access, and reports itself as anything but an auth problem.
+        assert_eq!(
+            credential_config_args(None),
+            ["-c", "credential.helper="],
+            "a profile with no credential must not borrow one"
+        );
+
+        let credential = Credential {
+            username: "tok3n".to_owned(),
+            secret: "s3cret".to_owned(),
+        };
+        let args = credential_config_args(Some(&credential));
+        assert_eq!(
+            args[..2],
+            ["-c", "credential.helper="],
+            "the reset must come first, or the inherited helpers stay in the list"
+        );
+        assert_eq!(args.len(), 4);
+        assert!(args[3].starts_with("credential.helper=!"));
+    }
+
+    #[test]
+    fn the_credential_never_reaches_the_argument_vector() {
+        // `ps` shows argv to every user on the box, and a push runs as long as
+        // the transfer does. The helper names the variables; the values travel
+        // in the environment.
+        let credential = Credential {
+            username: "tok3n".to_owned(),
+            secret: "s3cret".to_owned(),
+        };
+        let rendered = credential_config_args(Some(&credential)).join(" ");
+
+        assert!(!rendered.contains("tok3n"), "username leaked: {rendered}");
+        assert!(!rendered.contains("s3cret"), "secret leaked: {rendered}");
+        assert!(rendered.contains(CREDENTIAL_USERNAME_ENV));
+        assert!(rendered.contains(CREDENTIAL_SECRET_ENV));
+    }
+
+    #[test]
+    fn a_rejected_credential_is_authentication_not_a_retryable_transport_fault() {
+        // gitoxide reports a 401 as "An IO error occurred when talking to the
+        // server", with the status only in the wrapped cause. Read as a
+        // transport fault it is `Transient`, and the profile then retries a
+        // credential that will never begin to work.
+        for status in ["401", "403"] {
+            let message = format!(
+                "An IO error occurred when talking to the server: Received HTTP status {status}"
+            );
+            let err = classify_message(&message, "profile", Some("git.example.com"), &[])
+                .unwrap_or_else(|| panic!("{status} must classify"));
+
+            assert_eq!(err.code(), "auth", "{message}");
+            assert_eq!(
+                err.retriability(),
+                crate::error::Retriability::Permanent,
+                "a rejected credential must park the profile, not spin against the host"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_credential_is_authentication_not_a_broken_terminal() {
+        // What a profile with no stored secret hits once the inherited helper
+        // chain is cleared: gitoxide falls through to its own prompt and the
+        // prompt dies on the missing tty. Classified on the first line rather
+        // than the last, or the profile would retry a secret nobody has yet.
+        let message = "Failed to obtain credentials: Couldn't obtain Username for \
+             https://git.example.com: : Failed to open terminal at \"/dev/tty\" for writing \
+             prompt, or to write it: Device not configured (os error 6)";
+        let err = classify_message(message, "profile", Some("git.example.com"), &[])
+            .expect("a missing credential must classify");
+
+        assert_eq!(err.code(), "auth");
+        assert_eq!(err.retriability(), crate::error::Retriability::Permanent);
     }
 
     #[test]

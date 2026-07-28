@@ -170,11 +170,20 @@ impl Peer {
     fn assert_intact(&self, expected: &[(String, Vec<u8>)], at: Duration) {
         let context = format!("after a kill at {at:?}");
 
-        // A kill early enough that the repository was never created leaves
+        // A kill early enough that the repository was never *finished* leaves
         // nothing for git to check. The user's own files still must be
         // untouched, which is asserted below either way — but running fsck
         // against a plain directory would fail the test for the wrong reason.
-        if !self.work.join(".git").exists() {
+        //
+        // Keyed on `HEAD` rather than on `.git` itself: `gix::init` lays down
+        // `info/` and `hooks/` before it writes `HEAD`, so a kill inside that
+        // window leaves a `.git` that exists and is not a repository — no
+        // objects, no index, nothing that can be corrupt, and `git fsck`
+        // reports "not a git repository". Which side of that window a kill
+        // lands on is a property of the machine and of how much work the
+        // daemon does before it, so testing for the directory alone made this
+        // sweep pass or fail on timing rather than on durability.
+        if !self.work.join(".git").join("HEAD").exists() {
             assert_files_intact(&self.work, expected, &context);
             return;
         }

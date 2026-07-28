@@ -510,6 +510,17 @@ fn reconcile(engine: &Engine, config: &DaemonConfig) -> SyncResult<()> {
         let mut profile = profile.clone();
         if let Some(known) = existing.iter().find(|known| known.id == profile.id) {
             profile.enabled = known.enabled;
+            // The volume binding is engine state, not configuration: it is
+            // minted on first sight of the media and lives in the marker on the
+            // volume. Letting a config file that never carried it reset the
+            // binding on every start would unbind the profile, and an unbound
+            // profile adopts whatever is mounted at its path instead of
+            // refusing a different volume as `Foreign`. An explicit `volumeId`
+            // in the config still wins — that is an operator saying which
+            // volume they mean.
+            if profile.volume_id.is_none() {
+                profile.volume_id = known.volume_id.clone();
+            }
         }
         engine.upsert_profile(&profile)?;
     }

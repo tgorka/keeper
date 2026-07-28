@@ -366,6 +366,12 @@ logLevel = "info"
 # Removable media get a longer settle window: their mtime granularity is worse.
 # settleMs = 10000
 # enabled = true
+# `volumeId` names the marker at the volume's mount root. Leave it out: the
+# daemon mints it on first sight of the media and remembers it across restarts,
+# and setting it by hand only makes sense to point a profile at a volume that is
+# already marked — a wrong value reads as "some other stick is mounted here" and
+# stops the profile rather than syncing it.
+# volumeId = "01JQ8ZK9V3M4N5P6R7S8T9W0Z3"
 "#
     .to_owned()
 }

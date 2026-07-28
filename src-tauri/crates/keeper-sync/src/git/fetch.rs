@@ -126,7 +126,7 @@ pub fn fetch(
 
     let mut connection = remote
         .connect(gix::remote::Direction::Fetch)
-        .map_err(|err| classify(&flatten(&err), &host, interrupt))?;
+        .map_err(|err| classify("fetch", &flatten(&err), &host, interrupt))?;
 
     if let Some(credential) = credential {
         // Owned clones because the callback must be `'static`: gix keeps it for
@@ -166,7 +166,7 @@ pub fn fetch(
         Err(err) if mentions_an_empty_advertisement(&flatten(&err)) => {
             return nothing_to_pull();
         }
-        Err(err) => return Err(classify(&flatten(&err), &host, interrupt)),
+        Err(err) => return Err(classify("fetch", &flatten(&err), &host, interrupt)),
     };
     let prepared = match options.shallow {
         Some(depth) => prepared.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth)),
@@ -178,7 +178,7 @@ pub fn fetch(
         Err(err) if mentions_an_empty_advertisement(&flatten(&err)) => {
             return nothing_to_pull();
         }
-        Err(err) => return Err(classify(&flatten(&err), &host, interrupt)),
+        Err(err) => return Err(classify("fetch", &flatten(&err), &host, interrupt)),
     };
 
     summarize(repo, &outcome)
@@ -203,7 +203,7 @@ fn mentions_an_empty_advertisement(text: &str) -> bool {
 // 192-byte `Err` variant lives in `gix_credentials::protocol::Error` — a
 // foreign type we cannot box or shrink. Boxing our side would not change it.
 #[allow(clippy::result_large_err)]
-fn static_credential(
+pub(crate) fn static_credential(
     username: &str,
     secret: &str,
     action: gix::credentials::helper::Action,
@@ -232,7 +232,7 @@ fn static_credential(
 /// about *which* ref or *why*, and the actual reason lives two or three
 /// `source()` hops down. Reporting only the top frame turns a diagnosable
 /// problem into a guess, so the whole chain is kept.
-fn flatten(err: &dyn std::error::Error) -> String {
+pub(crate) fn flatten(err: &dyn std::error::Error) -> String {
     let mut message = err.to_string();
     let mut cause = err.source();
     while let Some(current) = cause {
@@ -253,7 +253,12 @@ fn flatten(err: &dyn std::error::Error) -> String {
 /// An interruption is checked first: gitoxide reports a cancelled transfer as
 /// an ordinary transport error, and a user-requested stop must never be
 /// retried with backoff or shown as a warning.
-fn classify(text: &str, host: &str, interrupt: &AtomicBool) -> SyncError {
+pub(crate) fn classify(
+    operation: &str,
+    text: &str,
+    host: &str,
+    interrupt: &AtomicBool,
+) -> SyncError {
     if interrupt.load(Ordering::Relaxed) {
         return SyncError::Cancelled;
     }
@@ -261,7 +266,7 @@ fn classify(text: &str, host: &str, interrupt: &AtomicBool) -> SyncError {
     // wording whether they came from gix or from the binary.
     let message = cli::truncate(&cli::scrub_userinfo(text), 1_024);
     cli::classify_message(&message, host, Some(host), &[])
-        .unwrap_or_else(|| SyncError::Git(format!("fetch from {host} failed: {message}")))
+        .unwrap_or_else(|| SyncError::Git(format!("{operation} from {host} failed: {message}")))
 }
 
 /// Derive the outcome from the ref advertisement and the local branch.
@@ -671,7 +676,12 @@ mod tests {
     #[test]
     fn an_interrupted_fetch_is_cancelled_not_failed() {
         let interrupt = AtomicBool::new(true);
-        let err = classify("connection reset by peer", "git.example.com", &interrupt);
+        let err = classify(
+            "fetch",
+            "connection reset by peer",
+            "git.example.com",
+            &interrupt,
+        );
         assert_eq!(err.code(), "cancelled");
         assert_eq!(
             err.retriability(),
@@ -685,6 +695,7 @@ mod tests {
         let interrupt = AtomicBool::new(false);
 
         let auth = classify(
+            "fetch",
             "Authentication failed for 'https://tok:en@git.example.com/x.git'",
             "git.example.com",
             &interrupt,
@@ -700,6 +711,7 @@ mod tests {
         );
 
         let network = classify(
+            "fetch",
             "could not resolve host: git.example.com",
             "git.example.com",
             &interrupt,
@@ -708,6 +720,7 @@ mod tests {
         assert!(network.to_string().contains("git.example.com"), "{network}");
 
         let unknown = classify(
+            "fetch",
             "pack index checksum mismatch for 'https://u:p@git.example.com/x.git'",
             "git.example.com",
             &interrupt,
