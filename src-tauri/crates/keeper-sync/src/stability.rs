@@ -98,7 +98,7 @@ impl FileSample {
     }
 
     #[cfg(unix)]
-    fn from_metadata(md: &std::fs::Metadata) -> Self {
+    pub(crate) fn from_metadata(md: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt as _;
         const NANOS_PER_SEC: i128 = 1_000_000_000;
         Self {
@@ -110,7 +110,7 @@ impl FileSample {
     }
 
     #[cfg(not(unix))]
-    fn from_metadata(md: &std::fs::Metadata) -> Self {
+    pub(crate) fn from_metadata(md: &std::fs::Metadata) -> Self {
         // No portable `ctime` or inode exists, so both are pinned to zero and
         // the tuple degrades to `(size, mtime)`. That is strictly weaker — an
         // atomic-rename replacement carrying an identical size and mtime

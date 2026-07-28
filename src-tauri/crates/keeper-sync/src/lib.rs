@@ -36,6 +36,7 @@
 //! * **An absent volume is never a deletion** ([`volume`]).
 
 pub mod backoff;
+pub mod copy;
 pub mod db;
 pub mod engine;
 pub mod error;
@@ -50,6 +51,9 @@ pub mod stability;
 pub mod volume;
 pub mod watch;
 
+pub use copy::{
+    copy_verified, CopyEntry, CopyOptions, CopyOutcome, CopyProgress, CopyReport, CopySink,
+};
 pub use db::{ActivityKind, ActivityRow};
 pub use engine::{
     Engine, ParkedUnit, PendingFile, PendingReason, ProblemReport, SyncOutcome, VerifyReport,
