@@ -12,10 +12,26 @@ For the release-time manual measurements CI cannot run unattended, see
 
 ## Reference hardware
 
-- **CI runner / reference baseline: GitHub `macos-latest` = Apple Silicon
-  (`aarch64-apple-darwin`).** All CI-enforced gates below run on this runner, and
-  every threshold is stated against this reference Apple Silicon baseline (it is
-  also the only architecture keeper ships — see [`docs/release.md`](release.md)).
+- **CI runner: GitHub `macos-latest` = Apple Silicon (`aarch64-apple-darwin`).**
+  All CI-enforced gates below run on this runner, and every threshold is stated
+  against an Apple Silicon baseline (it is also the only architecture keeper
+  ships — see [`docs/release.md`](release.md)).
+- **The runner is Apple Silicon, but not a fixed speed.** `macos-latest` boxes
+  are shared, and the FTS gate saw the *same commit* pass at 150 ms and fail at
+  266 ms on consecutive runs. NFR-2 therefore measures the runner before it
+  judges keeper: it times a yardstick scan (a full, non-indexed aggregate over
+  the same corpus — same SQLite, same pages, none of the code under test) and
+  scales its budget by how much slower this box is than the reference. Every
+  other gate stays absolute.
+- **NFR-2 reference: an M1 MacBook Pro** (macOS 26.5, `cargo nextest`, dev
+  profile — the same unoptimised build CI runs), where the yardstick's median is
+  **32 ms** and search p95 lands at 123–126 ms against the flat 200 ms. That
+  32 ms is `REFERENCE_SCAN` in the gate. Hardware at or above reference speed is
+  held to the unscaled 200 ms; only a slower box earns proportional slack.
+  The yardstick is calibrated within Apple Silicon, which is all CI runs: on an
+  x86-64 Linux box it reads 2.7x slower while search is only 1.4x slower, so it
+  over-grants there and the gate is correspondingly loose. Acceptable, because
+  no CI job runs on one.
 - Release-time manual measurements are taken on reference Apple Silicon hardware
   with a realistically seeded install (a 100k+-event archive; 1 and 5 configured
   accounts). Intel Macs are out of scope by design.
@@ -25,7 +41,7 @@ For the release-time manual measurements CI cannot run unattended, see
 | # | Dimension (PRD) | Threshold | Enforcement point |
 | --- | --- | --- | --- |
 | NFR-1 | Cold start to interactive inbox | < 2 s (full) | **CI slice:** `src-tauri/crates/keeper-core/tests/cold_start_perf.rs::local_init_under_budget_at_100k_events` guards the deterministic offline **subset** (archive open + boot registry reads on a seeded ≥100k-event archive) under `LOCAL_INIT_BUDGET`. **Full figure:** release checklist (needs the webview + lazy per-account SDK activation). |
-| NFR-2 | Offline FTS first results | < 200 ms p95 at 100k+ events | **CI:** `src-tauri/crates/keeper-core/tests/archive_search_perf.rs::search_p95_under_200ms_at_120k_events` (120k-event corpus, over the 100k+ threshold). |
+| NFR-2 | Offline FTS first results | < 200 ms p95 at 100k+ events | **CI:** `src-tauri/crates/keeper-core/tests/archive_search_perf.rs::search_p95_under_200ms_at_120k_events` (120k-event corpus, over the 100k+ threshold). Budget is machine-scaled: `allowed = 200 ms x max(1, scan / REFERENCE_SCAN)` — see "Reference hardware" above. |
 | FR-48 | Command palette latency | ≤ 100 ms at 10k chats | **CI:** `src-tauri/crates/keeper-core/src/palette.rs::latency_under_100ms_at_10k_entries` (10k-entry index). |
 | NFR-3 | Idle memory | ~500 MB with 5 accounts, ~300 MB with 1 account | **Release checklist — measure & flag.** See the assumption note below; these budgets are **not** hard CI gates. |
 | NFR-8 | Crash safety (zero lost persisted events on kill) | Zero previously-committed rows lost; `PRAGMA integrity_check` = `ok` | **CI:** `src-tauri/crates/keeper-core/tests/crash_safety.rs` (real SIGKILL of a writing child for archive ingest, outbox insert, and settings write). |
