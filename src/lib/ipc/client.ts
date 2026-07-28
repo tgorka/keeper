@@ -39,6 +39,9 @@ export type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
+export type { CopyEntryVm } from "./gen/CopyEntryVm";
+export type { CopyJobState } from "./gen/CopyJobState";
+export type { CopyJobVm } from "./gen/CopyJobVm";
 export type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
@@ -139,6 +142,7 @@ import type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 import type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
+import type { CopyJobVm } from "./gen/CopyJobVm";
 import type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
 import type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
 import type { EditVersionVm } from "./gen/EditVersionVm";
@@ -2593,4 +2597,63 @@ export async function syncSubscribeProgress(
  */
 export async function syncUnsubscribeProgress(id: number): Promise<void> {
   await invoke<void>("sync_unsubscribe_progress", { id });
+}
+
+// ---------------------------------------------------------------------------
+// One-time verified copy (Epic 33, AD-C1..AD-C6)
+//
+// A copy is a job, never a relationship: it is keyed by an opaque id, lives in
+// app memory for the length of the run, and finishing it changes nothing about
+// either folder. Nothing here is written into `profiles` and nothing here joins
+// the sync journal.
+// ---------------------------------------------------------------------------
+
+/**
+ * Start copying `source` into `destination`, resolving the job id to poll.
+ *
+ * `source` may be a file or a directory; `destination` is always a directory
+ * the copy lands inside. Resolves as soon as the job is registered — the work
+ * itself runs on a blocking thread, because every byte is hashed twice.
+ *
+ * Rejects with the {@link IpcError} envelope before any job exists when
+ * `source` does not exist, or when `destination` sits inside `source` (which
+ * would copy the tree into itself); the message names which one it was.
+ *
+ * `replaceExisting` defaults to `false` in Rust: an existing destination file
+ * with identical content is reported `identical`, a differing one is reported
+ * `collision` and left untouched. With it set, the old bytes are replaced only
+ * after the new ones have passed verification.
+ */
+export async function copyStart(
+  source: string,
+  destination: string,
+  replaceExisting?: boolean,
+): Promise<string> {
+  return await invoke<string>("copy_start", { source, destination, replaceExisting });
+}
+
+/**
+ * Read one job's snapshot -- what the copy card polls and renders from.
+ *
+ * `entries` is empty until the job reaches a terminal state, so a partial
+ * report can never be rendered as a finished one, and `error` is the job
+ * failing to run at all: one unreadable file is an entry with outcome
+ * `failed`, not a failed job.
+ *
+ * Rejects with the {@link IpcError} envelope for an id nobody minted -- a
+ * caller polling an unknown job is a bug worth seeing, not a job that quietly
+ * never finishes.
+ */
+export async function copyStatus(id: string): Promise<CopyJobVm> {
+  return await invoke<CopyJobVm>("copy_status", { id });
+}
+
+/**
+ * Ask a job to stop. Idempotent, and safe at any moment: the engine checks the
+ * flag between files and between chunks, leaves no temp file behind, and
+ * settles the job `cancelled` with the report of everything that had already
+ * finished.
+ */
+export async function copyCancel(id: string): Promise<void> {
+  await invoke<void>("copy_cancel", { id });
 }

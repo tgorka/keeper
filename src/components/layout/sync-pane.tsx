@@ -1,6 +1,6 @@
 /**
  * The Sync primary view (Epic 32, Story 32.5, AD-S1..AD-S6; Epic 33,
- * Story 33.4).
+ * Stories 33.3 and 33.4).
  *
  * Folder sync worked long before it could be watched: Settings could name a
  * profile's state but never a *file*. This pane answers the three questions a
@@ -16,6 +16,14 @@
  * the shared {@link AddFolderForm} (AD-C7). Until Story 33.4 the empty state
  * named Settings and stopped there, which meant a new user's Sync view could
  * only tell them to leave it.
+ *
+ * Beneath the folders sits the one thing here that is not a folder: a one-time
+ * verified copy (Story 33.3, AD-C1). It is deliberately adjacent to sync and
+ * deliberately unlike it — a job with a beginning and an end, no profile, no
+ * schedule, nothing watched afterwards — so it is drawn as an outline under the
+ * solid cards rather than as one more of them. Its whole value is the part `cp`
+ * does not do, so the card says that in one sentence and claims nothing beyond
+ * it: bytes, modification time and the executable bit are what a copy carries.
  *
  * Two rules carried over from the Settings section, because they are the whole
  * reason this surface can be trusted:
@@ -33,8 +41,9 @@
  * the app-shell / sidebar level: a machine with no usable `git` gets no sync UI
  * at all, never a disabled one.
  */
+import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import { FileIcon, FileMinus, FilePen, FilePlus, GitMerge } from "lucide-react";
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useId, useState } from "react";
 import {
   SYNC_NOW_LABEL,
   SYNC_PAUSE_LABEL,
@@ -47,10 +56,15 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Separator } from "@/components/ui/separator";
 import { formatDraftAge } from "@/lib/format-time";
 import type {
+  CopyJobState,
+  CopyJobVm,
   SyncActivityVm,
   SyncParkedVm,
   SyncPendingVm,
@@ -58,6 +72,17 @@ import type {
   SyncProfileVm,
   SyncStatusVm,
 } from "@/lib/ipc/client";
+import {
+  type CopyGroup,
+  cancelCopyJob,
+  copyEntryGroups,
+  copyJobFraction,
+  isCopyJobTerminal,
+  isCopyRunning,
+  startCopyJob,
+  startCopyJobPolling,
+  useCopyJobStore,
+} from "@/lib/stores/copy-job";
 import {
   ensureSyncHydrated,
   isSyncStatusActive,
@@ -229,6 +254,190 @@ export function syncParkedSummary(unit: SyncParkedVm): string {
   return `${PARKED_KINDS[unit.kind] ?? unit.kind} · stopped after ${attempts}`;
 }
 
+// ---------------------------------------------------------------------------
+// Copy files once (Epic 33, Story 33.3, AD-C1..AD-C6)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the card is, and what separates it from every card above it. "Once" is
+ * the whole distinction: no profile is created, nothing is watched, and
+ * finishing changes nothing about either side.
+ */
+export const COPY_TITLE = "Copy files once";
+export const COPY_SUBTITLE =
+  "A one-time job, not a folder to keep in sync. keeper copies what you point it at and then forgets it.";
+
+/**
+ * The claim the feature exists to make (AD-C2), and the one it must never be
+ * read as making. Every copy tool stops at a successful write; this one reads
+ * the bytes back off the destination, so the card says exactly that — and then
+ * says what a copy carries, because bytes, modification time and the executable
+ * bit are all it carries.
+ */
+export const COPY_VERIFY_SENTENCE =
+  "Every file is read back from the destination and compared with the source, and counts as copied only when the two match.";
+export const COPY_CARRIES_SENTENCE =
+  "Contents, modification time and the executable bit are carried; nothing else about a file is.";
+
+/**
+ * The two paths. Each note says the thing a user would otherwise have to find
+ * out by running the job: a folder source contributes its contents rather than
+ * itself, and the destination is a container, not the copy's new name.
+ */
+export const COPY_FROM_LABEL = "From";
+export const COPY_FROM_NOTE = "A file, or a folder whose contents are copied.";
+export const COPY_INTO_LABEL = "Into";
+export const COPY_INTO_NOTE = "A folder. Everything lands inside it.";
+export const COPY_NOTHING_CHOSEN_LABEL = "Nothing chosen";
+
+/** Test ids for the two chosen-path displays (read-only truncated paths). */
+export const COPY_SOURCE_TESTID = "copy-source-path";
+export const COPY_DESTINATION_TESTID = "copy-destination-path";
+
+/**
+ * Test id for the settled job's report. The section exists only for a terminal
+ * job, so its absence is the assertion that a partial report is never drawn.
+ */
+export const COPY_REPORT_TESTID = "copy-report";
+
+/**
+ * The pickers: short on screen, named in full to a screen reader. Two of these
+ * read "Choose folder", and a third sits in the add-folder form above them, so
+ * the visible word alone would leave three buttons indistinguishable by name.
+ */
+export const COPY_CHOOSE_FILE_TEXT = "Choose file";
+export const COPY_CHOOSE_FOLDER_TEXT = "Choose folder";
+export const COPY_PICK_SOURCE_FILE_LABEL = "Choose a source file";
+export const COPY_PICK_SOURCE_FOLDER_LABEL = "Choose a source folder";
+export const COPY_PICK_DESTINATION_LABEL = "Choose a destination folder";
+
+/**
+ * The replace choice, off by default (AD-C4). The note says what *off* means,
+ * because "replace" alone leaves the user to guess whether the alternative is
+ * skipping, failing, or renaming.
+ */
+export const COPY_REPLACE_LABEL = "Replace files that already exist";
+export const COPY_REPLACE_NOTE =
+  "Left off, a file that is already identical is skipped, and one that differs is left alone and reported.";
+
+/** The two actions. Only one of them is ever on screen. */
+export const COPY_SUBMIT_LABEL = "Copy";
+export const COPY_STOP_LABEL = "Stop";
+
+/** Between the start landing and the first snapshot: under way, not idle. */
+export const COPY_STARTING_SENTENCE = "Starting…";
+
+/** Names the meter and the in-flight path for a screen reader. */
+export const COPY_PROGRESS_LABEL = "Copy progress";
+export const COPY_CURRENT_LABEL = "Currently copying:";
+
+/** The settled job's section, and the two endings that have no file list. */
+export const COPY_RESULT_TITLE = "Result";
+export const COPY_STOPPED_SENTENCE =
+  "You stopped the copy. The file in flight left nothing behind, so the destination holds only whole, verified files.";
+export const COPY_NOTHING_SENTENCE = "The source held no files, so nothing was copied.";
+
+/**
+ * The word for each job state. `done` is "Finished" rather than "Done": a job
+ * can finish with files that failed, and "Done" over a report led by failures
+ * would be a verdict the report contradicts.
+ */
+export const COPY_STATE_WORDS: Record<CopyJobState, string> = {
+  copying: "Copying",
+  verifying: "Verifying",
+  done: "Finished",
+  failed: "Failed",
+  cancelled: "Stopped",
+};
+
+/**
+ * The heading over each outcome's files, and the word the summary counts it
+ * with. Both are keyed by the wire outcome, so one Rust grows later renders as
+ * itself rather than vanishing.
+ */
+const COPY_OUTCOME_TITLES: Record<string, string> = {
+  failed: "Could not be copied",
+  collision: "Already there, and different",
+  copied: "Copied and verified",
+  identical: "Already identical",
+};
+
+const COPY_OUTCOME_COUNTS: Record<string, string> = {
+  failed: "failed",
+  collision: "left untouched",
+  copied: "copied and verified",
+  identical: "already identical",
+};
+
+/**
+ * What a group means, where its heading does not already say it. `failed` needs
+ * none — every row under it carries its own reason — and `copied` is the claim
+ * the card already makes at the top.
+ */
+const COPY_OUTCOME_NOTES: Record<string, string> = {
+  collision: `A file of the same name is already at the destination and its contents differ. keeper left it exactly as it was; turn on ${COPY_REPLACE_LABEL} to overwrite it on the next copy.`,
+  identical: "The destination already held these bytes, so nothing was written.",
+};
+
+/** Decimal size units, counted the way a file manager counts them. */
+const COPY_BYTE_UNITS = ["bytes", "kB", "MB", "GB", "TB"];
+
+/**
+ * A byte figure for the progress line and the report.
+ *
+ * Deliberately not `formatSize` from the recording surface: that one is a
+ * digit-for-digit mirror of the Rust tray's whole-MB convention, and a copy of
+ * three text files would read "0 MB of 0 MB" through it. Truncates for the same
+ * reason it does — a figure here must never overstate what has reached disk.
+ */
+export function formatCopyBytes(bytes: number): string {
+  const total = Math.max(0, Math.floor(bytes));
+  if (total < 1000) {
+    return total === 1 ? "1 byte" : `${total} bytes`;
+  }
+  let scaled = total;
+  let unit = 0;
+  while (scaled >= 1000 && unit < COPY_BYTE_UNITS.length - 1) {
+    scaled /= 1000;
+    unit += 1;
+  }
+  const tenths = Math.floor(scaled * 10);
+  return `${Math.floor(tenths / 10)}.${tenths % 10} ${COPY_BYTE_UNITS[unit]}`;
+}
+
+/**
+ * The state word and whatever counters are genuinely known, shaped like the
+ * Rust-composed sync line so the two read as one family.
+ *
+ * A total the engine has not worked out yet is `0`, which means unknown: it is
+ * left out rather than printed, because this card must never claim a total it
+ * does not have.
+ */
+export function copyProgressSentence(job: CopyJobVm): string {
+  const counters: string[] = [];
+  if (job.filesTotal > 0) {
+    counters.push(`${job.filesDone} of ${job.filesTotal} files`);
+  }
+  if (job.bytesTotal > 0) {
+    counters.push(`${formatCopyBytes(job.bytesDone)} of ${formatCopyBytes(job.bytesTotal)}`);
+  }
+  const word = COPY_STATE_WORDS[job.state];
+  return counters.length === 0 ? word : `${word} — ${counters.join(" · ")}`;
+}
+
+/**
+ * What happened, counted off the very grouping the list below renders (AD-C6)
+ * rather than tallied separately — so the headline and the rows cannot disagree
+ * about how many files failed.
+ */
+export function copySummarySentence(groups: readonly CopyGroup[]): string {
+  return groups
+    .map(
+      (group) => `${group.entries.length} ${COPY_OUTCOME_COUNTS[group.outcome] ?? group.outcome}`,
+    )
+    .join(" · ");
+}
+
 export function SyncPane() {
   const profiles = useSyncStore((state) => state.profiles);
   const statuses = useSyncStore((state) => state.statuses);
@@ -327,6 +536,10 @@ export function SyncPane() {
           {profiles?.map((profile) => (
             <SyncProfileCard key={profile.id} profile={profile} status={statuses[profile.id]} />
           ))}
+          {/* The break between the folders keeper keeps, and the one thing on
+              this surface it keeps nothing about. */}
+          <Separator />
+          <CopyCard />
         </div>
       </ScrollArea>
     </section>
@@ -672,6 +885,323 @@ function SyncProblemsSection({
             })}
           </ul>
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The one-time verified copy (Story 33.3, AD-C1..AD-C6).
+ *
+ * Drawn as a dashed outline under the solid folder cards, because a fifth solid
+ * card would read as a fifth configured folder — and this configures nothing.
+ *
+ * Everything it claims comes from the polled job; it counts nothing itself. It
+ * renders no report until that job is terminal, because `entries` is empty
+ * before then and a partial report would read as a finished one.
+ */
+function CopyCard() {
+  const [source, setSource] = useState("");
+  const [destination, setDestination] = useState("");
+  const [replaceExisting, setReplaceExisting] = useState(false);
+  const fieldId = useId();
+
+  const job = useCopyJobStore((state) => state.job);
+  const error = useCopyJobStore((state) => state.error);
+  const running = useCopyJobStore(isCopyRunning);
+
+  /**
+   * Watch only while there is something to watch. A foreground job the user is
+   * looking at is polled an order of magnitude faster than the folder detail
+   * behind it, and the loop retires itself on a terminal snapshot; this
+   * teardown is the other ending — the view closing mid-copy, which leaves the
+   * job running in Rust and simply stops watching it.
+   */
+  useEffect(() => {
+    if (!running) {
+      return;
+    }
+    return startCopyJobPolling();
+  }, [running]);
+
+  /**
+   * Open the OS-native picker and record what came back. A cancellation writes
+   * nothing, the rule the add-folder form's picker follows.
+   */
+  const pick = async (directory: boolean, choose: (path: string) => void) => {
+    try {
+      const selection = await openFolder({ directory });
+      if (typeof selection === "string") {
+        choose(selection);
+      }
+    } catch {
+      // Picker cancellation / failure → keep the current choice (no write).
+    }
+  };
+
+  // Only a settled job has a report; only a running one has counters worth
+  // drawing. The two are never on screen together.
+  const report = job !== null && isCopyJobTerminal(job.state) ? job : null;
+  const fraction = job === null ? null : copyJobFraction(job);
+  const percent = fraction === null ? null : Math.round(fraction * 100);
+  const sentence = job === null ? COPY_STARTING_SENTENCE : copyProgressSentence(job);
+  const current = job?.current ?? null;
+
+  return (
+    <Card
+      size="sm"
+      className="border border-border border-dashed bg-transparent shadow-none ring-0"
+    >
+      <CardHeader>
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 flex-col gap-1">
+            <CardTitle>{COPY_TITLE}</CardTitle>
+            <p className="text-muted-foreground text-xs">{COPY_SUBTITLE}</p>
+          </div>
+          {/* The verdict, and only once there is one: a badge over a running
+              job would repeat the state word the progress line already carries. */}
+          {report !== null && (
+            <Badge variant={report.state === "failed" ? "destructive" : "secondary"}>
+              {COPY_STATE_WORDS[report.state]}
+            </Badge>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        <CopyPathRow
+          label={COPY_FROM_LABEL}
+          note={COPY_FROM_NOTE}
+          path={source}
+          testId={COPY_SOURCE_TESTID}
+        >
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={running}
+            aria-label={COPY_PICK_SOURCE_FILE_LABEL}
+            onClick={() => {
+              void pick(false, setSource);
+            }}
+          >
+            {COPY_CHOOSE_FILE_TEXT}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={running}
+            aria-label={COPY_PICK_SOURCE_FOLDER_LABEL}
+            onClick={() => {
+              void pick(true, setSource);
+            }}
+          >
+            {COPY_CHOOSE_FOLDER_TEXT}
+          </Button>
+        </CopyPathRow>
+        <CopyPathRow
+          label={COPY_INTO_LABEL}
+          note={COPY_INTO_NOTE}
+          path={destination}
+          testId={COPY_DESTINATION_TESTID}
+        >
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={running}
+            aria-label={COPY_PICK_DESTINATION_LABEL}
+            onClick={() => {
+              void pick(true, setDestination);
+            }}
+          >
+            {COPY_CHOOSE_FOLDER_TEXT}
+          </Button>
+        </CopyPathRow>
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-replace`}>{COPY_REPLACE_LABEL}</Label>
+            <Checkbox
+              id={`${fieldId}-replace`}
+              checked={replaceExisting}
+              disabled={running}
+              aria-describedby={`${fieldId}-replace-note`}
+              onCheckedChange={(checked) => setReplaceExisting(checked === true)}
+            />
+          </div>
+          <p id={`${fieldId}-replace-note`} className="text-muted-foreground text-xs">
+            {COPY_REPLACE_NOTE}
+          </p>
+        </div>
+        <div className="flex flex-col gap-2">
+          {/* The claim first, in the card's own voice, then the limit on it —
+              two stacked muted lines would read as one grey block with neither
+              of them landing. */}
+          <p className="text-xs">{COPY_VERIFY_SENTENCE}</p>
+          <p className="text-muted-foreground text-xs">{COPY_CARRIES_SENTENCE}</p>
+          {/* The IPC refusing, which is not a job that failed: Rust rejects a
+              missing source and a destination inside the source before any job
+              exists, and its message names which one it was. */}
+          {error !== null && (
+            <p role="alert" className="text-destructive text-xs">
+              {error}
+            </p>
+          )}
+          <div className="flex justify-end">
+            <Button
+              type="button"
+              size="sm"
+              disabled={running || source === "" || destination === ""}
+              onClick={() => {
+                void startCopyJob(source, destination, replaceExisting);
+              }}
+            >
+              {COPY_SUBMIT_LABEL}
+            </Button>
+          </div>
+        </div>
+        {running && (
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between gap-3">
+              <span className="min-w-0 truncate text-xs">{sentence}</span>
+              <Button
+                type="button"
+                variant="outline"
+                size="xs"
+                className="shrink-0"
+                onClick={() => {
+                  void cancelCopyJob();
+                }}
+              >
+                {COPY_STOP_LABEL}
+              </Button>
+            </div>
+            {/* A bar only where there is a real denominator; without one the
+                line above still says what is happening. `aria-valuetext` reuses
+                that line rather than wording progress a second way. */}
+            {percent !== null && (
+              <Progress
+                value={percent}
+                aria-label={COPY_PROGRESS_LABEL}
+                aria-valuenow={percent}
+                aria-valuetext={sentence}
+              />
+            )}
+            {current !== null && (
+              <p className="truncate font-mono text-muted-foreground text-xs" title={current}>
+                {/* Under a moving bar the bare path is unambiguous on screen; to
+                    a screen reader it would be a path from nowhere. */}
+                <span className="sr-only">{COPY_CURRENT_LABEL} </span>
+                {current}
+              </p>
+            )}
+          </div>
+        )}
+        {report !== null && <CopyReport job={report} />}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** One chosen path: what it is for, what it is, and the picker that sets it. */
+function CopyPathRow({
+  label,
+  note,
+  path,
+  testId,
+  children,
+}: {
+  label: string;
+  note: string;
+  path: string;
+  testId: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <div className="flex min-w-0 flex-col gap-0.5">
+        <Label>{label}</Label>
+        <p
+          className="truncate font-mono text-xs"
+          data-testid={testId}
+          title={path === "" ? undefined : path}
+        >
+          {path === "" ? COPY_NOTHING_CHOSEN_LABEL : path}
+        </p>
+        <p className="text-muted-foreground text-xs">{note}</p>
+      </div>
+      <div className="flex shrink-0 items-center gap-1">{children}</div>
+    </div>
+  );
+}
+
+/**
+ * What happened to every file, worst first (AD-C6).
+ *
+ * Only ever rendered for a settled job. The summary is counted off the same
+ * grouping the lists below render, so the two cannot disagree, and the two
+ * endings that legitimately have no file list say so instead of showing an
+ * empty one.
+ */
+function CopyReport({ job }: { job: CopyJobVm }) {
+  const groups = copyEntryGroups(job.entries);
+  return (
+    <div className="flex flex-col gap-3" data-testid={COPY_REPORT_TESTID}>
+      <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+        {COPY_RESULT_TITLE}
+      </h2>
+      {/* The job failing to run at all — never a file that could not be copied,
+          which is an entry below and leaves the job finished. */}
+      {job.error !== null && (
+        <Alert variant="destructive">
+          <AlertDescription>{job.error}</AlertDescription>
+        </Alert>
+      )}
+      {job.state === "cancelled" && (
+        <p className="text-muted-foreground text-xs">{COPY_STOPPED_SENTENCE}</p>
+      )}
+      {job.state === "done" && groups.length === 0 && (
+        <p className="text-muted-foreground text-xs">{COPY_NOTHING_SENTENCE}</p>
+      )}
+      {groups.length > 0 && (
+        <>
+          <p className="text-xs">{copySummarySentence(groups)}</p>
+          {groups.map((group) => {
+            const title = COPY_OUTCOME_TITLES[group.outcome] ?? group.outcome;
+            const note = COPY_OUTCOME_NOTES[group.outcome];
+            return (
+              <div key={group.outcome} className="flex flex-col gap-1.5">
+                <h3 className="font-medium text-xs">{title}</h3>
+                {note !== undefined && <p className="text-muted-foreground text-xs">{note}</p>}
+                <ul aria-label={title} className="flex flex-col gap-1">
+                  {group.entries.map((entry) => (
+                    <li key={entry.path} className="flex flex-col gap-0.5">
+                      <div className="flex items-baseline justify-between gap-3">
+                        <span
+                          className="min-w-0 flex-1 truncate font-mono text-xs"
+                          title={entry.path}
+                        >
+                          {entry.path}
+                        </span>
+                        {/* No size beside a failure: none of it reached the
+                            destination, and a byte count there would read as
+                            how much did. */}
+                        {group.outcome !== "failed" && (
+                          <span className="shrink-0 text-muted-foreground text-xs">
+                            {formatCopyBytes(entry.bytes)}
+                          </span>
+                        )}
+                      </div>
+                      {entry.reason !== null && (
+                        <span className="font-mono text-destructive text-xs">{entry.reason}</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            );
+          })}
+        </>
       )}
     </div>
   );

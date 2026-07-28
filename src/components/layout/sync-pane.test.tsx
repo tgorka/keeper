@@ -18,6 +18,10 @@ vi.mock("@/lib/ipc/client", () => ({
   // The progress stream, the only source of in-flight counters.
   syncSubscribeProgress: vi.fn(),
   syncUnsubscribeProgress: vi.fn(),
+  // The one-time verified copy (Story 33.3): start, poll, stop.
+  copyStart: vi.fn(),
+  copyStatus: vi.fn(),
+  copyCancel: vi.fn(),
   // The shared add-folder form's keychain pair (Story 32.7).
   syncSetCredential: vi.fn(),
   syncClearCredential: vi.fn(),
@@ -31,6 +35,23 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import {
+  COPY_CURRENT_LABEL,
+  COPY_DESTINATION_TESTID,
+  COPY_NOTHING_SENTENCE,
+  COPY_PICK_DESTINATION_LABEL,
+  COPY_PICK_SOURCE_FOLDER_LABEL,
+  COPY_PROGRESS_LABEL,
+  COPY_REPLACE_LABEL,
+  COPY_REPLACE_NOTE,
+  COPY_REPORT_TESTID,
+  COPY_RESULT_TITLE,
+  COPY_SOURCE_TESTID,
+  COPY_STOP_LABEL,
+  COPY_STOPPED_SENTENCE,
+  COPY_SUBMIT_LABEL,
+  copyProgressSentence,
+  copySummarySentence,
+  formatCopyBytes,
   formatSyncWaited,
   SYNC_ACTIVITY_EMPTY_SENTENCE,
   SYNC_ACTIVITY_TITLE,
@@ -67,6 +88,7 @@ import {
   SYNC_TOKEN_LABEL,
 } from "@/components/sync/add-folder-form";
 import type {
+  CopyJobVm,
   SyncActivityVm,
   SyncPendingVm,
   SyncProblemsVm,
@@ -75,6 +97,9 @@ import type {
   SyncStatusVm,
 } from "@/lib/ipc/client";
 import {
+  copyCancel,
+  copyStart,
+  copyStatus,
   syncActivity,
   syncFolderNow,
   syncPending,
@@ -88,6 +113,12 @@ import {
   syncSubscribeProgress,
   syncUnsubscribeProgress,
 } from "@/lib/ipc/client";
+import {
+  COPY_POLL_MS,
+  copyEntryGroups,
+  copyJobStore,
+  resetCopyJobStoreForTest,
+} from "@/lib/stores/copy-job";
 import { resetSyncStoreForTest, syncStore } from "@/lib/stores/sync";
 import {
   refreshSyncDetail,
@@ -108,6 +139,9 @@ const mockUnsubscribe = vi.mocked(syncUnsubscribeProgress);
 const mockSave = vi.mocked(syncProfileSave);
 const mockPicker = vi.mocked(openFolder);
 const mockSetCredential = vi.mocked(syncSetCredential);
+const mockCopyStart = vi.mocked(copyStart);
+const mockCopyStatus = vi.mocked(copyStatus);
+const mockCopyCancel = vi.mocked(copyCancel);
 
 /** The exact line Rust composes — the pane must render it character for character. */
 const RUST_LINE = "tgdrive — 3 waiting to sync";
@@ -184,6 +218,47 @@ function problemsVm(over: Partial<SyncProblemsVm> = {}): SyncProblemsVm {
   return { warning: null, error: null, parked: [], conflicts: [], ...over };
 }
 
+/** The two paths every copy test picks, and a job carrying them. */
+const COPY_SOURCE = "/Users/alice/Pictures";
+const COPY_DESTINATION = "/Volumes/backup";
+
+function copyJobVm(over: Partial<CopyJobVm> = {}): CopyJobVm {
+  return {
+    id: "job-1",
+    source: COPY_SOURCE,
+    destination: COPY_DESTINATION,
+    state: "copying",
+    filesDone: 42,
+    filesTotal: 310,
+    bytesDone: 1_200_000_000,
+    bytesTotal: 4_700_000_000,
+    current: "2019/summer.jpg",
+    // Empty until the job is terminal, exactly as Rust reports it.
+    entries: [],
+    error: null,
+    ...over,
+  };
+}
+
+/** Put a job in the mirror as though this session had started it. */
+function seedCopyJob(job: CopyJobVm) {
+  copyJobStore.setState({ id: job.id, job, starting: false, error: null });
+}
+
+/** Choose both paths through the native picker, as the user would. */
+async function chooseCopyPaths() {
+  mockPicker.mockResolvedValueOnce(COPY_SOURCE);
+  fireEvent.click(screen.getByRole("button", { name: COPY_PICK_SOURCE_FOLDER_LABEL }));
+  await waitFor(() =>
+    expect(screen.getByTestId(COPY_SOURCE_TESTID)).toHaveTextContent(COPY_SOURCE),
+  );
+  mockPicker.mockResolvedValueOnce(COPY_DESTINATION);
+  fireEvent.click(screen.getByRole("button", { name: COPY_PICK_DESTINATION_LABEL }));
+  await waitFor(() =>
+    expect(screen.getByTestId(COPY_DESTINATION_TESTID)).toHaveTextContent(COPY_DESTINATION),
+  );
+}
+
 /** Mount the pane and wait for the first status snapshot to land. */
 async function renderPane() {
   const view = render(<SyncPane />);
@@ -194,6 +269,7 @@ async function renderPane() {
 beforeEach(() => {
   resetSyncStoreForTest();
   resetSyncDetailStoreForTest();
+  resetCopyJobStoreForTest();
   emitProgress = null;
   mockProfiles.mockResolvedValue([profileVm()]);
   mockStatuses.mockResolvedValue([statusVm()]);
@@ -205,6 +281,9 @@ beforeEach(() => {
     return Promise.resolve(7);
   });
   mockUnsubscribe.mockResolvedValue(undefined);
+  mockCopyStart.mockResolvedValue("job-1");
+  mockCopyStatus.mockResolvedValue(copyJobVm());
+  mockCopyCancel.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -614,6 +693,252 @@ describe("SyncPane problems", () => {
   });
 });
 
+describe("SyncPane copy files once", () => {
+  it("keeps Copy disabled until both a source and a destination are chosen", async () => {
+    await renderPane();
+
+    const copy = screen.getByRole("button", { name: COPY_SUBMIT_LABEL });
+    expect(copy).toBeDisabled();
+
+    mockPicker.mockResolvedValueOnce(COPY_SOURCE);
+    fireEvent.click(screen.getByRole("button", { name: COPY_PICK_SOURCE_FOLDER_LABEL }));
+    await waitFor(() =>
+      expect(screen.getByTestId(COPY_SOURCE_TESTID)).toHaveTextContent(COPY_SOURCE),
+    );
+    // Half a job is not a job: a copy with nowhere to land cannot be started.
+    expect(copy).toBeDisabled();
+
+    mockPicker.mockResolvedValueOnce(COPY_DESTINATION);
+    fireEvent.click(screen.getByRole("button", { name: COPY_PICK_DESTINATION_LABEL }));
+    await waitFor(() => expect(copy).toBeEnabled());
+
+    fireEvent.click(copy);
+
+    // Replace defaults off (AD-C4), and the choice is sent rather than assumed.
+    await waitFor(() =>
+      expect(mockCopyStart).toHaveBeenCalledWith(COPY_SOURCE, COPY_DESTINATION, false),
+    );
+  });
+
+  it("carries the replace choice, reached by the label that explains it", async () => {
+    await renderPane();
+    await chooseCopyPaths();
+
+    // Named by its own label, so it is reachable and announced without sight of
+    // the box, and described by the note that says what leaving it off means.
+    const replace = screen.getByRole("checkbox", { name: COPY_REPLACE_LABEL });
+    expect(replace).not.toBeChecked();
+    expect(replace).toHaveAccessibleDescription(COPY_REPLACE_NOTE);
+
+    fireEvent.click(replace);
+    expect(replace).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: COPY_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockCopyStart).toHaveBeenCalledWith(COPY_SOURCE, COPY_DESTINATION, true),
+    );
+  });
+
+  it("shows the state, the bar, the file in flight and Stop, then stops polling once settled", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderPane();
+      await chooseCopyPaths();
+      fireEvent.click(screen.getByRole("button", { name: COPY_SUBMIT_LABEL }));
+
+      const meter = await screen.findByRole("progressbar", { name: COPY_PROGRESS_LABEL });
+      // 1.2 GB of 4.7 GB, from the job's own counters.
+      expect(meter).toHaveAttribute("aria-valuenow", "26");
+      expect(meter).toHaveAttribute(
+        "aria-valuetext",
+        "Copying — 42 of 310 files · 1.2 GB of 4.7 GB",
+      );
+      // The path in flight, spoken with what it is.
+      expect(screen.getByText("2019/summer.jpg")).toBeInTheDocument();
+      expect(screen.getByText(COPY_CURRENT_LABEL)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: COPY_STOP_LABEL })).toBeInTheDocument();
+      await waitFor(() => expect(mockCopyStatus).toHaveBeenCalledWith("job-1"));
+
+      // The next poll finds it settled…
+      mockCopyStatus.mockResolvedValue(
+        copyJobVm({
+          state: "done",
+          current: null,
+          entries: [{ path: "2019/summer.jpg", bytes: 4_200_000, outcome: "copied", reason: null }],
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(COPY_POLL_MS);
+      await waitFor(() =>
+        expect(screen.queryByRole("button", { name: COPY_STOP_LABEL })).not.toBeInTheDocument(),
+      );
+
+      // …and nothing asks again: a terminal job cannot change, and the report
+      // arrived with the state that ended it.
+      const settledReads = mockCopyStatus.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(COPY_POLL_MS * 4);
+      expect(mockCopyStatus.mock.calls.length).toBe(settledReads);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("asks the job to stop and shows what had already finished", async () => {
+    seedCopyJob(copyJobVm());
+    mockCopyStatus.mockResolvedValue(
+      copyJobVm({
+        state: "cancelled",
+        current: null,
+        entries: [{ path: "2019/summer.jpg", bytes: 4_200_000, outcome: "copied", reason: null }],
+      }),
+    );
+    await renderPane();
+
+    fireEvent.click(screen.getByRole("button", { name: COPY_STOP_LABEL }));
+
+    await waitFor(() => expect(mockCopyCancel).toHaveBeenCalledWith("job-1"));
+    expect(await screen.findByText("Stopped")).toBeInTheDocument();
+    // Nothing was left half-written, so the partial report is worth showing.
+    const report = screen.getByTestId(COPY_REPORT_TESTID);
+    expect(report).toHaveTextContent("2019/summer.jpg");
+    expect(report).toHaveTextContent(COPY_STOPPED_SENTENCE);
+  });
+
+  it("says a job that found nothing found nothing, rather than showing an empty list", async () => {
+    seedCopyJob(copyJobVm({ state: "done", current: null, filesTotal: 0, bytesTotal: 0 }));
+    await renderPane();
+
+    const report = within(screen.getByTestId(COPY_REPORT_TESTID));
+    expect(report.getByText(COPY_NOTHING_SENTENCE)).toBeInTheDocument();
+    expect(report.queryAllByRole("list")).toHaveLength(0);
+  });
+
+  it("groups a settled report worst first and gives a failure its reason", async () => {
+    seedCopyJob(
+      copyJobVm({
+        state: "done",
+        current: null,
+        // Deliberately arriving best first, so the order below is the pane's.
+        entries: [
+          { path: "2019/notes.txt", bytes: 1_024, outcome: "identical", reason: null },
+          { path: "2019/summer.jpg", bytes: 4_200_000, outcome: "copied", reason: null },
+          { path: "2019/receipt.pdf", bytes: 90_000, outcome: "collision", reason: null },
+          {
+            path: "2019/inbox",
+            bytes: 0,
+            outcome: "failed",
+            reason: "symbolic links are not followed",
+          },
+        ],
+      }),
+    );
+    await renderPane();
+
+    const report = within(screen.getByTestId(COPY_REPORT_TESTID));
+    expect(report.getAllByRole("list").map((list) => list.getAttribute("aria-label"))).toEqual([
+      "Could not be copied",
+      "Already there, and different",
+      "Copied and verified",
+      "Already identical",
+    ]);
+    // The summary is counted off that same grouping, so the two cannot disagree.
+    expect(
+      report.getByText("1 failed · 1 left untouched · 1 copied and verified · 1 already identical"),
+    ).toBeInTheDocument();
+    // A failure says why, in Rust's own words.
+    expect(report.getByText("symbolic links are not followed")).toBeInTheDocument();
+    // …and carries no byte figure, because none of it reached the destination.
+    expect(
+      within(report.getByRole("list", { name: "Could not be copied" })).getByRole("listitem"),
+    ).not.toHaveTextContent("bytes");
+  });
+
+  it("says a collision left the existing file untouched", async () => {
+    seedCopyJob(
+      copyJobVm({
+        state: "done",
+        current: null,
+        entries: [{ path: "2019/receipt.pdf", bytes: 90_000, outcome: "collision", reason: null }],
+      }),
+    );
+    await renderPane();
+
+    const report = within(screen.getByTestId(COPY_REPORT_TESTID));
+    const note = report.getByText(/left it exactly as it was/);
+    // Nothing was overwritten, and the lever that would change that is named.
+    expect(note).toHaveTextContent(COPY_REPLACE_LABEL);
+  });
+
+  it("renders a job-level error as a failed job, and a file that failed as neither", async () => {
+    seedCopyJob(
+      copyJobVm({ state: "failed", current: null, error: "/Volumes/backup is read-only" }),
+    );
+    const view = await renderPane();
+
+    expect(screen.getByText("Failed")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("/Volumes/backup is read-only");
+    view.unmount();
+
+    resetSyncStoreForTest();
+    resetCopyJobStoreForTest();
+    seedCopyJob(
+      copyJobVm({
+        state: "done",
+        current: null,
+        entries: [
+          {
+            path: "2019/inbox",
+            bytes: 0,
+            outcome: "failed",
+            reason: "symbolic links are not followed",
+          },
+        ],
+      }),
+    );
+    render(<SyncPane />);
+    await screen.findByTestId(COPY_REPORT_TESTID);
+
+    // One file that could not be copied is an entry, never a failed job: the
+    // job finished, and the report says what happened to that file.
+    expect(screen.getByText("Finished")).toBeInTheDocument();
+    expect(screen.queryByText("Failed")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByText("symbolic links are not followed")).toBeInTheDocument();
+  });
+
+  it("renders no report while the job's entries are still empty", async () => {
+    seedCopyJob(copyJobVm());
+    await renderPane();
+
+    // `entries` is empty until a job is terminal; drawing it now would present
+    // a copy that has touched nothing as one that finished with nothing to say.
+    expect(screen.queryByTestId(COPY_REPORT_TESTID)).not.toBeInTheDocument();
+    expect(screen.queryByText(COPY_RESULT_TITLE)).not.toBeInTheDocument();
+    expect(screen.queryByText(COPY_NOTHING_SENTENCE)).not.toBeInTheDocument();
+    // It is still running, and still stoppable.
+    expect(screen.getByRole("button", { name: COPY_STOP_LABEL })).toBeInTheDocument();
+  });
+
+  it("reports the start Rust refused, and starts no job", async () => {
+    mockCopyStart.mockRejectedValue({
+      code: "internal",
+      message: "the destination is inside the source, which would copy the tree into itself",
+    });
+    await renderPane();
+    await chooseCopyPaths();
+
+    fireEvent.click(screen.getByRole("button", { name: COPY_SUBMIT_LABEL }));
+
+    expect(
+      await screen.findByText(
+        "the destination is inside the source, which would copy the tree into itself",
+      ),
+    ).toBeInTheDocument();
+    // No job exists, so nothing is polled and the action is offered again.
+    expect(mockCopyStatus).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: COPY_SUBMIT_LABEL })).toBeEnabled();
+  });
+});
+
 describe("sync pane projections", () => {
   it("reports a wait as elapsed time, coarsely, and never below zero", () => {
     expect(formatSyncWaited(NOW - 30_000, NOW)).toBe("under a minute");
@@ -660,5 +985,56 @@ describe("sync pane projections", () => {
     expect(syncLiveFraction(busy, progressVm({ fraction: 1.4 }))).toBe(1);
     // With no event yet, the polled counters still answer.
     expect(syncLiveFraction(busy, undefined)).toBeCloseTo(0.25);
+  });
+});
+
+describe("copy pane projections", () => {
+  it("leaves out a total the engine has not worked out yet", () => {
+    // A zero total means unknown, and a card must never claim a total it does
+    // not have — not even as "0 of 0".
+    expect(copyProgressSentence(copyJobVm({ filesTotal: 0, bytesTotal: 0 }))).toBe("Copying");
+    expect(copyProgressSentence(copyJobVm({ filesTotal: 0 }))).toBe("Copying — 1.2 GB of 4.7 GB");
+    expect(copyProgressSentence(copyJobVm({ state: "verifying" }))).toBe(
+      "Verifying — 42 of 310 files · 1.2 GB of 4.7 GB",
+    );
+  });
+
+  it("counts small copies in bytes rather than rounding them away", () => {
+    expect(formatCopyBytes(0)).toBe("0 bytes");
+    expect(formatCopyBytes(1)).toBe("1 byte");
+    expect(formatCopyBytes(999)).toBe("999 bytes");
+    expect(formatCopyBytes(1_500)).toBe("1.5 kB");
+    // Truncates: a figure here must never overstate what reached the disk.
+    expect(formatCopyBytes(1_299_000_000)).toBe("1.2 GB");
+  });
+
+  it("counts the summary off the grouping the list renders, worst first", () => {
+    const groups = copyEntryGroups([
+      { path: "a", bytes: 1, outcome: "copied", reason: null },
+      { path: "b", bytes: 1, outcome: "identical", reason: null },
+      { path: "c", bytes: 1, outcome: "copied", reason: null },
+      { path: "d", bytes: 0, outcome: "failed", reason: "gone" },
+      { path: "e", bytes: 1, outcome: "collision", reason: null },
+    ]);
+    expect(groups.map((group) => group.outcome)).toEqual([
+      "failed",
+      "collision",
+      "copied",
+      "identical",
+    ]);
+    expect(copySummarySentence(groups)).toBe(
+      "1 failed · 1 left untouched · 2 copied and verified · 1 already identical",
+    );
+  });
+
+  it("shows an outcome Rust grows later rather than dropping its files", () => {
+    const groups = copyEntryGroups([
+      { path: "a", bytes: 1, outcome: "quarantined", reason: null },
+      { path: "b", bytes: 1, outcome: "copied", reason: null },
+    ]);
+    // Ranked after everything known, but never swallowed: a report that lost a
+    // row would under-report the copy.
+    expect(groups.map((group) => group.outcome)).toEqual(["copied", "quarantined"]);
+    expect(copySummarySentence(groups)).toBe("1 copied and verified · 1 quarantined");
   });
 });

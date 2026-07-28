@@ -131,15 +131,20 @@ let hydration: Promise<void> | null = null;
  * The human message carried by an {@link IpcError} rejection, or the honest
  * fallback. Shared so the form, the rows and the read path all surface the
  * Rust-authored sentence rather than each inventing their own wording.
+ *
+ * `fallback` is what a rejection with no readable message reads as. It exists
+ * for the neighbouring one-time-copy store, whose failures are not sync
+ * failures and must not be reported as one: a second extractor beside this one
+ * would be a second place for the envelope shape to be got wrong.
  */
-export function syncErrorMessage(raw: unknown): string {
+export function syncErrorMessage(raw: unknown, fallback: string = SYNC_UNKNOWN_ERROR): string {
   if (typeof raw === "object" && raw !== null && "message" in raw) {
     const { message } = raw as { message: unknown };
     if (typeof message === "string" && message.trim() !== "") {
       return message;
     }
   }
-  return SYNC_UNKNOWN_ERROR;
+  return fallback;
 }
 
 /**
