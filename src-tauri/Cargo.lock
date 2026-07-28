@@ -4186,7 +4186,7 @@ dependencies = [
 
 [[package]]
 name = "keeper"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -4220,7 +4220,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "futures-util",
  "matrix-sdk",
@@ -4244,7 +4244,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-sync"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "gix",
@@ -4268,7 +4268,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-syncd"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "hex",
