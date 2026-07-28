@@ -168,18 +168,68 @@ stages nothing must not publish a busy phase at all. Tests: the existing `sync_t
 (`tray.rs:1148-1276`) plus a new one asserting a repeated identical state performs no icon
 write. Verify on hesperia: watch the menu bar for 60 s with folders configured and idle.
 
-**34.2 — One titlebar inset, and a drawer that scrolls.** `src/components/layout/app-shell.tsx`
-+ `sidebar-pane.tsx`. Replace the full-width band (`app-shell.tsx:141`) with a two-column band
-that paints `bg-sidebar` over the drawer's width and `bg-background` over the rest, both
-carrying `data-tauri-drag-region` (AD-34-3), rendered only on macOS (AD-34-2 — `titleBarStyle`
-and `hiddenTitle` in `tauri.conf.json:26-27` are macOS-only, so the band is pure waste under a
-real title bar elsewhere; get the platform from the existing capability/platform surface rather
-than sniffing the user agent). Delete the duplicate inset at `sidebar-pane.tsx:106`. Give the
-`<nav>` (`:100-104`) `min-h-0` and put the view list plus Spaces plus Networks inside a scroll
-container, leaving the `mt-auto` footer (`:246`) pinned and always reachable — match the pattern
-at `sync-pane.tsx:516`. Acceptance: at the 600 px minimum window height with eight Spaces the
-account footer is visible and the lists scroll; the top of the window is one continuous colour
-per column in both themes.
+**34.2 — Give the window back its 96 px, and let the drawer reach its own bottom.**
+
+MEASURED ON HESPERIA, 2026-07-28, keeper 0.6.2, window pinned to (200, 200, 1280x800) and read
+out of the accessibility tree. These are the numbers the fix has to satisfy; do not re-derive
+them from CSS, because CSS is only half of it:
+
+| Element | Reported frame | What it means |
+|---|---|---|
+| window (`AXWindow`) | `(200, 200) 1280x800` | the whole window |
+| traffic lights (close button) | `(208, 208) 16x16` | native, 8 px below the window top |
+| **`HTML content`** | **`(200, 256) 1280x800`** | **the web viewport starts 56 px down and is a FULL 800 tall** |
+| drag band (`app-shell.tsx:141`) | `(200, 256) 1280x28` | first 28 px of the viewport |
+| verify banner | `(212, 284) 1256x46` | |
+| nav (`Views`) | `(200, 338) 260x718` | ends at y=1056 |
+| `Add account` button | `(208, 1012) 243x36` | **below the window bottom at y=1000 — unreachable** |
+
+**The root cause is not CSS.** The web viewport is offset 56 px down inside the window *and*
+sized to the window's full 800 px height, so `100vh` is 56 px taller than the visible area and
+everything anchored to the bottom is pushed out of sight by exactly that much. `mt-auto` is not
+collapsing — it is doing its job in a viewport whose bottom is off-screen. This is why the
+account footer is clipped with no scrollbar, and it is a strictly separate defect from the two
+stacked insets.
+
+So the top of the window wastes **96 px** in three independent layers: 56 px of native titlebar
+the webview is pushed below, the 28 px band at `app-shell.tsx:141`, and the 12 px `pt-3` at
+`sidebar-pane.tsx:106`. The user sees ~90 px of nothing and calls it a black strip.
+
+Work, in this order:
+
+(a) **Fix the 56 px offset first, and confirm it with a measurement, not a screenshot.**
+`titleBarStyle: "Overlay"` + `hiddenTitle: true` (`tauri.conf.json:26-27`) are supposed to give
+a full-size content view with the traffic lights floating over it — the measurement says that is
+not what is happening. Establish which it is before changing anything: either the setting is not
+taking effect (check the value Tauri v2 actually accepts for `titleBarStyle`, and whether
+anything overrides it at runtime), or it takes effect and the 56 px is a unified-titlebar area
+macOS reserves anyway. If Overlay cannot be made to give a full-height viewport, **drop
+`titleBarStyle`/`hiddenTitle` and take the native title bar** — it is the boring, correct
+outcome, and then (b) and (c) below become deletions rather than rewrites. Do not "fix" this by
+subtracting a magic 56 px in CSS; a hard-coded native-chrome constant is how this bug comes back
+on the next macOS release.
+
+(b) **One inset, painted per column (AD-34-2, AD-34-3).** If a band survives (a), it replaces
+the full-width one at `app-shell.tsx:141` and paints `bg-sidebar` across the drawer's width and
+`bg-background` across the rest, both carrying `data-tauri-drag-region` — a single
+`bg-background` strip above a `bg-sidebar` drawer is a seam in light mode and a black bar in
+dark mode, which is the whole of the reported "black strip". Render it only where traffic lights
+actually float over the webview; `titleBarStyle`/`hiddenTitle` are macOS-only, so elsewhere it
+is waste under a real title bar. Take the platform from the existing capability/platform
+surface, not a user-agent sniff. Delete the duplicate inset at `sidebar-pane.tsx:106` either
+way.
+
+(c) **The drawer scrolls (AD-34-4).** Give the `<nav>` (`sidebar-pane.tsx:100-104`) `min-h-0`
+and put the view list plus `SpacesGroup` plus `NetworksGroup` in a scroll container, leaving the
+`mt-auto` footer (`:246`) pinned — the pattern every other pane already uses
+(`sync-pane.tsx:516`, `bridges-pane.tsx:43`, `recording-pane.tsx:264`). This is needed even
+after (a): eight Spaces in a 600 px window overflow on their own.
+
+Acceptance, measured on hesperia the same way: with the window at 1280x800, the web viewport's
+reported height equals the window's visible height (no bottom overflow), `Add account` reports a
+frame fully inside the window, and the top of the window is one continuous colour per column in
+both light and dark. Then at the 600 px minimum height with eight Spaces the footer is still
+visible and the lists scroll.
 
 **34.3 — The window stays draggable on the Recording tab.** Make every recording command that
 touches the filesystem `async` (AD-34-5): `recording_status` (`ipc.rs:4757`),
