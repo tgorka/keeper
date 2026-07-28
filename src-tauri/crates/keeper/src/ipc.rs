@@ -86,6 +86,11 @@ pub struct AppState {
     /// spawning the blocking job, `export_cancel` sets it, and the job deregisters
     /// itself on any terminal phase. The `AtomicU64` mints monotonic ids.
     pub exports: Arc<ExportRegistry>,
+    /// Live and recently-finished one-time copy jobs (Epic 33). A copy is a
+    /// job rather than a relationship, so it lives here in app memory and
+    /// never reaches `profiles` or the sync journal.
+    #[cfg(desktop)]
+    pub copies: Arc<crate::copy_ipc::CopyRegistry>,
     /// Live `bbctl` self-hosted-bridge runs (Story 6.7). Maps each `sessionId` to
     /// its driver-task abort handle, keyed also by `(accountId, networkId)` so a
     /// second run for the same target replaces the first rather than spawning a
@@ -415,6 +420,8 @@ impl AppState {
             oauth_flows: Arc::new(OAuthFlowRegistry::new()),
             beeper_flows: Arc::new(BeeperFlowRegistry::new()),
             exports: Arc::new(ExportRegistry::default()),
+            #[cfg(desktop)]
+            copies: Arc::new(crate::copy_ipc::CopyRegistry::default()),
             bbctl_runs: Arc::new(BbctlRunRegistry::default()),
             paused_at: Mutex::new(None),
             nav_state: Mutex::new(None),

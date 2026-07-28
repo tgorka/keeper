@@ -5,6 +5,8 @@
 // default type-layout recursion depth; raise it as matrix-sdk recommends.
 #![recursion_limit = "256"]
 
+#[cfg(desktop)]
+mod copy_ipc;
 mod debug_log;
 #[cfg(desktop)]
 mod hotkey;
@@ -508,6 +510,9 @@ pub fn run() {
         sync_ipc::sync_retry_parked,
         sync_ipc::sync_set_credential,
         sync_ipc::sync_clear_credential,
+        copy_ipc::copy_start,
+        copy_ipc::copy_status,
+        copy_ipc::copy_cancel,
     );
     #[cfg(not(desktop))]
     let builder = keeper_with_commands!(builder);
