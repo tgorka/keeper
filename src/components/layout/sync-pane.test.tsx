@@ -81,6 +81,9 @@ import {
   SYNC_ADD_TITLE,
   SYNC_ADVANCED_TOGGLE_TESTID,
   SYNC_CHOOSE_FOLDER_LABEL,
+  SYNC_EDIT_SUBMIT_LABEL,
+  SYNC_EDIT_TITLE,
+  SYNC_FORM_CANCEL_LABEL,
   SYNC_FORM_PATH_TESTID,
   SYNC_NAME_LABEL,
   SYNC_REMOTE_URL_LABEL,
@@ -518,6 +521,98 @@ describe("SyncPane add a folder", () => {
       await screen.findByText(`${SYNC_TOKEN_FAILED_PREFIX}keychain refused`),
     ).toBeInTheDocument();
     expect(await screen.findByText("notes")).toBeInTheDocument();
+  });
+});
+
+describe("SyncPane edit a folder", () => {
+  /** The accessible name of the only card's form: one per folder on screen. */
+  const EDIT_FORM = `${SYNC_EDIT_TITLE}: tgdrive`;
+
+  /** Mount the pane and open the card's edit form. */
+  async function openEdit() {
+    await renderPane();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_TITLE }));
+    return await screen.findByRole("form", { name: EDIT_FORM });
+  }
+
+  it("fixes a mistyped remote from the card itself, without waiting for a poll", async () => {
+    const form = await openEdit();
+    // The form sits inside the card it belongs to, which goes on reporting.
+    expect(screen.getByText(RUST_LINE)).toBeInTheDocument();
+
+    const fixed = "git@gitlab.example.org:alice/tgdrive.git";
+    fireEvent.change(within(form).getByLabelText(SYNC_REMOTE_URL_LABEL), {
+      target: { value: fixed },
+    });
+    const edited = profileVm({ remoteUrl: fixed });
+    mockSave.mockResolvedValue(edited);
+    mockProfiles.mockResolvedValue([edited]);
+    fireEvent.click(within(form).getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    // The id is the whole difference between this and adding a second folder,
+    // and the path it was bound to goes back unchanged.
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "p1",
+          remoteUrl: fixed,
+          localPath: "/Users/alice/Documents/tgdrive",
+        }),
+      ),
+    );
+    // Saving closes the form, and the save re-read the mirror, so the card
+    // already points at the corrected remote rather than a poll interval later.
+    expect(await screen.findByText("gitlab.example.org")).toBeInTheDocument();
+    expect(screen.queryByText("github.com")).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("form", { name: EDIT_FORM })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("leaves a paused folder paused", async () => {
+    mockProfiles.mockResolvedValue([profileVm({ enabled: false })]);
+    mockStatuses.mockResolvedValue([statusVm({ state: "paused" })]);
+    const form = await openEdit();
+
+    fireEvent.change(within(form).getByLabelText(SYNC_NAME_LABEL), {
+      target: { value: "tgdrive archive" },
+    });
+    const renamed = profileVm({ enabled: false, name: "tgdrive archive" });
+    mockSave.mockResolvedValue(renamed);
+    mockProfiles.mockResolvedValue([renamed]);
+    mockStatuses.mockResolvedValue([statusVm({ state: "paused", profileName: "tgdrive archive" })]);
+    fireEvent.click(within(form).getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    expect(await screen.findByText("tgdrive archive")).toBeInTheDocument();
+    // An edit is one write to one command. Routing it through anything that
+    // also toggles pause would quietly resume a folder that was stopped on
+    // purpose…
+    expect(mockSetEnabled).not.toHaveBeenCalled();
+    // …and the request carries no pause state for the merge in Rust to
+    // contradict, which is what keeps the two ends from disagreeing.
+    expect(mockSave.mock.calls[0]?.[0]).not.toHaveProperty("enabled");
+    expect(screen.getByText("Paused")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: SYNC_RESUME_LABEL })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: SYNC_PAUSE_LABEL })).not.toBeInTheDocument();
+  });
+
+  it("cancels back to the card with nothing saved, and reopens from the profile", async () => {
+    const form = await openEdit();
+    fireEvent.change(within(form).getByLabelText(SYNC_NAME_LABEL), {
+      target: { value: "half-typed rename" },
+    });
+
+    fireEvent.click(within(form).getByRole("button", { name: SYNC_FORM_CANCEL_LABEL }));
+
+    await waitFor(() =>
+      expect(screen.queryByRole("form", { name: EDIT_FORM })).not.toBeInTheDocument(),
+    );
+    expect(mockSave).not.toHaveBeenCalled();
+    expect(screen.getByText("tgdrive")).toBeInTheDocument();
+    // Reopening starts from the stored profile, not from the abandoned edit.
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_TITLE }));
+    const reopened = await screen.findByRole("form", { name: EDIT_FORM });
+    expect(within(reopened).getByLabelText(SYNC_NAME_LABEL)).toHaveValue("tgdrive");
   });
 });
 

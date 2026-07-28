@@ -1115,7 +1115,18 @@ resolution: fixed in PR #7. Neither surface claims a digest comparison any more:
 origin: found while answering a user question about sync frequency, 2026-07-27
 location: keeper-sync/src/profile.rs:159 + keeper-syncd/src/config.rs:59 + commands.rs:323
 reason: `SyncProfile.poll_interval_ms` (profile.rs:159, default 15 s at :122) and `DaemonSettings.poll_interval_ms` (config.rs:59, floor-checked at :131-136) are both round-tripped through TOML and settable via `keeper-syncd add --poll-interval-ms` (commands.rs:323, stored :638-639), and the starter config documents them (config.rs:292, :322). Nothing consumes either: the supervisor's cadence is the hardcoded `TICK_MS = 1_000` (engine.rs:73, used at :373) and `main.rs:61` reads only `daemon.log_level`. An operator who sets the value gets no error and no effect, which is worse than not offering it. Either honour it (per-profile due time in the tick) or delete both fields and the CLI flag.
-status: open
+status: done 2026-07-28
+resolution: honoured, per the entry's first option. `Engine::scan_is_due`
+  (engine.rs) gives every profile its own due time from `poll_interval_ms`,
+  floored at 2 s so a stored zero cannot mean "every tick". Draining the
+  journal still runs at `TICK_MS`, so queued work is not delayed; only the
+  tree walk that DISCOVERS work is paced. A new profile scans on sight and
+  resuming a paused one reopens the window. This was not cosmetic: rescanning
+  every folder every second published a `Scanning` phase at 1 Hz, which made
+  the menu-bar glyph strobe on an idle folder. The daemon-level
+  `DaemonSettings.poll_interval_ms` remains unconsumed — the daemon drives the
+  same engine, so its profiles are paced by their own per-profile value, but
+  the daemon-wide default still reaches no timer.
 
 ### DW-117: Every commit keeper makes is stamped `Keeper-Source: watch`, including manual and CLI syncs, so the trailer cannot distinguish what triggered a change.
 

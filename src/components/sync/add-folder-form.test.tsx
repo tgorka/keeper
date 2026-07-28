@@ -25,16 +25,30 @@ import {
   AddFolderForm,
   SYNC_ADD_SUBMIT_LABEL,
   SYNC_ADVANCED_TOGGLE_TESTID,
+  SYNC_AUTHOR_LABEL,
+  SYNC_BRANCH_LABEL,
   SYNC_CHOOSE_FOLDER_LABEL,
+  SYNC_EDIT_SUBMIT_LABEL,
+  SYNC_EDIT_TITLE,
+  SYNC_EXCLUDES_LABEL,
+  SYNC_FOLDER_LABEL,
   SYNC_FORM_PATH_TESTID,
+  SYNC_LFS_THRESHOLD_LABEL,
   SYNC_NAME_LABEL,
+  SYNC_PATH_FIXED_NOTE,
   SYNC_REMOTE_URL_LABEL,
+  SYNC_SETTLE_LABEL,
+  SYNC_SUBPATHS_LABEL,
+  SYNC_TAGS_LABEL,
   SYNC_TOKEN_CLEAR_LABEL,
+  SYNC_TOKEN_CLEARED_LABEL,
+  SYNC_TOKEN_EDIT_NOTE,
   SYNC_TOKEN_LABEL,
 } from "@/components/sync/add-folder-form";
 import type { SyncProfileVm } from "@/lib/ipc/client";
 import {
   syncActivity,
+  syncClearCredential,
   syncPending,
   syncProblems,
   syncProfileSave,
@@ -52,6 +66,7 @@ const mockActivity = vi.mocked(syncActivity);
 const mockPending = vi.mocked(syncPending);
 const mockProblems = vi.mocked(syncProblems);
 const mockSetCredential = vi.mocked(syncSetCredential);
+const mockClearCredential = vi.mocked(syncClearCredential);
 const mockPicker = vi.mocked(openFolder);
 
 function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
@@ -115,13 +130,13 @@ describe("AddFolderForm", () => {
 
   it("reports a settled add to its caller only after clearing the form", async () => {
     mockSave.mockResolvedValue(profileVm());
-    const onAdded = vi.fn();
-    render(<AddFolderForm onAdded={onAdded} />);
+    const onSaved = vi.fn();
+    render(<AddFolderForm onSaved={onSaved} />);
     await fillRequired();
 
     fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
 
-    await waitFor(() => expect(onAdded).toHaveBeenCalledWith(profileVm(), true));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(profileVm(), true));
     expect(screen.getByLabelText(SYNC_NAME_LABEL)).toHaveValue("");
   });
 
@@ -148,8 +163,8 @@ describe("AddFolderForm", () => {
       code: "internal",
       message: "local path must be absolute, got relative/path",
     });
-    const onAdded = vi.fn();
-    render(<AddFolderForm onAdded={onAdded} />);
+    const onSaved = vi.fn();
+    render(<AddFolderForm onSaved={onSaved} />);
     await fillRequired();
     fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
       target: { value: "git@github.com:alice/half-typed" },
@@ -167,14 +182,14 @@ describe("AddFolderForm", () => {
       "git@github.com:alice/half-typed",
     );
     expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("/Users/alice/notes");
-    expect(onAdded).not.toHaveBeenCalled();
+    expect(onSaved).not.toHaveBeenCalled();
   });
 
   it("tells the caller a stored token leaves the form something only it can show", async () => {
     mockSave.mockResolvedValue(profileVm());
     mockSetCredential.mockResolvedValue(undefined);
-    const onAdded = vi.fn();
-    render(<AddFolderForm onAdded={onAdded} />);
+    const onSaved = vi.fn();
+    render(<AddFolderForm onSaved={onSaved} />);
     await fillRequired();
     fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
     fireEvent.change(screen.getByLabelText(SYNC_TOKEN_LABEL), { target: { value: "ghp_secret" } });
@@ -185,6 +200,172 @@ describe("AddFolderForm", () => {
     // offer it later — so the caller is told the folder exists and told, in the
     // same call, that hiding the form now would destroy the only way to use it.
     expect(await screen.findByRole("button", { name: SYNC_TOKEN_CLEAR_LABEL })).toBeInTheDocument();
-    expect(onAdded).toHaveBeenCalledWith(profileVm(), false);
+    expect(onSaved).toHaveBeenCalledWith(profileVm(), false);
+  });
+});
+
+describe("AddFolderForm editing an existing folder", () => {
+  /** A stored profile with something in every field the form can carry. */
+  function stored(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
+    return profileVm({
+      id: "p9",
+      name: "field notes",
+      localPath: "/Volumes/stick/field",
+      remoteUrl: "git@github.com:alice/field.git",
+      branch: "trunk",
+      direction: "pushOnly",
+      subpaths: ["today", "archive"],
+      excludes: ["*.tmp"],
+      removable: true,
+      lfsMode: "pointerOnly",
+      lfsThresholdBytes: 8 * 1024 * 1024,
+      settleMs: 12_000,
+      tags: ["field"],
+      authorOverride: "Ada <ada@example.org>",
+      ...over,
+    });
+  }
+
+  it("starts from the stored profile and saves it back under its own id", async () => {
+    const profile = stored();
+    mockSave.mockResolvedValue(profile);
+    render(<AddFolderForm profile={profile} />);
+
+    // Named for the folder it belongs to: several of these can be open at once.
+    expect(
+      screen.getByRole("form", { name: `${SYNC_EDIT_TITLE}: field notes` }),
+    ).toBeInTheDocument();
+    // Every field arrives filled in. An edit form that opened empty would be an
+    // add form pointed at an existing folder, and saving it would erase the
+    // settings the user came to change one of.
+    expect(screen.getByLabelText(SYNC_NAME_LABEL)).toHaveValue("field notes");
+    expect(screen.getByLabelText(SYNC_REMOTE_URL_LABEL)).toHaveValue(
+      "git@github.com:alice/field.git",
+    );
+    expect(screen.getByLabelText(SYNC_BRANCH_LABEL)).toHaveValue("trunk");
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    // Seconds and MB here, milliseconds and bytes on the wire.
+    expect(screen.getByLabelText(SYNC_SETTLE_LABEL)).toHaveValue(12);
+    expect(screen.getByLabelText(SYNC_LFS_THRESHOLD_LABEL)).toHaveValue(8);
+    expect(screen.getByLabelText(SYNC_EXCLUDES_LABEL)).toHaveValue("*.tmp");
+    expect(screen.getByLabelText(SYNC_SUBPATHS_LABEL)).toHaveValue("today, archive");
+    expect(screen.getByLabelText(SYNC_TAGS_LABEL)).toHaveValue("field");
+    expect(screen.getByLabelText(SYNC_AUTHOR_LABEL)).toHaveValue("Ada <ada@example.org>");
+
+    fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
+      target: { value: "git@github.com:alice/field-notes.git" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    // The id is what Rust reads as "update that one", and the request is exact:
+    // it carries no `enabled`, so the merge on the other side cannot be handed
+    // a pause state to contradict.
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith({
+        id: "p9",
+        name: "field notes",
+        localPath: "/Volumes/stick/field",
+        remoteUrl: "git@github.com:alice/field-notes.git",
+        branch: "trunk",
+        direction: "pushOnly",
+        lane: "main",
+        subpaths: ["today", "archive"],
+        excludes: ["*.tmp"],
+        removable: true,
+        lfsMode: "pointerOnly",
+        lfsThresholdBytes: 8 * 1024 * 1024,
+        settleMs: 12_000,
+        tags: ["field"],
+        authorOverride: "Ada <ada@example.org>",
+      }),
+    );
+  });
+
+  it("shows the folder it is bound to without offering to repoint it", async () => {
+    render(<AddFolderForm profile={stored()} />);
+
+    expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("/Volumes/stick/field");
+    // No picker and no field: the engine binds a profile to this folder, and on
+    // removable media to a marker written inside it.
+    expect(
+      screen.queryByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: SYNC_FOLDER_LABEL })).not.toBeInTheDocument();
+    // Explained rather than quietly dropped — a field that vanished would read
+    // as one the form forgot.
+    expect(screen.getByText(SYNC_PATH_FIXED_NOTE)).toBeInTheDocument();
+  });
+
+  it("starts the token field empty, and an untouched one keeps what is stored", async () => {
+    const profile = stored();
+    mockSave.mockResolvedValue(profile);
+    render(<AddFolderForm profile={profile} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+
+    // Write-only: no command reads a stored token back, so anything in this
+    // field — even a placeholder of dots — would be a claim the form cannot
+    // make. The note is what says so.
+    const token = screen.getByLabelText(SYNC_TOKEN_LABEL);
+    expect(token).toHaveValue("");
+    expect(token).not.toHaveAttribute("placeholder");
+    expect(screen.getByText(SYNC_TOKEN_EDIT_NOTE)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalled());
+    // Empty means "leave it alone", so neither keychain write may fire.
+    expect(mockSetCredential).not.toHaveBeenCalled();
+    expect(mockClearCredential).not.toHaveBeenCalled();
+  });
+
+  it("removes a stored token through the keychain, and reports it", async () => {
+    mockClearCredential.mockResolvedValue(undefined);
+    render(<AddFolderForm profile={stored()} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_TOKEN_CLEAR_LABEL }));
+
+    await waitFor(() => expect(mockClearCredential).toHaveBeenCalledWith("p9"));
+    // A keychain has no read side, so this line is the only report there is.
+    expect(await screen.findByText(SYNC_TOKEN_CLEARED_LABEL)).toBeInTheDocument();
+    // Clearing a credential is not a profile change.
+    expect(mockSave).not.toHaveBeenCalled();
+  });
+
+  it("says an emptied author override out loud, since an omission would keep it", async () => {
+    const profile = stored();
+    mockSave.mockResolvedValue(profile);
+    render(<AddFolderForm profile={profile} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+
+    fireEvent.change(screen.getByLabelText(SYNC_AUTHOR_LABEL), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    // Rust reads an absent override as "leave whatever is stored", so clearing
+    // the field has to send the empty string or it does nothing at all.
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ authorOverride: "" })),
+    );
+  });
+
+  it("keeps every entered value on screen when the save is rejected", async () => {
+    mockSave.mockRejectedValue({ code: "internal", message: "remote is not reachable" });
+    const onSaved = vi.fn();
+    render(<AddFolderForm profile={stored()} onSaved={onSaved} />);
+    fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
+      target: { value: "git@github.com:alice/half-typed" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    expect(await screen.findByText("remote is not reachable")).toBeInTheDocument();
+    // A correction that has to be retyped from memory is worse than no edit.
+    expect(screen.getByLabelText(SYNC_REMOTE_URL_LABEL)).toHaveValue(
+      "git@github.com:alice/half-typed",
+    );
+    expect(screen.getByLabelText(SYNC_NAME_LABEL)).toHaveValue("field notes");
+    expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("/Volumes/stick/field");
+    // Nothing was saved, so no surface may close over the message.
+    expect(onSaved).not.toHaveBeenCalled();
   });
 });

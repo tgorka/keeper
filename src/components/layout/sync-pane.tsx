@@ -10,12 +10,16 @@
  * progress, the row actions), then Activity, Pending, and a Problems section
  * that exists only while something is wrong.
  *
- * Settings keeps profile *configuration* (AD-S1) — editing, pausing, removing.
- * This view owns activity, state and problems, and never offers Remove. The
- * one configuration act it does offer is the first one: adding a folder, via
- * the shared {@link AddFolderForm} (AD-C7). Until Story 33.4 the empty state
- * named Settings and stopped there, which meant a new user's Sync view could
- * only tell them to leave it.
+ * Settings keeps the profile *list* affordances this view has no business
+ * repeating: it is the only surface that removes a folder. What this view owns
+ * besides activity, state and problems is configuration of the folder in front
+ * of you — adding one, and editing one — through the shared
+ * {@link AddFolderForm} (AD-C7), which is one component in two modes so the
+ * two surfaces cannot word or validate the same profile differently. Until
+ * Story 33.4 the empty state named Settings and stopped there, which meant a
+ * new user's Sync view could only tell them to leave it; until edit mode, a
+ * mistyped remote URL could only be fixed by removing the folder and setting
+ * it up again.
  *
  * Beneath the folders sits the one thing here that is not a folder: a one-time
  * verified copy (Story 33.3, AD-C1). It is deliberately adjacent to sync and
@@ -51,7 +55,7 @@ import {
   SYNC_RESUME_LABEL,
   syncRemoteHost,
 } from "@/components/settings/sync-section";
-import { AddFolderForm, SYNC_ADD_TITLE } from "@/components/sync/add-folder-form";
+import { AddFolderForm, SYNC_ADD_TITLE, SYNC_EDIT_TITLE } from "@/components/sync/add-folder-form";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -529,7 +533,7 @@ export function SyncPane() {
           {showAddForm && (
             <Card size="sm">
               <CardContent>
-                <AddFolderForm onAdded={(_profile, settled) => setAdding(!settled)} />
+                <AddFolderForm onSaved={(_profile, settled) => setAdding(!settled)} />
               </CardContent>
             </Card>
           )}
@@ -558,6 +562,11 @@ function SyncProfileCard({
   const progress = useSyncDetailStore((state) => state.progress[profile.id]);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  /**
+   * Whether this folder's configuration is open for editing. Per card, because
+   * the form it reveals is about this folder and nothing else.
+   */
+  const [editing, setEditing] = useState(false);
 
   /**
    * Run a card action with the shared busy/error lifecycle, then re-read this
@@ -647,6 +656,18 @@ function SyncProfileCard({
             >
               {profile.enabled ? SYNC_PAUSE_LABEL : SYNC_RESUME_LABEL}
             </Button>
+            {/* Quieter than its neighbours: the two beside it act on the folder
+                now, this one opens what the folder *is*. */}
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              aria-expanded={editing}
+              disabled={busy}
+              onClick={() => setEditing((shown) => !shown)}
+            >
+              {SYNC_EDIT_TITLE}
+            </Button>
           </div>
         </div>
         {/* A bar only where there is a real denominator. Without one the
@@ -678,6 +699,17 @@ function SyncProfileCard({
         )}
       </CardHeader>
       <CardContent className="flex flex-col gap-5">
+        {/* Mounted fresh on each open, so it seeds from the profile as it is
+            now; `settled` false leaves it standing over a keychain failure that
+            nothing else on screen would report. */}
+        {editing && (
+          <AddFolderForm
+            className="border-border border-b pb-5"
+            profile={profile}
+            onSaved={(_saved, settled) => setEditing(!settled)}
+            onCancel={() => setEditing(false)}
+          />
+        )}
         <SyncActivityList profile={profile} rows={detail?.activity ?? null} />
         <SyncPendingList profile={profile} rows={detail?.pending ?? null} />
         <SyncProblemsSection

@@ -187,6 +187,17 @@ pub struct Engine {
     /// that has silently stopped syncing, and reporting that one as healthy is
     /// the dishonesty this counter exists to prevent. Reset by any success.
     transient_failures: Mutex<HashMap<String, u32>>,
+    /// When each profile may next be rescanned for local work.
+    ///
+    /// The supervisor ticks at 1 Hz because a queued unit should start almost
+    /// at once, but WALKING THE TREE at that rate is a different thing
+    /// entirely: it re-stats every file every second — on a pendrive, over a
+    /// network mount — and it made the menu-bar glyph flip between armed and
+    /// working once a second, because a scan that finds nothing still passes
+    /// through the `Scanning` phase. Draining stays at the tick; scanning is
+    /// paced by the profile's own `poll_interval_ms`, which until now was
+    /// parsed, validated, documented and read by nothing (DW-116).
+    next_scan_ms: Mutex<HashMap<String, i64>>,
     /// Absolute path to the binary git should invoke as the `lfs` filter.
     ///
     /// `None` when the running executable cannot be resolved — the filter is an
@@ -252,6 +263,7 @@ impl Engine {
             gates: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
             transient_failures: Mutex::new(HashMap::new()),
+            next_scan_ms: Mutex::new(HashMap::new()),
             // `current_exe` is the daemon in a CLI run and the app binary in a
             // desktop run; both understand `lfs clean|smudge`.
             filter_program: std::env::current_exe().ok(),
@@ -341,6 +353,7 @@ impl Engine {
         self.with_db(|conn| db::delete_profile(conn, id))?;
         Self::lock(&self.status).remove(id);
         Self::lock(&self.gates).remove(id);
+        Self::lock(&self.next_scan_ms).remove(id);
         Ok(())
     }
 
@@ -356,6 +369,9 @@ impl Engine {
             // making the user wait out a backoff they did not cause is rude.
             let now = self.platform.now_ms();
             self.with_db(|conn| db::undefer_profile(conn, id, now))?;
+            // ...and neither is making them wait out a scan window: resuming is
+            // a request to look now.
+            Self::lock(&self.next_scan_ms).remove(id);
         }
         Ok(())
     }
@@ -530,7 +546,35 @@ impl Engine {
             None => return Ok(()),
         };
 
-        self.drain_journal(profile).await
+        let scan = self.scan_is_due(profile);
+        self.drain_journal(profile, scan).await
+    }
+
+    /// Whether this profile's tree may be walked on this tick, arming the next
+    /// window when it may.
+    ///
+    /// Queued work is drained every tick; discovering NEW work is paced, because
+    /// a scan is a full re-stat of the tree and a `Scanning` phase the UI and the
+    /// tray both render. At 1 Hz that made the menu-bar glyph flip continuously
+    /// on a folder where nothing was happening.
+    ///
+    /// The floor exists because the field is user-supplied: a zero would restore
+    /// the every-tick behaviour this replaces, and a profile written before the
+    /// field meant anything still deserves a sane cadence.
+    fn scan_is_due(&self, profile: &SyncProfile) -> bool {
+        const MIN_SCAN_INTERVAL_MS: i64 = 2_000;
+        let now = self.platform.now_ms();
+        let mut due = Self::lock(&self.next_scan_ms);
+        match due.get(&profile.id) {
+            // First sight of this profile: scan at once, so adding a folder does
+            // not appear to do nothing for a quarter of a minute.
+            None => {}
+            Some(at) if now >= *at => {}
+            Some(_) => return false,
+        }
+        let interval = (profile.poll_interval_ms as i64).max(MIN_SCAN_INTERVAL_MS);
+        due.insert(profile.id.clone(), now.saturating_add(interval));
+        true
     }
 
     /// Execute every journal unit that is ready for this profile.
@@ -539,13 +583,19 @@ impl Engine {
     /// committed a pointer but never ran the LFS transfer it queued would leave
     /// the remote holding a pointer to content it does not have.
     ///
+    /// `scan_when_idle` is what separates the two callers. With nothing queued,
+    /// the supervisor looks for new local work only when the profile's scan
+    /// window is open; an explicit "sync now" always looks, because the user
+    /// just asked.
+    ///
     /// The caller owns the profile reservation.
-    async fn drain_journal(&self, profile: &SyncProfile) -> Result<()> {
+    async fn drain_journal(&self, profile: &SyncProfile, scan_when_idle: bool) -> Result<()> {
         let now = self.platform.now_ms();
         let claimed = self.with_db(|conn| db::claim_ready(conn, &profile.id, now, CLAIM_LIMIT))?;
         if claimed.is_empty() {
-            // Nothing queued — look for new local work.
-            self.scan_and_enqueue(profile)?;
+            if scan_when_idle {
+                self.scan_and_enqueue(profile)?;
+            }
             return Ok(());
         }
 
@@ -1923,7 +1973,7 @@ impl Engine {
         // here would leave the remote holding a pointer to content it does not
         // have, so the queue is drained before this call is allowed to claim
         // success.
-        self.drain_journal(&profile).await?;
+        self.drain_journal(&profile, true).await?;
         outcome.bytes = self
             .transferred_bytes(&profile.id)
             .saturating_sub(transferred_before);
@@ -2455,6 +2505,66 @@ mod tests {
             dir.join("work"),
             "https://git.invalid/x/y.git",
         )
+    }
+    /// The supervisor ticks at 1 Hz so queued work starts promptly. Walking the
+    /// tree at that rate is what made the menu-bar glyph blink on an idle
+    /// folder, and it re-stats every file on the drive once a second.
+    #[test]
+    fn scanning_is_paced_by_the_poll_interval_not_the_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.poll_interval_ms = 15_000;
+
+        // First sight scans at once: adding a folder must not look inert.
+        assert!(engine.scan_is_due(&p), "a new profile scans immediately");
+        assert!(!engine.scan_is_due(&p), "the very next tick does not");
+
+        platform.advance_ms(14_999);
+        assert!(!engine.scan_is_due(&p), "still inside the window");
+        platform.advance_ms(1);
+        assert!(engine.scan_is_due(&p), "the window has opened");
+    }
+
+    /// `poll_interval_ms` is user-supplied and older rows predate it meaning
+    /// anything, so a zero must not restore per-tick scanning.
+    #[test]
+    fn a_zero_poll_interval_still_leaves_a_gap_between_scans() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.poll_interval_ms = 0;
+
+        assert!(engine.scan_is_due(&p));
+        platform.advance_ms(1_000);
+        assert!(!engine.scan_is_due(&p), "one tick later is still too soon");
+        platform.advance_ms(1_000);
+        assert!(engine.scan_is_due(&p), "the floor is a gap, not a stall");
+    }
+
+    /// Resuming is a request to look now; the pacing must not hold a folder
+    /// idle for a window the user never waited through.
+    #[test]
+    fn resuming_a_paused_profile_reopens_the_scan_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.poll_interval_ms = 60_000;
+        engine.upsert_profile(&p).expect("store");
+
+        assert!(engine.scan_is_due(&p), "first sight");
+        assert!(!engine.scan_is_due(&p), "window closed");
+        engine.set_enabled(&p.id, true).expect("resume");
+        assert!(engine.scan_is_due(&p), "resume looks now");
     }
 
     #[test]

@@ -45,9 +45,12 @@ import {
 } from "@/components/settings/sync-section";
 import {
   SYNC_ADD_SUBMIT_LABEL,
+  SYNC_ADD_TITLE,
   SYNC_ADVANCED_TOGGLE_TESTID,
   SYNC_AUTHOR_LABEL,
   SYNC_CHOOSE_FOLDER_LABEL,
+  SYNC_EDIT_SUBMIT_LABEL,
+  SYNC_EDIT_TITLE,
   SYNC_EXCLUDES_LABEL,
   SYNC_FORM_PATH_TESTID,
   SYNC_NAME_LABEL,
@@ -365,6 +368,40 @@ describe("SyncSection remove", () => {
     await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
     expect(mockRemove).not.toHaveBeenCalled();
     expect(screen.getByText(RUST_LINE)).toBeInTheDocument();
+  });
+});
+
+describe("SyncSection edit a folder", () => {
+  it("corrects the row's own profile in place, rather than by removing and re-adding it", async () => {
+    render(<SyncSection open />);
+
+    fireEvent.click(await screen.findByRole("button", { name: SYNC_EDIT_TITLE }));
+
+    // This is the surface that removes a folder, so until now it was also the
+    // surface where a mistyped remote meant removing it and starting over.
+    const form = await screen.findByRole("form", { name: `${SYNC_EDIT_TITLE}: tgdrive` });
+    const remote = within(form).getByLabelText(SYNC_REMOTE_URL_LABEL);
+    expect(remote).toHaveValue("git@github.com:alice/tgdrive.git");
+
+    const fixed = "git@github.com:alice/tgdrive-2.git";
+    fireEvent.change(remote, { target: { value: fixed } });
+    mockSave.mockResolvedValue(profileVm({ remoteUrl: fixed }));
+    mockProfiles.mockResolvedValue([profileVm({ remoteUrl: fixed })]);
+    fireEvent.click(within(form).getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "p1", remoteUrl: fixed }),
+      ),
+    );
+    expect(mockRemove).not.toHaveBeenCalled();
+    // The add form below the list is a different form, and it stays put.
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("form", { name: `${SYNC_EDIT_TITLE}: tgdrive` }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.getByRole("form", { name: SYNC_ADD_TITLE })).toBeInTheDocument();
   });
 });
 

@@ -981,6 +981,56 @@ fn sync_glyph(state: TraySyncState, frame: u8) -> Option<&'static [u8]> {
     }
 }
 
+/// How many ~1 s ticks a busy glyph survives after the engine stops reporting
+/// one. Long enough to swallow a scan that begins and ends between two ticks,
+/// short enough that the menu bar is not lying about what is happening now.
+const BUSY_DWELL_TICKS: u8 = 3;
+
+/// The busy state being held, and for how many more ticks.
+static SYNC_DWELL: Mutex<Option<(TraySyncState, u8)>> = Mutex::new(None);
+
+/// Smooth the reported state so short work cannot blink the menu bar.
+///
+/// The engine reports what is true at the instant it is asked. A scan that
+/// takes 40 ms is true, and rendering it faithfully at 1 Hz turned the glyph
+/// into a strobe: armed, working, armed, working, on a folder where nothing
+/// was happening. Slowing the scans (`Engine::scan_is_due`) removed the cause;
+/// this removes the symptom for every OTHER short unit of work — a small
+/// commit, a fast merge — which no cadence change can prevent.
+///
+/// Only the fall BACK to rest is delayed. Escalation is immediate: a problem,
+/// a transfer, or the last profile going away all render on the tick they
+/// happen. Delaying bad news to keep the icon calm would be the dishonest
+/// version of this.
+fn dwelled(reported: TraySyncState) -> TraySyncState {
+    let mut held = SYNC_DWELL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match reported {
+        // Busy: show it, and arm the hold.
+        TraySyncState::Transferring | TraySyncState::Active => {
+            *held = Some((reported, BUSY_DWELL_TICKS));
+            reported
+        }
+        // Something the user must see, or nothing left to render.
+        TraySyncState::Warning | TraySyncState::Absent => {
+            *held = None;
+            reported
+        }
+        // At rest. Keep showing the recent work until its hold expires.
+        TraySyncState::Armed | TraySyncState::Paused => match *held {
+            Some((state, ticks)) if ticks > 0 => {
+                *held = Some((state, ticks - 1));
+                state
+            }
+            _ => {
+                *held = None;
+                reported
+            }
+        },
+    }
+}
+
 /// Build the sync tray menu: a disabled status line, then Show and Quit.
 fn build_sync_menu(app: &AppHandle, line: &str) -> Option<(Menu<Wry>, MenuItem<Wry>)> {
     let status = menu_item(app, SYNC_STATUS_ID, line, false)?;
@@ -1035,6 +1085,9 @@ pub fn apply_sync_state(app: &AppHandle, state: TraySyncState, line: &str, frame
         return;
     }
 
+    // Smooth the glyph, never the words: the status line below still reports
+    // exactly what the engine said this tick.
+    let state = dwelled(state);
     let Some(glyph) = sync_glyph(state, frame) else {
         // No profiles at all: leave the plain idle tray exactly as it was, and
         // tear down a sync menu if one is still installed.
@@ -1111,6 +1164,53 @@ mod sync_tray_tests {
     fn no_profiles_means_no_sync_glyph_at_all() {
         // Absent must leave the plain idle tray alone rather than claiming it.
         assert!(sync_glyph(TraySyncState::Absent, 0).is_none());
+    }
+    /// One test, not four: `dwelled` keeps its hold in a process-wide static,
+    /// and cargo runs tests in parallel threads that would interleave on it.
+    #[test]
+    fn a_busy_glyph_is_held_briefly_but_bad_news_is_not() {
+        *SYNC_DWELL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        // Nothing held: rest renders as rest.
+        assert_eq!(dwelled(TraySyncState::Armed), TraySyncState::Armed);
+
+        // A single tick of work, then quiet — the reason the menu bar blinked.
+        assert_eq!(dwelled(TraySyncState::Active), TraySyncState::Active);
+        for tick in 0..BUSY_DWELL_TICKS {
+            assert_eq!(
+                dwelled(TraySyncState::Armed),
+                TraySyncState::Active,
+                "tick {tick} fell back to armed while the hold was live"
+            );
+        }
+        assert_eq!(
+            dwelled(TraySyncState::Armed),
+            TraySyncState::Armed,
+            "the hold expires; it does not pin the glyph forever"
+        );
+
+        // A problem during a hold shows at once, and ends the hold.
+        assert_eq!(dwelled(TraySyncState::Active), TraySyncState::Active);
+        assert_eq!(dwelled(TraySyncState::Warning), TraySyncState::Warning);
+        assert_eq!(
+            dwelled(TraySyncState::Armed),
+            TraySyncState::Armed,
+            "a warning clears the hold rather than resuming it"
+        );
+
+        // The last profile going away must tear the glyph down immediately,
+        // not linger for three seconds on a folder that no longer exists.
+        assert_eq!(dwelled(TraySyncState::Active), TraySyncState::Active);
+        assert_eq!(dwelled(TraySyncState::Absent), TraySyncState::Absent);
+
+        // Transferring outranks Active and is held in its own right.
+        assert_eq!(
+            dwelled(TraySyncState::Transferring),
+            TraySyncState::Transferring
+        );
+        assert_eq!(dwelled(TraySyncState::Paused), TraySyncState::Transferring);
     }
 
     #[test]
