@@ -194,7 +194,19 @@ jobs:
                  src-tauri/target/release/incremental
           df -h / | tail -1
           VERSION="${GITHUB_REF_NAME#v}"
-          hdiutil create -volname "keeper" -srcfolder "$APP" -ov -format UDZO "keeper_${VERSION}_aarch64.dmg"
+          # Size the image explicitly. Left to itself, `hdiutil create -srcfolder`
+          # derives the size from the source and UNDER-allocates for a bundle made
+          # of many small files, because APFS metadata inside the image is not in
+          # that estimate. The failure is ENOSPC while copying into
+          # /Volumes/keeper — with the host disk nearly empty, which is what made
+          # v0.6.0 fail three lines after `df` reported 95 GiB free. It is
+          # intermittent only because it depends on the bundle crossing a
+          # threshold, so it will keep coming back as the app grows.
+          APP_KB=$(du -sk "$APP" | cut -f1)
+          DMG_KB=$(( APP_KB * 16 / 10 + 65536 ))
+          echo "app ${APP_KB}KB -> image ${DMG_KB}KB"
+          hdiutil create -volname "keeper" -srcfolder "$APP" -ov -format UDZO \
+            -size "${DMG_KB}k" "keeper_${VERSION}_aarch64.dmg"
           ditto -c -k --keepParent "$APP" "keeper_${VERSION}_aarch64_app.zip"
           # Updater artifacts (only when the signing key was present): normalize names
           # and compose latest.json for the tauri-plugin-updater endpoint
