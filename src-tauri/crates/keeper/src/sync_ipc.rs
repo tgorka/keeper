@@ -429,6 +429,12 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
     if let Some(prior) = prior {
         profile.enabled = prior.enabled;
         profile.author_override = prior.author_override.clone();
+        // The volume binding is minted by the engine on first sight of the
+        // media and must outlive an edit: dropping it here would leave the
+        // profile unbound, and an unbound profile adopts whatever volume is
+        // mounted at its path — including a different stick that would
+        // otherwise have been refused as `Foreign`.
+        profile.volume_id = prior.volume_id.clone();
     }
     // An explicit value overrides; an explicit empty string clears back to the
     // device identity, which is how the form offers "use the default".

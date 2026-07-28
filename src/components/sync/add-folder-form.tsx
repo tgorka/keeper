@@ -74,7 +74,9 @@ export const SYNC_LFS_MODE_LABEL = "Large files";
 export const SYNC_LFS_THRESHOLD_LABEL = "Track files at or above (MB)";
 export const SYNC_REMOVABLE_LABEL = "This folder is on removable or network storage";
 export const SYNC_REMOVABLE_NOTE =
-  "keeper waits longer for writes to settle there, because those volumes report changes late.";
+  "keeper marks the drive and follows it, so unplugging pauses this folder instead of syncing " +
+  "everything on it as deleted. It also waits longer for writes to settle, because those volumes " +
+  "report changes late. The folder has to be on the drive, not on this computer's own disk.";
 
 /**
  * The advanced knobs (Story 32.7, AD-S8). Every one of these was already

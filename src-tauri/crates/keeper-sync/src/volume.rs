@@ -279,6 +279,86 @@ pub fn find_mount_root(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Find the mount root of an **unmarked** volume, for the one moment
+/// [`find_mount_root`] cannot help: the first time a profile is bound, when no
+/// marker exists yet to walk up to.
+///
+/// Resolved from the filesystem itself — the topmost ancestor still on the same
+/// device as `path` — rather than from a mount table, because a mount table is
+/// a different answer on every platform and this only has to identify the
+/// boundary, not describe it.
+///
+/// `path` **must exist**. Falling back to "the nearest ancestor that does" is
+/// what would make this dangerous: with the stick unplugged, `/Volumes/merope`
+/// is gone and `/Volumes` belongs to the system disk, so a fallback would mint
+/// a marker on the internal drive and bind the profile to it. A missing path is
+/// therefore `None` — absent media, not a new volume.
+///
+/// The filesystem root is refused outright: a marker at `/` would claim the
+/// whole machine is the removable volume, after which nothing could ever read
+/// as detached. That check alone is **not** sufficient on macOS, where the
+/// system data volume is its own mount — callers decide whether the root they
+/// get back is one they may mark (see `Engine::adopt_volume`, which refuses the
+/// volume keeper keeps its own state on).
+pub fn detect_mount_root(path: &Path) -> Option<PathBuf> {
+    let root = same_device_root(path)?;
+    (!is_system_root(&root)).then_some(root)
+}
+
+#[cfg(unix)]
+fn same_device_root(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let device = std::fs::metadata(path).ok()?.dev();
+    let mut root = path.to_path_buf();
+    // `ancestors()` yields `path` first; the walk starts one above it and stops
+    // at the first ancestor on a different device — that ancestor is the
+    // directory the volume is mounted *into*, so the one below it is the root.
+    for ancestor in path.ancestors().skip(1) {
+        match std::fs::metadata(ancestor) {
+            Ok(meta) if meta.dev() == device => root = ancestor.to_path_buf(),
+            _ => break,
+        }
+    }
+    Some(root)
+}
+
+#[cfg(windows)]
+fn same_device_root(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if !path.exists() {
+        return None;
+    }
+    // No `st_dev` here, and a volume is a drive letter or a UNC share — which
+    // is exactly what the path prefix already spells out.
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Prefix(prefix)), Some(Component::RootDir)) => {
+            let mut root = PathBuf::from(prefix.as_os_str());
+            root.push(std::path::MAIN_SEPARATOR_STR);
+            Some(root)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn is_system_root(root: &Path) -> bool {
+    root == Path::new("/")
+}
+
+#[cfg(windows)]
+fn is_system_root(root: &Path) -> bool {
+    // `SystemDrive` is `C:` on a default install. Compared case-insensitively
+    // because a path can spell the same drive either way.
+    std::env::var("SystemDrive").is_ok_and(|drive| {
+        root.to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with(&drive.to_ascii_uppercase())
+    })
+}
+
 /// Classify the volume at `mount_root` against the id a profile expects.
 ///
 /// `expected_volume_id` is `None` for a profile that has not been bound to a
@@ -576,5 +656,42 @@ mod tests {
         plant(root.path(), r#"{"schemaVersion":1,"label":"No Id"}"#);
 
         assert!(VolumeMarker::read(root.path()).is_err());
+    }
+
+    #[test]
+    fn a_missing_path_has_no_mount_root_to_adopt() {
+        // The whole point: with the stick unplugged the folder is gone, and
+        // answering with the nearest existing ancestor would mint a marker on
+        // the disk that ancestor belongs to.
+        let root = temp_root();
+
+        assert_eq!(detect_mount_root(&root.path().join("not-here")), None);
+    }
+
+    #[test]
+    fn a_resolved_mount_root_contains_the_path_and_is_never_the_filesystem_root() {
+        let root = temp_root();
+        let nested = root.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).expect("create nested");
+
+        // Whether a temp directory sits on its own mount is a property of the
+        // machine, not of this code: `/tmp` is tmpfs on one box and part of the
+        // system volume on the next. Both answers are correct — `None` is the
+        // refusal that keeps a marker off the system disk — so the test pins
+        // what must hold *when* a root comes back, rather than pinning the
+        // environment.
+        if let Some(mount_root) = detect_mount_root(&nested) {
+            assert!(
+                nested.starts_with(&mount_root),
+                "{} must contain {}",
+                mount_root.display(),
+                nested.display()
+            );
+            assert_ne!(
+                mount_root,
+                Path::new("/"),
+                "the filesystem root is never a volume keeper may mark"
+            );
+        }
     }
 }

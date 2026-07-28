@@ -150,6 +150,20 @@ pub struct SyncProfile {
     /// deletion (AD-48).
     #[serde(default)]
     pub removable: bool,
+    /// The volume this profile is bound to, once it has seen it.
+    ///
+    /// `None` means "not bound yet": the next scan that finds the folder
+    /// present adopts the volume there — minting `.keeper-sync/volume.json` if
+    /// the media carries no marker — and records its id here. From then on the
+    /// id is what [`crate::volume::status`] matches on, which is what makes
+    /// `Foreign` (a *different* stick mounted at this path) distinguishable
+    /// from `Absent` (no stick at all). Only meaningful with `removable`.
+    ///
+    /// Never edited by hand and never re-minted: rewriting it would silently
+    /// re-point a profile at another volume's history, which is exactly the
+    /// confusion AD-48 exists to prevent.
+    #[serde(default)]
+    pub volume_id: Option<String>,
     pub lfs_mode: LfsMode,
     #[serde(default = "default_lfs_threshold")]
     pub lfs_threshold_bytes: u64,
@@ -200,6 +214,7 @@ impl SyncProfile {
             subpaths: Vec::new(),
             excludes: Vec::new(),
             removable: false,
+            volume_id: None,
             lfs_mode: LfsMode::Materialize,
             lfs_threshold_bytes: DEFAULT_LFS_THRESHOLD_BYTES,
             settle_ms: DEFAULT_SETTLE_MS,

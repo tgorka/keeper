@@ -27,6 +27,7 @@ use std::{
 };
 
 use crate::error::{Result, SyncError};
+use crate::git::fetch::Credential;
 
 /// How long an `index.lock` must sit untouched before it is debris.
 ///
@@ -131,11 +132,23 @@ pub fn is_empty_remote(err: &SyncError) -> bool {
         || message.contains("did not have any ref that matched")
 }
 
-/// Clone `url` into `dest` on `branch`.
+/// Clone `url` into `dest` on `branch`, authenticating with `credential`.
 ///
 /// `index.sparse=false` is applied as an in-memory override for the clone
 /// itself; [`enforce_local_config`] must still be called afterwards to make it
 /// durable, because the override does not reach `.git/config`.
+///
+/// `credential` is threaded through the same static callback [`super::fetch`]
+/// uses, and `credential.helper` is cleared for the duration. Both halves
+/// matter. Without the callback gitoxide falls back to the OS credential helper
+/// — which is not merely "unauthenticated", it is *authenticated as somebody
+/// else*: whatever account the system git store happens to hold for that host,
+/// regardless of which profile is syncing. That reads as a per-repository
+/// failure (the stored account has access to one repo but not another) and
+/// reports itself as a transport error that never mentions credentials.
+/// Clearing the helper chain is what makes the profile's own secret the only
+/// answer, so a profile that has no credential fails as unauthenticated instead
+/// of silently borrowing one.
 ///
 /// Blocking: gitoxide's HTTP transport has no async path, so callers on a tokio
 /// runtime must wrap this in `spawn_blocking`.
@@ -144,11 +157,12 @@ pub fn clone(
     dest: &Path,
     branch: &str,
     shallow_depth: Option<NonZeroU32>,
+    credential: Option<&Credential>,
     interrupt: &AtomicBool,
 ) -> Result<gix::Repository> {
     let mut prepare = gix::prepare_clone(url, dest)
         .map_err(|err| SyncError::Config(format!("invalid remote URL: {err}")))?
-        .with_in_memory_config_overrides(["index.sparse=false"])
+        .with_in_memory_config_overrides(["index.sparse=false", "credential.helper="])
         .with_ref_name(Some(branch))
         .map_err(|err| SyncError::Config(format!("invalid branch name {branch:?}: {err}")))?;
 
@@ -156,10 +170,32 @@ pub fn clone(
         prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
     }
 
+    if let Some(credential) = credential {
+        // Cloned per connection rather than moved: `configure_connection` takes
+        // an `FnMut` (gitoxide may reconnect, e.g. across a redirect) while the
+        // callback it installs has to own its strings.
+        let username = credential.username.clone();
+        let secret = credential.secret.clone();
+        prepare = prepare.configure_connection(move |connection| {
+            let username = username.clone();
+            let secret = secret.clone();
+            // The closure's return type is gix's, and its 192-byte `Err` lives
+            // in `gix_credentials::protocol::Error` — a foreign type we can
+            // neither box nor shrink, and the callback signature is not ours to
+            // change. Same allow, same reason, as in `super::fetch`.
+            #[allow(clippy::result_large_err)]
+            connection.set_credentials(move |action| {
+                super::fetch::static_credential(&username, &secret, action)
+            });
+            Ok(())
+        });
+    }
+
+    let host = host_of(url);
     let (mut checkout, _outcome) = prepare
         .fetch_then_checkout(gix::progress::Discard, interrupt)
         .map_err(|err| {
-            cancelled_or(interrupt, || SyncError::Git(format!("clone failed: {err}")))
+            super::fetch::classify("clone", &super::fetch::flatten(&err), &host, interrupt)
         })?;
 
     let (repo, _outcome) = checkout
@@ -465,6 +501,17 @@ fn to_path(rela_path: &gix::bstr::BStr) -> PathBuf {
 /// gitoxide surfaces an interruption as an ordinary transport error, and a
 /// user-requested stop must never be reported as a failure (it would otherwise
 /// be retried with backoff and shown as a warning).
+/// The host a clone is talking to, for error messages.
+///
+/// `local` mirrors [`super::fetch`]'s answer for a `file://` or pendrive-to-
+/// pendrive remote (AD-48), which genuinely has no host.
+fn host_of(url: &str) -> String {
+    gix::url::parse(url.as_bytes())
+        .ok()
+        .and_then(|parsed| parsed.host().map(str::to_owned))
+        .unwrap_or_else(|| "local".to_owned())
+}
+
 fn cancelled_or(interrupt: &AtomicBool, otherwise: impl FnOnce() -> SyncError) -> SyncError {
     if interrupt.load(Ordering::Relaxed) {
         SyncError::Cancelled
@@ -951,6 +998,7 @@ mod tests {
             &source_dir.path().to_string_lossy(),
             &dest,
             &branch,
+            None,
             None,
             &interrupt,
         )

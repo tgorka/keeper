@@ -73,6 +73,7 @@ reports names a profile. Profiles run concurrently and fail independently.
 | `subpaths` | Repository subpaths to materialize; empty means everything |
 | `excludes` | Extra exclusion globs on top of the built-in set |
 | `removable` | The folder lives on removable media (see §6) |
+| `volumeId` | Which volume it is bound to. Written by keeper, not by you (§6) |
 | `lfsMode` | `materialize`, `pointerOnly`, or `disabled` |
 | `lfsThresholdBytes` | Files at or above this are tracked through LFS (default 4 MiB) |
 | `settleMs` | Quiescence window (see §4) |
@@ -202,6 +203,25 @@ that read as *"the user deleted 40 GB"*.
 A profile marked `removable` is bound to the **volume**, not the path. Keeper
 writes `.keeper-sync/volume.json` at the mount root and matches on its contents,
 so re-mounting at a different mountpoint is still the same volume.
+
+The binding is made **once**, the first time keeper sees the media: the marker
+is minted if the volume carries none, its id is recorded in the profile as
+`volumeId`, and the profile id is recorded in the marker. From then on that id
+is what every scan compares against — which is what lets a *different* stick
+mounted at the same path be refused (§6, `Foreign`) instead of silently synced
+into. An existing marker is joined, never re-minted, so a volume already used by
+another profile or another machine keeps its identity.
+
+Two things are refused rather than adopted, both for the same reason — a marker
+in the wrong place would make the pause that protects you unreachable:
+
+- a folder that **is not there**. With the drive unplugged its mountpoint is
+  gone, and adopting the nearest directory that does exist would mark the
+  internal disk. Create the folder on the drive first.
+- a folder on the **same volume keeper itself lives on**. A removable volume is
+  by definition not the one holding keeper's own state; marking that one would
+  bind the profile to the whole machine, after which nothing could ever read as
+  detached. The profile says so and stays paused.
 
 When the marker is absent the profile enters **`Paused (media absent)`** — a
 normal state, not an error:
@@ -481,9 +501,18 @@ Two things worth setting deliberately for an agent workspace:
 
 ## 14. Security posture
 
-- Credentials live in the OS keychain (or, headless, a `0600` file) and are
-  injected through gitoxide's programmatic credential callback — no helper
-  subprocess is ever spawned.
+- Credentials live in the OS keychain (or, headless, a `0600` file). Everything
+  gitoxide drives — fetch and the first clone — takes them through a
+  programmatic callback, so no helper subprocess is involved.
+- **Push is the exception**, because it shells out to `git` (§1). It runs with
+  the inherited `credential.helper` chain **cleared** and a helper of keeper's
+  own that answers from the environment, never from the argument vector. The
+  clearing is the security-relevant half: without it git falls through to
+  whatever the OS store holds for that host, and keeper would push as an
+  account the profile never named. A profile with no credential fails as
+  unauthenticated rather than borrowing one — and for the same reason, a
+  credential you have working in `git` alone will *not* be picked up here.
+  Store it against the profile.
 - SSH remotes delegate entirely to your own `ssh` binary, agent and config.
   Keeper never reads a private key.
 - Every configured remote is a **disclosed egress destination**, computed from
@@ -507,6 +536,9 @@ free space, and exits non-zero when something is genuinely wrong.
 | A file syncs late | It is settling. Large files written slowly wait for the quiescence window, up to the 60 s ceiling. |
 | `…sync-conflict-…` files appeared | Both sides changed the same file. Both revisions are kept; delete the one you do not want. |
 | Profile says *drive not connected* | The volume marker is absent. Re-attach the drive; nothing was deleted. |
+| A new removable profile stays *drive not connected* | Its folder is missing, or it is on this computer's own disk. Keeper will not mark either (§6): create the folder on the drive, or clear `removable`. |
+| *A different volume is mounted at this path* | Another drive is where this profile's own drive should be. Nothing is synced either way until the right one is attached. |
+| Authentication rejected, but `git` works in that folder by hand | Keeper uses the credential stored against the profile and nothing else — plain `git` is reading your OS credential store, which keeper deliberately ignores (§14). Add the token to the profile. |
 | Watch mode misses changes on a network mount | inotify/FSEvents do not work on many network and FUSE mounts. Enable polling for that profile. |
 | `Too many open files` / watches exhausted | Raise `fs.inotify.max_user_watches`. One watcher is used per profile, not per folder. |
 | LFS upload restarts from zero | Expected. The `basic` adapter has no resumable upload. |

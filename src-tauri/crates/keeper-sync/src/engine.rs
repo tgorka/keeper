@@ -42,7 +42,7 @@ use crate::profile::{LfsMode, ProfileState, SyncDirection, SyncLane, SyncProfile
 use crate::progress::{ProgressSink, SyncPhase, SyncProgress, SyncStatus, TransferTally};
 use crate::provenance::{commit_message, Provenance, SyncSource};
 use crate::stability::{StabilityGate, StabilityVerdict};
-use crate::volume::{self, VolumeStatus};
+use crate::volume::{self, VolumeMarker, VolumeStatus};
 
 /// What one `sync_once` actually did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -655,8 +655,18 @@ impl Engine {
         if !profile.removable {
             return Ok(true);
         }
-        match volume::scan(&profile.local_path, None)? {
-            VolumeStatus::Present { .. } => {
+        let status = match volume::scan(&profile.local_path, profile.volume_id.as_deref())? {
+            // Never bound, and no marker anywhere above the folder: this is the
+            // first time keeper has seen this media. Adopting it here is what
+            // makes `removable` work at all — the marker exists nowhere else,
+            // so without this the profile would report `MediaAbsent` forever
+            // and never sync a byte.
+            VolumeStatus::Absent if profile.volume_id.is_none() => self.adopt_volume(profile)?,
+            other => other,
+        };
+        match status {
+            VolumeStatus::Present { marker } => {
+                self.bind_volume(profile, &marker)?;
                 let previously_absent = Self::lock(&self.status).get(&profile.id).map(|s| s.state)
                     == Some(ProfileState::MediaAbsent);
                 if previously_absent {
@@ -687,6 +697,90 @@ impl Engine {
                 Ok(false)
             }
         }
+    }
+
+    /// Claim the volume holding this profile's folder, minting
+    /// `.keeper-sync/volume.json` if it carries no marker yet.
+    ///
+    /// Called only for a profile with no `volume_id`, so a volume is adopted
+    /// once and never re-adopted. Returns [`VolumeStatus::Absent`] — not an
+    /// error — when the folder is not there to be looked at: that is the
+    /// ordinary "stick is unplugged and always was" case, and it is also the
+    /// guard that keeps a marker off the system disk (see
+    /// [`volume::detect_mount_root`]).
+    fn adopt_volume(&self, profile: &SyncProfile) -> Result<VolumeStatus> {
+        let Some(root) = volume::detect_mount_root(&profile.local_path) else {
+            return Ok(VolumeStatus::Absent);
+        };
+        // A removable volume is, by definition, not the one keeper lives on.
+        // Checking that — rather than trying to ask the OS whether a device is
+        // ejectable — is both portable and exactly the property that gives the
+        // marker its meaning: only a volume that can go away makes "the folder
+        // is gone" mean "the media is gone". Without this, marking a folder in
+        // the home directory as removable would mint a marker on the system
+        // data volume (its own mount on macOS, so the `/` check does not catch
+        // it) and bind the profile to the whole machine.
+        if let Ok(data_dir) = self.platform.data_dir() {
+            if volume::detect_mount_root(&data_dir).as_deref() == Some(root.as_path()) {
+                self.warn(
+                    &profile.id,
+                    &profile.name,
+                    format!(
+                        "{} is not on a separate volume, so it cannot be treated as removable \
+                         media — clear that setting, or point the folder at the drive",
+                        profile.local_path.display()
+                    ),
+                );
+                return Ok(VolumeStatus::Absent);
+            }
+        }
+        // The mount point's own name is the label a human already uses for the
+        // stick ("merope"); the profile name is only a fallback for a volume
+        // mounted somewhere nameless.
+        let label = root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| profile.name.clone());
+        let marker = VolumeMarker::ensure(&root, &label, &profile.id, self.platform.now_ms())?;
+        tracing::info!(
+            profile = profile.name,
+            volume = %marker.volume_id,
+            root = %root.display(),
+            "adopted the removable volume for this profile"
+        );
+        Ok(VolumeStatus::Present { marker })
+    }
+
+    /// Record which volume this profile lives on, both ways round: the id into
+    /// the profile, the profile id into the marker.
+    ///
+    /// Idempotent, and cheap in the overwhelmingly common case where both sides
+    /// already agree — this runs on every tick of every removable profile.
+    fn bind_volume(&self, profile: &SyncProfile, marker: &VolumeMarker) -> Result<()> {
+        let bound = profile.volume_id.as_deref() == Some(marker.volume_id.as_str());
+        let listed = marker.profile_ids.iter().any(|id| id == &profile.id);
+        if bound && listed {
+            return Ok(());
+        }
+        let now = self.platform.now_ms();
+        if !listed {
+            // A second profile on a stick another one already marked: join the
+            // existing marker rather than minting a competing one.
+            if let Some(root) = volume::find_mount_root(&profile.local_path) {
+                VolumeMarker::ensure(&root, &marker.label, &profile.id, now)?;
+            }
+        }
+        if !bound {
+            let mut bound_profile = profile.clone();
+            bound_profile.volume_id = Some(marker.volume_id.clone());
+            self.with_db(|conn| db::upsert_profile(conn, &bound_profile, now))?;
+            tracing::info!(
+                profile = profile.name,
+                volume = %marker.volume_id,
+                "bound profile to its removable volume"
+            );
+        }
+        Ok(())
     }
 
     fn reserve(&self, profile_id: &str) -> Option<Reservation<'_>> {
@@ -823,6 +917,7 @@ impl Engine {
                 &profile.local_path,
                 &profile.branch,
                 None,
+                self.credential(profile)?.as_ref(),
                 &self.interrupt,
             ) {
                 Ok(repo) => repo,
@@ -1211,9 +1306,12 @@ impl Engine {
         // construction rather than by care (AD-50).
         let working = Self::working_branch(profile);
         let refspec = format!("refs/heads/{working}:refs/heads/{working}");
-        tokio::task::spawn_blocking(move || git.push(&repo_path, "origin", &refspec))
-            .await
-            .map_err(|err| SyncError::Journal(format!("push task failed: {err}")))??;
+        let credential = self.credential(profile)?;
+        tokio::task::spawn_blocking(move || {
+            git.push(&repo_path, "origin", &refspec, credential.as_ref())
+        })
+        .await
+        .map_err(|err| SyncError::Journal(format!("push task failed: {err}")))??;
 
         if count > 0 {
             let mut event = self.progress(profile, SyncPhase::Pushing);
@@ -2637,6 +2735,109 @@ mod tests {
         assert_eq!(
             engine.status(&p.id).expect("status").state,
             ProfileState::MediaAbsent
+        );
+    }
+
+    #[test]
+    fn an_absent_volume_is_never_marked_on_the_disk_keeper_itself_lives_on() {
+        // The dangerous half of adoption. `TestPlatform`'s data dir and the
+        // profile folder share a volume here, exactly as they would if someone
+        // ticked "removable" for a folder in their home directory — and a
+        // marker minted there would bind the profile to the whole machine,
+        // after which an unplugged drive could never be detected because there
+        // is no drive.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.removable = true;
+        std::fs::create_dir_all(&p.local_path).expect("create work dir");
+        engine.upsert_profile(&p).expect("upsert");
+
+        assert!(!engine.volume_ready(&p).expect("scan"), "must skip");
+        assert_eq!(
+            volume::find_mount_root(&p.local_path),
+            None,
+            "no marker may have been written anywhere above the folder"
+        );
+        assert_eq!(
+            engine
+                .list_profiles()
+                .expect("list")
+                .into_iter()
+                .find(|stored| stored.id == p.id)
+                .expect("stored")
+                .volume_id,
+            None,
+            "a refused adoption must not leave the profile bound"
+        );
+    }
+
+    #[test]
+    fn a_marked_volume_binds_the_profile_and_records_it_in_the_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.removable = true;
+        std::fs::create_dir_all(&p.local_path).expect("create work dir");
+        engine.upsert_profile(&p).expect("upsert");
+        // Stand in for a stick another machine — or another profile — already
+        // adopted: the marker exists, so nothing is minted and the id in it is
+        // the one this profile must take.
+        let marker = VolumeMarker::ensure(dir.path(), "Field Drive", "other-profile", 1)
+            .expect("plant a marker");
+
+        assert!(engine.volume_ready(&p).expect("scan"), "the media is here");
+
+        let stored = engine
+            .list_profiles()
+            .expect("list")
+            .into_iter()
+            .find(|stored| stored.id == p.id)
+            .expect("stored");
+        assert_eq!(
+            stored.volume_id.as_deref(),
+            Some(marker.volume_id.as_str()),
+            "the profile must remember which volume it is on"
+        );
+        let on_disk = VolumeMarker::read(dir.path())
+            .expect("read")
+            .expect("present");
+        assert!(
+            on_disk.profile_ids.iter().any(|id| id == &p.id),
+            "the marker must list the profile that joined it: {:?}",
+            on_disk.profile_ids
+        );
+        assert_eq!(
+            on_disk.volume_id, marker.volume_id,
+            "joining a marked volume must never re-mint its identity"
+        );
+    }
+
+    #[test]
+    fn a_different_volume_at_the_same_path_stops_the_profile() {
+        // Only reachable once a profile records the volume it expects: while
+        // every scan asked for "any marker", a stranger's stick mounted at this
+        // path read as `Present` and would have been synced into.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.removable = true;
+        p.volume_id = Some("01VOLUMEWEEXPECT".to_owned());
+        std::fs::create_dir_all(&p.local_path).expect("create work dir");
+        engine.upsert_profile(&p).expect("upsert");
+        VolumeMarker::ensure(dir.path(), "Someone Else's Stick", "their-profile", 1)
+            .expect("plant a foreign marker");
+
+        assert!(!engine.volume_ready(&p).expect("scan"), "must refuse");
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::NeedsAttention
         );
     }
 
