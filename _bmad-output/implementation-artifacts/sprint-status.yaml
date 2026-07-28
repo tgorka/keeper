@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-03
-last_updated: 2026-07-16
+last_updated: 2026-07-28
 project: keeper
 project_key: NOKEY
 tracking_system: file-system
@@ -287,6 +287,18 @@ development_status:
   31-5-cross-host-field-test: done
   31-6-docs-sync-md-and-phase-acceptance: done
   epic-31-retrospective: optional
+  epic-34: backlog
+  34-1-tray-glyph-stops-repainting-itself: backlog
+  34-2-one-titlebar-inset-and-a-drawer-that-scrolls: backlog
+  34-3-window-stays-draggable-on-the-recording-tab: backlog
+  34-4-access-token-can-be-revealed: backlog
+  34-5-machine-name-commit-subject-and-hidden-knobs: backlog
+  34-6-activity-says-what-changed-and-how-big: backlog
+  34-7-discard-an-add-remove-a-folder-clear-the-secret: backlog
+  34-8-progress-you-can-watch: backlog
+  34-9-files-sync-when-they-land: backlog
+  34-10-sync-now-proves-it-ran: backlog
+  epic-34-retrospective: optional
 
 # Phase 4 state as of 2026-07-25 — what is actually true, not what was planned.
 #
