@@ -321,12 +321,33 @@ impl RepoStatus {
 /// staged) and index-to-worktree changes (not yet staged). A path can therefore
 /// legitimately appear in two buckets — staged as added, then edited again —
 /// and that is reported rather than collapsed.
+///
+/// # Untracked content is listed file by file, on purpose
+///
+/// gitoxide's dirwalk defaults to `CollapseDirectory`, which reports a
+/// brand-new folder as ONE entry naming the directory. Expanding that by hand
+/// meant re-walking the filesystem ourselves — and a hand-rolled walk does not
+/// know about `.gitignore`, so an ignored file inside a NEW directory was
+/// staged and pushed while the identical file one level up was correctly
+/// skipped. A new folder holding `node_modules/`, build output or a `.env`
+/// went to the remote in full.
+///
+/// Asking the dirwalk to emit matching entries individually hands that
+/// judgement back to git, which is the only thing that reads every
+/// `.gitignore`, `.git/info/exclude` and the global excludes file correctly.
+/// It costs one entry per untracked file instead of one per directory — the
+/// same paths the caller had to produce anyway.
 pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
     use gix::status::{index_worktree::Item as WorktreeItem, plumbing::index_as_worktree, Item};
 
     let platform = repo
         .status(gix::progress::Discard)
-        .map_err(|err| SyncError::Git(format!("status failed: {err}")))?;
+        .map_err(|err| SyncError::Git(format!("status failed: {err}")))?
+        .index_worktree_options_mut(|options| {
+            if let Some(dirwalk) = options.dirwalk_options.as_mut() {
+                dirwalk.set_emit_untracked(gix::dir::walk::EmissionMode::Matching);
+            }
+        });
     let iter = platform
         .into_iter(None)
         .map_err(|err| SyncError::Git(format!("status failed: {err}")))?;

@@ -1239,20 +1239,24 @@ impl Engine {
         Ok(())
     }
 
-    /// Turn collapsed untracked entries into the regular files they contain.
+    /// Pass untracked entries through, refusing anything that is not a file.
     ///
-    /// A path that is already a file passes through. A directory is walked
-    /// recursively; `.git` is never descended into, and symlinked directories
-    /// are not followed (a symlink is staged as its target by the commit path,
-    /// and following one could walk out of the profile entirely, or in circles).
+    /// This used to walk a collapsed directory itself, because gitoxide's
+    /// dirwalk defaulted to `CollapseDirectory` and reported a brand-new folder
+    /// as one entry. That hand-rolled walk was a **data leak**: it read the
+    /// filesystem directly and knew nothing about `.gitignore`, so an ignored
+    /// file inside a NEW directory was staged and pushed while the identical
+    /// file one level up was correctly skipped — a new folder containing
+    /// `node_modules/`, build output or a `.env` went to the remote in full.
+    ///
+    /// `status_paths` now asks the dirwalk to emit untracked content file by
+    /// file, so git decides what is ignored and a directory never reaches here.
+    /// If one somehow does, it is skipped and logged rather than walked: not
+    /// syncing a folder is visible and recoverable, whereas publishing a
+    /// secret because a walk ignored `.gitignore` is neither.
     fn expand_untracked(root: &Path, entries: &[PathBuf]) -> Result<Vec<PathBuf>> {
         let mut out = Vec::with_capacity(entries.len());
-        let mut stack: Vec<PathBuf> = Vec::new();
         for rela in entries {
-            // `.git` is skipped at the top level too, not only as a child. gix
-            // does not report it as untracked and tier 0 excludes it anyway,
-            // but walking a repository's own object store would be a very
-            // expensive way to discover that.
             if rela.components().any(|c| c.as_os_str() == ".git") {
                 continue;
             }
@@ -1264,33 +1268,14 @@ impl Engine {
                 Err(err) => return Err(SyncError::io("stat untracked entry", absolute, err)),
             };
             if metadata.is_dir() {
-                stack.push(rela.clone());
-            } else {
-                out.push(rela.clone());
+                tracing::warn!(
+                    path = %rela.display(),
+                    "sync: skipping a collapsed untracked directory — git should have listed its \
+                     files individually, and walking it here would ignore .gitignore"
+                );
+                continue;
             }
-        }
-        while let Some(dir) = stack.pop() {
-            let absolute = root.join(&dir);
-            let listing = match std::fs::read_dir(&absolute) {
-                Ok(listing) => listing,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(SyncError::io("read untracked directory", absolute, err)),
-            };
-            for entry in listing.flatten() {
-                let name = entry.file_name();
-                if name == ".git" {
-                    continue;
-                }
-                let child = dir.join(&name);
-                match entry.file_type() {
-                    Ok(kind) if kind.is_dir() => stack.push(child),
-                    Ok(_) => out.push(child),
-                    // Unreadable type: skip it rather than fail the whole scan.
-                    Err(err) => {
-                        tracing::debug!(path = %child.display(), error = %err, "skipping unreadable entry");
-                    }
-                }
-            }
+            out.push(rela.clone());
         }
         out.sort();
         Ok(out)
@@ -2425,17 +2410,20 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_untracked_directories_expand_into_their_files() {
-        // gitoxide reports a brand-new folder as ONE entry naming the
-        // directory. Staging that directly fails with "only regular files and
-        // symlinks can be synchronized", and nothing inside it ever syncs.
+    fn a_collapsed_directory_is_skipped_rather_than_walked_without_ignore_rules() {
+        // This used to expand recursively, and that was a data leak: the walk
+        // read the filesystem directly, so a `.gitignore`d file inside a NEW
+        // folder was staged and pushed while the same file one level up was
+        // correctly skipped. `status_paths` now has git list untracked content
+        // file by file, so a directory should never arrive here — and if one
+        // does, not syncing it is visible and recoverable, where publishing a
+        // secret is neither.
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::create_dir_all(root.join("sub/deeper")).expect("mkdir");
         std::fs::create_dir_all(root.join(".git/objects")).expect("mkdir .git");
         std::fs::write(root.join("top.txt"), b"x").expect("write");
         std::fs::write(root.join("sub/a.txt"), b"x").expect("write");
-        std::fs::write(root.join("sub/deeper/b.txt"), b"x").expect("write");
         std::fs::write(root.join(".git/objects/pack"), b"x").expect("write");
 
         let expanded = Engine::expand_untracked(
@@ -2450,12 +2438,8 @@ mod tests {
 
         assert_eq!(
             expanded,
-            vec![
-                PathBuf::from("sub/a.txt"),
-                PathBuf::from("sub/deeper/b.txt"),
-                PathBuf::from("top.txt"),
-            ],
-            "directories expand recursively, .git is never descended into"
+            vec![PathBuf::from("top.txt")],
+            "files pass through; a directory is refused, not walked"
         );
     }
 
