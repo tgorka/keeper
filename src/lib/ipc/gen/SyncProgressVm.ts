@@ -17,4 +17,10 @@ current: string | null,
  * Completion in [0,1], or `null` when the total is not yet known and the
  * UI must render an indeterminate meter rather than invent a denominator.
  */
-fraction: number | null, };
+fraction: number | null, 
+/**
+ * Whole bytes per second, or `null` when there is no honest figure — too
+ * little time measured, or nothing moving. Never zero: "0 B/s" would claim
+ * a measurement of an idle wire, so the UI renders `null` as nothing.
+ */
+bytesPerSecond: number | null, };

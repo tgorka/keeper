@@ -29,7 +29,7 @@
 //! and the app keeps running (the tray is a convenience, never load-bearing).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use keeper_core::vm::{RecordingStatusVm, RecordingUiState};
 use keeper_sync::progress::TraySyncState;
@@ -127,6 +127,15 @@ struct TrayState {
     /// Mutually exclusive with the recording rendering — recording owns the
     /// tray whenever it is live or holding an error, and sync waits.
     sync_item: Option<MenuItem<Wry>>,
+    /// What the sync renderer last actually pushed to this tray: the glyph on
+    /// screen and the words in the status line (AD-34-1). `None` means nothing
+    /// has been pushed yet, so the next sync tick writes unconditionally.
+    ///
+    /// It lives in the slot rather than a module `static` precisely so that
+    /// dropping the tray forgets it — a rebuilt menu-bar item starts on the
+    /// idle mark and has to be painted once, whatever the engine happens to be
+    /// reporting at that moment.
+    sync_memo: Option<SyncMemo>,
 }
 
 /// The single tray slot (see [`TrayState`]).
@@ -349,6 +358,7 @@ pub fn set_tray_presence(app: &AppHandle, enabled: bool) {
             status_item: None,
             error_rendered: false,
             sync_item: None,
+            sync_memo: None,
         });
     } else {
         // Dropping the handle removes the tray icon.
@@ -515,6 +525,7 @@ fn force_present(app: &AppHandle, snapshot: &RecordingStatusVm) {
                 status_item: None,
                 error_rendered: false,
                 sync_item: None,
+                sync_memo: None,
             });
             FORCED_PRESENCE.store(true, Ordering::Relaxed);
             true
@@ -649,12 +660,20 @@ fn restore_idle(app: &AppHandle, tray: &TrayIcon) {
 /// back into the tray slot, unless the slot was rebuilt (toggle off→on) while
 /// the menu was installed lock-free, in which case the fresh tray's own state
 /// wins.
+///
+/// Whichever rendering this installs displaced the sync menu, so the held sync
+/// line and the memo of what sync last pushed go with it: a `MenuItem` that is
+/// no longer in any installed menu would have the next sync tick `set_text`
+/// into nothing, and a surviving memo would have it believe its glyph is still
+/// on screen.
 fn store_rendered_mode(tray_id: &TrayIconId, item: Option<MenuItem<Wry>>, error_rendered: bool) {
     let mut guard = tray_guard();
     if let Some(state) = guard.as_mut() {
         if state.icon.id() == tray_id {
             state.status_item = item;
             state.error_rendered = error_rendered;
+            state.sync_item = None;
+            state.sync_memo = None;
         }
     }
 }
@@ -981,6 +1000,83 @@ fn sync_glyph(state: TraySyncState, frame: u8) -> Option<&'static [u8]> {
     }
 }
 
+/// Which glyph is on the tray, as an identity cheap enough to compare on every
+/// tick: the address of the `&'static [u8]` asset [`sync_glyph`] returned.
+///
+/// Derived from the asset instead of declared beside it, so it cannot drift
+/// from the mapping it describes, and so the animation is compared frame by
+/// frame for free — a frame IS a different asset. Decoding the image to
+/// compare it, or hashing the PNG, would cost more per tick than the repaint
+/// this exists to avoid. Two byte-identical assets the linker chose to merge
+/// would compare equal, which is the right answer anyway: the same bytes
+/// render the same glyph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncGlyphId(usize);
+
+impl SyncGlyphId {
+    fn of(glyph: &'static [u8]) -> Self {
+        Self(glyph.as_ptr() as usize)
+    }
+}
+
+/// What the sync renderer last pushed to a tray (AD-34-1), held in
+/// [`TrayState`] so it dies with the tray it describes.
+#[derive(Debug, Clone)]
+struct SyncMemo {
+    /// The glyph that is on screen.
+    glyph: SyncGlyphId,
+    /// The status line as installed. `Arc<str>` because the memo is cloned out
+    /// of the slot on every ~1 Hz tick, and the steady state — the one this
+    /// exists to make free — must not allocate to discover it has nothing to
+    /// do.
+    line: Arc<str>,
+}
+
+/// What a sync tick still owes the tray.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncWrites {
+    /// `set_icon` plus the `set_icon_as_template` that must follow it.
+    icon: bool,
+    /// The status line: a `set_text`, or the menu install that carries it.
+    text: bool,
+}
+
+impl SyncWrites {
+    /// A tray nothing has been pushed to yet.
+    const BOTH: Self = Self {
+        icon: true,
+        text: true,
+    };
+
+    /// Nothing to push: the tick returns without touching the OS.
+    fn is_empty(self) -> bool {
+        !self.icon && !self.text
+    }
+}
+
+/// Diff this tick's rendering against what the tray was last given (AD-34-1).
+///
+/// Pure, and a returned value rather than an inline `if`, because the property
+/// worth testing is a negative — N identical ticks perform ONE write — and a
+/// `TrayIcon` cannot be built in a unit test to observe it.
+fn sync_writes(
+    memo: Option<&SyncMemo>,
+    installed: bool,
+    glyph: SyncGlyphId,
+    line: &str,
+) -> SyncWrites {
+    match memo {
+        // A fresh or rebuilt tray carries the idle mark and no sync menu.
+        None => SyncWrites::BOTH,
+        Some(memo) => SyncWrites {
+            icon: memo.glyph != glyph,
+            // A displaced menu has to be reinstalled even when the words did
+            // not change, or the sync line never comes back.
+            text: !installed || &*memo.line != line,
+        },
+    }
+}
+
 /// How many ~1 s ticks a busy glyph survives after the engine stops reporting
 /// one. Long enough to swallow a scan that begins and ends between two ticks,
 /// short enough that the menu bar is not lying about what is happening now.
@@ -1062,20 +1158,29 @@ fn build_sync_menu(app: &AppHandle, line: &str) -> Option<(Menu<Wry>, MenuItem<W
 ///    summoning a menu-bar item because a background folder started syncing
 ///    would be a surprise, and the in-app surfaces carry the same information.
 ///
+/// And one rule about when it writes at all:
+///
+/// 3. **A write happens on a transition, never on a tick** (AD-34-1). The
+///    engine reports the same state second after second; the glyph and the
+///    status line are each diffed against what this tray was last given, and a
+///    tick that would push neither returns without touching the OS.
+///
 /// Follows `apply_recording_state`'s lock discipline exactly: handles are
 /// cloned out, every `TrayIcon`/`MenuItem` call runs lock-free (each blocks on
-/// an internal main-thread dispatch), and the held item is stored back under a
-/// fresh lock checked against the tray id.
+/// an internal main-thread dispatch), and the held item — with the memo of what
+/// actually landed — is stored back under a fresh lock checked against the
+/// tray id.
 pub fn apply_sync_state(app: &AppHandle, state: TraySyncState, line: &str, frame: u8) {
-    let (tray, sync_item, recording_owns) = {
+    let (tray, sync_item, memo, recording_owns) = {
         let guard = tray_guard();
         match guard.as_ref() {
             Some(tray_state) => (
                 Some(tray_state.icon.clone()),
                 tray_state.sync_item.clone(),
+                tray_state.sync_memo.clone(),
                 tray_state.status_item.is_some() || tray_state.error_rendered,
             ),
-            None => (None, None, false),
+            None => (None, None, None, false),
         }
     };
     let Some(tray) = tray else {
@@ -1090,24 +1195,43 @@ pub fn apply_sync_state(app: &AppHandle, state: TraySyncState, line: &str, frame
     let state = dwelled(state);
     let Some(glyph) = sync_glyph(state, frame) else {
         // No profiles at all: leave the plain idle tray exactly as it was, and
-        // tear down a sync menu if one is still installed.
+        // tear down a sync menu if one is still installed. `restore_idle` drops
+        // the held line and the memo with it, and only once the idle menu is
+        // really installed — a failed teardown is then retried next tick
+        // instead of forgetting that the sync menu is still on screen.
         if sync_item.is_some() {
             restore_idle(app, &tray);
-            store_sync_item(tray.id(), None);
         }
         return;
     };
+    let id = SyncGlyphId::of(glyph);
 
-    match sync_item {
+    // AD-34-1: a write happens on a transition, never on a tick. The engine
+    // reports the same state second after second, and this used to decode the
+    // same PNG and push it again every second — the flicker the user saw. The
+    // icon and the line are diffed apart because they move on different
+    // cadences: a pending count changes while the glyph holds still, and
+    // neither should drag the other onto the tray.
+    let writes = sync_writes(memo.as_ref(), sync_item.is_some(), id, line);
+    if writes.is_empty() {
+        return;
+    }
+
+    let (item, line_landed) = match sync_item {
         // Steady state: refresh the text only. No menu rebuild, no flicker, and
         // an open menu stays open.
         Some(item) => {
-            if let Err(error) = item.set_text(line) {
-                tracing::warn!(%error, "tray: could not refresh the sync status line");
+            let mut landed = true;
+            if writes.text {
+                if let Err(error) = item.set_text(line) {
+                    tracing::warn!(%error, "tray: could not refresh the sync status line");
+                    landed = false;
+                }
             }
-            store_sync_item(tray.id(), Some(item));
+            (item, landed)
         }
-        // First sync tick since the tray went idle: install the menu once.
+        // First sync tick since the tray went idle: install the menu once. It
+        // is built around this line, so no separate text write is owed.
         None => {
             let Some((menu, item)) = build_sync_menu(app, line) else {
                 return;
@@ -1116,28 +1240,48 @@ pub fn apply_sync_state(app: &AppHandle, state: TraySyncState, line: &str, frame
                 tracing::warn!(%error, "tray: could not install the sync menu");
                 return;
             }
-            store_sync_item(tray.id(), Some(item));
+            (item, true)
         }
-    }
+    };
 
-    // The icon is cosmetic — a decode or set failure keeps the current glyph
-    // rather than desyncing the menu that was just installed.
-    if let Ok(image) = Image::from_bytes(glyph) {
-        if let Err(error) = tray.set_icon(Some(image)) {
-            tracing::warn!(%error, "tray: could not set the sync icon");
-        }
-        let _ = tray.set_icon_as_template(true);
-    }
+    let glyph_landed = !writes.icon || push_sync_glyph(&tray, glyph);
+    // Remember only a tick whose writes actually landed. A failed push has to
+    // stay pending, or the next tick would skip its retry and leave the wrong
+    // glyph — or a stale claim — on the tray until the state happens to change.
+    let pushed = (line_landed && glyph_landed).then(|| SyncMemo {
+        glyph: id,
+        line: Arc::from(line),
+    });
+    store_sync_render(tray.id(), Some(item), pushed);
 }
 
-/// Store the held sync line back into the slot, unless the slot was rebuilt
-/// (presence toggled off→on) while the menu was installed lock-free — in which
-/// case the fresh tray's own state wins.
-fn store_sync_item(tray_id: &TrayIconId, item: Option<MenuItem<Wry>>) {
+/// Decode and install a sync glyph, reporting whether it landed.
+///
+/// The icon is cosmetic — a decode or set failure keeps whatever glyph is
+/// already up rather than desyncing the menu that was just installed — but the
+/// caller must not memoise a glyph that never reached the OS.
+fn push_sync_glyph(tray: &TrayIcon, glyph: &'static [u8]) -> bool {
+    let Ok(image) = Image::from_bytes(glyph) else {
+        return false;
+    };
+    if let Err(error) = tray.set_icon(Some(image)) {
+        tracing::warn!(%error, "tray: could not set the sync icon");
+        return false;
+    }
+    let _ = tray.set_icon_as_template(true);
+    true
+}
+
+/// Store the held sync line and the memo of what actually reached the tray,
+/// unless the slot was rebuilt (presence toggled off→on) while the menu was
+/// installed lock-free — in which case the fresh tray's own state wins, and
+/// this tick's writes went to a menu-bar item that no longer exists.
+fn store_sync_render(tray_id: &TrayIconId, item: Option<MenuItem<Wry>>, memo: Option<SyncMemo>) {
     let mut guard = tray_guard();
     if let Some(state) = guard.as_mut() {
         if state.icon.id() == tray_id {
             state.sync_item = item;
+            state.sync_memo = memo;
         }
     }
 }
@@ -1271,5 +1415,102 @@ mod sync_tray_tests {
             assert_eq!(image.width(), idle.width());
             assert_eq!(image.height(), idle.height());
         }
+    }
+
+    #[test]
+    fn an_unchanged_tick_writes_nothing_at_all() {
+        // The story in one assertion: the engine reports the same state every
+        // second, and the tray used to decode and re-push the identical PNG
+        // every second with it.
+        let glyph =
+            SyncGlyphId::of(sync_glyph(TraySyncState::Armed, 0).expect("armed has a glyph"));
+        let line = "Photos — up to date";
+        assert_eq!(
+            sync_writes(None, false, glyph, line),
+            SyncWrites::BOTH,
+            "a tray with nothing on it yet owes both writes"
+        );
+        let memo = SyncMemo {
+            glyph,
+            line: Arc::from(line),
+        };
+        for tick in 0..5 {
+            assert!(
+                sync_writes(Some(&memo), true, glyph, line).is_empty(),
+                "tick {tick} repainted a tray that had not changed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_change_reaches_the_tray_on_the_very_next_tick() {
+        // De-duplication must not become coalescing: there is no dwell here,
+        // only a diff, so a real transition costs no extra tick.
+        let armed = SyncGlyphId::of(sync_glyph(TraySyncState::Armed, 0).expect("armed"));
+        let line = "Photos — up to date";
+        let memo = SyncMemo {
+            glyph: armed,
+            line: Arc::from(line),
+        };
+
+        let warning = SyncGlyphId::of(sync_glyph(TraySyncState::Warning, 0).expect("warning"));
+        let escalated = sync_writes(Some(&memo), true, warning, line);
+        assert!(escalated.icon, "a new glyph must repaint on this tick");
+        assert!(
+            !escalated.text,
+            "the words did not change, so the line is left alone"
+        );
+
+        let relabelled = sync_writes(Some(&memo), true, armed, "Photos — 3 waiting to sync");
+        assert!(
+            relabelled.text,
+            "new words must reach the line on this tick"
+        );
+        assert!(
+            !relabelled.icon,
+            "the glyph did not change, so the icon is left alone"
+        );
+    }
+
+    #[test]
+    fn a_transfer_still_animates_through_the_memo() {
+        // The obvious way to break the de-duplication: memoise the STATE.
+        // `Transferring` equals `Transferring` on every tick, so the ring would
+        // freeze on one frame and the menu bar would stop reading as motion.
+        let line = "Photos — Transferring · 40 MB";
+        let mut memo = SyncMemo {
+            glyph: SyncGlyphId::of(sync_glyph(TraySyncState::Transferring, 0).expect("frame 0")),
+            line: Arc::from(line),
+        };
+        for frame in 1u8..=8 {
+            let glyph = SyncGlyphId::of(
+                sync_glyph(TraySyncState::Transferring, frame).expect("every frame has a glyph"),
+            );
+            assert!(
+                sync_writes(Some(&memo), true, glyph, line).icon,
+                "frame {frame} was skipped, so the transfer ring stopped moving"
+            );
+            memo.glyph = glyph;
+        }
+    }
+
+    #[test]
+    fn a_rebuilt_tray_is_painted_again() {
+        // The memo lives in the tray slot, so toggling presence off→on drops it
+        // with the tray: the fresh menu-bar item carries the idle mark and must
+        // be painted even though the composed state never changed.
+        let glyph = SyncGlyphId::of(sync_glyph(TraySyncState::Active, 0).expect("active"));
+        let line = "Photos — Committing — 1/3 files";
+        assert_eq!(sync_writes(None, true, glyph, line), SyncWrites::BOTH);
+        let memo = SyncMemo {
+            glyph,
+            line: Arc::from(line),
+        };
+
+        // And a menu the recording renderer displaced is reinstalled even when
+        // the words are the ones already memoised.
+        let restored = sync_writes(Some(&memo), false, glyph, line);
+        assert!(restored.text, "a displaced sync menu must be reinstalled");
+        assert!(!restored.icon, "its glyph was never taken down");
     }
 }

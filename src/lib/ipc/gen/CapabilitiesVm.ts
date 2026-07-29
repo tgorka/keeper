@@ -58,4 +58,15 @@ recording: boolean,
  * engine cannot be constructed at all — and every sync surface stays
  * absent rather than failing when pressed (AD-27, "no dead buttons").
  */
-sync: boolean, };
+sync: boolean, 
+/**
+ * The window's title bar is a transparent overlay over the webview, so the
+ * native window controls float over page content (Story 34.2, AD-34-2):
+ * `true` only on desktop macOS, the only platform where `tauri.conf.json`'s
+ * `titleBarStyle: "Overlay"` + `hiddenTitle` apply at all. Everywhere else
+ * the OS draws a real title bar above the webview, so reserving an inset or
+ * painting a drag band there would be empty space under chrome the platform
+ * already owns. Those two config keys are the other half of this fact —
+ * changing them means changing this flag with them.
+ */
+overlayTitleBar: boolean, };

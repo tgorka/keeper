@@ -831,6 +831,10 @@ mod tests {
         Provenance::new("fixture", "test-box", "01ABC", "localhost", SyncSource::Cli)
     }
 
+    fn profile(root: &std::path::Path) -> crate::profile::SyncProfile {
+        crate::profile::SyncProfile::new("01JFIXTURE", "fixture", root, "https://git.invalid/r.git")
+    }
+
     /// A repository with `a.txt` and `b.txt` committed.
     fn repo_with_two_files() -> (tempfile::TempDir, gix::Repository) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -845,9 +849,10 @@ mod tests {
             &repo,
             &changes,
             &provenance(),
-            "fixture",
+            &profile(dir.path()),
             &signature(),
             &std::collections::BTreeMap::new(),
+            None,
         )
         .expect("commit")
         .expect("a non-empty commit");

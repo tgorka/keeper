@@ -12,6 +12,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +91,12 @@ pub struct SyncProgress {
     /// -relative path, never an absolute one — absolute paths leak home
     /// directory names into logs and screenshots.
     pub current: Option<String>,
+    /// Whole bytes per second, or `None` when no honest figure exists yet.
+    ///
+    /// Derived by [`RateMeter`], which never yields zero: a rate of nothing is
+    /// the absence of a transfer, not a measurement of one, and the UI renders
+    /// `None` as nothing rather than "0 B/s".
+    pub bytes_per_second: Option<u64>,
 }
 
 impl SyncProgress {
@@ -103,6 +110,7 @@ impl SyncProgress {
             bytes_done: 0,
             bytes_total: None,
             current: None,
+            bytes_per_second: None,
         }
     }
 
@@ -116,6 +124,91 @@ impl SyncProgress {
         }
         let total = self.files_total.filter(|t| *t > 0)?;
         Some((self.files_done as f64 / total as f64).clamp(0.0, 1.0))
+    }
+}
+
+/// Shortest window a rate may be measured over, in milliseconds.
+///
+/// Both byte producers sample at ~100 ms — `git::fetch::REPORT_INTERVAL_MS` and
+/// `lfs::basic::DEFAULT_PROGRESS_INTERVAL` — and one sample can carry a whole
+/// chunk that a buffered reader handed over at once. Dividing by 100 ms would
+/// therefore report a burst as if it were the sustained rate, so a figure is
+/// withheld until a full second of movement backs it.
+const RATE_MIN_WINDOW_MS: u64 = 1_000;
+
+/// How long a measurement window runs before it is reopened, in milliseconds.
+///
+/// The window has to close, or the figure becomes the average since the
+/// transfer began: on a multi-gigabyte push that average would still read
+/// "12 MB/s" minutes after the connection dropped to a crawl. Reopening every
+/// two seconds keeps the number about the recent past while staying long
+/// enough to be steady.
+const RATE_WINDOW_MS: u64 = 2_000;
+
+/// A transfer rate in whole bytes per second, measured over a rolling window.
+///
+/// Time is a parameter rather than a read of the clock, matching
+/// `lfs::basic::ProgressCoalescer`, which is what makes the boundaries
+/// testable.
+///
+/// Two rules make the figure honest, and both are expressed as `None`:
+///
+/// * **Not enough time.** One sample is a point, not a rate, and a window
+///   shorter than [`RATE_MIN_WINDOW_MS`] is noise (see that constant).
+/// * **Nothing moved.** A window that carries no bytes has no rate to report.
+///   "0 B/s" would claim a measurement where there is only an idle wire — a
+///   pack that finished arriving while its deltas resolve, or an object being
+///   retried. So the meter never yields `Some(0)`: every `Some` is at least
+///   1 B/s, which is what lets the UI render `None` as nothing without ever
+///   having to special-case a zero.
+///
+/// The counter it is fed must be cumulative. Both feeds are monotonic by
+/// construction — [`TransferTally`]'s per-object high-water marks, and the
+/// `fetched` maximum on the fetch leg, where gitoxide's per-node counters
+/// restart on every phase — and a counter that dropped anyway is absorbed by a
+/// saturating subtraction: it reports no movement, so the meter falls silent
+/// and re-anchors within one window instead of computing a negative rate.
+#[derive(Debug, Default, Clone)]
+pub struct RateMeter {
+    /// When the open window started, and the byte count it started from.
+    window: Option<(Instant, u64)>,
+    /// The last figure measured over a full window, held while the next one
+    /// fills so the display does not blink to nothing every two seconds.
+    last: Option<u64>,
+}
+
+impl RateMeter {
+    /// Fold in a cumulative byte count observed at `now` and return the rate.
+    pub fn observe(&mut self, bytes: u64, now: Instant) -> Option<u64> {
+        let Some((opened, opening_bytes)) = self.window else {
+            self.window = Some((now, bytes));
+            return None;
+        };
+
+        // Milliseconds, because a rate in whole bytes per second cannot resolve
+        // anything finer and `u128` arithmetic buys nothing here.
+        let elapsed = u64::try_from(now.saturating_duration_since(opened).as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        if elapsed < RATE_MIN_WINDOW_MS {
+            return self.last;
+        }
+
+        let moved = bytes.saturating_sub(opening_bytes);
+        // `elapsed` is at least `RATE_MIN_WINDOW_MS` here, so this divides by a
+        // full second at minimum; `saturating_mul` keeps an absurd byte count
+        // from wrapping on the way in.
+        let rate = moved.saturating_mul(1_000) / elapsed;
+        self.last = (rate > 0).then_some(rate);
+        if elapsed >= RATE_WINDOW_MS {
+            self.window = Some((now, bytes));
+        }
+        self.last
+    }
+
+    /// The current rate, without folding a new observation in.
+    pub fn bytes_per_second(&self) -> Option<u64> {
+        self.last
     }
 }
 
@@ -149,6 +242,7 @@ pub struct TransferTally {
     objects: HashMap<String, ObjectBytes>,
     total: u64,
     done: u64,
+    rate: RateMeter,
 }
 
 impl TransferTally {
@@ -165,8 +259,17 @@ impl TransferTally {
         self.done
     }
 
-    /// Fold one transfer event into the totals.
+    /// Fold one transfer event into the totals, observed now.
     pub fn fold(&mut self, event: &TransferEvent) {
+        self.fold_at(event, Instant::now());
+    }
+
+    /// Fold one transfer event into the totals as of `now`.
+    ///
+    /// The clock is a parameter here for the same reason it is one on
+    /// `lfs::basic::ProgressCoalescer::should_emit`: the rate's window
+    /// boundaries are only testable if a test can choose when things happened.
+    pub fn fold_at(&mut self, event: &TransferEvent, now: Instant) {
         match event {
             TransferEvent::Started { oid, size } => {
                 // A second `Started` for one oid is a re-driven journal unit,
@@ -198,12 +301,17 @@ impl TransferTally {
             // is exactly what a failed transfer looks like.
             TransferEvent::Failed { .. } => {}
         }
+        // Every arm above is a byte observation, including the ones that move
+        // nothing: a `Failed` that stalls the count for a second is exactly the
+        // moment the rate should start falling.
+        self.rate.observe(self.done, now);
     }
 
-    /// Stamp the byte totals onto a progress event.
+    /// Stamp the byte totals and the current rate onto a progress event.
     pub fn apply(&self, progress: &mut SyncProgress) {
         progress.bytes_done = self.done;
         progress.bytes_total = self.bytes_total();
+        progress.bytes_per_second = self.rate.bytes_per_second();
     }
 
     /// Raise one object's high-water mark, capped at its announced size.
@@ -242,6 +350,13 @@ pub struct SyncStatus {
     /// Units still queued, including deferred ones. Non-zero while offline,
     /// which is how the UI can say "12 changes waiting" honestly.
     pub pending: u32,
+    /// Paths the completeness gate is holding inside their quiescence window:
+    /// seen, deliberately not yet queued, and therefore invisible to
+    /// `pending`, which counts journal rows (AD-34-10). A folder with five
+    /// thousand files still being written has no journal rows at all, which is
+    /// how "up to date" came to be printed over it. Maintained by the scan,
+    /// which is the only thing that knows.
+    pub settling: u32,
     /// Sticky warning, last-write-wins, cleared only by a clean run. Mirrors
     /// `RecordingStatusVm::warning` so the banner behaves identically.
     pub warning: Option<String>,
@@ -263,6 +378,7 @@ impl SyncStatus {
             bytes_done: 0,
             bytes_total: None,
             pending: 0,
+            settling: 0,
             warning: None,
             error: None,
             last_sync_ms: None,
@@ -390,16 +506,32 @@ pub fn status_line(status: &SyncStatus) -> String {
             }
             line
         }
-        // "up to date" is only honest when nothing is waiting. A queued unit
-        // means work has been accepted but not yet published, and reporting
-        // that as up to date is how a user comes to believe a file reached the
-        // server when it did not.
+        // "up to date" is only honest when nothing is waiting for ANY reason
+        // (AD-34-10). The two reasons are different facts and are worded
+        // differently: a queued unit means work has been accepted but not yet
+        // published, and a settling file means work has been *seen* and is
+        // being deliberately held until its writer stops. Reporting either as
+        // up to date is how a user comes to believe a file reached the server
+        // when it did not — and the settling case is the one that used to be
+        // invisible here, because it has no journal row to be counted by.
+        //
+        // The wording matches the Pending list's own "Waiting for writes to
+        // stop", so the tray and the window never explain the same wait two
+        // different ways.
+        _ if status.pending > 0 && status.settling > 0 => format!(
+            "{} — {} waiting to sync, {} waiting for writes to stop",
+            status.profile_name, status.pending, status.settling
+        ),
         _ if status.pending > 0 => {
             format!(
                 "{} — {} waiting to sync",
                 status.profile_name, status.pending
             )
         }
+        _ if status.settling > 0 => format!(
+            "{} — {} waiting for writes to stop",
+            status.profile_name, status.settling
+        ),
         _ => format!("{} — up to date", status.profile_name),
     }
 }
@@ -519,6 +651,82 @@ mod tests {
         assert_eq!(p.fraction(), None);
     }
 
+    /// `t0 + ms`, for reading a rate timeline as the wall clock it stands in for.
+    fn at(t0: Instant, ms: u64) -> Instant {
+        t0 + std::time::Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn a_rate_waits_for_a_full_second_before_it_claims_one() {
+        let t0 = Instant::now();
+        let mut meter = RateMeter::default();
+
+        // One sample is a point, not a rate.
+        assert_eq!(meter.observe(0, t0), None);
+        // A 100 ms sample is one producer tick, and one tick can be a whole
+        // buffered chunk: 1 MB in 100 ms would read as 10 MB/s.
+        assert_eq!(meter.observe(1_000_000, at(t0, 100)), None);
+
+        assert_eq!(meter.observe(2_000_000, at(t0, 1_000)), Some(2_000_000));
+        // Still inside the same window, so the figure widens rather than
+        // restarting: 3 MB over 1.5 s.
+        assert_eq!(meter.observe(3_000_000, at(t0, 1_500)), Some(2_000_000));
+    }
+
+    #[test]
+    fn a_rate_is_never_zero_and_never_divides_by_no_time() {
+        let t0 = Instant::now();
+        let mut meter = RateMeter::default();
+
+        // Two observations stamped the same instant. A naive elapsed of zero
+        // here is exactly how a rate becomes infinite.
+        assert_eq!(meter.observe(0, t0), None);
+        assert_eq!(meter.observe(5_000, t0), None);
+
+        // A real window, so the figures below are measured against something.
+        assert_eq!(meter.observe(5_000, at(t0, 2_000)), Some(2_500));
+
+        // The window reopened at 5 000 bytes, and nothing has moved since. That
+        // is not a rate of zero — "0 B/s" would claim a measurement of an idle
+        // wire — so there is nothing to report.
+        assert_eq!(meter.observe(5_000, at(t0, 3_100)), None);
+        // And 50 bytes in a minute rounds to under 1 B/s, which is the same
+        // answer for the same reason.
+        assert_eq!(meter.observe(5_050, at(t0, 62_000)), None);
+    }
+
+    #[test]
+    fn a_counter_that_restarts_falls_silent_and_recovers() {
+        // The shape of a retry that could not resume, and of a fetch phase
+        // rolling over onto a node whose counter starts at zero.
+        let t0 = Instant::now();
+        let mut meter = RateMeter::default();
+        assert_eq!(meter.observe(1_000_000, t0), None);
+        assert_eq!(meter.observe(3_000_000, at(t0, 1_000)), Some(2_000_000));
+
+        // Backwards. The subtraction saturates, so this is "nothing moved"
+        // rather than a negative rate.
+        assert_eq!(meter.observe(0, at(t0, 1_500)), None);
+        // Past the window length, so the meter re-anchors on the lower count…
+        assert_eq!(meter.observe(500_000, at(t0, 4_000)), None);
+        // …and measures again from there.
+        assert_eq!(meter.observe(1_500_000, at(t0, 5_000)), Some(1_000_000));
+    }
+
+    #[test]
+    fn the_window_reopens_so_a_stall_stops_reporting_the_old_rate() {
+        let t0 = Instant::now();
+        let mut meter = RateMeter::default();
+        assert_eq!(meter.observe(0, t0), None);
+        assert_eq!(meter.observe(10_000_000, at(t0, 2_000)), Some(5_000_000));
+        assert_eq!(meter.bytes_per_second(), Some(5_000_000));
+
+        // Nothing more arrives. An average since the transfer began would still
+        // be claiming 5 MB/s here.
+        assert_eq!(meter.observe(10_000_000, at(t0, 3_000)), None);
+        assert_eq!(meter.bytes_per_second(), None);
+    }
+
     fn started(oid: &str, size: u64) -> TransferEvent {
         TransferEvent::Started {
             oid: oid.to_owned(),
@@ -621,6 +829,45 @@ mod tests {
     }
 
     #[test]
+    fn the_tally_carries_a_rate_that_survives_a_retry() {
+        let t0 = Instant::now();
+        let mut tally = TransferTally::default();
+        tally.fold_at(&started("a", 4_000_000), t0);
+        tally.fold_at(
+            &TransferEvent::Progress {
+                oid: "a".to_owned(),
+                bytes_done: 1_000_000,
+            },
+            at(t0, 1_000),
+        );
+
+        let mut progress = SyncProgress::idle("id", "n");
+        tally.apply(&mut progress);
+        assert_eq!(progress.bytes_per_second, Some(1_000_000));
+
+        // The retry that `BasicTransfer` drives in place: this object's counter
+        // restarts at zero while the tally's high-water mark holds. No new bytes
+        // are landing, so after the window rolls there is no rate to report —
+        // and at no point is there a zero one, which would read as a claim.
+        for ms in [1_500, 4_000, 5_000] {
+            tally.fold_at(
+                &TransferEvent::Progress {
+                    oid: "a".to_owned(),
+                    bytes_done: 0,
+                },
+                at(t0, ms),
+            );
+            tally.apply(&mut progress);
+            assert_ne!(progress.bytes_per_second, Some(0), "at {ms} ms");
+        }
+        assert_eq!(tally.bytes_done(), 1_000_000, "the mark never walked back");
+        assert_eq!(
+            progress.bytes_per_second, None,
+            "a stalled retry has no rate"
+        );
+    }
+
+    #[test]
     fn a_re_driven_unit_does_not_inflate_the_denominator() {
         // The journal re-drives a unit after a crash, so the same oid can be
         // announced twice in one run. Counting its size twice would strand the
@@ -680,6 +927,52 @@ mod tests {
 
         s.pending = 0;
         assert_eq!(status_line(&s), "tgdrive — up to date");
+    }
+
+    /// AD-34-10, and the single most misleading string in the app before this.
+    ///
+    /// `pending` counts journal rows. A folder where five thousand files are
+    /// mid-write has none, so the line printed "up to date" over it for as long
+    /// as the writing lasted.
+    #[test]
+    fn a_folder_whose_files_are_still_being_written_is_never_up_to_date() {
+        let mut s = status("tgdrive");
+        s.state = ProfileState::Watching;
+        s.settling = 5_000;
+        assert_eq!(
+            status_line(&s),
+            "tgdrive — 5000 waiting for writes to stop",
+            "no journal row exists, and the line must still tell the truth"
+        );
+
+        // Both kinds of wait at once: queued work must not hide the held files
+        // (nor the reverse — each is a separate fact about the same folder).
+        s.pending = 2;
+        assert_eq!(
+            status_line(&s),
+            "tgdrive — 2 waiting to sync, 5000 waiting for writes to stop"
+        );
+
+        // Only once BOTH are zero is the claim honest.
+        s.settling = 0;
+        assert_eq!(status_line(&s), "tgdrive — 2 waiting to sync");
+        s.pending = 0;
+        assert_eq!(status_line(&s), "tgdrive — up to date");
+    }
+
+    /// An in-flight transfer already says what it is doing, and its own line is
+    /// the more useful one — the settling count must not displace it.
+    #[test]
+    fn an_active_phase_still_outranks_the_settling_count() {
+        let mut s = status("tgdrive");
+        s.state = ProfileState::Syncing;
+        s.phase = SyncPhase::Committing;
+        s.settling = 7;
+        assert!(
+            status_line(&s).starts_with(SyncPhase::Committing.label()),
+            "got {}",
+            status_line(&s)
+        );
     }
 
     #[test]

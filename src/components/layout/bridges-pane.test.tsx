@@ -74,6 +74,7 @@ const DESKTOP_CAPABILITIES = {
   revealInFileManager: true,
   recording: false,
   sync: false,
+  overlayTitleBar: false,
 };
 
 function account(id: string, userId: string, hue = 0, provider: Provider = "password"): AccountVm {

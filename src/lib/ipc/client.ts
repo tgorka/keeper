@@ -113,6 +113,7 @@ export type { SendState } from "./gen/SendState";
 export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 export type { SpaceVm } from "./gen/SpaceVm";
 export type { SyncActivityVm } from "./gen/SyncActivityVm";
+export type { SyncDeviceVm } from "./gen/SyncDeviceVm";
 export type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
 export type { SyncParkedVm } from "./gen/SyncParkedVm";
 export type { SyncPendingVm } from "./gen/SyncPendingVm";
@@ -171,6 +172,7 @@ import type { SearchFilterVm } from "./gen/SearchFilterVm";
 import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
+import type { SyncDeviceVm } from "./gen/SyncDeviceVm";
 import type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
 import type { SyncPendingVm } from "./gen/SyncPendingVm";
 import type { SyncProblemsVm } from "./gen/SyncProblemsVm";
@@ -2547,14 +2549,27 @@ export async function syncRetryParked(id: string, unitId: number): Promise<void>
  * Store an access token for a profile in the OS keychain.
  *
  * The token goes straight to the keychain under a key derived from the profile
- * id -- never into the config file, never into `sync.db`, and never back out:
- * there is deliberately no command that reads a stored credential, so a caller
- * can write one or clear one and nothing else.
+ * id -- never into the config file, never into `sync.db`. It can be read back,
+ * but only through {@link syncGetCredential}, which nothing calls on its own.
  *
  * Rejects with: `unsupported`, `internal` (no such profile, keychain refusal).
  */
 export async function syncSetCredential(id: string, token: string): Promise<void> {
   await invoke<void>("sync_set_credential", { id, token });
+}
+
+/**
+ * Read a profile's stored access token out of the OS keychain.
+ *
+ * Resolves `null` when the profile has no stored token, which is an ordinary
+ * state rather than a failure -- a public remote needs none. Call this only
+ * from an explicit user action: no secret may reach the UI as a side effect of
+ * loading a profile, and {@link SyncProfileVm} carries none for that reason.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile, keychain refusal).
+ */
+export async function syncGetCredential(id: string): Promise<string | null> {
+  return await invoke<string | null>("sync_get_credential", { id });
 }
 
 /**
@@ -2565,6 +2580,35 @@ export async function syncSetCredential(id: string, token: string): Promise<void
  */
 export async function syncClearCredential(id: string): Promise<void> {
   await invoke<void>("sync_clear_credential", { id });
+}
+
+/**
+ * Read this device's identity -- the name that rides every commit keeper makes.
+ *
+ * Minted once from the machine's hostname the first time sync opens and the
+ * user's from then on, so it is read from the engine rather than re-derived
+ * here: a renamed device must not answer with its hostname again.
+ *
+ * Rejects with: `unsupported` (no usable git), `internal`.
+ */
+export async function syncDevice(): Promise<SyncDeviceVm> {
+  return await invoke<SyncDeviceVm>("sync_device");
+}
+
+/**
+ * Rename this device, resolving the identity as stored.
+ *
+ * Takes effect on the next commit and rewrites nothing: a `Keeper-Device`
+ * trailer already in a repository keeps the name the machine had when it made
+ * that commit. The `id` never changes -- it is what a shared history tells two
+ * machines apart by, and what the git author address is derived from.
+ *
+ * Use the resolved label rather than the argument: the store trims it.
+ *
+ * Rejects with: `unsupported`, `internal` (an empty label).
+ */
+export async function syncDeviceSetLabel(label: string): Promise<SyncDeviceVm> {
+  return await invoke<SyncDeviceVm>("sync_device_set_label", { label });
 }
 
 /**

@@ -30,7 +30,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    time::Instant,
 };
 
 use gix::{
@@ -41,9 +42,49 @@ use gix::{
 use crate::{
     db::DeviceIdentity,
     error::{Result, SyncError},
+    lfs::basic::{ProgressCoalescer, DEFAULT_PROGRESS_INTERVAL},
     profile::SyncProfile,
     provenance::{change_subject, commit_message, Provenance},
 };
+
+/// Observes staging as it walks the change set: `(files_done, path in flight)`.
+///
+/// `false` means the receiver is gone and reporting should stop, the same
+/// contract [`crate::progress::ProgressSink`] and
+/// [`crate::lfs::basic::TransferSink`] carry. Narrower than `ProgressSink` on
+/// purpose: staging knows which path it is reading and how many it has passed,
+/// and nothing else — profiles, phases and denominators belong to the engine.
+pub type StagingSink<'a> = &'a dyn Fn(u64, &Path) -> bool;
+
+/// Report one staging step, if anyone is listening and it is not too soon.
+///
+/// Coalesced at [`DEFAULT_PROGRESS_INTERVAL`] like every other progress
+/// producer in the crate: staging ten thousand files is ten events a second,
+/// not ten thousand events. The clock is only read when a sink exists, so a
+/// caller that passes `None` pays nothing per file.
+///
+/// The last path of the change set is always reported, for the reason
+/// `git::fetch`'s emitter always forwards its completion tick: a detail line
+/// left naming the second of ten thousand files while the commit is written is
+/// worse than one that updates a little less often.
+fn report(
+    sink: &mut Option<StagingSink<'_>>,
+    coalescer: &mut ProgressCoalescer,
+    files_done: u64,
+    files_total: u64,
+    current: &Path,
+) {
+    let Some(observer) = *sink else {
+        return;
+    };
+    let last = files_done + 1 >= files_total;
+    if !last && !coalescer.should_emit(Instant::now()) {
+        return;
+    }
+    if !observer(files_done, current) {
+        *sink = None;
+    }
+}
 
 /// Paths to stage, all repository-relative.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -54,6 +95,15 @@ pub struct StagedChange {
     pub modified: Vec<PathBuf>,
     /// Tracked paths to remove.
     pub deleted: Vec<PathBuf>,
+    /// How big each path was when it was last measured (Story 34.6).
+    ///
+    /// A missing key means the size is not knowable, which is a real answer: a
+    /// file can vanish between the scan and the commit, and a deletion only has
+    /// a size while something still records one. Staging never reads this — it
+    /// rides here because this is the last structure that still names the
+    /// individual paths one commit moved, and the recently-synced list needs
+    /// them named and measured together.
+    pub sizes: BTreeMap<PathBuf, u64>,
 }
 
 impl StagedChange {
@@ -82,14 +132,17 @@ const MAX_LISTED_PATHS: usize = 50;
 /// created: it would be pushed, replicated to every peer and shown in the UI
 /// while meaning nothing.
 ///
+/// `progress` observes each path as it is reached; see [`StagingSink`].
+///
 /// See the module docs for the LFS precondition on `changes`.
 pub fn stage_and_commit(
     repo: &gix::Repository,
     changes: &StagedChange,
     provenance: &Provenance,
-    profile_name: &str,
+    profile: &SyncProfile,
     author: &gix::actor::Signature,
     substitutions: &BTreeMap<PathBuf, Vec<u8>>,
+    progress: Option<StagingSink<'_>>,
 ) -> Result<Option<gix::hash::ObjectId>> {
     if changes.is_empty() {
         return Ok(None);
@@ -107,7 +160,17 @@ pub fn stage_and_commit(
     // was sorted when we started. Everything pushed below lands after it.
     let sorted_len = index.entries().len();
 
+    // `files_done` counts paths this loop has finished, so a report names the
+    // path being read next to the number already behind it — which is exactly
+    // the pairing the engine publishes before staging starts, so the stream
+    // never contradicts its own opening frame.
+    let mut sink = progress;
+    let mut coalescer = ProgressCoalescer::new(DEFAULT_PROGRESS_INTERVAL);
+    let mut files_done = 0u64;
+    let files_total = changes.len() as u64;
+
     for rela in changes.added.iter().chain(changes.modified.iter()) {
+        report(&mut sink, &mut coalescer, files_done, files_total, rela);
         let key = index_key(rela)?;
         let absolute = workdir.join(rela);
         let metadata = gix::index::fs::Metadata::from_path_no_follow(&absolute)
@@ -174,12 +237,20 @@ pub fn stage_and_commit(
             }
             None => index.dangerously_push_entry(stat, oid, Flags::empty(), mode, key.as_ref()),
         }
+        files_done += 1;
     }
 
     if !changes.deleted.is_empty() {
         let mut doomed: BTreeSet<BString> = BTreeSet::new();
         for rela in &changes.deleted {
+            // Removal itself is one bulk index pass, so this walk is the only
+            // place a deletion can be named. Counting them here is what lets the
+            // bar reach its denominator: the engine's total spans all three
+            // groups, and a counter that stopped at added+modified would strand
+            // it short on any pass that deleted anything.
+            report(&mut sink, &mut coalescer, files_done, files_total, rela);
             doomed.insert(index_key(rela)?);
+            files_done += 1;
         }
         // `BString: Borrow<BStr>`, so the callback's borrowed path is the key.
         index.remove_entries(|_, path, _| doomed.contains(path));
@@ -214,14 +285,15 @@ pub fn stage_and_commit(
     };
     if parent_tree == Some(tree_id) {
         tracing::debug!(
-            profile = profile_name,
+            profile = profile.name,
             "staged paths matched HEAD exactly; no commit created"
         );
         return Ok(None);
     }
 
     let subject = change_subject(
-        profile_name,
+        &profile.commit_subject_template,
+        &profile.name,
         changes.added.len(),
         changes.modified.len(),
         changes.deleted.len(),
@@ -532,9 +604,10 @@ mod tests {
             repo,
             &changes,
             &provenance(),
-            "docs",
+            &profile(),
             &signature(),
             &no_lfs(),
+            None,
         )
         .expect("commit")
     }
@@ -547,9 +620,10 @@ mod tests {
             &repo,
             &StagedChange::default(),
             &provenance(),
-            "docs",
+            &profile(),
             &signature(),
             &no_lfs(),
+            None,
         )
         .expect("no error");
         assert_eq!(got, None);
@@ -568,6 +642,47 @@ mod tests {
         assert!(
             message.starts_with("sync(docs): 1 added"),
             "unexpected subject: {message}"
+        );
+    }
+
+    /// The end-to-end half of Story 34.5(b): a template stored on the profile
+    /// has to be what `git log` shows, and the trailer block has to be
+    /// untouched by it — provenance is not decoration.
+    #[test]
+    fn a_profiles_subject_template_is_what_the_commit_says() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        let mut templated = profile();
+        templated.commit_subject_template = "backup {profile}: {changed} file(s)".to_owned();
+        std::fs::write(dir.path().join("a.txt"), "alpha").expect("write");
+        let changes = StagedChange {
+            added: vec![PathBuf::from("a.txt")],
+            ..StagedChange::default()
+        };
+
+        let id = stage_and_commit(
+            &repo,
+            &changes,
+            &provenance(),
+            &templated,
+            &signature(),
+            &no_lfs(),
+            None,
+        )
+        .expect("commit")
+        .expect("a non-empty commit");
+
+        let message = repo
+            .find_commit(id)
+            .expect("find")
+            .message_raw_sloppy()
+            .to_string();
+        let mut lines = message.lines();
+        assert_eq!(lines.next(), Some("backup docs: 1 file(s)"));
+        // The trailer block is not templatable, so it still parses whole.
+        assert_eq!(
+            Provenance::parse(&message).expect("trailers are present"),
+            provenance()
         );
     }
 
@@ -614,9 +729,10 @@ mod tests {
             &repo,
             &again,
             &provenance(),
-            "docs",
+            &profile(),
             &signature(),
             &no_lfs(),
+            None,
         )
         .expect("no error");
         assert_eq!(got, None, "an unchanged file must not create a commit");
@@ -638,9 +754,10 @@ mod tests {
             &repo,
             &removal,
             &provenance(),
-            "docs",
+            &profile(),
             &signature(),
             &no_lfs(),
+            None,
         )
         .expect("commit")
         .expect("a deletion is a change");
@@ -654,6 +771,118 @@ mod tests {
             .lookup_entry_by_path("b.txt")
             .expect("lookup")
             .is_none());
+    }
+
+    #[test]
+    fn staging_names_each_path_and_counts_past_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        commit_files(dir.path(), &repo, &[("gone.txt", "bye")]).expect("first commit");
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(dir.path().join(name), name).expect("write");
+        }
+        std::fs::remove_file(dir.path().join("gone.txt")).expect("remove");
+
+        let changes = StagedChange {
+            added: vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")],
+            deleted: vec![PathBuf::from("gone.txt")],
+            ..StagedChange::default()
+        };
+        let seen = std::sync::Mutex::new(Vec::<(u64, PathBuf)>::new());
+        let sink = |files_done: u64, current: &Path| -> bool {
+            let mut log = seen.lock().expect("sink lock");
+            log.push((files_done, current.to_owned()));
+            true
+        };
+        stage_and_commit(
+            &repo,
+            &changes,
+            &provenance(),
+            &profile(),
+            &signature(),
+            &no_lfs(),
+            Some(&sink),
+        )
+        .expect("commit")
+        .expect("three paths are a change");
+
+        let seen = seen.into_inner().expect("sink lock");
+        // Two frames are guaranteed whatever the clock did: the coalescer always
+        // passes the first call, and the last path is forced. Anything between
+        // them depends on how long three tiny files took, which is not something
+        // a test may assume.
+        assert_eq!(
+            seen.first(),
+            Some(&(0, PathBuf::from("a.txt"))),
+            "the first frame names the first path with nothing behind it"
+        );
+        assert_eq!(
+            seen.last(),
+            Some(&(2, PathBuf::from("gone.txt"))),
+            "the last frame is the deletion, with both writes counted past it"
+        );
+        // Every frame moves forward, and no frame invents a path. A `current`
+        // pinned to the first staged path — which is what the engine used to
+        // publish once and never revise — fails here.
+        let order = [
+            PathBuf::from("a.txt"),
+            PathBuf::from("b.txt"),
+            PathBuf::from("gone.txt"),
+        ];
+        let mut previous: Option<u64> = None;
+        for (files_done, current) in &seen {
+            assert!(
+                previous.is_none_or(|earlier| *files_done > earlier),
+                "{files_done} did not advance past {previous:?}"
+            );
+            assert_eq!(
+                order.get(*files_done as usize),
+                Some(current),
+                "frame {files_done} named the wrong path"
+            );
+            previous = Some(*files_done);
+        }
+        assert!(
+            seen.len() <= order.len(),
+            "staging must never report more frames than it has paths"
+        );
+    }
+
+    #[test]
+    fn a_sink_that_says_stop_is_not_called_again() {
+        // The `ProgressSink` contract: `false` means the receiver is gone, so a
+        // ten-thousand-path commit must not keep calling into a dead channel.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        let mut changes = StagedChange::default();
+        for index in 0..8 {
+            let name = format!("f{index}.txt");
+            std::fs::write(dir.path().join(&name), "x").expect("write");
+            changes.added.push(PathBuf::from(name));
+        }
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let sink = |_: u64, _: &Path| -> bool {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        };
+        stage_and_commit(
+            &repo,
+            &changes,
+            &provenance(),
+            &profile(),
+            &signature(),
+            &no_lfs(),
+            Some(&sink),
+        )
+        .expect("commit")
+        .expect("eight paths are a change");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the sink refused the first frame, so there is no second"
+        );
     }
 
     #[test]
@@ -691,6 +920,7 @@ mod tests {
             added: vec![PathBuf::from("new.txt")],
             modified: vec![PathBuf::from("edited.txt")],
             deleted: vec![PathBuf::from("gone.txt")],
+            ..StagedChange::default()
         };
         let body = change_body(&changes);
         assert_eq!(body, "+ new.txt\n~ edited.txt\n- gone.txt\n");

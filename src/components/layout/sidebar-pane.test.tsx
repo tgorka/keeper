@@ -27,6 +27,7 @@ import { bridgeHealthStore } from "@/lib/stores/bridge-health";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { draftsStore } from "@/lib/stores/drafts";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { spacesStore } from "@/lib/stores/spaces";
 
 const OFFLINE_TEXT = "Offline — showing your local archive. Messages queue until you're back.";
 
@@ -347,5 +348,49 @@ describe("SidebarPane settings", () => {
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toBeInTheDocument();
     expect(screen.getByText("Archive & Storage")).toBeInTheDocument();
+  });
+});
+
+describe("SidebarPane reachable footer (Story 34.2)", () => {
+  afterEach(() => {
+    spacesStore.getState().clear();
+  });
+
+  /** Eight Spaces — enough to overflow the drawer at the 600px minimum height. */
+  function seedSpaces(count: number) {
+    spacesStore.getState().applySnapshot({
+      spaces: Array.from({ length: count }, (_, i) => ({
+        accountId: account.accountId,
+        spaceId: `!space${i}:example.org`,
+        name: `Space ${i}`,
+        avatarUrl: null,
+      })),
+    });
+  }
+
+  it("scrolls the views and both groups while the account footer stays outside", () => {
+    // AD-34-4: the growing content is the only thing inside the scroller, so the
+    // `mt-auto` footer cannot be pushed past the `overflow-hidden` root however
+    // many Spaces the user belongs to. Putting the footer inside the scroller —
+    // or leaving the groups outside it — is what makes "Add account" unreachable.
+    accountsStore.getState().addAccount(account);
+    seedSpaces(8);
+    renderSidebar();
+
+    const viewport = document.querySelector('[data-slot="scroll-area-viewport"]');
+    expect(viewport).toBeInTheDocument();
+    expect(viewport).toContainElement(screen.getByRole("button", { name: "Chats" }));
+    expect(viewport).toContainElement(screen.getByRole("region", { name: "Spaces" }));
+    expect(viewport).not.toContainElement(screen.getByRole("button", { name: "Add account" }));
+  });
+
+  it("pairs the drawer's own min-h-0 with that scroller", () => {
+    // Without `min-h-0` the pane's content sets its floor and the scroller never
+    // gets a bounded height to scroll within — the container would be inert.
+    renderSidebar();
+
+    const nav = screen.getByRole("navigation", { name: "Views" });
+    expect(nav).toHaveClass("min-h-0");
+    expect(document.querySelector('[data-slot="scroll-area"]')).toHaveClass("min-h-0", "flex-1");
   });
 });

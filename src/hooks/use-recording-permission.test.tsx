@@ -14,6 +14,7 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import {
   DEFAULT_RECORDING_PERMISSION,
+  RETURN_PROBE_COALESCE_MS,
   useRecordingPermission,
 } from "@/hooks/use-recording-permission";
 import type { RecordingPermissionVm } from "@/lib/ipc/client";
@@ -108,29 +109,73 @@ describe("useRecordingPermission", () => {
   });
 
   it("re-detects when the document becomes visible again", async () => {
-    const { result } = renderHook(() => useRecordingPermission());
-    await waitFor(() => expect(result.current.permission).toEqual(GRANTED));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = renderHook(() => useRecordingPermission());
+      await waitFor(() => expect(result.current.permission).toEqual(GRANTED));
 
-    mockFetch.mockResolvedValue(DENIED);
-    act(() => {
-      document.dispatchEvent(new Event("visibilitychange"));
-    });
+      mockFetch.mockResolvedValue(DENIED);
+      act(() => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
 
-    // jsdom reports visibilityState "visible", so the re-detect fires.
-    await waitFor(() => expect(result.current.permission).toEqual(DENIED));
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+      // jsdom reports visibilityState "visible", so the re-detect is scheduled —
+      // one coalesce window later, never on the event itself (AD-34-6).
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(RETURN_PROBE_COALESCE_MS);
+      await waitFor(() => expect(result.current.permission).toEqual(DENIED));
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("re-detects on window focus (the System Settings round-trip)", async () => {
-    const { result } = renderHook(() => useRecordingPermission());
-    await waitFor(() => expect(result.current.permission).toEqual(GRANTED));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = renderHook(() => useRecordingPermission());
+      await waitFor(() => expect(result.current.permission).toEqual(GRANTED));
 
-    mockFetch.mockResolvedValue(DENIED);
-    act(() => {
-      window.dispatchEvent(new Event("focus"));
-    });
+      mockFetch.mockResolvedValue(DENIED);
+      act(() => {
+        window.dispatchEvent(new Event("focus"));
+      });
 
-    await waitFor(() => expect(result.current.permission).toEqual(DENIED));
+      await vi.advanceTimersByTimeAsync(RETURN_PROBE_COALESCE_MS);
+      await waitFor(() => expect(result.current.permission).toEqual(DENIED));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("coalesces a return-to-window burst into one sidecar probe (AD-34-6)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = renderHook(() => useRecordingPermission());
+      await waitFor(() => expect(result.current.permission).toEqual(GRANTED));
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+
+      // macOS fires `focus` and `visibilitychange` back-to-back on a window return,
+      // and `focus` also arrives on the mousedown that starts a titlebar drag. Every
+      // probe spawns a `keeper-rec`, so the whole burst must cost exactly one — and
+      // none of it on the click.
+      act(() => {
+        window.dispatchEvent(new Event("focus"));
+        document.dispatchEvent(new Event("visibilitychange"));
+        window.dispatchEvent(new Event("focus"));
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(RETURN_PROBE_COALESCE_MS);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+
+      // Quiet window: nothing further is queued.
+      await vi.advanceTimersByTimeAsync(RETURN_PROBE_COALESCE_MS * 4);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("re-fetches with the mic flag when the mic source is toggled on (Story 20.2)", async () => {
@@ -288,9 +333,11 @@ describe("useRecordingPermission", () => {
     mockFetch.mockReturnValueOnce(slow).mockResolvedValue(DENIED);
 
     const { result } = renderHook(() => useRecordingPermission());
-    // Kick a newer probe while the mount probe is still pending.
-    act(() => {
-      window.dispatchEvent(new Event("focus"));
+    // Kick a newer probe while the mount probe is still pending. The focus path is
+    // coalesced (AD-34-6), so `refresh` is the direct way to take a newer token —
+    // token ordering is what this test is about, not the focus schedule.
+    await act(async () => {
+      await result.current.refresh();
     });
     await waitFor(() => expect(result.current.permission).toEqual(DENIED));
 
@@ -341,14 +388,27 @@ describe("useRecordingPermission", () => {
   });
 
   it("removes its listeners on unmount (no re-detect after teardown)", async () => {
-    const { result, unmount } = renderHook(() => useRecordingPermission());
-    await waitFor(() => expect(result.current.permission).toEqual(GRANTED));
-    const calls = mockFetch.mock.calls.length;
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result, unmount } = renderHook(() => useRecordingPermission());
+      await waitFor(() => expect(result.current.permission).toEqual(GRANTED));
+      const calls = mockFetch.mock.calls.length;
 
-    unmount();
-    document.dispatchEvent(new Event("visibilitychange"));
-    window.dispatchEvent(new Event("focus"));
+      // A probe queued by a return-to-window and then unmounted before its coalesce
+      // window elapses must never reach the sidecar (AD-34-6): teardown outruns it.
+      act(() => {
+        window.dispatchEvent(new Event("focus"));
+      });
+      unmount();
+      await vi.advanceTimersByTimeAsync(RETURN_PROBE_COALESCE_MS * 2);
 
-    expect(mockFetch).toHaveBeenCalledTimes(calls);
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+      await vi.advanceTimersByTimeAsync(RETURN_PROBE_COALESCE_MS * 2);
+
+      expect(mockFetch).toHaveBeenCalledTimes(calls);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

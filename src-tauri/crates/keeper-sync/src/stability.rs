@@ -336,6 +336,45 @@ impl StabilityGate {
         StabilityVerdict::Stable
     }
 
+    /// The earliest instant at which any held path could become
+    /// [`StabilityVerdict::Stable`]. `None` when nothing is held.
+    ///
+    /// This is what lets the supervisor stop guessing. A settling path needs a
+    /// **second** observation to clear, and observations only happen inside a
+    /// scan — so before this existed the second one arrived on the paced poll,
+    /// and a file that landed at t=0 waited two whole poll intervals to sync
+    /// rather than its settle window. The engine schedules its next walk from
+    /// this number instead.
+    ///
+    /// It mirrors [`Self::verdict`] term for term, and is deliberately allowed
+    /// to be **early** rather than late: an extra walk that finds nothing costs
+    /// one `git status`, while a late one is a file that does not sync. `now_ms`
+    /// is needed for exactly one reason — the future-mtime escape hatch, which
+    /// `verdict` applies and which would otherwise push the deadline out to a
+    /// broken clock's idea of later and hold the file forever.
+    pub fn next_stable_ms(&self, now_ms: i64) -> Option<i64> {
+        let ceiling = i64::try_from(SETTLE_CEILING_MS).unwrap_or(i64::MAX);
+        self.entries
+            .values()
+            .map(|entry| {
+                let effective = if entry.close_write {
+                    CLOSE_WRITE_SETTLE_MS
+                } else {
+                    self.settle_ms
+                };
+                let window = i64::try_from(effective.min(SETTLE_CEILING_MS)).unwrap_or(i64::MAX);
+                let mut by_window = entry.unchanged_since_ms.saturating_add(window);
+                let mtime_ms = entry.last.mtime_ms();
+                if mtime_ms <= now_ms.saturating_add(FUTURE_MTIME_GRACE_MS) {
+                    by_window = by_window.max(mtime_ms.saturating_add(window));
+                }
+                // The ceiling outvotes every other condition in `verdict`, so
+                // it caps the wait here too.
+                by_window.min(entry.pending_since_ms.saturating_add(ceiling))
+            })
+            .min()
+    }
+
     /// The full gate for one path: tier 0, the iCloud guard, a fresh sample,
     /// then tier 2.
     ///
@@ -1230,5 +1269,127 @@ mod tests {
         gate.retain(&keep);
         assert_eq!(gate.tracked(), 1);
         assert!(gate.export().iter().all(|(path, _)| *path == kept));
+    }
+
+    /// The engine schedules its next walk from this number, so it must never be
+    /// later than the verdict it predicts — otherwise a settled file waits for
+    /// the paced poll, which is the whole bug.
+    #[test]
+    fn the_next_stable_instant_is_never_later_than_the_verdict_it_predicts() {
+        let mut g = gate();
+        assert_eq!(
+            g.next_stable_ms(0),
+            None,
+            "nothing held, nothing to wait for"
+        );
+
+        let path = p("done.txt");
+        g.observe(&path, sample(4_096, 0, 7), 0, false);
+        let at = g.next_stable_ms(0).expect("a held path has a deadline");
+        assert_eq!(at, 5_000, "one settle window after the observation");
+        assert_eq!(
+            g.verdict(&path, at - 1, SETTLE),
+            StabilityVerdict::Settling { since_ms: 0 },
+            "a walk one millisecond early would find nothing"
+        );
+        assert_eq!(
+            g.verdict(&path, at, SETTLE),
+            StabilityVerdict::Stable,
+            "and a walk at the predicted instant must find it stable"
+        );
+    }
+
+    /// A file written just now is held by its mtime, not only by its unchanged
+    /// run — so the deadline is the later of the two, or the engine would walk
+    /// early, find nothing, and go back to sleep until the paced poll.
+    #[test]
+    fn a_fresh_mtime_pushes_the_deadline_out_as_far_as_the_verdict_does() {
+        let mut g = gate();
+        let path = p("just-written.bin");
+        // Observed at t=9000, written at t=8000: the unchanged run alone would
+        // clear at 14 000, but the mtime condition holds it until 13 000 — the
+        // deadline is the later, 14 000.
+        g.observe(&path, sample(10, 8_000, 3), 9_000, false);
+        assert_eq!(g.next_stable_ms(9_000), Some(14_000));
+
+        // Reverse the ordering: an old file observed late is governed by its
+        // mtime being long past, so the run is what decides.
+        let mut g = gate();
+        let old = p("copied-in.bin");
+        g.observe(&old, sample(10, 0, 4), 20_000, false);
+        assert_eq!(g.next_stable_ms(20_000), Some(25_000));
+    }
+
+    /// A watcher-delivered close-write is the entire point of wiring the
+    /// watcher up: it collapses the wait to one second.
+    #[test]
+    fn a_close_write_pulls_the_deadline_in_to_the_short_window() {
+        let mut g = gate();
+        let path = p("saved.txt");
+        g.observe(&path, sample(64, 0, 9), 0, true);
+        assert_eq!(
+            g.next_stable_ms(0),
+            Some(i64::try_from(CLOSE_WRITE_SETTLE_MS).expect("fits")),
+            "the close-write window, not the five-second default"
+        );
+    }
+
+    /// The ceiling outvotes everything in `verdict`, so it caps the deadline
+    /// too: a log that is appended to forever must still be scheduled.
+    #[test]
+    fn a_file_that_never_quiesces_is_still_scheduled_by_the_ceiling() {
+        let mut g = StabilityGate::new(
+            "/tmp/profile-root",
+            ExcludeSet::new(&[]).expect("excludes"),
+            SETTLE_CEILING_MS,
+        );
+        let path = p("app.log");
+        // Appended to on every tick, so the unchanged run keeps restarting and
+        // the window alone would never elapse.
+        let mut t = 0;
+        while t <= 30_000 {
+            g.observe(&path, sample(t as u64, t, 11), t, false);
+            t += 1_000;
+        }
+        let at = g.next_stable_ms(t).expect("a held path has a deadline");
+        assert_eq!(
+            at,
+            i64::try_from(SETTLE_CEILING_MS).expect("fits"),
+            "the episode began at t=0, so the ceiling falls at exactly 60 s"
+        );
+        assert_eq!(
+            g.verdict(&path, at, SETTLE_CEILING_MS),
+            StabilityVerdict::Stable
+        );
+    }
+
+    /// A timestamp far in the future is a broken clock, and `verdict` skips the
+    /// mtime condition for it. The deadline must skip it too, or the file is
+    /// scheduled for whenever that clock thinks "later" is — i.e. never.
+    #[test]
+    fn an_implausibly_future_mtime_does_not_push_the_deadline_out() {
+        let mut g = gate();
+        let path = p("from-a-broken-clock.txt");
+        g.observe(&path, sample(10, 900_000, 5), 1_000, false);
+        assert_eq!(
+            g.next_stable_ms(1_000),
+            Some(6_000),
+            "the unchanged run decides; the future mtime is ignored"
+        );
+        assert_eq!(g.verdict(&path, 6_000, SETTLE), StabilityVerdict::Stable);
+    }
+
+    /// The engine asks one question of the whole gate, so the answer has to be
+    /// the soonest of many.
+    #[test]
+    fn the_deadline_is_the_soonest_of_every_held_path() {
+        let mut g = gate();
+        g.observe(&p("slow.bin"), sample(1, 0, 1), 10_000, false);
+        g.observe(&p("quick.txt"), sample(2, 0, 2), 1_000, true);
+        assert_eq!(
+            g.next_stable_ms(1_000),
+            Some(2_000),
+            "quick.txt clears first"
+        );
     }
 }

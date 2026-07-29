@@ -23,6 +23,7 @@ const DESKTOP_CAPABILITIES = {
   revealInFileManager: true,
   recording: false,
   sync: false,
+  overlayTitleBar: false,
 };
 
 function setVisibility(state: "hidden" | "visible"): void {

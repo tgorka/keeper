@@ -13,9 +13,11 @@
 use std::sync::Arc;
 
 use keeper_core::vm::{IpcError, IpcErrorCode};
-use keeper_sync::engine::PendingReason;
-use keeper_sync::profile::{LfsMode, ProfileState, SyncDirection, SyncLane};
-use keeper_sync::progress::{SyncPhase, SyncStatus};
+use keeper_sync::engine::{PendingReason, SyncOutcome};
+use keeper_sync::profile::{
+    LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS, DEFAULT_SETTLE_MS,
+};
+use keeper_sync::progress::{format_bytes, SyncPhase, SyncStatus};
 use keeper_sync::provenance::SyncSource;
 use keeper_sync::{ActivityKind, SyncError, SyncPlatform, SyncProfile};
 use serde::{Deserialize, Serialize};
@@ -61,9 +63,36 @@ pub struct SyncProfileVm {
     pub lfs_mode: String,
     #[ts(type = "number")]
     pub lfs_threshold_bytes: u64,
+    /// The quiescence window this profile PINS, or `None` when it pins none and
+    /// keeper picks (Story 34.5, AD-34-8). Not the same as the window in force:
+    /// see `effective_settle_ms`. The distinction is load-bearing — a form that
+    /// showed a substituted number as a pinned one would turn "let keeper
+    /// choose" into a hard-coded user value on the next save.
+    #[ts(type = "number | null")]
+    pub settle_ms: Option<u64>,
+    /// The quiescence window actually in force, substitutions included: 10 s on
+    /// removable media that pins nothing (`REMOVABLE_SETTLE_MS`), otherwise the
+    /// pinned value clamped to the ceiling. Every numeric knob has to be able to
+    /// show the number in force (AD-34-8), and this is that number.
     #[ts(type = "number")]
-    pub settle_ms: u64,
+    pub effective_settle_ms: u64,
+    /// The scan cadence this profile pins, or `None` when it pins none.
+    ///
+    /// The knob that actually governs sync latency: the engine paces its tree
+    /// walk by it (`scan_is_due`, DW-116). Until Story 34.5 it was reachable
+    /// only from `keeper-syncd`'s CLI.
+    #[ts(type = "number | null")]
+    pub poll_interval_ms: Option<u64>,
+    /// The scan cadence actually in force — the pinned value floored at
+    /// `MIN_POLL_INTERVAL_MS`, because a zero would re-stat the tree every tick.
+    #[ts(type = "number")]
+    pub effective_poll_interval_ms: u64,
     pub tags: Vec<String>,
+    /// Shapes the generated commit subject; empty means keeper's own
+    /// `sync(<profile>): 3 added, 1 modified`. Placeholders are a closed set
+    /// (`provenance::SUBJECT_PLACEHOLDERS`) and an unknown one is refused on
+    /// save. The trailer block is not shapeable — provenance is not decoration.
+    pub commit_subject_template: String,
     /// Overrides the commit author, in any of `Name <email>`, a bare address,
     /// or a bare display name. `None` keeps the device identity and its
     /// non-routable `sync@<device-id>.keeper.invalid` address.
@@ -86,8 +115,13 @@ impl From<&SyncProfile> for SyncProfileVm {
             removable: p.removable,
             lfs_mode: lfs_str(p.lfs_mode).to_owned(),
             lfs_threshold_bytes: p.lfs_threshold_bytes,
-            settle_ms: p.settle_ms,
+            settle_ms: (p.settle_ms != DEFAULT_SETTLE_MS).then_some(p.settle_ms),
+            effective_settle_ms: p.effective_settle_ms(),
+            poll_interval_ms: (p.poll_interval_ms != DEFAULT_POLL_INTERVAL_MS)
+                .then_some(p.poll_interval_ms),
+            effective_poll_interval_ms: p.effective_poll_interval_ms(),
             tags: p.tags.clone(),
+            commit_subject_template: p.commit_subject_template.clone(),
             author_override: p.author_override.clone(),
             enabled: p.enabled,
         }
@@ -119,6 +153,14 @@ pub struct SyncStatusVm {
     pub bytes_total: Option<u64>,
     #[ts(type = "number")]
     pub pending: u32,
+    /// Files the completeness gate is holding inside their quiescence window.
+    ///
+    /// Distinct from `pending`, which counts journal rows: a folder where a
+    /// thousand files are still being written has none of those, so `pending`
+    /// alone reported it as up to date (AD-34-10). `line` already says this in
+    /// words; the number is here so a surface can show it without parsing prose.
+    #[ts(type = "number")]
+    pub settling: u32,
     /// Sticky, last-write-wins, cleared only by a clean run — the same shape as
     /// `RecordingStatusVm::warning` so the banner behaves identically.
     pub warning: Option<String>,
@@ -143,6 +185,7 @@ impl From<&SyncStatus> for SyncStatusVm {
             bytes_done: s.bytes_done,
             bytes_total: s.bytes_total,
             pending: s.pending,
+            settling: s.settling,
             warning: s.warning.clone(),
             error: s.error.clone(),
             last_sync_ms: s.last_sync_ms,
@@ -152,6 +195,12 @@ impl From<&SyncStatus> for SyncStatusVm {
 }
 
 /// What one manual sync did.
+///
+/// Both the raw counts and the sentence composed from them, for the same
+/// reason [`SyncStatusVm`] carries both: the Sync view and the Settings row
+/// render the sentence verbatim, so the two surfaces cannot word one result
+/// two different ways, and a caller that wants to branch on the numbers still
+/// can.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
@@ -162,6 +211,14 @@ pub struct SyncOutcomeVm {
     #[ts(type = "number")]
     pub files_changed: u64,
     pub conflicts: Vec<String>,
+    /// Bytes this run moved over the network — the received pack plus every
+    /// LFS object transferred. Zero for a pass that found nothing to do, which
+    /// is the common and correct answer, never an error.
+    #[ts(type = "number")]
+    pub bytes: u64,
+    /// One sentence naming what happened, ready to render. See
+    /// [`outcome_line`].
+    pub line: String,
 }
 
 /// One recorded thing sync did to one file.
@@ -178,6 +235,12 @@ pub struct SyncActivityVm {
     /// `added` | `modified` | `deleted` | `conflict`.
     pub kind: String,
     pub path: String,
+    /// How big the file was, or `null` when nobody measured it: a row recorded
+    /// before sizes existed, or a deletion the repository no longer remembers
+    /// the size of. The list renders nothing at all for `null` — never `0 B`,
+    /// which would claim the file was empty.
+    #[ts(type = "number | null")]
+    pub size_bytes: Option<u64>,
 }
 
 /// One file sync has seen but not yet carried.
@@ -222,6 +285,12 @@ pub struct SyncProblemsVm {
 }
 
 /// Fields a caller may set when creating or updating a profile.
+///
+/// Every `Option` here means the same thing when it is `None`: **the caller did
+/// not express this field**, so `parse_req` leaves whatever the stored profile
+/// already has (AD-34-9). None of them is a "reset to the default" instruction;
+/// a caller that wants the default sends it. That rule is why adding a field to
+/// `SyncProfile` can no longer silently erase it on the next save from the app.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
@@ -243,8 +312,17 @@ pub struct SyncProfileReq {
     pub lfs_mode: String,
     #[ts(type = "number | null")]
     pub lfs_threshold_bytes: Option<u64>,
+    /// The quiescence window to pin. Sending `DEFAULT_SETTLE_MS` is how "let
+    /// keeper choose the wait" is expressed, which is what `effective_settle_ms`
+    /// reads as unpinned — so a removable folder gets its longer window back.
     #[ts(type = "number | null")]
     pub settle_ms: Option<u64>,
+    /// The scan cadence to pin, in the same shape. The engine paces its tree
+    /// walk by it, so this is the knob that governs how soon a change is noticed
+    /// (DW-116); before Story 34.5 the app could not send it at all and every
+    /// save reset a daemon-configured cadence back to 15 s.
+    #[ts(type = "number | null")]
+    pub poll_interval_ms: Option<u64>,
     #[serde(default)]
     pub tags: Vec<String>,
     /// Absent leaves whatever the stored profile already has, so a caller that
@@ -252,6 +330,13 @@ pub struct SyncProfileReq {
     /// clears the override back to the device identity.
     #[serde(default)]
     pub author_override: Option<String>,
+    /// Shapes the generated commit subject. An explicit empty string clears it
+    /// back to keeper's mechanical `sync(<profile>): 3 added, 1 modified`, which
+    /// is a real value here rather than a clearing sentinel — an empty template
+    /// IS the default. An unknown placeholder is refused with a message naming
+    /// it, before the profile is stored.
+    #[serde(default)]
+    pub commit_subject_template: Option<String>,
 }
 
 /// Mint an opaque, sortable, collision-free profile id.
@@ -363,15 +448,22 @@ pub fn sync_ipc_error(err: &SyncError) -> IpcError {
     }
 }
 
-/// Build the profile to store from a request, carrying forward everything the
-/// request cannot express.
+/// Build the profile to store from a request.
 ///
-/// `prior` is the stored profile when this is an update. It matters because
-/// `db::upsert_profile` replaces the whole JSON row, so any field this function
-/// leaves at its constructor default is silently ERASED on save. That is not
-/// hypothetical: before `prior` existed, saving an edit to a paused profile
-/// reset `enabled` to `true` and quietly resumed syncing a folder the user had
-/// deliberately stopped, and wiped any `author_override` set through the daemon.
+/// `prior` is the stored profile when this is an update, and it is the **base**
+/// rather than a source of fix-ups (AD-34-9): `db::upsert_profile` replaces the
+/// whole JSON row, so anything this function does not carry is erased on save.
+/// Cloning `prior` makes that structural — a field added to `SyncProfile` is
+/// preserved by default and has to be opted INTO the request, which is the
+/// inverse of the old shape and the reason this bug class is now closed.
+///
+/// It bit twice. The first shape built from `SyncProfile::new` with no `prior`
+/// at all, so saving an edit to a paused profile reset `enabled` to `true` and
+/// quietly resumed syncing a folder the user had deliberately stopped, and wiped
+/// any `author_override` set through the daemon. The fix for that re-added three
+/// survivors by name — and `poll_interval_ms`, which the engine started pacing
+/// its scans by on 2026-07-28 (DW-116), was not one of them, so every save from
+/// the app silently pulled the cadence back to 15 s.
 fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncProfile, IpcError> {
     let direction = match req.direction.as_str() {
         "bidirectional" => SyncDirection::Bidirectional,
@@ -403,12 +495,30 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
         }
     };
 
-    // A new profile needs an opaque stable id. The engine's ULID crate is not
-    // a dependency of the shell and does not need to be: any collision-free
-    // opaque string satisfies the contract, and the engine treats it as
-    // entirely opaque.
-    let id = req.id.clone().unwrap_or_else(new_profile_id);
-    let mut profile = SyncProfile::new(id, &req.name, &req.local_path, &req.remote_url);
+    // The stored profile IS the starting point. `SyncProfile::new` is reached
+    // only when there is nothing to start from, and even then the assignments
+    // below cover the same fields, so the two paths converge on one list of
+    // "everything a request expresses" that can be read top to bottom.
+    let mut profile = match prior {
+        // The id is deliberately not reassigned from the request: `prior` IS the
+        // row `req.id` named (`sync_profile_save` looked it up by exactly that),
+        // and a request naming a different one would be re-pointing a row rather
+        // than editing it.
+        Some(prior) => prior.clone(),
+        // A new profile needs an opaque stable id. The engine's ULID crate is
+        // not a dependency of the shell and does not need to be: any
+        // collision-free opaque string satisfies the contract, and the engine
+        // treats it as entirely opaque.
+        None => SyncProfile::new(
+            req.id.clone().unwrap_or_else(new_profile_id),
+            &req.name,
+            &req.local_path,
+            &req.remote_url,
+        ),
+    };
+    profile.name = req.name.clone();
+    profile.local_path = req.local_path.clone().into();
+    profile.remote_url = req.remote_url.clone();
     profile.branch = req.branch.clone();
     profile.direction = direction;
     profile.lane = lane;
@@ -416,31 +526,34 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
     profile.excludes = req.excludes.clone();
     profile.removable = req.removable;
     profile.lfs_mode = lfs_mode;
+    // Every `Option` below means "the caller did not express this", never "reset
+    // it": a form that shows a knob sends the value it showed, and one that does
+    // not show it must not be able to move it. `enabled` and `volume_id` have no
+    // slot at all and so cannot be touched from here — `enabled` moves only via
+    // the explicit pause/resume command, and the volume binding is minted by the
+    // engine on first sight of the media, where dropping it would leave the
+    // profile unbound and free to adopt whatever stick is mounted at its path,
+    // including one that would otherwise have been refused as `Foreign`.
     if let Some(bytes) = req.lfs_threshold_bytes {
         profile.lfs_threshold_bytes = bytes;
     }
     if let Some(ms) = req.settle_ms {
         profile.settle_ms = ms;
     }
-    profile.tags = req.tags.clone();
-    // Fields the request cannot carry survive from the stored profile, because
-    // the upsert replaces the whole row. `enabled` is only ever moved by the
-    // explicit pause/resume command; an edit must not resume a paused folder.
-    if let Some(prior) = prior {
-        profile.enabled = prior.enabled;
-        profile.author_override = prior.author_override.clone();
-        // The volume binding is minted by the engine on first sight of the
-        // media and must outlive an edit: dropping it here would leave the
-        // profile unbound, and an unbound profile adopts whatever volume is
-        // mounted at its path — including a different stick that would
-        // otherwise have been refused as `Foreign`.
-        profile.volume_id = prior.volume_id.clone();
+    if let Some(ms) = req.poll_interval_ms {
+        profile.poll_interval_ms = ms;
     }
+    profile.tags = req.tags.clone();
     // An explicit value overrides; an explicit empty string clears back to the
     // device identity, which is how the form offers "use the default".
     if let Some(author) = req.author_override.as_ref() {
         let trimmed = author.trim();
         profile.author_override = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    }
+    // An empty template is a real value rather than a clearing sentinel: it IS
+    // keeper's mechanical subject.
+    if let Some(template) = req.commit_subject_template.as_ref() {
+        profile.commit_subject_template = template.trim().to_owned();
     }
     // Validate here so a bad profile is rejected at the edge with an actionable
     // message rather than deep inside the engine.
@@ -498,6 +611,13 @@ pub async fn sync_profile_save(
 
 /// Forget a profile. The folder and its repository are left on disk untouched —
 /// removing a profile is a configuration change, never a deletion of content.
+///
+/// The one thing it deletes outside `sync.db` is the profile's stored remote
+/// credential, which `Engine::remove_profile` clears before it touches a row
+/// (AD-34-14). That is not an exception to the sentence above: the secret is
+/// keeper's own configuration, it never lived in the folder, and its keychain
+/// key is derived from the profile id — so a secret that outlived its profile
+/// could never be found again.
 #[tauri::command]
 pub async fn sync_profile_remove(
     state: tauri::State<'_, AppState>,
@@ -522,6 +642,72 @@ pub async fn sync_profile_set_enabled(
     Ok(SyncStatusVm::from(&status))
 }
 
+/// `s`, unless there is exactly one of whatever it is.
+fn plural(count: u64) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// The answer when a sync had nothing to do.
+///
+/// This is the common case for a folder that is already in sync, and it is a
+/// result rather than a failure. Saying it out loud is most of the point of
+/// AD-34-12: a pass that stages nothing finishes in milliseconds, far inside
+/// the 2 s status poll, so without a sentence of its own the button reads as
+/// dead.
+const NOTHING_TO_SYNC: &str = "Nothing to sync — this folder already matches the remote.";
+
+/// One sentence naming what a sync did.
+///
+/// Composed in Rust for the same reason `SyncStatusVm.line` is: the Sync view
+/// and the Settings row both render it verbatim, and two hand-written copies
+/// of one wording drift.
+///
+/// `pushed` and `pulled` are deliberately not reported as work. They say which
+/// legs the profile's direction allows, not that either leg carried anything,
+/// and announcing "pushed" over a no-op push is the same class of lie as
+/// `Keeper-Source: watch` on a manual sync. What is left is what actually
+/// happened: commits made, bytes moved, revisions kept aside. A failed pass
+/// never reaches here — the command returns `Err` and the caller renders that.
+fn outcome_line(outcome: &SyncOutcome) -> String {
+    let mut clauses: Vec<String> = Vec::new();
+    if outcome.files_changed > 0 {
+        // Only a profile that pushes ever commits, and a push that fails fails
+        // the whole pass, so by here these files really are on the remote.
+        clauses.push(format!(
+            "committed and pushed {} file{}",
+            outcome.files_changed,
+            plural(outcome.files_changed)
+        ));
+    }
+    if outcome.bytes > 0 {
+        clauses.push(format!("moved {}", format_bytes(outcome.bytes)));
+    }
+    if !outcome.conflicts.is_empty() {
+        let count = outcome.conflicts.len() as u64;
+        clauses.push(format!(
+            "kept your version of {count} file{} that changed in both places, \
+             alongside the remote's",
+            plural(count)
+        ));
+    }
+    if clauses.is_empty() {
+        return NOTHING_TO_SYNC.to_owned();
+    }
+
+    let mut line = clauses.join(", ");
+    line.push('.');
+    // Sentence case. Every clause above opens with an ASCII verb, so this is
+    // the sentence's first letter and nothing else.
+    if let Some(first) = line.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    line
+}
+
 /// Sync one profile now, ignoring the schedule.
 ///
 /// Named `sync_folder_now` rather than `sync_now`: the latter is already the
@@ -542,6 +728,8 @@ pub async fn sync_folder_now(
         pushed: outcome.pushed,
         pulled: outcome.pulled,
         files_changed: outcome.files_changed,
+        bytes: outcome.bytes,
+        line: outcome_line(&outcome),
         conflicts: outcome.conflicts,
     })
 }
@@ -570,6 +758,7 @@ pub async fn sync_activity(
             ts_ms: row.ts_ms,
             kind: activity_kind_str(row.kind).to_owned(),
             path: row.path,
+            size_bytes: row.size_bytes,
         })
         .collect())
 }
@@ -655,8 +844,8 @@ pub async fn sync_retry_parked(
 /// engine's own persistence can see it (never `sync.db`, never a config file),
 /// which is the port's stated contract.
 ///
-/// Write-only by design: there is no command that reads a token back out. The
-/// form can replace it or clear it, and that is the whole surface.
+/// Writing is the common direction, but not the only one: [`sync_get_credential`]
+/// reads the same key back when a person explicitly asks for it.
 #[tauri::command]
 pub async fn sync_set_credential(
     state: tauri::State<'_, AppState>,
@@ -667,6 +856,29 @@ pub async fn sync_set_credential(
     let platform = crate::sync::sync_platform(Arc::clone(&state.platform));
     platform
         .secret_set(&profile.secret_key(), &token)
+        .map_err(|err| sync_ipc_error(&err))
+}
+
+/// Read a profile's stored access token, on demand only.
+///
+/// Deliberately its own command rather than a field on [`SyncProfileVm`]
+/// (AD-34-7): loading a profile must not carry a secret to the frontend, so
+/// the token crosses the boundary only when someone asks for it by name. That
+/// keeps the keychain prompt — on the platforms that raise one — attached to a
+/// user action instead of to opening a form.
+///
+/// `Ok(None)` is the ordinary "no token stored" state rather than a failure: a
+/// profile on a public remote has none, and the caller needs to be able to say
+/// so instead of showing an empty box that reads like a broken read.
+#[tauri::command]
+pub async fn sync_get_credential(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<Option<String>, IpcError> {
+    let profile = profile_by_id(&state, &id)?;
+    let platform = crate::sync::sync_platform(Arc::clone(&state.platform));
+    platform
+        .secret_get(&profile.secret_key())
         .map_err(|err| sync_ipc_error(&err))
 }
 
@@ -683,6 +895,61 @@ pub async fn sync_clear_credential(
     platform
         .secret_delete(&profile.secret_key())
         .map_err(|err| sync_ipc_error(&err))
+}
+
+/// This installation's identity, as Settings shows it (Story 34.5).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncDeviceVm {
+    /// The stable id, shown but not editable. Every commit's `Keeper-Device`
+    /// trailer records it beside the label so two machines the user has called
+    /// the same thing stay distinguishable in a shared history, and the git
+    /// author address is derived from it — so a rename must not move it.
+    pub id: String,
+    /// The editable name. Reaches the next commit; rewrites no old one.
+    pub label: String,
+}
+
+impl From<keeper_sync::db::DeviceIdentity> for SyncDeviceVm {
+    fn from(d: keeper_sync::db::DeviceIdentity) -> Self {
+        Self {
+            id: d.id,
+            label: d.label,
+        }
+    }
+}
+
+/// This device's identity — the name that rides every commit keeper makes.
+///
+/// Minted once from the machine's hostname at first open and the user's from
+/// then on, which is why it is read from the engine rather than re-derived: a
+/// renamed device must not answer with its hostname again.
+///
+/// Rejects with: `unsupported` (no usable git), `internal`.
+#[tauri::command]
+pub async fn sync_device(state: tauri::State<'_, AppState>) -> Result<SyncDeviceVm, IpcError> {
+    let engine = engine_of(&state)?;
+    Ok(engine.device().into())
+}
+
+/// Rename this device, returning the identity as stored.
+///
+/// Returns the stored form rather than echoing the argument, because the store
+/// trims it and refuses an empty one — a caller that assumed its own string had
+/// been kept verbatim would render a label the trailers do not use.
+///
+/// Rejects with: `unsupported`, `internal` (an empty label).
+#[tauri::command]
+pub async fn sync_device_set_label(
+    state: tauri::State<'_, AppState>,
+    label: String,
+) -> Result<SyncDeviceVm, IpcError> {
+    let engine = engine_of(&state)?;
+    engine
+        .set_device_label(&label)
+        .map_err(|err| sync_ipc_error(&err))?;
+    Ok(engine.device().into())
 }
 
 /// Resolve a profile by id, or report it as a config error naming the id.
@@ -745,6 +1012,11 @@ pub struct SyncProgressVm {
     /// UI must render an indeterminate meter rather than invent a denominator.
     #[ts(type = "number | null")]
     pub fraction: Option<f64>,
+    /// Whole bytes per second, or `null` when there is no honest figure — too
+    /// little time measured, or nothing moving. Never zero: "0 B/s" would claim
+    /// a measurement of an idle wire, so the UI renders `null` as nothing.
+    #[ts(type = "number | null")]
+    pub bytes_per_second: Option<u64>,
 }
 
 /// Stream sync progress until the channel closes.
@@ -769,6 +1041,7 @@ pub async fn sync_subscribe_progress(
             bytes_total: event.bytes_total,
             current: event.current.clone(),
             fraction: event.fraction(),
+            bytes_per_second: event.bytes_per_second,
         };
         channel.send(vm).is_ok()
     }));
@@ -857,9 +1130,234 @@ mod tests {
             lfs_mode: "materialize".into(),
             lfs_threshold_bytes: None,
             settle_ms: None,
+            poll_interval_ms: None,
             tags: vec![],
             author_override: None,
+            commit_subject_template: None,
         }
+    }
+
+    /// Every serialized field of `SyncProfile`, split by whether a request can
+    /// express it. These are the exact keys `db::upsert_profile` writes into the
+    /// row, which is why the split is stated over the JSON rather than over the
+    /// struct: the bug is a lost KEY, and serde is what decides what a key is.
+    ///
+    /// A field the request has a slot for.
+    const EXPRESSED: [&str; 16] = [
+        "name",
+        "localPath",
+        "remoteUrl",
+        "branch",
+        "direction",
+        "lane",
+        "subpaths",
+        "excludes",
+        "removable",
+        "lfsMode",
+        "lfsThresholdBytes",
+        "settleMs",
+        "pollIntervalMs",
+        "tags",
+        "authorOverride",
+        "commitSubjectTemplate",
+    ];
+
+    /// A field no request can express, which `parse_req` must therefore never
+    /// touch. `enabled` moves only through pause/resume, `volumeId` is minted by
+    /// the engine on first sight of the media, and `id` names the row.
+    const PRESERVED: [&str; 3] = ["id", "volumeId", "enabled"];
+
+    fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
+        match serde_json::to_value(profile).expect("a profile serializes") {
+            serde_json::Value::Object(map) => map,
+            other => panic!("a profile is a JSON object, got {other}"),
+        }
+    }
+
+    /// AD-34-9, mechanized. The old `parse_req` rebuilt the profile from
+    /// `SyncProfile::new` and re-added three survivors by name, so a field added
+    /// to `SyncProfile` after that list was written was silently reset by every
+    /// save from the app — `poll_interval_ms` for two months (DW-116).
+    ///
+    /// This is written to fail when a twelfth field arrives and nobody thinks
+    /// about it, which takes three assertions rather than one:
+    ///
+    /// 1. The classification is COMPLETE, so a new field fails here until it is
+    ///    named as expressible or preserved — one line away from `parse_req`.
+    /// 2. Nothing preserved moved, which is the property itself.
+    /// 3. Every preserved field holds a value a fresh profile would NOT have, so
+    ///    assertion 2 cannot pass by coincidence. Add a preserved field and this
+    ///    fails until the fixture below gives it a distinctive value — at which
+    ///    point assertion 2 genuinely bites.
+    ///
+    /// No reflection is involved: serde's own field names are the same mechanism
+    /// the row is written with, so the test cannot disagree with the store.
+    #[test]
+    fn a_save_cannot_move_a_field_no_request_can_express() {
+        // Everything unexpressible, set to something a fresh profile never has.
+        let mut prior = parse_req(&req(), None).expect("valid");
+        prior.enabled = false;
+        prior.volume_id = Some("01VOLUME".into());
+
+        // An edit that moves every field it CAN move, so nothing below passes by
+        // standing still.
+        let mut edit = req();
+        edit.id = Some(prior.id.clone());
+        edit.name = "renamed".into();
+        edit.local_path = "/home/u/elsewhere".into();
+        edit.remote_url = "https://git.example/u/elsewhere.git".into();
+        edit.branch = "trunk".into();
+        // A worktree lane is legal only together with `pushOnly`, so these two
+        // move as a pair.
+        edit.direction = "pushOnly".into();
+        edit.lane = "worktree".into();
+        edit.subpaths = vec!["notes".into()];
+        edit.excludes = vec!["*.tmp".into()];
+        edit.removable = true;
+        edit.lfs_mode = "pointerOnly".into();
+        edit.lfs_threshold_bytes = Some(8 * 1024 * 1024);
+        edit.settle_ms = Some(9_000);
+        edit.poll_interval_ms = Some(45_000);
+        edit.tags = vec!["drive".into()];
+        edit.author_override = Some("Ada <ada@example.org>".into());
+        edit.commit_subject_template = Some("{profile}: {changed}".into());
+        let merged = parse_req(&edit, Some(&prior)).expect("valid");
+
+        let before = json_fields(&prior);
+        let after = json_fields(&merged);
+        let fresh = json_fields(&SyncProfile::new(
+            "00DIFFERENTID",
+            "unused",
+            "/unused",
+            "unused",
+        ));
+
+        let mut classified: Vec<&str> = EXPRESSED.iter().chain(PRESERVED.iter()).copied().collect();
+        classified.sort_unstable();
+        let mut actual: Vec<&str> = before.keys().map(String::as_str).collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, classified,
+            "SyncProfile gained or lost a field: name it in EXPRESSED (parse_req \
+             assigns it from the request) or in PRESERVED (parse_req must never \
+             touch it), and make sure parse_req agrees"
+        );
+
+        for key in PRESERVED {
+            assert_eq!(
+                before.get(key),
+                after.get(key),
+                "saving moved `{key}`, which no request can express"
+            );
+            assert_ne!(
+                before.get(key),
+                fresh.get(key),
+                "the fixture leaves `{key}` at a fresh profile's value, so the \
+                 assertion above would pass however parse_req behaved — give it \
+                 a distinctive value in `prior`"
+            );
+        }
+
+        for key in EXPRESSED {
+            assert_ne!(
+                before.get(key),
+                after.get(key),
+                "`{key}` is listed as expressible but the edit did not move it: \
+                 either parse_req does not assign it, or this test's `edit` does \
+                 not change it"
+            );
+        }
+    }
+
+    /// The concrete case AD-34-9 was written for, spelled out beside the general
+    /// one: `poll_interval_ms` became load-bearing on 2026-07-28 (DW-116) and
+    /// `parse_req` did not know about it, so every save from the app pulled a
+    /// cadence configured through `keeper-syncd` back to 15 s — silently, with
+    /// nothing in the UI to hint that the folder had just got slower.
+    #[test]
+    fn saving_an_edit_does_not_reset_a_daemon_configured_scan_cadence() {
+        let mut prior = parse_req(&req(), None).expect("valid");
+        prior.poll_interval_ms = 45_000;
+
+        let mut edit = req();
+        edit.id = Some(prior.id.clone());
+        edit.name = "renamed".into();
+        // The form did not show the cadence, so it says nothing about it.
+        assert!(edit.poll_interval_ms.is_none());
+
+        let merged = parse_req(&edit, Some(&prior)).expect("valid");
+        assert_eq!(merged.poll_interval_ms, 45_000);
+        assert_eq!(merged.effective_poll_interval_ms(), 45_000);
+    }
+
+    #[test]
+    fn a_commit_subject_template_round_trips_and_a_bad_one_is_refused_at_the_edge() {
+        let mut set = req();
+        set.commit_subject_template = Some("  {profile}: {changed} files  ".into());
+        let stored = parse_req(&set, None).expect("valid");
+        assert_eq!(stored.commit_subject_template, "{profile}: {changed} files");
+        assert_eq!(
+            SyncProfileVm::from(&stored).commit_subject_template,
+            "{profile}: {changed} files"
+        );
+
+        // An empty string is a real value here, not an omission: it IS keeper's
+        // mechanical subject, so it clears a template rather than keeping one.
+        let mut cleared = req();
+        cleared.commit_subject_template = Some(String::new());
+        assert_eq!(
+            parse_req(&cleared, Some(&stored))
+                .expect("valid")
+                .commit_subject_template,
+            ""
+        );
+
+        // A typo is refused where the user can still see the field, with a
+        // message naming it — not rendered into every commit from here on.
+        let mut typo = req();
+        typo.commit_subject_template = Some("{Profile} moved".into());
+        let err = parse_req(&typo, None).expect_err("must reject");
+        assert_eq!(err.code, IpcErrorCode::Internal);
+        assert!(
+            err.message.contains("{Profile}"),
+            "the message must name the placeholder: {}",
+            err.message
+        );
+    }
+
+    /// AD-34-8. A form that showed a number the backend was about to substitute
+    /// would be lying, and one that turned that substitution into a pinned value
+    /// on the next save would take "let keeper choose" away for good. So the view
+    /// model says both things: what the profile pins, and what is in force.
+    #[test]
+    fn the_view_model_separates_a_pinned_knob_from_the_one_in_force() {
+        let mut unpinned = parse_req(&req(), None).expect("valid");
+        let vm = SyncProfileVm::from(&unpinned);
+        assert_eq!(vm.settle_ms, None, "a profile that pins nothing says so");
+        assert_eq!(vm.effective_settle_ms, DEFAULT_SETTLE_MS);
+        assert_eq!(vm.poll_interval_ms, None);
+        assert_eq!(vm.effective_poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
+
+        // The measured bug: a removable folder showed 5 while 10 was in force.
+        unpinned.removable = true;
+        let vm = SyncProfileVm::from(&unpinned);
+        assert_eq!(vm.settle_ms, None);
+        assert_eq!(vm.effective_settle_ms, 10_000);
+
+        let mut pinned = unpinned.clone();
+        pinned.settle_ms = 30_000;
+        pinned.poll_interval_ms = 1_000;
+        let vm = SyncProfileVm::from(&pinned);
+        assert_eq!(vm.settle_ms, Some(30_000));
+        assert_eq!(
+            vm.effective_settle_ms, 30_000,
+            "a pin beats the substitution"
+        );
+        assert_eq!(vm.poll_interval_ms, Some(1_000));
+        assert_eq!(
+            vm.effective_poll_interval_ms, 2_000,
+            "a cadence below the floor is floored, and the form has to say so"
+        );
     }
 
     /// The bug this guards: `db::upsert_profile` replaces the whole JSON row,
@@ -1008,5 +1506,72 @@ mod tests {
             !auth.retriable,
             "retrying rejected credentials gets an account locked"
         );
+    }
+
+    /// AD-34-12. `Sync now` returned a full outcome and the UI rendered none
+    /// of it, so a successful click produced no visible statement at all — the
+    /// reported symptom was "even after clicking Sync now I cannot see that
+    /// sync works". Every case has to say something, and each has to say
+    /// something different.
+    #[test]
+    fn every_kind_of_pass_states_what_it_did() {
+        // Nothing to do is a result, not silence and not a failure.
+        assert_eq!(
+            outcome_line(&SyncOutcome {
+                pulled: true,
+                pushed: true,
+                ..SyncOutcome::default()
+            }),
+            NOTHING_TO_SYNC
+        );
+
+        // Work that happened, named.
+        assert_eq!(
+            outcome_line(&SyncOutcome {
+                committed: Some("main".to_owned()),
+                pushed: true,
+                files_changed: 3,
+                bytes: 2_048,
+                ..SyncOutcome::default()
+            }),
+            "Committed and pushed 3 files, moved 2 KB."
+        );
+
+        // A pull that carried bytes but committed nothing locally still moved
+        // something, and must not read as "nothing to do".
+        assert_eq!(
+            outcome_line(&SyncOutcome {
+                pulled: true,
+                bytes: 3_072,
+                ..SyncOutcome::default()
+            }),
+            "Moved 3 KB."
+        );
+
+        // A conflict is not a checkmark: both revisions survive and the user
+        // has to look.
+        let line = outcome_line(&SyncOutcome {
+            pulled: true,
+            conflicts: vec!["notes.sync-conflict-20250725-120000-host.md".to_owned()],
+            ..SyncOutcome::default()
+        });
+        assert_eq!(
+            line,
+            "Kept your version of 1 file that changed in both places, alongside the remote's."
+        );
+    }
+
+    /// A pass whose legs all ran and moved nothing is the single most common
+    /// outcome, and reporting it as "pushed" would be the same lie the
+    /// provenance half of this story exists to remove.
+    #[test]
+    fn a_leg_that_ran_is_never_reported_as_work_it_did_not_do() {
+        let ran_everything = SyncOutcome {
+            pushed: true,
+            pulled: true,
+            ..SyncOutcome::default()
+        };
+        assert_eq!(outcome_line(&ran_everything), NOTHING_TO_SYNC);
+        assert!(!outcome_line(&ran_everything).contains("push"));
     }
 }

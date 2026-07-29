@@ -95,6 +95,36 @@ pub const BUILTIN_EXCLUDES: &[&str] = &[
     ".directory",    // KDE folder settings
     ".Trash-*",
     "**/.Trash-*/**",
+    // --- Regenerable dependency and cache trees ----------------------------
+    // Names a toolchain *reserves*, never ones a human picks for their own
+    // content, so excluding them unconditionally cannot surprise anyone. Both
+    // forms, per the module doc: the name so the wrapper directory is skipped,
+    // and the subtree so nothing inside it leaks.
+    //
+    // Deliberately NOT here: `target`, `dist` and `build`. Tier 0 is
+    // unconditional and invisible — an excluded path is never staged and never
+    // reported as pending — and those three are ordinary English words that a
+    // photo library, a woodworking archive or a marketing folder will use for
+    // real content. Their build-output meaning is *contextual*: only a `target`
+    // beside a `Cargo.toml` is Rust's, only a `build` beside a `CMakeLists.txt`
+    // is CMake's, and this tier matches names, not context (it never touches
+    // the filesystem, which is what makes it one compiled glob set). The right
+    // authority for them is `.gitignore`: git already honours it
+    // (`git::repo`'s status walk), every real project already carries those
+    // three in it, and the user can read and edit it. So putting them here
+    // would buy almost nothing for projects and cost someone their `build/`
+    // folder, silently. A user who wants them gone can say so per profile
+    // through `SyncProfile::excludes`, which is visible and reversible.
+    "node_modules",
+    "**/node_modules/**",
+    "__pycache__",
+    "**/__pycache__/**",
+    ".venv",
+    "**/.venv/**",
+    ".next",
+    "**/.next/**",
+    ".cache",
+    "**/.cache/**",
     // --- Engine-owned trees ------------------------------------------------
     // The repository's own metadata and our volume marker are engine state,
     // never user content. Both forms: anchored for the profile root, and
@@ -264,9 +294,78 @@ mod tests {
             (".git/config", "repository metadata"),
             ("vendor/lib/.git/HEAD", "nested repository metadata"),
             (".keeper-sync/volume.json", "engine volume marker"),
+            ("node_modules", "npm tree, as a name"),
+            ("node_modules/react/index.js", "npm tree, as a subtree"),
+            ("app/node_modules/left-pad/x.js", "npm tree, nested"),
+            ("__pycache__/mod.cpython-312.pyc", "python bytecode cache"),
+            ("pkg/sub/__pycache__/a.pyc", "python bytecode cache, nested"),
+            (".venv/lib/python3.12/site-packages/x.py", "virtualenv"),
+            (".next/server/pages/index.js", "next.js build cache"),
+            (".cache/babel/abc.json", "generic tool cache"),
         ];
         for (path, why) in cases {
             assert!(excluded(&set, path), "{path} should be excluded ({why})");
+        }
+    }
+
+    /// The three names the field report asked for that tier 0 must NOT take.
+    ///
+    /// `target`, `dist` and `build` are ordinary English words. Tier 0 is
+    /// unconditional and invisible, so putting them here would silently and
+    /// permanently unsync a woodworking archive's `build/`, a design studio's
+    /// `dist/`, or a marketing folder's `target/` — with no pending row to
+    /// reveal that it happened. `.gitignore` is the authority for them: git
+    /// honours it, every real project already lists them there, and a user can
+    /// read and change it.
+    #[test]
+    fn ordinary_english_build_directory_names_are_not_tier_zero() {
+        let set = default_set();
+        for path in [
+            "build/bench-plan.pdf",
+            "target/q3-audience.numbers",
+            "dist/press-kit.zip",
+            "workshop/build/cut-list.txt",
+            "campaign/target/brief.docx",
+        ] {
+            assert!(
+                !excluded(&set, path),
+                "{path} must stay visible — tier 0 cannot tell a build tree from a folder \
+                 someone named after one, and .gitignore already covers the build tree"
+            );
+        }
+        for name in ["build", "dist", "target", "**/build/**"] {
+            assert!(
+                !BUILTIN_EXCLUDES.contains(&name),
+                "{name} is contextual, not a reserved name; it belongs in .gitignore"
+            );
+        }
+    }
+
+    /// Both forms or neither: a name rule alone leaks every file inside the
+    /// directory, and a subtree rule alone leaks the directory itself.
+    #[test]
+    fn every_directory_shaped_convention_carries_a_name_and_a_subtree_rule() {
+        for name in [
+            "node_modules",
+            "__pycache__",
+            ".venv",
+            ".next",
+            ".cache",
+            ".Spotlight-V100",
+            ".fseventsd",
+            ".TemporaryItems",
+            ".Trashes",
+            ".DocumentRevisions-V100",
+        ] {
+            assert!(
+                BUILTIN_EXCLUDES.contains(&name),
+                "{name} needs a bare name rule so the directory itself is skipped"
+            );
+            let subtree = format!("**/{name}/**");
+            assert!(
+                BUILTIN_EXCLUDES.contains(&subtree.as_str()),
+                "{name} needs {subtree} too, or every file inside it is synced"
+            );
         }
     }
 

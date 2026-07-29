@@ -533,6 +533,17 @@ impl Drop for FolderWatcher {
     }
 }
 
+/// `Send` is load-bearing rather than incidental: since AD-34-11 the engine
+/// holds one watcher per profile inside a `Mutex` on a value shared across tokio
+/// tasks, which makes `Mutex<..>: Sync` — and therefore this — a requirement.
+/// It comes from `notify`'s own `unsafe impl Send` for the platform backends, so
+/// it is asserted here, where those types live, rather than discovered as a
+/// baffling error about `Engine` after a dependency bump.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<FolderWatcher>();
+};
+
 /// Translate a `notify` failure into the engine's taxonomy.
 ///
 /// `MaxFilesWatch` gets its own message because it is the one watcher failure a

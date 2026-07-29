@@ -10,7 +10,7 @@ vi.mock("@/lib/ipc/client", () => ({
   syncVerify: vi.fn(),
 }));
 
-import type { SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
+import type { SyncOutcomeVm, SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
 import {
   syncFolderNow,
   syncProfileRemove,
@@ -58,8 +58,12 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     removable: false,
     lfsMode: "materialize",
     lfsThresholdBytes: 4 * 1024 * 1024,
-    settleMs: 5000,
+    settleMs: null,
+    effectiveSettleMs: 5_000,
+    pollIntervalMs: null,
+    effectivePollIntervalMs: 15_000,
     tags: [],
+    commitSubjectTemplate: "",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -78,6 +82,7 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
     bytesDone: 0,
     bytesTotal: null,
     pending: 0,
+    settling: 0,
     warning: null,
     error: null,
     lastSyncMs: null,
@@ -190,8 +195,10 @@ describe("actions", () => {
       lfsMode: "materialize",
       lfsThresholdBytes: null,
       settleMs: null,
+      pollIntervalMs: null,
       tags: [],
       authorOverride: null,
+      commitSubjectTemplate: null,
     });
 
     expect(result).toEqual(saved);
@@ -217,8 +224,10 @@ describe("actions", () => {
         lfsMode: "materialize",
         lfsThresholdBytes: null,
         settleMs: null,
+        pollIntervalMs: null,
         tags: [],
         authorOverride: null,
+        commitSubjectTemplate: null,
       }),
     ).rejects.toMatchObject({ message: "local path must be absolute" });
     // A rejected write is the caller's to surface; it is not a read failure.
@@ -240,20 +249,24 @@ describe("actions", () => {
     expect(syncStore.getState().profiles?.[0].enabled).toBe(false);
   });
 
-  it("syncNow resolves the outcome and refreshes the statuses", async () => {
+  it("syncNow resolves the whole outcome and refreshes the statuses", async () => {
     await ensureSyncHydrated();
-    mockFolderNow.mockResolvedValue({
+    // The sentence and the byte figure are the report the UI renders; a store
+    // action that dropped either would leave the click with nothing to show,
+    // which is the bug (AD-34-12).
+    const outcome: SyncOutcomeVm = {
       committed: true,
       pushed: true,
       pulled: false,
       filesChanged: 3,
       conflicts: [],
-    });
+      bytes: 2_048,
+      line: "Committed and pushed 3 files, moved 2 KB.",
+    };
+    mockFolderNow.mockResolvedValue(outcome);
     mockStatuses.mockResolvedValue([statusVm({ line: "tgdrive — up to date just now" })]);
 
-    const outcome = await syncProfileNow("p1");
-
-    expect(outcome.filesChanged).toBe(3);
+    await expect(syncProfileNow("p1")).resolves.toEqual(outcome);
     expect(syncStore.getState().statuses.p1.line).toBe("tgdrive — up to date just now");
   });
 

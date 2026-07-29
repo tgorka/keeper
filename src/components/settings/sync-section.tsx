@@ -1,21 +1,25 @@
 /**
- * Settings → Sync section (Epic 29, Stories 29.4 + 29.5, FR-77..FR-93).
+ * Settings → Sync section (Epic 29, Stories 29.4 + 29.5, FR-77..FR-93; Epic 34,
+ * Story 34.7).
  *
  * Lists every configured folder↔repository binding with the status line Rust
  * composed for it, and lets a folder be synced now, paused, resumed, edited or
  * removed. Both adding and editing are the shared {@link AddFolderForm} (Story
  * 33.4) in its two modes, which the Sync view renders too — the form carries
- * rules Rust enforces, and two copies of it would drift. This is the surface
- * that removes a folder, so it is also the surface where "I typed the remote
- * wrong" used to mean removing it and starting over. The whole section is
+ * rules Rust enforces, and two copies of it would drift. Removal is shared the
+ * same way and for the same reason: the Sync view's folder card renders this
+ * section's confirmation constants and calls the same store action, so the two
+ * surfaces cannot describe what removal keeps differently. The whole section is
  * capability-gated at its call site (`CapabilitiesVm.sync`): a machine with no
  * usable `git` gets no sync UI at all, never a disabled or failing one.
  *
  * Two rules this surface exists to honor:
  *   - `SyncStatusVm.line` is rendered verbatim. It is composed in Rust so the
  *     tray and this window can never word the same state differently.
- *   - Removing a profile is a configuration change. The folder and everything
- *     in it stay on disk, and the confirmation says so in those words.
+ *   - Removing a profile is a configuration change: the folder, its contents
+ *     and its git repository stay on disk, and the settings and the stored
+ *     access token are the only things deleted. The confirmation says both
+ *     halves in those words.
  */
 import { useEffect, useState } from "react";
 import { AddFolderForm, SYNC_ADD_TITLE, SYNC_EDIT_TITLE } from "@/components/sync/add-folder-form";
@@ -31,8 +35,14 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
-import type { SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
+import type { SyncDeviceVm, SyncOutcomeVm, SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
+// Read and written straight through rather than through the mirror store: the
+// device name is one app-global string nothing else changes, so mirroring it
+// would be a second source of truth for a value read once per open.
+import { syncDevice, syncDeviceSetLabel } from "@/lib/ipc/client";
 import {
   ensureSyncHydrated,
   isSyncStatusActive,
@@ -83,12 +93,43 @@ export const SYNC_ATTENTION_FALLBACK_SENTENCE =
 /** Accessible name for a row's progress meter. */
 export const SYNC_PROGRESS_LABEL = "Sync progress";
 
-/** The remove confirmation. Says plainly that nothing on disk is deleted. */
+/**
+ * The remove confirmation, shared verbatim with the Sync view's folder card so
+ * the two surfaces cannot promise different things about what removal keeps.
+ *
+ * It has to name both halves, because removal is not symmetric: the settings
+ * and the stored access token go (AD-34-14 — the token's keychain key is
+ * derived from the profile id, so one that outlived its folder could never be
+ * found again, let alone deleted), while the folder, its contents and its git
+ * repository are left exactly as they are.
+ */
 export const SYNC_REMOVE_CONFIRM_TITLE = "Stop syncing this folder?";
 export const SYNC_REMOVE_CONFIRM_SENTENCE =
-  "keeper stops syncing this folder and forgets its settings. The folder and its contents are left on disk exactly as they are — removing a folder never deletes anything.";
+  "keeper stops syncing this folder, forgets its settings and deletes the access token it stored for the remote. The folder, its contents and its git repository are left on disk exactly as they are — removing a folder never deletes your files.";
 export const SYNC_REMOVE_CONFIRM_LABEL = "Stop syncing";
 export const SYNC_REMOVE_CANCEL_LABEL = "Keep syncing";
+
+/**
+ * The device name (Story 34.5). It is not a per-folder setting: one name goes
+ * into every commit keeper makes, in every folder, plus the filename of any
+ * second copy it has to keep — so it lives beside the folder list rather than in
+ * the form.
+ *
+ * The note has to say what a rename does NOT do. Nothing rewrites history, so a
+ * `git log` from before the rename keeps the name this machine had then, and
+ * someone who renames a machine to correct a mistake should not be left
+ * expecting old commits to change.
+ */
+export const SYNC_DEVICE_TITLE = "This device";
+export const SYNC_DEVICE_NAME_LABEL = "Device name";
+export const SYNC_DEVICE_NOTE =
+  "keeper writes this name into every commit it makes, in every folder, and into the filename of any second copy it has to keep when two machines change the same file. Renaming it changes what later commits say — the ones already made keep the name this machine had then.";
+export const SYNC_DEVICE_SAVE_LABEL = "Rename";
+export const SYNC_DEVICE_SAVED_SENTENCE = "The next commit will carry the new name.";
+/** The stable id, shown because it is in every trailer and never changes. */
+export const SYNC_DEVICE_ID_LABEL = "Identifier";
+export const SYNC_DEVICE_ID_NOTE =
+  "Not editable and never changes — it is what tells this machine apart from another one with the same name.";
 
 /**
  * The host a git remote points at — the part worth showing in a settings row.
@@ -115,6 +156,17 @@ export function SyncSection({ open }: { open: boolean }) {
   const statuses = useSyncStore((state) => state.statuses);
   const readError = useSyncStore((state) => state.error);
 
+  /**
+   * The device identity, read once per open. Not in the mirror store: nothing
+   * outside this block changes it, so polling it would buy nothing.
+   */
+  const [device, setDevice] = useState<SyncDeviceVm | null>(null);
+  const [deviceName, setDeviceName] = useState("");
+  const [deviceBusy, setDeviceBusy] = useState(false);
+  const [deviceError, setDeviceError] = useState<string | null>(null);
+  /** Whether a rename went through; nothing else on screen would report it. */
+  const [deviceRenamed, setDeviceRenamed] = useState(false);
+
   // Hydrate on open and poll for as long as the dialog stays open; the stop
   // function tears the poll down on close (and on unmount).
   useEffect(() => {
@@ -122,8 +174,46 @@ export function SyncSection({ open }: { open: boolean }) {
       return;
     }
     void ensureSyncHydrated();
-    return startSyncStatusPolling();
+    let live = true;
+    void (async () => {
+      try {
+        const read = await syncDevice();
+        if (live) {
+          setDevice(read);
+          setDeviceName(read.label);
+        }
+      } catch (raw) {
+        if (live) {
+          setDeviceError(syncErrorMessage(raw));
+        }
+      }
+    })();
+    const stopPolling = startSyncStatusPolling();
+    return () => {
+      live = false;
+      stopPolling();
+    };
   }, [open]);
+
+  const renameDevice = async () => {
+    setDeviceBusy(true);
+    setDeviceError(null);
+    setDeviceRenamed(false);
+    try {
+      const stored = await syncDeviceSetLabel(deviceName);
+      setDevice(stored);
+      // Seeded from what was STORED, not from what was typed: Rust trims, and a
+      // box that kept the untrimmed text would disagree with the trailers.
+      setDeviceName(stored.label);
+      setDeviceRenamed(true);
+    } catch (raw) {
+      setDeviceError(syncErrorMessage(raw));
+    } finally {
+      setDeviceBusy(false);
+    }
+  };
+  const renameable =
+    device !== null && deviceName.trim() !== "" && deviceName.trim() !== device.label;
 
   return (
     <div className="mt-2 flex flex-col gap-3 border-border border-t pt-3 text-sm">
@@ -143,7 +233,52 @@ export function SyncSection({ open }: { open: boolean }) {
       })}
       <div className="mt-1 flex flex-col gap-2 border-border border-t pt-3">
         <p className="font-medium">{SYNC_ADD_TITLE}</p>
+        {/* No `onCancel`, unlike the Sync view's disclosure: this form is a
+            permanent part of the section, so a discard would have nothing to
+            close and would have to mean "clear the fields" instead — a second
+            meaning for the same control, on the one surface where abandoning a
+            draft already costs a single click on the dialog. */}
         <AddFolderForm disabled={profiles === null} />
+      </div>
+      <div className="mt-1 flex flex-col gap-2 border-border border-t pt-3">
+        <p className="font-medium">{SYNC_DEVICE_TITLE}</p>
+        <div className="flex items-center justify-between gap-2">
+          <Label htmlFor="sync-device-name">{SYNC_DEVICE_NAME_LABEL}</Label>
+          <div className="flex items-center gap-1">
+            <Input
+              id="sync-device-name"
+              className="w-56"
+              value={deviceName}
+              disabled={device === null || deviceBusy}
+              onChange={(event) => {
+                setDeviceRenamed(false);
+                setDeviceName(event.target.value);
+              }}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={!renameable || deviceBusy}
+              onClick={() => {
+                void renameDevice();
+              }}
+            >
+              {SYNC_DEVICE_SAVE_LABEL}
+            </Button>
+          </div>
+        </div>
+        <p className="text-muted-foreground text-xs">{SYNC_DEVICE_NOTE}</p>
+        {deviceRenamed && (
+          <p className="text-muted-foreground text-xs">{SYNC_DEVICE_SAVED_SENTENCE}</p>
+        )}
+        {deviceError !== null && <p className="text-destructive text-xs">{deviceError}</p>}
+        {device !== null && (
+          <p className="font-mono text-muted-foreground text-xs">
+            {SYNC_DEVICE_ID_LABEL}: {device.id}
+          </p>
+        )}
+        {device !== null && <p className="text-muted-foreground text-xs">{SYNC_DEVICE_ID_NOTE}</p>}
       </div>
     </div>
   );
@@ -159,6 +294,16 @@ function SyncProfileRow({
 }) {
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  /**
+   * What the last `Sync now` on this row did, or `null` before one has run.
+   *
+   * Held here rather than read off the polled status: a pass that stages
+   * nothing finishes in milliseconds while the status poll runs at 2 s (10 s
+   * when idle), so a report that waited for the poll would arrive long after
+   * the click, if the status moved at all. It never has to — "nothing to do"
+   * leaves the status exactly as it was.
+   */
+  const [outcome, setOutcome] = useState<SyncOutcomeVm | null>(null);
   const [problems, setProblems] = useState<string[] | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   /**
@@ -171,6 +316,9 @@ function SyncProfileRow({
   const run = async (action: () => Promise<void>) => {
     setBusy(true);
     setActionError(null);
+    // Any action supersedes the last sync report: Pause and Remove make it
+    // stale, and a fresh Sync now is about to replace it.
+    setOutcome(null);
     try {
       await action();
     } catch (raw) {
@@ -206,7 +354,7 @@ function SyncProfileRow({
             disabled={busy}
             onClick={() => {
               void run(async () => {
-                await syncProfileNow(profile.id);
+                setOutcome(await syncProfileNow(profile.id));
               });
             }}
           >
@@ -300,6 +448,27 @@ function SyncProfileRow({
             ))}
           </ul>
         ))}
+      {outcome !== null && (
+        // Inline, in the row that was acted on, exactly where Check files
+        // already reports what it found — nothing on the sync surfaces is
+        // ephemeral, and a toast for the result of a button in view would be
+        // the one exception. Rust composed the sentence (`SyncOutcomeVm.line`)
+        // for the same reason it composes the status line: the Sync view says
+        // it in these words too. `role="status"` announces it without stealing
+        // focus; conflicts take the destructive colour because "both versions
+        // survive, go and look" is not a checkmark, but they are non-blocking
+        // by contract, so this is never an interrupting alert.
+        <p
+          role="status"
+          className={
+            outcome.conflicts.length > 0
+              ? "text-destructive text-xs"
+              : "text-muted-foreground text-xs"
+          }
+        >
+          {outcome.line}
+        </p>
+      )}
       {actionError !== null && <p className="text-destructive text-xs">{actionError}</p>}
       {/* Under everything the row reports about the folder, so opening it never
           pushes a live warning off the top. Mounted fresh on each open, so it

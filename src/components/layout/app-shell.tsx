@@ -10,7 +10,7 @@ import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
 import { PhoneShell } from "@/components/layout/phone-shell";
 import { RecordingPane } from "@/components/layout/recording-pane";
-import { SidebarPane } from "@/components/layout/sidebar-pane";
+import { SIDEBAR_WIDTH_CLASS, SidebarPane } from "@/components/layout/sidebar-pane";
 import { SyncPane } from "@/components/layout/sync-pane";
 import { VerifyBanner } from "@/components/layout/verify-banner";
 import { SearchOverlay } from "@/components/search/search-overlay";
@@ -40,6 +40,7 @@ import { useViewShortcuts } from "@/hooks/use-view-shortcuts";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { useDetailStore } from "@/lib/stores/detail-ui";
 import { usePrimaryView } from "@/lib/stores/primary-view";
+import { cn } from "@/lib/utils";
 
 export function AppShell() {
   const { phone, sidebarCollapsed, detailFloating } = useShellLayout();
@@ -114,6 +115,11 @@ export function AppShell() {
   // Folder sync needs a usable `git` (Story 32.5, AD-41): same rule, so a stale
   // "sync" primary-view can never show the pane where sync cannot run.
   const sync = useCapabilitiesStore((s) => s.capabilities.sync);
+  // Where the platform floats the window controls over the webview (desktop macOS,
+  // via the macOS-only `titleBarStyle`/`hiddenTitle` keys) the app owes the window
+  // its own drag region; under a real title bar the same band would be empty space
+  // under chrome the OS already draws, so it is absent there (AD-34-2).
+  const overlayTitleBar = useCapabilitiesStore((s) => s.capabilities.overlayTitleBar);
 
   const closeDetail = useCallback(() => {
     storeCloseDetail();
@@ -135,10 +141,27 @@ export function AppShell() {
   return (
     <TooltipProvider>
       <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
-        {/* Draggable overlay titlebar band (~28px, standard macOS height) so the
-            window stays movable and the traffic lights float over empty space
-            above the panes rather than overlapping pane content in any state. */}
-        <div data-tauri-drag-region className="h-7 shrink-0" />
+        {/* One drag band, painted per column (AD-34-2, AD-34-3). It is the single
+            element that both makes the window movable and clears the floating
+            window controls, which is why no pane reserves an inset of its own. The
+            band spans two panes with two different backgrounds, so it is painted
+            per column to match what sits beneath it: one full-width `bg-background`
+            strip above a `bg-sidebar` drawer reads as a seam in light mode and a
+            black bar in dark, and that is the whole of the reported black strip. */}
+        {overlayTitleBar && (
+          <div className="flex h-7 shrink-0">
+            {!phone && (
+              <div
+                data-tauri-drag-region
+                className={cn(
+                  "h-full shrink-0 bg-sidebar",
+                  sidebarCollapsed ? SIDEBAR_WIDTH_CLASS.collapsed : SIDEBAR_WIDTH_CLASS.expanded,
+                )}
+              />
+            )}
+            <div data-tauri-drag-region className="h-full flex-1 bg-background" />
+          </div>
+        )}
         <VerifyBanner />
         <div className="flex min-h-0 flex-1">
           {phone ? (

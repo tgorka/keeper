@@ -56,6 +56,26 @@ export const SYNC_DEFAULT_BRANCH = "main";
 /** Default LFS threshold in bytes — 4 MiB (mirrors `DEFAULT_LFS_THRESHOLD_BYTES`). */
 export const SYNC_DEFAULT_LFS_THRESHOLD_BYTES = 4 * 1024 * 1024;
 
+/**
+ * The numbers Rust substitutes when a profile pins nothing, or pins something it
+ * cannot honour (Story 34.5, AD-34-8).
+ *
+ * Mirrored rather than fetched because the form has to name the value that will
+ * be in force *while the user is still typing* — ticking the removable box
+ * changes the answer before anything is saved, and asking Rust per keystroke is
+ * absurd. Rust stays the authority: these only produce placeholders and notes,
+ * and `SyncProfileVm.effectiveSettleMs` / `effectivePollIntervalMs` carry the
+ * real answer for a profile that exists. Keep them in step with
+ * `keeper-sync/src/profile.rs`.
+ */
+export const SYNC_DEFAULT_SETTLE_MS = 5_000;
+/** Mirrors `REMOVABLE_SETTLE_MS`: removable and network volumes report late. */
+export const SYNC_REMOVABLE_SETTLE_MS = 10_000;
+/** Mirrors `DEFAULT_POLL_INTERVAL_MS`. */
+export const SYNC_DEFAULT_POLL_INTERVAL_MS = 15_000;
+/** Mirrors `MIN_POLL_INTERVAL_MS`: below this a scan runs on every 1 Hz tick. */
+export const SYNC_MIN_POLL_INTERVAL_MS = 2_000;
+
 /** Fast poll cadence, used while any profile is doing work. */
 export const SYNC_ACTIVE_POLL_MS = 2_000;
 
@@ -251,8 +271,10 @@ export async function saveSyncProfile(req: SyncProfileReq): Promise<SyncProfileV
 }
 
 /**
- * Forget a profile, then re-read the mirror. Configuration only — the folder
- * and its contents are left on disk.
+ * Forget a profile, then re-read the mirror. Configuration only — the folder,
+ * its contents and its git repository are left on disk. Rust also deletes the
+ * profile's stored access token, which is keeper's own configuration and never
+ * lived in the folder (AD-34-14).
  */
 export async function removeSyncProfile(id: string): Promise<void> {
   await syncProfileRemove(id);
@@ -272,7 +294,16 @@ export async function setSyncProfileEnabled(id: string, enabled: boolean): Promi
   return status;
 }
 
-/** Sync one folder now, ignoring its schedule, then re-read the statuses. */
+/**
+ * Sync one folder now, ignoring its schedule, then re-read the statuses.
+ *
+ * The outcome is the caller's report and every caller renders it. It is not
+ * optional decoration: a pass that finds nothing to do completes in
+ * milliseconds and leaves the status untouched, so the refresh below can
+ * change nothing at all and the click would otherwise look like it did
+ * nothing. The engine already knows what happened; this is the only place that
+ * answer reaches the screen (AD-34-12).
+ */
 export async function syncProfileNow(id: string): Promise<SyncOutcomeVm> {
   const outcome = await syncFolderNow(id);
   await refreshSyncStatuses();

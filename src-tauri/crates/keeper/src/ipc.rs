@@ -1190,6 +1190,31 @@ fn to_ipc_error(err: CoreError) -> IpcError {
     }
 }
 
+/// Run a blocking body on the runtime's blocking pool and await it (AD-34-5).
+///
+/// Tauri v2 invokes a non-`async` `#[tauri::command]` on the main thread, which on
+/// macOS is the same thread `startDragging` resolves to `performWindowDragWithEvent`
+/// on — so a `read_dir`/`stat`/`keeper.db` read there is a window that will not
+/// move while it runs. Marking the command `async` gets it off the main thread, but
+/// it then occupies a runtime worker for the duration, which is what starves
+/// messaging (the same reason [`export_start`] hands its job to
+/// `tokio::task::spawn_blocking`). Both hazards go away by handing the synchronous
+/// body to the blocking pool.
+///
+/// A join failure means the body panicked or the runtime is shutting down; neither
+/// is retriable, so it funnels through [`to_ipc_error`] as `Internal`.
+async fn off_async_runtime<T, F>(body: F) -> Result<T, IpcError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(body).await.map_err(|error| {
+        to_ipc_error(CoreError::Internal(format!(
+            "a blocking command task failed: {error}"
+        )))
+    })
+}
+
 /// Read a required raw-string request header (ASCII value), mapping a missing /
 /// non-ASCII value to a retriable `SendFailed` IPC error. Used by the raw-body
 /// pasted-attachment command for `accountId`/`roomId`/`mime` (all ASCII).
@@ -1276,6 +1301,11 @@ pub fn capabilities() -> Result<CapabilitiesVm, IpcError> {
         // and a machine without git gets no sync surface at all rather than
         // buttons that fail when pressed.
         sync: sync_available(),
+        // The overlay title bar (Story 34.2) is a pure platform fact, not a probe:
+        // `titleBarStyle`/`hiddenTitle` in `tauri.conf.json` are macOS-only keys, so
+        // only a desktop macOS build floats the window controls over the webview and
+        // needs the app to supply its own drag region and traffic-light clearance.
+        overlay_title_bar: cfg!(all(desktop, target_os = "macos")),
     })
 }
 
@@ -4613,29 +4643,60 @@ pub(crate) fn stop_active_recording(state: &AppState) {
 }
 
 /// Read (clone) the current recording-session status snapshot (Story 16.6 +
-/// 18.1) — the single authoritative figure both the [`recording_status`] poll
-/// and the tray's ~1 Hz tick render from. No session yet this app lifetime ⇒
+/// 18.1) — the single authoritative figure the tray's ~1 Hz tick, the quit gate
+/// and the tray's Reveal item render from. No session yet this app lifetime ⇒
 /// the honest idle snapshot.
+///
+/// Blocking: the enrichment below stats every segment file. The `recording_status`
+/// / `recording_acknowledge` commands take [`recording_snapshot_off_runtime`]
+/// instead, which produces the identical figures without occupying the calling
+/// thread; this synchronous form exists for the callers that have no runtime to
+/// await on (the tray menu handler and `ExitRequested`).
 pub(crate) fn recording_snapshot(state: &AppState) -> RecordingStatusVm {
-    // Clone the driver-kept snapshot and capture the session cap under the slot
-    // lock, then RELEASE it before the best-effort disk I/O below (Story 18.3) —
-    // never hold the `recording_run` slot across blocking `read_dir`/`stat`
-    // syscalls, so a slow/unreadable volume can't stall `stop`/`start`/quit.
-    let (mut snapshot, segment_cap_mb) = {
-        let guard = slot_lock(&state.recording_run);
-        let Some(run) = guard.as_ref() else {
-            return RecordingStatusVm::idle();
-        };
-        // Bind the clone first so the transient `status` MutexGuard drops before
-        // `guard` (both released here, before the disk I/O below).
-        let snapshot = status_lock(&run.status).clone();
-        (snapshot, run.segment_cap_mb)
+    let Some((snapshot, segment_cap_mb)) = live_snapshot(&state.recording_run) else {
+        return RecordingStatusVm::idle();
     };
-    // Enrich the driver-kept snapshot with the read-time byte figures and the
-    // session-captured cap (Story 18.3), so the tray and the in-app banner render
-    // byte-identical size/segment/meter figures from this one shared read. The
-    // driver never maintains these on the stored snapshot; they are filled here
-    // best-effort — a missing/unreadable folder simply yields 0 (never an error).
+    with_disk_figures(snapshot, segment_cap_mb)
+}
+
+/// [`recording_snapshot`] for the `async` command path (Story 34.3, AD-34-5):
+/// byte-identical figures, with the `read_dir`/`stat` half on the blocking pool
+/// so a slow volume neither stalls the main thread (where macOS resolves
+/// `startDragging`) nor holds a runtime worker.
+async fn recording_snapshot_off_runtime(state: &AppState) -> Result<RecordingStatusVm, IpcError> {
+    let Some((snapshot, segment_cap_mb)) = live_snapshot(&state.recording_run) else {
+        return Ok(RecordingStatusVm::idle());
+    };
+    off_async_runtime(move || with_disk_figures(snapshot, segment_cap_mb)).await
+}
+
+/// The lock-held half of [`recording_snapshot`]: clone the driver-kept snapshot
+/// and capture the session cap, releasing the slot before returning. `None` ⇒ no
+/// session this app lifetime.
+///
+/// Split from the disk half so "never hold the `recording_run` slot across
+/// blocking `read_dir`/`stat` syscalls" (Story 18.3 — a slow/unreadable volume
+/// must not stall `stop`/`start`/quit, which contend on that slot) is enforced by
+/// the signature rather than by comment, and so the async path can keep the
+/// non-`Send` guard entirely on its own thread and hand owned values to the pool.
+/// Takes the slot rather than the whole state ([`acknowledge_recording_slot`]'s
+/// convention) so it is unit-testable without an `AppState`.
+fn live_snapshot(slot: &Mutex<Option<RecordingRun>>) -> Option<(RecordingStatusVm, u32)> {
+    let guard = slot_lock(slot);
+    let run = guard.as_ref()?;
+    // Bind the clone first so the transient `status` MutexGuard drops before
+    // `guard` (both released as this returns).
+    let snapshot = status_lock(&run.status).clone();
+    Some((snapshot, run.segment_cap_mb))
+}
+
+/// The disk half of [`recording_snapshot`]: enrich the driver-kept snapshot with
+/// the read-time byte figures and the session-captured cap (Story 18.3), so the
+/// tray and the in-app banner render byte-identical size/segment/meter figures
+/// from this one shared read. The driver never maintains these on the stored
+/// snapshot; they are filled here best-effort — a missing/unreadable folder simply
+/// yields 0 (never an error).
+fn with_disk_figures(mut snapshot: RecordingStatusVm, segment_cap_mb: u32) -> RecordingStatusVm {
     if let Some(folder) = snapshot.output_path.as_deref() {
         let folder = Path::new(folder);
         snapshot.on_disk_bytes = session_bytes_on_disk(folder);
@@ -4745,17 +4806,25 @@ pub(crate) fn finalize_recording_for_quit(state: &AppState) {
 /// one-shot stop trigger; the sidecar finalizes the file (`stopping` →
 /// `finalized` on the polled snapshot) and exits. Idempotent — a second stop (or
 /// a stop after the session ended) is a no-op, never an error, never a kill.
+///
+/// `async` per AD-34-5: Stop is the click that most often precedes a window drag,
+/// and a non-`async` command would fire the trigger on the main thread.
 #[tauri::command]
-pub fn recording_stop(state: State<'_, AppState>) -> Result<(), IpcError> {
+pub async fn recording_stop(state: State<'_, AppState>) -> Result<(), IpcError> {
     stop_active_recording(&state);
     Ok(())
 }
 
 /// Read the current recording-session status snapshot (Story 16.6) — the poll
-/// the Recording view's active-session UI renders from. Infallible in practice.
+/// the Recording view's active-session UI renders from. Infallible in practice
+/// (only a blocking-pool join failure can error).
+///
+/// `async` per AD-34-5: this is polled at ~1 Hz for the whole session and stats
+/// every segment file on each tick, so on the main thread it would contend with
+/// `startDragging` roughly once a second.
 #[tauri::command]
-pub fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatusVm, IpcError> {
-    Ok(recording_snapshot(&state))
+pub async fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatusVm, IpcError> {
+    recording_snapshot_off_runtime(&state).await
 }
 
 /// Acknowledge (dismiss) a settled recording session's outcome (Story 18.4): a
@@ -4764,16 +4833,25 @@ pub fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatusVm,
 /// the next ~1 Hz tick and the banner error variant hides — while a **live**
 /// session is a strict no-op (never a silent stop). Returns the fresh snapshot
 /// either way (the idle default after a clear; the untouched live snapshot on
-/// the no-op). Shared with the tray's **Dismiss Error** item via
-/// [`acknowledge_recording`].
+/// the no-op).
+///
+/// Shares [`acknowledge_recording_slot`] — the actual clear — with the tray's
+/// **Dismiss Error** item, which reaches it through the synchronous
+/// [`acknowledge_recording`]. `async` per AD-34-5: the snapshot it returns stats
+/// the session folder.
 #[tauri::command]
-pub fn recording_acknowledge(state: State<'_, AppState>) -> Result<RecordingStatusVm, IpcError> {
-    Ok(acknowledge_recording(&state))
+pub async fn recording_acknowledge(
+    state: State<'_, AppState>,
+) -> Result<RecordingStatusVm, IpcError> {
+    acknowledge_recording_slot(&state.recording_run);
+    recording_snapshot_off_runtime(&state).await
 }
 
-/// The [`recording_acknowledge`] core, shared with the tray (Story 18.4): clear
-/// a terminal slot ([`acknowledge_recording_slot`]) and return the resulting
-/// authoritative snapshot.
+/// The tray's **Dismiss Error** path (Story 18.4): clear a terminal slot
+/// ([`acknowledge_recording_slot`]) and return the resulting authoritative
+/// snapshot. The [`recording_acknowledge`] command performs the same two steps
+/// with the snapshot taken off the runtime (AD-34-5); the tray menu handler has no
+/// runtime to await on, so it keeps the synchronous form.
 pub(crate) fn acknowledge_recording(state: &AppState) -> RecordingStatusVm {
     acknowledge_recording_slot(&state.recording_run);
     recording_snapshot(state)
@@ -4875,19 +4953,25 @@ fn manifest_summary(folder: &Path, manifest: &SessionManifest) -> RecordingSumma
 /// honest "Saved N segments · {size}" figures, never the live `segments_closed`
 /// rotation counter. A manifest load failure surfaces as an [`IpcError`] so the
 /// card can still fall back to folder + Reveal (the frontend omits count/size).
+///
+/// `async` per AD-34-5: reading and parsing a manifest off a slow (possibly
+/// removable) volume must not hold the main thread.
 #[cfg(desktop)]
 #[tauri::command]
-pub fn recording_session_summary(folder: String) -> Result<RecordingSummaryVm, IpcError> {
-    let path = PathBuf::from(&folder);
-    let manifest = SessionManifest::load(&path).map_err(|e| to_ipc_error(e.into()))?;
-    Ok(manifest_summary(&path, &manifest))
+pub async fn recording_session_summary(folder: String) -> Result<RecordingSummaryVm, IpcError> {
+    off_async_runtime(move || -> Result<RecordingSummaryVm, IpcError> {
+        let path = PathBuf::from(folder);
+        let manifest = SessionManifest::load(&path).map_err(|e| to_ipc_error(e.into()))?;
+        Ok(manifest_summary(&path, &manifest))
+    })
+    .await?
 }
 
 /// Mobile stub for [`recording_session_summary`] (Story 20.3): recording is a
 /// desktop-only surface — an honest `Unsupported` (`retriable: false`).
 #[cfg(not(desktop))]
 #[tauri::command]
-pub fn recording_session_summary(folder: String) -> Result<RecordingSummaryVm, IpcError> {
+pub async fn recording_session_summary(folder: String) -> Result<RecordingSummaryVm, IpcError> {
     let _ = folder;
     Err(to_ipc_error(CoreError::Unsupported(
         "recording session summaries are desktop-only".to_owned(),
@@ -4908,14 +4992,20 @@ pub fn recording_session_summary(folder: String) -> Result<RecordingSummaryVm, I
 /// aborting the scan or propagating an error.
 #[cfg(desktop)]
 #[tauri::command]
-pub fn recovered_sessions_list(
+pub async fn recovered_sessions_list(
     state: State<'_, AppState>,
 ) -> Result<Vec<RecordingSummaryVm>, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    let base = effective_destination_dir(&data_dir)?;
-    let acknowledged = keeper_core::registry::get_recovered_sessions_acknowledged(&data_dir)
-        .map_err(to_ipc_error)?;
-    Ok(scan_recovered_sessions(&base, &acknowledged))
+    // `async` per AD-34-5, and the whole scan goes to the blocking pool as one
+    // unit: two `keeper.db` reads plus a `read_dir` with a manifest load per
+    // subfolder is the heaviest command the Recording pane issues.
+    off_async_runtime(move || -> Result<Vec<RecordingSummaryVm>, IpcError> {
+        let base = effective_destination_dir(&data_dir)?;
+        let acknowledged = keeper_core::registry::get_recovered_sessions_acknowledged(&data_dir)
+            .map_err(to_ipc_error)?;
+        Ok(scan_recovered_sessions(&base, &acknowledged))
+    })
+    .await?
 }
 
 /// The pure, best-effort recovery scan behind [`recovered_sessions_list`] (Story
@@ -4985,7 +5075,7 @@ fn scan_recovered_sessions(base: &Path, acknowledged: &[String]) -> Vec<Recordin
 /// desktop-only surface — an honest empty list (no recovery on mobile).
 #[cfg(not(desktop))]
 #[tauri::command]
-pub fn recovered_sessions_list(
+pub async fn recovered_sessions_list(
     state: State<'_, AppState>,
 ) -> Result<Vec<RecordingSummaryVm>, IpcError> {
     let _ = state;
@@ -5059,20 +5149,34 @@ fn destination_writable(directory: &Path) -> bool {
 /// destination is resolved to the EFFECTIVE folder (the persisted choice or the
 /// `~/Movies/keeper` default), so the VM always carries concrete, in-bounds
 /// values. Failures funnel through [`to_ipc_error`].
+///
+/// `async` per AD-34-5: the Recording pane mounts three surfaces that each hydrate
+/// from this, so six `keeper.db` reads plus a destination probe would otherwise
+/// land on the main thread three times over on every visit to the tab.
 #[tauri::command]
-pub fn recording_settings_get(state: State<'_, AppState>) -> Result<RecordingSettingsVm, IpcError> {
+pub async fn recording_settings_get(
+    state: State<'_, AppState>,
+) -> Result<RecordingSettingsVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    off_async_runtime(move || read_recording_settings(&data_dir)).await?
+}
+
+/// The blocking body of [`recording_settings_get`], shared with
+/// [`recording_settings_set`]'s re-read so there is exactly one definition of
+/// "effective settings" and the write path never returns a value the read path
+/// would not.
+fn read_recording_settings(data_dir: &Path) -> Result<RecordingSettingsVm, IpcError> {
     Ok(RecordingSettingsVm {
-        segment_mb: keeper_core::registry::get_recording_segment_mb(&data_dir)
+        segment_mb: keeper_core::registry::get_recording_segment_mb(data_dir)
             .map_err(to_ipc_error)?,
-        duration_cap_minutes: keeper_core::registry::get_recording_duration_cap_minutes(&data_dir)
+        duration_cap_minutes: keeper_core::registry::get_recording_duration_cap_minutes(data_dir)
             .map_err(to_ipc_error)?,
-        destination_dir: effective_destination_dir(&data_dir)?
+        destination_dir: effective_destination_dir(data_dir)?
             .to_string_lossy()
             .into_owned(),
-        fps: keeper_core::registry::get_recording_fps(&data_dir).map_err(to_ipc_error)?,
-        codec: keeper_core::registry::get_recording_codec(&data_dir).map_err(to_ipc_error)?,
-        scale_percent: keeper_core::registry::get_recording_scale_percent(&data_dir)
+        fps: keeper_core::registry::get_recording_fps(data_dir).map_err(to_ipc_error)?,
+        codec: keeper_core::registry::get_recording_codec(data_dir).map_err(to_ipc_error)?,
+        scale_percent: keeper_core::registry::get_recording_scale_percent(data_dir)
             .map_err(to_ipc_error)?,
     })
 }
@@ -5085,26 +5189,33 @@ pub fn recording_settings_get(state: State<'_, AppState>) -> Result<RecordingSet
 /// Start time by the pre-flight, not here. A running session is never mutated —
 /// `recording_start` re-reads at start, so edits apply to the next Recording
 /// Session only. Failures funnel through [`to_ipc_error`].
+///
+/// `async` per AD-34-5, with the writes and the re-read in one blocking hop so no
+/// other command can observe a half-written settings row from between them.
 #[tauri::command]
-pub fn recording_settings_set(
+pub async fn recording_settings_set(
     state: State<'_, AppState>,
     settings: RecordingSettingsVm,
 ) -> Result<RecordingSettingsVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    keeper_core::registry::set_recording_segment_mb(&data_dir, settings.segment_mb)
+    off_async_runtime(move || -> Result<RecordingSettingsVm, IpcError> {
+        keeper_core::registry::set_recording_segment_mb(&data_dir, settings.segment_mb)
+            .map_err(to_ipc_error)?;
+        keeper_core::registry::set_recording_duration_cap_minutes(
+            &data_dir,
+            settings.duration_cap_minutes,
+        )
         .map_err(to_ipc_error)?;
-    keeper_core::registry::set_recording_duration_cap_minutes(
-        &data_dir,
-        settings.duration_cap_minutes,
-    )
-    .map_err(to_ipc_error)?;
-    keeper_core::registry::set_recording_destination_dir(&data_dir, &settings.destination_dir)
-        .map_err(to_ipc_error)?;
-    keeper_core::registry::set_recording_fps(&data_dir, settings.fps).map_err(to_ipc_error)?;
-    keeper_core::registry::set_recording_codec(&data_dir, &settings.codec).map_err(to_ipc_error)?;
-    keeper_core::registry::set_recording_scale_percent(&data_dir, settings.scale_percent)
-        .map_err(to_ipc_error)?;
-    recording_settings_get(state)
+        keeper_core::registry::set_recording_destination_dir(&data_dir, &settings.destination_dir)
+            .map_err(to_ipc_error)?;
+        keeper_core::registry::set_recording_fps(&data_dir, settings.fps).map_err(to_ipc_error)?;
+        keeper_core::registry::set_recording_codec(&data_dir, &settings.codec)
+            .map_err(to_ipc_error)?;
+        keeper_core::registry::set_recording_scale_percent(&data_dir, settings.scale_percent)
+            .map_err(to_ipc_error)?;
+        read_recording_settings(&data_dir)
+    })
+    .await?
 }
 
 /// Read whether the one-time iOS no-background-sync disclosure has been shown
@@ -6491,6 +6602,60 @@ mod tests {
         let slot: Mutex<Option<RecordingRun>> = Mutex::new(None);
         assert!(!acknowledge_recording_slot(&slot));
         assert!(slot_lock(&slot).is_none());
+    }
+
+    /// Story 34.3 (AD-34-5): the snapshot read is split so its `read_dir`/`stat`
+    /// half can leave the calling thread — the main thread on a non-`async`
+    /// command, which on macOS is also where `startDragging` resolves. The halves
+    /// must still compose into exactly the one authoritative read both the tray and
+    /// the command render from, so this pins what each half is responsible for.
+    #[test]
+    fn the_snapshot_halves_compose_into_one_authoritative_read() {
+        // No session this app lifetime: the lock-held half reports nothing, which
+        // is what makes both snapshot paths answer the honest idle default.
+        let empty: Mutex<Option<RecordingRun>> = Mutex::new(None);
+        assert!(live_snapshot(&empty).is_none());
+
+        let slot = run_slot_in(RecordingUiState::Recording, None);
+        let (live, segment_cap_mb) = live_snapshot(&slot).expect("a live slot yields its snapshot");
+        assert_eq!(live.state, RecordingUiState::Recording);
+        // The cap is SESSION-captured on the run, not on the driver's snapshot, so
+        // it has to travel out of the lock alongside it or the meter loses its
+        // denominator once the read happens on another thread.
+        assert_eq!(segment_cap_mb, 500);
+        assert_eq!(
+            live.segment_cap_mb, 0,
+            "the stored snapshot never carries it"
+        );
+
+        // What came out is a clone: the blocking half owns it outright, so a driver
+        // write landing meanwhile cannot mutate the value in flight.
+        {
+            let guard = slot_lock(&slot);
+            let run = guard.as_ref().expect("slot retained");
+            status_lock(&run.status).state = RecordingUiState::Stopping;
+        }
+        assert_eq!(live.state, RecordingUiState::Recording);
+
+        // The disk half stamps the cap and reads the real byte figures.
+        let folder = scan_temp_dir("snapshot-halves");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 40]).expect("segment");
+        let mut recording = live.clone();
+        recording.output_path = Some(folder.to_string_lossy().into_owned());
+        let enriched = with_disk_figures(recording, segment_cap_mb);
+        assert_eq!(enriched.segment_cap_mb, 500);
+        assert_eq!(enriched.on_disk_bytes, 40);
+        assert_eq!(enriched.current_segment_bytes, 40);
+
+        // A session whose folder is gone still yields a snapshot with the cap and
+        // zeroed bytes — best-effort, never an error (Story 18.3).
+        let _ = std::fs::remove_dir_all(&folder);
+        let mut vanished = live.clone();
+        vanished.output_path = Some(folder.to_string_lossy().into_owned());
+        let enriched = with_disk_figures(vanished, segment_cap_mb);
+        assert_eq!(enriched.segment_cap_mb, 500);
+        assert_eq!(enriched.on_disk_bytes, 0);
+        assert_eq!(enriched.current_segment_bytes, 0);
     }
 
     // --- Story 18.5: live disk-space guard (executor + pre-start gate) ------

@@ -1,6 +1,6 @@
 /**
  * The Sync primary view (Epic 32, Story 32.5, AD-S1..AD-S6; Epic 33,
- * Stories 33.3 and 33.4).
+ * Stories 33.3 and 33.4; Epic 34, Story 34.7).
  *
  * Folder sync worked long before it could be watched: Settings could name a
  * profile's state but never a *file*. This pane answers the three questions a
@@ -10,12 +10,14 @@
  * progress, the row actions), then Activity, Pending, and a Problems section
  * that exists only while something is wrong.
  *
- * Settings keeps the profile *list* affordances this view has no business
- * repeating: it is the only surface that removes a folder. What this view owns
- * besides activity, state and problems is configuration of the folder in front
- * of you — adding one, and editing one — through the shared
+ * Everything this view can do about the folder in front of you, it does here
+ * rather than sending you to Settings for it: adding a folder, editing one,
+ * and removing one. The two configuration modes go through the shared
  * {@link AddFolderForm} (AD-C7), which is one component in two modes so the
- * two surfaces cannot word or validate the same profile differently. Until
+ * two surfaces cannot word or validate the same profile differently; removal
+ * reuses the Settings row's confirmation wording and store action for the same
+ * reason — two surfaces must not describe what removal keeps differently, and
+ * what it keeps is the only thing anyone confirming it cares about. Until
  * Story 33.4 the empty state named Settings and stopped there, which meant a
  * new user's Sync view could only tell them to leave it; until edit mode, a
  * mistyped remote URL could only be fixed by removing the folder and setting
@@ -46,17 +48,32 @@
  * at all, never a disabled one.
  */
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
-import { FileIcon, FileMinus, FilePen, FilePlus, GitMerge } from "lucide-react";
+import { CircleMinus, CirclePlus, FileIcon, SquarePen, TriangleAlert } from "lucide-react";
 import { type ReactNode, useEffect, useId, useState } from "react";
 import {
   SYNC_NOW_LABEL,
   SYNC_PAUSE_LABEL,
   SYNC_PROGRESS_LABEL,
+  SYNC_REMOVE_CANCEL_LABEL,
+  SYNC_REMOVE_CONFIRM_LABEL,
+  SYNC_REMOVE_CONFIRM_SENTENCE,
+  SYNC_REMOVE_CONFIRM_TITLE,
+  SYNC_REMOVE_LABEL,
   SYNC_RESUME_LABEL,
   syncRemoteHost,
 } from "@/components/settings/sync-section";
 import { AddFolderForm, SYNC_ADD_TITLE, SYNC_EDIT_TITLE } from "@/components/sync/add-folder-form";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -70,6 +87,7 @@ import type {
   CopyJobState,
   CopyJobVm,
   SyncActivityVm,
+  SyncOutcomeVm,
   SyncParkedVm,
   SyncPendingVm,
   SyncProblemsVm,
@@ -90,6 +108,7 @@ import {
 import {
   ensureSyncHydrated,
   isSyncStatusActive,
+  removeSyncProfile,
   setSyncProfileEnabled,
   startSyncStatusPolling,
   syncErrorMessage,
@@ -103,6 +122,7 @@ import {
   startSyncDetailPolling,
   startSyncProgressStream,
   syncLiveFraction,
+  syncLiveRate,
   useSyncDetailStore,
 } from "@/lib/stores/sync-detail";
 
@@ -185,12 +205,21 @@ export const SYNC_STATE_WORDS: Record<string, string> = {
   needsAttention: "Needs attention",
 };
 
-/** The icon and screen-reader word for each recorded activity kind. */
-const ACTIVITY_KINDS: Record<string, { icon: typeof FileIcon; word: string }> = {
-  added: { icon: FilePlus, word: "Added" },
-  modified: { icon: FilePen, word: "Changed" },
-  deleted: { icon: FileMinus, word: "Deleted" },
-  conflict: { icon: GitMerge, word: "Conflict copy" },
+/**
+ * The icon, its tone and the screen-reader word for each recorded activity
+ * kind.
+ *
+ * Four silhouettes rather than four variations on a page outline: at this size
+ * a plus, a pen and a minus tucked inside the same file shape all read as the
+ * same grey smudge, which is what made a column of them unscannable. Only a
+ * conflict copy carries colour — it is the one row that asks the reader to do
+ * something.
+ */
+const ACTIVITY_KINDS: Record<string, { icon: typeof FileIcon; word: string; tone: string }> = {
+  added: { icon: CirclePlus, word: "Added", tone: "text-muted-foreground" },
+  modified: { icon: SquarePen, word: "Changed", tone: "text-muted-foreground" },
+  deleted: { icon: CircleMinus, word: "Deleted", tone: "text-muted-foreground" },
+  conflict: { icon: TriangleAlert, word: "Conflict copy", tone: "text-destructive" },
 };
 
 /** Why a file is waiting, for every reason except `settling` (which is timed). */
@@ -529,11 +558,23 @@ export function SyncPane() {
           )}
           {empty && <p className="text-muted-foreground text-sm">{SYNC_PANE_EMPTY_SENTENCE}</p>}
           {/* Whether it arrived as the empty state or from the header action,
-              this is the one add form; see `showAddForm` above for why. */}
+              this is the one add form; see `showAddForm` above for why.
+
+              Discarding closes the disclosure, which unmounts the form and
+              takes the draft with it — the same end state a settled save
+              reaches, so the next open always starts from an empty form rather
+              than from an abandoned one. It is offered only when there is
+              something to go back to: with nothing configured this form is the
+              whole content of the surface and the header action that would
+              reopen it is hidden, so a discard there would leave a user with
+              nothing to do and no way to undo it. */}
           {showAddForm && (
             <Card size="sm">
               <CardContent>
-                <AddFolderForm onSaved={(_profile, settled) => setAdding(!settled)} />
+                <AddFolderForm
+                  onSaved={(_profile, settled) => setAdding(!settled)}
+                  onCancel={empty ? undefined : () => setAdding(false)}
+                />
               </CardContent>
             </Card>
           )}
@@ -563,25 +604,46 @@ function SyncProfileCard({
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   /**
+   * What the last `Sync now` on this card did, or `null` before one has run.
+   *
+   * Held here rather than read off the polled status: a pass that stages
+   * nothing finishes in milliseconds while the status poll runs at 2 s (10 s
+   * when idle), so a report that waited for the poll would arrive long after
+   * the click — if the status moved at all, which for "nothing to do" it does
+   * not.
+   */
+  const [outcome, setOutcome] = useState<SyncOutcomeVm | null>(null);
+  /**
    * Whether this folder's configuration is open for editing. Per card, because
    * the form it reveals is about this folder and nothing else.
    */
   const [editing, setEditing] = useState(false);
+  /** Whether this folder's remove confirmation is open. Also per card. */
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   /**
    * Run a card action with the shared busy/error lifecycle, then re-read this
    * folder's lists: an action is exactly the moment the three lists are most
    * likely to have moved, and the poll is deliberately too slow to notice.
+   *
+   * `refresh` is false for removal alone. There is no folder left to re-read,
+   * and asking anyway would record three rejections against an id the store
+   * has just forgotten.
    */
-  const run = async (action: () => Promise<void>) => {
+  const run = async (action: () => Promise<void>, refresh = true) => {
     setBusy(true);
     setActionError(null);
+    // Any action supersedes the last sync report: Pause and Remove make it
+    // stale, and a fresh Sync now is about to replace it.
+    setOutcome(null);
     try {
       await action();
     } catch (raw) {
       setActionError(syncErrorMessage(raw));
     } finally {
-      await refreshSyncDetail(profile.id);
+      if (refresh) {
+        await refreshSyncDetail(profile.id);
+      }
       setBusy(false);
     }
   };
@@ -589,9 +651,31 @@ function SyncProfileCard({
   const active = status !== undefined && isSyncStatusActive(status);
   const fraction = syncLiveFraction(status, progress);
   const percent = fraction === null ? null : Math.round(fraction * 100);
-  // The path in flight exists only on the stream, so a window that just mounted
-  // honestly has none until the next event.
-  const current = active ? (progress?.current ?? null) : null;
+  // The live detail comes off the stream alone, so a window that just mounted
+  // honestly has none of it until the next event — and a folder the poll calls
+  // settled has none either, however recently an event arrived.
+  const streamed = active ? progress : undefined;
+  const current = streamed?.current ?? null;
+  // Both figures worded the way the Rust status line words them, so this fast
+  // copy and the 2 s-polled sentence above read as the same quantity rather
+  // than two competing claims. Built as a list for the reason
+  // `copyProgressSentence` builds one: a figure that is not known yet drops out
+  // and leaves no orphaned separator behind.
+  const flying: string[] = [];
+  if (streamed !== undefined) {
+    if (streamed.filesTotal !== null) {
+      flying.push(`${streamed.filesDone}/${streamed.filesTotal} files`);
+    } else if (streamed.filesDone > 0) {
+      flying.push(`${streamed.filesDone} files`);
+    }
+  }
+  // `null` covers both "too little measured to say" and "nothing is moving";
+  // neither is a rate, and printing "0 B/s" for the second would be a claim
+  // about an idle wire (AD-34-13).
+  const rate = syncLiveRate(status, progress);
+  if (rate !== null) {
+    flying.push(`${formatCopyBytes(rate)}/s`);
+  }
 
   return (
     <Card size="sm">
@@ -637,7 +721,7 @@ function SyncProfileCard({
               disabled={busy}
               onClick={() => {
                 void run(async () => {
-                  await syncProfileNow(profile.id);
+                  setOutcome(await syncProfileNow(profile.id));
                 });
               }}
             >
@@ -656,8 +740,8 @@ function SyncProfileCard({
             >
               {profile.enabled ? SYNC_PAUSE_LABEL : SYNC_RESUME_LABEL}
             </Button>
-            {/* Quieter than its neighbours: the two beside it act on the folder
-                now, this one opens what the folder *is*. */}
+            {/* Quieter than the two before it, which act on the folder now:
+                these last two are about what the folder *is*. */}
             <Button
               type="button"
               variant="ghost"
@@ -667,6 +751,18 @@ function SyncProfileCard({
               onClick={() => setEditing((shown) => !shown)}
             >
               {SYNC_EDIT_TITLE}
+            </Button>
+            {/* No louder than Edit beside it, and deliberately so: the
+                destructive step is the confirmation, not the button that opens
+                it. Nothing here is irreversible until the dialog is accepted. */}
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              disabled={busy}
+              onClick={() => setConfirmOpen(true)}
+            >
+              {SYNC_REMOVE_LABEL}
             </Button>
           </div>
         </div>
@@ -683,12 +779,47 @@ function SyncProfileCard({
             aria-valuetext={status?.line}
           />
         )}
-        {current !== null && (
-          <p className="truncate font-mono text-muted-foreground text-xs" title={current}>
-            {/* Under a moving bar the bare path is unambiguous on screen; to a
-                screen reader it would be a path from nowhere. */}
-            <span className="sr-only">{SYNC_CURRENT_LABEL} </span>
-            {current}
+        {(current !== null || flying.length > 0) && (
+          // The live detail under the bar: the path being carried, then how far
+          // through the set and how fast. Laid out like the folder's own
+          // path·host line in the header — one truncating span and a shrink-0
+          // tail, so a long path gives way to the figures rather than pushing
+          // them off the card.
+          <p className="flex min-w-0 items-baseline gap-1.5 text-muted-foreground text-xs">
+            {current !== null && (
+              <span className="truncate font-mono" title={current}>
+                {/* Under a moving bar the bare path is unambiguous on screen; to
+                    a screen reader it would be a path from nowhere. */}
+                <span className="sr-only">{SYNC_CURRENT_LABEL} </span>
+                {current}
+              </span>
+            )}
+            {current !== null && flying.length > 0 && <span aria-hidden="true">·</span>}
+            {/* Monospaced so a rate climbing from 4.1 to 12.3 MB/s does not
+                reflow the line it sits on. */}
+            {flying.length > 0 && <span className="shrink-0 font-mono">{flying.join(" · ")}</span>}
+          </p>
+        )}
+        {outcome !== null && (
+          // Inline, in the card that was acted on, beside everything else this
+          // header reports about the folder — the sync surfaces have never used
+          // a toast, and a disappearing one for the result of a button in view
+          // would be the worst place to start. Rust composed the sentence
+          // (`SyncOutcomeVm.line`) for the same reason it composes the status
+          // line above: the Settings row says it in these words too.
+          // `role="status"` announces it without stealing focus; conflicts take
+          // the destructive colour because "both versions survive, go and look"
+          // is not a checkmark, but they are non-blocking by contract, so this
+          // is never an interrupting alert.
+          <p
+            role="status"
+            className={
+              outcome.conflicts.length > 0
+                ? "text-destructive text-xs"
+                : "text-muted-foreground text-xs"
+            }
+          >
+            {outcome.line}
           </p>
         )}
         {actionError !== null && <p className="text-destructive text-xs">{actionError}</p>}
@@ -723,6 +854,31 @@ function SyncProfileCard({
           }}
         />
       </CardContent>
+      {/* The Settings row's confirmation, verbatim: same title, same sentence,
+          same two labels, same store action. Removal is the one thing on this
+          card that cannot be undone, so what it keeps has to be worded in
+          exactly one place. */}
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{SYNC_REMOVE_CONFIRM_TITLE}</AlertDialogTitle>
+            <AlertDialogDescription>{SYNC_REMOVE_CONFIRM_SENTENCE}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{SYNC_REMOVE_CANCEL_LABEL}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                void run(async () => {
+                  await removeSyncProfile(profile.id);
+                }, false);
+              }}
+            >
+              {SYNC_REMOVE_CONFIRM_LABEL}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Card>
   );
 }
@@ -753,17 +909,29 @@ function SyncActivityList({
           className="flex flex-col gap-1.5"
         >
           {rows.map((row) => {
-            const kind = ACTIVITY_KINDS[row.kind] ?? { icon: FileIcon, word: row.kind };
+            const kind = ACTIVITY_KINDS[row.kind] ?? {
+              icon: FileIcon,
+              word: row.kind,
+              tone: "text-muted-foreground",
+            };
             const Icon = kind.icon;
             return (
               <li key={`${row.tsMs}-${row.kind}-${row.path}`} className="flex items-center gap-2">
-                <Icon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+                <Icon aria-hidden="true" className={`size-3.5 shrink-0 ${kind.tone}`} />
                 {/* The kind is carried by an icon, so its word is spoken but not
                     repeated on screen. */}
                 <span className="sr-only">{kind.word}</span>
                 <span className="min-w-0 flex-1 truncate font-mono text-xs" title={row.path}>
                   {row.path}
                 </span>
+                {/* A size nobody measured shows nothing at all: "0 B" would
+                    claim the file was empty, and "unknown" is noise on a line
+                    already busy answering when. */}
+                {row.sizeBytes !== null && (
+                  <span className="shrink-0 text-muted-foreground text-xs">
+                    {formatCopyBytes(row.sizeBytes)}
+                  </span>
+                )}
                 <span className="shrink-0 text-muted-foreground text-xs">
                   {formatDraftAge(row.tsMs)}
                 </span>

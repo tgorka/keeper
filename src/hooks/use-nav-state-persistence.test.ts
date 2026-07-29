@@ -29,6 +29,7 @@ const DESKTOP_CAPABILITIES = {
   revealInFileManager: true,
   recording: false,
   sync: false,
+  overlayTitleBar: false,
 };
 
 const storedNav: NavState = {

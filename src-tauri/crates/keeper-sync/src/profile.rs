@@ -14,7 +14,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, SyncError};
+use crate::{
+    error::{Result, SyncError},
+    provenance,
+};
 
 /// Which way changes are allowed to flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +123,12 @@ pub const SETTLE_CEILING_MS: u64 = 60_000;
 pub const DEFAULT_LFS_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024;
 /// Default interval between scheduler ticks.
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 15_000;
+/// Floor on the scan cadence.
+///
+/// The field is user-supplied, and a profile written before it meant anything
+/// (DW-116) carries a zero — either of which would put a full re-stat of the
+/// tree on every 1 Hz supervisor tick, on a pendrive or over a network mount.
+pub const MIN_POLL_INTERVAL_MS: u64 = 2_000;
 
 /// One folder bound to one repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +183,16 @@ pub struct SyncProfile {
     /// Extra `Keeper-Tag:` trailer values stamped on every commit (FR-86).
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Shapes the generated commit subject, or empty for keeper's own
+    /// `sync(<profile>): 3 added, 1 modified`.
+    ///
+    /// Placeholders are the closed set in
+    /// [`crate::provenance::SUBJECT_PLACEHOLDERS`]; an unknown one is refused by
+    /// [`SyncProfile::validate`] rather than carried into every commit. Only the
+    /// subject is shapeable — the trailer block is provenance, and a clone has
+    /// to be able to trust its shape without keeper installed.
+    #[serde(default)]
+    pub commit_subject_template: String,
     /// Overrides the derived git author for this profile.
     #[serde(default)]
     pub author_override: Option<String>,
@@ -220,6 +239,7 @@ impl SyncProfile {
             settle_ms: DEFAULT_SETTLE_MS,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             tags: Vec::new(),
+            commit_subject_template: String::new(),
             author_override: None,
             enabled: true,
         }
@@ -228,13 +248,26 @@ impl SyncProfile {
     /// The effective quiescence window, before the close-write fast path.
     ///
     /// Removable and network media get a longer window because their mtime
-    /// lags; a profile may still override it explicitly.
+    /// lags; a profile may still override it explicitly. `settle_ms` still
+    /// holding [`DEFAULT_SETTLE_MS`] is how "let keeper choose the wait" is
+    /// encoded, which is why a removable profile that has never pinned one gets
+    /// [`REMOVABLE_SETTLE_MS`] and one that pinned exactly 5 s does not.
     pub fn effective_settle_ms(&self) -> u64 {
         if self.removable && self.settle_ms == DEFAULT_SETTLE_MS {
             REMOVABLE_SETTLE_MS
         } else {
             self.settle_ms.min(SETTLE_CEILING_MS)
         }
+    }
+
+    /// The scan cadence the scheduler will actually use.
+    ///
+    /// Beside `effective_settle_ms` because it is the same kind of thing: the
+    /// number in force is not always the number stored, and both the form and
+    /// the degraded-watcher warning have to be able to say which is which
+    /// (AD-34-8).
+    pub fn effective_poll_interval_ms(&self) -> u64 {
+        self.poll_interval_ms.max(MIN_POLL_INTERVAL_MS)
     }
 
     /// Keychain key for this profile's remote credential. Never the secret.
@@ -282,6 +315,20 @@ impl SyncProfile {
                 "settle window must not exceed {SETTLE_CEILING_MS} ms"
             )));
         }
+        // Refused here, where the user can still see the field, rather than
+        // rendered literally into every commit the folder makes from now on.
+        // `validate` also runs on load, so a hand-edited `config.json` cannot
+        // smuggle a typo past this either.
+        if let Some(unknown) =
+            provenance::unknown_subject_placeholder(&self.commit_subject_template)
+        {
+            let known = provenance::SUBJECT_PLACEHOLDERS
+                .map(|name| format!("{{{name}}}"))
+                .join(", ");
+            return Err(SyncError::Config(format!(
+                "unknown commit subject placeholder {{{unknown}}}; keeper knows {known}"
+            )));
+        }
         Ok(())
     }
 }
@@ -321,6 +368,38 @@ mod tests {
         p.removable = true;
         p.settle_ms = 30_000;
         assert_eq!(p.effective_settle_ms(), 30_000);
+    }
+
+    #[test]
+    fn the_scan_cadence_is_floored_but_never_capped() {
+        let mut p = profile();
+        assert_eq!(p.effective_poll_interval_ms(), DEFAULT_POLL_INTERVAL_MS);
+        // A row written before the field meant anything (DW-116) carries a zero,
+        // which would re-stat the tree on every 1 Hz tick.
+        p.poll_interval_ms = 0;
+        assert_eq!(p.effective_poll_interval_ms(), MIN_POLL_INTERVAL_MS);
+        assert!(p.validate().is_ok(), "a zero is floored, never refused");
+        p.poll_interval_ms = 45_000;
+        assert_eq!(p.effective_poll_interval_ms(), 45_000);
+    }
+
+    #[test]
+    fn a_commit_subject_template_is_optional_and_its_placeholders_are_checked() {
+        let mut p = profile();
+        assert_eq!(p.commit_subject_template, "", "no template is the default");
+        assert!(p.validate().is_ok());
+
+        p.commit_subject_template = "{profile}: {changed} files".to_owned();
+        assert!(p.validate().is_ok());
+
+        // A typo caught at the edge, not rendered into every commit the folder
+        // makes from here on. The message has to name it to be actionable.
+        p.commit_subject_template = "{Profile} moved {count}".to_owned();
+        let err = p.validate().expect_err("an unknown placeholder is refused");
+        assert!(
+            err.to_string().contains("{Profile}"),
+            "the message must name the placeholder: {err}"
+        );
     }
 
     #[test]
@@ -372,6 +451,8 @@ mod tests {
         let parsed: SyncProfile = serde_json::from_str(minimal).expect("parse");
         assert_eq!(parsed.lfs_threshold_bytes, DEFAULT_LFS_THRESHOLD_BYTES);
         assert_eq!(parsed.settle_ms, DEFAULT_SETTLE_MS);
+        assert_eq!(parsed.poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
+        assert_eq!(parsed.commit_subject_template, "");
         assert!(parsed.enabled);
 
         let round = serde_json::to_string(&parsed).expect("encode");

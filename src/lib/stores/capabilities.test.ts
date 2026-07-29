@@ -16,6 +16,7 @@ const desktopCapabilities: CapabilitiesVm = {
   revealInFileManager: true,
   recording: true,
   sync: true,
+  overlayTitleBar: true,
 };
 
 afterEach(() => {
@@ -36,6 +37,7 @@ describe("capabilitiesStore", () => {
       revealInFileManager: false,
       recording: false,
       sync: false,
+      overlayTitleBar: false,
     });
   });
 
@@ -73,17 +75,9 @@ describe("isReducedCapabilityPlatform", () => {
   });
 
   it("a single present flag (hydrated) is NOT reduced — every flag must be absent", () => {
-    // Exercise each flag: with any one surface present, the platform is not reduced.
-    const flags: Array<keyof CapabilitiesVm> = [
-      "trayIcon",
-      "globalHotkey",
-      "launchAtLogin",
-      "inAppUpdater",
-      "nativeMenuBar",
-      "bridgeSidecar",
-      "revealInFileManager",
-      "recording",
-    ];
+    // Derived from the VM's own keys so a capability added later is exercised
+    // automatically: the hand-written list had already drifted past `sync`.
+    const flags = Object.keys(DEFAULT_CAPABILITIES) as Array<keyof CapabilitiesVm>;
     for (const flag of flags) {
       capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, [flag]: true });
       expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(false);

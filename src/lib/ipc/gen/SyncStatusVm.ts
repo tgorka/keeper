@@ -19,6 +19,15 @@ phase: string,
  */
 line: string, filesDone: number, filesTotal: number | null, bytesDone: number, bytesTotal: number | null, pending: number, 
 /**
+ * Files the completeness gate is holding inside their quiescence window.
+ *
+ * Distinct from `pending`, which counts journal rows: a folder where a
+ * thousand files are still being written has none of those, so `pending`
+ * alone reported it as up to date (AD-34-10). `line` already says this in
+ * words; the number is here so a surface can show it without parsing prose.
+ */
+settling: number, 
+/**
  * Sticky, last-write-wins, cleared only by a clean run — the same shape as
  * `RecordingStatusVm::warning` so the banner behaves identically.
  */
