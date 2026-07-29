@@ -165,38 +165,105 @@ pub fn clean(store: &LfsStore, absolute: &Path) -> Result<Pointer> {
     Ok(Pointer::new(oid, size))
 }
 
-/// Is `path` reported as modified only because of git's racily-clean rule?
+/// The index key for a repository-relative path.
 ///
-/// Right after staging, the file's mtime is not older than the index, so git
-/// re-reads content regardless of stat and sees the worktree bytes differ from
-/// the pointer blob. That is not a modification.
-///
-/// The check is cheap: compare the worktree file's **size** against the size
-/// recorded in the pointer. A real edit that preserves byte-length exactly and
-/// leaves the content in the store is not distinguishable this way — but the
-/// caller only reaches here for a path whose stat tuple the completeness gate
-/// already saw as unchanged, so the length check is the last discriminator
-/// needed rather than the only one.
-pub fn is_false_modification(indexed: &Pointer, absolute: &Path) -> bool {
-    std::fs::symlink_metadata(absolute).is_ok_and(|md| md.is_file() && md.len() == indexed.size)
+/// git spells every path with forward slashes, so a Windows `a\b` finds
+/// nothing until it is asked for as `a/b`.
+fn index_key(rela: &Path) -> String {
+    rela.to_string_lossy().replace('\\', "/")
 }
 
-/// Read the pointer recorded in the index for `path`, if the blob is one.
+/// The pointer `blob` holds, if it is one.
 ///
-/// Returns `None` for an ordinary file — the common case — after reading at
-/// most [`pointer::MAX_POINTER_BYTES`], so this is safe to call on every
-/// modified path.
-pub fn indexed_pointer(repo: &gix::Repository, rela: &Path) -> Option<Pointer> {
-    let index = repo.index_or_empty().ok()?;
-    let key = rela.to_string_lossy().replace('\\', "/");
-    let entry = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes()))?;
-    // A pointer is under 1 KiB by specification, so an oversized blob cannot be
-    // one and must not be loaded to find that out.
-    if entry.stat.size as usize > pointer::MAX_POINTER_BYTES {
+/// The **blob's own** length decides it, read from the object header so
+/// nothing larger is ever loaded. Consulting the index entry's `stat.size`
+/// instead is the mistake this was born with: for an LFS entry that stat is
+/// the WORKTREE file's, deliberately — see `git::commit::stage_and_commit` —
+/// so it measures the gigabytes the pointer stands in for and never the ~130
+/// bytes actually staged. It therefore rejected precisely the entries this
+/// exists to recognise, and every real LFS file answered `None`.
+fn pointer_blob(repo: &gix::Repository, blob: gix::hash::ObjectId) -> Option<Pointer> {
+    if repo.find_header(blob).ok()?.size() > pointer::MAX_POINTER_BYTES as u64 {
         return None;
     }
-    let object = repo.find_object(entry.id).ok()?;
-    Pointer::parse(&object.data)
+    Pointer::parse(&repo.find_object(blob).ok()?.data)
+}
+
+/// Read the pointer recorded in the index for `rela`, if the blob is one.
+///
+/// Returns `None` for an ordinary file — the common case — after reading at
+/// most [`pointer::MAX_POINTER_BYTES`] of object data, so this is safe to call
+/// on any modified path.
+pub fn indexed_pointer(repo: &gix::Repository, rela: &Path) -> Option<Pointer> {
+    let index = repo.index_or_empty().ok()?;
+    let key = index_key(rela);
+    let entry = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes()))?;
+    pointer_blob(repo, entry.id)
+}
+
+/// Is `rela` reported as modified only because of git's racily-clean rule?
+///
+/// An entry whose mtime is not older than the index is re-read regardless of
+/// its stat, and re-reading an LFS entry finds the worktree's gigabytes where
+/// the blob holds a pointer. That difference is the design, not an edit, and
+/// acting on it re-hashes the whole file to arrive back at the same pointer.
+///
+/// Three things must hold before a report is dismissed, and none of them reads
+/// the file's content:
+///
+/// * The worktree's stat still matches the entry's. `gix::status` calls a path
+///   unchanged exactly when that comparison passes and the entry is not racy,
+///   so a match here means raciness was its only reason for speaking up. A
+///   stat that differs is a genuine touch and must be re-staged even at
+///   identical length — which is what a comparison against the pointer's
+///   `size` alone could not tell apart, and it would have dropped an in-place
+///   edit that happened to preserve the byte count for good. The repository's
+///   own `core.trustCtime` / `core.checkStat` settings are read rather than
+///   assumed, so the comparison is the same one status made.
+/// * The staged blob is a pointer. For an ordinary blob, a racily-clean
+///   re-read finding different bytes is a real edit caught inside the race
+///   window, and swallowing it would lose the user's work.
+/// * `HEAD` already records that same blob. `stage_and_commit` writes the
+///   index before the commit so a crash between the two is re-driven on the
+///   next pass (NFR-24); dismissing a path whose pointer is staged but not yet
+///   committed would strand it until the file changed again.
+pub fn is_false_modification(repo: &gix::Repository, rela: &Path, absolute: &Path) -> bool {
+    let Ok(index) = repo.index_or_empty() else {
+        return false;
+    };
+    let key = index_key(rela);
+    let Some(entry) = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes())) else {
+        return false;
+    };
+    let Ok(options) = repo.stat_options() else {
+        return false;
+    };
+    // The stat comparison leads because it costs one `lstat` and it is what
+    // rejects an ordinary modified file, whose stat has moved. Both checks
+    // below reach into the object database, and this keeps them off the path
+    // every non-LFS modification takes.
+    let unmoved = gix::index::fs::Metadata::from_path_no_follow(absolute)
+        .ok()
+        .and_then(|metadata| gix::index::entry::Stat::from_fs(&metadata).ok())
+        .is_some_and(|worktree| worktree.matches(&entry.stat, options));
+    if !unmoved || pointer_blob(repo, entry.id).is_none() {
+        return false;
+    }
+    head_records(repo, rela, entry.id)
+}
+
+/// Does `HEAD` already record `blob` for `rela`?
+///
+/// An unborn branch, an unreadable tree and a path the commit does not carry
+/// all answer no, which is the safe direction: the path is staged rather than
+/// dismissed.
+fn head_records(repo: &gix::Repository, rela: &Path, blob: gix::hash::ObjectId) -> bool {
+    repo.head_tree().is_ok_and(|tree| {
+        tree.lookup_entry_by_path(rela)
+            .ok()
+            .flatten()
+            .is_some_and(|entry| entry.object_id() == blob)
+    })
 }
 
 /// Prepare LFS staging for a set of candidate paths.
@@ -478,20 +545,5 @@ mod tests {
         assert!(staging.substitutions.is_empty());
         assert!(staging.uploads.is_empty());
         assert!(!root.join(".gitattributes").exists());
-    }
-
-    #[test]
-    fn a_matching_length_marks_the_racily_clean_case_and_a_real_edit_does_not() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("v.bin");
-        std::fs::write(&file, vec![0u8; 500]).expect("write");
-        let indexed = Pointer::new("a".repeat(64), 500);
-        assert!(is_false_modification(&indexed, &file));
-
-        std::fs::write(&file, vec![0u8; 501]).expect("grow");
-        assert!(!is_false_modification(&indexed, &file));
-
-        std::fs::remove_file(&file).expect("remove");
-        assert!(!is_false_modification(&indexed, &file));
     }
 }

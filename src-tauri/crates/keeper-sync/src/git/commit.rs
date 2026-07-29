@@ -307,6 +307,13 @@ pub fn stage_and_commit(
     let signature = author.to_ref(&mut time_buf);
     let parents: Vec<gix::hash::ObjectId> = parent.into_iter().collect();
 
+    // Checked here rather than on entry, and deliberately as late as possible:
+    // this is the instant before the reference transaction opens, so it is the
+    // moment at which the answer is most nearly still true. See
+    // `repo::ensure_head_unlocked` — a branch lock somebody else holds does
+    // not fail this call, it hangs it, on a full core, indefinitely.
+    super::repo::ensure_head_unlocked(repo)?;
+
     let id = repo
         .commit_as(signature, signature, "HEAD", &message, tree_id, parents)
         .map_err(|err| SyncError::Git(format!("commit failed: {err}")))?

@@ -1455,19 +1455,29 @@ impl Engine {
         let trust_full = profile.removable;
         let git_dir = profile.local_path.join(".git");
         if git_dir.exists() {
-            let repo = git::repo::open(&profile.local_path, trust_full)?;
-            git::repo::enforce_local_config_with_filter(&repo, self.filter_program.as_deref())?;
-            // A kill between `gix::init` and the config write in `adopt` leaves a
-            // repository with no remote, and this branch — taken from then on,
-            // because `.git` exists — would otherwise fail every future sync with
-            // "the remote named origin did not exist". Restore it instead.
-            if git::repo::ensure_remote(&repo, &profile.remote_url)? {
-                tracing::warn!(
-                    profile = %profile.id,
-                    "sync: restored the missing origin remote (interrupted setup)"
-                );
+            match self.open_existing_repo(profile, trust_full) {
+                Ok(repo) => return Ok(repo),
+                Err(err) => {
+                    // A kill inside `gix::init` — the first thing `adopt` does
+                    // — leaves a `.git` that exists and is not a repository:
+                    // no `HEAD` yet, or no `config`. This branch is then taken
+                    // forever *because* `.git` exists, `adopt` is never
+                    // reached again, and every sync fails identically until a
+                    // human deletes the directory. `discard_unfinished_init`
+                    // removes it only when it can prove there is no history in
+                    // it, and says so either way; if it refuses, this is a
+                    // repository with real content that genuinely will not
+                    // open, and that error is the user's answer.
+                    if !git::repo::discard_unfinished_init(&git_dir)? {
+                        return Err(err);
+                    }
+                    tracing::warn!(
+                        profile = %profile.id,
+                        error = %err,
+                        "sync: re-creating a repository an interrupted setup left half-made"
+                    );
+                }
             }
-            return Ok(repo);
         }
 
         // Cloning refuses a non-empty destination — and "sync this folder I
@@ -1530,6 +1540,32 @@ impl Engine {
         if !profile.subpaths.is_empty() {
             self.git
                 .sparse_set(&profile.local_path, &profile.subpaths)?;
+        }
+        Ok(repo)
+    }
+
+    /// The `.git`-already-exists path: open it, pin the configuration the
+    /// engine depends on, and restore an origin an interrupted setup lost.
+    ///
+    /// Split out from [`Self::open_repo`] so its caller can tell "this folder
+    /// is not a usable repository" from "this folder is not a repository yet",
+    /// which are the same symptom and opposite answers.
+    fn open_existing_repo(
+        &self,
+        profile: &SyncProfile,
+        trust_full: bool,
+    ) -> Result<gix::Repository> {
+        let repo = git::repo::open(&profile.local_path, trust_full)?;
+        git::repo::enforce_local_config_with_filter(&repo, self.filter_program.as_deref())?;
+        // A kill between `gix::init` and the config write in `adopt` leaves a
+        // repository with no remote, and this branch — taken from then on,
+        // because `.git` exists — would otherwise fail every future sync with
+        // "the remote named origin did not exist". Restore it instead.
+        if git::repo::ensure_remote(&repo, &profile.remote_url)? {
+            tracing::warn!(
+                profile = %profile.id,
+                "sync: restored the missing origin remote (interrupted setup)"
+            );
         }
         Ok(repo)
     }
@@ -2030,17 +2066,12 @@ impl Engine {
                     StabilityVerdict::Stable => {
                         if is_new {
                             new_paths.push(rela.clone());
-                        } else if let Some(indexed) = lfs::stage::indexed_pointer(&repo, rela) {
-                            // An LFS-tracked path. git re-reads content for any
-                            // entry whose mtime is not older than the index
-                            // ("racily clean"), so right after staging it will
-                            // report the worktree bytes as differing from the
-                            // pointer blob. That is not an edit, and
-                            // re-committing it would loop forever.
-                            if !lfs::stage::is_false_modification(&indexed, &absolute) {
-                                changed_paths.push(rela.clone());
-                            }
-                        } else {
+                        } else if !lfs::stage::is_false_modification(&repo, rela, &absolute) {
+                            // An LFS-tracked path whose entry is racily clean
+                            // reports the worktree's bytes as differing from
+                            // its pointer blob. That is not an edit, and
+                            // staging it again would re-hash the whole file
+                            // only to write back the pointer it already has.
                             changed_paths.push(rela.clone());
                         }
                     }
@@ -3889,6 +3920,97 @@ mod tests {
         engine
             .commit_local(p, SyncSource::Watch)
             .expect("second pass commits")
+    }
+
+    /// The scan consults the LFS guard and honours a "this is real work"
+    /// answer, which no LFS path reached until `lfs::stage::indexed_pointer`
+    /// stopped rejecting every one of them.
+    ///
+    /// # What this cannot cover, and what does
+    ///
+    /// Only the guard's `false` answer is reachable from here. Its `true`
+    /// answer needs a racily-clean entry, and git only reaches that state by
+    /// re-reading the worktree **through `filter.lfs.clean`** — which `Engine`
+    /// registers as `std::env::current_exe()` (see `Engine::open`), the libtest
+    /// harness under `cargo test`. Driving that from here would spawn the
+    /// harness as a filter it cannot be, print its argument-parser error into
+    /// an otherwise green run, and prove nothing about the clean filter.
+    /// `tests/lfs_roundtrip.rs` owns that instead: it registers the filter
+    /// itself, so it can measure the decision with a working one and without.
+    ///
+    /// The state used here needs no worktree read at all. A pointer written to
+    /// the index and not yet committed is a `HEAD`-to-index difference, which
+    /// git reports from objects alone.
+    #[test]
+    fn a_pointer_staged_ahead_of_head_survives_the_scan_and_is_committed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1024;
+        let payload = vec![42u8; 200_000];
+        std::fs::write(p.local_path.join("clip.mp4"), &payload).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        let repo = engine.open_repo(&p).expect("open");
+        let committed = lfs::stage::indexed_pointer(&repo, Path::new("clip.mp4"))
+            .expect("the committed blob is a pointer");
+
+        // Exactly what a kill between `stage_and_commit`'s index write and its
+        // commit leaves behind: the index names a pointer `HEAD` has never
+        // heard of. The worktree is not touched, so its stat still matches and
+        // nothing re-reads the file.
+        let staged = lfs::pointer::Pointer::new("c".repeat(64), payload.len() as u64);
+        let blob = repo
+            .write_blob(staged.render().as_bytes())
+            .expect("write blob")
+            .detach();
+        let shared = repo.index_or_empty().expect("index");
+        let mut index: gix::index::File = (**shared).clone();
+        index
+            .entry_mut_by_path_and_stage(
+                gix::bstr::BStr::new("clip.mp4"),
+                gix::index::entry::Stage::Unconflicted,
+            )
+            .expect("clip.mp4 is indexed")
+            .id = blob;
+        index
+            .write(gix::index::write::Options::default())
+            .expect("write index");
+        drop(shared);
+        drop(repo);
+
+        // Age the index past the file. Everything above happened inside one
+        // wall-clock second, which makes the entry racily clean — git would
+        // re-read the worktree through `filter.lfs.clean` and this test would
+        // be measuring the filter instead of the guard. In production the
+        // index is always written after the file was last touched; a second of
+        // sleeping would say the same thing far more slowly.
+        let unracy = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(p.local_path.join(".git").join("index"))
+            .and_then(|index| index.set_modified(unracy))
+            .expect("age the index");
+
+        assert_eq!(
+            commit_after_settling(&engine, &platform, &p),
+            1,
+            "the guard must not dismiss a pointer HEAD does not record, or the \
+             commit the crash interrupted is never re-driven"
+        );
+        let repo = engine.open_repo(&p).expect("open");
+        let after = lfs::stage::indexed_pointer(&repo, Path::new("clip.mp4"))
+            .expect("the path is still LFS-tracked");
+        assert_eq!(
+            after, committed,
+            "the re-drive re-cleans the worktree, so the committed pointer \
+             describes the bytes on disk rather than the interrupted guess"
+        );
     }
 
     #[tokio::test]

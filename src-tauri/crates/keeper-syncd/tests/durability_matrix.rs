@@ -19,8 +19,10 @@
 //! can never push again has still lost the user's data, just later.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// What a kill was observed to have interrupted.
 ///
@@ -217,6 +219,34 @@ impl Peer {
         assert_files_intact(&self.work, expected, &context);
     }
 
+    /// Stand in for the minute the index-lock recovery is entitled to take.
+    ///
+    /// `git::repo::STALE_INDEX_LOCK` is deliberately sixty seconds: an
+    /// `index.lock` younger than that may still belong to a `git` command the
+    /// user is running by hand, and taking it would corrupt a real index to
+    /// fix a problem nobody has. That policy is correct and is not weakened —
+    /// not in the engine, and not by shortening it here.
+    ///
+    /// But the passes below run inside a single second, so a kill that leaves
+    /// an `index.lock` used to make this helper assert a convergence deadline
+    /// the daemon never promised: the profile *does* recover, sixty seconds
+    /// later, and the test failed roughly one run in thirty on that timing
+    /// accident rather than on any defect. Backdating the lock is the passage
+    /// of time the daemon is allowed, nothing more. The daemon still has to
+    /// notice the lock and clear it, which is the part under test.
+    ///
+    /// Reference locks are deliberately NOT aged. Their recovery is a watch
+    /// rather than an age and completes in seconds, so the sweep exercises it
+    /// exactly as a user's machine would.
+    fn age_any_index_lock(&self) {
+        let lock = self.work.join(".git").join("index.lock");
+        let Ok(file) = std::fs::File::options().write(true).open(&lock) else {
+            return;
+        };
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(600);
+        let _ = file.set_times(std::fs::FileTimes::new().set_modified(long_ago));
+    }
+
     /// Drive the profile to a settled state the way the daemon would, keeping
     /// what each pass said.
     ///
@@ -227,6 +257,10 @@ impl Peer {
     /// log. Returning the last failing pass's stderr means the next failure
     /// names its own cause (a stale `index.lock` after a kill -9, say).
     fn sync_to_completion(&self) -> String {
+        // The lock a kill may have left is aged once, before any pass runs:
+        // see `age_any_index_lock` for why this is the passage of time rather
+        // than a weakened rule.
+        self.age_any_index_lock();
         let mut last_failure = String::new();
         for pass in 0..6 {
             // `daemon()` nulls both streams for the spawn-and-kill path; undo that
@@ -256,6 +290,19 @@ impl Peer {
             }
         }
         last_failure
+    }
+
+    /// One sync pass, with both streams captured.
+    ///
+    /// The output is the point: a recovery that repairs somebody's `.git`
+    /// without saying so is not acceptable, so the tests below read what the
+    /// pass reported as well as what it left on disk.
+    fn sync_once(&self) -> Output {
+        self.daemon(&["sync", "--once"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run a sync pass")
     }
 
     fn remote_files(&self) -> Vec<String> {
@@ -441,4 +488,223 @@ fn a_kill_leaves_no_committed_work_unpublished_forever() {
     if !observed_orphan {
         eprintln!("note: no kill landed between commit and push in this run");
     }
+}
+
+/// The reference lock `commit_as` leaves when a kill lands inside its
+/// transaction, planted rather than raced for.
+///
+/// `HEAD` is the first reference the transaction locks and therefore the one a
+/// kill is most likely to strand — it is the lock the CI failure on
+/// `release/v0.6.3` left behind. The content is what gitoxide had written into
+/// it: the id of a commit that exists locally and was never published.
+fn plant_head_lock(work: &Path, oid: &str) -> PathBuf {
+    let lock = work.join(".git").join("HEAD.lock");
+    std::fs::write(&lock, format!("{oid}\n")).expect("plant the reference lock");
+    lock
+}
+
+#[test]
+fn a_reference_lock_left_by_a_kill_does_not_strand_a_folder() {
+    if !git_available() {
+        return;
+    }
+
+    // The deterministic half of `a_kill_leaves_no_committed_work_unpublished_forever`.
+    // That test has to race a SIGKILL into a window a few microseconds wide, so
+    // a green run of it proves very little; this one plants exactly what the
+    // kill leaves and asserts the folder digs itself out.
+    let peer = Peer::new("reflock", 6, 0);
+    assert!(
+        peer.sync_once().status.success(),
+        "the first pass must publish, or the fixture proves nothing"
+    );
+    let head = peer
+        .rev_parse(&peer.work, "HEAD")
+        .expect("the first pass committed");
+
+    std::fs::write(
+        peer.work.join("after-the-kill.txt"),
+        b"work that must survive",
+    )
+    .expect("seed the change the killed run was publishing");
+    let lock = plant_head_lock(&peer.work, &head);
+
+    let out = peer.sync_once();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "a folder holding an abandoned reference lock must recover on its own; \
+         stderr={stderr}"
+    );
+    assert!(
+        !lock.exists(),
+        "the abandoned lock must be gone, not merely worked around"
+    );
+    assert!(
+        peer.remote_files()
+            .iter()
+            .any(|path| path == "after-the-kill.txt"),
+        "the work the kill interrupted must reach the remote; published: {:?}",
+        peer.remote_files()
+    );
+    // Silently repairing someone's git directory is not acceptable, so the
+    // repair has to be legible in the log rather than inferred from the fact
+    // that syncing started working again.
+    assert!(
+        stderr.contains("released a reference lock left behind by a killed run"),
+        "the recovery must say what it removed; stderr={stderr}"
+    );
+}
+
+#[test]
+fn a_reference_lock_a_live_writer_holds_is_left_alone() {
+    if !git_available() {
+        return;
+    }
+
+    // The direction that stops this from being "delete every `.lock`". These
+    // folders are meant to be used with plain `git`, so the holder of a
+    // reference lock is quite likely a person's own commit in progress, and
+    // taking it would break their write to fix a problem nobody has.
+    let peer = Peer::new("livelock", 6, 0);
+    assert!(
+        peer.sync_once().status.success(),
+        "the first pass must publish, or the fixture proves nothing"
+    );
+    let head = peer
+        .rev_parse(&peer.work, "HEAD")
+        .expect("the first pass committed");
+    let published = peer.remote_files();
+
+    std::fs::write(
+        peer.work.join("not-yours.txt"),
+        b"must not be published here",
+    )
+    .expect("seed a change so the pass reaches the commit path");
+    let lock = plant_head_lock(&peer.work, &head);
+
+    // A writer that is actually working touches its lock. Keeping it moving
+    // for as long as the pass runs is what a concurrent `git commit` looks
+    // like from keeper's side.
+    let writing = Arc::new(AtomicBool::new(true));
+    let writer = {
+        let lock = lock.clone();
+        let writing = Arc::clone(&writing);
+        std::thread::spawn(move || {
+            let mut held = 1usize;
+            while writing.load(Ordering::Relaxed) {
+                held += 1;
+                let _ = std::fs::write(&lock, vec![b'w'; held]);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+
+    let out = peer.sync_once();
+    writing.store(false, Ordering::Relaxed);
+    writer.join().expect("the writer thread");
+
+    assert!(
+        lock.exists(),
+        "a lock a live writer holds must survive the pass untouched"
+    );
+    assert!(
+        !out.status.success(),
+        "the pass must report the ordinary lock error rather than steal the lock; \
+         stdout={:?}",
+        String::from_utf8_lossy(&out.stdout).trim()
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr)
+            .contains("released a reference lock left behind by a killed run"),
+        "nothing was recovered, so nothing may claim to have been"
+    );
+    assert_eq!(
+        peer.remote_files(),
+        published,
+        "a refused commit must publish nothing"
+    );
+}
+
+#[test]
+fn a_branch_lock_a_live_writer_holds_never_hangs_the_daemon() {
+    if !git_available() {
+        return;
+    }
+
+    // The other shape of the same defect, and the expensive one. gitoxide does
+    // not fail on a held *branch* lock the way it fails on a held `HEAD.lock`:
+    // `gix-ref` 0.66.0 walks the failed edit's parent chain without advancing
+    // its cursor (`store/file/transaction/prepare.rs:398-410`), so a child
+    // edit's lock failure becomes an infinite loop on a full core, with no
+    // error and no output. That is how one CI run spent ninety-six minutes on
+    // this file, and on a user's machine it is a wedged, hot process for as
+    // long as their own `git commit` holds the lock.
+    //
+    // Recovery cannot help here — a lock a live writer holds is precisely the
+    // one it must leave alone — so the commit path refuses to enter the
+    // transaction instead. This asserts the daemon comes back.
+    let peer = Peer::new("nohang", 4, 0);
+    assert!(
+        peer.sync_once().status.success(),
+        "the first pass must publish, or the fixture proves nothing"
+    );
+    std::fs::write(peer.work.join("blocked.txt"), b"waits for the other writer")
+        .expect("seed a change so the pass reaches the commit path");
+
+    let lock = peer.work.join(".git").join("refs/heads/main.lock");
+    std::fs::write(&lock, b"w").expect("plant the branch lock");
+    let writing = Arc::new(AtomicBool::new(true));
+    let writer = {
+        let lock = lock.clone();
+        let writing = Arc::clone(&writing);
+        std::thread::spawn(move || {
+            let mut held = 1usize;
+            while writing.load(Ordering::Relaxed) {
+                held += 1;
+                let _ = std::fs::write(&lock, vec![b'w'; held]);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+
+    let mut child = peer
+        .daemon(&["sync", "--once"])
+        .spawn()
+        .expect("spawn a sync pass");
+    // Bounded by the test itself rather than by the harness. A regression here
+    // is a hang, and the whole point is that a hang must produce a verdict:
+    // waiting for nextest's four-minute axe would report a timeout without
+    // naming what caused it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("poll the pass") {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    writing.store(false, Ordering::Relaxed);
+    writer.join().expect("the writer thread");
+
+    let status = status.expect(
+        "the pass must return while another writer holds the branch lock, \
+         not spin on it",
+    );
+    assert!(
+        !status.success(),
+        "a refused pass is a failure the scheduler retries, not a success"
+    );
+    assert!(
+        lock.exists(),
+        "the other writer's lock must survive the refusal"
+    );
+    assert!(
+        !peer.remote_files().iter().any(|path| path == "blocked.txt"),
+        "a refused commit must publish nothing"
+    );
 }
