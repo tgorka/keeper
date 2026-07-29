@@ -6242,12 +6242,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    #[test]
-    fn session_summary_reports_manifest_authoritative_figures() {
+    #[tokio::test]
+    async fn session_summary_reports_manifest_authoritative_figures() {
         let base = scan_temp_dir("summary");
         let folder = write_session(&base, "keeper-rec summary", ManifestStatus::Finalized);
-        let summary =
-            recording_session_summary(folder.to_string_lossy().into_owned()).expect("summary");
+        let summary = recording_session_summary(folder.to_string_lossy().into_owned())
+            .await
+            .expect("summary");
         assert!(summary.session_folder.ends_with("keeper-rec summary"));
         assert_eq!(summary.screen_segment_count, 1);
         assert_eq!(summary.total_bytes, 100);
