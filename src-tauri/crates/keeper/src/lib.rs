@@ -320,6 +320,12 @@ pub fn run() {
                 $($extra,)*
                 ipc::app_ping,
                 ipc::capabilities,
+                // Registered on every platform, unlike the rest of the sync
+                // surface: the report is what tells a desktop user their `git`
+                // is unusable, and a phone gets `unsupported` rather than an
+                // `invoke` rejection the frontend would have to special-case.
+                ipc::sync_git_status,
+                ipc::sync_git_path_set,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,

@@ -7,10 +7,15 @@
 //!
 //! # Availability is a runtime fact, not a build flag
 //!
-//! The engine cannot exist without a usable `git` (AD-41), so it is built
-//! lazily and its absence is reported honestly through `CapabilitiesVm.sync`
-//! rather than by shipping surfaces that fail when pressed. A machine with no
-//! git simply has no sync UI — the AD-27 "no dead buttons" rule.
+//! The engine cannot exist without a usable `git` (AD-41), so it is built lazily
+//! and its absence is reported honestly through `CapabilitiesVm.sync` rather
+//! than by shipping surfaces that fail when pressed. A machine with no usable
+//! git has no sync UI — the AD-27 "no dead buttons" rule.
+//!
+//! **Usable**, not present. [`git_resolution`] probes candidates in `PATH` order
+//! and answers with the first that clears the engine's version floor, so the
+//! capability and `Engine::open` cannot disagree; [`git_report`] is what tells a
+//! person which binary won, or why none did.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -19,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use keeper_core::platform::Platform;
 use keeper_core::vm::NotifyTarget;
 use keeper_sync::engine::Engine;
+use keeper_sync::git::resolve::{GitRequest, GitResolution};
 use keeper_sync::{Result as SyncResult, SyncError, SyncPlatform};
 
 /// Bridges the engine's port onto the shell's existing [`Platform`].
@@ -96,9 +102,7 @@ impl SyncPlatform for ShellSyncPlatform {
     }
 
     fn git_program(&self) -> SyncResult<PathBuf> {
-        find_git().ok_or_else(|| SyncError::GitMissing {
-            reason: "no `git` on PATH; install git 2.42 or newer to use folder sync".to_owned(),
-        })
+        git_resolution(self.platform.as_ref()).program()
     }
 
     fn host_label(&self) -> String {
@@ -106,31 +110,134 @@ impl SyncPlatform for ShellSyncPlatform {
     }
 }
 
-/// Locate `git` on `PATH`.
+/// Extra places to look for `git` after `PATH` is exhausted.
 ///
-/// Resolved by hand rather than with a crate: this is a handful of `join`s and
-/// an `is_file` check, and a GUI app's `PATH` is thin enough that the extra
-/// well-known locations matter more than any library would.
-fn find_git() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("git");
-            if candidate.is_file() {
-                return Some(candidate);
+/// A macOS app launched from Finder inherits `launchctl`'s `PATH`
+/// (`/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`), not the user's shell's, so
+/// a bare `PATH` search reports "no git" on a machine that plainly has one in
+/// Homebrew. These come *after* `PATH` so a user who put a git first still gets
+/// it — and, because resolution probes, a Homebrew 2.52 is now reached even when
+/// `launchctl`'s `PATH` puts a broken `/usr/local/bin/git` ahead of it.
+const EXTRA_GIT_LOCATIONS: [&str; 3] = [
+    "/opt/homebrew/bin/git",
+    "/usr/local/bin/git",
+    "/usr/bin/git",
+];
+
+/// What to do about a machine with no usable `git`, in the app's own terms.
+///
+/// Named rather than inlined for the reason `keeper-syncd`'s install advice is:
+/// it is the most likely message a person will ever see from this subsystem, and
+/// a refusal without a next step is a support ticket. Both halves matter — the
+/// version floor, and the fact that a shadowed `PATH` is fixable from Settings
+/// without touching the machine's git at all.
+pub const GIT_ADVICE: &str = "install git 2.42 or newer (`brew install git`, or \
+     `xcode-select --install`), or point keeper at one in Settings → Sync";
+
+/// Candidate `git` paths, in the order they will be probed.
+fn git_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("git"))
+                .collect()
+        })
+        .unwrap_or_default();
+    candidates.extend(EXTRA_GIT_LOCATIONS.iter().map(PathBuf::from));
+    // A `PATH` that already names one of the well-known locations would
+    // otherwise be probed twice, spawning a process to learn what we just
+    // learned.
+    candidates.dedup();
+    candidates
+}
+
+/// The resolution this process is using, computed at most once per outcome.
+///
+/// **Why cached.** Resolution spawns one process per candidate up to the winner,
+/// and it gates a UI surface: `capabilities()` asks on every window handshake and
+/// the Settings report asks on every open. Re-searching a 12-entry `PATH` each
+/// time would spawn twelve `git --version` calls to answer a question whose
+/// answer had not changed.
+///
+/// **When it is thrown away.** Two triggers, and no timer:
+///
+/// * The explicit-path setting changes — [`invalidate_git_resolution`] runs from
+///   the setter, so a person who fixes a shadowed `PATH` sees the effect on the
+///   next read rather than after a relaunch.
+/// * The cached answer is a *refusal*. A refusal is not cached at all, because
+///   the fix for it happens outside this process — `brew install git` — and a
+///   cache that kept saying "no git" after the user installed one would be the
+///   same class of bug as the one this story fixes, just quieter. A success is
+///   sticky: the chosen path cannot become unusable by someone upgrading git,
+///   and if the binary is deleted the next real `git` call fails loudly with
+///   git's own diagnostic rather than a stale capability.
+///
+/// So the cost of a broken machine is one search per capability read, which is
+/// exactly the machine where a person is waiting for an answer.
+static GIT: LazyLock<Mutex<Option<CachedGit>>> = LazyLock::new(|| Mutex::new(None));
+
+/// A cached successful resolution, and the setting it was computed for.
+struct CachedGit {
+    /// The explicit path in force when this was resolved; `None` = automatic.
+    /// Compared on read so a setting change cannot be served a stale answer even
+    /// if some future caller forgets to invalidate.
+    requested: Option<String>,
+    resolution: GitResolution,
+}
+
+fn git_slot() -> MutexGuard<'static, Option<CachedGit>> {
+    GIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Forget the cached resolution. Called when the explicit path is written.
+pub fn invalidate_git_resolution() {
+    git_slot().take();
+}
+
+/// Resolve the `git` this installation will drive.
+///
+/// An explicitly configured path is used **exactly**: when it does not clear the
+/// floor this refuses and reports why, and never quietly searches `PATH` for a
+/// substitute. Silent substitution is the defect this story exists to remove,
+/// and replacing it with a different silent substitution would not be a fix.
+pub fn git_resolution(platform: &dyn Platform) -> GitResolution {
+    let requested = configured_git_path(platform);
+    {
+        let guard = git_slot();
+        if let Some(cached) = guard.as_ref() {
+            if cached.requested == requested {
+                return cached.resolution.clone();
             }
         }
     }
-    // A macOS app launched from Finder inherits a minimal `PATH` that often
-    // omits Homebrew entirely, so a bare PATH search would report "no git" on
-    // a machine that plainly has it.
-    [
-        "/opt/homebrew/bin/git",
-        "/usr/local/bin/git",
-        "/usr/bin/git",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .find(|p| p.is_file())
+
+    let resolution = match &requested {
+        Some(path) => GitRequest::explicit(PathBuf::from(path), GIT_ADVICE).resolve(),
+        None => GitRequest::search(git_candidates(), GIT_ADVICE).resolve(),
+    };
+    if resolution.chosen().is_some() {
+        *git_slot() = Some(CachedGit {
+            requested,
+            resolution: resolution.clone(),
+        });
+    }
+    resolution
+}
+
+/// The explicitly chosen `git`, or `None` for automatic resolution.
+///
+/// A read failure is `None` — automatic — and is logged rather than swallowed: a
+/// `keeper.db` that cannot be read is a real fault, but making it *also* mean "no
+/// sync at all" would turn one problem into two.
+pub fn configured_git_path(platform: &dyn Platform) -> Option<String> {
+    let data_dir = platform.data_dir().ok()?;
+    match keeper_core::registry::get_sync_git_path(&data_dir) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(%err, "sync: could not read the configured git path; searching PATH");
+            None
+        }
+    }
 }
 
 /// This machine's short name, for provenance trailers and conflict filenames.
@@ -215,11 +322,12 @@ static SUPERVISOR: LazyLock<Mutex<Option<tokio::sync::watch::Sender<bool>>>> =
 /// (its `run_supervisor`); this is the app doing the equivalent so a configured
 /// folder converges without a separate daemon installed.
 ///
-/// Best-effort and quiet by design. A machine with no `git` has no sync
-/// capability and therefore no surface to feed, so a failed engine build is a
-/// debug line, not a warning — exactly the honesty rule the capability handshake
-/// already follows. Idempotent; safe to call before any profile exists (the
-/// tick is a no-op then).
+/// Best-effort, and **loud** when it cannot start. A failed engine build here is
+/// almost always a `git` that keeper cannot use, and until Story 34.14 that was
+/// a `debug!` line — a level nobody turns on — so from the outside sync simply
+/// did nothing, with no record of why. The refusal now carries the resolver's
+/// full sentence (which candidates were tried, what each said) at `warn`.
+/// Idempotent; safe to call before any profile exists (the tick is a no-op then).
 pub fn start_supervisor(platform: Arc<dyn Platform>) {
     let mut guard = supervisor_slot();
     if guard.is_some() {
@@ -228,7 +336,7 @@ pub fn start_supervisor(platform: Arc<dyn Platform>) {
     let engine = match engine(platform) {
         Ok(engine) => engine,
         Err(err) => {
-            tracing::debug!(%err, "sync: no supervisor (engine unavailable)");
+            tracing::warn!(%err, "sync: no background sync on this machine");
             return;
         }
     };
@@ -260,15 +368,6 @@ fn supervisor_slot() -> MutexGuard<'static, Option<tokio::sync::watch::Sender<bo
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Whether folder sync can run here — the `CapabilitiesVm.sync` answer.
-///
-/// Deliberately cheap and side-effect-free: it asks whether a `git` binary
-/// exists, not whether the engine has been built, so the capability handshake
-/// never pays for opening a database.
-pub fn is_available() -> bool {
-    cfg!(desktop) && find_git().is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,25 +386,142 @@ mod tests {
     }
 
     #[test]
-    fn git_is_found_on_a_machine_that_has_it() {
-        // The whole sync surface is gated on this answer, so a false negative
-        // silently removes the feature.
-        let found = find_git();
-        let on_path = std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        assert_eq!(
-            found.is_some(),
-            on_path,
-            "find_git disagreed with whether git actually runs here"
+    fn the_candidate_list_is_path_order_then_the_well_known_locations() {
+        // Order is the whole fix: probing in `PATH` order is what lets a
+        // Homebrew 2.52 win over a `/usr/local/bin/git` that `launchctl`'s PATH
+        // puts first, while a user who deliberately put a git first still gets it.
+        let candidates = git_candidates();
+        let from_path: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join("git"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            candidates.starts_with(&from_path),
+            "PATH must be probed before the fallbacks"
         );
+        for extra in EXTRA_GIT_LOCATIONS {
+            assert!(
+                candidates.iter().any(|c| c == Path::new(extra)),
+                "a Finder-launched app needs {extra} as a fallback"
+            );
+        }
     }
 
+    /// A `Platform` whose data dir is a fresh temp tree, so the `sync.git_path`
+    /// setting can be written and read for real rather than mocked.
+    struct SettingsPlatform {
+        data_dir: PathBuf,
+    }
+
+    impl Platform for SettingsPlatform {
+        fn data_dir(&self) -> Result<PathBuf, CoreError> {
+            Ok(self.data_dir.clone())
+        }
+        fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn keychain_get(&self, _key: &str) -> Result<Option<String>, CoreError> {
+            Ok(None)
+        }
+        fn keychain_delete(&self, _key: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn open_url(&self, _url: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn notify(&self, _t: &str, _b: &str, _target: &NotifyTarget) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
+            Err(CoreError::Unsupported("unused".to_owned()))
+        }
+        fn exclude_from_backup(&self, _path: &Path) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    /// A private data dir for one test. `tempfile` is not a dependency of this
+    /// crate; `std::env::temp_dir()` plus the pid is the convention here.
+    fn test_data_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("keeper-git-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test data dir");
+        dir
+    }
+
+    /// A fake `git` that answers `--version` with `version`.
+    fn fake_git(dir: &Path, name: &str, version: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let program = dir.join(name);
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\necho 'git version {version}'\n"),
+        )
+        .expect("fixture");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        program
+    }
+
+    /// One test, not three, because [`GIT`] is process-global: two tests that
+    /// each invalidated it would race each other's cache assertions.
     #[test]
-    fn availability_tracks_the_git_probe() {
-        assert_eq!(is_available(), cfg!(desktop) && find_git().is_some());
+    fn a_configured_git_is_obeyed_exactly_and_its_success_is_cached() {
+        let dir = test_data_dir("configured");
+        let platform = SettingsPlatform {
+            data_dir: dir.clone(),
+        };
+
+        // --- Below the floor: refuse, and do NOT fall back --------------------
+        // Replacing one silent substitution with another is not a fix, so a
+        // named binary that cannot serve must refuse even though this very
+        // machine has a usable git on `PATH` to fall back onto.
+        let old = fake_git(&dir, "git-2.23", "2.23.0");
+        keeper_core::registry::set_sync_git_path(&dir, &old.display().to_string())
+            .expect("set old");
+        invalidate_git_resolution();
+
+        let resolution = git_resolution(&platform);
+        assert!(resolution.is_explicit());
+        assert!(resolution.chosen().is_none(), "no fallback to PATH");
+        assert_eq!(
+            resolution.program().expect_err("must refuse").code(),
+            "gitMissing"
+        );
+        let refusal = resolution.refusal();
+        assert!(refusal.contains("2.23"), "{refusal}");
+        assert!(refusal.contains(GIT_ADVICE), "{refusal}");
+
+        // --- Clearing the setting searches again, in this same process --------
+        keeper_core::registry::set_sync_git_path(&dir, "").expect("clear");
+        invalidate_git_resolution();
+        assert!(!git_resolution(&platform).is_explicit());
+
+        // --- Above the floor: used, and the success is sticky -----------------
+        let good = fake_git(&dir, "git-2.52", "2.52.0");
+        keeper_core::registry::set_sync_git_path(&dir, &good.display().to_string())
+            .expect("set good");
+        invalidate_git_resolution();
+        assert_eq!(git_resolution(&platform).program().expect("chosen"), good);
+
+        // Deleting the binary must not change the answer within this process: a
+        // success is cached, and the next real `git` call is what reports a
+        // binary that went away — with git's own diagnostic, not a stale flag.
+        std::fs::remove_file(&good).expect("remove");
+        assert_eq!(git_resolution(&platform).program().expect("cached"), good);
+
+        // A refusal, by contrast, is never cached, which is what lets
+        // `brew install git` take effect without relaunching the app.
+        invalidate_git_resolution();
+        assert!(git_resolution(&platform).chosen().is_none());
+
+        invalidate_git_resolution();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- Story 29.6: the desktop end of "notify exactly once, on onset" -----

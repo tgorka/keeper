@@ -59,6 +59,7 @@ pub use engine::{
     Engine, ParkedUnit, PendingFile, PendingReason, ProblemReport, SyncOutcome, VerifyReport,
 };
 pub use error::{Result, SyncError};
+pub use git::resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};
 pub use platform::SyncPlatform;
 pub use profile::{ProfileState, SyncDirection, SyncLane, SyncProfile};
 pub use progress::{SyncPhase, SyncProgress, SyncStatus};

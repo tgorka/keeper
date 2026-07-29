@@ -29,6 +29,7 @@
 //! * [`commit`] — worktree → index → tree → commit, with provenance trailers.
 //! * [`conflict`] — the pure AD-43 convergence policy.
 //! * [`cli`] — push, worktree mutation, sparse patterns, gc.
+//! * [`resolve`] — which of the machine's `git` binaries [`cli`] gets to drive.
 //!
 //! Two hazards documented in [`repo`] are load-bearing rather than defensive:
 //! gitoxide silently drops repo-local `filter.*` configuration under the trust
@@ -41,9 +42,11 @@ pub mod commit;
 pub mod conflict;
 pub mod fetch;
 pub mod repo;
+pub mod resolve;
 
 pub use cli::{GitCapabilities, GitCli};
 pub use commit::StagedChange;
 pub use conflict::{ChangeKind, Resolution, Side};
 pub use fetch::{Credential, FetchOptions, FetchOutcome, TransferProgress};
 pub use repo::RepoStatus;
+pub use resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};

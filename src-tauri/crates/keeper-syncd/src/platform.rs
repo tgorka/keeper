@@ -24,7 +24,7 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use keeper_sync::{Result, SyncError, SyncPlatform};
+use keeper_sync::{GitRequest, Result, SyncError, SyncPlatform};
 
 /// The per-application segment appended to each XDG base directory.
 pub const APP_DIR: &str = "keeper-sync";
@@ -37,7 +37,7 @@ pub const SECRETS_DIR: &str = "secrets";
 /// Prefix for the environment-variable secret source.
 pub const SECRET_ENV_PREFIX: &str = "KEEPER_SYNC_SECRET_";
 
-/// What `doctor` and every failed command print on a box with no `git`.
+/// What `doctor` and every failed command tell an operator to install.
 ///
 /// A constant rather than an inline literal because it is the single most
 /// likely message a new operator will ever see, and it has to survive as an
@@ -45,9 +45,13 @@ pub const SECRET_ENV_PREFIX: &str = "KEEPER_SYNC_SECRET_";
 /// fallback, so "not found" without "here is how to get it" is a support
 /// ticket. Also lets the wording be asserted without depending on whether the
 /// test machine happens to have git installed.
-pub const GIT_MISSING_REASON: &str = "no `git` executable on PATH. keeper-syncd needs it for \
-     push, worktree and sparse-checkout operations (AD-41). Install it with `apt install git`, \
-     `dnf install git`, `pacman -S git` or `apk add git`, then re-run `keeper-syncd doctor`";
+///
+/// Phrased as the *tail* of a sentence: `keeper_sync::git::resolve` owns the
+/// lead clause (which candidates were tried, and what each of them said) and
+/// appends this, so the daemon and the app cannot describe one fault two ways.
+pub const GIT_ADVICE: &str = "install git 2.42 or newer with `apt install git`, \
+     `dnf install git`, `pacman -S git` or `apk add git`, or set `[daemon] gitPath` in \
+     config.toml, then re-run `keeper-syncd doctor`";
 
 /// `SyncPlatform` over the XDG base directories.
 #[derive(Debug, Clone)]
@@ -56,6 +60,10 @@ pub struct LinuxPlatform {
     data_dir: PathBuf,
     state_dir: PathBuf,
     host_label: String,
+    /// `[daemon] gitPath`, when the operator named a binary. `None` searches
+    /// `PATH`. Held on the platform rather than read from the config at each
+    /// call because `SyncPlatform::git_program` has no access to the config.
+    git_path: Option<PathBuf>,
 }
 
 impl LinuxPlatform {
@@ -95,6 +103,33 @@ impl LinuxPlatform {
             data_dir: data_dir.into(),
             state_dir: state_dir.into(),
             host_label: read_host_label(),
+            git_path: None,
+        }
+    }
+
+    /// Bind the configured `[daemon] gitPath` (Story 34.14).
+    ///
+    /// Applied after the config is parsed, which is *after* the platform exists
+    /// — the startup order is deliberate (the configured log level is an input
+    /// to the logger, so the config is read before logging is initialised).
+    pub fn with_git_path(mut self, git_path: Option<PathBuf>) -> Self {
+        self.git_path = git_path;
+        self
+    }
+
+    /// Which `git` this daemon will drive, and what was rejected on the way.
+    ///
+    /// **Not cached, unlike the app's.** The app's resolution gates a UI surface
+    /// that is re-read on every window handshake; this one is consulted once per
+    /// process, by `Engine::open` (and once more by `doctor`, which is a
+    /// one-shot command). Caching it would add interior mutability to a `Clone`
+    /// platform to save a spawn that happens once.
+    pub fn git_resolution(&self) -> keeper_sync::GitResolution {
+        match &self.git_path {
+            // Exactly this binary. A named git that cannot serve refuses; it is
+            // never quietly replaced by one from `PATH`.
+            Some(program) => GitRequest::explicit(program.clone(), GIT_ADVICE).resolve(),
+            None => GitRequest::search(path_candidates("git"), GIT_ADVICE).resolve(),
         }
     }
 
@@ -208,27 +243,31 @@ fn check_secret_permissions(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Find `program` on a `PATH`-shaped variable.
+/// Every `PATH` entry's `program`, in the order `PATH` lists them.
+///
+/// Candidates, not an answer: which of them is a *usable* git is decided by
+/// probing (`keeper_sync::git::resolve`). This used to be `find_executable`,
+/// which returned the first executable hit — and an executable file named `git`
+/// is not the same thing as a git this engine can drive, which is the whole of
+/// Story 34.14.
 ///
 /// Written out rather than shelling out to `which`: resolving a hard
 /// prerequisite by spawning another process that might equally be missing is
 /// circular, and `which`'s exit codes differ between the shell builtin and the
 /// binary.
-fn find_executable(path_var: Option<&OsStr>, program: &str) -> Option<PathBuf> {
-    let path_var = path_var?;
+fn path_candidates(program: &str) -> Vec<PathBuf> {
+    candidates_in(std::env::var_os("PATH").as_deref(), program)
+}
+
+/// [`path_candidates`] over an explicit `PATH`-shaped value, for tests.
+fn candidates_in(path_var: Option<&OsStr>, program: &str) -> Vec<PathBuf> {
+    let Some(path_var) = path_var else {
+        return Vec::new();
+    };
     std::env::split_paths(path_var)
         .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| dir.join(program))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    // `metadata` follows symlinks, which is what we want: `/usr/bin/git` is a
-    // symlink on plenty of distributions.
-    match std::fs::metadata(path) {
-        Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
-        Err(_) => false,
-    }
+        .collect()
 }
 
 /// Pick a host label from the two places a Linux box publishes one.
@@ -379,11 +418,7 @@ impl SyncPlatform for LinuxPlatform {
     }
 
     fn git_program(&self) -> Result<PathBuf> {
-        find_executable(std::env::var_os("PATH").as_deref(), "git").ok_or_else(|| {
-            SyncError::GitMissing {
-                reason: GIT_MISSING_REASON.to_owned(),
-            }
-        })
+        self.git_resolution().program()
     }
 
     fn host_label(&self) -> String {
@@ -595,39 +630,88 @@ mod tests {
     }
 
     #[test]
-    fn path_resolution_finds_an_executable_and_skips_a_plain_file() {
+    fn path_candidates_are_every_path_entry_in_order() {
+        // Candidates, not an answer: a non-executable file of the right name is
+        // still offered to the prober, which is what turns "a stray `git` note
+        // shadows the real binary" from a silent substitution into a reported
+        // rejection.
         let root = tempfile::tempdir().expect("temp dir");
-        let empty = root.path().join("empty");
-        let real = root.path().join("real");
-        std::fs::create_dir_all(&empty).expect("empty dir");
-        std::fs::create_dir_all(&real).expect("real dir");
-        // A non-executable file of the right name must not win: that is exactly
-        // how a stray `git` note in a directory would shadow the real binary.
-        write_with_mode(&empty.join("git"), "not a program", 0o644);
-        write_with_mode(&real.join("git"), "#!/bin/sh\n", 0o755);
-
-        let joined = std::env::join_paths([&empty, &real]).expect("join paths");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let joined = std::env::join_paths([&first, &second]).expect("join paths");
 
         assert_eq!(
-            find_executable(Some(joined.as_os_str()), "git"),
-            Some(real.join("git"))
+            candidates_in(Some(joined.as_os_str()), "git"),
+            vec![first.join("git"), second.join("git")]
         );
+        // An unset PATH must be an empty list, not a panic or a bare-name spawn.
+        assert!(candidates_in(None, "git").is_empty());
     }
 
     #[test]
-    fn an_empty_or_gitless_path_resolves_nothing() {
+    fn resolution_skips_a_broken_git_for_a_good_one_further_down_path() {
+        // The daemon's half of Story 34.14, in the shape the old
+        // `find_executable` tests had: fixture directories holding fake gits.
         let root = tempfile::tempdir().expect("temp dir");
-        assert_eq!(find_executable(Some(root.path().as_os_str()), "git"), None);
-        // An unset PATH must be a miss, not a panic or a bare-name execution.
-        assert_eq!(find_executable(None, "git"), None);
+        let shadow = root.path().join("shadow");
+        let real = root.path().join("real");
+        std::fs::create_dir_all(&shadow).expect("shadow dir");
+        std::fs::create_dir_all(&real).expect("real dir");
+        // A `git` that is executable and answers with a version below the floor —
+        // `find_executable` returned exactly this one, and the engine refused it.
+        write_with_mode(
+            &shadow.join("git"),
+            "#!/bin/sh\necho 'git version 2.23.0'\n",
+            0o755,
+        );
+        write_with_mode(
+            &real.join("git"),
+            "#!/bin/sh\necho 'git version 2.52.0'\n",
+            0o755,
+        );
+        let joined = std::env::join_paths([&shadow, &real]).expect("join paths");
+
+        let resolution =
+            GitRequest::search(candidates_in(Some(joined.as_os_str()), "git"), GIT_ADVICE)
+                .resolve();
+
+        assert_eq!(
+            resolution.program().expect("a usable git"),
+            real.join("git")
+        );
+        assert_eq!(resolution.rejected().len(), 1);
+        assert_eq!(resolution.rejected()[0].program, shadow.join("git"));
     }
 
     #[test]
-    fn the_missing_git_message_tells_an_operator_what_to_install() {
+    fn a_configured_git_path_is_obeyed_exactly_and_never_replaced() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let named = root.path().join("git-2.23");
+        write_with_mode(&named, "#!/bin/sh\necho 'git version 2.23.0'\n", 0o755);
+        let platform =
+            LinuxPlatform::with_dirs("/c", "/d", "/s").with_git_path(Some(named.clone()));
+
+        let resolution = platform.git_resolution();
+
+        assert!(resolution.is_explicit());
+        assert!(
+            resolution.chosen().is_none(),
+            "a named git below the floor must refuse, not fall back to PATH"
+        );
+        let err = platform.git_program().expect_err("must refuse");
+        assert_eq!(err.code(), "gitMissing");
+        let message = err.to_string();
+        assert!(message.contains(&named.display().to_string()), "{message}");
+        assert!(message.contains("2.23"), "{message}");
+        assert!(message.contains("gitPath"), "{message}");
+    }
+
+    #[test]
+    fn the_git_advice_tells_an_operator_what_to_install() {
         // Asserted on the constant, not on `git_program()`, so the guarantee
         // holds on a build machine that happens to have git installed.
         let err = SyncError::GitMissing {
-            reason: GIT_MISSING_REASON.to_owned(),
+            reason: GIT_ADVICE.to_owned(),
         };
 
         assert_eq!(err.code(), "gitMissing");
@@ -635,9 +719,14 @@ mod tests {
             err.needs_user_action(),
             "no git is a human's problem to fix"
         );
-        for expected in ["apt install git", "dnf install git", "pacman -S git"] {
+        for expected in [
+            "apt install git",
+            "dnf install git",
+            "pacman -S git",
+            "gitPath",
+        ] {
             assert!(
-                GIT_MISSING_REASON.contains(expected),
+                GIT_ADVICE.contains(expected),
                 "the message must name {expected}"
             );
         }

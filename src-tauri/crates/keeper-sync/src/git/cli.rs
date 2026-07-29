@@ -360,32 +360,59 @@ impl GitCli {
 /// [`SyncError::GitCommand`]: for the caller both mean "there is no usable git
 /// here", and collapsing them keeps `doctor` down to one branch.
 pub fn version(program: &Path) -> Result<(u32, u32)> {
+    version_detail(program).map_err(|detail| SyncError::GitMissing {
+        reason: format!("{}: {detail}", program.display()),
+    })
+}
+
+/// `git --version`, with the failure detail unwrapped from any sentence.
+///
+/// Two callers want two shapes of one fact. [`version`] names the program,
+/// because a standalone `GitMissing` that does not say which binary failed is
+/// unactionable. [`super::resolve`] renders one line per candidate and has
+/// already printed the path, so it wants the detail alone.
+///
+/// The detail carries `git`'s own `stderr`, and that is the point rather than a
+/// nicety: a git whose system `gitconfig` is malformed exits non-zero on
+/// `--version` and says exactly why (`bad config line 44 in file …`). Reporting
+/// only "exited non-zero" handed the user a fault that had named its own cause.
+/// Scrubbed and capped like every other diagnostic that leaves this module, and
+/// folded onto one line because it lands in a settings row.
+pub(crate) fn version_detail(program: &Path) -> std::result::Result<(u32, u32), String> {
     let args = [String::from("--version")];
-    let output = capture(program, None, &args, None)?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    let output = capture(program, None, &args, None).map_err(|err| err.to_string())?;
     if !output.status.success() {
-        return Err(SyncError::GitMissing {
-            reason: format!("{} --version exited non-zero", program.display()),
-        });
+        let stderr = one_line(&scrub_userinfo(&String::from_utf8_lossy(&output.stderr)));
+        return Err(format!("`git --version` failed: {stderr}"));
     }
-    parse_version(&text).ok_or_else(|| SyncError::GitMissing {
-        reason: format!(
-            "{} did not report a recognizable version",
-            program.display()
-        ),
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_version(&text).ok_or_else(|| {
+        format!(
+            "`git --version` answered `{}`, which is not a version",
+            one_line(&text)
+        )
     })
 }
 
 /// Version plus the 2.42 floor check.
 pub fn probe(program: &Path) -> Result<GitCapabilities> {
     let (major, minor) = version(program)?;
+    Ok(capabilities_of(major, minor))
+}
+
+/// Project a version onto the capability set, without spawning anything.
+///
+/// Split out so [`super::resolve`] derives the same capabilities from the same
+/// version it just read, rather than probing a second time — and so the floor is
+/// applied in exactly one place for both callers.
+pub(crate) fn capabilities_of(major: u32, minor: u32) -> GitCapabilities {
     let clears = clears_floor(major, minor);
-    Ok(GitCapabilities {
+    GitCapabilities {
         major,
         minor,
         sparse_cone: clears,
         ls_files_format: clears,
-    })
+    }
 }
 
 /// Whether `<major>.<minor>` is at or above the 2.42 floor.
@@ -900,6 +927,27 @@ fn first_line(text: &str) -> String {
         .find(|line| !line.is_empty())
         .unwrap_or("git reported no detail")
         .to_owned()
+}
+
+/// Every non-empty line, folded onto one with `; ` and capped.
+///
+/// [`first_line`] is right for a `GitCommand` whose first line is the failure;
+/// it is wrong for a broken `gitconfig`, where line one is the symptom
+/// (`could not expand include path …`) and line two is the cause (`bad config
+/// line 44 in file …`). A settings row and a notification are both one line, so
+/// the lines are joined rather than picked between.
+pub(crate) fn one_line(text: &str) -> String {
+    let joined = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if joined.is_empty() {
+        "git reported no detail".to_owned()
+    } else {
+        truncate(&joined, STDERR_CAP)
+    }
 }
 
 /// Name a repository directory for an error message.

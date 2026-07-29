@@ -46,8 +46,10 @@ use keeper_core::vm::{
     RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm,
     SearchHitVm, SpacesSnapshot, TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
+use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::State;
+use ts_rs::TS;
 
 /// The build-target [`Recorder`] impl behind the recording IPC commands (Story
 /// 16.5). The `Recorder` trait is not object-safe (its async methods are RPITIT),
@@ -1283,7 +1285,7 @@ pub fn app_ping(state: State<'_, AppState>) -> Result<PingVm, IpcError> {
 /// so `keeper-core` stays free of `cfg(target_os)` (AD-26). A later target
 /// (Android / Windows) reuses the mechanism by reporting its own flags.
 #[tauri::command]
-pub fn capabilities() -> Result<CapabilitiesVm, IpcError> {
+pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcError> {
     Ok(CapabilitiesVm {
         tray_icon: cfg!(desktop),
         global_hotkey: cfg!(desktop),
@@ -1296,11 +1298,13 @@ pub fn capabilities() -> Result<CapabilitiesVm, IpcError> {
         // OS-version probe in the shell adapter (AD-35), not a bare `cfg!(desktop)`.
         // Any detection failure defaults to `false` (safe-hide).
         recording: crate::macos_version::recording_supported(),
-        // Folder sync (Story 23.5, AD-41/AD-51) needs a `git` binary, which is
-        // a runtime fact rather than a build one: the answer is a PATH probe,
-        // and a machine without git gets no sync surface at all rather than
-        // buttons that fail when pressed.
-        sync: sync_available(),
+        // Folder sync (Story 23.5, AD-41/AD-51) needs a `git` binary that clears
+        // the engine's version floor. Derived from the same resolution
+        // [`sync_git_status`] reports (Story 34.14), so the capability cannot say
+        // yes where `Engine::open` says no: before that it asked only whether a
+        // file called `git` existed, and a machine whose first `PATH` git was
+        // 2.23 got a full Sync surface over an engine that had refused to open.
+        sync: git_report(&state).state == SyncGitState::Ok,
         // The overlay title bar (Story 34.2) is a pure platform fact, not a probe:
         // `titleBarStyle`/`hiddenTitle` in `tauri.conf.json` are macOS-only keys, so
         // only a desktop macOS build floats the window controls over the webview and
@@ -1318,18 +1322,141 @@ pub fn sync_tray_snapshot(
     crate::sync_ipc::tray_snapshot(app)
 }
 
-/// Whether folder sync can run on this machine.
+/// Which `git` folder sync can drive here (Story 34.14).
 ///
-/// Split out so the iOS build — which has no `crate::sync` module at all — still
-/// compiles: the capability is simply false there.
-fn sync_available() -> bool {
+/// Four failures rather than one, because they need four different next steps:
+/// "install git" is useless advice for a git that is installed and too old, and
+/// "upgrade git" is useless for one whose system `gitconfig` is malformed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncGitState {
+    /// This build has no folder sync at all (iOS). The report renders nothing —
+    /// telling a phone user about a git version floor would be noise.
+    Unsupported,
+    /// A binary cleared the floor. `CapabilitiesVm.sync` is `true` exactly here.
+    Ok,
+    /// Nothing called `git` at any candidate path.
+    Missing,
+    /// Something is there and cannot run: a stray non-executable file, or a git
+    /// that exits non-zero on `--version`.
+    Unusable,
+    /// It runs and reports a version below the floor.
+    TooOld,
+}
+
+/// The resolved `git`, or why there isn't one — Settings → Sync's report.
+///
+/// This exists because the refusal used to be invisible. `Engine::open` rejects a
+/// git below the floor, the shell logged that at `debug` (opt-in, so nobody saw
+/// it), and the capability probe disagreed with the engine — so the Sync surface
+/// could appear and then do nothing at all.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncGitVm {
+    pub state: SyncGitState,
+    /// `git 2.52 at /opt/homebrew/bin/git (clears the 2.42 floor)` when one was
+    /// chosen. Worded as `keeper-syncd doctor` words it — one fact, one spelling.
+    pub summary: Option<String>,
+    /// Why nothing was chosen, naming every candidate that was tried and what
+    /// to do about it. `None` when a binary was chosen.
+    pub problem: Option<String>,
+    /// The path the owner set explicitly, or `None` for automatic resolution.
+    /// Present even when it was rejected: a field that cleared itself on a bad
+    /// value would be a silent fallback to auto, which is the defect being fixed.
+    pub configured_path: Option<String>,
+}
+
+/// Resolve `git` and project the answer, without opening the engine.
+///
+/// Deliberately engine-free: the whole point is that it answers on exactly the
+/// machines where the engine will not open.
+fn git_report(state: &AppState) -> SyncGitVm {
     #[cfg(desktop)]
     {
-        crate::sync::is_available()
+        use keeper_sync::GitReject;
+
+        let platform = state.platform.as_ref();
+        let resolution = crate::sync::git_resolution(platform);
+        let rejected = resolution.rejected();
+        let vm_state = if resolution.chosen().is_some() {
+            SyncGitState::Ok
+        } else if rejected
+            .iter()
+            .any(|r| matches!(r.cause, GitReject::TooOld { .. }))
+        {
+            // Ranked, not first-wins: "you have git, upgrade it" is the most
+            // actionable thing to say when a search met several kinds of failure.
+            SyncGitState::TooOld
+        } else if rejected.iter().any(|r| {
+            matches!(
+                r.cause,
+                GitReject::Unusable { .. } | GitReject::NotExecutable
+            )
+        }) {
+            SyncGitState::Unusable
+        } else {
+            SyncGitState::Missing
+        };
+        SyncGitVm {
+            state: vm_state,
+            summary: resolution.summary(),
+            problem: match resolution.chosen() {
+                Some(_) => None,
+                None => Some(resolution.refusal()),
+            },
+            configured_path: crate::sync::configured_git_path(platform),
+        }
     }
     #[cfg(not(desktop))]
     {
-        false
+        let _ = state;
+        SyncGitVm {
+            state: SyncGitState::Unsupported,
+            summary: None,
+            problem: None,
+            configured_path: None,
+        }
+    }
+}
+
+/// The `git` report Settings → Sync renders.
+///
+/// Registered on every platform (unlike the rest of the sync surface) so the
+/// frontend can ask one question and get `unsupported` on a phone instead of an
+/// `invoke` rejection it would have to special-case.
+#[tauri::command]
+pub fn sync_git_status(state: State<'_, AppState>) -> Result<SyncGitVm, IpcError> {
+    Ok(git_report(&state))
+}
+
+/// Point keeper at a specific `git` binary, or clear the choice with `""`.
+///
+/// Returns the fresh report rather than `()`, and **does not reject** a path
+/// that fails: the path is stored, the refusal is reported, and nothing falls
+/// back to a PATH search. Rejecting-without-storing would leave a mistyped path
+/// silently reverted to automatic, which is the same class of silent
+/// substitution this whole story removes.
+#[tauri::command]
+pub fn sync_git_path_set(state: State<'_, AppState>, path: String) -> Result<SyncGitVm, IpcError> {
+    #[cfg(desktop)]
+    {
+        let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+        keeper_core::registry::set_sync_git_path(&data_dir, path.trim()).map_err(to_ipc_error)?;
+        // The cached resolution was computed for the old setting; a stale hit
+        // would report the previous binary as the one in force.
+        crate::sync::invalidate_git_resolution();
+        Ok(git_report(&state))
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (state, path);
+        Err(IpcError {
+            code: IpcErrorCode::Unsupported,
+            message: "folder sync is not available on this platform".to_owned(),
+            retriable: false,
+        })
     }
 }
 

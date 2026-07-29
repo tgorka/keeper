@@ -1226,6 +1226,36 @@ pub fn set_recording_scale_percent(data_dir: &Path, percent: u32) -> Result<(), 
     )
 }
 
+/// The `settings` key holding an explicit path to the `git` binary folder sync
+/// drives (Story 34.14). Stored as the raw absolute path string; absent / empty
+/// ⇒ automatic resolution, which is the default and what almost every install
+/// wants.
+///
+/// Per **installation**, not per profile: every profile shares one engine and
+/// one binary (`Engine::open` resolves it once and holds a single `GitCli`), so
+/// a per-profile knob would offer a choice the engine has no way to honour.
+/// It sits in the same k/v table as `recording.destination_dir` for the same
+/// reason — a user-chosen absolute path whose validity is a runtime fact this
+/// core crate must not probe.
+const SYNC_GIT_PATH_KEY: &str = "sync.git_path";
+
+/// Read the explicitly chosen `git` binary (Story 34.14). `None` when the
+/// setting is absent or empty — the caller (shell) then searches `PATH`.
+///
+/// No validation here, exactly as [`get_recording_destination_dir`] does none:
+/// whether the path is a git that clears the engine's version floor is answered
+/// by probing it, which needs a subprocess this crate does not spawn.
+pub fn get_sync_git_path(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, SYNC_GIT_PATH_KEY)?.filter(|value| !value.trim().is_empty()))
+}
+
+/// Write the explicitly chosen `git` binary (Story 34.14) verbatim under
+/// `sync.git_path`. An empty string clears the choice back to automatic
+/// resolution — the shell's "use whichever git is on PATH" path.
+pub fn set_sync_git_path(data_dir: &Path, path: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, SYNC_GIT_PATH_KEY, path)
+}
+
 /// A single held-send row from the `outbox` table (Story 8.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRow {
@@ -2444,6 +2474,27 @@ mod tests {
             get_recording_destination_dir(&dir).expect("get blank"),
             None
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_git_path_defaults_to_none_and_round_trips() {
+        let dir = temp_dir();
+        // Absent ⇒ automatic resolution: the shell searches PATH.
+        assert_eq!(get_sync_git_path(&dir).expect("get default"), None);
+        // Stored verbatim — the shell probes it, this crate never rewrites it.
+        set_sync_git_path(&dir, "/opt/homebrew/bin/git").expect("set path");
+        assert_eq!(
+            get_sync_git_path(&dir).expect("get path"),
+            Some("/opt/homebrew/bin/git".to_owned())
+        );
+        // "Cleared" and "never set" must be the same state, or a user who
+        // emptied the field would be left with an explicit empty path that
+        // resolves to nothing.
+        set_sync_git_path(&dir, "").expect("set empty");
+        assert_eq!(get_sync_git_path(&dir).expect("get empty"), None);
+        set_sync_git_path(&dir, "   ").expect("set blank");
+        assert_eq!(get_sync_git_path(&dir).expect("get blank"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

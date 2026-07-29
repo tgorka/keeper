@@ -61,8 +61,20 @@ pub trait SyncPlatform: Send + Sync {
 
     /// Absolute path to a usable `git` binary, or why there isn't one.
     ///
-    /// AD-41 makes this a hard prerequisite: push, worktree mutation,
-    /// sparse-checkout patterns and gc have no in-process implementation.
+    /// AD-41 makes this a hard prerequisite: push, the three merge entry points,
+    /// `is_ancestor`, branch handling, the worktree lanes, sparse-checkout and
+    /// gc have no in-process implementation.
+    ///
+    /// **Usable**, not merely present. An implementation MUST answer with a
+    /// binary that clears [`git::cli::MIN_GIT_MAJOR`]/[`MIN_GIT_MINOR`], which
+    /// means probing candidates rather than taking the first file named `git`
+    /// (see [`git::resolve`](crate::git::resolve) for what that costs on a real
+    /// machine, and why). [`Engine::open`](crate::engine::Engine::open) probes
+    /// again and refuses below the floor, so a host that returns a too-old git
+    /// has not degraded sync — it has built a surface the engine will not serve.
+    ///
+    /// [`git::cli::MIN_GIT_MAJOR`]: crate::git::cli::MIN_GIT_MAJOR
+    /// [`MIN_GIT_MINOR`]: crate::git::cli::MIN_GIT_MINOR
     fn git_program(&self) -> Result<PathBuf>;
 
     /// Stable label for this machine, used in provenance trailers and conflict
@@ -102,6 +114,16 @@ impl TestPlatform {
     /// Simulate a machine with no usable git (Story 23.5).
     pub fn without_git(mut self) -> Self {
         self.git = None;
+        self
+    }
+
+    /// Point the port at one specific binary, for tests about resolution.
+    ///
+    /// Absent this, `git_program` answers `/usr/bin/git` — fine for the engine
+    /// tests that only need *a* git, useless for asserting that the engine
+    /// refuses the binaries [`crate::git::resolve`] rejects.
+    pub fn with_git(mut self, program: impl Into<PathBuf>) -> Self {
+        self.git = Some(program.into());
         self
     }
 

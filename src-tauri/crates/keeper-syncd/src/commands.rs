@@ -30,7 +30,6 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use keeper_sync::engine::Engine;
-use keeper_sync::git::cli as git_cli;
 use keeper_sync::lfs::pointer::{Pointer, MAX_POINTER_BYTES};
 use keeper_sync::lfs::store::LfsStore;
 use keeper_sync::profile::LfsMode;
@@ -1212,53 +1211,52 @@ fn cmd_doctor(
     Ok(())
 }
 
-/// Returns the `GitMissing` reason when git is absent, so `doctor` can exit 3.
+/// Returns the refusal when no usable git was found, so `doctor` can exit 3.
+///
+/// One resolution rather than resolve-then-probe: the resolution already probed
+/// every candidate it tried, so asking again would spawn a second `git
+/// --version` to learn what it just learned — and could, on a machine where the
+/// binary is being replaced under us, report a different version than the one
+/// the engine will actually drive.
+///
+/// The OK line also names what was *rejected*, when anything was. That is the
+/// whole point on a box with several gits: "using /opt/homebrew/bin/git" without
+/// "skipped /usr/local/bin/git, which is 2.23" leaves an operator wondering why
+/// their `git --version` disagrees with the daemon's.
 fn check_git(platform: &LinuxPlatform, checks: &mut Vec<Check>) -> Option<String> {
-    let program = match platform.git_program() {
-        Ok(program) => program,
-        Err(SyncError::GitMissing { reason }) => {
-            checks.push(Check::new("git", CheckStatus::Fail, reason.clone()));
-            return Some(reason);
-        }
-        Err(err) => {
-            checks.push(Check::new("git", CheckStatus::Fail, err.to_string()));
-            return Some(err.to_string());
-        }
-    };
-    match git_cli::probe(&program) {
-        Ok(caps) if caps.meets_floor() => {
-            checks.push(Check::new(
-                "git",
-                CheckStatus::Ok,
-                format!(
-                    "{} {}.{} (clears the {}.{} floor)",
-                    program.display(),
-                    caps.major,
-                    caps.minor,
-                    git_cli::MIN_GIT_MAJOR,
-                    git_cli::MIN_GIT_MINOR
-                ),
-            ));
+    let resolution = platform.git_resolution();
+    match resolution.summary() {
+        Some(summary) => {
+            let detail = if resolution.rejected().is_empty() {
+                summary
+            } else {
+                format!("{summary}; skipped {}", rejected_list(&resolution))
+            };
+            checks.push(Check::new("git", CheckStatus::Ok, detail));
             None
         }
-        Ok(caps) => {
-            let detail = format!(
-                "{} is {}.{}, below the {}.{} floor; cone sparse-checkout and the \
-                 ls-files format this engine depends on are unreliable before then — upgrade git",
-                program.display(),
-                caps.major,
-                caps.minor,
-                git_cli::MIN_GIT_MAJOR,
-                git_cli::MIN_GIT_MINOR
-            );
-            checks.push(Check::new("git", CheckStatus::Fail, detail.clone()));
-            Some(detail)
-        }
-        Err(err) => {
-            checks.push(Check::new("git", CheckStatus::Fail, err.to_string()));
-            Some(err.to_string())
+        None => {
+            let refusal = resolution.refusal();
+            checks.push(Check::new("git", CheckStatus::Fail, refusal.clone()));
+            Some(refusal)
         }
     }
+}
+
+/// `<path> (<why>)`, comma-separated, for the candidates that were passed over.
+fn rejected_list(resolution: &keeper_sync::GitResolution) -> String {
+    resolution
+        .rejected()
+        .iter()
+        .map(|rejection| {
+            format!(
+                "{} ({})",
+                rejection.program.display(),
+                rejection.cause.describe()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn check_paths(profiles: &[SyncProfile], checks: &mut Vec<Check>) {
