@@ -80,6 +80,8 @@
 pub mod basic;
 pub mod batch;
 pub mod endpoint;
+pub mod local;
 pub mod pointer;
+pub mod ssh;
 pub mod stage;
 pub mod store;
