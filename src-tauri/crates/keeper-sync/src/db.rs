@@ -97,6 +97,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         -- bounded: it is a human-facing log, not a source of truth, so a
         -- profile that syncs a million files must not grow `sync.db` without
         -- limit. Rows hold repository-relative paths, never content.
+        --
+        -- `size_bytes` (Story 34.6) is missing here on purpose:
+        -- `ensure_activity_size_column` adds it, so a fresh install and one
+        -- that predates the column reach the same schema down one path.
         CREATE TABLE IF NOT EXISTS activity (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             profile_id  TEXT NOT NULL,
@@ -118,6 +122,28 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    ensure_activity_size_column(conn)?;
+    Ok(())
+}
+
+/// Add the nullable `size_bytes` column to `activity` if it is not there yet
+/// (Story 34.6).
+///
+/// Idempotent and non-destructive, the shape `keeper-core`'s registry already
+/// uses for its own late columns: read the table's column list and only
+/// `ALTER TABLE ... ADD COLUMN` when the column is missing. An install that
+/// predates it keeps every one of its capped rows, which read back with no
+/// size — `NULL` here means "nobody measured it", never zero.
+fn ensure_activity_size_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(activity)")?;
+    // Column 1 of `table_info` is the column name.
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    if !existing.iter().any(|c| c == "size_bytes") {
+        conn.execute("ALTER TABLE activity ADD COLUMN size_bytes INTEGER", [])?;
+    }
     Ok(())
 }
 
@@ -125,8 +151,14 @@ fn migrate(conn: &Connection) -> Result<()> {
 // Device identity (Story 23.4)
 // ---------------------------------------------------------------------------
 
-/// This installation's stable identity, used in provenance trailers and in
-/// conflict filenames so a conflict copy names the machine that made it.
+/// This installation's identity.
+///
+/// Two halves that age differently. The `id` is minted once and never moves: it
+/// is what `git::commit::author_for` derives the non-routable author address
+/// from, and what a `Keeper-Device` trailer records beside the label so two
+/// machines both called "MacBook Pro" stay distinguishable in a shared history.
+/// The `label` is the human name, editable at any time (Story 34.5), and it is
+/// what a conflict copy is named after.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceIdentity {
     pub id: String,
@@ -135,8 +167,11 @@ pub struct DeviceIdentity {
 
 /// Read the device identity, minting it once on first call.
 ///
-/// The `CHECK (singleton = 0)` primary key makes "there is exactly one device
-/// row" a schema invariant rather than a convention someone can violate.
+/// `default_label` seeds the label on the very first call and is ignored after
+/// that, because the label is the user's from then on — see
+/// [`set_device_label`]. The `CHECK (singleton = 0)` primary key makes "there is
+/// exactly one device row" a schema invariant rather than a convention someone
+/// can violate.
 pub fn device_identity(conn: &Connection, default_label: &str) -> Result<DeviceIdentity> {
     let existing = conn
         .query_row(
@@ -164,9 +199,33 @@ pub fn device_identity(conn: &Connection, default_label: &str) -> Result<DeviceI
     Ok(minted)
 }
 
-pub fn set_device_label(conn: &Connection, label: &str) -> Result<()> {
-    conn.execute("UPDATE device SET label = ?1 WHERE singleton = 0", [label])?;
-    Ok(())
+/// Rename this device, returning the label as stored.
+///
+/// The label rides every commit's `Keeper-Device` trailer and names the machine
+/// in conflict-copy filenames, so a rename changes what commits made **from now
+/// on** say and nothing about the ones already written: history is not rewritten
+/// to match a new name, and a `git log` from before the rename stays true to the
+/// machine as it was called then.
+///
+/// The id is deliberately not a parameter. It is the stable identity — moving it
+/// would re-point the author address and make one machine read as two across a
+/// shared history — so a rename cannot touch it even by accident.
+///
+/// Validation runs first, the way [`upsert_profile`] validates a profile, so no
+/// route can store a label that makes a trailer meaningless: an empty one would
+/// print `Keeper-Device:  (01J…)` on every commit from here on. The stored
+/// (trimmed) label comes back so a caller holding an in-memory copy does not
+/// have to re-derive the normalization and risk disagreeing with the row.
+pub fn set_device_label(conn: &Connection, label: &str) -> Result<String> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return Err(SyncError::Config("device label must not be empty".into()));
+    }
+    conn.execute(
+        "UPDATE device SET label = ?1 WHERE singleton = 0",
+        [trimmed],
+    )?;
+    Ok(trimmed.to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -633,35 +692,57 @@ pub fn load_file_state(
     Ok(out)
 }
 
-/// Replace the profile's cached state with `entries`.
+/// Replace the profile's cached state with `entries`, atomically.
 ///
 /// A full replace rather than an upsert: a path that is no longer mid-episode
 /// (it settled, or it was deleted) must not linger, or the table would grow
 /// without bound on a busy profile.
+///
+/// One transaction for the whole replace, for two separate reasons.
+///
+/// **Correctness.** The `DELETE` and the inserts are one edit of one fact —
+/// "everything this profile is currently holding". Un-transacted, a crash or a
+/// concurrent reader between them sees a profile that is holding *nothing*, and
+/// every quiescence window in flight silently restarts from zero: each of those
+/// files then needs two fresh observations before it can sync.
+///
+/// **Cost.** Without an enclosing transaction SQLite commits every statement on
+/// its own, so N rows cost N+1 commits — each a WAL frame write and, under
+/// `synchronous=NORMAL`, a page-cache flush. This runs up to four times per sync
+/// pass and is largest exactly when the tree is busiest, which is the worst
+/// possible place to pay per row.
 pub fn save_file_state(
     conn: &Connection,
     profile_id: &str,
     entries: &[(PathBuf, PersistedEntry)],
 ) -> Result<()> {
-    conn.execute("DELETE FROM file_state WHERE profile_id = ?1", [profile_id])?;
-    let mut stmt = conn.prepare(
-        "INSERT INTO file_state
+    // `unchecked_transaction` rather than `transaction`, as in
+    // [`record_activity`]: the engine holds this connection behind a `Mutex` and
+    // hands out `&Connection`, so there is no `&mut` to be had — and no second
+    // handle that could nest a transaction.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM file_state WHERE profile_id = ?1", [profile_id])?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO file_state
            (profile_id, path, size, mtime_ns, ctime_ns, inode, first_seen_ms, last_change_ms, close_write)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-    )?;
-    for (path, entry) in entries {
-        stmt.execute(rusqlite::params![
-            profile_id,
-            path.to_string_lossy().as_ref(),
-            entry.sample.size as i64,
-            ns_to_i64(entry.sample.mtime_ns),
-            ns_to_i64(entry.sample.ctime_ns),
-            entry.sample.inode as i64,
-            entry.pending_since_ms,
-            entry.unchanged_since_ms,
-            i64::from(entry.close_write),
-        ])?;
+        )?;
+        for (path, entry) in entries {
+            stmt.execute(rusqlite::params![
+                profile_id,
+                path.to_string_lossy().as_ref(),
+                entry.sample.size as i64,
+                ns_to_i64(entry.sample.mtime_ns),
+                ns_to_i64(entry.sample.ctime_ns),
+                entry.sample.inode as i64,
+                entry.pending_since_ms,
+                entry.unchanged_since_ms,
+                i64::from(entry.close_write),
+            ])?;
+        }
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -725,6 +806,12 @@ pub struct ActivityRow {
     /// Repository-relative, always. An absolute path would leak the user's
     /// home directory into a list that is rendered verbatim.
     pub path: String,
+    /// How many bytes the file held, or `None` when that is not knowable: a
+    /// row written before Story 34.6, or a deletion whose previous size the
+    /// index no longer records. Never zero standing in for unknown — an empty
+    /// file and an unmeasured one are different facts, and only one of them is
+    /// worth showing a size for.
+    pub size_bytes: Option<u64>,
 }
 
 /// Append what a sync just did, then trim the profile back to [`ACTIVITY_CAP`].
@@ -734,11 +821,13 @@ pub struct ActivityRow {
 /// commit that only partly happened. The insert and the trim share the
 /// transaction for the same reason — a reader must never see the table above
 /// its cap.
+///
+/// The third element of a row is its size, absent when it could not be known.
 pub fn record_activity(
     conn: &Connection,
     profile_id: &str,
     ts_ms: i64,
-    rows: &[(ActivityKind, String)],
+    rows: &[(ActivityKind, String, Option<u64>)],
 ) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
@@ -749,10 +838,14 @@ pub fn record_activity(
     let tx = conn.unchecked_transaction()?;
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO activity (profile_id, ts_ms, kind, path) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO activity (profile_id, ts_ms, kind, path, size_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
-        for (kind, path) in rows {
-            stmt.execute((profile_id, ts_ms, kind.as_str(), path))?;
+        for (kind, path, size_bytes) in rows {
+            // A size no `i64` can hold is not a size anyone can render, so it
+            // is stored as unknown rather than wrapped into a wrong number.
+            let size = size_bytes.and_then(|bytes| i64::try_from(bytes).ok());
+            stmt.execute((profile_id, ts_ms, kind.as_str(), path, size))?;
         }
     }
     // Trim by `id`, never by `ts_ms`. Every row of one commit carries the same
@@ -782,7 +875,7 @@ pub fn list_activity(
     limit: usize,
 ) -> Result<Vec<ActivityRow>> {
     let mut stmt = conn.prepare(
-        "SELECT ts_ms, kind, path FROM activity
+        "SELECT ts_ms, kind, path, size_bytes FROM activity
          WHERE profile_id = ?1
          ORDER BY id DESC LIMIT ?2",
     )?;
@@ -791,13 +884,22 @@ pub fn list_activity(
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
+            r.get::<_, Option<i64>>(3)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (ts_ms, kind, path) = row?;
+        let (ts_ms, kind, path, size) = row?;
+        // A row from before the column existed reads back `NULL`, and a
+        // negative size is not a size: both mean the same thing here.
+        let size_bytes = size.and_then(|bytes| u64::try_from(bytes).ok());
         match ActivityKind::from_stored(&kind) {
-            Some(kind) => out.push(ActivityRow { ts_ms, kind, path }),
+            Some(kind) => out.push(ActivityRow {
+                ts_ms,
+                kind,
+                path,
+                size_bytes,
+            }),
             None => tracing::debug!(kind, "skipping an unrecognised activity row"),
         }
     }
@@ -864,10 +966,31 @@ mod tests {
         let first = device_identity(&c, "host-a").expect("mint");
         let second = device_identity(&c, "host-b").expect("read");
         assert_eq!(first, second, "the id must not change on a relabel");
-        set_device_label(&c, "renamed").expect("relabel");
+        assert_eq!(
+            set_device_label(&c, "  renamed  ").expect("relabel"),
+            "renamed",
+            "the caller is told what was stored, not what was passed"
+        );
         let third = device_identity(&c, "ignored").expect("read");
+        // The id is what the author address and a shared history's device
+        // attribution are derived from: a rename must not move it.
         assert_eq!(third.id, first.id);
         assert_eq!(third.label, "renamed");
+    }
+
+    #[test]
+    fn an_empty_device_label_is_refused_rather_than_stored() {
+        // `Keeper-Device:  (01J…)` on every commit from here on is worse than a
+        // rejected rename the user can see and correct.
+        let c = conn();
+        let before = device_identity(&c, "host-a").expect("mint");
+        for blank in ["", "   ", "\n"] {
+            assert!(
+                set_device_label(&c, blank).is_err(),
+                "{blank:?} must be refused"
+            );
+        }
+        assert_eq!(device_identity(&c, "ignored").expect("read"), before);
     }
 
     #[test]
@@ -973,13 +1096,18 @@ mod tests {
             "p",
             10,
             &[
-                (ActivityKind::Added, "a.txt".to_owned()),
-                (ActivityKind::Deleted, "b.txt".to_owned()),
+                (ActivityKind::Added, "a.txt".to_owned(), Some(4_096)),
+                (ActivityKind::Deleted, "b.txt".to_owned(), None),
             ],
         )
         .expect("record");
-        record_activity(&c, "q", 11, &[(ActivityKind::Modified, "other.txt".into())])
-            .expect("record");
+        record_activity(
+            &c,
+            "q",
+            11,
+            &[(ActivityKind::Modified, "other.txt".into(), Some(7))],
+        )
+        .expect("record");
 
         let rows = list_activity(&c, "p", 10).expect("list");
         assert_eq!(
@@ -988,15 +1116,65 @@ mod tests {
                 ActivityRow {
                     ts_ms: 10,
                     kind: ActivityKind::Deleted,
-                    path: "b.txt".to_owned()
+                    path: "b.txt".to_owned(),
+                    size_bytes: None
                 },
                 ActivityRow {
                     ts_ms: 10,
                     kind: ActivityKind::Added,
-                    path: "a.txt".to_owned()
+                    path: "a.txt".to_owned(),
+                    size_bytes: Some(4_096)
                 },
             ],
-            "newest first, and one profile never sees another's files"
+            "newest first, each size as it was recorded, and one profile never \
+             sees another's files"
+        );
+    }
+
+    #[test]
+    fn an_activity_table_predating_the_size_column_upgrades_in_place() {
+        // The exact shape `sync.db` had before Story 34.6. An install carrying
+        // rows of it has to come through the upgrade with every row intact —
+        // recreating the table empty, or refusing the next insert, would both
+        // read to a user as history that vanished.
+        let c = Connection::open_in_memory().expect("in-memory db");
+        c.execute_batch(
+            "CREATE TABLE activity (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 profile_id  TEXT NOT NULL,
+                 ts_ms       INTEGER NOT NULL,
+                 kind        TEXT NOT NULL,
+                 path        TEXT NOT NULL
+             );
+             INSERT INTO activity (profile_id, ts_ms, kind, path)
+             VALUES ('p', 5, 'added', 'old.txt');",
+        )
+        .expect("plant the pre-34.6 schema");
+
+        migrate(&c).expect("migrate an existing install");
+
+        assert_eq!(
+            list_activity(&c, "p", 10).expect("list"),
+            vec![ActivityRow {
+                ts_ms: 5,
+                kind: ActivityKind::Added,
+                path: "old.txt".to_owned(),
+                size_bytes: None
+            }],
+            "the old row survives and reads back with no size, not with zero"
+        );
+
+        // And the upgraded table records sizes from here on.
+        record_activity(
+            &c,
+            "p",
+            6,
+            &[(ActivityKind::Modified, "old.txt".into(), Some(12_288))],
+        )
+        .expect("record");
+        assert_eq!(
+            list_activity(&c, "p", 10).expect("list")[0].size_bytes,
+            Some(12_288)
         );
     }
 
@@ -1006,8 +1184,8 @@ mod tests {
         // either spare all of them or delete all of them. This is why the cap
         // is enforced by id.
         let c = conn();
-        let batch: Vec<(ActivityKind, String)> = (0..ACTIVITY_CAP + 25)
-            .map(|n| (ActivityKind::Added, format!("f{n}.txt")))
+        let batch: Vec<(ActivityKind, String, Option<u64>)> = (0..ACTIVITY_CAP + 25)
+            .map(|n| (ActivityKind::Added, format!("f{n}.txt"), Some(n as u64)))
             .collect();
         record_activity(&c, "p", 7, &batch).expect("record");
 
@@ -1029,7 +1207,13 @@ mod tests {
     fn an_unrecognised_activity_kind_is_skipped_not_fatal() {
         // A newer keeper's vocabulary must not brick an older one's list.
         let c = conn();
-        record_activity(&c, "p", 1, &[(ActivityKind::Added, "good.txt".into())]).expect("record");
+        record_activity(
+            &c,
+            "p",
+            1,
+            &[(ActivityKind::Added, "good.txt".into(), None)],
+        )
+        .expect("record");
         c.execute(
             "INSERT INTO activity (profile_id, ts_ms, kind, path)
              VALUES ('p', 2, 'teleported', 'weird.txt')",
@@ -1047,7 +1231,8 @@ mod tests {
         // file names.
         let c = conn();
         upsert_profile(&c, &profile("01A"), 1).expect("insert");
-        record_activity(&c, "01A", 1, &[(ActivityKind::Added, "a.txt".into())]).expect("record");
+        record_activity(&c, "01A", 1, &[(ActivityKind::Added, "a.txt".into(), None)])
+            .expect("record");
         delete_profile(&c, "01A").expect("delete");
         assert!(list_activity(&c, "01A", 10).expect("list").is_empty());
     }
@@ -1088,5 +1273,72 @@ mod tests {
         // and a running one would be pulled out from under the supervisor.
         assert!(!unpark(&c, "p", id).expect("unpark"));
         assert!(claim_ready(&c, "p", 100, 10).expect("claim").is_empty());
+    }
+
+    fn entry(mtime_ms: i64, close_write: bool) -> PersistedEntry {
+        PersistedEntry {
+            sample: FileSample {
+                size: 42,
+                mtime_ns: i128::from(mtime_ms) * 1_000_000,
+                ctime_ns: i128::from(mtime_ms) * 1_000_000,
+                inode: 7,
+            },
+            unchanged_since_ms: mtime_ms,
+            pending_since_ms: mtime_ms,
+            close_write,
+        }
+    }
+
+    #[test]
+    fn quiescence_state_round_trips_and_replaces_rather_than_accumulating() {
+        let c = conn();
+        let held = vec![
+            (PathBuf::from("/w/a.bin"), entry(1_000, false)),
+            (PathBuf::from("/w/b.bin"), entry(2_000, true)),
+        ];
+        save_file_state(&c, "p", &held).expect("save");
+        let mut back = load_file_state(&c, "p").expect("load");
+        back.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(back, held, "every field survives the schema round trip");
+
+        // A path that settled must not linger, or the table grows forever.
+        save_file_state(&c, "p", &held[..1]).expect("save");
+        assert_eq!(load_file_state(&c, "p").expect("load").len(), 1);
+        // ...and one profile's replace never touches another's rows.
+        save_file_state(&c, "q", &held).expect("save");
+        save_file_state(&c, "p", &[]).expect("save");
+        assert_eq!(load_file_state(&c, "q").expect("load").len(), 2);
+    }
+
+    /// The `DELETE` and the inserts are one edit of one fact. If a row fails
+    /// partway through, the delete must go back too — otherwise the profile is
+    /// left holding nothing, and every quiescence window in flight silently
+    /// restarts from zero.
+    #[test]
+    fn a_failed_row_rolls_the_whole_replace_back() {
+        let c = conn();
+        let held = vec![
+            (PathBuf::from("/w/a.bin"), entry(1_000, false)),
+            (PathBuf::from("/w/b.bin"), entry(2_000, false)),
+        ];
+        save_file_state(&c, "p", &held).expect("save");
+
+        // Two entries for one path violate `PRIMARY KEY (profile_id, path)`, so
+        // the second insert fails after the delete has already run.
+        let doomed = vec![
+            (PathBuf::from("/w/c.bin"), entry(3_000, false)),
+            (PathBuf::from("/w/c.bin"), entry(4_000, false)),
+        ];
+        assert!(
+            save_file_state(&c, "p", &doomed).is_err(),
+            "a constraint violation must surface, not be swallowed"
+        );
+
+        let mut back = load_file_state(&c, "p").expect("load");
+        back.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            back, held,
+            "the previous state is intact: no delete without its inserts"
+        );
     }
 }

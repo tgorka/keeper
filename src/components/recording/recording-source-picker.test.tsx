@@ -18,9 +18,11 @@ import type { RecordingSourcesVm } from "@/lib/ipc/client";
 import { listRecordingSources } from "@/lib/ipc/client";
 import { resetRecordingAudioForTest, setSystemAudioEnabled } from "@/lib/stores/recording-audio";
 import {
+  RECORDING_SOURCE_POLL_MS,
   resetRecordingSourceForTest,
   selectedRecordingTarget,
   selectRecordingTarget,
+  stopRecordingSourcePolling,
 } from "@/lib/stores/recording-source";
 
 const mockList = vi.mocked(listRecordingSources);
@@ -131,6 +133,35 @@ describe("RecordingSourcePicker", () => {
     // fresh keeper-rec child spawns every ~3s.
     await Promise.resolve();
     expect(mockList).not.toHaveBeenCalled();
+  });
+
+  it("does not enumerate on the focus event itself; a burst costs one read (AD-34-6)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      render(<RecordingSourcePicker />);
+      await waitFor(() => expect(mockList).toHaveBeenCalled());
+      // Halt the 3 s timer so the count below is about the focus path alone —
+      // `stopRecordingSourcePolling` clears the interval without unbinding the
+      // listener the same effect installed beside it.
+      stopRecordingSourcePolling();
+      const afterMount = mockList.mock.calls.length;
+
+      // Each enumeration spawns a fresh `keeper-rec`, and one of these events is
+      // delivered by the very mousedown that begins a titlebar drag — so no focus
+      // may reach the sidecar on the event itself.
+      for (let i = 0; i < 4; i += 1) {
+        window.dispatchEvent(new Event("focus"));
+      }
+      await Promise.resolve();
+      expect(mockList).toHaveBeenCalledTimes(afterMount);
+
+      // One coalesce window later the whole burst has cost a single read: every
+      // superseded schedule is a no-op rather than a spawn.
+      await vi.advanceTimersByTimeAsync(RECORDING_SOURCE_POLL_MS);
+      expect(mockList).toHaveBeenCalledTimes(afterMount + 1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renders the real icon for apps that have one and a fallback glyph otherwise", async () => {

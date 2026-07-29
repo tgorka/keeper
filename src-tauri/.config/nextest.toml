@@ -1,0 +1,31 @@
+# nextest configuration for the `src-tauri` workspace.
+#
+# This file exists for one reason: a test that hangs must fail, and must fail
+# soon. On 2026-07-29 `keeper-syncd::durability_matrix
+# a_kill_at_any_instant_costs_no_data_and_corrupts_no_index` stopped making
+# progress on a macos-latest runner and nextest waited for it for ninety-six
+# minutes, logging `SLOW [>5760.000s]` once a minute and nothing else, until a
+# human noticed and cancelled the run. The other 1525 tests had finished inside
+# two minutes. That is the worst possible outcome: a burned runner, no verdict,
+# and no named culprit — every one of those SLOW lines was advice, and advice is
+# not a gate.
+#
+# `terminate-after` makes it a gate. Past the bound nextest kills the test's
+# process group and reports TIMEOUT against the test by name, which both fails
+# the build and cleans up the child processes the hung test had left running.
+
+[profile.default]
+# Warn on the same cadence as before — `period` is unchanged from nextest's
+# default, so a legitimately slow test logs exactly what it logged yesterday —
+# and give up after the fourth warning, at four minutes.
+#
+# Four minutes is chosen off the suite's measured worst case on the CI runner
+# itself, not off a guess. The slowest honest tests there are the archive search
+# perf gate at 24.98 s and this same durability sweep at 12.05-21.54 s across
+# three green runs; the next slowest test in the whole workspace is 4.4 s, and
+# all 1469 of them together take 43 s. So the bound sits at roughly ten times
+# the slowest test that has ever legitimately run, which is enough headroom for
+# a runner having a bad day — the perf gate scales its own budget for exactly
+# that reason and must not be second-guessed here — while still turning a hang
+# into a verdict inside four minutes instead of ninety-six.
+slow-timeout = { period = "60s", terminate-after = 4 }

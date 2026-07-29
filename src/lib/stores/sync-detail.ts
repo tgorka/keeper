@@ -155,6 +155,31 @@ export function syncLiveFraction(
 }
 
 /**
+ * The transfer rate to show for a profile in whole bytes per second, or `null`
+ * when there is nothing honest to show.
+ *
+ * Gated on the polled status for exactly the reason {@link syncLiveFraction} is,
+ * and deliberately in the same order: the poll decides *whether* a profile is
+ * working, and only then does the stream get to say how fast. A rate arriving
+ * between two polls must not be what makes a card look busy — the last event
+ * the engine sent outlives the work it described.
+ *
+ * Anything not above zero is `null` here, so the "never 0 B/s" rule holds in the
+ * one place the figure is read rather than resting on the engine's promise not
+ * to send one.
+ */
+export function syncLiveRate(
+  status: SyncStatusVm | undefined,
+  progress: SyncProgressVm | undefined,
+): number | null {
+  if (status === undefined || !isSyncStatusActive(status)) {
+    return null;
+  }
+  const rate = progress?.bytesPerSecond ?? 0;
+  return rate > 0 ? rate : null;
+}
+
+/**
  * Re-read one profile's three lists. Never throws and never blanks: a leg that
  * fails keeps its previous value and records the message, because an unknown
  * profile rejects rather than resolving empty and "no rows" must never be

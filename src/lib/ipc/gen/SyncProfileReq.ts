@@ -2,15 +2,42 @@
 
 /**
  * Fields a caller may set when creating or updating a profile.
+ *
+ * Every `Option` here means the same thing when it is `None`: **the caller did
+ * not express this field**, so `parse_req` leaves whatever the stored profile
+ * already has (AD-34-9). None of them is a "reset to the default" instruction;
+ * a caller that wants the default sends it. That rule is why adding a field to
+ * `SyncProfile` can no longer silently erase it on the next save from the app.
  */
 export type SyncProfileReq = { 
 /**
  * Absent creates a profile; present updates that one.
  */
-id: string | null, name: string, localPath: string, remoteUrl: string, branch: string, direction: string, lane: string, subpaths: Array<string>, excludes: Array<string>, removable: boolean, lfsMode: string, lfsThresholdBytes: number | null, settleMs: number | null, tags: Array<string>, 
+id: string | null, name: string, localPath: string, remoteUrl: string, branch: string, direction: string, lane: string, subpaths: Array<string>, excludes: Array<string>, removable: boolean, lfsMode: string, lfsThresholdBytes: number | null, 
+/**
+ * The quiescence window to pin. Sending `DEFAULT_SETTLE_MS` is how "let
+ * keeper choose the wait" is expressed, which is what `effective_settle_ms`
+ * reads as unpinned — so a removable folder gets its longer window back.
+ */
+settleMs: number | null, 
+/**
+ * The scan cadence to pin, in the same shape. The engine paces its tree
+ * walk by it, so this is the knob that governs how soon a change is noticed
+ * (DW-116); before Story 34.5 the app could not send it at all and every
+ * save reset a daemon-configured cadence back to 15 s.
+ */
+pollIntervalMs: number | null, tags: Array<string>, 
 /**
  * Absent leaves whatever the stored profile already has, so a caller that
  * does not know about this field cannot erase it. An explicit empty string
  * clears the override back to the device identity.
  */
-authorOverride: string | null, };
+authorOverride: string | null, 
+/**
+ * Shapes the generated commit subject. An explicit empty string clears it
+ * back to keeper's mechanical `sync(<profile>): 3 added, 1 modified`, which
+ * is a real value here rather than a clearing sentinel — an empty template
+ * IS the default. An unknown placeholder is refused with a message naming
+ * it, before the profile is stored.
+ */
+commitSubjectTemplate: string | null, };

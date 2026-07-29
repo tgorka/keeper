@@ -22,8 +22,9 @@ vi.mock("@/lib/ipc/client", () => ({
   copyStart: vi.fn(),
   copyStatus: vi.fn(),
   copyCancel: vi.fn(),
-  // The shared add-folder form's keychain pair (Story 32.7).
+  // The shared add-folder form's keychain calls (Story 32.7, Story 34.4).
   syncSetCredential: vi.fn(),
+  syncGetCredential: vi.fn(),
   syncClearCredential: vi.fn(),
 }));
 
@@ -74,6 +75,10 @@ import {
   SYNC_NOW_LABEL,
   SYNC_PAUSE_LABEL,
   SYNC_PROGRESS_LABEL,
+  SYNC_REMOVE_CANCEL_LABEL,
+  SYNC_REMOVE_CONFIRM_LABEL,
+  SYNC_REMOVE_CONFIRM_SENTENCE,
+  SYNC_REMOVE_LABEL,
   SYNC_RESUME_LABEL,
 } from "@/components/settings/sync-section";
 import {
@@ -86,6 +91,7 @@ import {
   SYNC_FORM_CANCEL_LABEL,
   SYNC_FORM_PATH_TESTID,
   SYNC_NAME_LABEL,
+  SYNC_NO_FOLDER_CHOSEN_LABEL,
   SYNC_REMOTE_URL_LABEL,
   SYNC_TOKEN_FAILED_PREFIX,
   SYNC_TOKEN_LABEL,
@@ -93,6 +99,7 @@ import {
 import type {
   CopyJobVm,
   SyncActivityVm,
+  SyncOutcomeVm,
   SyncPendingVm,
   SyncProblemsVm,
   SyncProfileVm,
@@ -107,6 +114,7 @@ import {
   syncFolderNow,
   syncPending,
   syncProblems,
+  syncProfileRemove,
   syncProfileSave,
   syncProfileSetEnabled,
   syncProfiles,
@@ -127,6 +135,7 @@ import {
   refreshSyncDetail,
   resetSyncDetailStoreForTest,
   syncLiveFraction,
+  syncLiveRate,
 } from "@/lib/stores/sync-detail";
 
 const mockProfiles = vi.mocked(syncProfiles);
@@ -140,6 +149,7 @@ const mockSetEnabled = vi.mocked(syncProfileSetEnabled);
 const mockSubscribe = vi.mocked(syncSubscribeProgress);
 const mockUnsubscribe = vi.mocked(syncUnsubscribeProgress);
 const mockSave = vi.mocked(syncProfileSave);
+const mockRemove = vi.mocked(syncProfileRemove);
 const mockPicker = vi.mocked(openFolder);
 const mockSetCredential = vi.mocked(syncSetCredential);
 const mockCopyStart = vi.mocked(copyStart);
@@ -174,8 +184,12 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     removable: false,
     lfsMode: "materialize",
     lfsThresholdBytes: 4 * 1024 * 1024,
-    settleMs: 5000,
+    settleMs: null,
+    effectiveSettleMs: 5_000,
+    pollIntervalMs: null,
+    effectivePollIntervalMs: 15_000,
     tags: [],
+    commitSubjectTemplate: "",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -194,6 +208,7 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
     bytesDone: 0,
     bytesTotal: null,
     pending: 3,
+    settling: 0,
     warning: null,
     error: null,
     lastSyncMs: null,
@@ -213,6 +228,7 @@ function progressVm(over: Partial<SyncProgressVm> = {}): SyncProgressVm {
     bytesTotal: 4_700_000_000,
     current: null,
     fraction: null,
+    bytesPerSecond: null,
     ...over,
   };
 }
@@ -279,6 +295,7 @@ beforeEach(() => {
   mockActivity.mockResolvedValue([]);
   mockPending.mockResolvedValue([]);
   mockProblems.mockResolvedValue(problemsVm());
+  mockRemove.mockResolvedValue(undefined);
   mockSubscribe.mockImplementation((onProgress: (event: SyncProgressVm) => void) => {
     emitProgress = onProgress;
     return Promise.resolve(7);
@@ -305,14 +322,22 @@ describe("SyncPane profile header", () => {
     expect(screen.getByText("github.com")).toBeInTheDocument();
   });
 
-  it("offers Sync now and re-reads the lists after the action", async () => {
-    mockFolderNow.mockResolvedValue({
-      committed: true,
+  /** A `sync_folder_now` reply, with the fields a case does not care about. */
+  function outcomeVm(over: Partial<SyncOutcomeVm> = {}): SyncOutcomeVm {
+    return {
+      committed: false,
       pushed: true,
-      pulled: false,
-      filesChanged: 2,
+      pulled: true,
+      filesChanged: 0,
       conflicts: [],
-    });
+      bytes: 0,
+      line: "Nothing to sync — this folder already matches the remote.",
+      ...over,
+    };
+  }
+
+  it("offers Sync now and re-reads the lists after the action", async () => {
+    mockFolderNow.mockResolvedValue(outcomeVm({ committed: true, filesChanged: 2 }));
     await renderPane();
     await waitFor(() => expect(mockActivity).toHaveBeenCalled());
     const readsBefore = mockActivity.mock.calls.length;
@@ -323,6 +348,66 @@ describe("SyncPane profile header", () => {
     // An action is exactly when the three lists are most likely to have moved,
     // and the poll is deliberately too slow to notice.
     await waitFor(() => expect(mockActivity.mock.calls.length).toBeGreaterThan(readsBefore));
+  });
+
+  /**
+   * AD-34-12. The command already returned the whole outcome and the card threw
+   * it away, so a successful click rendered nothing whatsoever — and a pass
+   * that stages nothing finishes far inside the 2 s status poll, so there was
+   * nothing else on screen to move either.
+   */
+  it("states what Sync now did, including when it did nothing", async () => {
+    mockFolderNow.mockResolvedValue(
+      outcomeVm({
+        committed: true,
+        filesChanged: 3,
+        bytes: 2_048,
+        line: "Committed and pushed 3 files, moved 2 KB.",
+      }),
+    );
+    await renderPane();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_NOW_LABEL }));
+
+    const report = await screen.findByText("Committed and pushed 3 files, moved 2 KB.");
+    // Announced, not just painted: the result of a button press has to reach a
+    // screen reader without stealing focus.
+    expect(report).toHaveAttribute("role", "status");
+    expect(report).not.toHaveClass("text-destructive");
+  });
+
+  it("says so when there was nothing to sync, rather than nothing", async () => {
+    mockFolderNow.mockResolvedValue(outcomeVm());
+    await renderPane();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_NOW_LABEL }));
+
+    expect(
+      await screen.findByText("Nothing to sync — this folder already matches the remote."),
+    ).toBeInTheDocument();
+  });
+
+  it("does not dress a conflict up as a success", async () => {
+    mockFolderNow.mockResolvedValue(
+      outcomeVm({
+        conflicts: ["notes.sync-conflict-20250725-120000-host.md"],
+        line: "Kept your version of 1 file that changed in both places, alongside the remote's.",
+      }),
+    );
+    await renderPane();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_NOW_LABEL }));
+
+    const report = await screen.findByText(
+      "Kept your version of 1 file that changed in both places, alongside the remote's.",
+    );
+    expect(report).toHaveClass("text-destructive");
+  });
+
+  it("reports a failed pass as a failure and claims nothing else", async () => {
+    mockFolderNow.mockRejectedValue({ code: "serverUnreachable", message: "remote unreachable" });
+    await renderPane();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_NOW_LABEL }));
+
+    expect(await screen.findByText("remote unreachable")).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
   it("offers Resume instead of Pause for a paused folder", async () => {
@@ -361,6 +446,53 @@ describe("SyncPane profile header", () => {
     expect(meter).toHaveAttribute("aria-valuetext", RUST_TRANSFER_LINE);
     // The path in flight exists only on the stream.
     expect(screen.getByText("notes/today.md")).toBeInTheDocument();
+  });
+
+  it("shows how fast and how far while a folder is working", async () => {
+    mockStatuses.mockResolvedValue([
+      statusVm({ state: "syncing", phase: "pushing", line: RUST_TRANSFER_LINE }),
+    ]);
+    render(<SyncPane />);
+    await screen.findByText(RUST_TRANSFER_LINE);
+
+    act(() => {
+      emitProgress?.(
+        progressVm({
+          fraction: 0.42,
+          current: "clips/holiday.mov",
+          filesDone: 3,
+          filesTotal: 12,
+          bytesPerSecond: 4_100_000,
+        }),
+      );
+    });
+
+    // Worded the way the Rust status line words its counter, so the fast copy
+    // and the polled sentence above read as one quantity.
+    expect(await screen.findByText("3/12 files · 4.1 MB/s")).toBeInTheDocument();
+    expect(screen.getByText("clips/holiday.mov")).toBeInTheDocument();
+  });
+
+  it("never prints a rate of nothing", async () => {
+    // Committing: the leg where files move one at a time with no wire to measure,
+    // so the counter is the whole of what the engine honestly knows.
+    const committing = "Committing tgdrive — 6/12 files";
+    mockStatuses.mockResolvedValue([
+      statusVm({ state: "syncing", phase: "committing", line: committing }),
+    ]);
+    render(<SyncPane />);
+    await screen.findByText(committing);
+
+    act(() => {
+      emitProgress?.(
+        progressVm({ fraction: 0.5, filesDone: 6, filesTotal: 12, bytesPerSecond: null }),
+      );
+    });
+
+    // The counter still lands; a rate the engine could not honestly measure is
+    // absent rather than zero, and no separator is orphaned where it would be.
+    expect(await screen.findByText("6/12 files")).toBeInTheDocument();
+    expect(screen.queryByText(/B\/s/)).not.toBeInTheDocument();
   });
 
   it("drops a stale streamed fraction once the poll says the folder is settled", async () => {
@@ -440,8 +572,11 @@ describe("SyncPane add a folder", () => {
     expect(await screen.findByText(SYNC_PANE_EMPTY_SENTENCE)).toBeInTheDocument();
     // The first thing a new user can do here is the thing they came for.
     expect(screen.getByRole("form", { name: SYNC_ADD_TITLE })).toBeInTheDocument();
-    // No folders, so nothing to reveal: the form is the empty state.
+    // No folders, so nothing to reveal: the form is the empty state. Which is
+    // also why it offers no discard — there is nothing behind it to go back to,
+    // and the action that would reopen it is not on screen.
     expect(screen.queryByRole("button", { name: SYNC_ADD_TITLE })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: SYNC_FORM_CANCEL_LABEL })).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain("Settings");
   });
 
@@ -521,6 +656,32 @@ describe("SyncPane add a folder", () => {
       await screen.findByText(`${SYNC_TOKEN_FAILED_PREFIX}keychain refused`),
     ).toBeInTheDocument();
     expect(await screen.findByText("notes")).toBeInTheDocument();
+  });
+
+  it("discards a half-typed add, and reopens on an empty form", async () => {
+    await renderPane();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_TITLE }));
+    await fillRequired();
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_FORM_CANCEL_LABEL }));
+
+    await waitFor(() =>
+      expect(screen.queryByRole("form", { name: SYNC_ADD_TITLE })).not.toBeInTheDocument(),
+    );
+    // Discarding is not a save with the fields blanked: nothing was created.
+    expect(mockSave).not.toHaveBeenCalled();
+
+    // A draft that survived a discard is a draft the next add would submit by
+    // accident, so the reopened form starts from nothing — including the folder
+    // that was picked through the native dialog.
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_TITLE }));
+    const reopened = screen.getByRole("form", { name: SYNC_ADD_TITLE });
+    expect(within(reopened).getByLabelText(SYNC_NAME_LABEL)).toHaveValue("");
+    expect(within(reopened).getByLabelText(SYNC_REMOTE_URL_LABEL)).toHaveValue("");
+    expect(within(reopened).getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent(
+      SYNC_NO_FOLDER_CHOSEN_LABEL,
+    );
+    expect(within(reopened).getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL })).toBeDisabled();
   });
 });
 
@@ -616,12 +777,71 @@ describe("SyncPane edit a folder", () => {
   });
 });
 
+describe("SyncPane remove a folder", () => {
+  it("asks first, in the Settings wording, and then forgets the folder", async () => {
+    await renderPane();
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_REMOVE_LABEL }));
+
+    // Nothing is forgotten until the confirmation is accepted.
+    expect(mockRemove).not.toHaveBeenCalled();
+    const dialog = await screen.findByRole("alertdialog");
+    // The same sentence Settings shows, not a second wording of the same
+    // promise: what removal keeps is the whole question being answered here.
+    expect(within(dialog).getByText(SYNC_REMOVE_CONFIRM_SENTENCE)).toBeInTheDocument();
+    expect(SYNC_REMOVE_CONFIRM_SENTENCE).toMatch(/git repository are left on disk/);
+    expect(SYNC_REMOVE_CONFIRM_SENTENCE).toMatch(/deletes the access token/);
+
+    mockProfiles.mockResolvedValue([]);
+    mockStatuses.mockResolvedValue([]);
+    fireEvent.click(within(dialog).getByRole("button", { name: SYNC_REMOVE_CONFIRM_LABEL }));
+
+    await waitFor(() => expect(mockRemove).toHaveBeenCalledWith("p1"));
+    expect(await screen.findByText(SYNC_PANE_EMPTY_SENTENCE)).toBeInTheDocument();
+  });
+
+  it("keeps the folder when the confirmation is declined", async () => {
+    await renderPane();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_REMOVE_LABEL }));
+    const dialog = await screen.findByRole("alertdialog");
+
+    fireEvent.click(within(dialog).getByRole("button", { name: SYNC_REMOVE_CANCEL_LABEL }));
+
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+    expect(mockRemove).not.toHaveBeenCalled();
+    expect(screen.getByText(RUST_LINE)).toBeInTheDocument();
+  });
+
+  it("does not re-read the lists of the folder it just removed", async () => {
+    await renderPane();
+    await waitFor(() => expect(mockActivity).toHaveBeenCalledWith("p1", expect.any(Number)));
+    const reads = mockActivity.mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_REMOVE_LABEL }));
+    const dialog = await screen.findByRole("alertdialog");
+    mockProfiles.mockResolvedValue([]);
+    mockStatuses.mockResolvedValue([]);
+    fireEvent.click(within(dialog).getByRole("button", { name: SYNC_REMOVE_CONFIRM_LABEL }));
+
+    await waitFor(() => expect(mockRemove).toHaveBeenCalledWith("p1"));
+    // Every other card action ends in a re-read, because the lists are most
+    // likely to have moved. This one has no folder left to read, and asking
+    // would only record three rejections against an id nothing will show again.
+    expect(mockActivity.mock.calls.length).toBe(reads);
+  });
+});
+
 describe("SyncPane activity", () => {
   const activity: SyncActivityVm[] = [
-    { tsMs: NOW - 120_000, kind: "modified", path: "notes/today.md" },
-    { tsMs: NOW - 3_600_000, kind: "added", path: "notes/new.md" },
-    { tsMs: NOW - 7_200_000, kind: "deleted", path: "notes/old.md" },
-    { tsMs: NOW - 10_800_000, kind: "conflict", path: "notes/shared.sync-conflict-01.md" },
+    { tsMs: NOW - 120_000, kind: "modified", path: "notes/today.md", sizeBytes: 2_500_000 },
+    { tsMs: NOW - 3_600_000, kind: "added", path: "notes/new.md", sizeBytes: 12 },
+    { tsMs: NOW - 7_200_000, kind: "deleted", path: "notes/old.md", sizeBytes: 4_000 },
+    {
+      tsMs: NOW - 10_800_000,
+      kind: "conflict",
+      path: "notes/shared.sync-conflict-01.md",
+      sizeBytes: null,
+    },
   ];
 
   it("lists what sync did, newest first, with the kind spoken and the time relative", async () => {
@@ -641,6 +861,16 @@ describe("SyncPane activity", () => {
     expect(rows[3]).toHaveTextContent("Conflict copy");
     // Relative, in whatever the runtime locale calls two minutes.
     expect(rows[0].textContent ?? "").toMatch(/2\s*min/);
+    // Four kinds, four glyphs: this list is scanned rather than read, and
+    // three variations on one page outline made every row look like the last.
+    const glyphs = rows.map((row) => row.querySelector("svg")?.getAttribute("class") ?? "");
+    expect(new Set(glyphs).size).toBe(4);
+    // The size sits beside the time, and a row nobody measured shows none at
+    // all — never "0 B", which would claim the file was empty.
+    expect(rows[0]).toHaveTextContent("2.5 MB");
+    expect(rows[1]).toHaveTextContent("12 bytes");
+    expect(rows[2]).toHaveTextContent("4.0 kB");
+    expect(rows[3].textContent ?? "").not.toMatch(/\d\s(bytes?|kB|MB|GB|TB)/);
   });
 
   it("asks for a bounded page rather than the whole history", async () => {
@@ -1080,6 +1310,19 @@ describe("sync pane projections", () => {
     expect(syncLiveFraction(busy, progressVm({ fraction: 1.4 }))).toBe(1);
     // With no event yet, the polled counters still answer.
     expect(syncLiveFraction(busy, undefined)).toBeCloseTo(0.25);
+  });
+
+  it("keeps a streamed rate behind the poll's verdict on whether work is happening", () => {
+    const idle = statusVm({ state: "idle", pending: 0 });
+    const busy = statusVm({ state: "syncing", phase: "pushing" });
+    // A rate arriving between two polls must not be what makes a card look busy.
+    expect(syncLiveRate(undefined, progressVm({ bytesPerSecond: 9_000_000 }))).toBeNull();
+    expect(syncLiveRate(idle, progressVm({ bytesPerSecond: 9_000_000 }))).toBeNull();
+    expect(syncLiveRate(busy, progressVm({ bytesPerSecond: 9_000_000 }))).toBe(9_000_000);
+    // No event yet, and a zero the poll cannot vouch for, are the same answer:
+    // nothing to show. The poll carries no rate of its own to fall back on.
+    expect(syncLiveRate(busy, undefined)).toBeNull();
+    expect(syncLiveRate(busy, progressVm({ bytesPerSecond: 0 }))).toBeNull();
   });
 });
 

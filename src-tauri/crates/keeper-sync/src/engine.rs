@@ -23,11 +23,12 @@
 //!   volume *before* it looks at the filesystem, because a detached drive looks
 //!   exactly like a user deleting every file in it (AD-48).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -35,14 +36,18 @@ use serde::{Deserialize, Serialize};
 use crate::backoff::{jitter_sample, Backoff};
 use crate::db::{self, ActivityKind, ActivityRow, DeviceIdentity, WorkKind, WorkState};
 use crate::error::{Result, Retriability, SyncError};
+use crate::exclude::ExcludeSet;
 use crate::git::{self, cli::GitCli};
 use crate::lfs;
 use crate::platform::SyncPlatform;
 use crate::profile::{LfsMode, ProfileState, SyncDirection, SyncLane, SyncProfile};
-use crate::progress::{ProgressSink, SyncPhase, SyncProgress, SyncStatus, TransferTally};
+use crate::progress::{
+    ProgressSink, RateMeter, SyncPhase, SyncProgress, SyncStatus, TransferTally,
+};
 use crate::provenance::{commit_message, Provenance, SyncSource};
-use crate::stability::{StabilityGate, StabilityVerdict};
+use crate::stability::{FileSample, StabilityGate, StabilityVerdict};
 use crate::volume::{self, VolumeMarker, VolumeStatus};
+use crate::watch::{FolderWatcher, WatchConfig, WatchEvent};
 
 /// What one `sync_once` actually did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -162,6 +167,53 @@ const TICK_MS: u64 = 1_000;
 /// never raises a notification for something that fixed itself.
 const TRANSIENT_FAILURES_BEFORE_WARNING: u32 = 3;
 
+/// How long a profile waits before trying to arm a watcher again.
+///
+/// A watcher fails for reasons that do not fix themselves in a second — an
+/// exhausted inotify instance limit, a mount that refuses to be watched — so
+/// retrying at the tick rate would be a syscall storm against a condition that
+/// needs a human. A minute is short enough that raising `max_user_watches`
+/// takes effect without a restart, and the paced scan covers the whole interval
+/// meanwhile.
+const WATCH_REARM_INTERVAL_MS: i64 = 60_000;
+
+/// The opening words of the "no watcher" warning.
+///
+/// A constant rather than a literal in one `format!` because the warning has to
+/// be retired again without disturbing anything else on display, and matching
+/// its own prefix is the only way to tell our message from someone else's.
+const WATCH_DEGRADED_PREFIX: &str = "keeper cannot watch this folder for changes";
+
+/// One profile's filesystem watcher, or the memory of it failing.
+///
+/// A single map holds both so there is exactly one place that answers "does
+/// this profile have a watcher, and if not why not" — a second map for
+/// failures would be a second thing to keep in step with profile lifetime.
+enum ProfileWatch {
+    Live {
+        /// Dropping this joins the debouncer thread and the rescan thread, so
+        /// replacing or removing an entry is what makes "a watcher never
+        /// outlives its profile" true rather than aspirational. It is also
+        /// asked for the root it was armed over — a profile whose folder moved
+        /// needs a new watcher, and comparing against the watcher's own answer
+        /// is one fewer copy of the same fact to keep in step.
+        watcher: FolderWatcher,
+        /// Drained without blocking at the top of every tick.
+        events: tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
+    },
+    Failed {
+        /// The root the failed attempt was for, so a profile that has since
+        /// moved is retried at once rather than waiting out a window that was
+        /// armed against a different folder.
+        root: PathBuf,
+        /// Rendered once, at the failure, and re-shown on every tick — the
+        /// message names the fix (an inotify sysctl, most usefully) and it
+        /// would be a lie to recompute it from a later, healthier world.
+        reason: String,
+        retry_at_ms: i64,
+    },
+}
+
 pub struct Engine {
     platform: Arc<dyn SyncPlatform>,
     /// Single connection behind a mutex. `sync.db` is small and every access is
@@ -170,7 +222,14 @@ pub struct Engine {
     /// checkable by inspection — every guard here is dropped inside a sync
     /// helper before any await point.
     db: Mutex<Connection>,
-    device: DeviceIdentity,
+    /// This installation's identity.
+    ///
+    /// Behind a mutex because the LABEL is renameable while the engine runs
+    /// (Story 34.5) and every commit reads it. `Engine` is only ever held as an
+    /// `Arc`, so `&mut self` is not available; a snapshot accessor
+    /// ([`Engine::device`]) is also what keeps the mutex from being held across
+    /// a commit. The id inside it never moves — see `db::set_device_label`.
+    device: Mutex<DeviceIdentity>,
     git: GitCli,
     http: reqwest::Client,
     /// Live status per profile id, the polled snapshot the tray reads.
@@ -193,10 +252,11 @@ pub struct Engine {
     /// at once, but WALKING THE TREE at that rate is a different thing
     /// entirely: it re-stats every file every second — on a pendrive, over a
     /// network mount — and it made the menu-bar glyph flip between armed and
-    /// working once a second, because a scan that finds nothing still passes
-    /// through the `Scanning` phase. Draining stays at the tick; scanning is
-    /// paced by the profile's own `poll_interval_ms`, which until now was
-    /// parsed, validated, documented and read by nothing (DW-116).
+    /// working once a second, because a scan that found nothing published the
+    /// `Scanning` phase anyway (`collect_stable_changes` no longer does — but
+    /// the re-stat itself is reason enough to pace). Draining stays at the tick;
+    /// scanning is paced by the profile's own `poll_interval_ms`, which until
+    /// now was parsed, validated, documented and read by nothing (DW-116).
     next_scan_ms: Mutex<HashMap<String, i64>>,
     /// Absolute path to the binary git should invoke as the `lfs` filter.
     ///
@@ -218,6 +278,21 @@ pub struct Engine {
     /// [`Engine::sync_once`] reads this before and after its run and reports
     /// the difference, which is exactly "what this run moved".
     transferred: Mutex<HashMap<String, u64>>,
+    /// Live filesystem watchers per profile id (AD-34-11).
+    ///
+    /// The supervisor owns these rather than either host, because the
+    /// supervisor is the only consumer of what they emit and AD-52 forbids a
+    /// second copy of this policy on the daemon side. `run` tears them all
+    /// down on its way out.
+    watchers: Mutex<HashMap<String, ProfileWatch>>,
+    /// Profiles whose watcher has reported activity that no walk has answered.
+    ///
+    /// Separate from `watchers` because a wake has to survive its watcher and
+    /// its tick: a tick that drains journal work instead of walking must not
+    /// swallow one, or the change it announced goes back to waiting for the
+    /// paced poll — which is the entire latency bug. Cleared by the walk that
+    /// answers it.
+    watch_wake: Mutex<HashSet<String>>,
 }
 
 impl Engine {
@@ -256,7 +331,7 @@ impl Engine {
         let engine = Self {
             platform,
             db: Mutex::new(conn),
-            device,
+            device: Mutex::new(device),
             git,
             http,
             status: Mutex::new(HashMap::new()),
@@ -271,6 +346,8 @@ impl Engine {
             next_sink: AtomicU64::new(1),
             interrupt: Arc::new(AtomicBool::new(false)),
             transferred: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
+            watch_wake: Mutex::new(HashSet::new()),
         };
         engine.seed_status()?;
         Ok(engine)
@@ -290,6 +367,33 @@ impl Engine {
         f(&guard)
     }
 
+    /// A snapshot of this device's identity.
+    ///
+    /// A clone rather than a borrow: a rename can land at any moment, and
+    /// handing out a guard would mean holding the mutex across a commit. A
+    /// caller that needs both halves takes ONE snapshot, so no rename can slip
+    /// in between reading the label and reading the id and produce a trailer
+    /// naming a machine that never existed.
+    pub fn device(&self) -> DeviceIdentity {
+        Self::lock(&self.device).clone()
+    }
+
+    /// Rename this device.
+    ///
+    /// Takes effect on the next commit and rewrites nothing: `Keeper-Device` on
+    /// an existing commit keeps the name this machine had when it made it, which
+    /// is the only honest answer to "who wrote this". The id is untouched.
+    ///
+    /// The row is written first, so a label the store refuses (an empty one)
+    /// never reaches the copy every commit reads.
+    pub fn set_device_label(&self, label: &str) -> Result<()> {
+        let stored = self.with_db(|conn| db::set_device_label(conn, label))?;
+        // Updating the in-memory copy is what makes the rename visible without a
+        // restart: it, not the row, is what `commit` reads.
+        Self::lock(&self.device).label = stored;
+        Ok(())
+    }
+
     fn seed_status(&self) -> Result<()> {
         let profiles = self.with_db(db::list_profiles)?;
         let mut status = Self::lock(&self.status);
@@ -297,6 +401,16 @@ impl Engine {
             let pending = self.pending_for(&profile.id).unwrap_or(0);
             let mut snapshot = SyncStatus::idle(&profile.id, &profile.name);
             snapshot.pending = pending;
+            // Seeded, not left at zero, because a one-shot `keeper-syncd
+            // status` never ticks: without this it would read the journal,
+            // find nothing, and print "up to date" over a folder whose files
+            // are all mid-window (AD-34-10). These are the windows the last run
+            // left open — the first walk replaces the count with a measured
+            // one, and until then the previous run's answer beats no answer.
+            snapshot.settling = self
+                .with_db(|conn| db::load_file_state(conn, &profile.id))
+                .map(|held| held.len() as u32)
+                .unwrap_or(0);
             snapshot.state = if !profile.enabled {
                 ProfileState::Paused
             } else {
@@ -349,11 +463,39 @@ impl Engine {
         Ok(())
     }
 
+    /// Forget a profile: its stored remote credential, then its rows, then the
+    /// in-memory state keyed by its id. The folder and its repository are left
+    /// on disk untouched — removal is a configuration change, never a deletion
+    /// of content.
+    ///
+    /// The credential goes first, and a keychain failure aborts the removal
+    /// before anything is deleted (AD-34-14). The key is derived from the
+    /// profile id, so a secret that outlived its row could never be found
+    /// again, let alone deleted: the two failure modes are not comparable. This
+    /// ordering fails with the profile intact and the removal retryable; the
+    /// reverse would trade that for a permanent orphan. If the row delete then
+    /// fails, what is left is a profile whose token is gone — which reports
+    /// itself as an authentication failure on the next sync, and is fixed by
+    /// entering the token again or by removing the folder again.
+    ///
+    /// Lives here rather than in the Tauri command because the ordering above
+    /// is only a guarantee if the two deletes are one operation: split across
+    /// crates, every other caller of this function skips the first half.
+    /// `keeper-syncd` is exactly that caller — it removes profiles through this
+    /// engine and never goes near the IPC layer — and the read side of the same
+    /// secret already lives here (`Self::credential`).
     pub fn remove_profile(&self, id: &str) -> Result<()> {
+        // Read before deleting: after the row is gone there is nothing left to
+        // ask for the key. A profile that is already absent has no secret to
+        // delete, and the row deletes below stay idempotent either way.
+        if let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? {
+            self.platform.secret_delete(&profile.secret_key())?;
+        }
         self.with_db(|conn| db::delete_profile(conn, id))?;
         Self::lock(&self.status).remove(id);
         Self::lock(&self.gates).remove(id);
         Self::lock(&self.next_scan_ms).remove(id);
+        self.drop_watcher(id);
         Ok(())
     }
 
@@ -484,7 +626,7 @@ impl Engine {
         // backlog of them fired back to back at a git server.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        tracing::info!(device = %self.device.id, "sync supervisor started");
+        tracing::info!(device = %self.device().id, "sync supervisor started");
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -505,6 +647,11 @@ impl Engine {
         }
 
         self.interrupt.store(true, Ordering::SeqCst);
+        // The supervisor is the only consumer of what a watcher emits, so the
+        // watchers stop with it. Leaving them armed would hold an inotify
+        // instance and two threads per profile for the life of the process, and
+        // a later `start_supervisor` would arm a second set beside them.
+        self.stop_all_watchers();
         self.finalize()?;
         tracing::info!("sync supervisor stopped");
         Ok(())
@@ -518,7 +665,12 @@ impl Engine {
     }
 
     async fn tick(&self) -> Result<()> {
-        for profile in self.list_profiles()? {
+        let profiles = self.list_profiles()?;
+        // A watcher must not outlive its profile (AD-34-11). Pausing one or
+        // removing one is visible only from here: `tick_profile` never runs for
+        // a disabled profile, so it cannot be the thing that notices.
+        self.retain_watchers(&profiles);
+        for profile in profiles {
             if !profile.enabled {
                 continue;
             }
@@ -537,6 +689,9 @@ impl Engine {
         // detached drive is indistinguishable from a mass deletion once you
         // start walking the tree, so we never start walking (AD-48).
         if !self.volume_ready(profile)? {
+            // A watcher on a detached drive is watching a path that no longer
+            // exists; the tick after the volume returns arms a fresh one.
+            self.drop_watcher(&profile.id);
             return Ok(());
         }
 
@@ -546,23 +701,35 @@ impl Engine {
             None => return Ok(()),
         };
 
-        let scan = self.scan_is_due(profile);
-        self.drain_journal(profile, scan).await
+        // Arming happens after the volume gate — the root has to exist — and
+        // inside the reservation, so nothing drains a wake on a tick that is
+        // about to bail without answering it.
+        self.ensure_watcher(profile);
+        self.fold_watch_events(profile)?;
+
+        let scan = self.scan_due(profile);
+        // The supervisor's own pass. Nobody asked for this one — the clock
+        // did — so it is the only genuinely `Watch` caller (AD-34-12).
+        self.drain_journal(profile, scan, SyncSource::Watch).await
     }
 
     /// Whether this profile's tree may be walked on this tick, arming the next
     /// window when it may.
     ///
     /// Queued work is drained every tick; discovering NEW work is paced, because
-    /// a scan is a full re-stat of the tree and a `Scanning` phase the UI and the
-    /// tray both render. At 1 Hz that made the menu-bar glyph flip continuously
-    /// on a folder where nothing was happening.
+    /// a scan is a full re-stat of the tree, on a pendrive or over a network
+    /// mount. It also used to publish a `Scanning` phase whatever it found,
+    /// which at 1 Hz made the menu-bar glyph flip continuously on a folder where
+    /// nothing was happening; `collect_stable_changes` now reports only a scan
+    /// that found work, and the pacing stands on the cost of the walk alone.
     ///
     /// The floor exists because the field is user-supplied: a zero would restore
     /// the every-tick behaviour this replaces, and a profile written before the
-    /// field meant anything still deserves a sane cadence.
+    /// field meant anything still deserves a sane cadence. It lives on the
+    /// profile as `effective_poll_interval_ms` rather than here, because the
+    /// form and the degraded-watcher warning have to name the cadence that is
+    /// actually in force and must not re-derive it (AD-34-8).
     fn scan_is_due(&self, profile: &SyncProfile) -> bool {
-        const MIN_SCAN_INTERVAL_MS: i64 = 2_000;
         let now = self.platform.now_ms();
         let mut due = Self::lock(&self.next_scan_ms);
         match due.get(&profile.id) {
@@ -572,9 +739,309 @@ impl Engine {
             Some(at) if now >= *at => {}
             Some(_) => return false,
         }
-        let interval = (profile.poll_interval_ms as i64).max(MIN_SCAN_INTERVAL_MS);
+        let interval = profile.effective_poll_interval_ms() as i64;
         due.insert(profile.id.clone(), now.saturating_add(interval));
         true
+    }
+
+    /// Whether this profile's tree may be walked on this tick.
+    ///
+    /// Three independent reasons, and only the last of them existed before
+    /// AD-34-11:
+    ///
+    /// 1. **The watcher saw something.** The low-latency path: a file that
+    ///    lands is walked on the next tick rather than on the next poll.
+    /// 2. **A held file's window has elapsed.** A settling path needs a
+    ///    *second* observation to clear, and observations happen only inside a
+    ///    walk — so before this the second one arrived on the paced poll, and a
+    ///    file took two poll intervals to sync rather than its settle window.
+    ///    That, and not the settle window, was the reported "waiting for writes
+    ///    to stop takes ages".
+    /// 3. **The paced backstop**, unchanged, because it is the only cover for
+    ///    what a watcher cannot see: a dropped event queue, a mount that
+    ///    notifies nothing (NFS, CIFS, some FUSE), and a watcher that failed to
+    ///    arm at all.
+    ///
+    /// [`Self::scan_is_due`] is evaluated FIRST and unconditionally, never
+    /// short-circuited away: it is the thing that advances the paced window, so
+    /// letting an event-driven walk skip it would let a busy folder starve the
+    /// backstop it depends on.
+    ///
+    /// None of this can walk faster than the 1 Hz tick, and both new reasons
+    /// are self-limiting besides: the debouncer collapses a burst into one
+    /// event per path per 500 ms, and a deadline is by construction at least
+    /// `CLOSE_WRITE_SETTLE_MS` later than the observation that produced it.
+    fn scan_due(&self, profile: &SyncProfile) -> bool {
+        let paced = self.scan_is_due(profile);
+        paced || self.watch_wake_pending(&profile.id) || self.settle_window_elapsed(profile)
+    }
+
+    /// Whether any path this profile is holding could be stable by now.
+    ///
+    /// Reads the live gate and deliberately never creates one: a gate is seeded
+    /// by the first walk, and this question is asked *before* every walk.
+    fn settle_window_elapsed(&self, profile: &SyncProfile) -> bool {
+        let now = self.platform.now_ms();
+        Self::lock(&self.gates)
+            .get(&profile.id)
+            .and_then(|gate| gate.next_stable_ms(now))
+            .is_some_and(|at| now >= at)
+    }
+
+    // -----------------------------------------------------------------------
+    // Filesystem watchers (AD-34-11)
+    // -----------------------------------------------------------------------
+
+    /// Arm this profile's watcher unless it already has the right one.
+    ///
+    /// Idempotent, and the healthy case is one hash lookup. Arming lives on the
+    /// tick rather than at add / resume / re-attach time on purpose: "every
+    /// enabled profile has a watcher" is then a property the supervisor
+    /// re-establishes continuously, instead of three call sites that each have
+    /// to remember.
+    fn ensure_watcher(&self, profile: &SyncProfile) {
+        let now = self.platform.now_ms();
+        // `Some(reason)` means "still failing, and not yet due for another
+        // attempt"; `None` means "arm one"; the early return means the profile
+        // already has exactly the watcher it should have.
+        let degraded = {
+            let watchers = Self::lock(&self.watchers);
+            match watchers.get(&profile.id) {
+                Some(ProfileWatch::Live { watcher, .. })
+                    if watcher.root() == profile.local_path.as_path() =>
+                {
+                    return;
+                }
+                Some(ProfileWatch::Failed {
+                    root,
+                    reason,
+                    retry_at_ms,
+                }) if *root == profile.local_path && now < *retry_at_ms => Some(reason.clone()),
+                _ => None,
+            }
+        };
+        if let Some(reason) = degraded {
+            self.warn_watch_degraded(profile, &reason, false);
+            return;
+        }
+
+        // `WatchConfig::default()` in full: a 500 ms debounce, comfortably below
+        // the shortest quiescence window so debouncing never becomes the thing
+        // that decides when a file syncs, plus the 15-minute sweep that covers a
+        // dropped event queue. `force_poll` stays off deliberately —
+        // `notify::PollWatcher` re-stats the whole tree every 30 s, which is
+        // *slower* than this engine's own paced scan, so a poll backend would be
+        // a worse fallback than the one already in place.
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        match FolderWatcher::start(&profile.local_path, WatchConfig::default(), tx) {
+            Ok(watcher) => {
+                let replaced = Self::lock(&self.watchers)
+                    .insert(profile.id.clone(), ProfileWatch::Live { watcher, events });
+                // Retiring the previous watcher hands its teardown to a thread
+                // of its own and returns (`watch::retire`), so replacing a
+                // watcher costs this tick nothing — it happens with the map
+                // unlocked anyway, because an IPC-thread `remove_profile` must
+                // never queue behind a tick that is arming.
+                drop(replaced);
+                self.clear_watch_warning(&profile.id);
+            }
+            Err(err) => {
+                let reason = err.to_string();
+                tracing::warn!(
+                    profile = profile.name,
+                    error = %reason,
+                    "folder watch failed to arm; falling back to the paced scan"
+                );
+                let replaced = Self::lock(&self.watchers).insert(
+                    profile.id.clone(),
+                    ProfileWatch::Failed {
+                        root: profile.local_path.clone(),
+                        reason: reason.clone(),
+                        retry_at_ms: now.saturating_add(WATCH_REARM_INTERVAL_MS),
+                    },
+                );
+                drop(replaced);
+                self.warn_watch_degraded(profile, &reason, true);
+            }
+        }
+    }
+
+    /// Say, in the UI, that this profile is on the paced scan alone.
+    ///
+    /// Two different things, deliberately separated. The **text** is a state,
+    /// re-asserted on every tick the watcher is down, because
+    /// [`Self::clear_warning`] retires whatever is on display as soon as any
+    /// unit succeeds — and a degradation that stops announcing itself is exactly
+    /// the silent downgrade AD-34-11 forbids. The **notification** is an event
+    /// and belongs to the onset alone: routing the re-assertion through
+    /// [`Self::warn`] would fire a fresh notification every time a successful
+    /// unit happened to wipe the text, which on a busy profile is one per sync.
+    ///
+    /// `reason` is the watcher's own message, which for the one watcher failure
+    /// a user can actually fix names the sysctl to raise. The text is otherwise
+    /// fixed on purpose: `warn` compares before it notifies, so a countdown or
+    /// any other changing number in here would defeat the once-per-onset rule.
+    fn warn_watch_degraded(&self, profile: &SyncProfile, reason: &str, notify: bool) {
+        let seconds = profile.effective_poll_interval_ms() / 1_000;
+        let message = format!(
+            "{WATCH_DEGRADED_PREFIX}, so a new file can take up to {seconds} s to sync \
+             instead of a second or two. {reason}"
+        );
+        if notify {
+            self.warn(&profile.id, &profile.name, message);
+        } else if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
+            snapshot.warning = Some(message);
+        }
+    }
+
+    /// Retire the watcher warning, and only that one.
+    ///
+    /// [`Self::clear_warning`] wipes whatever is on display, so calling it from
+    /// here would silently retire an unrelated problem the moment a watcher
+    /// happened to arm. Matching our own opening words keeps the two
+    /// independent.
+    fn clear_watch_warning(&self, profile_id: &str) {
+        if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
+            if snapshot
+                .warning
+                .as_deref()
+                .is_some_and(|shown| shown.starts_with(WATCH_DEGRADED_PREFIX))
+            {
+                snapshot.warning = None;
+            }
+        }
+    }
+
+    /// Drain everything this profile's watcher has delivered since the last
+    /// tick, folding the close-writes into the gate.
+    ///
+    /// A close-write is the one event that means something on its own: it takes
+    /// the path down the 1 s `CLOSE_WRITE_SETTLE_MS` route instead of the full
+    /// window. That route has existed since Story 26.3 and was unreachable
+    /// until now, because nothing outside `watch.rs`'s own tests ever built a
+    /// watcher.
+    ///
+    /// Every other event means only "look at this profile now", and is recorded
+    /// as a wake rather than acted on: `git status` decides what changed, and it
+    /// is authoritative in a way an event stream is not. That is also why no
+    /// [`crate::watch::EchoSuppressor`] registration is needed here — the
+    /// engine's own checkouts leave the tree clean against the new HEAD, so they
+    /// cost at most one extra fruitless walk rather than a re-commit loop.
+    fn fold_watch_events(&self, profile: &SyncProfile) -> Result<()> {
+        let mut closed: Vec<PathBuf> = Vec::new();
+        let mut delivered = false;
+        {
+            let mut watchers = Self::lock(&self.watchers);
+            let Some(ProfileWatch::Live { events, .. }) = watchers.get_mut(&profile.id) else {
+                return Ok(());
+            };
+            // `try_recv` never blocks, so the map is locked for exactly as long
+            // as it takes to move what is already queued.
+            while let Ok(event) = events.try_recv() {
+                delivered = true;
+                if event.close_write {
+                    closed.push(event.path);
+                }
+            }
+        }
+        if !delivered {
+            return Ok(());
+        }
+        self.note_watch_wake(&profile.id);
+        if !closed.is_empty() {
+            let mut gates = Self::lock(&self.gates);
+            let gate = self.ensure_gate(&mut gates, profile)?;
+            for path in &closed {
+                gate.note_close_write(path);
+            }
+        }
+        Ok(())
+    }
+
+    /// The watcher reported something no walk has answered yet.
+    fn note_watch_wake(&self, profile_id: &str) {
+        Self::lock(&self.watch_wake).insert(profile_id.to_owned());
+    }
+
+    fn watch_wake_pending(&self, profile_id: &str) -> bool {
+        Self::lock(&self.watch_wake).contains(profile_id)
+    }
+
+    /// A walk has now answered whatever the watcher reported.
+    fn clear_watch_wake(&self, profile_id: &str) {
+        Self::lock(&self.watch_wake).remove(profile_id);
+    }
+
+    /// Tear down a profile's watcher, if it has one, and forget its wake.
+    fn drop_watcher(&self, profile_id: &str) {
+        let dropped = Self::lock(&self.watchers).remove(profile_id);
+        self.clear_watch_wake(profile_id);
+        if dropped.is_some() {
+            tracing::debug!(profile_id, "folder watch retired");
+        }
+        // Retiring a live watcher never blocks: `watch::retire` moves the
+        // teardown to its own thread precisely because this line is on the IPC
+        // thread whenever `remove_profile` is what called us. The map is
+        // unlocked first regardless, so nothing else serialises behind it
+        // either.
+        drop(dropped);
+    }
+
+    /// Drop the watcher of every profile that must not have one.
+    ///
+    /// Takes the whole profile list because *absence* is the signal: a removed
+    /// profile is simply not in it, and a paused one is in it with `enabled`
+    /// false. `tick_profile` cannot do this job — it never runs for a disabled
+    /// profile, which is precisely the case that would leak a thread per resume.
+    fn retain_watchers(&self, profiles: &[SyncProfile]) {
+        let stale: Vec<String> = {
+            let watchers = Self::lock(&self.watchers);
+            watchers
+                .keys()
+                .filter(|id| {
+                    let id = id.as_str();
+                    !profiles.iter().any(|p| p.enabled && p.id == id)
+                })
+                .cloned()
+                .collect()
+        };
+        for id in stale {
+            self.drop_watcher(&id);
+        }
+    }
+
+    /// Stop every watcher this engine armed, without waiting for any of them.
+    ///
+    /// This is the last thing between a shutdown request and `finalize`, so it
+    /// is the one teardown that absolutely may not block: see `watch::retire`.
+    fn stop_all_watchers(&self) {
+        let dropped = std::mem::take(&mut *Self::lock(&self.watchers));
+        Self::lock(&self.watch_wake).clear();
+        drop(dropped);
+    }
+
+    /// This profile's completeness gate, seeded from `file_state` on first use
+    /// in this process.
+    ///
+    /// Without the seeding a one-shot `sync --once` could never reach a second
+    /// observation, so every file would be held forever, and an app restart
+    /// would silently restart every in-flight quiescence window. Extracted from
+    /// the walk so that the watcher's close-write notes and the walk itself
+    /// reach the same gate instead of racing to create two.
+    fn ensure_gate<'a>(
+        &self,
+        gates: &'a mut HashMap<String, StabilityGate>,
+        profile: &SyncProfile,
+    ) -> Result<&'a mut StabilityGate> {
+        if !gates.contains_key(&profile.id) {
+            let mut fresh = StabilityGate::for_profile(profile)?;
+            let saved = self.with_db(|conn| db::load_file_state(conn, &profile.id))?;
+            fresh.import(saved);
+            gates.insert(profile.id.clone(), fresh);
+        }
+        gates
+            .get_mut(&profile.id)
+            .ok_or_else(|| SyncError::Journal("gate vanished after insert".to_owned()))
     }
 
     /// Execute every journal unit that is ready for this profile.
@@ -588,8 +1055,17 @@ impl Engine {
     /// window is open; an explicit "sync now" always looks, because the user
     /// just asked.
     ///
+    /// `source` rides along to whatever gets drained: a journaled push commits
+    /// before it publishes, and that commit has to record who asked for it
+    /// rather than claiming the watcher did (AD-34-12).
+    ///
     /// The caller owns the profile reservation.
-    async fn drain_journal(&self, profile: &SyncProfile, scan_when_idle: bool) -> Result<()> {
+    async fn drain_journal(
+        &self,
+        profile: &SyncProfile,
+        scan_when_idle: bool,
+        source: SyncSource,
+    ) -> Result<()> {
         let now = self.platform.now_ms();
         let claimed = self.with_db(|conn| db::claim_ready(conn, &profile.id, now, CLAIM_LIMIT))?;
         if claimed.is_empty() {
@@ -600,7 +1076,7 @@ impl Engine {
         }
 
         for item in claimed {
-            match self.execute(profile, &item.kind).await {
+            match self.execute(profile, &item.kind, source).await {
                 Ok(()) => {
                     self.with_db(|conn| db::complete(conn, item.id))?;
                     self.clear_warning(&profile.id);
@@ -684,10 +1160,26 @@ impl Engine {
         }
     }
 
+    /// Refresh both halves of "what is this profile waiting on".
+    ///
+    /// `pending` counts journal rows and `settling` counts paths the gate is
+    /// holding, and they are refreshed together because they are two halves of
+    /// one answer: a snapshot that updated one without the other is how "up to
+    /// date" came to be printed over a folder still being written (AD-34-10).
+    ///
+    /// The gate is read, never recounted. An absent gate means nothing has been
+    /// walked yet in this process, and the count seeded at open stands until the
+    /// first walk measures a real one.
     fn refresh_pending(&self, profile_id: &str) {
+        let settling = Self::lock(&self.gates)
+            .get(profile_id)
+            .map(|gate| gate.tracked() as u32);
         if let Ok(pending) = self.pending_for(profile_id) {
             if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
                 snapshot.pending = pending;
+                if let Some(settling) = settling {
+                    snapshot.settling = settling;
+                }
                 if pending == 0 && snapshot.state == ProfileState::Syncing {
                     snapshot.state = ProfileState::Watching;
                     snapshot.phase = SyncPhase::Idle;
@@ -849,16 +1341,48 @@ impl Engine {
     // Work execution
     // -----------------------------------------------------------------------
 
-    async fn execute(&self, profile: &SyncProfile, kind: &WorkKind) -> Result<()> {
+    async fn execute(
+        &self,
+        profile: &SyncProfile,
+        kind: &WorkKind,
+        source: SyncSource,
+    ) -> Result<()> {
         match kind {
             // The conflict copies are already recorded and warned about;
             // a journaled pull has no caller to hand them back to.
-            WorkKind::Pull => self.do_pull(profile).await.map(drop),
-            WorkKind::Push => self.do_push(profile).await,
+            WorkKind::Pull => {
+                self.do_pull(profile, source).await?;
+                self.mark_synced(&profile.id);
+                Ok(())
+            }
+            WorkKind::Push => {
+                self.do_push(profile, source).await?;
+                self.mark_synced(&profile.id);
+                Ok(())
+            }
             WorkKind::LfsDownload { oid, size } => self.do_lfs(profile, oid, *size, false).await,
             WorkKind::LfsUpload { oid, size } => self.do_lfs(profile, oid, *size, true).await,
             WorkKind::OpenPullRequest { branch } => self.do_open_pr(profile, branch).await,
             WorkKind::Verify => self.verify(&profile.id).await.map(drop),
+        }
+    }
+
+    /// Record that a pass finished without error.
+    ///
+    /// "Synced" means one whole reconciliation leg came back clean: a pull that
+    /// fetched and applied, a push that published — including one that found
+    /// nothing to publish — or a complete [`Engine::sync_once`]. It
+    /// deliberately does NOT mean "the supervisor ticked": a tick that claimed
+    /// no work and was not due a scan checked nothing, and stamping that would
+    /// leave the field reading "just now" forever.
+    ///
+    /// This used to live at the tail of `do_push` alone, so a pull-only
+    /// profile — and a push profile whose tree had nothing to send, which
+    /// returns early — never recorded that it had succeeded, and the UI could
+    /// not tell "never synced" from "synced, nothing to do".
+    fn mark_synced(&self, profile_id: &str) {
+        if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
+            snapshot.last_sync_ms = Some(self.platform.now_ms());
         }
     }
 
@@ -1029,7 +1553,7 @@ impl Engine {
     /// they are the one thing a merge leaves behind that the user has to act
     /// on, and the working tree stops naming them as soon as they are
     /// committed.
-    async fn do_pull(&self, profile: &SyncProfile) -> Result<Vec<String>> {
+    async fn do_pull(&self, profile: &SyncProfile, source: SyncSource) -> Result<Vec<String>> {
         if !profile.direction.pulls() {
             return Ok(Vec::new());
         }
@@ -1044,7 +1568,7 @@ impl Engine {
         // be exactly the silent data loss AD-43 exists to prevent. Committing
         // first also turns a divergence into commit-vs-commit, which is the
         // shape the conflict-copy path can actually resolve.
-        self.commit_local(profile)?;
+        self.commit_local(profile, source)?;
         self.publish(self.progress(profile, SyncPhase::Fetching));
 
         let profile = profile.clone();
@@ -1087,6 +1611,7 @@ impl Engine {
         // is running — that is `git::fetch`'s documented design — while the
         // high-water mark is the honest answer to "how much did this move".
         let mut fetched = 0u64;
+        let mut rate = RateMeter::default();
         let outcome = self
             .publish_while(
                 &profile,
@@ -1096,6 +1621,16 @@ impl Engine {
                     fetched = fetched.max(done);
                     event.bytes_done = done;
                     event.bytes_total = (total > 0).then_some(total);
+                    // The rate is measured off the high-water mark, never off
+                    // `done`. `done` belongs to whichever node ticked last and
+                    // restarts at zero on each phase, and its unit is that
+                    // node's — objects while deltas resolve, not bytes. The mark
+                    // is the figure this function already treats as bytes
+                    // received (see `add_transferred` below), and it stays flat
+                    // through a phase that is not moving bytes, which is exactly
+                    // when the meter should fall silent rather than divide an
+                    // object count by a second.
+                    event.bytes_per_second = rate.observe(fetched, Instant::now());
                 },
                 fetching,
             )
@@ -1170,7 +1705,7 @@ impl Engine {
             });
         }
 
-        let device = self.device.label.clone();
+        let device = self.device();
         let stamp = conflict_stamp(self.platform.now_ms());
         let profile_for_task = profile.clone();
         // A merge is a sync action like any other, and until now it was the one
@@ -1179,10 +1714,10 @@ impl Engine {
         // exists to answer.
         let provenance = Provenance::new(
             &profile.name,
-            &self.device.label,
-            &self.device.id,
+            &device.label,
+            &device.id,
             self.platform.host_label(),
-            SyncSource::Watch,
+            Self::commit_source(&profile, source),
         )
         .with_tags(profile.tags.clone());
         let conflicts = tokio::task::spawn_blocking(move || {
@@ -1191,7 +1726,7 @@ impl Engine {
                 &profile_for_task,
                 &tracking,
                 &stamp,
-                &device,
+                &device.label,
                 &provenance,
             )
         })
@@ -1214,9 +1749,18 @@ impl Engine {
             // Until now the warning counted the copies and nothing named them,
             // so the one artifact the user has to deal with was unfindable
             // once the notification was dismissed.
-            let rows: Vec<(ActivityKind, String)> = conflicts
+            let rows: Vec<(ActivityKind, String, Option<u64>)> = conflicts
                 .iter()
-                .map(|path| (ActivityKind::Conflict, path.clone()))
+                .map(|path| {
+                    // Unlike a deletion, the copy is sitting in the folder
+                    // right now, so its size is simply readable — and this is
+                    // the one row a user has to act on, so how much of their
+                    // disk it is holding is worth saying.
+                    let size = std::fs::metadata(profile.local_path.join(path))
+                        .ok()
+                        .map(|md| md.len());
+                    (ActivityKind::Conflict, path.clone(), size)
+                })
                 .collect();
             let now = self.platform.now_ms();
             self.with_db(|conn| db::record_activity(conn, &profile.id, now, &rows))?;
@@ -1291,7 +1835,7 @@ impl Engine {
     ///
     /// Shared by both legs so the working tree is always clean before a merge
     /// and always current before a push.
-    fn commit_local(&self, profile: &SyncProfile) -> Result<u64> {
+    fn commit_local(&self, profile: &SyncProfile, source: SyncSource) -> Result<u64> {
         if !profile.direction.pushes() {
             // A pull-only profile never commits; a local edit there is
             // preserved by the merge's own conflict handling instead.
@@ -1309,7 +1853,7 @@ impl Engine {
         event.files_total = Some(count);
         event.current = Self::first_staged(&staged);
         self.publish(event);
-        self.commit(profile, &staged)?;
+        self.commit(profile, &staged, source)?;
         // The commit is durable, so every staged path landed. Reporting it
         // leaves the bar full rather than stranded mid-way when the phase
         // changes underneath it.
@@ -1320,11 +1864,11 @@ impl Engine {
         Ok(count)
     }
 
-    async fn do_push(&self, profile: &SyncProfile) -> Result<()> {
+    async fn do_push(&self, profile: &SyncProfile, source: SyncSource) -> Result<()> {
         if !profile.direction.pushes() {
             return Ok(());
         }
-        let count = self.commit_local(profile)?;
+        let count = self.commit_local(profile, source)?;
 
         // A folder whose files are all still inside the settle window has no
         // commits yet, and neither does a fresh profile on an empty remote.
@@ -1380,10 +1924,6 @@ impl Engine {
             };
             self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now).map(drop))?;
         }
-
-        if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
-            snapshot.last_sync_ms = Some(self.platform.now_ms());
-        }
         Ok(())
     }
 
@@ -1433,33 +1973,33 @@ impl Engine {
     ///
     /// Blocking, and deliberately synchronous: it is pure filesystem work with
     /// no await points, so it holds no lock across a suspension.
+    ///
+    /// Publishes `Scanning` only once the walk knows there is work (AD-34-1).
+    /// It used to publish on entry, and [`Self::publish`] promotes any active
+    /// phase to [`ProfileState::Syncing`], so a walk that staged nothing still
+    /// left the snapshot claiming the profile was busy until `refresh_pending`
+    /// cleared it at the end of the same tick. The tray samples that snapshot on
+    /// its own ~1 Hz timer, caught the window at random, and then held the busy
+    /// glyph for three more ticks — which is how a folder where nothing was
+    /// happening read as active for four seconds at a time.
+    ///
+    /// Announcing on entry and retracting at the end would not fix that: the
+    /// window the tray can sample would be exactly as wide as it is now. So the
+    /// report is deferred instead, and the trade is deliberate — a slow walk is
+    /// silent until it knows whether it has anything to say, where before it was
+    /// busy from the first instant. Work is never left unannounced: a walk that
+    /// finds something reports it here, before the caller publishes `Committing`
+    /// or enqueues the push.
     fn collect_stable_changes(&self, profile: &SyncProfile) -> Result<git::commit::StagedChange> {
-        self.publish(self.progress(profile, SyncPhase::Scanning));
         let repo = self.open_repo(profile)?;
         let status = git::repo::status_paths(&repo)?;
         let now = self.platform.now_ms();
 
         let mut gates = Self::lock(&self.gates);
-        let gate = match gates.get_mut(&profile.id) {
-            Some(existing) => existing,
-            None => {
-                // First use in this process: seed the gate from `file_state`.
-                // Without this a one-shot `sync --once` would never reach a
-                // second observation, so every file would be held forever, and
-                // an app restart would silently restart every in-flight
-                // quiescence window.
-                let mut fresh = StabilityGate::for_profile(profile)?;
-                let saved = self.with_db(|conn| db::load_file_state(conn, &profile.id))?;
-                fresh.import(saved);
-                gates.insert(profile.id.clone(), fresh);
-                gates
-                    .get_mut(&profile.id)
-                    .ok_or_else(|| SyncError::Journal("gate vanished after insert".to_owned()))?
-            }
-        };
+        let gate = self.ensure_gate(&mut gates, profile)?;
 
         let mut staged = git::commit::StagedChange::default();
-        let mut held = 0usize;
+        let mut held = 0u32;
         // `added` and `untracked` both land in the same bucket, so the buckets
         // are collected first and moved into `staged` afterwards — taking two
         // simultaneous `&mut` borrows of one field would not compile.
@@ -1536,15 +2076,77 @@ impl Engine {
         drop(gates);
         self.with_db(|conn| db::save_file_state(conn, &profile.id, &pending))?;
 
+        // How big each of those paths is, measured here because nothing after
+        // this point can: `stage_and_commit` folds them into a tree, the
+        // working tree goes clean, and the gate has already dropped the sample
+        // it took a moment ago. One `lstat` on a file whose every byte is
+        // about to be read costs nothing next to the read, and a file that
+        // vanished in between simply has no size to record. It waits until
+        // here on purpose: every other profile's scan queues behind the gate
+        // lock, and this walk has no business holding it.
+        for rela in staged.added.iter().chain(staged.modified.iter()) {
+            if let Ok(Some(sample)) = FileSample::of(&profile.local_path.join(rela)) {
+                staged.sizes.insert(rela.clone(), sample.size);
+            }
+        }
+        for rela in &staged.deleted {
+            if let Some(size) = Self::removed_size(&repo, rela) {
+                staged.sizes.insert(rela.clone(), size);
+            }
+        }
+
+        // The walk is the only thing that knows this number, and it used to
+        // throw it into a `debug!` and forget it. `pending` counts journal rows,
+        // so a folder where five thousand files are mid-write has none of them,
+        // reports `pending = 0`, and printed "up to date" over itself for as
+        // long as the writing lasted (AD-34-10).
+        //
+        // Written even when zero: a walk that finds nothing settling is exactly
+        // what retires the previous claim. It is also the more honest of the two
+        // counts — `StabilityGate::tracked`, which [`Self::refresh_pending`]
+        // reads between walks, cannot see a path held because its `lstat`
+        // failed, because no entry is recorded for one.
+        if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
+            snapshot.settling = held;
+        }
         if held > 0 {
             tracing::debug!(profile = profile.name, held, "files still settling");
+        }
+        // The deferred report (AD-34-1): the count is the one thing the walk
+        // learned, and it is what makes the phase legible rather than a bare
+        // "Scanning".
+        if !staged.is_empty() {
+            let mut event = self.progress(profile, SyncPhase::Scanning);
+            event.files_total = Some(staged.len() as u64);
+            self.publish(event);
         }
         Ok(staged)
     }
 
-    fn commit(&self, profile: &SyncProfile, staged: &git::commit::StagedChange) -> Result<()> {
+    /// The source recorded in a commit's trailers.
+    ///
+    /// Straight through, with one substitution: on a worktree lane the working
+    /// copy belongs to an autonomous agent (AD-50), so a pass the supervisor
+    /// started there is publishing a bot's work and `Bot` is the honest answer.
+    /// An explicit `Manual` or `Cli` request is left alone even on a lane — a
+    /// person really did ask for that commit to exist, which is precisely what
+    /// `Keeper-Source` records.
+    fn commit_source(profile: &SyncProfile, requested: SyncSource) -> SyncSource {
+        match requested {
+            SyncSource::Watch if profile.lane == SyncLane::Worktree => SyncSource::Bot,
+            other => other,
+        }
+    }
+
+    fn commit(
+        &self,
+        profile: &SyncProfile,
+        staged: &git::commit::StagedChange,
+        source: SyncSource,
+    ) -> Result<()> {
         let repo = self.open_repo(profile)?;
-        let (name, email) = git::commit::author_for(profile, &self.device);
+        let device = self.device();
+        let (name, email) = git::commit::author_for(profile, &device);
         let when = gix::date::Time::new(self.platform.now_ms() / 1_000, 0);
         let author = gix::actor::Signature {
             name: name.into(),
@@ -1553,10 +2155,10 @@ impl Engine {
         };
         let provenance = Provenance::new(
             &profile.name,
-            &self.device.label,
-            &self.device.id,
+            &device.label,
+            &device.id,
             self.platform.host_label(),
-            SyncSource::Watch,
+            Self::commit_source(profile, source),
         )
         .with_tags(profile.tags.clone());
 
@@ -1572,6 +2174,11 @@ impl Engine {
             .collect();
         let staging = lfs::stage::prepare(profile, &store, &candidates)?;
 
+        // The denominator for staging progress, read before the augmentation
+        // below: it is the same count `commit_local` has already published, and
+        // a counter that overshot its own denominator would read as a bug.
+        let files_total = staged.len() as u64;
+
         // A changed `.gitattributes` must land in the SAME commit as the files
         // it governs, or a peer cloning that commit would not know the pointers
         // are pointers.
@@ -1583,13 +2190,36 @@ impl Engine {
             }
         }
 
+        // Per-file staging progress (AD-34-13). Before this, `files_done` jumped
+        // 0 -> total in one step and `current` was set once to the first staged
+        // path and never revised, so a long commit looked stuck on file one.
+        // Always `true`: `publish` drops its own dead subscribers, so the engine
+        // itself is never the party that has stopped listening.
+        let staging_progress = |files_done: u64, current: &Path| -> bool {
+            // `commit_local`, this function's only caller, already published the
+            // first path entering the phase — it has to, because `prepare` above
+            // can spend real time hashing before staging starts. Publishing that
+            // frame again here would be byte-identical noise, which AD-34-1 says
+            // must not reach the tray.
+            if files_done == 0 {
+                return true;
+            }
+            let mut event = self.progress(profile, SyncPhase::Committing);
+            event.files_total = Some(files_total);
+            event.files_done = files_done.min(files_total);
+            event.current = Some(current.to_string_lossy().into_owned());
+            self.publish(event);
+            true
+        };
+
         let Some(id) = git::commit::stage_and_commit(
             &repo,
             &staged,
             &provenance,
-            &profile.name,
+            profile,
             &author,
             &staging.substitutions,
+            Some(&staging_progress),
         )?
         else {
             return Ok(());
@@ -1640,7 +2270,7 @@ impl Engine {
         profile: &SyncProfile,
         staged: &git::commit::StagedChange,
     ) -> Result<()> {
-        let mut rows: Vec<(ActivityKind, String)> = Vec::with_capacity(staged.len());
+        let mut rows: Vec<(ActivityKind, String, Option<u64>)> = Vec::with_capacity(staged.len());
         let buckets = [
             (ActivityKind::Added, &staged.added),
             (ActivityKind::Modified, &staged.modified),
@@ -1650,11 +2280,39 @@ impl Engine {
             for path in paths {
                 // Repository-relative already — `StagedChange` holds nothing
                 // else — so this never leaks a home directory into the UI.
-                rows.push((kind, path.to_string_lossy().into_owned()));
+                rows.push((
+                    kind,
+                    path.to_string_lossy().into_owned(),
+                    staged.sizes.get(path).copied(),
+                ));
             }
         }
         let now = self.platform.now_ms();
         self.with_db(|conn| db::record_activity(conn, &profile.id, now, &rows))
+    }
+
+    /// How big a deleted path used to be, if the repository still knows.
+    ///
+    /// The index entry git kept for the path names the blob it last recorded,
+    /// and a blob's length *is* the file's length — except for an LFS-tracked
+    /// path, where the blob is a pointer and the real size is the number
+    /// written inside it. Both are answered here. Anything else — a path whose
+    /// index entry an earlier, half-finished stage already removed — answers
+    /// `None`: a guessed figure in a size column is worse than a blank one.
+    fn removed_size(repo: &gix::Repository, rela: &Path) -> Option<u64> {
+        let index = repo.index_or_empty().ok()?;
+        // The index keys paths with forward slashes on every platform, the
+        // same conversion `lfs::stage::indexed_pointer` makes.
+        let key = rela.to_string_lossy().replace('\\', "/");
+        let entry = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes()))?;
+        let blob = repo.find_header(entry.id).ok()?.size();
+        // A pointer is under 1 KiB by specification, so a larger blob cannot
+        // be one and must not be loaded to find that out.
+        if blob > lfs::pointer::MAX_POINTER_BYTES as u64 {
+            return Some(blob);
+        }
+        let object = repo.find_object(entry.id).ok()?;
+        Some(lfs::pointer::Pointer::parse(&object.data).map_or(blob, |pointer| pointer.size))
     }
 
     async fn do_lfs(
@@ -1852,13 +2510,16 @@ impl Engine {
             "{}/api/v1/repos/{}/{}/pulls",
             target.base, target.owner, target.repo
         );
+        // One snapshot for both strings: a rename between them would name two
+        // different machines in the same pull request.
+        let device = self.device();
         let body = serde_json::json!({
             "head": branch,
             "base": profile.branch,
-            "title": format!("{}: changes from {}", profile.name, self.device.label),
+            "title": format!("{}: changes from {}", profile.name, device.label),
             "body": format!(
                 "Opened by keeper-sync for profile `{}` on `{}`.",
-                profile.name, self.device.label
+                profile.name, device.label
             ),
         });
         let response = self
@@ -1949,13 +2610,13 @@ impl Engine {
         // conflict-copy path can resolve. Pulling before pushing means we never
         // hand the remote a non-fast-forward it would just reject.
         self.ensure_repo(&profile)?;
-        outcome.files_changed = self.commit_local(&profile)?;
+        outcome.files_changed = self.commit_local(&profile, source)?;
         if outcome.files_changed > 0 {
             outcome.committed = Some(profile.branch.clone());
         }
 
         if profile.direction.pulls() {
-            outcome.conflicts = self.do_pull(&profile).await?;
+            outcome.conflicts = self.do_pull(&profile, source).await?;
             outcome.pulled = true;
             // Whatever the apply checked out may include pointers. Materialize
             // what is already local and queue the rest, BEFORE the push leg —
@@ -1965,7 +2626,7 @@ impl Engine {
             self.materialize_pending(&profile, &store)?;
         }
         if profile.direction.pushes() {
-            self.do_push(&profile).await?;
+            self.do_push(&profile, source).await?;
             outcome.pushed = true;
         }
 
@@ -1973,10 +2634,16 @@ impl Engine {
         // here would leave the remote holding a pointer to content it does not
         // have, so the queue is drained before this call is allowed to claim
         // success.
-        self.drain_journal(&profile, true).await?;
+        self.drain_journal(&profile, true, source).await?;
         outcome.bytes = self
             .transferred_bytes(&profile.id)
             .saturating_sub(transferred_before);
+
+        // Every leg this profile's direction calls for ran and none of them
+        // raised: that is the whole definition of a successful pass, and it is
+        // the only definition under which a pull-only profile — or a push with
+        // nothing staged — can ever record that it worked.
+        self.mark_synced(&profile.id);
 
         self.set_state(&profile.id, ProfileState::Watching);
         self.publish(self.progress(&profile, SyncPhase::Idle));
@@ -2080,6 +2747,13 @@ impl Engine {
                 "no such sync profile: {profile_id}"
             )));
         };
+        // Tier 0 applies here exactly as it applies to the commit path. An
+        // excluded path is invisible — "not staged, not queued, not counted, and
+        // never reported as pending" is `crate::exclude`'s own contract — and
+        // this list used to be the one place that broke it, so a `.DS_Store`
+        // that was not in `.gitignore` sat in the Pending list forever while the
+        // commit path correctly ignored it (AD-34-15).
+        let excludes = ExcludeSet::new(&profile.excludes)?;
 
         // Settling paths are absolute in `file_state` (that is what the gate
         // samples), and everything the user sees must be repository-relative.
@@ -2088,11 +2762,14 @@ impl Engine {
         let mut named: std::collections::HashSet<String> =
             std::collections::HashSet::with_capacity(settling.len());
         for (path, entry) in settling {
-            let relative = path
-                .strip_prefix(&profile.local_path)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
+            let relative = path.strip_prefix(&profile.local_path).unwrap_or(&path);
+            // A row written before a pattern was added to the profile: the gate
+            // will drop it on the next walk, and until then it must not be
+            // shown.
+            if excludes.is_excluded(relative) {
+                continue;
+            }
+            let relative = relative.to_string_lossy().into_owned();
             if named.insert(relative.clone()) {
                 out.push(PendingFile {
                     path: relative,
@@ -2109,6 +2786,7 @@ impl Engine {
         if profile.local_path.join(".git").exists() {
             let repo_path = profile.local_path.clone();
             let removable = profile.removable;
+            let filter = excludes.clone();
             // The status walk and the untracked expansion are both blocking
             // filesystem work on a tree that may hold a hundred thousand
             // files; running them on the async runtime would stall every other
@@ -2117,10 +2795,17 @@ impl Engine {
                 move || -> Result<(git::repo::RepoStatus, Vec<PathBuf>)> {
                     let repo = git::repo::open(&repo_path, removable)?;
                     let status = git::repo::status_paths(&repo)?;
-                    // gitoxide collapses a brand-new folder into one entry
-                    // naming the directory; listing that would tell the user
-                    // "sub/" is waiting instead of the files they created.
-                    let untracked = Self::expand_untracked(&repo_path, &status.untracked)?;
+                    // Tier 0 before the expansion, not only after it: that walk
+                    // `lstat`s every entry, and a `node_modules` the user has
+                    // not put in `.gitignore` would otherwise cost fifty
+                    // thousand stats per poll to produce nothing.
+                    let candidates: Vec<PathBuf> = status
+                        .untracked
+                        .iter()
+                        .filter(|rela| !filter.is_excluded(rela.as_path()))
+                        .cloned()
+                        .collect();
+                    let untracked = Self::expand_untracked(&repo_path, &candidates)?;
                     Ok((status, untracked))
                 },
             )
@@ -2135,6 +2820,9 @@ impl Engine {
             ];
             for (paths, reason) in buckets {
                 for rela in paths {
+                    if excludes.is_excluded(rela) {
+                        continue;
+                    }
                     let relative = rela.to_string_lossy().into_owned();
                     // Already named as settling, or reported by two status
                     // buckets at once (staged as added, then edited again).
@@ -2239,6 +2927,14 @@ impl Engine {
     /// Queue the work a profile needs, based on what the tree looks like now.
     fn scan_and_enqueue(&self, profile: &SyncProfile) -> Result<()> {
         let now = self.platform.now_ms();
+        // The walk this function is about to do answers whatever the watcher
+        // reported, so the wake is spent here rather than at the point the
+        // decision was taken — a tick that chose to drain journal work instead
+        // must leave it set (AD-34-11). Cleared before the walk, not after: a
+        // walk that fails would otherwise re-run on every tick against a
+        // repository that is not going to get better, and the paced backstop
+        // already covers a lost attempt.
+        self.clear_watch_wake(&profile.id);
         // A pointer left in the worktree by an earlier apply is work too, and
         // the supervisor is the only thing that will notice it.
         let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
@@ -2548,6 +3244,66 @@ mod tests {
         assert!(engine.scan_is_due(&p), "the floor is a gap, not a stall");
     }
 
+    /// AD-34-1: a scan that stages nothing must not report a busy phase.
+    ///
+    /// The tray samples the polled snapshot on its own ~1 Hz timer and then
+    /// holds a busy glyph for three more ticks, so a phase that existed only for
+    /// the milliseconds of a fruitless walk read as four seconds of activity on
+    /// a folder where nothing had happened.
+    #[test]
+    fn a_scan_that_stages_nothing_reports_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        // An empty folder sends `open_repo` down the clone path, and no test may
+        // reach a network remote. Content makes the engine adopt the folder in
+        // place instead (`git init` plus a remote config). The seed ignores
+        // itself, so the tree the first scan walks is genuinely clean.
+        std::fs::write(p.local_path.join(".gitignore"), b".gitignore\n").expect("seed");
+        engine.upsert_profile(&p).expect("upsert");
+        let published: Arc<Mutex<Vec<SyncPhase>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event.phase);
+            true
+        }));
+
+        // A clean tree has nothing to say.
+        assert!(engine.collect_stable_changes(&p).expect("scan").is_empty());
+        // Nor has a file still inside its settle window: the walk saw it, but it
+        // has nothing to hand the commit, so no work exists to report.
+        std::fs::write(p.local_path.join("held.txt"), b"still writing").expect("write");
+        assert!(engine.collect_stable_changes(&p).expect("scan").is_empty());
+
+        let seen = Engine::lock(&published).clone();
+        assert!(seen.is_empty(), "a fruitless scan published {seen:?}");
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.phase, SyncPhase::Idle);
+        assert_ne!(
+            snapshot.state,
+            ProfileState::Syncing,
+            "nothing was staged, so nothing was syncing"
+        );
+
+        // A scan that does find work still says so, or the tray could never show
+        // a folder that is genuinely mid-sync.
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert!(!engine.collect_stable_changes(&p).expect("scan").is_empty());
+        let seen = Engine::lock(&published).clone();
+        assert_eq!(
+            seen,
+            vec![SyncPhase::Scanning],
+            "a scan that found work has to report itself"
+        );
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Syncing
+        );
+    }
+
     /// Resuming is a request to look now; the pacing must not hold a folder
     /// idle for a window the user never waited through.
     #[test]
@@ -2750,6 +3506,46 @@ mod tests {
         engine.upsert_profile(&p).expect("upsert");
         engine.remove_profile(&p.id).expect("remove");
         assert!(engine.statuses().expect("statuses").is_empty());
+    }
+
+    #[test]
+    fn removing_a_profile_deletes_its_credential_and_only_its_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        let other = SyncProfile::new(
+            "01JOTHERPROFILE",
+            "other",
+            dir.path().join("other"),
+            "https://git.invalid/x/z.git",
+        );
+        engine.upsert_profile(&p).expect("upsert");
+        engine.upsert_profile(&other).expect("upsert the second");
+        platform
+            .secret_set(&p.secret_key(), "token-for-p")
+            .expect("store a credential");
+        platform
+            .secret_set(&other.secret_key(), "token-for-other")
+            .expect("store the second credential");
+
+        engine.remove_profile(&p.id).expect("remove");
+
+        // The key is derived from the profile id, and nothing re-derives the id
+        // of a profile that is gone: a secret left behind here would outlive
+        // every way of finding it (AD-34-14).
+        assert_eq!(
+            platform.secret_get(&p.secret_key()).expect("get"),
+            None,
+            "removing a profile must take its credential with it"
+        );
+        assert_eq!(
+            platform.secret_get(&other.secret_key()).expect("get"),
+            Some("token-for-other".to_owned()),
+            "and must take nobody else's"
+        );
     }
 
     #[test]
@@ -3087,10 +3883,12 @@ mod tests {
     /// pass only opens the episode. Returns how many paths the commit carried.
     fn commit_after_settling(engine: &Engine, platform: &TestPlatform, p: &SyncProfile) -> u64 {
         engine
-            .commit_local(p)
+            .commit_local(p, SyncSource::Watch)
             .expect("first pass opens the episode");
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
-        engine.commit_local(p).expect("second pass commits")
+        engine
+            .commit_local(p, SyncSource::Watch)
+            .expect("second pass commits")
     }
 
     #[tokio::test]
@@ -3105,10 +3903,12 @@ mod tests {
         };
         let p = adoptable(dir.path());
         std::fs::write(p.local_path.join("a.txt"), b"one").expect("write");
-        std::fs::write(p.local_path.join("b.txt"), b"two").expect("write");
+        std::fs::write(p.local_path.join("b.txt"), b"twelve bytes").expect("write");
         engine.upsert_profile(&p).expect("upsert");
 
-        engine.commit_local(&p).expect("first pass");
+        engine
+            .commit_local(&p, SyncSource::Watch)
+            .expect("first pass");
         assert!(
             engine
                 .activity(&p.id, 10)
@@ -3119,19 +3919,25 @@ mod tests {
         );
 
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
-        assert_eq!(engine.commit_local(&p).expect("commit"), 2);
+        assert_eq!(
+            engine.commit_local(&p, SyncSource::Watch).expect("commit"),
+            2
+        );
 
         let rows = engine.activity(&p.id, 10).await.expect("activity");
-        let mut seen: Vec<(ActivityKind, String)> =
-            rows.iter().map(|r| (r.kind, r.path.clone())).collect();
+        let mut seen: Vec<(ActivityKind, String, Option<u64>)> = rows
+            .iter()
+            .map(|r| (r.kind, r.path.clone(), r.size_bytes))
+            .collect();
         seen.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(
             seen,
             vec![
-                (ActivityKind::Added, "a.txt".to_owned()),
-                (ActivityKind::Added, "b.txt".to_owned()),
+                (ActivityKind::Added, "a.txt".to_owned(), Some(3)),
+                (ActivityKind::Added, "b.txt".to_owned(), Some(12)),
             ],
-            "exactly the committed paths, repository-relative, as additions"
+            "exactly the committed paths, repository-relative, as additions, each \
+             carrying the size it was committed at"
         );
         assert!(
             rows.iter().all(|r| r.ts_ms == platform.now_ms()),
@@ -3146,24 +3952,30 @@ mod tests {
         // while the edit has to serve a fresh settle window.
         std::fs::write(p.local_path.join("a.txt"), b"one edited").expect("edit");
         std::fs::remove_file(p.local_path.join("b.txt")).expect("remove");
-        assert_eq!(engine.commit_local(&p).expect("removal"), 1);
+        assert_eq!(
+            engine.commit_local(&p, SyncSource::Watch).expect("removal"),
+            1
+        );
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
-        assert_eq!(engine.commit_local(&p).expect("edit"), 1);
+        assert_eq!(engine.commit_local(&p, SyncSource::Watch).expect("edit"), 1);
 
         let rows = engine.activity(&p.id, 10).await.expect("activity");
-        let mut latest: Vec<(ActivityKind, String)> = rows
+        let mut latest: Vec<(ActivityKind, String, Option<u64>)> = rows
             .iter()
             .take(2)
-            .map(|r| (r.kind, r.path.clone()))
+            .map(|r| (r.kind, r.path.clone(), r.size_bytes))
             .collect();
         latest.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(
             latest,
             vec![
-                (ActivityKind::Modified, "a.txt".to_owned()),
-                (ActivityKind::Deleted, "b.txt".to_owned()),
+                (ActivityKind::Modified, "a.txt".to_owned(), Some(10)),
+                // Nothing is left on disk to measure, so this size can only
+                // have come from what the index still recorded for the path.
+                (ActivityKind::Deleted, "b.txt".to_owned(), Some(12)),
             ],
-            "newest first, and each path carries the kind that actually happened"
+            "newest first, each path carrying the kind that actually happened and \
+             the size that moved"
         );
         assert_eq!(rows.len(), 4, "earlier entries are kept, not replaced");
     }
@@ -3209,7 +4021,7 @@ mod tests {
 
         // One pass opens the quiescence episode and persists it to `file_state`.
         let opened_at = platform.now_ms();
-        engine.commit_local(&p).expect("scan");
+        engine.commit_local(&p, SyncSource::Watch).expect("scan");
 
         let pending = engine.pending(&p.id).await.expect("pending");
         assert_eq!(
@@ -3226,7 +4038,10 @@ mod tests {
 
         // Once it settles and lands, it is not pending at all any more.
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
-        assert_eq!(engine.commit_local(&p).expect("commit"), 1);
+        assert_eq!(
+            engine.commit_local(&p, SyncSource::Watch).expect("commit"),
+            1
+        );
         assert!(engine.pending(&p.id).await.expect("pending").is_empty());
     }
 
@@ -3288,7 +4103,7 @@ mod tests {
                     conn,
                     &p.id,
                     platform.now_ms(),
-                    &[(ActivityKind::Conflict, copy.to_owned())],
+                    &[(ActivityKind::Conflict, copy.to_owned(), Some(11))],
                 )
             })
             .expect("record");
@@ -3435,10 +4250,11 @@ mod tests {
             ts_ms: 1,
             kind: ActivityKind::Conflict,
             path: "a.md".to_owned(),
+            size_bytes: Some(4_096),
         };
         assert_eq!(
             serde_json::to_string(&row).expect("serialize"),
-            r#"{"tsMs":1,"kind":"conflict","path":"a.md"}"#
+            r#"{"tsMs":1,"kind":"conflict","path":"a.md","sizeBytes":4096}"#
         );
     }
 
@@ -3612,8 +4428,8 @@ mod tests {
             .collect();
         assert_eq!(
             committing.len(),
-            2,
-            "one publish entering the commit and one on its completion"
+            3,
+            "one entering the commit, one per staged path after the first, one on completion"
         );
         assert_eq!(committing[0].files_total, Some(2));
         assert_eq!(committing[0].files_done, 0);
@@ -3623,8 +4439,14 @@ mod tests {
             Some("a.txt"),
             "the detail line names a repository-relative path, never an absolute one"
         );
-        assert_eq!(committing[1].files_done, 2);
-        assert_eq!(committing[1].fraction(), Some(1.0));
+        // Staging reports the second path as it reaches it (Story 34.8). Before
+        // this the middle frame did not exist: the count went straight from 0 to
+        // 2 and the detail line never left `a.txt`.
+        assert_eq!(committing[1].files_done, 1);
+        assert_eq!(committing[1].current.as_deref(), Some("b.txt"));
+        assert_eq!(committing[1].fraction(), Some(0.5));
+        assert_eq!(committing[2].files_done, 2);
+        assert_eq!(committing[2].fraction(), Some(1.0));
 
         let snapshot = engine.status(&p.id).expect("status");
         assert_eq!(snapshot.files_total, Some(2));
@@ -3731,6 +4553,601 @@ mod tests {
             outcome.bytes > 0,
             "a run that received a pack must report the bytes it moved, got {}",
             outcome.bytes
+        );
+    }
+
+    /// The whole trailer block on the profile worktree's HEAD commit.
+    fn head_provenance(p: &SyncProfile) -> Provenance {
+        let repo = gix::open(&p.local_path).expect("open the worktree");
+        let message = repo
+            .head_commit()
+            .expect("a commit")
+            .message_raw_sloppy()
+            .to_string();
+        Provenance::parse(&message).expect("an engine commit carries trailers")
+    }
+
+    /// The `Keeper-Source` trailer on the profile worktree's HEAD commit.
+    fn head_source(p: &SyncProfile) -> SyncSource {
+        head_provenance(p).source
+    }
+
+    /// AD-34-12. `Keeper-Source` answers "what caused this commit to exist",
+    /// and it said `watch` for every commit keeper had ever made: the source
+    /// reached one `tracing::info!` in `sync_once` and both `Provenance::new`
+    /// sites hard-coded `SyncSource::Watch`. `git log` on a folder a person had
+    /// just synced by hand blamed a watcher that had not run.
+    #[tokio::test]
+    async fn a_commit_records_which_kind_of_request_caused_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.remote_url = remote_dir.path().to_string_lossy().into_owned();
+        engine.upsert_profile(&p).expect("upsert");
+
+        // The scheduled path, which is the only genuinely watcher-initiated one.
+        std::fs::write(p.local_path.join("watched.txt"), b"one").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        assert_eq!(head_source(&p), SyncSource::Watch);
+
+        // A person clicking Sync now. Two passes because the stability gate
+        // needs two identical observations a settle window apart.
+        platform.advance_ms(1_000);
+        std::fs::write(p.local_path.join("asked.txt"), b"two").expect("write");
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("the pass that opens the episode");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("the pass that commits");
+        assert_eq!(
+            head_source(&p),
+            SyncSource::Manual,
+            "a sync a person asked for must not be recorded as the watcher's"
+        );
+
+        // And `keeper-syncd`, which is neither.
+        platform.advance_ms(1_000);
+        std::fs::write(p.local_path.join("cron.txt"), b"three").expect("write");
+        engine
+            .sync_once(&p.id, SyncSource::Cli)
+            .await
+            .expect("the pass that opens the episode");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        engine
+            .sync_once(&p.id, SyncSource::Cli)
+            .await
+            .expect("the pass that commits");
+        assert_eq!(head_source(&p), SyncSource::Cli);
+    }
+
+    /// The fourth arm of `SyncSource`, which no caller passes and which could
+    /// therefore never appear in a trailer. A worktree lane IS an agent's lane
+    /// (AD-50), so an unattended pass there is a bot publishing its own work.
+    #[test]
+    fn an_unattended_pass_on_an_agent_lane_is_recorded_as_a_bot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut p = profile(dir.path());
+        assert_eq!(
+            Engine::commit_source(&p, SyncSource::Watch),
+            SyncSource::Watch
+        );
+
+        p.lane = SyncLane::Worktree;
+        p.direction = SyncDirection::PushOnly;
+        assert_eq!(
+            Engine::commit_source(&p, SyncSource::Watch),
+            SyncSource::Bot
+        );
+        // Asking is asking. A human who clicks Sync now on a lane really did
+        // cause that commit, and the trailer records the cause.
+        assert_eq!(
+            Engine::commit_source(&p, SyncSource::Manual),
+            SyncSource::Manual
+        );
+        assert_eq!(Engine::commit_source(&p, SyncSource::Cli), SyncSource::Cli);
+    }
+
+    /// Story 34.5(a). `db::set_device_label` had existed with no caller since
+    /// Story 23.4, so the name minted from `hostname` at first open was the name
+    /// every commit carried forever. The rename has to reach the NEXT commit —
+    /// which means the engine's in-memory copy, not just the row — and it must
+    /// not move the id, which is what the author address is derived from and
+    /// what tells two machines with the same name apart in a shared history.
+    #[test]
+    fn renaming_the_device_reaches_the_next_commit_and_leaves_the_id_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let minted = engine.device();
+
+        std::fs::write(p.local_path.join("before.txt"), b"one").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        let first = head_provenance(&p);
+        assert_eq!(first.device_label, minted.label);
+
+        engine.set_device_label("  Studio Mac  ").expect("rename");
+        assert_eq!(
+            engine.device().id,
+            minted.id,
+            "a rename must not re-mint the identity"
+        );
+
+        platform.advance_ms(1_000);
+        std::fs::write(p.local_path.join("after.txt"), b"two").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        let second = head_provenance(&p);
+        assert_eq!(second.device_label, "Studio Mac");
+        assert_eq!(second.device_id, minted.id);
+
+        // History is not rewritten to match a new name: the earlier commit still
+        // says what this machine was called when it made it.
+        assert_eq!(first.device_label, minted.label);
+        assert_eq!(first.device_id, minted.id);
+
+        // An empty rename is refused, and refusing it leaves the live copy as it
+        // was rather than blanking the trailer on every commit from here on.
+        assert!(engine.set_device_label("   ").is_err());
+        assert_eq!(engine.device().label, "Studio Mac");
+    }
+
+    /// `last_sync_ms` was stamped inside `do_push` and nowhere else, so a
+    /// pull-only folder could sync correctly for a week and still report that
+    /// it had never synced — indistinguishable, in the UI, from a folder sync
+    /// has never once succeeded on.
+    #[tokio::test]
+    async fn a_pass_with_nothing_to_push_still_records_that_it_succeeded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.remote_url = remote_dir.path().to_string_lossy().into_owned();
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(
+            engine.status(&p.id).expect("status").last_sync_ms,
+            None,
+            "nothing has synced yet"
+        );
+
+        // A pass that really does publish something, so the remote has a branch
+        // for the later passes to compare against.
+        std::fs::write(p.local_path.join("notes.md"), b"root").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("publish to the local bare remote");
+        assert_eq!(
+            engine.status(&p.id).expect("status").last_sync_ms,
+            Some(platform.now_ms())
+        );
+
+        // Nothing has changed since. The pass still ran every leg and still
+        // succeeded, so it still counts.
+        platform.advance_ms(60_000);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("a pass with nothing to do");
+        assert_eq!(
+            engine.status(&p.id).expect("status").last_sync_ms,
+            Some(platform.now_ms()),
+            "a sync that found nothing to do still succeeded"
+        );
+
+        // And the case that never recorded anything at all: a folder that only
+        // ever pulls reaches no push leg to be stamped by.
+        p.direction = SyncDirection::PullOnly;
+        engine.upsert_profile(&p).expect("upsert");
+        platform.advance_ms(60_000);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("a pull-only pass");
+        assert_eq!(
+            engine.status(&p.id).expect("status").last_sync_ms,
+            Some(platform.now_ms()),
+            "a pull-only folder must be able to report that it synced"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Story 34.9 — the watcher, the honest wait, and tier 0 in the list
+    // -----------------------------------------------------------------------
+
+    fn watch_is_live(engine: &Engine, id: &str) -> bool {
+        matches!(
+            Engine::lock(&engine.watchers).get(id),
+            Some(ProfileWatch::Live { .. })
+        )
+    }
+
+    fn watch_failure(engine: &Engine, id: &str) -> Option<String> {
+        match Engine::lock(&engine.watchers).get(id) {
+            Some(ProfileWatch::Failed { reason, .. }) => Some(reason.clone()),
+            _ => None,
+        }
+    }
+
+    fn armed_count(engine: &Engine) -> usize {
+        Engine::lock(&engine.watchers).len()
+    }
+
+    /// A `FolderWatcher` owns two threads and an inotify instance, so the
+    /// lifecycle is the part that can leak. Deliberately proves nothing about
+    /// event *delivery*: this test never waits on the filesystem.
+    #[test]
+    fn a_watcher_is_armed_for_every_enabled_profile_and_outlives_none_of_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        engine.ensure_watcher(&p);
+        assert!(
+            watch_is_live(&engine, &p.id),
+            "an enabled profile is watched"
+        );
+
+        // Idempotent: this runs once a second, and must not build a second
+        // instance — nor a second pair of threads — per tick.
+        engine.ensure_watcher(&p);
+        engine.ensure_watcher(&p);
+        assert_eq!(armed_count(&engine), 1);
+
+        // Paused. `tick_profile` never runs for a disabled profile, so if the
+        // reconciliation lived there the watcher would survive the pause.
+        p.enabled = false;
+        engine.retain_watchers(std::slice::from_ref(&p));
+        assert_eq!(armed_count(&engine), 0, "a paused profile keeps no watcher");
+
+        // Resumed, and still exactly one: a resume must not leak a thread per
+        // cycle.
+        p.enabled = true;
+        engine.ensure_watcher(&p);
+        engine.retain_watchers(std::slice::from_ref(&p));
+        assert_eq!(armed_count(&engine), 1);
+
+        // A profile the engine no longer knows about keeps nothing at all.
+        engine.retain_watchers(&[]);
+        assert_eq!(armed_count(&engine), 0);
+
+        // Removal takes the watcher in the same call, not a tick later.
+        engine.ensure_watcher(&p);
+        engine.remove_profile(&p.id).expect("remove");
+        assert_eq!(armed_count(&engine), 0);
+
+        // A watcher armed for a root the profile no longer uses is replaced,
+        // not kept beside the right one.
+        engine.upsert_profile(&p).expect("re-add");
+        engine.ensure_watcher(&p);
+        let moved = dir.path().join("moved");
+        std::fs::create_dir_all(&moved).expect("new root");
+        p.local_path = moved;
+        engine.ensure_watcher(&p);
+        assert_eq!(armed_count(&engine), 1);
+        assert!(watch_is_live(&engine, &p.id));
+
+        // And the supervisor's own teardown leaves none armed, because the
+        // supervisor is their only consumer.
+        engine.stop_all_watchers();
+        assert_eq!(armed_count(&engine), 0);
+    }
+
+    /// A watcher that cannot arm degrades to the paced scan, and says so where
+    /// the user can see it — never silently (AD-34-11).
+    #[test]
+    fn a_watcher_that_cannot_arm_says_so_and_keeps_saying_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        // `profile` does not create the folder, and a recursive watch over a
+        // path that does not exist fails on both backends we ship: inotify with
+        // ENOENT, FSEvents with its own path-not-found.
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        engine.ensure_watcher(&p);
+        assert!(
+            watch_failure(&engine, &p.id).is_some(),
+            "the failure is remembered, so it is not retried at the tick rate"
+        );
+        let warning = engine
+            .status(&p.id)
+            .expect("status")
+            .warning
+            .expect("a degraded profile must say so where the user can see it");
+        assert!(warning.starts_with(WATCH_DEGRADED_PREFIX), "got {warning}");
+        assert!(
+            warning.contains("to sync"),
+            "the line has to say what the user loses by it: {warning}"
+        );
+
+        // Any successful unit clears the sticky text. The next tick must put it
+        // back — that is the difference between degrading loudly and degrading
+        // silently.
+        engine.clear_warning(&p.id);
+        engine.ensure_watcher(&p);
+        assert!(
+            engine.status(&p.id).expect("status").warning.is_some(),
+            "a degradation that stops announcing itself is a silent downgrade"
+        );
+
+        // ...and re-asserting the text is not a fresh event. One notification
+        // per onset, however many ticks the condition lasts.
+        let notifications = platform
+            .notifications
+            .lock()
+            .map(|n| n.len())
+            .unwrap_or_default();
+        assert_eq!(notifications, 1, "re-stating a state must not re-notify");
+
+        // The folder appearing does not license an immediate retry: the window
+        // exists so a real failure is not hammered.
+        std::fs::create_dir_all(&p.local_path).expect("work dir");
+        engine.ensure_watcher(&p);
+        assert!(
+            watch_failure(&engine, &p.id).is_some(),
+            "still inside the re-arm window"
+        );
+
+        // Once it elapses the watcher arms, and retires its own warning without
+        // touching anything else on display.
+        platform.advance_ms(WATCH_REARM_INTERVAL_MS);
+        engine.ensure_watcher(&p);
+        assert!(watch_is_live(&engine, &p.id));
+        assert!(
+            engine.status(&p.id).expect("status").warning.is_none(),
+            "a working watcher retires the warning it raised"
+        );
+    }
+
+    /// `clear_watch_warning` must not become a general-purpose warning eraser.
+    #[test]
+    fn arming_a_watcher_does_not_retire_someone_elses_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine.warn(&p.id, &p.name, "the drive is nearly full".to_owned());
+
+        engine.ensure_watcher(&p);
+        assert_eq!(
+            engine.status(&p.id).expect("status").warning.as_deref(),
+            Some("the drive is nearly full"),
+            "an unrelated problem must survive a watcher arming"
+        );
+    }
+
+    /// The latency fix, stated as the two reasons that did not exist before.
+    ///
+    /// A settling path needs a *second* observation to clear, and observations
+    /// happen only inside a walk. Before AD-34-11 the only thing that produced
+    /// one was the paced poll, so a file that landed took two poll intervals —
+    /// 30 s at the default — rather than its 5 s settle window.
+    #[test]
+    fn a_held_file_reopens_the_walk_on_its_own_window_not_the_poll_interval() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.poll_interval_ms = 15_000;
+
+        // First sight walks at once; the tick after does not.
+        assert!(engine.scan_due(&p), "a new profile is walked immediately");
+        assert!(
+            !engine.scan_due(&p),
+            "the next tick is inside the paced window"
+        );
+
+        // One path mid-window. Its deadline, not the poll interval, is what the
+        // supervisor now waits for.
+        let now = platform.now_ms();
+        let held = p.local_path.join("held.bin");
+        let mut gate = StabilityGate::for_profile(&p).expect("gate");
+        gate.observe(
+            &held,
+            FileSample {
+                size: 128,
+                mtime_ns: i128::from(now) * 1_000_000,
+                ctime_ns: i128::from(now) * 1_000_000,
+                inode: 11,
+            },
+            now,
+            false,
+        );
+        Engine::lock(&engine.gates).insert(p.id.clone(), gate);
+
+        assert!(
+            !engine.scan_due(&p),
+            "a file still inside its window is not yet a reason to walk"
+        );
+        platform.advance_ms(p.effective_settle_ms() as i64);
+        assert!(
+            engine.scan_due(&p),
+            "the second observation a settling file needs must not wait out the poll interval"
+        );
+
+        // The other new reason: an event the watcher delivered. It survives a
+        // tick that drained journal work instead of walking, because only the
+        // walk itself spends it.
+        Engine::lock(&engine.gates).remove(&p.id);
+        platform.advance_ms(p.poll_interval_ms as i64);
+        assert!(engine.scan_due(&p), "the paced window has come round");
+        assert!(!engine.scan_due(&p), "and closed again");
+
+        engine.note_watch_wake(&p.id);
+        assert!(
+            engine.scan_due(&p),
+            "a delivered event opens the walk at once"
+        );
+        assert!(
+            engine.scan_due(&p),
+            "and stays open until a walk answers it — a tick that drained work \
+             instead must not swallow the change"
+        );
+        engine.clear_watch_wake(&p.id);
+        assert!(!engine.scan_due(&p), "the walk spent it");
+    }
+
+    /// The wiring, without waiting on a real event queue: the event is placed on
+    /// the same channel a watcher would place it on, which is how `watch.rs`'s
+    /// own tests keep timing out of the picture.
+    #[test]
+    fn a_delivered_close_write_reaches_the_gate_and_shortens_the_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                // No sweep: this test owns no timers.
+                rescan_interval_ms: 0,
+                force_poll: false,
+            },
+            tx.clone(),
+        )
+        .expect("a watcher arms over a real directory");
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+
+        let path = p.local_path.join("saved.txt");
+        std::fs::write(&path, b"done").expect("write");
+        tx.send(WatchEvent {
+            path: path.clone(),
+            close_write: true,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+
+        assert!(
+            engine.watch_wake_pending(&p.id),
+            "a delivered event is a reason to walk now"
+        );
+
+        // And the close-write took the path down the 1 s route — the branch that
+        // has existed since Story 26.3 and was unreachable until the watcher was
+        // wired up, because nothing outside `watch.rs` ever built one.
+        let now = platform.now_ms();
+        let mut gates = Engine::lock(&engine.gates);
+        let gate = gates.get_mut(&p.id).expect("folding seeded the gate");
+        assert!(matches!(
+            gate.is_stable(&path, now),
+            StabilityVerdict::Settling { .. }
+        ));
+        assert_eq!(
+            gate.next_stable_ms(now),
+            Some(now + i64::try_from(crate::profile::CLOSE_WRITE_SETTLE_MS).expect("fits")),
+            "one second, not the full settle window"
+        );
+    }
+
+    /// AD-34-10: the count the walk computes has to reach the line the user
+    /// reads, not a `debug!` nobody sees.
+    #[test]
+    fn a_walk_that_holds_files_says_how_many_instead_of_up_to_date() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        // Content, so `open_repo` adopts the folder instead of taking the clone
+        // path to an unreachable remote. The seed ignores itself.
+        std::fs::write(p.local_path.join(".gitignore"), b".gitignore\n").expect("seed");
+        engine.upsert_profile(&p).expect("upsert");
+
+        assert!(engine.collect_stable_changes(&p).expect("scan").is_empty());
+        assert_eq!(
+            crate::progress::status_line(&engine.status(&p.id).expect("status")),
+            format!("{} — up to date", p.name),
+            "a genuinely clean folder is up to date"
+        );
+
+        // Two files inside their settle window. Neither has a journal row, so
+        // `pending` is zero — which is exactly how "up to date" came to be
+        // printed over a folder that was still being written.
+        std::fs::write(p.local_path.join("a.bin"), b"still writing").expect("write");
+        std::fs::write(p.local_path.join("b.bin"), b"still writing").expect("write");
+        assert!(engine.collect_stable_changes(&p).expect("scan").is_empty());
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.pending, 0, "nothing is queued yet");
+        assert_eq!(snapshot.settling, 2);
+        assert_eq!(
+            crate::progress::status_line(&snapshot),
+            format!("{} — 2 waiting for writes to stop", p.name)
+        );
+
+        // And the claim is retired by the walk that finds them settled, not left
+        // standing until something else happens to refresh it.
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert!(!engine.collect_stable_changes(&p).expect("scan").is_empty());
+        assert_eq!(engine.status(&p.id).expect("status").settling, 0);
+    }
+
+    /// AD-34-15: an excluded path is invisible everywhere, and the Pending list
+    /// was the one place that broke `crate::exclude`'s own contract.
+    #[tokio::test]
+    async fn an_excluded_file_never_appears_in_the_pending_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        // Deliberately no `.gitignore`: git has been told about none of these,
+        // so tier 0 is the only thing that can keep them out of the list.
+        std::fs::write(p.local_path.join("notes.md"), b"real").expect("write");
+        std::fs::write(p.local_path.join(".DS_Store"), b"finder").expect("write");
+        std::fs::write(p.local_path.join("movie.mkv.part"), b"half").expect("write");
+        let dep = p.local_path.join("node_modules/left-pad");
+        std::fs::create_dir_all(&dep).expect("dependency tree");
+        std::fs::write(dep.join("index.js"), b"module").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        // Adopts the folder, so git can classify it, and opens a quiescence
+        // episode for everything tier 0 did not reject.
+        engine.collect_stable_changes(&p).expect("adopt and scan");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let paths: Vec<&str> = pending.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["notes.md"],
+            "only the user's own file is waiting; got {paths:?}"
         );
     }
 }

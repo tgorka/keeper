@@ -50,7 +50,11 @@ fn commit(
         email: "t@example.invalid".into(),
         time: gix::date::Time::new(1_700_000_000, 0),
     };
-    git::commit::stage_and_commit(repo, changes, &prov, "media", &sig, subs).expect("commit");
+    let root = repo
+        .workdir()
+        .expect("the fixture repository has a work tree");
+    git::commit::stage_and_commit(repo, changes, &prov, &profile(root), &sig, subs, None)
+        .expect("commit");
 }
 
 #[test]

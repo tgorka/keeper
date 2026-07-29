@@ -3,6 +3,22 @@ import { Select as SelectPrimitive } from "radix-ui";
 import type * as React from "react";
 import { cn } from "@/lib/utils";
 
+/**
+ * Radix `Select` has no `modal` prop — unlike `Dialog` (`modal = true`) and
+ * `Popover` (`modal = false`), its Root's whole surface is
+ * `{children, open, defaultOpen, onOpenChange, dir, name, autoComplete, disabled,
+ * required, form, value, defaultValue, onValueChange}` and its content hard-codes
+ * `disableOutsidePointerEvents` (verified against `@radix-ui/react-select@2.3.5`).
+ * So while a Select is open, `DismissableLayer` holds
+ * `document.body.style.pointerEvents = "none"`, and that is not configurable here.
+ *
+ * It matters to a Tauri window because Tauri's drag-region init script decides on
+ * `mousedown` whether `e.target` carries `data-tauri-drag-region`; with `body` at
+ * `pointer-events: none` the target is `<html>` and the titlebar cannot start a
+ * drag. Nothing can shorten that lock while the list is open, so the only rule this
+ * wrapper can enforce is that it never outlasts the open state — see
+ * {@link SelectContent}.
+ */
 function Select({ ...props }: React.ComponentProps<typeof SelectPrimitive.Root>) {
   return <SelectPrimitive.Root data-slot="select" {...props} />;
 }
@@ -47,6 +63,25 @@ function SelectTrigger({
   );
 }
 
+/**
+ * The option list. Carries NO exit animation, deliberately.
+ *
+ * Radix's `Presence` keeps the content mounted for as long as a closing element
+ * still computes an `animation-name` other than `none`, and Radix `Select` passes a
+ * constant `disableOutsidePointerEvents` rather than gating it on `open` (as
+ * `Dialog` does). An exit animation would therefore hold
+ * `document.body { pointer-events: none }` for its whole duration *after* the list
+ * was dismissed — a window in which the app is closed, the list is invisible, and a
+ * click on the titlebar silently does nothing (see {@link Select} for why that
+ * breaks dragging specifically). Leaving the closed state with no `animation`
+ * declaration makes `Presence` unmount on the same tick, which runs
+ * `DismissableLayer`'s effect cleanup and restores `body`.
+ *
+ * This costs nothing today: the default `position="item-aligned"` already suppresses
+ * both animations via `data-[align-trigger=true]:animate-none`, because a list drawn
+ * over its own trigger must not slide. The rule exists so a future
+ * `position="popper"` callsite cannot reintroduce the dead-click window.
+ */
 function SelectContent({
   className,
   children,
@@ -60,7 +95,7 @@ function SelectContent({
         data-slot="select-content"
         data-align-trigger={position === "item-aligned"}
         className={cn(
-          "relative z-50 max-h-(--radix-select-content-available-height) min-w-36 origin-(--radix-select-content-transform-origin) overflow-x-hidden overflow-y-auto rounded-md bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10 duration-100 data-[align-trigger=true]:animate-none data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+          "relative z-50 max-h-(--radix-select-content-available-height) min-w-36 origin-(--radix-select-content-transform-origin) overflow-x-hidden overflow-y-auto rounded-md bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10 duration-100 data-[align-trigger=true]:animate-none data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95",
           position === "popper" &&
             "data-[side=bottom]:translate-y-1 data-[side=left]:-translate-x-1 data-[side=right]:translate-x-1 data-[side=top]:-translate-y-1",
           className,

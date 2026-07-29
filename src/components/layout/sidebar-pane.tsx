@@ -14,6 +14,7 @@ import { NetworksGroup } from "@/components/layout/networks-group";
 import { SpacesGroup } from "@/components/layout/spaces-group";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { BridgeHealth } from "@/lib/ipc/client";
 import { useShellOffline } from "@/lib/stores/account-status";
@@ -64,6 +65,12 @@ interface SidebarPaneProps {
 export const OFFLINE_PILL_TEXT =
   "Offline — showing your local archive. Messages queue until you're back.";
 
+/** The drawer's width, per state. Exported so the drag band's drawer column
+ * (`app-shell.tsx`) is painted at exactly the drawer's width: the band and the
+ * drawer sit edge to edge, and a desync between them is the visible seam
+ * AD-34-3 exists to prevent. */
+export const SIDEBAR_WIDTH_CLASS = { collapsed: "w-12", expanded: "w-[260px]" } as const;
+
 export function SidebarPane({ collapsed }: SidebarPaneProps) {
   const offline = useShellOffline();
   // Controlled state for the Settings dialog (Story 2.6). Only the Settings view
@@ -98,147 +105,152 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
     <nav
       aria-label="Views"
       className={cn(
-        "flex h-full shrink-0 flex-col border-border border-r bg-sidebar",
-        collapsed ? "w-12" : "w-[260px]",
+        "flex h-full min-h-0 shrink-0 flex-col border-border border-r bg-sidebar",
+        collapsed ? SIDEBAR_WIDTH_CLASS.collapsed : SIDEBAR_WIDTH_CLASS.expanded,
       )}
     >
-      {/* Reserve the macOS traffic-light inset (78x12px) in every state. */}
-      <div className={cn("shrink-0", collapsed ? "pt-3 pl-3" : "pt-3 pl-[78px]")} />
-      <ul className={cn("flex flex-col gap-1 p-2", collapsed && "items-center")}>
-        {views.map((view) => {
-          const Icon = view.icon;
-          // "Chats", "Archive", "Bridges", "Recording", and "Sync" switch the
-          // primary view; Settings opens the dialog.
-          const onClick =
-            view.label === "Settings"
-              ? () => setSettingsOpen(true)
-              : view.label === "Chats"
-                ? () => primaryViewStore.getState().setView("inbox")
-                : view.label === "Archive"
-                  ? () => primaryViewStore.getState().setView("archive")
-                  : view.label === "Approvals"
-                    ? () => primaryViewStore.getState().setView("approval")
-                    : view.label === "Bridges"
-                      ? () => primaryViewStore.getState().setView("bridges")
-                      : view.label === "Recording"
-                        ? () => primaryViewStore.getState().setView("recording")
-                        : view.label === "Sync"
-                          ? () => primaryViewStore.getState().setView("sync")
-                          : undefined;
-          // Reflect the active primary view on the Chats/Archive/Approvals/Bridges/
-          // Recording/Sync entries.
-          const active =
-            (view.label === "Chats" && primaryView === "inbox") ||
-            (view.label === "Archive" && primaryView === "archive") ||
-            (view.label === "Approvals" && primaryView === "approval") ||
-            (view.label === "Bridges" && primaryView === "bridges") ||
-            (view.label === "Recording" && primaryView === "recording") ||
-            (view.label === "Sync" && primaryView === "sync");
-          // The Bridges entry carries the worst-state health roll-up dot (Story
-          // 6.1): shown only when at least one bridge reports non-null health.
-          const healthDot =
-            view.label === "Bridges" && bridgeHealth !== null ? (
-              <span
-                aria-hidden="true"
-                data-slot="bridge-health-rollup"
-                className={cn(
-                  "ml-auto size-2 shrink-0 rounded-full",
-                  HEALTH_DOT_CLASS[bridgeHealth],
-                )}
-              />
-            ) : null;
-          // The "Approvals" entry carries an amber count badge (Story 7.3): the
-          // number of chats with a pending draft, shown only when > 0 ("written,
-          // not sent"). Amber (`--held`) marks the badge — nothing else.
-          const showApprovalBadge = view.label === "Approvals" && pendingDraftCount > 0;
-          const approvalBadge = showApprovalBadge ? (
-            <span
-              data-slot="approval-count"
-              aria-hidden="true"
-              className="ml-auto inline-flex min-w-5 shrink-0 items-center justify-center rounded-full bg-held px-1.5 py-0.5 font-medium text-[11px] text-held-foreground leading-none"
-            >
-              {pendingDraftCount}
-            </span>
-          ) : null;
-          if (collapsed) {
-            return (
-              <li key={view.label}>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      aria-label={
-                        showApprovalBadge
-                          ? `${view.label}, ${pendingDraftCount} pending`
-                          : view.label
-                      }
-                      aria-current={active ? "page" : undefined}
-                      className={cn(
-                        "relative focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
-                        active && "bg-accent text-accent-foreground",
-                      )}
-                      onClick={onClick}
-                    >
-                      <Icon aria-hidden="true" />
-                      {healthDot !== null && (
-                        <span
-                          aria-hidden="true"
-                          data-slot="bridge-health-rollup"
+      <ScrollArea className="min-h-0 flex-1">
+        {/* The primary views and both data-driven groups scroll as one, so the
+            footer below stays reachable however many Spaces or Networks the user
+            belongs to (AD-34-4). */}
+        <div className="flex flex-col">
+          <ul className={cn("flex flex-col gap-1 p-2", collapsed && "items-center")}>
+            {views.map((view) => {
+              const Icon = view.icon;
+              // "Chats", "Archive", "Bridges", "Recording", and "Sync" switch the
+              // primary view; Settings opens the dialog.
+              const onClick =
+                view.label === "Settings"
+                  ? () => setSettingsOpen(true)
+                  : view.label === "Chats"
+                    ? () => primaryViewStore.getState().setView("inbox")
+                    : view.label === "Archive"
+                      ? () => primaryViewStore.getState().setView("archive")
+                      : view.label === "Approvals"
+                        ? () => primaryViewStore.getState().setView("approval")
+                        : view.label === "Bridges"
+                          ? () => primaryViewStore.getState().setView("bridges")
+                          : view.label === "Recording"
+                            ? () => primaryViewStore.getState().setView("recording")
+                            : view.label === "Sync"
+                              ? () => primaryViewStore.getState().setView("sync")
+                              : undefined;
+              // Reflect the active primary view on the Chats/Archive/Approvals/Bridges/
+              // Recording/Sync entries.
+              const active =
+                (view.label === "Chats" && primaryView === "inbox") ||
+                (view.label === "Archive" && primaryView === "archive") ||
+                (view.label === "Approvals" && primaryView === "approval") ||
+                (view.label === "Bridges" && primaryView === "bridges") ||
+                (view.label === "Recording" && primaryView === "recording") ||
+                (view.label === "Sync" && primaryView === "sync");
+              // The Bridges entry carries the worst-state health roll-up dot (Story
+              // 6.1): shown only when at least one bridge reports non-null health.
+              const healthDot =
+                view.label === "Bridges" && bridgeHealth !== null ? (
+                  <span
+                    aria-hidden="true"
+                    data-slot="bridge-health-rollup"
+                    className={cn(
+                      "ml-auto size-2 shrink-0 rounded-full",
+                      HEALTH_DOT_CLASS[bridgeHealth],
+                    )}
+                  />
+                ) : null;
+              // The "Approvals" entry carries an amber count badge (Story 7.3): the
+              // number of chats with a pending draft, shown only when > 0 ("written,
+              // not sent"). Amber (`--held`) marks the badge — nothing else.
+              const showApprovalBadge = view.label === "Approvals" && pendingDraftCount > 0;
+              const approvalBadge = showApprovalBadge ? (
+                <span
+                  data-slot="approval-count"
+                  aria-hidden="true"
+                  className="ml-auto inline-flex min-w-5 shrink-0 items-center justify-center rounded-full bg-held px-1.5 py-0.5 font-medium text-[11px] text-held-foreground leading-none"
+                >
+                  {pendingDraftCount}
+                </span>
+              ) : null;
+              if (collapsed) {
+                return (
+                  <li key={view.label}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          aria-label={
+                            showApprovalBadge
+                              ? `${view.label}, ${pendingDraftCount} pending`
+                              : view.label
+                          }
+                          aria-current={active ? "page" : undefined}
                           className={cn(
-                            "absolute top-1.5 right-1.5 size-2 rounded-full",
-                            bridgeHealth !== null && HEALTH_DOT_CLASS[bridgeHealth],
+                            "relative focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+                            active && "bg-accent text-accent-foreground",
                           )}
-                        />
-                      )}
-                      {showApprovalBadge && (
-                        <span
-                          aria-hidden="true"
-                          data-slot="approval-count"
-                          className="absolute top-1 right-1 size-2 rounded-full bg-held"
-                        />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="right">
-                    {showApprovalBadge ? `${view.label} (${pendingDraftCount})` : view.label}
-                  </TooltipContent>
-                </Tooltip>
-              </li>
-            );
-          }
-          return (
-            <li key={view.label}>
-              <Button
-                type="button"
-                variant="ghost"
-                aria-current={active ? "page" : undefined}
-                className={cn(
-                  "w-full justify-start gap-2 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
-                  active && "bg-accent text-accent-foreground",
-                )}
-                onClick={onClick}
-              >
-                <Icon aria-hidden="true" />
-                {view.label}
-                {healthDot}
-                {approvalBadge}
-              </Button>
-            </li>
-          );
-        })}
-      </ul>
-      {/* SPACES group (Story 4.5): a single-select list of the Matrix Spaces the
-          user belongs to, filtering the Unified Inbox. Rendered after the primary
-          views, before the footer. Hidden entirely when there are no Spaces, and
-          suppressed on the collapsed rail (it needs labels + names). */}
-      {!collapsed && <SpacesGroup />}
-      {/* NETWORKS group (Story 4.6): a single-select list of the distinct bridged
-          Networks connected across all accounts, filtering the Unified Inbox.
-          Rendered immediately after SPACES. Hidden entirely when there are no
-          bridged rooms, and suppressed on the collapsed rail (needs labels). */}
-      {!collapsed && <NetworksGroup />}
+                          onClick={onClick}
+                        >
+                          <Icon aria-hidden="true" />
+                          {healthDot !== null && (
+                            <span
+                              aria-hidden="true"
+                              data-slot="bridge-health-rollup"
+                              className={cn(
+                                "absolute top-1.5 right-1.5 size-2 rounded-full",
+                                bridgeHealth !== null && HEALTH_DOT_CLASS[bridgeHealth],
+                              )}
+                            />
+                          )}
+                          {showApprovalBadge && (
+                            <span
+                              aria-hidden="true"
+                              data-slot="approval-count"
+                              className="absolute top-1 right-1 size-2 rounded-full bg-held"
+                            />
+                          )}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="right">
+                        {showApprovalBadge ? `${view.label} (${pendingDraftCount})` : view.label}
+                      </TooltipContent>
+                    </Tooltip>
+                  </li>
+                );
+              }
+              return (
+                <li key={view.label}>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    aria-current={active ? "page" : undefined}
+                    className={cn(
+                      "w-full justify-start gap-2 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+                      active && "bg-accent text-accent-foreground",
+                    )}
+                    onClick={onClick}
+                  >
+                    <Icon aria-hidden="true" />
+                    {view.label}
+                    {healthDot}
+                    {approvalBadge}
+                  </Button>
+                </li>
+              );
+            })}
+          </ul>
+          {/* SPACES group (Story 4.5): a single-select list of the Matrix Spaces the
+              user belongs to, filtering the Unified Inbox. Rendered after the primary
+              views, before the footer. Hidden entirely when there are no Spaces, and
+              suppressed on the collapsed rail (it needs labels + names). */}
+          {!collapsed && <SpacesGroup />}
+          {/* NETWORKS group (Story 4.6): a single-select list of the distinct bridged
+              Networks connected across all accounts, filtering the Unified Inbox.
+              Rendered immediately after SPACES. Hidden entirely when there are no
+              bridged rooms, and suppressed on the collapsed rail (needs labels). */}
+          {!collapsed && <NetworksGroup />}
+        </div>
+      </ScrollArea>
       {/* Persistent sidebar-footer region (pushed to the bottom with `mt-auto`):
           the offline pill directly ABOVE the account row, both inside the footer
           region. The account row is always mounted while signed in; the pill

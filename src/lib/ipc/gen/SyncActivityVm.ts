@@ -11,4 +11,11 @@ export type SyncActivityVm = { tsMs: number,
 /**
  * `added` | `modified` | `deleted` | `conflict`.
  */
-kind: string, path: string, };
+kind: string, path: string, 
+/**
+ * How big the file was, or `null` when nobody measured it: a row recorded
+ * before sizes existed, or a deletion the repository no longer remembers
+ * the size of. The list renders nothing at all for `null` — never `0 B`,
+ * which would claim the file was empty.
+ */
+sizeBytes: number | null, };

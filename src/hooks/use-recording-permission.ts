@@ -8,12 +8,14 @@
  * revoke) a permission in System Settings and return, and the rows must flip
  * without a relaunch where the OS allows — and re-fetches whenever the mic or
  * webcam enabled state changes, so an enabled source's leg appears (and gates
- * Start) immediately. The enabled flags come from the same stores the setup
- * cards write ({@link useMicEnabled}/{@link useWebcamEnabled}); all three legs
- * resolve from one `getCapabilities` probe on the Rust side. Detection is
- * always live (a fresh sidecar probe per call, bounded by a timeout); nothing
- * is cached optimistically here — the state held is only the latest probe
- * result.
+ * Start) immediately. The two return-to-window paths are coalesced behind
+ * {@link RETURN_PROBE_COALESCE_MS} so a window return costs one sidecar spawn
+ * rather than one per event (AD-34-6). The enabled flags come from the same
+ * stores the setup cards write ({@link useMicEnabled}/{@link useWebcamEnabled});
+ * all three legs resolve from one `getCapabilities` probe on the Rust side.
+ * Detection is always live (a fresh sidecar probe per call, bounded by a
+ * timeout); nothing is cached optimistically here — the state held is only the
+ * latest probe result.
  *
  * Error-safe by design: every IPC failure (sidecar unavailable / hung / iOS) is
  * swallowed to the safe default — Start stays disabled and no row claims a
@@ -47,6 +49,19 @@ export const DEFAULT_RECORDING_PERMISSION: RecordingPermissionVm = Object.freeze
   camera: null,
   canStart: false,
 });
+
+/**
+ * How long a return-to-window waits before re-probing the pre-flight (AD-34-6).
+ *
+ * Each probe spawns a `keeper-rec` child, so the window in which `focus` and
+ * `visibilitychange` both arrive must produce one probe, not two — and a `focus`
+ * delivered by the mousedown that begins a titlebar drag must not spawn anything on
+ * that click at all. Sized against the human action the probe exists to catch: a
+ * grant made in System Settings and a switch back to keeper takes seconds, so half
+ * of one is invisible here, while a burst of events is milliseconds apart and
+ * collapses completely.
+ */
+export const RETURN_PROBE_COALESCE_MS = 500;
 
 export interface UseRecordingPermission {
   /** The latest resolved pre-flight (the safe default until a probe lands). */
@@ -170,20 +185,39 @@ export function useRecordingPermission(): UseRecordingPermission {
     // the System Settings round-trip where the document never went hidden.
     // `refresh` is stable, so the listeners bind exactly once for the hook's
     // lifetime (no rebind churn on source toggles).
+    //
+    // AD-34-6: the return-to-window probes are COALESCED onto a trailing edge.
+    // Every probe spawns a fresh `keeper-rec`, macOS fires `focus` and
+    // `visibilitychange` back-to-back on a window return, and `focus` also arrives
+    // on the mousedown that starts a titlebar drag — so unthrottled these two
+    // listeners cost two process launches at exactly the wrong moment. One
+    // `RETURN_PROBE_COALESCE_MS` window collapses the pair (and any
+    // focus/blur burst) into a single probe that lands after the click, which is
+    // imperceptible against the seconds a real System Settings round-trip takes.
+    // The mount probe stays immediate — nothing is pending to coalesce with, and
+    // the rows must not render "not requested" any longer than necessary.
     void refresh();
+    let queued = 0;
+    const probeOnReturn = (): void => {
+      const token = ++queued;
+      setTimeout(() => {
+        if (token === queued) {
+          void refresh();
+        }
+      }, RETURN_PROBE_COALESCE_MS);
+    };
     const onVisibility = (): void => {
       if (document.visibilityState === "visible") {
-        void refresh();
+        probeOnReturn();
       }
     };
-    const onFocus = (): void => {
-      void refresh();
-    };
-    window.addEventListener("focus", onFocus);
+    window.addEventListener("focus", probeOnReturn);
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       mounted.current = false;
-      window.removeEventListener("focus", onFocus);
+      // Outrun every queued probe so an unmount cannot spawn a sidecar.
+      queued += 1;
+      window.removeEventListener("focus", probeOnReturn);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [refresh]);

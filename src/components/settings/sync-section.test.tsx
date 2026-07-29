@@ -9,10 +9,14 @@ vi.mock("@/lib/ipc/client", () => ({
   syncProfileSetEnabled: vi.fn(),
   syncFolderNow: vi.fn(),
   syncVerify: vi.fn(),
-  // The Advanced disclosure's access-token field (Story 32.7) writes straight
-  // through to the keychain pair; there is no read side to mock, because no
-  // command reports what a keychain holds.
+  // The device name (Story 34.5): read once when the section opens, written by
+  // the Rename button.
+  syncDevice: vi.fn(),
+  syncDeviceSetLabel: vi.fn(),
+  // The Advanced disclosure's access-token field (Story 32.7, Story 34.4): two
+  // writes and a read the user has to ask for.
   syncSetCredential: vi.fn(),
+  syncGetCredential: vi.fn(),
   syncClearCredential: vi.fn(),
   // A successful add re-reads the new folder's three detail lists so the Sync
   // view is not blank for a poll interval — the same add path runs from here.
@@ -30,6 +34,10 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import {
   SYNC_ATTENTION_FALLBACK_SENTENCE,
+  SYNC_DEVICE_ID_LABEL,
+  SYNC_DEVICE_NAME_LABEL,
+  SYNC_DEVICE_SAVE_LABEL,
+  SYNC_DEVICE_SAVED_SENTENCE,
   SYNC_NO_PROFILES_SENTENCE,
   SYNC_NOW_LABEL,
   SYNC_PAUSE_LABEL,
@@ -63,9 +71,11 @@ import {
   SYNC_TOKEN_LABEL,
   SYNC_TOKEN_STORED_LABEL,
 } from "@/components/sync/add-folder-form";
-import type { SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
+import type { SyncOutcomeVm, SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
 import {
   syncClearCredential,
+  syncDevice,
+  syncDeviceSetLabel,
   syncFolderNow,
   syncProfileRemove,
   syncProfileSave,
@@ -87,6 +97,8 @@ const mockFolderNow = vi.mocked(syncFolderNow);
 const mockVerify = vi.mocked(syncVerify);
 const mockSetCredential = vi.mocked(syncSetCredential);
 const mockClearCredential = vi.mocked(syncClearCredential);
+const mockDevice = vi.mocked(syncDevice);
+const mockSetDeviceLabel = vi.mocked(syncDeviceSetLabel);
 const mockPicker = vi.mocked(openFolder);
 
 /** The exact line Rust composes — the UI must render it character for character. */
@@ -107,8 +119,12 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     removable: false,
     lfsMode: "materialize",
     lfsThresholdBytes: 4 * 1024 * 1024,
-    settleMs: 5000,
+    settleMs: null,
+    effectiveSettleMs: 5_000,
+    pollIntervalMs: null,
+    effectivePollIntervalMs: 15_000,
     tags: [],
+    commitSubjectTemplate: "",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -127,6 +143,7 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
     bytesDone: 0,
     bytesTotal: null,
     pending: 3,
+    settling: 0,
     warning: null,
     error: null,
     lastSyncMs: null,
@@ -141,6 +158,7 @@ beforeEach(() => {
   mockProfiles.mockResolvedValue([profileVm()]);
   mockStatuses.mockResolvedValue([statusVm()]);
   mockPicker.mockResolvedValue(null);
+  mockDevice.mockResolvedValue({ id: "01JDEVICE", label: "hesperia" });
 });
 
 afterEach(() => {
@@ -191,18 +209,71 @@ describe("SyncSection profile rows", () => {
     expect(screen.getByText("github.com")).toBeInTheDocument();
   });
 
-  it("syncs one folder now", async () => {
-    mockFolderNow.mockResolvedValue({
-      committed: true,
+  /** A `sync_folder_now` reply, with the fields a case does not care about. */
+  function outcomeVm(over: Partial<SyncOutcomeVm> = {}): SyncOutcomeVm {
+    return {
+      committed: false,
       pushed: true,
-      pulled: false,
-      filesChanged: 3,
+      pulled: true,
+      filesChanged: 0,
       conflicts: [],
-    });
+      bytes: 0,
+      line: "Nothing to sync — this folder already matches the remote.",
+      ...over,
+    };
+  }
+
+  /**
+   * AD-34-12. The click used to produce nothing at all: the command returned a
+   * full outcome and the row threw it away, so "even after clicking Sync now I
+   * cannot see that sync works" was literally true. Each honest case has to
+   * land on screen, and the sentence comes from Rust so this row and the Sync
+   * view cannot word one result two ways.
+   */
+  it("states what Sync now did, including when it did nothing", async () => {
+    mockFolderNow.mockResolvedValue(
+      outcomeVm({
+        committed: true,
+        filesChanged: 3,
+        bytes: 2_048,
+        line: "Committed and pushed 3 files, moved 2 KB.",
+      }),
+    );
     render(<SyncSection open />);
     fireEvent.click(await screen.findByRole("button", { name: SYNC_NOW_LABEL }));
 
     await waitFor(() => expect(mockFolderNow).toHaveBeenCalledWith("p1"));
+    const report = await screen.findByText("Committed and pushed 3 files, moved 2 KB.");
+    // Announced, not just painted: the result of a button press has to reach a
+    // screen reader without stealing focus.
+    expect(report).toHaveAttribute("role", "status");
+    expect(report).not.toHaveClass("text-destructive");
+  });
+
+  it("says so when there was nothing to sync, rather than nothing", async () => {
+    mockFolderNow.mockResolvedValue(outcomeVm());
+    render(<SyncSection open />);
+    fireEvent.click(await screen.findByRole("button", { name: SYNC_NOW_LABEL }));
+
+    expect(
+      await screen.findByText("Nothing to sync — this folder already matches the remote."),
+    ).toBeInTheDocument();
+  });
+
+  it("does not dress a conflict up as a success", async () => {
+    mockFolderNow.mockResolvedValue(
+      outcomeVm({
+        conflicts: ["notes.sync-conflict-20250725-120000-host.md"],
+        line: "Kept your version of 1 file that changed in both places, alongside the remote's.",
+      }),
+    );
+    render(<SyncSection open />);
+    fireEvent.click(await screen.findByRole("button", { name: SYNC_NOW_LABEL }));
+
+    const report = await screen.findByText(
+      "Kept your version of 1 file that changed in both places, alongside the remote's.",
+    );
+    expect(report).toHaveClass("text-destructive");
   });
 
   it("surfaces a rejected row action inline", async () => {
@@ -211,6 +282,8 @@ describe("SyncSection profile rows", () => {
     fireEvent.click(await screen.findByRole("button", { name: SYNC_NOW_LABEL }));
 
     expect(await screen.findByText("remote unreachable")).toBeInTheDocument();
+    // And nothing claims the pass did anything.
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
   it("pauses and resumes, reflecting the status the backend returned", async () => {
@@ -440,9 +513,14 @@ describe("SyncSection add-profile form", () => {
         removable: false,
         lfsMode: "materialize",
         lfsThresholdBytes: 4 * 1024 * 1024,
-        settleMs: null,
+        // An empty box means "keeper picks", and keeper's own number is how that
+        // is spelled on the wire: `null` would be the omission Rust reads as
+        // "leave whatever is stored" (AD-34-9), a different instruction.
+        settleMs: 5_000,
+        pollIntervalMs: 15_000,
         tags: [],
         authorOverride: null,
+        commitSubjectTemplate: "",
       }),
     );
     // Nothing was typed into the token field, so the keychain was left alone.
@@ -606,5 +684,53 @@ describe("syncRemoteHost", () => {
       "git.example.org:2222",
     );
     expect(syncRemoteHost("/srv/mirrors/tgdrive.git")).toBe("/srv/mirrors/tgdrive.git");
+  });
+});
+
+describe("SyncSection device name (Story 34.5)", () => {
+  it("shows the name and the id keeper writes into every commit", async () => {
+    render(<SyncSection open />);
+
+    const field = await screen.findByLabelText(SYNC_DEVICE_NAME_LABEL);
+    expect(field).toHaveValue("hesperia");
+    // The id is in every trailer, so someone reading `git log` can find it here.
+    expect(screen.getByText(`${SYNC_DEVICE_ID_LABEL}: 01JDEVICE`)).toBeInTheDocument();
+  });
+
+  it("renames on request, keeps the id, and says the change is for later commits", async () => {
+    mockSetDeviceLabel.mockResolvedValue({ id: "01JDEVICE", label: "Studio Mac" });
+    render(<SyncSection open />);
+
+    const field = await screen.findByLabelText(SYNC_DEVICE_NAME_LABEL);
+    const rename = screen.getByRole("button", { name: SYNC_DEVICE_SAVE_LABEL });
+    // Nothing to do until the name actually differs.
+    expect(rename).toBeDisabled();
+
+    fireEvent.change(field, { target: { value: "  Studio Mac  " } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_DEVICE_SAVE_LABEL }));
+
+    await waitFor(() => expect(mockSetDeviceLabel).toHaveBeenCalledWith("  Studio Mac  "));
+    // Seeded from what Rust stored, not from what was typed: Rust trims.
+    await waitFor(() =>
+      expect(screen.getByLabelText(SYNC_DEVICE_NAME_LABEL)).toHaveValue("Studio Mac"),
+    );
+    expect(screen.getByText(SYNC_DEVICE_SAVED_SENTENCE)).toBeInTheDocument();
+    expect(screen.getByText(`${SYNC_DEVICE_ID_LABEL}: 01JDEVICE`)).toBeInTheDocument();
+  });
+
+  it("reports a refused rename instead of showing a name nothing will use", async () => {
+    mockSetDeviceLabel.mockRejectedValue({
+      code: "internal",
+      message: "device label must not be empty",
+    });
+    render(<SyncSection open />);
+
+    fireEvent.change(await screen.findByLabelText(SYNC_DEVICE_NAME_LABEL), {
+      target: { value: "renamed" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_DEVICE_SAVE_LABEL }));
+
+    expect(await screen.findByText("device label must not be empty")).toBeInTheDocument();
+    expect(screen.queryByText(SYNC_DEVICE_SAVED_SENTENCE)).not.toBeInTheDocument();
   });
 });

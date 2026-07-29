@@ -11,16 +11,24 @@
  *     `pushOnly`, so the form never offers it and always sends
  *     {@link SYNC_DEFAULT_LANE}. A second copy could easily grow a lane control
  *     that composes a profile Rust rejects.
- *   - The settle window and LFS threshold are seconds/MB here and
- *     milliseconds/bytes on the wire, and an empty field means "let Rust
- *     choose" rather than zero.
+ *   - The three numeric knobs are seconds/MB here and milliseconds/bytes on the
+ *     wire, and an empty field means "keeper picks" rather than zero. That is
+ *     NOT `null` on the wire: `null` is the omission Rust reads as "leave
+ *     whatever is stored" (AD-34-9), so an empty field sends keeper's documented
+ *     default, which is the value `effective_settle_ms` reads as "nothing
+ *     pinned". Each box's placeholder names the number that will be in force,
+ *     and a note appears under it when the typed number is not that number
+ *     (AD-34-8).
  *   - The access token is a second write to a different store (the OS
  *     keychain), keyed by the profile id. Its failure is reported as its own
- *     thing, because the profile is stored by then.
- *   - `SyncProfileReq` carries no `enabled`, and Rust merges an update onto the
- *     stored profile rather than rebuilding it, so saving an edit leaves a
- *     paused folder paused. An edit must therefore never be routed through
- *     anything that also toggles pause.
+ *     thing, because the profile is stored by then. Reading one back out is a
+ *     third call, made only when the user presses for it (AD-34-7) — never as
+ *     part of loading the form.
+ *   - `SyncProfileReq` carries no `enabled`, and Rust merges an update onto a
+ *     CLONE of the stored profile rather than rebuilding it, so saving an edit
+ *     leaves a paused folder paused and cannot move any field this form does not
+ *     show. An edit must therefore never be routed through anything that also
+ *     toggles pause.
  *   - The local path is not editable. The engine binds a profile to its folder
  *     — and on removable media to a marker written inside it — so repointing a
  *     profile is not an edit to it but a different folder.
@@ -33,7 +41,7 @@
  * is rendered, including where nothing visible repeats the title.
  */
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, Eye, EyeOff } from "lucide-react";
 import { type FormEvent, useId, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -47,16 +55,20 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { SyncProfileVm } from "@/lib/ipc/client";
-// The credential pair is called straight from the form rather than through the
-// mirror store: neither write changes anything the store mirrors, and there is
-// no read side to keep in sync — nothing can report what a keychain holds.
-import { syncClearCredential, syncSetCredential } from "@/lib/ipc/client";
+// The credential calls are made straight from the form rather than through the
+// mirror store: none of them change anything the store mirrors, and the read is
+// a one-shot answer to a button press rather than state worth keeping in sync.
+import { syncClearCredential, syncGetCredential, syncSetCredential } from "@/lib/ipc/client";
 import {
   SYNC_DEFAULT_BRANCH,
   SYNC_DEFAULT_LANE,
   SYNC_DEFAULT_LFS_THRESHOLD_BYTES,
+  SYNC_DEFAULT_POLL_INTERVAL_MS,
+  SYNC_DEFAULT_SETTLE_MS,
   SYNC_DIRECTIONS,
   SYNC_LFS_MODES,
+  SYNC_MIN_POLL_INTERVAL_MS,
+  SYNC_REMOVABLE_SETTLE_MS,
   type SyncDirection,
   type SyncLfsMode,
   saveSyncProfile,
@@ -105,13 +117,24 @@ export const SYNC_REMOVABLE_NOTE =
   "report changes late. The folder has to be on the drive, not on this computer's own disk.";
 
 /**
- * The advanced knobs (Story 32.7, AD-S8). Every one of these was already
- * carried by `SyncProfileReq` and hardcoded away by this form; a knob that
- * does nothing (`pollIntervalMs`) was deleted in Rust rather than exposed here.
+ * The advanced knobs (Story 32.7, AD-S8; Story 34.5, AD-34-8). Every one of
+ * these was already carried by `SyncProfileReq` and hardcoded away by this form.
+ *
+ * Each numeric knob shows the number that is actually IN FORCE. Leaving one
+ * empty means "keeper picks", and the placeholder then names what keeper will
+ * pick; typing a number pins it, and if Rust would not honour that number
+ * verbatim the note under the field says what it will use instead. A blank box
+ * that silently meant 5 000 was the whole of AD-34-8.
  */
 export const SYNC_SETTLE_LABEL = "Wait for writes to stop (seconds)";
 export const SYNC_SETTLE_NOTE =
-  "How long a file must go untouched before keeper copies it. Left empty, keeper picks the wait itself.";
+  "How long a file must go untouched before keeper copies it. Left empty, keeper picks the wait itself — and picks a longer one on removable or network storage, where changes are reported late.";
+export const SYNC_POLL_LABEL = "Re-read the folder every (seconds)";
+export const SYNC_POLL_NOTE =
+  "How often keeper walks the whole folder looking for changes. Lower notices a change sooner and costs more on a drive or a network share. Left empty, keeper picks the interval itself.";
+export const SYNC_SUBJECT_LABEL = "Commit subject";
+export const SYNC_SUBJECT_NOTE =
+  "The first line of every commit keeper makes for this folder. {profile} is the folder's name; {added}, {modified}, {deleted} and {changed} are file counts. Left empty, keeper writes its own — sync(folder): 3 added, 1 modified.";
 export const SYNC_EXCLUDES_LABEL = "Skip these files";
 export const SYNC_EXCLUDES_NOTE =
   "Comma-separated patterns, for example *.tmp, .DS_Store. Left empty, keeper syncs everything in the folder.";
@@ -126,20 +149,37 @@ export const SYNC_AUTHOR_NOTE =
   "Name <email>, an address, or just a name. Left empty, commits are authored by this device.";
 
 /**
- * The access-token field (Story 32.7, AD-S7). The token is written to the OS
- * keychain in a second call once the profile has an id, and is never rendered
- * back: no command can read a stored token out, so a field that claimed to
- * show one would be showing something it cannot know. That is exactly why
- * editing a profile still starts this field empty, and why the note under it
- * has to say what empty *means* there.
+ * The access-token field (Story 32.7, AD-S7; Story 34.4, AD-34-7). The token is
+ * written to the OS keychain in a second call once the profile has an id, and
+ * can be read back out of it — but only when the user asks. The field therefore
+ * still starts empty in both modes, and the note under it has to say where the
+ * token is kept and that showing it is a thing the user does.
  */
 export const SYNC_TOKEN_LABEL = "Access token";
 export const SYNC_TOKEN_NOTE =
-  "Used to authenticate with the remote. keeper stores it in the system keychain when the folder is added and never shows it again — there is no way to read a stored token back out.";
+  "Used to authenticate with the remote. keeper stores it in the system keychain when the folder is added, and shows it again only when you ask.";
 export const SYNC_TOKEN_EDIT_NOTE =
-  "Left empty, whatever is stored stays as it is. Type a new one to replace it, or clear it to remove it. keeper cannot show a stored token — there is no way to read one back out.";
+  "Left empty, whatever is stored stays as it is. Type a new one to replace it, or clear it to remove it. The stored one is in the system keychain, and keeper reads it back only when you ask for it.";
 export const SYNC_TOKEN_STORED_LABEL = "Access token stored in the keychain.";
 export const SYNC_TOKEN_CLEAR_LABEL = "Clear token";
+
+/**
+ * The eye toggle over the field, named for what pressing it will do rather than
+ * for the state it is in, because that is what a screen reader announces before
+ * the press.
+ */
+export const SYNC_TOKEN_SHOW_LABEL = "Show token";
+export const SYNC_TOKEN_HIDE_LABEL = "Hide token";
+
+/**
+ * The reveal and the two answers that are not a token. A keychain read has one
+ * outcome a write does not — there may be nothing stored — and that is not a
+ * failure, so neither it nor a failed read may be reported by leaving the field
+ * blank: blank is what both would look like.
+ */
+export const SYNC_TOKEN_REVEAL_LABEL = "Show stored token";
+export const SYNC_TOKEN_NONE_STORED_LABEL = "No token is stored for this folder.";
+export const SYNC_TOKEN_READ_FAILED_PREFIX = "The stored token could not be read: ";
 
 /** The only report a clear can get: nothing else on screen can reflect it. */
 export const SYNC_TOKEN_CLEARED_LABEL = "The stored token was removed.";
@@ -158,6 +198,19 @@ export const SYNC_TOKEN_EDIT_FAILED_PREFIX =
 export const SYNC_ADD_SUBMIT_LABEL = "Add folder";
 export const SYNC_EDIT_SUBMIT_LABEL = "Save changes";
 export const SYNC_FORM_CANCEL_LABEL = "Cancel";
+
+/**
+ * The line under a numeric knob whose box holds a number Rust will not use.
+ *
+ * Reachable two ways: a scan cadence below the floor keeper can work with, and
+ * a wait of exactly the default on removable storage — which Rust reads as "no
+ * wait pinned" and answers with the longer removable window. Either way the box
+ * would otherwise show a number that is not the number in force, which is the
+ * defect AD-34-8 names.
+ */
+export function syncInForceNote(seconds: number): string {
+  return `keeper is using ${seconds} s here.`;
+}
 
 /** Test id for the form's chosen-folder display (a read-only truncated path). */
 export const SYNC_FORM_PATH_TESTID = "sync-form-path";
@@ -196,19 +249,27 @@ interface SyncFormValues {
   /** The LFS threshold in MB; empty defers to the Rust default. */
   lfsThresholdMb: string;
   removable: boolean;
-  /** The settle window in seconds; empty defers to the Rust default. */
+  /**
+   * The settle window in seconds; empty means the profile pins none and keeper
+   * picks — a different thing from pinning keeper's own number, and the
+   * distinction is what `effective_settle_ms` reads (AD-34-8).
+   */
   settleSeconds: string;
+  /** The scan cadence in seconds; empty means keeper picks, same rule. */
+  pollSeconds: string;
   /** Comma-separated patterns; empty excludes nothing. */
   excludes: string;
   /** Comma-separated paths inside the folder; empty syncs all of it. */
   subpaths: string;
   /** Comma-separated commit tags; empty adds no tag trailers. */
   tags: string;
+  /** The commit-subject template; empty means keeper's mechanical subject. */
+  commitSubjectTemplate: string;
   /** The commit-author override; empty keeps the device identity. */
   authorOverride: string;
   /**
-   * The access token, held only until the profile is saved and the keychain
-   * write goes through. Never read back from anywhere.
+   * The access token: typed, or fetched back out of the keychain by an explicit
+   * reveal. Never seeded from a profile — a profile carries none.
    */
   token: string;
 }
@@ -223,17 +284,20 @@ const EMPTY_FORM: SyncFormValues = {
   lfsThresholdMb: String(SYNC_DEFAULT_LFS_THRESHOLD_BYTES / 1024 / 1024),
   removable: false,
   settleSeconds: "",
+  pollSeconds: "",
   excludes: "",
   subpaths: "",
   tags: "",
+  commitSubjectTemplate: "",
   authorOverride: "",
   token: "",
 };
 
 /**
  * A stored profile as the fields that carry it. Everything editable starts from
- * what is stored; the token starts empty in every mode, because nothing can
- * read one back out to fill it in.
+ * what is stored; the token starts empty in every mode, because a profile
+ * carries none — reading one is a separate keychain call the user has to ask
+ * for (AD-34-7), and loading a form is not asking.
  */
 function formValuesFor(profile: SyncProfileVm): SyncFormValues {
   return {
@@ -246,16 +310,60 @@ function formValuesFor(profile: SyncProfileVm): SyncFormValues {
     // together — it exists because `SyncProfileVm` widens them to `string`.
     direction: SYNC_DIRECTIONS.find((legal) => legal === profile.direction) ?? "bidirectional",
     lfsMode: SYNC_LFS_MODES.find((legal) => legal === profile.lfsMode) ?? "materialize",
-    // Back into the units these two fields are typed in.
+    // Back into the units these fields are typed in. `null` on the two windows
+    // means the profile pins nothing, and an empty box is how the form says that
+    // back — never a number, which the next save would store as a choice the
+    // user never made.
     lfsThresholdMb: String(profile.lfsThresholdBytes / 1024 / 1024),
-    settleSeconds: String(profile.settleMs / 1000),
+    settleSeconds: profile.settleMs === null ? "" : String(profile.settleMs / 1000),
+    pollSeconds: profile.pollIntervalMs === null ? "" : String(profile.pollIntervalMs / 1000),
     removable: profile.removable,
     excludes: profile.excludes.join(", "),
     subpaths: profile.subpaths.join(", "),
     tags: profile.tags.join(", "),
+    commitSubjectTemplate: profile.commitSubjectTemplate,
     authorOverride: profile.authorOverride ?? "",
     token: "",
   };
+}
+
+/**
+ * The number a numeric box holds, or `null` when it holds nothing usable.
+ *
+ * Empty, unparseable and non-positive all mean the same thing to this form —
+ * "keeper picks" — because a zero-second wait would commit half-written files, a
+ * zero-second cadence would re-read the tree on every tick, and a zero-byte LFS
+ * threshold would route every file through LFS.
+ */
+function pinnedValue(raw: string): number | null {
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+/**
+ * The wait keeper will actually use, given what the form holds right now.
+ *
+ * Mirrors `SyncProfile::effective_settle_ms`, including the part that surprises:
+ * a wait of exactly keeper's own default IS how "keeper picks" is stored, so a
+ * removable folder gets the longer window whether the box is empty or holds a 5.
+ * Recomputed from the LIVE form rather than read off `effectiveSettleMs`,
+ * because ticking the removable box changes the answer before anything is saved.
+ *
+ * No ceiling clamp: Rust refuses a window above `SETTLE_CEILING_MS` outright, so
+ * a value this would clamp cannot be saved in the first place.
+ */
+function effectiveSettleSeconds(form: SyncFormValues): number {
+  const pinned = pinnedValue(form.settleSeconds);
+  const ms = pinned === null ? SYNC_DEFAULT_SETTLE_MS : pinned * 1000;
+  const effective = form.removable && ms === SYNC_DEFAULT_SETTLE_MS ? SYNC_REMOVABLE_SETTLE_MS : ms;
+  return effective / 1000;
+}
+
+/** The scan cadence keeper will actually use — mirrors the same-named Rust fn. */
+function effectivePollSeconds(form: SyncFormValues): number {
+  const pinned = pinnedValue(form.pollSeconds);
+  const ms = pinned === null ? SYNC_DEFAULT_POLL_INTERVAL_MS : pinned * 1000;
+  return Math.max(ms, SYNC_MIN_POLL_INTERVAL_MS) / 1000;
 }
 
 /**
@@ -316,16 +424,33 @@ export function AddFolderForm({
   const [error, setError] = useState<string | null>(null);
   /**
    * The profile whose token was just written, if any. The only acknowledgement
-   * the user will ever get that the keychain took it — and the only moment the
-   * form holds an id to clear it with, since nothing can read a stored token
-   * back to offer this later.
+   * the user will ever get that the keychain took it — and the first moment the
+   * form holds an id to clear it with, since a folder being added has none.
    */
   const [storedToken, setStoredToken] = useState<{ id: string; name: string } | null>(null);
   /**
-   * Whether a clear went through. The acknowledgement for a write nothing else
-   * can reflect: a keychain holds no read side to go quiet.
+   * Whether a clear went through. Nothing else on screen goes quiet when a
+   * keychain entry disappears, so this acknowledgement is the whole report.
    */
   const [tokenCleared, setTokenCleared] = useState(false);
+  /**
+   * Whether the field shows what it holds. About the field, not about where its
+   * contents came from: it flips a token being typed and a token just revealed
+   * alike.
+   */
+  const [tokenVisible, setTokenVisible] = useState(false);
+  /**
+   * That the reveal came back with nothing. Kept apart from both an error and
+   * an empty field, because "the keychain holds no token for this folder" is a
+   * fact, and the other two are not it.
+   */
+  const [noStoredToken, setNoStoredToken] = useState(false);
+  /**
+   * A reveal in flight. Separate from `saving` so a keychain read — which may
+   * put an OS prompt in front of the window — disables only its own button
+   * rather than the form the user is still filling in.
+   */
+  const [revealing, setRevealing] = useState(false);
   const fieldId = useId();
   // Several folders can have an edit form open at once, so the name carries the
   // one it belongs to. A folder being added has no name of its own yet.
@@ -353,10 +478,16 @@ export function AddFolderForm({
     // save never leaves the previous one's report standing.
     setStoredToken(null);
     setTokenCleared(false);
-    // An empty or unusable threshold / settle window defers to the Rust
-    // default rather than sending a number nobody asked for.
-    const thresholdMb = Number.parseFloat(form.lfsThresholdMb);
-    const settleSeconds = Number.parseFloat(form.settleSeconds);
+    setNoStoredToken(false);
+    // An empty box means "keeper picks", and keeper's own number is what it
+    // means: `null` on the wire is the OMISSION Rust reads as "leave whatever is
+    // stored" (AD-34-9), which is the opposite instruction. Sending the
+    // documented default is not a hard-coded user opinion either — a stored
+    // value equal to the default is exactly how `effective_settle_ms` encodes
+    // "nothing pinned here", so a removable folder still gets its longer window.
+    const thresholdMb = pinnedValue(form.lfsThresholdMb);
+    const settle = pinnedValue(form.settleSeconds);
+    const poll = pinnedValue(form.pollSeconds);
     const author = form.authorOverride.trim();
     const { token } = form;
     try {
@@ -383,22 +514,25 @@ export function AddFolderForm({
         removable: form.removable,
         lfsMode: form.lfsMode,
         lfsThresholdBytes:
-          Number.isFinite(thresholdMb) && thresholdMb > 0
-            ? Math.round(thresholdMb * 1024 * 1024)
-            : null,
-        settleMs:
-          Number.isFinite(settleSeconds) && settleSeconds > 0
-            ? Math.round(settleSeconds * 1000)
-            : null,
+          thresholdMb === null
+            ? SYNC_DEFAULT_LFS_THRESHOLD_BYTES
+            : Math.round(thresholdMb * 1024 * 1024),
+        settleMs: settle === null ? SYNC_DEFAULT_SETTLE_MS : Math.round(settle * 1000),
+        pollIntervalMs: poll === null ? SYNC_DEFAULT_POLL_INTERVAL_MS : Math.round(poll * 1000),
         tags: splitSyncList(form.tags),
         // Emptying the field on an existing profile *clears* the override, and
         // only an explicit empty string says so — `null` is the omission Rust
         // reads as "leave whatever is stored". On a new profile there is
         // nothing to clear, so the omission is the more precise thing to send.
         authorOverride: author === "" && !editing ? null : author,
+        // Always expressed, because the field is always on screen. An empty
+        // string is a value here rather than an omission: it IS keeper's own
+        // mechanical subject.
+        commitSubjectTemplate: form.commitSubjectTemplate.trim(),
       });
       if (!editing) {
         setForm(EMPTY_FORM);
+        setTokenVisible(false);
       }
       // `saveSyncProfile` re-reads the profile/status mirror, but the Sync
       // view's three per-folder lists are a *second* mirror on a deliberately
@@ -428,12 +562,13 @@ export function AddFolderForm({
         // being edited, so the write has an undo without the form staying open
         // to carry one.
         setForm((live) => ({ ...live, token: "" }));
+        setTokenVisible(false);
         onSaved?.(saved, true);
         return;
       }
       // On a new folder the acknowledgement and its Clear button are the only
-      // undo there is — nothing can read a stored token back to offer one later
-      // — so the caller is told to keep the form mounted.
+      // undo left once the form is gone, so the caller is told to keep it
+      // mounted.
       setStoredToken({ id: saved.id, name: saved.name });
       onSaved?.(saved, false);
     } catch (raw) {
@@ -444,9 +579,9 @@ export function AddFolderForm({
   };
 
   /**
-   * Forget the stored token. The only undo there is — nothing reads one back —
-   * so it is offered wherever the form has an id to clear against: throughout
-   * an edit, and after a new folder's token was just written.
+   * Forget the stored token. Offered wherever the form has an id to clear
+   * against: throughout an edit, and after a new folder's token was just
+   * written, which is the only moment an add has one.
    */
   const clearToken = async (id: string) => {
     setSaving(true);
@@ -455,10 +590,45 @@ export function AddFolderForm({
       await syncClearCredential(id);
       setStoredToken(null);
       setTokenCleared(true);
+      // A revealed token still on screen would contradict the line that just
+      // said it is gone — and the next save would write it straight back.
+      setForm((live) => ({ ...live, token: "" }));
+      setTokenVisible(false);
+      setNoStoredToken(false);
     } catch (raw) {
       setError(syncErrorMessage(raw));
     } finally {
       setSaving(false);
+    }
+  };
+
+  /**
+   * Read the stored token out of the keychain, because the user pressed for it.
+   * Never called on mount or from any load path (AD-34-7): a secret crosses
+   * into the UI on a press and on nothing else. All three answers are reported
+   * as themselves, since an empty field is what two of them would look like.
+   */
+  const revealStoredToken = async (id: string) => {
+    setRevealing(true);
+    setError(null);
+    setNoStoredToken(false);
+    try {
+      const stored = await syncGetCredential(id);
+      if (stored === null) {
+        setNoStoredToken(true);
+        return;
+      }
+      setForm((live) => ({ ...live, token: stored }));
+      // Asking for a secret and then rendering it as dots would be asking and
+      // withholding, so a reveal reveals.
+      setTokenVisible(true);
+      // The field now holds what the keychain holds, so a prior "removed" no
+      // longer describes anything on screen.
+      setTokenCleared(false);
+    } catch (raw) {
+      setError(`${SYNC_TOKEN_READ_FAILED_PREFIX}${syncErrorMessage(raw)}`);
+    } finally {
+      setRevealing(false);
     }
   };
 
@@ -601,6 +771,7 @@ export function AddFolderForm({
               type="number"
               min={0}
               className="w-24"
+              placeholder={String(SYNC_DEFAULT_LFS_THRESHOLD_BYTES / 1024 / 1024)}
               value={form.lfsThresholdMb}
               disabled={disabled || saving}
               onChange={(event) =>
@@ -627,6 +798,10 @@ export function AddFolderForm({
               type="number"
               min={0}
               className="w-24"
+              // Empty means "keeper picks", so the box shows nothing and the
+              // placeholder names what keeper will pick — 10 s on removable
+              // storage, and it follows the checkbox above live.
+              placeholder={String(effectiveSettleSeconds({ ...form, settleSeconds: "" }))}
               value={form.settleSeconds}
               disabled={disabled || saving}
               onChange={(event) =>
@@ -635,6 +810,40 @@ export function AddFolderForm({
             />
           </div>
           <p className="text-muted-foreground text-xs">{SYNC_SETTLE_NOTE}</p>
+          {/* A typed number Rust will not use verbatim. The reachable case is a
+              wait of exactly keeper's own default on removable storage, which
+              Rust reads as "nothing pinned" and answers with the longer window
+              — so the box would otherwise show 5 while 10 was in force. */}
+          {pinnedValue(form.settleSeconds) !== null &&
+            pinnedValue(form.settleSeconds) !== effectiveSettleSeconds(form) && (
+              <p className="text-muted-foreground text-xs">
+                {syncInForceNote(effectiveSettleSeconds(form))}
+              </p>
+            )}
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-poll`}>{SYNC_POLL_LABEL}</Label>
+            <Input
+              id={`${fieldId}-poll`}
+              type="number"
+              min={0}
+              className="w-24"
+              placeholder={String(effectivePollSeconds({ ...form, pollSeconds: "" }))}
+              value={form.pollSeconds}
+              disabled={disabled || saving}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, pollSeconds: event.target.value }))
+              }
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{SYNC_POLL_NOTE}</p>
+          {/* Here the divergence is the floor: a cadence under two seconds would
+              put a full re-stat of the tree on every supervisor tick. */}
+          {pinnedValue(form.pollSeconds) !== null &&
+            pinnedValue(form.pollSeconds) !== effectivePollSeconds(form) && (
+              <p className="text-muted-foreground text-xs">
+                {syncInForceNote(effectivePollSeconds(form))}
+              </p>
+            )}
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-excludes`}>{SYNC_EXCLUDES_LABEL}</Label>
             <Input
@@ -669,6 +878,24 @@ export function AddFolderForm({
           </div>
           <p className="text-muted-foreground text-xs">{SYNC_TAGS_NOTE}</p>
           <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-subject`}>{SYNC_SUBJECT_LABEL}</Label>
+            <Input
+              id={`${fieldId}-subject`}
+              className="w-56"
+              // The placeholder is what an empty field produces, so it is the
+              // real subject rather than an example: `{profile}` is substituted
+              // with the name being typed, and the counts stand for whatever a
+              // commit turns out to carry.
+              placeholder={`sync(${form.name.trim() === "" ? "folder" : form.name.trim()}): 3 added, 1 modified`}
+              value={form.commitSubjectTemplate}
+              disabled={disabled || saving}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, commitSubjectTemplate: event.target.value }))
+              }
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{SYNC_SUBJECT_NOTE}</p>
+          <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-author`}>{SYNC_AUTHOR_LABEL}</Label>
             <Input
               id={`${fieldId}-author`}
@@ -683,32 +910,60 @@ export function AddFolderForm({
           <p className="text-muted-foreground text-xs">{SYNC_AUTHOR_NOTE}</p>
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-token`}>{SYNC_TOKEN_LABEL}</Label>
-            {/* A write-only field: typed here, handed to the keychain once the
-                profile has an id, and never rendered back — there is no command
-                that could fill it in, for a new folder or an existing one. */}
-            <Input
-              id={`${fieldId}-token`}
-              type="password"
-              autoComplete="off"
-              className="w-56"
-              value={form.token}
-              disabled={disabled || saving}
-              onChange={(event) => {
-                // A typed token replaces whatever is stored, so a prior
-                // "removed" no longer describes what saving will do.
-                setTokenCleared(false);
-                setForm((live) => ({ ...live, token: event.target.value }));
-              }}
-            />
+            <div className="flex w-56 items-center gap-1">
+              <Input
+                id={`${fieldId}-token`}
+                type={tokenVisible ? "text" : "password"}
+                autoComplete="off"
+                className="min-w-0 flex-1"
+                value={form.token}
+                disabled={disabled || saving}
+                onChange={(event) => {
+                  // A typed token replaces whatever is stored, so neither a
+                  // prior "removed" nor a prior "none stored" still describes
+                  // what saving will do.
+                  setTokenCleared(false);
+                  setNoStoredToken(false);
+                  setForm((live) => ({ ...live, token: event.target.value }));
+                }}
+              />
+              {/* A button, not an adornment with a click handler: it changes
+                  what is on screen, so it has to be reachable by keyboard, carry
+                  its state, and say which way it will flip. */}
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-pressed={tokenVisible}
+                aria-label={tokenVisible ? SYNC_TOKEN_HIDE_LABEL : SYNC_TOKEN_SHOW_LABEL}
+                disabled={disabled || saving}
+                onClick={() => setTokenVisible((shown) => !shown)}
+              >
+                {tokenVisible ? <EyeOff /> : <Eye />}
+              </Button>
+            </div>
           </div>
           <p className="text-muted-foreground text-xs">
             {editing ? SYNC_TOKEN_EDIT_NOTE : SYNC_TOKEN_NOTE}
           </p>
-          {/* Clearing is a keychain write of its own, offered for as long as
-              there is an id to clear against, and acknowledged — nothing else
-              on screen could report that it happened. */}
+          {/* The two keychain calls the form can make against an id it already
+              has. Both are offered for as long as there is one: revealing is a
+              read the user asks for, clearing a write nothing else on screen
+              could report. */}
           {profile !== undefined && (
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                variant="ghost"
+                size="xs"
+                className="w-fit"
+                disabled={disabled || saving || revealing}
+                onClick={() => {
+                  void revealStoredToken(profile.id);
+                }}
+              >
+                {SYNC_TOKEN_REVEAL_LABEL}
+              </Button>
               <Button
                 type="button"
                 variant="ghost"
@@ -721,6 +976,9 @@ export function AddFolderForm({
               >
                 {SYNC_TOKEN_CLEAR_LABEL}
               </Button>
+              {noStoredToken && (
+                <p className="text-muted-foreground text-xs">{SYNC_TOKEN_NONE_STORED_LABEL}</p>
+              )}
               {tokenCleared && (
                 <p className="text-muted-foreground text-xs">{SYNC_TOKEN_CLEARED_LABEL}</p>
               )}

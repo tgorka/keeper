@@ -44,6 +44,7 @@ const DESKTOP_CAPABILITIES = {
   revealInFileManager: true,
   recording: false,
   sync: false,
+  overlayTitleBar: false,
 };
 
 const UPDATE_ENDPOINT = "https://github.com/tgorka/keeper/releases/latest/download/latest.json";

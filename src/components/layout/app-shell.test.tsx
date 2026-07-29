@@ -147,4 +147,59 @@ describe("AppShell", () => {
 
     expect(screen.queryByRole("region", { name: "Sync" })).not.toBeInTheDocument();
   });
+
+  // ── Overlay-titlebar drag band (Story 34.2) ────────────────────────────────
+  it("renders no drag band where the platform draws its own title bar", () => {
+    // Off macOS the window controls live in a real title bar above the webview, so
+    // a band there is empty space under chrome the OS already owns (AD-34-2).
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: true });
+    render(<AppShell />);
+
+    expect(document.querySelectorAll("[data-tauri-drag-region]")).toHaveLength(0);
+  });
+
+  it("paints the drag band per column so each column matches the pane beneath it", () => {
+    // AD-34-3: a single full-width `bg-background` strip above a `bg-sidebar` drawer
+    // is a seam in light mode and a black bar in dark — the reported "black strip".
+    // Both columns carry the drag region, so the whole band moves the window.
+    capabilitiesStore.getState().applySnapshot({
+      ...DEFAULT_CAPABILITIES,
+      overlayTitleBar: true,
+    });
+    render(<AppShell />);
+
+    const columns = document.querySelectorAll("[data-tauri-drag-region]");
+    expect(columns).toHaveLength(2);
+    // The drawer column is exactly the drawer's width, then the rest of the row.
+    expect(columns[0]).toHaveClass("bg-sidebar", "w-[260px]");
+    expect(columns[1]).toHaveClass("bg-background");
+  });
+
+  it("leaves the band as the only element reserving the window-control inset", () => {
+    // AD-34-2: the sidebar's second `pt-3 pl-[78px]` inset is gone, so the top of
+    // the window is never paid for twice.
+    capabilitiesStore.getState().applySnapshot({
+      ...DEFAULT_CAPABILITIES,
+      overlayTitleBar: true,
+    });
+    render(<AppShell />);
+
+    expect(document.querySelectorAll(".pl-\\[78px\\]")).toHaveLength(0);
+  });
+
+  it("drops the drawer column from the band on the phone tier", () => {
+    // Below 768 there is no drawer, so a `bg-sidebar` column would paint a strip
+    // above content that is `bg-background` — the same seam, mirrored.
+    mockViewportWidth(600);
+    capabilitiesStore.getState().applySnapshot({
+      ...DEFAULT_CAPABILITIES,
+      overlayTitleBar: true,
+    });
+    render(<AppShell />);
+
+    const columns = document.querySelectorAll("[data-tauri-drag-region]");
+    expect(columns).toHaveLength(1);
+    expect(columns[0]).toHaveClass("bg-background");
+    expect(columns[0]).not.toHaveClass("bg-sidebar");
+  });
 });

@@ -94,6 +94,14 @@ pub const DEFAULT_RESCAN_INTERVAL_MS: u64 = 15 * 60 * 1_000;
 /// at all, not a general-purpose mode. Matches `notify`'s own default.
 const POLL_INTERVAL_MS: u64 = 30_000;
 
+/// How long a retirement may run before it is worth complaining about.
+///
+/// A healthy teardown costs at most one debouncer tick, so anything past this
+/// is a backend that is stuck rather than one that is finishing. It is only a
+/// log threshold: nothing waits on it, because nothing waits on a retirement at
+/// all (see [`retire`]).
+const RETIRE_WARN_AFTER: Duration = Duration::from_secs(5);
+
 /// One coalesced change notification.
 ///
 /// A `path` equal to the profile root means **rescan the whole tree**: that is
@@ -337,10 +345,13 @@ impl Backend {
         }
     }
 
-    /// Joins the debouncer's worker thread. `Debouncer`'s own `Drop` only sets
-    /// a stop flag and returns immediately, so events can still be delivered
-    /// for up to one tick after it — which is not what "stopped" should mean
-    /// when a profile is being torn down.
+    /// Joins the debouncer's worker thread, so that after this returns the
+    /// debouncer really has stopped. `Debouncer`'s own `Drop` only sets a stop
+    /// flag and returns, leaving events deliverable for up to one more tick.
+    ///
+    /// Only ever called from [`retire`]'s thread: the join is bounded but the
+    /// backend drop that follows it is not, on macOS, so no caller of ours is
+    /// allowed to be the one waiting here.
     fn stop(self) {
         match self {
             Self::Native(debouncer) => debouncer.stop(),
@@ -502,27 +513,29 @@ impl FolderWatcher {
         self.suppressor.clone()
     }
 
-    /// Tear the watcher down and wait for both threads to finish.
+    /// Retire the watcher, without waiting for its threads to finish.
     ///
-    /// Deterministic by contract: after this returns, no further `WatchEvent`
-    /// can be produced. `Drop` does the same thing, so a forgotten `stop` is a
-    /// tidiness problem rather than a correctness one.
+    /// Returns as soon as the teardown has been handed to [`retire`]. `Drop`
+    /// does exactly the same thing, so a forgotten `stop` is a tidiness problem
+    /// rather than a correctness one.
+    ///
+    /// This deliberately does **not** promise that no further [`WatchEvent`] can
+    /// be produced, because on macOS that promise cannot be kept in bounded time
+    /// — see [`retire`] for why. It does not need to. Events are sent to a
+    /// channel whose receiver the caller drops along with this watcher, so a
+    /// late batch finds a closed channel and `start`'s handler discards it.
     pub fn stop(mut self) {
         self.shutdown();
     }
 
     fn shutdown(&mut self) {
         // Dropping the sender is what wakes the rescan thread out of
-        // `recv_timeout`; without it teardown would block for up to a full
-        // rescan interval.
+        // `recv_timeout`; without it the join inside `retire` would sit there
+        // for up to a full rescan interval.
         drop(self.rescan_stop.take());
-        if let Some(handle) = self.rescan_thread.take() {
-            if handle.join().is_err() {
-                tracing::warn!(root = %self.root.display(), "rescan thread panicked");
-            }
-        }
+        let rescan = self.rescan_thread.take();
         if let Some(backend) = self.backend.take() {
-            backend.stop();
+            retire(&self.root, backend, rescan);
         }
     }
 }
@@ -532,6 +545,89 @@ impl Drop for FolderWatcher {
         self.shutdown();
     }
 }
+
+/// Tear a retired watcher down on a thread of its own, and never wait for it.
+///
+/// Dropping a platform backend is not reliably prompt, and on macOS it is not
+/// reliably *finite*. `notify`'s FSEvents teardown spins
+///
+/// ```text
+/// while CFRunLoopIsWaiting(runloop) == 0 { thread::yield_now(); }
+/// ```
+///
+/// (`notify-8.2.0/src/fsevent.rs:338`) with no deadline and no sleep, and it is
+/// reached from `FsEventWatcher`'s own `Drop`. A run loop that is not parked
+/// when we ask is therefore waited for forever: one that has not yet entered
+/// `CFRunLoopRun` — the handle is published to us *before* the loop is entered
+/// (`fsevent.rs:477-495`) — or one that has already left it, for which
+/// `CFRunLoopIsWaiting` is false permanently. Linux hides all of this, which is
+/// why a green Linux run says nothing about it: `INotifyWatcher::drop`
+/// (`inotify.rs:606`) posts a shutdown message, wakes the poll, and returns
+/// without joining anything.
+///
+/// Nothing the engine does needs a finished teardown, and three things it does
+/// need must never wait for one: the supervisor tick replaces and retains
+/// watchers, the graceful shutdown stops all of them, and `remove_profile`
+/// drops one from an IPC thread. Blocking any of those on a backend that may
+/// never let go is how a folder watch takes the whole app down with it, which
+/// AD-34-11 forbids in as many words.
+///
+/// So the teardown gets its own named thread and nobody joins it. A wedged
+/// backend then wedges exactly one thread, and `sample`/`ps -T` finds it by
+/// name instead of the app simply stopping.
+fn retire(root: &Path, backend: Backend, rescan: Option<std::thread::JoinHandle<()>>) {
+    let label = backend.label();
+    let owned_root = root.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("keeper-sync-retire".to_owned())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            if let Some(handle) = rescan {
+                if handle.join().is_err() {
+                    tracing::warn!(root = %owned_root.display(), "rescan thread panicked");
+                }
+            }
+            backend.stop();
+            let elapsed = started.elapsed();
+            if elapsed >= RETIRE_WARN_AFTER {
+                tracing::warn!(
+                    root = %owned_root.display(),
+                    backend = label,
+                    elapsed_ms = elapsed.as_millis(),
+                    "folder watch took far too long to tear down"
+                );
+            } else {
+                tracing::debug!(
+                    root = %owned_root.display(),
+                    backend = label,
+                    "folder watch torn down"
+                );
+            }
+        });
+    if let Err(err) = spawned {
+        // The closure was dropped with the backend inside it, so the teardown
+        // has already happened inline on this thread — the one case where a
+        // caller does wait. Saying so is the point: a process that cannot
+        // create a thread has a larger problem than this watcher, and silence
+        // here would make the resulting stall unattributable.
+        tracing::error!(
+            root = %root.display(),
+            %err,
+            "could not spawn a watch-retirement thread; the watch was torn down inline"
+        );
+    }
+}
+
+/// `Send` is load-bearing rather than incidental: since AD-34-11 the engine
+/// holds one watcher per profile inside a `Mutex` on a value shared across tokio
+/// tasks, which makes `Mutex<..>: Sync` — and therefore this — a requirement.
+/// It comes from `notify`'s own `unsafe impl Send` for the platform backends, so
+/// it is asserted here, where those types live, rather than discovered as a
+/// baffling error about `Engine` after a dependency bump.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<FolderWatcher>();
+};
 
 /// Translate a `notify` failure into the engine's taxonomy.
 ///
@@ -848,6 +944,34 @@ mod tests {
         assert_eq!(watcher.root(), dir.path());
         assert!(watcher.suppressor().is_empty());
         watcher.stop();
+    }
+
+    #[test]
+    fn retiring_a_watcher_does_not_wait_for_its_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        // A four-second debounce gives the debouncer a one-second tick
+        // (`notify-debouncer-full` derives `tick = timeout / 4` and sleeps a
+        // whole tick per iteration), so a teardown that JOINS that thread takes
+        // up to a second on every platform — while a teardown that hands the
+        // backend to `retire` costs a thread spawn. That gap is the contract,
+        // and it is the one a re-added `join()` in `shutdown` would break, on
+        // Linux as well as on the macOS backend that cannot be bounded at all.
+        let config = WatchConfig {
+            debounce_ms: 4_000,
+            rescan_interval_ms: 0,
+            force_poll: false,
+        };
+        let watcher = FolderWatcher::start(dir.path(), config, tx).expect("watcher arms");
+
+        let started = Instant::now();
+        watcher.stop();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "stop() waited {elapsed:?} for the backend; the supervisor, the \
+             shutdown path and remove_profile all sit on this call"
+        );
     }
 
     #[test]

@@ -198,6 +198,7 @@ const DESKTOP_CAPABILITIES = {
   revealInFileManager: true,
   recording: false,
   sync: false,
+  overlayTitleBar: false,
 };
 
 function account(id: string): AccountVm {

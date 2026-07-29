@@ -11,7 +11,9 @@
  *
  * The list is *live*: the picker polls `list_sources` on a fixed interval (~3s)
  * while mounted and again on window focus, showing a subtle "refreshing…"
- * affordance during an in-flight enumeration, and stops polling on unmount.
+ * affordance during an in-flight enumeration, and stops polling on unmount. The
+ * focus re-enumeration is coalesced onto the trailing edge of one poll interval, so
+ * a focus burst costs one enumeration rather than one per event (AD-34-6).
  *
  * When an application is selected, an inline disclosure states the exclusion
  * plainly (recording voice, sentence case): only that app's windows land in the
@@ -27,6 +29,7 @@ import { useSystemAudioEnabled } from "@/lib/stores/recording-audio";
 import {
   isSameTarget,
   isSelectionAvailable,
+  RECORDING_SOURCE_POLL_MS,
   refreshRecordingSources,
   selectRecordingTarget,
   startRecordingSourcePolling,
@@ -132,18 +135,39 @@ export function RecordingSourcePicker({ active = true }: { active?: boolean }) {
   // is recording (`active === false`) or on unmount — otherwise a fresh
   // `keeper-rec` child would spawn every ~3s throughout an active recording. Also
   // re-enumerate on window focus (return-to-app), like the permission pre-flight.
+  //
+  // AD-34-6: the focus re-enumeration is COALESCED, not immediate. `focus` fires on
+  // the mousedown that begins a titlebar drag, and each enumeration spawns a fresh
+  // `keeper-rec`; a burst (focus/blur/focus, or a click-through into the window)
+  // therefore used to cost one process launch each, at exactly the moment the window
+  // is trying to move. Deferring to the trailing edge of one poll interval means a
+  // burst costs one enumeration, that enumeration never lands on the mousedown
+  // itself, and nothing is lost: the list is already re-read every
+  // `RECORDING_SOURCE_POLL_MS` while this effect is mounted, so the focus path only
+  // has to cover the case where the browser throttled or suspended that timer while
+  // the window sat in the background. Superseding is by monotonic token (the idiom
+  // `useRecordingPermission` uses for the same reason) — a queued refresh whose
+  // token has been outrun, including by unmount, is a no-op rather than a spawn.
   useEffect(() => {
     if (!active) {
       stopRecordingSourcePolling();
       return;
     }
     startRecordingSourcePolling();
+    let queued = 0;
     const onFocus = () => {
-      void refreshRecordingSources();
+      const token = ++queued;
+      setTimeout(() => {
+        if (token === queued) {
+          void refreshRecordingSources();
+        }
+      }, RECORDING_SOURCE_POLL_MS);
     };
     window.addEventListener("focus", onFocus);
     return () => {
       window.removeEventListener("focus", onFocus);
+      // Outrun every queued refresh so an unmount (or a Start) cannot spawn.
+      queued += 1;
       stopRecordingSourcePolling();
     };
   }, [active]);

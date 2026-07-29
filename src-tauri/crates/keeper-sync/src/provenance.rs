@@ -236,11 +236,173 @@ pub fn commit_message(subject: &str, body: &str, provenance: &Provenance) -> Str
     out
 }
 
-/// Generated commit subject: `sync(<profile>): 3 added, 1 modified, 1 deleted`.
+/// The placeholders a commit-subject template may name, without their braces.
+///
+/// Closed and small on purpose. A template is written once and then rides every
+/// commit that folder will ever make, so the set has to be short enough to
+/// document in one line of help text and stable enough that a profile written
+/// today still renders in a year. Only the SUBJECT is templatable — the trailer
+/// block is provenance, and a repository has to be able to trust its shape.
+pub const SUBJECT_PLACEHOLDERS: [&str; 5] = ["profile", "added", "modified", "deleted", "changed"];
+
+/// One piece of a parsed subject template.
+enum Piece<'a> {
+    /// Literal text, emitted as it stands.
+    Text(&'a str),
+    /// A `{name}` reference. Whether `name` is one keeper knows is the caller's
+    /// business: the renderer leaves an unknown one alone, the validator refuses
+    /// it, and both have to agree on what counts as a reference at all.
+    Placeholder(&'a str),
+}
+
+/// Split a template into literal text and `{name}` references.
+///
+/// The grammar is deliberately tiny and has NO escape sequence: `{`, one or more
+/// ASCII letters or underscores, `}` is a reference, and every other `{` is
+/// ordinary text. So a literal `{profile}` cannot be written — an acceptable
+/// trade in a one-line commit subject, and the reason the placeholder set is
+/// closed rather than open. One scanner, two consumers, so a template can never
+/// pass validation and then render as something else.
+fn pieces(template: &str) -> Pieces<'_> {
+    Pieces { rest: template }
+}
+
+struct Pieces<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Iterator for Pieces<'a> {
+    type Item = Piece<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        match self.rest.find('{') {
+            // No brace left: all that remains is literal.
+            None => Some(Piece::Text(std::mem::take(&mut self.rest))),
+            // A brace at the front: a reference, or a brace that is just a
+            // brace. Either way one piece is consumed, so this terminates.
+            Some(0) => {
+                let after = &self.rest[1..];
+                match placeholder_name(after) {
+                    Some(name) => {
+                        // `name.len()` is the offset of `}`, so +1 clears it.
+                        self.rest = &after[name.len() + 1..];
+                        Some(Piece::Placeholder(name))
+                    }
+                    None => {
+                        self.rest = after;
+                        Some(Piece::Text("{"))
+                    }
+                }
+            }
+            // Literal text up to the next brace; the brace is the next piece,
+            // whatever it turns out to be.
+            Some(open) => {
+                let (text, rest) = self.rest.split_at(open);
+                self.rest = rest;
+                Some(Piece::Text(text))
+            }
+        }
+    }
+}
+
+/// The placeholder name `after` opens with, when it opens with
+/// `<letters-or-underscores>}`.
+///
+/// The shape check is what separates a typo from a stray brace: `{Profile}` is
+/// shaped like a reference and is reported as an unknown one, while `{a{b}` is
+/// not shaped like one and stays literal text.
+fn placeholder_name(after: &str) -> Option<&str> {
+    let end = after.find('}')?;
+    let name = &after[..end];
+    (!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_')).then_some(name)
+}
+
+/// The first `{placeholder}` a template names that keeper does not know.
+///
+/// [`crate::profile::SyncProfile::validate`] calls this, so a typo is refused
+/// where the user can still see the field rather than riding into every commit
+/// the folder makes from then on. It returns the name rather than a bool so the
+/// message can say which one.
+pub fn unknown_subject_placeholder(template: &str) -> Option<&str> {
+    pieces(template).find_map(|piece| match piece {
+        Piece::Placeholder(name) if !SUBJECT_PLACEHOLDERS.contains(&name) => Some(name),
+        _ => None,
+    })
+}
+
+/// The generated commit subject: a profile's template, or the mechanical
+/// `sync(<profile>): 3 added, 1 modified, 1 deleted` when it has none.
+///
+/// An empty (or all-whitespace) template is the documented default and produces
+/// the mechanical subject byte for byte — that string is what a human scanning
+/// `git log` recognizes as a keeper commit, and it has been in every repository
+/// keeper has ever written to.
+///
+/// Two things a template cannot do, because a commit subject is exactly one
+/// line and must not be blank:
+///
+/// * **Span lines.** Newlines collapse to spaces, the same `sanitize` every
+///   trailer value goes through — a subject that ran on would turn the rest of
+///   itself into an unasked-for commit body.
+/// * **Render to nothing.** `{deleted}` alone on a commit that deleted nothing
+///   is legitimately empty, and an empty subject makes `git log --oneline`
+///   unreadable, so the mechanical subject stands in.
+///
+/// An unknown placeholder is left verbatim rather than dropped. `validate`
+/// refuses one on save and on load, so this is only reachable by a row that got
+/// in some other way — and a visible `{oops}` in `git log` is a bug report,
+/// while a silently deleted one is a mystery. A commit still happens either way:
+/// refusing to sync over the wording of a subject would be absurd.
+pub fn change_subject(
+    template: &str,
+    profile: &str,
+    added: usize,
+    modified: usize,
+    deleted: usize,
+) -> String {
+    if template.trim().is_empty() {
+        return mechanical_subject(profile, added, modified, deleted);
+    }
+    let mut out = String::with_capacity(template.len() + 32);
+    for piece in pieces(template) {
+        match piece {
+            Piece::Text(text) => out.push_str(text),
+            // The profile name goes in raw: the whole subject is sanitized
+            // below, which is where a newline in any part of it is collapsed.
+            Piece::Placeholder("profile") => out.push_str(profile),
+            Piece::Placeholder("added") => {
+                let _ = write!(out, "{added}");
+            }
+            Piece::Placeholder("modified") => {
+                let _ = write!(out, "{modified}");
+            }
+            Piece::Placeholder("deleted") => {
+                let _ = write!(out, "{deleted}");
+            }
+            Piece::Placeholder("changed") => {
+                let _ = write!(out, "{}", added + modified + deleted);
+            }
+            Piece::Placeholder(unknown) => {
+                let _ = write!(out, "{{{unknown}}}");
+            }
+        }
+    }
+    let subject = sanitize(&out);
+    if subject.is_empty() {
+        return mechanical_subject(profile, added, modified, deleted);
+    }
+    subject
+}
+
+/// `sync(<profile>): 3 added, 1 modified, 1 deleted`.
 ///
 /// Stable and mechanical on purpose — a human reading `git log` should be able
-/// to tell at a glance which commits the engine made.
-pub fn change_subject(profile: &str, added: usize, modified: usize, deleted: usize) -> String {
+/// to tell at a glance which commits the engine made. This is what an empty
+/// template means, so its bytes are a compatibility surface, not a detail.
+fn mechanical_subject(profile: &str, added: usize, modified: usize, deleted: usize) -> String {
     let mut parts = Vec::with_capacity(3);
     if added > 0 {
         parts.push(format!("{added} added"));
@@ -338,11 +500,126 @@ mod tests {
     #[test]
     fn subjects_describe_only_what_actually_changed() {
         assert_eq!(
-            change_subject("p", 3, 1, 1),
+            change_subject("", "p", 3, 1, 1),
             "sync(p): 3 added, 1 modified, 1 deleted"
         );
-        assert_eq!(change_subject("p", 0, 2, 0), "sync(p): 2 modified");
-        assert_eq!(change_subject("p", 0, 0, 0), "sync(p): no file changes");
+        assert_eq!(change_subject("", "p", 0, 2, 0), "sync(p): 2 modified");
+        assert_eq!(change_subject("", "p", 0, 0, 0), "sync(p): no file changes");
+    }
+
+    /// The regression that would go unnoticed: every repository keeper has ever
+    /// written to carries these bytes, and no profile has a template yet, so a
+    /// templating bug in the empty case reworks all of history's future.
+    #[test]
+    fn an_empty_template_reproduces_the_mechanical_subject_byte_for_byte() {
+        for (added, modified, deleted) in [(3, 1, 1), (0, 2, 0), (1, 0, 0), (0, 0, 0)] {
+            let mechanical = mechanical_subject("tgdrive", added, modified, deleted);
+            assert_eq!(
+                change_subject("", "tgdrive", added, modified, deleted),
+                mechanical
+            );
+            // Whitespace is not a template either: a field the user tabbed
+            // through must not reword every commit.
+            assert_eq!(
+                change_subject("  \t ", "tgdrive", added, modified, deleted),
+                mechanical
+            );
+        }
+    }
+
+    #[test]
+    fn a_template_substitutes_the_profile_name_and_the_counts() {
+        assert_eq!(
+            change_subject(
+                "{profile}: {changed} files ({added}/{modified}/{deleted})",
+                "tgdrive",
+                3,
+                1,
+                1
+            ),
+            "tgdrive: 5 files (3/1/1)"
+        );
+    }
+
+    /// Every documented placeholder must actually be wired into the renderer.
+    /// The set and the match arms are two lists that have to agree, and this is
+    /// what makes a name added to one but not the other fail.
+    #[test]
+    fn every_documented_placeholder_is_wired_up() {
+        for name in SUBJECT_PLACEHOLDERS {
+            // Padded so the render can never come out empty and fall back to
+            // the mechanical subject, which would mask an unwired name.
+            let template = format!("x{{{name}}}y");
+            let rendered = change_subject(&template, "p", 1, 2, 3);
+            assert_ne!(
+                rendered, template,
+                "{{{name}}} is documented but renders as itself"
+            );
+            assert!(
+                unknown_subject_placeholder(&template).is_none(),
+                "{{{name}}} is documented but the validator refuses it"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_placeholder_is_named_by_the_validator_and_left_alone_by_the_renderer() {
+        // Shaped like a reference, so a typo is caught rather than silently
+        // treated as decoration.
+        assert_eq!(
+            unknown_subject_placeholder("{Profile} moved"),
+            Some("Profile")
+        );
+        assert_eq!(unknown_subject_placeholder("{oops}"), Some("oops"));
+        // Reachable only by a row that skipped validation; a visible marker is
+        // a bug report, a dropped one is a mystery.
+        assert_eq!(change_subject("a {oops} b", "p", 0, 0, 0), "a {oops} b");
+    }
+
+    #[test]
+    fn a_brace_that_is_not_a_reference_is_ordinary_text() {
+        for template in ["{", "a{b", "{a b}", "{}", "{1}"] {
+            assert_eq!(
+                unknown_subject_placeholder(template),
+                None,
+                "{template} must not read as a placeholder"
+            );
+            assert_eq!(change_subject(template, "p", 0, 0, 0), template);
+        }
+        // The inner reference still resolves; only the stray brace is literal.
+        assert_eq!(change_subject("{a{profile}", "p", 0, 0, 0), "{ap");
+    }
+
+    #[test]
+    fn a_template_cannot_produce_a_second_line() {
+        // A subject that ran on would turn its own tail into a commit body, and
+        // a value containing a trailer key would land inside the trailer block.
+        let subject = change_subject("one\ntwo\rKeeper-Source: bot", "p", 1, 0, 0);
+        assert_eq!(subject.lines().count(), 1);
+        assert_eq!(subject, "one two Keeper-Source: bot");
+    }
+
+    #[test]
+    fn a_count_placeholder_always_renders_a_number_even_when_it_is_zero() {
+        // "{deleted} removed" must read "0 removed", not " removed". A
+        // placeholder named after a count is that count, always — anything else
+        // would have a template silently reshape itself around the commit.
+        assert_eq!(
+            change_subject("{deleted} removed", "p", 1, 0, 0),
+            "0 removed"
+        );
+    }
+
+    #[test]
+    fn a_template_that_renders_to_nothing_falls_back_to_the_mechanical_subject() {
+        // `git log --oneline` on a blank subject is unreadable, so a render that
+        // comes out empty is refused rather than committed. Counts cannot cause
+        // this (see above); a profile whose name is all whitespace can.
+        assert_eq!(
+            change_subject("{profile}", "  ", 1, 0, 0),
+            "sync(): 1 added"
+        );
+        assert_eq!(change_subject("   ", "p", 1, 0, 0), "sync(p): 1 added");
     }
 
     #[test]
