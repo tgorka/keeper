@@ -8,6 +8,7 @@
  */
 import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
@@ -2061,6 +2062,38 @@ export async function debugModeSet(enabled: boolean): Promise<void> {
   await invoke("debug_mode_set", { enabled });
 }
 
+/** Which stage of an app-driven title-bar drag is being reported (Story 34.3). */
+export type TitlebarDragStage = "issued" | "accepted" | "refused";
+
+/**
+ * Start dragging the window from the current mouse-down (Story 34.3).
+ *
+ * The same `plugin:window|start_dragging` command Tauri's `data-tauri-drag-region`
+ * shim invokes, called explicitly so its outcome is observable: the shim drops the
+ * promise, which is why a refused drag is silent today. Issues the IPC message
+ * synchronously — nothing is awaited before the call — because on macOS the window
+ * layer only honours the drag for the mouse event it is currently processing.
+ *
+ * Rejects with whatever the window plugin rejects with: a bare string for an ACL
+ * denial (`window.start_dragging not allowed. …`), never the {@link IpcError}
+ * envelope, so this deliberately skips the {@link invoke} normalization.
+ */
+export async function startWindowDragging(): Promise<void> {
+  await getCurrentWindow().startDragging();
+}
+
+/**
+ * Record one stage of an app-driven title-bar drag in the app log (Story 34.3).
+ *
+ * Diagnostic-only, and the only frontend path into `~/Library/Logs/keeper/keeper.log`:
+ * Rust authors the log text, `detail` carries a refusal message. Rejects with the
+ * {@link IpcError} envelope; callers swallow it — a report must never be the thing
+ * that breaks a drag.
+ */
+export async function titlebarDragReport(stage: TitlebarDragStage, detail?: string): Promise<void> {
+  await invoke<void>("titlebar_drag_report", { stage, detail: detail ?? null });
+}
+
 export async function menuBarPresenceGet(): Promise<boolean> {
   return await invoke<boolean>("menu_bar_presence_get");
 }
@@ -2488,6 +2521,26 @@ export async function syncVerify(id: string): Promise<string[]> {
 }
 
 /**
+ * Open a synced folder in the OS file manager (Finder on macOS).
+ *
+ * Takes the profile id, never a path: Rust reads the folder off the stored
+ * profile, so this cannot be used to open an arbitrary location on disk the way
+ * {@link revealPath} can. That one stays for a path the frontend already
+ * legitimately holds -- an export it just produced -- and sync does not widen
+ * it.
+ *
+ * Gate the affordance on `capabilities.revealInFileManager`: a platform with no
+ * user-visible file manager rejects rather than doing nothing.
+ *
+ * Rejects with: `internal` (no such profile, the folder is gone or its volume
+ * is not attached, the file manager refused). The message names the folder and
+ * the next step, so it is worth showing verbatim.
+ */
+export async function syncOpenPath(id: string): Promise<void> {
+  await invoke<void>("sync_open_path", { id });
+}
+
+/**
  * Read the newest recorded activity for a profile -- what sync has actually
  * done to which files, newest first.
  *
@@ -2549,8 +2602,8 @@ export async function syncRetryParked(id: string, unitId: number): Promise<void>
  * Store an access token for a profile in the OS keychain.
  *
  * The token goes straight to the keychain under a key derived from the profile
- * id -- never into the config file, never into `sync.db`. It can be read back,
- * but only through {@link syncGetCredential}, which nothing calls on its own.
+ * id -- never into the config file, never into `sync.db`. It can be read back
+ * through {@link syncGetCredential}, which the edit form calls as it opens.
  *
  * Rejects with: `unsupported`, `internal` (no such profile, keychain refusal).
  */
@@ -2562,9 +2615,11 @@ export async function syncSetCredential(id: string, token: string): Promise<void
  * Read a profile's stored access token out of the OS keychain.
  *
  * Resolves `null` when the profile has no stored token, which is an ordinary
- * state rather than a failure -- a public remote needs none. Call this only
- * from an explicit user action: no secret may reach the UI as a side effect of
- * loading a profile, and {@link SyncProfileVm} carries none for that reason.
+ * state rather than a failure -- a public remote needs none. The edit form
+ * calls this as it opens, so the field arrives holding the stored token
+ * (Story 34.12, overriding AD-34-7). {@link SyncProfileVm} still carries no
+ * token: a profile list is read for every folder at once and on a poll, and a
+ * secret has no business in it.
  *
  * Rejects with: `unsupported`, `internal` (no such profile, keychain refusal).
  */

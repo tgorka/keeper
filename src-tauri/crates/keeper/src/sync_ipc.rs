@@ -952,16 +952,24 @@ pub async fn sync_device_set_label(
     Ok(engine.device().into())
 }
 
+/// Find `id` among the stored profiles, or report it as a config error naming
+/// the id.
+///
+/// Pure over the list so the refusal of an id nothing stored is testable
+/// without an engine behind it — the property [`sync_open_path`] leans on.
+fn find_profile<'a>(profiles: &'a [SyncProfile], id: &str) -> Result<&'a SyncProfile, IpcError> {
+    profiles
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| sync_ipc_error(&SyncError::Config(format!("no such sync profile: {id}"))))
+}
+
 /// Resolve a profile by id, or report it as a config error naming the id.
 fn profile_by_id(state: &AppState, id: &str) -> Result<keeper_sync::SyncProfile, IpcError> {
     let engine =
         crate::sync::engine(Arc::clone(&state.platform)).map_err(|e| sync_ipc_error(&e))?;
-    engine
-        .list_profiles()
-        .map_err(|e| sync_ipc_error(&e))?
-        .into_iter()
-        .find(|p| p.id == id)
-        .ok_or_else(|| sync_ipc_error(&SyncError::Config(format!("no such sync profile: {id}"))))
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    find_profile(&profiles, id).cloned()
 }
 
 /// Re-read a profile's tracked files and report the ones that failed.
@@ -983,6 +991,76 @@ pub async fn sync_verify(
         .into_iter()
         .map(|(path, reason)| format!("{path}: {reason}"))
         .collect())
+}
+
+/// An `IpcError` carrying a message written for the person who will read it.
+///
+/// Sync's errors normally funnel through [`sync_ipc_error`], which takes the
+/// wording from the `SyncError`'s own `Display`. The open path has none to take:
+/// a folder that is not on disk is not a failure the engine raised, and
+/// `SyncError::Config`'s "invalid sync configuration" prefix would blame the
+/// settings for a volume that is merely unplugged. Non-retriable, because
+/// nothing changes until someone plugs the media back in or moves the folder
+/// back.
+fn open_failure(message: String) -> IpcError {
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message,
+        account_id: None,
+        retriable: false,
+    }
+}
+
+/// Why this profile's folder cannot be opened, and what to do about it.
+///
+/// Both cases have to be said out loud, and they need different next steps: a
+/// removable profile binds to media that gets unplugged (AD-48), which is a
+/// pause rather than a fault, while a fixed folder that is gone was moved or
+/// deleted outside keeper and needs the profile re-pointed. Reporting either as
+/// a silent no-op — the shape a bare `reveal_item_in_dir` failure would take —
+/// leaves a person clicking a path that does nothing.
+fn unavailable_sentence(profile: &SyncProfile) -> String {
+    let next_step = if profile.removable {
+        "This folder lives on removable media — reattach the volume, then open it again."
+    } else {
+        "It was moved, renamed or deleted outside keeper — use Edit folder to point keeper at it."
+    };
+    format!("{} is not there. {next_step}", profile.local_path.display())
+}
+
+/// Open a profile's folder in the OS file manager (Story 32.4).
+///
+/// Takes the profile id and nothing else. The folder comes from the stored
+/// profile, resolved here, so this command cannot be used to open an arbitrary
+/// location: a webview that asked for `/etc` would have to have persuaded the
+/// engine to store a profile pointing there first. `reveal_path` remains the
+/// command for a path the frontend legitimately already holds (an export it
+/// just produced); sync deliberately does not widen that reach, because the
+/// only path it has to offer is one it can look up itself.
+///
+/// Reveals through the same `tauri_plugin_opener::reveal_item_in_dir` seam as
+/// the recordings folder, the export reveal and the tray, so keeper has one way
+/// of showing a folder rather than a second one that could behave differently.
+///
+/// Rejects with: `internal` (no such profile, the folder is gone or its volume
+/// is not attached, the file manager refused).
+#[tauri::command]
+pub async fn sync_open_path(state: tauri::State<'_, AppState>, id: String) -> Result<(), IpcError> {
+    let engine = engine_of(&state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    let profile = find_profile(&profiles, &id)?;
+    // Checked before the reveal, not left to it: the plugin fails the same way
+    // whether the volume is out or the folder was deleted, and on some platforms
+    // it succeeds at showing an empty window instead.
+    if !profile.local_path.is_dir() {
+        return Err(open_failure(unavailable_sentence(profile)));
+    }
+    tauri_plugin_opener::reveal_item_in_dir(&profile.local_path).map_err(|e| {
+        open_failure(format!(
+            "could not open {} in the file manager: {e}",
+            profile.local_path.display()
+        ))
+    })
 }
 
 /// One streamed progress update (Story 29.1, AD-51).
@@ -1573,5 +1651,74 @@ mod tests {
         };
         assert_eq!(outcome_line(&ran_everything), NOTHING_TO_SYNC);
         assert!(!outcome_line(&ran_everything).contains("push"));
+    }
+
+    /// Story 32.4. The command takes an id and looks the folder up, which is the
+    /// whole reason it is not `reveal_path(path)`: the frontend cannot name a
+    /// path here, so it cannot open one keeper does not already sync.
+    #[test]
+    fn opening_a_folder_takes_the_path_from_the_stored_profile() {
+        let profiles = vec![
+            SyncProfile::new("p1", "tgdrive", "/Users/alice/tgdrive", "u1"),
+            SyncProfile::new("p2", "notes", "/Users/alice/notes", "u2"),
+        ];
+        let found = find_profile(&profiles, "p2").expect("p2 is stored");
+        assert_eq!(found.local_path.to_str(), Some("/Users/alice/notes"));
+    }
+
+    /// An id nothing stored is refused rather than resolved to the first profile
+    /// or to a default, either of which would open a folder nobody asked for.
+    #[test]
+    fn opening_an_unknown_profile_is_refused_and_names_the_id() {
+        let profiles = vec![SyncProfile::new(
+            "p1",
+            "tgdrive",
+            "/Users/alice/tgdrive",
+            "u1",
+        )];
+        let err = find_profile(&profiles, "nope").expect_err("must refuse");
+        assert_eq!(err.code, IpcErrorCode::Internal);
+        assert!(err.message.contains("nope"), "the message names the id");
+        assert!(!err.retriable);
+        assert!(
+            find_profile(&[], "p1").is_err(),
+            "an empty store refuses rather than falling back"
+        );
+    }
+
+    /// A folder that is not on disk has to say what to do about it, and the two
+    /// cases do not say the same thing: removable media is unplugged and comes
+    /// back (AD-48), a fixed folder was moved and has to be re-pointed. Neither
+    /// may be a silent no-op.
+    #[test]
+    fn an_absent_folder_reports_something_a_person_can_act_on() {
+        let fixed = SyncProfile::new("p1", "notes", "/Users/alice/notes", "u1");
+        let moved = unavailable_sentence(&fixed);
+        assert!(moved.contains("/Users/alice/notes"), "names the folder");
+        assert!(
+            moved.contains("Edit folder"),
+            "names the control that re-points it"
+        );
+
+        let mut stick = SyncProfile::new("p2", "field", "/Volumes/stick/field", "u2");
+        stick.removable = true;
+        let detached = unavailable_sentence(&stick);
+        assert!(
+            detached.contains("/Volumes/stick/field"),
+            "names the folder"
+        );
+        assert!(
+            detached.contains("reattach"),
+            "says to plug the volume back in"
+        );
+        assert_ne!(
+            detached, moved,
+            "a detached volume and a deleted folder need different next steps"
+        );
+
+        // Non-retriable either way: nothing changes until a person acts.
+        let err = open_failure(detached);
+        assert_eq!(err.code, IpcErrorCode::Internal);
+        assert!(!err.retriable);
     }
 }

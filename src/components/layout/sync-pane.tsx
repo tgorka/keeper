@@ -60,6 +60,7 @@ import {
   SYNC_REMOVE_CONFIRM_TITLE,
   SYNC_REMOVE_LABEL,
   SYNC_RESUME_LABEL,
+  SyncFolderPath,
   syncRemoteHost,
 } from "@/components/settings/sync-section";
 import { AddFolderForm, SYNC_ADD_TITLE, SYNC_EDIT_TITLE } from "@/components/sync/add-folder-form";
@@ -706,9 +707,11 @@ function SyncProfileCard({
                 muted lines under an already-muted status line read as one grey
                 block with no shape to it. */}
             <p className="flex min-w-0 items-baseline gap-1.5 text-muted-foreground text-xs">
-              <span className="truncate font-mono" title={profile.localPath}>
-                {profile.localPath}
-              </span>
+              <SyncFolderPath
+                profile={profile}
+                className="min-w-0 truncate font-mono"
+                onError={setActionError}
+              />
               <span aria-hidden="true">·</span>
               <span className="shrink-0">{syncRemoteHost(profile.remoteUrl)}</span>
             </p>

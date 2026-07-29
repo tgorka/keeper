@@ -142,3 +142,103 @@ The third mechanism the epic proposed — defaulting the shared `Select` wrapper
 **Commands for the caller to run:** `cargo test -p keeper`, `cargo clippy --all-targets`, `cargo fmt --check`, `bun run check`.
 
 **Manual check still owed (from the epic, macOS-only):** on hesperia, with the Recording tab active, drag the window by its titlebar band and confirm it moves as readily as on the Sync tab — including while a session is live and the ~1 Hz poll is running, and immediately after repeatedly opening and closing the fps and mic Selects. This is the only confirmation that closes the story; the reasoning above narrows the cause to mechanisms 1 and 2 but does not observe the fix.
+
+---
+
+## Follow-up 2026-07-29 — the epic was wrong twice, and the real cause is an ACL grant
+
+Everything above this heading is left as written. This section records what measurement found
+afterwards, and what was changed on top.
+
+### What the epic got wrong
+
+**1. It is not Recording-specific.** Measured on macOS 26.5 (Tahoe, arm64) with the window pinned to
+(200, 200, 1280x800) and its position read back from a full-screen capture: window **inactive** →
+a click-drag on the band moves it; window **active** → it does not move. Both outcomes reproduce on
+the **Chats** tab as well as the Recording tab (x stayed at 200 in both active runs). Chats spawns no
+sidecar and calls no synchronous filesystem command, so mechanism A — main-thread stalls, the whole
+premise of AD-34-5 as a *drag* fix — cannot explain the symptom. The `async`-ification above remains
+correct work on its own terms (a `read_dir` on the main thread is a defect regardless), but it was
+not the cause of what the user reported. The user perceived it as Recording-only; measurement says
+every tab.
+
+**2. The `pointer-events` theory is refuted, not merely unconfirmed.** With the window active, a real
+foreground mouse click on a sidebar nav item lands and switches the view — impossible if
+`document.body` were `pointer-events: none`. The drag also failed with no `Select` ever opened. The
+`select.tsx` hardening stays (it is right on its own smaller merit: a body lock must never outlast
+the open state), but its doc comment overstated the case as causation and now says the opposite.
+
+### The measured rule, and the mechanism that produces it
+
+`data-tauri-drag-region` is not a browser feature. It is a shim Tauri injects
+(`crates/tauri/src/window/scripts/drag.js`): a **bubble-phase `document` `mousedown` listener** that
+calls `window.__TAURI_INTERNALS__.invoke('plugin:window|start_dragging')` and **drops the returned
+promise**. That command is ACL-gated, and `core:window:default` — the set this app inherits through
+`core:default` — **does not contain `allow-start-dragging`**. Tauri's own custom-titlebar guide adds
+`core:window:allow-start-dragging` as a separate, explicit line for exactly this reason. Neither
+`capabilities/default.json` nor `capabilities/desktop.json` granted it.
+
+So every webview-initiated drag this app has ever asked for was denied before it reached AppKit, and
+denied *silently*, because the shim was not holding the promise that carried the denial. That
+predicts the measured rule exactly:
+
+- **Window inactive.** `WKWebView` does not accept the first mouse, so the click never reaches the
+  DOM; AppKit activates and drags the window natively through the transparent title bar that
+  `titleBarStyle: "Overlay"` keeps. No IPC, no ACL, no shim. **Moves.**
+- **Window active.** The click reaches the DOM, and the shim is the only path to a drag → denied →
+  nothing happens, nothing is logged, nothing rejects loudly. **Does not move.**
+
+It also predicts what the epic could not: tab-independence, macOS-version-independence, and the total
+absence of any trace anywhere.
+
+**A prediction that can be checked on the shipped 0.6.3 build, with no rebuild.** The same shim
+listener also implements double-click-to-zoom, and it does that through
+`plugin:window|internal_toggle_maximize` — which `core:window:default` **does** include. So with the
+window active, on the current build: **double-clicking the band should zoom the window while
+dragging it does nothing.** Same listener, same event, same IPC path; the only difference is which of
+the two commands the ACL allows. If that holds, the diagnosis is confirmed before a single line is
+compiled. If double-click does nothing either, the event is not reaching the shim at all and the
+`handler never fired` row of the table below is where the next build's log will land.
+
+### What changed
+
+- `src-tauri/crates/keeper/capabilities/desktop.json` — grants `core:window:allow-start-dragging`.
+  **This is the fix.** Desktop-scoped because window dragging is meaningless on iOS, and least
+  privilege is what a capability file is for.
+- `src-tauri/crates/keeper/src/ipc.rs` — new `titlebar_drag_report(stage, detail)` command: the
+  frontend's only path into `~/Library/Logs/keeper/keeper.log`. `WARN`, deliberately — the file leg
+  admits `WARN`/`ERROR` regardless of the debug-mode toggle, and that toggle is off by default, so an
+  `INFO` line would exist only on a stderr nobody reads. Registered in `lib.rs` in the single
+  `generate_handler!` list.
+- `src/lib/ipc/client.ts` — `startWindowDragging()` (`getCurrentWindow().startDragging()`, i.e. the
+  same `plugin:window|start_dragging`) and `titlebarDragReport()`.
+- `src/lib/titlebar-drag.ts` (new) — `beginTitleBarDrag()`: issue the drag, then report `issued`,
+  then `accepted` or `refused` with the refusal text verbatim.
+- `src/components/layout/app-shell.tsx` — `onMouseDown` on both band columns: primary button, direct
+  hit, opening click only; `preventDefault` + `stopPropagation` so exactly one `start_dragging` is
+  issued per gesture and the outcome is attributable to it. Both columns keep
+  `data-tauri-drag-region`: where the handler does not run, the shim behaves as before.
+- Tests: `src/lib/titlebar-drag.test.ts` (5 — synchronous issue before any await, both outcomes, ACL
+  string preserved verbatim, never rejects) and three added to `app-shell.test.tsx` (drag asked for
+  on both columns; secondary/middle/double-click ignored; the document-level shim is bypassed, proven
+  non-vacuously).
+
+### What the next install tests, and how to read it
+
+Two things can refuse this drag and only one of them was fixed here. The second — AppKit honouring
+`performWindowDragWithEvent:` only while `NSApp.currentEvent` is still the mouse-down being
+processed, which an asynchronous IPC hop cannot guarantee — is a race the frontend can narrow but not
+close. That is what the log lines are for. `grep 'titlebar drag' ~/Library/Logs/keeper/keeper.log`
+after dragging the band with the window **active**:
+
+| Log | Window | Conclusion |
+|-----|--------|------------|
+| nothing at all | did not move | The handler never fired: the `mousedown` never reached React. Look at event delivery (band geometry, an overlay, first-mouse), not at the drag command. |
+| `issued` only | did not move | The call went out and never came back — the Rust side never answered (`start_dragging` blocking the main thread inside the nested AppKit drag loop is the candidate). |
+| `issued` + `REFUSED detail=…` | did not move | Read `detail`. If it still names `core:window:allow-start-dragging`, the capability edit did not reach the built app (stale `gen/schemas`, wrong capability file, unsigned rebuild). Anything else is a new, named failure. |
+| `issued` + `accepted` | did not move | The ACL is fixed and AppKit declined anyway — the `currentEvent` race, i.e. the upstream Tahoe-plausible half. Next step is Rust-side: capture the mouse-down event and drag from it, or drop to `isMovableByWindowBackground`. |
+| `issued` + `accepted` | **moved** | Fixed, and it was the ACL. Drop `titlebar_drag_report` and its frontend caller; keep the capability grant and the explicit handler (it is what makes the failure visible next time). |
+
+**Not verified here:** `cargo build`/`clippy`/`nextest` cannot run on the Linux box (tauri needs
+GTK), so the new command is reasoned-and-reread, not compiled. `bun run typecheck`, `bun run lint`
+and `bun run test` were run: 145 files, 1655 tests, all passing.

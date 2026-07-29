@@ -14,6 +14,13 @@ notarization material lives in GitHub Actions secrets — never in the repositor
 
 Configure these under **Settings → Secrets and variables → Actions**.
 
+**All of them are required.** The release job's second step names every missing Apple secret
+and fails in seconds; it does not fall back to an unsigned build. That fallback existed until
+2026-07-29 and is why v0.4.0–v0.4.2 published Gatekeeper-rejected artifacts behind a green run
+(DW-113). An ad-hoc-signed build is also keychain-incompatible with a signed one — its identity
+is a cdhash that changes on every build — so shipping one costs the user their stored accounts
+on the next update.
+
 ### Developer ID signing
 
 | Secret | What it is |
@@ -96,12 +103,10 @@ Because `externalBin` binaries are copied into the app bundle as-is and must alr
 valid signature before notarization (tauri#11992), the sidecar is **built and codesigned before
 the app bundle** in the release workflow:
 
-- **Signed path:** the Developer ID certificate is imported into a temp keychain, then
-  `bun run rec:build` builds the sidecar and `codesign --force --options runtime --entitlements
-  src-tauri/crates/keeper/keeper-rec.entitlements --sign "$APPLE_SIGNING_IDENTITY"` signs it with
-  the hardened runtime — all *before* the `tauri-action` step bundles and notarizes the app.
-- **Unsigned path:** `bun run rec:build` builds the sidecar and it is ad-hoc-signed
-  (`codesign --force --options runtime -s -`) before `tauri build`.
+The Developer ID certificate is imported into a temp keychain, then `bun run rec:build` builds
+the sidecar and `codesign --force --options runtime --entitlements
+src-tauri/crates/keeper/keeper-rec.entitlements --sign "$APPLE_SIGNING_IDENTITY"` signs it with
+the hardened runtime — all *before* the `tauri-action` step bundles and notarizes the app.
 
 Locally, `bun run rec:build` is chained into `bun run tauri:dev` and `bun run tauri:build`, so the
 sidecar is always freshly built into `binaries/` before Tauri consults `externalBin` (the built

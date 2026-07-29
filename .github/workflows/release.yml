@@ -40,6 +40,47 @@ jobs:
           fi
           echo "tag $REF matches the app version"
 
+      # An unsigned macOS build is not a lesser release, it is a broken one. Gatekeeper
+      # rejects it, and because an ad-hoc signature's identity is a cdhash that changes on
+      # every build, it cannot read keychain items an earlier build wrote — so each update
+      # would silently sign the user out. v0.4.0, v0.4.1 and v0.4.2 all shipped that way
+      # behind a green run, an "(unsigned build)" title on a draft nobody opens and a
+      # `::notice::` nobody reads, which is why the owner's Mac runs a locally-signed build
+      # instead of a release artifact. So signing is required, and missing material is named
+      # here, in seconds, for the same reason the tag check above does it here: a build that
+      # can only ship a lie should not take 16 minutes to say so. Every notarization secret
+      # counts, not just the certificate — tauri-action skips notarization silently when the
+      # API-key trio is incomplete, which is the same defect wearing a different hat. The
+      # keeper-syncd job below is unaffected: it is ordered after this one with
+      # `if: always()`, so a Linux box still gets its daemon.
+      - name: Apple signing material must be present
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          # Named one per line rather than looped over indirect expansion: the runner's
+          # bash is 3.2, where `${#arr[@]}` on an empty array trips `set -u`, and a gate
+          # this load-bearing has to be correct by reading. Only the NAME is ever echoed.
+          missing=""
+          [ -n "${APPLE_CERTIFICATE:-}" ] || missing="$missing APPLE_CERTIFICATE"
+          [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ] || missing="$missing APPLE_CERTIFICATE_PASSWORD"
+          [ -n "${APPLE_SIGNING_IDENTITY:-}" ] || missing="$missing APPLE_SIGNING_IDENTITY"
+          [ -n "${KEYCHAIN_PASSWORD:-}" ] || missing="$missing KEYCHAIN_PASSWORD"
+          [ -n "${APPLE_API_ISSUER:-}" ] || missing="$missing APPLE_API_ISSUER"
+          [ -n "${APPLE_API_KEY_ID:-}" ] || missing="$missing APPLE_API_KEY_ID"
+          [ -n "${APPLE_API_KEY_P8_BASE64:-}" ] || missing="$missing APPLE_API_KEY_P8_BASE64"
+          if [ -n "$missing" ]; then
+            echo "::error::this release cannot be signed or notarized — missing secrets:$missing. Add them per docs/release.md and re-run this workflow. Nothing is published unsigned."
+            exit 1
+          fi
+          echo "every Apple signing and notarization secret is present"
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -58,23 +99,13 @@ jobs:
       # the base64-encoded .p8; decode it to a file that tauri-action can read. Note
       # the secret is named APPLE_API_KEY_P8_BASE64 (not APPLE_API_KEY) so it never
       # collides with the APPLE_API_KEY env var below, which is the Key ID string.
-      # Signing/notarization is OPTIONAL: with no Apple secrets configured the release
-      # still builds and publishes an UNSIGNED (ad-hoc) bundle, clearly labeled. Add the
-      # secrets (docs/release.md) to get Developer ID signing + notarization.
-      - name: Detect Apple signing secrets
-        id: signing
+      # It is present unconditionally: the gate above already failed the job otherwise.
+      - name: Decode the notarization API key
         env:
           APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
         run: |
           set -euo pipefail
-          if [ -n "$APPLE_API_KEY_BASE64" ] && [ -n "$APPLE_CERTIFICATE" ]; then
-            echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/api_key.p8"
-            echo "signed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "signed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Apple signing secrets absent — publishing an unsigned (ad-hoc) build."
-          fi
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/api_key.p8"
 
       # Build + codesign the keeper-rec capture sidecar BEFORE tauri-action bundles
       # and notarizes the app (the externalBin notarization rough edge, tauri#11992):
@@ -83,27 +114,18 @@ jobs:
       # the Developer ID cert into a temp keychain (reusing the existing signing
       # secrets), build the sidecar, then sign it in place. tauri-action reuses the same
       # login keychain for its own signing, so the identity remains available to it.
-      - name: Import Developer ID certificate (signed path)
-        if: steps.signing.outputs.signed == 'true'
+      - name: Import Developer ID certificate
         uses: apple-actions/import-codesign-certs@v3
         with:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           keychain-password: ${{ secrets.KEYCHAIN_PASSWORD }}
 
-      - name: Build & codesign keeper-rec sidecar (signed path)
-        if: steps.signing.outputs.signed == 'true'
+      - name: Build & codesign keeper-rec sidecar
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
-          # `signed==true` only guarantees the cert + notarization key are present;
-          # the identity string is a separate secret. Fail clearly if it's unset
-          # rather than letting `codesign --sign ""` produce an ambiguous error.
-          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
-            echo "error: APPLE_SIGNING_IDENTITY is empty on the signed path." >&2
-            exit 1
-          fi
           bun run rec:build
           BIN="src-tauri/crates/keeper/binaries/keeper-rec-aarch64-apple-darwin"
           codesign --force --options runtime \
@@ -111,8 +133,7 @@ jobs:
             --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
           codesign -dv --verbose=2 "$BIN"
 
-      - name: Build, sign, notarize, and publish release (signed path)
-        if: steps.signing.outputs.signed == 'true'
+      - name: Build, sign, notarize, and publish release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -139,125 +160,6 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: --config src-tauri/crates/keeper/tauri.conf.json --target aarch64-apple-darwin
-
-      # Unsigned path: plain ad-hoc build (no keychain import, no notarization), DMG via
-      # hdiutil (bundle_dmg AppleScript styling is flaky headless), draft release via gh.
-      - name: Build unsigned (ad-hoc) bundle
-        if: steps.signing.outputs.signed == 'false'
-        env:
-          # Updater (minisign) signing is independent of Apple codesigning: when the
-          # keypair secrets exist, even Apple-unsigned builds ship signed updater
-          # artifacts + latest.json, so in-app auto-update works. Without them the
-          # build falls back to no updater artifacts (first bootstrap releases).
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # "-" = ad-hoc codesign during bundling, so the updater tar.gz contains the
-          # final (ad-hoc-signed) app rather than an unsigned one.
-          APPLE_SIGNING_IDENTITY: "-"
-        run: |
-          set -euo pipefail
-          # Build the keeper-rec sidecar and ad-hoc-sign it (hardened runtime) before
-          # tauri build bundles it via externalBin — mirrors the signed path, minus a
-          # Developer ID identity. macOS 15+ rejects ad-hoc SCK at runtime (Cap #1722),
-          # but that only affects real capture, not this bundling/handshake stub.
-          bun run rec:build
-          REC_BIN="src-tauri/crates/keeper/binaries/keeper-rec-aarch64-apple-darwin"
-          # Entitlements are REQUIRED under the hardened runtime even ad-hoc:
-          # without audio-input/camera TCC refuses to even post the mic/camera
-          # prompts (found live on macOS 26, story 20.5/20.6).
-          codesign --force --options runtime \
-            --entitlements src-tauri/crates/keeper/keeper-rec.entitlements \
-            -s - "$REC_BIN"
-          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            bun run tauri build --config src-tauri/crates/keeper/tauri.conf.json --target aarch64-apple-darwin --bundles app
-          else
-            bun run tauri build --config src-tauri/crates/keeper/tauri.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --target aarch64-apple-darwin --bundles app
-          fi
-          BUNDLE="src-tauri/target/aarch64-apple-darwin/release/bundle/macos"
-          APP="$BUNDLE/keeper.app"
-          # Re-assert the app seal WITH entitlements (tauri signs with them via
-          # bundle.macOS.entitlements; this is belt-and-braces for older caches).
-          codesign --force --options runtime \
-            --entitlements src-tauri/crates/keeper/keeper-rec.entitlements \
-            -s - "$APP"
-          # `hdiutil` needs room for a whole second copy of the app, and by this
-          # point the runner's disk is nearly full: the cached registry plus this
-          # workspace's Rust intermediates dominate a macOS runner's ~14 GB. Both
-          # v0.4.1 attempts died here with "hdiutil: create failed - No space left
-          # on device" AFTER a clean 16-minute build — the bundle was fine, only
-          # the packaging had nowhere to go. Compilation is finished and the .app
-          # is already bundled, so the object files that got us here are dead
-          # weight; `bundle/` is a sibling of these and is untouched.
-          BUILT="src-tauri/target/aarch64-apple-darwin/release"
-          rm -rf "$BUILT/deps" "$BUILT/build" "$BUILT/incremental" \
-                 src-tauri/target/release/deps src-tauri/target/release/build \
-                 src-tauri/target/release/incremental
-          df -h / | tail -1
-          VERSION="${GITHUB_REF_NAME#v}"
-          # Size the image explicitly. Left to itself, `hdiutil create -srcfolder`
-          # derives the size from the source and UNDER-allocates for a bundle made
-          # of many small files, because APFS metadata inside the image is not in
-          # that estimate. The failure is ENOSPC while copying into
-          # /Volumes/keeper — with the host disk nearly empty, which is what made
-          # v0.6.0 fail three lines after `df` reported 95 GiB free. It is
-          # intermittent only because it depends on the bundle crossing a
-          # threshold, so it will keep coming back as the app grows.
-          APP_KB=$(du -sk "$APP" | cut -f1)
-          DMG_KB=$(( APP_KB * 16 / 10 + 65536 ))
-          echo "app ${APP_KB}KB -> image ${DMG_KB}KB"
-          hdiutil create -volname "keeper" -srcfolder "$APP" -ov -format UDZO \
-            -size "${DMG_KB}k" "keeper_${VERSION}_aarch64.dmg"
-          ditto -c -k --keepParent "$APP" "keeper_${VERSION}_aarch64_app.zip"
-          # Updater artifacts (only when the signing key was present): normalize names
-          # and compose latest.json for the tauri-plugin-updater endpoint
-          # (.../releases/latest/download/latest.json).
-          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            TARBALL=$(find "$BUNDLE" -maxdepth 1 -name "keeper*.app.tar.gz" | head -1)
-            SIGFILE="$TARBALL.sig"
-            cp "$TARBALL" "keeper_${VERSION}_aarch64.app.tar.gz"
-            cp "$SIGFILE" "keeper_${VERSION}_aarch64.app.tar.gz.sig"
-            SIGNATURE=$(cat "$SIGFILE")
-            PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/keeper_${VERSION}_aarch64.app.tar.gz"
-            SIGNATURE="$SIGNATURE" URL="$URL" VERSION="$VERSION" PUB_DATE="$PUB_DATE" python3 - <<'PY'
-          import json, os
-          json.dump({
-              "version": os.environ["VERSION"],
-              "notes": "keeper release",
-              "pub_date": os.environ["PUB_DATE"],
-              "platforms": {
-                  "darwin-aarch64": {
-                      "signature": os.environ["SIGNATURE"],
-                      "url": os.environ["URL"],
-                  }
-              },
-          }, open("latest.json", "w"), indent=2)
-          PY
-          fi
-
-      - name: Publish unsigned draft release
-        if: steps.signing.outputs.signed == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          ASSETS=("keeper_${VERSION}_aarch64.dmg" "keeper_${VERSION}_aarch64_app.zip")
-          [ -f latest.json ] && ASSETS+=("keeper_${VERSION}_aarch64.app.tar.gz" "keeper_${VERSION}_aarch64.app.tar.gz.sig" "latest.json")
-          # `gh release create` does NOT fail when a DRAFT already exists for this
-          # tag — a draft carries no tag server-side, so GitHub happily opens a
-          # second, untagged one and the assets land where nobody looks. That is
-          # exactly what v0.4.2 did. Ask first, and only create when there is
-          # genuinely nothing to upload into; this also makes a re-run idempotent.
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "${ASSETS[@]}" --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" \
-              --draft \
-              --title "keeper $GITHUB_REF_NAME (unsigned build)" \
-              --notes "Unsigned (ad-hoc) macOS build — first launch requires right-click → Open. In-app auto-update is enabled via signed updater artifacts. Add Apple signing secrets per docs/release.md for notarized releases." \
-              "${ASSETS[@]}"
-          fi
 
       # Per-release egress diff note (Story 11.2, NFR-11, AD-23): docs/egress.md is the
       # canonical, diffable egress surface. Diff it against the previous tag into the job

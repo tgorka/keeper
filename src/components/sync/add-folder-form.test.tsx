@@ -44,15 +44,14 @@ import {
   SYNC_SUBJECT_LABEL,
   SYNC_SUBPATHS_LABEL,
   SYNC_TAGS_LABEL,
-  SYNC_TOKEN_CLEAR_LABEL,
-  SYNC_TOKEN_CLEARED_LABEL,
   SYNC_TOKEN_EDIT_NOTE,
   SYNC_TOKEN_HIDE_LABEL,
   SYNC_TOKEN_LABEL,
-  SYNC_TOKEN_NONE_STORED_LABEL,
+  SYNC_TOKEN_NONE_STORED_NOTE,
+  SYNC_TOKEN_NOTE,
   SYNC_TOKEN_READ_FAILED_PREFIX,
-  SYNC_TOKEN_REVEAL_LABEL,
   SYNC_TOKEN_SHOW_LABEL,
+  SYNC_TOKEN_UNREADABLE_NOTE,
   syncInForceNote,
 } from "@/components/sync/add-folder-form";
 import type { SyncProfileVm } from "@/lib/ipc/client";
@@ -127,6 +126,10 @@ beforeEach(() => {
   mockActivity.mockResolvedValue([]);
   mockPending.mockResolvedValue([]);
   mockProblems.mockResolvedValue({ warning: null, error: null, parked: [], conflicts: [] });
+  // The default keychain answer: a folder with nothing stored. Every edit form
+  // reads this as it opens (Story 34.12), so every test that renders one needs
+  // an answer here or the read resolves to nothing at all.
+  mockGetCredential.mockResolvedValue(null);
   mockPicker.mockResolvedValue("/Users/alice/notes");
 });
 
@@ -203,7 +206,7 @@ describe("AddFolderForm", () => {
     expect(onSaved).not.toHaveBeenCalled();
   });
 
-  it("tells the caller a stored token leaves the form something only it can show", async () => {
+  it("reports a settled add once the keychain has taken the token", async () => {
     mockSave.mockResolvedValue(profileVm());
     mockSetCredential.mockResolvedValue(undefined);
     const onSaved = vi.fn();
@@ -214,11 +217,15 @@ describe("AddFolderForm", () => {
 
     fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
 
-    // Clear is the only undo left once this form is gone, so the caller is told
-    // the folder exists and told, in the same call, that hiding the form now
-    // would take the undo with it.
-    expect(await screen.findByRole("button", { name: SYNC_TOKEN_CLEAR_LABEL })).toBeInTheDocument();
-    expect(onSaved).toHaveBeenCalledWith(profileVm(), false);
+    await waitFor(() => expect(mockSetCredential).toHaveBeenCalledWith("p2", "ghp_secret"));
+    // Both writes went through, and the edit form is where the token is changed
+    // or removed from now on — so this form has nothing left to hold open
+    // (Story 34.12).
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(profileVm(), true));
+    expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveValue("");
+    // The add form has no stored token to describe, so it keeps the note that
+    // says where the one being typed will go.
+    expect(screen.getByText(SYNC_TOKEN_NOTE)).toBeInTheDocument();
   });
 
   it("shows exactly what was typed when the eye is pressed, and hides it again", () => {
@@ -344,42 +351,43 @@ describe("AddFolderForm editing an existing folder", () => {
     expect(screen.getByText(SYNC_PATH_FIXED_NOTE)).toBeInTheDocument();
   });
 
-  it("starts the token field empty, and an untouched one keeps what is stored", async () => {
-    const profile = stored();
-    mockSave.mockResolvedValue(profile);
-    render(<AddFolderForm profile={profile} />);
-    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
-
-    // Nothing is read on the way in (AD-34-7): opening an edit form must not
-    // touch the keychain, and a placeholder of dots would claim a token the
-    // form has not asked for. The note is what says where one lives.
-    const token = screen.getByLabelText(SYNC_TOKEN_LABEL);
-    expect(token).toHaveValue("");
-    expect(token).not.toHaveAttribute("placeholder");
-    expect(mockGetCredential).not.toHaveBeenCalled();
-    expect(screen.getByText(SYNC_TOKEN_EDIT_NOTE)).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
-
-    await waitFor(() => expect(mockSave).toHaveBeenCalled());
-    // Empty means "leave it alone", so neither keychain write may fire.
-    expect(mockSetCredential).not.toHaveBeenCalled();
-    expect(mockClearCredential).not.toHaveBeenCalled();
-  });
-
-  it("removes a stored token through the keychain, and reports it", async () => {
-    mockClearCredential.mockResolvedValue(undefined);
+  it("opens with the stored token in the field, as dots until the eye is pressed", async () => {
+    mockGetCredential.mockResolvedValue("ghp_stored");
     render(<AddFolderForm profile={stored()} />);
     fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
 
-    fireEvent.click(screen.getByRole("button", { name: SYNC_TOKEN_CLEAR_LABEL }));
+    // Story 34.12 overrides AD-34-7: opening the form is the ask.
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p9"));
+    const token = screen.getByLabelText(SYNC_TOKEN_LABEL);
+    await waitFor(() => expect(token).toHaveValue("ghp_stored"));
+    expect(token).toHaveAttribute("type", "password");
+    expect(screen.getByText(SYNC_TOKEN_EDIT_NOTE)).toBeInTheDocument();
 
-    await waitFor(() => expect(mockClearCredential).toHaveBeenCalledWith("p9"));
-    // Nothing else on screen goes quiet when a keychain entry disappears, so
-    // this line is the only report there is.
-    expect(await screen.findByText(SYNC_TOKEN_CLEARED_LABEL)).toBeInTheDocument();
-    // Clearing a credential is not a profile change.
-    expect(mockSave).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_TOKEN_SHOW_LABEL }));
+
+    // The eye is the only way to see it, and it shows the stored value exactly.
+    expect(token).toHaveAttribute("type", "text");
+    expect(token).toHaveValue("ghp_stored");
+  });
+
+  it("starts masked again on the next open, so a reveal cannot outlive one", async () => {
+    mockGetCredential.mockResolvedValue("ghp_stored");
+    const profile = stored();
+    const first = render(<AddFolderForm profile={profile} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    await waitFor(() => expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveValue("ghp_stored"));
+    fireEvent.click(screen.getByRole("button", { name: SYNC_TOKEN_SHOW_LABEL }));
+    expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveAttribute("type", "text");
+
+    // Every surface unmounts the form when it closes, which is what makes the
+    // reveal mount-scoped rather than something that has to be reset.
+    first.unmount();
+    render(<AddFolderForm profile={profile} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+
+    const reopened = screen.getByLabelText(SYNC_TOKEN_LABEL);
+    await waitFor(() => expect(reopened).toHaveValue("ghp_stored"));
+    expect(reopened).toHaveAttribute("type", "password");
   });
 
   it("says an emptied author override out loud, since an omission would keep it", async () => {
@@ -419,71 +427,133 @@ describe("AddFolderForm editing an existing folder", () => {
     expect(onSaved).not.toHaveBeenCalled();
   });
 
-  it("reads a stored token only when asked, and then shows it", async () => {
+  it("writes nothing to the keychain when the field still holds what was read", async () => {
     mockGetCredential.mockResolvedValue("ghp_stored");
-    render(<AddFolderForm profile={stored()} />);
+    const profile = stored();
+    mockSave.mockResolvedValue(profile);
+    const onSaved = vi.fn();
+    render(<AddFolderForm profile={profile} onSaved={onSaved} />);
     fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
-    // Mounting and expanding are not asking (AD-34-7).
-    expect(mockGetCredential).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveValue("ghp_stored"));
 
-    fireEvent.click(screen.getByRole("button", { name: SYNC_TOKEN_REVEAL_LABEL }));
+    fireEvent.change(screen.getByLabelText(SYNC_BRANCH_LABEL), { target: { value: "trunk-2" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
 
-    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p9"));
+    // `onSaved` is the last thing the save does, so waiting on it is what makes
+    // the two assertions below mean "never" rather than "not yet".
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    // Re-storing a byte-identical secret is a keychain write, and on some
+    // platforms a prompt, for no change at all.
+    expect(mockSetCredential).not.toHaveBeenCalled();
+    expect(mockClearCredential).not.toHaveBeenCalled();
+  });
+
+  it("removes the stored token when the field it arrived in is emptied", async () => {
+    mockGetCredential.mockResolvedValue("ghp_stored");
+    mockClearCredential.mockResolvedValue(undefined);
+    const profile = stored();
+    mockSave.mockResolvedValue(profile);
+    render(<AddFolderForm profile={profile} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
     const token = screen.getByLabelText(SYNC_TOKEN_LABEL);
     await waitFor(() => expect(token).toHaveValue("ghp_stored"));
-    // Fetching a secret and then rendering it as dots would be asking for it
-    // and withholding it.
-    expect(token).toHaveAttribute("type", "text");
+
+    fireEvent.change(token, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    // The field arrived carrying the token, so emptying it is the removal —
+    // there is no separate button left to mean it.
+    await waitFor(() => expect(mockClearCredential).toHaveBeenCalledWith("p9"));
+    expect(mockSetCredential).not.toHaveBeenCalled();
   });
 
-  it("says a folder has no stored token rather than revealing an empty box", async () => {
-    mockGetCredential.mockResolvedValue(null);
-    render(<AddFolderForm profile={stored()} />);
+  it("replaces the stored token when a different one is typed over it", async () => {
+    mockGetCredential.mockResolvedValue("ghp_stored");
+    mockSetCredential.mockResolvedValue(undefined);
+    const profile = stored();
+    mockSave.mockResolvedValue(profile);
+    const onSaved = vi.fn();
+    render(<AddFolderForm profile={profile} onSaved={onSaved} />);
     fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
-
-    fireEvent.click(screen.getByRole("button", { name: SYNC_TOKEN_REVEAL_LABEL }));
-
-    expect(await screen.findByText(SYNC_TOKEN_NONE_STORED_LABEL)).toBeInTheDocument();
-    // A blank field is what a failed read looks like too, so it may not be the
-    // report for either — and it must stay masked, since nothing was revealed.
     const token = screen.getByLabelText(SYNC_TOKEN_LABEL);
-    expect(token).toHaveValue("");
-    expect(token).toHaveAttribute("type", "password");
+    await waitFor(() => expect(token).toHaveValue("ghp_stored"));
+
+    fireEvent.change(token, { target: { value: "ghp_rotated" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    await waitFor(() => expect(mockSetCredential).toHaveBeenCalledWith("p9", "ghp_rotated"));
+    expect(mockClearCredential).not.toHaveBeenCalled();
+
+    // The baseline moved with the write, so a second Save rewrites nothing —
+    // without that, every save of an open form would re-enter the keychain.
+    mockSetCredential.mockClear();
+    onSaved.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    expect(mockSetCredential).not.toHaveBeenCalled();
   });
 
-  it("reports a failed keychain read as a failure, with what the keychain said", async () => {
-    mockGetCredential.mockRejectedValue({ code: "internal", message: "the keychain is locked" });
-    render(<AddFolderForm profile={stored()} />);
+  it("says no token is stored rather than letting an empty field imply one", async () => {
+    mockGetCredential.mockResolvedValue(null);
+    const profile = stored();
+    mockSave.mockResolvedValue(profile);
+    const onSaved = vi.fn();
+    render(<AddFolderForm profile={profile} onSaved={onSaved} />);
     fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
 
-    fireEvent.click(screen.getByRole("button", { name: SYNC_TOKEN_REVEAL_LABEL }));
+    expect(await screen.findByText(SYNC_TOKEN_NONE_STORED_NOTE)).toBeInTheDocument();
+    expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveValue("");
+    // The note that describes a stored token would be a claim there is one.
+    expect(screen.queryByText(SYNC_TOKEN_EDIT_NOTE)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    // Nothing is stored, so the empty field has nothing to remove.
+    expect(mockClearCredential).not.toHaveBeenCalled();
+    expect(mockSetCredential).not.toHaveBeenCalled();
+  });
+
+  it("will not read an empty field as a removal when the read failed", async () => {
+    mockGetCredential.mockRejectedValue({ code: "internal", message: "the keychain is locked" });
+    const profile = stored();
+    mockSave.mockResolvedValue(profile);
+    const onSaved = vi.fn();
+    render(<AddFolderForm profile={profile} onSaved={onSaved} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
 
     expect(
       await screen.findByText(`${SYNC_TOKEN_READ_FAILED_PREFIX}the keychain is locked`),
     ).toBeInTheDocument();
-    expect(screen.queryByText(SYNC_TOKEN_NONE_STORED_LABEL)).not.toBeInTheDocument();
-  });
-
-  it("empties a revealed token when it is cleared, so the next save cannot restore it", async () => {
-    mockGetCredential.mockResolvedValue("ghp_stored");
-    mockClearCredential.mockResolvedValue(undefined);
-    mockSave.mockResolvedValue(stored());
-    render(<AddFolderForm profile={stored()} />);
-    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
-    fireEvent.click(screen.getByRole("button", { name: SYNC_TOKEN_REVEAL_LABEL }));
-    await waitFor(() => expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveValue("ghp_stored"));
-
-    fireEvent.click(screen.getByRole("button", { name: SYNC_TOKEN_CLEAR_LABEL }));
-
-    expect(await screen.findByText(SYNC_TOKEN_CLEARED_LABEL)).toBeInTheDocument();
-    // A revealed token left in the field would be written straight back by the
-    // very next save, quietly undoing the clear.
+    // The field is empty and emptying it is how a token is removed, so the form
+    // has to say out loud that this particular empty field is not that.
+    expect(screen.getByText(SYNC_TOKEN_UNREADABLE_NOTE)).toBeInTheDocument();
     expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveValue("");
 
     fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
 
-    await waitFor(() => expect(mockSave).toHaveBeenCalled());
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    // A locked keychain must not be able to destroy a working credential by
+    // looking exactly like a user who cleared the field.
+    expect(mockClearCredential).not.toHaveBeenCalled();
     expect(mockSetCredential).not.toHaveBeenCalled();
+  });
+
+  it("still stores a token typed after a failed read, which is unambiguous", async () => {
+    mockGetCredential.mockRejectedValue({ code: "internal", message: "the keychain is locked" });
+    mockSetCredential.mockResolvedValue(undefined);
+    const profile = stored();
+    mockSave.mockResolvedValue(profile);
+    render(<AddFolderForm profile={profile} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    await screen.findByText(SYNC_TOKEN_UNREADABLE_NOTE);
+
+    fireEvent.change(screen.getByLabelText(SYNC_TOKEN_LABEL), { target: { value: "ghp_typed" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    // Refusing this too would make an unreadable keychain unwritable as well.
+    await waitFor(() => expect(mockSetCredential).toHaveBeenCalledWith("p9", "ghp_typed"));
   });
 });
 
@@ -564,7 +634,7 @@ describe("AddFolderForm numeric knobs (Story 34.5, AD-34-8)", () => {
     );
   });
 
-  it("seeds an edit form from what the profile pins, leaving unpinned knobs blank", () => {
+  it("seeds an edit form from what the profile pins, leaving unpinned knobs blank", async () => {
     // `null` means the profile pins nothing. Rendering 5 there would make the
     // next save store 5 s as a deliberate choice and take the removable
     // substitution away for good.
@@ -581,6 +651,9 @@ describe("AddFolderForm numeric knobs (Story 34.5, AD-34-8)", () => {
       />,
     );
     fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    // The edit form reads the stored token as it opens (Story 34.12), so settle
+    // that before asserting — otherwise the read lands outside `act`.
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p2"));
 
     const settle = screen.getByLabelText(SYNC_SETTLE_LABEL);
     expect(settle).toHaveValue(null);

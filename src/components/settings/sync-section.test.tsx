@@ -9,6 +9,8 @@ vi.mock("@/lib/ipc/client", () => ({
   syncProfileSetEnabled: vi.fn(),
   syncFolderNow: vi.fn(),
   syncVerify: vi.fn(),
+  // The path control (Story 32.4): resolves and opens the folder in Rust.
+  syncOpenPath: vi.fn(),
   // The device name (Story 34.5): read once when the section opens, written by
   // the Rename button.
   syncDevice: vi.fn(),
@@ -40,6 +42,7 @@ import {
   SYNC_DEVICE_SAVED_SENTENCE,
   SYNC_NO_PROFILES_SENTENCE,
   SYNC_NOW_LABEL,
+  SYNC_OPEN_PATH_LABEL,
   SYNC_PAUSE_LABEL,
   SYNC_PROGRESS_LABEL,
   SYNC_REMOVE_CANCEL_LABEL,
@@ -66,17 +69,18 @@ import {
   SYNC_SETTLE_LABEL,
   SYNC_SUBPATHS_LABEL,
   SYNC_TAGS_LABEL,
-  SYNC_TOKEN_CLEAR_LABEL,
+  SYNC_TOKEN_EDIT_NOTE,
   SYNC_TOKEN_FAILED_PREFIX,
   SYNC_TOKEN_LABEL,
-  SYNC_TOKEN_STORED_LABEL,
+  SYNC_TOKEN_SHOW_LABEL,
 } from "@/components/sync/add-folder-form";
 import type { SyncOutcomeVm, SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
 import {
-  syncClearCredential,
   syncDevice,
   syncDeviceSetLabel,
   syncFolderNow,
+  syncGetCredential,
+  syncOpenPath,
   syncProfileRemove,
   syncProfileSave,
   syncProfileSetEnabled,
@@ -85,6 +89,7 @@ import {
   syncStatuses,
   syncVerify,
 } from "@/lib/ipc/client";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { resetSyncStoreForTest } from "@/lib/stores/sync";
 import { resetSyncDetailStoreForTest } from "@/lib/stores/sync-detail";
 
@@ -96,10 +101,11 @@ const mockSetEnabled = vi.mocked(syncProfileSetEnabled);
 const mockFolderNow = vi.mocked(syncFolderNow);
 const mockVerify = vi.mocked(syncVerify);
 const mockSetCredential = vi.mocked(syncSetCredential);
-const mockClearCredential = vi.mocked(syncClearCredential);
+const mockGetCredential = vi.mocked(syncGetCredential);
 const mockDevice = vi.mocked(syncDevice);
 const mockSetDeviceLabel = vi.mocked(syncDeviceSetLabel);
 const mockPicker = vi.mocked(openFolder);
+const mockOpenPath = vi.mocked(syncOpenPath);
 
 /** The exact line Rust composes — the UI must render it character for character. */
 const RUST_LINE = "tgdrive — 3 waiting to sync";
@@ -159,10 +165,20 @@ beforeEach(() => {
   mockStatuses.mockResolvedValue([statusVm()]);
   mockPicker.mockResolvedValue(null);
   mockDevice.mockResolvedValue({ id: "01JDEVICE", label: "hesperia" });
+  // Every edit form reads the keychain as it opens (Story 34.12); this is the
+  // answer for the folders that have nothing stored.
+  mockGetCredential.mockResolvedValue(null);
+  mockOpenPath.mockResolvedValue(undefined);
+  // The path control is gated on a real file manager existing, so these rows
+  // render as a desktop would show them.
+  capabilitiesStore
+    .getState()
+    .applySnapshot({ ...DEFAULT_CAPABILITIES, revealInFileManager: true });
 });
 
 afterEach(() => {
   vi.clearAllMocks();
+  capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
 });
 
 describe("SyncSection hydration", () => {
@@ -307,6 +323,36 @@ describe("SyncSection profile rows", () => {
     expect(await screen.findByText(RUST_LINE)).toBeInTheDocument();
     expect(mockSetEnabled).toHaveBeenLastCalledWith("p1", true);
     expect(screen.getByRole("button", { name: SYNC_PAUSE_LABEL })).toBeInTheDocument();
+  });
+
+  /**
+   * Story 32.4. The path was on screen as plain text with no way to reach the
+   * folder from the app at all, so the path itself is the control.
+   */
+  it("opens the folder from the path itself, asking for it by profile id", async () => {
+    render(<SyncSection open />);
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: `${SYNC_OPEN_PATH_LABEL}: /Users/alice/Documents/tgdrive`,
+      }),
+    );
+
+    // The id, never a path: the frontend cannot name a folder here, so it cannot
+    // ask for one keeper does not already sync.
+    await waitFor(() => expect(mockOpenPath).toHaveBeenCalledWith("p1"));
+    expect(mockOpenPath).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves the path as plain text where there is no file manager to open it in", async () => {
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(<SyncSection open />);
+
+    // Still readable — just not a control that would fail on activation.
+    expect(await screen.findByText("/Users/alice/Documents/tgdrive")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: new RegExp(SYNC_OPEN_PATH_LABEL) }),
+    ).not.toBeInTheDocument();
   });
 });
 
@@ -633,29 +679,30 @@ describe("SyncSection advanced options (Story 32.7)", () => {
 
     // Keyed by the id the save minted, which is why it is a second write.
     await waitFor(() => expect(mockSetCredential).toHaveBeenCalledWith("p2", "ghp_secret"));
-    // The acknowledgement says a token is held; it never shows which.
-    expect(await screen.findByText(new RegExp(SYNC_TOKEN_STORED_LABEL))).toBeInTheDocument();
-    expect(screen.queryByDisplayValue("ghp_secret")).not.toBeInTheDocument();
+    // The add form goes back to a blank draft; the token it just stored belongs
+    // to the folder now, and the folder's edit form is where it is seen again.
+    await waitFor(() => expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveValue(""));
     expect(document.body.textContent).not.toContain("ghp_secret");
   });
 
-  it("clears a stored token through the keychain, not by blanking a field", async () => {
-    mockSetCredential.mockResolvedValue(undefined);
-    mockClearCredential.mockResolvedValue(undefined);
-    await openAdvanced();
+  it("hands the edit form the stored token, masked, without a reveal step", async () => {
+    mockGetCredential.mockResolvedValue("ghp_stored");
+    render(<SyncSection open />);
 
-    fireEvent.change(screen.getByLabelText(SYNC_TOKEN_LABEL), { target: { value: "ghp_secret" } });
-    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
-    const clear = await screen.findByRole("button", { name: SYNC_TOKEN_CLEAR_LABEL });
+    fireEvent.click(await screen.findByRole("button", { name: SYNC_EDIT_TITLE }));
+    const form = await screen.findByRole("form", { name: `${SYNC_EDIT_TITLE}: tgdrive` });
+    fireEvent.click(within(form).getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
 
-    fireEvent.click(clear);
+    // Story 34.12: the read happens because the form opened, and the only thing
+    // standing between the secret and the screen is the eye.
+    const token = within(form).getByLabelText(SYNC_TOKEN_LABEL);
+    await waitFor(() => expect(token).toHaveValue("ghp_stored"));
+    expect(token).toHaveAttribute("type", "password");
+    expect(within(form).getByText(SYNC_TOKEN_EDIT_NOTE)).toBeInTheDocument();
 
-    await waitFor(() => expect(mockClearCredential).toHaveBeenCalledWith("p2"));
-    await waitFor(() =>
-      expect(
-        screen.queryByRole("button", { name: SYNC_TOKEN_CLEAR_LABEL }),
-      ).not.toBeInTheDocument(),
-    );
+    fireEvent.click(within(form).getByRole("button", { name: SYNC_TOKEN_SHOW_LABEL }));
+
+    expect(token).toHaveAttribute("type", "text");
   });
 
   it("says the folder was added when only the keychain write failed", async () => {
