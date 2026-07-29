@@ -92,7 +92,7 @@ or the front end — other Epic 34 agents own them.
   collapses to `else if !lfs::stage::is_false_modification(&repo, rela, &absolute)`; new test
   `a_pointer_staged_ahead_of_head_survives_the_scan_and_is_committed` (`:3945`).
 - `src-tauri/crates/keeper-sync/tests/lfs_roundtrip.rs` -- new fixtures `commit_pointer_for_clip`,
-  `backdate_index_to`, `advance_mtime`, `register_working_clean_filter`, and four tests
+  `make_racily_clean`, `advance_mtime`, `register_working_clean_filter`, and four tests
   (`:290-494`).
 - Read but deliberately unchanged: `git/commit.rs:193-222` (the worktree-stat decision this bug
   misread) and `engine.rs:2333` (`removed_size`, whose approach is reused — its own contract differs,
@@ -114,7 +114,7 @@ or the front end — other Epic 34 agents own them.
   cost rather than restating the code.
 - [x] Tests -- `lfs_roundtrip.rs`: a committed pointer whose entry stat is 200 000 is recognised
   (and the test asserts that stat, so the mis-diagnosis cannot come back unnoticed) while a
-  200 000-byte ordinary blob, a 5-byte non-pointer and an unknown path are not; a backdated index
+  200 000-byte ordinary blob, a 5-byte non-pointer and an unknown path are not; an aged index
   makes the entry racily clean and the guard dismisses it, then an edit at identical length is not
   dismissed; a pointer swapped into the index ahead of `HEAD` is not dismissed; and the same
   fixture run with and without a working `filter.lfs.clean` shows which of the two configurations
@@ -217,6 +217,30 @@ duplication. `index_key` — the forward-slash conversion both need — is now a
 - `cargo test -p keeper-sync` — **396 lib tests, 8 `lfs_roundtrip`, 1 `lfs_pointer_stat`, 1
   `gitignore_is_respected`, 1 `index_refresh`, all passing, and no output on stderr.**
 - `cargo fmt -p keeper-sync -- --check` — clean.
+- **The racily-clean precondition was holding by luck, and now holds by construction.** CI caught it
+  on macos-latest: `a_racily_clean_pointer_…` failed with an entirely clean `RepoStatus`, while the
+  same test passed on Linux. Probing the real inputs here showed why. `Stat::is_racy` compares
+  **seconds**, and the first fixture set the index's mtime *equal* to the worktree file's — the
+  `Ordering::Equal` arm. That arm is also where a fixture that simply runs fast already lands: with
+  the probe the entry measured `is_racy == true` **with the backdating removed entirely**, so the
+  helper was contributing nothing and the test was riding on the whole fixture finishing inside one
+  wall-clock second. On a runner where the index write crossed a second boundary the comparison
+  became `Ordering::Greater`, the entry was not racy, and git reported nothing — which is exactly
+  what macOS saw. It was never an APFS-versus-ext4 timestamp difference; nanoseconds are not even
+  consulted, because `stat_options` leaves `use_nsec` at `false`
+  (`gix-0.86.0/src/config/cache/access.rs:283`, from `gitoxide.core.useNsec`).
+  `make_racily_clean` now puts the index **ten seconds behind** the file, which is
+  `Ordering::Less` — racy unconditionally, with no nanosecond fields, no filesystem granularity and
+  no dependence on how long the test takes. Moving the index's own mtime cannot disturb
+  `Stat::matches`, which compares the worktree against the *entry*. The helper then asserts both
+  halves of the state with gix's own `matches` and `is_racy` against the real index, so a fixture
+  that stops reproducing fails loudly at the cause instead of silently at a downstream expectation.
+  Verified by simulation: setting the margin to `+1s` — the macOS shape — makes the helper fail on
+  its own `is_racy` assertion, and both racily-clean tests fail there rather than going vacuous.
+- The engine test needs the *opposite* state and gets it the same deterministic way: it ages the
+  index ten seconds **ahead** of the file (`Ordering::Greater`), so the entry is never racy and no
+  content re-read is attempted. `a_pointer_staged_ahead_of_head_is_never_dismissed` needs neither,
+  and says so — its report is a `HEAD`-to-index difference, derived from objects alone.
 - **The tests were proven to fail before the fix, not merely to pass after it.** With
   `indexed_pointer`'s `entry.stat.size` test temporarily restored on top of everything else, three
   `lfs_roundtrip` tests fail: recognition returns `None`
@@ -252,8 +276,7 @@ duplication. `index_key` — the forward-slash conversion both need — is now a
   file through `filter.lfs.clean`. That is why even an edit at identical length runs the filter,
   and why the filter's presence is what decides whether the guard is reached at all.
 - `gix-index-0.54.0/src/file/init.rs:94-97` — the index `timestamp` is the index file's own
-  mtime, which is what `backdate_index_to` manipulates to reach the racily-clean state a test cannot
-  wait for.
+  mtime, which is what `make_racily_clean` moves to reach a state a test cannot wait for.
 - `gix-0.86.0`: `Repository::head_tree` (`repository/reference.rs:298`), `Repository::stat_options`
   (`repository/config/mod.rs:53`, `index`-gated and the crate already uses `index`),
   `Tree::lookup_entry_by_path` (`object/tree/mod.rs:175`) and `Entry::object_id`

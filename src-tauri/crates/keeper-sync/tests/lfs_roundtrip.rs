@@ -217,21 +217,57 @@ fn commit_pointer_for_clip(root: &Path, payload: &[u8]) -> stage::LfsStaging {
     staging
 }
 
-/// Make every index entry racily clean.
+/// Make `rela`'s index entry racily clean, and prove that it is.
 ///
 /// git re-reads the content of an entry whose mtime is not older than the
-/// index file itself. A test cannot wait for that — the index is always
-/// written last — so the condition is arranged by moving the index's own mtime
-/// back onto the worktree file's.
-fn backdate_index_to(root: &Path, file: &Path) {
-    let mtime = std::fs::metadata(file)
+/// index file's own. The index is always written last, so a test has to
+/// arrange the condition rather than wait for it.
+///
+/// The margin is what makes this deterministic. `Stat::is_racy` compares
+/// **seconds**, and only its `Ordering::Equal` arm consults nanoseconds — and
+/// then only when `gitoxide.core.useNsec` is on, which it is not by default.
+/// An earlier version of this helper set the index's mtime *equal* to the
+/// file's, which lands on that arm and, worse, was indistinguishable from
+/// doing nothing at all: a fixture that finishes inside one second already has
+/// both timestamps in the same second. It therefore passed on ext4 and failed
+/// on APFS purely on where a second boundary happened to fall. Ten seconds
+/// earlier lands on `Ordering::Less`, which is racy unconditionally — no
+/// nanosecond fields, no filesystem granularity, no dependence on how long the
+/// test takes.
+///
+/// Moving the index's own mtime cannot disturb `Stat::matches`, which compares
+/// the worktree against the *entry*; the index file's timestamp is not one of
+/// its inputs.
+fn make_racily_clean(root: &Path, rela: &str) {
+    let mtime = std::fs::metadata(root.join(rela))
         .and_then(|metadata| metadata.modified())
         .expect("worktree mtime");
+    let older = mtime - std::time::Duration::from_secs(10);
     std::fs::File::options()
         .write(true)
         .open(root.join(".git").join("index"))
-        .and_then(|index| index.set_modified(mtime))
-        .expect("backdate the index");
+        .and_then(|index| index.set_modified(older))
+        .expect("age the index behind the file");
+
+    // Assert the state with gix's own predicate, against the real index this
+    // repository will be read with. A precondition a test merely hopes for is
+    // how a vacuous test is born.
+    let repo = git::repo::open(root, false).expect("open");
+    let index = repo.index_or_empty().expect("index");
+    let entry = index
+        .entry_by_path(gix::bstr::BStr::new(rela))
+        .expect("the path is indexed");
+    let options = repo.stat_options().expect("stat options");
+    let metadata = gix::index::fs::Metadata::from_path_no_follow(&root.join(rela)).expect("lstat");
+    let worktree = gix::index::entry::Stat::from_fs(&metadata).expect("stat");
+    assert!(
+        worktree.matches(&entry.stat, options),
+        "the worktree must still match the entry, or this is not the racy case at all"
+    );
+    assert!(
+        worktree.is_racy(index.timestamp(), options),
+        "the entry has to be racily clean for the guard to be the thing under test"
+    );
 }
 
 /// Move a file's mtime a clear second forward.
@@ -347,7 +383,7 @@ fn a_racily_clean_pointer_is_not_a_modification_but_an_equal_length_edit_is() {
     commit_pointer_for_clip(root, &payload);
     let absolute = root.join("clip.mp4");
 
-    backdate_index_to(root, &absolute);
+    make_racily_clean(root, "clip.mp4");
     let repo = git::repo::open(root, false).expect("reopen");
     let status = git::repo::status_paths(&repo).expect("status");
     assert!(
@@ -391,6 +427,10 @@ fn a_racily_clean_pointer_is_not_a_modification_but_an_equal_length_edit_is() {
 /// the two is re-driven on the next pass (NFR-24). That re-drive only happens
 /// because the path is reported modified, so dismissing it would strand the
 /// staged pointer until the file changed again.
+///
+/// This one deliberately does not arrange raciness. The report it relies on is
+/// the `HEAD`-to-index difference, which git derives from objects alone, so it
+/// holds on every filesystem and whatever the clock does.
 #[test]
 fn a_pointer_staged_ahead_of_head_is_never_dismissed() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -467,7 +507,7 @@ fn a_working_clean_filter_settles_the_racily_clean_case_before_the_guard_does() 
             register_working_clean_filter(root);
         }
         let absolute = root.join("clip.mp4");
-        backdate_index_to(root, &absolute);
+        make_racily_clean(root, "clip.mp4");
 
         let repo = git::repo::open(root, false).expect("open");
         let racily_clean = git::repo::status_paths(&repo).expect("status");
