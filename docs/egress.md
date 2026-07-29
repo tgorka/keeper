@@ -30,7 +30,7 @@ live egress view, because the app does not run it — so it is disclosed here in
 
 | Destination | When | Why |
 | --- | --- | --- |
-| **Each sync profile's git remote** (e.g. `https://forgejo.example.org/…`, `ssh://host/…`) | Every sync tick for an enabled profile | The whole point: fetch, push and LFS transfer. One entry per configured profile; a profile pointing at a local path or a pendrive reaches no network at all. |
+| **Each sync profile's git remote** (e.g. `https://forgejo.example.org/…`, `ssh://host/…`) | Every sync tick for an enabled profile | The whole point: fetch, push and LFS transfer. One entry per configured profile; a profile pointing at a local path or a pendrive reaches no network at all. An `ssh://` profile reaches that **same host over HTTPS** as well, because the LFS API is HTTP even when git is not — the host is unchanged, so the destination disclosed here still covers it. |
 | **`api.github.com/repos/tgorka/keeper/releases/latest`** | On `keeper-syncd doctor`, and on `keeper-syncd update` | The version check. Read-only, unauthenticated, and it never installs anything by itself. |
 | **`*.githubusercontent.com`** | Only during `keeper-syncd update`, after you ran it | Where GitHub actually serves the release binary and its `.sha256`. |
 
