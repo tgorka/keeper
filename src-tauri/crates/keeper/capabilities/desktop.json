@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "desktop",
-  "description": "Desktop-only capability for the main window: global hotkey, autostart, in-app updater, and process relaunch (Story 12.2 compile seam — these plugins are never linked on iOS/Android)",
+  "description": "Desktop-only capability for the main window: global hotkey, autostart, in-app updater, and process relaunch (Story 12.2 compile seam — these plugins are never linked on iOS/Android), plus the window-drag grant the overlay title bar needs (Story 34.3: `core:window:default` deliberately omits `allow-start-dragging`, so without this line every webview-initiated drag of the drag band is refused by the ACL)",
   "windows": ["main"],
   "platforms": ["macOS", "windows", "linux"],
   "permissions": [
@@ -13,6 +13,7 @@
     "autostart:allow-is-enabled",
     "updater:default",
     "process:default",
-    "process:allow-restart"
+    "process:allow-restart",
+    "core:window:allow-start-dragging"
   ]
 }

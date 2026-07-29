@@ -12,12 +12,16 @@ import { cn } from "@/lib/utils";
  * So while a Select is open, `DismissableLayer` holds
  * `document.body.style.pointerEvents = "none"`, and that is not configurable here.
  *
- * It matters to a Tauri window because Tauri's drag-region init script decides on
- * `mousedown` whether `e.target` carries `data-tauri-drag-region`; with `body` at
- * `pointer-events: none` the target is `<html>` and the titlebar cannot start a
- * drag. Nothing can shorten that lock while the list is open, so the only rule this
- * wrapper can enforce is that it never outlasts the open state — see
- * {@link SelectContent}.
+ * A body-wide `pointer-events: none` also blinds Tauri's drag-region shim, which
+ * reads `e.target` on `mousedown`: with `body` inert that target is `<html>`, never
+ * the band. That is why Story 34.3 hardened this wrapper — but it was NOT the
+ * window-drag defect that story chased, and measurement refuted it as the cause:
+ * with the window active a real foreground click on a sidebar item lands and
+ * switches the view, and the drag failed on every tab with no Select ever opened.
+ * The cause was a missing ACL grant — `core:window:allow-start-dragging`, see
+ * `src-tauri/crates/keeper/capabilities/desktop.json`. So the rule below stands on
+ * its own smaller merit: whatever the lock costs, it must never outlast the open
+ * state — see {@link SelectContent}.
  */
 function Select({ ...props }: React.ComponentProps<typeof SelectPrimitive.Root>) {
   return <SelectPrimitive.Root data-slot="select" {...props} />;
@@ -72,9 +76,9 @@ function SelectTrigger({
  * `Dialog` does). An exit animation would therefore hold
  * `document.body { pointer-events: none }` for its whole duration *after* the list
  * was dismissed — a window in which the app is closed, the list is invisible, and a
- * click on the titlebar silently does nothing (see {@link Select} for why that
- * breaks dragging specifically). Leaving the closed state with no `animation`
- * declaration makes `Presence` unmount on the same tick, which runs
+ * click on the titlebar silently does nothing (see {@link Select} — the same lock,
+ * and what it was and was not responsible for). Leaving the closed state with no
+ * `animation` declaration makes `Presence` unmount on the same tick, which runs
  * `DismissableLayer`'s effect cleanup and restores `body`.
  *
  * This costs nothing today: the default `position="item-aligned"` already suppresses

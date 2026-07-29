@@ -21,9 +21,15 @@
  *     (AD-34-8).
  *   - The access token is a second write to a different store (the OS
  *     keychain), keyed by the profile id. Its failure is reported as its own
- *     thing, because the profile is stored by then. Reading one back out is a
- *     third call, made only when the user presses for it (AD-34-7) — never as
- *     part of loading the form.
+ *     thing, because the profile is stored by then. An edit form reads it back
+ *     as the form opens and shows it masked (Story 34.12, which overrides
+ *     AD-34-7 at the owner's instruction), so the field holds a *copy* of what
+ *     the keychain holds and a save has to compare the two.
+ *   - Which keychain call a save makes is therefore decided by
+ *     {@link credentialWrite} against the answer the form opened with, never by
+ *     the field alone: an empty box is what a removed token, a folder that
+ *     never had one, and a read that failed all look like, and only the first
+ *     of those may delete anything.
  *   - `SyncProfileReq` carries no `enabled`, and Rust merges an update onto a
  *     CLONE of the stored profile rather than rebuilding it, so saving an edit
  *     leaves a paused folder paused and cannot move any field this form does not
@@ -42,7 +48,7 @@
  */
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import { ChevronDown, ChevronRight, Eye, EyeOff } from "lucide-react";
-import { type FormEvent, useId, useState } from "react";
+import { type FormEvent, useEffect, useId, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -56,8 +62,8 @@ import {
 } from "@/components/ui/select";
 import type { SyncProfileVm } from "@/lib/ipc/client";
 // The credential calls are made straight from the form rather than through the
-// mirror store: none of them change anything the store mirrors, and the read is
-// a one-shot answer to a button press rather than state worth keeping in sync.
+// mirror store: none of them change anything the store mirrors, and the read
+// belongs to one open of one form rather than to state worth keeping in sync.
 import { syncClearCredential, syncGetCredential, syncSetCredential } from "@/lib/ipc/client";
 import {
   SYNC_DEFAULT_BRANCH,
@@ -149,19 +155,32 @@ export const SYNC_AUTHOR_NOTE =
   "Name <email>, an address, or just a name. Left empty, commits are authored by this device.";
 
 /**
- * The access-token field (Story 32.7, AD-S7; Story 34.4, AD-34-7). The token is
- * written to the OS keychain in a second call once the profile has an id, and
- * can be read back out of it — but only when the user asks. The field therefore
- * still starts empty in both modes, and the note under it has to say where the
- * token is kept and that showing it is a thing the user does.
+ * The access-token field (Story 32.7, AD-S7; Story 34.4, AD-34-7; Story 34.12,
+ * which overrides AD-34-7). The token is written to the OS keychain in a second
+ * call once the profile has an id, and an edit form reads it back as it opens
+ * and shows it masked. So the note under the field has to say which of the
+ * three answers the keychain gave — a token, none, or a read that did not
+ * complete — because two of them leave the field looking identical while
+ * meaning opposite things at save time.
  */
 export const SYNC_TOKEN_LABEL = "Access token";
 export const SYNC_TOKEN_NOTE =
-  "Used to authenticate with the remote. keeper stores it in the system keychain when the folder is added, and shows it again only when you ask.";
+  "Used to authenticate with the remote. keeper stores it in the system keychain when the folder is added, and fills this field in again when you edit the folder.";
+export const SYNC_TOKEN_READING_NOTE = "Reading the stored token from the system keychain.";
 export const SYNC_TOKEN_EDIT_NOTE =
-  "Left empty, whatever is stored stays as it is. Type a new one to replace it, or clear it to remove it. The stored one is in the system keychain, and keeper reads it back only when you ask for it.";
-export const SYNC_TOKEN_STORED_LABEL = "Access token stored in the keychain.";
-export const SYNC_TOKEN_CLEAR_LABEL = "Clear token";
+  "This is the token stored in the system keychain, shown as dots until you press the eye. Type a different one to replace it, or empty the field to remove it from the keychain.";
+export const SYNC_TOKEN_NONE_STORED_NOTE =
+  "No token is stored for this folder. Type one to store it in the system keychain.";
+
+/**
+ * What the field means while the form does not know what is stored. Saying it
+ * outright matters more than naming the failure: the field is empty, emptying
+ * it is how a token is removed, and the user has to be told that this
+ * particular empty field will remove nothing.
+ */
+export const SYNC_TOKEN_UNREADABLE_NOTE =
+  "keeper could not read the stored token, so saving leaves whatever is there as it is and an empty field will not remove it. Type a new one to replace it.";
+export const SYNC_TOKEN_READ_FAILED_PREFIX = "The stored token could not be read: ";
 
 /**
  * The eye toggle over the field, named for what pressing it will do rather than
@@ -172,27 +191,17 @@ export const SYNC_TOKEN_SHOW_LABEL = "Show token";
 export const SYNC_TOKEN_HIDE_LABEL = "Hide token";
 
 /**
- * The reveal and the two answers that are not a token. A keychain read has one
- * outcome a write does not — there may be nothing stored — and that is not a
- * failure, so neither it nor a failed read may be reported by leaving the field
- * blank: blank is what both would look like.
- */
-export const SYNC_TOKEN_REVEAL_LABEL = "Show stored token";
-export const SYNC_TOKEN_NONE_STORED_LABEL = "No token is stored for this folder.";
-export const SYNC_TOKEN_READ_FAILED_PREFIX = "The stored token could not be read: ";
-
-/** The only report a clear can get: nothing else on screen can reflect it. */
-export const SYNC_TOKEN_CLEARED_LABEL = "The stored token was removed.";
-
-/**
- * Reported when the profile was stored but the keychain write was not. Two
- * writes, two outcomes: "add failed" would send the user back to a form that
- * can now only reject as a duplicate, and "save failed" would send them back
- * to redo changes the engine already took.
+ * Reported when the profile was stored but the keychain was not. Two writes,
+ * two outcomes: "add failed" would send the user back to a form that can now
+ * only reject as a duplicate, and "save failed" would send them back to redo
+ * changes the engine already took. A removal gets its own wording, because
+ * "not stored" describes the opposite of what was attempted.
  */
 export const SYNC_TOKEN_FAILED_PREFIX = "The folder was added, but the token was not stored: ";
 export const SYNC_TOKEN_EDIT_FAILED_PREFIX =
   "The changes were saved, but the token was not stored: ";
+export const SYNC_TOKEN_REMOVE_FAILED_PREFIX =
+  "The changes were saved, but the token was not removed: ";
 
 /** The submit, worded for what it does, and the way out of a revealed form. */
 export const SYNC_ADD_SUBMIT_LABEL = "Add folder";
@@ -268,8 +277,9 @@ interface SyncFormValues {
   /** The commit-author override; empty keeps the device identity. */
   authorOverride: string;
   /**
-   * The access token: typed, or fetched back out of the keychain by an explicit
-   * reveal. Never seeded from a profile — a profile carries none.
+   * The access token. Typed from empty on an add, and seeded from the keychain
+   * when an edit form opens (Story 34.12) — so on an edit form this is a copy
+   * of a stored secret, and emptying it is how that secret is removed.
    */
   token: string;
 }
@@ -295,9 +305,9 @@ const EMPTY_FORM: SyncFormValues = {
 
 /**
  * A stored profile as the fields that carry it. Everything editable starts from
- * what is stored; the token starts empty in every mode, because a profile
- * carries none — reading one is a separate keychain call the user has to ask
- * for (AD-34-7), and loading a form is not asking.
+ * what is stored; the token starts empty even here, because a profile carries
+ * none. It lives in the keychain, and arrives — if it arrives — from the read
+ * the form starts as it opens.
  */
 function formValuesFor(profile: SyncProfileVm): SyncFormValues {
   return {
@@ -379,6 +389,66 @@ function splitSyncList(raw: string): string[] {
 }
 
 /**
+ * What the keychain answered when this form opened. It is the baseline every
+ * save is judged against, and it is exactly the state the field cannot carry:
+ * an empty box is what a removed token, a folder that never had one, and a read
+ * that failed all look like.
+ */
+type StoredToken =
+  | { readonly kind: "reading" }
+  | { readonly kind: "stored"; readonly value: string }
+  | { readonly kind: "absent" }
+  | { readonly kind: "unreadable" };
+
+/** The one keychain call a save makes for the token, or none at all. */
+type CredentialWrite =
+  | { readonly kind: "none" }
+  | { readonly kind: "set"; readonly value: string }
+  | { readonly kind: "clear" };
+
+/**
+ * Decide what a save does to the stored token, from the answer the form got
+ * when it opened and what the field holds now (Story 34.12).
+ *
+ * The field cannot say this on its own. Once it opens pre-filled, an empty box
+ * means "remove it" — and that is the same empty box produced by a folder with
+ * no token and by a keychain that refused to answer. So only a `stored`
+ * baseline licenses a removal: a locked keychain must not be able to destroy a
+ * working credential by looking like a user who cleared the field. The price is
+ * that a token cannot be removed while it cannot be read, which is the right
+ * way round — the read failure is on screen and can be retried, a silent
+ * deletion could not be.
+ */
+function credentialWrite(stored: StoredToken, field: string): CredentialWrite {
+  if (stored.kind === "stored") {
+    // Byte-identical to what was read back is the untouched field. Re-storing
+    // the same secret is still a keychain write — and on some platforms a
+    // prompt — for no change at all.
+    if (field === stored.value) {
+      return { kind: "none" };
+    }
+    return field === "" ? { kind: "clear" } : { kind: "set", value: field };
+  }
+  // Under the other three an empty field means nothing to do, for two different
+  // reasons: `absent` because there is nothing to remove, `reading` and
+  // `unreadable` because the form never learned whether there is. A typed value
+  // is unambiguous under all three and still goes through.
+  return field === "" ? { kind: "none" } : { kind: "set", value: field };
+}
+
+/**
+ * The line under the field on an edit form. It is the whole report of what the
+ * keychain answered, because two of the answers leave the field looking the
+ * same while the difference between them is what saving will do.
+ */
+const TOKEN_NOTES: Record<StoredToken["kind"], string> = {
+  reading: SYNC_TOKEN_READING_NOTE,
+  stored: SYNC_TOKEN_EDIT_NOTE,
+  absent: SYNC_TOKEN_NONE_STORED_NOTE,
+  unreadable: SYNC_TOKEN_UNREADABLE_NOTE,
+};
+
+/**
  * Create a folder, or edit one that exists. A rejected save keeps every typed
  * value and shows the Rust validation message inline — losing a half-typed
  * remote URL to a validation error would be infuriating.
@@ -423,38 +493,67 @@ export function AddFolderForm({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /**
-   * The profile whose token was just written, if any. The only acknowledgement
-   * the user will ever get that the keychain took it — and the first moment the
-   * form holds an id to clear it with, since a folder being added has none.
+   * What the keychain holds for this profile, as of when the form opened. A
+   * folder being added has nothing stored under an id it does not have yet, so
+   * that is `absent` and needs no read.
    */
-  const [storedToken, setStoredToken] = useState<{ id: string; name: string } | null>(null);
+  const [stored, setStored] = useState<StoredToken>(() =>
+    profile === undefined ? { kind: "absent" } : { kind: "reading" },
+  );
+  /** What the keychain said when the read failed, for the line that reports it. */
+  const [readError, setReadError] = useState<string | null>(null);
   /**
-   * Whether a clear went through. Nothing else on screen goes quiet when a
-   * keychain entry disappears, so this acknowledgement is the whole report.
-   */
-  const [tokenCleared, setTokenCleared] = useState(false);
-  /**
-   * Whether the field shows what it holds. About the field, not about where its
-   * contents came from: it flips a token being typed and a token just revealed
-   * alike.
+   * Whether the field shows what it holds. Mount-scoped on purpose: every
+   * surface unmounts this form when it closes, so a reveal cannot outlive the
+   * open it happened in and the next open starts masked.
    */
   const [tokenVisible, setTokenVisible] = useState(false);
-  /**
-   * That the reveal came back with nothing. Kept apart from both an error and
-   * an empty field, because "the keychain holds no token for this folder" is a
-   * fact, and the other two are not it.
-   */
-  const [noStoredToken, setNoStoredToken] = useState(false);
-  /**
-   * A reveal in flight. Separate from `saving` so a keychain read — which may
-   * put an OS prompt in front of the window — disables only its own button
-   * rather than the form the user is still filling in.
-   */
-  const [revealing, setRevealing] = useState(false);
   const fieldId = useId();
   // Several folders can have an edit form open at once, so the name carries the
   // one it belongs to. A folder being added has no name of its own yet.
   const title = profile === undefined ? SYNC_ADD_TITLE : `${SYNC_EDIT_TITLE}: ${profile.name}`;
+
+  /**
+   * Read the stored token into the field as the edit form opens (Story 34.12).
+   *
+   * This is the override of AD-34-7: the secret crosses the IPC boundary on a
+   * form open rather than on a press. Keyed on the id and not the profile
+   * object, because the mirror store hands this component a fresh object on
+   * every refresh and re-running the read would overwrite what was typed since.
+   */
+  const profileId = profile?.id;
+  useEffect(() => {
+    if (profileId === undefined) {
+      return;
+    }
+    let abandoned = false;
+    void (async () => {
+      try {
+        const value = await syncGetCredential(profileId);
+        if (abandoned) {
+          return;
+        }
+        if (value === null) {
+          setStored({ kind: "absent" });
+          return;
+        }
+        setStored({ kind: "stored", value });
+        // Only into a field nobody has started filling in: a keychain read can
+        // be slower than typing, and an answer that overwrites what the user
+        // just entered is worse than no answer.
+        setForm((live) => (live.token === "" ? { ...live, token: value } : live));
+      } catch (raw) {
+        if (abandoned) {
+          return;
+        }
+        setStored({ kind: "unreadable" });
+        setReadError(syncErrorMessage(raw));
+      }
+    })();
+    return () => {
+      abandoned = true;
+    };
+  }, [profileId]);
 
   /** Open the OS-native directory picker; a cancellation writes nothing. */
   const pickFolder = async () => {
@@ -473,12 +572,9 @@ export function AddFolderForm({
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setSaving(true);
+    // Only the save's own error is reset: a failed keychain read still
+    // describes the keychain, and it still governs what an empty field means.
     setError(null);
-    // Both acknowledgements belong to the write that produced them, so a second
-    // save never leaves the previous one's report standing.
-    setStoredToken(null);
-    setTokenCleared(false);
-    setNoStoredToken(false);
     // An empty box means "keeper picks", and keeper's own number is what it
     // means: `null` on the wire is the OMISSION Rust reads as "leave whatever is
     // stored" (AD-34-9), which is the opposite instruction. Sending the
@@ -489,7 +585,11 @@ export function AddFolderForm({
     const settle = pinnedValue(form.settleSeconds);
     const poll = pinnedValue(form.pollSeconds);
     const author = form.authorOverride.trim();
-    const { token } = form;
+    // Decided before anything is written, against the answer this form opened
+    // with, so a keychain read landing mid-save cannot change what the save
+    // means. The field on its own cannot tell "remove it" from "keeper never
+    // found out what is there".
+    const credential = credentialWrite(stored, form.token);
     try {
       const saved = await saveSyncProfile({
         // Present updates that profile, absent creates one — the only field
@@ -540,7 +640,7 @@ export function AddFolderForm({
       // folder — is what keeps its card from sitting stale for a poll
       // interval. Never throws.
       await refreshSyncDetail(saved.id);
-      if (token === "") {
+      if (credential.kind === "none") {
         onSaved?.(saved, true);
         return;
       }
@@ -548,87 +648,48 @@ export function AddFolderForm({
       // failure is reported as its own thing: the profile is stored by now, and
       // a blanket failure would be a lie.
       try {
-        await syncSetCredential(saved.id, token);
+        if (credential.kind === "clear") {
+          await syncClearCredential(saved.id);
+        } else {
+          await syncSetCredential(saved.id, credential.value);
+        }
       } catch (raw) {
-        const prefix = editing ? SYNC_TOKEN_EDIT_FAILED_PREFIX : SYNC_TOKEN_FAILED_PREFIX;
+        // A removal is only reachable from an edit form, since an add has no
+        // stored token to remove — but "not stored" would describe the opposite
+        // of what was attempted, so it gets its own wording.
+        let prefix = SYNC_TOKEN_FAILED_PREFIX;
+        if (credential.kind === "clear") {
+          prefix = SYNC_TOKEN_REMOVE_FAILED_PREFIX;
+        } else if (editing) {
+          prefix = SYNC_TOKEN_EDIT_FAILED_PREFIX;
+        }
         setError(`${prefix}${syncErrorMessage(raw)}`);
-        // The form now holds something only it can show, so the caller is told
-        // the profile is stored but must not hide the form yet.
+        // The profile is stored and the keychain is not, so the caller is told
+        // to keep the form up: the field still holds the value that has to get
+        // in, and hiding the form would take it away.
         onSaved?.(saved, false);
         return;
       }
       if (editing) {
-        // Clear stands under the token field for as long as this profile is
-        // being edited, so the write has an undo without the form staying open
-        // to carry one.
-        setForm((live) => ({ ...live, token: "" }));
+        // The keychain now holds what the field holds, so the baseline moves
+        // with it. Otherwise a second Save of an untouched form would rewrite
+        // the same secret, and a save after a removal would try to remove it
+        // again. An add form has already been reset to a blank draft for the
+        // next folder, whose baseline is still "nothing stored".
+        setStored(
+          credential.kind === "clear"
+            ? { kind: "absent" }
+            : { kind: "stored", value: credential.value },
+        );
+        setReadError(null);
+        // The secret is committed; there is no reason to leave it legible.
         setTokenVisible(false);
-        onSaved?.(saved, true);
-        return;
       }
-      // On a new folder the acknowledgement and its Clear button are the only
-      // undo left once the form is gone, so the caller is told to keep it
-      // mounted.
-      setStoredToken({ id: saved.id, name: saved.name });
-      onSaved?.(saved, false);
+      onSaved?.(saved, true);
     } catch (raw) {
       setError(syncErrorMessage(raw));
     } finally {
       setSaving(false);
-    }
-  };
-
-  /**
-   * Forget the stored token. Offered wherever the form has an id to clear
-   * against: throughout an edit, and after a new folder's token was just
-   * written, which is the only moment an add has one.
-   */
-  const clearToken = async (id: string) => {
-    setSaving(true);
-    setError(null);
-    try {
-      await syncClearCredential(id);
-      setStoredToken(null);
-      setTokenCleared(true);
-      // A revealed token still on screen would contradict the line that just
-      // said it is gone — and the next save would write it straight back.
-      setForm((live) => ({ ...live, token: "" }));
-      setTokenVisible(false);
-      setNoStoredToken(false);
-    } catch (raw) {
-      setError(syncErrorMessage(raw));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  /**
-   * Read the stored token out of the keychain, because the user pressed for it.
-   * Never called on mount or from any load path (AD-34-7): a secret crosses
-   * into the UI on a press and on nothing else. All three answers are reported
-   * as themselves, since an empty field is what two of them would look like.
-   */
-  const revealStoredToken = async (id: string) => {
-    setRevealing(true);
-    setError(null);
-    setNoStoredToken(false);
-    try {
-      const stored = await syncGetCredential(id);
-      if (stored === null) {
-        setNoStoredToken(true);
-        return;
-      }
-      setForm((live) => ({ ...live, token: stored }));
-      // Asking for a secret and then rendering it as dots would be asking and
-      // withholding, so a reveal reveals.
-      setTokenVisible(true);
-      // The field now holds what the keychain holds, so a prior "removed" no
-      // longer describes anything on screen.
-      setTokenCleared(false);
-    } catch (raw) {
-      setError(`${SYNC_TOKEN_READ_FAILED_PREFIX}${syncErrorMessage(raw)}`);
-    } finally {
-      setRevealing(false);
     }
   };
 
@@ -919,11 +980,6 @@ export function AddFolderForm({
                 value={form.token}
                 disabled={disabled || saving}
                 onChange={(event) => {
-                  // A typed token replaces whatever is stored, so neither a
-                  // prior "removed" nor a prior "none stored" still describes
-                  // what saving will do.
-                  setTokenCleared(false);
-                  setNoStoredToken(false);
                   setForm((live) => ({ ...live, token: event.target.value }));
                 }}
               />
@@ -944,69 +1000,18 @@ export function AddFolderForm({
             </div>
           </div>
           <p className="text-muted-foreground text-xs">
-            {editing ? SYNC_TOKEN_EDIT_NOTE : SYNC_TOKEN_NOTE}
+            {editing ? TOKEN_NOTES[stored.kind] : SYNC_TOKEN_NOTE}
           </p>
-          {/* The two keychain calls the form can make against an id it already
-              has. Both are offered for as long as there is one: revealing is a
-              read the user asks for, clearing a write nothing else on screen
-              could report. */}
-          {profile !== undefined && (
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                type="button"
-                variant="ghost"
-                size="xs"
-                className="w-fit"
-                disabled={disabled || saving || revealing}
-                onClick={() => {
-                  void revealStoredToken(profile.id);
-                }}
-              >
-                {SYNC_TOKEN_REVEAL_LABEL}
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="xs"
-                className="w-fit"
-                disabled={disabled || saving}
-                onClick={() => {
-                  void clearToken(profile.id);
-                }}
-              >
-                {SYNC_TOKEN_CLEAR_LABEL}
-              </Button>
-              {noStoredToken && (
-                <p className="text-muted-foreground text-xs">{SYNC_TOKEN_NONE_STORED_LABEL}</p>
-              )}
-              {tokenCleared && (
-                <p className="text-muted-foreground text-xs">{SYNC_TOKEN_CLEARED_LABEL}</p>
-              )}
-            </div>
+          {/* What the keychain said, kept beside the field it explains. The
+              note above already says the field will not be acted on; this says
+              why, in the keychain's own words, so the user can decide whether
+              it is worth reopening the form. */}
+          {readError !== null && (
+            <p className="text-destructive text-xs">
+              {SYNC_TOKEN_READ_FAILED_PREFIX}
+              {readError}
+            </p>
           )}
-        </div>
-      )}
-      {/* Outside the disclosure on purpose: this is the acknowledgement for an
-          action that already happened, and it would be invisible collapsed. Set
-          only while adding — an edit keeps its Clear under the token field, and
-          two buttons of the same name on one screen would be one too many. */}
-      {storedToken !== null && (
-        <div className="flex items-center justify-between gap-2">
-          <p className="text-muted-foreground text-xs">
-            {SYNC_TOKEN_STORED_LABEL} ({storedToken.name})
-          </p>
-          <Button
-            type="button"
-            variant="ghost"
-            size="xs"
-            className="shrink-0"
-            disabled={saving}
-            onClick={() => {
-              void clearToken(storedToken.id);
-            }}
-          >
-            {SYNC_TOKEN_CLEAR_LABEL}
-          </Button>
         </div>
       )}
       {error !== null && <p className="text-destructive text-xs">{error}</p>}

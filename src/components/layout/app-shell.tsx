@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { type MouseEvent, useCallback, useRef } from "react";
 import { ApprovalPane } from "@/components/approval/approval-pane";
 import { NewChatDialog } from "@/components/chat/new-chat-dialog";
 import { CheatSheetOverlay } from "@/components/cheat-sheet/cheat-sheet-overlay";
@@ -40,6 +40,7 @@ import { useViewShortcuts } from "@/hooks/use-view-shortcuts";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { useDetailStore } from "@/lib/stores/detail-ui";
 import { usePrimaryView } from "@/lib/stores/primary-view";
+import { beginTitleBarDrag } from "@/lib/titlebar-drag";
 import { cn } from "@/lib/utils";
 
 export function AppShell() {
@@ -138,6 +139,32 @@ export function AppShell() {
     [openDetail, closeDetail],
   );
 
+  // The band starts the window drag itself rather than relying only on Tauri's
+  // `data-tauri-drag-region` shim, which invokes the same `start_dragging` command
+  // and then drops the promise — so a refused drag moves nothing and says nothing.
+  // `beginTitleBarDrag` issues the call where its outcome can be recorded (Story
+  // 34.3). Both columns keep the attribute: wherever this handler does not run,
+  // the shim still behaves exactly as it did before.
+  const handleBandMouseDown = useCallback((event: MouseEvent<HTMLDivElement>) => {
+    // Primary button; a direct hit on the band itself, which is Tauri's own rule
+    // for a bare `data-tauri-drag-region` and keeps a future child of the band
+    // from becoming a drag handle; and the opening click only, because on macOS
+    // the shim implements double-click-to-zoom on the following `mouseup` and a
+    // drag started from the second `mousedown` would swallow that gesture.
+    if (event.button !== 0 || event.detail !== 1 || event.target !== event.currentTarget) {
+      return;
+    }
+    // Take the gesture over instead of letting the shim fire as well: one
+    // `start_dragging` per mouse-down keeps the recorded outcome attributable to
+    // this call, and `preventDefault` is what the shim spends the event on too —
+    // suppressing the text cursor. Nothing here reads or writes React state, so
+    // the mouse-down cannot re-render the band out from under the drag, and the
+    // callback closes over nothing that could go stale.
+    event.preventDefault();
+    event.stopPropagation();
+    void beginTitleBarDrag();
+  }, []);
+
   return (
     <TooltipProvider>
       <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
@@ -151,15 +178,23 @@ export function AppShell() {
         {overlayTitleBar && (
           <div className="flex h-7 shrink-0">
             {!phone && (
+              // biome-ignore lint/a11y/noStaticElementInteractions: the band is window chrome with no accessible semantics — an empty 28px strip whose only affordance is dragging the window with a pointer, which has no keyboard or AT analogue (the OS moves windows through its own Window menu).
               <div
                 data-tauri-drag-region
+                onMouseDown={handleBandMouseDown}
                 className={cn(
                   "h-full shrink-0 bg-sidebar",
                   sidebarCollapsed ? SIDEBAR_WIDTH_CLASS.collapsed : SIDEBAR_WIDTH_CLASS.expanded,
                 )}
               />
             )}
-            <div data-tauri-drag-region className="h-full flex-1 bg-background" />
+            {/* biome-ignore lint/a11y/noStaticElementInteractions: same as the drawer
+                column above — pointer-only window chrome, no accessible semantics. */}
+            <div
+              data-tauri-drag-region
+              onMouseDown={handleBandMouseDown}
+              className="h-full flex-1 bg-background"
+            />
           </div>
         )}
         <VerifyBanner />

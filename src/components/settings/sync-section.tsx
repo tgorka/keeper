@@ -41,8 +41,11 @@ import { Progress } from "@/components/ui/progress";
 import type { SyncDeviceVm, SyncOutcomeVm, SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
 // Read and written straight through rather than through the mirror store: the
 // device name is one app-global string nothing else changes, so mirroring it
-// would be a second source of truth for a value read once per open.
-import { syncDevice, syncDeviceSetLabel } from "@/lib/ipc/client";
+// would be a second source of truth for a value read once per open. Opening a
+// folder is here for the adjacent reason — it changes nothing, so there is no
+// mirrored state for a store action to keep in step.
+import { syncDevice, syncDeviceSetLabel, syncOpenPath } from "@/lib/ipc/client";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import {
   ensureSyncHydrated,
   isSyncStatusActive,
@@ -55,6 +58,7 @@ import {
   useSyncStore,
   verifySyncProfile,
 } from "@/lib/stores/sync";
+import { cn } from "@/lib/utils";
 
 /** Section heading. */
 export const SYNC_SECTION_TITLE = "Sync";
@@ -71,6 +75,13 @@ export const SYNC_NOW_LABEL = "Sync now";
 export const SYNC_PAUSE_LABEL = "Pause";
 export const SYNC_RESUME_LABEL = "Resume";
 export const SYNC_REMOVE_LABEL = "Remove";
+
+/**
+ * The folder-path control's verb, worded exactly as the export dialog and the
+ * recording completion card word theirs: keeper has one way of saying "show me
+ * this in the file manager" and this is it.
+ */
+export const SYNC_OPEN_PATH_LABEL = "Reveal in Finder";
 
 /** The needs-attention alert's inline action: re-check the folder's contents. */
 export const SYNC_VERIFY_LABEL = "Check files";
@@ -149,6 +160,72 @@ export function syncRemoteHost(remoteUrl: string): string {
   } catch {
     return trimmed;
   }
+}
+
+/**
+ * A synced folder's path, as the control that opens the folder (Story 32.4).
+ *
+ * The path was already on screen as plain text on both surfaces and there was no
+ * way to reach the folder from the app at all, so the affordance is the thing a
+ * person would reach for first: the path itself, a real button and therefore
+ * keyboard-reachable. It passes the profile id — the folder is resolved in Rust
+ * from the stored profile, so nothing here can ask to open an arbitrary
+ * location.
+ *
+ * Shared by the Settings row and the Sync view's folder card for the reason the
+ * removal confirmation is shared: two copies of one affordance drift.
+ *
+ * Gated on `capabilities.revealInFileManager` and inert text when it is off,
+ * matching the recording completion card — a platform with no user-visible file
+ * manager gets no affordance rather than one that fails on activation.
+ */
+export function SyncFolderPath({
+  profile,
+  className,
+  onError,
+}: {
+  profile: SyncProfileVm;
+  /** Text styling from the surface that owns the line: mono here, plain there. */
+  className?: string;
+  /** Where a refusal goes — the caller's existing action-error line. */
+  onError: (message: string) => void;
+}) {
+  const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
+
+  if (!canReveal) {
+    return (
+      <span className={className} title={profile.localPath}>
+        {profile.localPath}
+      </span>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      // The visible text is a path, and a path does not say that activating it
+      // opens that folder — so the accessible name carries the verb as well.
+      // `title` stays the bare path: both surfaces truncate it, and reading the
+      // whole thing on hover is what that attribute was already there for.
+      aria-label={`${SYNC_OPEN_PATH_LABEL}: ${profile.localPath}`}
+      title={profile.localPath}
+      className={cn(
+        "underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring",
+        className,
+      )}
+      onClick={() => {
+        // Deliberately not through the caller's action lifecycle: opening a
+        // folder changes nothing about it, so it must not take the busy lock or
+        // clear the last sync report. A refusal — a folder that is gone, a
+        // volume that is out — still lands where action errors are shown.
+        void syncOpenPath(profile.id).catch((raw: unknown) => {
+          onError(syncErrorMessage(raw));
+        });
+      }}
+    >
+      {profile.localPath}
+    </button>
+  );
 }
 
 export function SyncSection({ open }: { open: boolean }) {
@@ -341,9 +418,11 @@ function SyncProfileRow({
           {status !== undefined && (
             <span className="font-mono text-muted-foreground text-xs">{status.line}</span>
           )}
-          <p className="truncate text-muted-foreground text-xs" title={profile.localPath}>
-            {profile.localPath}
-          </p>
+          <SyncFolderPath
+            profile={profile}
+            className="block max-w-full truncate text-left text-muted-foreground text-xs"
+            onError={setActionError}
+          />
           <p className="text-muted-foreground text-xs">{syncRemoteHost(profile.remoteUrl)}</p>
         </div>
         <div className="flex shrink-0 items-center gap-1">

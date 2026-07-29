@@ -5338,6 +5338,53 @@ pub fn debug_log_path() -> Result<String, IpcError> {
     Ok(crate::debug_log::app_log_path().display().to_string())
 }
 
+/// Record one stage of an app-driven title-bar drag in the app log (Story 34.3).
+///
+/// The overlay title bar's drag band cannot report its own failures. Tauri's
+/// `data-tauri-drag-region` shim invokes `plugin:window|start_dragging` and
+/// drops the returned promise, so a refusal — an ACL denial, or AppKit declining
+/// `performWindowDragWithEvent:` because the originating mouse-down is no longer
+/// the current event by the time the IPC hop lands — is completely silent: the
+/// window simply does not move. The frontend therefore issues that call itself
+/// and reports each stage here, where it lands in a file a bug report can carry.
+///
+/// `WARN`, not `INFO`, deliberately: the file leg of the app log admits
+/// `WARN`/`ERROR` regardless of the debug-mode toggle ([`crate::debug_log`]), and
+/// that toggle is off by default — an `INFO` line would exist only on a stderr
+/// nobody reads once the app is launched from Finder, which is the wrong place
+/// for the one thing we need to read back off a user's machine.
+///
+/// The log text is authored here rather than passed in, so the webview cannot
+/// write arbitrary lines into the app log; only `detail` (a refusal message)
+/// crosses, capped to one line's worth. Drop this command, and the frontend call
+/// that feeds it, once the drag defect is closed.
+#[tauri::command]
+pub fn titlebar_drag_report(stage: String, detail: Option<String>) {
+    // As much of a refusal message as is worth keeping on one log line.
+    const MAX_DETAIL_CHARS: usize = 200;
+    let detail: String = detail
+        .unwrap_or_default()
+        .chars()
+        .take(MAX_DETAIL_CHARS)
+        .collect();
+    match stage.as_str() {
+        "issued" => tracing::warn!(
+            "titlebar drag: start_dragging issued from the drag band (story 34.3 probe)"
+        ),
+        "accepted" => tracing::warn!(
+            "titlebar drag: start_dragging accepted by the window layer (story 34.3 probe)"
+        ),
+        "refused" => {
+            tracing::warn!(%detail, "titlebar drag: start_dragging REFUSED (story 34.3 probe)")
+        }
+        other => tracing::warn!(
+            stage = %other,
+            %detail,
+            "titlebar drag: unrecognised stage reported by the webview"
+        ),
+    }
+}
+
 /// Read the menu-bar (tray) presence toggle (Story 10.3, FR-53). Reads the persisted
 /// `system.menu_bar_presence` setting (default off). Errors funnel through
 /// [`to_ipc_error`].

@@ -1093,14 +1093,62 @@ location: .github/workflows/release.yml (Detect Apple signing secrets) + reposit
 reason: The workflow treats Apple signing as optional and falls back to an ad-hoc build with only a `::notice::`, which nobody reads on a green run. The repository holds only `TAURI_SIGNING_PRIVATE_KEY`/`_PASSWORD` — every `APPLE_*` secret is absent — so v0.4.0/v0.4.1/v0.4.2 all published "(unsigned build)" artifacts while the release looked entirely successful. `spctl -a` rejects the result, so a fresh install needs the right-click→Open ceremony. The keychain leg is real but latent: macOS binds keychain ACLs to the signing identity, and an ad-hoc signature has no certificate — its identity is a cdhash that changes with every build — so an ad-hoc build cannot read credentials written by a signed one, and in that steady state every update would force a re-login. Fix: provision the `APPLE_*` secrets so the signed path runs, and make the unsigned fallback loud (fail a tagged release by default, opt in explicitly for a local/test build). The identity must then stay stable across releases — changing certificate costs one forced re-login.
 status: open
 correction: 2026-07-27 — this entry originally blamed the signing change for the accounts vanishing after installing v0.4.2 on hesperia. That diagnosis was WRONG and the evidence for it was circumstantial (a rollback to the signed 0.3.0 restored the accounts, which both explanations predict). The actual cause was a code regression, since fixed: `lib.rs` called Tauri's `invoke_handler` twice, and that method ASSIGNS (`self.invoke_handler = Box::new(handler)`), so the second registration — folder sync's desktop-only commands — discarded all 164 commands from the first. The desktop build had nine reachable commands and answered "Command <name> not found" to everything else, which is why the account never restored, the recording surface never appeared, and the Bridges pane showed a raw IPC error. What falsified the keychain story: `bridge_catalog` failed too, and it touches no credential. The keychain hazard above stands on its own and stays open; it simply was not what broke that install.
+note: 2026-07-29 — the workflow half is fixed; the entry stays open because its `location` also
+  names the repository's Actions secrets, and those are still absent. `release.yml` no longer has
+  an unsigned path at all: a preflight step beside the tag-vs-version check requires all seven
+  Apple secrets (`APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
+  `KEYCHAIN_PASSWORD`, `APPLE_API_ISSUER`, `APPLE_API_KEY_ID`, `APPLE_API_KEY_P8_BASE64`) and
+  fails the job in seconds naming every one that is missing, and the ad-hoc build plus its
+  `gh release create --title "keeper <tag> (unsigned build)"` step are deleted. So a release can
+  no longer be green and unsigned — it is either signed and notarized or it is red. Two things
+  the old gate got wrong are also closed: it accepted just the certificate and the `.p8`, so a
+  repository without `APPLE_API_ISSUER` took the signed path and produced a signed-but-NOT-
+  notarized build on a green run; and the ad-hoc path shipped signed updater artifacts, which
+  would have delivered this entry's keychain harm on every auto-update rather than once.
+  `keeper-syncd` binaries still publish when the app job fails (`needs: release` +
+  `if: always()`). What remains is provisioning: until the seven secrets exist, tags produce a
+  red app job and no macOS artifact. See
+  `spec-dw-113-signed-releases-and-the-epic-34-ledger.md`, including how to verify the gate on a
+  throwaway tag without burning a release.
 
 ### DW-114: Nothing anywhere constructs the filesystem watcher, so no host is event-driven — both the app and the daemon poll at 1 Hz. (The app-side half, never starting the supervisor at all, is fixed.)
 
 origin: found while answering a user question about the sync surface, 2026-07-27
 location: src-tauri/crates/keeper/src/sync.rs (engine built, never driven) + keeper-sync/src/watch.rs (no production constructor)
 reason: `Engine::run` (keeper-sync/src/engine.rs:372) is the 1 Hz supervisor that drains the journal and rescans the tree. Its only caller in the repo is `run_supervisor` in the daemon (keeper-syncd/src/commands.rs:879); the `keeper` crate builds the engine as a lazy singleton (keeper/src/sync.rs:155-175) and never calls `run`, despite that module's own doc claiming it owns "the supervisor task" (sync.rs:5). Separately, `watch.rs` implements a complete per-profile watcher — `FolderWatcher` (:360), `EchoSuppressor` (:161), inotify close-write fast path, overflow rescan, poll fallback — and a repo-wide grep for `FolderWatcher|WatchConfig|EchoSuppressor` matches only that file and its own tests, so NO host is event-driven; even the daemon polls at 1 Hz. Consequences: in the app a profile added in Settings does nothing until "Sync now" is clicked, and no remote change ever arrives on its own; the `close_write` 1 s settle window (profile.rs:116) is dead code; Story 26-2 (watcher) and Epic 29 are marked done in sprint-status while the app-side behaviour they imply does not exist. Fix is a design decision, not a patch: either drive the engine from the app lifecycle (start on launch, pause on quit-to-tray, stop before teardown) or state plainly in the UI that in-app sync is manual and continuous sync requires keeper-syncd.
-status: open
-resolution: 2026-07-27 (app half only, PR #7) — the app now starts the supervisor from `setup` and signals it on the quit path before account teardown, so a configured folder converges without a separate daemon; verified live on macOS by `sync supervisor started` in the app's own log with both accounts still syncing. What stays open is the watcher: `FolderWatcher`/`WatchConfig`/`EchoSuppressor` still have no production constructor anywhere, so nothing is event-driven, the Linux close-write fast path (profile.rs:116) remains dead code, and both hosts discover work only by rescanning on the tick.
+status: done 2026-07-29
+note: 2026-07-27 (app half only, PR #7) — the app now starts the supervisor from `setup` and signals it on the quit path before account teardown, so a configured folder converges without a separate daemon; verified live on macOS by `sync supervisor started` in the app's own log with both accounts still syncing. What stays open is the watcher: `FolderWatcher`/`WatchConfig`/`EchoSuppressor` still have no production constructor anywhere, so nothing is event-driven, the Linux close-write fast path (profile.rs:116) remains dead code, and both hosts discover work only by rescanning on the tick.
+resolution: watcher half fixed by story 34.9
+  (`spec-34-9-files-sync-when-they-land.md`), which closes this entry.
+  `Engine::ensure_watcher` arms one `watch::FolderWatcher` per enabled profile and
+  `retain_watchers` re-establishes that on every tick, so "every enabled profile is watched"
+  is a property re-derived continuously rather than three call sites that must remember. The
+  lifetime lives in the engine, so both hosts get it and neither `keeper/src/sync.rs` nor
+  `keeper-syncd/src/commands.rs` was touched. `FolderWatcher`, `WatchConfig` and
+  `EchoSuppressor` therefore have production constructors for the first time.
+  WHAT IS EVENT-DRIVEN NOW: a delivered batch sets a sticky wake that reopens the walk on the
+  next 1 s tick instead of at `poll_interval_ms`, and a delivered close-write reaches
+  `StabilityGate::note_close_write`, so the 1 s `CLOSE_WRITE_SETTLE_MS` path is reachable
+  rather than the dead code this entry named. A new `StabilityGate::next_stable_ms` also
+  reopens the walk when a held path's own window elapses, so the second observation no longer
+  waits for a poll.
+  WHAT IS NOT: close-write is an inotify concept, so that fast path is Linux-only — on macOS
+  the FSEvents backend has none and the bound is the settle window plus a tick, roughly 6-7 s,
+  against two 15 s poll intervals before. `git status` remains the sole authority on WHAT
+  changed; events only say when to look. The paced scan is unchanged and still evaluated
+  first and unconditionally on every tick, so nothing is watcher-only, and watcher failure
+  degrades to it loudly (a sticky warning naming the cadence and the reason) — deliberately
+  with no `notify::PollWatcher` fallback, which re-stats the whole tree every 30 s and is
+  therefore slower than the backstop it would replace. No `EchoSuppressor` is registered;
+  `fold_watch_events` records why. Teardown is deliberately NOT waited on: `watch::retire`
+  (watch.rs:578) hands the backend to an unjoined `keeper-sync-retire` thread because
+  `notify-8.2.0`'s FSEvents drop spins on `CFRunLoopIsWaiting` with no deadline, which had put
+  an unbounded wait on the supervisor tick, on `stop_all_watchers` and on
+  `sync_profile_remove` → `drop_watcher` on a tokio worker; `FolderWatcher::stop` no longer
+  promises that no further event can arrive. The daemon-wide
+  `DaemonSettings.poll_interval_ms` is still unconsumed (DW-116), and the 500-file-drop
+  latency acceptance is a machine check on hesperia that has not been run — see that spec's
+  Verification section.
 
 ### DW-115: The "Check files" action and its IPC doc promise verification against recorded digests, but no digest is ever recorded and the one it computes is thrown away.
 
@@ -1133,4 +1181,161 @@ resolution: honoured, per the entry's first option. `Engine::scan_is_due`
 origin: found while answering a user question about commit provenance, 2026-07-27
 location: keeper-sync/src/engine.rs:889 and :1240
 reason: `SyncSource` has four variants (provenance.rs:22-30) and the trigger is threaded correctly as far as `sync_once` — the app passes `SyncSource::Manual` (sync_ipc.rs:411) and the daemon passes `SyncSource::Cli` (commands.rs:807) — but both commit sites construct the provenance with a literal `SyncSource::Watch`, discarding the argument. `docs/sync.md:310` documents the field as `watch|manual|cli|bot`, and AD-50's bot-lane audit story leans on it, so the trailer is currently misleading rather than merely incomplete. One-line fix at each site once the value is threaded through; worth a test that a manual sync's commit carries `manual`.
+status: done 2026-07-29
+resolution: fixed by story 34.10
+  (`spec-34-10-sync-now-proves-it-ran.md`). `SyncSource` is now an explicit parameter threaded
+  down the one chain that reaches a commit — `drain_journal` → `execute` →
+  `do_pull`/`do_push` → `commit_local` → `commit` — so both `Provenance::new` sites use the
+  caller's value instead of the literal `SyncSource::Watch` this entry named. `tick_profile` is
+  the only caller that passes `Watch`, and `sync_once` forwards its own, which is how the app's
+  `Manual` and the daemon's `Cli` finally reach the trailer; a merge commit from `do_pull`
+  carries the caller's source too, not `watch`. The fourth variant is derived rather than
+  passed: new `Engine::commit_source` (engine.rs:2134) maps `Watch` on a `SyncLane::Worktree`
+  profile to `Bot` per AD-50, while a `Manual` pass on the same lane still says `manual`
+  because a person really did ask. `SyncSource::Bot` was previously unreachable — no caller
+  ever passed it. Tests read the trailer back out of the worktree's HEAD for a manual, a CLI
+  and a supervisor commit, plus the lane rule, so `docs/sync.md`'s documented
+  `watch|manual|cli|bot` is now true rather than aspirational.
+
+### DW-118: On macOS the web viewport sits 56 px below the window top while still sized to the window's full height, so `100vh` overshoots the visible area and everything anchored to the bottom is pushed out of view.
+
+origin: spec-34-2-window-chrome-and-reachable-drawer-bottom.md (story 34.2), 2026-07-29
+location: src-tauri/crates/keeper/tauri.conf.json:26-27 (`titleBarStyle: "Overlay"`, `hiddenTitle: true`) + the window's `WKWebView`, which no keeper code reaches today + docs/constraints-and-limitations.md:52-59 (the `unsafe_code` policy that blocks the remedy)
+reason: Measured on hesperia (macOS 26.5, keeper 0.6.2) out of the accessibility tree with the
+  window pinned to (200, 200) 1280x800: the window reports `(200, 200) 1280x800`, the close
+  button `(208, 208) 16x16`, and `HTML content` `(200, 256) 1280x800` — the viewport starts 56 px
+  down AND is a full 800 tall, so its bottom 56 px is off-screen. `Add account` reports
+  `(208, 1012) 243x36` against a window bottom of y=1000: unreachable, with no scrollbar,
+  because `mt-auto` is doing its job in a viewport whose bottom does not exist. Story 34.2
+  chased this to WebKit's automatic top obscured content inset, against pinned tao/wry/WebKit
+  sources: every macOS `WKWebView` opts in at init (`WKWebView.mm:690`) and wry 0.55.1 never
+  opts out (a grep for `obscuredContentInsets|automaticallyAdjustsContentInsets|safeArea|
+  contentLayoutRect` returns nothing), and the value is computed in
+  `PageClientImplMac.mm:1115-1127` behind `(styleMask & FullSizeContentView) && ![window
+  titlebarAppearsTransparent] && ![view enclosingScrollView]`. Apple's own commit for that code
+  (`291818@main`, bug 289350) describes both the normal case ("this inset ends up being the
+  height of the window's titlebar") and this failure ("the inset update occurs with incomplete
+  constraints... AppKit does not report the change via KVO, leaving WKWebView stuck in state.
+  This lack of update is a clear AppKit bug") — i.e. the inset is computed while the titlebar is
+  still opaque and never recomputed. That mechanism is the only one whose signature matches the
+  measurement: an obscured inset moves the rendered page and the `AXWebArea` while leaving the
+  layout viewport at the view's full height, which is exactly why `100vh` stays 800 and why no
+  CSS unit can see the problem. `Overlay` is already the safest of the three settings — the
+  truth table in that spec's Design Notes has `Visible` (= dropping the key) APPLYING the inset
+  and `Transparent` suppressing it only by painting a titlebar strip in a window background
+  colour Tauri cannot set — so `tauri.conf.json` was left untouched. Story 34.2 returned the
+  12 px duplicate inset and made the remaining 28 px band honest; these 56 px are diagnosed and
+  attributed, not fixed. Do not "fix" it by subtracting 56 px in CSS: a hard-coded
+  native-chrome constant is how this returns on the next macOS release.
 status: open
+blocked: 2026-07-29 — needs an authorised `unsafe` exception, which is not this story's to
+  grant. The reliable remedy is to disable the automatic inset on the window's own `WKWebView`
+  through `with_webview`, and the public `obscuredContentInsets` setter cannot do it (macOS
+  26.0+ only, against a floor of 11.0, and it early-returns when the new value equals the
+  current one, so assigning zero-while-zero is a no-op) — leaving the SPI
+  `_setAutomaticallyAdjustsContentInsets:NO` (`WKWebViewPrivate.h:874`). That is a second objc
+  FFI site, and the workspace declares `unsafe_code = "deny"` with exactly one audited
+  function-level exception (`IosPlatform::exclude_from_backup`) under the dated coordinator
+  policy in docs/constraints-and-limitations.md:52-59. THE DECISION THAT IS BLOCKED: whether to
+  amend that policy for a second `#[allow(unsafe_code)]` site in the `keeper` shell crate.
+  Either answer needs a runtime discriminator logged first — `[window
+  titlebarAppearsTransparent]`, `[window contentLayoutRect]`, `[webView
+  _obscuredContentInsets]` and the `WKWebView`'s frame in contentView coordinates — because it
+  separates a wrong `NSView` frame (a wry bug to file) from a stuck obscured inset (the
+  WebKit/AppKit bug above). The fallbacks, in order, are: file the wry issue with those four
+  values and the AX numbers; or accept the 56 px, which costs nothing else — the drag band is
+  unaffected either way.
+
+### DW-119: `target`, `dist` and `build` are deliberately NOT tier-0 built-in excludes — the list is short on purpose, and "completing" it later would be silent data loss.
+
+origin: spec-34-9-files-sync-when-they-land.md (story 34.9), 2026-07-29
+location: src-tauri/crates/keeper-sync/src/exclude.rs:104-127 (`BUILTIN_EXCLUDES`, with the reasoning recorded in the corpus itself) + the pinning test `ordinary_english_build_directory_names_are_not_tier_zero` (exclude.rs:321)
+reason: The epic named eight directory conventions for tier 0; five shipped (`node_modules`,
+  `__pycache__`, `.venv`, `.next`, `.cache`, each with a name rule and a `**/name/**` subtree
+  rule). Tier 0 is unconditional and invisible — an excluded path is never staged, never queued,
+  never counted and never reported as pending — so a wrong entry there is silent, permanent data
+  loss from the user's point of view, with no pending row to reveal it. Every entry that does
+  belong is either a machine-generated name with a distinctive shape (`*.crdownload`, `~$*`,
+  `.~lock.*#`) or a reserved-looking OS metadata directory (`.DS_Store`, `.Spotlight-V100`); the
+  five that shipped fit that shape and three of them are dotfiles besides. `target`, `dist` and
+  `build` do not: they are ordinary English words, they are not hidden, and their build-output
+  meaning is CONTEXTUAL — only a `target` beside a `Cargo.toml` is Rust's, only a `build` beside
+  a `CMakeLists.txt` is CMake's — while this tier matches names with one compiled glob set and
+  never touches the filesystem, which is exactly what makes it cheap. `.gitignore` already
+  handles them, is honoured by the same status walk the commit path uses, and is readable and
+  editable by the user. So tier 0 would buy almost nothing for real projects and would cost a
+  woodworking archive its `build/` folder. Checkable: the test at exclude.rs:321 asserts
+  `build/bench-plan.pdf`, `target/q3-audience.numbers`, `dist/press-kit.zip` and two nested
+  cases stay visible, and that none of the three names is in `BUILTIN_EXCLUDES`; and
+  `extra_profile_patterns_apply_with_gitignore_anchoring` already uses `build/**` as a USER
+  pattern and asserts `crate/build/out.o` still syncs, so adding them to tier 0 would have
+  broken an existing test.
+status: closed
+resolution: wont-fix by design (story 34.9, 2026-07-29). This is a decision, not a gap: the
+  three names are refused, not deferred, and the argument is recorded both in the corpus comment
+  and in a test that fails if someone adds them. A user who does want them gone says so per
+  profile through `SyncProfile.excludes`, which is visible and reversible. Revisit only if tier 0
+  ever gains filesystem context (a `Cargo.toml`/`CMakeLists.txt` sibling check), which would
+  make it a different mechanism with a different cost.
+
+### DW-120: `gix-ref`'s failed-lock error path can loop forever, which is what the 96-minute CI hang on the NFR-8 durability sweep was; the trigger is fixed in keeper, the upstream loop is not.
+
+origin: CI run 30417789975 on commit 3523a25 (job `Rust (fmt, clippy, test)`, macos-latest); recorded in spec-34-9-files-sync-when-they-land.md's follow-up and diagnosed by story 34.11, 2026-07-29
+location: upstream `gix-ref-0.66.0/src/store/file/transaction/prepare.rs:398-410` (gix 0.86.0, both pinned in src-tauri/Cargo.lock) + src-tauri/crates/keeper-sync/src/git/repo.rs (where story 34.11 removes the trigger) + src-tauri/.config/nextest.toml (the guard)
+reason: 1525 of 1526 tests finished inside two minutes; the run then sat on
+  `keeper-syncd::durability_matrix a_kill_at_any_instant_costs_no_data_and_corrupts_no_index`
+  for ninety-six minutes, emitting `SLOW [>N]` once a minute and nothing else, until a human
+  cancelled it. The job's `Cleaning up orphan processes` step named a live `keeper-syncd`, a live
+  `durability_matr` and a live `cargo-nextest`, so a daemon child outlived the run. The same test
+  takes 12.05-21.54 s on that runner across the three preceding green runs.
+  RULED OUT, with evidence: (a) not story 34.9's watcher wiring, the obvious suspect — the
+  durability matrix only ever runs `keeper-syncd sync --once` (durability_matrix.rs:130 and
+  :237), and that path returns from `cmd_sync` before `run_supervisor`, so it never enters
+  `Engine::run`, never calls `stop_all_watchers` and constructs no `FolderWatcher` at all;
+  confirmed empirically by running the daemon under `RUST_LOG=debug`, where a `sync --once` over
+  a registered profile emits zero `folder watch armed` lines. (b) Not reproducible on Linux — the
+  sweep was re-run 48 times (~336 daemon invocations) under 2x CPU oversubscription on 3 cores
+  and stayed clean, which is expected rather than reassuring, because `INotifyWatcher::drop`
+  joins nothing while the FSEvents teardown spins. A green Linux run was therefore never
+  evidence for this.
+  CAUSE, identified 2026-07-29 by story 34.11
+  (`spec-34-11-a-kill-during-a-ref-update-must-not-strand-a-folder.md`): a SIGKILL during a
+  reference update leaves a stale `.git/refs/heads/<branch>.lock`, and the next
+  `keeper-syncd sync --once` never returns because gix-ref's failed-lock error-message fixup
+  walks `parent_index` without ever advancing `cursor` once it reaches the root edit — so a
+  failed lock on a deref'd CHILD ref becomes an infinite 100%-CPU loop instead of an error, and
+  `sync_to_completion`'s `.output()` waits on that child forever. That is precisely the live
+  trio the CI cleanup step named. Isolated with no keeper code in the loop: planting
+  `refs/heads/main.lock` and calling `gix::Repository::commit_as("HEAD", ..)` directly never
+  returns (killed at 15 s), while planting `.git/HEAD.lock` — the root edit, whose
+  `parent_index` is `None`, so the loop body never runs — returns
+  `Err("A lock could not be obtained for reference \"HEAD\"")` in 134 ms, which is verbatim the
+  PR #21 failure. One root cause, two shapes.
+  WHAT STAYS OPEN, and why this entry is not closed: the gitoxide loop itself. Story 34.11 adds
+  stale-ref-lock recovery at repo open, which removes its only OBSERVED trigger, but the
+  upstream defect is untouched and any other route to a failed lock on a child ref — a
+  concurrent writer, a lock this repo did not leave behind — still reaches it. Closing it needs
+  an upstream report and patch against gix-ref, or a keeper-side deadline around ref
+  transactions; the pinned versions are in src-tauri/Cargo.lock, so a bump is the thing to check
+  first.
+status: open
+note: 2026-07-29 — the recurrence cost is already bounded, and that guard is not part of what
+  stays open. `src-tauri/.config/nextest.toml` sets
+  `slow-timeout = { period = "60s", terminate-after = 4 }`: the warning cadence is nextest's
+  existing default, so a legitimately slow test logs exactly what it logged before, but past
+  four minutes the test is killed and reported as `TIMEOUT` against its own name — which fails
+  the build and reaps the child processes a hung test leaves behind. Four minutes came off
+  measured CI timings, not a guess: the slowest honest tests on that runner are the archive
+  search perf gate at 24.98 s and this sweep at 12.05-21.54 s, the next slowest test in the
+  workspace is 4.4 s, and all 1469 together take 43 s. So a recurrence costs four minutes and a
+  named failing test instead of ninety-six minutes and a cancelled run.
+
+### DW-121: The desktop app registers itself as the git LFS clean/smudge filter, but the app binary has no `lfs` subcommand — so the filter fails on every invocation.
+
+origin: found while repairing the racily-clean guard for story 34.13, 2026-07-29
+location: keeper-sync/src/engine.rs:342-344 (`filter_program` = `current_exe()`) + keeper-syncd/src/commands.rs:1621 (the only implementation) + keeper/src (no `lfs` subcommand anywhere)
+reason: `Engine::open` configures `filter.lfs.clean`/`smudge` to `std::env::current_exe()`, and its comment claims "both understand `lfs clean|smudge`". `keeper-syncd` does. The `keeper` app binary does not — a repo-wide grep of `crates/keeper/src` finds only `lfs_mode` and `lfs_threshold_bytes` in `sync_ipc.rs`, and no argument parsing that could answer `lfs clean --repo <path>`. Because keeper also sets `filter.lfs.required=false`, a filter that fails is indistinguishable from one that is absent, so nothing reports it: git falls back to storing the bytes it was given. Measured against both plain git and gitoxide while fixing 34.13: with a WORKING clean filter a racily-clean LFS entry reads clean, because git re-reads the worktree and cleans it back into the pointer the index already holds; without one it reads modified. So on desktop the guard `lfs::stage::is_false_modification` is the ONLY thing standing between a committed LFS file and a full re-clean of every such file on the next scan, and on a `keeper-syncd` host that same guard is dead code. keeper stages its own pointers (`lfs/stage.rs`), so this is not why LFS sync works — the harm is to anything that drives real `git` inside a synced folder, which is exactly the concurrent human writer the ref-lock work (34.11) was scoped to protect.
+evidence: Measured while fixing 34.13, against both plain git and gitoxide: with a WORKING clean filter a racily-clean LFS entry reads clean, because git re-reads the worktree and cleans it back into the pointer the index already holds; without one the raw bytes are hashed and the path reads as modified. The test that demonstrated this (`a_working_clean_filter_settles_the_racily_clean_case_before_the_guard_does`) was removed on 2026-07-29 — see the platform note below — so the observation lives here rather than in a test.
+status: open
+note: 2026-07-29 — two routes, and the choice is a real decision rather than a detail. Either the app learns the `lfs clean|smudge` subcommand (a CLI surface inside a GUI binary, which needs its own argument-parsing decision and must stay invisible to normal launches), or `enforce_local_config_with_filter` refuses to register a program that cannot serve — which is honest, but leaves a synced LFS folder with no clean filter at all for external git, so it trades a silent failure for a loud absence. Not fixed with 34.13 because it lives in `git/repo.rs`, and because picking between those two is not a decision to make in passing.
+note: 2026-07-29 — a failing clean filter produces DIFFERENT status outcomes on macOS and Linux, which is a new fact about this defect and the strongest argument yet for fixing it. Same fixture, same code, same git 2.55: an LFS entry that is genuinely racily clean (verified in-test with gix's own `Stat::matches` and `Stat::is_racy`, both true) is reported MODIFIED on Linux/ext4 and CLEAN on macOS/APFS. The racily-clean re-read is a content comparison, so it runs `filter.lfs.clean` — the broken filter this entry is about — and the platforms evidently disagree about what a failing non-required filter yields. Consequence for coverage: keeper-sync's end-to-end racily-clean path CANNOT be tested on the only platform keeper ships to while this defect stands. Story 34.13 responded by testing `lfs::stage::is_false_modification` directly on constructed state, which is deterministic everywhere, and by deleting the two integration tests that depended on the re-read. Fixing this defect is what would let that integration coverage exist at all.

@@ -23,7 +23,7 @@ use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::error::{Result, SyncError};
@@ -36,6 +36,26 @@ use crate::git::fetch::Credential;
 /// is not tuned for speed — it is deliberately far longer than any real write,
 /// so the only locks it ever removes are ones nobody is holding.
 const STALE_INDEX_LOCK: Duration = Duration::from_secs(60);
+
+/// How long a reference lock must sit untouched before it is debris.
+///
+/// git states its own bound: `core.filesRefLockTimeout` defaults to 100 ms,
+/// which is how long git is prepared to *wait* for a loose reference lock
+/// somebody else holds before giving up, and gitoxide uses the same default.
+/// That is git saying a live holder releases in a fraction of a second — which
+/// it does, because publishing a loose reference is a 41-byte write and a
+/// rename. Two seconds is twenty times that bound, with room for a filesystem
+/// having a bad day, and the window is only ever spent in full on a lock that
+/// nobody is holding.
+const STALE_REF_LOCK: Duration = Duration::from_secs(2);
+
+/// How often [`release_ref_lock_if_abandoned`] re-stats the lock it is
+/// watching.
+///
+/// Short, because the overwhelmingly likely reason to find a reference lock at
+/// all is a `git` command running right now, and that case must cost one poll
+/// rather than the whole window.
+const REF_LOCK_POLL: Duration = Duration::from_millis(25);
 
 /// Open a managed repository.
 ///
@@ -50,6 +70,7 @@ pub fn open(path: &Path, trust_full: bool) -> Result<gix::Repository> {
     let repo = gix::open_opts(path, options)
         .map_err(|err| SyncError::Git(format!("open failed: {err}")))?;
     release_stale_index_lock(repo.git_dir());
+    release_stale_ref_locks(repo.git_dir());
     Ok(repo)
 }
 
@@ -110,6 +131,238 @@ fn release_index_lock_older_than(git_dir: &Path, threshold: Duration) {
             "could not release a stale index lock"
         ),
     }
+}
+
+/// Remove reference locks left behind by a process that was killed.
+///
+/// The same wound as the `index.lock` above, one layer further in and with a
+/// worse ending. `gix::Repository::commit_as` publishes a commit by running a
+/// reference transaction over `HEAD`, which locks `HEAD` and then the branch
+/// it points at. A `SIGKILL` anywhere in that window — a crash, an OOM kill, a
+/// laptop lid closing on a pendrive — leaves `HEAD.lock` or
+/// `refs/heads/<branch>.lock` on disk with nobody holding it, and from then on
+/// *every* commit in that folder fails with `A lock could not be obtained for
+/// reference "HEAD"`. Work keeps being committed nowhere and published never,
+/// the folder reports itself as merely failing, and the cure is a human
+/// deleting a file they have no reason to know exists. That is the
+/// unattended-recovery failure NFR-24 forbids, and the durability matrix
+/// caught it twice: once as twelve committed changes that never reached the
+/// remote, and once as a run that stopped making progress for ninety-six
+/// minutes (see `.config/nextest.toml`).
+///
+/// **Waiting longer cannot fix this.** gitoxide already retries acquisition
+/// with quadratic backoff, bounded by `core.filesRefLockTimeout` — 100 ms by
+/// default. That is the right answer for a lock a live writer holds and no
+/// answer at all for one whose owner is dead: there is nobody left to release
+/// it, so every timeout, however generous, expires against the same file.
+/// Raising it only turns "fails at once, forever" into "hangs first, then
+/// fails, forever".
+///
+/// # Telling a dead process's lock from a live writer's
+///
+/// The lock file names no owner — no pid, no host, nothing to ask whether the
+/// holder still exists — and keeper cannot assume it is the only writer
+/// either, because these folders are meant to be usable with plain `git`. The
+/// holder may be the user's own `git commit`, a GUI, or a second keeper
+/// process. What *is* observable is whether the lock is moving, so that is
+/// what this tests: the lock is watched for [`STALE_REF_LOCK`] and released
+/// only if it was neither rewritten nor let go while we looked. A live writer
+/// finishes inside a single poll and its lock is then left to it, released or
+/// replaced, either way untouched by us.
+///
+/// The window is measured on our own clock rather than read off the lock's
+/// mtime. A file timestamp is a claim by whichever machine wrote it, and on
+/// removable media (AD-48) that is routinely not this one; elapsed time we
+/// measured ourselves needs no such trust, and a clock that jumps cannot make
+/// this either eager or blind.
+///
+/// And if the judgement is ever wrong, it still cannot corrupt anything. A
+/// reference is published by renaming its lock over it, so a writer whose lock
+/// we removed fails its own rename with `ENOENT` and reports an error while
+/// the reference keeps the value it already had. A torn or half-written
+/// reference is not a state this can produce — the worst case is somebody
+/// else's write failing loudly, not silently landing wrong.
+///
+/// git itself never does any of this, and is right not to: git is run by a
+/// person at a terminal, so it can print "another git process seems to be
+/// running" and let them decide. keeper is a daemon syncing a folder nobody is
+/// looking at. There is no one to read the message, which is the whole reason
+/// NFR-24 exists.
+///
+/// `packed-refs.lock` is deliberately **not** included. It is the one
+/// reference lock a legitimate operation holds for a long time — `git gc` and
+/// `git pack-refs` hold it while rewriting every reference in the repository,
+/// which is not bounded by the 100 ms above — and keeper's own commit and
+/// fetch paths never create one, so nothing observed has ever stranded on it.
+/// Covering it would put a guess on the same footing as a measurement.
+///
+/// Best-effort throughout, like its index-lock neighbour: a removal that races
+/// another process, or a directory that will not be read, leaves the sync to
+/// fail on its own terms rather than turning a cleanup into a hard error.
+fn release_stale_ref_locks(git_dir: &Path) {
+    release_ref_locks_unheld_for(git_dir, STALE_REF_LOCK);
+}
+
+/// The rule itself, with the window passed in so a test can exercise both
+/// sides of the decision without waiting out the real one.
+fn release_ref_locks_unheld_for(git_dir: &Path, window: Duration) {
+    for lock in loose_ref_locks(git_dir) {
+        release_ref_lock_if_abandoned(&lock, window);
+    }
+}
+
+/// Every `*.lock` sitting beside a loose reference: `HEAD` itself, and
+/// anything under `refs/`.
+///
+/// The whole set is collected before any of it is watched, so the walk reads
+/// one consistent picture of the reference store rather than re-reading
+/// directories that its own removals have changed.
+fn loose_ref_locks(git_dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let head = git_dir.join("HEAD.lock");
+    if head.is_file() {
+        found.push(head);
+    }
+    let mut stack = vec![git_dir.join("refs")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // The entry's own type, not the target's, so a symlink can never
+            // walk this out of the reference store. git forbids a reference
+            // whose name ends in `.lock`, so the extension is unambiguous.
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "lock") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Watch one lock for `window` and release it only if nothing touched it.
+///
+/// Returns as soon as the lock proves itself alive, so the cost of being
+/// careful is paid by abandoned locks and not by the user's own `git`.
+fn release_ref_lock_if_abandoned(lock: &Path, window: Duration) {
+    let Some(before) = lock_identity(lock) else {
+        return;
+    };
+    let started = Instant::now();
+    while let Some(remaining) = window.checked_sub(started.elapsed()) {
+        std::thread::sleep(remaining.min(REF_LOCK_POLL));
+        match lock_identity(lock) {
+            // Let go while we watched: a live writer did exactly what one
+            // does, and there was never anything here to recover.
+            None => return,
+            // Rewritten, or replaced by a second writer's: either way somebody
+            // is using this and it is not ours to take.
+            Some(after) if after != before => return,
+            Some(_) => {}
+        }
+    }
+    match std::fs::remove_file(lock) {
+        // Logged, never silent. Quietly repairing somebody's git directory is
+        // not a repair, it is a surprise; and a folder that keeps needing this
+        // is a machine that keeps dying mid-write, which is worth seeing.
+        Ok(()) => tracing::warn!(
+            lock = %lock.display(),
+            watched_ms = %window.as_millis(),
+            "released a reference lock left behind by a killed run"
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(
+            lock = %lock.display(),
+            error = %err,
+            "could not release a stale reference lock"
+        ),
+    }
+}
+
+/// Enough of a lock file to notice that somebody rewrote or replaced it.
+///
+/// Length and modification time rather than content: a reference lock is
+/// written once and renamed away, so any change at all is proof of a writer,
+/// and reading the bytes would race that writer for no extra information. An
+/// unreadable stat is reported as absent, which is the conservative answer —
+/// it ends the watch without removing anything.
+fn lock_identity(lock: &Path) -> Option<(u64, SystemTime)> {
+    let metadata = std::fs::metadata(lock).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
+/// The path gitoxide locks while it updates `reference`.
+///
+/// `.lock` is appended to the whole name rather than swapped in as an
+/// extension, matching `gix_lock::acquire`'s own suffix rule — which is the
+/// only version that gets a reference like `refs/tags/v1.0` right.
+fn reference_lock_path(git_dir: &Path, reference: &gix::bstr::BStr) -> PathBuf {
+    let mut path = git_dir
+        .join(gix::path::from_bstr(reference))
+        .into_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+/// Refuse to start a reference transaction that somebody else is already in.
+///
+/// This is a decision about whether to *attempt* a commit, not a second lock
+/// implementation: gitoxide still acquires the real lock, and this only
+/// declines to call it when we can already see that doing so is pointless.
+///
+/// It exists because the failure is not merely pointless, it is unbounded.
+/// `commit_as("HEAD", …)` derefs into two reference edits — `HEAD`, and the
+/// branch it resolves to — and `gix-ref` 0.66.0 builds the name for a failed
+/// acquisition by walking the edit's parent chain
+/// (`store/file/transaction/prepare.rs:398-410`) without ever advancing its
+/// cursor once it reaches the root. So which lock is held decides what
+/// happens: a held `HEAD.lock` fails the ROOT edit, the loop body never runs,
+/// and gitoxide returns the ordinary error; a held branch lock fails a CHILD
+/// edit and gitoxide spins on a full core, forever, with no error and no
+/// output. On a user's machine that is a wedged, hot process for as long as
+/// their `git commit` holds the lock — and [`release_stale_ref_locks`] cannot
+/// help there, because a lock a live writer holds is precisely the one it must
+/// leave alone. Not entering the transaction is the only remedy available
+/// while the defect lives upstream.
+///
+/// A refused pass is a normal outcome, not a fault: nothing is staged away,
+/// the working tree still holds the change, and the failure is transient so
+/// the scheduler retries it after backoff. A human's commit takes a moment,
+/// so in practice the next pass simply succeeds.
+///
+/// **The check-then-act window is real and is not closed here.** A writer can
+/// still take the lock between this call and gitoxide's acquisition. What this
+/// removes is the whole *duration* of somebody else's hold — seconds for a
+/// person typing a commit message, unbounded for debris — leaving only the few
+/// microseconds between the two calls. Closing it entirely would need
+/// gitoxide to expose its own acquisition, which it does not, so this is the
+/// bound rather than the cure.
+pub fn ensure_head_unlocked(repo: &gix::Repository) -> Result<()> {
+    let git_dir = repo.git_dir();
+    // Both references the transaction touches, named in the order it locks
+    // them. An unborn branch has no name yet and cannot be locked.
+    let branch = repo.head_name().ok().flatten();
+    let references = [
+        Some(gix::bstr::BStr::new("HEAD")),
+        branch.as_ref().map(|name| name.as_bstr()),
+    ];
+    for reference in references.into_iter().flatten() {
+        if reference_lock_path(git_dir, reference).is_file() {
+            return Err(SyncError::Git(format!(
+                "{reference} is being updated by another process; nothing was committed"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Does this clone failure mean the remote simply has no commits yet?
@@ -588,6 +841,143 @@ pub fn adopt(root: &Path, remote_url: &str, branch: &str) -> Result<gix::Reposit
     open(root, false)
 }
 
+/// Everything `gix::init` writes into a fresh `.git`, and nothing else.
+///
+/// Taken from `gix::create::into`, which lays them down in this order: `info/`,
+/// `hooks/`, `objects/`, `refs/`, then `HEAD`, `description` and `config`. A
+/// `.git` holding any name outside this list got further than an init did,
+/// whatever else is wrong with it.
+const INIT_SCAFFOLD: &[&str] = &[
+    "HEAD",
+    "config",
+    "description",
+    "hooks",
+    "info",
+    "objects",
+    "refs",
+];
+
+/// Discard a `.git` that keeper began creating and never finished, so the
+/// caller can create it properly. Returns whether it removed one.
+///
+/// [`adopt`] starts with `gix::init`, and `gix::init` is a sequence of
+/// filesystem steps, not an atomic one: it writes `info/`, `hooks/`,
+/// `objects/` and `refs/` before it writes `HEAD`, and `config` after that. A
+/// `SIGKILL` inside that sequence leaves a `.git` directory that exists and is
+/// not a repository. From then on [`crate::engine::Engine`] takes its
+/// "repository already exists" branch — precisely *because* `.git` exists —
+/// never calls `adopt` again, and fails every single sync forever with
+/// `does not appear to be a git repository` or `.git/config could not be
+/// read`. The folder is stranded exactly as an abandoned reference lock
+/// strands it, and for the same reason: nothing on the recovery path knows
+/// this state exists. Found by the durability matrix, which reproduces it
+/// whenever a kill lands in the first few milliseconds of the very first sync.
+///
+/// # This finishes keeper's own init; it never repairs a repository
+///
+/// The distinction is the whole safety argument, because being wrong here
+/// destroys somebody's history. Removing a `.git` is only defensible when
+/// there is provably nothing in it to lose, so that is what is checked rather
+/// than assumed: every name at the top level must be one `gix::init` itself
+/// writes, and `refs/` and `objects/` — the only two places history can be —
+/// must contain nothing but the empty directories it leaves behind. One
+/// reference, one object, one `index`, one `logs/`, one `packed-refs`, a
+/// `modules/`, a `worktrees/`, a `.git` that is a file pointing into somebody
+/// else's repository: any of them and this refuses, loudly, and the caller's
+/// original error stands. A stranded folder that says so is recoverable by a
+/// human. A deleted history is not.
+///
+/// The user's own files are never involved either way: they live in the
+/// working tree, and only `.git` is touched.
+pub fn discard_unfinished_init(git_dir: &Path) -> Result<bool> {
+    if let Some(evidence) = signs_of_real_history(git_dir) {
+        tracing::warn!(
+            git_dir = %git_dir.display(),
+            evidence,
+            "refusing to re-create a repository that is not an unfinished init; \
+             this folder needs a human"
+        );
+        return Ok(false);
+    }
+    // Logged before the removal, not after: if this is ever the wrong call,
+    // the line that says what was about to happen is the only evidence left.
+    tracing::warn!(
+        git_dir = %git_dir.display(),
+        "discarding a half-made `.git` that provably holds no history"
+    );
+    std::fs::remove_dir_all(git_dir)
+        .map_err(|source| SyncError::io("discard an unfinished repository", git_dir, source))?;
+    Ok(true)
+}
+
+/// The first sign that `git_dir` holds something a finished repository would
+/// hold, or `None` when there is provably nothing in it to lose.
+///
+/// Anything that cannot be established counts as a sign. "I could not read it"
+/// and "there is nothing there" must never collapse into the same answer when
+/// the answer authorizes a deletion.
+fn signs_of_real_history(git_dir: &Path) -> Option<String> {
+    match std::fs::symlink_metadata(git_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        // A `.git` that is a file is a linked worktree or a submodule pointing
+        // into another repository, and a symlink is somebody's deliberate
+        // arrangement. Neither is an init of ours that stopped halfway.
+        Ok(_) => return Some("`.git` is not a directory".to_owned()),
+        Err(err) => return Some(format!("`.git` could not be read: {err}")),
+    }
+
+    let entries = match std::fs::read_dir(git_dir) {
+        Ok(entries) => entries,
+        Err(err) => return Some(format!("`.git` could not be listed: {err}")),
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Some("`.git` holds an entry that could not be read".to_owned());
+        };
+        match entry.file_name().to_str() {
+            Some(name) if INIT_SCAFFOLD.contains(&name) => {}
+            Some(name) => return Some(format!("`.git/{name}` is present")),
+            None => return Some("`.git` holds an entry with a non-UTF-8 name".to_owned()),
+        }
+    }
+
+    // `gix::init` leaves both of these holding empty directories and nothing
+    // else, so a single entry in either is the entire answer.
+    for place in ["refs", "objects"] {
+        if let Some(found) = first_entry_under(&git_dir.join(place)) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Describe the first non-directory anywhere under `dir`, or `None` if it holds
+/// only (possibly nested) empty directories.
+///
+/// A directory that is absent is not a sign — a kill early enough that
+/// `gix::init` never created it leaves nothing behind either. A directory that
+/// cannot be read *is* a sign, for the reason above.
+fn first_entry_under(dir: &Path) -> Option<String> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Some(format!("{} could not be read: {err}", current.display())),
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return Some(format!("{} holds an unreadable entry", current.display()));
+            };
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => stack.push(entry.path()),
+                _ => return Some(format!("{} exists", entry.path().display())),
+            }
+        }
+    }
+    None
+}
+
 /// Make sure a managed repository still has the `origin` its profile syncs with,
 /// restoring it when it is gone. Returns whether it had to repair one.
 ///
@@ -739,10 +1129,322 @@ mod tests {
 
     #[test]
     fn releasing_a_lock_that_was_never_there_is_not_an_error() {
-        // Every repository open runs this, and the overwhelmingly common case
-        // is that there is no lock at all.
+        // Every repository open runs both of these, and the overwhelmingly
+        // common case is that there is no lock at all.
         let dir = tempfile::tempdir().expect("tempdir");
         release_stale_index_lock(dir.path());
+        release_stale_ref_locks(dir.path());
+    }
+
+    /// Plant the debris a `SIGKILL` inside a reference transaction leaves, at
+    /// each of the three places gitoxide can leave it.
+    fn plant_ref_locks(git_dir: &std::path::Path) -> Vec<PathBuf> {
+        let locks = [
+            git_dir.join("HEAD.lock"),
+            git_dir.join("refs/heads/main.lock"),
+            git_dir.join("refs/remotes/origin/main.lock"),
+        ];
+        for lock in &locks {
+            let parent = lock.parent().expect("a lock always has a parent");
+            std::fs::create_dir_all(parent).expect("reference directory");
+            // 41 bytes, the shape gitoxide writes: an object id and a newline.
+            std::fs::write(lock, b"9e2f04c0c1a70cb9e0e2b2d2f4a8e6c3d1b5a7f9\n")
+                .expect("plant the lock");
+        }
+        locks.into_iter().collect()
+    }
+
+    #[test]
+    fn a_reference_lock_left_by_a_killed_run_is_released() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path();
+        let locks = plant_ref_locks(git_dir);
+        // A real reference beside each one: recovery removes the debris and
+        // must not so much as glance at what it was shadowing.
+        let reference = git_dir.join("refs/heads/main");
+        std::fs::write(&reference, b"kept\n").expect("write the reference");
+
+        release_ref_locks_unheld_for(git_dir, Duration::ZERO);
+
+        for lock in &locks {
+            assert!(
+                !lock.exists(),
+                "a lock nobody holds must be released: {}",
+                lock.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read(&reference).expect("the reference must survive"),
+            b"kept\n",
+            "recovery removes locks, never references"
+        );
+    }
+
+    #[test]
+    fn a_reference_lock_is_watched_before_it_is_broken() {
+        // The property that keeps this from degenerating into "delete every
+        // `.lock`": a lock is only debris once it has been observed doing
+        // nothing for the whole window, so the call cannot return sooner.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path();
+        let lock = git_dir.join("HEAD.lock");
+        std::fs::write(&lock, b"held\n").expect("plant the lock");
+
+        let window = Duration::from_millis(300);
+        let started = Instant::now();
+        release_ref_locks_unheld_for(git_dir, window);
+
+        assert!(
+            started.elapsed() >= window,
+            "a lock must be watched for the whole window, not deleted on sight"
+        );
+        assert!(!lock.exists(), "a lock nobody touched must be released");
+    }
+
+    #[test]
+    fn a_reference_lock_a_live_writer_is_using_is_left_alone() {
+        // The direction that matters most. A human running `git commit` in a
+        // synced folder holds this exact file, and breaking it would corrupt
+        // their write to fix a problem nobody has. A writer that is working
+        // touches its lock; that is the signal, and it must win.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path();
+        let lock = git_dir.join("HEAD.lock");
+        std::fs::write(&lock, b"w").expect("plant the lock");
+
+        let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer = {
+            let lock = lock.clone();
+            let writing = std::sync::Arc::clone(&writing);
+            std::thread::spawn(move || {
+                let mut written = 1usize;
+                while writing.load(Ordering::Relaxed) {
+                    written += 1;
+                    // Growing the file changes both halves of the identity, so
+                    // this cannot pass by a filesystem with a coarse clock.
+                    let _ = std::fs::write(&lock, vec![b'w'; written]);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+
+        // A window far longer than the writer's cadence: the call still has to
+        // give up on it, and give up early.
+        let started = Instant::now();
+        release_ref_locks_unheld_for(git_dir, Duration::from_secs(30));
+        let waited = started.elapsed();
+        writing.store(false, Ordering::Relaxed);
+        writer.join().expect("the writer thread");
+
+        assert!(
+            lock.exists(),
+            "a lock somebody is still writing must survive"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "proof of a live writer must end the watch at once, not run it out; waited {waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_reference_lock_that_is_let_go_mid_watch_is_not_chased() {
+        // The ordinary contention case: keeper opened the repository while
+        // somebody else's reference update was in flight. It completes, its
+        // lock disappears, and there is nothing to recover — least of all a
+        // lock the *next* writer took in the meantime.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path();
+        let lock = git_dir.join("refs/heads/main.lock");
+        std::fs::create_dir_all(lock.parent().expect("parent")).expect("reference directory");
+        std::fs::write(&lock, b"first\n").expect("plant the lock");
+
+        let releasing = {
+            let lock = lock.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                std::fs::remove_file(&lock).expect("the writer releases its lock");
+                std::thread::sleep(Duration::from_millis(40));
+                std::fs::write(&lock, b"second\n").expect("a second writer takes it");
+            })
+        };
+
+        release_ref_locks_unheld_for(git_dir, Duration::from_secs(30));
+        releasing.join().expect("the writer thread");
+
+        assert!(
+            lock.exists(),
+            "the second writer's lock must not be collected by a watch that \
+             started before it existed"
+        );
+    }
+
+    #[test]
+    fn a_packed_refs_lock_is_never_touched() {
+        // Deliberate scope, pinned so it survives a tidy-up. `git gc` and
+        // `git pack-refs` hold this one while rewriting every reference in the
+        // repository, which is not bounded by the fraction of a second that
+        // justifies the window above, and keeper's own paths never create it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path();
+        let lock = git_dir.join("packed-refs.lock");
+        std::fs::write(&lock, b"").expect("plant the lock");
+
+        release_ref_locks_unheld_for(git_dir, Duration::ZERO);
+
+        assert!(
+            lock.exists(),
+            "packed-refs is out of scope and must be left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_commit_is_refused_while_the_reference_it_would_move_is_locked() {
+        // Not an optimization. A held branch lock does not fail
+        // `commit_as`, it hangs it on a full core indefinitely (gix-ref
+        // 0.66.0, `prepare.rs:398-410`), so refusing to enter the transaction
+        // is the only bound available while that lives upstream.
+        let (dir, repo) = repo_with_two_files();
+        ensure_head_unlocked(&repo).expect("an unlocked repository must be usable");
+
+        let branch = repo
+            .head_name()
+            .expect("head")
+            .expect("a born branch")
+            .as_bstr()
+            .to_string();
+        let branch_lock = repo.git_dir().join(format!("{branch}.lock"));
+        std::fs::write(&branch_lock, b"").expect("plant the branch lock");
+        assert!(
+            ensure_head_unlocked(&repo).is_err(),
+            "a locked branch must stop the commit before gitoxide is called"
+        );
+        std::fs::remove_file(&branch_lock).expect("the writer finishes");
+        ensure_head_unlocked(&repo).expect("a released lock must unblock the commit");
+
+        let head_lock = repo.git_dir().join("HEAD.lock");
+        std::fs::write(&head_lock, b"").expect("plant the HEAD lock");
+        assert!(
+            ensure_head_unlocked(&repo).is_err(),
+            "a locked HEAD must stop the commit too"
+        );
+        drop(dir);
+    }
+
+    /// The `.git` a kill leaves when it lands inside `gix::init`: every
+    /// directory and template that init writes before `HEAD`, and nothing else.
+    fn unfinished_init(root: &std::path::Path) -> PathBuf {
+        let git_dir = root.join(".git");
+        for dir in [
+            "info",
+            "hooks",
+            "objects/info",
+            "objects/pack",
+            "refs/heads",
+            "refs/tags",
+        ] {
+            std::fs::create_dir_all(git_dir.join(dir)).expect("init scaffold");
+        }
+        std::fs::write(git_dir.join("info/exclude"), b"").expect("info/exclude");
+        std::fs::write(git_dir.join("hooks/pre-commit.sample"), b"#!/bin/sh\n").expect("a hook");
+        git_dir
+    }
+
+    #[test]
+    fn a_repository_holding_history_is_never_discarded() {
+        // The test that matters most: being wrong here deletes somebody's
+        // work. This is a real repository wearing the exact symptom an
+        // unfinished init wears — `.git` exists and will not open — and the
+        // only thing that may tell them apart is what is inside.
+        let (dir, repo) = repo_with_two_files();
+        let git_dir = repo.git_dir().to_path_buf();
+        drop(repo);
+        std::fs::remove_file(git_dir.join("HEAD")).expect("break the repository");
+
+        assert!(
+            !discard_unfinished_init(&git_dir).expect("classify"),
+            "a repository with commits in it must never be discarded"
+        );
+        assert!(
+            git_dir.join("objects").exists() && git_dir.join("refs/heads").exists(),
+            "the refusal must leave every byte where it was"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn every_sign_of_a_finished_repository_refuses_the_discard() {
+        // One sign each, planted into an otherwise pristine half-made `.git`.
+        // Each is something `gix::init` never writes, so each means somebody
+        // — git, keeper or a person — got further than an init did here.
+        for sign in [
+            "index",
+            "packed-refs",
+            "ORIG_HEAD",
+            "logs/HEAD",
+            "refs/heads/main",
+            "refs/remotes/origin/main",
+            "objects/ab/cdef0123456789",
+            "objects/pack/pack-abc.pack",
+            "modules/vendored/config",
+            "worktrees/other/HEAD",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let git_dir = unfinished_init(dir.path());
+            let planted = git_dir.join(sign);
+            std::fs::create_dir_all(planted.parent().expect("a parent")).expect("sign directory");
+            std::fs::write(&planted, b"x").expect("plant the sign");
+
+            assert!(
+                !discard_unfinished_init(&git_dir).expect("classify"),
+                "{sign} must stop the discard"
+            );
+            assert!(planted.exists(), "{sign} must still be there afterwards");
+        }
+    }
+
+    #[test]
+    fn a_git_file_pointing_at_another_repository_is_never_discarded() {
+        // A linked worktree or a submodule: `.git` is a file naming somebody
+        // else's object store, and removing it detaches a repository that is
+        // working perfectly well.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path().join(".git");
+        std::fs::write(&git_dir, b"gitdir: ../elsewhere/.git/worktrees/here\n")
+            .expect("write the gitdir pointer");
+
+        assert!(
+            !discard_unfinished_init(&git_dir).expect("classify"),
+            "a gitdir pointer is not an unfinished init"
+        );
+        assert!(git_dir.exists(), "the pointer must survive");
+    }
+
+    #[test]
+    fn an_init_that_never_finished_is_discarded_and_the_worktree_is_untouched() {
+        // Both halves of the window `gix::init` leaves open: killed before it
+        // wrote `HEAD`, and killed after `HEAD` but before `config`. Either
+        // way there is no history, and leaving the directory in place strands
+        // the folder for good.
+        for head in [None, Some(&b"ref: refs/heads/main\n"[..])] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let theirs = dir.path().join("their-work.txt");
+            std::fs::write(&theirs, b"never keeper's to delete").expect("worktree file");
+            let git_dir = unfinished_init(dir.path());
+            if let Some(head) = head {
+                std::fs::write(git_dir.join("HEAD"), head).expect("HEAD");
+            }
+
+            assert!(
+                discard_unfinished_init(&git_dir).expect("classify"),
+                "a half-made repository must be cleared so it can be made properly"
+            );
+            assert!(!git_dir.exists(), "the half-made directory must be gone");
+            assert_eq!(
+                std::fs::read(&theirs).expect("the user's file must survive"),
+                b"never keeper's to delete",
+                "only `.git` is ever touched"
+            );
+        }
     }
 
     #[test]

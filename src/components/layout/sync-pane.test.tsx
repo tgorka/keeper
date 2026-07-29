@@ -10,6 +10,8 @@ vi.mock("@/lib/ipc/client", () => ({
   syncProfileSetEnabled: vi.fn(),
   syncFolderNow: vi.fn(),
   syncVerify: vi.fn(),
+  // The path control (Story 32.4): resolves and opens the folder in Rust.
+  syncOpenPath: vi.fn(),
   // The three detail reads plus the parked-unit retry (Story 32.4).
   syncActivity: vi.fn(),
   syncPending: vi.fn(),
@@ -73,6 +75,7 @@ import {
 } from "@/components/layout/sync-pane";
 import {
   SYNC_NOW_LABEL,
+  SYNC_OPEN_PATH_LABEL,
   SYNC_PAUSE_LABEL,
   SYNC_PROGRESS_LABEL,
   SYNC_REMOVE_CANCEL_LABEL,
@@ -112,6 +115,8 @@ import {
   copyStatus,
   syncActivity,
   syncFolderNow,
+  syncGetCredential,
+  syncOpenPath,
   syncPending,
   syncProblems,
   syncProfileRemove,
@@ -124,6 +129,7 @@ import {
   syncSubscribeProgress,
   syncUnsubscribeProgress,
 } from "@/lib/ipc/client";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import {
   COPY_POLL_MS,
   copyEntryGroups,
@@ -152,6 +158,8 @@ const mockSave = vi.mocked(syncProfileSave);
 const mockRemove = vi.mocked(syncProfileRemove);
 const mockPicker = vi.mocked(openFolder);
 const mockSetCredential = vi.mocked(syncSetCredential);
+const mockGetCredential = vi.mocked(syncGetCredential);
+const mockOpenPath = vi.mocked(syncOpenPath);
 const mockCopyStart = vi.mocked(copyStart);
 const mockCopyStatus = vi.mocked(copyStatus);
 const mockCopyCancel = vi.mocked(copyCancel);
@@ -295,6 +303,9 @@ beforeEach(() => {
   mockActivity.mockResolvedValue([]);
   mockPending.mockResolvedValue([]);
   mockProblems.mockResolvedValue(problemsVm());
+  // Every edit form reads the keychain as it opens (Story 34.12); this folder
+  // has nothing stored.
+  mockGetCredential.mockResolvedValue(null);
   mockRemove.mockResolvedValue(undefined);
   mockSubscribe.mockImplementation((onProgress: (event: SyncProgressVm) => void) => {
     emitProgress = onProgress;
@@ -304,10 +315,17 @@ beforeEach(() => {
   mockCopyStart.mockResolvedValue("job-1");
   mockCopyStatus.mockResolvedValue(copyJobVm());
   mockCopyCancel.mockResolvedValue(undefined);
+  mockOpenPath.mockResolvedValue(undefined);
+  // The path control is gated on a real file manager existing, so these cards
+  // render as a desktop would show them.
+  capabilitiesStore
+    .getState()
+    .applySnapshot({ ...DEFAULT_CAPABILITIES, revealInFileManager: true });
 });
 
 afterEach(() => {
   vi.clearAllMocks();
+  capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
 });
 
 describe("SyncPane profile header", () => {
@@ -399,6 +417,55 @@ describe("SyncPane profile header", () => {
       "Kept your version of 1 file that changed in both places, alongside the remote's.",
     );
     expect(report).toHaveClass("text-destructive");
+  });
+
+  /**
+   * Story 32.4, specified and never shipped: the card showed the path as text
+   * and there was no way to open the folder from the app at all. The path itself
+   * is the control, and it is a real button so it is keyboard-reachable.
+   */
+  it("opens the folder from the path itself, asking for it by profile id", async () => {
+    await renderPane();
+
+    const control = screen.getByRole("button", {
+      name: `${SYNC_OPEN_PATH_LABEL}: /Users/alice/Documents/tgdrive`,
+    });
+    fireEvent.click(control);
+
+    // The id, never a path: the frontend cannot name a folder here, so it cannot
+    // ask for one keeper does not already sync.
+    await waitFor(() => expect(mockOpenPath).toHaveBeenCalledWith("p1"));
+    expect(mockOpenPath).toHaveBeenCalledTimes(1);
+    // Opening a folder changes nothing about it, so it must not clear the card's
+    // last sync report or re-read the three detail lists.
+    expect(mockFolderNow).not.toHaveBeenCalled();
+  });
+
+  it("shows what Rust said when the folder is gone or its volume is out", async () => {
+    const refusal =
+      "/Volumes/stick/field is not there. This folder lives on removable media — reattach the volume, then open it again.";
+    mockOpenPath.mockRejectedValue({ code: "internal", message: refusal, retriable: false });
+    await renderPane();
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `${SYNC_OPEN_PATH_LABEL}: /Users/alice/Documents/tgdrive`,
+      }),
+    );
+
+    // Verbatim: the sentence Rust composed is the one that names the next step.
+    expect(await screen.findByText(refusal)).toBeInTheDocument();
+  });
+
+  it("leaves the path as plain text where there is no file manager to open it in", async () => {
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    await renderPane();
+
+    // Still readable — just not a control that would fail on activation.
+    expect(screen.getByText("/Users/alice/Documents/tgdrive")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: new RegExp(SYNC_OPEN_PATH_LABEL) }),
+    ).not.toBeInTheDocument();
   });
 
   it("reports a failed pass as a failure and claims nothing else", async () => {

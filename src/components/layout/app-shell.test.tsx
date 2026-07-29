@@ -6,6 +6,14 @@ import { detailStore } from "@/lib/stores/detail-ui";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 
+const beginTitleBarDrag = vi.fn();
+
+// The band's drag path is asserted here as "the app asked for a drag"; what the
+// window layer answers is `titlebar-drag`'s own suite.
+vi.mock("@/lib/titlebar-drag", () => ({
+  beginTitleBarDrag: () => beginTitleBarDrag(),
+}));
+
 /**
  * Mock matchMedia so that any query with a `max-width: <bp>` matches when the
  * simulated viewport width is below that breakpoint (mirrors the
@@ -38,6 +46,7 @@ afterEach(() => {
   roomsStore.getState().selectRoom(null);
   primaryViewStore.getState().setView("inbox");
   capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  beginTitleBarDrag.mockClear();
 });
 
 describe("AppShell", () => {
@@ -201,5 +210,77 @@ describe("AppShell", () => {
     expect(columns).toHaveLength(1);
     expect(columns[0]).toHaveClass("bg-background");
     expect(columns[0]).not.toHaveClass("bg-sidebar");
+  });
+
+  // ── App-driven window drag (Story 34.3) ────────────────────────────────────
+  it("asks for a window drag on a primary-button mousedown on either column", () => {
+    // Tauri's `data-tauri-drag-region` shim invokes `start_dragging` and drops the
+    // promise, so a refused drag is silent. The app issues the call itself.
+    capabilitiesStore.getState().applySnapshot({
+      ...DEFAULT_CAPABILITIES,
+      overlayTitleBar: true,
+    });
+    render(<AppShell />);
+    const columns = document.querySelectorAll("[data-tauri-drag-region]");
+
+    fireEvent.mouseDown(columns[0], { button: 0, detail: 1 });
+    fireEvent.mouseDown(columns[1], { button: 0, detail: 1 });
+
+    expect(beginTitleBarDrag).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves a mousedown that is aimed at something else alone", () => {
+    capabilitiesStore.getState().applySnapshot({
+      ...DEFAULT_CAPABILITIES,
+      overlayTitleBar: true,
+    });
+    render(<AppShell />);
+    const band = document.querySelectorAll("[data-tauri-drag-region]")[1];
+
+    // A secondary or middle button is not a drag, and the second mousedown of a
+    // double click belongs to macOS double-click-to-zoom, which Tauri's shim
+    // completes on the following mouseup — a drag there would eat that gesture.
+    fireEvent.mouseDown(band, { button: 2, detail: 1 });
+    fireEvent.mouseDown(band, { button: 1, detail: 1 });
+    fireEvent.mouseDown(band, { button: 0, detail: 2 });
+
+    expect(beginTitleBarDrag).not.toHaveBeenCalled();
+  });
+
+  it("takes the gesture over from Tauri's document-level drag-region shim", () => {
+    // The shim is a bubble-phase listener on `document` that invokes the same
+    // command. One `start_dragging` per mousedown keeps the recorded outcome
+    // attributable, and the `preventDefault` the shim spent the event on — which
+    // suppresses the text cursor — happens here instead.
+    capabilitiesStore.getState().applySnapshot({
+      ...DEFAULT_CAPABILITIES,
+      overlayTitleBar: true,
+    });
+    render(<AppShell />);
+    const band = document.querySelectorAll("[data-tauri-drag-region]")[1];
+    const shim = vi.fn();
+    document.addEventListener("mousedown", shim);
+
+    try {
+      // First prove the listener is reachable at all, so "the shim never fired"
+      // below cannot pass vacuously: a mousedown the band ignores still bubbles
+      // to `document` exactly where the shim binds.
+      fireEvent.mouseDown(band, { button: 2, detail: 1 });
+      expect(shim).toHaveBeenCalledTimes(1);
+
+      const event = new MouseEvent("mousedown", {
+        button: 0,
+        detail: 1,
+        bubbles: true,
+        cancelable: true,
+      });
+      fireEvent(band, event);
+
+      expect(beginTitleBarDrag).toHaveBeenCalledTimes(1);
+      expect(shim).toHaveBeenCalledTimes(1);
+      expect(event.defaultPrevented).toBe(true);
+    } finally {
+      document.removeEventListener("mousedown", shim);
+    }
   });
 });

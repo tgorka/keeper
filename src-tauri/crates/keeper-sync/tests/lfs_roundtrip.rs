@@ -199,3 +199,297 @@ fn attributes_written_for_one_profile_are_readable_as_git_attributes() {
     assert!(text.contains("b.iso: filter: lfs"), "got:\n{text}");
     assert!(text.contains("c.txt: filter: unspecified"), "got:\n{text}");
 }
+
+/// A repository whose `clip.mp4` is committed as an LFS pointer while the
+/// worktree keeps the real bytes — the state every LFS-tracked path lives in.
+fn commit_pointer_for_clip(root: &Path, payload: &[u8]) -> stage::LfsStaging {
+    init_repo(root);
+    std::fs::write(root.join("clip.mp4"), payload).expect("write");
+    let store = LfsStore::in_git_dir(root.join(".git"));
+    let staging =
+        stage::prepare(&profile(root), &store, &[PathBuf::from("clip.mp4")]).expect("prepare");
+    let repo = git::repo::open(root, false).expect("open");
+    let changes = git::commit::StagedChange {
+        added: vec![PathBuf::from(".gitattributes"), PathBuf::from("clip.mp4")],
+        ..Default::default()
+    };
+    commit(&repo, &changes, &staging.substitutions);
+    staging
+}
+
+/// Move a file's mtime a clear second forward.
+///
+/// Stat comparison uses mtime *seconds* unless `core.checkStat` asks for
+/// nanoseconds, so a rewrite inside the same second is indistinguishable to
+/// git itself and a test must not depend on how fast it runs.
+fn advance_mtime(path: &Path) {
+    let when = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(when))
+        .expect("advance the mtime");
+}
+
+/// Regression: `indexed_pointer` decided "too big to be a pointer" from
+/// `entry.stat.size`, and an LFS entry's stat is the WORKTREE file's — so it
+/// answered `None` for every real LFS file, the only thing it exists to
+/// recognise. The blob's own length is the question being asked.
+#[test]
+fn an_indexed_pointer_is_recognised_although_its_entry_stat_is_the_worktree_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let payload = vec![42u8; 200_000];
+    let staging = commit_pointer_for_clip(root, &payload);
+
+    // Two ordinary blobs to bracket it: one far too large to be a pointer, one
+    // small enough to read but not one either.
+    std::fs::write(root.join("prose.txt"), vec![b'x'; 200_000]).expect("write");
+    std::fs::write(root.join("note.txt"), b"small").expect("write");
+    let repo = git::repo::open(root, false).expect("open");
+    let changes = git::commit::StagedChange {
+        added: vec![PathBuf::from("note.txt"), PathBuf::from("prose.txt")],
+        ..Default::default()
+    };
+    commit(&repo, &changes, &std::collections::BTreeMap::new());
+
+    let repo = git::repo::open(root, false).expect("reopen");
+    // The premise of the bug: the entry's stat measures the worktree file.
+    let index = repo.index_or_empty().expect("index");
+    let entry = index
+        .entry_by_path(gix::bstr::BStr::new("clip.mp4"))
+        .expect("clip.mp4 is indexed");
+    assert_eq!(
+        u64::from(entry.stat.size),
+        payload.len() as u64,
+        "the entry's stat is the worktree file's, which is what made the old size test wrong"
+    );
+
+    let indexed = stage::indexed_pointer(&repo, Path::new("clip.mp4"))
+        .expect("the staged blob is a pointer and has to be recognised");
+    assert_eq!(indexed.oid, staging.uploads[0].oid);
+    assert_eq!(indexed.size, payload.len() as u64);
+
+    assert!(
+        stage::indexed_pointer(&repo, Path::new("prose.txt")).is_none(),
+        "a 200 000-byte blob cannot be a pointer"
+    );
+    assert!(
+        stage::indexed_pointer(&repo, Path::new("note.txt")).is_none(),
+        "a small blob that is not a pointer is still not one"
+    );
+    assert!(stage::indexed_pointer(&repo, Path::new("absent.bin")).is_none());
+}
+
+/// The guard's decision, asked of the guard.
+///
+/// This deliberately does **not** go through `status_paths`. The state git
+/// hands the guard is a racily-clean entry, and reaching that state end to end
+/// means making git re-read the worktree — a content comparison that runs
+/// `filter.lfs.clean`, which under `cargo test` is the broken filter of DW-121,
+/// and whose outcome then differs by platform. `is_false_modification` itself
+/// asks none of that: its inputs are the entry's stat, the staged blob, `HEAD`
+/// and one `lstat`. Constructing those directly covers every answer
+/// deterministically, on every platform, with no clock and no subprocess.
+#[test]
+fn the_guard_dismisses_an_untouched_pointer_entry_and_nothing_else() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let payload = vec![42u8; 200_000];
+    commit_pointer_for_clip(root, &payload);
+    let absolute = root.join("clip.mp4");
+    let repo = git::repo::open(root, false).expect("open");
+
+    // Nothing has touched the file since it was staged, so a report about it
+    // can only be the re-read finding the pointer design.
+    assert!(
+        stage::is_false_modification(&repo, Path::new("clip.mp4"), &absolute),
+        "an untouched pointer entry is not a modification"
+    );
+    // A path git has never heard of is not dismissed either.
+    assert!(!stage::is_false_modification(
+        &repo,
+        Path::new("absent.bin"),
+        &root.join("absent.bin")
+    ));
+
+    // A real edit that keeps the byte count exactly. Comparing the worktree's
+    // length against the pointer's `size` — what the guard used to do — cannot
+    // see this one, and the user's work would never be committed again.
+    let mut edited = payload.clone();
+    edited[0] = 7;
+    std::fs::write(&absolute, &edited).expect("edit");
+    advance_mtime(&absolute);
+    let repo = git::repo::open(root, false).expect("reopen");
+    assert!(
+        stage::indexed_pointer(&repo, Path::new("clip.mp4")).is_some(),
+        "the index is untouched, so the path is still LFS-tracked"
+    );
+    assert!(
+        !stage::is_false_modification(&repo, Path::new("clip.mp4"), &absolute),
+        "an edit at identical length is still an edit"
+    );
+    // And git agrees it is one. This report needs no re-read: the stat moved,
+    // so the comparison never reaches the racy branch — it holds on every
+    // platform, which is why it survives here while the racily-clean half
+    // could not.
+    assert!(
+        git::repo::status_paths(&repo)
+            .expect("status")
+            .modified
+            .contains(&PathBuf::from("clip.mp4")),
+        "a same-length edit is reported, so the guard's answer is what decides"
+    );
+
+    // An edit that changes the length, and then the file vanishing: neither is
+    // the untouched case, and a missing file must never be dismissed.
+    std::fs::write(&absolute, vec![7u8; 199_999]).expect("shrink");
+    assert!(!stage::is_false_modification(
+        &repo,
+        Path::new("clip.mp4"),
+        &absolute
+    ));
+    std::fs::remove_file(&absolute).expect("remove");
+    assert!(!stage::is_false_modification(
+        &repo,
+        Path::new("clip.mp4"),
+        &absolute
+    ));
+}
+
+/// An ordinary blob is never dismissed, however still its stat is.
+///
+/// For a non-pointer entry a re-read that finds different bytes is a real edit
+/// caught inside the race window, and swallowing it would lose the user's work.
+/// The pointer check is what makes dismissing safe, so it has to be the thing
+/// that refuses here — not the stat, which matches.
+#[test]
+fn the_guard_never_dismisses_an_ordinary_blob() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    init_repo(root);
+    std::fs::write(root.join("note.txt"), b"small").expect("write");
+    let repo = git::repo::open(root, false).expect("open");
+    let changes = git::commit::StagedChange {
+        added: vec![PathBuf::from("note.txt")],
+        ..Default::default()
+    };
+    commit(&repo, &changes, &std::collections::BTreeMap::new());
+
+    let repo = git::repo::open(root, false).expect("reopen");
+    let absolute = root.join("note.txt");
+    assert!(
+        stage::indexed_pointer(&repo, Path::new("note.txt")).is_none(),
+        "the fixture has to be a non-pointer blob for this to mean anything"
+    );
+    assert!(
+        !stage::is_false_modification(&repo, Path::new("note.txt"), &absolute),
+        "an ordinary blob is not the pointer design and must never be dismissed"
+    );
+}
+
+/// A pointer with no commit behind it is not dismissed.
+///
+/// The index carries the entry and the worktree matches it, so only `HEAD`
+/// can refuse — and on an unborn branch there is no tree to ask. Erring
+/// towards "this is real work" is what keeps the path staged.
+#[test]
+fn the_guard_never_dismisses_a_pointer_with_no_commit_behind_it() {
+    use gix::index::{entry::Flags, entry::Mode, entry::Stat, State};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    init_repo(root);
+    let payload = vec![42u8; 200_000];
+    let absolute = root.join("clip.mp4");
+    std::fs::write(&absolute, &payload).expect("write");
+
+    let store = LfsStore::in_git_dir(root.join(".git"));
+    let staging =
+        stage::prepare(&profile(root), &store, &[PathBuf::from("clip.mp4")]).expect("prepare");
+    let repo = git::repo::open(root, false).expect("open");
+    let blob = repo
+        .write_blob(&staging.substitutions[Path::new("clip.mp4")])
+        .expect("write blob")
+        .detach();
+
+    // The index entry a commit would have written, without the commit.
+    let metadata = gix::index::fs::Metadata::from_path_no_follow(&absolute).expect("lstat");
+    let stat = Stat::from_fs(&metadata).expect("stat convert");
+    let mut state = State::new(repo.object_hash());
+    state.dangerously_push_entry(stat, blob, Flags::empty(), Mode::FILE, "clip.mp4".into());
+    state.sort_entries();
+    gix::index::File::from_state(state, repo.index_path())
+        .write(gix::index::write::Options::default())
+        .expect("write index");
+
+    let repo = git::repo::open(root, false).expect("reopen");
+    assert_eq!(
+        stage::indexed_pointer(&repo, Path::new("clip.mp4")),
+        Some(staging.uploads[0].oid.clone())
+            .map(|oid| keeper_sync::lfs::pointer::Pointer::new(oid, payload.len() as u64)),
+        "the staged blob is a pointer, so recognition is not what refuses"
+    );
+    assert!(
+        !stage::is_false_modification(&repo, Path::new("clip.mp4"), &absolute),
+        "nothing is committed yet, so the pointer still has to be staged"
+    );
+}
+
+/// A pointer staged ahead of `HEAD` is not a false modification.
+///
+/// `stage_and_commit` writes the index before the commit so a crash between
+/// the two is re-driven on the next pass (NFR-24). That re-drive only happens
+/// because the path is reported modified, so dismissing it would strand the
+/// staged pointer until the file changed again.
+///
+/// This one deliberately does not arrange raciness. The report it relies on is
+/// the `HEAD`-to-index difference, which git derives from objects alone, so it
+/// holds on every filesystem and whatever the clock does.
+#[test]
+fn a_pointer_staged_ahead_of_head_is_never_dismissed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let payload = vec![42u8; 200_000];
+    commit_pointer_for_clip(root, &payload);
+    let absolute = root.join("clip.mp4");
+
+    // Stage a different pointer for the same path and stop there, exactly as a
+    // crash between the index write and the commit leaves things.
+    let repo = git::repo::open(root, false).expect("open");
+    let ahead = Pointer::new("c".repeat(64), payload.len() as u64);
+    let blob = repo
+        .write_blob(ahead.render().as_bytes())
+        .expect("write blob")
+        .detach();
+    let shared = repo.index_or_empty().expect("index");
+    let mut index: gix::index::File = (**shared).clone();
+    index
+        .entry_mut_by_path_and_stage(
+            gix::bstr::BStr::new("clip.mp4"),
+            gix::index::entry::Stage::Unconflicted,
+        )
+        .expect("clip.mp4 is indexed")
+        .id = blob;
+    index
+        .write(gix::index::write::Options::default())
+        .expect("write index");
+
+    let repo = git::repo::open(root, false).expect("reopen");
+    assert!(
+        git::repo::status_paths(&repo)
+            .expect("status")
+            .modified
+            .contains(&PathBuf::from("clip.mp4")),
+        "the index is ahead of HEAD, so the path is reported modified"
+    );
+    assert_eq!(
+        stage::indexed_pointer(&repo, Path::new("clip.mp4")),
+        Some(ahead),
+        "the staged blob is still a pointer, so recognition is not what refuses"
+    );
+    assert!(
+        !stage::is_false_modification(&repo, Path::new("clip.mp4"), &absolute),
+        "the pointer is staged but not committed, so the next pass has to re-drive it"
+    );
+}
