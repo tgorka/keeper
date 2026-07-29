@@ -92,8 +92,8 @@ or the front end — other Epic 34 agents own them.
   collapses to `else if !lfs::stage::is_false_modification(&repo, rela, &absolute)`; new test
   `a_pointer_staged_ahead_of_head_survives_the_scan_and_is_committed` (`:3945`).
 - `src-tauri/crates/keeper-sync/tests/lfs_roundtrip.rs` -- new fixtures `commit_pointer_for_clip`,
-  `make_racily_clean`, `advance_mtime`, `register_working_clean_filter`, and four tests
-  (`:290-494`).
+  `advance_mtime`, and five tests (`:234-495`) — three of them asking
+  `is_false_modification` directly, on constructed state.
 - Read but deliberately unchanged: `git/commit.rs:193-222` (the worktree-stat decision this bug
   misread) and `engine.rs:2333` (`removed_size`, whose approach is reused — its own contract differs,
   so the two stay separate functions).
@@ -114,20 +114,22 @@ or the front end — other Epic 34 agents own them.
   cost rather than restating the code.
 - [x] Tests -- `lfs_roundtrip.rs`: a committed pointer whose entry stat is 200 000 is recognised
   (and the test asserts that stat, so the mis-diagnosis cannot come back unnoticed) while a
-  200 000-byte ordinary blob, a 5-byte non-pointer and an unknown path are not; an aged index
-  makes the entry racily clean and the guard dismisses it, then an edit at identical length is not
-  dismissed; a pointer swapped into the index ahead of `HEAD` is not dismissed; and the same
-  fixture run with and without a working `filter.lfs.clean` shows which of the two configurations
-  the guard is load-bearing in. `engine.rs`: the call site honours a `false` answer end to end
-  through `collect_stable_changes` / `commit_local`.
+  200 000-byte ordinary blob, a 5-byte non-pointer and an unknown path are not. Then
+  `is_false_modification` is asked directly, on constructed state, once per branch: an untouched
+  pointer entry is dismissed and a same-length edit, a length change, a vanished file and an
+  unknown path are not; an ordinary blob with a matching stat is not; a pointer on an unborn
+  branch is not; a pointer staged ahead of a real `HEAD` is not. `engine.rs`: the call site
+  honours a `false` answer end to end through `collect_stable_changes` / `commit_local`.
 
 **Acceptance Criteria:**
 - Given a path committed through LFS, when `indexed_pointer` reads its index entry, then it returns
   the staged pointer even though the entry's stat reports the multi-gigabyte worktree file.
 - Given a 200 000-byte ordinary blob, when `indexed_pointer` reads it, then it returns `None`
   without loading the blob body.
-- Given an LFS entry that git re-read only because it is racily clean, when the scan runs, then the
-  path is not staged and the file is not hashed again.
+- Given an LFS entry that nothing has touched since it was staged, when the guard is asked, then it
+  answers that the report is false and the file is not hashed again. (Asked of the guard directly:
+  the end-to-end route to this state is unavailable on macOS while DW-121 stands — see
+  Verification.)
 - Given an LFS file edited in place to exactly the same byte count, when the scan runs, then the
   edit is staged and committed.
 - Given an LFS pointer written to the index but not yet committed, when the scan runs, then the path
@@ -182,12 +184,13 @@ other direction is cheap by construction: a guard that declines to dismiss costs
 identical pointer leaves the tree unchanged and produces no commit.
 
 **Third finding: which configuration the guard is alive in, and the comment that says otherwise.**
-Measured, not reasoned (`a_working_clean_filter_settles_the_racily_clean_case_before_the_guard_does`,
-and confirmed against plain `git` as well as gitoxide). A racily-clean LFS entry is *not* reported
-modified when `filter.lfs.clean` works: git re-reads the worktree, cleans it back into the pointer
-the index already holds, and calls the path unchanged — the guard is never consulted. It is only
-reported modified when the filter is absent or fails, because `enforce_local_config_with_filter`
-sets `filter.lfs.required = false` and a filter that fails is a filter that is not there.
+Measured against both plain `git` and gitoxide while fixing this story: a racily-clean LFS entry is
+**not** reported modified when `filter.lfs.clean` works. git re-reads the worktree, cleans it back
+into the pointer the index already holds, and calls the path unchanged — the guard is never
+consulted. It is only reported modified when the filter is absent or fails, because
+`enforce_local_config_with_filter` sets `filter.lfs.required = false`, and a filter that fails is a
+filter that is not there. (The test that demonstrated this had to be deleted afterwards; see the
+Verification section and DW-121's platform note for why, and where the observation now lives.)
 
 `Engine::open` registers `std::env::current_exe()` as that filter and its comment claims "`current_exe`
 is the daemon in a CLI run and the app binary in a desktop run; **both** understand `lfs clean|smudge`"
@@ -213,52 +216,52 @@ duplication. `index_key` — the forward-slash conversion both need — is now a
 
 ## Verification
 
+**Coverage gap, stated first because a reader must not assume otherwise.** The end-to-end
+racily-clean path — git re-reads an LFS entry, reports it modified, and the guard dismisses it — is
+**not covered on macOS, the only platform keeper ships to.** It cannot be, while DW-121 stands.
+That re-read is a content comparison, so it runs `filter.lfs.clean`, which is the broken filter
+DW-121 is about, and a failing non-required filter yields *different status outcomes per platform*:
+CI showed an entry that was genuinely racily clean — verified in-test with gix's own
+`Stat::matches` and `Stat::is_racy`, both true — reported modified on Linux/ext4 and clean on
+macOS/APFS. Two rounds of fixture work did not change that and could not have: the fixture was
+never the problem. The guard's **logic** is covered instead, by asking `is_false_modification`
+directly on constructed state, which is deterministic on every platform. Closing the gap depends on
+fixing DW-121; the new platform observation is appended there.
+
 **Ran here (this slice owns `keeper-sync`, which compiles on this box):**
-- `cargo test -p keeper-sync` — **396 lib tests, 8 `lfs_roundtrip`, 1 `lfs_pointer_stat`, 1
+- `cargo test -p keeper-sync` — **396 lib tests, 9 `lfs_roundtrip`, 1 `lfs_pointer_stat`, 1
   `gitignore_is_respected`, 1 `index_refresh`, all passing, and no output on stderr.**
 - `cargo fmt -p keeper-sync -- --check` — clean.
-- **The racily-clean precondition was holding by luck, and now holds by construction.** CI caught it
-  on macos-latest: `a_racily_clean_pointer_…` failed with an entirely clean `RepoStatus`, while the
-  same test passed on Linux. Probing the real inputs here showed why. `Stat::is_racy` compares
-  **seconds**, and the first fixture set the index's mtime *equal* to the worktree file's — the
-  `Ordering::Equal` arm. That arm is also where a fixture that simply runs fast already lands: with
-  the probe the entry measured `is_racy == true` **with the backdating removed entirely**, so the
-  helper was contributing nothing and the test was riding on the whole fixture finishing inside one
-  wall-clock second. On a runner where the index write crossed a second boundary the comparison
-  became `Ordering::Greater`, the entry was not racy, and git reported nothing — which is exactly
-  what macOS saw. It was never an APFS-versus-ext4 timestamp difference; nanoseconds are not even
-  consulted, because `stat_options` leaves `use_nsec` at `false`
-  (`gix-0.86.0/src/config/cache/access.rs:283`, from `gitoxide.core.useNsec`).
-  `make_racily_clean` now puts the index **ten seconds behind** the file, which is
-  `Ordering::Less` — racy unconditionally, with no nanosecond fields, no filesystem granularity and
-  no dependence on how long the test takes. Moving the index's own mtime cannot disturb
-  `Stat::matches`, which compares the worktree against the *entry*. The helper then asserts both
-  halves of the state with gix's own `matches` and `is_racy` against the real index, so a fixture
-  that stops reproducing fails loudly at the cause instead of silently at a downstream expectation.
-  Verified by simulation: setting the margin to `+1s` — the macOS shape — makes the helper fail on
-  its own `is_racy` assertion, and both racily-clean tests fail there rather than going vacuous.
-- The engine test needs the *opposite* state and gets it the same deterministic way: it ages the
-  index ten seconds **ahead** of the file (`Ordering::Greater`), so the entry is never racy and no
-  content re-read is attempted. `a_pointer_staged_ahead_of_head_is_never_dismissed` needs neither,
-  and says so — its report is a `HEAD`-to-index difference, derived from objects alone.
-- **The tests were proven to fail before the fix, not merely to pass after it.** With
-  `indexed_pointer`'s `entry.stat.size` test temporarily restored on top of everything else, three
-  `lfs_roundtrip` tests fail: recognition returns `None`
-  (`an_indexed_pointer_is_recognised_…`), the path stops being seen as LFS-tracked
-  (`a_racily_clean_pointer_…`), and the staged-ahead pointer is unrecognised
-  (`a_pointer_staged_ahead_of_head_…`). With the engine guard temporarily inverted (dropping the
-  `!`), the engine test fails — so it genuinely exercises the call site rather than passing on the
-  strength of the rest of the pipeline.
-- **The engine test's scope is deliberate and stated in its own doc comment.** It covers only the
-  guard's `false` answer. Reaching the `true` answer needs a racily-clean entry, and git only gets
-  there by re-reading the worktree *through* `filter.lfs.clean` — which under `cargo test` is the
-  libtest harness, since `Engine` registers `current_exe()`. An earlier draft did drive that state
-  and printed two `error: Unrecognized option: 'repo'` lines from the harness into a green run
-  while proving nothing about the filter. The test now uses a `HEAD`-to-index difference, which git
-  reports from objects alone, and explicitly ages the index past the worktree file so that a whole
-  test finishing inside one wall-clock second cannot make the entry racy by accident. The guard's
-  decision, in both filter configurations, is covered in `tests/lfs_roundtrip.rs`, which registers
-  the filter itself.
+- **The guard is covered as a unit, one test per branch, none of them touching `status_paths`,
+  the clock or a subprocess.** `the_guard_dismisses_an_untouched_pointer_entry_and_nothing_else`
+  takes the `true` path and then the stat dimension (same-length edit, length change, vanished
+  file, unknown path); `the_guard_never_dismisses_an_ordinary_blob` takes the pointer check with a
+  matching stat, so only the blob can refuse; `the_guard_never_dismisses_a_pointer_with_no_commit_behind_it`
+  hand-builds an index entry on an unborn branch, so only `HEAD` can refuse;
+  `a_pointer_staged_ahead_of_head_is_never_dismissed` takes the same refusal with a real commit
+  behind it.
+- **Every branch of the guard was mutation-checked, and each is killed by a different test.**
+  Replacing `head_records(…)` with `true` kills
+  `the_guard_never_dismisses_a_pointer_with_no_commit_behind_it` and
+  `a_pointer_staged_ahead_of_head_is_never_dismissed`; dropping the `pointer_blob` check kills
+  `the_guard_never_dismisses_an_ordinary_blob`; dropping the stat check kills
+  `the_guard_dismisses_an_untouched_pointer_entry_and_nothing_else`. No mutant survived.
+- **The recognition fix was proven to fail before it, not merely to pass after it.** With
+  `indexed_pointer`'s `entry.stat.size` test temporarily restored, `an_indexed_pointer_is_recognised_…`
+  fails on the pointer it must recognise, and the staged-ahead tests fail on the pointer they must
+  see. With the engine guard temporarily inverted (dropping the `!`), the engine test fails.
+- **What was removed, and why.** Two integration tests depended on `status_paths` reporting the
+  re-read: the racily-clean half of `a_racily_clean_pointer_…` and the whole of
+  `a_working_clean_filter_settles_…`. Both are gone rather than skipped, `#[ignore]`d or
+  `cfg(target_os)`-gated — a test that silently does not run on the shipping platform is worse than
+  no test. What survived the dependency was kept: a same-length edit is still asserted to be
+  reported by git, because that report comes from a moved stat and never reaches the racy branch.
+  The filter observation the deleted test carried now lives in DW-121.
+- **The engine test's scope is deliberate and stated in its own doc comment.** It reaches only the
+  guard's `false` answer, using a `HEAD`-to-index difference that git derives from objects alone —
+  no worktree read, so no filter subprocess. It ages the index ten seconds ahead of the file so
+  that a test finishing inside one wall-clock second cannot make the entry racy by accident, which
+  is what made an earlier draft print `error: Unrecognized option: 'repo'` into a green run.
 - Not run, per the batch constraint: anything that builds the `keeper` crate (needs GTK here),
   `cargo clippy`, and the front-end suites — this slice touches no TypeScript and no generated IPC
   type.
@@ -276,7 +279,7 @@ duplication. `index_key` — the forward-slash conversion both need — is now a
   file through `filter.lfs.clean`. That is why even an edit at identical length runs the filter,
   and why the filter's presence is what decides whether the guard is reached at all.
 - `gix-index-0.54.0/src/file/init.rs:94-97` — the index `timestamp` is the index file's own
-  mtime, which is what `make_racily_clean` moves to reach a state a test cannot wait for.
+  mtime; a racily-clean fixture built on it is what DW-121's platform note retires.
 - `gix-0.86.0`: `Repository::head_tree` (`repository/reference.rs:298`), `Repository::stat_options`
   (`repository/config/mod.rs:53`, `index`-gated and the crate already uses `index`),
   `Tree::lookup_entry_by_path` (`object/tree/mod.rs:175`) and `Entry::object_id`

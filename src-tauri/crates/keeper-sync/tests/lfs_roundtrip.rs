@@ -217,59 +217,6 @@ fn commit_pointer_for_clip(root: &Path, payload: &[u8]) -> stage::LfsStaging {
     staging
 }
 
-/// Make `rela`'s index entry racily clean, and prove that it is.
-///
-/// git re-reads the content of an entry whose mtime is not older than the
-/// index file's own. The index is always written last, so a test has to
-/// arrange the condition rather than wait for it.
-///
-/// The margin is what makes this deterministic. `Stat::is_racy` compares
-/// **seconds**, and only its `Ordering::Equal` arm consults nanoseconds — and
-/// then only when `gitoxide.core.useNsec` is on, which it is not by default.
-/// An earlier version of this helper set the index's mtime *equal* to the
-/// file's, which lands on that arm and, worse, was indistinguishable from
-/// doing nothing at all: a fixture that finishes inside one second already has
-/// both timestamps in the same second. It therefore passed on ext4 and failed
-/// on APFS purely on where a second boundary happened to fall. Ten seconds
-/// earlier lands on `Ordering::Less`, which is racy unconditionally — no
-/// nanosecond fields, no filesystem granularity, no dependence on how long the
-/// test takes.
-///
-/// Moving the index's own mtime cannot disturb `Stat::matches`, which compares
-/// the worktree against the *entry*; the index file's timestamp is not one of
-/// its inputs.
-fn make_racily_clean(root: &Path, rela: &str) {
-    let mtime = std::fs::metadata(root.join(rela))
-        .and_then(|metadata| metadata.modified())
-        .expect("worktree mtime");
-    let older = mtime - std::time::Duration::from_secs(10);
-    std::fs::File::options()
-        .write(true)
-        .open(root.join(".git").join("index"))
-        .and_then(|index| index.set_modified(older))
-        .expect("age the index behind the file");
-
-    // Assert the state with gix's own predicate, against the real index this
-    // repository will be read with. A precondition a test merely hopes for is
-    // how a vacuous test is born.
-    let repo = git::repo::open(root, false).expect("open");
-    let index = repo.index_or_empty().expect("index");
-    let entry = index
-        .entry_by_path(gix::bstr::BStr::new(rela))
-        .expect("the path is indexed");
-    let options = repo.stat_options().expect("stat options");
-    let metadata = gix::index::fs::Metadata::from_path_no_follow(&root.join(rela)).expect("lstat");
-    let worktree = gix::index::entry::Stat::from_fs(&metadata).expect("stat");
-    assert!(
-        worktree.matches(&entry.stat, options),
-        "the worktree must still match the entry, or this is not the racy case at all"
-    );
-    assert!(
-        worktree.is_racy(index.timestamp(), options),
-        "the entry has to be racily clean for the guard to be the thing under test"
-    );
-}
-
 /// Move a file's mtime a clear second forward.
 ///
 /// Stat comparison uses mtime *seconds* unless `core.checkStat` asks for
@@ -282,45 +229,6 @@ fn advance_mtime(path: &Path) {
         .open(path)
         .and_then(|file| file.set_modified(when))
         .expect("advance the mtime");
-}
-
-/// Register a genuinely working `filter.lfs.clean` for this repository.
-///
-/// Not a stub that replays a known pointer: it hashes whatever it is given, so
-/// it keeps telling the truth after the worktree file changes. `keeper-syncd`'s
-/// `lfs clean` (`commands.rs:1621`) is the real article and cannot be run from
-/// here — an integration test's `current_exe` is the libtest harness — so the
-/// shape is reproduced with the two digest tools that exist on the platforms
-/// keeper builds for.
-fn register_working_clean_filter(root: &Path) {
-    let script = root.join("clean-filter.sh");
-    std::fs::write(
-        &script,
-        "#!/bin/sh\nt=$(mktemp)\ncat > \"$t\"\n\
-         h=$(sha256sum \"$t\" 2>/dev/null | cut -d' ' -f1 || shasum -a 256 \"$t\" | cut -d' ' -f1)\n\
-         printf 'version https://git-lfs.github.com/spec/v1\\noid sha256:%s\\nsize %s\\n' \\\n\
-         \"$h\" \"$(wc -c < \"$t\" | tr -d ' ')\"\nrm -f \"$t\"\n",
-    )
-    .expect("write filter");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
-    // The same single-invocation shape `enforce_local_config_with_filter`
-    // writes, minus the `--repo` argument this stand-in has no use for.
-    for (key, value) in [
-        ("filter.lfs.clean", format!("\"{}\"", script.display())),
-        ("filter.lfs.required", "false".to_owned()),
-    ] {
-        let ok = std::process::Command::new("git")
-            .args(["config", key, &value])
-            .current_dir(root)
-            .status()
-            .expect("git config")
-            .success();
-        assert!(ok, "git config {key} must succeed");
-    }
 }
 
 /// Regression: `indexed_pointer` decided "too big to be a pointer" from
@@ -373,44 +281,46 @@ fn an_indexed_pointer_is_recognised_although_its_entry_stat_is_the_worktree_file
     assert!(stage::indexed_pointer(&repo, Path::new("absent.bin")).is_none());
 }
 
-/// The racily-clean guard, which no LFS path ever reached while
-/// `indexed_pointer` was rejecting them all.
+/// The guard's decision, asked of the guard.
+///
+/// This deliberately does **not** go through `status_paths`. The state git
+/// hands the guard is a racily-clean entry, and reaching that state end to end
+/// means making git re-read the worktree — a content comparison that runs
+/// `filter.lfs.clean`, which under `cargo test` is the broken filter of DW-121,
+/// and whose outcome then differs by platform. `is_false_modification` itself
+/// asks none of that: its inputs are the entry's stat, the staged blob, `HEAD`
+/// and one `lstat`. Constructing those directly covers every answer
+/// deterministically, on every platform, with no clock and no subprocess.
 #[test]
-fn a_racily_clean_pointer_is_not_a_modification_but_an_equal_length_edit_is() {
+fn the_guard_dismisses_an_untouched_pointer_entry_and_nothing_else() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     let payload = vec![42u8; 200_000];
     commit_pointer_for_clip(root, &payload);
     let absolute = root.join("clip.mp4");
+    let repo = git::repo::open(root, false).expect("open");
 
-    make_racily_clean(root, "clip.mp4");
-    let repo = git::repo::open(root, false).expect("reopen");
-    let status = git::repo::status_paths(&repo).expect("status");
-    assert!(
-        status.modified.contains(&PathBuf::from("clip.mp4")),
-        "the fixture has to reproduce the racily-clean re-read, got {status:?}"
-    );
+    // Nothing has touched the file since it was staged, so a report about it
+    // can only be the re-read finding the pointer design.
     assert!(
         stage::is_false_modification(&repo, Path::new("clip.mp4"), &absolute),
-        "nothing touched the file, so the re-read found the design and not an edit"
+        "an untouched pointer entry is not a modification"
     );
+    // A path git has never heard of is not dismissed either.
+    assert!(!stage::is_false_modification(
+        &repo,
+        Path::new("absent.bin"),
+        &root.join("absent.bin")
+    ));
 
     // A real edit that keeps the byte count exactly. Comparing the worktree's
     // length against the pointer's `size` — what the guard used to do — cannot
-    // see it, and the user's work would never be committed again.
+    // see this one, and the user's work would never be committed again.
     let mut edited = payload.clone();
     edited[0] = 7;
     std::fs::write(&absolute, &edited).expect("edit");
     advance_mtime(&absolute);
-
     let repo = git::repo::open(root, false).expect("reopen");
-    assert!(
-        git::repo::status_paths(&repo)
-            .expect("status")
-            .modified
-            .contains(&PathBuf::from("clip.mp4")),
-        "git still reports the edit"
-    );
     assert!(
         stage::indexed_pointer(&repo, Path::new("clip.mp4")).is_some(),
         "the index is untouched, so the path is still LFS-tracked"
@@ -418,6 +328,111 @@ fn a_racily_clean_pointer_is_not_a_modification_but_an_equal_length_edit_is() {
     assert!(
         !stage::is_false_modification(&repo, Path::new("clip.mp4"), &absolute),
         "an edit at identical length is still an edit"
+    );
+    // And git agrees it is one. This report needs no re-read: the stat moved,
+    // so the comparison never reaches the racy branch — it holds on every
+    // platform, which is why it survives here while the racily-clean half
+    // could not.
+    assert!(
+        git::repo::status_paths(&repo)
+            .expect("status")
+            .modified
+            .contains(&PathBuf::from("clip.mp4")),
+        "a same-length edit is reported, so the guard's answer is what decides"
+    );
+
+    // An edit that changes the length, and then the file vanishing: neither is
+    // the untouched case, and a missing file must never be dismissed.
+    std::fs::write(&absolute, vec![7u8; 199_999]).expect("shrink");
+    assert!(!stage::is_false_modification(
+        &repo,
+        Path::new("clip.mp4"),
+        &absolute
+    ));
+    std::fs::remove_file(&absolute).expect("remove");
+    assert!(!stage::is_false_modification(
+        &repo,
+        Path::new("clip.mp4"),
+        &absolute
+    ));
+}
+
+/// An ordinary blob is never dismissed, however still its stat is.
+///
+/// For a non-pointer entry a re-read that finds different bytes is a real edit
+/// caught inside the race window, and swallowing it would lose the user's work.
+/// The pointer check is what makes dismissing safe, so it has to be the thing
+/// that refuses here — not the stat, which matches.
+#[test]
+fn the_guard_never_dismisses_an_ordinary_blob() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    init_repo(root);
+    std::fs::write(root.join("note.txt"), b"small").expect("write");
+    let repo = git::repo::open(root, false).expect("open");
+    let changes = git::commit::StagedChange {
+        added: vec![PathBuf::from("note.txt")],
+        ..Default::default()
+    };
+    commit(&repo, &changes, &std::collections::BTreeMap::new());
+
+    let repo = git::repo::open(root, false).expect("reopen");
+    let absolute = root.join("note.txt");
+    assert!(
+        stage::indexed_pointer(&repo, Path::new("note.txt")).is_none(),
+        "the fixture has to be a non-pointer blob for this to mean anything"
+    );
+    assert!(
+        !stage::is_false_modification(&repo, Path::new("note.txt"), &absolute),
+        "an ordinary blob is not the pointer design and must never be dismissed"
+    );
+}
+
+/// A pointer with no commit behind it is not dismissed.
+///
+/// The index carries the entry and the worktree matches it, so only `HEAD`
+/// can refuse — and on an unborn branch there is no tree to ask. Erring
+/// towards "this is real work" is what keeps the path staged.
+#[test]
+fn the_guard_never_dismisses_a_pointer_with_no_commit_behind_it() {
+    use gix::index::{entry::Flags, entry::Mode, entry::Stat, State};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    init_repo(root);
+    let payload = vec![42u8; 200_000];
+    let absolute = root.join("clip.mp4");
+    std::fs::write(&absolute, &payload).expect("write");
+
+    let store = LfsStore::in_git_dir(root.join(".git"));
+    let staging =
+        stage::prepare(&profile(root), &store, &[PathBuf::from("clip.mp4")]).expect("prepare");
+    let repo = git::repo::open(root, false).expect("open");
+    let blob = repo
+        .write_blob(&staging.substitutions[Path::new("clip.mp4")])
+        .expect("write blob")
+        .detach();
+
+    // The index entry a commit would have written, without the commit.
+    let metadata = gix::index::fs::Metadata::from_path_no_follow(&absolute).expect("lstat");
+    let stat = Stat::from_fs(&metadata).expect("stat convert");
+    let mut state = State::new(repo.object_hash());
+    state.dangerously_push_entry(stat, blob, Flags::empty(), Mode::FILE, "clip.mp4".into());
+    state.sort_entries();
+    gix::index::File::from_state(state, repo.index_path())
+        .write(gix::index::write::Options::default())
+        .expect("write index");
+
+    let repo = git::repo::open(root, false).expect("reopen");
+    assert_eq!(
+        stage::indexed_pointer(&repo, Path::new("clip.mp4")),
+        Some(staging.uploads[0].oid.clone())
+            .map(|oid| keeper_sync::lfs::pointer::Pointer::new(oid, payload.len() as u64)),
+        "the staged blob is a pointer, so recognition is not what refuses"
+    );
+    assert!(
+        !stage::is_false_modification(&repo, Path::new("clip.mp4"), &absolute),
+        "nothing is committed yet, so the pointer still has to be staged"
     );
 }
 
@@ -477,58 +492,4 @@ fn a_pointer_staged_ahead_of_head_is_never_dismissed() {
         !stage::is_false_modification(&repo, Path::new("clip.mp4"), &absolute),
         "the pointer is staged but not committed, so the next pass has to re-drive it"
     );
-}
-
-/// Which configuration the racily-clean guard is actually load-bearing in.
-///
-/// A working `filter.lfs.clean` answers the question before keeper does: git
-/// re-reads the worktree, cleans it back into the pointer it already has, and
-/// calls the path unchanged, so `is_false_modification` is never consulted.
-/// Without one — `filter.lfs.required` is `false`, so a filter that fails is a
-/// filter that is not there — the raw bytes are hashed, the path reads as
-/// modified, and the guard is the only thing between the user and a full
-/// re-clean of the file on every pass.
-///
-/// That difference is not academic. `Engine` registers `std::env::current_exe()`
-/// as the filter (`engine.rs:342-344`), which is `keeper-syncd` in a CLI run —
-/// and the desktop app binary, which has no `lfs` subcommand at all. So the
-/// unfiltered column is the desktop configuration, not a test artefact.
-#[test]
-fn a_working_clean_filter_settles_the_racily_clean_case_before_the_guard_does() {
-    let payload = vec![42u8; 200_000];
-    let mut edited = payload.clone();
-    edited[0] = 7;
-
-    for filtered in [false, true] {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        commit_pointer_for_clip(root, &payload);
-        if filtered {
-            register_working_clean_filter(root);
-        }
-        let absolute = root.join("clip.mp4");
-        make_racily_clean(root, "clip.mp4");
-
-        let repo = git::repo::open(root, false).expect("open");
-        let racily_clean = git::repo::status_paths(&repo).expect("status");
-        assert_eq!(
-            racily_clean.modified.contains(&PathBuf::from("clip.mp4")),
-            !filtered,
-            "filtered={filtered}: a working filter resolves the re-read itself, \
-             and without one the guard has to; got {racily_clean:?}"
-        );
-
-        // A real edit is reported either way, so the guard's other answer is
-        // reachable in both configurations.
-        std::fs::write(&absolute, &edited).expect("edit");
-        advance_mtime(&absolute);
-        let repo = git::repo::open(root, false).expect("reopen");
-        assert!(
-            git::repo::status_paths(&repo)
-                .expect("status")
-                .modified
-                .contains(&PathBuf::from("clip.mp4")),
-            "filtered={filtered}: an edit at identical length is reported whatever the filter does"
-        );
-    }
 }
