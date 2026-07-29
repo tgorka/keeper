@@ -1373,5 +1373,24 @@ note: 2026-07-29 — not a regression and not release-blocking: it is a surface 
 origin: found while reconciling sprint-status.yaml with the epic-34 tail, 2026-07-29
 location: _bmad-output/implementation-artifacts/ (spec files stop at `spec-34-13-…`) + sprint-status.yaml (34-14..34-19 added 2026-07-29 with this gap noted inline)
 reason: every other story in this project has a spec that records the problem, the decision and the acceptance before the code exists. These six were implemented from a field report and a defect investigation instead, so the artifact trail runs the other way: the commits are unusually detailed and `docs/sync.md` §§3/8/11/14/15 carry the user-facing contract, but there is no single document stating what each story was accepted against. That makes the epic-34 retrospective harder than it needs to be and leaves nothing for a reviewer to check the code against.
-status: open
+status: done 2026-07-29
+resolution: all six written (1544 lines), each to the structure `spec-34-13` establishes, with
+  `</intent-contract>` closing after the I/O matrix as every existing spec does. The earlier note
+  below argued for not back-filling them; that was over-weighted. The authorship-bias risk is real
+  but the mitigation is mechanical — write the Problem from the evidence as it stood BEFORE the fix
+  (the field report, the ledger entry, the live-server probe, the test that was passing falsely) and
+  derive Acceptance from observable behaviour — and no spec at all is plainly worse than one written
+  with that discipline. Each carries an explicit "not covered" section rather than implying
+  completeness.
+  Reviewing them paid for itself twice. 34-17's author flagged the `--` ssh-option-injection guard as
+  the one detail with a security consequence and no test; it is now covered by the argv assertion and
+  mutation-checked, and the spec records that rather than the gap. 34-17 also found that the engine
+  wiring for that story landed in `8a8aba4` and not `339acaf`, and says so, so a reader diffing one
+  commit is not misled. Every multi-word `snake_case` identifier cited across all six was checked
+  programmatically against the tree: the only two that do not resolve are `ensure_activity_size_column`
+  and `a_working_clean_filter_settles_the_racily_clean_case_before_the_guard_does`, both correctly
+  framed as things this work replaced or that 34.13 deleted.
+  Not claimed: none of the six has been through code review, and all nine epic-34 tail stories remain
+  at `review` in sprint-status. Four of the six were written by the implementer of the code they
+  describe, which is exactly the bias the note below names — a reviewer should read them as such.
 note: 2026-07-29 — deliberately not back-filled in the same pass that wrote the code. A spec written after the fact by the author of the code tends to describe what was built rather than what was needed, which is the failure mode the specs exist to prevent; these are better written from the commits and the ledger by someone doing the epic-34 review.

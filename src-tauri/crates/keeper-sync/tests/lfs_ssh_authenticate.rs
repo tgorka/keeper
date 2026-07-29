@@ -149,6 +149,37 @@ async fn the_handshake_sends_the_argv_git_lfs_sends_and_reads_every_answer() {
         ]
     );
 
+    // A host that looks like an ssh option is separated from the options with
+    // `--`. This is the one assertion here with a security consequence: without
+    // the separator ssh reads `-oProxyCommand=…` as an OPTION, and
+    // `ProxyCommand` runs a shell command — so a crafted remote URL would be
+    // arbitrary code execution the moment a large file was staged. git-lfs
+    // guards this the same way, and a guard asserted only by reading it is not
+    // a guard.
+    let hostile = SshRemote::parse("ssh://-oProxyCommand=evil@forge.example/owner/repo.git")
+        .expect("it parses; `--` is the defence, not refusal");
+    authenticate_with(&hostile, Operation::Upload, &ssh)
+        .await
+        .expect("answered");
+    let argv = recorded(dir.path());
+    let separator = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .expect("`--` must be emitted for a host beginning with `-`");
+    let host = argv
+        .iter()
+        .position(|arg| arg == "-oProxyCommand=evil@forge.example")
+        .expect("the host is passed through, userinfo and all");
+    assert!(
+        separator < host,
+        "the separator must PRECEDE the host or it defends nothing, got: {argv:?}"
+    );
+    assert_eq!(
+        argv.last().map(String::as_str),
+        Some("git-lfs-authenticate /owner/repo.git upload"),
+        "and the remote command still arrives intact"
+    );
+
     // ---------------------------------------------------------------------
     // 2. A plain bare repository over ssh: a login shell runs the command and
     //    reports exit 127. There is no LFS server here at all, so this is a

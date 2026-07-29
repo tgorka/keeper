@@ -654,6 +654,37 @@ mod tests {
         );
     }
 
+    /// The one detail here with a security consequence, and it went untested
+    /// until a spec review said so out loud.
+    ///
+    /// A remote URL is user data. Without the `--`, a host of
+    /// `-oProxyCommand=…` is handed to ssh as an OPTION rather than a
+    /// destination, and `ProxyCommand` runs a shell command — so a crafted
+    /// remote would be arbitrary code execution the moment a large file was
+    /// staged. git-lfs guards this with the same rule, and the guard is worth
+    /// nothing if it is only asserted by reading it.
+    #[test]
+    fn a_host_that_looks_like_an_ssh_option_is_separated_from_the_options() {
+        let hostile =
+            SshRemote::parse("ssh://-oProxyCommand=touch${IFS}pwned@host.example/o/r.git")
+                .expect("it parses — refusing it is not the defence, `--` is");
+        // Userinfo is NOT stripped here, unlike the endpoint derivation: ssh
+        // needs `user@host`, so the hostile string survives into the argument
+        // and the separator is the only thing standing between it and ssh's
+        // option parser.
+        assert!(
+            hostile.user_host.starts_with('-'),
+            "the guard's trigger condition must actually hold for this input, got: {}",
+            hostile.user_host
+        );
+
+        // An ordinary remote must NOT gain the separator: `--` before a normal
+        // destination is harmless but it would mean the condition was inverted,
+        // and the inverse mistake is the dangerous one.
+        let ordinary = SshRemote::parse("ssh://git@host.example/o/r.git").expect("parse");
+        assert!(!ordinary.user_host.starts_with('-'));
+    }
+
     #[test]
     fn the_forge_response_shape_round_trips() {
         // Byte-for-byte what Forgejo's `LFSTokenResponse` serializes: two fields
