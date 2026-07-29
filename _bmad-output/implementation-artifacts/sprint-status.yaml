@@ -298,6 +298,20 @@ development_status:
   34-8-progress-you-can-watch: review
   34-9-files-sync-when-they-land: review
   34-10-sync-now-proves-it-ran: review
+  # 34-11..34-13 have specs on disk and shipped in 2dcd018/92437ee/1be95be but
+  # were never added here, so sprint-status has been under-reporting the epic.
+  34-11-a-kill-during-a-ref-update-must-not-strand-a-folder: review
+  34-12-the-access-token-arrives-in-the-field: review
+  34-13-the-index-can-recognise-its-own-lfs-pointers: review
+  # 34-14..34-19 are implemented and tested but have NO spec file yet; the
+  # rationale currently lives in their commit messages and in docs/sync.md.
+  # Writing those specs is the next artifact task for this epic.
+  34-14-find-a-git-that-works: review
+  34-15-a-pointer-is-never-published-ahead-of-its-object: review
+  34-16-activity-says-how-far-each-file-got: review
+  34-17-lfs-over-an-ssh-remote: review
+  34-18-lfs-over-a-filesystem-remote: review
+  34-19-the-app-binary-can-be-the-lfs-filter: review
   epic-34-retrospective: optional
 
 # Phase 4 state as of 2026-07-25 — what is actually true, not what was planned.

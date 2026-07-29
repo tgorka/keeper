@@ -1336,6 +1336,42 @@ origin: found while repairing the racily-clean guard for story 34.13, 2026-07-29
 location: keeper-sync/src/engine.rs:342-344 (`filter_program` = `current_exe()`) + keeper-syncd/src/commands.rs:1621 (the only implementation) + keeper/src (no `lfs` subcommand anywhere)
 reason: `Engine::open` configures `filter.lfs.clean`/`smudge` to `std::env::current_exe()`, and its comment claims "both understand `lfs clean|smudge`". `keeper-syncd` does. The `keeper` app binary does not — a repo-wide grep of `crates/keeper/src` finds only `lfs_mode` and `lfs_threshold_bytes` in `sync_ipc.rs`, and no argument parsing that could answer `lfs clean --repo <path>`. Because keeper also sets `filter.lfs.required=false`, a filter that fails is indistinguishable from one that is absent, so nothing reports it: git falls back to storing the bytes it was given. Measured against both plain git and gitoxide while fixing 34.13: with a WORKING clean filter a racily-clean LFS entry reads clean, because git re-reads the worktree and cleans it back into the pointer the index already holds; without one it reads modified. So on desktop the guard `lfs::stage::is_false_modification` is the ONLY thing standing between a committed LFS file and a full re-clean of every such file on the next scan, and on a `keeper-syncd` host that same guard is dead code. keeper stages its own pointers (`lfs/stage.rs`), so this is not why LFS sync works — the harm is to anything that drives real `git` inside a synced folder, which is exactly the concurrent human writer the ref-lock work (34.11) was scoped to protect.
 evidence: Measured while fixing 34.13, against both plain git and gitoxide: with a WORKING clean filter a racily-clean LFS entry reads clean, because git re-reads the worktree and cleans it back into the pointer the index already holds; without one the raw bytes are hashed and the path reads as modified. The test that demonstrated this (`a_working_clean_filter_settles_the_racily_clean_case_before_the_guard_does`) was removed on 2026-07-29 — see the platform note below — so the observation lives here rather than in a test.
-status: open
+status: done 2026-07-29
+resolution: fixed as story 34.19. The first of the two routes was taken — the app
+  binary learned the subcommand — because the other one contradicts a promise
+  docs/sync.md §8 already makes ("that is what lets you use ordinary `git` inside
+  a synced folder"), and refusing to register the filter would have meant editing
+  that promise out rather than keeping it.
+  The filter body moved out of `keeper-syncd` into `keeper_sync::lfs::filter`, so
+  there is now ONE implementation rather than one per binary — the same reasoning
+  AD-52 applies to the engine, a layer down. `keeper::run` serves it before the
+  Tauri builder exists and returns; the parse demands `lfs` as the very first
+  argument, so a Finder launch (no arguments) and an older macOS launch
+  (`-psn_…`) are untouched, and that is asserted. `filter::run` is generic over
+  its streams rather than locking stdio, which is what finally makes the thing
+  testable: a clean round-trips to a stored object and its pointer, a smudge
+  restores the content byte-exactly, an unresolvable pointer and a
+  larger-than-a-pointer input both pass through whole.
+  The macOS/Linux status divergence recorded below should now be moot, and the
+  end-to-end racily-clean test that had to be deleted for it can be restored —
+  that is left as a follow-up rather than claimed here, because it was not
+  re-attempted.
 note: 2026-07-29 — two routes, and the choice is a real decision rather than a detail. Either the app learns the `lfs clean|smudge` subcommand (a CLI surface inside a GUI binary, which needs its own argument-parsing decision and must stay invisible to normal launches), or `enforce_local_config_with_filter` refuses to register a program that cannot serve — which is honest, but leaves a synced LFS folder with no clean filter at all for external git, so it trades a silent failure for a loud absence. Not fixed with 34.13 because it lives in `git/repo.rs`, and because picking between those two is not a decision to make in passing.
 note: 2026-07-29 — a failing clean filter produces DIFFERENT status outcomes on macOS and Linux, which is a new fact about this defect and the strongest argument yet for fixing it. Same fixture, same code, same git 2.55: an LFS entry that is genuinely racily clean (verified in-test with gix's own `Stat::matches` and `Stat::is_racy`, both true) is reported MODIFIED on Linux/ext4 and CLEAN on macOS/APFS. The racily-clean re-read is a content comparison, so it runs `filter.lfs.clean` — the broken filter this entry is about — and the platforms evidently disagree about what a failing non-required filter yields. Consequence for coverage: keeper-sync's end-to-end racily-clean path CANNOT be tested on the only platform keeper ships to while this defect stands. Story 34.13 responded by testing `lfs::stage::is_false_modification` directly on constructed state, which is deterministic everywhere, and by deleting the two integration tests that depended on the re-read. Fixing this defect is what would let that integration coverage exist at all.
+
+### DW-122: Story 34.14's `sync_git_status` / `sync_git_path_set` are fully implemented, registered and typed, and no frontend surface calls either — so a machine with an unusable `git` still has no way to say where a usable one is.
+
+origin: found while committing the epic-34 tail, 2026-07-29
+location: keeper/src/ipc.rs (`git_report`, `sync_git_status`, `sync_git_path_set`) + keeper/src/lib.rs:327-328 (both registered) + src/lib/ipc/gen/{SyncGitVm,SyncGitState}.ts (generated) + src/components/settings/sync-section.tsx (no consumer)
+reason: the resolution, the settings key, the IPC pair and the generated bindings all exist and are tested; a repo-wide grep for `syncGit`/`SyncGitVm` outside `src/lib/ipc/gen/` finds nothing. So the report that says "git 2.23 at /usr/local/bin/git does not clear the 2.42 floor, and here is what was skipped" is computed and then discarded, and the setting that would fix it can only be written by a caller that does not exist. The capability flag DOES consume the same resolution, so the Sync surface correctly hides itself — which makes this a dead end rather than a broken screen: the user is told sync is unavailable and given no way to act on it.
+evidence: `bun run typecheck` passes with the bindings unreferenced; `git_report` is exercised only through `capabilities`. The two commands are reachable over IPC by hand (`invoke("sync_git_status")`) but nothing in the UI does.
+status: open
+note: 2026-07-29 — not a regression and not release-blocking: it is a surface that was never wired, and the state it reports is one the capability flag already handles safely. It is the obvious next slice of 34.14 and wants Settings → Sync to render the report plus a path picker.
+
+### DW-123: Stories 34-14 through 34-19 have no `spec-*.md`, so six shipped stories carry their rationale only in commit messages and `docs/sync.md`.
+
+origin: found while reconciling sprint-status.yaml with the epic-34 tail, 2026-07-29
+location: _bmad-output/implementation-artifacts/ (spec files stop at `spec-34-13-…`) + sprint-status.yaml (34-14..34-19 added 2026-07-29 with this gap noted inline)
+reason: every other story in this project has a spec that records the problem, the decision and the acceptance before the code exists. These six were implemented from a field report and a defect investigation instead, so the artifact trail runs the other way: the commits are unusually detailed and `docs/sync.md` §§3/8/11/14/15 carry the user-facing contract, but there is no single document stating what each story was accepted against. That makes the epic-34 retrospective harder than it needs to be and leaves nothing for a reviewer to check the code against.
+status: open
+note: 2026-07-29 — deliberately not back-filled in the same pass that wrote the code. A spec written after the fact by the author of the code tends to describe what was built rather than what was needed, which is the failure mode the specs exist to prevent; these are better written from the commits and the ledger by someone doing the epic-34 review.
