@@ -837,10 +837,11 @@ impl Engine {
             Ok(watcher) => {
                 let replaced = Self::lock(&self.watchers)
                     .insert(profile.id.clone(), ProfileWatch::Live { watcher, events });
-                // Joining the previous watcher's threads takes up to one
-                // debouncer tick, and happens with the map unlocked:
-                // `remove_profile` runs on an IPC thread and must not queue
-                // behind a join.
+                // Retiring the previous watcher hands its teardown to a thread
+                // of its own and returns (`watch::retire`), so replacing a
+                // watcher costs this tick nothing — it happens with the map
+                // unlocked anyway, because an IPC-thread `remove_profile` must
+                // never queue behind a tick that is arming.
                 drop(replaced);
                 self.clear_watch_warning(&profile.id);
             }
@@ -976,11 +977,13 @@ impl Engine {
         let dropped = Self::lock(&self.watchers).remove(profile_id);
         self.clear_watch_wake(profile_id);
         if dropped.is_some() {
-            tracing::debug!(profile_id, "folder watch stopped");
+            tracing::debug!(profile_id, "folder watch retired");
         }
-        // Dropping a live watcher joins both of its threads, and it happens with
-        // the map unlocked so an IPC-thread `remove_profile` never waits behind
-        // a join.
+        // Retiring a live watcher never blocks: `watch::retire` moves the
+        // teardown to its own thread precisely because this line is on the IPC
+        // thread whenever `remove_profile` is what called us. The map is
+        // unlocked first regardless, so nothing else serialises behind it
+        // either.
         drop(dropped);
     }
 
@@ -1007,7 +1010,10 @@ impl Engine {
         }
     }
 
-    /// Stop every watcher this engine armed.
+    /// Stop every watcher this engine armed, without waiting for any of them.
+    ///
+    /// This is the last thing between a shutdown request and `finalize`, so it
+    /// is the one teardown that absolutely may not block: see `watch::retire`.
     fn stop_all_watchers(&self) {
         let dropped = std::mem::take(&mut *Self::lock(&self.watchers));
         Self::lock(&self.watch_wake).clear();

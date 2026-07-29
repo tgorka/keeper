@@ -298,3 +298,121 @@ is decided in the pure `fold_batch`.
 8. Leak check: `Activity Monitor` (or `ls /proc/<pid>/task | wc -l`) across ten pause/resume cycles of
    one profile — **expect** a flat thread count, and on Linux a flat
    `ls -l /proc/<pid>/fd | grep -c inotify`.
+
+## Follow-up (2026-07-29): the watcher teardown could not be waited on
+
+Added after the fact. Nothing above is rewritten — this section records a defect found by CI in the
+work this spec describes, and the change made to close it.
+
+### What CI actually showed
+
+Run `30417789975` on commit `3523a25`, job `Rust (fmt, clippy, test)`, macos-latest: 1525 of 1526
+tests finished inside two minutes and the run then sat on
+`keeper-syncd::durability_matrix a_kill_at_any_instant_costs_no_data_and_corrupts_no_index` for
+ninety-six minutes, emitting `SLOW [>N]` once a minute and nothing else, until it was cancelled. The
+job's `Cleaning up orphan processes` step named a live `keeper-syncd`, a live `durability_matr` and a
+live `cargo-nextest`, so the test was blocked waiting on a daemon child that never exited. The same
+test takes 12.05–21.54 s on that same runner across the three preceding green runs, and 18.6 s on this
+Linux box.
+
+### The hypothesis that was wrong, and why it matters
+
+The obvious reading was that story 34.9's new watcher wiring blocked the child's graceful shutdown:
+`Engine::run` calls `stop_all_watchers` before `finalize`, so a watcher whose teardown never returns
+would hold the process open forever. That reading is **refuted for this test**. The durability matrix
+only ever runs `keeper-syncd sync --once` (`durability_matrix.rs:130` and `:237`), and that path —
+`Command::Sync { once: true }` → `cmd_sync` → `Engine::sync_once`, returning at `commands.rs:874-876`
+before `run_supervisor` — never enters `Engine::run`, never calls `stop_all_watchers`, and never
+constructs a `FolderWatcher` at all. `ensure_watcher` has exactly one non-test caller, `tick_profile`,
+which is reachable only from the supervisor loop. Confirmed by running the daemon directly with
+`RUST_LOG=debug`: a `sync --once` over a registered profile emits **zero** `folder watch armed` lines.
+So the hang in that specific test is not this story's watcher, and lengthening any timeout would have
+been the wrong fix.
+
+### The real defect the investigation found
+
+A watcher's teardown is genuinely unbounded on macOS, on four paths that must all stay responsive.
+`FolderWatcher::shutdown` used to join the rescan thread and then call `Backend::stop`, which joins the
+debouncer's loop thread and then drops the platform watcher. That last drop is the problem.
+`notify-8.2.0/src/fsevent.rs:329-348` tears an FSEvents watcher down with
+
+```text
+while CFRunLoopIsWaiting(runloop) == 0 { thread::yield_now(); }
+```
+
+— no deadline, no sleep, and reached from `FsEventWatcher`'s own `Drop` (`:608`), so there is no
+`notify` API that avoids it: `Debouncer::stop_nonblocking` still leaves the `Debouncer` to be dropped,
+and dropping it drops the watcher. A run loop that is not parked when we ask is waited for forever,
+and there are two ways to be in that state: the loop handle is published to the stopping thread
+*before* `CFRunLoopRun` is entered (`:477-495`), and a loop that has already returned reports
+`CFRunLoopIsWaiting` false permanently. On a contended three-vCPU runner a `yield_now` spin is also
+maximally hostile, because it never blocks and so stays runnable against the very thread it waits for.
+
+**Linux cannot see any of this, which is why a green Linux run is not evidence.** `INotifyWatcher::drop`
+(`notify-8.2.0/src/inotify.rs:606-611`) posts a shutdown message, wakes the poll and returns without
+joining anything. The sweep was re-run here 48 times (~336 daemon invocations) under 2× CPU
+oversubscription on 3 cores and stayed clean, which says only that the inotify backend has no such
+teardown — not that the code was correct.
+
+### The fix
+
+`watch::retire` (`watch.rs`) now owns every teardown: `shutdown` drops the rescan stop-sender, hands
+the backend and the rescan join handle to a thread named `keeper-sync-retire`, and returns. Nobody
+joins that thread. A wedged backend therefore wedges exactly one thread that `sample` or `ps -T` finds
+by name, instead of taking the supervisor tick (`retain_watchers`, and the replace inside
+`ensure_watcher`), the graceful shutdown (`stop_all_watchers`, the last thing before `finalize`) or an
+IPC call (`sync_profile_remove` → `Engine::remove_profile` → `drop_watcher`) with it. This is the
+"if a teardown cannot be made reliably prompt, do not block on it at all" reading of AD-34-11, and it
+is the only reading available while the spin lives upstream.
+
+`FolderWatcher::stop`'s contract was weakened honestly in its doc comment. It no longer promises that
+no further `WatchEvent` can be produced, because that promise cannot be kept in bounded time. It does
+not need to: events go to a channel whose receiver the engine drops along with the watcher, so a late
+batch finds a closed channel and `start`'s handler discards it (`watch.rs:408-412`). The engine's
+comments at the three drop sites, which each asserted the old joining behaviour, were corrected rather
+than left to describe a guarantee that had been deliberately removed.
+
+### Sibling paths audited
+
+- **`remove_profile` on the IPC thread** — confirmed as a real freeze, now fixed. `sync_profile_remove`
+  (`sync_ipc.rs:621-628`) is an `async` Tauri command that calls `Engine::remove_profile` inline on a
+  runtime worker, and that reaches `drop_watcher`. Before this change, removing a folder could park a
+  tokio worker permanently on the FSEvents spin — the same bug wearing different clothes.
+- **`ensure_watcher` inside the reservation** — arming is bounded on both backends and is left inline.
+  On macOS `watch_inner` (`fsevent.rs:308-312`) does call `stop()` first, but only ever on a watcher
+  that `is_running()` reports false for, because `FolderWatcher::start` builds a fresh debouncer and
+  calls `watch` exactly once; `stop` returns at `:330-332` without reaching the spin. Registration is
+  then O(1) — FSEvents watches recursively in the kernel. On Linux it is O(directories), which is real
+  synchronous work on a tokio worker, but bounded, and it matches what this crate already does inline
+  for comparable local work (`commit_local` stages a whole tree straight from `sync_once`). Calling out
+  the one thing that would break it: a second `watch` call on a live watcher *would* enter the spin,
+  so arming must keep going through a fresh `FolderWatcher`.
+- **`fold_watch_events`** — clean. It holds the watcher map only for a `try_recv` drain, which cannot
+  block, and the gate work happens after the map lock is released.
+- Every drop site releases the map guard before the value is dropped, because each takes the guard in
+  a statement of its own; that was already true and is now belt-and-braces rather than load-bearing.
+
+### The guard, which is what actually closes the CI risk
+
+`src-tauri/.config/nextest.toml` adds `slow-timeout = { period = "60s", terminate-after = 4 }`. The
+warning cadence is nextest's existing default, so nothing about a legitimately slow test changes; past
+four minutes the test is killed and reported as `TIMEOUT` against its own name, which fails the build
+and reaps the child processes the hung test left behind. Four minutes was chosen off measured CI
+timings, not a guess: the slowest honest tests on that runner are the archive search perf gate at
+24.98 s and this durability sweep at 12.05–21.54 s, the next slowest test in the workspace is 4.4 s,
+and all 1469 together take 43 s — so the bound is about ten times the slowest test that has ever
+legitimately run, and the perf gate keeps scaling its own budget as before.
+
+### Still unproven
+
+The durability matrix's own ninety-six-minute hang is **not** explained by the defect fixed here, and
+it did not reproduce on Linux. What is established is negative and specific: it is not the watcher,
+because that path arms none. The daemon child that would not exit is consistent with a blocking task
+outliving `sync_once` and holding the multi-threaded runtime's shutdown, since a running
+`spawn_blocking` closure cannot be aborted and `Runtime`'s drop waits for it — but no unbounded wait
+was found anywhere on the `sync --once` path (`drain_journal` claims and executes without sleeping,
+`publish_while` disables its channel arm on `None` rather than spinning, the SQLite handles set no
+`busy_timeout` so a lock conflict errors instead of blocking, and `git` is spawned with
+`GIT_TERMINAL_PROMPT=0`, empty askpass and null stdin), so naming a mechanism would be a guess. The
+guard above is what makes the next occurrence cheap: four minutes and a named failing test instead of
+ninety-six minutes and a cancelled run.
