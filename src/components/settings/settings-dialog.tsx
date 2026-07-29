@@ -14,6 +14,7 @@ import {
   NO_BACKGROUND_SYNC_SENTENCE,
 } from "@/components/settings/no-background-sync-disclosure";
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
+import { SyncGitRow } from "@/components/settings/sync-git-row";
 import { SyncSection } from "@/components/settings/sync-section";
 import { Button } from "@/components/ui/button";
 import {
@@ -184,6 +185,13 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           {/* Folder sync needs a usable `git` (Epic 29): absent on every machine
               that has none, never a section whose every button would reject. */}
           {sync && <SyncSection open={open} />}
+          {/* BESIDE that gate, not behind it. `capabilities.sync` IS "a usable
+              git was found", so a machine without one renders no Sync section —
+              and the report explaining why, plus the field that fixes it, would
+              be unreachable exactly when it is the only thing worth reading
+              (Story 34.14, DW-122). It renders itself away on a build with no
+              folder sync at all. */}
+          <SyncGitRow open={open} />
           <EncryptionSection />
           <SetupSection onOpenChange={onOpenChange} />
           <AboutSection open={open} />

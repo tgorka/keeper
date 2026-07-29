@@ -89,6 +89,20 @@ vi.mock("@/lib/ipc/client", () => ({
   syncProfileSetEnabled: vi.fn(),
   syncFolderNow: vi.fn(),
   syncVerify: vi.fn(),
+  // The git report (Story 34.14) renders BESIDE the `sync` gate, so it mounts on
+  // every desktop tier including one with sync off. `unsupported` is the default
+  // here because that is the one state which renders nothing, leaving every
+  // pre-existing assertion in this file untouched; the cases that care opt in.
+  syncGitStatus: vi.fn(() =>
+    Promise.resolve({
+      state: "unsupported",
+      summary: null,
+      problem: null,
+      configuredPath: null,
+    }),
+  ),
+  syncGitPathSet: vi.fn(),
+  capabilities: vi.fn(),
 }));
 
 // The About section (mounted by the dialog) imports the updater/process plugins
@@ -119,6 +133,7 @@ import {
   NO_BACKGROUND_SYNC_SENTENCE,
 } from "@/components/settings/no-background-sync-disclosure";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
+import { SYNC_GIT_TITLE } from "@/components/settings/sync-git-row";
 import { SYNC_SECTION_SENTENCE, SYNC_SECTION_TITLE } from "@/components/settings/sync-section";
 import type { AccountVm } from "@/lib/ipc/client";
 import {
@@ -139,6 +154,7 @@ import {
   recordingHotkeySet,
   setHonorRemoteDeletions,
   setUndoSendWindow,
+  syncGitStatus,
   syncProfiles,
   undoSendWindow,
 } from "@/lib/ipc/client";
@@ -168,6 +184,7 @@ const mockPermissionState = vi.mocked(notificationPermissionState);
 const mockOpenAppSettings = vi.mocked(iosOpenAppSettings);
 const mockBadgeModeSet = vi.mocked(dockBadgeModeSet);
 const mockSyncProfiles = vi.mocked(syncProfiles);
+const mockGitStatus = vi.mocked(syncGitStatus);
 
 const DEFAULT_HOTKEY_VM: HotkeyVm = {
   accelerator: "Control+Alt+Space",
@@ -842,5 +859,47 @@ describe("SettingsDialog", () => {
     expect(await screen.findByText(SYNC_SECTION_TITLE)).toBeInTheDocument();
     expect(screen.getByText(SYNC_SECTION_SENTENCE)).toBeInTheDocument();
     await waitFor(() => expect(mockSyncProfiles).toHaveBeenCalled());
+  });
+});
+
+/**
+ * The placement, which is the whole decision in DW-122 and the one thing a unit
+ * test of the component in isolation cannot check.
+ *
+ * `capabilities.sync` IS "a usable git was found", so the Sync section is absent
+ * on exactly the machines the report exists for. Putting the report inside that
+ * section would make it unreachable precisely when it is the only thing worth
+ * reading, and nothing else in this suite would notice.
+ */
+describe("SettingsDialog git report placement", () => {
+  beforeEach(() => {
+    mockGitStatus.mockResolvedValue({
+      state: "tooOld",
+      summary: null,
+      problem: "/usr/local/bin/git is 2.23, below the 2.42 floor",
+      configuredPath: null,
+    });
+  });
+
+  it("renders the git report with the sync capability OFF, where the Sync section is not", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(SYNC_GIT_TITLE)).toBeInTheDocument();
+    expect(
+      screen.getByText("/usr/local/bin/git is 2.23, below the 2.42 floor"),
+    ).toBeInTheDocument();
+    // The section it explains the absence of is genuinely absent.
+    expect(screen.queryByText(SYNC_SECTION_TITLE)).not.toBeInTheDocument();
+  });
+
+  it("renders it with the capability ON too, so a pinned path can still be cleared", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_CAPABILITIES, sync: true });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(SYNC_GIT_TITLE)).toBeInTheDocument();
+    expect(screen.getByText(SYNC_SECTION_TITLE)).toBeInTheDocument();
   });
 });
