@@ -135,8 +135,19 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         SyncError::GitCommand { .. }
         | SyncError::Network { .. }
         | SyncError::Auth { .. }
+        // Beside `Auth`, which is its sibling: both are a credential the remote
+        // would not act on, and the remedies differ only in which thing a human
+        // has to change.
+        | SyncError::Forbidden { .. }
         | SyncError::InvalidPathForRemote { .. }
         | SyncError::MediaAbsent
+        // A one-shot run that ends here published nothing, because `sync_once`
+        // drains the uploads BEFORE the push leg — so reaching this means the
+        // objects genuinely could not be transferred, which is a failed pass and
+        // worth a `Restart=on-failure`. Inside the supervisor the same condition
+        // is not a failure at all; it defers the push and the next upload to land
+        // releases it.
+        | SyncError::LfsUploadPending { .. }
         | SyncError::Integrity { .. }
         | SyncError::Quota { .. }
         | SyncError::Diverged { .. }

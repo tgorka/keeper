@@ -19,7 +19,7 @@ use keeper_sync::profile::{
 };
 use keeper_sync::progress::{format_bytes, SyncPhase, SyncStatus};
 use keeper_sync::provenance::SyncSource;
-use keeper_sync::{ActivityKind, SyncError, SyncPlatform, SyncProfile};
+use keeper_sync::{ActivityKind, DeliveryState, SyncError, SyncPlatform, SyncProfile};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -42,6 +42,18 @@ fn activity_kind_str(kind: ActivityKind) -> &'static str {
         ActivityKind::Modified => "modified",
         ActivityKind::Deleted => "deleted",
         ActivityKind::Conflict => "conflict",
+    }
+}
+
+/// The wire spelling of a delivery state, written out for the same reason
+/// [`activity_kind_str`] is.
+fn delivery_str(delivery: DeliveryState) -> &'static str {
+    match delivery {
+        DeliveryState::Success => "success",
+        DeliveryState::InProgress => "inProgress",
+        DeliveryState::Failed => "failed",
+        DeliveryState::Abandoned => "abandoned",
+        DeliveryState::Unknown => "unknown",
     }
 }
 
@@ -241,6 +253,34 @@ pub struct SyncActivityVm {
     /// which would claim the file was empty.
     #[ts(type = "number | null")]
     pub size_bytes: Option<u64>,
+    /// How far this file has got toward the remote:
+    ///
+    /// * `success` — the work unit that had to deliver it completed.
+    /// * `inProgress` — a unit is queued, running, or waiting on a condition.
+    /// * `failed` — a unit failed and keeper is still retrying it.
+    /// * `abandoned` — keeper stopped retrying; a human must ask again.
+    /// * `unknown` — no unit is accountable for this row.
+    ///
+    /// `unknown` is a real answer, not a gap to paper over: a row recorded
+    /// before this column existed, or a conflict copy the merge wrote whose
+    /// publication belongs to a commit that does not exist yet. The list renders
+    /// no glyph at all for it, because inventing one would claim a fact.
+    pub delivery: String,
+    /// The last error recorded against the delivering unit, verbatim, or `null`.
+    ///
+    /// Present for `failed` and `abandoned`, and also on `inProgress` when the
+    /// unit is being retried after an earlier failure or is waiting on a named
+    /// condition. The Activity row shows it in a popover, which is the whole
+    /// point: before this, the only way to learn why a file had not arrived was
+    /// the Problems section far below, and that section names the unit rather
+    /// than the file.
+    pub failure: Option<String>,
+    /// The delivering unit, present only while it still exists.
+    ///
+    /// The same id [`sync_retry_parked`] takes, which is what lets a file row
+    /// offer Retry for the work that is actually stuck.
+    #[ts(type = "number | null")]
+    pub unit_id: Option<i64>,
 }
 
 /// One file sync has seen but not yet carried.
@@ -759,6 +799,9 @@ pub async fn sync_activity(
             kind: activity_kind_str(row.kind).to_owned(),
             path: row.path,
             size_bytes: row.size_bytes,
+            delivery: delivery_str(row.delivery).to_owned(),
+            failure: row.failure,
+            unit_id: row.unit_id,
         })
         .collect())
 }

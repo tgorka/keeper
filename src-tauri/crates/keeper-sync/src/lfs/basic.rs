@@ -42,8 +42,8 @@ use url::Url;
 
 use crate::error::{Result, SyncError};
 use crate::lfs::batch::{
-    bounded_body, header_string, json_headers, sensitive_auth, transport_reason, Action,
-    AuthRefresh, Disposition, ObjectId, ObjectSpec, Operation, MAX_ERROR_BODY_BYTES,
+    auth_challenge, bounded_body, header_string, json_headers, sensitive_auth, transport_reason,
+    Action, AuthRefresh, Disposition, ObjectId, ObjectSpec, Operation, MAX_ERROR_BODY_BYTES,
 };
 use crate::lfs::store::LfsStore;
 
@@ -443,7 +443,7 @@ impl BasicTransfer {
 
             let status = response.status().as_u16();
             let retry_after = header_string(response.headers(), "retry-after");
-            let challenge = header_string(response.headers(), "lfs-authenticate");
+            let challenge = auth_challenge(response.headers());
             let content_range = header_string(response.headers(), "content-range");
 
             if response.status().is_success() {
@@ -680,7 +680,7 @@ impl BasicTransfer {
 
             let status = response.status().as_u16();
             let retry_after = header_string(response.headers(), "retry-after");
-            let challenge = header_string(response.headers(), "lfs-authenticate");
+            let challenge = auth_challenge(response.headers());
             let body = if response.status().is_success() {
                 // A successful PUT answers with nothing we need; do not read it.
                 String::new()

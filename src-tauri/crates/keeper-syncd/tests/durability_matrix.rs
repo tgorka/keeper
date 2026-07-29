@@ -449,6 +449,35 @@ fn a_kill_during_a_large_object_transfer_leaves_the_object_recoverable() {
          published: {published:?}; last failing pass: {}",
         if trouble.is_empty() { "none" } else { &trouble }
     );
+
+    // `git ls-tree` above proves only that a BLOB for the path is on the remote,
+    // and for an LFS path that blob is a ~130-byte pointer. It was therefore
+    // satisfied for as long as this test has existed by a remote that held a
+    // pointer to content nobody but this machine had — the exact silent failure
+    // Story 34.15 gates against. So the content itself is checked, in the store
+    // a peer cloning this remote would read it from.
+    let objects = peer.remote.join("lfs").join("objects");
+    let mut found = Vec::new();
+    let mut stack = vec![objects.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(meta) = entry.metadata() {
+                found.push((path, meta.len()));
+            }
+        }
+    }
+    assert!(
+        found.iter().any(|(_, len)| *len == BIG as u64),
+        "the remote must hold the {BIG}-byte object its pointer names, not just \
+         the pointer; {} held: {found:?}",
+        objects.display()
+    );
 }
 
 #[test]

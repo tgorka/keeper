@@ -34,6 +34,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::backoff::{jitter_sample, Backoff};
+use crate::credential::{challenge_accepts_basic, AccessToken};
 use crate::db::{self, ActivityKind, ActivityRow, DeviceIdentity, WorkKind, WorkState};
 use crate::error::{Result, Retriability, SyncError};
 use crate::exclude::ExcludeSet;
@@ -293,6 +294,35 @@ pub struct Engine {
     /// paced poll — which is the entire latency bug. Cleared by the walk that
     /// answers it.
     watch_wake: Mutex<HashSet<String>>,
+    /// LFS credentials minted by `git-lfs-authenticate` over ssh, keyed by
+    /// [`lfs::ssh::SshRemote::cache_key`] (Story 34.17).
+    ///
+    /// Cached because a credential is per *repository and operation*, while a
+    /// journal unit is per *object*: without this, a folder committing forty
+    /// large files would open forty ssh connections to be told the same thing
+    /// forty times. Entries carry their own expiry — see
+    /// [`lfs::ssh::DEFAULT_TTL_MS`] for why a silent server does not get an
+    /// eternal one — and are dropped outright when the server rejects the
+    /// credential they hold, so a rotated token costs one retry rather than a
+    /// wait for the TTL.
+    ///
+    /// In-process only, like git-lfs's own. A token with a lifetime measured in
+    /// hours is not worth a row in `sync.db`, and keeping it out of there keeps
+    /// it out of a backup.
+    lfs_ssh_credentials: Mutex<HashMap<String, CachedSshAnswer>>,
+}
+
+/// One remembered answer from `git-lfs-authenticate`, with its own deadline.
+///
+/// The deadline is stored rather than recomputed because the two answers expire
+/// for different reasons — a credential when the server says so (or after
+/// [`lfs::ssh::DEFAULT_TTL_MS`] when it does not), an absent
+/// `git-lfs-authenticate` after a window long enough that enabling it server-side
+/// does not need a restart here.
+struct CachedSshAnswer {
+    answer: lfs::ssh::Answer,
+    /// Absolute millisecond, on the platform clock, after which this is void.
+    expires_ms: i64,
 }
 
 impl Engine {
@@ -348,6 +378,7 @@ impl Engine {
             transferred: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             watch_wake: Mutex::new(HashSet::new()),
+            lfs_ssh_credentials: Mutex::new(HashMap::new()),
         };
         engine.seed_status()?;
         Ok(engine)
@@ -1076,10 +1107,11 @@ impl Engine {
         }
 
         for item in claimed {
-            match self.execute(profile, &item.kind, source).await {
+            match self.execute(profile, &item.kind, item.id, source).await {
                 Ok(()) => {
                     self.with_db(|conn| db::complete(conn, item.id))?;
                     self.clear_warning(&profile.id);
+                    self.release_held_push(profile, &item.kind)?;
                 }
                 Err(err) => {
                     self.reschedule_after(profile, item.id, item.attempts, &err)?;
@@ -1087,6 +1119,40 @@ impl Engine {
             }
         }
         self.refresh_pending(&profile.id);
+        Ok(())
+    }
+
+    /// Put a push held by [`SyncError::LfsUploadPending`] back in the queue once
+    /// the upload it was waiting for was the last one.
+    ///
+    /// The other half of the gate in [`Self::do_push`], and the sentence
+    /// [`SyncError::LfsUploadPending`] promises: "the waiting unit is re-queued
+    /// by whichever upload lands last". Deferred work waits on a condition
+    /// rather than a clock, and `claim_ready` only ever looks at `pending`, so
+    /// without something to say the condition cleared a held push would sit
+    /// deferred until the profile was paused and resumed — which is to say,
+    /// forever.
+    ///
+    /// Called after a completion rather than from the gate itself because
+    /// "outstanding" is a fact about the whole queue, not about one unit: the
+    /// last upload to finish is the only one that can know it was the last.
+    fn release_held_push(&self, profile: &SyncProfile, kind: &WorkKind) -> Result<()> {
+        if !matches!(kind, WorkKind::LfsUpload { .. }) {
+            return Ok(());
+        }
+        if self.lfs_uploads_outstanding(profile)? > 0 {
+            return Ok(());
+        }
+        let now = self.platform.now_ms();
+        let released =
+            self.with_db(|conn| db::undefer_kind(conn, &profile.id, WorkKind::PUSH, now))?;
+        if released > 0 {
+            tracing::info!(
+                profile = profile.name,
+                units = released,
+                "large files are on the remote, so publishing can go ahead"
+            );
+        }
         Ok(())
     }
 
@@ -1118,8 +1184,18 @@ impl Engine {
 
     fn record_failure(&self, profile: &SyncProfile, err: &SyncError) {
         match err.retriability() {
+            // Both deferred conditions wait on a condition rather than a clock,
+            // but they are waiting on utterly different things and a user reads
+            // the state word, not the retriability. `MediaAbsent` renders as
+            // "Large files missing", which for a held push would accuse an
+            // attached drive of being unplugged — and would send someone hunting
+            // for a pendrive while the truth is that keeper is uploading.
             Retriability::Deferred => {
-                self.set_state(&profile.id, ProfileState::MediaAbsent);
+                let state = match err {
+                    SyncError::LfsUploadPending { .. } => ProfileState::Syncing,
+                    _ => ProfileState::MediaAbsent,
+                };
+                self.set_state(&profile.id, state);
             }
             Retriability::Transient if matches!(err, SyncError::Network { .. }) => {
                 // Offline is a state, not a failure: local git keeps working
@@ -1341,10 +1417,14 @@ impl Engine {
     // Work execution
     // -----------------------------------------------------------------------
 
+    /// `unit_id` is the journal row being executed. Only the push leg uses it:
+    /// the activity rows its commit records name it as the unit whose success
+    /// delivers them (Story 34.16).
     async fn execute(
         &self,
         profile: &SyncProfile,
         kind: &WorkKind,
+        unit_id: i64,
         source: SyncSource,
     ) -> Result<()> {
         match kind {
@@ -1356,7 +1436,7 @@ impl Engine {
                 Ok(())
             }
             WorkKind::Push => {
-                self.do_push(profile, source).await?;
+                self.do_push(profile, source, Some(unit_id)).await?;
                 self.mark_synced(&profile.id);
                 Ok(())
             }
@@ -1570,16 +1650,20 @@ impl Engine {
         Ok(repo)
     }
 
+    /// This profile's stored access token, if it has one.
+    ///
+    /// The single read point. Every consumer takes the [`AccessToken`] and
+    /// asks it for the shape it needs, so no call site is in a position to
+    /// invent a fourth spelling of one secret (see [`crate::credential`]).
+    fn token(&self, profile: &SyncProfile) -> Result<Option<AccessToken>> {
+        Ok(self
+            .platform
+            .secret_get(&profile.secret_key())?
+            .map(AccessToken::new))
+    }
+
     fn credential(&self, profile: &SyncProfile) -> Result<Option<git::fetch::Credential>> {
-        let Some(secret) = self.platform.secret_get(&profile.secret_key())? else {
-            return Ok(None);
-        };
-        // Forgejo and GitHub both accept a token as the username with an inert
-        // password, which is the shape that works for both Basic and PAT auth.
-        Ok(Some(git::fetch::Credential {
-            username: secret,
-            secret: String::new(),
-        }))
+        Ok(self.token(profile)?.map(|token| token.git()))
     }
 
     /// Fetch and apply, returning the conflict copies the apply had to write.
@@ -1604,7 +1688,10 @@ impl Engine {
         // be exactly the silent data loss AD-43 exists to prevent. Committing
         // first also turns a divergence into commit-vs-commit, which is the
         // shape the conflict-copy path can actually resolve.
-        self.commit_local(profile, source)?;
+        // `None`: this commit exists to give the merge a clean tree, and nothing
+        // journaled has promised to publish it. The push that eventually does is
+        // a different unit, made after these rows were written.
+        self.commit_local(profile, source, None)?;
         self.publish(self.progress(profile, SyncPhase::Fetching));
 
         let profile = profile.clone();
@@ -1785,7 +1872,7 @@ impl Engine {
             // Until now the warning counted the copies and nothing named them,
             // so the one artifact the user has to deal with was unfindable
             // once the notification was dismissed.
-            let rows: Vec<(ActivityKind, String, Option<u64>)> = conflicts
+            let rows: Vec<db::ActivityEntry> = conflicts
                 .iter()
                 .map(|path| {
                     // Unlike a deletion, the copy is sitting in the folder
@@ -1795,7 +1882,16 @@ impl Engine {
                     let size = std::fs::metadata(profile.local_path.join(path))
                         .ok()
                         .map(|md| md.len());
-                    (ActivityKind::Conflict, path.clone(), size)
+                    db::ActivityEntry {
+                        kind: ActivityKind::Conflict,
+                        path: path.clone(),
+                        size_bytes: size,
+                        // A conflict copy is a file the merge just wrote into
+                        // the worktree. No unit has promised to deliver it —
+                        // the commit that will is not made yet — so it reports
+                        // no delivery rather than inheriting the pull's.
+                        unit_id: None,
+                    }
                 })
                 .collect();
             let now = self.platform.now_ms();
@@ -1871,7 +1967,15 @@ impl Engine {
     ///
     /// Shared by both legs so the working tree is always clean before a merge
     /// and always current before a push.
-    fn commit_local(&self, profile: &SyncProfile, source: SyncSource) -> Result<u64> {
+    ///
+    /// `push_unit` is forwarded to [`Self::commit`]; see its docs for what
+    /// naming it buys and why `None` is a legitimate answer.
+    fn commit_local(
+        &self,
+        profile: &SyncProfile,
+        source: SyncSource,
+        push_unit: Option<i64>,
+    ) -> Result<u64> {
         if !profile.direction.pushes() {
             // A pull-only profile never commits; a local edit there is
             // preserved by the merge's own conflict handling instead.
@@ -1889,7 +1993,7 @@ impl Engine {
         event.files_total = Some(count);
         event.current = Self::first_staged(&staged);
         self.publish(event);
-        self.commit(profile, &staged, source)?;
+        self.commit(profile, &staged, source, push_unit)?;
         // The commit is durable, so every staged path landed. Reporting it
         // leaves the bar full rather than stranded mid-way when the phase
         // changes underneath it.
@@ -1900,11 +2004,55 @@ impl Engine {
         Ok(count)
     }
 
-    async fn do_push(&self, profile: &SyncProfile, source: SyncSource) -> Result<()> {
+    /// Are this profile's committed pointers still waiting on their objects?
+    ///
+    /// The precondition on publishing anything (Story 34.15). A pointer names
+    /// content by digest and carries none of it, so pushing a commit whose
+    /// objects are not on the server yet produces the one failure nobody
+    /// observes: git accepts the push, the remote is "up to date", and the next
+    /// peer to clone checks out a tree of ~130-byte text stubs with no error
+    /// anywhere. `keeper-sync`'s own `.git/lfs` still holds the bytes, so
+    /// nothing is lost — but only the machine that made the commit can supply
+    /// them, which is exactly the property sync exists to remove.
+    ///
+    /// Counted from the journal rather than by asking the server: the units are
+    /// the record of what has not landed, they are durable across a restart, and
+    /// the answer costs one indexed `COUNT(*)` on every push.
+    fn lfs_uploads_outstanding(&self, profile: &SyncProfile) -> Result<u32> {
+        self.with_db(|conn| db::outstanding_count(conn, &profile.id, WorkKind::LFS_UPLOAD))
+    }
+
+    /// `push_unit` is this push's own journal row, when a journaled unit is
+    /// driving. It is handed to the commit so the rows it records can name the
+    /// work that will publish them (Story 34.16).
+    async fn do_push(
+        &self,
+        profile: &SyncProfile,
+        source: SyncSource,
+        push_unit: Option<i64>,
+    ) -> Result<()> {
         if !profile.direction.pushes() {
             return Ok(());
         }
-        let count = self.commit_local(profile, source)?;
+        let count = self.commit_local(profile, source, push_unit)?;
+
+        // After the commit, because the commit is what creates the debt: a
+        // freshly staged large file queues its upload inside `commit_local`
+        // above, and that upload must land before this push publishes the
+        // pointer naming it. Before the `head_commit_id` check below, because a
+        // profile whose only commits are held ones has nothing it may publish
+        // regardless of what git would accept.
+        let outstanding = self.lfs_uploads_outstanding(profile)?;
+        if outstanding > 0 {
+            tracing::info!(
+                profile = profile.name,
+                objects = outstanding,
+                "holding the push until this folder's large files reach the remote"
+            );
+            return Err(SyncError::LfsUploadPending {
+                objects: outstanding,
+            });
+        }
 
         // A folder whose files are all still inside the settle window has no
         // commits yet, and neither does a fresh profile on an empty remote.
@@ -2169,11 +2317,19 @@ impl Engine {
         }
     }
 
+    /// `push_unit` is the journal unit that will publish this commit, when one
+    /// is driving: the activity rows for every path that is *not* routed through
+    /// LFS name it as the unit whose success delivers them (Story 34.16). `None`
+    /// where no journaled unit owns the publication — a `sync_once` running the
+    /// legs inline, or the commit `do_pull` makes to clear the tree before a
+    /// merge — and those rows honestly read as `DeliveryState::Unknown` rather
+    /// than borrowing someone else's verdict.
     fn commit(
         &self,
         profile: &SyncProfile,
         staged: &git::commit::StagedChange,
         source: SyncSource,
+        push_unit: Option<i64>,
     ) -> Result<()> {
         let repo = self.open_repo(profile)?;
         let device = self.device();
@@ -2263,6 +2419,22 @@ impl Engine {
             "committed"
         );
 
+        // Journal the uploads BEFORE recording activity, and only now, with the
+        // pointer durably committed: a crash before this point loses nothing,
+        // and a crash after it re-drives the transfer. Recording activity second
+        // is what lets each row name the unit that will deliver it — the reverse
+        // order would have to guess an id that does not exist yet.
+        let now = self.platform.now_ms();
+        let mut lfs_units: HashMap<PathBuf, i64> = HashMap::with_capacity(staging.uploads.len());
+        for object in &staging.uploads {
+            let unit = WorkKind::LfsUpload {
+                oid: object.oid.clone(),
+                size: object.size,
+            };
+            let id = self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now))?;
+            lfs_units.insert(object.path.clone(), id);
+        }
+
         // The commit is proven to exist, so this is the first moment an
         // activity row can honestly claim it. Recording in `commit_local`
         // instead would also cover the `stage_and_commit` → `None` case, where
@@ -2271,20 +2443,7 @@ impl Engine {
         //
         // `staged` is the local, `.gitattributes`-augmented copy on purpose:
         // it is exactly the set of paths this commit changed.
-        self.record_commit_activity(profile, &staged)?;
-
-        // Only now, with the pointer durably committed, is an upload worth
-        // journaling: a crash before this point loses nothing, and a crash
-        // after it re-drives the transfer.
-        let now = self.platform.now_ms();
-        for object in &staging.uploads {
-            let unit = WorkKind::LfsUpload {
-                oid: object.oid.clone(),
-                size: object.size,
-            };
-            self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now).map(drop))?;
-        }
-        Ok(())
+        self.record_commit_activity(profile, &staged, &lfs_units, push_unit)
     }
 
     /// Write the recently-synced entries one commit produced (Story 32.1).
@@ -2295,13 +2454,25 @@ impl Engine {
     /// information is gone. Recording here is what turns "3 files synced" into
     /// a list a user can actually recognise their work in.
     ///
+    /// Every row also names the unit that has to *deliver* it (Story 34.16), and
+    /// which unit that is depends on the path:
+    ///
+    /// * a path routed through LFS is delivered by its own object upload, so it
+    ///   names that — a 3 GB video whose pointer is committed and whose bytes are
+    ///   stuck is the case this whole column exists for;
+    /// * every other path is delivered by the push that publishes the commit, so
+    ///   they all name `push_unit` and move together, which is the truth: git
+    ///   publishes a commit whole or not at all.
+    ///
     /// Only ever called once a commit object exists.
     fn record_commit_activity(
         &self,
         profile: &SyncProfile,
         staged: &git::commit::StagedChange,
+        lfs_units: &HashMap<PathBuf, i64>,
+        push_unit: Option<i64>,
     ) -> Result<()> {
-        let mut rows: Vec<(ActivityKind, String, Option<u64>)> = Vec::with_capacity(staged.len());
+        let mut rows: Vec<db::ActivityEntry> = Vec::with_capacity(staged.len());
         let buckets = [
             (ActivityKind::Added, &staged.added),
             (ActivityKind::Modified, &staged.modified),
@@ -2311,11 +2482,12 @@ impl Engine {
             for path in paths {
                 // Repository-relative already — `StagedChange` holds nothing
                 // else — so this never leaks a home directory into the UI.
-                rows.push((
+                rows.push(db::ActivityEntry {
                     kind,
-                    path.to_string_lossy().into_owned(),
-                    staged.sizes.get(path).copied(),
-                ));
+                    path: path.to_string_lossy().into_owned(),
+                    size_bytes: staged.sizes.get(path).copied(),
+                    unit_id: lfs_units.get(path).copied().or(push_unit),
+                });
             }
         }
         let now = self.platform.now_ms();
@@ -2346,6 +2518,205 @@ impl Engine {
         Some(lfs::pointer::Pointer::parse(&object.data).map_or(blob, |pointer| pointer.size))
     }
 
+    /// Where this profile's LFS server is, and what to show it (Story 34.17).
+    ///
+    /// Three sources of authority, in this order, and the order is the whole
+    /// content of this function:
+    ///
+    /// 1. **`.lfsconfig`.** A repository that names its LFS server has settled
+    ///    the question; nothing below may second-guess it.
+    /// 2. **`git-lfs-authenticate` over ssh**, for an `ssh://` or scp-style
+    ///    remote. This is the case that was simply missing, and it is the reason
+    ///    a folder synced over ssh pushed happily while every large file's
+    ///    upload parked on a 401: `git push` authenticates with the user's ssh
+    ///    key and needs no token, while the LFS batch API is HTTPS and needs
+    ///    one, and there was no bridge between the two. The server mints a
+    ///    `Bearer` JWT it signs itself — the one scheme [`crate::credential`]
+    ///    documents as impossible for keeper to produce — and hands back the
+    ///    endpoint to spend it at.
+    /// 3. **The derived endpoint plus the stored token.** What every https
+    ///    remote has always used, and the fallback when the remote turns out to
+    ///    have no `git-lfs-authenticate` at all.
+    ///
+    /// A stored token still applies in case 2 when the server sends no
+    /// `Authorization` of its own, which is legal and which the batch client
+    /// then has something to answer a 401 with.
+    async fn lfs_access(
+        &self,
+        profile: &SyncProfile,
+        lfsconfig: Option<&str>,
+        operation: lfs::ssh::Operation,
+    ) -> Result<(url::Url, Option<String>)> {
+        let stored = self.token(profile)?.map(|token| token.lfs_basic());
+        if let Some(override_url) = lfs::endpoint::override_url(lfsconfig, "origin")? {
+            return Ok((override_url, stored));
+        }
+
+        let Some(remote) = lfs::ssh::SshRemote::parse(&profile.remote_url) else {
+            // An https remote: Basic, with the token as the user-id — the same
+            // credential the push side hands git, dressed by the one type that
+            // knows how (AD-53). `Bearer` here is what Forgejo answers 401 to,
+            // because it reserves that scheme for the LFS JWT it signs itself.
+            return Ok((lfs::endpoint::derive(&profile.remote_url)?, stored));
+        };
+
+        let key = remote.cache_key(operation);
+        match self.cached_ssh_answer(&key) {
+            Some(lfs::ssh::Answer::Granted(credential)) => {
+                return Ok(self.spend(profile, credential, stored));
+            }
+            Some(lfs::ssh::Answer::NoSshLfs) => {
+                return Ok((lfs::endpoint::derive(&profile.remote_url)?, stored));
+            }
+            None => {}
+        }
+
+        let answer = lfs::ssh::authenticate(&remote, operation).await?;
+        let expires_ms = match &answer {
+            lfs::ssh::Answer::Granted(credential) => credential.expires_ms(self.platform.now_ms()),
+            // A server without LFS over ssh is remembered for the same window a
+            // credential would live, so enabling it on the server takes effect
+            // without a restart while forty objects in one commit still cost one
+            // handshake between them.
+            lfs::ssh::Answer::NoSshLfs => self.platform.now_ms() + lfs::ssh::DEFAULT_TTL_MS,
+        };
+        Self::lock(&self.lfs_ssh_credentials).insert(
+            key,
+            CachedSshAnswer {
+                answer: answer.clone(),
+                expires_ms,
+            },
+        );
+
+        match answer {
+            lfs::ssh::Answer::Granted(credential) => {
+                tracing::info!(
+                    profile = profile.name,
+                    "the remote minted an LFS credential over ssh"
+                );
+                Ok(self.spend(profile, credential, stored))
+            }
+            lfs::ssh::Answer::NoSshLfs => Ok((lfs::endpoint::derive(&profile.remote_url)?, stored)),
+        }
+    }
+
+    /// Turn a minted credential into the endpoint and header the batch client
+    /// takes.
+    ///
+    /// `href` is used **verbatim** when the server named one: `/info/lfs` is a
+    /// property of the *derivation*, and the server has already put it in the
+    /// URL. Appending it again produces a 404 that reads plausibly enough in a
+    /// log to cost an afternoon.
+    fn spend(
+        &self,
+        profile: &SyncProfile,
+        credential: lfs::ssh::Credential,
+        stored: Option<String>,
+    ) -> (url::Url, Option<String>) {
+        let endpoint = match credential.href {
+            Some(href) => href,
+            None => match lfs::endpoint::derive(&profile.remote_url) {
+                Ok(url) => url,
+                // Unreachable in practice: the remote parsed as ssh a moment
+                // ago, which is strictly harder than deriving from it. Falling
+                // back rather than raising keeps this infallible for the caller.
+                Err(err) => {
+                    tracing::warn!(profile = profile.name, %err, "cannot derive an LFS endpoint");
+                    return (
+                        url::Url::parse("https://invalid.localhost/").expect("static URL"),
+                        credential.authorization.or(stored),
+                    );
+                }
+            },
+        };
+        (endpoint, credential.authorization.or(stored))
+    }
+
+    /// The cached answer for one key, if it has not expired.
+    fn cached_ssh_answer(&self, key: &str) -> Option<lfs::ssh::Answer> {
+        let now = self.platform.now_ms();
+        let mut cache = Self::lock(&self.lfs_ssh_credentials);
+        let cached = cache.get(key)?;
+        if cached.expires_ms <= now {
+            cache.remove(key);
+            return None;
+        }
+        Some(cached.answer.clone())
+    }
+
+    /// Forget every ssh-minted credential for this remote.
+    ///
+    /// Called when the server rejects one. A cached credential that has been
+    /// refused is worse than none: it would be re-sent on every retry until its
+    /// TTL ran out, turning a rotated key into minutes of identical 401s.
+    /// Dropping both operations rather than the one that failed is deliberate —
+    /// they come from the same key and the same session, so one being refused
+    /// says nothing good about the other.
+    fn forget_ssh_credentials(&self, profile: &SyncProfile) {
+        let Some(remote) = lfs::ssh::SshRemote::parse(&profile.remote_url) else {
+            return;
+        };
+        let mut cache = Self::lock(&self.lfs_ssh_credentials);
+        for operation in [lfs::ssh::Operation::Upload, lfs::ssh::Operation::Download] {
+            cache.remove(&remote.cache_key(operation));
+        }
+    }
+
+    /// The credential refresher an LFS 401 consults (Story 34.15).
+    ///
+    /// A 401 carrying `WWW-Authenticate: Basic` is the server saying "not that
+    /// credential, or not that shape". Two things can genuinely have changed
+    /// since the request went out, and both are answered from the keychain
+    /// without a round trip: the user pasted a new token while a transfer was
+    /// in flight, and a unit re-driven from the journal is carrying whatever
+    /// the *previous* process read.
+    ///
+    /// `None` back means "nothing new to say", which
+    /// [`lfs::batch::BatchClient`] turns into [`SyncError::Auth`] rather than a
+    /// second identical request — a retry storm against a git host is how an
+    /// account gets locked. That is the answer in three cases: the challenge
+    /// asks for a scheme we cannot mint (Forgejo's LFS `Bearer` is a JWT its
+    /// own server signs, reachable only over SSH), the keychain has no token,
+    /// or it still holds exactly what we already sent.
+    ///
+    /// `sent` is the header value in flight, not the token: comparing dressed
+    /// values is what answers "would the retry be byte-identical", and it keeps
+    /// the raw secret out of the closure's captured state.
+    fn lfs_auth_refresh(
+        &self,
+        profile: &SyncProfile,
+        sent: Option<String>,
+    ) -> lfs::batch::AuthRefresh {
+        let platform = Arc::clone(&self.platform);
+        let key = profile.secret_key();
+        let profile_name = profile.name.clone();
+        Box::new(move |challenge| {
+            if !challenge_accepts_basic(challenge) {
+                tracing::debug!(
+                    profile = profile_name,
+                    "the LFS server asked for an authentication scheme keeper cannot supply"
+                );
+                return None;
+            }
+            // A keychain read that fails is not a place to raise: the caller
+            // has a rejection in hand either way, and `None` is exactly "no
+            // fresh credential".
+            let fresh = platform
+                .secret_get(&key)
+                .ok()
+                .flatten()
+                .map(|secret| AccessToken::new(secret).lfs_basic())?;
+            if Some(&fresh) == sent.as_ref() {
+                return None;
+            }
+            tracing::info!(
+                profile = profile_name,
+                "retrying the LFS request with the stored credential"
+            );
+            Some(fresh)
+        })
+    }
+
     async fn do_lfs(
         &self,
         profile: &SyncProfile,
@@ -2372,19 +2743,54 @@ impl Engine {
                 ));
             }
         };
-        let endpoint = lfs::endpoint::resolve(&profile.remote_url, lfsconfig.as_deref(), "origin")?;
-        let auth = self
-            .platform
-            .secret_get(&profile.secret_key())?
-            .map(|secret| format!("Bearer {secret}"));
+
+        // A filesystem remote has no LFS server and never will, so the object
+        // moves by copy. Ahead of the endpoint resolution below because there is
+        // no endpoint to resolve: `endpoint::derive` refuses a local path
+        // outright, which is correct and used to mean the object simply stayed
+        // behind while the push published its pointer (Story 34.18). An explicit
+        // `.lfsconfig` still wins — someone who has named an LFS server beside a
+        // pendrive remote meant it.
+        if lfsconfig.is_none() {
+            if let Some(remote) = lfs::local::remote_store(&profile.remote_url) {
+                return self
+                    .copy_lfs_object(profile, remote, oid, size, upload)
+                    .await;
+            }
+        }
+        let operation = if upload {
+            lfs::ssh::Operation::Upload
+        } else {
+            lfs::ssh::Operation::Download
+        };
+        let (endpoint, auth) = self
+            .lfs_access(profile, lfsconfig.as_deref(), operation)
+            .await?;
         let client = lfs::batch::BatchClient::new(self.http.clone(), endpoint, auth.clone())
-            .with_ref(format!("refs/heads/{}", profile.branch));
+            .with_ref(format!("refs/heads/{}", profile.branch))
+            // Without this the 401 path in `BatchClient` has no credential to
+            // fall back on and turns every rejection straight into a permanent
+            // `Auth` failure — a parked unit, from one round trip.
+            .with_auth_refresh(self.lfs_auth_refresh(profile, auth.clone()));
 
         let want = vec![lfs::batch::ObjectId::new(oid, size)];
-        let specs = if upload {
-            client.upload(&want).await?
+        let batched = if upload {
+            client.upload(&want).await
         } else {
-            client.download(&want).await?
+            client.download(&want).await
+        };
+        // A credential the server has refused must not be re-sent on the next
+        // attempt: a rotated ssh key or an expired JWT would otherwise cost the
+        // whole cache window in identical 401s, and the unit would park having
+        // never tried a fresh one.
+        let specs = match batched {
+            Ok(specs) => specs,
+            Err(err) => {
+                if matches!(err, SyncError::Auth { .. } | SyncError::Forbidden { .. }) {
+                    self.forget_ssh_credentials(profile);
+                }
+                return Err(err);
+            }
         };
 
         let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
@@ -2396,13 +2802,16 @@ impl Engine {
         // a channel rather than touching the engine directly.
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let transfer = Arc::new(
-            lfs::basic::BasicTransfer::new(self.http.clone(), store.clone()).with_sink(Box::new(
-                move |event| {
+            lfs::basic::BasicTransfer::new(self.http.clone(), store.clone())
+                .with_sink(Box::new(move |event| {
                     // `false` detaches the reporter for good, so this says
                     // "stop" only once the receiver is genuinely gone.
                     event_tx.send(event).is_ok()
-                },
-            )),
+                }))
+                // The object transfer can be rejected on its own — Forgejo
+                // echoes the batch credential into the action headers, where it
+                // can age out mid-transfer — so it gets the same refresher.
+                .with_auth_refresh(self.lfs_auth_refresh(profile, auth.clone())),
         );
 
         let mut tally = TransferTally::default();
@@ -2433,6 +2842,9 @@ impl Engine {
         for (oid, result) in results {
             if let Err(err) = result {
                 tracing::warn!(oid, error = %err, "lfs transfer failed");
+                if matches!(err, SyncError::Auth { .. } | SyncError::Forbidden { .. }) {
+                    self.forget_ssh_credentials(profile);
+                }
                 return Err(err);
             }
         }
@@ -2442,6 +2854,66 @@ impl Engine {
             // that was checked out. Replacing it is what makes a peer's clone
             // contain real bytes rather than a text stub.
             self.materialize_pending(profile, &store)?;
+        }
+        Ok(())
+    }
+
+    /// Move one LFS object to or from a filesystem remote (Story 34.18).
+    ///
+    /// The counterpart of [`Self::do_lfs`]'s HTTP path, for a remote that is a
+    /// directory rather than a server: a pendrive, an SMB mount, a bare
+    /// repository elsewhere on the disk. `git push` has always copied its own
+    /// objects into such a remote; this is the same courtesy for the content the
+    /// pointers name, and without it a pendrive carries a tree of stubs.
+    ///
+    /// Blocking, so it runs on `spawn_blocking`: the copy hashes every byte to
+    /// verify it, which for this subsystem means gigabytes.
+    async fn copy_lfs_object(
+        &self,
+        profile: &SyncProfile,
+        remote: lfs::store::LfsStore,
+        oid: &str,
+        size: u64,
+        upload: bool,
+    ) -> Result<()> {
+        // An unmounted volume is absence, never failure (AD-48), and it must not
+        // read as a corrupt or missing object. `Deferred` waits for the volume to
+        // come back rather than spending the retry budget on a drive nobody has
+        // plugged in.
+        if !lfs::local::is_reachable(&remote) {
+            return Err(SyncError::MediaAbsent);
+        }
+
+        let local = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        local.ensure_layout()?;
+        let (from, to) = if upload {
+            (local.clone(), remote)
+        } else {
+            (remote, local.clone())
+        };
+        let oid = oid.to_owned();
+        let moved = {
+            let oid = oid.clone();
+            tokio::task::spawn_blocking(move || lfs::local::transfer(&from, &to, &oid, size))
+                .await
+                .map_err(|err| SyncError::Journal(format!("lfs copy task failed: {err}")))??
+        };
+        // Reported as traffic because that is what it is: on a pendrive or an
+        // SMB mount these bytes cross a bus the user is waiting on, and a
+        // transfer that reported zero would make the whole run look idle.
+        self.add_transferred(&profile.id, moved);
+        tracing::info!(
+            profile = profile.name,
+            bytes = moved,
+            direction = if upload { "upload" } else { "download" },
+            "copied a large object to a filesystem remote"
+        );
+
+        if !upload {
+            // The object is in the store; the worktree still holds the pointer
+            // that was checked out. Replacing it is what makes this clone contain
+            // real bytes rather than a text stub.
+            self.materialize_pending(profile, &local)?;
         }
         Ok(())
     }
@@ -2523,7 +2995,7 @@ impl Engine {
             );
             return Ok(());
         };
-        let Some(token) = self.platform.secret_get(&profile.secret_key())? else {
+        let Some(token) = self.token(profile)? else {
             // Without a credential we cannot call the API, and prompting is not
             // this engine's job. Say exactly what is waiting, and where.
             self.warn(
@@ -2556,7 +3028,10 @@ impl Engine {
         let response = self
             .http
             .post(&url)
-            .header("Authorization", format!("token {token}"))
+            // `token <PAT>` — the REST API's own scheme, and the one place it
+            // is right. It is not interchangeable with the Basic the LFS
+            // endpoints want, which is why the spelling lives on the type.
+            .header("Authorization", token.forge_api())
             .json(&body)
             .send()
             .await
@@ -2633,7 +3108,7 @@ impl Engine {
         let transferred_before = self.transferred_bytes(&profile.id);
         let mut outcome = SyncOutcome::default();
 
-        // Order is load-bearing: commit, then pull, then push.
+        // Order is load-bearing: commit, then pull, then transfer, then push.
         //
         // Committing first means the merge never meets a dirty tree (git
         // refuses, correctly, rather than overwriting an uncommitted edit) and
@@ -2641,7 +3116,11 @@ impl Engine {
         // conflict-copy path can resolve. Pulling before pushing means we never
         // hand the remote a non-fast-forward it would just reject.
         self.ensure_repo(&profile)?;
-        outcome.files_changed = self.commit_local(&profile, source)?;
+        // `None`: the legs below run inline, so there is no journal row whose
+        // success these rows can be pinned to. A push that fails here is
+        // reported to this call's caller, and the supervisor's next scan queues
+        // a real unit for the retry.
+        outcome.files_changed = self.commit_local(&profile, source, None)?;
         if outcome.files_changed > 0 {
             outcome.committed = Some(profile.branch.clone());
         }
@@ -2656,15 +3135,28 @@ impl Engine {
             let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
             self.materialize_pending(&profile, &store)?;
         }
+
+        // The commit above may have queued LFS transfers, and `do_push` refuses
+        // to publish a pointer whose object is still outstanding. So the queue
+        // is drained HERE, before the push, not after it: draining afterwards —
+        // which is what this did — satisfied the letter of "the objects are
+        // uploaded before the call claims success" while the pointer had already
+        // been published a few lines earlier, which is the exact window a peer
+        // clones a tree of pointer text through.
+        //
+        // `false`, not `true`: this drain exists to settle work the commit just
+        // created. Scanning again here would walk the tree a second time in one
+        // pass for nothing.
+        self.drain_journal(&profile, false, source).await?;
+
         if profile.direction.pushes() {
-            self.do_push(&profile, source).await?;
+            self.do_push(&profile, source, None).await?;
             outcome.pushed = true;
         }
 
-        // Commit may have queued LFS transfers. A one-shot sync that returned
-        // here would leave the remote holding a pointer to content it does not
-        // have, so the queue is drained before this call is allowed to claim
-        // success.
+        // And again afterwards, for the units the push itself queues — a lane's
+        // `OpenPullRequest` is the whole reason: a one-shot run may have no next
+        // tick to pick it up.
         self.drain_journal(&profile, true, source).await?;
         outcome.bytes = self
             .transferred_bytes(&profile.id)
@@ -3474,6 +3966,59 @@ mod tests {
         assert_eq!(err.code(), "gitMissing");
     }
 
+    /// The engine's floor check and [`crate::git::resolve`]'s must answer the
+    /// same question, because the desktop capability the Sync UI is gated on is
+    /// the resolver's answer while the surface behind it is the engine's.
+    /// Story 34.14: before this, `sync_available()` asked only whether a file
+    /// called `git` existed, so the app could render a Sync section over an
+    /// engine that had already refused to open — a section that did nothing at
+    /// all, with a refusal logged at `debug`.
+    #[test]
+    fn the_engine_accepts_exactly_the_gits_the_resolver_chooses() {
+        use crate::git::resolve::GitRequest;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, body: &str| {
+            let program = dir.path().join(name);
+            std::fs::write(&program, body).expect("fixture");
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+                .expect("mode");
+            program
+        };
+        let candidates = [
+            write("git-good", "#!/bin/sh\necho 'git version 2.52.0'\n"),
+            write("git-old", "#!/bin/sh\necho 'git version 2.23.0'\n"),
+            write(
+                "git-broken",
+                "#!/bin/sh\necho 'fatal: bad config line 44' >&2\nexit 128\n",
+            ),
+        ];
+
+        for program in candidates {
+            let resolver_says = GitRequest::explicit(program.clone(), "install git")
+                .resolve()
+                .chosen()
+                .is_some();
+            // A fresh data dir per case: `Engine::open` recovers a journal, and
+            // sharing one would make the second open depend on the first.
+            let data = dir.path().join(format!(
+                "data-{}",
+                program.file_name().expect("name").to_string_lossy()
+            ));
+            std::fs::create_dir_all(&data).expect("data dir");
+            let platform = Arc::new(TestPlatform::new(&data).with_git(&program));
+            let engine_says = Engine::open(platform).is_ok();
+
+            assert_eq!(
+                engine_says,
+                resolver_says,
+                "{} — the engine and the resolver disagreed",
+                program.display()
+            );
+        }
+    }
+
     #[test]
     fn profiles_round_trip_and_pausing_is_reflected_in_status() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3914,11 +4459,11 @@ mod tests {
     /// pass only opens the episode. Returns how many paths the commit carried.
     fn commit_after_settling(engine: &Engine, platform: &TestPlatform, p: &SyncProfile) -> u64 {
         engine
-            .commit_local(p, SyncSource::Watch)
+            .commit_local(p, SyncSource::Watch, None)
             .expect("first pass opens the episode");
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
         engine
-            .commit_local(p, SyncSource::Watch)
+            .commit_local(p, SyncSource::Watch, None)
             .expect("second pass commits")
     }
 
@@ -4013,6 +4558,152 @@ mod tests {
         );
     }
 
+    /// The precondition on publishing anything, and the release that keeps it
+    /// from being a deadlock (Stories 34.15, 34.16).
+    ///
+    /// This is the defect the whole gate exists for. `do_push` used to commit
+    /// the pointer and push it in the same call, leaving the queued upload for a
+    /// later tick — so the remote held a pointer to content only this machine
+    /// had, git reported the push as fine, and the next peer to clone got a
+    /// working tree of ~130-byte text stubs with no error anywhere. `sync_once`
+    /// had a comment claiming it drained the queue to prevent exactly this; it
+    /// drained it *after* the push.
+    #[tokio::test]
+    async fn a_pointer_is_not_published_until_its_object_is_on_the_remote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1024;
+        std::fs::write(p.local_path.join("clip.mp4"), vec![42u8; 200_000]).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        // Open the quiescence episode, then let it elapse: the commit inside
+        // `do_push` below is the one that stages the pointer.
+        engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect("first pass opens the episode");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+
+        // The push unit, claimed the way the supervisor claims it.
+        let push = engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &WorkKind::Push, platform.now_ms(), 0))
+            .expect("enqueue");
+        let claimed = engine
+            .with_db(|conn| db::claim_ready(conn, &p.id, platform.now_ms(), 10))
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "only the push is queued yet");
+
+        // The gate fires before anything touches the network, so this never
+        // reaches the remote `adoptable` does not have.
+        let err = engine
+            .do_push(&p, SyncSource::Watch, Some(push))
+            .await
+            .expect_err("the push must be held");
+        assert!(
+            matches!(err, SyncError::LfsUploadPending { objects: 1 }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            engine.lfs_uploads_outstanding(&p).expect("count"),
+            1,
+            "the commit queued the upload it owes"
+        );
+
+        // A wait, not a breakage — and specifically not "Large files missing",
+        // which is what every deferred failure used to report and would have
+        // sent someone looking for an unplugged drive.
+        engine
+            .reschedule_after(&p, push, 1, &err)
+            .expect("defer the push");
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Syncing
+        );
+
+        // One claim answers two questions: the held push is NOT offered, and the
+        // upload is — which is the whole shape of the gate. It also hands over
+        // the upload's id, which the activity rows below have to name.
+        let ready = engine
+            .with_db(|conn| db::claim_ready(conn, &p.id, platform.now_ms(), 10))
+            .expect("claim");
+        assert_eq!(ready.len(), 1, "the deferred push is not offered");
+        assert!(
+            matches!(ready[0].kind, WorkKind::LfsUpload { .. }),
+            "got {:?}",
+            ready[0].kind
+        );
+        let upload = ready[0].id;
+
+        // Both files this commit carried, and what each is waiting on. The
+        // pointer names its own upload; `.gitattributes` — which HAS to land in
+        // the same commit or a peer would not know the pointer is one — names
+        // the push.
+
+        let rows = engine.activity(&p.id, 10).await.expect("activity");
+        let clip = rows
+            .iter()
+            .find(|row| row.path == "clip.mp4")
+            .expect("the pointer was recorded");
+        assert_eq!(clip.unit_id, Some(upload));
+        assert_eq!(clip.delivery, db::DeliveryState::InProgress);
+
+        let attributes = rows
+            .iter()
+            .find(|row| row.path == ".gitattributes")
+            .expect(".gitattributes rides along");
+        assert_eq!(attributes.unit_id, Some(push));
+        assert_eq!(attributes.delivery, db::DeliveryState::InProgress);
+        assert!(
+            attributes
+                .failure
+                .as_deref()
+                .is_some_and(|reason| reason.contains("on hold")),
+            "the row says what it is waiting for, got: {:?}",
+            attributes.failure
+        );
+
+        // The upload lands. THAT is what releases the push — nothing else can,
+        // because `claim_ready` only ever looks at `pending` and a deferred unit
+        // waits on a condition rather than a clock.
+        engine
+            .with_db(|conn| db::complete(conn, upload))
+            .expect("complete");
+        engine
+            .release_held_push(
+                &p,
+                &WorkKind::LfsUpload {
+                    oid: "unused".to_owned(),
+                    size: 1,
+                },
+            )
+            .expect("release");
+        let released = engine
+            .with_db(|conn| db::claim_ready(conn, &p.id, platform.now_ms(), 10))
+            .expect("claim");
+        assert_eq!(
+            released.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![push],
+            "the held push is queued again once nothing is outstanding"
+        );
+
+        // And the file row now says it arrived, while the one still riding the
+        // push does not.
+        let rows = engine.activity(&p.id, 10).await.expect("activity");
+        let clip = rows
+            .iter()
+            .find(|row| row.path == "clip.mp4")
+            .expect("still recorded");
+        assert_eq!(
+            clip.delivery,
+            db::DeliveryState::Success,
+            "the unit left the journal, which is the only way it ever does"
+        );
+        assert_eq!(clip.unit_id, None, "there is nothing left to retry");
+    }
+
     #[tokio::test]
     async fn a_commit_records_exactly_the_paths_it_carried() {
         // `commit_local` reduces a whole `StagedChange` to a count and the
@@ -4029,7 +4720,7 @@ mod tests {
         engine.upsert_profile(&p).expect("upsert");
 
         engine
-            .commit_local(&p, SyncSource::Watch)
+            .commit_local(&p, SyncSource::Watch, None)
             .expect("first pass");
         assert!(
             engine
@@ -4042,7 +4733,9 @@ mod tests {
 
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
         assert_eq!(
-            engine.commit_local(&p, SyncSource::Watch).expect("commit"),
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("commit"),
             2
         );
 
@@ -4075,11 +4768,18 @@ mod tests {
         std::fs::write(p.local_path.join("a.txt"), b"one edited").expect("edit");
         std::fs::remove_file(p.local_path.join("b.txt")).expect("remove");
         assert_eq!(
-            engine.commit_local(&p, SyncSource::Watch).expect("removal"),
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("removal"),
             1
         );
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
-        assert_eq!(engine.commit_local(&p, SyncSource::Watch).expect("edit"), 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("edit"),
+            1
+        );
 
         let rows = engine.activity(&p.id, 10).await.expect("activity");
         let mut latest: Vec<(ActivityKind, String, Option<u64>)> = rows
@@ -4143,7 +4843,9 @@ mod tests {
 
         // One pass opens the quiescence episode and persists it to `file_state`.
         let opened_at = platform.now_ms();
-        engine.commit_local(&p, SyncSource::Watch).expect("scan");
+        engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect("scan");
 
         let pending = engine.pending(&p.id).await.expect("pending");
         assert_eq!(
@@ -4161,7 +4863,9 @@ mod tests {
         // Once it settles and lands, it is not pending at all any more.
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
         assert_eq!(
-            engine.commit_local(&p, SyncSource::Watch).expect("commit"),
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("commit"),
             1
         );
         assert!(engine.pending(&p.id).await.expect("pending").is_empty());
@@ -4225,7 +4929,12 @@ mod tests {
                     conn,
                     &p.id,
                     platform.now_ms(),
-                    &[(ActivityKind::Conflict, copy.to_owned(), Some(11))],
+                    &[db::ActivityEntry {
+                        kind: ActivityKind::Conflict,
+                        path: copy.to_owned(),
+                        size_bytes: Some(11),
+                        unit_id: None,
+                    }],
                 )
             })
             .expect("record");
@@ -4373,10 +5082,13 @@ mod tests {
             kind: ActivityKind::Conflict,
             path: "a.md".to_owned(),
             size_bytes: Some(4_096),
+            delivery: db::DeliveryState::Abandoned,
+            failure: Some("401".to_owned()),
+            unit_id: Some(7),
         };
         assert_eq!(
             serde_json::to_string(&row).expect("serialize"),
-            r#"{"tsMs":1,"kind":"conflict","path":"a.md","sizeBytes":4096}"#
+            r#"{"tsMs":1,"kind":"conflict","path":"a.md","sizeBytes":4096,"delivery":"abandoned","failure":"401","unitId":7}"#
         );
     }
 

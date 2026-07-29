@@ -161,9 +161,16 @@ describe("AddFolderForm", () => {
 
   it("re-reads the new folder's lists instead of leaving the Sync view to its poll", async () => {
     mockSave.mockResolvedValue(profileVm());
-    mockActivity.mockResolvedValue([
-      { tsMs: 1, kind: "added", path: "notes/today.md", sizeBytes: 128 },
-    ]);
+    const carried = {
+      tsMs: 1,
+      kind: "added",
+      path: "notes/today.md",
+      sizeBytes: 128,
+      delivery: "success",
+      failure: null,
+      unitId: null,
+    };
+    mockActivity.mockResolvedValue([carried]);
     render(<AddFolderForm />);
     await fillRequired();
 
@@ -172,11 +179,7 @@ describe("AddFolderForm", () => {
     // The detail mirror is a second mirror on a deliberately slower poll; a
     // card that just appeared would otherwise sit blank for a poll interval.
     await waitFor(() => expect(mockActivity).toHaveBeenCalledWith("p2", expect.any(Number)));
-    await waitFor(() =>
-      expect(syncDetailStore.getState().detail.p2?.activity).toEqual([
-        { tsMs: 1, kind: "added", path: "notes/today.md", sizeBytes: 128 },
-      ]),
-    );
+    await waitFor(() => expect(syncDetailStore.getState().detail.p2?.activity).toEqual([carried]));
   });
 
   it("shows a rejected save inline, keeps every typed value, and reports no add", async () => {

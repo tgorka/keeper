@@ -60,6 +60,9 @@ import {
   SYNC_ACTIVITY_TITLE,
   SYNC_CONFLICT_SENTENCE,
   SYNC_CONFLICT_TITLE,
+  SYNC_DELIVERY_DETAIL_LABEL,
+  SYNC_DELIVERY_RETRYING_SENTENCE,
+  SYNC_DELIVERY_STATES,
   SYNC_PANE_EMPTY_SENTENCE,
   SYNC_PARKED_NO_ERROR_SENTENCE,
   SYNC_PARKED_TITLE,
@@ -243,6 +246,24 @@ function progressVm(over: Partial<SyncProgressVm> = {}): SyncProgressVm {
 
 function problemsVm(over: Partial<SyncProblemsVm> = {}): SyncProblemsVm {
   return { warning: null, error: null, parked: [], conflicts: [], ...over };
+}
+
+/**
+ * One activity row, with the fields a case does not care about. `success` and
+ * no failure is the shape nearly every real row has, so a delivery case says
+ * only how it differs from that.
+ */
+function activityVm(over: Partial<SyncActivityVm> = {}): SyncActivityVm {
+  return {
+    tsMs: NOW - 120_000,
+    kind: "modified",
+    path: "notes/today.md",
+    sizeBytes: 2_500_000,
+    delivery: "success",
+    failure: null,
+    unitId: null,
+    ...over,
+  };
 }
 
 /** The two paths every copy test picks, and a job carrying them. */
@@ -900,15 +921,18 @@ describe("SyncPane remove a folder", () => {
 
 describe("SyncPane activity", () => {
   const activity: SyncActivityVm[] = [
-    { tsMs: NOW - 120_000, kind: "modified", path: "notes/today.md", sizeBytes: 2_500_000 },
-    { tsMs: NOW - 3_600_000, kind: "added", path: "notes/new.md", sizeBytes: 12 },
-    { tsMs: NOW - 7_200_000, kind: "deleted", path: "notes/old.md", sizeBytes: 4_000 },
-    {
+    activityVm(),
+    activityVm({ tsMs: NOW - 3_600_000, kind: "added", path: "notes/new.md", sizeBytes: 12 }),
+    activityVm({ tsMs: NOW - 7_200_000, kind: "deleted", path: "notes/old.md", sizeBytes: 4_000 }),
+    // A conflict copy is written by the pull itself, so no unit of work is
+    // accountable for carrying it — which is what `unknown` delivery is for.
+    activityVm({
       tsMs: NOW - 10_800_000,
       kind: "conflict",
       path: "notes/shared.sync-conflict-01.md",
       sizeBytes: null,
-    },
+      delivery: "unknown",
+    }),
   ];
 
   it("lists what sync did, newest first, with the kind spoken and the time relative", async () => {
@@ -971,6 +995,150 @@ describe("SyncPane activity", () => {
     expect(await screen.findByText("no such profile")).toBeInTheDocument();
     expect(screen.getByText("notes/today.md")).toBeInTheDocument();
     expect(screen.queryByText(SYNC_ACTIVITY_EMPTY_SENTENCE)).not.toBeInTheDocument();
+  });
+});
+
+describe("SyncPane activity delivery", () => {
+  /**
+   * One row per delivery value, so the case that renders nothing is asserted
+   * beside the four that render rather than in isolation.
+   */
+  const delivered: SyncActivityVm[] = [
+    activityVm({ path: "notes/arrived.md", delivery: "success" }),
+    activityVm({ path: "notes/moving.md", delivery: "inProgress" }),
+    activityVm({
+      path: "notes/failing.md",
+      delivery: "failed",
+      failure: "fatal: could not read from remote repository",
+      unitId: 88,
+    }),
+    activityVm({
+      path: "notes/given-up.md",
+      delivery: "abandoned",
+      failure: "413 Payload Too Large",
+      unitId: 77,
+    }),
+    activityVm({ path: "notes/copy.md", kind: "conflict", delivery: "unknown" }),
+  ];
+
+  it("says how far each file got, and says nothing where nothing is accountable", async () => {
+    mockActivity.mockResolvedValue(delivered);
+    await renderPane();
+
+    const list = await screen.findByRole("list", { name: `${SYNC_ACTIVITY_TITLE}: tgdrive` });
+    const rows = within(list).getAllByRole("listitem");
+    // The state rides a glyph on screen and a word to a screen reader, the way
+    // the kind at the other end of the row does.
+    expect(rows[0]).toHaveTextContent(SYNC_DELIVERY_STATES.success.word);
+    expect(rows[1]).toHaveTextContent(SYNC_DELIVERY_STATES.inProgress.word);
+    expect(rows[2]).toHaveTextContent(SYNC_DELIVERY_STATES.failed.word);
+    expect(rows[3]).toHaveTextContent(SYNC_DELIVERY_STATES.abandoned.word);
+    // Two glyphs on a row with a delivery fact — the kind and the delivery —
+    // and the kind alone on the row that has none.
+    expect(rows[0].querySelectorAll("svg")).toHaveLength(2);
+    expect(rows[4].querySelectorAll("svg")).toHaveLength(1);
+    // Not a word either, and not a placeholder held open: a row nothing is
+    // accountable for reports no delivery at all rather than a guess.
+    for (const state of Object.values(SYNC_DELIVERY_STATES)) {
+      expect(rows[4]).not.toHaveTextContent(state.word);
+    }
+    // Only a row with something recorded against it is a control at all — a
+    // trigger that opened an empty popover would claim there was a reason to read.
+    expect(
+      screen.queryByRole("button", { name: `${SYNC_DELIVERY_DETAIL_LABEL}: notes/arrived.md` }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: `${SYNC_DELIVERY_DETAIL_LABEL}: notes/failing.md` }),
+    ).toBeInTheDocument();
+  });
+
+  it("names the file, the state and the engine's own message when asked why", async () => {
+    mockActivity.mockResolvedValue(delivered);
+    await renderPane();
+
+    await screen.findByRole("list", { name: `${SYNC_ACTIVITY_TITLE}: tgdrive` });
+    fireEvent.click(
+      screen.getByRole("button", { name: `${SYNC_DELIVERY_DETAIL_LABEL}: notes/given-up.md` }),
+    );
+
+    // The reason sits with the file, which the Problems section below can never
+    // do: it reports the unit of work and never the path.
+    const why = await screen.findByRole("dialog");
+    expect(within(why).getByText("notes/given-up.md")).toBeInTheDocument();
+    expect(within(why).getByText(SYNC_DELIVERY_STATES.abandoned.word)).toBeInTheDocument();
+    // Verbatim, as the engine recorded it.
+    expect(within(why).getByText("413 Payload Too Large")).toBeInTheDocument();
+  });
+
+  it("retries exactly the unit the abandoned row was waiting on", async () => {
+    mockActivity.mockResolvedValue(delivered);
+    mockRetryParked.mockResolvedValue(undefined);
+    await renderPane();
+
+    await screen.findByRole("list", { name: `${SYNC_ACTIVITY_TITLE}: tgdrive` });
+    fireEvent.click(
+      screen.getByRole("button", { name: `${SYNC_DELIVERY_DETAIL_LABEL}: notes/given-up.md` }),
+    );
+    // Named for the file it is about: a card holds one of these per row.
+    fireEvent.click(
+      await screen.findByRole("button", { name: `${SYNC_RETRY_LABEL}: notes/given-up.md` }),
+    );
+
+    // That row's unit, not the failing row's — the two are different work.
+    await waitFor(() => expect(mockRetryParked).toHaveBeenCalledWith("p1", 77));
+    expect(mockRetryParked).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers no retry on a row keeper has not given up on", async () => {
+    mockActivity.mockResolvedValue(delivered);
+    await renderPane();
+
+    await screen.findByRole("list", { name: `${SYNC_ACTIVITY_TITLE}: tgdrive` });
+    fireEvent.click(
+      screen.getByRole("button", { name: `${SYNC_DELIVERY_DETAIL_LABEL}: notes/failing.md` }),
+    );
+
+    // keeper is still retrying this one, so the popover says so instead of
+    // offering a button whose whole meaning would be that it had stopped.
+    const why = await screen.findByRole("dialog");
+    expect(within(why).getByText(SYNC_DELIVERY_RETRYING_SENTENCE)).toBeInTheDocument();
+    expect(within(why).queryByRole("button")).not.toBeInTheDocument();
+    expect(mockRetryParked).not.toHaveBeenCalled();
+  });
+
+  it("shows a held file's reason for waiting without dressing it as a failure", async () => {
+    // The shape this whole feature exists to make legible: a large file's
+    // pointer is committed, its upload has not landed, and the push that would
+    // publish it is deferred carrying the reason. It is `inProgress`, not
+    // `failed` — reporting it as broken would accuse keeper of failing while it
+    // is doing the one careful thing that keeps a peer from cloning a pointer to
+    // content nobody has.
+    const held =
+      "publishing is on hold until this folder's large files reach the remote (1 outstanding)";
+    mockActivity.mockResolvedValue([
+      activityVm({
+        path: "footage/clip.mp4",
+        delivery: "inProgress",
+        failure: held,
+        unitId: 91,
+      }),
+    ]);
+    await renderPane();
+
+    await screen.findByRole("list", { name: `${SYNC_ACTIVITY_TITLE}: tgdrive` });
+    fireEvent.click(
+      screen.getByRole("button", { name: `${SYNC_DELIVERY_DETAIL_LABEL}: footage/clip.mp4` }),
+    );
+
+    const why = await screen.findByRole("dialog");
+    const reason = within(why).getByText(held);
+    expect(reason).toBeInTheDocument();
+    // Toned as the state is, so a wait does not read as a breakage.
+    expect(reason.className).toContain(SYNC_DELIVERY_STATES.inProgress.tone);
+    expect(reason.className).not.toContain(SYNC_DELIVERY_STATES.failed.tone);
+    // And no Retry: nothing has stopped, and there is nothing for a human to
+    // restart.
+    expect(within(why).queryByRole("button")).not.toBeInTheDocument();
   });
 });
 
