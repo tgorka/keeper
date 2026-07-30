@@ -30,6 +30,7 @@ import {
   type SyncProgressVm,
   type SyncStatusVm,
   syncActivity,
+  syncListSettingsGet,
   syncPending,
   syncProblems,
   syncRetryParked,
@@ -44,10 +45,54 @@ import {
 } from "@/lib/stores/sync";
 
 /**
- * How many activity rows the view asks for. The engine keeps far more per
- * profile, but a card is a recent-history surface, not a log viewer.
+ * Fallback row counts, used until the persisted sizes arrive from Rust.
+ *
+ * Duplicating the Rust defaults is deliberate: the alternative is rendering an
+ * empty card for one IPC round trip on every cold start. They are asserted equal
+ * to the Rust constants by a test rather than left to drift on trust.
  */
-export const SYNC_ACTIVITY_LIMIT = 20;
+export const SYNC_LIST_FOLDED_FALLBACK = 10;
+export const SYNC_LIST_UNFOLDED_FALLBACK = 100;
+
+/**
+ * How many rows the lists currently show, folded and unfolded.
+ *
+ * Module state rather than store state: it is one global preference, read once,
+ * and threading it through the per-profile detail entries would put the same two
+ * numbers in every one of them.
+ */
+let listSizes = {
+  folded: SYNC_LIST_FOLDED_FALLBACK,
+  unfolded: SYNC_LIST_UNFOLDED_FALLBACK,
+};
+
+/** The current sizes. Callers render from this; nothing mutates it but Rust. */
+export function syncListSizes(): { folded: number; unfolded: number } {
+  return listSizes;
+}
+
+/**
+ * Adopt the persisted sizes.
+ *
+ * Called on mount and again after the settings form saves, so a changed number
+ * takes effect on the next poll without a reload. `unfolded` also bounds the
+ * activity query, so raising it is what makes more history reachable at all.
+ */
+export function setSyncListSizes(sizes: { folded: number; unfolded: number }): void {
+  listSizes = sizes;
+}
+
+/**
+ * Read the persisted row counts out of Rust and adopt them.
+ *
+ * Rejects on an IPC failure rather than swallowing it, so a caller can decide;
+ * the Sync pane ignores the rejection because the fallbacks equal the Rust
+ * defaults and a card that renders ten rows is not a failure worth a banner.
+ */
+export async function hydrateSyncListSizes(): Promise<void> {
+  const { folded, unfolded } = await syncListSettingsGet();
+  setSyncListSizes({ folded, unfolded });
+}
 
 /**
  * Detail poll cadence. Deliberately slower than the status poll: the status
@@ -187,7 +232,7 @@ export function syncLiveRate(
  */
 export async function refreshSyncDetail(id: string): Promise<void> {
   const [activity, pending, problems] = await Promise.allSettled([
-    syncActivity(id, SYNC_ACTIVITY_LIMIT),
+    syncActivity(id, listSizes.unfolded),
     syncPending(id),
     syncProblems(id),
   ]);

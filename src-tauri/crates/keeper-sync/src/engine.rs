@@ -2878,7 +2878,15 @@ impl Engine {
         if profile.lfs_mode == LfsMode::Disabled {
             return Ok(());
         }
-        self.publish(self.progress(profile, SyncPhase::TransferringLfs));
+        // The direction is in the phase because that is what the tray reads: an
+        // upload and a download are different glyphs, so they have to be
+        // different phases (see `SyncPhase::direction`).
+        let phase = if upload {
+            SyncPhase::UploadingLfs
+        } else {
+            SyncPhase::DownloadingLfs
+        };
+        self.publish(self.progress(profile, phase));
 
         // `.lfsconfig` at the repository root overrides the derived endpoint —
         // the documented precedence, and the shape a self-hosted LFS server
@@ -2976,7 +2984,7 @@ impl Engine {
         let results = self
             .publish_while(
                 profile,
-                SyncPhase::TransferringLfs,
+                phase,
                 event_rx,
                 |event, transfer_event| {
                     tally.fold(&transfer_event);
@@ -4334,11 +4342,11 @@ mod tests {
         };
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
-        let mut event = engine.progress(&p, SyncPhase::TransferringLfs);
+        let mut event = engine.progress(&p, SyncPhase::UploadingLfs);
         event.bytes_done = 42;
         engine.publish(event);
         let snapshot = engine.status(&p.id).expect("status");
-        assert_eq!(snapshot.phase, SyncPhase::TransferringLfs);
+        assert_eq!(snapshot.phase, SyncPhase::UploadingLfs);
         assert_eq!(snapshot.bytes_done, 42);
         assert_eq!(snapshot.state, ProfileState::Syncing);
     }
@@ -5798,7 +5806,7 @@ mod tests {
         engine
             .publish_while(
                 &p,
-                SyncPhase::TransferringLfs,
+                SyncPhase::UploadingLfs,
                 event_rx,
                 |event, transfer_event| {
                     tally.fold(&transfer_event);
@@ -5819,7 +5827,7 @@ mod tests {
         let mut previous_done = 0;
         let mut previous_total = 0;
         for event in &published {
-            assert_eq!(event.phase, SyncPhase::TransferringLfs);
+            assert_eq!(event.phase, SyncPhase::UploadingLfs);
             let total = event
                 .bytes_total
                 .expect("a started object gives the bar a denominator");

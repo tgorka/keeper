@@ -35,11 +35,25 @@ pub enum SyncPhase {
     Staging,
     Committing,
     Pushing,
-    /// Large-object transfer, tracked separately because its byte counts dwarf
+    /// Large-object upload, tracked separately because its byte counts dwarf
     /// everything else and a user reads it as a different activity.
-    TransferringLfs,
+    ///
+    /// Split from the download direction (rather than one `TransferringLfs`
+    /// carrying a flag) because the tray renders the two differently and the
+    /// phase is the only thing that reaches it: a state the icon must
+    /// distinguish has to be distinguishable in the type.
+    UploadingLfs,
+    /// Large-object download. See [`Self::UploadingLfs`].
+    DownloadingLfs,
     Verifying,
     Idle,
+}
+
+/// Which way bytes are moving, for the tray glyph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    Up,
+    Down,
 }
 
 impl SyncPhase {
@@ -50,11 +64,35 @@ impl SyncPhase {
 
     /// Whether bytes are actually crossing the network in this phase.
     ///
-    /// Split out from [`Self::is_active`] because the tray animates only for
-    /// real movement: a scan or a commit is work too, but animating over it
-    /// promises a transfer that is not happening.
+    /// Split out from [`Self::is_active`] because the tray marks only real
+    /// movement: a scan or a commit is work too, but claiming a transfer over it
+    /// promises something that is not happening.
+    ///
+    /// `Pushing` counts, which it did not before the tray learned direction. A
+    /// push is bytes on the wire by any honest reading — for a folder of text
+    /// files it is *all* of them, since only large objects go by LFS — and
+    /// leaving it out meant an upload in progress drew the same glyph as a
+    /// directory scan.
     pub fn is_transferring(self) -> bool {
-        matches!(self, Self::Fetching | Self::TransferringLfs)
+        self.direction().is_some()
+    }
+
+    /// Which way this phase is moving bytes, if it is moving any.
+    ///
+    /// The tray's whole direction story comes from here, so the mapping is
+    /// deliberately total rather than a pair of `matches!` that could disagree
+    /// with each other as phases are added.
+    pub fn direction(self) -> Option<TransferDirection> {
+        match self {
+            Self::Fetching | Self::DownloadingLfs => Some(TransferDirection::Down),
+            Self::Pushing | Self::UploadingLfs => Some(TransferDirection::Up),
+            Self::Scanning
+            | Self::Applying
+            | Self::Staging
+            | Self::Committing
+            | Self::Verifying
+            | Self::Idle => None,
+        }
     }
 
     /// Short human label for the tray status line.
@@ -66,7 +104,11 @@ impl SyncPhase {
             Self::Staging => "Staging",
             Self::Committing => "Committing",
             Self::Pushing => "Pushing",
-            Self::TransferringLfs => "Transferring",
+            // Both directions keep the word the line has always used: the
+            // status line already names the profile and the byte counts, and
+            // "Uploading 3 of 8" would be the third place one sync says which
+            // way it is going.
+            Self::UploadingLfs | Self::DownloadingLfs => "Transferring",
             Self::Verifying => "Verifying",
             Self::Idle => "Idle",
         }
@@ -400,9 +442,16 @@ pub enum TraySyncState {
     Absent,
     /// Configured and healthy, nothing in flight.
     Armed,
-    /// At least one profile is moving bytes over the network — a fetch, or an
-    /// LFS transfer. Ranked above `Active` because when both are happening the
-    /// user is waiting on the wire, and that is the thing worth animating.
+    /// At least one profile is sending bytes and none is receiving any.
+    Uploading,
+    /// At least one profile is receiving bytes and none is sending any.
+    Downloading,
+    /// Both directions are in flight at once, across one profile or several.
+    ///
+    /// Its own state rather than a tie broken towards one direction: with four
+    /// folders configured, "something is uploading and something is downloading"
+    /// is the common case, and picking a winner would make the tray lie about
+    /// half of it.
     Transferring,
     /// At least one profile is working with nothing on the wire: a scan, a
     /// merge, a commit, a verify. Kept distinct from `Transferring` so the tray
@@ -421,15 +470,18 @@ pub fn tray_state(statuses: &[SyncStatus]) -> TraySyncState {
         return TraySyncState::Absent;
     }
     let mut has_warning = false;
-    let mut has_transfer = false;
+    let mut has_up = false;
+    let mut has_down = false;
     let mut has_active = false;
     let mut has_paused = false;
     for s in statuses {
         if s.error.is_some() || s.warning.is_some() || s.state.is_warning() {
             has_warning = true;
         }
-        if s.phase.is_transferring() {
-            has_transfer = true;
+        match s.phase.direction() {
+            Some(TransferDirection::Up) => has_up = true,
+            Some(TransferDirection::Down) => has_down = true,
+            None => {}
         }
         if s.state.is_active() || s.phase.is_active() {
             has_active = true;
@@ -440,11 +492,16 @@ pub fn tray_state(statuses: &[SyncStatus]) -> TraySyncState {
     }
     // Warning first: a problem must never be masked by concurrent activity.
     // Transfers next: of two busy profiles, the one on the wire is the one the
-    // user is actually waiting for.
+    // user is actually waiting for. Both directions at once outrank either alone
+    // — it is the only answer that is true about every profile.
     if has_warning {
         TraySyncState::Warning
-    } else if has_transfer {
+    } else if has_up && has_down {
         TraySyncState::Transferring
+    } else if has_up {
+        TraySyncState::Uploading
+    } else if has_down {
+        TraySyncState::Downloading
     } else if has_active {
         TraySyncState::Active
     } else if has_paused {
@@ -581,13 +638,21 @@ mod tests {
         fetching.phase = SyncPhase::Fetching;
         assert_eq!(
             tray_state(&[scanning.clone(), fetching.clone()]),
-            TraySyncState::Transferring
+            TraySyncState::Downloading
         );
 
         let mut lfs = status("c");
-        lfs.phase = SyncPhase::TransferringLfs;
+        lfs.phase = SyncPhase::UploadingLfs;
         assert_eq!(
             tray_state(std::slice::from_ref(&lfs)),
+            TraySyncState::Uploading
+        );
+
+        // One of each, across two profiles: the only honest answer names both.
+        let mut down = status("e");
+        down.phase = SyncPhase::DownloadingLfs;
+        assert_eq!(
+            tray_state(&[lfs.clone(), down]),
             TraySyncState::Transferring
         );
 
@@ -600,10 +665,10 @@ mod tests {
     #[test]
     fn a_transfer_outranks_a_paused_sibling() {
         let mut fetching = status("a");
-        fetching.phase = SyncPhase::TransferringLfs;
+        fetching.phase = SyncPhase::DownloadingLfs;
         let mut paused = status("b");
         paused.state = ProfileState::Paused;
-        assert_eq!(tray_state(&[fetching, paused]), TraySyncState::Transferring);
+        assert_eq!(tray_state(&[fetching, paused]), TraySyncState::Downloading);
     }
 
     #[test]
@@ -905,7 +970,7 @@ mod tests {
     fn an_active_line_carries_counts_and_bytes() {
         let mut s = status("tgdrive");
         s.state = ProfileState::Syncing;
-        s.phase = SyncPhase::TransferringLfs;
+        s.phase = SyncPhase::UploadingLfs;
         s.files_done = 42;
         s.files_total = Some(310);
         s.bytes_done = 1_288_490_188;

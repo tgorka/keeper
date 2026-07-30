@@ -44,7 +44,8 @@ use keeper_core::vm::{
     PaletteResultsVm, PingVm, Provider, RecordingPermissionVm, RecordingSettingsVm,
     RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState,
     RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm,
-    SearchHitVm, SpacesSnapshot, TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
+    SearchHitVm, SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch, TypingBatch,
+    VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -5293,6 +5294,50 @@ pub async fn recording_settings_get(
 ) -> Result<RecordingSettingsVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     off_async_runtime(move || read_recording_settings(&data_dir)).await?
+}
+
+/// Read the folder-card list sizes (folded / unfolded).
+///
+/// `async` for the same reason [`recording_settings_get`] is: the Sync pane
+/// hydrates from this on every visit, and a `keeper.db` read belongs off the main
+/// thread. The registry getters default and clamp, so the VM is always in bounds.
+#[tauri::command]
+pub async fn sync_list_settings_get(
+    state: State<'_, AppState>,
+) -> Result<SyncListSettingsVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    off_async_runtime(move || read_sync_list_settings(&data_dir)).await?
+}
+
+/// The blocking body of [`sync_list_settings_get`], shared with the setter's
+/// re-read so there is one definition of "effective sizes" and the write path can
+/// never return a pair the read path would not.
+fn read_sync_list_settings(data_dir: &Path) -> Result<SyncListSettingsVm, IpcError> {
+    Ok(SyncListSettingsVm {
+        folded: keeper_core::registry::get_sync_list_folded(data_dir).map_err(to_ipc_error)?,
+        unfolded: keeper_core::registry::get_sync_list_unfolded(data_dir).map_err(to_ipc_error)?,
+    })
+}
+
+/// Persist the folder-card list sizes, returning what was actually stored.
+///
+/// Returns the re-read VM rather than the input: both values are clamped, so
+/// echoing the request back would leave the UI displaying a number that is not in
+/// the database.
+#[tauri::command]
+pub async fn sync_list_settings_set(
+    state: State<'_, AppState>,
+    settings: SyncListSettingsVm,
+) -> Result<SyncListSettingsVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    off_async_runtime(move || -> Result<SyncListSettingsVm, IpcError> {
+        keeper_core::registry::set_sync_list_folded(&data_dir, settings.folded)
+            .map_err(to_ipc_error)?;
+        keeper_core::registry::set_sync_list_unfolded(&data_dir, settings.unfolded)
+            .map_err(to_ipc_error)?;
+        read_sync_list_settings(&data_dir)
+    })
+    .await?
 }
 
 /// The blocking body of [`recording_settings_get`], shared with

@@ -17,6 +17,8 @@ vi.mock("@/lib/ipc/client", () => ({
   syncPending: vi.fn(),
   syncProblems: vi.fn(),
   syncRetryParked: vi.fn(),
+  // The persisted list sizes (folded / unfolded).
+  syncListSettingsGet: vi.fn(),
   // The progress stream, the only source of in-flight counters.
   syncSubscribeProgress: vi.fn(),
   syncUnsubscribeProgress: vi.fn(),
@@ -120,6 +122,7 @@ import {
   syncActivity,
   syncFolderNow,
   syncGetCredential,
+  syncListSettingsGet,
   syncOpenPath,
   syncPending,
   syncProblems,
@@ -151,6 +154,7 @@ import {
 const mockProfiles = vi.mocked(syncProfiles);
 const mockStatuses = vi.mocked(syncStatuses);
 const mockActivity = vi.mocked(syncActivity);
+const mockListSettings = vi.mocked(syncListSettingsGet);
 const mockPending = vi.mocked(syncPending);
 const mockProblems = vi.mocked(syncProblems);
 const mockRetryParked = vi.mocked(syncRetryParked);
@@ -323,6 +327,7 @@ beforeEach(() => {
   mockProfiles.mockResolvedValue([profileVm()]);
   mockStatuses.mockResolvedValue([statusVm()]);
   mockActivity.mockResolvedValue([]);
+  mockListSettings.mockResolvedValue({ folded: 10, unfolded: 100 });
   mockPending.mockResolvedValue([]);
   mockProblems.mockResolvedValue(problemsVm());
   // Every edit form reads the keychain as it opens (Story 34.12); this folder
@@ -1188,6 +1193,91 @@ describe("SyncPane pending", () => {
     await renderPane();
 
     expect(await screen.findByText(SYNC_PENDING_EMPTY_SENTENCE)).toBeInTheDocument();
+  });
+});
+
+describe("SyncPane list folding", () => {
+  /** `n` activity rows, each with a distinct path so they are tellable apart. */
+  const rows = (n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      activityVm({ tsMs: NOW - i * 60_000, path: `notes/file-${i}.md` }),
+    );
+
+  it("shows only the folded count and unfolds to the rest on request", async () => {
+    mockActivity.mockResolvedValue(rows(25));
+    await renderPane();
+
+    const list = await screen.findByRole("list", { name: `${SYNC_ACTIVITY_TITLE}: tgdrive` });
+    await waitFor(() => expect(within(list).getAllByRole("listitem")).toHaveLength(10));
+    // The newest is kept and the oldest dropped: a recent-history surface that
+    // folded away the recent half would be useless.
+    expect(within(list).getByTitle("notes/file-0.md")).toBeInTheDocument();
+    expect(within(list).queryByTitle("notes/file-10.md")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Show all 25/ }));
+
+    await waitFor(() => expect(within(list).getAllByRole("listitem")).toHaveLength(25));
+    expect(within(list).getByTitle("notes/file-24.md")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Show fewer/ }));
+    await waitFor(() => expect(within(list).getAllByRole("listitem")).toHaveLength(10));
+  });
+
+  it("offers no fold when the whole list already fits", async () => {
+    mockActivity.mockResolvedValue(rows(4));
+    await renderPane();
+
+    await screen.findByRole("list", { name: `${SYNC_ACTIVITY_TITLE}: tgdrive` });
+    // Four rows below a fold of ten: the control would do nothing in either
+    // direction, so it must not be drawn at all.
+    expect(screen.queryByRole("button", { name: /^Show all/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Show fewer/ })).not.toBeInTheDocument();
+  });
+
+  it("never offers to reveal more rows than were read", async () => {
+    // 40 rows with an unfolded size of 12: the query asked Rust for 12, so
+    // "Show all 40" would be a promise nothing can keep.
+    mockListSettings.mockResolvedValue({ folded: 3, unfolded: 12 });
+    mockActivity.mockResolvedValue(rows(12));
+    await renderPane();
+
+    const list = await screen.findByRole("list", { name: `${SYNC_ACTIVITY_TITLE}: tgdrive` });
+    await waitFor(() => expect(within(list).getAllByRole("listitem")).toHaveLength(3));
+    expect(screen.getByRole("button", { name: /^Show all 12/ })).toBeInTheDocument();
+  });
+
+  it("reads history up to the unfolded size, so the setting bounds the query", async () => {
+    mockListSettings.mockResolvedValue({ folded: 5, unfolded: 250 });
+    await renderPane();
+
+    // The saved unfolded count IS the `LIMIT`: without this the fold could only
+    // ever reveal rows the default read happened to include.
+    await waitFor(() => expect(mockActivity).toHaveBeenCalledWith("p1", 250));
+  });
+
+  it("folds the parked list too, without narrowing what Retry all covers", async () => {
+    mockListSettings.mockResolvedValue({ folded: 2, unfolded: 100 });
+    mockProblems.mockResolvedValue(
+      problemsVm({
+        parked: Array.from({ length: 5 }, (_, i) => ({
+          id: 40 + i,
+          kind: "lfsUpload",
+          attempts: 3,
+          lastError: `rejected ${i}`,
+        })),
+      }),
+    );
+    mockRetryParked.mockResolvedValue(undefined);
+    await renderPane();
+
+    const list = await screen.findByRole("list", { name: `${SYNC_PARKED_TITLE}: tgdrive` });
+    await waitFor(() => expect(within(list).getAllByRole("listitem")).toHaveLength(2));
+
+    // The fold is about reading, not about scope: the bulk retry still requeues
+    // every parked unit, including the three currently hidden.
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${SYNC_RETRY_ALL_LABEL}`) }));
+    await waitFor(() => expect(mockRetryParked).toHaveBeenCalledTimes(5));
+    expect(mockRetryParked.mock.calls.map(([, id]) => id)).toEqual([40, 41, 42, 43, 44]);
   });
 });
 

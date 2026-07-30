@@ -88,17 +88,20 @@ const IDLE_ICON_PNG: &[u8] = include_bytes!("../icons/tray-idle-template.png");
 /// only the interior differs.
 ///
 /// Template images again: the menu bar recolours them, so **state must read
-/// from SHAPE, never colour**. Armed is a static cycle; the four frames are a
-/// ring whose gap walks a quarter turn per tick, which is what reads as motion
-/// at the tray's 1 Hz refresh where a pulse or fade would just look like
-/// flicker.
+/// from SHAPE, never colour**. Armed is a static cycle in the bubble interior;
+/// the four transfer states carry a mark in the bottom-right corner instead —
+/// an arrow up, an arrow down, both, or circular arrows for work with nothing on
+/// the wire.
+///
+/// These four replaced a four-frame rotating ring. The animation said "something
+/// is happening" and nothing about *what*, so a 40 GB upload and a directory scan
+/// drew the same picture; a direction says it without moving, which is also why
+/// the tray no longer advances a frame counter.
 const SYNC_ARMED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-template.png");
-const SYNC_FRAME_PNGS: [&[u8]; 4] = [
-    include_bytes!("../icons/tray-sync-1-template.png"),
-    include_bytes!("../icons/tray-sync-2-template.png"),
-    include_bytes!("../icons/tray-sync-3-template.png"),
-    include_bytes!("../icons/tray-sync-4-template.png"),
-];
+const SYNC_UP_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-up-template.png");
+const SYNC_DOWN_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-down-template.png");
+const SYNC_UPDOWN_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-updown-template.png");
+const SYNC_REFRESH_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-refresh-template.png");
 const SYNC_PAUSED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-paused-template.png");
 const SYNC_WARNING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-warning-template.png");
 
@@ -973,28 +976,26 @@ mod tests {
 /// The sync menu's disabled status line.
 const SYNC_STATUS_ID: &str = "tray-sync-status";
 
-/// Pick this tick's sync glyph.
+/// Pick the sync glyph for a state.
 ///
 /// Pure so the precedence is testable without a tray: **warning outranks
 /// transferring outranks activity outranks paused outranks armed**, because a
 /// problem must never be hidden by something else happening to be busy.
-/// `frame` is advanced by the caller's tick and only matters while animating.
 ///
-/// Motion is reserved for bytes actually moving. `Transferring` (fetching or an
-/// LFS transfer) animates; `Active` — scanning, committing, pushing a small
-/// change — holds the first frame still. That distinction is the whole point of
-/// glancing at the menu bar: a folder mid-upload looks different from one doing
-/// bookkeeping, without either being mistaken for idle. No new asset: the still
-/// frame is the animation's own, so the two states are visibly the same glyph
-/// in the same weight, differing only in movement.
-fn sync_glyph(state: TraySyncState, frame: u8) -> Option<&'static [u8]> {
+/// Every state is one still asset, so the glyph is a function of state alone —
+/// the reason this no longer takes a frame. What used to be carried by motion is
+/// now carried by the corner mark, and carried better: an arrow says which way
+/// the bytes are going, where a spinning ring only said that something was.
+/// `Active` — scanning, committing, verifying — gets the circular arrows, which
+/// is the same "working" claim without the promise of a transfer.
+fn sync_glyph(state: TraySyncState) -> Option<&'static [u8]> {
     match state {
         TraySyncState::Absent => None,
         TraySyncState::Warning => Some(SYNC_WARNING_ICON_PNG),
-        TraySyncState::Transferring => {
-            Some(SYNC_FRAME_PNGS[(frame as usize) % SYNC_FRAME_PNGS.len()])
-        }
-        TraySyncState::Active => Some(SYNC_FRAME_PNGS[0]),
+        TraySyncState::Transferring => Some(SYNC_UPDOWN_ICON_PNG),
+        TraySyncState::Uploading => Some(SYNC_UP_ICON_PNG),
+        TraySyncState::Downloading => Some(SYNC_DOWN_ICON_PNG),
+        TraySyncState::Active => Some(SYNC_REFRESH_ICON_PNG),
         TraySyncState::Paused => Some(SYNC_PAUSED_ICON_PNG),
         TraySyncState::Armed => Some(SYNC_ARMED_ICON_PNG),
     }
@@ -1103,8 +1104,13 @@ fn dwelled(reported: TraySyncState) -> TraySyncState {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match reported {
-        // Busy: show it, and arm the hold.
-        TraySyncState::Transferring | TraySyncState::Active => {
+        // Busy: show it, and arm the hold. Each direction holds as *itself*, so
+        // an upload that ends does not decay through a generic "transferring"
+        // glyph on its way back to armed.
+        TraySyncState::Transferring
+        | TraySyncState::Uploading
+        | TraySyncState::Downloading
+        | TraySyncState::Active => {
             *held = Some((reported, BUSY_DWELL_TICKS));
             reported
         }
@@ -1170,7 +1176,7 @@ fn build_sync_menu(app: &AppHandle, line: &str) -> Option<(Menu<Wry>, MenuItem<W
 /// an internal main-thread dispatch), and the held item — with the memo of what
 /// actually landed — is stored back under a fresh lock checked against the
 /// tray id.
-pub fn apply_sync_state(app: &AppHandle, state: TraySyncState, line: &str, frame: u8) {
+pub fn apply_sync_state(app: &AppHandle, state: TraySyncState, line: &str) {
     let (tray, sync_item, memo, recording_owns) = {
         let guard = tray_guard();
         match guard.as_ref() {
@@ -1193,7 +1199,7 @@ pub fn apply_sync_state(app: &AppHandle, state: TraySyncState, line: &str, frame
     // Smooth the glyph, never the words: the status line below still reports
     // exactly what the engine said this tick.
     let state = dwelled(state);
-    let Some(glyph) = sync_glyph(state, frame) else {
+    let Some(glyph) = sync_glyph(state) else {
         // No profiles at all: leave the plain idle tray exactly as it was, and
         // tear down a sync menu if one is still installed. `restore_idle` drops
         // the held line and the memo with it, and only once the idle menu is
@@ -1295,11 +1301,11 @@ mod sync_tray_tests {
         // The precedence that matters: a user must not miss a problem because
         // some other profile happens to be transferring.
         assert_eq!(
-            sync_glyph(TraySyncState::Warning, 0).map(<[u8]>::len),
+            sync_glyph(TraySyncState::Warning).map(<[u8]>::len),
             Some(SYNC_WARNING_ICON_PNG.len())
         );
         assert_eq!(
-            sync_glyph(TraySyncState::Paused, 0).map(<[u8]>::len),
+            sync_glyph(TraySyncState::Paused).map(<[u8]>::len),
             Some(SYNC_PAUSED_ICON_PNG.len())
         );
     }
@@ -1307,7 +1313,7 @@ mod sync_tray_tests {
     #[test]
     fn no_profiles_means_no_sync_glyph_at_all() {
         // Absent must leave the plain idle tray alone rather than claiming it.
-        assert!(sync_glyph(TraySyncState::Absent, 0).is_none());
+        assert!(sync_glyph(TraySyncState::Absent).is_none());
     }
     /// One test, not four: `dwelled` keeps its hold in a process-wide static,
     /// and cargo runs tests in parallel threads that would interleave on it.
@@ -1358,43 +1364,39 @@ mod sync_tray_tests {
     }
 
     #[test]
-    fn transfer_frames_cycle_and_never_index_out_of_bounds() {
-        // `frame` comes from a free-running tick counter, so it must wrap
-        // safely for every u8 rather than panicking once a minute.
-        for frame in 0u8..=255 {
-            assert!(sync_glyph(TraySyncState::Transferring, frame).is_some());
-        }
-        let first = sync_glyph(TraySyncState::Transferring, 0).expect("frame 0");
-        let wrapped = sync_glyph(TraySyncState::Transferring, 4).expect("frame 4");
-        assert_eq!(
-            first.len(),
-            wrapped.len(),
-            "the cycle repeats every four frames"
-        );
-        let second = sync_glyph(TraySyncState::Transferring, 1).expect("frame 1");
-        assert_ne!(
-            first.len(),
-            second.len(),
-            "consecutive frames must differ, or the ring does not appear to move"
-        );
+    fn every_direction_is_its_own_glyph() {
+        // The whole point of the corner mark: three transfer states a user can
+        // tell apart. Sharing an asset between any two would silently reduce
+        // "which way are the bytes going" back to "something is happening".
+        let up = SyncGlyphId::of(sync_glyph(TraySyncState::Uploading).expect("up"));
+        let down = SyncGlyphId::of(sync_glyph(TraySyncState::Downloading).expect("down"));
+        let both = SyncGlyphId::of(sync_glyph(TraySyncState::Transferring).expect("both"));
+        assert_ne!(up, down);
+        assert_ne!(up, both);
+        assert_ne!(down, both);
     }
 
     #[test]
-    fn working_holds_still_so_only_moving_bytes_animate() {
-        // The glance-value of the menu bar depends on motion meaning one thing.
-        // Scanning or committing is work, not transfer, and must not look like
-        // an upload — but it must still differ from armed, or "busy" and "idle"
-        // become the same picture.
-        let a = sync_glyph(TraySyncState::Active, 0).expect("frame 0");
-        let b = sync_glyph(TraySyncState::Active, 1).expect("frame 1");
-        let c = sync_glyph(TraySyncState::Active, 200).expect("late frame");
-        assert_eq!(a.len(), b.len(), "working must not animate");
-        assert_eq!(a.len(), c.len(), "working must not animate");
-        assert_ne!(
-            a.len(),
-            SYNC_ARMED_ICON_PNG.len(),
-            "working must still be distinguishable from armed"
-        );
+    fn working_differs_from_both_armed_and_every_transfer() {
+        // Scanning or committing is work, not transfer, so it must not draw as
+        // one — but it must still differ from armed, or "busy" and "idle" become
+        // the same picture. Armed is the centred ring; this is the corner
+        // circular arrows.
+        let active = SyncGlyphId::of(sync_glyph(TraySyncState::Active).expect("active"));
+        for other in [
+            TraySyncState::Armed,
+            TraySyncState::Uploading,
+            TraySyncState::Downloading,
+            TraySyncState::Transferring,
+            TraySyncState::Paused,
+            TraySyncState::Warning,
+        ] {
+            assert_ne!(
+                active,
+                SyncGlyphId::of(sync_glyph(other).expect("a glyph")),
+                "active must not share an asset with {other:?}"
+            );
+        }
     }
 
     #[test]
@@ -1406,10 +1408,10 @@ mod sync_tray_tests {
             SYNC_ARMED_ICON_PNG,
             SYNC_PAUSED_ICON_PNG,
             SYNC_WARNING_ICON_PNG,
-            SYNC_FRAME_PNGS[0],
-            SYNC_FRAME_PNGS[1],
-            SYNC_FRAME_PNGS[2],
-            SYNC_FRAME_PNGS[3],
+            SYNC_UP_ICON_PNG,
+            SYNC_DOWN_ICON_PNG,
+            SYNC_UPDOWN_ICON_PNG,
+            SYNC_REFRESH_ICON_PNG,
         ] {
             let image = Image::from_bytes(bytes).expect("sync glyph decodes");
             assert_eq!(image.width(), idle.width());
@@ -1422,8 +1424,7 @@ mod sync_tray_tests {
         // The story in one assertion: the engine reports the same state every
         // second, and the tray used to decode and re-push the identical PNG
         // every second with it.
-        let glyph =
-            SyncGlyphId::of(sync_glyph(TraySyncState::Armed, 0).expect("armed has a glyph"));
+        let glyph = SyncGlyphId::of(sync_glyph(TraySyncState::Armed).expect("armed has a glyph"));
         let line = "Photos — up to date";
         assert_eq!(
             sync_writes(None, false, glyph, line),
@@ -1446,14 +1447,14 @@ mod sync_tray_tests {
     fn a_change_reaches_the_tray_on_the_very_next_tick() {
         // De-duplication must not become coalescing: there is no dwell here,
         // only a diff, so a real transition costs no extra tick.
-        let armed = SyncGlyphId::of(sync_glyph(TraySyncState::Armed, 0).expect("armed"));
+        let armed = SyncGlyphId::of(sync_glyph(TraySyncState::Armed).expect("armed"));
         let line = "Photos — up to date";
         let memo = SyncMemo {
             glyph: armed,
             line: Arc::from(line),
         };
 
-        let warning = SyncGlyphId::of(sync_glyph(TraySyncState::Warning, 0).expect("warning"));
+        let warning = SyncGlyphId::of(sync_glyph(TraySyncState::Warning).expect("warning"));
         let escalated = sync_writes(Some(&memo), true, warning, line);
         assert!(escalated.icon, "a new glyph must repaint on this tick");
         assert!(
@@ -1473,25 +1474,34 @@ mod sync_tray_tests {
     }
 
     #[test]
-    fn a_transfer_still_animates_through_the_memo() {
-        // The obvious way to break the de-duplication: memoise the STATE.
-        // `Transferring` equals `Transferring` on every tick, so the ring would
-        // freeze on one frame and the menu bar would stop reading as motion.
+    fn a_change_of_direction_repaints_the_icon() {
+        // The de-duplication memoises the GLYPH, and that is what makes this
+        // work: a direction change is a different asset, so it writes. Were the
+        // memo keyed on some coarser "is it transferring" notion instead, an
+        // upload turning into a download would keep the old arrow on screen —
+        // the tray would be stale in exactly the case the arrows exist for.
         let line = "Photos — Transferring · 40 MB";
         let mut memo = SyncMemo {
-            glyph: SyncGlyphId::of(sync_glyph(TraySyncState::Transferring, 0).expect("frame 0")),
+            glyph: SyncGlyphId::of(sync_glyph(TraySyncState::Uploading).expect("up")),
             line: Arc::from(line),
         };
-        for frame in 1u8..=8 {
-            let glyph = SyncGlyphId::of(
-                sync_glyph(TraySyncState::Transferring, frame).expect("every frame has a glyph"),
-            );
+        for state in [
+            TraySyncState::Downloading,
+            TraySyncState::Transferring,
+            TraySyncState::Uploading,
+        ] {
+            let glyph = SyncGlyphId::of(sync_glyph(state).expect("a glyph"));
             assert!(
                 sync_writes(Some(&memo), true, glyph, line).icon,
-                "frame {frame} was skipped, so the transfer ring stopped moving"
+                "{state:?} was skipped, so the tray kept the previous direction"
             );
             memo.glyph = glyph;
         }
+
+        // And the converse, which is the reason the memo exists: an unchanged
+        // direction on the next tick must not touch the OS.
+        let same = SyncGlyphId::of(sync_glyph(TraySyncState::Uploading).expect("up"));
+        assert!(!sync_writes(Some(&memo), true, same, line).icon);
     }
 
     #[test]
@@ -1499,7 +1509,7 @@ mod sync_tray_tests {
         // The memo lives in the tray slot, so toggling presence off→on drops it
         // with the tray: the fresh menu-bar item carries the idle mark and must
         // be painted even though the composed state never changed.
-        let glyph = SyncGlyphId::of(sync_glyph(TraySyncState::Active, 0).expect("active"));
+        let glyph = SyncGlyphId::of(sync_glyph(TraySyncState::Active).expect("active"));
         let line = "Photos — Committing — 1/3 files";
         assert_eq!(sync_writes(None, true, glyph, line), SyncWrites::BOTH);
         let memo = SyncMemo {

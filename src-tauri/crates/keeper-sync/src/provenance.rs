@@ -243,7 +243,32 @@ pub fn commit_message(subject: &str, body: &str, provenance: &Provenance) -> Str
 /// document in one line of help text and stable enough that a profile written
 /// today still renders in a year. Only the SUBJECT is templatable — the trailer
 /// block is provenance, and a repository has to be able to trust its shape.
-pub const SUBJECT_PLACEHOLDERS: [&str; 5] = ["profile", "added", "modified", "deleted", "changed"];
+pub const SUBJECT_PLACEHOLDERS: [&str; 6] = [
+    "profile", "device", "added", "modified", "deleted", "changed",
+];
+
+/// The `@device` qualifier for a commit subject, or `None` when this machine
+/// still answers to its hostname.
+///
+/// The subject names the device only once the user has *renamed* it. A label
+/// that is still the hostname carries nothing a reader wants: `Keeper-Device`
+/// already records it on every commit, and repeating it in the one line
+/// `git log --oneline` shows would spend the scarcest space in history on the
+/// least surprising fact. A deliberate name is the opposite — someone chose it
+/// so they could tell two machines apart at a glance, which is exactly what a
+/// subject is for.
+///
+/// Compared case-insensitively after trimming: macOS reports the same host as
+/// `Hesperia` and `hesperia` depending on who is asking, and a qualifier that
+/// appeared or vanished with the casing of a hostname would be a mystery rather
+/// than a feature.
+pub fn device_qualifier<'a>(label: &'a str, host_label: &str) -> Option<&'a str> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(host_label.trim()) {
+        return None;
+    }
+    Some(trimmed)
+}
 
 /// One piece of a parsed subject template.
 enum Piece<'a> {
@@ -359,12 +384,13 @@ pub fn unknown_subject_placeholder(template: &str) -> Option<&str> {
 pub fn change_subject(
     template: &str,
     profile: &str,
+    device: Option<&str>,
     added: usize,
     modified: usize,
     deleted: usize,
 ) -> String {
     if template.trim().is_empty() {
-        return mechanical_subject(profile, added, modified, deleted);
+        return mechanical_subject(profile, device, added, modified, deleted);
     }
     let mut out = String::with_capacity(template.len() + 32);
     for piece in pieces(template) {
@@ -373,6 +399,10 @@ pub fn change_subject(
             // The profile name goes in raw: the whole subject is sanitized
             // below, which is where a newline in any part of it is collapsed.
             Piece::Placeholder("profile") => out.push_str(profile),
+            // Bare, with no `@`: a template author writes their own separator,
+            // and `{profile}@{device}` on an un-renamed machine would otherwise
+            // leave a trailing `@` with nothing after it.
+            Piece::Placeholder("device") => out.push_str(device.unwrap_or_default()),
             Piece::Placeholder("added") => {
                 let _ = write!(out, "{added}");
             }
@@ -392,17 +422,27 @@ pub fn change_subject(
     }
     let subject = sanitize(&out);
     if subject.is_empty() {
-        return mechanical_subject(profile, added, modified, deleted);
+        return mechanical_subject(profile, device, added, modified, deleted);
     }
     subject
 }
 
-/// `sync(<profile>): 3 added, 1 modified, 1 deleted`.
+/// `sync(<profile>): 3 added, 1 modified, 1 deleted`, with the device appended as
+/// `sync(<profile>@<device>)` once this machine has been renamed.
 ///
 /// Stable and mechanical on purpose — a human reading `git log` should be able
 /// to tell at a glance which commits the engine made. This is what an empty
-/// template means, so its bytes are a compatibility surface, not a detail.
-fn mechanical_subject(profile: &str, added: usize, modified: usize, deleted: usize) -> String {
+/// template means, so its bytes are a compatibility surface, not a detail: the
+/// un-renamed form is unchanged to the byte, and only a machine the user has
+/// deliberately named gains the qualifier. See [`device_qualifier`] for why that
+/// is the condition.
+fn mechanical_subject(
+    profile: &str,
+    device: Option<&str>,
+    added: usize,
+    modified: usize,
+    deleted: usize,
+) -> String {
     let mut parts = Vec::with_capacity(3);
     if added > 0 {
         parts.push(format!("{added} added"));
@@ -416,7 +456,11 @@ fn mechanical_subject(profile: &str, added: usize, modified: usize, deleted: usi
     if parts.is_empty() {
         parts.push("no file changes".to_owned());
     }
-    format!("sync({}): {}", sanitize(profile), parts.join(", "))
+    let scope = match device {
+        Some(device) => format!("{}@{}", sanitize(profile), sanitize(device)),
+        None => sanitize(profile),
+    };
+    format!("sync({scope}): {}", parts.join(", "))
 }
 
 #[cfg(test)]
@@ -500,11 +544,17 @@ mod tests {
     #[test]
     fn subjects_describe_only_what_actually_changed() {
         assert_eq!(
-            change_subject("", "p", 3, 1, 1),
+            change_subject("", "p", None, 3, 1, 1),
             "sync(p): 3 added, 1 modified, 1 deleted"
         );
-        assert_eq!(change_subject("", "p", 0, 2, 0), "sync(p): 2 modified");
-        assert_eq!(change_subject("", "p", 0, 0, 0), "sync(p): no file changes");
+        assert_eq!(
+            change_subject("", "p", None, 0, 2, 0),
+            "sync(p): 2 modified"
+        );
+        assert_eq!(
+            change_subject("", "p", None, 0, 0, 0),
+            "sync(p): no file changes"
+        );
     }
 
     /// The regression that would go unnoticed: every repository keeper has ever
@@ -513,18 +563,91 @@ mod tests {
     #[test]
     fn an_empty_template_reproduces_the_mechanical_subject_byte_for_byte() {
         for (added, modified, deleted) in [(3, 1, 1), (0, 2, 0), (1, 0, 0), (0, 0, 0)] {
-            let mechanical = mechanical_subject("tgdrive", added, modified, deleted);
+            let mechanical = mechanical_subject("tgdrive", None, added, modified, deleted);
             assert_eq!(
-                change_subject("", "tgdrive", added, modified, deleted),
+                change_subject("", "tgdrive", None, added, modified, deleted),
                 mechanical
             );
             // Whitespace is not a template either: a field the user tabbed
             // through must not reword every commit.
             assert_eq!(
-                change_subject("  \t ", "tgdrive", added, modified, deleted),
+                change_subject("  \t ", "tgdrive", None, added, modified, deleted),
                 mechanical
             );
         }
+    }
+
+    #[test]
+    fn a_renamed_device_qualifies_the_subject_and_an_un_renamed_one_does_not() {
+        // The requested shape, verbatim.
+        assert_eq!(
+            change_subject("", "tgdrive", Some("hesperia"), 2, 0, 0),
+            "sync(tgdrive@hesperia): 2 added"
+        );
+        // Untouched machines keep the string every existing repository holds.
+        assert_eq!(
+            change_subject("", "tgdrive", None, 2, 0, 0),
+            "sync(tgdrive): 2 added"
+        );
+    }
+
+    #[test]
+    fn a_device_qualifier_exists_only_once_the_label_stops_being_the_hostname() {
+        assert_eq!(device_qualifier("hesperia", "electra"), Some("hesperia"));
+        // Still the default: `Keeper-Device` already records it, so the subject
+        // would only be repeating itself.
+        assert_eq!(device_qualifier("electra", "electra"), None);
+        // macOS reports one host under either casing, and the qualifier must not
+        // blink in and out with it.
+        assert_eq!(device_qualifier("Electra", "electra"), None);
+        assert_eq!(device_qualifier("  electra  ", "electra"), None);
+        // An empty label cannot qualify anything, and `sync(p@)` would be worse
+        // than saying nothing.
+        assert_eq!(device_qualifier("   ", "electra"), None);
+    }
+
+    #[test]
+    fn the_qualifier_reads_the_hostname_out_of_the_provenance_origin() {
+        // `git::commit` derives the qualifier from `Provenance`'s own fields
+        // rather than taking it as an argument, so the subject and the trailers
+        // can never disagree about which machine made a commit. That relies on
+        // `origin` being this host — which every production `Provenance::new`
+        // passes. If `origin` ever becomes the volume label its doc comment
+        // mentions, this is the test that says so, and the qualifier needs a
+        // parameter of its own.
+        let p = Provenance::new("tgdrive", "hesperia", "01J", "electra", SyncSource::Watch);
+        assert_eq!(
+            device_qualifier(&p.device_label, &p.origin),
+            Some("hesperia")
+        );
+
+        let plain = Provenance::new("tgdrive", "electra", "01J", "electra", SyncSource::Watch);
+        assert_eq!(device_qualifier(&plain.device_label, &plain.origin), None);
+    }
+
+    #[test]
+    fn a_template_can_place_the_device_itself_and_gets_nothing_when_unset() {
+        assert_eq!(
+            change_subject(
+                "{profile}@{device}: {changed}",
+                "p",
+                Some("hesperia"),
+                1,
+                0,
+                0
+            ),
+            "p@hesperia: 1"
+        );
+        // Bare substitution, so the template author owns the separator — and an
+        // un-renamed machine leaves a dangling `@` they chose to write.
+        assert_eq!(
+            change_subject("{profile}@{device}: {changed}", "p", None, 1, 0, 0),
+            "p@: 1"
+        );
+        // Which is why `{device}` is a known placeholder: `validate` must accept
+        // it rather than refusing the template outright.
+        assert!(SUBJECT_PLACEHOLDERS.contains(&"device"));
+        assert_eq!(unknown_subject_placeholder("{profile}@{device}"), None);
     }
 
     #[test]
@@ -533,6 +656,7 @@ mod tests {
             change_subject(
                 "{profile}: {changed} files ({added}/{modified}/{deleted})",
                 "tgdrive",
+                None,
                 3,
                 1,
                 1
@@ -550,7 +674,7 @@ mod tests {
             // Padded so the render can never come out empty and fall back to
             // the mechanical subject, which would mask an unwired name.
             let template = format!("x{{{name}}}y");
-            let rendered = change_subject(&template, "p", 1, 2, 3);
+            let rendered = change_subject(&template, "p", None, 1, 2, 3);
             assert_ne!(
                 rendered, template,
                 "{{{name}}} is documented but renders as itself"
@@ -573,7 +697,10 @@ mod tests {
         assert_eq!(unknown_subject_placeholder("{oops}"), Some("oops"));
         // Reachable only by a row that skipped validation; a visible marker is
         // a bug report, a dropped one is a mystery.
-        assert_eq!(change_subject("a {oops} b", "p", 0, 0, 0), "a {oops} b");
+        assert_eq!(
+            change_subject("a {oops} b", "p", None, 0, 0, 0),
+            "a {oops} b"
+        );
     }
 
     #[test]
@@ -584,17 +711,17 @@ mod tests {
                 None,
                 "{template} must not read as a placeholder"
             );
-            assert_eq!(change_subject(template, "p", 0, 0, 0), template);
+            assert_eq!(change_subject(template, "p", None, 0, 0, 0), template);
         }
         // The inner reference still resolves; only the stray brace is literal.
-        assert_eq!(change_subject("{a{profile}", "p", 0, 0, 0), "{ap");
+        assert_eq!(change_subject("{a{profile}", "p", None, 0, 0, 0), "{ap");
     }
 
     #[test]
     fn a_template_cannot_produce_a_second_line() {
         // A subject that ran on would turn its own tail into a commit body, and
         // a value containing a trailer key would land inside the trailer block.
-        let subject = change_subject("one\ntwo\rKeeper-Source: bot", "p", 1, 0, 0);
+        let subject = change_subject("one\ntwo\rKeeper-Source: bot", "p", None, 1, 0, 0);
         assert_eq!(subject.lines().count(), 1);
         assert_eq!(subject, "one two Keeper-Source: bot");
     }
@@ -605,7 +732,7 @@ mod tests {
         // placeholder named after a count is that count, always — anything else
         // would have a template silently reshape itself around the commit.
         assert_eq!(
-            change_subject("{deleted} removed", "p", 1, 0, 0),
+            change_subject("{deleted} removed", "p", None, 1, 0, 0),
             "0 removed"
         );
     }
@@ -616,10 +743,13 @@ mod tests {
         // comes out empty is refused rather than committed. Counts cannot cause
         // this (see above); a profile whose name is all whitespace can.
         assert_eq!(
-            change_subject("{profile}", "  ", 1, 0, 0),
+            change_subject("{profile}", "  ", None, 1, 0, 0),
             "sync(): 1 added"
         );
-        assert_eq!(change_subject("   ", "p", 1, 0, 0), "sync(p): 1 added");
+        assert_eq!(
+            change_subject("   ", "p", None, 1, 0, 0),
+            "sync(p): 1 added"
+        );
     }
 
     #[test]

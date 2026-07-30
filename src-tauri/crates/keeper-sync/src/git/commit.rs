@@ -294,6 +294,10 @@ pub fn stage_and_commit(
     let subject = change_subject(
         &profile.commit_subject_template,
         &profile.name,
+        // Derived from the provenance rather than passed separately: the label
+        // and the hostname are both already on it, so a caller cannot hand the
+        // subject one device and the trailers another.
+        crate::provenance::device_qualifier(&provenance.device_label, &provenance.origin),
         changes.added.len(),
         changes.modified.len(),
         changes.deleted.len(),
@@ -598,6 +602,16 @@ mod tests {
         repo: &gix::Repository,
         files: &[(&str, &str)],
     ) -> Option<gix::hash::ObjectId> {
+        commit_files_with(dir, repo, files, &provenance())
+    }
+
+    /// `commit_files`, for a test that needs to say which device made the commit.
+    fn commit_files_with(
+        dir: &std::path::Path,
+        repo: &gix::Repository,
+        files: &[(&str, &str)],
+        provenance: &Provenance,
+    ) -> Option<gix::hash::ObjectId> {
         let mut changes = StagedChange::default();
         for (name, content) in files {
             let path = dir.join(name);
@@ -610,7 +624,7 @@ mod tests {
         stage_and_commit(
             repo,
             &changes,
-            &provenance(),
+            provenance,
             &profile(),
             &signature(),
             &no_lfs(),
@@ -646,6 +660,33 @@ mod tests {
         let message = commit.message_raw_sloppy().to_string();
         let parsed = Provenance::parse(&message).expect("trailers are present");
         assert_eq!(parsed, provenance());
+        // `provenance()` names the device "work laptop" on a host called
+        // "localhost", which is a renamed machine — so the subject qualifies
+        // itself. That is the whole point of the qualifier, and asserting the
+        // bare `sync(docs)` here would be asserting the bug.
+        assert!(
+            message.starts_with("sync(docs@work laptop): 1 added"),
+            "unexpected subject: {message}"
+        );
+    }
+
+    #[test]
+    fn a_device_still_answering_to_its_hostname_leaves_the_subject_alone() {
+        // The other half of the same rule, end to end: the mechanical subject is
+        // a compatibility surface, and an un-renamed machine must keep writing
+        // the exact string every existing repository already holds.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        let mut prov = provenance();
+        prov.device_label = prov.origin.clone();
+        let id =
+            commit_files_with(dir.path(), &repo, &[("a.txt", "alpha")], &prov).expect("a commit");
+
+        let message = repo
+            .find_commit(id)
+            .expect("find")
+            .message_raw_sloppy()
+            .to_string();
         assert!(
             message.starts_with("sync(docs): 1 added"),
             "unexpected subject: {message}"

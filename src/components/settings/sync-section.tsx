@@ -44,7 +44,14 @@ import type { SyncDeviceVm, SyncOutcomeVm, SyncProfileVm, SyncStatusVm } from "@
 // would be a second source of truth for a value read once per open. Opening a
 // folder is here for the adjacent reason — it changes nothing, so there is no
 // mirrored state for a store action to keep in step.
-import { syncDevice, syncDeviceSetLabel, syncOpenPath } from "@/lib/ipc/client";
+import {
+  type SyncListSettingsVm,
+  syncDevice,
+  syncDeviceSetLabel,
+  syncListSettingsGet,
+  syncListSettingsSet,
+  syncOpenPath,
+} from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import {
   ensureSyncHydrated,
@@ -58,6 +65,7 @@ import {
   useSyncStore,
   verifySyncProfile,
 } from "@/lib/stores/sync";
+import { setSyncListSizes } from "@/lib/stores/sync-detail";
 import { cn } from "@/lib/utils";
 
 /** Section heading. */
@@ -228,6 +236,28 @@ export function SyncFolderPath({
   );
 }
 
+/** List-size copy (the folder cards' Activity / Pending / Problems lists). */
+export const SYNC_LISTS_TITLE = "List length";
+export const SYNC_LISTS_NOTE =
+  "How many rows each folder's Activity, Pending and Problems lists show before you unfold them, and after. The unfolded number is also how much history keeper reads at all, so raising it is what makes older entries reachable.";
+export const SYNC_LISTS_FOLDED_LABEL = "Rows shown";
+export const SYNC_LISTS_UNFOLDED_LABEL = "Rows when unfolded";
+export const SYNC_LISTS_SAVE_LABEL = "Save";
+export const SYNC_LISTS_SAVED_SENTENCE = "Saved. It applies on the next refresh.";
+
+/**
+ * The bounds, mirrored from `keeper-core::registry` for the number inputs' own
+ * spinners and validation.
+ *
+ * Advisory only: Rust clamps on write and returns what it stored, so these
+ * numbers going stale makes the stepper wrong, never the database. That is the
+ * same division the recording settings use.
+ */
+export const SYNC_LIST_FOLDED_MIN = 1;
+export const SYNC_LIST_FOLDED_MAX = 50;
+export const SYNC_LIST_UNFOLDED_MIN = 10;
+export const SYNC_LIST_UNFOLDED_MAX = 1000;
+
 export function SyncSection({ open }: { open: boolean }) {
   const profiles = useSyncStore((state) => state.profiles);
   const statuses = useSyncStore((state) => state.statuses);
@@ -243,6 +273,21 @@ export function SyncSection({ open }: { open: boolean }) {
   const [deviceError, setDeviceError] = useState<string | null>(null);
   /** Whether a rename went through; nothing else on screen would report it. */
   const [deviceRenamed, setDeviceRenamed] = useState(false);
+
+  /**
+   * The list sizes, as text.
+   *
+   * Held as strings rather than numbers so a half-typed field is representable:
+   * with `number` state, clearing the box to retype it becomes `NaN` (or snaps to
+   * 0), and the input fights the user mid-edit. Rust clamps whatever is parsed
+   * and hands back what it stored.
+   */
+  const [lists, setLists] = useState<SyncListSettingsVm | null>(null);
+  const [foldedText, setFoldedText] = useState("");
+  const [unfoldedText, setUnfoldedText] = useState("");
+  const [listsBusy, setListsBusy] = useState(false);
+  const [listsError, setListsError] = useState<string | null>(null);
+  const [listsSaved, setListsSaved] = useState(false);
 
   // Hydrate on open and poll for as long as the dialog stays open; the stop
   // function tears the poll down on close (and on unmount).
@@ -262,6 +307,18 @@ export function SyncSection({ open }: { open: boolean }) {
       } catch (raw) {
         if (live) {
           setDeviceError(syncErrorMessage(raw));
+        }
+      }
+      try {
+        const read = await syncListSettingsGet();
+        if (live) {
+          setLists(read);
+          setFoldedText(String(read.folded));
+          setUnfoldedText(String(read.unfolded));
+        }
+      } catch (raw) {
+        if (live) {
+          setListsError(syncErrorMessage(raw));
         }
       }
     })();
@@ -289,6 +346,52 @@ export function SyncSection({ open }: { open: boolean }) {
       setDeviceBusy(false);
     }
   };
+  const saveLists = async () => {
+    setListsBusy(true);
+    setListsError(null);
+    setListsSaved(false);
+    try {
+      const stored = await syncListSettingsSet({
+        folded: Number(foldedText),
+        unfolded: Number(unfoldedText),
+      });
+      setLists(stored);
+      // Seeded from what was STORED, exactly as the rename above is: Rust clamps,
+      // and a box still showing 9000 would disagree with the database.
+      setFoldedText(String(stored.folded));
+      setUnfoldedText(String(stored.unfolded));
+      // Adopted immediately so the open Sync view folds to the new numbers on its
+      // next poll rather than at the next launch.
+      setSyncListSizes(stored);
+      setListsSaved(true);
+    } catch (raw) {
+      setListsError(syncErrorMessage(raw));
+    } finally {
+      setListsBusy(false);
+    }
+  };
+  /**
+   * Both fields must be whole numbers, and different from what is stored.
+   *
+   * `Number("")` is 0 and `Number("12abc")` is `NaN`, either of which would be
+   * clamped into something the user did not ask for — so the button refuses
+   * rather than silently saving a guess.
+   */
+  const listsDirty = (() => {
+    if (lists === null) {
+      return false;
+    }
+    const folded = Number(foldedText);
+    const unfolded = Number(unfoldedText);
+    if (!Number.isInteger(folded) || !Number.isInteger(unfolded)) {
+      return false;
+    }
+    if (foldedText.trim() === "" || unfoldedText.trim() === "") {
+      return false;
+    }
+    return folded !== lists.folded || unfolded !== lists.unfolded;
+  })();
+
   const renameable =
     device !== null && deviceName.trim() !== "" && deviceName.trim() !== device.label;
 
@@ -356,6 +459,59 @@ export function SyncSection({ open }: { open: boolean }) {
           </p>
         )}
         {device !== null && <p className="text-muted-foreground text-xs">{SYNC_DEVICE_ID_NOTE}</p>}
+      </div>
+      <div className="mt-1 flex flex-col gap-2 border-border border-t pt-3">
+        <p className="font-medium">{SYNC_LISTS_TITLE}</p>
+        <div className="flex items-center justify-between gap-2">
+          <Label htmlFor="sync-list-folded">{SYNC_LISTS_FOLDED_LABEL}</Label>
+          <Input
+            id="sync-list-folded"
+            className="w-24"
+            type="number"
+            inputMode="numeric"
+            min={SYNC_LIST_FOLDED_MIN}
+            max={SYNC_LIST_FOLDED_MAX}
+            value={foldedText}
+            disabled={lists === null || listsBusy}
+            onChange={(event) => {
+              setListsSaved(false);
+              setFoldedText(event.target.value);
+            }}
+          />
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <Label htmlFor="sync-list-unfolded">{SYNC_LISTS_UNFOLDED_LABEL}</Label>
+          <div className="flex items-center gap-1">
+            <Input
+              id="sync-list-unfolded"
+              className="w-24"
+              type="number"
+              inputMode="numeric"
+              min={SYNC_LIST_UNFOLDED_MIN}
+              max={SYNC_LIST_UNFOLDED_MAX}
+              value={unfoldedText}
+              disabled={lists === null || listsBusy}
+              onChange={(event) => {
+                setListsSaved(false);
+                setUnfoldedText(event.target.value);
+              }}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={!listsDirty || listsBusy}
+              onClick={() => {
+                void saveLists();
+              }}
+            >
+              {SYNC_LISTS_SAVE_LABEL}
+            </Button>
+          </div>
+        </div>
+        <p className="text-muted-foreground text-xs">{SYNC_LISTS_NOTE}</p>
+        {listsSaved && <p className="text-muted-foreground text-xs">{SYNC_LISTS_SAVED_SENTENCE}</p>}
+        {listsError !== null && <p className="text-destructive text-xs">{listsError}</p>}
       </div>
     </div>
   );
