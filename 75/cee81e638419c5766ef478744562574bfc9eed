@@ -1,0 +1,19 @@
+src/components/layout/sync-pane.tsx
+  s_29241f23d6ee7e::t_20862343467721 898-905,939,1545-1552
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "75cee81e638419c5766ef478744562574bfc9eed",
+  "prompts": {},
+  "sessions": {
+    "s_29241f23d6ee7e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2a17679b-9653-4738-aa3f-aa90c1886fd7",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
