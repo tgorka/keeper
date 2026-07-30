@@ -264,7 +264,6 @@ pub fn run() {
                     // A stalled main thread must not queue a burst of catch-up
                     // renders afterwards.
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    let mut frame: u8 = 0;
                     loop {
                         tick.tick().await;
                         let snapshot = {
@@ -276,11 +275,13 @@ pub fn run() {
                         // the gap it leaves: `apply_sync_state` returns
                         // immediately while a recording line or error hold is
                         // installed, so the two never fight over one icon.
-                        // `frame` free-runs and wraps; the glyph lookup is
-                        // modulo, so a u8 rollover is a cycle, not a panic.
-                        frame = frame.wrapping_add(1);
+                        //
+                        // The tick still runs at 1 Hz even though no glyph
+                        // animates any more: it is what polls the engine for a
+                        // state change at all, and `apply_sync_state` writes only
+                        // on a transition.
                         let (sync_state, sync_line) = ipc::sync_tray_snapshot(&handle);
-                        tray::apply_sync_state(&handle, sync_state, &sync_line, frame);
+                        tray::apply_sync_state(&handle, sync_state, &sync_line);
                     }
                 });
             }
@@ -537,6 +538,8 @@ pub fn run() {
                 ipc::recording_status,
                 ipc::recording_acknowledge,
                 ipc::recording_settings_get,
+                ipc::sync_list_settings_get,
+                ipc::sync_list_settings_set,
                 ipc::recording_settings_set,
                 ipc::recording_session_summary,
                 ipc::recovered_sessions_list,

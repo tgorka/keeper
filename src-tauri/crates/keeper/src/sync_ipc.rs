@@ -458,7 +458,8 @@ fn phase_str(p: SyncPhase) -> &'static str {
         SyncPhase::Staging => "staging",
         SyncPhase::Committing => "committing",
         SyncPhase::Pushing => "pushing",
-        SyncPhase::TransferringLfs => "transferringLfs",
+        SyncPhase::UploadingLfs => "uploadingLfs",
+        SyncPhase::DownloadingLfs => "downloadingLfs",
         SyncPhase::Verifying => "verifying",
         SyncPhase::Idle => "idle",
     }

@@ -1073,6 +1073,78 @@ pub fn set_recording_duration_cap_minutes(data_dir: &Path, minutes: u16) -> Resu
     )
 }
 
+/// The `settings` keys holding how many rows a folder card's lists show folded
+/// and unfolded.
+///
+/// One pair for every list on the card — Activity, Pending and Problems — rather
+/// than three pairs. A user setting this is answering "how much of this card do I
+/// want to read", not making three independent decisions, and three sliders for
+/// one intent is how a settings pane becomes unusable.
+const SYNC_LIST_FOLDED_KEY: &str = "sync.list_folded";
+const SYNC_LIST_UNFOLDED_KEY: &str = "sync.list_unfolded";
+
+/// Rows shown before the fold when the setting is absent.
+pub const SYNC_LIST_FOLDED_DEFAULT: u32 = 10;
+
+/// Rows shown after unfolding when the setting is absent.
+pub const SYNC_LIST_UNFOLDED_DEFAULT: u32 = 100;
+
+/// Bounds for the folded count. One row is a defensible choice; past a few dozen
+/// the fold has stopped folding anything.
+pub const SYNC_LIST_FOLDED_MIN: u32 = 1;
+pub const SYNC_LIST_FOLDED_MAX: u32 = 50;
+
+/// Bounds for the unfolded count.
+///
+/// The ceiling is a real limit, not a formality: the unfolded count is the
+/// `LIMIT` on the activity query and the length of a list React reconciles on
+/// every 5 s detail poll, so a user who typed 100000 would be asking for a frozen
+/// window rather than a longer list.
+pub const SYNC_LIST_UNFOLDED_MIN: u32 = 10;
+pub const SYNC_LIST_UNFOLDED_MAX: u32 = 1000;
+
+/// Read the folded row count (default 10), clamped defensively on read so a
+/// hand-edited row can never surface out of range.
+pub fn get_sync_list_folded(data_dir: &Path) -> Result<u32, CoreError> {
+    let raw = get_setting(data_dir, SYNC_LIST_FOLDED_KEY)?;
+    let n = raw
+        .as_deref()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(SYNC_LIST_FOLDED_DEFAULT);
+    Ok(n.clamp(SYNC_LIST_FOLDED_MIN, SYNC_LIST_FOLDED_MAX))
+}
+
+/// Read the unfolded row count (default 100), clamped as above.
+///
+/// Never returns less than the folded count: the two settings are independent
+/// rows and nothing stops a user from saving 40 and 20, which would leave an
+/// "unfold" that showed *fewer* rows than the fold it opened.
+pub fn get_sync_list_unfolded(data_dir: &Path) -> Result<u32, CoreError> {
+    let raw = get_setting(data_dir, SYNC_LIST_UNFOLDED_KEY)?;
+    let n = raw
+        .as_deref()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(SYNC_LIST_UNFOLDED_DEFAULT);
+    let folded = get_sync_list_folded(data_dir)?;
+    Ok(n.clamp(SYNC_LIST_UNFOLDED_MIN, SYNC_LIST_UNFOLDED_MAX)
+        .max(folded))
+}
+
+/// Write the folded row count, clamping before it is persisted.
+pub fn set_sync_list_folded(data_dir: &Path, rows: u32) -> Result<(), CoreError> {
+    let clamped = rows.clamp(SYNC_LIST_FOLDED_MIN, SYNC_LIST_FOLDED_MAX);
+    set_setting(data_dir, SYNC_LIST_FOLDED_KEY, &clamped.to_string())
+}
+
+/// Write the unfolded row count, clamping before it is persisted.
+///
+/// The folded-count floor is applied on *read* rather than here, so saving the
+/// two in either order can never leave a stored pair the reader has to distrust.
+pub fn set_sync_list_unfolded(data_dir: &Path, rows: u32) -> Result<(), CoreError> {
+    let clamped = rows.clamp(SYNC_LIST_UNFOLDED_MIN, SYNC_LIST_UNFOLDED_MAX);
+    set_setting(data_dir, SYNC_LIST_UNFOLDED_KEY, &clamped.to_string())
+}
+
 /// The `settings` key holding the user-chosen recording destination folder
 /// (Story 19.5, AD-25). Stored as the raw absolute path string; absent / empty ⇒
 /// no explicit choice — the SHELL resolves the effective default
@@ -2366,6 +2438,56 @@ mod tests {
             get_undo_send_window(&dir).expect("get garbage"),
             UNDO_SEND_WINDOW_DEFAULT
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_list_sizes_default_and_clamp() {
+        let dir = temp_dir();
+        assert_eq!(
+            get_sync_list_folded(&dir).expect("folded default"),
+            SYNC_LIST_FOLDED_DEFAULT
+        );
+        assert_eq!(
+            get_sync_list_unfolded(&dir).expect("unfolded default"),
+            SYNC_LIST_UNFOLDED_DEFAULT
+        );
+
+        set_sync_list_folded(&dir, 25).expect("set 25");
+        set_sync_list_unfolded(&dir, 400).expect("set 400");
+        assert_eq!(get_sync_list_folded(&dir).expect("folded 25"), 25);
+        assert_eq!(get_sync_list_unfolded(&dir).expect("unfolded 400"), 400);
+
+        // Clamp, never reject — the same contract the recording settings use.
+        set_sync_list_folded(&dir, 0).expect("set 0");
+        assert_eq!(
+            get_sync_list_folded(&dir).expect("folded floor"),
+            SYNC_LIST_FOLDED_MIN
+        );
+        set_sync_list_unfolded(&dir, 100_000).expect("set 100000");
+        assert_eq!(
+            get_sync_list_unfolded(&dir).expect("unfolded ceiling"),
+            SYNC_LIST_UNFOLDED_MAX
+        );
+
+        // Garbage falls back to the default rather than to zero rows.
+        set_setting(&dir, SYNC_LIST_FOLDED_KEY, "abc").expect("set garbage");
+        assert_eq!(
+            get_sync_list_folded(&dir).expect("folded garbage"),
+            SYNC_LIST_FOLDED_DEFAULT
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unfold_never_reveals_fewer_rows_than_the_fold_it_opens() {
+        let dir = temp_dir();
+        // Two independent rows, so nothing stops this pair being stored — and an
+        // "unfold" that showed 20 rows where the fold showed 40 would be a
+        // control that visibly does the opposite of its label.
+        set_sync_list_folded(&dir, 40).expect("set folded 40");
+        set_sync_list_unfolded(&dir, 20).expect("set unfolded 20");
+        assert_eq!(get_sync_list_unfolded(&dir).expect("unfolded"), 40);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

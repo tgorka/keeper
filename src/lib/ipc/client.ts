@@ -117,6 +117,7 @@ export type { SyncActivityVm } from "./gen/SyncActivityVm";
 export type { SyncDeviceVm } from "./gen/SyncDeviceVm";
 export type { SyncGitState } from "./gen/SyncGitState";
 export type { SyncGitVm } from "./gen/SyncGitVm";
+export type { SyncListSettingsVm } from "./gen/SyncListSettingsVm";
 export type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
 export type { SyncParkedVm } from "./gen/SyncParkedVm";
 export type { SyncPendingVm } from "./gen/SyncPendingVm";
@@ -177,6 +178,7 @@ import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
 import type { SyncDeviceVm } from "./gen/SyncDeviceVm";
 import type { SyncGitVm } from "./gen/SyncGitVm";
+import type { SyncListSettingsVm } from "./gen/SyncListSettingsVm";
 import type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
 import type { SyncPendingVm } from "./gen/SyncPendingVm";
 import type { SyncProblemsVm } from "./gen/SyncProblemsVm";
@@ -1994,6 +1996,29 @@ export async function recoveredSessionAcknowledge(folder: string): Promise<void>
  */
 export async function recordingSettingsGet(): Promise<RecordingSettingsVm> {
   return await invoke<RecordingSettingsVm>("recording_settings_get");
+}
+
+/**
+ * Read how many rows a folder card's lists show, folded and unfolded.
+ *
+ * Rust defaults (10 / 100) and clamps, and reads `unfolded` as never less than
+ * `folded`, so the resolved VM is always coherent even over a hand-edited row.
+ */
+export async function syncListSettingsGet(): Promise<SyncListSettingsVm> {
+  return await invoke<SyncListSettingsVm>("sync_list_settings_get");
+}
+
+/**
+ * Persist the folder-card list sizes, resolving the EFFECTIVE (clamped) VM.
+ *
+ * Clamp, not reject — the same contract the recording settings use: a number out
+ * of bounds is pulled into range and returned, so the field never sits showing a
+ * value the database does not hold.
+ */
+export async function syncListSettingsSet(
+  settings: SyncListSettingsVm,
+): Promise<SyncListSettingsVm> {
+  return await invoke<SyncListSettingsVm>("sync_list_settings_set", { settings });
 }
 
 /**

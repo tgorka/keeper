@@ -140,11 +140,14 @@ import {
   useSyncStore,
 } from "@/lib/stores/sync";
 import {
+  hydrateSyncListSizes,
   refreshSyncDetail,
   refreshSyncDetailAll,
   retrySyncParked,
+  retrySyncParkedAll,
   startSyncDetailPolling,
   startSyncProgressStream,
+  syncListSizes,
   syncLiveFraction,
   syncLiveRate,
   useSyncDetailStore,
@@ -207,11 +210,111 @@ export const SYNC_CONFLICT_NOTE =
 /** Parked-work copy. */
 export const SYNC_PARKED_TITLE = "Stopped retrying";
 export const SYNC_PARKED_SENTENCE =
-  "keeper stopped retrying these after repeated failures. Retry puts one back in the queue.";
+  "keeper stopped retrying these after repeated failures. Retry puts one back in the queue; Retry all puts back every one listed here.";
 export const SYNC_PARKED_NO_ERROR_SENTENCE = "No error was recorded.";
+
+/**
+ * The fold control's labels.
+ *
+ * "Show all N" and not "Show more": the unfolded size is a fixed setting, so the
+ * button reveals a known quantity and can say so. `{n}` is the count that will be
+ * visible after the press, which for a list longer than the unfolded size is that
+ * size rather than the list's length — the button must not promise rows the query
+ * never asked Rust for.
+ */
+export const SYNC_FOLD_MORE_LABEL = (n: number) => `Show all ${n}`;
+export const SYNC_FOLD_LESS_LABEL = "Show fewer";
+
+/**
+ * How many rows a list shows, and the control to change it.
+ *
+ * Shared by all three lists on the card so one press-and-read habit works
+ * everywhere, and so the folded/unfolded numbers cannot drift apart between them.
+ * Collapsing is per-list state rather than per-card: a long Activity list and a
+ * two-row Problems list have nothing to say to each other about how much of
+ * themselves the user wants to see.
+ */
+function useFold<T>(rows: readonly T[] | null): {
+  visible: readonly T[];
+  hidden: number;
+  expanded: boolean;
+  toggle: () => void;
+  limit: number;
+} {
+  const [expanded, setExpanded] = useState(false);
+  const { folded, unfolded } = syncListSizes();
+  const limit = expanded ? unfolded : folded;
+  // An unread list folds to nothing rather than to `null`: every caller already
+  // branches on its own `rows === null` before reaching the rows, and a nullable
+  // `visible` only moves that check somewhere it has to be repeated.
+  const visible = (rows ?? []).slice(0, limit);
+  return {
+    visible,
+    hidden: (rows?.length ?? 0) - visible.length,
+    expanded,
+    limit,
+    toggle: () => setExpanded((v) => !v),
+  };
+}
+
+/**
+ * The fold control, or nothing when the whole list already fits.
+ *
+ * Rendered below its list rather than beside the heading: it is about the rows,
+ * and the row it sits under is the last one shown — which is where the eye
+ * already is when it runs out of list.
+ */
+function FoldToggle({
+  rows,
+  fold,
+  label,
+}: {
+  rows: readonly unknown[];
+  fold: { hidden: number; expanded: boolean; toggle: () => void; limit: number };
+  label: string;
+}) {
+  // Nothing folded and nothing to fold back: the control would do nothing in
+  // either direction.
+  if (fold.hidden === 0 && !fold.expanded) {
+    return null;
+  }
+  // Capped at the list's own length: unfolding cannot reveal rows Rust was never
+  // asked for, so "Show all 100" over a 12-row list would be a promise the query
+  // cannot keep.
+  const text = fold.expanded
+    ? SYNC_FOLD_LESS_LABEL
+    : SYNC_FOLD_MORE_LABEL(Math.min(rows.length, syncListSizes().unfolded));
+  return (
+    <button
+      type="button"
+      onClick={fold.toggle}
+      // A link-weight control, not a Button: it changes how much of a list is on
+      // screen, which is not an action on the folder and must not carry the same
+      // visual weight as Retry or Sync now.
+      className="self-start text-muted-foreground text-xs underline decoration-dotted hover:text-foreground"
+      // Named for its list: three folds on one card would otherwise be three
+      // buttons a screen reader calls the same thing.
+      aria-label={`${text}: ${label}`}
+    >
+      {text}
+    </button>
+  );
+}
 
 /** The parked-unit action label. */
 export const SYNC_RETRY_LABEL = "Retry";
+
+/**
+ * The bulk action, offered only when there is more than one parked unit — beside
+ * a single row it would be a second button that does exactly what the first one
+ * does.
+ *
+ * "Retry all" and not "Retry everything": what it requeues is this folder's
+ * parked units, and a folder card is the only place it appears. The count is in
+ * the accessible name rather than the visible label, because the list it sits
+ * above already shows how many there are to anyone who can see it.
+ */
+export const SYNC_RETRY_ALL_LABEL = "Retry all";
 
 /**
  * Delivery copy. The label names what is behind an Activity row's delivery
@@ -547,7 +650,15 @@ export function SyncPane() {
   // poll, the modest per-profile detail poll, and the progress stream that is
   // the only sub-second source of in-flight counters.
   useEffect(() => {
-    void ensureSyncHydrated().then(refreshSyncDetailAll);
+    // The row counts come first, because `unfolded` is the `LIMIT` the activity
+    // read runs with: hydrating after the first read would fetch the fallback
+    // 100 and then quietly disagree with the saved setting until the next poll.
+    // A failure is not worth surfacing — the fallbacks match the Rust defaults,
+    // so the lists render correctly either way.
+    void hydrateSyncListSizes()
+      .catch(() => {})
+      .then(ensureSyncHydrated)
+      .then(refreshSyncDetailAll);
     const stopStatuses = startSyncStatusPolling();
     const stopDetail = startSyncDetailPolling();
     const stopProgress = startSyncProgressStream();
@@ -719,6 +830,18 @@ function SyncProfileCard({
   const retryUnit = (unitId: number) => {
     void run(async () => {
       await retrySyncParked(profile.id, unitId);
+    });
+  };
+
+  /**
+   * Put every parked unit back in the queue, under the same busy lock one Retry
+   * takes. The ids are passed in from the rendered list rather than re-read
+   * here, so what the click requeues is what the user was looking at — a unit
+   * that parked between the render and the click is left for the next press.
+   */
+  const retryAllUnits = (unitIds: readonly number[]) => {
+    void run(async () => {
+      await retrySyncParkedAll(profile.id, unitIds);
     });
   };
 
@@ -929,6 +1052,7 @@ function SyncProfileCard({
           problems={detail?.problems ?? null}
           busy={busy}
           onRetry={retryUnit}
+          onRetryAll={retryAllUnits}
         />
       </CardContent>
       {/* The Settings row's confirmation, verbatim: same title, same sentence,
@@ -972,6 +1096,7 @@ function SyncActivityList({
   busy: boolean;
   onRetry: (unitId: number) => void;
 }) {
+  const fold = useFold(rows);
   return (
     <div className="flex flex-col gap-2">
       {/* The project's group-label treatment (the Bridges / Approvals panes and
@@ -989,7 +1114,7 @@ function SyncActivityList({
           aria-label={`${SYNC_ACTIVITY_TITLE}: ${profile.name}`}
           className="flex flex-col gap-1.5"
         >
-          {rows.map((row) => {
+          {fold.visible.map((row) => {
             const kind = ACTIVITY_KINDS[row.kind] ?? {
               icon: FileIcon,
               word: row.kind,
@@ -1021,6 +1146,9 @@ function SyncActivityList({
             );
           })}
         </ul>
+      )}
+      {rows !== null && rows.length > 0 && (
+        <FoldToggle rows={rows} fold={fold} label={`${SYNC_ACTIVITY_TITLE}: ${profile.name}`} />
       )}
     </div>
   );
@@ -1142,6 +1270,7 @@ function SyncPendingList({
   rows: SyncPendingVm[] | null;
 }) {
   const settling = rows?.some((row) => row.reason === "settling");
+  const fold = useFold(rows);
   return (
     <div className="flex flex-col gap-2">
       <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
@@ -1157,7 +1286,7 @@ function SyncPendingList({
             aria-label={`${SYNC_PENDING_TITLE}: ${profile.name}`}
             className="flex flex-col gap-1.5"
           >
-            {rows.map((row) => (
+            {fold.visible.map((row) => (
               <li key={`${row.reason}-${row.path}`} className="flex items-center gap-3">
                 <span className="min-w-0 flex-1 truncate font-mono text-xs" title={row.path}>
                   {row.path}
@@ -1168,6 +1297,7 @@ function SyncPendingList({
               </li>
             ))}
           </ul>
+          <FoldToggle rows={rows} fold={fold} label={`${SYNC_PENDING_TITLE}: ${profile.name}`} />
           {settling && <p className="text-muted-foreground text-xs">{SYNC_SETTLING_NOTE}</p>}
         </>
       )}
@@ -1187,12 +1317,17 @@ function SyncProblemsSection({
   problems,
   busy,
   onRetry,
+  onRetryAll,
 }: {
   profile: SyncProfileVm;
   problems: SyncProblemsVm | null;
   busy: boolean;
   onRetry: (unitId: number) => void;
+  onRetryAll: (unitIds: readonly number[]) => void;
 }) {
+  // Called before the early return below, because a hook must be. `useFold`
+  // takes `null` for exactly this reason.
+  const parkedFold = useFold(problems?.parked ?? null);
   if (
     problems === null ||
     (problems.error === null &&
@@ -1242,10 +1377,30 @@ function SyncProblemsSection({
       )}
       {problems.parked.length > 0 && (
         <div className="flex flex-col gap-1.5">
-          <h3 className="font-medium text-xs">{SYNC_PARKED_TITLE}</h3>
+          {/* The bulk action sits on the heading, not in the list: it acts on the
+              whole group, and a row carrying it would read as another per-unit
+              Retry. Above the sentence that explains what Retry does, so the
+              explanation covers both buttons rather than trailing the one it
+              does not mention. */}
+          <div className="flex items-start justify-between gap-3">
+            <h3 className="font-medium text-xs">{SYNC_PARKED_TITLE}</h3>
+            {problems.parked.length > 1 && (
+              <Button
+                type="button"
+                variant="outline"
+                size="xs"
+                className="shrink-0"
+                disabled={busy}
+                aria-label={`${SYNC_RETRY_ALL_LABEL}: ${problems.parked.length} ${SYNC_PARKED_TITLE.toLowerCase()}, ${profile.name}`}
+                onClick={() => onRetryAll(problems.parked.map((unit) => unit.id))}
+              >
+                {SYNC_RETRY_ALL_LABEL}
+              </Button>
+            )}
+          </div>
           <p className="text-muted-foreground text-xs">{SYNC_PARKED_SENTENCE}</p>
           <ul aria-label={`${SYNC_PARKED_TITLE}: ${profile.name}`} className="flex flex-col gap-2">
-            {problems.parked.map((unit) => {
+            {parkedFold.visible.map((unit) => {
               const summary = syncParkedSummary(unit);
               return (
                 <li key={unit.id} className="flex items-start justify-between gap-3">
@@ -1273,6 +1428,11 @@ function SyncProblemsSection({
               );
             })}
           </ul>
+          <FoldToggle
+            rows={problems.parked}
+            fold={parkedFold}
+            label={`${SYNC_PARKED_TITLE}: ${profile.name}`}
+          />
         </div>
       )}
     </div>

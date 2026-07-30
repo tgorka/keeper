@@ -17,9 +17,9 @@
  *    (recorded in epic-21-context.md, and re-asserted by AD-51).
  *  - The existing glyphs are 44x44 RGBA8. A test in `tray.rs` asserts every
  *    state icon decodes at identical dimensions, so the output size is fixed.
- *  - The four `sync-N` frames are advanced by the tray's existing ~1 Hz tick.
- *    A rotating gap reads as motion at 1 fps where a pulse or a fade would just
- *    look like flicker.
+ *  - State must be legible at the retina downscale to ~22 px, which is the
+ *    binding constraint on every size below: a mark whose stroke lands under
+ *    ~1.5 px merges into its neighbours and stops carrying information.
  *
  * Run: bun run scripts/gen-tray-sync-icons.ts
  */
@@ -196,6 +196,224 @@ function union(...shapes: Coverage[]): Coverage {
   return (x, y) => shapes.some((s) => s(x, y));
 }
 
+// ---------------------------------------------------------------------------
+// Where the direction / refresh mark goes.
+//
+// `corner` is the requested design: bottom-RIGHT, outside the bubble. That
+// quadrant is genuinely free — the outline stops at x=38,y=30 and the tail hangs
+// off the bottom-*left* — so the mark collides with nothing and needs no notch
+// punched out of the brand shape. Every number below is measured off the shipped
+// glyph's alpha map, not guessed.
+//
+// `interior` is the same marks drawn centred in the bubble, where the existing
+// state glyphs live.
+//
+// The trade is legibility, and it is not close. A menu bar renders these at
+// ~22 px, so the free corner region is about 6 px across and an arrow inside it
+// lands near 3 px — under the ~1.5 px stroke floor this file already warns about
+// twice, and in a 22 px downscale the three corner marks are hard to tell apart.
+// Centred, the same arrows get ~12x8 px and read cleanly. Both sets are kept
+// because that is a product call, not a technical one: flip `PLACEMENT` and
+// re-run. Renders of both are attached to the PR that introduced this.
+// ---------------------------------------------------------------------------
+
+type Placement = "corner" | "interior";
+
+/** The shipped placement. See the trade-off note above before changing it. */
+const PLACEMENT: Placement = "corner";
+
+/**
+ * Geometry per placement. The corner set is scaled down because the free region
+ * is smaller, not because the marks want to be — which is the whole legibility
+ * problem in one comment.
+ */
+const GEOMETRY = {
+  corner: {
+    cx: 34.2,
+    cy: 37.2,
+    // No notch: the mark sits clear of the outline rather than biting into it.
+    // An earlier revision punched a moat here and ate the bubble's whole bottom
+    // edge, which read as damage rather than as a badge.
+    notch: 0,
+    arrowHalfH: 4.8,
+    stemHalfW: 0.9,
+    headHalfW: 2.3,
+    headH: 3.1,
+    pairDx: 2.9,
+    refreshR: 4.0,
+    refreshHeadLen: 2.6,
+    refreshHeadHalfW: 1.5,
+  },
+  interior: {
+    cx: CENTER_X,
+    cy: CENTER_Y,
+    notch: 0,
+    arrowHalfH: 6.6,
+    stemHalfW: 1.15,
+    headHalfW: 3.4,
+    headH: 3.6,
+    pairDx: 3.9,
+    refreshR: 5.2,
+    refreshHeadLen: 3.3,
+    refreshHeadHalfW: 1.9,
+  },
+} as const satisfies Record<Placement, unknown>;
+
+const G = GEOMETRY[PLACEMENT];
+
+const BADGE_CX = G.cx;
+const BADGE_CY = G.cy;
+
+/**
+ * Transparent moat between the mark and the bubble outline, when the mark
+ * overlaps it at all.
+ *
+ * Zero for both shipped placements — `corner` clears the outline by geometry and
+ * `interior` draws inside an interior `clearInterior` has already emptied. Kept
+ * because a placement that *does* overlap needs it: without a moat the two
+ * shapes merge into one blob at menu-bar size, the same failure `clearInterior`
+ * exists to prevent.
+ */
+const NOTCH_R = G.notch;
+
+/** Punch the badge's moat out of the base glyph. */
+function clearDisc(base: Rgba, cx: number, cy: number, r: number): Rgba {
+  const out = new Uint8Array(base);
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      if (Math.hypot(x - cx, y - cy) <= r) {
+        out[(y * SIZE + x) * BYTES_PER_PIXEL + 3] = 0;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Isosceles triangle from three vertices, for arrow heads.
+ *
+ * Half-plane sign test rather than barycentric coordinates: the vertices are
+ * authored counter-clockwise in screen space, so all three cross products share
+ * a sign for an interior point.
+ */
+function triangle(
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  cx: number,
+  cy: number,
+): Coverage {
+  const side = (px: number, py: number, x1: number, y1: number, x2: number, y2: number) =>
+    (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1);
+  return (x, y) => {
+    const s1 = side(x, y, ax, ay, bx, by);
+    const s2 = side(x, y, bx, by, cx, cy);
+    const s3 = side(x, y, cx, cy, ax, ay);
+    return (s1 >= 0 && s2 >= 0 && s3 >= 0) || (s1 <= 0 && s2 <= 0 && s3 <= 0);
+  };
+}
+
+/** Arrow geometry, sized so a pair still separates at menu-bar scale. */
+const ARROW_HALF_H = G.arrowHalfH;
+const ARROW_STEM_HALF_W = G.stemHalfW;
+const ARROW_HEAD_HALF_W = G.headHalfW;
+const ARROW_HEAD_H = G.headH;
+
+/** Horizontal offset of each arrow in the two-arrow (both-directions) badge. */
+const ARROW_PAIR_DX = G.pairDx;
+
+/**
+ * Vertical arrow: a stem from the tail to the head's base, plus the head.
+ *
+ * `dir` is -1 for up (screen +y points down), +1 for down. The stem deliberately
+ * stops where the head begins — running it on to the tip fattens the point and
+ * costs the arrow its direction at 22 px.
+ */
+function arrow(cx: number, cy: number, dir: -1 | 1): Coverage {
+  const tailY = cy - dir * ARROW_HALF_H;
+  const tipY = cy + dir * ARROW_HALF_H;
+  const headBaseY = tipY - dir * ARROW_HEAD_H;
+  return union(
+    bar(cx, (tailY + headBaseY) / 2, ARROW_STEM_HALF_W, Math.abs(headBaseY - tailY) / 2),
+    triangle(cx, tipY, cx - ARROW_HEAD_HALF_W, headBaseY, cx + ARROW_HEAD_HALF_W, headBaseY),
+  );
+}
+
+/** Radius of the refresh mark's two arcs. */
+const REFRESH_R = G.refreshR;
+
+/**
+ * A tangential arrow head sitting at one end of an arc.
+ *
+ * The base is the arc's radial cross-section at `angleDeg` and the tip runs
+ * along the tangent, which is what makes the head read as continuing the curve
+ * rather than as a blob stuck to it. `sign` picks which way round: +1 follows
+ * increasing angle.
+ *
+ * Screen +y points down, so the radial unit vector negates y and the tangent is
+ * its derivative in that same flipped frame.
+ */
+function arcHead(angleDeg: number, r: number, sign: -1 | 1): Coverage {
+  const a = (angleDeg * Math.PI) / 180;
+  const px = BADGE_CX + Math.cos(a) * r;
+  const py = BADGE_CY - Math.sin(a) * r;
+  const tx = -Math.sin(a) * sign;
+  const ty = -Math.cos(a) * sign;
+  const nx = Math.cos(a);
+  const ny = -Math.sin(a);
+  return triangle(
+    px + tx * REFRESH_HEAD_LEN,
+    py + ty * REFRESH_HEAD_LEN,
+    px + nx * REFRESH_HEAD_HALF_W,
+    py + ny * REFRESH_HEAD_HALF_W,
+    px - nx * REFRESH_HEAD_HALF_W,
+    py - ny * REFRESH_HEAD_HALF_W,
+  );
+}
+
+/**
+ * Head geometry for the refresh mark.
+ *
+ * Deliberately wider than the arc stroke: a head flush with the stroke leaves a
+ * plain ring, and a plain ring is exactly the *armed* glyph. The two states have
+ * to differ by silhouette, so the heads must visibly protrude.
+ */
+const REFRESH_HEAD_LEN = G.refreshHeadLen;
+const REFRESH_HEAD_HALF_W = G.refreshHeadHalfW;
+
+/**
+ * Circular-arrow refresh mark: two arcs, each ending in a tangential head, so
+ * the mark reads as a cycle in motion.
+ *
+ * Two arcs and not one: a single gapped ring is what the *armed* glyph already
+ * is, and the two must not share a silhouette. The heads are what carry that
+ * difference, which is why they are sized against the armed ring rather than
+ * against the arc they terminate.
+ */
+function refreshBadge(): Coverage {
+  const strokeHalf = STROKE / 2 + 0.15;
+  const shell =
+    (from: number, to: number): Coverage =>
+    (x, y) => {
+      const dx = x - BADGE_CX;
+      const dy = y - BADGE_CY;
+      if (Math.abs(Math.hypot(dx, dy) - REFRESH_R) > strokeHalf) return false;
+      let deg = (Math.atan2(-dy, dx) * 180) / Math.PI;
+      if (deg < 0) deg += 360;
+      return from <= to ? deg >= from && deg <= to : deg >= from || deg <= to;
+    };
+  // Two arcs a half turn apart, each stopping short so its head has somewhere
+  // to go. The gaps sit left and right rather than top and bottom: a horizontal
+  // break is what distinguishes this from the armed ring's single top gap.
+  return union(
+    shell(30, 150),
+    arcHead(150, REFRESH_R, 1),
+    shell(210, 330),
+    arcHead(330, REFRESH_R, 1),
+  );
+}
+
 /**
  * Composite a mark onto a copy of the base glyph.
  *
@@ -254,17 +472,51 @@ function head(angleDeg: number): Coverage {
 
 const GAP_SWEEP = 70;
 
-const variants: Array<{ name: string; mark: Coverage }> = [
+/**
+ * The badge states, drawn on a base whose bottom-right corner is notched out.
+ *
+ * These four replaced the four rotating `sync-N` frames. The frames animated a
+ * ring gap a quarter turn per tick, which said "something is happening" and
+ * nothing about *what* — so a 40 GB upload and a directory scan were the same
+ * picture. A direction reads off the badge with no animation at all, which is
+ * also why the tray no longer needs a frame counter.
+ */
+const badged = NOTCH_R > 0 ? clearDisc(base, BADGE_CX, BADGE_CY, NOTCH_R) : base;
+
+const variants: Array<{ name: string; mark: Coverage; on?: Rgba }> = [
   // Armed: a complete cycle, static — sync is configured and healthy.
   { name: "tray-sync-template", mark: union(arc(90, GAP_SWEEP), head(90), head(270)) },
-  // Four activity frames. The gap walks a quarter turn per tick, so the ring
-  // reads as spinning even at the tray's 1 Hz refresh.
-  ...[0, 1, 2, 3].map((i) => ({
-    name: `tray-sync-${i + 1}-template`,
-    mark: union(arc(i * 90, GAP_SWEEP), head(i * 90)),
-  })),
+  // Uploading: one arrow up. The bubble interior stays empty, so the badge is
+  // the only mark and reads without competition.
+  {
+    name: "tray-sync-up-template",
+    mark: arrow(BADGE_CX, BADGE_CY, -1),
+    on: badged,
+  },
+  // Downloading: the same arrow, mirrored.
+  {
+    name: "tray-sync-down-template",
+    mark: arrow(BADGE_CX, BADGE_CY, 1),
+    on: badged,
+  },
+  // Both at once: two arrows side by side, the universal transfer glyph. Up on
+  // the left so the pair reads in the same order as the words.
+  {
+    name: "tray-sync-updown-template",
+    mark: union(
+      arrow(BADGE_CX - ARROW_PAIR_DX, BADGE_CY, -1),
+      arrow(BADGE_CX + ARROW_PAIR_DX, BADGE_CY, 1),
+    ),
+    on: badged,
+  },
+  // Working with nothing on the wire: circular arrows, the refresh glyph.
+  {
+    name: "tray-sync-refresh-template",
+    mark: refreshBadge(),
+    on: badged,
+  },
   // Paused / media absent: two bars. Unambiguous at 44 px and shares no
-  // silhouette with the activity frames.
+  // silhouette with the badge states.
   {
     name: "tray-sync-paused-template",
     mark: union(bar(CENTER_X - 2.6, CENTER_Y, 1.1, 4.4), bar(CENTER_X + 2.6, CENTER_Y, 1.1, 4.4)),
@@ -281,8 +533,8 @@ const variants: Array<{ name: string; mark: Coverage }> = [
   },
 ];
 
-for (const { name, mark } of variants) {
-  const png = encodePng(SIZE, SIZE, withMark(base, mark));
+for (const { name, mark, on } of variants) {
+  const png = encodePng(SIZE, SIZE, withMark(on ?? base, mark));
   writeFileSync(`${ICON_DIR}/${name}.png`, png);
   console.log(`${name}.png  ${png.length} B`);
 }
