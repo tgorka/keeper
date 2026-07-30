@@ -10,6 +10,11 @@
  * progress, the row actions), then Activity, Pending, and a Problems section
  * that exists only while something is wrong.
  *
+ * Every Activity row also says how far that file got toward the remote, and a
+ * row that did not get there can be asked why. Until then the failure text
+ * existed only in the Problems section below, which names the unit of work and
+ * never the file — so nothing on screen connected the two.
+ *
  * Everything this view can do about the folder in front of you, it does here
  * rather than sending you to Settings for it: adding a folder, editing one,
  * and removing one. The two configuration modes go through the shared
@@ -48,7 +53,17 @@
  * at all, never a disabled one.
  */
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
-import { CircleMinus, CirclePlus, FileIcon, SquarePen, TriangleAlert } from "lucide-react";
+import {
+  CircleAlert,
+  CircleCheck,
+  CircleDashed,
+  CircleMinus,
+  CirclePlus,
+  CircleSlash,
+  FileIcon,
+  SquarePen,
+  TriangleAlert,
+} from "lucide-react";
 import { type ReactNode, useEffect, useId, useState } from "react";
 import {
   SYNC_NOW_LABEL,
@@ -80,6 +95,14 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
+import {
+  Popover,
+  PopoverContent,
+  PopoverDescription,
+  PopoverHeader,
+  PopoverTitle,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
@@ -191,6 +214,16 @@ export const SYNC_PARKED_NO_ERROR_SENTENCE = "No error was recorded.";
 export const SYNC_RETRY_LABEL = "Retry";
 
 /**
+ * Delivery copy. The label names what is behind an Activity row's delivery
+ * glyph, because the glyph says what state the file is in but not that there
+ * is anything to read about it; the sentence answers the question a `failed`
+ * row otherwise raises — why it has no Retry when the parked list's rows do.
+ */
+export const SYNC_DELIVERY_DETAIL_LABEL = "What happened to this file";
+export const SYNC_DELIVERY_RETRYING_SENTENCE =
+  "keeper is still retrying this one on its own, so there is nothing to press yet. If it gives up, this is where the Retry appears.";
+
+/**
  * The coarse state word shown beside the Rust-composed line. Keys mirror the
  * Rust `SyncStatusVm.state` values; an unrecognized state renders as itself
  * rather than as nothing, so a state added in Rust is visible before it is
@@ -221,6 +254,32 @@ const ACTIVITY_KINDS: Record<string, { icon: typeof FileIcon; word: string; tone
   modified: { icon: SquarePen, word: "Changed", tone: "text-muted-foreground" },
   deleted: { icon: CircleMinus, word: "Deleted", tone: "text-muted-foreground" },
   conflict: { icon: TriangleAlert, word: "Conflict copy", tone: "text-destructive" },
+};
+
+/**
+ * The icon, its tone and the screen-reader word for how far a file got toward
+ * the remote.
+ *
+ * The kind glyph at the other end of the row says what happened on this disk;
+ * this one says whether the remote ever heard about it. Success is muted on
+ * purpose — it is what nearly every row is, and a column of ticks in green
+ * would bury the one row that needs a reader. Only the two failures carry
+ * colour, and `abandoned` is worded with the Problems section's own title
+ * because it is the same fact about the same unit of work, not a second one.
+ *
+ * `unknown` is deliberately absent, and so is any value Rust adds before this
+ * record knows it: a row with no accountable unit of work has no delivery fact
+ * to report, and a glyph would invent one. Such a row renders nothing at all —
+ * not a placeholder, not a gap held open.
+ */
+export const SYNC_DELIVERY_STATES: Record<
+  string,
+  { icon: typeof FileIcon; word: string; tone: string }
+> = {
+  success: { icon: CircleCheck, word: "Reached the remote", tone: "text-muted-foreground" },
+  inProgress: { icon: CircleDashed, word: "On its way", tone: "text-muted-foreground" },
+  failed: { icon: CircleAlert, word: "Failed, still retrying", tone: "text-destructive" },
+  abandoned: { icon: CircleSlash, word: SYNC_PARKED_TITLE, tone: "text-destructive" },
 };
 
 /** Why a file is waiting, for every reason except `settling` (which is timed). */
@@ -649,6 +708,20 @@ function SyncProfileCard({
     }
   };
 
+  /**
+   * Put one parked unit of work back in the queue.
+   *
+   * Shared by the two surfaces that offer it — the Problems section's own list
+   * and the Activity row whose file that unit was carrying — so one click
+   * cannot take the busy lock and re-read the lists while the other does
+   * neither.
+   */
+  const retryUnit = (unitId: number) => {
+    void run(async () => {
+      await retrySyncParked(profile.id, unitId);
+    });
+  };
+
   const active = status !== undefined && isSyncStatusActive(status);
   const fraction = syncLiveFraction(status, progress);
   const percent = fraction === null ? null : Math.round(fraction * 100);
@@ -844,17 +917,18 @@ function SyncProfileCard({
             onCancel={() => setEditing(false)}
           />
         )}
-        <SyncActivityList profile={profile} rows={detail?.activity ?? null} />
+        <SyncActivityList
+          profile={profile}
+          rows={detail?.activity ?? null}
+          busy={busy}
+          onRetry={retryUnit}
+        />
         <SyncPendingList profile={profile} rows={detail?.pending ?? null} />
         <SyncProblemsSection
           profile={profile}
           problems={detail?.problems ?? null}
           busy={busy}
-          onRetry={(unitId) => {
-            void run(async () => {
-              await retrySyncParked(profile.id, unitId);
-            });
-          }}
+          onRetry={retryUnit}
         />
       </CardContent>
       {/* The Settings row's confirmation, verbatim: same title, same sentence,
@@ -890,9 +964,13 @@ function SyncProfileCard({
 function SyncActivityList({
   profile,
   rows,
+  busy,
+  onRetry,
 }: {
   profile: SyncProfileVm;
   rows: SyncActivityVm[] | null;
+  busy: boolean;
+  onRetry: (unitId: number) => void;
 }) {
   return (
     <div className="flex flex-col gap-2">
@@ -938,12 +1016,120 @@ function SyncActivityList({
                 <span className="shrink-0 text-muted-foreground text-xs">
                   {formatDraftAge(row.tsMs)}
                 </span>
+                <SyncDeliveryMark row={row} busy={busy} onRetry={onRetry} />
               </li>
             );
           })}
         </ul>
       )}
     </div>
+  );
+}
+
+/**
+ * How far one file got toward the remote: the glyph that ends its Activity
+ * row, and — when something went wrong carrying it — the popover that says
+ * what.
+ *
+ * A popover rather than a line under the row because the failure is an engine
+ * message of no fixed length, and one of those beneath every failing row would
+ * push the answer to "what has synced lately" off the card. It is worth the
+ * click: before it, a reader who wanted to know why a file had not arrived had
+ * only the Problems section far below, which reports the unit of work and
+ * never the path, so the two halves of the answer could not be put together on
+ * screen at all.
+ *
+ * A row with nothing recorded against it stays a plain icon rather than an
+ * empty trigger. A control that opens nothing claims there is something to
+ * read, and a list where most rows are fine would be mostly that claim.
+ */
+function SyncDeliveryMark({
+  row,
+  busy,
+  onRetry,
+}: {
+  row: SyncActivityVm;
+  busy: boolean;
+  onRetry: (unitId: number) => void;
+}) {
+  const state = SYNC_DELIVERY_STATES[row.delivery];
+  // `unknown`, and anything Rust grows later: no glyph at all, for the reason
+  // {@link SYNC_DELIVERY_STATES} gives.
+  if (state === undefined) {
+    return null;
+  }
+  // Read out as a local because the guard on it has to hold inside a callback:
+  // only an abandoned unit is a human's to restart, and only one keeper still
+  // remembers has an id to name.
+  const unitId = row.unitId;
+  const Icon = state.icon;
+  // The state rides an icon on screen and a word to a screen reader, exactly as
+  // the kind glyph at the other end of the row does.
+  const glyph = (
+    <>
+      <Icon aria-hidden="true" className={`size-3.5 shrink-0 ${state.tone}`} />
+      <span className="sr-only">{state.word}</span>
+    </>
+  );
+  if (row.failure === null) {
+    return glyph;
+  }
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        {/* Named the way the folder-path button is named: what the glyph shows
+            is a state, which does not say that activating it explains the
+            state — so the accessible name carries that, and the path, because
+            a card holds as many of these as it holds rows. */}
+        <button
+          type="button"
+          aria-label={`${SYNC_DELIVERY_DETAIL_LABEL}: ${row.path}`}
+          className="flex shrink-0 items-center rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {glyph}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="gap-2">
+        <PopoverHeader>
+          {/* The row truncates the path to fit beside the figures; this is the
+              one place it has room to be read whole. */}
+          <PopoverTitle className="font-mono text-xs [overflow-wrap:anywhere]">
+            {row.path}
+          </PopoverTitle>
+          <PopoverDescription className="text-xs">{state.word}</PopoverDescription>
+        </PopoverHeader>
+        {/* Verbatim: this is the one string here keeper did not write, and a
+            reworded git or LFS message is one nobody can search for.
+
+            Toned by the state rather than always destructive, because this line
+            is not always a failure. A push held until its own large files reach
+            the remote is `inProgress` and carries the reason it is waiting —
+            "publishing is on hold until…" — which in red would accuse keeper of
+            breaking while it is in fact doing the careful thing. That is the
+            same mistake the engine used to make by reporting every deferred
+            unit as a missing drive. */}
+        <p className={`font-mono text-xs [overflow-wrap:anywhere] ${state.tone}`}>{row.failure}</p>
+        {/* No Retry for a failed row: keeper has not stopped, and a button
+            saying otherwise would invite a click that changes nothing. */}
+        {row.delivery === "failed" && (
+          <p className="text-muted-foreground text-xs">{SYNC_DELIVERY_RETRYING_SENTENCE}</p>
+        )}
+        {row.delivery === "abandoned" && unitId !== null && (
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            className="self-start"
+            disabled={busy}
+            aria-label={`${SYNC_RETRY_LABEL}: ${row.path}`}
+            onClick={() => onRetry(unitId)}
+          >
+            {SYNC_RETRY_LABEL}
+          </Button>
+        )}
+      </PopoverContent>
+    </Popover>
   );
 }
 

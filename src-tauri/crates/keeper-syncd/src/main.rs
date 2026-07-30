@@ -55,6 +55,17 @@ async fn main() -> ExitCode {
     let config_path = cli.config.clone().unwrap_or_else(|| platform.config_path());
     let config = config::load(&config_path);
 
+    // `[daemon] gitPath` reaches the platform here rather than at construction
+    // because the platform must exist before the config can be read at all (the
+    // log path comes from it). A broken config leaves resolution automatic,
+    // which is what makes `doctor` still work on a box whose config is wrong.
+    let platform = platform.with_git_path(
+        config
+            .as_ref()
+            .ok()
+            .and_then(|config| config.daemon.git_path.clone()),
+    );
+
     let configured_level = config
         .as_ref()
         .ok()

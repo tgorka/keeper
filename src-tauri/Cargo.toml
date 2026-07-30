@@ -191,3 +191,10 @@ toml = "0.9"
 # no new crate to the tree. MIT (http-body) / MIT (bytes).
 http-body = "1"
 bytes = "1"
+# HTTP Basic credentials for the LFS endpoints (Story 34.15). git-lfs takes the
+# access token as a plain `Authorization: Basic base64("<token>:")`, and unlike
+# `git` there is no credential helper in the way to encode it for us. Already
+# resolved in the lock as a dependency of both gix-transport and reqwest, so a
+# direct dep pulls no new crate version. MIT OR Apache-2.0 — passes
+# `cargo deny check`.
+base64 = "0.22"

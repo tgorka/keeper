@@ -115,6 +115,8 @@ export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 export type { SpaceVm } from "./gen/SpaceVm";
 export type { SyncActivityVm } from "./gen/SyncActivityVm";
 export type { SyncDeviceVm } from "./gen/SyncDeviceVm";
+export type { SyncGitState } from "./gen/SyncGitState";
+export type { SyncGitVm } from "./gen/SyncGitVm";
 export type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
 export type { SyncParkedVm } from "./gen/SyncParkedVm";
 export type { SyncPendingVm } from "./gen/SyncPendingVm";
@@ -174,6 +176,7 @@ import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
 import type { SyncDeviceVm } from "./gen/SyncDeviceVm";
+import type { SyncGitVm } from "./gen/SyncGitVm";
 import type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
 import type { SyncPendingVm } from "./gen/SyncPendingVm";
 import type { SyncProblemsVm } from "./gen/SyncProblemsVm";
@@ -2596,6 +2599,34 @@ export async function syncProblems(id: string): Promise<SyncProblemsVm> {
  */
 export async function syncRetryParked(id: string, unitId: number): Promise<void> {
   await invoke<void>("sync_retry_parked", { id, unitId });
+}
+
+/**
+ * Which `git` folder sync resolved, or why there isn't one (Story 34.14).
+ *
+ * Answers on exactly the machines where the engine will not open, which is the
+ * point: it resolves without opening one. `state` is `ok` precisely when
+ * `CapabilitiesVm.sync` is true, so this is also the explanation for a missing
+ * Sync section rather than a second opinion about it.
+ *
+ * Never rejects for want of a git -- an absent one is a `state`, not an error.
+ */
+export async function syncGitStatus(): Promise<SyncGitVm> {
+  return await invoke<SyncGitVm>("sync_git_status");
+}
+
+/**
+ * Name the `git` binary folder sync should use, and get the new report back.
+ *
+ * An empty string clears the setting and returns to searching `PATH`. The
+ * returned {@link SyncGitVm} reflects the path that is now in force, including
+ * when it was rejected -- a field that cleared itself on a bad value would be a
+ * silent fallback to automatic, which is the defect this exists to end.
+ *
+ * Rejects with: `unsupported` (no folder sync in this build), `internal`.
+ */
+export async function syncGitPathSet(path: string): Promise<SyncGitVm> {
+  return await invoke<SyncGitVm>("sync_git_path_set", { path });
 }
 
 /**

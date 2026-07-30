@@ -30,9 +30,6 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use keeper_sync::engine::Engine;
-use keeper_sync::git::cli as git_cli;
-use keeper_sync::lfs::pointer::{Pointer, MAX_POINTER_BYTES};
-use keeper_sync::lfs::store::LfsStore;
 use keeper_sync::profile::LfsMode;
 use keeper_sync::progress::status_line;
 use keeper_sync::provenance::SyncSource;
@@ -136,8 +133,19 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         SyncError::GitCommand { .. }
         | SyncError::Network { .. }
         | SyncError::Auth { .. }
+        // Beside `Auth`, which is its sibling: both are a credential the remote
+        // would not act on, and the remedies differ only in which thing a human
+        // has to change.
+        | SyncError::Forbidden { .. }
         | SyncError::InvalidPathForRemote { .. }
         | SyncError::MediaAbsent
+        // A one-shot run that ends here published nothing, because `sync_once`
+        // drains the uploads BEFORE the push leg — so reaching this means the
+        // objects genuinely could not be transferred, which is a failed pass and
+        // worth a `Restart=on-failure`. Inside the supervisor the same condition
+        // is not a failure at all; it defers the push and the next upload to land
+        // releases it.
+        | SyncError::LfsUploadPending { .. }
         | SyncError::Integrity { .. }
         | SyncError::Quota { .. }
         | SyncError::Diverged { .. }
@@ -1212,53 +1220,52 @@ fn cmd_doctor(
     Ok(())
 }
 
-/// Returns the `GitMissing` reason when git is absent, so `doctor` can exit 3.
+/// Returns the refusal when no usable git was found, so `doctor` can exit 3.
+///
+/// One resolution rather than resolve-then-probe: the resolution already probed
+/// every candidate it tried, so asking again would spawn a second `git
+/// --version` to learn what it just learned — and could, on a machine where the
+/// binary is being replaced under us, report a different version than the one
+/// the engine will actually drive.
+///
+/// The OK line also names what was *rejected*, when anything was. That is the
+/// whole point on a box with several gits: "using /opt/homebrew/bin/git" without
+/// "skipped /usr/local/bin/git, which is 2.23" leaves an operator wondering why
+/// their `git --version` disagrees with the daemon's.
 fn check_git(platform: &LinuxPlatform, checks: &mut Vec<Check>) -> Option<String> {
-    let program = match platform.git_program() {
-        Ok(program) => program,
-        Err(SyncError::GitMissing { reason }) => {
-            checks.push(Check::new("git", CheckStatus::Fail, reason.clone()));
-            return Some(reason);
-        }
-        Err(err) => {
-            checks.push(Check::new("git", CheckStatus::Fail, err.to_string()));
-            return Some(err.to_string());
-        }
-    };
-    match git_cli::probe(&program) {
-        Ok(caps) if caps.meets_floor() => {
-            checks.push(Check::new(
-                "git",
-                CheckStatus::Ok,
-                format!(
-                    "{} {}.{} (clears the {}.{} floor)",
-                    program.display(),
-                    caps.major,
-                    caps.minor,
-                    git_cli::MIN_GIT_MAJOR,
-                    git_cli::MIN_GIT_MINOR
-                ),
-            ));
+    let resolution = platform.git_resolution();
+    match resolution.summary() {
+        Some(summary) => {
+            let detail = if resolution.rejected().is_empty() {
+                summary
+            } else {
+                format!("{summary}; skipped {}", rejected_list(&resolution))
+            };
+            checks.push(Check::new("git", CheckStatus::Ok, detail));
             None
         }
-        Ok(caps) => {
-            let detail = format!(
-                "{} is {}.{}, below the {}.{} floor; cone sparse-checkout and the \
-                 ls-files format this engine depends on are unreliable before then — upgrade git",
-                program.display(),
-                caps.major,
-                caps.minor,
-                git_cli::MIN_GIT_MAJOR,
-                git_cli::MIN_GIT_MINOR
-            );
-            checks.push(Check::new("git", CheckStatus::Fail, detail.clone()));
-            Some(detail)
-        }
-        Err(err) => {
-            checks.push(Check::new("git", CheckStatus::Fail, err.to_string()));
-            Some(err.to_string())
+        None => {
+            let refusal = resolution.refusal();
+            checks.push(Check::new("git", CheckStatus::Fail, refusal.clone()));
+            Some(refusal)
         }
     }
+}
+
+/// `<path> (<why>)`, comma-separated, for the candidates that were passed over.
+fn rejected_list(resolution: &keeper_sync::GitResolution) -> String {
+    resolution
+        .rejected()
+        .iter()
+        .map(|rejection| {
+            format!(
+                "{} ({})",
+                rejection.program.display(),
+                rejection.cause.describe()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn check_paths(profiles: &[SyncProfile], checks: &mut Vec<Check>) {
@@ -1616,74 +1623,20 @@ fn cmd_update(printer: &Printer, check_only: bool) -> Result<(), CliError> {
 /// never a status message — because git treats everything it emits as file
 /// content.
 ///
-/// Both directions stream in bounded chunks. A multi-gigabyte smudge must never
-/// be buffered, which is the entire reason LFS exists here (AD-46).
+/// The work itself is [`keeper_sync::lfs::filter`], not a copy of it. The engine
+/// registers whichever executable is running as the filter, so the app binary has
+/// to answer this too (DW-121) — and a filter with one implementation per binary
+/// is how the two would come to disagree about what a pointer means.
 fn cmd_lfs_filter(direction: LfsDirection) -> Result<(), CliError> {
-    use std::io::{Read, Write};
+    use keeper_sync::lfs::filter;
 
-    let (repo, smudging) = match &direction {
-        LfsDirection::Clean { repo, .. } => (repo.clone(), false),
-        LfsDirection::Smudge { repo, .. } => (repo.clone(), true),
+    let (repo, which) = match &direction {
+        LfsDirection::Clean { repo, .. } => (repo.clone(), filter::Direction::Clean),
+        LfsDirection::Smudge { repo, .. } => (repo.clone(), filter::Direction::Smudge),
     };
-    let store = LfsStore::in_git_dir(repo.join(".git"));
-    store.ensure_layout()?;
-
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let mut input = stdin.lock();
-    let mut output = stdout.lock();
-
-    if smudging {
-        // The pointer is under 1 KiB by specification, so reading it whole is
-        // bounded. Anything larger is not a pointer and passes straight
-        // through — the same tolerance git-lfs shows.
-        let mut buffer = Vec::with_capacity(MAX_POINTER_BYTES);
-        // `take` by mutable reference: the lock must stay usable for the
-        // pass-through branch below, which streams the remainder.
-        Read::by_ref(&mut input)
-            .take(MAX_POINTER_BYTES as u64 + 1)
-            .read_to_end(&mut buffer)
-            .map_err(|err| SyncError::io("read smudge input", &repo, err))?;
-
-        let resolved = Pointer::parse(&buffer)
-            .filter(|p| store.contains(&p.oid, p.size))
-            .map(|p| store.object_path(&p.oid));
-
-        match resolved {
-            Some(path) => {
-                let mut object = std::fs::File::open(&path)
-                    .map_err(|err| SyncError::io("open lfs object", &path, err))?;
-                std::io::copy(&mut object, &mut output)
-                    .map_err(|err| SyncError::io("stream lfs object", &path, err))?;
-            }
-            // Not a pointer, or an object we do not hold yet. Passing the bytes
-            // through unchanged is what git-lfs does, and it keeps a partial
-            // fetch usable instead of failing the checkout.
-            None => {
-                output
-                    .write_all(&buffer)
-                    .map_err(|err| SyncError::io("pass through pointer", &repo, err))?;
-                std::io::copy(&mut input, &mut output)
-                    .map_err(|err| SyncError::io("pass through remainder", &repo, err))?;
-            }
-        }
-        output
-            .flush()
-            .map_err(|err| SyncError::io("flush smudge output", &repo, err))?;
-        return Ok(());
-    }
-
-    // Clean: worktree bytes in, pointer out. The content is hashed straight
-    // into the object store as it streams, so the object is already present by
-    // the time the pointer is emitted.
-    let (oid, size) = store.insert_streaming(&mut input)?;
-    let pointer = Pointer::new(oid, size);
-    output
-        .write_all(pointer.render().as_bytes())
-        .map_err(|err| SyncError::io("write pointer", &repo, err))?;
-    output
-        .flush()
-        .map_err(|err| SyncError::io("flush clean output", &repo, err))?;
+    filter::run(&repo, which, &mut stdin.lock(), &mut stdout.lock())?;
     Ok(())
 }
 
@@ -1912,6 +1865,18 @@ mod tests {
                 },
                 EXIT_FAILURE,
             ),
+            // The two variants Story 34.15 added. The wildcard-free `match`
+            // above only proves they COMPILE; a wrapper script branches on the
+            // classification, and `LfsUploadPending => EXIT_OK` would report a
+            // successful `keeper-syncd sync` for a one-shot run that published
+            // nothing — the outcome that arm's own comment argues against.
+            (
+                SyncError::Forbidden {
+                    host: "example.com".to_owned(),
+                },
+                EXIT_FAILURE,
+            ),
+            (SyncError::LfsUploadPending { objects: 2 }, EXIT_FAILURE),
             (
                 SyncError::InvalidPathForRemote {
                     path: PathBuf::from("/srv/aux"),

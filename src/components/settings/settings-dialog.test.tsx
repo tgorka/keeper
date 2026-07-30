@@ -89,6 +89,20 @@ vi.mock("@/lib/ipc/client", () => ({
   syncProfileSetEnabled: vi.fn(),
   syncFolderNow: vi.fn(),
   syncVerify: vi.fn(),
+  // The git report (Story 34.14) renders BESIDE the `sync` gate, so it mounts on
+  // every desktop tier including one with sync off. `unsupported` is the default
+  // here because that is the one state which renders nothing, leaving every
+  // pre-existing assertion in this file untouched; the cases that care opt in.
+  syncGitStatus: vi.fn(() =>
+    Promise.resolve({
+      state: "unsupported",
+      summary: null,
+      problem: null,
+      configuredPath: null,
+    }),
+  ),
+  syncGitPathSet: vi.fn(),
+  capabilities: vi.fn(),
 }));
 
 // The About section (mounted by the dialog) imports the updater/process plugins
@@ -119,6 +133,7 @@ import {
   NO_BACKGROUND_SYNC_SENTENCE,
 } from "@/components/settings/no-background-sync-disclosure";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
+import { SYNC_GIT_TITLE } from "@/components/settings/sync-git-row";
 import { SYNC_SECTION_SENTENCE, SYNC_SECTION_TITLE } from "@/components/settings/sync-section";
 import type { AccountVm } from "@/lib/ipc/client";
 import {
@@ -139,6 +154,7 @@ import {
   recordingHotkeySet,
   setHonorRemoteDeletions,
   setUndoSendWindow,
+  syncGitStatus,
   syncProfiles,
   undoSendWindow,
 } from "@/lib/ipc/client";
@@ -168,6 +184,7 @@ const mockPermissionState = vi.mocked(notificationPermissionState);
 const mockOpenAppSettings = vi.mocked(iosOpenAppSettings);
 const mockBadgeModeSet = vi.mocked(dockBadgeModeSet);
 const mockSyncProfiles = vi.mocked(syncProfiles);
+const mockGitStatus = vi.mocked(syncGitStatus);
 
 const DEFAULT_HOTKEY_VM: HotkeyVm = {
   accelerator: "Control+Alt+Space",
@@ -211,63 +228,86 @@ function account(id: string): AccountVm {
   };
 }
 
+/**
+ * File-scoped rather than nested inside `describe("SettingsDialog")`, so that a
+ * sibling `describe` in this file is self-sufficient instead of luck-sufficient.
+ *
+ * The placement describe at the bottom inherited none of this and leaned on the
+ * `vi.mock` factory defaults surviving every test above it — which held only
+ * because `vitest.config.ts` sets no `mockReset`, and because no test above it
+ * happened to leave a resolved value behind. `vi.clearAllMocks()` clears calls,
+ * not implementations, so a `mockResolvedValue` set in one of these tests leaks
+ * into every test after it, in every describe.
+ */
+beforeEach(() => {
+  mockPosture.mockClear();
+  mockHonorGet.mockClear();
+  mockHonorSet.mockClear();
+  mockHonorGet.mockResolvedValue(false);
+  mockHonorSet.mockResolvedValue(undefined);
+  mockUndoGet.mockClear();
+  mockUndoSet.mockClear();
+  mockUndoGet.mockResolvedValue(10);
+  mockUndoSet.mockResolvedValue(undefined);
+  mockHotkeyGet.mockClear();
+  mockHotkeySet.mockClear();
+  mockHotkeyGet.mockResolvedValue(DEFAULT_HOTKEY_VM);
+  mockHotkeySet.mockResolvedValue(DEFAULT_HOTKEY_VM);
+  mockRecordingHotkeyGet.mockClear();
+  mockRecordingHotkeySet.mockClear();
+  mockRecordingHotkeyClear.mockClear();
+  mockRecordingHotkeyGet.mockResolvedValue(UNSET_RECORDING_HOTKEY_VM);
+  mockRecordingHotkeySet.mockResolvedValue({
+    accelerator: "Control+Alt+R",
+    isDefault: false,
+    active: true,
+    conflict: null,
+  });
+  mockRecordingHotkeyClear.mockResolvedValue(UNSET_RECORDING_HOTKEY_VM);
+  mockNotifyGet.mockClear();
+  mockNotifySet.mockClear();
+  mockNotifyGet.mockResolvedValue(true);
+  mockNotifySet.mockResolvedValue(undefined);
+  mockPermissionState.mockClear();
+  mockPermissionState.mockResolvedValue("granted");
+  mockOpenAppSettings.mockClear();
+  mockOpenAppSettings.mockResolvedValue(undefined);
+  mockBadgeModeSet.mockClear();
+  mockBadgeModeSet.mockResolvedValue(undefined);
+  mockGitStatus.mockClear();
+  // Pinned here rather than left to the `vi.mock` factory: `unsupported` is the
+  // one state the git row renders nothing for, which is what keeps every
+  // assertion in `describe("SettingsDialog")` untouched by it. The placement
+  // describe overrides this, and overriding a default that is re-established
+  // every test is a decision; overriding one that merely survived is a guess.
+  mockGitStatus.mockResolvedValue({
+    state: "unsupported",
+    summary: null,
+    problem: null,
+    configuredPath: null,
+  });
+  accountsStore.getState().clear();
+  encryptionStatusStore.getState().reset();
+  keyBackupStore.getState().reset();
+  verificationStore.setState({ flow: null, modalOpen: false, activeAccountId: null });
+  wizardStore.setState({ active: false, dismissed: false, step: "welcome", accountId: null });
+  // Default the mirror to the desktop tier so the capability-gated surfaces (the
+  // Shortcuts section, the Launch-at-login / Keep-in-menu-bar rows) render for the
+  // existing assertions; the reduced-platform cases opt in explicitly.
+  capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
+});
+
+afterEach(() => {
+  vi.clearAllMocks();
+  accountsStore.getState().clear();
+  encryptionStatusStore.getState().reset();
+  keyBackupStore.getState().reset();
+  verificationStore.setState({ flow: null, modalOpen: false, activeAccountId: null });
+  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  resetSyncStoreForTest();
+});
+
 describe("SettingsDialog", () => {
-  beforeEach(() => {
-    mockPosture.mockClear();
-    mockHonorGet.mockClear();
-    mockHonorSet.mockClear();
-    mockHonorGet.mockResolvedValue(false);
-    mockHonorSet.mockResolvedValue(undefined);
-    mockUndoGet.mockClear();
-    mockUndoSet.mockClear();
-    mockUndoGet.mockResolvedValue(10);
-    mockUndoSet.mockResolvedValue(undefined);
-    mockHotkeyGet.mockClear();
-    mockHotkeySet.mockClear();
-    mockHotkeyGet.mockResolvedValue(DEFAULT_HOTKEY_VM);
-    mockHotkeySet.mockResolvedValue(DEFAULT_HOTKEY_VM);
-    mockRecordingHotkeyGet.mockClear();
-    mockRecordingHotkeySet.mockClear();
-    mockRecordingHotkeyClear.mockClear();
-    mockRecordingHotkeyGet.mockResolvedValue(UNSET_RECORDING_HOTKEY_VM);
-    mockRecordingHotkeySet.mockResolvedValue({
-      accelerator: "Control+Alt+R",
-      isDefault: false,
-      active: true,
-      conflict: null,
-    });
-    mockRecordingHotkeyClear.mockResolvedValue(UNSET_RECORDING_HOTKEY_VM);
-    mockNotifyGet.mockClear();
-    mockNotifySet.mockClear();
-    mockNotifyGet.mockResolvedValue(true);
-    mockNotifySet.mockResolvedValue(undefined);
-    mockPermissionState.mockClear();
-    mockPermissionState.mockResolvedValue("granted");
-    mockOpenAppSettings.mockClear();
-    mockOpenAppSettings.mockResolvedValue(undefined);
-    mockBadgeModeSet.mockClear();
-    mockBadgeModeSet.mockResolvedValue(undefined);
-    accountsStore.getState().clear();
-    encryptionStatusStore.getState().reset();
-    keyBackupStore.getState().reset();
-    verificationStore.setState({ flow: null, modalOpen: false, activeAccountId: null });
-    wizardStore.setState({ active: false, dismissed: false, step: "welcome", accountId: null });
-    // Default the mirror to the desktop tier so the capability-gated surfaces (the
-    // Shortcuts section, the Launch-at-login / Keep-in-menu-bar rows) render for the
-    // existing assertions; the reduced-platform cases opt in explicitly.
-    capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
-  });
-
-  afterEach(() => {
-    vi.clearAllMocks();
-    accountsStore.getState().clear();
-    encryptionStatusStore.getState().reset();
-    keyBackupStore.getState().reset();
-    verificationStore.setState({ flow: null, modalOpen: false, activeAccountId: null });
-    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
-    resetSyncStoreForTest();
-  });
-
   it("shows the honest archive.db/keeper.db + FileVault copy when open", async () => {
     mockPosture.mockResolvedValue(false);
     render(<SettingsDialog open onOpenChange={() => {}} />);
@@ -842,5 +882,55 @@ describe("SettingsDialog", () => {
     expect(await screen.findByText(SYNC_SECTION_TITLE)).toBeInTheDocument();
     expect(screen.getByText(SYNC_SECTION_SENTENCE)).toBeInTheDocument();
     await waitFor(() => expect(mockSyncProfiles).toHaveBeenCalled());
+  });
+});
+
+/**
+ * The placement, which is the whole decision in DW-122 and the one thing a unit
+ * test of the component in isolation cannot check.
+ *
+ * `capabilities.sync` IS "a usable git was found", so the Sync section is absent
+ * on exactly the machines the report exists for. Putting the report inside that
+ * section would make it unreachable precisely when it is the only thing worth
+ * reading, and nothing else in this suite would notice.
+ *
+ * A sibling of `describe("SettingsDialog")` rather than a case inside it,
+ * because it asserts what that describe's own tests take for granted. That is
+ * why the mock and store hooks above are file-scoped: this block inherits the
+ * same baseline every other test gets, and its `beforeEach` below overrides one
+ * pinned value rather than depending on which value happened to survive.
+ */
+describe("SettingsDialog git report placement", () => {
+  beforeEach(() => {
+    // Overrides the file-scoped `unsupported`, which renders nothing: a report
+    // that renders nothing cannot demonstrate where it renders.
+    mockGitStatus.mockResolvedValue({
+      state: "tooOld",
+      summary: null,
+      problem: "/usr/local/bin/git is 2.23, below the 2.42 floor",
+      configuredPath: null,
+    });
+  });
+
+  it("renders the git report with the sync capability OFF, where the Sync section is not", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(SYNC_GIT_TITLE)).toBeInTheDocument();
+    expect(
+      screen.getByText("/usr/local/bin/git is 2.23, below the 2.42 floor"),
+    ).toBeInTheDocument();
+    // The section it explains the absence of is genuinely absent.
+    expect(screen.queryByText(SYNC_SECTION_TITLE)).not.toBeInTheDocument();
+  });
+
+  it("renders it with the capability ON too, so a pinned path can still be cleared", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_CAPABILITIES, sync: true });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(SYNC_GIT_TITLE)).toBeInTheDocument();
+    expect(screen.getByText(SYNC_SECTION_TITLE)).toBeInTheDocument();
   });
 });

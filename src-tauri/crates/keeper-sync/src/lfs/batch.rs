@@ -304,9 +304,9 @@ impl ObjectError {
 pub enum BatchAction {
     /// 2xx — read the body.
     Proceed,
-    /// 401 — refresh credentials and retry exactly once. `challenge` is the
-    /// `LFS-Authenticate` value, which mirrors `WWW-Authenticate` under a
-    /// custom key so browsers do not raise a password prompt.
+    /// 401 — refresh credentials and retry exactly once. `challenge` is
+    /// whichever authentication challenge the server sent; see
+    /// [`auth_challenge`] for why that is two header names and not one.
     Reauthenticate { challenge: Option<String> },
     /// 413 with a "too many objects" body — halve the batch and retry.
     HalveBatch,
@@ -331,9 +331,12 @@ pub fn classify_status(
         401 => BatchAction::Reauthenticate {
             challenge: challenge.map(str::to_owned),
         },
-        // Read access but not write. Only a human can grant the scope, and a
-        // fine-grained Forgejo PAT must carry repo scope explicitly.
-        403 => BatchAction::Fail(SyncError::Auth {
+        // Read access but not write. The token itself was accepted — that is
+        // what separates this from the 401 above — so the remedy is a scope,
+        // not a new token, and `Forbidden` is what says so. Only a human can
+        // grant it, and a fine-grained Forgejo PAT must carry repo scope
+        // explicitly.
+        403 => BatchAction::Fail(SyncError::Forbidden {
             host: host.to_owned(),
         }),
         // Ambiguous by design: Forgejo answers 404 both when `LFS_START_SERVER`
@@ -428,9 +431,10 @@ pub fn sensitive_auth(auth: &str, host: &str) -> Result<HeaderValue> {
 /// Supplies a fresh `Authorization` header value after a 401.
 ///
 /// Matches the crate's sink convention (`Box<dyn Fn(..) + Send + Sync>`, see
-/// [`crate::progress::ProgressSink`]). The argument is the `LFS-Authenticate`
-/// challenge; `None` back means "no fresh credential", which turns the 401
-/// into [`SyncError::Auth`] rather than a retry storm against a git host.
+/// [`crate::progress::ProgressSink`]). The argument is the challenge
+/// [`auth_challenge`] read off the rejection; `None` back means "no fresh
+/// credential", which turns the 401 into [`SyncError::Auth`] rather than a
+/// retry storm against a git host.
 pub type AuthRefresh = Box<dyn Fn(Option<&str>) -> Option<String> + Send + Sync>;
 
 /// A client for one repository's batch endpoint.
@@ -577,7 +581,7 @@ impl BatchClient {
                 .map_err(|err| self.network_error(&err))?;
 
             let status = response.status().as_u16();
-            let challenge = header_string(response.headers(), "lfs-authenticate");
+            let challenge = auth_challenge(response.headers());
             let retry_after = header_string(response.headers(), "retry-after");
             // Bounded, not `text()`: a batch answer is metadata (tens of
             // kilobytes for 100 objects), and an unbounded read of a broken or
@@ -699,6 +703,25 @@ pub(crate) fn transport_reason(err: &reqwest::Error) -> &'static str {
 /// `AsHeaderName`; header lookup is case-insensitive either way.
 pub(crate) fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
     headers.get(name)?.to_str().ok().map(str::to_owned)
+}
+
+/// The authentication challenge a rejected LFS response carries, under
+/// whichever of the two header names the server chose.
+///
+/// `LFS-Authenticate` is git-lfs's own: it mirrors `WWW-Authenticate` under a
+/// custom key so a browser hitting the endpoint does not raise a password
+/// prompt. It is **optional**, and Forgejo does not send it — `services/lfs/
+/// server.go` answers a rejected batch with a plain
+/// `WWW-Authenticate: Basic realm="gitea-lfs"`. Reading only the LFS spelling
+/// meant the challenge was always `None` against the one server this engine
+/// exists to talk to, so the whole re-authentication path was unreachable
+/// there (Story 34.15).
+///
+/// The LFS-specific header still wins when both are present: a server that
+/// bothers to send it is being explicit about what the *LFS* endpoint wants.
+pub(crate) fn auth_challenge(headers: &HeaderMap) -> Option<String> {
+    header_string(headers, "lfs-authenticate")
+        .or_else(|| header_string(headers, "www-authenticate"))
 }
 
 /// Read at most `max` bytes of a response body, lossily, as UTF-8.
@@ -981,8 +1004,7 @@ mod tests {
         assert!(matches!(classify(200, ""), BatchAction::Proceed));
 
         match classify_status(401, host, Some("Basic realm=gitea-lfs"), None, "") {
-            // The challenge mirrors `WWW-Authenticate` under a custom key, and
-            // the re-auth path needs it to pick the credential scheme.
+            // The challenge is what the re-auth path reads to pick a scheme.
             BatchAction::Reauthenticate { challenge } => {
                 assert_eq!(challenge.as_deref(), Some("Basic realm=gitea-lfs"));
             }
@@ -990,7 +1012,9 @@ mod tests {
         }
 
         for (status, code) in [
-            (403u16, "auth"),
+            // 403 is not 401: the token was accepted and then refused, and the
+            // two must not read as the same sentence to the person holding it.
+            (403u16, "forbidden"),
             (404, "config"),
             (406, "config"),
             (415, "config"),
@@ -1048,6 +1072,39 @@ mod tests {
         assert_eq!(retry_after_delay(None), DEFAULT_RETRY_AFTER);
         // A hostile or broken value must not park the daemon indefinitely.
         assert_eq!(retry_after_delay(Some("999999999")), MAX_RETRY_AFTER);
+    }
+
+    /// The header the recovery path reads — which was the one header Forgejo
+    /// never sends.
+    #[test]
+    fn a_challenge_is_read_from_either_header_name() {
+        let mut headers = HeaderMap::new();
+
+        // No challenge at all is the terse-server case, not a malformed one.
+        assert_eq!(auth_challenge(&headers), None);
+
+        // What Forgejo actually answers a rejected batch with. Reading only
+        // `LFS-Authenticate` left this invisible, so the re-auth path could
+        // never fire against the one server this engine targets.
+        headers.insert(
+            "www-authenticate",
+            HeaderValue::from_static("Basic realm=\"gitea-lfs\",charset=\"UTF-8\""),
+        );
+        assert_eq!(
+            auth_challenge(&headers).as_deref(),
+            Some("Basic realm=\"gitea-lfs\",charset=\"UTF-8\"")
+        );
+
+        // A server that sends the LFS-specific one is being explicit about the
+        // LFS endpoint, so it wins.
+        headers.insert(
+            "lfs-authenticate",
+            HeaderValue::from_static("Basic realm=\"lfs\""),
+        );
+        assert_eq!(
+            auth_challenge(&headers).as_deref(),
+            Some("Basic realm=\"lfs\"")
+        );
     }
 
     #[tokio::test]

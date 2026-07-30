@@ -51,6 +51,50 @@ static QUIT_CONFIRMED: AtomicBool = AtomicBool::new(false);
 #[cfg(desktop)]
 static QUIT_CONFIRM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// Serve a `lfs clean|smudge` invocation and exit, if that is what this process
+/// was started for (DW-121).
+///
+/// `Engine::open` registers `filter.lfs.clean`/`smudge` as
+/// `std::env::current_exe()`, which in a desktop run is **this** binary. Until
+/// now only `keeper-syncd` could answer, so every filter invocation from the app
+/// failed — silently, because keeper sets `filter.lfs.required=false` on purpose
+/// and git cannot tell a filter that failed from one that was never there. The
+/// visible symptom was LFS-tracked files reading as permanently modified under
+/// plain `git`, differently on macOS and Linux.
+///
+/// Called first, before the Tauri builder exists, and returns `false` for every
+/// ordinary launch. Two rules make that safe: the parse demands `lfs` as the very
+/// first argument (Finder passes none, older macOS passes `-psn_…`), and nothing
+/// here writes to stdout except object bytes, because git reads stdout as content.
+///
+/// Desktop-only, like the `keeper-sync` dependency itself: an iOS build has no
+/// folder sync and therefore no filter to be.
+#[cfg(desktop)]
+fn served_as_lfs_filter() -> bool {
+    use keeper_sync::lfs::filter;
+
+    // Skipping argv[0]: the parse wants the verb first, and argv[0] is the path
+    // git invoked us by.
+    let Some((direction, repo)) = filter::parse_args(std::env::args().skip(1)) else {
+        return false;
+    };
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    if let Err(err) = filter::run(&repo, direction, &mut stdin.lock(), &mut stdout.lock()) {
+        // stderr, never stdout. git shows this in `GIT_TRACE` and on a required
+        // filter's failure, and it is the only channel that is not content.
+        eprintln!("keeper: lfs filter failed: {err}");
+        std::process::exit(1);
+    }
+    true
+}
+
+/// The iOS shell links no sync engine, so it can never be a git filter.
+#[cfg(not(desktop))]
+fn served_as_lfs_filter() -> bool {
+    false
+}
+
 /// Application entry point. Registers the plugin set and the typed IPC command
 /// surface, then runs the Tauri event loop.
 ///
@@ -59,8 +103,14 @@ static QUIT_CONFIRM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// iOS shell registers only notification, deep-link, dialog, opener, the
 /// `keeper-media://` protocol, and the IPC `invoke_handler`. The sequential
 /// `builder` rebinding below preserves the exact desktop registration order.
+///
+/// A `lfs clean|smudge` invocation is served and returns before any of that: git
+/// starts this binary as a filter, and a filter must not open a window.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if served_as_lfs_filter() {
+        return;
+    }
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -320,6 +370,12 @@ pub fn run() {
                 $($extra,)*
                 ipc::app_ping,
                 ipc::capabilities,
+                // Registered on every platform, unlike the rest of the sync
+                // surface: the report is what tells a desktop user their `git`
+                // is unusable, and a phone gets `unsupported` rather than an
+                // `invoke` rejection the frontend would have to special-case.
+                ipc::sync_git_status,
+                ipc::sync_git_path_set,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,

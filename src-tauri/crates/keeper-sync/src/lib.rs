@@ -37,6 +37,7 @@
 
 pub mod backoff;
 pub mod copy;
+pub mod credential;
 pub mod db;
 pub mod engine;
 pub mod error;
@@ -54,11 +55,13 @@ pub mod watch;
 pub use copy::{
     copy_verified, CopyEntry, CopyOptions, CopyOutcome, CopyProgress, CopyReport, CopySink,
 };
-pub use db::{ActivityKind, ActivityRow};
+pub use credential::AccessToken;
+pub use db::{ActivityEntry, ActivityKind, ActivityRow, DeliveryState};
 pub use engine::{
     Engine, ParkedUnit, PendingFile, PendingReason, ProblemReport, SyncOutcome, VerifyReport,
 };
 pub use error::{Result, SyncError};
+pub use git::resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};
 pub use platform::SyncPlatform;
 pub use profile::{ProfileState, SyncDirection, SyncLane, SyncProfile};
 pub use progress::{SyncPhase, SyncProgress, SyncStatus};

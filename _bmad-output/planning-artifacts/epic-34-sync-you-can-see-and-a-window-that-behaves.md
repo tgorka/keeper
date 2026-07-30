@@ -339,6 +339,67 @@ outside `do_push` (`engine.rs:1384-1386`) so a pull-only or push-nothing sync st
 it succeeded. Acceptance: clicking Sync now always produces a visible statement of what happened,
 and `git log` on a manually synced folder shows `Keeper-Source: manual`.
 
+### The tail: 34.11 – 34.19
+
+These nine were not planned here. The ten stories above came out of the field report; the tail came
+out of *running* the result — a defect investigation (the 96-minute CI hang, DW-120), a live-server
+probe against the field forge, and a second field report of large files that never arrived. They
+shipped before this file mentioned them, which is a traceability defect in its own right: the
+epic → story → spec chain broke here, at the epic, and there was nothing for epic-34's
+`in-progress → done` transition or its retrospective to close against.
+
+They are recorded here rather than re-derived. **The definition of record for each is its spec**, in
+`_bmad-output/implementation-artifacts/`, written after the code from the commits, the ledger and the
+evidence as it stood before each fix — four of the six by the implementer of the code they describe,
+which is the bias DW-123 names and a reviewer should read them as carrying. Acceptance for these nine
+lives in those specs, not in a line here.
+
+**34.11 — A kill during a ref update must not strand a folder.**
+`git/repo.rs` — `release_stale_ref_locks` (defined `:202`, called from the repository open at `:73`)
+clears a `.git/refs/**/*.lock` left by a SIGKILL before gitoxide can trip over it. The cause is
+upstream: `gix-ref`'s failed-lock error-message fixup never advances its cursor past the root edit,
+so a failed lock on a deref'd child ref is an infinite 100%-CPU loop rather than an error — which is
+what the 96-minute CI hang on the durability sweep was. Removing the trigger is keeper's whole side;
+the upstream loop stays open as DW-120, with a nextest `terminate-after` guard bounding a recurrence
+to four minutes. Spec: `spec-34-11-a-kill-during-a-ref-update-must-not-strand-a-folder.md`.
+
+**34.12 — The access token arrives in the field.** The credential a profile stores has to reach
+every consumer that needs it, in the shape that consumer wants. Spec:
+`spec-34-12-the-access-token-arrives-in-the-field.md`.
+
+**34.13 — The index can recognise its own LFS pointers.** `lfs/stage.rs` — `indexed_pointer`
+(`:197`): a racily-clean LFS entry must not read as modified because the index holds a pointer and
+the worktree holds gigabytes. Spec:
+`spec-34-13-the-index-can-recognise-its-own-lfs-pointers.md`.
+
+**34.14 — Find a git that works, not the first file called `git`.** `git::resolve` probes
+candidates and reports every rejection with its kind; `Engine::open`, the `sync` capability and
+`doctor` read the same resolution instead of asking two different questions. Spec:
+`spec-34-14-find-a-git-that-works.md`.
+
+**34.15 — A pointer is never published ahead of its object.** `do_push` counts outstanding
+`lfsUpload` units after the commit and refuses to publish while any remain; `AccessToken` owns every
+wire spelling of the one secret, so a PAT is never sent as `Bearer`. Read the scope in the spec: the
+gate covers the commits keeper stages, not a commit a human made with plain `git`. Spec:
+`spec-34-15-a-pointer-is-never-published-ahead-of-its-object.md`.
+
+**34.16 — Activity says how far each file got.** Every Activity row carries a delivery state and,
+where there is one, the engine's own message and a Retry — so *why* a file has not arrived is
+answerable where the file is. Spec: `spec-34-16-activity-says-how-far-each-file-got.md`.
+
+**34.17 — LFS over an ssh remote.** `lfs::ssh` runs `git-lfs-authenticate` over the connection that
+already authenticates, because an ssh profile correctly has no stored token and the LFS API is HTTP
+regardless. Spec: `spec-34-17-lfs-over-an-ssh-remote.md`.
+
+**34.18 — LFS over a filesystem remote.** `lfs::local` copies objects between the two `lfs/objects`
+stores, because `git push` has always copied its own objects to a pendrive and the content the
+pointers named stayed behind. Spec: `spec-34-18-lfs-over-a-filesystem-remote.md`.
+
+**34.19 — The app binary can be the LFS filter.** The app registered itself as the repository's
+clean/smudge filter and had no such subcommand, so it failed on every invocation — invisibly, because
+the filter is deliberately not required. The body now lives once in `keeper_sync::lfs::filter` and
+both binaries call it. Spec: `spec-34-19-the-app-binary-can-be-the-lfs-filter.md`.
+
 ## Out of scope
 
 - Deleting a profile's `.git` or working tree. `remove_profile` is a configuration change by

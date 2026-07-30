@@ -20,7 +20,7 @@
 //! or returns an error; a bad third profile does not leave two running.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use keeper_sync::profile::DEFAULT_POLL_INTERVAL_MS;
 use keeper_sync::{Result, SyncError, SyncProfile};
@@ -60,6 +60,21 @@ pub struct DaemonSettings {
     /// Default `tracing` level, overridden by `RUST_LOG` and `--verbose`.
     #[serde(alias = "log_level")]
     pub log_level: String,
+    /// An explicit `git` binary, or `None` to search `PATH` (Story 34.14).
+    ///
+    /// A process-wide fact, not a per-profile one: every profile shares one
+    /// engine and one `GitCli`, so this belongs in `[daemon]` beside the other
+    /// two settings that are about the process rather than a folder.
+    ///
+    /// A path that does not clear the version floor **refuses** — the daemon does
+    /// not fall back to `PATH`. Naming a binary and silently getting a different
+    /// one is the fault this setting exists to fix. An empty or all-whitespace
+    /// value is not such a naming: it means automatic, and
+    /// `LinuxPlatform::with_git_path` filters it out on the way in so that
+    /// clearing the key and never writing it are one state, exactly as the app's
+    /// own copy of this setting reads it back.
+    #[serde(alias = "git_path")]
+    pub git_path: Option<PathBuf>,
 }
 
 impl Default for DaemonSettings {
@@ -67,6 +82,7 @@ impl Default for DaemonSettings {
         Self {
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             log_level: "info".to_owned(),
+            git_path: None,
         }
     }
 }
@@ -292,6 +308,14 @@ pub fn example() -> String {
 pollIntervalMs = 15000
 # trace | debug | info | warn | error. RUST_LOG and --verbose override this.
 logLevel = "info"
+# Which `git` to drive. Left out, the daemon probes every `git` on PATH in order
+# and uses the first that is at least 2.42 -- an executable file called `git` is
+# not necessarily a git this engine can drive, so the first hit is not the
+# answer. Set this when PATH puts an old or broken git first. A gitPath that is
+# missing, unrunnable or below 2.42 REFUSES and says so; it never falls back to
+# PATH, because naming a binary and silently getting a different one is exactly
+# the fault this key exists to fix. `keeper-syncd doctor` prints what was chosen.
+# gitPath = "/usr/local/bin/git"
 
 # ---------------------------------------------------------------------------
 # The sample profiles below are COMMENTED OUT on purpose.

@@ -98,9 +98,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         -- profile that syncs a million files must not grow `sync.db` without
         -- limit. Rows hold repository-relative paths, never content.
         --
-        -- `size_bytes` (Story 34.6) is missing here on purpose:
-        -- `ensure_activity_size_column` adds it, so a fresh install and one
-        -- that predates the column reach the same schema down one path.
+        -- `size_bytes` (Story 34.6) and `unit_id` (Story 34.16) are missing
+        -- here on purpose: `ensure_activity_columns` adds them, so a fresh
+        -- install and one that predates either column reach the same schema
+        -- down one path.
         CREATE TABLE IF NOT EXISTS activity (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             profile_id  TEXT NOT NULL,
@@ -122,27 +123,39 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
-    ensure_activity_size_column(conn)?;
+    ensure_activity_columns(conn)?;
     Ok(())
 }
 
-/// Add the nullable `size_bytes` column to `activity` if it is not there yet
-/// (Story 34.6).
+/// Add the late nullable columns `activity` has grown, if they are not there
+/// yet: `size_bytes` (Story 34.6) and `unit_id` (Story 34.16).
 ///
 /// Idempotent and non-destructive, the shape `keeper-core`'s registry already
-/// uses for its own late columns: read the table's column list and only
-/// `ALTER TABLE ... ADD COLUMN` when the column is missing. An install that
-/// predates it keeps every one of its capped rows, which read back with no
-/// size — `NULL` here means "nobody measured it", never zero.
-fn ensure_activity_size_column(conn: &Connection) -> Result<()> {
+/// uses for its own late columns: read the table's column list once and only
+/// `ALTER TABLE ... ADD COLUMN` for what is missing. An install that predates
+/// either column keeps every one of its capped rows, which read back `NULL` —
+/// and `NULL` is a fact in both cases rather than a default. For `size_bytes`
+/// it means "nobody measured it", never zero. For `unit_id` it means "no work
+/// unit is accountable for this row", which is why [`DeliveryState::Unknown`]
+/// exists instead of a cheerful assumption that the file arrived.
+///
+/// One PRAGMA for both columns rather than a function per column: the read is
+/// the expensive half, and a second copy of this loop is how the two would
+/// drift.
+fn ensure_activity_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(activity)")?;
     // Column 1 of `table_info` is the column name.
     let existing: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    if !existing.iter().any(|c| c == "size_bytes") {
-        conn.execute("ALTER TABLE activity ADD COLUMN size_bytes INTEGER", [])?;
+    for column in ["size_bytes", "unit_id"] {
+        if !existing.iter().any(|c| c == column) {
+            conn.execute(
+                &format!("ALTER TABLE activity ADD COLUMN {column} INTEGER"),
+                [],
+            )?;
+        }
     }
     Ok(())
 }
@@ -329,13 +342,19 @@ pub enum WorkKind {
 }
 
 impl WorkKind {
+    /// The `kind` column spelling for a push, named so a query can filter for
+    /// it without owning a [`WorkKind`] value to ask.
+    pub const PUSH: &'static str = "push";
+    /// The `kind` column spelling for one LFS object upload. Same reason.
+    pub const LFS_UPLOAD: &'static str = "lfsUpload";
+
     /// Discriminant used as the journal's `kind` column, so a row can be
     /// filtered without deserializing its payload.
-    fn tag(&self) -> &'static str {
+    pub fn tag(&self) -> &'static str {
         match self {
             Self::Pull => "pull",
-            Self::Push => "push",
-            Self::LfsUpload { .. } => "lfsUpload",
+            Self::Push => Self::PUSH,
+            Self::LfsUpload { .. } => Self::LFS_UPLOAD,
             Self::LfsDownload { .. } => "lfsDownload",
             Self::OpenPullRequest { .. } => "openPullRequest",
             Self::Verify => "verify",
@@ -400,17 +419,23 @@ pub fn enqueue(
     Ok(conn.last_insert_rowid())
 }
 
-/// Enqueue only if an equivalent pending unit is not already queued.
+/// Enqueue only if an equivalent pending unit is not already queued, and
+/// return the id of the unit that now covers this work either way.
 ///
 /// The watcher can produce a burst of events for one profile; without this a
 /// hundred file writes would queue a hundred identical pushes.
+///
+/// The return value is the *covering* unit rather than "did I insert one":
+/// every caller discarded the old `Option`, and an activity row needs the id of
+/// whatever unit will actually deliver it — which for the second of a hundred
+/// identical pushes is the one already queued (Story 34.16).
 pub fn enqueue_unique(
     conn: &Connection,
     profile_id: &str,
     kind: &WorkKind,
     now_ms: i64,
     not_before_ms: i64,
-) -> Result<Option<i64>> {
+) -> Result<i64> {
     let payload = serde_json::to_string(kind)
         .map_err(|e| SyncError::Journal(format!("work item is not serializable: {e}")))?;
     let existing: Option<i64> = conn
@@ -422,10 +447,10 @@ pub fn enqueue_unique(
             |r| r.get(0),
         )
         .optional()?;
-    if existing.is_some() {
-        return Ok(None);
+    if let Some(id) = existing {
+        return Ok(id);
     }
-    enqueue(conn, profile_id, kind, now_ms, not_before_ms).map(Some)
+    enqueue(conn, profile_id, kind, now_ms, not_before_ms)
 }
 
 /// Claim the ready units for one profile, marking them `running` in the same
@@ -525,6 +550,89 @@ pub fn undefer_profile(conn: &Connection, profile_id: &str, now_ms: i64) -> Resu
          WHERE profile_id = ?1 AND state = 'deferred'",
         (profile_id, now_ms),
     )?)
+}
+
+/// Move one *kind* of deferred work back to pending, undoing the wait itself.
+///
+/// The narrow sibling of [`undefer_profile`], and the exit a push held by
+/// [`crate::error::SyncError::LfsUploadPending`] needs: that push is waiting on
+/// a condition inside this same journal — its own uploads — so the moment the
+/// last of them clears, something has to say so. Nothing else does.
+/// [`undefer_profile`] cannot: it releases *everything* deferred, including a
+/// unit waiting on an absent volume, which would spend an attempt to be
+/// re-deferred straight away.
+///
+/// `kind` is the [`WorkKind::tag`] spelling, so this filters on the indexed
+/// `kind` column without deserializing a payload.
+///
+/// # Why the wait is refunded
+///
+/// [`claim_ready`] charged an attempt to make the try that ended in the
+/// deferral, and the deferral wrote the reason it is waiting into `last_error`.
+/// Neither describes anything once the condition has cleared, and leaving them
+/// was two distinct lies at once:
+///
+/// * [`DeliveryState`]'s `from_journal` reads `"pending"` with `attempts > 0` as
+///   [`DeliveryState::Failed`], so between the release and the next claim every
+///   file the released push delivers reported **Failed** — with a `last_error`
+///   describing a wait that had already ended. A held row is supposed to read
+///   [`DeliveryState::InProgress`], which is what it read while it was still
+///   deferred.
+/// * [`crate::backoff::Backoff`] is a function of `attempts`, so a folder
+///   continuously fed large files walked its push up to the ceiling one held
+///   publication at a time, and its first genuinely transient failure then
+///   waited minutes.
+///
+/// So the row is put back the way it was found, the way [`unpark`] already puts
+/// a retried unit back: the reason is cleared and the attempt is refunded.
+/// `MAX(attempts - 1, 0)` rather than `0` because the count is still the unit's
+/// history — a push that failed twice for real and was then held once has one
+/// genuine failure refunded to nobody.
+pub fn undefer_kind(conn: &Connection, profile_id: &str, kind: &str, now_ms: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE journal
+            SET state = 'pending', not_before_ms = ?3, last_error = NULL,
+                attempts = MAX(attempts - 1, 0)
+          WHERE profile_id = ?1 AND kind = ?2 AND state = 'deferred'",
+        (profile_id, kind, now_ms),
+    )?)
+}
+
+/// How many units of one kind this profile still owes, parked ones included.
+///
+/// Parked rows count deliberately, and that is the whole point of the query:
+/// this answers "is it safe to publish a pointer whose object may not be on the
+/// remote", and an upload that has *stopped* being retried is the strongest
+/// possible no. Counting only live work would let the push proceed exactly when
+/// the object is most certainly missing.
+pub fn outstanding_count(conn: &Connection, profile_id: &str, kind: &str) -> Result<u32> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM journal WHERE profile_id = ?1 AND kind = ?2",
+        (profile_id, kind),
+        |r| r.get(0),
+    )?;
+    Ok(n.max(0) as u32)
+}
+
+/// How many units of one kind are still being *worked* on — parked excluded.
+///
+/// The deliberate counterpart of [`outstanding_count`], and the two are not
+/// interchangeable. That one answers "may a pointer be published", where a
+/// parked upload is the strongest possible no; this one answers "is anything
+/// still moving", where a parked upload is the strongest possible no as well —
+/// but of the *opposite* sign. A push held behind an upload that has stopped
+/// being retried is not syncing, it is stopped, and reporting it as
+/// `ProfileState::Syncing` left a tray glyph and a folder pane both showing
+/// healthy progress for a folder that had permanently ceased publishing. See
+/// `Engine::record_failure`.
+pub fn live_count(conn: &Connection, profile_id: &str, kind: &str) -> Result<u32> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM journal
+          WHERE profile_id = ?1 AND kind = ?2 AND state != 'parked'",
+        (profile_id, kind),
+        |r| r.get(0),
+    )?;
+    Ok(n.max(0) as u32)
 }
 
 pub fn pending_count(conn: &Connection, profile_id: &str) -> Result<u32> {
@@ -797,6 +905,74 @@ impl ActivityKind {
     }
 }
 
+/// How far one recorded file has got toward the remote (Story 34.16).
+///
+/// Derived, never stored. An activity row records what a commit did to a file
+/// and names the journal unit that has to *deliver* it; the delivery answer is
+/// then whatever that unit's row currently says, which is why it is read from
+/// the journal on every list rather than written down and left to rot.
+///
+/// The mapping is the journal's own vocabulary, read honestly:
+///
+/// | journal row | delivery |
+/// |---|---|
+/// | gone | [`Self::Success`] — `complete` deletes a unit only after its effect is durable |
+/// | `running` | [`Self::InProgress`] |
+/// | `pending`, never attempted | [`Self::InProgress`] |
+/// | `deferred` | [`Self::InProgress`] — waiting on a condition is waiting, not failing |
+/// | `pending`, attempted at least once | [`Self::Failed`] — keeper is still retrying |
+/// | `parked` | [`Self::Abandoned`] — keeper stopped; a human must ask again |
+/// | no unit named at all | [`Self::Unknown`] |
+///
+/// `Deferred` sitting under `InProgress` is the entry worth defending: a push
+/// held by [`crate::error::SyncError::LfsUploadPending`] has a `last_error`
+/// spelling out what it is waiting for, and rendering that as a failure would
+/// accuse keeper of breaking while it is in fact doing the careful thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeliveryState {
+    /// The unit that had to deliver this file completed.
+    Success,
+    /// A unit is queued, running, or waiting on a condition.
+    InProgress,
+    /// A unit failed and is still being retried.
+    Failed,
+    /// A unit stopped being retried.
+    Abandoned,
+    /// No unit is accountable for this row: it predates the `unit_id` column,
+    /// or nothing journaled ever owned it — a conflict copy the pull wrote, for
+    /// instance, whose own publication belongs to a later commit.
+    Unknown,
+}
+
+impl DeliveryState {
+    /// Read the journal's answer for one activity row.
+    ///
+    /// Only reached when a journal row genuinely exists: the caller has already
+    /// told "names no unit" and "the unit it named is gone" apart, because those
+    /// two are [`Self::Unknown`] and [`Self::Success`] and neither has a state to
+    /// read.
+    fn from_journal(state: &str, attempts: i64) -> Self {
+        match state {
+            "running" => Self::InProgress,
+            "deferred" => Self::InProgress,
+            "parked" => Self::Abandoned,
+            // A pending unit that has already been claimed once failed to get
+            // through; one that has not is simply queued.
+            "pending" if attempts > 0 => Self::Failed,
+            "pending" => Self::InProgress,
+            // A state this build does not know is not a claim we can make.
+            other => {
+                tracing::debug!(
+                    state = other,
+                    "unrecognised journal state for an activity row"
+                );
+                Self::Unknown
+            }
+        }
+    }
+}
+
 /// One entry in the recently-synced list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -812,6 +988,36 @@ pub struct ActivityRow {
     /// file and an unmeasured one are different facts, and only one of them is
     /// worth showing a size for.
     pub size_bytes: Option<u64>,
+    /// How far this file has got toward the remote. See [`DeliveryState`].
+    pub delivery: DeliveryState,
+    /// The last error recorded against the delivering unit, verbatim.
+    ///
+    /// Kept even when the delivery reads [`DeliveryState::InProgress`], because
+    /// that is exactly when it is most useful: a unit being retried after a
+    /// failure, and a unit deferred on a named condition, both carry the reason
+    /// they are not done yet.
+    pub failure: Option<String>,
+    /// The delivering unit, present only while it still exists.
+    ///
+    /// This is the id [`unpark`] takes, which is what lets a file row offer the
+    /// same Retry the problems view does — for the same unit, named by the file
+    /// a human actually recognises.
+    pub unit_id: Option<i64>,
+}
+
+/// One row to append to the recently-synced list.
+///
+/// A struct rather than the tuple this used to be: four positional fields, two
+/// of them optional integers, is a call site nobody can read or safely reorder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityEntry {
+    pub kind: ActivityKind,
+    /// Repository-relative.
+    pub path: String,
+    /// `None` when nobody measured it.
+    pub size_bytes: Option<u64>,
+    /// The journal unit whose success delivers this file, when one owns it.
+    pub unit_id: Option<i64>,
 }
 
 /// Append what a sync just did, then trim the profile back to [`ACTIVITY_CAP`].
@@ -821,13 +1027,11 @@ pub struct ActivityRow {
 /// commit that only partly happened. The insert and the trim share the
 /// transaction for the same reason — a reader must never see the table above
 /// its cap.
-///
-/// The third element of a row is its size, absent when it could not be known.
 pub fn record_activity(
     conn: &Connection,
     profile_id: &str,
     ts_ms: i64,
-    rows: &[(ActivityKind, String, Option<u64>)],
+    rows: &[ActivityEntry],
 ) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
@@ -838,14 +1042,21 @@ pub fn record_activity(
     let tx = conn.unchecked_transaction()?;
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO activity (profile_id, ts_ms, kind, path, size_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO activity (profile_id, ts_ms, kind, path, size_bytes, unit_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
-        for (kind, path, size_bytes) in rows {
+        for entry in rows {
             // A size no `i64` can hold is not a size anyone can render, so it
             // is stored as unknown rather than wrapped into a wrong number.
-            let size = size_bytes.and_then(|bytes| i64::try_from(bytes).ok());
-            stmt.execute((profile_id, ts_ms, kind.as_str(), path, size))?;
+            let size = entry.size_bytes.and_then(|bytes| i64::try_from(bytes).ok());
+            stmt.execute((
+                profile_id,
+                ts_ms,
+                entry.kind.as_str(),
+                &entry.path,
+                size,
+                entry.unit_id,
+            ))?;
         }
     }
     // Trim by `id`, never by `ts_ms`. Every row of one commit carries the same
@@ -869,15 +1080,25 @@ pub fn record_activity(
 /// A row whose `kind` is not one this build understands is skipped rather than
 /// fatal, the same tolerance [`list_profiles`] gives an unreadable profile: a
 /// newer keeper's activity must not brick an older one's list.
+///
+/// The `LEFT JOIN` is what makes [`DeliveryState`] derivable in one read. It is
+/// safe against id reuse because `journal.id` is `AUTOINCREMENT`, which SQLite
+/// guarantees is monotonic even across deletes — so an activity row can never
+/// find a *different* unit wearing the id its own unit had. The join is scoped
+/// to the same profile anyway, which costs nothing and says so out loud.
 pub fn list_activity(
     conn: &Connection,
     profile_id: &str,
     limit: usize,
 ) -> Result<Vec<ActivityRow>> {
     let mut stmt = conn.prepare(
-        "SELECT ts_ms, kind, path, size_bytes FROM activity
-         WHERE profile_id = ?1
-         ORDER BY id DESC LIMIT ?2",
+        "SELECT a.ts_ms, a.kind, a.path, a.size_bytes, a.unit_id,
+                j.state, j.attempts, j.last_error
+         FROM activity a
+         LEFT JOIN journal j
+                ON j.id = a.unit_id AND j.profile_id = a.profile_id
+         WHERE a.profile_id = ?1
+         ORDER BY a.id DESC LIMIT ?2",
     )?;
     let rows = stmt.query_map((profile_id, limit as i64), |r| {
         Ok((
@@ -885,20 +1106,38 @@ pub fn list_activity(
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
             r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<i64>>(6)?,
+            r.get::<_, Option<String>>(7)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (ts_ms, kind, path, size) = row?;
+        let (ts_ms, kind, path, size, unit_id, state, attempts, last_error) = row?;
         // A row from before the column existed reads back `NULL`, and a
         // negative size is not a size: both mean the same thing here.
         let size_bytes = size.and_then(|bytes| u64::try_from(bytes).ok());
+        // Three distinguishable cases, and only the middle one is a success:
+        // no unit was ever named; a unit was named and its row is gone, which
+        // is the only way a unit ever leaves the journal; a unit was named and
+        // is still there.
+        let delivery = match (unit_id, state.as_deref()) {
+            (None, _) => DeliveryState::Unknown,
+            (Some(_), None) => DeliveryState::Success,
+            (Some(_), Some(state)) => DeliveryState::from_journal(state, attempts.unwrap_or(0)),
+        };
         match ActivityKind::from_stored(&kind) {
             Some(kind) => out.push(ActivityRow {
                 ts_ms,
                 kind,
                 path,
                 size_bytes,
+                delivery,
+                failure: last_error,
+                // A unit that has completed is gone, and reporting its id would
+                // offer a Retry for work there is nothing left to retry.
+                unit_id: state.is_some().then_some(unit_id).flatten(),
             }),
             None => tracing::debug!(kind, "skipping an unrecognised activity row"),
         }
@@ -1035,20 +1274,20 @@ mod tests {
     fn duplicate_work_is_collapsed_while_still_queued() {
         // A burst of file events must not queue a hundred identical pushes.
         let c = conn();
-        assert!(enqueue_unique(&c, "p", &WorkKind::Push, 1, 0)
-            .expect("first")
-            .is_some());
-        assert!(enqueue_unique(&c, "p", &WorkKind::Push, 2, 0)
-            .expect("second")
-            .is_none());
+        let first = enqueue_unique(&c, "p", &WorkKind::Push, 1, 0).expect("first");
+        let second = enqueue_unique(&c, "p", &WorkKind::Push, 2, 0).expect("second");
+        assert_eq!(
+            second, first,
+            "the second caller is told which unit already covers its work, so an \
+             activity row can name it"
+        );
         // A different object is a different unit.
         let obj = WorkKind::LfsUpload {
             oid: "aa".into(),
             size: 1,
         };
-        assert!(enqueue_unique(&c, "p", &obj, 3, 0)
-            .expect("third")
-            .is_some());
+        let third = enqueue_unique(&c, "p", &obj, 3, 0).expect("third");
+        assert_ne!(third, first);
         assert_eq!(pending_count(&c, "p").expect("count"), 2);
     }
 
@@ -1088,6 +1327,17 @@ mod tests {
         assert!(get_profile(&c, "01A").expect("get").is_none());
     }
 
+    /// An activity row nothing is accountable for — the shape every test that
+    /// is not about delivery wants.
+    fn unowned(kind: ActivityKind, path: &str, size_bytes: Option<u64>) -> ActivityEntry {
+        ActivityEntry {
+            kind,
+            path: path.to_owned(),
+            size_bytes,
+            unit_id: None,
+        }
+    }
+
     #[test]
     fn activity_round_trips_newest_first_and_stays_per_profile() {
         let c = conn();
@@ -1096,8 +1346,8 @@ mod tests {
             "p",
             10,
             &[
-                (ActivityKind::Added, "a.txt".to_owned(), Some(4_096)),
-                (ActivityKind::Deleted, "b.txt".to_owned(), None),
+                unowned(ActivityKind::Added, "a.txt", Some(4_096)),
+                unowned(ActivityKind::Deleted, "b.txt", None),
             ],
         )
         .expect("record");
@@ -1105,7 +1355,7 @@ mod tests {
             &c,
             "q",
             11,
-            &[(ActivityKind::Modified, "other.txt".into(), Some(7))],
+            &[unowned(ActivityKind::Modified, "other.txt", Some(7))],
         )
         .expect("record");
 
@@ -1117,13 +1367,19 @@ mod tests {
                     ts_ms: 10,
                     kind: ActivityKind::Deleted,
                     path: "b.txt".to_owned(),
-                    size_bytes: None
+                    size_bytes: None,
+                    delivery: DeliveryState::Unknown,
+                    failure: None,
+                    unit_id: None,
                 },
                 ActivityRow {
                     ts_ms: 10,
                     kind: ActivityKind::Added,
                     path: "a.txt".to_owned(),
-                    size_bytes: Some(4_096)
+                    size_bytes: Some(4_096),
+                    delivery: DeliveryState::Unknown,
+                    failure: None,
+                    unit_id: None,
                 },
             ],
             "newest first, each size as it was recorded, and one profile never \
@@ -1132,11 +1388,12 @@ mod tests {
     }
 
     #[test]
-    fn an_activity_table_predating_the_size_column_upgrades_in_place() {
+    fn an_activity_table_predating_the_late_columns_upgrades_in_place() {
         // The exact shape `sync.db` had before Story 34.6. An install carrying
         // rows of it has to come through the upgrade with every row intact —
         // recreating the table empty, or refusing the next insert, would both
-        // read to a user as history that vanished.
+        // read to a user as history that vanished. The same applies to `unit_id`
+        // (Story 34.16), which this schema also predates.
         let c = Connection::open_in_memory().expect("in-memory db");
         c.execute_batch(
             "CREATE TABLE activity (
@@ -1159,23 +1416,32 @@ mod tests {
                 ts_ms: 5,
                 kind: ActivityKind::Added,
                 path: "old.txt".to_owned(),
-                size_bytes: None
+                size_bytes: None,
+                delivery: DeliveryState::Unknown,
+                failure: None,
+                unit_id: None,
             }],
-            "the old row survives and reads back with no size, not with zero"
+            "the old row survives, reading back with no size rather than zero \
+             and no delivery claim rather than a cheerful one"
         );
 
-        // And the upgraded table records sizes from here on.
+        // And the upgraded table records both late columns from here on.
+        let unit = enqueue(&c, "p", &WorkKind::Push, 6, 0).expect("enqueue");
         record_activity(
             &c,
             "p",
             6,
-            &[(ActivityKind::Modified, "old.txt".into(), Some(12_288))],
+            &[ActivityEntry {
+                kind: ActivityKind::Modified,
+                path: "old.txt".to_owned(),
+                size_bytes: Some(12_288),
+                unit_id: Some(unit),
+            }],
         )
         .expect("record");
-        assert_eq!(
-            list_activity(&c, "p", 10).expect("list")[0].size_bytes,
-            Some(12_288)
-        );
+        let row = &list_activity(&c, "p", 10).expect("list")[0];
+        assert_eq!(row.size_bytes, Some(12_288));
+        assert_eq!(row.unit_id, Some(unit));
     }
 
     #[test]
@@ -1184,8 +1450,8 @@ mod tests {
         // either spare all of them or delete all of them. This is why the cap
         // is enforced by id.
         let c = conn();
-        let batch: Vec<(ActivityKind, String, Option<u64>)> = (0..ACTIVITY_CAP + 25)
-            .map(|n| (ActivityKind::Added, format!("f{n}.txt"), Some(n as u64)))
+        let batch: Vec<ActivityEntry> = (0..ACTIVITY_CAP + 25)
+            .map(|n| unowned(ActivityKind::Added, &format!("f{n}.txt"), Some(n as u64)))
             .collect();
         record_activity(&c, "p", 7, &batch).expect("record");
 
@@ -1211,7 +1477,7 @@ mod tests {
             &c,
             "p",
             1,
-            &[(ActivityKind::Added, "good.txt".into(), None)],
+            &[unowned(ActivityKind::Added, "good.txt", None)],
         )
         .expect("record");
         c.execute(
@@ -1231,10 +1497,252 @@ mod tests {
         // file names.
         let c = conn();
         upsert_profile(&c, &profile("01A"), 1).expect("insert");
-        record_activity(&c, "01A", 1, &[(ActivityKind::Added, "a.txt".into(), None)])
+        record_activity(&c, "01A", 1, &[unowned(ActivityKind::Added, "a.txt", None)])
             .expect("record");
         delete_profile(&c, "01A").expect("delete");
         assert!(list_activity(&c, "01A", 10).expect("list").is_empty());
+    }
+
+    /// The journal is the delivery answer, and every state it can be in has to
+    /// map to something a file row can say without lying.
+    #[test]
+    fn a_file_reports_the_state_of_the_unit_that_has_to_deliver_it() {
+        let c = conn();
+        let unit = enqueue(&c, "p", &WorkKind::Push, 1, 0).expect("enqueue");
+        record_activity(
+            &c,
+            "p",
+            1,
+            &[ActivityEntry {
+                kind: ActivityKind::Added,
+                path: "big.bin".to_owned(),
+                size_bytes: Some(9),
+                unit_id: Some(unit),
+            }],
+        )
+        .expect("record");
+
+        let delivery = |c: &Connection| list_activity(c, "p", 10).expect("list")[0].clone();
+
+        // Queued and never attempted: on its way, with nothing to report.
+        let row = delivery(&c);
+        assert_eq!(row.delivery, DeliveryState::InProgress);
+        assert_eq!(row.failure, None);
+        assert_eq!(row.unit_id, Some(unit));
+
+        // Claimed: still on its way.
+        claim_ready(&c, "p", 1, 10).expect("claim");
+        assert_eq!(delivery(&c).delivery, DeliveryState::InProgress);
+
+        // Failed and being retried. This is the state the row must NOT call
+        // success, and must not call abandoned either.
+        reschedule(&c, unit, WorkState::Pending, 5, Some("connection reset")).expect("retry");
+        let row = delivery(&c);
+        assert_eq!(row.delivery, DeliveryState::Failed);
+        assert_eq!(row.failure.as_deref(), Some("connection reset"));
+
+        // Deferred is a wait, not a failure — a push held for its own uploads
+        // lands here, and reading it as broken would accuse keeper of failing
+        // while it is doing the careful thing.
+        reschedule(
+            &c,
+            unit,
+            WorkState::Deferred,
+            5,
+            Some("publishing is on hold"),
+        )
+        .expect("defer");
+        let row = delivery(&c);
+        assert_eq!(row.delivery, DeliveryState::InProgress);
+        assert_eq!(row.failure.as_deref(), Some("publishing is on hold"));
+
+        // Parked: keeper stopped, so the row offers the unit for a retry.
+        reschedule(&c, unit, WorkState::Parked, 5, Some("bad credentials")).expect("park");
+        let row = delivery(&c);
+        assert_eq!(row.delivery, DeliveryState::Abandoned);
+        assert_eq!(row.failure.as_deref(), Some("bad credentials"));
+        assert_eq!(row.unit_id, Some(unit));
+
+        // Completed. The unit leaves the journal, which is the ONLY way it ever
+        // does, so its absence is the success signal — and there is nothing left
+        // to retry, so no id is offered.
+        complete(&c, unit).expect("complete");
+        let row = delivery(&c);
+        assert_eq!(row.delivery, DeliveryState::Success);
+        assert_eq!(row.failure, None);
+        assert_eq!(row.unit_id, None);
+    }
+
+    #[test]
+    fn one_kind_of_deferred_work_can_be_released_without_disturbing_the_rest() {
+        // A push held for its own uploads must come back when they land, and an
+        // upload held for an absent volume must NOT be woken to fail again.
+        let c = conn();
+        let push = enqueue(&c, "p", &WorkKind::Push, 1, 0).expect("push");
+        let upload = enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsUpload {
+                oid: "aa".into(),
+                size: 1,
+            },
+            1,
+            0,
+        )
+        .expect("upload");
+        claim_ready(&c, "p", 1, 10).expect("claim");
+        reschedule(&c, push, WorkState::Deferred, 0, Some("waiting on uploads")).expect("defer");
+        reschedule(&c, upload, WorkState::Deferred, 0, Some("media absent")).expect("defer");
+
+        assert_eq!(
+            undefer_kind(&c, "p", WorkKind::PUSH, 42).expect("release"),
+            1
+        );
+        let ready = claim_ready(&c, "p", 42, 10).expect("claim");
+        assert_eq!(
+            ready.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![push],
+            "only the push woke up"
+        );
+    }
+
+    /// The window between a wait ending and the next claim, which is the one
+    /// moment nobody thought about.
+    ///
+    /// A held push spends that window `pending` with an attempt already charged
+    /// against it and the reason for the wait still written down, and both of
+    /// those are read by things a user looks at: the delivery state of every file
+    /// the push carries, and the backoff the next real failure gets.
+    #[test]
+    fn a_released_wait_does_not_read_as_a_failure() {
+        let c = conn();
+        let push = enqueue(&c, "p", &WorkKind::Push, 1, 0).expect("push");
+        record_activity(
+            &c,
+            "p",
+            1,
+            &[ActivityEntry {
+                kind: ActivityKind::Added,
+                path: "clip.mp4".to_owned(),
+                size_bytes: Some(200_000),
+                unit_id: Some(push),
+            }],
+        )
+        .expect("record");
+        // The claim charges the attempt, and the deferral writes the reason —
+        // exactly the two marks `Engine::reschedule_after` leaves on a push held
+        // for its own uploads.
+        claim_ready(&c, "p", 1, 10).expect("claim");
+        reschedule(
+            &c,
+            push,
+            WorkState::Deferred,
+            1,
+            Some("publishing is on hold until this folder's large files reach the remote"),
+        )
+        .expect("defer");
+        assert_eq!(
+            list_activity(&c, "p", 10).expect("list")[0].delivery,
+            DeliveryState::InProgress,
+            "a wait is not a failure while it is still waiting"
+        );
+
+        assert_eq!(
+            undefer_kind(&c, "p", WorkKind::PUSH, 42).expect("release"),
+            1
+        );
+        let row = list_activity(&c, "p", 10).expect("list")[0].clone();
+        assert_eq!(
+            row.delivery,
+            DeliveryState::InProgress,
+            "...and it is not a failure the instant it ends either: `pending` with \
+             an attempt on the clock reads as Failed, so the release has to hand \
+             the attempt back"
+        );
+        assert_eq!(
+            row.failure, None,
+            "the reason described a wait that is over; keeping it tells the user \
+             their file failed for a condition that no longer holds"
+        );
+
+        // And the refund is a refund, not a reset: the next claim starts from
+        // attempt one, so a folder continuously fed large files does not walk its
+        // push up to the backoff ceiling one held publication at a time.
+        let ready = claim_ready(&c, "p", 42, 10).expect("claim");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].attempts, 1);
+        assert_eq!(ready[0].last_error, None);
+    }
+
+    #[test]
+    fn a_parked_unit_is_outstanding_but_it_is_not_moving() {
+        // The two counts differ by exactly the parked rows, and that difference
+        // is load-bearing in opposite directions: an abandoned upload forbids
+        // publishing (`outstanding_count`) *and* means nothing is in progress
+        // (`live_count`). A folder held behind one is stopped, not syncing.
+        let c = conn();
+        let upload = enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsUpload {
+                oid: "aa".into(),
+                size: 1,
+            },
+            1,
+            0,
+        )
+        .expect("upload");
+        assert_eq!(live_count(&c, "p", WorkKind::LFS_UPLOAD).expect("count"), 1);
+
+        claim_ready(&c, "p", 1, 10).expect("claim");
+        reschedule(&c, upload, WorkState::Parked, 1, Some("403")).expect("park");
+        assert_eq!(
+            outstanding_count(&c, "p", WorkKind::LFS_UPLOAD).expect("count"),
+            1,
+            "the remote still does not have the object"
+        );
+        assert_eq!(
+            live_count(&c, "p", WorkKind::LFS_UPLOAD).expect("count"),
+            0,
+            "and nothing is going to put it there without a human"
+        );
+    }
+
+    #[test]
+    fn outstanding_work_counts_the_parked_units_too() {
+        // This answers "is it safe to publish a pointer", and an upload that has
+        // STOPPED being retried is the strongest possible no.
+        let c = conn();
+        let upload = enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsUpload {
+                oid: "aa".into(),
+                size: 1,
+            },
+            1,
+            0,
+        )
+        .expect("upload");
+        enqueue(&c, "p", &WorkKind::Push, 1, 0).expect("push");
+
+        assert_eq!(
+            outstanding_count(&c, "p", WorkKind::LFS_UPLOAD).expect("count"),
+            1,
+            "the push is not an upload"
+        );
+        claim_ready(&c, "p", 1, 10).expect("claim");
+        reschedule(&c, upload, WorkState::Parked, 0, Some("401")).expect("park");
+        assert_eq!(
+            outstanding_count(&c, "p", WorkKind::LFS_UPLOAD).expect("count"),
+            1,
+            "a parked upload is still an object the remote does not have"
+        );
+        complete(&c, upload).expect("complete");
+        assert_eq!(
+            outstanding_count(&c, "p", WorkKind::LFS_UPLOAD).expect("count"),
+            0
+        );
     }
 
     #[test]

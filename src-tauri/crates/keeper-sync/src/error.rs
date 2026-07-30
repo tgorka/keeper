@@ -57,10 +57,33 @@ pub enum SyncError {
     #[error("network failure talking to {host}: {reason}")]
     Network { host: String, reason: String },
 
-    /// Credentials were rejected. Never retried unchanged — a retry storm
-    /// against a git host is how an account gets rate-limited or locked.
-    #[error("authentication rejected for {host}")]
+    /// The credential was **rejected** (HTTP 401, or git's own "authentication
+    /// failed"). Never retried unchanged — a retry storm against a git host is
+    /// how an account gets rate-limited or locked.
+    ///
+    /// The host is the only fact available at every site that raises this: a
+    /// 401 says the credential was not accepted and nothing about why, so the
+    /// message names the one action that can change the outcome rather than
+    /// guessing between expired, revoked and mistyped.
+    #[error("{host} rejected the access token — replace it with a current one")]
     Auth { host: String },
+
+    /// The credential was **accepted and then refused** (HTTP 403).
+    ///
+    /// A separate variant because the remedy is the opposite of [`Self::Auth`]'s:
+    /// the token is valid, so pasting the same one again — or a freshly minted
+    /// one with the same scopes — changes nothing. What is missing is
+    /// permission, and only a human can grant it.
+    ///
+    /// Deliberately does not name a scope. A 403 from a forge is also how an
+    /// archived repository, a lapsed membership and a fine-grained token
+    /// missing repository access all read, and the wire carries nothing that
+    /// tells them apart.
+    #[error(
+        "{host} accepted the access token but refused the request — give that token access to \
+         this repository, or use one that already has it"
+    )]
+    Forbidden { host: String },
 
     /// A path cannot be represented on the remote or on a peer's filesystem
     /// (reserved name, illegal character, too long). This is one of the few
@@ -73,6 +96,25 @@ pub enum SyncError {
     /// because it aborts the current operation.
     #[error("removable volume for this profile is not attached")]
     MediaAbsent,
+
+    /// A push is holding because objects the commit's pointers name are not on
+    /// the remote yet (Story 34.15).
+    ///
+    /// **Not a failure**, and the sibling of [`Self::MediaAbsent`]: both are
+    /// waits on a condition rather than on a clock, which is why both are
+    /// [`Retriability::Deferred`]. Publishing a pointer whose object the server
+    /// does not have is the one outcome nobody sees go wrong — git accepts the
+    /// push, and the next peer to clone gets a working tree full of pointer
+    /// text with no error anywhere — so the push waits for its own uploads
+    /// instead. The waiting unit is re-queued by whichever upload lands last.
+    ///
+    /// The count is outstanding upload *units*, not bytes, and it is a count
+    /// rather than a list because the journal rows are the list.
+    #[error(
+        "publishing is on hold until this folder's large files reach the remote \
+         ({objects} outstanding)"
+    )]
+    LfsUploadPending { objects: u32 },
 
     /// Content did not match its expected digest or length. Always hard: we
     /// discard the staged bytes rather than resume from a poisoned prefix.
@@ -152,11 +194,13 @@ impl SyncError {
             // always discarded first, so this is a retry from zero, not a
             // resume from poisoned bytes.
             Self::Integrity { .. } => Retriability::Transient,
-            // Waiting on an external condition, not on time.
-            Self::MediaAbsent => Retriability::Deferred,
+            // Waiting on an external condition, not on time: a volume that has
+            // to come back, or an upload that has to land first.
+            Self::MediaAbsent | Self::LfsUploadPending { .. } => Retriability::Deferred,
             // Someone must change something.
             Self::GitMissing { .. }
             | Self::Auth { .. }
+            | Self::Forbidden { .. }
             | Self::InvalidPathForRemote { .. }
             | Self::Diverged { .. }
             | Self::Journal(_)
@@ -179,6 +223,7 @@ impl SyncError {
             self,
             Self::GitMissing { .. }
                 | Self::Auth { .. }
+                | Self::Forbidden { .. }
                 | Self::InvalidPathForRemote { .. }
                 | Self::Quota { .. }
                 | Self::Diverged { .. }
@@ -194,8 +239,10 @@ impl SyncError {
             Self::GitCommand { .. } => "gitCommand",
             Self::Network { .. } => "network",
             Self::Auth { .. } => "auth",
+            Self::Forbidden { .. } => "forbidden",
             Self::InvalidPathForRemote { .. } => "invalidPath",
             Self::MediaAbsent => "mediaAbsent",
+            Self::LfsUploadPending { .. } => "lfsUploadPending",
             Self::Integrity { .. } => "integrity",
             Self::Quota { .. } => "quota",
             Self::Diverged { .. } => "diverged",

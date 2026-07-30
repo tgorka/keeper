@@ -360,32 +360,63 @@ impl GitCli {
 /// [`SyncError::GitCommand`]: for the caller both mean "there is no usable git
 /// here", and collapsing them keeps `doctor` down to one branch.
 pub fn version(program: &Path) -> Result<(u32, u32)> {
+    version_detail(program).map_err(|detail| SyncError::GitMissing {
+        reason: format!("{}: {detail}", program.display()),
+    })
+}
+
+/// `git --version`, with the failure detail unwrapped from any sentence.
+///
+/// Two callers want two shapes of one fact. [`version`] names the program,
+/// because a standalone `GitMissing` that does not say which binary failed is
+/// unactionable. [`super::resolve`] renders one line per candidate and has
+/// already printed the path, so it wants the detail alone.
+///
+/// The detail carries `git`'s own `stderr`, and that is the point rather than a
+/// nicety: a git whose system `gitconfig` is malformed exits non-zero on
+/// `--version` and says exactly why (`bad config line 44 in file …`). Reporting
+/// only "exited non-zero" handed the user a fault that had named its own cause.
+/// Scrubbed and capped like every other diagnostic that leaves this module, and
+/// folded onto one line because it lands in a settings row.
+pub(crate) fn version_detail(program: &Path) -> std::result::Result<(u32, u32), String> {
     let args = [String::from("--version")];
-    let output = capture(program, None, &args, None)?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    let output = capture(program, None, &args, None).map_err(|err| err.to_string())?;
     if !output.status.success() {
-        return Err(SyncError::GitMissing {
-            reason: format!("{} --version exited non-zero", program.display()),
-        });
+        let stderr = one_line(&scrub_userinfo(&String::from_utf8_lossy(&output.stderr)));
+        return Err(format!("`git --version` failed: {stderr}"));
     }
-    parse_version(&text).ok_or_else(|| SyncError::GitMissing {
-        reason: format!(
-            "{} did not report a recognizable version",
-            program.display()
-        ),
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_version(&text).ok_or_else(|| {
+        // Not "is not a version": `Python 3.13.0` *is* a version, and saying so
+        // sent the reader looking for an upgrade instead of at the binary they
+        // had pointed keeper at. What is missing is git's own `git version`
+        // wording, so the detail says that.
+        format!(
+            "`git --version` answered `{}`, which is not git reporting its version",
+            one_line(&text)
+        )
     })
 }
 
 /// Version plus the 2.42 floor check.
 pub fn probe(program: &Path) -> Result<GitCapabilities> {
     let (major, minor) = version(program)?;
+    Ok(capabilities_of(major, minor))
+}
+
+/// Project a version onto the capability set, without spawning anything.
+///
+/// Split out so [`super::resolve`] derives the same capabilities from the same
+/// version it just read, rather than probing a second time — and so the floor is
+/// applied in exactly one place for both callers.
+pub(crate) fn capabilities_of(major: u32, minor: u32) -> GitCapabilities {
     let clears = clears_floor(major, minor);
-    Ok(GitCapabilities {
+    GitCapabilities {
         major,
         minor,
         sparse_cone: clears,
         ls_files_format: clears,
-    })
+    }
 }
 
 /// Whether `<major>.<minor>` is at or above the 2.42 floor.
@@ -680,15 +711,33 @@ fn absolute_arg(path: &Path) -> Result<String> {
 
 /// Parse the first line of `git --version`.
 ///
-/// Vendors append their own suffixes (`2.39.5 (Apple Git-154)`,
-/// `2.53.0.windows.1`), so only the leading `<major>.<minor>` is read and the
-/// rest is ignored.
+/// Two obligations, in this order, and the first one is the whole point: the
+/// line must **identify itself as git**, and only then is a version read out of
+/// it. Reading the first digit-leading token on its own accepted any executable
+/// that prints a version — `python3 --version` answers `Python 3.13.0`, which
+/// parsed as `(3, 13)`, cleared the 2.42 floor, and made
+/// [`super::resolve::GitResolution::summary`] report `git 3.13` for a binary
+/// that is not git. The engine then drove it for every push, merge and worktree
+/// call, so the first symptom was an unclassifiable `GitCommand` failure deep
+/// inside a sync rather than a rejection at resolution time — and a wrapper or
+/// shim called `git` ahead of the real one on `PATH`, the exact fault Story
+/// 34.14 exists to catch, was accepted in silence.
+///
+/// `git version` is the only wording git has ever printed here, on every
+/// platform and in every locale (the string is not translated), so requiring it
+/// costs nothing a real git has. What follows it varies: vendors append their
+/// own suffixes (`2.39.5 (Apple Git-154)`, `2.53.0.windows.1`), so only the
+/// leading `<major>.<minor>` is read and the rest is ignored.
 pub(crate) fn parse_version(output: &str) -> Option<(u32, u32)> {
+    const IDENTITY: &str = "git version";
     let token = output
         .lines()
         .next()?
+        .trim_start()
+        .strip_prefix(IDENTITY)?
         .split_whitespace()
-        .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))?;
+        .next()
+        .filter(|token| token.starts_with(|c: char| c.is_ascii_digit()))?;
     let mut parts = token.split('.');
     let major = parts.next()?.parse().ok()?;
     // A hypothetical bare `git version 3` is still a usable answer.
@@ -900,6 +949,27 @@ fn first_line(text: &str) -> String {
         .find(|line| !line.is_empty())
         .unwrap_or("git reported no detail")
         .to_owned()
+}
+
+/// Every non-empty line, folded onto one with `; ` and capped.
+///
+/// [`first_line`] is right for a `GitCommand` whose first line is the failure;
+/// it is wrong for a broken `gitconfig`, where line one is the symptom
+/// (`could not expand include path …`) and line two is the cause (`bad config
+/// line 44 in file …`). A settings row and a notification are both one line, so
+/// the lines are joined rather than picked between.
+pub(crate) fn one_line(text: &str) -> String {
+    let joined = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if joined.is_empty() {
+        "git reported no detail".to_owned()
+    } else {
+        truncate(&joined, STDERR_CAP)
+    }
 }
 
 /// Name a repository directory for an error message.
@@ -1244,6 +1314,23 @@ mod tests {
         assert_eq!(parse_version(""), None);
         assert_eq!(parse_version("not a git binary at all"), None);
         assert_eq!(parse_version("git version banana"), None);
+    }
+
+    #[test]
+    fn a_version_from_something_that_is_not_git_is_not_a_git_version() {
+        // The defect this guards: the token scan alone accepted any executable
+        // that prints a version, so a `git` on PATH that was really a wrapper,
+        // a shim, or the wrong binary entirely cleared the floor and was driven
+        // for every push and merge.
+        assert_eq!(parse_version("Python 3.13.0\n"), None);
+        assert_eq!(parse_version("git-lfs/3.5.1 (GitHub; linux amd64)"), None);
+        assert_eq!(
+            parse_version("hub version 2.14.2\ngit version 2.52.0"),
+            None
+        );
+        // The identity has to be on the line the version is read from, not
+        // anywhere in the output: a wrapper is free to mention git afterwards.
+        assert_eq!(parse_version("mygit 1.2.3 (git version 2.52.0)"), None);
     }
 
     #[test]

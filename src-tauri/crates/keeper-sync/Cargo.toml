@@ -34,6 +34,12 @@ tempfile = { workspace = true }
 # manifest for why `wrap_stream` cannot be used. Adds no new crate.
 http-body = { workspace = true }
 bytes = { workspace = true }
+# HTTP Basic for the LFS endpoints (`credential.rs`). git-lfs speaks plain
+# `Authorization: Basic`, with no credential helper in the way to encode it —
+# unlike `git` itself, which is why this is needed here and nowhere else.
+# Already resolved in this crate's own tree via gix-transport and reqwest, so a
+# direct dep adds no new crate. MIT/Apache — passes `cargo deny check`.
+base64 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

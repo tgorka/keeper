@@ -40,24 +40,39 @@ pub fn derive(remote_url: &str) -> Result<Url> {
     parts.build(&path)
 }
 
-/// Resolve the endpoint, honouring `.lfsconfig` overrides.
+/// The endpoint the repository's own `.lfsconfig` names, if it names one.
+///
+/// Split out from [`resolve`] because an override is not merely a different
+/// answer, it is a different *authority*: a repository that names its LFS server
+/// explicitly has settled the question, so the ssh handshake in
+/// [`super::ssh`] must not run and second-guess it. A caller that only wants an
+/// endpoint still wants [`resolve`].
 ///
 /// `lfsconfig` is the *contents* of the repository's root `.lfsconfig`, which
 /// git-lfs reads as an additional git-config file. `remote_name` selects the
 /// `remote.<name>.lfsurl` key — normally `"origin"`.
-pub fn resolve(remote_url: &str, lfsconfig: Option<&str>, remote_name: &str) -> Result<Url> {
-    if let Some(text) = lfsconfig {
-        let config = GitConfig::parse(text);
-        // Most specific first: a key naming this one remote outranks the
-        // repository-wide one.
-        if let Some(raw) = config.get(&format!("remote.{remote_name}.lfsurl")) {
-            return parse_override(raw);
-        }
-        if let Some(raw) = config.get("lfs.url") {
-            return parse_override(raw);
-        }
+pub fn override_url(lfsconfig: Option<&str>, remote_name: &str) -> Result<Option<Url>> {
+    let Some(text) = lfsconfig else {
+        return Ok(None);
+    };
+    let config = GitConfig::parse(text);
+    // Most specific first: a key naming this one remote outranks the
+    // repository-wide one.
+    if let Some(raw) = config.get(&format!("remote.{remote_name}.lfsurl")) {
+        return parse_override(raw).map(Some);
     }
-    derive(remote_url)
+    if let Some(raw) = config.get("lfs.url") {
+        return parse_override(raw).map(Some);
+    }
+    Ok(None)
+}
+
+/// Resolve the endpoint, honouring `.lfsconfig` overrides.
+pub fn resolve(remote_url: &str, lfsconfig: Option<&str>, remote_name: &str) -> Result<Url> {
+    match override_url(lfsconfig, remote_name)? {
+        Some(url) => Ok(url),
+        None => derive(remote_url),
+    }
 }
 
 /// Append a path *under* an LFS endpoint.
