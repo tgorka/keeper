@@ -303,16 +303,23 @@ development_status:
   34-11-a-kill-during-a-ref-update-must-not-strand-a-folder: review
   34-12-the-access-token-arrives-in-the-field: review
   34-13-the-index-can-recognise-its-own-lfs-pointers: review
-  # 34-14..34-19 now have specs (DW-123, closed 2026-07-29). All nine of the
-  # epic-34 tail stories are implemented, tested and specced, and none has been
-  # through code-review — which is what `review` means here and the next step
-  # for this epic.
-  34-14-find-a-git-that-works: review
-  34-15-a-pointer-is-never-published-ahead-of-its-object: review
-  34-16-activity-says-how-far-each-file-got: review
-  34-17-lfs-over-an-ssh-remote: review
-  34-18-lfs-over-a-filesystem-remote: review
-  34-19-the-app-binary-can-be-the-lfs-filter: review
+  # 34-14..34-19 have specs (DW-123, closed 2026-07-29) and are now through
+  # code-review: an adversarial pass over the six (four review layers — two
+  # blind hunters, an edge-case hunter and an acceptance auditor — plus a docs
+  # and ledger audit) returned 41 acceptance criteria checked and a verdict of
+  # `incorrect`, naming four blocking durability holes. All four are fixed in
+  # 62d7cbd, released in v0.6.4, and the narrower findings are either fixed
+  # there or filed as DW-124..DW-129. So these six are `done`.
+  #
+  # 34-1..34-13 stay `review` deliberately: they shipped in 0.6.2/0.6.3 without
+  # a code-review pass, and `review` is what that state means here. Epic-34
+  # therefore stays `in-progress` — reviewing them is the next step for it.
+  34-14-find-a-git-that-works: done
+  34-15-a-pointer-is-never-published-ahead-of-its-object: done
+  34-16-activity-says-how-far-each-file-got: done
+  34-17-lfs-over-an-ssh-remote: done
+  34-18-lfs-over-a-filesystem-remote: done
+  34-19-the-app-binary-can-be-the-lfs-filter: done
   epic-34-retrospective: optional
 
 # Phase 4 state as of 2026-07-25 — what is actually true, not what was planned.
