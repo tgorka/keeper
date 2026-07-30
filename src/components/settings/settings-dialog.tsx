@@ -15,7 +15,7 @@ import {
 } from "@/components/settings/no-background-sync-disclosure";
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
 import { SyncGitRow } from "@/components/settings/sync-git-row";
-import { SyncSection } from "@/components/settings/sync-section";
+import { DeviceSection, SyncSection } from "@/components/settings/sync-section";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -92,6 +92,45 @@ const ARCHIVE_BACKUP_EXCLUSION_SENTENCE =
  * only and is never re-prompted here.
  */
 export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      {/* The Settings body is taller than the viewport, so it must scroll. Override
+          the shadcn DialogContent from `grid` to a height-capped `flex flex-col` that
+          clips (`overflow-hidden`): the header sizes to content, and the body below is
+          `flex-1 min-h-0` so it takes the remaining bounded height and scrolls within
+          it. `min-h-0` is required — a flex child defaults to min-height:auto (= its
+          content size), which would grow past the cap and bleed out of the dialog
+          instead of scrolling. `min-w-0` lets the copy wrap rather than clip on the
+          right. (An arbitrary `grid-rows-[…minmax(0,1fr)]` looked equivalent but the
+          comma inside `minmax()` isn't emitted by the Tailwind arbitrary-value parser,
+          so no rule was generated and the cap never applied — flex avoids that.) */}
+      <DialogContent className="flex max-h-[85vh] flex-col gap-0 overflow-hidden">
+        <DialogHeader>
+          <DialogTitle>Settings</DialogTitle>
+          <DialogDescription>Archive &amp; Storage</DialogDescription>
+        </DialogHeader>
+        <div className="-mr-2 mt-2 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto pr-2">
+          <SettingsBody open={open} onOpenChange={onOpenChange} />
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * Every Settings section, in order, with no chrome of its own.
+ *
+ * Split out of the dialog so the Settings *pane* renders the same sections from
+ * one definition — two copies would drift on which settings exist and in what
+ * order, and that drift is invisible until someone goes looking for a setting on
+ * the surface that lost it. The caller owns the scroll container and the
+ * heading, because a dialog and a pane want different ones.
+ *
+ * `open` stays the hydration signal each section already takes: a section reads
+ * its state from Rust when this flips true. In the pane it means "mounted", which
+ * is the same claim.
+ */
+export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
   // The OS-global summon hotkey is a desktop-only capability; hide the whole
   // Shortcuts section wherever the platform lacks it (the phone tier).
   const globalHotkey = useCapabilitiesStore((s) => s.capabilities.globalHotkey);
@@ -146,58 +185,46 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         : SDK_STORE_UNENCRYPTED_STATUS;
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      {/* The Settings body is taller than the viewport, so it must scroll. Override
-          the shadcn DialogContent from `grid` to a height-capped `flex flex-col` that
-          clips (`overflow-hidden`): the header sizes to content, and the body below is
-          `flex-1 min-h-0` so it takes the remaining bounded height and scrolls within
-          it. `min-h-0` is required — a flex child defaults to min-height:auto (= its
-          content size), which would grow past the cap and bleed out of the dialog
-          instead of scrolling. `min-w-0` lets the copy wrap rather than clip on the
-          right. (An arbitrary `grid-rows-[…minmax(0,1fr)]` looked equivalent but the
-          comma inside `minmax()` isn't emitted by the Tailwind arbitrary-value parser,
-          so no rule was generated and the cap never applied — flex avoids that.) */}
-      <DialogContent className="flex max-h-[85vh] flex-col gap-0 overflow-hidden">
-        <DialogHeader>
-          <DialogTitle>Settings</DialogTitle>
-          <DialogDescription>Archive &amp; Storage</DialogDescription>
-        </DialogHeader>
-        <div className="-mr-2 mt-2 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto pr-2">
-          <div className="flex min-w-0 flex-col gap-3 text-sm">
-            <p>{sdkStatus}</p>
-            <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>
-            {reducedPlatform && (
-              <p className="text-muted-foreground">{ARCHIVE_BACKUP_EXCLUSION_SENTENCE}</p>
-            )}
-            <HonorRemoteDeletionsRow />
-          </div>
-          <NotificationsSection open={open} />
-          {/* The desktop "Background & dock" section (⌘W/⌘Q mechanics, Dock badge,
+    <>
+      <div className="flex min-w-0 flex-col gap-3 text-sm">
+        <p>{sdkStatus}</p>
+        <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>
+        {reducedPlatform && (
+          <p className="text-muted-foreground">{ARCHIVE_BACKUP_EXCLUSION_SENTENCE}</p>
+        )}
+        <HonorRemoteDeletionsRow />
+      </div>
+      <NotificationsSection open={open} />
+      {/* The desktop "Background & dock" section (⌘W/⌘Q mechanics, Dock badge,
               launch-at-login, menu bar) never renders on the reduced (phone) tier —
               its keeps-syncing-in-background copy would be a false background-delivery
               claim on iOS (Story 14.2, FR-53/FR-61). Desktop (Story 10.3) unchanged. */}
-          {!reducedPlatform && <BackgroundSection open={open} />}
-          <PrivacySection open={open} />
-          {globalHotkey && <ShortcutsSection open={open} />}
-          {/* The Recording section is desktop-macOS-≥13 only (Story 16.3): absent on
+      {!reducedPlatform && <BackgroundSection open={open} />}
+      <PrivacySection open={open} />
+      {globalHotkey && <ShortcutsSection open={open} />}
+      {/* The Recording section is desktop-macOS-≥13 only (Story 16.3): absent on
               every platform that cannot record, never a dead affordance. */}
-          {recording && <RecordingSection open={open} />}
-          {/* Folder sync needs a usable `git` (Epic 29): absent on every machine
+      {recording && <RecordingSection open={open} />}
+      {/* Folder sync needs a usable `git` (Epic 29): absent on every machine
               that has none, never a section whose every button would reject. */}
-          {sync && <SyncSection open={open} />}
-          {/* BESIDE that gate, not behind it. `capabilities.sync` IS "a usable
+      {sync && <SyncSection open={open} />}
+      {/* Its own section, not a block inside Sync: the device name is not a sync
+          setting — it rides every commit's `Keeper-Device` trailer, names this
+          machine in conflict-copy filenames, and now qualifies the commit subject
+          itself. Same capability gate, because the identity is read and written
+          through the sync engine's own IPC. */}
+      {sync && <DeviceSection open={open} />}
+      {/* BESIDE that gate, not behind it. `capabilities.sync` IS "a usable
               git was found", so a machine without one renders no Sync section —
               and the report explaining why, plus the field that fixes it, would
               be unreachable exactly when it is the only thing worth reading
               (Story 34.14, DW-122). It renders itself away on a build with no
               folder sync at all. */}
-          <SyncGitRow open={open} />
-          <EncryptionSection />
-          <SetupSection onOpenChange={onOpenChange} />
-          <AboutSection open={open} />
-        </div>
-      </DialogContent>
-    </Dialog>
+      <SyncGitRow open={open} />
+      <EncryptionSection />
+      <SetupSection onOpenChange={onOpenChange} />
+      <AboutSection open={open} />
+    </>
   );
 }
 

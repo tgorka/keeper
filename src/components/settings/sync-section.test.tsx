@@ -35,6 +35,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import {
+  DeviceSection,
   SYNC_ATTENTION_FALLBACK_SENTENCE,
   SYNC_DEVICE_ID_LABEL,
   SYNC_DEVICE_NAME_LABEL,
@@ -734,9 +735,14 @@ describe("syncRemoteHost", () => {
   });
 });
 
-describe("SyncSection device name (Story 34.5)", () => {
+/**
+ * The device name moved out of Sync into its own section — it is not a sync
+ * setting, it names the machine. Same assertions, pointed at the component that
+ * owns them now.
+ */
+describe("DeviceSection (Story 34.5)", () => {
   it("shows the name and the id keeper writes into every commit", async () => {
-    render(<SyncSection open />);
+    render(<DeviceSection open />);
 
     const field = await screen.findByLabelText(SYNC_DEVICE_NAME_LABEL);
     expect(field).toHaveValue("hesperia");
@@ -746,7 +752,7 @@ describe("SyncSection device name (Story 34.5)", () => {
 
   it("renames on request, keeps the id, and says the change is for later commits", async () => {
     mockSetDeviceLabel.mockResolvedValue({ id: "01JDEVICE", label: "Studio Mac" });
-    render(<SyncSection open />);
+    render(<DeviceSection open />);
 
     const field = await screen.findByLabelText(SYNC_DEVICE_NAME_LABEL);
     const rename = screen.getByRole("button", { name: SYNC_DEVICE_SAVE_LABEL });
@@ -770,7 +776,7 @@ describe("SyncSection device name (Story 34.5)", () => {
       code: "internal",
       message: "device label must not be empty",
     });
-    render(<SyncSection open />);
+    render(<DeviceSection open />);
 
     fireEvent.change(await screen.findByLabelText(SYNC_DEVICE_NAME_LABEL), {
       target: { value: "renamed" },

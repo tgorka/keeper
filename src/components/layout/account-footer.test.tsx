@@ -29,7 +29,7 @@ import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { addAccountStore } from "@/lib/stores/add-account";
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
-import { settingsUiStore } from "@/lib/stores/settings-ui";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 
 function account(id: string, userId: string, hue = 0, provider: Provider = "password"): AccountVm {
   return {
@@ -75,7 +75,7 @@ beforeEach(() => {
   accountsStore.setState({ filterAccountId: null });
   accountStatusStore.getState().reset();
   encryptionStatusStore.getState().reset();
-  settingsUiStore.getState().setSettingsOpen(false);
+  primaryViewStore.getState().setView("inbox");
   addAccountStore.getState().closeAddAccount();
   signOutHandler.mockReset();
   signOutHandler.mockResolvedValue(undefined);
@@ -184,15 +184,18 @@ describe("AccountFooter", () => {
     expect(signOutHandler).not.toHaveBeenCalled();
   });
 
-  it("the row menu opens the Settings dialog", async () => {
+  it("the row menu goes to the Settings view", async () => {
+    primaryViewStore.getState().setView("inbox");
     accountsStore.getState().hydrateAll([alice]);
     renderFooter();
 
     const menu = await openRowMenu(alice.userId);
     fireEvent.click(within(menu).getByRole("menuitem", { name: "Settings" }));
 
-    const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText("Archive & Storage")).toBeInTheDocument();
+    // No dialog to find any more: the footer routes to the pane, so the app
+    // stays visible behind whatever the user came here to change.
+    expect(primaryViewStore.getState().view).toBe("settings");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("offers a Beeper coverage menu item that opens the disclosure for a Beeper account", async () => {

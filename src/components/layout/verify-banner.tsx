@@ -14,7 +14,7 @@ import { X } from "lucide-react";
 import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { encryptionStatusStore, useShowVerifyBanner } from "@/lib/stores/encryption-status";
-import { settingsUiStore } from "@/lib/stores/settings-ui";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 
 /** The honest, verbatim banner copy (Story 3.1 fixed string). */
 export const VERIFY_BANNER_TEXT = "Verify this device to read encrypted history";
@@ -34,7 +34,7 @@ export function VerifyBanner() {
             type="button"
             variant="outline"
             size="xs"
-            onClick={() => settingsUiStore.getState().setSettingsOpen(true)}
+            onClick={() => primaryViewStore.getState().setView("settings")}
           >
             Verify
           </Button>

@@ -10,6 +10,7 @@ import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
 import { PhoneShell } from "@/components/layout/phone-shell";
 import { RecordingPane } from "@/components/layout/recording-pane";
+import { SettingsPane } from "@/components/layout/settings-pane";
 import { SIDEBAR_WIDTH_CLASS, SidebarPane } from "@/components/layout/sidebar-pane";
 import { SyncPane } from "@/components/layout/sync-pane";
 import { VerifyBanner } from "@/components/layout/verify-banner";
@@ -215,6 +216,8 @@ export function AppShell() {
                 <BridgesPane />
               ) : primaryView === "approval" ? (
                 <ApprovalPane />
+              ) : primaryView === "settings" ? (
+                <SettingsPane />
               ) : (
                 <>
                   <ChatListPane />
