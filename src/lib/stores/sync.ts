@@ -30,6 +30,7 @@ import {
   syncProfileSave,
   syncProfileSetEnabled,
   syncProfiles,
+  syncRescan,
   syncStatuses,
   syncVerify,
 } from "@/lib/ipc/client";
@@ -318,6 +319,19 @@ export async function verifySyncProfile(id: string): Promise<string[]> {
   const problems = await syncVerify(id);
   await refreshSyncStatuses();
   return problems;
+}
+
+/**
+ * Make a profile forget its remembered tree and look again.
+ *
+ * The statuses are re-read straight after, but the visible answer arrives on the
+ * next walk rather than here — the engine queues the work, it does not do it
+ * inline, and pretending otherwise would leave the caller reporting a result it
+ * does not have.
+ */
+export async function rescanSyncProfile(id: string): Promise<void> {
+  await syncRescan(id);
+  await refreshSyncStatuses();
 }
 
 /**

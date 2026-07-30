@@ -562,6 +562,7 @@ pub fn run() {
         sync_ipc::sync_profile_set_enabled,
         sync_ipc::sync_folder_now,
         sync_ipc::sync_verify,
+        sync_ipc::sync_rescan,
         sync_ipc::sync_open_path,
         sync_ipc::sync_subscribe_progress,
         sync_ipc::sync_unsubscribe_progress,

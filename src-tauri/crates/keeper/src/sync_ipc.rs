@@ -1068,6 +1068,22 @@ pub async fn sync_verify(
         .collect())
 }
 
+/// Forget what this profile remembers about its own tree, and look again.
+///
+/// The counterpart to [`sync_verify`], and a different question: verify asks
+/// "is what I have intact", this asks "is what I *think* I have still what is
+/// there". A file copied in with its modification time preserved can match the
+/// remembered row exactly, and no amount of re-scanning finds it — the scan is
+/// asking the wrong question. Clearing the memory is what changes the answer.
+///
+/// Returns nothing: the effect shows up as the folder's own Pending list on the
+/// next walk, which is the thing the user was looking at when they pressed it.
+#[tauri::command]
+pub async fn sync_rescan(state: tauri::State<'_, AppState>, id: String) -> Result<(), IpcError> {
+    let engine = engine_of(&state)?;
+    engine.rescan(&id).map_err(|e| sync_ipc_error(&e))
+}
+
 /// An `IpcError` carrying a message written for the person who will read it.
 ///
 /// Sync's errors normally funnel through [`sync_ipc_error`], which takes the

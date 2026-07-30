@@ -133,6 +133,7 @@ import {
   ensureSyncHydrated,
   isSyncStatusActive,
   removeSyncProfile,
+  rescanSyncProfile,
   setSyncProfileEnabled,
   startSyncStatusPolling,
   syncErrorMessage,
@@ -300,6 +301,23 @@ function FoldToggle({
     </button>
   );
 }
+
+/**
+ * The forget-and-look-again action.
+ *
+ * Named for what a person wants ("check every file again"), not for what it does
+ * to the database. The note says the rest, because the button is only ever the
+ * right answer to a specific symptom: files that are on disk and not in Pending.
+ *
+ * That happens because change detection compares each path against the size,
+ * mtime, ctime and inode it recorded last time — and a copy that preserves the
+ * modification time (which keeper's own Copy files once does) can land a file
+ * that matches a remembered row exactly. Re-scanning cannot find it; only
+ * forgetting can.
+ */
+export const SYNC_RESCAN_LABEL = "Recheck all files";
+export const SYNC_RESCAN_NOTE =
+  "Forget what keeper remembers about this folder and look at every file again. Use it when a file is on disk but never appears as waiting to sync — a copy that kept its original modification time can look identical to a file keeper has already accounted for.";
 
 /** The parked-unit action label. */
 export const SYNC_RETRY_LABEL = "Retry";
@@ -939,8 +957,24 @@ function SyncProfileCard({
             >
               {profile.enabled ? SYNC_PAUSE_LABEL : SYNC_RESUME_LABEL}
             </Button>
-            {/* Quieter than the two before it, which act on the folder now:
-                these last two are about what the folder *is*. */}
+            {/* Between the act-now pair above and the configuration pair below,
+                because it is a bit of both: it acts now, but only a folder whose
+                Pending list is visibly wrong needs it. Ghost weight for the same
+                reason — reaching for this should feel like an exception. */}
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              disabled={busy}
+              title={SYNC_RESCAN_NOTE}
+              onClick={() => {
+                void run(async () => {
+                  await rescanSyncProfile(profile.id);
+                });
+              }}
+            >
+              {SYNC_RESCAN_LABEL}
+            </Button>
             <Button
               type="button"
               variant="ghost"
@@ -1715,43 +1749,57 @@ function CopyReport({ job }: { job: CopyJobVm }) {
       {groups.length > 0 && (
         <>
           <p className="text-xs">{copySummarySentence(groups)}</p>
-          {groups.map((group) => {
-            const title = COPY_OUTCOME_TITLES[group.outcome] ?? group.outcome;
-            const note = COPY_OUTCOME_NOTES[group.outcome];
-            return (
-              <div key={group.outcome} className="flex flex-col gap-1.5">
-                <h3 className="font-medium text-xs">{title}</h3>
-                {note !== undefined && <p className="text-muted-foreground text-xs">{note}</p>}
-                <ul aria-label={title} className="flex flex-col gap-1">
-                  {group.entries.map((entry) => (
-                    <li key={entry.path} className="flex flex-col gap-0.5">
-                      <div className="flex items-baseline justify-between gap-3">
-                        <span
-                          className="min-w-0 flex-1 truncate font-mono text-xs"
-                          title={entry.path}
-                        >
-                          {entry.path}
-                        </span>
-                        {/* No size beside a failure: none of it reached the
-                            destination, and a byte count there would read as
-                            how much did. */}
-                        {group.outcome !== "failed" && (
-                          <span className="shrink-0 text-muted-foreground text-xs">
-                            {formatCopyBytes(entry.bytes)}
-                          </span>
-                        )}
-                      </div>
-                      {entry.reason !== null && (
-                        <span className="font-mono text-destructive text-xs">{entry.reason}</span>
-                      )}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            );
-          })}
+          {groups.map((group) => (
+            <CopyReportGroup key={group.outcome} group={group} />
+          ))}
         </>
       )}
+    </div>
+  );
+}
+
+/**
+ * One outcome's file list, folded to the same limits as the sync lists.
+ *
+ * A copy of ten thousand files reports ten thousand lines, and the report is the
+ * one surface where that is the *expected* size rather than a pathology — so it
+ * folds for the same reason Activity does, and to the same numbers, because a
+ * user who set "show me ten" meant it about lists in general.
+ *
+ * Its own component because the fold is a hook: a `.map` over the groups cannot
+ * call one per group without breaking the rules of hooks.
+ */
+function CopyReportGroup({ group }: { group: ReturnType<typeof copyEntryGroups>[number] }) {
+  const fold = useFold(group.entries);
+  const title = COPY_OUTCOME_TITLES[group.outcome] ?? group.outcome;
+  const note = COPY_OUTCOME_NOTES[group.outcome];
+  return (
+    <div className="flex flex-col gap-1.5">
+      <h3 className="font-medium text-xs">{title}</h3>
+      {note !== undefined && <p className="text-muted-foreground text-xs">{note}</p>}
+      <ul aria-label={title} className="flex flex-col gap-1">
+        {fold.visible.map((entry) => (
+          <li key={entry.path} className="flex flex-col gap-0.5">
+            <div className="flex items-baseline justify-between gap-3">
+              <span className="min-w-0 flex-1 truncate font-mono text-xs" title={entry.path}>
+                {entry.path}
+              </span>
+              {/* No size beside a failure: none of it reached the
+                            destination, and a byte count there would read as
+                            how much did. */}
+              {group.outcome !== "failed" && (
+                <span className="shrink-0 text-muted-foreground text-xs">
+                  {formatCopyBytes(entry.bytes)}
+                </span>
+              )}
+            </div>
+            {entry.reason !== null && (
+              <span className="font-mono text-destructive text-xs">{entry.reason}</span>
+            )}
+          </li>
+        ))}
+      </ul>
+      <FoldToggle rows={group.entries} fold={fold} label={title} />
     </div>
   );
 }
