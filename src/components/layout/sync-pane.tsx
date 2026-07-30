@@ -143,6 +143,7 @@ import {
   refreshSyncDetail,
   refreshSyncDetailAll,
   retrySyncParked,
+  retrySyncParkedAll,
   startSyncDetailPolling,
   startSyncProgressStream,
   syncLiveFraction,
@@ -207,11 +208,23 @@ export const SYNC_CONFLICT_NOTE =
 /** Parked-work copy. */
 export const SYNC_PARKED_TITLE = "Stopped retrying";
 export const SYNC_PARKED_SENTENCE =
-  "keeper stopped retrying these after repeated failures. Retry puts one back in the queue.";
+  "keeper stopped retrying these after repeated failures. Retry puts one back in the queue; Retry all puts back every one listed here.";
 export const SYNC_PARKED_NO_ERROR_SENTENCE = "No error was recorded.";
 
 /** The parked-unit action label. */
 export const SYNC_RETRY_LABEL = "Retry";
+
+/**
+ * The bulk action, offered only when there is more than one parked unit — beside
+ * a single row it would be a second button that does exactly what the first one
+ * does.
+ *
+ * "Retry all" and not "Retry everything": what it requeues is this folder's
+ * parked units, and a folder card is the only place it appears. The count is in
+ * the accessible name rather than the visible label, because the list it sits
+ * above already shows how many there are to anyone who can see it.
+ */
+export const SYNC_RETRY_ALL_LABEL = "Retry all";
 
 /**
  * Delivery copy. The label names what is behind an Activity row's delivery
@@ -722,6 +735,18 @@ function SyncProfileCard({
     });
   };
 
+  /**
+   * Put every parked unit back in the queue, under the same busy lock one Retry
+   * takes. The ids are passed in from the rendered list rather than re-read
+   * here, so what the click requeues is what the user was looking at — a unit
+   * that parked between the render and the click is left for the next press.
+   */
+  const retryAllUnits = (unitIds: readonly number[]) => {
+    void run(async () => {
+      await retrySyncParkedAll(profile.id, unitIds);
+    });
+  };
+
   const active = status !== undefined && isSyncStatusActive(status);
   const fraction = syncLiveFraction(status, progress);
   const percent = fraction === null ? null : Math.round(fraction * 100);
@@ -929,6 +954,7 @@ function SyncProfileCard({
           problems={detail?.problems ?? null}
           busy={busy}
           onRetry={retryUnit}
+          onRetryAll={retryAllUnits}
         />
       </CardContent>
       {/* The Settings row's confirmation, verbatim: same title, same sentence,
@@ -1187,11 +1213,13 @@ function SyncProblemsSection({
   problems,
   busy,
   onRetry,
+  onRetryAll,
 }: {
   profile: SyncProfileVm;
   problems: SyncProblemsVm | null;
   busy: boolean;
   onRetry: (unitId: number) => void;
+  onRetryAll: (unitIds: readonly number[]) => void;
 }) {
   if (
     problems === null ||
@@ -1242,7 +1270,27 @@ function SyncProblemsSection({
       )}
       {problems.parked.length > 0 && (
         <div className="flex flex-col gap-1.5">
-          <h3 className="font-medium text-xs">{SYNC_PARKED_TITLE}</h3>
+          {/* The bulk action sits on the heading, not in the list: it acts on the
+              whole group, and a row carrying it would read as another per-unit
+              Retry. Above the sentence that explains what Retry does, so the
+              explanation covers both buttons rather than trailing the one it
+              does not mention. */}
+          <div className="flex items-start justify-between gap-3">
+            <h3 className="font-medium text-xs">{SYNC_PARKED_TITLE}</h3>
+            {problems.parked.length > 1 && (
+              <Button
+                type="button"
+                variant="outline"
+                size="xs"
+                className="shrink-0"
+                disabled={busy}
+                aria-label={`${SYNC_RETRY_ALL_LABEL}: ${problems.parked.length} ${SYNC_PARKED_TITLE.toLowerCase()}, ${profile.name}`}
+                onClick={() => onRetryAll(problems.parked.map((unit) => unit.id))}
+              >
+                {SYNC_RETRY_ALL_LABEL}
+              </Button>
+            )}
+          </div>
           <p className="text-muted-foreground text-xs">{SYNC_PARKED_SENTENCE}</p>
           <ul aria-label={`${SYNC_PARKED_TITLE}: ${profile.name}`} className="flex flex-col gap-2">
             {problems.parked.map((unit) => {

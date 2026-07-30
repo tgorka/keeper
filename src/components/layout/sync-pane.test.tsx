@@ -69,6 +69,7 @@ import {
   SYNC_PENDING_EMPTY_SENTENCE,
   SYNC_PENDING_TITLE,
   SYNC_PROBLEMS_TITLE,
+  SYNC_RETRY_ALL_LABEL,
   SYNC_RETRY_LABEL,
   SYNC_SETTLING_NOTE,
   SYNC_SETTLING_SENTENCE,
@@ -1227,6 +1228,70 @@ describe("SyncPane problems", () => {
 
     await waitFor(() => expect(mockRetryParked).toHaveBeenCalledWith("p1", 42));
     expect(mockRetryParked).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries every parked unit from one press", async () => {
+    mockProblems.mockResolvedValue(
+      problemsVm({
+        parked: [
+          { id: 41, kind: "push", attempts: 5, lastError: "remote hung up" },
+          { id: 42, kind: "lfsUpload", attempts: 2, lastError: null },
+          { id: 43, kind: "lfsUpload", attempts: 10, lastError: "rejected" },
+        ],
+      }),
+    );
+    mockRetryParked.mockResolvedValue(undefined);
+    await renderPane();
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: `${SYNC_RETRY_ALL_LABEL}: 3 ${SYNC_PARKED_TITLE.toLowerCase()}, tgdrive`,
+      }),
+    );
+
+    await waitFor(() => expect(mockRetryParked).toHaveBeenCalledTimes(3));
+    expect(mockRetryParked.mock.calls.map(([, unitId]) => unitId)).toEqual([41, 42, 43]);
+  });
+
+  it("retries the units behind one that will not requeue, and still reports it", async () => {
+    mockProblems.mockResolvedValue(
+      problemsVm({
+        parked: [
+          { id: 41, kind: "push", attempts: 5, lastError: "remote hung up" },
+          { id: 42, kind: "lfsUpload", attempts: 2, lastError: null },
+        ],
+      }),
+    );
+    // The first unit is the one that fails: a bulk action that gave up on the
+    // rest would be worse than not offering the button at all.
+    mockRetryParked.mockRejectedValueOnce({ code: "journal", message: "unit is gone" });
+    mockRetryParked.mockResolvedValue(undefined);
+    await renderPane();
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: `${SYNC_RETRY_ALL_LABEL}: 2 ${SYNC_PARKED_TITLE.toLowerCase()}, tgdrive`,
+      }),
+    );
+
+    await waitFor(() => expect(mockRetryParked).toHaveBeenCalledTimes(2));
+    expect(mockRetryParked.mock.calls.map(([, unitId]) => unitId)).toEqual([41, 42]);
+    // The rejection is surfaced rather than swallowed into a silent success.
+    expect(await screen.findByText("unit is gone")).toBeInTheDocument();
+  });
+
+  it("offers no bulk retry for a single parked unit", async () => {
+    mockProblems.mockResolvedValue(
+      problemsVm({ parked: [{ id: 41, kind: "push", attempts: 5, lastError: "remote hung up" }] }),
+    );
+    await renderPane();
+
+    // The row's own Retry is already the whole action; a second button beside it
+    // would do exactly the same thing.
+    await screen.findByRole("list", { name: `${SYNC_PARKED_TITLE}: tgdrive` });
+    expect(
+      screen.queryByRole("button", { name: new RegExp(`^${SYNC_RETRY_ALL_LABEL}`) }),
+    ).not.toBeInTheDocument();
   });
 
   it("lists conflict copies and says which version is which", async () => {

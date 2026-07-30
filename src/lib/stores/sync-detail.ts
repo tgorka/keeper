@@ -301,6 +301,40 @@ export async function retrySyncParked(id: string, unitId: number): Promise<void>
 }
 
 /**
+ * Return every named parked unit to the pending queue, then re-read the detail
+ * once.
+ *
+ * Not a loop over {@link retrySyncParked}: that would re-read the whole detail
+ * after each unit, so a folder with a dozen parked units would spend eleven
+ * round trips rendering lists that the next requeue immediately invalidates.
+ *
+ * A unit that will not requeue does not stop the ones behind it. Each is
+ * independent work and the whole point of the bulk action is not having to press
+ * twelve buttons — abandoning the tail because the first failed would be the
+ * one outcome worse than that. The first rejection is re-thrown once every unit
+ * has had its turn, so the caller still surfaces a message rather than
+ * reporting a silent success; a later one is dropped, because a list of near
+ * identical errors says nothing the first does not.
+ */
+export async function retrySyncParkedAll(id: string, unitIds: readonly number[]): Promise<void> {
+  let failure: unknown = null;
+  for (const unitId of unitIds) {
+    try {
+      await syncRetryParked(id, unitId);
+    } catch (raw) {
+      failure ??= raw;
+    }
+  }
+  // Before the re-throw: the units that *did* requeue have left the parked list,
+  // and the caller's error path must not be what decides whether the screen says
+  // so.
+  await refreshSyncDetail(id);
+  if (failure !== null) {
+    throw failure;
+  }
+}
+
+/**
  * React selector hook over {@link syncDetailStore}. Pass a selector to
  * subscribe to just the slice a component needs.
  */
