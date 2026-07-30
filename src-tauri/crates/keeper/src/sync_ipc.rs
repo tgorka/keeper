@@ -470,12 +470,43 @@ fn phase_str(p: SyncPhase) -> &'static str {
 /// that funnel is exhaustive over `CoreError` and sync is deliberately not part
 /// of it (AD-40). The classification itself is not re-derived here: the error
 /// already knows whether it is retriable and whether it needs a human.
+///
+/// **Exhaustive by construction — no `_` arm**, for the reason
+/// `keeper-syncd`'s `sync_exit_code` has none: which code a new variant gets is
+/// a decision, and `_` makes it `internal` silently. `internal` is what the app
+/// says when it has hit a bug, so both variants Epic 34 added landed there — an
+/// LFS 403 a person provoked by pressing "Sync now" reached the frontend
+/// indistinguishable from a panic, and no affordance could be built for either.
 pub fn sync_ipc_error(err: &SyncError) -> IpcError {
     let code = match err {
         SyncError::GitMissing { .. } => IpcErrorCode::Unsupported,
-        SyncError::Auth { .. } => IpcErrorCode::InvalidCredentials,
+        // Beside `Auth`, as `sync_exit_code` puts it: both are a credential the
+        // remote would not act on, and the remedies differ only in which thing a
+        // human has to change. `IpcErrorCode` has no `forbidden`, and minting
+        // one would be a frontend contract change to draw a distinction the two
+        // `Display` strings already draw in the message the user reads.
+        SyncError::Auth { .. } | SyncError::Forbidden { .. } => IpcErrorCode::InvalidCredentials,
         SyncError::Network { .. } => IpcErrorCode::ServerUnreachable,
-        _ => IpcErrorCode::Internal,
+        // A wait, not a fault: the push is held until this folder's own uploads
+        // reach the remote. `syncUnavailable` is the app's "sync cannot continue
+        // right now" code, which is exactly what this is. `retriable` stays
+        // `false` on its own account — the wait is on the uploads, not on a
+        // clock, and pressing "Sync now" again cannot shorten it.
+        SyncError::LfsUploadPending { .. } => IpcErrorCode::SyncUnavailable,
+        // Everything else keeps the `internal` this funnel has always given it.
+        // Spelled out rather than defaulted so that growing the taxonomy asks
+        // the question here instead of answering it.
+        SyncError::GitCommand { .. }
+        | SyncError::InvalidPathForRemote { .. }
+        | SyncError::MediaAbsent
+        | SyncError::Integrity { .. }
+        | SyncError::Quota { .. }
+        | SyncError::Diverged { .. }
+        | SyncError::Journal(_)
+        | SyncError::Git(_)
+        | SyncError::Io { .. }
+        | SyncError::Config(_)
+        | SyncError::Cancelled => IpcErrorCode::Internal,
     };
     IpcError {
         code,
@@ -1627,6 +1658,69 @@ mod tests {
             !auth.retriable,
             "retrying rejected credentials gets an account locked"
         );
+    }
+
+    /// The two conditions Epic 34 added, both of which the `_` arm sent to
+    /// `internal` — the code the app reserves for its own bugs.
+    ///
+    /// Neither is one. A 403 is a permission a human has to grant, reachable
+    /// from a user-initiated `sync_now` on an LFS transfer; a held push is a
+    /// wait on this folder's own uploads. Arriving as `internal` left the
+    /// frontend unable to tell either from a panic, so neither could ever be
+    /// given an affordance.
+    #[test]
+    fn the_two_conditions_epic_34_added_do_not_arrive_as_internal_faults() {
+        let forbidden = sync_ipc_error(&SyncError::Forbidden {
+            host: "git.example.org".into(),
+        });
+        assert_ne!(forbidden.code, IpcErrorCode::Internal);
+        // Beside `Auth`, its documented sibling: a credential the remote would
+        // not act on. The message carries which of the two it is.
+        assert_eq!(forbidden.code, IpcErrorCode::InvalidCredentials);
+        assert!(
+            !forbidden.retriable,
+            "the same token gets the same 403 every time"
+        );
+        assert!(
+            forbidden.message.contains("git.example.org"),
+            "{}",
+            forbidden.message
+        );
+
+        let pending = sync_ipc_error(&SyncError::LfsUploadPending { objects: 3 });
+        assert_ne!(pending.code, IpcErrorCode::Internal, "a wait is not a bug");
+        assert_eq!(pending.code, IpcErrorCode::SyncUnavailable);
+        assert!(
+            !pending.retriable,
+            "the wait is on the uploads landing, not on a clock"
+        );
+    }
+
+    /// The five wire spellings `SyncActivityVm.delivery` carries.
+    ///
+    /// Asserted here, where they are produced, because nothing else can reach
+    /// them: the generated TypeScript types `delivery` as a bare `string`, so
+    /// `tsc` cannot check a value, and `keeper-sync`'s camelCase serialization
+    /// test covers `db::ActivityRow` through serde's derive — a different code
+    /// path from this hand-written match, which is what [`sync_activity`]
+    /// actually puts on the wire.
+    ///
+    /// A typo like `"inprogress"` makes `SYNC_DELIVERY_STATES[row.delivery]`
+    /// `undefined`, `SyncDeliveryMark` return `null`, and every delivery glyph,
+    /// popover and Retry button vanish from the Sync pane — with the Rust and
+    /// TypeScript suites both green, because the frontend tests mock the IPC
+    /// client and nothing in Rust touched this function.
+    #[test]
+    fn every_delivery_state_keeps_the_camel_case_spelling_the_ui_indexes_by() {
+        for (state, wire) in [
+            (DeliveryState::Success, "success"),
+            (DeliveryState::InProgress, "inProgress"),
+            (DeliveryState::Failed, "failed"),
+            (DeliveryState::Abandoned, "abandoned"),
+            (DeliveryState::Unknown, "unknown"),
+        ] {
+            assert_eq!(delivery_str(state), wire);
+        }
     }
 
     /// AD-34-12. `Sync now` returned a full outcome and the UI rendered none

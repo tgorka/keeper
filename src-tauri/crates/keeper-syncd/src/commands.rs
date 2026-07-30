@@ -1865,6 +1865,18 @@ mod tests {
                 },
                 EXIT_FAILURE,
             ),
+            // The two variants Story 34.15 added. The wildcard-free `match`
+            // above only proves they COMPILE; a wrapper script branches on the
+            // classification, and `LfsUploadPending => EXIT_OK` would report a
+            // successful `keeper-syncd sync` for a one-shot run that published
+            // nothing — the outcome that arm's own comment argues against.
+            (
+                SyncError::Forbidden {
+                    host: "example.com".to_owned(),
+                },
+                EXIT_FAILURE,
+            ),
+            (SyncError::LfsUploadPending { objects: 2 }, EXIT_FAILURE),
             (
                 SyncError::InvalidPathForRemote {
                     path: PathBuf::from("/srv/aux"),

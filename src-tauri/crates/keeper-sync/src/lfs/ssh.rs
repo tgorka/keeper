@@ -228,16 +228,26 @@ fn split_port(authority: &str) -> (&str, Option<String>) {
     // `[::1]:22` — the port is only the colon AFTER the bracket.
     if let Some(end) = authority.rfind(']') {
         return match authority[end..].split_once(':') {
-            Some((_, port)) if !port.is_empty() => (&authority[..end + 1], Some(port.to_owned())),
+            Some((_, port)) if is_port(port) => (&authority[..end + 1], Some(port.to_owned())),
             _ => (authority, None),
         };
     }
     match authority.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
-            (host, Some(port.to_owned()))
-        }
+        Some((host, port)) if is_port(port) => (host, Some(port.to_owned())),
         _ => (authority, None),
     }
+}
+
+/// Is this the port part of an authority, or something else that followed a
+/// colon?
+///
+/// Shared by both of [`split_port`]'s branches, which is the whole point: the
+/// bracketed branch used to accept any non-empty string, so
+/// `[fe80::1]:-oProxyCommand=x` reached ssh as the argument of `-p`. A remote URL
+/// is user data, and the two branches disagreeing about what a port is means the
+/// safer one is decoration.
+fn is_port(candidate: &str) -> bool {
+    !candidate.is_empty() && candidate.chars().all(|c| c.is_ascii_digit())
 }
 
 /// What the server said.
@@ -384,17 +394,33 @@ pub async fn authenticate_with(
 
     let stderr = truncated(&output.stderr);
     if !output.status.success() {
-        if is_command_absent(output.status.code(), &stderr) {
+        // BOTH streams, folded into one line. A `ForceCommand` or `git-shell`
+        // wrapper prints its refusal on stdout, so consulting stderr alone
+        // reports "It said: nothing" while the explanation sits unread in the
+        // other pipe — and worse, a wrapper that names the missing command on
+        // stdout would park the unit instead of returning [`Answer::NoSshLfs`]
+        // and falling back to https. `git::cli::run_as` folds the two the same
+        // way, in the same order, for the same reason.
+        let said = diagnostic(&stderr, &output.stdout);
+        if is_command_absent(output.status.code(), &said) {
             tracing::debug!(
                 host = remote.user_host,
                 "the remote has no git-lfs-authenticate, so LFS falls back to https"
             );
             return Ok(Answer::NoSshLfs);
         }
-        // Everything else is a real refusal, and the stderr is the only
-        // diagnostic the forge gives: Forgejo says "Unknown git command" when
-        // LFS is switched off, Gitea says "LFS Server is not enabled", and
-        // neither is distinguishable any other way.
+        if is_ssh_transport_failure(output.status.code(), &said) {
+            // ssh could not reach the server, so nothing has been learned about
+            // the server. `Transient`, and therefore retried after backoff.
+            return Err(SyncError::Network {
+                host: remote.user_host.clone(),
+                reason: said,
+            });
+        }
+        // Everything else is a real refusal, and what the server said is the only
+        // diagnostic the forge gives: Forgejo says "Unknown git command" when LFS
+        // is switched off, Gitea says "LFS Server is not enabled", and neither is
+        // distinguishable any other way.
         //
         // `Config` rather than `Auth`, deliberately. `Auth` means "the token was
         // rejected" and its message says to replace the token, which is the
@@ -411,10 +437,10 @@ pub async fn authenticate_with(
                 .code()
                 .map(|code| format!(" (exit {code})"))
                 .unwrap_or_default(),
-            if stderr.is_empty() {
+            if said.is_empty() {
                 "nothing. Check that the remote is a forge with LFS enabled"
             } else {
-                stderr.as_str()
+                said.as_str()
             }
         )));
     }
@@ -443,6 +469,56 @@ fn is_command_absent(code: Option<i32>, stderr: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// Did **ssh** fail to reach the server, as opposed to the server refusing?
+///
+/// This is the difference between a transient failure and a permanent one, and
+/// getting it wrong is expensive in one direction only. `ssh(1)` exits **255**
+/// for its own failures — network unreachable, DNS failure, connection
+/// refused/reset, `kex_exchange_identification: Connection closed by remote
+/// host`, and the [`CONNECT_TIMEOUT_SECS`] this module itself sets. Classified as
+/// [`SyncError::Config`] every one of those is `Permanent`, which parks the
+/// `LfsUpload` unit on its FIRST failure; a parked unit counts toward
+/// `outstanding_count`, so the push is then held by `LfsUploadPending` with no
+/// auto-recovery — only an explicit `db::unpark` clears it. A closed lid or a
+/// VPN drop would therefore stop publishing permanently, which is precisely what
+/// the wall-clock-timeout branch above already refuses to do.
+///
+/// Exit 255 alone is **not** enough, because `permission denied` and
+/// `host key verification failed` are also 255 and a permanent park is the right
+/// answer for both: nothing about the world changing will fix an unauthorized
+/// key. So the code narrows the candidates and the message decides, and an
+/// unrecognized 255 stays on the `Config` path — a park with the server's own
+/// words in it beats an invisible retry loop.
+///
+/// Not [`crate::git::cli::classify_message`], whose lists are the right shape but
+/// the wrong verdicts here: its AUTH family matches `permission denied (publickey`
+/// and would return [`SyncError::Auth`], whose "replace the token" advice is
+/// exactly what this module documents as the wrong instruction for an ssh key.
+fn is_ssh_transport_failure(code: Option<i32>, said: &str) -> bool {
+    if code != Some(255) {
+        return false;
+    }
+    let lower = said.to_ascii_lowercase();
+    // `connect to host` is the load-bearing one: ssh prefixes every failed dial
+    // with `ssh: connect to host <h> port <p>: <strerror>`, so it catches the
+    // whole family — including `No route to host` and the `Operation timed out`
+    // that BSD/macOS reports where Linux says `Connection timed out`.
+    const TRANSPORT: [&str; 7] = [
+        "connect to host",
+        // ssh spells it `Could not resolve hostname`; git spells it `host`. The
+        // shorter needle matches both.
+        "could not resolve host",
+        "connection timed out",
+        "connection refused",
+        "network is unreachable",
+        // `kex_exchange_identification: Connection closed by remote host` — a
+        // loaded server or a firewall closing the door mid-handshake.
+        "connection closed by remote host",
+        "connection reset",
+    ];
+    TRANSPORT.iter().any(|needle| lower.contains(needle))
+}
+
 /// Read the JSON body.
 ///
 /// Strict on purpose, matching git-lfs: exactly one value, nothing but
@@ -450,29 +526,50 @@ fn is_command_absent(code: Option<i32>, stderr: &str) -> bool {
 /// because a banner means every LFS operation on this remote is broken until
 /// someone silences it, which is a thing to be told once rather than retried.
 fn parse_response(stdout: &[u8], remote: &SshRemote, stderr: &str) -> Result<Credential> {
+    // Whatever the server printed AHEAD of the body — a login banner, a
+    // `ForceCommand` wrapper's chatter — folded in beside stderr. This is the one
+    // thing that explains the failure and until now it reached nobody: every
+    // caller passes stderr, and a banner lands on STDOUT with the JSON behind it,
+    // so the operator got "not the expected JSON" and no sight of the cause.
+    //
+    // The body itself is never quoted, which is what [`diagnostic`] guarantees: a
+    // successful body carries the minted `Authorization`, and this error is
+    // persisted into `journal.last_error` and rendered as `ActivityRow.failure`.
+    let said = diagnostic(stderr, stdout);
     let text = std::str::from_utf8(stdout)
-        .map_err(|_| malformed(remote, "the answer was not UTF-8", stderr))?;
+        .map_err(|_| malformed(remote, "the answer was not UTF-8", &said))?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err(malformed(remote, "the answer was empty", stderr));
+        return Err(malformed(remote, "the answer was empty", &said));
     }
     let parsed: AuthResponse = serde_json::from_str(trimmed).map_err(|err| {
         malformed(
             remote,
-            &format!("the answer was not the expected JSON ({err})"),
-            stderr,
+            // The POSITION only, never serde's own message. serde renders a type
+            // mismatch as `invalid type: string "<value>", expected a map`, so a
+            // server answering `{"header":"Bearer eyJ…"}` — a plausible mistake,
+            // since the field IS a map of headers — would put the JWT into an
+            // error this PR persists into `journal.last_error` and renders in the
+            // activity list. The shape is what a human needs; the value is what
+            // must never be written down.
+            &format!(
+                "the answer was not the expected JSON (at line {}, column {})",
+                err.line(),
+                err.column()
+            ),
+            &said,
         )
     })?;
 
     let href = match parsed.href {
         Some(raw) if !raw.is_empty() => {
             let url = Url::parse(&raw)
-                .map_err(|_| malformed(remote, "the `href` it named is not a URL", stderr))?;
+                .map_err(|_| malformed(remote, "the `href` it named is not a URL", &said))?;
             if !matches!(url.scheme(), "http" | "https") {
                 return Err(malformed(
                     remote,
                     "the `href` it named is not an http(s) URL",
-                    stderr,
+                    &said,
                 ));
             }
             // Verbatim. `/info/lfs` belongs to the DERIVATION, and the server
@@ -496,19 +593,45 @@ fn parse_response(stdout: &[u8], remote: &SshRemote, stderr: &str) -> Result<Cre
 }
 
 /// A well-formed refusal beats a parse error nobody can act on, so the message
-/// names the remote and carries whatever the server said on stderr.
-fn malformed(remote: &SshRemote, what: &str, stderr: &str) -> SyncError {
+/// names the remote and carries whatever the server said.
+fn malformed(remote: &SshRemote, what: &str, said: &str) -> SyncError {
     let mut reason = format!("asked {} for an LFS credential and {what}", remote.path);
-    if !stderr.is_empty() {
-        // A banner is the overwhelmingly common cause, and it lands on stderr.
-        reason.push_str(&format!(". The remote also said: {stderr}"));
+    if !said.is_empty() {
+        // A banner is the overwhelmingly common cause. It arrives on either
+        // stream, so [`diagnostic`] has already folded both.
+        reason.push_str(&format!(". The remote also said: {said}"));
     }
     SyncError::Config(reason)
 }
 
-/// Collapse captured stderr into one bounded line.
+/// Everything the remote said, in one bounded line: `stderr`, then whatever it
+/// printed on stdout ahead of the JSON body.
+///
+/// Both streams, in that order, because `git::cli::run_as` folds them the same
+/// way and for the same reason — a wrapper's refusal frequently arrives on the
+/// stream nobody reads.
+///
+/// **stdout is quoted only up to the first `{`.** The body begins there, and a
+/// body carries the minted `Authorization`: an error message built from raw
+/// stdout would print a live credential into `journal.last_error` and onto the
+/// file's own row in the activity list. The prose ahead of the body is exactly
+/// the part a human needs and carries no token, so the brace is the whole rule.
+/// A banner that itself contains a brace is cut short, which is the right way to
+/// be wrong.
+fn diagnostic(stderr: &str, stdout: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let prose = stdout.split('{').next().unwrap_or_default();
+    // One bound over the pair, so two noisy streams cannot double the ceiling.
+    collapse(&format!("{stderr}\n{prose}"))
+}
+
+/// Collapse captured output into one bounded line.
 fn truncated(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
+    collapse(&String::from_utf8_lossy(bytes))
+}
+
+/// As [`truncated`], for text already decoded.
+fn collapse(text: &str) -> String {
     let joined = text
         .lines()
         .map(str::trim)
@@ -625,6 +748,20 @@ mod tests {
         let ported = SshRemote::parse("ssh://git@[fe80::1]:2222/o/r.git").expect("ipv6 with port");
         assert_eq!(ported.user_host, "git@[fe80::1]");
         assert_eq!(ported.port.as_deref(), Some("2222"));
+
+        // A port is digits in BOTH branches. The bracketed one used to accept any
+        // non-empty string, so this reached ssh as the argument of `-p` — a remote
+        // URL is user data, and one branch being careful is not a guard.
+        let hostile =
+            SshRemote::parse("ssh://git@[fe80::1]:-oProxyCommand=x/o/r.git").expect("parses");
+        assert_eq!(
+            hostile.port, None,
+            "not a port, so it is not handed to `-p`: {hostile:?}"
+        );
+        assert!(
+            !hostile.user_host.starts_with('-'),
+            "and what is left is a destination ssh will simply fail to resolve"
+        );
     }
 
     #[test]
@@ -654,17 +791,24 @@ mod tests {
         );
     }
 
-    /// The one detail here with a security consequence, and it went untested
-    /// until a spec review said so out loud.
+    /// The trigger condition of the `--` guard, which is all this can pin.
     ///
-    /// A remote URL is user data. Without the `--`, a host of
-    /// `-oProxyCommand=…` is handed to ssh as an OPTION rather than a
-    /// destination, and `ProxyCommand` runs a shell command — so a crafted
-    /// remote would be arbitrary code execution the moment a large file was
-    /// staged. git-lfs guards this with the same rule, and the guard is worth
-    /// nothing if it is only asserted by reading it.
+    /// A remote URL is user data. Without the `--`, a host of `-oProxyCommand=…`
+    /// is handed to ssh as an OPTION rather than a destination, and
+    /// `ProxyCommand` runs a shell command — so a crafted remote would be
+    /// arbitrary code execution the moment a large file was staged. git-lfs
+    /// guards this with the same rule.
+    ///
+    /// What this test asserts is the *precondition*: userinfo survives parsing,
+    /// so `user_host.starts_with('-')` — the condition [`authenticate_with`]
+    /// branches on — actually holds for a hostile URL. It does NOT call
+    /// `authenticate_with`, so it cannot see whether the separator is emitted and
+    /// it passes with the guard deleted. The emission is pinned by
+    /// `tests/lfs_ssh_authenticate.rs`, which asserts `--` appears in the argv
+    /// and precedes the host; the name here says which half is which so nobody
+    /// mistakes this one for the guard's coverage again.
     #[test]
-    fn a_host_that_looks_like_an_ssh_option_is_separated_from_the_options() {
+    fn userinfo_survives_parsing_so_the_guard_condition_holds() {
         let hostile =
             SshRemote::parse("ssh://-oProxyCommand=touch${IFS}pwned@host.example/o/r.git")
                 .expect("it parses — refusing it is not the defence, `--` is");
@@ -767,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn a_login_banner_is_a_configuration_error_not_a_retry() {
+    fn a_login_banner_is_a_configuration_error_not_a_retry_and_reaches_the_operator() {
         // git-lfs retries this six times and then reports a JSON parse error. A
         // banner will still be there on the sixth attempt, so it is reported
         // once, with the banner itself included — because the banner IS the fix.
@@ -777,6 +921,12 @@ mod tests {
         assert!(matches!(err, SyncError::Config(_)), "got {err:?}");
         let message = err.to_string();
         assert!(message.contains("/o/r.git"), "got: {message}");
+        assert!(
+            message.contains("Welcome to host!"),
+            "the banner is on STDOUT, and quoting stderr alone told the operator \
+             only that the JSON was unparseable — the one fact they cannot act on, \
+             got: {message}"
+        );
 
         for body in [
             &b""[..],
@@ -787,6 +937,44 @@ mod tests {
         ] {
             assert!(parse_response(body, &remote, "").is_err(), "{body:?}");
         }
+    }
+
+    /// A refusal is persisted into `journal.last_error` and rendered as
+    /// `ActivityRow.failure`, so anything interpolated into one is written down
+    /// and shown. A credential must never be.
+    #[test]
+    fn a_refusal_never_carries_the_value_of_a_credential() {
+        let remote = SshRemote::parse("ssh://git@host.example/o/r.git").expect("parse");
+
+        // A plausible server mistake, since `header` IS a map of headers: send the
+        // one header as a bare string. serde renders that type mismatch as
+        // `invalid type: string "<value>", expected a map`, so echoing its message
+        // would put the JWT in the error.
+        let err = parse_response(
+            br#"{"header":"Bearer eyJhbGciOiJIUzI1NiJ9.secret.sig"}"#,
+            &remote,
+            "",
+        )
+        .expect_err("a string is not a header map");
+        let message = err.to_string();
+        assert!(
+            !message.contains("eyJhbGciOiJIUzI1NiJ9.secret.sig") && !message.contains("secret"),
+            "the token must not be written down: {message}"
+        );
+        assert!(
+            message.contains("line 1") && message.contains("column"),
+            "the position is the part a human can act on, got: {message}"
+        );
+
+        // And a body that parsed fine is not echoed either, on any path: a
+        // non-http `href` refusal sits beside a perfectly good `Authorization`.
+        let err = parse_response(
+            br#"{"header":{"Authorization":"Bearer eyJhbGciOiJIUzI1NiJ9.secret.sig"},"href":"ssh://h/x"}"#,
+            &remote,
+            "",
+        )
+        .expect_err("a non-http href is refused");
+        assert!(!err.to_string().contains("secret"), "got: {err}");
     }
 
     #[test]
@@ -829,6 +1017,87 @@ mod tests {
             "Gitea: User 2 has no \"write\" permission for owner/repo"
         ));
         assert!(!is_command_absent(None, ""));
+    }
+
+    /// The line between "try again in a minute" and "park until a human acts".
+    ///
+    /// Every one of the first group is `ssh(1)` reporting its OWN failure, exit
+    /// 255 — a closed lid, a VPN drop, a server too busy to finish the key
+    /// exchange. Classified `Permanent` they park the `LfsUpload` unit on the
+    /// FIRST occurrence, and a parked unit still counts toward
+    /// `outstanding_count`, so the push stays held by `LfsUploadPending` until
+    /// somebody runs `db::unpark`. That is publishing stopped by a lid.
+    #[test]
+    fn ssh_failing_to_reach_the_server_is_transient_and_a_refused_key_is_not() {
+        for said in [
+            "ssh: connect to host forge.example port 2222: Connection refused",
+            "ssh: connect to host forge.example port 22: Connection timed out",
+            "ssh: connect to host forge.example port 22: Network is unreachable",
+            // BSD/macOS wording for the same timeout, and `ConnectTimeout`'s own.
+            "ssh: connect to host forge.example port 22: Operation timed out",
+            "ssh: Could not resolve hostname forge.example: Name or service not known",
+            "kex_exchange_identification: Connection closed by remote host",
+            "ssh_exchange_identification: read: Connection reset by peer",
+        ] {
+            assert!(
+                is_ssh_transport_failure(Some(255), said),
+                "ssh's own failure is transient: {said}"
+            );
+        }
+
+        // Emphatically NOT transient, though both are also exit 255: retrying
+        // either forever would hide the one thing a human has to fix, and the
+        // `Config` message says what to change.
+        for said in [
+            "git@forge.example: Permission denied (publickey).",
+            "Host key verification failed.",
+            // An unrecognized 255 stays permanent too: a park carrying the
+            // server's own words beats an invisible retry loop.
+            "Forgejo: Unknown git command",
+        ] {
+            assert!(!is_ssh_transport_failure(Some(255), said), "{said}");
+        }
+
+        // The forge's own refusals never arrive as 255 — that code belongs to ssh
+        // — so the exit code has to gate the message, or "LFS Server is not
+        // enabled: connection refused by policy" would start being retried.
+        assert!(!is_ssh_transport_failure(
+            Some(1),
+            "ssh: connect to host forge.example port 22: Connection refused"
+        ));
+        assert!(!is_ssh_transport_failure(None, "connection reset"));
+    }
+
+    /// Both streams, and never the body.
+    #[test]
+    fn what_the_remote_said_includes_stdout_but_never_the_credential() {
+        // A `ForceCommand`/`git-shell` wrapper answers on stdout. Reading stderr
+        // alone reports "It said: nothing" — and worse, a wrapper naming the
+        // missing command there would park instead of falling back to https.
+        let said = diagnostic("", b"git-shell: git-lfs-authenticate: command not found\n");
+        assert_eq!(said, "git-shell: git-lfs-authenticate: command not found");
+        assert!(
+            is_command_absent(Some(1), &said),
+            "which is the whole point of folding stdout in: this is a fallback, \
+             not a park"
+        );
+
+        // The JSON body is never quoted, because it carries the minted token and
+        // this string ends up in `journal.last_error`.
+        let said = diagnostic(
+            "banner on stderr",
+            br#"Welcome{"header":{"Authorization":"Bearer eyJsecret"}}"#,
+        );
+        assert_eq!(said, "banner on stderr; Welcome");
+
+        // One bound over the pair, so two noisy streams cannot double the ceiling.
+        let noise = "x".repeat(MAX_STDERR_BYTES);
+        let said = diagnostic(&noise, noise.as_bytes());
+        assert!(
+            said.len() <= MAX_STDERR_BYTES + 4,
+            "got {} bytes",
+            said.len()
+        );
     }
 
     #[test]

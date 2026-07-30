@@ -1098,6 +1098,11 @@ impl Engine {
         source: SyncSource,
     ) -> Result<()> {
         let now = self.platform.now_ms();
+        // Before a single unit is claimed, and on every drain: deferred work
+        // waits on a condition rather than a clock, so the condition has to be
+        // re-read by whoever is about to do work. See
+        // [`Self::release_satisfied_waits`] for the two failures that shape it.
+        self.release_satisfied_waits(profile, now)?;
         let claimed = self.with_db(|conn| db::claim_ready(conn, &profile.id, now, CLAIM_LIMIT))?;
         if claimed.is_empty() {
             if scan_when_idle {
@@ -1111,7 +1116,6 @@ impl Engine {
                 Ok(()) => {
                     self.with_db(|conn| db::complete(conn, item.id))?;
                     self.clear_warning(&profile.id);
-                    self.release_held_push(profile, &item.kind)?;
                 }
                 Err(err) => {
                     self.reschedule_after(profile, item.id, item.attempts, &err)?;
@@ -1122,36 +1126,72 @@ impl Engine {
         Ok(())
     }
 
-    /// Put a push held by [`SyncError::LfsUploadPending`] back in the queue once
-    /// the upload it was waiting for was the last one.
+    /// Re-read every condition a deferred unit is waiting on, and release the
+    /// ones that have been satisfied.
     ///
-    /// The other half of the gate in [`Self::do_push`], and the sentence
-    /// [`SyncError::LfsUploadPending`] promises: "the waiting unit is re-queued
-    /// by whichever upload lands last". Deferred work waits on a condition
-    /// rather than a clock, and `claim_ready` only ever looks at `pending`, so
-    /// without something to say the condition cleared a held push would sit
-    /// deferred until the profile was paused and resumed — which is to say,
-    /// forever.
+    /// A deferred unit has nothing that will wake it: `claim_ready` only ever
+    /// offers `pending` rows, `recover_running` only rescues `running` ones, and
+    /// `enqueue_unique` dedups against `deferred`, so no fresh unit is queued in
+    /// its place either. A deferred unit nobody releases is therefore a unit
+    /// that never runs again — while [`db::outstanding_count`] keeps counting
+    /// it, which holds the push, which stops the folder publishing anything at
+    /// all. So the conditions are re-evaluated somewhere that runs
+    /// unconditionally, and this is it: once per drain, before any claim.
     ///
-    /// Called after a completion rather than from the gate itself because
-    /// "outstanding" is a fact about the whole queue, not about one unit: the
-    /// last upload to finish is the only one that can know it was the last.
-    fn release_held_push(&self, profile: &SyncProfile, kind: &WorkKind) -> Result<()> {
-        if !matches!(kind, WorkKind::LfsUpload { .. }) {
-            return Ok(());
+    /// Two conditions, and a distinct silent failure behind each:
+    ///
+    /// * **Every upload has landed** (Story 34.15), which releases a push held
+    ///   by [`SyncError::LfsUploadPending`]. This used to be answered only from
+    ///   an upload's own completion, across three separate transactions:
+    ///   `complete`, then the count, then the release. A kill in that window —
+    ///   or a `SQLITE_BUSY` whose `?` propagated out of the drain — left the
+    ///   push `deferred` with nothing outstanding and nothing that would ever
+    ///   look again, so the folder reported `Syncing` with one pending unit
+    ///   forever and the held unit surfaced in no problems view. Asked here it
+    ///   costs one indexed `COUNT(*)` per tick and the window cannot exist,
+    ///   because the next drain simply asks again.
+    /// * **A filesystem remote is reachable again** (Story 34.18). An upload to
+    ///   an unmounted remote folder defers as [`SyncError::MediaAbsent`] and
+    ///   nothing released it: [`db::undefer_profile`]'s only callers are a
+    ///   resume and the volume re-attach arm of [`Self::volume_ready`], and that
+    ///   arm returns early unless `profile.removable` — which describes the
+    ///   *local* folder's volume, not the remote's. One transient unmount of the
+    ///   remote therefore stopped that folder publishing permanently and
+    ///   invisibly. The remote's own reachability is the condition, so the
+    ///   remote is what gets asked.
+    ///
+    /// `now_ms` is the drain's own clock reading, which matters: a row released
+    /// with `not_before_ms = now` is claimable by the very next statement, so a
+    /// satisfied wait costs no extra tick.
+    fn release_satisfied_waits(&self, profile: &SyncProfile, now_ms: i64) -> Result<()> {
+        // The remote is asked first even though an upload released here is still
+        // outstanding and so cannot let the push through in the same breath: the
+        // order is what lets one pass handle a remote that came back *and* an
+        // upload queue that emptied on an earlier one.
+        if let Some(remote) = lfs::local::remote_store(&profile.remote_url) {
+            if lfs::local::is_reachable(&remote) {
+                let released = self.with_db(|conn| {
+                    db::undefer_kind(conn, &profile.id, WorkKind::LFS_UPLOAD, now_ms)
+                })?;
+                if released > 0 {
+                    tracing::info!(
+                        profile = profile.name,
+                        units = released,
+                        "the remote folder is reachable again, so its large files can move"
+                    );
+                }
+            }
         }
-        if self.lfs_uploads_outstanding(profile)? > 0 {
-            return Ok(());
-        }
-        let now = self.platform.now_ms();
-        let released =
-            self.with_db(|conn| db::undefer_kind(conn, &profile.id, WorkKind::PUSH, now))?;
-        if released > 0 {
-            tracing::info!(
-                profile = profile.name,
-                units = released,
-                "large files are on the remote, so publishing can go ahead"
-            );
+        if self.lfs_uploads_outstanding(profile)? == 0 {
+            let released =
+                self.with_db(|conn| db::undefer_kind(conn, &profile.id, WorkKind::PUSH, now_ms))?;
+            if released > 0 {
+                tracing::info!(
+                    profile = profile.name,
+                    units = released,
+                    "large files are on the remote, so publishing can go ahead"
+                );
+            }
         }
         Ok(())
     }
@@ -1192,7 +1232,34 @@ impl Engine {
             // for a pendrive while the truth is that keeper is uploading.
             Retriability::Deferred => {
                 let state = match err {
-                    SyncError::LfsUploadPending { .. } => ProfileState::Syncing,
+                    // ...and a held push is only "syncing" for as long as
+                    // something is actually moving. `outstanding_count`
+                    // deliberately counts a *parked* upload, so a 403 on one
+                    // object — permanent, abandoned, a human's problem — held the
+                    // push forever while the profile read `Syncing` and
+                    // `is_warning()` stayed false: tray and folder pane both
+                    // showed healthy progress for a folder that had permanently
+                    // stopped publishing. The parked upload does surface in the
+                    // problems view; the state word has to agree with it.
+                    //
+                    // A count that cannot be read leaves the optimistic answer
+                    // standing, the way `refresh_pending` treats its own query: a
+                    // momentary `SQLITE_BUSY` is not evidence that anything has
+                    // stopped, and the next failure asks again.
+                    SyncError::LfsUploadPending { .. } => {
+                        match self.lfs_uploads_still_moving(profile) {
+                            Ok(0) => ProfileState::NeedsAttention,
+                            Ok(_) => ProfileState::Syncing,
+                            Err(err) => {
+                                tracing::debug!(
+                                    profile = profile.name,
+                                    error = %err,
+                                    "cannot tell whether the held uploads are still moving"
+                                );
+                                ProfileState::Syncing
+                            }
+                        }
+                    }
                     _ => ProfileState::MediaAbsent,
                 };
                 self.set_state(&profile.id, state);
@@ -2022,6 +2089,19 @@ impl Engine {
         self.with_db(|conn| db::outstanding_count(conn, &profile.id, WorkKind::LFS_UPLOAD))
     }
 
+    /// Of the uploads this profile owes, how many are still being attempted?
+    ///
+    /// [`Self::lfs_uploads_outstanding`] counts a parked upload, and must: it
+    /// answers whether publishing is safe, and an abandoned upload is the
+    /// clearest possible "no". But the *state* the profile reports is a
+    /// different question with the opposite answer, because a push held behind
+    /// an abandoned upload is not in progress — it is stopped, and nothing will
+    /// restart it but a human. Told apart here rather than at the call site so
+    /// there is one place that knows the two counts differ and why.
+    fn lfs_uploads_still_moving(&self, profile: &SyncProfile) -> Result<u32> {
+        self.with_db(|conn| db::live_count(conn, &profile.id, WorkKind::LFS_UPLOAD))
+    }
+
     /// `push_unit` is this push's own journal row, when a journaled unit is
     /// driving. It is handed to the commit so the rows it records can name the
     /// work that will publish them (Story 34.16).
@@ -2399,6 +2479,44 @@ impl Engine {
             true
         };
 
+        // Journal the upload debt BEFORE the commit that creates it.
+        //
+        // This used to run after `stage_and_commit`, on the reasoning that a
+        // crash before the commit "loses nothing" — which had the direction of
+        // the risk exactly backwards. `stage_and_commit` writes the commit and
+        // moves the ref, so the pointer is durable the instant it returns,
+        // while these rows are one separate SQLite transaction each. The
+        // Story 34.15 gate reads ONLY the journal
+        // ([`Self::lfs_uploads_outstanding`]) and nothing re-derives the debt
+        // from committed-but-unpushed pointers, so a kill anywhere between the
+        // ref update and object N's INSERT lost the obligation outright: the
+        // next scan queues a push, the count comes back 0, and the push
+        // publishes a pointer whose bytes exist on this machine alone — exactly
+        // the silent failure the gate exists to prevent, through a window that
+        // was N transactions wide for an N-object commit.
+        //
+        // Enqueueing first inverts that failure into the harmless direction.
+        // `lfs::stage::prepare` above has already written every one of these
+        // objects into the local store, so a crash after these rows and before
+        // the commit leaves an upload for content nothing references yet: it
+        // runs, the remote gains an object no tree names, and the commit is
+        // re-driven from the worktree on the next pass. An unreferenced object
+        // on the remote costs disk; a lost obligation costs the file.
+        //
+        // The activity rows still go last, after the commit: each one names the
+        // unit that has to deliver it, and those ids do not exist until here.
+        let now = self.platform.now_ms();
+        let mut lfs_units: HashMap<PathBuf, i64> = HashMap::with_capacity(staging.uploads.len());
+        for object in &staging.uploads {
+            let unit = WorkKind::LfsUpload {
+                oid: object.oid.clone(),
+                size: object.size,
+            };
+            let unit_id =
+                self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now))?;
+            lfs_units.insert(object.path.clone(), unit_id);
+        }
+
         let Some(id) = git::commit::stage_and_commit(
             &repo,
             &staged,
@@ -2418,22 +2536,6 @@ impl Engine {
             lfs = staging.uploads.len(),
             "committed"
         );
-
-        // Journal the uploads BEFORE recording activity, and only now, with the
-        // pointer durably committed: a crash before this point loses nothing,
-        // and a crash after it re-drives the transfer. Recording activity second
-        // is what lets each row name the unit that will deliver it — the reverse
-        // order would have to guess an id that does not exist yet.
-        let now = self.platform.now_ms();
-        let mut lfs_units: HashMap<PathBuf, i64> = HashMap::with_capacity(staging.uploads.len());
-        for object in &staging.uploads {
-            let unit = WorkKind::LfsUpload {
-                oid: object.oid.clone(),
-                size: object.size,
-            };
-            let id = self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now))?;
-            lfs_units.insert(object.path.clone(), id);
-        }
 
         // The commit is proven to exist, so this is the first moment an
         // activity row can honestly claim it. Recording in `commit_local`
@@ -2563,7 +2665,7 @@ impl Engine {
         let key = remote.cache_key(operation);
         match self.cached_ssh_answer(&key) {
             Some(lfs::ssh::Answer::Granted(credential)) => {
-                return Ok(self.spend(profile, credential, stored));
+                return self.spend(profile, &remote, credential, stored);
             }
             Some(lfs::ssh::Answer::NoSshLfs) => {
                 return Ok((lfs::endpoint::derive(&profile.remote_url)?, stored));
@@ -2594,7 +2696,7 @@ impl Engine {
                     profile = profile.name,
                     "the remote minted an LFS credential over ssh"
                 );
-                Ok(self.spend(profile, credential, stored))
+                self.spend(profile, &remote, credential, stored)
             }
             lfs::ssh::Answer::NoSshLfs => Ok((lfs::endpoint::derive(&profile.remote_url)?, stored)),
         }
@@ -2607,29 +2709,78 @@ impl Engine {
     /// property of the *derivation*, and the server has already put it in the
     /// URL. Appending it again produces a 404 that reads plausibly enough in a
     /// log to cost an afternoon.
+    ///
+    /// # Which credential goes with which endpoint
+    ///
+    /// [`lfs::ssh`]'s response parser validates the `href`'s *scheme* and nothing
+    /// else, which is the right division of labour — a transport should not have
+    /// opinions about our keychain — but it does mean a server can name any host
+    /// on the internet and be believed. So the two credentials are treated as the
+    /// different things they are:
+    ///
+    /// * a **server-minted** `Authorization` is always honoured, at whatever
+    ///   host the same response named. It is the server's own token, scoped by
+    ///   the server, for the endpoint the server chose; that pairing is the
+    ///   entire content of the handshake and second-guessing it would break the
+    ///   CDN-and-object-store topologies it exists to express;
+    /// * the **stored** token is the user's keychain PAT for *this remote*, and
+    ///   it is attached only when the href stays on the remote's own host.
+    ///   Without that check a server answering `git-lfs-authenticate` with an
+    ///   href and no header — legal, and the case this fallback exists for —
+    ///   could harvest the PAT for any host it cared to name, in cleartext for
+    ///   an `http` href.
     fn spend(
         &self,
         profile: &SyncProfile,
+        remote: &lfs::ssh::SshRemote,
         credential: lfs::ssh::Credential,
         stored: Option<String>,
-    ) -> (url::Url, Option<String>) {
-        let endpoint = match credential.href {
-            Some(href) => href,
-            None => match lfs::endpoint::derive(&profile.remote_url) {
-                Ok(url) => url,
-                // Unreachable in practice: the remote parsed as ssh a moment
-                // ago, which is strictly harder than deriving from it. Falling
-                // back rather than raising keeps this infallible for the caller.
-                Err(err) => {
-                    tracing::warn!(profile = profile.name, %err, "cannot derive an LFS endpoint");
-                    return (
-                        url::Url::parse("https://invalid.localhost/").expect("static URL"),
-                        credential.authorization.or(stored),
-                    );
-                }
-            },
+    ) -> Result<(url::Url, Option<String>)> {
+        let Some(href) = credential.href else {
+            // No href: the endpoint is derived from the profile's own remote, so
+            // it is this remote's host by construction and the stored token
+            // belongs there. The error is propagated rather than swallowed —
+            // this used to answer `https://invalid.localhost/` with the
+            // credential still attached, and `*.localhost` resolves to loopback
+            // on every mainstream resolver, so the "unreachable" fallback was a
+            // real authenticated request to whatever happened to be listening on
+            // local 443. The caller is in a `Result` context and always was.
+            return Ok((
+                lfs::endpoint::derive(&profile.remote_url)?,
+                credential.authorization.or(stored),
+            ));
         };
-        (endpoint, credential.authorization.or(stored))
+        let authorization = match credential.authorization {
+            Some(minted) => Some(minted),
+            None if Self::href_is_same_host(remote, &href) => stored,
+            None => {
+                tracing::warn!(
+                    profile = profile.name,
+                    href = %href,
+                    "the remote named an LFS endpoint on another host and minted no \
+                     credential for it, so the stored token is not sent there"
+                );
+                None
+            }
+        };
+        Ok((href, authorization))
+    }
+
+    /// Does a server-named endpoint live on the host we authenticated to?
+    ///
+    /// `user_host` is `host` or `user@host` — the userinfo is ssh's business and
+    /// says nothing about where an HTTPS request goes, so it is stripped.
+    /// Compared case-insensitively because `Url` has already lowercased its own
+    /// host while a remote URL carries whatever the user typed. A bracketed IPv6
+    /// literal survives both steps intact: it contains no `@`, and `host_str`
+    /// returns it bracketed too.
+    fn href_is_same_host(remote: &lfs::ssh::SshRemote, href: &url::Url) -> bool {
+        let host = remote
+            .user_host
+            .rsplit_once('@')
+            .map_or(remote.user_host.as_str(), |(_, host)| host);
+        href.host_str()
+            .is_some_and(|named| named.eq_ignore_ascii_case(host))
     }
 
     /// The cached answer for one key, if it has not expired.
@@ -3144,10 +3295,34 @@ impl Engine {
         // been published a few lines earlier, which is the exact window a peer
         // clones a tree of pointer text through.
         //
-        // `false`, not `true`: this drain exists to settle work the commit just
+        // Drained to quiescence, not once. `drain_journal` claims one bounded
+        // batch — `CLAIM_LIMIT`, shared across every kind — so a single call
+        // leaves the seventeenth large file of a healthy first sync outstanding,
+        // the gate below refuses, and `sync_exit_code` turns that into a non-zero
+        // exit: `keeper-syncd sync` under `Restart=on-failure` failed on a folder
+        // where nothing whatsoever was wrong, and the app's "Sync now" reported
+        // the same thing as an error.
+        //
+        // The loop condition is *strictly decreasing*, not merely non-zero, so it
+        // is bounded by the queue rather than by the queue's health: an upload
+        // that genuinely cannot land makes no progress on its second pass, the
+        // loop stops, and the gate still refuses and still errors — which is the
+        // outcome that case deserves. `u32::MAX` seeds it so the first pass
+        // always runs, including the pass that discovers the debt: a `Push` unit
+        // drained here commits, and that commit can queue uploads of its own.
+        //
+        // `false`, not `true`: these drains exist to settle work the commit just
         // created. Scanning again here would walk the tree a second time in one
         // pass for nothing.
-        self.drain_journal(&profile, false, source).await?;
+        let mut previous = u32::MAX;
+        loop {
+            self.drain_journal(&profile, false, source).await?;
+            let outstanding = self.lfs_uploads_outstanding(&profile)?;
+            if outstanding == 0 || outstanding >= previous {
+                break;
+            }
+            previous = outstanding;
+        }
 
         if profile.direction.pushes() {
             self.do_push(&profile, source, None).await?;
@@ -4665,20 +4840,14 @@ mod tests {
             attributes.failure
         );
 
-        // The upload lands. THAT is what releases the push — nothing else can,
-        // because `claim_ready` only ever looks at `pending` and a deferred unit
-        // waits on a condition rather than a clock.
+        // The upload lands, and the next drain notices. Nothing else can notice:
+        // `claim_ready` only ever looks at `pending` and a deferred unit waits on
+        // a condition rather than a clock.
         engine
             .with_db(|conn| db::complete(conn, upload))
             .expect("complete");
         engine
-            .release_held_push(
-                &p,
-                &WorkKind::LfsUpload {
-                    oid: "unused".to_owned(),
-                    size: 1,
-                },
-            )
+            .release_satisfied_waits(&p, platform.now_ms())
             .expect("release");
         let released = engine
             .with_db(|conn| db::claim_ready(conn, &p.id, platform.now_ms(), 10))
@@ -4702,6 +4871,471 @@ mod tests {
             "the unit left the journal, which is the only way it ever does"
         );
         assert_eq!(clip.unit_id, None, "there is nothing left to retry");
+    }
+
+    /// The obligation is durable before the thing that creates it (Story 34.15).
+    ///
+    /// The gate reads the journal and nothing else — no code anywhere re-derives
+    /// the debt from committed-but-unpushed pointers — so the journal has to know
+    /// about an upload before the commit naming it exists. This used to run the
+    /// other way round: `stage_and_commit` moved the ref, and only then did one
+    /// SQLite transaction per object record what was owed. A kill in between lost
+    /// the obligation outright, and the next scan queued a push that published a
+    /// pointer to bytes no other machine could ever obtain.
+    ///
+    /// Observed from *inside* the commit rather than by killing a process. The
+    /// staging sink always reports the last path of the change set (see
+    /// `git::commit::report`), and the engine's own closure turns that into a
+    /// `Committing` frame carrying a path — which happens after the index and the
+    /// blobs are written and before the ref transaction runs. That frame is the
+    /// exact instant a `kill -9` was fatal, so it is the instant the row has to
+    /// already be there.
+    ///
+    /// The row is read over a *second* connection on purpose: the question is
+    /// whether the debt is committed to the database, not whether it is visible
+    /// inside the writer's own session.
+    #[test]
+    fn the_upload_debt_is_journaled_before_the_commit_that_creates_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1024;
+        std::fs::write(p.local_path.join("clip.mp4"), vec![42u8; 200_000]).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        // `(uploads owed, is there a commit yet)`, sampled mid-commit.
+        let observed: Arc<Mutex<Vec<(u32, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let samples = Arc::clone(&observed);
+        let db_file = db::db_path(dir.path());
+        let work = p.local_path.clone();
+        let profile_id = p.id.clone();
+        engine.subscribe(Box::new(move |event: SyncProgress| {
+            // A frame with a path in it comes from the staging loop, which only
+            // runs inside `stage_and_commit`; `commit_local`'s own opening and
+            // closing frames carry none.
+            if event.phase != SyncPhase::Committing
+                || event.files_done == 0
+                || event.current.is_none()
+            {
+                return true;
+            }
+            let conn = rusqlite::Connection::open(&db_file).expect("open the journal read-only");
+            let owed = db::outstanding_count(&conn, &profile_id, WorkKind::LFS_UPLOAD)
+                .expect("count the uploads owed");
+            let committed = gix::open(&work)
+                .ok()
+                .is_some_and(|repo| repo.head_id().is_ok());
+            Engine::lock(&samples).push((owed, committed));
+            true
+        }));
+
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        let samples = Engine::lock(&observed).clone();
+        assert_eq!(
+            samples.len(),
+            1,
+            "the staging loop reports its last path exactly once, and that frame \
+             is the whole measurement; got {samples:?}"
+        );
+        assert_eq!(samples, vec![(1u32, false)], "SAMPLES");
+        let (owed, committed) = samples[0];
+        assert!(
+            !committed,
+            "the sample has to be taken before the ref moves, or it proves nothing"
+        );
+        assert_eq!(
+            owed, 1,
+            "the upload must already be journaled while the commit is still being \
+             written: a kill here used to lose the obligation, and the pointer \
+             would then have been published with its object on this machine alone"
+        );
+    }
+
+    /// A remote folder that comes back has to release the uploads it turned away
+    /// (Story 34.18).
+    ///
+    /// `copy_lfs_object` defers on an unreachable remote, which is right — an
+    /// unmounted volume is absence, not failure (AD-48). Nothing released it,
+    /// though: `undefer_profile`'s callers are a resume and the volume re-attach
+    /// arm of `volume_ready`, which returns early unless `profile.removable` —
+    /// and `removable` describes the *local* folder's volume, not the remote's.
+    /// Meanwhile `enqueue_unique` dedups against the deferred row so no fresh
+    /// unit was ever queued, and `outstanding_count` counts it regardless of
+    /// state, so the push stayed held. One transient unmount of the remote
+    /// stopped the folder publishing permanently, and `list_parked` shows only
+    /// `parked` work, so nothing said so anywhere.
+    #[tokio::test]
+    async fn an_unreachable_remote_defers_the_upload_and_a_mounted_one_releases_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        // The pendrive, unplugged: the profile names a path that is not there.
+        let remote = remote_dir.path().join("stick").join("media.git");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1024;
+        p.remote_url = remote.to_string_lossy().into_owned();
+        std::fs::write(p.local_path.join("clip.mp4"), vec![42u8; 200_000]).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        // The upload finds nothing to copy to and waits for the volume.
+        engine
+            .drain_journal(&p, false, SyncSource::Watch)
+            .await
+            .expect("drain");
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::MediaAbsent
+        );
+        assert!(
+            engine
+                .with_db(|conn| db::claim_ready(conn, &p.id, platform.now_ms(), 10))
+                .expect("claim")
+                .is_empty(),
+            "a deferred unit waits on a condition, so no clock offers it again"
+        );
+        assert_eq!(engine.lfs_uploads_outstanding(&p).expect("count"), 1);
+
+        // The volume comes back. Nothing about the profile changes — the local
+        // folder was never removable — so the remote's own reachability is the
+        // only thing that can say so.
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        engine
+            .drain_journal(&p, false, SyncSource::Watch)
+            .await
+            .expect("drain");
+        assert_eq!(
+            engine.lfs_uploads_outstanding(&p).expect("count"),
+            0,
+            "the released upload ran in the same drain that released it"
+        );
+        let store = lfs::local::remote_store(&p.remote_url).expect("a filesystem remote");
+        let repo = engine.open_repo(&p).expect("open");
+        let pointer = lfs::stage::indexed_pointer(&repo, Path::new("clip.mp4"))
+            .expect("the committed blob is a pointer");
+        drop(repo);
+        assert!(
+            store.contains(&pointer.oid, pointer.size),
+            "the object the pointer names must be on the remote: {}",
+            store.object_path(&pointer.oid).display()
+        );
+
+        // And with nothing outstanding the push is free to publish.
+        engine
+            .do_push(&p, SyncSource::Watch, None)
+            .await
+            .expect("publish, now that the object is there");
+        let published = gix::open(&remote).expect("open the remote");
+        assert!(
+            published
+                .find_reference(&format!("refs/heads/{}", p.branch))
+                .is_ok(),
+            "the branch has to reach the remote once its objects have"
+        );
+    }
+
+    /// A push stranded in `deferred` has to be picked up by the next drain
+    /// (Story 34.15).
+    ///
+    /// The release used to fire only from an upload's own completion, over three
+    /// separate transactions: `complete`, then the count, then the release. A
+    /// `kill -9` in that window — or a `SQLITE_BUSY` whose `?` propagated out of
+    /// `drain_journal` — left the push `deferred` with nothing outstanding.
+    /// `recover_running` only rescues `running` rows, `claim_ready` never offers
+    /// a deferred one, and `enqueue_unique` dedups against it, so the folder
+    /// silently stopped publishing forever while reporting `Syncing` with one
+    /// pending unit. This is that state, planted rather than raced for.
+    #[tokio::test]
+    async fn a_push_stranded_in_deferred_is_released_by_the_next_drain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.remote_url = remote_dir.path().to_string_lossy().into_owned();
+        std::fs::write(p.local_path.join("notes.md"), b"unpublished").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        // Exactly what the crash leaves: the uploads are gone from the journal
+        // and the push that was waiting for them is still deferred.
+        let push = engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &WorkKind::Push, platform.now_ms(), 0))
+            .expect("enqueue");
+        engine
+            .with_db(|conn| {
+                db::reschedule(
+                    conn,
+                    push,
+                    WorkState::Deferred,
+                    platform.now_ms(),
+                    Some("publishing is on hold until this folder's large files reach the remote"),
+                )
+            })
+            .expect("strand the push");
+        assert_eq!(engine.lfs_uploads_outstanding(&p).expect("count"), 0);
+
+        engine
+            .drain_journal(&p, false, SyncSource::Watch)
+            .await
+            .expect("drain");
+
+        let published = gix::open(remote_dir.path()).expect("open the remote");
+        assert!(
+            published
+                .find_reference(&format!("refs/heads/{}", p.branch))
+                .is_ok(),
+            "the stranded push must publish on the next drain, not wait for a \
+             pause-and-resume that nobody knows to perform"
+        );
+        assert_eq!(
+            engine.pending_for(&p.id).expect("pending"),
+            0,
+            "and it leaves the journal, so the folder stops claiming work"
+        );
+    }
+
+    /// A healthy first sync of a folder with more large files than one claim
+    /// batch must succeed (Story 34.15, Story 34.18).
+    ///
+    /// `drain_journal` claims `CLAIM_LIMIT` units at a time, so one call left the
+    /// seventeenth upload outstanding, the gate refused, and `sync_exit_code`
+    /// turned that into a non-zero exit: `keeper-syncd sync` under
+    /// `Restart=on-failure` failed on a folder where nothing was wrong, and "Sync
+    /// now" in the app reported the same thing as an error.
+    #[tokio::test]
+    async fn a_one_shot_sync_publishes_a_folder_with_more_objects_than_one_claim_batch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1024;
+        p.remote_url = remote_dir.path().to_string_lossy().into_owned();
+        // One more than the claim batch, which is the whole point: the count has
+        // to come from `CLAIM_LIMIT` rather than from a number typed here.
+        let objects = CLAIM_LIMIT as usize + 1;
+        for i in 0..objects {
+            std::fs::write(
+                p.local_path.join(format!("clip-{i:02}.mp4")),
+                vec![7u8; 4_096],
+            )
+            .expect("write");
+        }
+        engine.upsert_profile(&p).expect("upsert");
+
+        // The first pass opens the quiescence episode; the second commits, and
+        // that commit is what owes the objects.
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("the opening pass has nothing settled to do");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        let outcome = engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("a healthy folder with 17 large files is not a failed sync");
+
+        assert!(outcome.pushed);
+        assert_eq!(
+            engine.lfs_uploads_outstanding(&p).expect("count"),
+            0,
+            "every object landed before the call returned"
+        );
+        let published = gix::open(remote_dir.path()).expect("open the remote");
+        assert!(
+            published
+                .find_reference(&format!("refs/heads/{}", p.branch))
+                .is_ok(),
+            "and the commit naming them was published"
+        );
+        let store = lfs::local::remote_store(&p.remote_url).expect("a filesystem remote");
+        let repo = engine.open_repo(&p).expect("open");
+        for i in 0..objects {
+            let rela = PathBuf::from(format!("clip-{i:02}.mp4"));
+            let pointer =
+                lfs::stage::indexed_pointer(&repo, &rela).expect("every clip is a pointer");
+            assert!(
+                store.contains(&pointer.oid, pointer.size),
+                "{} must be on the remote: {}",
+                rela.display(),
+                store.object_path(&pointer.oid).display()
+            );
+        }
+    }
+
+    /// The stored keychain token belongs to the remote's host and nowhere else
+    /// (Story 34.17).
+    ///
+    /// `git-lfs-authenticate` may answer with an `href` and no `Authorization`,
+    /// which is legal and is why the stored token is a fallback at all. But the
+    /// response parser validates only the href's *scheme*, so the host in it is
+    /// whatever the server felt like sending — and pairing the two meant a server
+    /// could name any host on the internet and be handed the user's PAT, in
+    /// cleartext for an `http` href.
+    #[test]
+    fn a_server_named_endpoint_on_another_host_never_receives_the_stored_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.remote_url = "ssh://git@git.example.com/o/r.git".to_owned();
+        let remote = lfs::ssh::SshRemote::parse(&p.remote_url).expect("an ssh remote");
+        let stored = || Some("Basic c3RvcmVkOnBhdA==".to_owned());
+        let granted = |href: &str, authorization: Option<&str>| lfs::ssh::Credential {
+            href: Some(url::Url::parse(href).expect("a valid href")),
+            authorization: authorization.map(str::to_owned),
+            expires_in_secs: None,
+        };
+
+        // Another host, no credential of its own: it gets the endpoint it asked
+        // for and nothing else.
+        let (endpoint, auth) = engine
+            .spend(
+                &p,
+                &remote,
+                granted("https://harvester.example.net/o/r.git/info/lfs", None),
+                stored(),
+            )
+            .expect("spend");
+        assert_eq!(
+            endpoint.as_str(),
+            "https://harvester.example.net/o/r.git/info/lfs",
+            "the href is still used verbatim; it is the credential that is withheld"
+        );
+        assert_eq!(
+            auth, None,
+            "the stored PAT must not leave the remote's host"
+        );
+
+        // The remote's own host, spelled with the userinfo and a different case,
+        // both of which say nothing about where the request goes.
+        let (_, auth) = engine
+            .spend(
+                &p,
+                &remote,
+                granted("https://GIT.example.com/o/r.git/info/lfs", None),
+                stored(),
+            )
+            .expect("spend");
+        assert_eq!(
+            auth,
+            stored(),
+            "on the remote's own host the stored token is the documented fallback"
+        );
+
+        // A credential the server minted for the endpoint it named is honoured
+        // wherever it named it: that pairing is the whole content of the
+        // handshake, and CDN-fronted object stores depend on it.
+        let (endpoint, auth) = engine
+            .spend(
+                &p,
+                &remote,
+                granted("https://objects.example.net/lfs", Some("Bearer eyJhbGciOi")),
+                stored(),
+            )
+            .expect("spend");
+        assert_eq!(endpoint.as_str(), "https://objects.example.net/lfs");
+        assert_eq!(auth.as_deref(), Some("Bearer eyJhbGciOi"));
+
+        // And a credential with no href at all, for a remote no endpoint can be
+        // derived from, is an error rather than a request. This used to answer
+        // `https://invalid.localhost/` with the credential still attached, and
+        // `*.localhost` resolves to loopback on every mainstream resolver — so
+        // the "unreachable" fallback was a real authenticated request to whatever
+        // was listening on local 443.
+        p.remote_url = "/media/stick/media.git".to_owned();
+        let err = engine
+            .spend(
+                &p,
+                &remote,
+                lfs::ssh::Credential {
+                    href: None,
+                    authorization: None,
+                    expires_in_secs: None,
+                },
+                stored(),
+            )
+            .expect_err("an endpoint that cannot be derived is not a URL to invent");
+        assert!(
+            !err.to_string().contains("localhost"),
+            "the failure must name the derivation, not a fabricated host: {err}"
+        );
+    }
+
+    /// A folder held behind an abandoned upload is stopped, not syncing
+    /// (Story 34.15).
+    ///
+    /// `outstanding_count` counts a parked upload deliberately — that is what
+    /// keeps the pointer unpublished — but the *state word* read from the same
+    /// fact was `Syncing`, and `is_warning()` for it is false. So a 403 on one
+    /// object left the tray glyph and the folder pane both showing healthy
+    /// progress for a folder that had permanently ceased publishing, with the
+    /// only trace in a problems list nobody had been given a reason to open.
+    #[test]
+    fn a_permanently_parked_upload_stops_the_folder_calling_itself_healthy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let now = 1_700_000_000_000;
+        let upload = engine
+            .with_db(|conn| {
+                db::enqueue(
+                    conn,
+                    &p.id,
+                    &WorkKind::LfsUpload {
+                        oid: "a".repeat(64),
+                        size: 200_000,
+                    },
+                    now,
+                    now,
+                )
+            })
+            .expect("enqueue the upload");
+        let held = SyncError::LfsUploadPending { objects: 1 };
+
+        // While the upload is still being attempted, a held push is exactly what
+        // it says: work in progress.
+        engine.record_failure(&p, &held);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Syncing
+        );
+
+        // Once keeper has given up on it, nothing will move it but a human.
+        engine
+            .with_db(|conn| db::reschedule(conn, upload, WorkState::Parked, now, Some("403")))
+            .expect("park the upload");
+        engine.record_failure(&p, &held);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::NeedsAttention,
+            "a wait that can never end is not progress, and the state word is \
+             what the tray reads"
+        );
     }
 
     #[tokio::test]

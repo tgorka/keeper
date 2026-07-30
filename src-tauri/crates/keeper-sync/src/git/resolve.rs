@@ -142,12 +142,25 @@ impl GitRequest {
 
     /// Probe the candidates. Stops at the first one that clears the floor, so a
     /// healthy `PATH` whose first entry is git costs exactly one process.
+    ///
+    /// Each candidate is pinned to an absolute path before it is touched; see
+    /// [`absolute`] for why that is correctness and not tidiness.
     pub fn resolve(self) -> GitResolution {
         let explicit = self.origin == GitOrigin::Explicit;
         let mut rejected = Vec::new();
         let mut chosen = None;
 
-        for program in self.candidates {
+        for candidate in self.candidates {
+            let program = match absolute(&candidate) {
+                Ok(program) => program,
+                Err(cause) => {
+                    rejected.push(GitRejection {
+                        program: candidate,
+                        cause,
+                    });
+                    continue;
+                }
+            };
             match judge(&program) {
                 Ok(capabilities) => {
                     chosen = Some(GitChoice {
@@ -273,6 +286,9 @@ impl GitResolution {
 }
 
 /// Probe one candidate: is this a git that can serve the engine?
+///
+/// `program` arrives absolute (see [`absolute`]), which is what makes the file
+/// probed here the same file [`super::cli`] will later execute.
 fn judge(program: &Path) -> std::result::Result<GitCapabilities, GitReject> {
     if !program.exists() {
         return Err(GitReject::Absent);
@@ -288,6 +304,45 @@ fn judge(program: &Path) -> std::result::Result<GitCapabilities, GitReject> {
     } else {
         Err(GitReject::TooOld { major, minor })
     }
+}
+
+/// Pin a candidate to one absolute path, before anything probes or runs it.
+///
+/// The mismatch this closes: [`judge`] probes with no working directory, so a
+/// relative path resolves against *this process's* cwd — while every real
+/// operation runs `Command::current_dir(repo)`, and on unix a program path
+/// containing a separator is resolved by the child, after it has chdir'd. The
+/// two therefore named two different files. `[daemon] gitPath = "usr/bin/git"`
+/// under systemd's default `WorkingDirectory=/` made `keeper-syncd doctor`
+/// print `git 2.50 at usr/bin/git (clears the 2.42 floor)` and `Engine::open`
+/// succeed, and then every git call failed with "does not exist or is not
+/// executable": the diagnostic contradicted the behaviour it was reporting on.
+/// Worse, had the synced folder held a matching relative path, the engine would
+/// have executed a binary out of content that arrived from peers.
+///
+/// Absolute, not canonical. `fs::canonicalize` would also resolve the final
+/// symlink, which changes two things this must not change: the path a person
+/// reads back (macOS canonicalizes `/var` to `/private/var`, so `doctor` would
+/// stop echoing the path the operator configured), and the name the program is
+/// executed under — a multi-call binary or a wrapper reached through a symlink
+/// branches on that name, and `is_executable` already follows symlinks on
+/// purpose. Absoluteness is the whole of what the probe/execute mismatch needs.
+fn absolute(program: &Path) -> std::result::Result<PathBuf, GitReject> {
+    if program.is_absolute() {
+        return Ok(program.to_owned());
+    }
+    // A process whose cwd has been removed cannot say what a relative path
+    // means. Reported as `Unusable` rather than guessed at: guessing is the
+    // failure mode above.
+    std::env::current_dir()
+        .map(|cwd| cwd.join(program))
+        .map_err(|err| GitReject::Unusable {
+            detail: format!(
+                "`{}` is a relative path and this process has no working directory to \
+                 resolve it against: {err}",
+                program.display()
+            ),
+        })
 }
 
 /// Whether `path` names something this process could execute.
@@ -538,17 +593,98 @@ mod tests {
 
     #[test]
     fn a_vendor_suffixed_version_is_accepted() {
-        // Apple and Windows both append their own text; only major.minor is read.
+        // Apple and Windows both append their own text; only major.minor is
+        // read. Both shapes end to end, because the `git version` identity the
+        // probe now insists on is what these have to keep clearing.
         let root = tempfile::tempdir().expect("temp dir");
         let apple = good_git(root.path(), "apple", "2.50.1 (Apple Git-155)");
+        let windows = good_git(root.path(), "windows", "2.45.1.windows.1");
 
-        let resolution = GitRequest::search(vec![apple], ADVICE).resolve();
+        for (program, expected) in [(apple, (2, 50)), (windows, (2, 45))] {
+            let resolution = GitRequest::search(vec![program], ADVICE).resolve();
+
+            assert_eq!(
+                resolution
+                    .chosen()
+                    .map(|c| (c.capabilities.major, c.capabilities.minor)),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn a_binary_that_prints_a_version_but_is_not_git_does_not_win() {
+        // The scenario Story 34.14 exists for: something called `git` earlier on
+        // PATH than the real one. `python3 --version` answers `Python 3.13.0`,
+        // which the bare token scan read as 3.13 — above the floor — so
+        // `summary()` announced `git 3.13 at …` for a binary that cannot serve
+        // one of the pushes, merges or worktree calls the engine would then make
+        // with it, and the first symptom arrived deep inside a sync.
+        let root = tempfile::tempdir().expect("temp dir");
+        let impostor = fake_git(
+            root.path(),
+            "shim",
+            "#!/bin/sh\necho 'Python 3.13.0'\n",
+            0o755,
+        );
+        let real = good_git(root.path(), "real", "2.52.0");
+
+        let resolution = GitRequest::search(vec![impostor.clone(), real.clone()], ADVICE).resolve();
 
         assert_eq!(
-            resolution
-                .chosen()
-                .map(|c| (c.capabilities.major, c.capabilities.minor)),
-            Some((2, 50))
+            resolution.chosen().map(|c| c.program.clone()),
+            Some(real),
+            "a version is not an identity: only a git may win"
+        );
+        // The same rejection shape as a git that cannot answer `--version` at
+        // all, so no caller needs a fifth branch to report it.
+        assert_eq!(resolution.rejected().len(), 1);
+        assert_eq!(resolution.rejected()[0].program, impostor);
+        match &resolution.rejected()[0].cause {
+            GitReject::Unusable { detail } => assert!(
+                detail.contains("Python 3.13.0") && detail.contains("not git"),
+                "the rejection must quote what the impostor answered: {detail}"
+            ),
+            other => panic!("expected Unusable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_relative_candidate_is_resolved_once_against_the_working_directory() {
+        // `[daemon] gitPath = "usr/bin/git"` under systemd's default
+        // `WorkingDirectory=/` was probed against this process's cwd and then
+        // executed against the repository (unix resolves a program path
+        // containing a separator after the child chdirs), so `doctor` reported a
+        // git that every later call then failed to find — and a matching
+        // relative path inside the synced folder would have been executed out of
+        // content that arrived from peers.
+        //
+        // The fixture lives *under* the cwd so the relative name needs no `..`,
+        // and nothing here calls `set_current_dir`: that is process-global state
+        // every other test in this binary shares.
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = tempfile::tempdir_in(&cwd).expect("temp dir under the cwd");
+        let absolute = good_git(root.path(), "bin", "2.50.1");
+        let relative = absolute
+            .strip_prefix(&cwd)
+            .expect("the fixture is under the cwd")
+            .to_owned();
+        assert!(relative.is_relative(), "the fixture name must be relative");
+
+        let resolution = GitRequest::explicit(relative, ADVICE).resolve();
+
+        let summary = resolution
+            .summary()
+            .expect("a relative path still names a usable git");
+        assert!(
+            summary.contains(&absolute.display().to_string()),
+            "the summary must name the file that will actually be executed: {summary}"
+        );
+        assert_eq!(
+            resolution.program().expect("chosen"),
+            absolute,
+            "the engine runs git with `current_dir(repo)`, so a program the \
+             engine receives relative would be resolved against the repository"
         );
     }
 

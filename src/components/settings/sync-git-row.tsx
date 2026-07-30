@@ -70,7 +70,8 @@ export const SYNC_GIT_CLEARED_SENTENCE = "Cleared. keeper will find a git itself
  *
  * Renders nothing at all when the build has no folder sync (iOS): telling a phone
  * user about a git version floor would be noise, which is what `unsupported`
- * means.
+ * means. And nothing before the first read lands, because there is nothing
+ * honest to say yet — but a read that *fails* is a fact, and gets said.
  */
 export function SyncGitRow({ open }: { open: boolean }) {
   const [report, setReport] = useState<SyncGitVm | null>(null);
@@ -128,9 +129,26 @@ export function SyncGitRow({ open }: { open: boolean }) {
     }
   };
 
-  // Before the first read lands, and on a build without folder sync, there is
-  // nothing honest to render.
-  if (report === null || report.state === "unsupported") {
+  // A refused probe is the one case where there is no report and something still
+  // has to be said. This used to be one guard — `report === null || state ===
+  // "unsupported"` — which returned before the error paragraph at the bottom of
+  // the block, so `load()`'s `setError` had nowhere to land and a rejected
+  // `sync_git_status` rendered the row as blank space. That is the silence this
+  // story exists to remove, one layer further out: when the report is missing,
+  // the reason it is missing is the only thing worth reading.
+  if (report === null) {
+    return error === null ? null : (
+      <div className="mt-1 flex flex-col gap-2 border-border border-t pt-3 text-sm">
+        {/* Titled, because an unlabelled red sentence in a settings dialog says
+            nothing about what failed. Named for the thing, as everywhere else. */}
+        <p className="font-medium">{SYNC_GIT_TITLE}</p>
+        <p className="text-destructive text-xs">{error}</p>
+      </div>
+    );
+  }
+  // On a build without folder sync there is nothing honest to render: telling a
+  // phone user about a git version floor would be noise.
+  if (report.state === "unsupported") {
     return null;
   }
   const healthy = report.state === "ok";

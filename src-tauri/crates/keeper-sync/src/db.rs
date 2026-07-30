@@ -552,7 +552,7 @@ pub fn undefer_profile(conn: &Connection, profile_id: &str, now_ms: i64) -> Resu
     )?)
 }
 
-/// Move one *kind* of deferred work back to pending.
+/// Move one *kind* of deferred work back to pending, undoing the wait itself.
 ///
 /// The narrow sibling of [`undefer_profile`], and the exit a push held by
 /// [`crate::error::SyncError::LfsUploadPending`] needs: that push is waiting on
@@ -564,10 +564,36 @@ pub fn undefer_profile(conn: &Connection, profile_id: &str, now_ms: i64) -> Resu
 ///
 /// `kind` is the [`WorkKind::tag`] spelling, so this filters on the indexed
 /// `kind` column without deserializing a payload.
+///
+/// # Why the wait is refunded
+///
+/// [`claim_ready`] charged an attempt to make the try that ended in the
+/// deferral, and the deferral wrote the reason it is waiting into `last_error`.
+/// Neither describes anything once the condition has cleared, and leaving them
+/// was two distinct lies at once:
+///
+/// * [`DeliveryState`]'s `from_journal` reads `"pending"` with `attempts > 0` as
+///   [`DeliveryState::Failed`], so between the release and the next claim every
+///   file the released push delivers reported **Failed** — with a `last_error`
+///   describing a wait that had already ended. A held row is supposed to read
+///   [`DeliveryState::InProgress`], which is what it read while it was still
+///   deferred.
+/// * [`crate::backoff::Backoff`] is a function of `attempts`, so a folder
+///   continuously fed large files walked its push up to the ceiling one held
+///   publication at a time, and its first genuinely transient failure then
+///   waited minutes.
+///
+/// So the row is put back the way it was found, the way [`unpark`] already puts
+/// a retried unit back: the reason is cleared and the attempt is refunded.
+/// `MAX(attempts - 1, 0)` rather than `0` because the count is still the unit's
+/// history — a push that failed twice for real and was then held once has one
+/// genuine failure refunded to nobody.
 pub fn undefer_kind(conn: &Connection, profile_id: &str, kind: &str, now_ms: i64) -> Result<usize> {
     Ok(conn.execute(
-        "UPDATE journal SET state = 'pending', not_before_ms = ?3
-         WHERE profile_id = ?1 AND kind = ?2 AND state = 'deferred'",
+        "UPDATE journal
+            SET state = 'pending', not_before_ms = ?3, last_error = NULL,
+                attempts = MAX(attempts - 1, 0)
+          WHERE profile_id = ?1 AND kind = ?2 AND state = 'deferred'",
         (profile_id, kind, now_ms),
     )?)
 }
@@ -582,6 +608,27 @@ pub fn undefer_kind(conn: &Connection, profile_id: &str, kind: &str, now_ms: i64
 pub fn outstanding_count(conn: &Connection, profile_id: &str, kind: &str) -> Result<u32> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM journal WHERE profile_id = ?1 AND kind = ?2",
+        (profile_id, kind),
+        |r| r.get(0),
+    )?;
+    Ok(n.max(0) as u32)
+}
+
+/// How many units of one kind are still being *worked* on — parked excluded.
+///
+/// The deliberate counterpart of [`outstanding_count`], and the two are not
+/// interchangeable. That one answers "may a pointer be published", where a
+/// parked upload is the strongest possible no; this one answers "is anything
+/// still moving", where a parked upload is the strongest possible no as well —
+/// but of the *opposite* sign. A push held behind an upload that has stopped
+/// being retried is not syncing, it is stopped, and reporting it as
+/// `ProfileState::Syncing` left a tray glyph and a folder pane both showing
+/// healthy progress for a folder that had permanently ceased publishing. See
+/// `Engine::record_failure`.
+pub fn live_count(conn: &Connection, profile_id: &str, kind: &str) -> Result<u32> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM journal
+          WHERE profile_id = ?1 AND kind = ?2 AND state != 'parked'",
         (profile_id, kind),
         |r| r.get(0),
     )?;
@@ -1556,6 +1603,108 @@ mod tests {
             ready.iter().map(|item| item.id).collect::<Vec<_>>(),
             vec![push],
             "only the push woke up"
+        );
+    }
+
+    /// The window between a wait ending and the next claim, which is the one
+    /// moment nobody thought about.
+    ///
+    /// A held push spends that window `pending` with an attempt already charged
+    /// against it and the reason for the wait still written down, and both of
+    /// those are read by things a user looks at: the delivery state of every file
+    /// the push carries, and the backoff the next real failure gets.
+    #[test]
+    fn a_released_wait_does_not_read_as_a_failure() {
+        let c = conn();
+        let push = enqueue(&c, "p", &WorkKind::Push, 1, 0).expect("push");
+        record_activity(
+            &c,
+            "p",
+            1,
+            &[ActivityEntry {
+                kind: ActivityKind::Added,
+                path: "clip.mp4".to_owned(),
+                size_bytes: Some(200_000),
+                unit_id: Some(push),
+            }],
+        )
+        .expect("record");
+        // The claim charges the attempt, and the deferral writes the reason —
+        // exactly the two marks `Engine::reschedule_after` leaves on a push held
+        // for its own uploads.
+        claim_ready(&c, "p", 1, 10).expect("claim");
+        reschedule(
+            &c,
+            push,
+            WorkState::Deferred,
+            1,
+            Some("publishing is on hold until this folder's large files reach the remote"),
+        )
+        .expect("defer");
+        assert_eq!(
+            list_activity(&c, "p", 10).expect("list")[0].delivery,
+            DeliveryState::InProgress,
+            "a wait is not a failure while it is still waiting"
+        );
+
+        assert_eq!(
+            undefer_kind(&c, "p", WorkKind::PUSH, 42).expect("release"),
+            1
+        );
+        let row = list_activity(&c, "p", 10).expect("list")[0].clone();
+        assert_eq!(
+            row.delivery,
+            DeliveryState::InProgress,
+            "...and it is not a failure the instant it ends either: `pending` with \
+             an attempt on the clock reads as Failed, so the release has to hand \
+             the attempt back"
+        );
+        assert_eq!(
+            row.failure, None,
+            "the reason described a wait that is over; keeping it tells the user \
+             their file failed for a condition that no longer holds"
+        );
+
+        // And the refund is a refund, not a reset: the next claim starts from
+        // attempt one, so a folder continuously fed large files does not walk its
+        // push up to the backoff ceiling one held publication at a time.
+        let ready = claim_ready(&c, "p", 42, 10).expect("claim");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].attempts, 1);
+        assert_eq!(ready[0].last_error, None);
+    }
+
+    #[test]
+    fn a_parked_unit_is_outstanding_but_it_is_not_moving() {
+        // The two counts differ by exactly the parked rows, and that difference
+        // is load-bearing in opposite directions: an abandoned upload forbids
+        // publishing (`outstanding_count`) *and* means nothing is in progress
+        // (`live_count`). A folder held behind one is stopped, not syncing.
+        let c = conn();
+        let upload = enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsUpload {
+                oid: "aa".into(),
+                size: 1,
+            },
+            1,
+            0,
+        )
+        .expect("upload");
+        assert_eq!(live_count(&c, "p", WorkKind::LFS_UPLOAD).expect("count"), 1);
+
+        claim_ready(&c, "p", 1, 10).expect("claim");
+        reschedule(&c, upload, WorkState::Parked, 1, Some("403")).expect("park");
+        assert_eq!(
+            outstanding_count(&c, "p", WorkKind::LFS_UPLOAD).expect("count"),
+            1,
+            "the remote still does not have the object"
+        );
+        assert_eq!(
+            live_count(&c, "p", WorkKind::LFS_UPLOAD).expect("count"),
+            0,
+            "and nothing is going to put it there without a human"
         );
     }
 

@@ -68,7 +68,11 @@ pub struct DaemonSettings {
     ///
     /// A path that does not clear the version floor **refuses** — the daemon does
     /// not fall back to `PATH`. Naming a binary and silently getting a different
-    /// one is the fault this setting exists to fix.
+    /// one is the fault this setting exists to fix. An empty or all-whitespace
+    /// value is not such a naming: it means automatic, and
+    /// `LinuxPlatform::with_git_path` filters it out on the way in so that
+    /// clearing the key and never writing it are one state, exactly as the app's
+    /// own copy of this setting reads it back.
     #[serde(alias = "git_path")]
     pub git_path: Option<PathBuf>,
 }

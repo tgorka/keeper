@@ -104,9 +104,10 @@ left mid-flight is returned to the queue at the next start.
 5. Stage what settled, route oversized files through LFS (§8), and commit with
    provenance trailers (§9).
 6. Transfer any LFS objects the commit queued.
-7. Push — but **only** once step 6 has nothing outstanding. A commit whose
-   pointers name objects the remote does not have yet is held back rather than
-   published; see §8.
+7. Push — but **only** once step 6 has nothing outstanding. A commit *this* pass
+   made, whose pointers name objects the remote does not have yet, is held back
+   rather than published; a commit you made yourself with plain `git` is not
+   tracked that way, which §8 spells out.
 
 Local git — staging, committing, reading status — **never** requires the
 network. Only fetch, push and LFS transfers do.
@@ -292,9 +293,24 @@ the next peer to clone checks out a tree of text stubs with no error anywhere.
 
 So the push waits. While a folder owes the remote any object, its push is
 **held** — the Sync view shows the folder as syncing and each affected file says
-what it is waiting for — and the last upload to land releases it. Nothing is
-lost while it waits: the commit is durable locally and the objects are in
-`.git/lfs`.
+what it is waiting for — and it is released as soon as a sync pass finds nothing
+outstanding. That check runs at the start of every pass rather than only when an
+upload reports in, so a crash between the last upload and the release cannot
+strand a folder holding a commit it is allowed to publish. Nothing is lost while
+it waits: the commit is durable locally and the objects are in `.git/lfs`.
+
+**The promise covers the commits keeper makes, which is narrower than it sounds.**
+What the push consults is keeper's own queue of outstanding uploads, and that
+queue only ever learns of an object from a commit keeper staged. A commit *you*
+make with plain `git` (*Working in the folder with plain `git`*, below) runs
+through the same clean filter and files the object into the same store — but it
+queues no upload, so the gate has nothing to count, and the next push publishes
+that pointer while its bytes are still only on your machine. Nothing afterwards
+compares the pointers in history against the objects the remote holds, so keeper
+does not notice later either. Hence the practical rule: **let keeper commit your
+large files.** Save them and leave them; the sync that stages a file is the sync
+that owes its upload. Committing a large file by hand is the one remaining way to
+put an unbacked pointer on the remote.
 
 ### Where the objects actually go
 
@@ -304,8 +320,8 @@ depends on the remote:
 | remote | endpoint | credential |
 |---|---|---|
 | `https://…` | derived, or `lfs.url` / `remote.<n>.lfsurl` from `.lfsconfig` | the profile's stored token, as HTTP Basic |
-| `ssh://…`, `git@host:…` | whatever `git-lfs-authenticate` returns over ssh, else derived | the `Bearer` token that command mints, else the stored token |
-| a filesystem path, `file://…` | none — there is no server | none |
+| `ssh://…`, `git@host:…` | the `href` `git-lfs-authenticate` names over ssh, else derived — `.lfsconfig` outranks both | the `Bearer` that command mints; the stored token only when the named host *is* the ssh host |
+| a filesystem path, `file://…` | none — the objects are copied store to store — unless `.lfsconfig` names a server | none; the stored token if `.lfsconfig` named a server |
 
 **An ssh remote needs no stored token.** `git push` over ssh authenticates with
 your ssh key, and keeper asks the same server for an LFS credential the same way
@@ -314,20 +330,40 @@ Forgejo and Gitea answer with a short-lived `Bearer` JWT they sign themselves an
 the endpoint to spend it at. keeper caches it briefly per repository and
 operation — they send no expiry although the token really does expire, so keeper
 imposes its own — and re-derives it whenever the server rejects one. The ssh call
-runs with `BatchMode=yes` and a connect timeout, so it can never block a
-background sync on a passphrase or host-key prompt.
+runs with `BatchMode=yes`, no password prompts, no askpass and a connect timeout,
+so it can never block a background sync on a passphrase or host-key prompt.
+
+**The endpoint is the server's answer; your token is not.** The `href` keeper
+contacts is whatever the server named, checked only for being `http(s)` — the
+server is the authority on where its own API lives. On Forgejo and Gitea that URL
+is built from `AppURL`/`ROOT_URL`, which is a *different* setting from
+`SSH_DOMAIN`, so an install whose web name differs from its git-ssh name
+legitimately names a different host and keeper follows it (both are disclosed in
+[egress.md](egress.md)). What does not follow it is your credential: the profile's
+stored token is attached only when the named host equals the ssh remote's host. A
+server that mints its own `Bearer` is honoured wherever it points; one that names
+a foreign host and mints nothing gets an unauthenticated request rather than a
+token you stored for somewhere else.
 
 If the remote has no `git-lfs-authenticate` at all — a plain bare repository
 behind a login shell — keeper falls back to the derived HTTPS endpoint with the
 stored token. If the remote *does* have it and refuses (LFS switched off, or your
 key lacks access), the folder says so and quotes the server's own words, because
-that message is the only diagnostic these servers give.
+that message is the only diagnostic these servers give. A handshake that cannot
+reach the server at all is a connectivity condition instead, and is retried like
+any other.
 
-**A filesystem remote has no LFS server**, and a pendrive is the case that
-matters (§6). `git push` has always copied its own objects into such a remote;
-keeper does the same for the content the pointers name, straight between the two
-`lfs/objects` stores, verified on arrival. Without that a pendrive carries a tree
-of stubs — which is what it used to do.
+**A filesystem remote has no LFS server** — unless the repository names one. A
+pendrive is the case that matters (§6): `git push` has always copied its own
+objects into such a remote, and keeper now does the same for the content the
+pointers name, straight between the two `lfs/objects` stores, verified on arrival.
+Without that a pendrive carries a tree of stubs — which is what it used to do.
+The exception is `.lfsconfig`: a repository whose `lfs.url` or
+`remote.origin.lfsurl` names an LFS server has settled the question, so keeper
+talks to that server over HTTP with the profile's stored token even though the git
+remote is a path on disk. That is git-lfs's own precedence and it is deliberate —
+someone who names a server beside a pendrive meant it — but it is also why "a path
+remote reaches no network" holds only in the absence of that file.
 
 Against Forgejo specifically, keeper works around several server behaviours: the
 LFS media type must be the first value in `Accept` (or the server returns 415);
@@ -338,11 +374,28 @@ back to a restart.
 ### Working in the folder with plain `git`
 
 keeper registers itself as the repository's `lfs` clean/smudge filter
-(`filter.lfs.clean` / `filter.lfs.smudge` in `.git/config`). That is what lets
-you use ordinary `git` inside a synced folder: `git status` stays clean,
-`git checkout` restores real content rather than pointer text, and a commit you
-make by hand stores a pointer and files the object into keeper's store, exactly
-as keeper's own commits do.
+(`filter.lfs.clean` / `filter.lfs.smudge` in `.git/config`) — whichever keeper
+executable is running, the app or the daemon, since both answer
+`lfs clean|smudge` on the same code. That is what lets you use ordinary `git`
+inside a synced folder: `git status` stays clean, `git checkout` restores real
+content rather than pointer text, and a commit you make by hand stores a pointer
+and files the object into keeper's store, exactly as keeper's own commits do.
+
+Two bounds on that, both worth knowing before you rely on it.
+
+**Until 0.6.4 the app-registered filter did not work at all.** The desktop binary
+registered itself and had no such subcommand, so every invocation failed — and
+because the filter is registered as *not required* (below), git could not tell a
+failed filter from an absent one and stored the bytes it was handed. A folder set
+up by the app before 0.6.4 could therefore have committed a large file raw, and
+read every LFS-tracked file as modified for no visible reason. Nothing repairs
+such a commit retroactively; the filter simply behaves from here.
+
+**A commit you make by hand is not covered by the publication gate.** The clean
+filter stores the object, but only a commit keeper stages records that the object
+is owed to the remote — see *A pointer is never published ahead of its object*
+above. Committing a large file yourself and letting keeper push is the one way to
+publish a pointer whose bytes never leave your disk.
 
 The filter is registered as **not required**, deliberately. If the keeper binary
 moves, git still works — checkouts simply yield pointer files, which is
@@ -351,7 +404,12 @@ repository.
 
 `lfsMode = pointerOnly` leaves excluded paths as pointer files. This is the only
 lever that reduces LFS traffic — sparse checkout does **not**, because git-lfs is
-entirely sparse-checkout-unaware.
+entirely sparse-checkout-unaware. Such a file reads clean regardless: handed
+bytes that are already a pointer, the clean filter re-emits them unchanged rather
+than storing them and naming *that*, so the worktree text and the blob in the
+index stay the same object. Byte-for-byte, not re-rendered — a pointer written
+with a different but legal spelling would otherwise change the blob's hash and
+the file would read as modified forever.
 
 ---
 
@@ -595,9 +653,20 @@ Two things worth setting deliberately for an agent workspace:
   never written to `sync.db` or any log. The ssh call is made with
   `BatchMode=yes` and prompting disabled, so it fails rather than waiting for a
   passphrase nobody is there to type.
-- Every configured remote is a **disclosed egress destination**, computed from
-  the live profile set and shown in Settings → About. It cannot drift from
-  reality because it is not maintained by hand.
+- **The profile's own token never leaves the host the profile named.** An ssh
+  remote's server answers the handshake with the address of its LFS API, and it is
+  free to name a different host (§8). A `Bearer` the server minted is spent
+  wherever it points — it is the server's own credential, scoped by the server.
+  Your stored token is not: it is attached only when the named host matches the
+  ssh remote's host, so a compromised or merely misconfigured forge cannot use the
+  handshake to redirect your keychain secret somewhere else.
+- Every configured remote is a **disclosed egress destination** — disclosed in
+  [egress.md](egress.md), which the release workflow diffs against the previous
+  tag, per profile and including the LFS endpoint an ssh remote's server names.
+  Note the boundary honestly: Settings → About renders the *app's* live egress
+  list, and that list is computed from your signed-in Matrix accounts plus the
+  update endpoint — folder-sync remotes are not in it. What keeps them from
+  drifting is the release diff, not that view.
 - Logs carry ids, hosts, paths and byte counts — never credentials, never file
   content.
 
@@ -623,10 +692,10 @@ free space, and exits non-zero when something is genuinely wrong.
 | `Too many open files` / watches exhausted | Raise `fs.inotify.max_user_watches`. One watcher is used per profile, not per folder. |
 | LFS upload restarts from zero | Expected. The `basic` adapter has no resumable upload. |
 | Resume fails on an object above 2 GiB | Forgejo parses range offsets as 32-bit. Keeper restarts the transfer instead. |
-| A large file's pointer is on the remote but its content is not | Fixed: the push now waits for its objects (§8). If you have such a commit from before, the object is still in `.git/lfs` on the machine that made it — sync that folder again and the upload is re-driven. |
-| *Publishing is on hold until this folder's large files reach the remote* | Not a failure. An upload has not landed yet; the push resumes when the last one does. If it persists, look at the affected file's own row for the reason the upload is failing. |
-| Every large file fails on an `ssh://` remote although `git push` works | The LFS API is HTTPS even when git is ssh. Keeper asks the server for a credential with `git-lfs-authenticate` — if that is refused, the file's row quotes the server's own words. `Unknown git command` or `LFS Server is not enabled` means LFS is switched off on the forge. |
-| Large files never arrive on a pendrive or other path remote | Fixed: objects are now copied between the two `lfs/objects` stores (§8). Sync again to re-drive the transfer. |
+| A large file's pointer is on the remote but its content is not | For commits keeper makes, fixed: the push waits for its objects (§8). For a commit that already exists, nothing re-drives it — keeper compares nothing between history and the remote's object store. If the file's row offers **Retry**, the upload is parked and that is the button; a sync pass alone never re-drives parked work. If there is no unit at all (the commit was made by hand, or predates 0.6.4), the only route is to change the file and let keeper commit the new revision, which queues a fresh upload. The old revision's bytes stay on the machine that made it. |
+| *Publishing is on hold until this folder's large files reach the remote* | Not a failure. An upload has not landed yet; the next sync pass that finds nothing outstanding releases the push. If it persists, look at the affected file's own row for the reason the upload is failing. |
+| Every large file fails on an `ssh://` remote although `git push` works | The LFS API is HTTPS even when git is ssh. Keeper asks the server for a credential with `git-lfs-authenticate` — if that is refused, the file's row quotes the server's own words. `Unknown git command` or `LFS Server is not enabled` means LFS is switched off on the forge. If the server answers but the transfer is rejected as unauthenticated, check whether its `href` names a different host from your ssh remote: keeper will not send that host the token you stored for this profile (§8), so such a server has to mint its own. |
+| Large files never arrive on a pendrive or other path remote | Fixed: objects are copied between the two `lfs/objects` stores (§8). A transfer that ran while the drive was absent is deferred, and reattaching the drive releases it on the next pass; one that already parked needs **Retry** on the file's row. |
 | History is growing fast | git keeps every revision. Run `git gc` on the repository, raise the LFS threshold, or exclude churning files. |
 
 Enable **Settings → Advanced → Debug logging** for on-disk logs

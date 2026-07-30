@@ -52,7 +52,9 @@ names one. The handshake is non-interactive by construction — `BatchMode=yes`,
 with `SSH_ASKPASS` and `DISPLAY` removed, a 20 s ceiling over the invocation, and `kill_on_drop`.
 The user's `~/.ssh/config` is still honoured, with keeper's options appended, because that
 configuration is what their `git push` already works through. A stored token still applies when the
-server grants a credential but sends no `Authorization` of its own.
+server grants a credential but sends no `Authorization` of its own **and** the endpoint is on the ssh
+remote's own host — either because the server named no `href`, or because the `href` it named resolves
+to that same host. That host comparison is the whole of the rule: see the `Never` below.
 
 **Block If:** the repository's `.lfsconfig` names an LFS server (`lfs.url` or
 `remote.origin.lfsurl`) — the handshake must not run at all, because that is a different authority
@@ -60,12 +62,24 @@ and not merely a different answer. The path contains whitespace or a control cha
 before spawning, with a `Config` error naming `.lfsconfig` as the remedy.
 
 **Never:** Never append `/info/lfs` to an `href`. Never treat a refusal as an absent command — only
-exit 127 or one of git-lfs's four not-found substrings means `NoSshLfs`; everything else is a
-`Config` error carrying the server's own words. Never report an ssh failure as `SyncError::Auth`.
-Never accept a non-`http(s)` `href`. Never read an absent expiry as "never stale". Never retry a
-login banner. Never write the minted token to `sync.db`, a log line or an error message. Do not
-change `endpoint::derive`, the batch client or the credential type: the ssh leg is another source of
-authority, not a change to what the batch client does with one.
+exit 127 or one of git-lfs's four not-found substrings means `NoSshLfs`. Never report an ssh
+*refusal* as `SyncError::Auth`; and never report a failure to *reach* the host as `Config` either.
+The two are separated by ssh's own signals: exit **255** together with one of ssh's connectivity
+phrases (`connect to host`, `could not resolve host`, `connection timed out|refused|reset`,
+`network is unreachable`, `connection closed by remote host`), and the 20 s ceiling, are
+`SyncError::Network { host, reason }` — `Config` is `Permanent`, and parking a unit that would have
+succeeded on the next attempt is how an offline laptop turns into a folder a human has to un-park by
+hand. `permission denied` and `host key verification failed` stay `Config`: those do not improve by
+being retried, and a permanent park with the server's own words is the correct answer. Everything
+else non-zero is `Config` carrying the server's own words. Never accept a non-`http(s)` `href`.
+Never read an absent expiry as "never stale". Never retry a login banner. Never write the minted
+token to `sync.db`, a log line or an error message. **Never send the profile's stored token to a host
+the *server* named and the profile did not** — the handshake is an instruction about where the API is,
+not permission to spend a keychain secret somewhere else. Do not change `endpoint::derive`, the batch
+client or the credential type: the ssh leg is another source of authority, not a change to what the
+batch client does with one. In particular `parse_response` keeps returning the `href` verbatim after
+a scheme check; the host comparison belongs to the caller that holds the token
+(`Engine::spend`), because that is the only place that knows what the profile's own remote is.
 
 ## I/O & Edge-Case Matrix
 
@@ -75,18 +89,23 @@ authority, not a change to what the batch client does with one.
 | An explicit port | `ssh://git@host.example:2222/owner/repo.git` | `-p 2222` emitted **before** the host argument | — |
 | scp-style | `git@host.example:owner/repo.git` | operand `owner/repo.git` — slash stripped, and only here; no port is representable | — |
 | No `.git` suffix | `ssh://git@host.example/owner/repo` | operand `/owner/repo`; `.git` is never added, and never removed where present | — |
-| A host starting with `-` | `ssh://-oProxyCommand=x@host/r.git` | `--` emitted before the host, so it cannot be read as an option | reasoned from `ssh.rs:330-332`; not test-covered |
+| A host starting with `-` | `ssh://-oProxyCommand=x@host/r.git` | `--` emitted before the host, so it cannot be read as an option | covered: `a_host_that_looks_like_an_ssh_option_is_separated_from_the_options` asserts the argv |
 | A download | any ssh remote, `upload == false` | operand ends `download`; separate cache key from `upload` | — |
 | Not an ssh remote | `https://`, `http://`, `git://`, `/srv/git/r.git`, `C:/repos/t.git`, `ssh://host` with no path | `SshRemote::parse` → `None`: derived endpoint + stored token, as before | not an error |
 | Whitespace in the path | `ssh://git@host.example/own er/r.git` | refused before spawning | `SyncError::Config`, naming `.lfsconfig` |
 | `.lfsconfig` names a server | `lfs.url` or `remote.origin.lfsurl` set | that URL verbatim; **no ssh handshake runs** | — |
 | Credential with `href` | `{"header":{"Authorization":"Bearer …"},"href":"https://h/o/r.git/info/lfs"}` | that `href` verbatim as the endpoint, that header on the batch request | — |
 | Credential without `href` | `{"header":{"Authorization":"Bearer …"}}` | header used; endpoint falls back to `endpoint::derive` | — |
+| `href` names the **ssh remote's own host** | `ssh://git@h/o/r.git` answered with `https://h/o/r.git/info/lfs` and no header | that `href`; the profile's stored token as Basic | — |
+| `href` names a **different** host, no header | `ssh://git@git.example/o/r.git` answered with `https://lfs.cdn.example/…` | that `href` verbatim as the endpoint, and **no credential at all** — the stored token is not forwarded | the server that redirected is the one that must mint a credential; a 401 from it says so |
+| `href` names a different host **with** a header | the same, plus `{"header":{"Authorization":"Bearer …"}}` | that `href` and that header — a server-minted credential is honoured wherever it points | — |
 | `expires_in` present | `600` | trusted: `now + 600 s − 5 s` slack | — |
 | `expires_in` absent | Forgejo/Gitea's actual response | `DEFAULT_TTL_MS` (10 min) − slack, **not** eternity | — |
 | `expires_in` negative | `-5` | deadline already past: not cached, re-derived next time | the server disowned it |
 | Command absent | exit **127**, or stderr matching `git-lfs-authenticate: *not found` | `Answer::NoSshLfs` → derived https endpoint + stored token | not an error; logged at debug |
-| Any other non-zero exit | exit 1, `Forgejo: Unknown git command` / `LFS Server is not enabled` / a permission refusal | `SyncError::Config` naming the remote, the exit code and the server's own words | said nothing? "It said: nothing. Check that the remote is a forge with LFS enabled" |
+| The forge refused | exit 1, `Forgejo: Unknown git command` / `LFS Server is not enabled` | `SyncError::Config` naming the remote, the exit code and the server's own words | said nothing? "It said: nothing. Check that the remote is a forge with LFS enabled" |
+| The key was refused | `permission denied`, `host key verification failed` | `SyncError::Config` — `Permanent`, and correctly so: retrying does not grant access | the server's own words reach the file's row |
+| ssh could not reach the host | exit **255** with `connect to host` / `could not resolve host` / `connection timed out\|refused\|reset` / `network is unreachable` / `connection closed by remote host` | `SyncError::Network { host, reason }` — `Transient`, so the unit backs off and retries | an offline laptop must not park a folder a human then has to un-park |
 | A login banner | `Welcome to host\n{…}` on stdout | `Config` once, with the banner quoted — the banner **is** the fix | not retried |
 | `href` not `http(s)` | `file:///etc/passwd`, `ssh://…`, a bare authority | `Config` — a non-http `href` must never become an endpoint | — |
 | Server accepts then wedges | no answer within 20 s | `SyncError::Network { host, reason }` | the process is killed, not orphaned |
@@ -188,6 +207,19 @@ be no token at all to replace. So the error carries the server's own words. They
 are the only diagnostic these servers give; quoting them is searchable, where classifying them is a
 dead end.
 
+**But `Config` for *every* non-zero exit was too broad, and the cost was borne by the wrong case.**
+`Config` is `Permanent`: the unit parks, and a human has to press Retry. That is right for a forge
+that does not serve LFS and for a key that lacks access — neither improves on its own. It is wrong
+for a laptop that was on a train. ssh reports a connection it could not make with exit **255** and
+its own prose (`connect to host … port 22: Connection refused`, `Could not resolve hostname`), and
+classifying that as a configuration error parks every LFS unit on the profile until somebody notices
+and un-parks them by hand — turning a network blip into manual work, in a subsystem whose entire
+promise is that convergence never waits on a prompt. Those exits are `SyncError::Network`, which is
+`Transient` and backs off. `permission denied` and `host key verification failed` stay `Config`,
+because they are exactly the cases a retry cannot help. The split is on ssh's own signals rather than
+on a guess, and `error.rs`'s retriability table is untouched — this is a classification fix, not a
+change to what the classifications mean.
+
 **`BatchMode=yes` and a connect timeout are mandatory here, where git-lfs sets no ssh options at
 all.** git-lfs runs in a terminal a human is watching, so a prompt is a question with an answer.
 keeper is a background sync daemon: there is no terminal, the prompt is not answered, and `ssh` does
@@ -277,12 +309,19 @@ field.
   parsing so the guard's trigger condition genuinely holds for such an input. Mutation-checked —
   deleting the guard fails the argv assertion with "`--` must be emitted for a host beginning with
   `-`".
-- **The engine layer is untested.** `lfs_access`, `spend`, `cached_ssh_answer` and
-  `forget_ssh_credentials` have no tests: `engine.rs`'s test module begins at `:3646` and names ssh
-  nowhere. The three-authorities ordering, the one-handshake-per-forty-objects claim, the cache
-  expiry and the drop-on-401 behaviour are reasoned from the code and from `Credential::expires_ms`,
-  which *is* tested — the composition is not. Nor is there a `.lfsconfig`-outranks-ssh test at that
-  level.
+- **The engine layer is thinly tested.** `lfs_access`, `cached_ssh_answer` and
+  `forget_ssh_credentials` have no tests. The three-authorities ordering, the
+  one-handshake-per-forty-objects claim, the cache expiry and the drop-on-401 behaviour are reasoned
+  from the code and from `Credential::expires_ms`, which *is* tested — the composition is not. Nor is
+  there a `.lfsconfig`-outranks-ssh test at that level. The exception is `spend`, which now carries
+  the credential decision and is covered:
+  `a_server_named_endpoint_on_another_host_never_receives_the_stored_credential` asserts that an
+  `href` on a foreign host with no server-minted header yields that endpoint and **no** credential,
+  that the same href with a minted header yields the header, and that an href on the remote's own
+  host still gets the stored token. It also pins the second half of that fix: a derive failure
+  propagates instead of fabricating `https://invalid.localhost/` with the credential still attached —
+  `*.localhost` resolves to loopback on every mainstream resolver, so the "unreachable" fallback was
+  an authenticated request to whatever was listening on local 443.
 - The 20 s timeout, the `ssh`-missing-from-`PATH` path, the `env_remove` / `SSH_ASKPASS_REQUIRE`
   environment, `kill_on_drop`, and an IPv6 host reaching the argv are unasserted; IPv6 is covered at
   `parse` level only. No test run was performed while writing this document: the test names, the
@@ -299,6 +338,11 @@ field.
 - `research-sync-2026-07-25.md` §5.6 (git-lfs's credential order, ssh first) and §5.7 (the adapter
   table: `basic` universally supported, `ssh` = `git-lfs-transfer` over pktline).
 - `credential.rs:92-96` and its test asserting `challenge_accepts_basic(Some("Bearer
-  realm=\"gitea-lfs\""))` is `false`; `docs/sync.md` §8 "Where the objects actually go" and §14
-  (keeper reads no private key; the minted token lives in memory for minutes, never in `sync.db` or
-  a log). Both docs already state this behaviour; neither needed changing.
+  realm=\"gitea-lfs\""))` is `false`.
+- `docs/sync.md` §8 "Where the objects actually go" and §14 stated the ssh handshake correctly and
+  now also state the host rule: which credential goes to a server-named endpoint was not documented
+  anywhere, and `docs/egress.md` had gone further and claimed the destination "is unchanged, so the
+  destination disclosed here still covers it" — false, because Forgejo and Gitea build the `href`
+  from `AppURL`/`ROOT_URL` and not from `SSH_DOMAIN`. Both files are corrected in this PR;
+  `docs/egress.md` is the release-diffed egress record, so a wrong claim there is the one that
+  matters most.

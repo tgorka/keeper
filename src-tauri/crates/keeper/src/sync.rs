@@ -17,6 +17,8 @@
 //! capability and `Engine::open` cannot disagree; [`git_report`] is what tells a
 //! person which binary won, or why none did.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -136,19 +138,43 @@ pub const GIT_ADVICE: &str = "install git 2.42 or newer (`brew install git`, or 
 
 /// Candidate `git` paths, in the order they will be probed.
 fn git_candidates() -> Vec<PathBuf> {
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
+    candidates_from(std::env::var_os("PATH"))
+}
+
+/// The candidate list for one `PATH`, deduplicated **by identity**.
+///
+/// Split from [`git_candidates`] so the deduplication can be exercised against
+/// a crafted `PATH`: reading the process environment would make the assertion
+/// depend on whichever machine ran it, and writing it would race every other
+/// test in this binary that resolves `git`.
+///
+/// Identity, not adjacency. This was `Vec::dedup`, which collapses only
+/// *consecutive* repeats — and the repeats here never are. Under the
+/// `launchctl` `PATH` a Finder-launched app inherits, the two entries that also
+/// appear in [`EXTRA_GIT_LOCATIONS`] sit at positions 0 and 1 and their copies
+/// are appended at 6 and 7, so nothing was removed at all: each duplicate cost
+/// a real `git --version` spawn — the exact cost the dedup exists to avoid —
+/// and `GitResolution::refusal` joins one line per rejected candidate, so the
+/// refusal rendered into `SyncGitVm.problem` named the same path twice with the
+/// same reason, on the one screen a person opens when they are already confused.
+fn candidates_from(path: Option<OsString>) -> Vec<PathBuf> {
+    // `None` (no `PATH` at all) is not the same as an empty one: splitting `""`
+    // yields a single empty entry, and joining `git` onto it would probe a
+    // *relative* `git` resolved against the process's working directory.
+    let from_path: Vec<PathBuf> = path
         .map(|path| {
             std::env::split_paths(&path)
                 .map(|dir| dir.join("git"))
                 .collect()
         })
         .unwrap_or_default();
-    candidates.extend(EXTRA_GIT_LOCATIONS.iter().map(PathBuf::from));
-    // A `PATH` that already names one of the well-known locations would
-    // otherwise be probed twice, spawning a process to learn what we just
-    // learned.
-    candidates.dedup();
-    candidates
+    let mut seen: HashSet<PathBuf> =
+        HashSet::with_capacity(from_path.len() + EXTRA_GIT_LOCATIONS.len());
+    from_path
+        .into_iter()
+        .chain(EXTRA_GIT_LOCATIONS.iter().map(PathBuf::from))
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .collect()
 }
 
 /// The resolution this process is using, computed at most once per outcome.
@@ -368,10 +394,88 @@ fn supervisor_slot() -> MutexGuard<'static, Option<tokio::sync::watch::Sender<bo
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Tear the engine down so the next [`engine`] call builds a fresh one.
+///
+/// [`Engine::open`] resolves `git` exactly once and keeps the resulting
+/// `GitCli` for the engine's whole life, and [`engine`] hands back the cached
+/// `Arc` without re-resolving. So forgetting the *resolution* alone cannot
+/// change what this process runs: on the common machine — sync already working,
+/// the engine built at boot by [`start_supervisor`] — pinning a different `git`
+/// would change the report and `CapabilitiesVm.sync` while every push, merge and
+/// worktree call for the rest of the session still ran the previous binary. The
+/// mirror case is worse: pinning a broken path would hide the whole Sync surface
+/// while the live supervisor kept syncing with the old `git` — "the capability
+/// probe disagreed with the engine", the defect Story 34.14 exists to end,
+/// reintroduced in mirror image.
+///
+/// The supervisor is signalled *before* the slot is emptied, because the running
+/// loop owns an `Arc` of its own: dropping this one would leave the old engine
+/// driving the old binary for the life of the process with nothing left holding
+/// a handle to stop it.
+fn reset_engine() {
+    stop_supervisor();
+    slot().take();
+}
+
+/// Adopt a just-written `sync.git_path`: forget the resolution, drop the engine
+/// built from the old one, and put background sync back if the new one works.
+///
+/// **Why the supervisor is restarted here.** `lib.rs`'s setup calls
+/// [`start_supervisor`] exactly once, at boot. On a machine where sync was
+/// broken then, repairing the path re-reveals the Sync surface — the frontend
+/// re-reads `capabilities` — but nothing would drain the journal until the app
+/// was relaunched. A surface that is live and inert is worse than the absent one
+/// it replaced, because the user has been told the fix worked.
+///
+/// **Why a broken path is safe.** The supervisor is reached only when the
+/// resolution chose a binary, which is the same fact `SyncGitVm.state == Ok` and
+/// `CapabilitiesVm.sync` are — one source of truth, so this cannot arm a
+/// supervisor on a machine the report calls unusable. [`start_supervisor`] is
+/// itself best-effort besides: a build that fails warns and returns, leaving
+/// both slots empty for the next attempt rather than poisoned.
+///
+/// **The overlap this accepts.** [`stop_supervisor`] only *signals*; the
+/// outgoing loop finishes its current unit before it exits, so a new one can
+/// briefly run beside it. That is the configuration the journal is already built
+/// for — `db::claim_ready` claims in a single UPDATE precisely so two
+/// supervisors can never take the same row, and a unit the outgoing loop returns
+/// to the queue on its way out is re-driven, which is the same "interrupted, so
+/// repeat it" path a crash takes. The alternative was to block this IPC call
+/// until the old loop joined: minutes of frozen Settings on a large push, to
+/// close a window the journal already covers.
+///
+/// Resolving here and again in the caller's report costs a second search only on
+/// a machine that has no usable `git` anywhere (a success is cached, and an
+/// explicit path is one probe, not a search) — which is the machine that has
+/// nothing to lose by it.
+pub fn repoint_engine(platform: Arc<dyn Platform>) {
+    invalidate_git_resolution();
+    reset_engine();
+    if git_resolution(platform.as_ref()).chosen().is_some() {
+        start_supervisor(platform);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use keeper_core::error::CoreError;
+
+    /// Serializes every test that touches the process-global [`GIT`], [`ENGINE`]
+    /// and [`SUPERVISOR`] slots.
+    ///
+    /// Cargo runs one crate's tests as threads in a single process, so without
+    /// this the resolution test and the repoint test would each be invalidating
+    /// the cache the other was asserting on.
+    static GLOBALS: Mutex<()> = Mutex::new(());
+
+    /// Take [`GLOBALS`], ignoring poisoning: a panicking test has already
+    /// failed, and letting it fail every *later* test too would bury the cause.
+    fn globals() -> MutexGuard<'static, ()> {
+        GLOBALS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn a_host_label_is_always_produced_and_is_a_short_name() {
@@ -391,10 +495,16 @@ mod tests {
         // Homebrew 2.52 win over a `/usr/local/bin/git` that `launchctl`'s PATH
         // puts first, while a user who deliberately put a git first still gets it.
         let candidates = git_candidates();
+        // Compared against the *unique* `PATH` entries: a directory named twice
+        // in a real `PATH` is now collapsed by `candidates_from`, so the raw
+        // split is no longer a prefix of the answer. Uniqueness itself is
+        // asserted deterministically below; this one is about order.
+        let mut seen = HashSet::new();
         let from_path: Vec<PathBuf> = std::env::var_os("PATH")
             .map(|path| {
                 std::env::split_paths(&path)
                     .map(|dir| dir.join("git"))
+                    .filter(|candidate| seen.insert(candidate.clone()))
                     .collect()
             })
             .unwrap_or_default();
@@ -408,6 +518,44 @@ mod tests {
                 "a Finder-launched app needs {extra} as a fallback"
             );
         }
+    }
+
+    #[test]
+    fn a_well_known_location_already_on_path_is_probed_once() {
+        // The `launchctl` PATH a Finder-launched macOS app inherits — the case
+        // the fallbacks exist for, and the case the old `Vec::dedup` could not
+        // touch: its two repeats are at 0 and 1 and their copies land at 6 and
+        // 7, never adjacent, so every one of them survived.
+        let launchctl = std::env::join_paths(["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin"])
+            .expect("a PATH with no separators in it");
+
+        // Whole-list equality rather than a count per entry, because both halves
+        // matter and they constrain each other: each path exactly once, and the
+        // `PATH` occurrence — not the fallback that repeats it — is the one that
+        // survives, which is what keeps a deliberately-placed git ahead.
+        assert_eq!(
+            candidates_from(Some(launchctl)),
+            [
+                "/usr/local/bin/git",
+                "/usr/bin/git",
+                "/bin/git",
+                "/usr/sbin/git",
+                // The only fallback this PATH did not already name.
+                "/opt/homebrew/bin/git",
+            ]
+            .map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn no_path_at_all_never_probes_a_relative_git() {
+        // `split_paths("")` yields one empty entry, so treating an absent PATH
+        // as an empty one would join `git` onto nothing and probe whatever the
+        // working directory happens to contain.
+        assert_eq!(
+            candidates_from(None),
+            EXTRA_GIT_LOCATIONS.map(PathBuf::from)
+        );
     }
 
     /// A `Platform` whose data dir is a fresh temp tree, so the `sync.git_path`
@@ -469,9 +617,12 @@ mod tests {
     }
 
     /// One test, not three, because [`GIT`] is process-global: two tests that
-    /// each invalidated it would race each other's cache assertions.
+    /// each invalidated it would race each other's cache assertions. [`globals`]
+    /// is what keeps the tests that *cannot* be folded together — the repoint
+    /// test below drives the engine, not the resolver — off the same slots.
     #[test]
     fn a_configured_git_is_obeyed_exactly_and_its_success_is_cached() {
+        let _serialized = globals();
         let dir = test_data_dir("configured");
         let platform = SettingsPlatform {
             data_dir: dir.clone(),
@@ -520,6 +671,77 @@ mod tests {
         invalidate_git_resolution();
         assert!(git_resolution(&platform).chosen().is_none());
 
+        invalidate_git_resolution();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Story 34.14's second half: writing the setting is not the change.
+    ///
+    /// [`Engine::open`] resolves `git` once and keeps the `GitCli`, and
+    /// [`engine`] hands back the cached `Arc`, so forgetting the resolution
+    /// alone left every push, merge and worktree call in the session running the
+    /// previous binary while the report and `CapabilitiesVm.sync` described the
+    /// new one. And with `start_supervisor` called exactly once at boot, a
+    /// machine whose `git` was broken then got its Sync surface back with
+    /// nothing draining the journal until the next relaunch.
+    ///
+    /// One test, for the reason the resolution test above is one: these legs
+    /// share process-global state and their order is the point.
+    #[test]
+    fn repointing_at_another_git_rebuilds_the_engine_and_re_arms_background_sync() {
+        let _serialized = globals();
+        let dir = test_data_dir("repoint");
+        let platform: Arc<dyn Platform> = Arc::new(SettingsPlatform {
+            data_dir: dir.clone(),
+        });
+
+        // --- A pin that cannot serve arms nothing -----------------------------
+        let old = fake_git(&dir, "git-2.23", "2.23.0");
+        keeper_core::registry::set_sync_git_path(&dir, &old.display().to_string())
+            .expect("set old");
+        repoint_engine(Arc::clone(&platform));
+        assert!(
+            engine_if_open().is_none(),
+            "a git below the floor cannot open an engine"
+        );
+        assert!(
+            supervisor_slot().is_none(),
+            "and a supervisor over an engine that does not exist is a dead loop"
+        );
+
+        // --- Repairing it must not need a relaunch ----------------------------
+        let good = fake_git(&dir, "git-2.52", "2.52.0");
+        keeper_core::registry::set_sync_git_path(&dir, &good.display().to_string())
+            .expect("set good");
+        repoint_engine(Arc::clone(&platform));
+        let first = engine_if_open().expect("a usable git builds the engine");
+        assert!(
+            supervisor_slot().is_some(),
+            "the Sync surface is back; something has to drain the journal"
+        );
+
+        // --- Pinning a different git changes what actually runs ---------------
+        let other = fake_git(&dir, "git-2.53", "2.53.0");
+        keeper_core::registry::set_sync_git_path(&dir, &other.display().to_string())
+            .expect("set other");
+        repoint_engine(Arc::clone(&platform));
+        let second = engine_if_open().expect("still open");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the cached engine still holds a GitCli over the previous binary"
+        );
+        assert!(supervisor_slot().is_some(), "and it is still being driven");
+
+        // --- Breaking it again tears the live one down ------------------------
+        // The mirror of the first leg, and the worse one: leaving the old
+        // supervisor running here is a hidden Sync surface over a live sync.
+        keeper_core::registry::set_sync_git_path(&dir, &old.display().to_string())
+            .expect("re-set old");
+        repoint_engine(Arc::clone(&platform));
+        assert!(engine_if_open().is_none(), "the engine is gone with it");
+        assert!(supervisor_slot().is_none(), "and so is its loop");
+
+        reset_engine();
         invalidate_git_resolution();
         let _ = std::fs::remove_dir_all(&dir);
     }

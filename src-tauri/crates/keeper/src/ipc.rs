@@ -1438,15 +1438,21 @@ pub fn sync_git_status(state: State<'_, AppState>) -> Result<SyncGitVm, IpcError
 /// back to a PATH search. Rejecting-without-storing would leave a mistyped path
 /// silently reverted to automatic, which is the same class of silent
 /// substitution this whole story removes.
+///
+/// The report is composed *after* [`crate::sync::repoint_engine`] so it
+/// describes the process that is now running rather than the one that was: the
+/// engine caches a `GitCli` built from the old setting, so a write that only
+/// forgot the resolution changed this report and `CapabilitiesVm.sync` while
+/// every push, merge and worktree call kept using the previous binary — the
+/// capability disagreeing with the engine again, which is the thing this
+/// command exists to stop.
 #[tauri::command]
 pub fn sync_git_path_set(state: State<'_, AppState>, path: String) -> Result<SyncGitVm, IpcError> {
     #[cfg(desktop)]
     {
         let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
         keeper_core::registry::set_sync_git_path(&data_dir, path.trim()).map_err(to_ipc_error)?;
-        // The cached resolution was computed for the old setting; a stale hit
-        // would report the previous binary as the one in force.
-        crate::sync::invalidate_git_resolution();
+        crate::sync::repoint_engine(Arc::clone(&state.platform));
         Ok(git_report(&state))
     }
     #[cfg(not(desktop))]
@@ -1455,6 +1461,7 @@ pub fn sync_git_path_set(state: State<'_, AppState>, path: String) -> Result<Syn
         Err(IpcError {
             code: IpcErrorCode::Unsupported,
             message: "folder sync is not available on this platform".to_owned(),
+            account_id: None,
             retriable: false,
         })
     }

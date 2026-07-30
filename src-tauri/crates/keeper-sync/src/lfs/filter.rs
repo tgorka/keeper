@@ -123,16 +123,68 @@ fn smudge(
 }
 
 /// Content in, pointer out.
+///
+/// # An input that is already a pointer is re-emitted, not hashed
+///
+/// Pointer text in the worktree is not a corner case: it is a state this very
+/// module produces. [`smudge`]'s `None` arm writes the pointer back whenever the
+/// object is not in the store, and under `LfsMode::PointerOnly` every LFS path
+/// holds pointer text permanently. So `git add`, `git commit -a`, `git stash`
+/// and a racily-clean re-read all hand those ~130 bytes to this function, and
+/// hashing them emits `Pointer::new(hash(P), len(P))` — a pointer naming a
+/// pointer.
+///
+/// That fails in two stages. First the path reads as MODIFIED, because the
+/// emitted pointer is not the one the index holds — enough for
+/// `git merge -X theirs` or `--ff-only` to refuse with "local changes would be
+/// overwritten". Then, if the index does take the clean, the commit replaces the
+/// only reference every peer has to the real object with a reference to 130
+/// bytes of text, and the object's oid is no longer named anywhere in the tree.
+///
+/// Story 34.19 makes the desktop app binary a filter, which is exactly where a
+/// human runs plain `git` by hand, so the blast radius is wider here than it was
+/// when only the daemon could be one. Upstream git-lfs guards the same case —
+/// `CleanPointerError`, whose handler re-emits the original bytes.
+///
+/// Re-emitting rather than re-encoding is deliberate. [`Pointer::parse`] accepts
+/// non-canonical spellings (a legacy version URL, unsorted keys), and rendering
+/// one of those afresh would change the blob hash and make the path read
+/// modified for a second, subtler reason.
 fn clean(
     store: &LfsStore,
     repo: &Path,
     input: &mut impl Read,
     output: &mut impl Write,
 ) -> Result<()> {
+    // The bounded-prefix trick [`smudge`] uses, for the same reason: a pointer is
+    // under 1 KiB by specification, so one byte past the ceiling is proof this is
+    // content. `by_ref` so the reader stays usable for the streaming branch.
+    let mut head = Vec::with_capacity(MAX_POINTER_BYTES);
+    Read::by_ref(input)
+        .take(MAX_POINTER_BYTES as u64 + 1)
+        .read_to_end(&mut head)
+        .map_err(|err| SyncError::io("read clean input", repo, err))?;
+
+    // A short read is EOF, so a `head` inside the ceiling IS the whole input —
+    // which is what makes "this file is a pointer" answerable after one bounded
+    // read. The emptiness guard is not redundant: `Pointer::parse` reads no bytes
+    // as the *empty pointer*, and an empty file must keep taking the path below,
+    // where it stores the empty object and `render` emits nothing for it.
+    if !head.is_empty() && head.len() <= MAX_POINTER_BYTES && Pointer::parse(&head).is_some() {
+        output
+            .write_all(&head)
+            .map_err(|err| SyncError::io("re-emit pointer", repo, err))?;
+        return output
+            .flush()
+            .map_err(|err| SyncError::io("flush clean output", repo, err));
+    }
+
     // Hashed straight into the object store as it streams, so the object is
     // already present by the time the pointer naming it is emitted. A crash
-    // between the two costs a re-clean, never a pointer to nothing.
-    let (oid, size) = store.insert_streaming(input)?;
+    // between the two costs a re-clean, never a pointer to nothing. `head` is
+    // chained back on rather than re-read: stdin does not rewind, and those first
+    // bytes are as much of the object as any other.
+    let (oid, size) = store.insert_streaming(head.as_slice().chain(input))?;
     let pointer = Pointer::new(oid, size);
     output
         .write_all(pointer.render().as_bytes())
@@ -201,6 +253,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How many objects the store holds, for a test that has to prove nothing
+    /// new was written.
+    fn stored_objects(store: &LfsStore) -> usize {
+        fn walk(dir: &Path) -> usize {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .map(|entry| {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path)
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        }
+        walk(&store.root().join("objects"))
+    }
 
     /// The exact command line `git::repo::enforce_local_config_with_filter`
     /// writes, minus the program. Getting this wrong means the filter silently
@@ -272,6 +346,96 @@ mod tests {
             std::fs::read(store.object_path(&pointer.oid)).expect("read back"),
             payload
         );
+    }
+
+    /// The one that costs an object rather than a round trip.
+    ///
+    /// A `clean` whose input is already a pointer must re-emit it. Pointer text
+    /// in the worktree is a state this module itself produces — `smudge` leaves
+    /// it for every object the store does not hold, and `LfsMode::PointerOnly`
+    /// leaves it there permanently — so `git add`, `git commit -a` and a
+    /// racily-clean re-read all reach here with it. Hashing it emits a pointer
+    /// naming the pointer: the path reads MODIFIED, and a commit that takes the
+    /// clean replaces every peer's only reference to the real object with 130
+    /// bytes of text.
+    #[test]
+    fn a_clean_of_a_pointer_re_emits_it_rather_than_naming_the_pointer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let store = LfsStore::in_git_dir(repo.join(".git"));
+
+        // The fixture is `smudge`'s OWN output for an object the store does not
+        // hold, rather than a hand-written pointer: these are the exact bytes the
+        // filter leaves in the worktree, which is what makes the round trip the
+        // thing under test.
+        let published = Pointer::new("b".repeat(64), 4_096).render().into_bytes();
+        let mut worktree = Vec::new();
+        run(
+            repo,
+            Direction::Smudge,
+            &mut published.as_slice(),
+            &mut worktree,
+        )
+        .expect("smudge an object the store does not hold");
+        assert_eq!(
+            worktree, published,
+            "which is where the pointer text comes from"
+        );
+
+        let before = stored_objects(&store);
+        let mut out = Vec::new();
+        run(repo, Direction::Clean, &mut worktree.as_slice(), &mut out).expect("clean");
+
+        assert_eq!(
+            out, published,
+            "byte-for-byte, so the index entry is unchanged and the path reads \
+             clean; anything else is a phantom modification at best and the loss \
+             of the object at worst"
+        );
+        assert_eq!(
+            stored_objects(&store),
+            before,
+            "and nothing was stored — hashing pointer text creates an object \
+             nobody will ever ask for"
+        );
+    }
+
+    /// The other half of the prefix read: content that merely *starts* like a
+    /// pointer must keep every byte.
+    #[test]
+    fn a_clean_keeps_every_byte_of_content_that_only_begins_like_a_pointer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let store = LfsStore::in_git_dir(repo.join(".git"));
+
+        // A real pointer's bytes and then a great deal more. The prefix read stops
+        // one byte past the pointer ceiling, so a version that forgot to chain
+        // `head` back on would store the tail alone — and silently, because the
+        // pointer it emitted would describe those bytes perfectly.
+        let mut long = Pointer::new("c".repeat(64), 1).render().into_bytes();
+        long.resize(long.len() + MAX_POINTER_BYTES * 3, b'z');
+
+        // And the boundary: one byte more than a pointer is content, and this one
+        // fits inside `head`, so nothing is chained on at all.
+        let mut barely = Pointer::new("d".repeat(64), 1).render().into_bytes();
+        barely.push(b'!');
+
+        for payload in [long, barely] {
+            let mut out = Vec::new();
+            run(repo, Direction::Clean, &mut payload.as_slice(), &mut out).expect("clean");
+            let pointer = Pointer::parse(&out).expect("content, so a fresh pointer");
+            assert_eq!(
+                pointer.size,
+                payload.len() as u64,
+                "the pointer must account for all {} bytes",
+                payload.len()
+            );
+            assert_eq!(
+                std::fs::read(store.object_path(&pointer.oid)).expect("read back"),
+                payload,
+                "and the store must hold all of them"
+            );
+        }
     }
 
     #[test]

@@ -76,6 +76,10 @@ Remote shape → whether there is a local store:
 | `git@host:owner/repo.git` (scp-style) | `None` — a network remote, not a path with a colon in it |
 | `/srv/git/r.git` | `Some(/srv/git/r.git/lfs)` |
 | `file:///srv/git/r.git` | `Some(/srv/git/r.git/lfs)` |
+| `file://localhost/srv/git/r.git` | `Some(/srv/git/r.git/lfs)` — an empty authority and `localhost` are the two RFC 8089 spellings of "this machine" |
+| `file://nas.example/srv/git/r.git` | **`None`** — a named authority is somebody else's host to dial, and treating it as a local path was a live defect (below) |
+| `file:///srv/my%20repo.git` | `Some(/srv/my repo.git/lfs)` — the URL form is percent-decoded, because that is the directory `git push` uses |
+| `/srv/my%20repo.git` (a bare path) | `Some(/srv/my%20repo.git/lfs)` — **not** decoded: a directory genuinely named that way is legal, and the bytes the user typed are the answer |
 | `C:/repos/r.git` | `Some(C:/repos/r.git/lfs)` — a drive letter is a path, which is what the one-character-authority guard protects |
 | a path whose `.git` is a directory | the store sits under `.git/lfs` |
 
@@ -97,9 +101,32 @@ Transfer behaviour:
 
 **`keeper-sync/src/lfs/local.rs`** (new) — `remote_store` (path → `LfsStore`, `None` for a URL),
 `remote_path` (the scheme and scp-style discrimination, borrowing `endpoint`'s two guards),
-`transfer` (the verified copy, returning bytes moved), `is_reachable` (asked of the store's parent,
-because `lfs/` may legitimately not exist on a remote that has never received an object), and
-`describe`.
+`transfer` (the verified copy, returning bytes moved) and `is_reachable` (asked of the store's
+parent, because `lfs/` may legitimately not exist on a remote that has never received an object).
+A fifth item, `describe`, shipped in the first pass and has been **deleted**: it was a `pub`
+forwarder over `LfsStore::object_path` with no call site anywhere, and `transfer` already calls
+`object_path` directly. Two spellings of one operation, one of them dead, is worse than the log line
+it was meant to serve.
+
+Two `remote_path` defects were fixed on the way, and the first is the more serious of the two:
+
+- **A named `file://` authority was ignored.** The rule was written in the comment from the start —
+  "the host is empty or `localhost`; anything else is a URL for somebody else to dial" — and never
+  applied, so `file://nas.example/srv/r.git` yielded the *local* path `/srv/r.git`. That is this
+  module's own failure mode arriving through the door this module installed: `do_lfs` consults
+  `remote_store` before `endpoint::derive`, so the local branch won, the objects were copied into a
+  same-named directory on **this** machine, the upload unit completed, story 34.15's gate was
+  satisfied by that completion, and the pointer was published to a remote that will never hold the
+  object. Before this transport existed the same URL produced a loud permanent refusal; returning
+  `None` restores it.
+- **A `file://` path was not percent-decoded.** `git remote add r file:///srv/my%20repo.git` pushes
+  to `/srv/my repo.git`, so keeper has to resolve to the same directory or the objects land in a
+  literally-`%20` sibling no `git` command will ever look in — a second store sharing no bytes with
+  git's own, which is precisely what `remote_store`'s bare/non-bare check exists to prevent. Only the
+  URL form is decoded; a bare path is bytes the user typed. A `%` that does not introduce two hex
+  digits, and a sequence that decodes to invalid UTF-8, are both kept verbatim rather than refused —
+  git's own `url_decode` rejects them, but the question here is "which directory", and the honest
+  answer for a byte that cannot be decoded is the byte that was written.
 
 **`keeper-sync/src/engine.rs`** — `do_lfs` branches to `copy_lfs_object` when `lfsconfig.is_none()`
 and the remote is a path, ahead of `lfs_access`. `copy_lfs_object` checks reachability, picks the
@@ -197,6 +224,13 @@ the old false pass reproduced. The mutation was reverted and the suite is green.
 
 - `a_url_remote_has_no_local_store_and_a_path_does` — the discrimination table above, including the
   scp-style and drive-letter guards.
+- `a_file_url_naming_a_host_is_somebody_elses_to_dial` — `file://nas.example/srv/r.git` is `None`,
+  and `file://localhost/…` and `file:///…` are both `Some`. Without it the named-authority case
+  copied objects into a local directory and reported success, which satisfied story 34.15's gate with
+  a lie.
+- `a_percent_escape_in_a_file_url_names_the_directory_git_names` — `file:///srv/my%20repo.git`
+  resolves to `/srv/my repo.git`, while the bare path `/srv/my%20repo.git` does not decode. Both
+  halves matter: decoding neither loses git's directory, decoding both invents a different one.
 - `a_non_bare_remote_keeps_its_objects_under_dot_git` — both layouts, on real directories.
 - `an_object_copied_between_stores_arrives_whole_and_verified` — 400,000 bytes so the streaming loop
   runs several times; asserts the reported byte count, that the target `contains` the object, that
@@ -204,6 +238,12 @@ the old false pass reproduced. The mutation was reverted and the suite is green.
 - `a_missing_source_object_is_named_rather_than_reported_as_an_io_error` — `Integrity`, not `Io`.
 - `a_truncated_source_never_becomes_a_published_object` — a length mismatch publishes nothing, so
   `contains` still answers false afterwards.
+- `an_unmounted_volume_is_absent_and_a_mounted_one_is_present_before_its_first_object` —
+  `is_reachable` in both directions, and the second half is the one that matters: a real bare-repo
+  directory with no `lfs/` yet answers **present**, because that is every pendrive on its first
+  upload, and asking about the store's own directory instead of its parent would report a perfectly
+  attached drive as absent. A path that does not exist answers absent, which the engine maps to
+  `MediaAbsent`.
 
 **Not covered, explicitly:**
 
@@ -212,11 +252,25 @@ the old false pass reproduced. The mutation was reverted and the suite is green.
   is covered only transitively by the durability matrix, which exercises it through a real
   `keeper-syncd` process. The seam between `do_lfs` and `lfs::local` has no direct test.
 - Nothing has been run against a real pendrive, an SMB mount, or any volume that can be physically
-  removed mid-copy. `MediaAbsent` is exercised by pointing at a path that does not exist, which is
-  not the same as a drive being yanked during `insert_verified` — the atomic-publish reasoning says
-  that leaves nothing behind, and that reasoning was not tested.
-- The `file://` form is covered by `remote_path`'s unit test but not end to end.
+  removed mid-copy. The `MediaAbsent` *decision* is now covered as a unit (above); what is not
+  covered is a drive yanked during `insert_verified` — the atomic-publish reasoning says that leaves
+  nothing behind, and that reasoning is still untested. The earlier claim here, that `MediaAbsent`
+  "is exercised by pointing at a path that does not exist", was false when written: `is_reachable`
+  had no test at all.
+- The objects this transport publishes into a remote store are created from a `NamedTempFile`, so
+  they land `0o600`, owned by the user running keeper. On the shared-bare-repository topology this
+  story exists to serve, a second user's keeper or `git-lfs` cannot read them, and the failure reads
+  as a filesystem mishap rather than a permission decision. Filed as DW-127; not addressed here.
+- A relative or `~`-prefixed remote path is taken verbatim, so it resolves against the process's
+  working directory rather than the repository (DW-128). Under systemd or an app bundle that is `/`.
+  Unlike the `file://` authority defect above, this one was left deferred: it changes what an
+  existing profile resolves to, which is a migration question rather than a patch.
+- The `file://` forms are covered by `remote_path`'s unit tests — including the named authority and
+  the percent escape — but not end to end.
 - No figure here is a measurement. The 24 MiB and 400,000-byte sizes are fixture sizes, not
   benchmarks; nothing profiles the copy.
 - The whole workspace, including this change, passed `cargo fmt`, `cargo clippy --workspace
-  --all-targets -- -D warnings` and `cargo test --workspace` on macOS/arm64.
+  --all-targets -- -D warnings` and `cargo test --workspace` on macOS/arm64 — **as this story
+  originally shipped.** The epic-34 review (2026-07-30) then fixed `remote_path`'s two defects,
+  deleted `describe` and added three tests; the workspace has not been re-run green as one command
+  since.

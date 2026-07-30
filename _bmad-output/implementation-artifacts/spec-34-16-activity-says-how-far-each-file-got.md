@@ -242,9 +242,14 @@ the upload completes `clip.mp4` reads `Success` with no unit id left to retry.
 - No test asserts the *ordering* of the enqueue against the activity write directly. It is covered
   transitively — the engine test's row would name no unit if the enqueue had not happened first —
   but nothing fails if the two are swapped and the ids happen to line up.
-- The frontend tests mock the IPC client, so `delivery_str`'s wire spellings are checked against the
-  TypeScript contract by `tsc` and by the Rust serialization test
-  `the_visibility_types_cross_the_ipc_boundary_as_camel_case`, not by an end-to-end call.
+- The frontend tests mock the IPC client, so no end-to-end call checks `delivery_str`'s five wire
+  spellings against the strings `SYNC_DELIVERY_STATES` indexes by. Two earlier claims here were
+  wrong and are worth naming: `tsc` cannot check them, because the generated binding types
+  `delivery` as a bare `string`; and `the_visibility_types_cross_the_ipc_boundary_as_camel_case`
+  does not either, because it serializes `db::ActivityRow` through serde's derive — a different code
+  path from the hand-written `delivery_str`. What does check them is
+  `every_delivery_state_keeps_the_camel_case_spelling_the_ui_indexes_by` in `sync_ipc.rs`'s tests,
+  which asserts the five literals `delivery_str` emits. An end-to-end invoke is still not exercised.
 - Nothing measures the `LEFT JOIN`'s cost. It is one indexed lookup per returned row against
   `journal`'s primary key, on a read already bounded to `SYNC_ACTIVITY_LIMIT` rows for the UI, so it
   was reasoned rather than profiled.

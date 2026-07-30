@@ -1365,7 +1365,36 @@ origin: found while committing the epic-34 tail, 2026-07-29
 location: keeper/src/ipc.rs (`git_report`, `sync_git_status`, `sync_git_path_set`) + keeper/src/lib.rs:327-328 (both registered) + src/lib/ipc/gen/{SyncGitVm,SyncGitState}.ts (generated) + src/components/settings/sync-section.tsx (no consumer)
 reason: the resolution, the settings key, the IPC pair and the generated bindings all exist and are tested; a repo-wide grep for `syncGit`/`SyncGitVm` outside `src/lib/ipc/gen/` finds nothing. So the report that says "git 2.23 at /usr/local/bin/git does not clear the 2.42 floor, and here is what was skipped" is computed and then discarded, and the setting that would fix it can only be written by a caller that does not exist. The capability flag DOES consume the same resolution, so the Sync surface correctly hides itself — which makes this a dead end rather than a broken screen: the user is told sync is unavailable and given no way to act on it.
 evidence: `bun run typecheck` passes with the bindings unreferenced; `git_report` is exercised only through `capabilities`. The two commands are reachable over IPC by hand (`invoke("sync_git_status")`) but nothing in the UI does.
-status: open
+status: done 2026-07-30
+resolution: STALE-OPEN, corrected. This was already fixed when the ledger commit (`e12e98f`) rewrote
+  this entry and left it `open` with the note below saying the surface "was never wired" — by then
+  false, because commit `5e9720e`, in the same change set, had added
+  `src/components/settings/sync-git-row.tsx` (207 lines, with its own 211-line test file) and mounted
+  it at `settings-dialog.tsx:194`. A stale-open entry is as wrong as a false close: it sends the next
+  person to build a surface that exists.
+  What shipped: `SyncGitRow` renders the report, the configured path, and a field that writes
+  `sync_git_path_set`. The placement contradicts this entry's own suggested one, and the commit
+  message argues it out: Settings → Sync is gated on `capabilities.sync`, which *is*
+  `git_report(..).state == Ok`, so a report placed inside that section would be unreachable on
+  precisely the machines it exists for. The row therefore sits BESIDE the gate, renders when git is
+  fine too (so a pinned path can be cleared before it breaks anything), renders nothing where folder
+  sync does not exist at all, and keeps a rejected path shown as rejected rather than clearing itself
+  — a field that reset itself on a bad value would be the silent fallback to automatic that story
+  34.14 exists to end. The dialog suite asserts the placement: the report renders with the capability
+  OFF while the Sync section does not, so moving the row behind the gate fails a test.
+  The remaining half, closed 2026-07-30 in this same PR: `sync_git_path_set` used to call only
+  `invalidate_git_resolution()`, so the report and `capabilities.sync` changed while the already-open
+  `Engine` kept its `GitCli` built from the old setting — every push, merge and worktree call still
+  driving the previous binary, the capability disagreeing with the engine again. It now goes through
+  `crate::sync::repoint_engine`: invalidate, `reset_engine()` (signal the supervisor, then empty the
+  engine slot), and re-arm the supervisor only when the new resolution chose something. Teardown is
+  unconditional, so a rejected path leaves no engine and no supervisor rather than a stale one still
+  syncing on the old binary. Test:
+  `repointing_at_another_git_rebuilds_the_engine_and_re_arms_background_sync`.
+  Not claimed: the teardown only signals the outgoing supervisor, which finishes its current unit, so
+  two loops can briefly overlap — bounded by `db::claim_ready`'s single-`UPDATE` claim. And nothing
+  notices a pinned binary that is moved or deleted outside the app; the next git call fails with
+  git's own diagnostic.
 note: 2026-07-29 — not a regression and not release-blocking: it is a surface that was never wired, and the state it reports is one the capability flag already handles safely. It is the obvious next slice of 34.14 and wants Settings → Sync to render the report plus a path picker.
 
 ### DW-123: Stories 34-14 through 34-19 have no `spec-*.md`, so six shipped stories carry their rationale only in commit messages and `docs/sync.md`.
@@ -1394,3 +1423,204 @@ resolution: all six written (1544 lines), each to the structure `spec-34-13` est
   at `review` in sprint-status. Four of the six were written by the implementer of the code they
   describe, which is exactly the bias the note below names — a reviewer should read them as such.
 note: 2026-07-29 — deliberately not back-filled in the same pass that wrote the code. A spec written after the fact by the author of the code tends to describe what was built rather than what was needed, which is the failure mode the specs exist to prevent; these are better written from the commits and the ledger by someone doing the epic-34 review.
+
+### DW-124: Nothing reconciles committed LFS pointers against the remote, so a large file committed with plain `git` publishes a pointer whose bytes never leave that machine — the exact failure story 34.15 is named after, through the one door it does not watch.
+
+origin: found while narrowing story 34.15's invariant during the epic-34 tail review, 2026-07-30
+location: keeper-sync/src/engine.rs:2021-2023 (`lfs_uploads_outstanding`) + :2045-2055 (the gate in `do_push`) + keeper-sync/src/lfs/filter.rs:126 (`clean`, which stores the object and journals nothing) + docs/sync.md §§3, 8 and §15's troubleshooting table
+reason: the gate that holds a push is `outstanding_count(profile, "lfsUpload")`, a query over
+  keeper's own journal — and the journal learns of an upload from exactly one place,
+  `commit_local`. Story 34.19 newly makes a human's `git commit` inside a synced folder work
+  properly: the clean filter runs, the object lands in `.git/lfs`, a pointer goes into the index.
+  It files no journal unit. So `outstanding_count` is 0, the gate passes, keeper's next push
+  publishes that pointer, and the bytes it names exist on one disk. Nothing afterwards compares the
+  pointers in history against the objects the remote holds, so keeper cannot notice later either —
+  and the object is not even lost, which is what makes it insidious: `git ls-tree` on the remote
+  reports the file present, because for an LFS path the blob IS the pointer. That is precisely the
+  false pass the durability matrix was giving before 34.15, reappearing with a different cause.
+  Worse, the recovery advice that suggests itself does not work. A parked upload can be retried from
+  the file's row; a pointer with no unit at all has nothing to retry, and re-running sync will not
+  create one, because keeper only stages files whose content changed. The only route today is to
+  modify the file so a new revision is staged, which uploads the *new* object and leaves the
+  published revision unbacked forever. `docs/sync.md` said "sync that folder again and the upload is
+  re-driven"; that was false and has been corrected.
+  Two candidate fixes, and they are not equivalent. (a) A reconciliation pass: walk the pointers
+  reachable from the pushed branch, batch-verify them against the remote's object store (the LFS
+  batch API's `download` operation answers exactly this, and `lfs::local::contains` answers it for a
+  filesystem remote), and enqueue an upload for every one the remote lacks. Correct, and costs a
+  history walk plus a batch round trip per push. (b) Have the clean filter record the debt it
+  creates — it already knows the oid and the size at the moment it stores the object. Cheap, and
+  wrong on its own: the filter runs for `git add` and for `git status`'s racily-clean re-read, neither
+  of which is a commit, so it would enqueue uploads for content that may never be committed and would
+  need the journal to learn to forget them. (b) also cannot repair a pointer that is already in
+  history, which is the case a user hits first. Not attempted in this PR: it is a new engine leg with
+  its own failure modes, and shipping the honest boundary in the spec and the docs is the correct
+  interim.
+status: open
+
+### DW-125: `Engine::open` throws away the resolution's probe and spawns `git --version` again, so one `doctor` run probes git at least three times and can name a binary the engine is not driving.
+
+origin: reported by the epic-34 code review (acceptance layer) and confirmed by FixGitResolution while fixing story 34.14's resolver, 2026-07-30
+location: keeper-sync/src/engine.rs:341-343 (`git_program()` then `git.capabilities()`) + keeper-sync/src/git/resolve.rs:97-98 (`GitChoice::capabilities`, which already holds the answer) + keeper-sync/src/git/cli.rs:408 (`capabilities_of`, which exists for exactly this) + keeper-sync/src/platform.rs (`SyncPlatform::git_program` returns a bare `PathBuf`) + keeper-syncd/src/commands.rs:1236 (`check_git`) and the `check_engine` call below it
+reason: `git::resolve` probes each candidate, and `cli::capabilities_of` turns the version it read
+  into a `GitCapabilities` that `GitChoice` carries — the whole point being that the version is read
+  once. `Engine::open` then asks the platform for a *program*, because that is all
+  `SyncPlatform::git_program` returns, and re-probes it. The capabilities the resolution computed die
+  at the trait boundary; the only thing that still reads them is `GitResolution::summary`'s prose
+  (`resolve.rs:226-228`), so the field is not literally dead, but no consumer of the *engine* ever
+  sees it.
+  Two costs. One process per engine open, which is trivial. And a second time-of-check/time-of-use
+  window: between the resolution's probe and the engine's, the file can be replaced — a Homebrew
+  upgrade mid-run is the realistic case — so the engine can end up driving a binary the report never
+  saw. `keeper-syncd doctor` is where this is most visible, because it is a single command that
+  answers a question about git: `check_git` resolves (probe 1), `check_engine` opens an `Engine`,
+  which resolves again (probe 2, since `LinuxPlatform::git_resolution` is deliberately uncached and
+  documents why) and then probes the chosen program (probe 3). Story 34.14's AC5 claimed doctor
+  reported "the same binary and version the engine will drive, from one probe"; that was not true and
+  the criterion has been narrowed to what the code does.
+  The fix is a signature change: have `SyncPlatform` hand out the resolution, or a
+  `(PathBuf, GitCapabilities)` pair, so one probe feeds both the report and the engine. It crosses
+  `engine.rs`, `platform.rs`, both platform implementations and the trait itself, which is why no
+  agent in this PR took it — and why it is worth doing deliberately rather than in passing: the
+  trait is the seam that keeps the engine free of Tauri, and widening it is a design decision.
+status: open
+
+### DW-126: `ensure_activity_columns` is a read-then-`ALTER` with no transaction, so two processes sharing one `sync.db` can both decide a column is missing and the loser dies with `duplicate column name` — on the first run after an upgrade, which is exactly when someone is watching.
+
+origin: found by the epic-34 code review (edge-case layer) while reading story 34.16's migration, 2026-07-30
+location: src-tauri/crates/keeper-sync/src/db.rs:145-158 (`ensure_activity_columns`)
+reason: the function prepares `PRAGMA table_info(activity)`, collects the column names, and then
+  runs `ALTER TABLE activity ADD COLUMN …` for each one it did not find. Between the read and the
+  write there is no transaction and no `BEGIN IMMEDIATE`, so the check is not serialized against
+  another connection doing the same thing. Two processes on one `sync.db` is not hypothetical: the
+  daemon is designed to coexist with an operator running `keeper-syncd doctor` or
+  `keeper-syncd sync --once` (the journal's whole claim protocol exists for that), and both open the
+  database through `db::open`, which runs the migrations. If they interleave, the second `ALTER`
+  fails with `duplicate column name: unit_id`, `db::open` returns an error, and the process exits
+  before doing any work.
+  The window is one statement wide and only exists until the columns are present, so it is narrow —
+  and it is narrow in the least forgiving place: the first start after an upgrade, on the machine
+  where somebody has just run the daemon and then immediately typed `doctor` to see whether it
+  worked. The failure mode is a hard startup error with a message about SQLite schemas, for a
+  condition that is actually benign.
+  The fix is small and the choice between two shapes is the only thing to think about: wrap the read
+  and the writes in one `BEGIN IMMEDIATE` transaction (correct, and matches what
+  `registry::reorder_pins` did for DW-36), or tolerate the race by treating a "duplicate column"
+  error as success (fewer moving parts, but it swallows a class of real schema errors and has to
+  match on an error string). The transaction is the right answer. Not done here because `db.rs` was
+  being edited concurrently by another slice of this PR and a migration is not a change to make in a
+  contested file.
+status: open
+
+### DW-127: `lfs::local` publishes objects into the REMOTE store with `0o600`, so on the shared bare repository story 34.18 exists to serve, the next user's keeper or `git-lfs` cannot read them — and the failure looks like a filesystem mishap.
+
+origin: found by the epic-34 code review (edge-case layer) while reading story 34.18, 2026-07-30
+location: src-tauri/crates/keeper-sync/src/lfs/store.rs:123 and :168 (`NamedTempFile::new_in`, whose file is created `0o600`) + :283-287 (the publish-by-rename that preserves those bits) + keeper-sync/src/lfs/local.rs:108-131 (`transfer`, the only caller that writes into a store belonging to somebody else)
+reason: `tempfile::NamedTempFile` creates its file `0o600` by design, and nothing widens the mode
+  before the rename that publishes it. For the *local* store that is right and should stay: those
+  objects are the user's own, under their own `.git`. `lfs::local::transfer` is the one path that
+  writes into a store the user does not own — the remote's — and it inherits the same bits, so the
+  object lands readable by one uid inside a repository whose whole purpose is to be shared.
+  Story 34.18's own module header names the topology: "a bare repository on a pendrive, an SMB
+  mount, another directory on the same disk". A pendrive is usually fine, because the filesystem has
+  no meaningful uids. A bare repo on a shared box is not: user A's keeper pushes and copies the
+  objects, user B clones and gets pointer files, and `git lfs` reports the object missing rather
+  than unreadable — so the diagnosis a user reaches for is "the transfer failed", which is the
+  wrong tree entirely. Note that git itself does not have this problem for its own objects, because
+  `core.sharedRepository` exists and git honours it.
+  Fix candidates: read `core.sharedRepository` from the remote's config and match the mode git would
+  use (correct and most in keeping — the remote already declares its own sharing policy), or
+  apply the directory's own mode to the published file, or simply widen group/other read on a
+  remote-store publish. Whichever, it belongs in `LfsStore::publish` behind an explicit flag rather
+  than in `transfer`, so the local store's `0o600` is not weakened by accident. Not done in this PR:
+  it needs a decision about honouring `core.sharedRepository`, and getting it wrong loosens
+  permissions on the user's own objects.
+status: open
+
+### DW-128: A relative or `~`-prefixed filesystem remote is resolved against the process's working directory rather than the repository, so under systemd or an app bundle it resolves against `/` and the profile reports "drive not connected" forever.
+
+origin: found by the epic-34 code review (edge-case layer) while reading story 34.18, 2026-07-30
+location: src-tauri/crates/keeper-sync/src/lfs/local.rs:70-91 (`remote_path`, which returns `PathBuf::from(trimmed)` verbatim) + :143-152 (`is_reachable`) + keeper-sync/src/engine.rs:2883-2885 (the reachability check that turns this into `MediaAbsent`)
+reason: `remote_path` decides whether a remote URL names a filesystem path, and when it does it
+  hands back the string as written. `../backup/repo.git` and `~/drives/pendrive.git` are both
+  accepted and neither is resolved: the first is resolved by the OS against the process's current
+  directory, and the second is not expanded at all, so it looks for a literal directory named `~`.
+  A daemon under systemd has a working directory of `/`; an app bundle's is arbitrary and not the
+  repository. So the path exists for the person who typed it into a shell and not for keeper.
+  What makes this worth an entry rather than a shrug is the failure it produces. `is_reachable`
+  answers false, `copy_lfs_object` returns `SyncError::MediaAbsent`, and the profile renders as
+  *drive not connected* — a state whose entire meaning is "re-attach the drive; nothing was
+  deleted". The user re-attaches a drive that was never detached, indefinitely, with no surface
+  naming the path keeper actually looked at. git itself does not disagree, incidentally: the git
+  remote is resolved by git relative to the repository, so `git push` can work while the LFS copy
+  cannot find the same remote — two components disagreeing about one path, which is the class of
+  defect story 34.14 was about at the binary level.
+  Fix: resolve a relative remote path against the profile's `local_path` (which is what git does)
+  and expand a leading `~` from the platform's home, both inside `remote_path`; and, independently,
+  refuse a relative remote at profile-creation time, because a relative remote is almost never what
+  someone means. Wants a test per shape. Not done here because it changes what an existing profile
+  resolves to, which is a migration question rather than a patch.
+status: open
+
+### DW-129: The `git-lfs-authenticate` handshake reads both of ssh's pipes to EOF into unbounded `Vec`s; only the rendered string is bounded, where the sibling batch client bounds the read itself.
+
+origin: found by the epic-34 code review (edge-case layer) while reading story 34.17, 2026-07-30
+location: src-tauri/crates/keeper-sync/src/lfs/ssh.rs:354 (`command.output()`) + :510-527 (`truncated`, which bounds the *rendered* string) + :452-465 (`parse_response`, which parses whatever arrived) — contrast keeper-sync/src/lfs/batch.rs (`bounded_body`, and its doc "Never `reqwest::Response::text`: that has no ceiling")
+reason: `Command::output()` reads stdout and stderr to EOF into `Vec<u8>`, with no ceiling. The
+  module was careful about the *symptom* — `MAX_STDERR_BYTES` keeps a megabyte-long login banner out
+  of an error message, and its comment says exactly that — but the bytes are already in memory by
+  then, and stdout has no equivalent guard at all: `parse_response` takes the whole buffer and hands
+  it to `serde_json`.
+  The ceiling that does exist is time, not size: the 20 s `COMMAND_TIMEOUT` with `kill_on_drop`, so
+  a hostile or broken server has twenty seconds of pipe bandwidth to spend. That is a bounded amount
+  of memory in the same sense that a fast disk is a bounded amount of disk. It is not a
+  vulnerability worth a release: reaching it requires an ssh server the user's own key authenticates
+  to. It is an inconsistency, and the inconsistency is the argument — `lfs/batch.rs` closed exactly
+  this hazard for HTTP responses in this same subsystem, with a comment explaining why an unbounded
+  read of an untrusted body is not acceptable, and the ssh leg simply did not get the same
+  treatment.
+  Fix: spawn with piped stdio and read each pipe through a `take(LIMIT)`, treating an over-long
+  stdout as malformed (a valid answer is a few hundred bytes; git-lfs's own is smaller) and an
+  over-long stderr as the banner it already suspects. `Command::output()`'s convenience is the only
+  thing lost. Not done in this PR because `ssh.rs` was being edited concurrently by another slice.
+status: open
+
+### DW-130: `sync_ipc_error` maps `Forbidden` onto `invalidCredentials` and `LfsUploadPending` onto `syncUnavailable`, because `IpcErrorCode` has no code for either — so the frontend is told "wrong token" for a scope problem and "sync unavailable" for a push that is deliberately waiting.
+
+origin: reported by FixAppIpcAndUi while wiring story 34.15's two new error variants through IPC, 2026-07-30
+location: src-tauri/crates/keeper/src/sync_ipc.rs (`sync_ipc_error`) + src-tauri/crates/keeper-core/src/vm.rs (`IpcErrorCode`, which has no `forbidden` and no deferred/waiting code) + src/lib/ipc/gen/IpcErrorCode.ts (generated) + src/lib/ipc/client.ts:2506-2508 (`syncFolderNow`'s documented rejection set)
+reason: story 34.15 added `SyncError::Forbidden` precisely because a 403 and a 401 have opposite
+  remedies — the token is valid and lacks a scope, versus the token is wrong — and then the IPC
+  boundary collapses them again, because `IpcErrorCode::InvalidCredentials` is the nearest thing
+  that exists. `LfsUploadPending` is worse in kind: it is not a failure at all, it is a wait that
+  resolves itself, and `syncUnavailable` says the opposite. Neither mapping is wrong *given the
+  available codes*; both are nearest-fit, and the frontend currently renders no distinct affordance
+  for either, so nothing is visibly broken today. It becomes a real defect the moment a surface acts
+  on the code — a "check your token" prompt on a 403 sends the user to replace a credential that is
+  fine.
+  Fix: add a `forbidden` variant to `IpcErrorCode` (keeper-core/src/vm.rs), regenerate the TS, and
+  handle it wherever `invalidCredentials` is handled today; decide separately whether a deferred wait
+  deserves a code at all or should stop being an error at the IPC boundary. Also, independently of
+  the enum: `client.ts:2506-2508` documents `syncFolderNow` as rejecting with
+  `unsupported | serverUnreachable | invalidCredentials | internal`, and `syncUnavailable` now
+  belongs in that list — a doc comment that under-reports the reject set is how a caller ends up with
+  an unhandled branch.
+status: open
+
+### DW-131: The "empty `gitPath` means automatic" rule is enforced twice, independently, in two crates — so a third host would have to remember it a third time.
+
+origin: reported by FixGitResolution while fixing story 34.14's resolver, 2026-07-30
+location: src-tauri/crates/keeper-core/src/registry.rs (`get_sync_git_path`, filters `value.trim().is_empty()`) + src-tauri/crates/keeper-syncd/src/platform.rs:128-131 (`with_git_path`, filters the same thing on the TOML value)
+reason: `gitPath = ""` in TOML deserializes to `Some(PathBuf::from(""))`, and taking the explicit
+  branch on it produced a refusal naming an empty path — which, because an explicit path deliberately
+  has no fallback, refused every git operation on the box. Both hosts now normalise it away, and both
+  document why, and each does it in its own crate: the app in `keeper-core::registry`, the daemon in
+  its platform's builder. The rule is "cleared and never set are one state", it belongs to the
+  resolver's contract, and it currently lives nowhere near `GitRequest`.
+  No user-visible defect remains after this PR — both spellings agree today. The cost is the ordinary
+  cost of a duplicated invariant: the next `SyncPlatform` implementation (an iOS build that grows
+  folder sync, a test platform, a Windows host) starts out wrong by omission, and nothing fails until
+  someone types two quotes into a config file. Fix: one normalizer beside `GitRequest` — a
+  `GitRequest::from_setting(Option<&str>)` that answers `search` or `explicit` — and have both hosts
+  call it instead of filtering for themselves.
+status: open

@@ -17,7 +17,9 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use keeper_sync::error::Retriability;
 use keeper_sync::lfs::ssh::{authenticate_with, Answer, Operation, SshRemote};
+use keeper_sync::SyncError;
 
 /// Write an executable stand-in for `ssh` that records its argv and then behaves
 /// as `body` says.
@@ -225,6 +227,9 @@ async fn the_handshake_sends_the_argv_git_lfs_sends_and_reads_every_answer() {
     // 4. A login banner. git-lfs retries this six times and then reports a JSON
     //    parse error; the banner is still there on the sixth attempt, so it is
     //    reported once with the banner included — because the banner IS the fix.
+    //    Note where the banner is: STDOUT, ahead of the body. Quoting stderr
+    //    alone left the operator with "the answer was not the expected JSON" and
+    //    no sight of the one thing they can act on.
     // ---------------------------------------------------------------------
     let ssh = fake_ssh(
         dir.path(),
@@ -235,4 +240,96 @@ async fn the_handshake_sends_the_argv_git_lfs_sends_and_reads_every_answer() {
         .await
         .expect_err("a banner ahead of the JSON is fatal");
     assert!(err.to_string().contains("/owner/repo.git"), "got: {err}");
+    assert!(
+        err.to_string().contains("Welcome to forge.example"),
+        "the banner itself is the fix, so it has to reach the message, got: {err}"
+    );
+
+    // ---------------------------------------------------------------------
+    // 5. ssh's OWN failures. `ssh(1)` exits 255 for a closed lid, a VPN drop, a
+    //    DNS failure or the `ConnectTimeout` this module sets — the server was
+    //    never reached, so nothing has been learned about it. Classified
+    //    `Permanent` these park the LfsUpload unit on the FIRST failure, and a
+    //    parked unit still counts toward `outstanding_count`, so the push stays
+    //    held by `LfsUploadPending` until somebody runs `db::unpark`. A lid must
+    //    not stop publishing.
+    // ---------------------------------------------------------------------
+    for stderr in [
+        "ssh: connect to host forge.example port 2222: Connection refused",
+        "ssh: connect to host forge.example port 2222: Connection timed out",
+        "ssh: connect to host forge.example port 2222: Network is unreachable",
+        "ssh: Could not resolve hostname forge.example: Name or service not known",
+        "kex_exchange_identification: Connection closed by remote host",
+        "ssh_exchange_identification: read: Connection reset by peer",
+    ] {
+        let ssh = fake_ssh(dir.path(), &format!("echo '{stderr}' >&2\nexit 255"));
+        let err = authenticate_with(&remote, Operation::Upload, &ssh)
+            .await
+            .expect_err("ssh could not reach the server");
+        assert!(
+            matches!(err, SyncError::Network { .. }),
+            "ssh's own failure is transient — a park here needs a human to undo \
+             it: {stderr} gave {err:?}"
+        );
+        assert_eq!(
+            err.retriability(),
+            Retriability::Transient,
+            "which is the consequence that matters: the unit retries after \
+             backoff rather than parking. {stderr}"
+        );
+        assert!(
+            err.to_string().contains("git@forge.example"),
+            "and it names the remote it could not reach, got: {err}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 6. The other side of exit 255, where a permanent park is exactly right:
+    //    no amount of backoff makes an unauthorized key authorized, and retrying
+    //    forever would bury the one message that says what to change.
+    // ---------------------------------------------------------------------
+    for stderr in [
+        "git@forge.example: Permission denied (publickey).",
+        "Host key verification failed.",
+    ] {
+        let ssh = fake_ssh(dir.path(), &format!("echo '{stderr}' >&2\nexit 255"));
+        let err = authenticate_with(&remote, Operation::Upload, &ssh)
+            .await
+            .expect_err("the server refused this key");
+        assert!(
+            matches!(err, SyncError::Config(_)),
+            "a refused key is not a network failure: {stderr} gave {err:?}"
+        );
+        assert_eq!(err.retriability(), Retriability::Permanent, "{stderr}");
+        assert!(err.to_string().contains(stderr), "got: {err}");
+    }
+
+    // ---------------------------------------------------------------------
+    // 7. A `ForceCommand`/`git-shell` wrapper that answers on STDOUT. Only
+    //    stderr used to be consulted, so this became "It said: nothing" — and
+    //    when what it says is that the command is missing, a park instead of the
+    //    https fallback the answer is supposed to be.
+    // ---------------------------------------------------------------------
+    let ssh = fake_ssh(
+        dir.path(),
+        "echo 'git-shell: git-lfs-authenticate: command not found'\nexit 1",
+    );
+    assert_eq!(
+        authenticate_with(&remote, Operation::Upload, &ssh)
+            .await
+            .expect("a missing command is a fallback, whichever stream says so"),
+        Answer::NoSshLfs
+    );
+
+    let ssh = fake_ssh(
+        dir.path(),
+        "echo 'sorry, this account is restricted to git commands'\nexit 1",
+    );
+    let err = authenticate_with(&remote, Operation::Upload, &ssh)
+        .await
+        .expect_err("a refusal is an error");
+    assert!(
+        err.to_string().contains("restricted to git commands"),
+        "a wrapper's refusal on stdout is the only diagnostic there is, got: {err}"
+    );
 }

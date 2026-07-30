@@ -64,29 +64,100 @@ pub fn remote_store(remote_url: &str) -> Option<LfsStore> {
 
 /// The filesystem path a remote names, if it names one.
 ///
-/// The two guards are [`super::endpoint`]'s, for the same reasons: a `/` before
-/// the colon means the colon is part of a path, and a single-character authority
-/// is a Windows drive letter rather than a host.
+/// The two guards on the scp-style branch are [`super::endpoint`]'s, for the same
+/// reasons: a `/` before the colon means the colon is part of a path, and a
+/// single-character authority is a Windows drive letter rather than a host.
+///
+/// # A `file://` authority is checked, not skipped over
+///
+/// The rule was always written down here — "the host is empty or `localhost`;
+/// anything else is a URL for somebody else to dial" — and was never applied, so
+/// `file://nas.example/srv/r.git` yielded the LOCAL path `/srv/r.git`. That is
+/// the exact failure this module exists to eliminate, arriving through the door
+/// this module installed: `Engine::do_lfs` consults [`remote_store`] before
+/// [`super::endpoint::derive`], so the local branch wins, the objects are copied
+/// into a same-named directory on THIS machine, the upload unit completes, the
+/// Story 34.15 gate is satisfied, and the pointer is published to a remote that
+/// will never hold the object. Before this transport existed that URL produced a
+/// loud permanent refusal — "remote scheme `file` has no LFS transport" — which
+/// is what returning `None` here restores.
 fn remote_path(remote_url: &str) -> Option<PathBuf> {
     let trimmed = remote_url.trim();
     if trimmed.is_empty() {
         return None;
     }
     if let Some((scheme, rest)) = trimmed.split_once("://") {
-        // `file://host/path` is legal and the host is empty or `localhost`;
-        // anything else is a URL for somebody else to dial.
         if scheme != "file" {
             return None;
         }
         let idx = rest.find('/')?;
-        let path = &rest[idx..];
-        return Some(PathBuf::from(path));
+        let (authority, path) = (&rest[..idx], &rest[idx..]);
+        // `file://host/path` is legal and the host is empty or `localhost`;
+        // anything else is a URL for somebody else to dial.
+        if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+            return None;
+        }
+        return Some(PathBuf::from(percent_decoded(path)));
     }
     match trimmed.split_once(':') {
         // scp-style `[user@]host:path` — a network remote.
         Some((authority, _)) if !authority.contains('/') && authority.len() > 1 => None,
         // Everything else is a path, including `C:/repos/thing.git`.
         _ => Some(PathBuf::from(trimmed)),
+    }
+}
+
+/// Percent-decode the path half of a `file://` URL.
+///
+/// `git remote add r file:///srv/my%20repo.git` pushes to `/srv/my repo.git`, so
+/// this has to resolve to the same directory or the objects land in a
+/// literally-`%20` sibling that no `git` command will ever look in — a store
+/// nothing shares a byte with, which is the one outcome
+/// [`remote_store`]'s bare/non-bare check exists to avoid.
+///
+/// Only the URL form is decoded. A bare path is bytes the user typed, and a
+/// directory genuinely named `my%20repo.git` is a legal directory: decoding that
+/// one would send its objects somewhere else.
+///
+/// A `%` that does not introduce two hex digits is kept verbatim rather than
+/// refused, and so is a sequence that decodes to invalid UTF-8. git's own
+/// `url_decode` rejects both, but the question here is "which directory", and the
+/// honest answer for a byte we cannot decode is the byte the user wrote.
+fn percent_decoded(path: &str) -> String {
+    if !path.contains('%') {
+        return path.to_owned();
+    }
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        match (bytes[idx], bytes.get(idx + 1), bytes.get(idx + 2)) {
+            (b'%', Some(&high), Some(&low)) => match (hex(high), hex(low)) {
+                (Some(high), Some(low)) => {
+                    out.push(high << 4 | low);
+                    idx += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    idx += 1;
+                }
+            },
+            (byte, _, _) => {
+                out.push(byte);
+                idx += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| path.to_owned())
+}
+
+/// One hex digit, either case.
+fn hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -130,11 +201,6 @@ pub fn transfer(from: &LfsStore, to: &LfsStore, oid: &str, size: u64) -> Result<
     Ok(size)
 }
 
-/// Where an object would live under `remote`, for a log line or an error.
-pub fn describe(store: &LfsStore, oid: &str) -> PathBuf {
-    store.object_path(oid)
-}
-
 /// Is this path reachable right now?
 ///
 /// A removable volume that is not mounted is [`SyncError::MediaAbsent`], not a
@@ -174,6 +240,9 @@ mod tests {
         for (url, expected) in [
             ("/srv/git/r.git", "/srv/git/r.git/lfs"),
             ("file:///srv/git/r.git", "/srv/git/r.git/lfs"),
+            // An empty authority and `localhost` are the two spellings of "this
+            // machine", and git accepts both.
+            ("file://localhost/srv/git/r.git", "/srv/git/r.git/lfs"),
             // A drive letter is a path, which is the case the scp-style guard
             // exists to protect.
             ("C:/repos/r.git", "C:/repos/r.git/lfs"),
@@ -181,6 +250,55 @@ mod tests {
             let store = remote_store(url).unwrap_or_else(|| panic!("{url} is a path"));
             assert_eq!(store.root(), Path::new(expected), "{url}");
         }
+    }
+
+    /// The failure this module exists to prevent, arriving through the door this
+    /// module installed.
+    ///
+    /// A `file://` URL naming a host is a remote on ANOTHER machine. Read as the
+    /// local path it happens to contain, the objects are copied into a same-named
+    /// directory here, the upload unit completes, the Story 34.15 gate is
+    /// satisfied, and the pointer is published to a remote that will never hold
+    /// the object.
+    #[test]
+    fn a_file_url_naming_a_host_is_somebody_elses_to_dial() {
+        for url in [
+            "file://nas.example/srv/r.git",
+            "file://nas.example:8080/srv/r.git",
+            "file://192.168.1.9/srv/r.git",
+        ] {
+            assert!(
+                remote_store(url).is_none(),
+                "{url} is not a path on this machine, and reading it as one \
+                 publishes a pointer to an object that stayed here"
+            );
+        }
+    }
+
+    /// git decodes a `file://` path and so must this, or the objects go into a
+    /// directory `git` will never look in.
+    #[test]
+    fn a_percent_escape_in_a_file_url_names_the_directory_git_names() {
+        assert_eq!(
+            remote_store("file:///srv/my%20repo.git")
+                .expect("a path")
+                .root(),
+            Path::new("/srv/my repo.git/lfs")
+        );
+        // A bare path is bytes the user typed: a directory really called
+        // `my%20repo.git` is legal, and decoding it would move its objects.
+        assert_eq!(
+            remote_store("/srv/my%20repo.git").expect("a path").root(),
+            Path::new("/srv/my%20repo.git/lfs")
+        );
+        // An escape that is not one survives verbatim rather than failing: the
+        // question is which directory, and a `%` is a legal character in a name.
+        assert_eq!(
+            remote_store("file:///srv/100%sure/r.git")
+                .expect("a path")
+                .root(),
+            Path::new("/srv/100%sure/r.git/lfs")
+        );
     }
 
     #[test]
@@ -275,6 +393,42 @@ mod tests {
             !target.contains(&oid, size),
             "nothing is published, so a retry starts from zero rather than from \
              poisoned bytes"
+        );
+    }
+
+    /// The one line that decides whether a pendrive's FIRST upload can ever run.
+    ///
+    /// `is_reachable` asks about the git directory, not about `lfs/`, and the
+    /// difference is the whole design note above it: a remote that has never
+    /// received an object legitimately has no `lfs/` yet, so asking about `lfs/`
+    /// reports every freshly attached drive as absent, `Engine::do_lfs` returns
+    /// [`SyncError::MediaAbsent`], the upload defers, and it defers again on every
+    /// tick because the condition it waits on can only be created by the upload.
+    /// Nothing else in the suite touched this, and inverting the line breaks no
+    /// other test.
+    #[test]
+    fn an_unmounted_volume_is_absent_and_a_mounted_one_is_present_before_its_first_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let attached = dir.path().join("bare.git");
+        std::fs::create_dir_all(&attached).expect("a bare repository on the volume");
+        let store = remote_store(attached.to_str().expect("utf-8")).expect("a path");
+        assert!(
+            !store.root().exists(),
+            "the fixture's whole point: the remote has no `lfs/` yet"
+        );
+        assert!(
+            is_reachable(&store),
+            "the volume is plugged in, so the upload that will CREATE `lfs/` must \
+             be allowed to run"
+        );
+
+        // The volume is not mounted: nothing along the path exists.
+        let detached =
+            remote_store(dir.path().join("unmounted").to_str().expect("utf-8")).expect("a path");
+        assert!(
+            !is_reachable(&detached),
+            "which is MediaAbsent — a wait on a condition, not a failure"
         );
     }
 }

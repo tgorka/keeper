@@ -117,6 +117,19 @@ describe("SyncGitRow", () => {
     expect(screen.queryByText(SYNC_GIT_OK_NOTE)).not.toBeInTheDocument();
   });
 
+  it("says why the report is missing when the probe itself is refused", async () => {
+    // The row used to return `null` while `report` was still null, which is
+    // exactly the state a rejected read leaves it in — so the one machine that
+    // could not even be asked about its git got a blank space where the reason
+    // belongs, and no way to reach the path field that might fix it.
+    mockStatus.mockRejectedValue({ code: "internal", message: "keeper.db could not be read" });
+    render(<SyncGitRow open />);
+
+    expect(await screen.findByText("keeper.db could not be read")).toBeInTheDocument();
+    // Titled, so the sentence is attached to the thing it is about.
+    expect(screen.getByText(SYNC_GIT_TITLE)).toBeInTheDocument();
+  });
+
   it("sends the typed path and adopts the report that comes back", async () => {
     mockStatus.mockResolvedValue(tooOldVm());
     mockPathSet.mockResolvedValue(okVm({ configuredPath: "/opt/homebrew/bin/git" }));

@@ -63,10 +63,16 @@ it as the file. Errors go to stderr: the app prints `keeper: lfs filter failed: 
 exits 1. The parse demands `lfs` as the very first argument after `argv[0]`, and `--repo`
 non-empty, because the object store's location is the one thing a filter cannot guess. Both
 directions stream: a clean hashes into the store in 128 KiB chunks (`store.rs:33`,
-`insert_streaming`) and nothing sizes a buffer from the file (AD-46, NFR-23); the single
-bounded read in the whole module is the smudge's `MAX_POINTER_BYTES + 1` prefix, which is 1025
-bytes. The object is published before the pointer naming it is emitted, so a crash between the
-two costs a re-clean and never leaves a pointer to nothing.
+`insert_streaming`) and nothing sizes a buffer from the file (AD-46, NFR-23); the only bounded reads
+in the module are the `MAX_POINTER_BYTES + 1` prefixes — 1025 bytes — that each direction takes to
+decide whether what it was handed is a pointer, and neither may truncate what follows.
+The object is published before the pointer naming it is emitted, so a crash between the
+two costs a re-clean and never leaves a pointer to nothing. **A clean is idempotent on a pointer:**
+input that already *is* a pointer, whole, is written back byte for byte and nothing is stored, so
+`clean(clean(x)) == clean(x)`. Byte for byte rather than re-rendered, because `Pointer::parse`
+accepts non-canonical spellings and re-rendering one would change the blob's hash — which is the
+whole property `lfsMode = pointerOnly` depends on: there the index blob IS that pointer, and a clean
+that named it instead would make every such path read modified forever.
 
 **Block If:** (none) — and that is a decision, not an omission. Nothing here refuses to serve.
 An unresolvable pointer and ordinary content both pass through rather than failing, because
@@ -101,6 +107,8 @@ as if it were the content. Do not change the registration in `engine.rs` or the 
 | `lfs` not first | `serve lfs clean --repo /w` | `None` | — |
 | Clean, any size | worktree bytes on stdin | object published at `<repo>/.git/lfs/objects/<a>/<b>/<oid>`, **then** the pointer naming it on stdout | `SyncError::io` up; git keeps its bytes |
 | Clean below the threshold | a small file `.gitattributes` routes here | still a pointer — the threshold lives in `.gitattributes`, not in the filter | — |
+| Clean of bytes that are already a pointer | smudge's own pass-through output for an absent object | those exact bytes back; **nothing inserted into the store** | idempotent, so `pointerOnly` paths read clean |
+| Clean of content that merely begins like a pointer | a `version https://git-lfs…` line followed by megabytes | an ordinary clean — every byte hashed into the store, output length is a pointer | the bounded prefix read must not truncate the chain |
 | Clean of an empty file | zero bytes on stdin | the empty pointer renders to nothing, so an empty file stays empty (`pointer.rs:192-195`) | reasoned from code, not test-covered |
 | Smudge, object held | a pointer the store can resolve | the object streamed to stdout | open/copy failure ⇒ `SyncError::io` |
 | Smudge, object missing | a well-formed pointer, nothing in the store | the pointer bytes pass through unchanged, so a partial fetch stays usable | — |
@@ -128,15 +136,21 @@ as if it were the content. Do not change the registration in `engine.rs` or the 
 - Read and deliberately unchanged: `engine.rs:268` and `:372-374` (the registration and the
   comment that was half-false and is now true); `git/repo.rs:485-556`
   (`enforce_local_config_with_filter` — the writer of the command line `parse_args` accepts, and
-  the source of `required = false`); `lfs/store.rs:99-150`; `lfs/pointer.rs:106-115` and `:192-195`;
-  `docs/sync.md` §8.
+  the source of `required = false`); `lfs/store.rs:99-150`; `lfs/pointer.rs:106-115` and `:192-195`.
+- `docs/sync.md` §8 *is* changed, and had to be: its "Working in the folder with plain `git`"
+  promise is what this story makes true, so it now says since when (nothing repairs a pre-0.6.4
+  hand commit retroactively), states the clean's idempotence on a pointer as the property
+  `lfsMode = pointerOnly` rests on, and names the bound this story does **not** lift — a commit a
+  human makes files no upload debt, so story 34.15's publication gate does not cover it.
 
 ## Tasks & Acceptance
 
 **Execution:**
 1. `lfs/filter.rs` -- `Direction`, and `run(repo, direction, input, output)` generic over
    `Read`/`Write`: opens `LfsStore::in_git_dir(repo.join(".git"))`, ensures the layout, dispatches.
-2. `lfs/filter.rs` -- `clean`: `insert_streaming`, then `Pointer::new(oid, size).render()` and
+2. `lfs/filter.rs` -- `clean`: read a bounded `MAX_POINTER_BYTES + 1` prefix; if it parses as a
+   pointer *and* is the whole input, write those bytes back verbatim and store nothing. Otherwise
+   `insert_streaming` over prefix-then-remainder, then `Pointer::new(oid, size).render()` and
    flush. Object first, pointer second, by construction rather than by comment.
 3. `lfs/filter.rs` -- `smudge`: read at most `MAX_POINTER_BYTES + 1` through `Read::by_ref` so the
    reader survives for the pass-through; resolve only a parsed pointer whose object the store
@@ -244,8 +258,8 @@ not re-attempted.** DW-121's macOS/Linux divergence should be moot once both bin
 does, the 34.13 guard stays covered only as a unit, and this story's claim to have removed the
 obstacle is a claim about the cause, not a measurement of the effect.
 
-**The six unit tests, all in `keeper-sync/src/lfs/filter.rs`, and the first tests this code has
-ever had.**
+**The unit tests, all in `keeper-sync/src/lfs/filter.rs`, and the first tests this code has ever
+had.**
 - `the_registered_command_line_is_recognised` — both directions of the exact line
   `enforce_local_config_with_filter` writes, plus the `--repo=` joined form and the form with no
   `%f`. Getting this wrong means the filter silently does nothing, which is the defect itself.
@@ -255,6 +269,14 @@ ever had.**
 - `a_clean_stores_the_object_and_emits_the_pointer_naming_it` — 300 000 bytes, several chunks'
   worth so the streaming loop runs rather than one read; asserts the pointer's size, that the
   store `contains` the object at the point the pointer was emitted, and the stored bytes.
+- `a_clean_of_a_pointer_re_emits_it_rather_than_naming_the_pointer` — the fixture is the smudge's own
+  pass-through output for an absent object, which is exactly what a `pointerOnly` worktree holds:
+  those bytes come back byte for byte and the store gains nothing. Without this, `clean(pointer)`
+  named the pointer, the emitted blob differed from the one in the index, and every such path read
+  modified forever — which is the shape of the very status divergence DW-121 recorded.
+- `a_clean_keeps_every_byte_of_content_that_only_begins_like_a_pointer` — the bounded prefix read is
+  a discriminator, not a limit; the chain must not truncate content that merely opens with a
+  `version https://git-lfs…` line.
 - `a_smudge_returns_the_content_the_pointer_names` — 200 000 bytes cleaned then smudged, byte-exact.
 - `a_smudge_passes_through_what_it_cannot_resolve` — ordinary text, and a well-formed pointer for
   an object the store does not hold; both come back unchanged.

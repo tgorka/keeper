@@ -316,6 +316,32 @@ impl Peer {
             .map(str::to_owned)
             .collect()
     }
+
+    /// The pointer the remote actually publishes for `path`.
+    ///
+    /// Read out of the remote's own blob rather than from anything local,
+    /// because the question every LFS assertion here is really asking is what a
+    /// peer cloning this remote would go looking for — and the digest it would
+    /// look for is written in that blob and nowhere else.
+    fn published_pointer(&self, path: &str) -> keeper_sync::lfs::pointer::Pointer {
+        let out = Command::new("git")
+            .args(["show", &format!("main:{path}")])
+            .current_dir(&self.remote)
+            .output()
+            .expect("read the published blob");
+        assert!(
+            out.status.success(),
+            "the remote must hold {path}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        keeper_sync::lfs::pointer::Pointer::parse(&out.stdout).unwrap_or_else(|| {
+            panic!(
+                "{path} on the remote is not an LFS pointer, so nothing published \
+                 an object for it: {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
 }
 
 impl Drop for Peer {
@@ -456,9 +482,38 @@ fn a_kill_during_a_large_object_transfer_leaves_the_object_recoverable() {
     // pointer to content nobody but this machine had — the exact silent failure
     // Story 34.15 gates against. So the content itself is checked, in the store
     // a peer cloning this remote would read it from.
-    let objects = peer.remote.join("lfs").join("objects");
+    //
+    // Checked at the oid the *published pointer* names, not by looking for a file
+    // of the right length anywhere under `lfs/objects`. Size alone cannot fail on
+    // `lfs::local::transfer` publishing under the wrong digest, nor on an
+    // interrupted `insert_verified` leaving a `tmp/` file that happens to be
+    // exactly this long — and those are precisely the mistakes a kill-sweep is
+    // here to catch. `LfsStore::contains` asks the question the smudge filter
+    // asks: is there a complete object at the path this digest maps to.
+    let pointer = peer.published_pointer("big.bin");
+    assert_eq!(
+        pointer.size, BIG as u64,
+        "the published pointer must describe the file that was committed"
+    );
+    let store = keeper_sync::lfs::local::remote_store(remote_str(&peer.remote))
+        .expect("a filesystem remote has an object store");
+    assert!(
+        store.contains(&pointer.oid, pointer.size),
+        "the remote must hold the {} bytes its pointer names at {}, not just the \
+         pointer; the store holds: {:?}",
+        pointer.size,
+        store.object_path(&pointer.oid).display(),
+        objects_held(store.root())
+    );
+}
+
+/// Every file under an LFS object store, with its length, for a diagnostic.
+///
+/// Only ever read on failure: the useful part of a store that does not hold what
+/// it should is what it holds instead.
+fn objects_held(root: &Path) -> Vec<(PathBuf, u64)> {
     let mut found = Vec::new();
-    let mut stack = vec![objects.clone()];
+    let mut stack = vec![root.join("objects")];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -472,12 +527,7 @@ fn a_kill_during_a_large_object_transfer_leaves_the_object_recoverable() {
             }
         }
     }
-    assert!(
-        found.iter().any(|(_, len)| *len == BIG as u64),
-        "the remote must hold the {BIG}-byte object its pointer names, not just \
-         the pointer; {} held: {found:?}",
-        objects.display()
-    );
+    found
 }
 
 #[test]

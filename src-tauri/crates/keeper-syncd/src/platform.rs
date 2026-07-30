@@ -112,8 +112,21 @@ impl LinuxPlatform {
     /// Applied after the config is parsed, which is *after* the platform exists
     /// — the startup order is deliberate (the configured log level is an input
     /// to the logger, so the config is read before logging is initialised).
+    ///
+    /// An empty or all-whitespace path means **automatic**, not "an explicit
+    /// path that happens to be empty". TOML's `gitPath = ""` deserializes to
+    /// `Some(PathBuf::from(""))`, and taking the explicit branch on it produced
+    /// a refusal that named an empty path — and, because naming a binary
+    /// deliberately has no fallback, refused every git operation on the box. The
+    /// app normalizes exactly this away in `keeper_core::registry`
+    /// (`get_sync_git_path` filters on `value.trim().is_empty()`, with a test
+    /// asserting that "cleared" and "never set" are one state), and two hosts
+    /// reading the same setting must not disagree about what it says. Filtered
+    /// here rather than in `config`, so both `git_resolution` (for `doctor`) and
+    /// `SyncPlatform::git_program` (for the engine) get the same answer without
+    /// either having to remember.
     pub fn with_git_path(mut self, git_path: Option<PathBuf>) -> Self {
-        self.git_path = git_path;
+        self.git_path = git_path.filter(|path| !path.to_string_lossy().trim().is_empty());
         self
     }
 
@@ -704,6 +717,34 @@ mod tests {
         assert!(message.contains(&named.display().to_string()), "{message}");
         assert!(message.contains("2.23"), "{message}");
         assert!(message.contains("gitPath"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_or_blank_git_path_means_automatic_just_as_it_does_in_the_app() {
+        // TOML's `gitPath = ""` deserializes to `Some("")`, and treating that as
+        // an explicit choice refused every git operation on the box while naming
+        // an empty path — an explicit request has no fallback by design. The app
+        // reads the same setting back as `None` (`keeper_core::registry`
+        // asserts "cleared" and "never set" are one state), so an operator who
+        // empties the field must get automatic resolution on both hosts.
+        for blank in ["", "   ", "\t\n"] {
+            let platform = LinuxPlatform::with_dirs("/c", "/d", "/s")
+                .with_git_path(Some(PathBuf::from(blank)));
+
+            let resolution = platform.git_resolution();
+
+            assert!(
+                !resolution.is_explicit(),
+                "`gitPath = {blank:?}` must search PATH, not name a binary"
+            );
+            // Whatever this build box has on PATH, the refusal for a search is
+            // never the explicit one that says a named git was not replaced.
+            let refusal = resolution.refusal();
+            assert!(
+                !refusal.contains("does not quietly use a different git"),
+                "a blank path must not refuse as if a binary had been named: {refusal}"
+            );
+        }
     }
 
     #[test]
