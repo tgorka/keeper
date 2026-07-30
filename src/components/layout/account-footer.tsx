@@ -82,6 +82,7 @@ import { useAccountsStore } from "@/lib/stores/accounts";
 import { useAddAccountStore } from "@/lib/stores/add-account";
 import { useShowVerifyBadgeForAccount } from "@/lib/stores/encryption-status";
 import { incognitoStore } from "@/lib/stores/incognito";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 import { settingsUiStore, useSettingsOpen } from "@/lib/stores/settings-ui";
 import { cn } from "@/lib/utils";
 
@@ -491,7 +492,6 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
   // The Settings dialog open-state is shared (Story 3.1) so the verify banner and
   // the UTD stub can open it too; the per-row menu drives the same store. The
   // single dialog instance is mounted once in {@link AccountFooter}.
-  const setSettingsOpen = settingsUiStore.getState().setSettingsOpen;
   const [coverageOpen, setCoverageOpen] = useState(false);
   const [signOutOpen, setSignOutOpen] = useState(false);
   // The persistent verify badge: shown on THIS account's row once the banner is
@@ -534,7 +534,7 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
           trigger
         )}
         <DropdownMenuContent align="end" side="right">
-          <DropdownMenuItem onSelect={() => setSettingsOpen(true)}>
+          <DropdownMenuItem onSelect={() => primaryViewStore.getState().setView("settings")}>
             <Settings aria-hidden="true" />
             Settings
             {showVerifyBadge && (

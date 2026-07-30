@@ -8,11 +8,9 @@ import {
   Video,
   WifiOff,
 } from "lucide-react";
-import { useState } from "react";
 import { AccountFooter } from "@/components/layout/account-footer";
 import { NetworksGroup } from "@/components/layout/networks-group";
 import { SpacesGroup } from "@/components/layout/spaces-group";
-import { SettingsDialog } from "@/components/settings/settings-dialog";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -75,7 +73,6 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
   const offline = useShellOffline();
   // Controlled state for the Settings dialog (Story 2.6). Only the Settings view
   // button opens it.
-  const [settingsOpen, setSettingsOpen] = useState(false);
   // The active primary view (Story 4.2 / 6.1): "Chats" switches to the Unified
   // Inbox, "Archive" to the Archive window, "Bridges" to the Bridges surface.
   // Reflected as `aria-current` + accent styling.
@@ -117,11 +114,11 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
           <ul className={cn("flex flex-col gap-1 p-2", collapsed && "items-center")}>
             {views.map((view) => {
               const Icon = view.icon;
-              // "Chats", "Archive", "Bridges", "Recording", and "Sync" switch the
-              // primary view; Settings opens the dialog.
+              // Every entry switches the primary view — Settings included, since
+              // it stopped being a dialog.
               const onClick =
                 view.label === "Settings"
-                  ? () => setSettingsOpen(true)
+                  ? () => primaryViewStore.getState().setView("settings")
                   : view.label === "Chats"
                     ? () => primaryViewStore.getState().setView("inbox")
                     : view.label === "Archive"
@@ -135,15 +132,15 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                             : view.label === "Sync"
                               ? () => primaryViewStore.getState().setView("sync")
                               : undefined;
-              // Reflect the active primary view on the Chats/Archive/Approvals/Bridges/
-              // Recording/Sync entries.
+              // Reflect the active primary view on every entry.
               const active =
                 (view.label === "Chats" && primaryView === "inbox") ||
                 (view.label === "Archive" && primaryView === "archive") ||
                 (view.label === "Approvals" && primaryView === "approval") ||
                 (view.label === "Bridges" && primaryView === "bridges") ||
                 (view.label === "Recording" && primaryView === "recording") ||
-                (view.label === "Sync" && primaryView === "sync");
+                (view.label === "Sync" && primaryView === "sync") ||
+                (view.label === "Settings" && primaryView === "settings");
               // The Bridges entry carries the worst-state health roll-up dot (Story
               // 6.1): shown only when at least one bridge reports non-null health.
               const healthDot =
@@ -285,7 +282,6 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
           ))}
         <AccountFooter collapsed={collapsed} />
       </div>
-      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
     </nav>
   );
 }

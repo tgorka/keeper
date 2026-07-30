@@ -1,14 +1,14 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { UTD_STUB_TEXT, UtdStub } from "@/components/chat/utd-stub";
-import { settingsUiStore } from "@/lib/stores/settings-ui";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 
 beforeEach(() => {
-  settingsUiStore.getState().setSettingsOpen(false);
+  primaryViewStore.getState().setView("inbox");
 });
 
 afterEach(() => {
-  settingsUiStore.getState().setSettingsOpen(false);
+  primaryViewStore.getState().setView("inbox");
 });
 
 describe("UtdStub", () => {
@@ -18,11 +18,13 @@ describe("UtdStub", () => {
     expect(UTD_STUB_TEXT).toBe("Can't decrypt yet — verify this device or restore key backup");
   });
 
-  it("its inline Verify action opens the shared Settings dialog", () => {
+  it("its inline Verify action goes to the Settings view", () => {
+    primaryViewStore.getState().setView("inbox");
     render(<UtdStub />);
-    expect(settingsUiStore.getState().settingsOpen).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Verify" }));
-    expect(settingsUiStore.getState().settingsOpen).toBe(true);
+    // Settings is a primary view now, not a dialog — the action still has to
+    // land the user on the surface that can actually verify the device.
+    expect(primaryViewStore.getState().view).toBe("settings");
   });
 
   it("is not an aria-live region, so a batch of historical UTD rows is not announced", () => {

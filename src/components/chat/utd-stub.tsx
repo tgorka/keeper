@@ -16,7 +16,7 @@
  */
 import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { settingsUiStore } from "@/lib/stores/settings-ui";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 
 /** The honest, verbatim UTD copy (Story 3.1 fixed string). */
 export const UTD_STUB_TEXT = "Can't decrypt yet — verify this device or restore key backup";
@@ -30,7 +30,7 @@ export function UtdStub() {
           type="button"
           variant="outline"
           size="xs"
-          onClick={() => settingsUiStore.getState().setSettingsOpen(true)}
+          onClick={() => primaryViewStore.getState().setView("settings")}
         >
           Verify
         </Button>

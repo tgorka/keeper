@@ -338,16 +338,29 @@ describe("SidebarPane sync entry (Story 32.5)", () => {
 });
 
 describe("SidebarPane settings", () => {
-  it("opens the Settings dialog when the Settings button is clicked", async () => {
+  it("switches to the Settings view rather than opening a dialog", () => {
+    primaryViewStore.getState().setView("inbox");
     renderSidebar();
-    // The dialog is closed initially.
+    // No modal, on this click or any other: Settings is a primary view now, and
+    // a dialog would trap focus over a surface meant to be read while the app
+    // keeps working behind it.
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
-    const dialog = await screen.findByRole("dialog");
-    expect(dialog).toBeInTheDocument();
-    expect(screen.getByText("Archive & Storage")).toBeInTheDocument();
+    expect(primaryViewStore.getState().view).toBe("settings");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("marks the Settings entry active while its view is showing, like every other entry", () => {
+    primaryViewStore.getState().setView("settings");
+    renderSidebar();
+
+    expect(screen.getByRole("button", { name: "Settings" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    primaryViewStore.getState().setView("inbox");
   });
 });
 

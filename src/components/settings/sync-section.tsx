@@ -264,17 +264,6 @@ export function SyncSection({ open }: { open: boolean }) {
   const readError = useSyncStore((state) => state.error);
 
   /**
-   * The device identity, read once per open. Not in the mirror store: nothing
-   * outside this block changes it, so polling it would buy nothing.
-   */
-  const [device, setDevice] = useState<SyncDeviceVm | null>(null);
-  const [deviceName, setDeviceName] = useState("");
-  const [deviceBusy, setDeviceBusy] = useState(false);
-  const [deviceError, setDeviceError] = useState<string | null>(null);
-  /** Whether a rename went through; nothing else on screen would report it. */
-  const [deviceRenamed, setDeviceRenamed] = useState(false);
-
-  /**
    * The list sizes, as text.
    *
    * Held as strings rather than numbers so a half-typed field is representable:
@@ -299,17 +288,6 @@ export function SyncSection({ open }: { open: boolean }) {
     let live = true;
     void (async () => {
       try {
-        const read = await syncDevice();
-        if (live) {
-          setDevice(read);
-          setDeviceName(read.label);
-        }
-      } catch (raw) {
-        if (live) {
-          setDeviceError(syncErrorMessage(raw));
-        }
-      }
-      try {
         const read = await syncListSettingsGet();
         if (live) {
           setLists(read);
@@ -329,23 +307,6 @@ export function SyncSection({ open }: { open: boolean }) {
     };
   }, [open]);
 
-  const renameDevice = async () => {
-    setDeviceBusy(true);
-    setDeviceError(null);
-    setDeviceRenamed(false);
-    try {
-      const stored = await syncDeviceSetLabel(deviceName);
-      setDevice(stored);
-      // Seeded from what was STORED, not from what was typed: Rust trims, and a
-      // box that kept the untrimmed text would disagree with the trailers.
-      setDeviceName(stored.label);
-      setDeviceRenamed(true);
-    } catch (raw) {
-      setDeviceError(syncErrorMessage(raw));
-    } finally {
-      setDeviceBusy(false);
-    }
-  };
   const saveLists = async () => {
     setListsBusy(true);
     setListsError(null);
@@ -392,9 +353,6 @@ export function SyncSection({ open }: { open: boolean }) {
     return folded !== lists.folded || unfolded !== lists.unfolded;
   })();
 
-  const renameable =
-    device !== null && deviceName.trim() !== "" && deviceName.trim() !== device.label;
-
   return (
     <div className="mt-2 flex flex-col gap-3 border-border border-t pt-3 text-sm">
       <p className="font-medium">{SYNC_SECTION_TITLE}</p>
@@ -419,46 +377,6 @@ export function SyncSection({ open }: { open: boolean }) {
             meaning for the same control, on the one surface where abandoning a
             draft already costs a single click on the dialog. */}
         <AddFolderForm disabled={profiles === null} />
-      </div>
-      <div className="mt-1 flex flex-col gap-2 border-border border-t pt-3">
-        <p className="font-medium">{SYNC_DEVICE_TITLE}</p>
-        <div className="flex items-center justify-between gap-2">
-          <Label htmlFor="sync-device-name">{SYNC_DEVICE_NAME_LABEL}</Label>
-          <div className="flex items-center gap-1">
-            <Input
-              id="sync-device-name"
-              className="w-56"
-              value={deviceName}
-              disabled={device === null || deviceBusy}
-              onChange={(event) => {
-                setDeviceRenamed(false);
-                setDeviceName(event.target.value);
-              }}
-            />
-            <Button
-              type="button"
-              variant="outline"
-              size="xs"
-              disabled={!renameable || deviceBusy}
-              onClick={() => {
-                void renameDevice();
-              }}
-            >
-              {SYNC_DEVICE_SAVE_LABEL}
-            </Button>
-          </div>
-        </div>
-        <p className="text-muted-foreground text-xs">{SYNC_DEVICE_NOTE}</p>
-        {deviceRenamed && (
-          <p className="text-muted-foreground text-xs">{SYNC_DEVICE_SAVED_SENTENCE}</p>
-        )}
-        {deviceError !== null && <p className="text-destructive text-xs">{deviceError}</p>}
-        {device !== null && (
-          <p className="font-mono text-muted-foreground text-xs">
-            {SYNC_DEVICE_ID_LABEL}: {device.id}
-          </p>
-        )}
-        {device !== null && <p className="text-muted-foreground text-xs">{SYNC_DEVICE_ID_NOTE}</p>}
       </div>
       <div className="mt-1 flex flex-col gap-2 border-border border-t pt-3">
         <p className="font-medium">{SYNC_LISTS_TITLE}</p>
@@ -738,6 +656,114 @@ function SyncProfileRow({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+    </div>
+  );
+}
+
+/**
+ * This machine's name and id.
+ *
+ * Its own section rather than a block inside Sync. The label is not a sync
+ * setting: it rides every commit's `Keeper-Device` trailer, names this machine in
+ * conflict-copy filenames, and now qualifies the commit subject itself
+ * (`sync(tgdrive@hesperia)`). Someone looking for "what is this Mac called"
+ * should not have to know that folder sync is where it was filed.
+ *
+ * Still rendered only where sync exists, because the identity is read and written
+ * through the sync engine's own IPC — there is nothing to show on a machine that
+ * has none.
+ */
+export function DeviceSection({ open }: { open: boolean }) {
+  const [device, setDevice] = useState<SyncDeviceVm | null>(null);
+  const [deviceName, setDeviceName] = useState("");
+  const [deviceBusy, setDeviceBusy] = useState(false);
+  const [deviceError, setDeviceError] = useState<string | null>(null);
+  /** Whether a rename went through; nothing else on screen would report it. */
+  const [deviceRenamed, setDeviceRenamed] = useState(false);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    let live = true;
+    void (async () => {
+      try {
+        const read = await syncDevice();
+        if (live) {
+          setDevice(read);
+          setDeviceName(read.label);
+        }
+      } catch (raw) {
+        if (live) {
+          setDeviceError(syncErrorMessage(raw));
+        }
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [open]);
+
+  const renameDevice = async () => {
+    setDeviceBusy(true);
+    setDeviceError(null);
+    setDeviceRenamed(false);
+    try {
+      const stored = await syncDeviceSetLabel(deviceName);
+      setDevice(stored);
+      // Seeded from what was STORED, not from what was typed: Rust trims, and a
+      // box that kept the untrimmed text would disagree with the trailers.
+      setDeviceName(stored.label);
+      setDeviceRenamed(true);
+    } catch (raw) {
+      setDeviceError(syncErrorMessage(raw));
+    } finally {
+      setDeviceBusy(false);
+    }
+  };
+  const renameable =
+    device !== null && deviceName.trim() !== "" && deviceName.trim() !== device.label;
+
+  return (
+    <div className="mt-2 flex flex-col gap-3 border-border border-t pt-3 text-sm">
+      <p className="font-medium">{SYNC_DEVICE_TITLE}</p>
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor="sync-device-name">{SYNC_DEVICE_NAME_LABEL}</Label>
+        <div className="flex items-center gap-1">
+          <Input
+            id="sync-device-name"
+            className="w-56"
+            value={deviceName}
+            disabled={device === null || deviceBusy}
+            onChange={(event) => {
+              setDeviceRenamed(false);
+              setDeviceName(event.target.value);
+            }}
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={!renameable || deviceBusy}
+            onClick={() => {
+              void renameDevice();
+            }}
+          >
+            {SYNC_DEVICE_SAVE_LABEL}
+          </Button>
+        </div>
+      </div>
+      <p className="text-muted-foreground text-xs">{SYNC_DEVICE_NOTE}</p>
+      {deviceRenamed && (
+        <p className="text-muted-foreground text-xs">{SYNC_DEVICE_SAVED_SENTENCE}</p>
+      )}
+      {deviceError !== null && <p className="text-destructive text-xs">{deviceError}</p>}
+      {device !== null && (
+        <p className="font-mono text-muted-foreground text-xs">
+          {SYNC_DEVICE_ID_LABEL}: {device.id}
+        </p>
+      )}
+      {device !== null && <p className="text-muted-foreground text-xs">{SYNC_DEVICE_ID_NOTE}</p>}
     </div>
   );
 }

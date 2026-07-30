@@ -4,7 +4,7 @@ import { VERIFY_BANNER_TEXT, VerifyBanner } from "@/components/layout/verify-ban
 import type { AccountVm } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
-import { settingsUiStore } from "@/lib/stores/settings-ui";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 
 function account(accountId: string): AccountVm {
   return {
@@ -19,13 +19,13 @@ function account(accountId: string): AccountVm {
 beforeEach(() => {
   encryptionStatusStore.getState().reset();
   accountsStore.getState().clear();
-  settingsUiStore.getState().setSettingsOpen(false);
+  primaryViewStore.getState().setView("inbox");
 });
 
 afterEach(() => {
   encryptionStatusStore.getState().reset();
   accountsStore.getState().clear();
-  settingsUiStore.getState().setSettingsOpen(false);
+  primaryViewStore.getState().setView("inbox");
 });
 
 describe("VerifyBanner", () => {
@@ -51,12 +51,13 @@ describe("VerifyBanner", () => {
     expect(VERIFY_BANNER_TEXT).toBe("Verify this device to read encrypted history");
   });
 
-  it("its CTA opens the shared Settings dialog", () => {
+  it("its CTA goes to the Settings view", () => {
+    primaryViewStore.getState().setView("inbox");
     accountsStore.getState().hydrateAll([account("a")]);
     encryptionStatusStore.getState().setStatus("a", "unverified");
     render(<VerifyBanner />);
     fireEvent.click(screen.getByRole("button", { name: "Verify" }));
-    expect(settingsUiStore.getState().settingsOpen).toBe(true);
+    expect(primaryViewStore.getState().view).toBe("settings");
   });
 
   it("dismissing hides it and sets the dismissal flag (collapses to badge)", () => {

@@ -12,11 +12,24 @@ import { createStore } from "zustand/vanilla";
 /**
  * Which primary window the shell renders: the Unified Inbox, the Archive, the
  * Bridges surface (Story 6.1), the Approval Pane (Story 7.3), the Recording
- * view (Story 16.3), or the Sync view (Story 32.5). "inbox"/"archive" pick which
- * window the chat-list pane shows; "bridges", "approval", "recording", and
- * "sync" each replace the chat-list + conversation cluster entirely.
+ * view (Story 16.3), the Sync view (Story 32.5), or Settings. "inbox"/"archive"
+ * pick which window the chat-list pane shows; "bridges", "approval",
+ * "recording", "sync" and "settings" each replace the chat-list + conversation
+ * cluster entirely.
+ *
+ * Settings joined this list rather than staying a dialog because it is a place
+ * you go and stay, not a question you answer and dismiss — and a modal covers the
+ * app, which is wrong for a surface whose Sync section you read *while* watching a
+ * folder work.
  */
-export type PrimaryView = "inbox" | "archive" | "bridges" | "approval" | "recording" | "sync";
+export type PrimaryView =
+  | "inbox"
+  | "archive"
+  | "bridges"
+  | "approval"
+  | "recording"
+  | "sync"
+  | "settings";
 
 export interface PrimaryViewState {
   /** The active primary view; defaults to the Unified Inbox. */
