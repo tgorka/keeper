@@ -1,0 +1,58 @@
+src/lib/stores/primary-view.ts
+  s_29241f23d6ee7e::t_d90071a73ae0cd 15-23,25-32
+src/components/layout/sidebar-pane.test.tsx
+  s_29241f23d6ee7e::t_9f8e0f290c16d9 341-342,344-346,351-363
+src/components/chat/utd-stub.test.tsx
+  s_29241f23d6ee7e::t_3fe9d495d0271b 4,7,11,21-22,25-27
+src/components/layout/account-footer.test.tsx
+  s_29241f23d6ee7e::t_3fe9d495d0271b 32,78,187-188,195-198
+src/components/layout/account-footer.tsx
+  s_29241f23d6ee7e::t_18dbc08f32562b 85,537
+src/components/layout/settings-pane.tsx
+  s_29241f23d6ee7e::t_18dbc08f32562b 45
+  s_29241f23d6ee7e::t_5127feaace6818 1-44,46-50
+src/components/layout/settings-pane.test.tsx
+  s_29241f23d6ee7e::t_430aa2dec74715 1-44
+src/components/settings/sync-section.tsx
+  s_29241f23d6ee7e::t_3838cfdf0c2561 707-726
+  s_29241f23d6ee7e::t_da4be6e779ea49 730-753,755-766
+  s_29241f23d6ee7e::t_a56cd7b6d8c7d5 767-768
+  s_29241f23d6ee7e::t_af802b0d9bb354 662-706,727-729,754
+  s_29241f23d6ee7e::t_24b773223e1665 769
+src/components/layout/sidebar-pane.tsx
+  s_29241f23d6ee7e::t_5d09a16d5765ab 117-118,121,135,142-143
+src/components/layout/verify-banner.test.tsx
+  s_29241f23d6ee7e::t_3fe9d495d0271b 7,22,28,54-55,60
+src/components/chat/utd-stub.tsx
+  s_29241f23d6ee7e::t_1c6645e6e8c0f7 19,33
+src/components/settings/sync-section.test.tsx
+  s_29241f23d6ee7e::t_402eb772ad1e42 38,738-743,745,755,779
+src/components/settings/settings-dialog.tsx
+  s_29241f23d6ee7e::t_62bccaafce9031 188-189
+  s_29241f23d6ee7e::t_23777b938432c8 190-198,202-205,207-208,210,217,223-226
+  s_29241f23d6ee7e::t_1c76bf9dd7f767 95-133
+  s_29241f23d6ee7e::t_e2106352118175 211-216
+  s_29241f23d6ee7e::t_b79b2102b4df37 227
+  s_29241f23d6ee7e::t_f86fa7f4635310 18
+src/components/layout/verify-banner.tsx
+  s_29241f23d6ee7e::t_1c6645e6e8c0f7 17,37
+src/components/layout/app-shell.tsx
+  s_29241f23d6ee7e::t_18dbc08f32562b 13
+  s_29241f23d6ee7e::t_d90071a73ae0cd 219-220
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "5f37f50c27fb7197dcbe03478c591bf888d7b769",
+  "prompts": {},
+  "sessions": {
+    "s_29241f23d6ee7e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2a17679b-9653-4738-aa3f-aa90c1886fd7",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
