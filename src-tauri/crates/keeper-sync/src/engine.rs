@@ -3357,6 +3357,46 @@ impl Engine {
         Ok(outcome)
     }
 
+    /// Forget everything this profile remembers about its own tree and look again.
+    ///
+    /// The escape hatch for the one failure the engine cannot detect from the
+    /// inside: it decides what changed by comparing each path against the
+    /// `file_state` row it recorded last time, so a file whose size, mtime, ctime
+    /// and inode all match a remembered row is *not* a change — and it is right
+    /// about that almost always. Almost. A copy that preserves mtime (which
+    /// [`crate::copy`] does deliberately), a restore from a backup, a clock that
+    /// moved, a filesystem that recycles inodes: each can land a file that looks
+    /// exactly like one already accounted for. Nothing on the next hundred scans
+    /// will notice, because every one of them asks the same question and gets the
+    /// same answer.
+    ///
+    /// So this deletes the rows rather than re-reading them. With nothing
+    /// remembered every path on disk is new, the next walk queues whatever the
+    /// tree actually holds, and the profile converges on the truth instead of on
+    /// its own record of it.
+    ///
+    /// The settle gate goes too. A gate seeded from the old state would hold
+    /// paths against observations that no longer exist, so the first walk after
+    /// this would report files as settling that nothing is writing.
+    ///
+    /// Cheap in the ordinary case — a tree that genuinely matches its rows is
+    /// re-recorded as it is walked and nothing is queued — and idempotent, so
+    /// pressing it twice costs one extra walk and changes nothing.
+    pub fn rescan(&self, id: &str) -> Result<()> {
+        if self.with_db(|conn| db::get_profile(conn, id))?.is_none() {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        }
+        self.with_db(|conn| db::clear_file_state(conn, id))?;
+        Self::lock(&self.gates).remove(id);
+        // The walk must happen now, not at the end of the poll window: pressing
+        // this is a request to look, and a folder that sat unchanged for a minute
+        // afterwards would read as the button having done nothing.
+        Self::lock(&self.next_scan_ms).remove(id);
+        self.note_watch_wake(id);
+        tracing::info!(profile = id, "forgot the remembered tree state on request");
+        Ok(())
+    }
+
     /// Re-verify stored content for a profile (Story 25.6).
     pub async fn verify(&self, id: &str) -> Result<VerifyReport> {
         let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {

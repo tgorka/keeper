@@ -17,6 +17,7 @@ vi.mock("@/lib/ipc/client", () => ({
   syncPending: vi.fn(),
   syncProblems: vi.fn(),
   syncRetryParked: vi.fn(),
+  syncRescan: vi.fn(),
   // The persisted list sizes (folded / unfolded).
   syncListSettingsGet: vi.fn(),
   // The progress stream, the only source of in-flight counters.
@@ -71,6 +72,8 @@ import {
   SYNC_PENDING_EMPTY_SENTENCE,
   SYNC_PENDING_TITLE,
   SYNC_PROBLEMS_TITLE,
+  SYNC_RESCAN_LABEL,
+  SYNC_RESCAN_NOTE,
   SYNC_RETRY_ALL_LABEL,
   SYNC_RETRY_LABEL,
   SYNC_SETTLING_NOTE,
@@ -130,6 +133,7 @@ import {
   syncProfileSave,
   syncProfileSetEnabled,
   syncProfiles,
+  syncRescan,
   syncRetryParked,
   syncSetCredential,
   syncStatuses,
@@ -155,6 +159,7 @@ const mockProfiles = vi.mocked(syncProfiles);
 const mockStatuses = vi.mocked(syncStatuses);
 const mockActivity = vi.mocked(syncActivity);
 const mockListSettings = vi.mocked(syncListSettingsGet);
+const mockRescan = vi.mocked(syncRescan);
 const mockPending = vi.mocked(syncPending);
 const mockProblems = vi.mocked(syncProblems);
 const mockRetryParked = vi.mocked(syncRetryParked);
@@ -328,6 +333,7 @@ beforeEach(() => {
   mockStatuses.mockResolvedValue([statusVm()]);
   mockActivity.mockResolvedValue([]);
   mockListSettings.mockResolvedValue({ folded: 10, unfolded: 100 });
+  mockRescan.mockResolvedValue(undefined);
   mockPending.mockResolvedValue([]);
   mockProblems.mockResolvedValue(problemsVm());
   // Every edit form reads the keychain as it opens (Story 34.12); this folder
@@ -1278,6 +1284,28 @@ describe("SyncPane list folding", () => {
     fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${SYNC_RETRY_ALL_LABEL}`) }));
     await waitFor(() => expect(mockRetryParked).toHaveBeenCalledTimes(5));
     expect(mockRetryParked.mock.calls.map(([, id]) => id)).toEqual([40, 41, 42, 43, 44]);
+  });
+});
+
+describe("SyncPane recheck", () => {
+  it("forgets the remembered tree for the folder it was pressed on", async () => {
+    await renderPane();
+
+    fireEvent.click(await screen.findByRole("button", { name: SYNC_RESCAN_LABEL }));
+
+    // Named for the profile, not for "all folders": the button lives on one
+    // card and must not quietly re-walk the others.
+    await waitFor(() => expect(mockRescan).toHaveBeenCalledWith("p1"));
+    expect(mockRescan).toHaveBeenCalledTimes(1);
+  });
+
+  it("explains, on hover, the one symptom it is the answer to", async () => {
+    await renderPane();
+
+    const button = await screen.findByRole("button", { name: SYNC_RESCAN_LABEL });
+    // The button is an exception, not a habit — the note is what stops it being
+    // pressed as a ritual after every copy.
+    expect(button).toHaveAttribute("title", SYNC_RESCAN_NOTE);
   });
 });
 

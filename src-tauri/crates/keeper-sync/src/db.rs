@@ -245,6 +245,16 @@ pub fn set_device_label(conn: &Connection, label: &str) -> Result<String> {
 // Profiles
 // ---------------------------------------------------------------------------
 
+/// Forget every remembered path for one profile, leaving the profile itself.
+///
+/// Split out of [`delete_profile`]'s own delete because the two mean different
+/// things: that one is tearing the profile down, this one is telling a profile
+/// that still exists to stop trusting its memory of the tree. See
+/// `Engine::rescan` for why that is ever the right thing to do.
+pub fn clear_file_state(conn: &Connection, profile_id: &str) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM file_state WHERE profile_id = ?1", [profile_id])?)
+}
+
 /// Insert or replace a profile. Validation runs first so a bad profile can
 /// never reach the database, whatever route it arrived by.
 pub fn upsert_profile(conn: &Connection, profile: &SyncProfile, now_ms: i64) -> Result<()> {

@@ -283,6 +283,28 @@ pub async fn copy_start(
                 } else {
                     CopyJobState::Done
                 };
+                // The log is written before the job settles, so a UI that reacts
+                // to `done` by opening the destination finds it already there.
+                //
+                // Written even for a cancelled job: the files that *were* copied
+                // are still on disk and still need a record, and a log that only
+                // appears for a perfect run is missing exactly when someone most
+                // wants to know what happened. A failure to write it is logged
+                // and swallowed — the copy itself succeeded, and refusing to
+                // report a good copy because its receipt could not be filed
+                // would be the wrong trade.
+                let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+                let when = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let log_path = destination.join(keeper_sync::copy::copy_log_filename(&stamp));
+                let body =
+                    keeper_sync::copy::render_copy_log(&report, &source, &destination, &when);
+                if let Err(err) = std::fs::write(&log_path, body) {
+                    tracing::warn!(
+                        path = %log_path.display(),
+                        %err,
+                        "could not write the copy log"
+                    );
+                }
                 registry.settle(&job_id, state, Some(report), None);
             }
             Err(err) => {

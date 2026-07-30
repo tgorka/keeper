@@ -118,6 +118,15 @@ pub struct CopyEntry {
     /// file bytes to copy.
     pub bytes: u64,
     pub outcome: CopyOutcome,
+    /// SHA-256 of the file's content, lower-case hex, when one was computed.
+    ///
+    /// Present for `Copied` (the digest an independent re-read proved) and for
+    /// `Identical` (the digest both sides hashed to). `None` where there is
+    /// genuinely nothing to report rather than where it was inconvenient to
+    /// carry: a refused entry, a collision left untouched, a failure that never
+    /// reached the hash. A log line with an empty digest column is then a fact
+    /// about the file, not a gap in the record.
+    pub sha256: Option<String>,
 }
 
 /// The result of a whole job.
@@ -240,6 +249,7 @@ fn copy_verified_hooked(
                     outcome: CopyOutcome::Failed {
                         reason: reason.clone(),
                     },
+                    sha256: None,
                 });
                 reporter.finish(0);
             }
@@ -250,17 +260,21 @@ fn copy_verified_hooked(
                 let step = match copy_one(&src, &dst, options, cancel, &mut reporter, hook) {
                     Ok(step) => step,
                     // One file's I/O problem is one line in the report.
-                    Err(err) => Step::Done(CopyOutcome::Failed {
-                        reason: err.to_string(),
-                    }),
+                    Err(err) => Step::Done(
+                        CopyOutcome::Failed {
+                            reason: err.to_string(),
+                        },
+                        None,
+                    ),
                 };
                 match step {
                     Step::Cancelled => break,
-                    Step::Done(outcome) => {
+                    Step::Done(outcome, sha256) => {
                         report.entries.push(CopyEntry {
                             path: display(rel),
                             bytes: *bytes,
                             outcome,
+                            sha256,
                         });
                         reporter.finish(*bytes);
                     }
@@ -281,7 +295,10 @@ fn copy_verified_hooked(
 
 /// Whether the walk should carry on.
 enum Step {
-    Done(CopyOutcome),
+    /// The file is settled, with the SHA-256 of its content when one was
+    /// computed. `None` where no digest exists to report: a refused entry, a
+    /// collision left untouched, or a failure that never got as far as hashing.
+    Done(CopyOutcome, Option<String>),
     /// The cancel flag was seen; nothing was published and nothing is staged.
     Cancelled,
 }
@@ -315,19 +332,22 @@ fn copy_one(
         // Never rename over a directory or a symlink: the first cannot be
         // replaced by a file at all, and the second would write through to
         // wherever it points, outside the destination the user chose.
-        return Ok(Step::Done(CopyOutcome::Failed {
-            reason: format!(
-                "destination already exists and is {}",
-                describe_kind(&existing)
-            ),
-        }));
+        return Ok(Step::Done(
+            CopyOutcome::Failed {
+                reason: format!(
+                    "destination already exists and is {}",
+                    describe_kind(&existing)
+                ),
+            },
+            None,
+        ));
     }
 
     if existing.len() != source_meta.len() {
         // A different length proves different content without reading a byte —
         // the cheap half of AD-C4, and the common case for a collision.
         if !options.replace_existing {
-            return Ok(Step::Done(CopyOutcome::Collision));
+            return Ok(Step::Done(CopyOutcome::Collision, None));
         }
         return stage(src, dst, Publish::Replacing, cancel, reporter, hook);
     }
@@ -340,15 +360,15 @@ fn copy_one(
     };
     match stream_source(src, None, cancel, reporter, hook)? {
         Streamed::Cancelled => Ok(Step::Cancelled),
-        Streamed::Changed { reason } => Ok(Step::Done(CopyOutcome::Failed { reason })),
+        Streamed::Changed { reason } => Ok(Step::Done(CopyOutcome::Failed { reason }, None)),
         Streamed::Read { digest, .. } if digest == destination_digest => {
             // Nothing is written, so the destination's mtime, ctime and inode
             // all survive untouched — which is what makes a re-run cheap and
             // provably non-destructive.
-            Ok(Step::Done(CopyOutcome::Identical))
+            Ok(Step::Done(CopyOutcome::Identical, Some(digest)))
         }
         Streamed::Read { .. } if !options.replace_existing => {
-            Ok(Step::Done(CopyOutcome::Collision))
+            Ok(Step::Done(CopyOutcome::Collision, None))
         }
         // The second read of the source is deliberate: paying for it here keeps
         // the identical case — a re-run over a whole tree — from having to
@@ -405,7 +425,9 @@ fn stage(
         // Dropping the temp unlinks it, so a cancelled or torn file leaves the
         // destination directory exactly as it was.
         Streamed::Cancelled => return Ok(Step::Cancelled),
-        Streamed::Changed { reason } => return Ok(Step::Done(CopyOutcome::Failed { reason })),
+        Streamed::Changed { reason } => {
+            return Ok(Step::Done(CopyOutcome::Failed { reason }, None))
+        }
         Streamed::Read {
             digest,
             bytes,
@@ -435,14 +457,17 @@ fn stage(
             return Ok(Step::Cancelled);
         };
         if written.0 != digest || written.1 != bytes {
-            return Ok(Step::Done(CopyOutcome::Failed {
-                reason: mismatch((&digest, bytes), &written),
-            }));
+            return Ok(Step::Done(
+                CopyOutcome::Failed {
+                    reason: mismatch((&digest, bytes), &written),
+                },
+                None,
+            ));
         }
         staged
             .persist(dst)
             .map_err(|err| SyncError::io("publish copied file", dst, err.error))?;
-        return Ok(Step::Done(CopyOutcome::Copied));
+        return Ok(Step::Done(CopyOutcome::Copied, Some(digest)));
     }
 
     staged
@@ -459,11 +484,14 @@ fn stage(
     };
     if verified.0 != digest || verified.1 != bytes {
         discard(dst);
-        return Ok(Step::Done(CopyOutcome::Failed {
-            reason: mismatch((&digest, bytes), &verified),
-        }));
+        return Ok(Step::Done(
+            CopyOutcome::Failed {
+                reason: mismatch((&digest, bytes), &verified),
+            },
+            None,
+        ));
     }
-    Ok(Step::Done(CopyOutcome::Copied))
+    Ok(Step::Done(CopyOutcome::Copied, Some(digest)))
 }
 
 /// What a source read produced.
@@ -939,6 +967,90 @@ impl<'a> Reporter<'a> {
             self.detached = true;
         }
     }
+}
+
+/// Basename of the log a finished job leaves in its destination.
+///
+/// Timestamped by the caller, because a second job into the same folder must not
+/// silently overwrite the first job's record — the log is evidence, and evidence
+/// that can be clobbered by a re-run is worth less than none.
+pub fn copy_log_filename(stamp: &str) -> String {
+    format!("keeper-copy-{stamp}.log")
+}
+
+/// Render the copy log.
+///
+/// Plain text, one file per line, because the point is that a person can read it
+/// in a year with no keeper installed — the same reasoning that put provenance in
+/// git trailers rather than a sidecar. Columns are outcome, size, SHA-256 and
+/// path, in that order: the outcome is what you scan for, and the path is the
+/// only field that can contain spaces, so it goes last and needs no quoting.
+///
+/// `stamp` and `source`/`destination` come from the caller. This module holds no
+/// clock — the same rule the rest of the crate follows — and a log that invented
+/// its own timestamp could disagree with the job that produced it.
+pub fn render_copy_log(
+    report: &CopyReport,
+    source: &Path,
+    destination: &Path,
+    stamp: &str,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(128 + report.entries.len() * 96);
+    let _ = writeln!(out, "keeper copy log");
+    let _ = writeln!(out, "when:        {stamp}");
+    let _ = writeln!(out, "source:      {}", source.display());
+    let _ = writeln!(out, "destination: {}", destination.display());
+    let _ = writeln!(
+        out,
+        "agent:       keeper-sync/{}",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let mut copied = 0usize;
+    let mut identical = 0usize;
+    let mut collision = 0usize;
+    let mut failed = 0usize;
+    for entry in &report.entries {
+        match entry.outcome {
+            CopyOutcome::Copied => copied += 1,
+            CopyOutcome::Identical => identical += 1,
+            CopyOutcome::Collision => collision += 1,
+            CopyOutcome::Failed { .. } => failed += 1,
+        }
+    }
+    let _ = writeln!(
+        out,
+        "files:       {} ({copied} copied, {identical} identical, {collision} left alone, {failed} failed)",
+        report.entries.len()
+    );
+    let _ = writeln!(out, "bytes:       {}", report.bytes_copied);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "outcome    bytes  sha256  path");
+
+    for entry in &report.entries {
+        let outcome = match &entry.outcome {
+            CopyOutcome::Copied => "copied",
+            CopyOutcome::Identical => "identical",
+            CopyOutcome::Collision => "left-alone",
+            CopyOutcome::Failed { .. } => "FAILED",
+        };
+        // `-` rather than an empty column: a reader must be able to tell "no
+        // digest exists for this outcome" from "the column is missing".
+        let digest = entry.sha256.as_deref().unwrap_or("-");
+        let _ = writeln!(
+            out,
+            "{outcome}  {}  {digest}  {}",
+            entry.bytes,
+            // Newlines in a path would forge a log line, the same injection the
+            // provenance trailers guard against.
+            entry.path.replace(['\n', '\r'], " ")
+        );
+        if let CopyOutcome::Failed { reason } = &entry.outcome {
+            let _ = writeln!(out, "    reason: {}", reason.replace(['\n', '\r'], " "));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1542,15 +1654,106 @@ mod tests {
             outcome: CopyOutcome::Failed {
                 reason: "nope".into(),
             },
+            sha256: None,
         })
         .expect("serialize");
         assert_eq!(
             json,
-            r#"{"path":"nested/beta.bin","bytes":12,"outcome":{"kind":"failed","reason":"nope"}}"#
+            r#"{"path":"nested/beta.bin","bytes":12,"outcome":{"kind":"failed","reason":"nope"},"sha256":null}"#
         );
         assert_eq!(
             serde_json::to_string(&CopyOutcome::Identical).expect("serialize"),
             r#"{"kind":"identical"}"#
         );
+    }
+
+    #[test]
+    fn the_log_records_every_file_with_its_digest_and_the_ones_that_have_none() {
+        let report = CopyReport {
+            entries: vec![
+                CopyEntry {
+                    path: "a.txt".into(),
+                    bytes: 4,
+                    outcome: CopyOutcome::Copied,
+                    sha256: Some("aa11".into()),
+                },
+                CopyEntry {
+                    path: "b.txt".into(),
+                    bytes: 8,
+                    outcome: CopyOutcome::Identical,
+                    sha256: Some("bb22".into()),
+                },
+                CopyEntry {
+                    path: "c.txt".into(),
+                    bytes: 2,
+                    outcome: CopyOutcome::Collision,
+                    sha256: None,
+                },
+                CopyEntry {
+                    path: "d.lnk".into(),
+                    bytes: 0,
+                    outcome: CopyOutcome::Failed {
+                        reason: "symbolic link".into(),
+                    },
+                    sha256: None,
+                },
+            ],
+            bytes_copied: 4,
+        };
+        let log = render_copy_log(
+            &report,
+            Path::new("/src"),
+            Path::new("/dst"),
+            "2026-07-30T12:00:00+02:00",
+        );
+
+        assert!(log.contains("source:      /src"), "{log}");
+        assert!(log.contains("destination: /dst"), "{log}");
+        assert!(log.contains("2026-07-30T12:00:00+02:00"), "{log}");
+        // The counts are the summary a person reads first.
+        assert!(
+            log.contains("4 (1 copied, 1 identical, 1 left alone, 1 failed)"),
+            "{log}"
+        );
+        assert!(log.contains("copied  4  aa11  a.txt"), "{log}");
+        assert!(log.contains("identical  8  bb22  b.txt"), "{log}");
+        // An outcome with no digest says so rather than leaving a blank column a
+        // reader would have to guess about.
+        assert!(log.contains("left-alone  2  -  c.txt"), "{log}");
+        assert!(log.contains("FAILED  0  -  d.lnk"), "{log}");
+        assert!(log.contains("reason: symbolic link"), "{log}");
+    }
+
+    #[test]
+    fn a_path_cannot_forge_a_log_line() {
+        // The same injection guard the provenance trailers carry: a newline in a
+        // path would otherwise write a line the reader takes for a second file.
+        let report = CopyReport {
+            entries: vec![CopyEntry {
+                path: "evil\ncopied  9  ff  planted.txt".into(),
+                bytes: 1,
+                outcome: CopyOutcome::Copied,
+                sha256: Some("cc33".into()),
+            }],
+            bytes_copied: 1,
+        };
+        let log = render_copy_log(&report, Path::new("/s"), Path::new("/d"), "now");
+        let planted = log
+            .lines()
+            .filter(|line| line.starts_with("copied"))
+            .count();
+        assert_eq!(planted, 1, "a newline in a path forged a line: {log}");
+    }
+
+    #[test]
+    fn each_job_gets_its_own_log_rather_than_overwriting_the_last() {
+        // The log is evidence. A second copy into the same folder must not be
+        // able to erase the first job's record.
+        assert_ne!(
+            copy_log_filename("20260730-120000"),
+            copy_log_filename("20260730-120001")
+        );
+        assert!(copy_log_filename("20260730-120000").starts_with("keeper-copy-"));
+        assert!(copy_log_filename("20260730-120000").ends_with(".log"));
     }
 }

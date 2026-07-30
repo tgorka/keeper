@@ -2549,6 +2549,20 @@ export async function syncVerify(id: string): Promise<string[]> {
 }
 
 /**
+ * Forget what a profile remembers about its own tree, so the next walk sees it
+ * fresh.
+ *
+ * The counterpart to {@link syncVerify}, and a different question: verify asks
+ * "is what I have intact", this asks "is what I *think* I have still what is
+ * there". A file copied in with its modification time preserved matches the
+ * remembered row exactly, so no amount of re-scanning finds it — clearing the
+ * memory is what changes the answer.
+ */
+export async function syncRescan(id: string): Promise<void> {
+  await invoke<void>("sync_rescan", { id });
+}
+
+/**
  * Open a synced folder in the OS file manager (Finder on macOS).
  *
  * Takes the profile id, never a path: Rust reads the folder off the stored
