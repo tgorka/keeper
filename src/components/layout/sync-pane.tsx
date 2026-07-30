@@ -895,8 +895,14 @@ function SyncProfileCard({
   return (
     <Card size="sm">
       <CardHeader>
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex min-w-0 flex-col gap-1">
+        {/* Wraps rather than overflowing. The actions used to be `shrink-0` beside
+            a `min-w-0` title, which works until there are five of them: the row
+            then pushes past the card's own edge and the last button is simply
+            unreachable. Wrapping costs a second line on a narrow window and keeps
+            every action clickable, which is the trade worth making — a control you
+            cannot see is not a control. */}
+        <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
+          <div className="flex min-w-0 flex-1 basis-64 flex-col gap-1">
             <div className="flex items-center gap-2">
               <CardTitle>{profile.name}</CardTitle>
               {status !== undefined && (
@@ -930,7 +936,7 @@ function SyncProfileCard({
               <span className="shrink-0">{syncRemoteHost(profile.remoteUrl)}</span>
             </p>
           </div>
-          <div className="flex shrink-0 items-center gap-1">
+          <div className="flex flex-wrap items-center justify-end gap-1">
             <Button
               type="button"
               variant="outline"
@@ -1536,8 +1542,14 @@ function CopyCard() {
       className="border border-border border-dashed bg-transparent shadow-none ring-0"
     >
       <CardHeader>
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex min-w-0 flex-col gap-1">
+        {/* Wraps rather than overflowing. The actions used to be `shrink-0` beside
+            a `min-w-0` title, which works until there are five of them: the row
+            then pushes past the card's own edge and the last button is simply
+            unreachable. Wrapping costs a second line on a narrow window and keeps
+            every action clickable, which is the trade worth making — a control you
+            cannot see is not a control. */}
+        <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
+          <div className="flex min-w-0 flex-1 basis-64 flex-col gap-1">
             <CardTitle>{COPY_TITLE}</CardTitle>
             <p className="text-muted-foreground text-xs">{COPY_SUBTITLE}</p>
           </div>
