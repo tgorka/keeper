@@ -341,6 +341,15 @@ logLevel = "info"
 # lfsMode = "materialize"          # materialize | pointerOnly | disabled
 # Files at or above this size are tracked through git-LFS (4 MiB).
 # lfsThresholdBytes = 4194304
+# Globs that must never go through LFS, whatever their size. The rule keeper
+# records in .gitattributes is per-EXTENSION, so one oversized note would write
+# `*.md filter=lfs` and every note in the repository stops being diffable.
+# Protect the formats you need to read as text -- especially when a low
+# threshold is set to catch bulk media. Same dialect as gitignore: a pattern
+# with no `/` matches the basename at any depth, one with `/` is anchored at the
+# repository root. The trade-off is real: a matched file stays an ordinary git
+# blob however large it grows, and gitoxide has no streaming object read.
+# lfsNever = ["*.md", "*.txt"]
 # How long a file must stop changing before it is considered complete.
 # settleMs = 5000
 # pollIntervalMs = 15000

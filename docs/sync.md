@@ -76,6 +76,7 @@ reports names a profile. Profiles run concurrently and fail independently.
 | `volumeId` | Which volume it is bound to. Written by keeper, not by you (§6) |
 | `lfsMode` | `materialize`, `pointerOnly`, or `disabled` |
 | `lfsThresholdBytes` | Files at or above this are tracked through LFS (default 4 MiB) |
+| `lfsNever` | Globs that never go through LFS, whatever their size (default none) |
 | `settleMs` | Quiescence window (see §4) |
 | `tags` | Extra `Keeper-Tag:` provenance trailers |
 
@@ -273,6 +274,33 @@ Files at or above `lfsThresholdBytes` (default 4 MiB) are tracked automatically:
 keeper maintains `.gitattributes` and commits it with provenance. The bytes move
 through keeper's own LFS client, streamed and hashed in a single pass, never
 buffered.
+
+### The rule is recorded per extension — which is why `lfsNever` exists
+
+The decision is per file and by size, but the rule keeper writes into
+`.gitattributes` covers the whole **extension** (`*.mp4`), so siblings are
+covered and the block stays small on a media folder. That is the right trade in
+a media folder and a trap in a mixed repository: one 300 KB note crossing the
+threshold writes `*.md filter=lfs`, and from then on every note in the
+repository is an opaque pointer — no diff, no merge, no blame.
+
+Lowering the threshold to catch bulk media makes that outcome *more* likely, not
+less. `lfsNever` is the escape hatch:
+
+```toml
+lfsThresholdBytes = 262144        # 256 KiB — catch bulk media
+lfsNever = ["*.md", "*.txt"]      # ...but never the formats you read as text
+```
+
+Same dialect as gitignore: a pattern with no `/` matches its basename at any
+depth, a pattern containing `/` is anchored at the repository root. A malformed
+glob is refused at startup rather than ignored — an opt-out that silently does
+nothing is how a note ends up an opaque pointer months later.
+
+The trade-off it accepts is real, and it is the reason this is the user's call
+rather than a built-in list: a matched file stays an ordinary git blob however
+large it grows, and gitoxide has no streaming object read. Exclude formats you
+need to diff, not formats you happen to have a lot of.
 
 - **Downloads resume.** An interrupted transfer restarts from where it stopped,
   and the digest of the existing prefix is carried forward.

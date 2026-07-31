@@ -24,8 +24,11 @@
 //! differing from the pointer blob. [`is_false_modification`] answers that
 //! without hashing gigabytes twice.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::error::{Result, SyncError};
 use crate::lfs::pointer::{self, Pointer};
@@ -70,6 +73,80 @@ pub struct LfsStaging {
 /// become a git blob.
 pub fn applies(profile: &SyncProfile, size: u64) -> bool {
     profile.lfs_mode != LfsMode::Disabled && size >= profile.lfs_threshold_bytes
+}
+
+/// The size rule plus the profile's opt-out globs, compiled once per run.
+///
+/// Two things make the opt-out necessary in a repository that holds both notes
+/// and media. First, the recorded `.gitattributes` rule is per-extension
+/// ([`pattern_for`]), so a single oversized file converts its whole extension
+/// for the rest of the repository's life. Second, the threshold that is right
+/// for media is far below the size of a large text file — the lower it goes to
+/// catch bulk, the likelier it is to swallow a format the user needs to diff.
+///
+/// Compiled once and reused: `prepare` walks every candidate, and building a
+/// [`GlobSet`] per path would make the common case (no opt-out configured) pay
+/// for a feature it does not use.
+#[derive(Debug)]
+pub struct LfsPolicy {
+    threshold: u64,
+    enabled: bool,
+    never: Option<GlobSet>,
+}
+
+impl LfsPolicy {
+    /// Glob semantics follow `.gitignore` and `.gitattributes`, because that is
+    /// what anyone writing these patterns has already learned: a pattern with no
+    /// `/` matches its basename at **any** depth (`*.md` covers
+    /// `10-notes/a/b.md`), and a pattern containing `/` is anchored at the
+    /// repository root (`10-notes/**` covers only that zone). Inventing a third
+    /// dialect here would be a trap, not a feature.
+    ///
+    /// Refuses malformed globs rather than silently ignoring them — a typo in
+    /// an opt-out that quietly does nothing is how a note ends up an opaque
+    /// pointer months later.
+    pub fn from_profile(profile: &SyncProfile) -> Result<Self> {
+        let never = if profile.lfs_never.is_empty() {
+            None
+        } else {
+            let mut builder = GlobSetBuilder::new();
+            for pattern in &profile.lfs_never {
+                let anchored: Cow<'_, str> = if pattern.contains('/') {
+                    Cow::Borrowed(pattern.as_str())
+                } else {
+                    Cow::Owned(format!("**/{pattern}"))
+                };
+                let glob = GlobBuilder::new(&anchored)
+                    .literal_separator(true)
+                    .build()
+                    .map_err(|err| {
+                        SyncError::Config(format!("invalid lfsNever glob `{pattern}`: {err}"))
+                    })?;
+                builder.add(glob);
+            }
+            Some(builder.build().map_err(|err| {
+                SyncError::Config(format!("could not compile lfsNever globs: {err}"))
+            })?)
+        };
+        Ok(Self {
+            threshold: profile.lfs_threshold_bytes,
+            enabled: profile.lfs_mode != LfsMode::Disabled,
+            never,
+        })
+    }
+
+    /// `path` is repository-relative, which is what the globs are written
+    /// against — matching an absolute path would make `*.md` depend on where
+    /// the folder happens to be mounted.
+    pub fn applies(&self, path: &Path, size: u64) -> bool {
+        if !self.enabled || size < self.threshold {
+            return false;
+        }
+        !self
+            .never
+            .as_ref()
+            .is_some_and(|never| never.is_match(path))
+    }
 }
 
 /// The `.gitattributes` pattern that covers `path`.
@@ -279,6 +356,9 @@ pub fn prepare(
     if profile.lfs_mode == LfsMode::Disabled {
         return Ok(staging);
     }
+    // Built before the walk so a malformed opt-out glob fails the run outright
+    // rather than after an arbitrary number of files have already been routed.
+    let policy = LfsPolicy::from_profile(profile)?;
     store.ensure_layout()?;
 
     let mut patterns: Vec<String> = Vec::new();
@@ -291,7 +371,7 @@ pub fn prepare(
             Err(err) => return Err(SyncError::io("stat LFS candidate", absolute, err)),
         };
         // A symlink's blob is its target; its size is meaningless here.
-        if !metadata.is_file() || !applies(profile, metadata.len()) {
+        if !metadata.is_file() || !policy.applies(rela, metadata.len()) {
             continue;
         }
 
@@ -413,6 +493,62 @@ mod tests {
         // Disabling LFS must disable it completely, not merely raise the bar.
         p.lfs_mode = LfsMode::Disabled;
         assert!(!applies(&p, u64::MAX));
+    }
+
+    #[test]
+    fn an_opt_out_glob_beats_the_size_rule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut p = profile(dir.path());
+        p.lfs_never = vec!["*.md".into()];
+        let policy = LfsPolicy::from_profile(&p).expect("policy");
+
+        // This is the case the field exists for: the recorded .gitattributes
+        // rule is per-extension, so without the opt-out one oversized note
+        // converts *.md for the whole repository and every note stops being
+        // diffable.
+        assert!(!policy.applies(Path::new("10-notes/huge.md"), 10_000));
+        assert!(policy.applies(Path::new("40-photos/shot.jpg"), 10_000));
+        // The opt-out is not a way to disable the threshold.
+        assert!(!policy.applies(Path::new("10-notes/small.md"), 10));
+    }
+
+    #[test]
+    fn opt_out_globs_match_the_repository_relative_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut p = profile(dir.path());
+        p.lfs_never = vec!["10-notes/**".into()];
+        let policy = LfsPolicy::from_profile(&p).expect("policy");
+
+        // Anchored at the repository root, so the rule does not depend on where
+        // the folder happens to be mounted, and a same-named folder elsewhere
+        // is unaffected.
+        assert!(!policy.applies(Path::new("10-notes/a/b.md"), 10_000));
+        assert!(policy.applies(Path::new("30-work/10-notes/a.md"), 10_000));
+    }
+
+    #[test]
+    fn a_malformed_opt_out_glob_is_refused_rather_than_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut p = profile(dir.path());
+        p.lfs_never = vec!["[unclosed".into()];
+        // Silently dropping it would leave the user believing a format is
+        // protected while every oversized file quietly converts its extension.
+        let err = LfsPolicy::from_profile(&p).expect_err("must refuse");
+        assert!(format!("{err}").contains("lfsNever"), "got: {err}");
+    }
+
+    #[test]
+    fn no_opt_out_configured_behaves_exactly_like_the_size_rule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = profile(dir.path());
+        let policy = LfsPolicy::from_profile(&p).expect("policy");
+        for size in [0_u64, 1023, 1024, 10_000] {
+            assert_eq!(
+                policy.applies(Path::new("any/file.bin"), size),
+                applies(&p, size),
+                "size {size} diverged from the plain threshold rule",
+            );
+        }
     }
 
     #[test]
