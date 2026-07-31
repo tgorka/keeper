@@ -325,6 +325,15 @@ pub struct AddArgs {
     pub removable: bool,
     #[arg(long, value_name = "BYTES")]
     pub lfs_threshold_bytes: Option<u64>,
+    /// Glob that must never go through LFS, whatever its size. Repeatable.
+    ///
+    /// The recorded `.gitattributes` rule is per-extension, so one oversized
+    /// file converts its whole extension for the rest of the repository's life
+    /// — use this to protect formats you need to diff (`--lfs-never '*.md'`).
+    /// Same dialect as gitignore: no `/` matches the basename at any depth, a
+    /// pattern with `/` is anchored at the repository root.
+    #[arg(long, value_name = "GLOB")]
+    pub lfs_never: Vec<String>,
     #[arg(long, value_name = "MS")]
     pub settle_ms: Option<u64>,
     #[arg(long, value_name = "MS")]
@@ -645,6 +654,7 @@ fn cmd_add(
     profile.lfs_mode = args.lfs_mode.into();
     profile.subpaths = args.subpath.clone();
     profile.excludes = args.exclude.clone();
+    profile.lfs_never = args.lfs_never.clone();
     profile.tags = args.tag.clone();
     profile.removable = args.removable;
     profile.author_override = args.author.clone();

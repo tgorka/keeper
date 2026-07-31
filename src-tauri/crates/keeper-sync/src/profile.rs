@@ -176,6 +176,23 @@ pub struct SyncProfile {
     pub lfs_mode: LfsMode,
     #[serde(default = "default_lfs_threshold")]
     pub lfs_threshold_bytes: u64,
+    /// Globs that must never be routed through LFS, whatever their size.
+    ///
+    /// The size rule alone is right for a media folder and wrong for a mixed
+    /// repository, because the `.gitattributes` rule keeper records is
+    /// **per-extension**: one 300 KB note crossing the threshold writes
+    /// `*.md filter=lfs`, and from then on every note in the repository is an
+    /// opaque pointer — no diff, no merge, no blame. Lowering the threshold to
+    /// catch bulk media makes that outcome more likely, not less.
+    ///
+    /// This is the escape hatch, and it is deliberately the user's call rather
+    /// than a built-in list: the trade-off it accepts is real. A file matched
+    /// here stays an ordinary git blob however large it grows, and gitoxide has
+    /// no streaming object read — a 6 GB `.csv` excluded this way means a 6 GB
+    /// allocation. Exclude formats you need to diff, not formats you have a lot
+    /// of.
+    #[serde(default)]
+    pub lfs_never: Vec<String>,
     #[serde(default = "default_settle_ms")]
     pub settle_ms: u64,
     #[serde(default = "default_poll_interval_ms")]
@@ -236,6 +253,7 @@ impl SyncProfile {
             volume_id: None,
             lfs_mode: LfsMode::Materialize,
             lfs_threshold_bytes: DEFAULT_LFS_THRESHOLD_BYTES,
+            lfs_never: Vec::new(),
             settle_ms: DEFAULT_SETTLE_MS,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             tags: Vec::new(),
