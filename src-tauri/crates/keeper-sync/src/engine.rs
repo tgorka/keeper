@@ -3351,10 +3351,54 @@ impl Engine {
         // nothing staged — can ever record that it worked.
         self.mark_synced(&profile.id);
 
+        // Only now: every leg ran, the upload queue drained to quiescence above,
+        // and the push has published. That ordering is the whole safety
+        // argument — prune refuses anything the journal still references, so
+        // running it before the drain would simply find nothing and running it
+        // before the push would race the obligation it depends on.
+        //
+        // Never fatal. Reclaiming space is housekeeping, and a sync that did
+        // everything asked of it must not report failure because a delete did
+        // not land.
+        if profile.lfs_prune_local {
+            if let Err(err) = self.prune_lfs_store(&profile) {
+                tracing::warn!(
+                    profile = profile.name,
+                    error = %err,
+                    "released no LFS objects this pass",
+                );
+            }
+        }
+
         self.set_state(&profile.id, ProfileState::Watching);
         self.publish(self.progress(&profile, SyncPhase::Idle));
         self.refresh_pending(&profile.id);
         Ok(outcome)
+    }
+
+    /// Release local LFS objects whose content is still in the worktree and
+    /// whose upload the journal no longer owes.
+    ///
+    /// See [`crate::lfs::prune`] for why those two conditions are sufficient,
+    /// and why this is safer than the heuristic `git lfs prune` has to use.
+    fn prune_lfs_store(&self, profile: &SyncProfile) -> Result<()> {
+        let repo = git::repo::open(&profile.local_path, false)?;
+        let tracked = git::repo::tracked_paths(&repo)?;
+        let owed = self.with_db(|conn| db::referenced_oids(conn, &profile.id))?;
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        let releasable = lfs::prune::plan(&repo, &profile.local_path, &store, &tracked, &owed)?;
+        if releasable.is_empty() {
+            return Ok(());
+        }
+        let count = releasable.len();
+        let reclaimed = lfs::prune::release(&store, &releasable)?;
+        tracing::info!(
+            profile = profile.name,
+            objects = count,
+            bytes = reclaimed,
+            "released local LFS objects the remote already holds",
+        );
+        Ok(())
     }
 
     /// Forget everything this profile remembers about its own tree and look again.

@@ -83,6 +83,7 @@ pub mod endpoint;
 pub mod filter;
 pub mod local;
 pub mod pointer;
+pub mod prune;
 pub mod ssh;
 pub mod stage;
 pub mod store;

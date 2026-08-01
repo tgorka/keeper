@@ -325,6 +325,14 @@ pub struct AddArgs {
     pub removable: bool,
     #[arg(long, value_name = "BYTES")]
     pub lfs_threshold_bytes: Option<u64>,
+    /// Release local LFS objects once the remote holds them.
+    ///
+    /// Reclaims the second copy every LFS file has on the machine where it
+    /// originated. The worktree keeps every file; only the redundant object in
+    /// `.git/lfs/objects` goes, and only when the journal owes no transfer for
+    /// it. Trades a self-sufficient local copy for a smaller one.
+    #[arg(long)]
+    pub lfs_prune_local: bool,
     /// Glob that must never go through LFS, whatever its size. Repeatable.
     ///
     /// The recorded `.gitattributes` rule is per-extension, so one oversized
@@ -655,6 +663,7 @@ fn cmd_add(
     profile.subpaths = args.subpath.clone();
     profile.excludes = args.exclude.clone();
     profile.lfs_never = args.lfs_never.clone();
+    profile.lfs_prune_local = args.lfs_prune_local;
     profile.tags = args.tag.clone();
     profile.removable = args.removable;
     profile.author_override = args.author.clone();
