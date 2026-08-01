@@ -1499,12 +1499,12 @@ impl Engine {
             // a journaled pull has no caller to hand them back to.
             WorkKind::Pull => {
                 self.do_pull(profile, source).await?;
-                self.mark_synced(&profile.id);
+                self.mark_synced(profile);
                 Ok(())
             }
             WorkKind::Push => {
                 self.do_push(profile, source, Some(unit_id)).await?;
-                self.mark_synced(&profile.id);
+                self.mark_synced(profile);
                 Ok(())
             }
             WorkKind::LfsDownload { oid, size } => self.do_lfs(profile, oid, *size, false).await,
@@ -1527,9 +1527,36 @@ impl Engine {
     /// profile — and a push profile whose tree had nothing to send, which
     /// returns early — never recorded that it had succeeded, and the UI could
     /// not tell "never synced" from "synced, nothing to do".
-    fn mark_synced(&self, profile_id: &str) {
-        if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
+    /// Record that a pass succeeded — and release what that success made
+    /// redundant.
+    ///
+    /// The prune lives HERE, and not at the end of `sync_once`, because
+    /// `sync_once` is only one of the three ways a pass finishes. The ordinary
+    /// watch-driven flow commits and enqueues a `Push`, which the journal drains
+    /// through `execute` — a path that never reaches `sync_once`'s tail. Hooking
+    /// the tail meant prune ran only on an explicit "sync now", which is exactly
+    /// the manual step it exists to avoid. This function is the single point
+    /// every path agrees means "it worked".
+    ///
+    /// Safe at each of them for the same reason: `do_push` refuses to publish
+    /// while an upload is outstanding, so a push that returned has landed its
+    /// objects, and the planner independently refuses anything the journal still
+    /// references.
+    ///
+    /// Never fatal. Reclaiming space is housekeeping, and a pass that did
+    /// everything asked of it must not report failure because a delete did not.
+    fn mark_synced(&self, profile: &SyncProfile) {
+        if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
             snapshot.last_sync_ms = Some(self.platform.now_ms());
+        }
+        if profile.lfs_prune_local {
+            if let Err(err) = self.prune_lfs_store(profile) {
+                tracing::warn!(
+                    profile = profile.name,
+                    error = %err,
+                    "released no LFS objects this pass",
+                );
+            }
         }
     }
 
@@ -3349,26 +3376,7 @@ impl Engine {
         // raised: that is the whole definition of a successful pass, and it is
         // the only definition under which a pull-only profile — or a push with
         // nothing staged — can ever record that it worked.
-        self.mark_synced(&profile.id);
-
-        // Only now: every leg ran, the upload queue drained to quiescence above,
-        // and the push has published. That ordering is the whole safety
-        // argument — prune refuses anything the journal still references, so
-        // running it before the drain would simply find nothing and running it
-        // before the push would race the obligation it depends on.
-        //
-        // Never fatal. Reclaiming space is housekeeping, and a sync that did
-        // everything asked of it must not report failure because a delete did
-        // not land.
-        if profile.lfs_prune_local {
-            if let Err(err) = self.prune_lfs_store(&profile) {
-                tracing::warn!(
-                    profile = profile.name,
-                    error = %err,
-                    "released no LFS objects this pass",
-                );
-            }
-        }
+        self.mark_synced(&profile);
 
         self.set_state(&profile.id, ProfileState::Watching);
         self.publish(self.progress(&profile, SyncPhase::Idle));
