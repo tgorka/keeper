@@ -22,6 +22,7 @@ pub mod egress;
 pub mod error;
 pub mod inbox;
 pub mod media;
+pub mod notes;
 pub mod notify;
 pub mod oauth;
 pub mod palette;

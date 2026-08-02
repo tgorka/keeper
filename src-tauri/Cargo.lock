@@ -4223,6 +4223,7 @@ name = "keeper-core"
 version = "0.6.5"
 dependencies = [
  "futures-util",
+ "globset",
  "matrix-sdk",
  "matrix-sdk-ui",
  "mime",

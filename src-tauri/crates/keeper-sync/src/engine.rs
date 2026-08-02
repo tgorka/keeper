@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use rusqlite::Connection;
@@ -185,6 +185,17 @@ const WATCH_REARM_INTERVAL_MS: i64 = 60_000;
 /// its own prefix is the only way to tell our message from someone else's.
 const WATCH_DEGRADED_PREFIX: &str = "keeper cannot watch this folder for changes";
 
+/// How many watch events [`Engine::watch_tap`] buffers for a slow subscriber.
+///
+/// A save storm — a branch checkout, an editor rewriting a directory — delivers
+/// thousands of paths in a second, and a subscriber doing real work per path
+/// will not keep up with that. 1 024 is generous enough that an ordinary burst
+/// is never dropped, and bounded so that a subscriber which stops reading
+/// costs a fixed amount of memory rather than one proportional to the tree. Past
+/// it the subscriber is told it lagged and can rescan, which is both cheaper
+/// and more correct than making the engine wait for it.
+const WATCH_TAP_CAPACITY: usize = 1_024;
+
 /// One profile's filesystem watcher, or the memory of it failing.
 ///
 /// A single map holds both so there is exactly one place that answers "does
@@ -310,6 +321,20 @@ pub struct Engine {
     /// hours is not worth a row in `sync.db`, and keeping it out of there keeps
     /// it out of a backup.
     lfs_ssh_credentials: Mutex<HashMap<String, CachedSshAnswer>>,
+    /// The fan-out behind [`Engine::watch_tap`], created by the first caller.
+    ///
+    /// A `OnceLock` rather than a channel built in [`Engine::open`] because
+    /// almost nobody taps: `keeper-syncd` never does, and neither does any test
+    /// that is not about the tap. An engine nobody has tapped does no extra
+    /// work and holds no extra buffer, and one that has been tapped pays a
+    /// relaxed atomic load per drain.
+    ///
+    /// Not a `LazyLock`, which is otherwise this codebase's default for a
+    /// value with a fixed initializer: the *fact* of initialization is the
+    /// signal here. The drain has to be able to ask "has anyone ever tapped?",
+    /// and a `LazyLock` answers that question by initializing — there is no way
+    /// to look without becoming the first caller.
+    watch_tap: OnceLock<tokio::sync::broadcast::Sender<(String, PathBuf)>>,
 }
 
 /// One remembered answer from `git-lfs-authenticate`, with its own deadline.
@@ -379,6 +404,7 @@ impl Engine {
             watchers: Mutex::new(HashMap::new()),
             watch_wake: Mutex::new(HashSet::new()),
             lfs_ssh_credentials: Mutex::new(HashMap::new()),
+            watch_tap: OnceLock::new(),
         };
         engine.seed_status()?;
         Ok(engine)
@@ -958,8 +984,14 @@ impl Engine {
     /// [`crate::watch::EchoSuppressor`] registration is needed here — the
     /// engine's own checkouts leave the tree clean against the new HEAD, so they
     /// cost at most one extra fruitless walk rather than a re-commit loop.
+    ///
+    /// Everything drained here is also fanned out to [`Self::watch_tap`], which
+    /// is an observer and nothing more — see there for why a failure to deliver
+    /// is not a failure to sync.
     fn fold_watch_events(&self, profile: &SyncProfile) -> Result<()> {
         let mut closed: Vec<PathBuf> = Vec::new();
+        let mut tapped: Vec<PathBuf> = Vec::new();
+        let tap = self.watch_tap.get();
         let mut delivered = false;
         {
             let mut watchers = Self::lock(&self.watchers);
@@ -968,11 +1000,30 @@ impl Engine {
             };
             // `try_recv` never blocks, so the map is locked for exactly as long
             // as it takes to move what is already queued.
-            while let Ok(event) = events.try_recv() {
+            while let Ok(WatchEvent { path, close_write }) = events.try_recv() {
                 delivered = true;
-                if event.close_write {
-                    closed.push(event.path);
+                // The gate wants only the paths whose writer demonstrably let
+                // go; the tap wants all of them. Cloning only where both want
+                // the same path keeps an untapped engine — every daemon, every
+                // other test — allocating exactly what it did before the tap
+                // existed.
+                match (close_write, tap.is_some()) {
+                    (true, true) => {
+                        closed.push(path.clone());
+                        tapped.push(path);
+                    }
+                    (true, false) => closed.push(path),
+                    (false, true) => tapped.push(path),
+                    (false, false) => {}
                 }
+            }
+        }
+        if let Some(tap) = tap {
+            // Outside the lock, and every outcome discarded. `send` fails only
+            // when nobody is subscribed, which is a subscriber's business and
+            // never sync's.
+            for path in tapped {
+                let _ = tap.send((profile.id.clone(), path));
             }
         }
         if !delivered {
@@ -987,6 +1038,42 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Subscribe to every path this engine's watchers report, as
+    /// `(profile id, absolute path)`.
+    ///
+    /// A read-only tap for a host that has to react to a change faster than the
+    /// sync cadence does. It is deliberately not a second `notify` watcher:
+    /// inotify instance limits, duplicate events, and a second echo-suppression
+    /// implementation that would have to agree with this one exactly are all
+    /// avoided by fanning out the stream the supervisor already drains.
+    ///
+    /// What a subscriber may rely on:
+    ///
+    /// * **It never affects sync.** No subscriber, a dropped subscriber and a
+    ///   failed send are the same thing here: ignored. What the engine believes
+    ///   changed still comes from `git status`, which is authoritative in a way
+    ///   an event stream is not.
+    /// * **It is lossy under load, and says so.** The channel holds 1 024
+    ///   events; a subscriber that falls behind receives
+    ///   `tokio::sync::broadcast::error::RecvError::Lagged` and should read
+    ///   that as "rescan", not as an error.
+    /// * **It is not filtered.** Tier-0 exclusions and the stability gate
+    ///   decide what *sync* does with a path; a subscriber wanting some subset
+    ///   of the tree applies its own rule. This reports what the filesystem
+    ///   said.
+    ///
+    /// Callable any number of times, from any thread, and before any profile
+    /// exists.
+    pub fn watch_tap(&self) -> tokio::sync::broadcast::Receiver<(String, PathBuf)> {
+        // The receiver `channel` hands back is dropped immediately: a broadcast
+        // sender with no receivers is legal, and `subscribe` is what mints the
+        // live ones. Keeping that first one alive would instead make the
+        // channel buffer every event forever for a reader that never reads.
+        self.watch_tap
+            .get_or_init(|| tokio::sync::broadcast::channel(WATCH_TAP_CAPACITY).0)
+            .subscribe()
     }
 
     /// The watcher reported something no walk has answered yet.
@@ -6642,6 +6729,66 @@ mod tests {
             gate.next_stable_ms(now),
             Some(now + i64::try_from(crate::profile::CLOSE_WRITE_SETTLE_MS).expect("fits")),
             "one second, not the full settle window"
+        );
+    }
+
+    /// The tap is an observer: it sees what the drain saw, and its absence —
+    /// or its subscriber's disappearance — cannot turn a drain into a failure.
+    #[test]
+    fn a_watch_event_reaches_a_tap_and_a_dropped_tap_cannot_break_the_drain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                rescan_interval_ms: 0,
+                force_poll: false,
+            },
+            tx.clone(),
+        )
+        .expect("a watcher arms over a real directory");
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+
+        let mut tap = engine.watch_tap();
+        let path = p.local_path.join("tapped.md");
+        std::fs::write(&path, b"note").expect("write");
+        tx.send(WatchEvent {
+            path: path.clone(),
+            // Not a close-write: the tap carries every path, not only the ones
+            // the gate fast-tracks.
+            close_write: false,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+
+        assert_eq!(
+            tap.try_recv().expect("the tap saw what the drain saw"),
+            (p.id.clone(), path.clone())
+        );
+
+        // The subscriber goes away mid-flight, which is the ordinary case when
+        // a window closes. The next drain must be indistinguishable from one on
+        // an engine nobody ever tapped.
+        drop(tap);
+        tx.send(WatchEvent {
+            path,
+            close_write: false,
+        })
+        .expect("the supervisor is listening");
+        engine
+            .fold_watch_events(&p)
+            .expect("a send with no receivers is not a sync failure");
+        assert!(
+            engine.watch_wake_pending(&p.id),
+            "and the event still counted as a reason to walk"
         );
     }
 

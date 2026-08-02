@@ -44,3 +44,8 @@ src-tauri/crates/keeper/binaries/
 
 # SwiftPM build products for the keeper-rec sidecar package.
 tools/keeper-rec/.build/
+
+# ts-rs writes here when it cannot see the workspace .cargo/config.toml (for example a
+# test binary invoked directly from src-tauri/). The real bindings live in
+# src/lib/ipc/gen; a second copy is duplicate generated output, never a source.
+src-tauri/bindings/

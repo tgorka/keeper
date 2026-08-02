@@ -1,0 +1,417 @@
+/**
+ * The live-preview decoration layer (Story 37.6, UX-DR40).
+ *
+ * This file is the renderer. There is no second one, and adding one would be a
+ * mistake: two rendering paths over the same markdown are two places for the
+ * document you read and the document you edit to disagree. So the editor never
+ * leaves edit mode — decorations hide the syntax and style what is left, and
+ * the line under the caret drops its decorations so its source is right there.
+ *
+ * That reveal rule is also why nothing here needs to be atomic. A hidden range
+ * is never on the caret's line, because putting the caret on a line un-hides
+ * it, so the caret can never be trapped inside something it cannot see.
+ *
+ * What is deliberately absent: syntax highlighting inside code fences (not this
+ * phase, and colour that implies highlighting would be a lie), any HTML
+ * rendering (raw HTML in a note body stays text — there is no HTML sink to
+ * inject into), and any fetch of a remote image URL (a note must not be able to
+ * become a tracking pixel).
+ */
+import { syntaxTree } from "@codemirror/language";
+import { type Extension, type Range, StateEffect, StateField } from "@codemirror/state";
+import {
+  Decoration,
+  type DecorationSet,
+  EditorView,
+  ViewPlugin,
+  type ViewUpdate,
+  WidgetType,
+} from "@codemirror/view";
+import { MermaidWidget } from "./mermaid-widget";
+
+/** How long an externally applied change stays highlighted. */
+export const EXTERNAL_FLASH_MS = 1_200;
+
+/** Syntax markers hidden on every line except the one being edited. */
+const HIDDEN_MARKS: Record<string, true> = {
+  EmphasisMark: true,
+  StrongMark: true,
+  CodeMark: true,
+  HeaderMark: true,
+  QuoteMark: true,
+  LinkMark: true,
+  StrikethroughMark: true,
+  CodeInfo: true,
+  URL: true,
+};
+
+/** Inline nodes that keep their text and gain a class. */
+const INLINE_CLASSES: Record<string, string> = {
+  Emphasis: "cm-lp-em",
+  StrongEmphasis: "cm-lp-strong",
+  InlineCode: "cm-lp-code",
+  Strikethrough: "cm-lp-strike",
+  Link: "cm-lp-link",
+};
+
+/** Block nodes that colour their whole line. */
+const LINE_CLASSES: Record<string, string> = {
+  ATXHeading1: "cm-lp-h1",
+  ATXHeading2: "cm-lp-h2",
+  ATXHeading3: "cm-lp-h3",
+  ATXHeading4: "cm-lp-h4",
+  ATXHeading5: "cm-lp-h5",
+  ATXHeading6: "cm-lp-h6",
+  SetextHeading1: "cm-lp-h1",
+  SetextHeading2: "cm-lp-h2",
+  Blockquote: "cm-lp-quote",
+};
+
+/** `[[target]]`, `[[target|alias]]` and the `![[…]]` embed form. Lezer's
+ *  markdown grammar knows nothing about wikilinks, so they are matched here. */
+const WIKILINK = /!?\[\[([^[\]|]+)(?:\|([^[\]]+))?]]/g;
+
+/** The attribute a click handler reads the link target back out of. */
+const WIKILINK_ATTR = "data-keeper-wikilink";
+
+export interface LivePreviewOptions {
+  /** Turn a vault-relative asset path into its `keeper-note://` URL (AD-59). */
+  assetUrl: (relPath: string) => string;
+  /** Follow a wikilink. Called with the raw target, never a filesystem path. */
+  onOpenLink: (target: string) => void;
+}
+
+/** An embedded image, or — when the file is not there — its alt text and the
+ *  path keeper looked for (UX-DR44). Never an empty box. */
+class ImageWidget extends WidgetType {
+  constructor(
+    private readonly alt: string,
+    private readonly src: string,
+    private readonly resolve: (relPath: string) => string,
+  ) {
+    super();
+  }
+
+  eq(other: ImageWidget): boolean {
+    return other.src === this.src && other.alt === this.alt;
+  }
+
+  toDOM(): HTMLElement {
+    const wrapper = document.createElement("span");
+    wrapper.className = "cm-lp-image";
+    const image = document.createElement("img");
+    image.alt = this.alt;
+    image.src = this.resolve(this.src);
+    image.addEventListener("error", () => {
+      const missing = document.createElement("span");
+      missing.className = "cm-lp-image-missing";
+      missing.textContent = `${this.alt === "" ? "image" : this.alt} — not found: ${this.src}`;
+      wrapper.replaceChildren(missing);
+    });
+    wrapper.append(image);
+    return wrapper;
+  }
+}
+
+/** The line numbers the selection touches: their source stays visible. */
+function revealedLines(view: EditorView): Set<number> {
+  const revealed = new Set<number>();
+  for (const range of view.state.selection.ranges) {
+    const first = view.state.doc.lineAt(range.from).number;
+    const last = view.state.doc.lineAt(range.to).number;
+    for (let line = first; line <= last; line += 1) {
+      revealed.add(line);
+    }
+  }
+  return revealed;
+}
+
+/** The info string of a fenced block (`mermaid` in ` ```mermaid `), or "". */
+function fenceInfo(view: EditorView, from: number, to: number): string {
+  let info = "";
+  syntaxTree(view.state).iterate({
+    from,
+    to,
+    enter: (node) => {
+      if (node.name === "CodeInfo") {
+        info = view.state.doc.sliceString(node.from, node.to).trim();
+        return false;
+      }
+      return undefined;
+    },
+  });
+  return info;
+}
+
+function buildDecorations(view: EditorView, options: LivePreviewOptions): DecorationSet {
+  const { doc } = view.state;
+  const revealed = revealedLines(view);
+  const decorations: Range<Decoration>[] = [];
+
+  /** Whether any line the range spans is showing its source. */
+  const isRevealed = (from: number, to: number): boolean => {
+    const first = doc.lineAt(from).number;
+    const last = doc.lineAt(to).number;
+    for (let line = first; line <= last; line += 1) {
+      if (revealed.has(line)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (const visible of view.visibleRanges) {
+    syntaxTree(view.state).iterate({
+      from: visible.from,
+      to: visible.to,
+      enter: (node) => {
+        const lineClass = LINE_CLASSES[node.name];
+        if (lineClass !== undefined) {
+          const first = doc.lineAt(node.from).number;
+          const last = doc.lineAt(node.to).number;
+          for (let line = first; line <= last; line += 1) {
+            decorations.push(Decoration.line({ class: lineClass }).range(doc.line(line).from));
+          }
+        }
+
+        if (node.name === "FencedCode") {
+          const blockFrom = doc.lineAt(node.from).from;
+          const blockTo = doc.lineAt(node.to).to;
+          if (
+            fenceInfo(view, node.from, node.to) === "mermaid" &&
+            !isRevealed(node.from, node.to)
+          ) {
+            const source = doc.sliceString(doc.lineAt(node.from).to + 1, doc.lineAt(node.to).from);
+            decorations.push(
+              Decoration.replace({ widget: new MermaidWidget(source), block: true }).range(
+                blockFrom,
+                blockTo,
+              ),
+            );
+            return false;
+          }
+          const first = doc.lineAt(node.from).number;
+          const last = doc.lineAt(node.to).number;
+          for (let line = first; line <= last; line += 1) {
+            decorations.push(Decoration.line({ class: "cm-lp-fence" }).range(doc.line(line).from));
+          }
+          return undefined;
+        }
+
+        if (node.name === "Image" && !isRevealed(node.from, node.to)) {
+          const raw = doc.sliceString(node.from, node.to);
+          const match = /^!\[([^\]]*)]\(([^)\s]+)\)$/.exec(raw);
+          // A remote URL is left as source on purpose: keeper never fetches one,
+          // so a note cannot become a tracking pixel (NFR-11's egress claim).
+          if (match && !/^[a-z][a-z0-9+.-]*:/i.test(match[2])) {
+            decorations.push(
+              Decoration.replace({
+                widget: new ImageWidget(match[1], match[2], options.assetUrl),
+              }).range(node.from, node.to),
+            );
+            return false;
+          }
+          return undefined;
+        }
+
+        const inlineClass = INLINE_CLASSES[node.name];
+        if (inlineClass !== undefined) {
+          decorations.push(Decoration.mark({ class: inlineClass }).range(node.from, node.to));
+        }
+
+        if (HIDDEN_MARKS[node.name] === true && !isRevealed(node.from, node.to)) {
+          decorations.push(Decoration.replace({}).range(node.from, node.to));
+        }
+        return undefined;
+      },
+    });
+
+    // Wikilinks, line by line, because the grammar does not see them.
+    let line = doc.lineAt(visible.from);
+    while (line.from <= visible.to) {
+      if (!revealed.has(line.number)) {
+        WIKILINK.lastIndex = 0;
+        for (const match of line.text.matchAll(WIKILINK)) {
+          const start = line.from + (match.index ?? 0);
+          const end = start + match[0].length;
+          const target = match[1];
+          const label = match[2] ?? target;
+          const labelStart = start + match[0].indexOf(label, match[0].indexOf("[[") + 2);
+          decorations.push(Decoration.replace({}).range(start, labelStart));
+          decorations.push(
+            Decoration.mark({
+              class: "cm-lp-wikilink",
+              attributes: { [WIKILINK_ATTR]: target },
+            }).range(labelStart, labelStart + label.length),
+          );
+          decorations.push(Decoration.replace({}).range(labelStart + label.length, end));
+        }
+      }
+      if (line.to >= doc.length) {
+        break;
+      }
+      line = doc.lineAt(line.to + 1);
+    }
+  }
+
+  return Decoration.set(decorations, true);
+}
+
+/** Highlight a range that arrived from outside this editor. */
+export const flashExternalEffect = StateEffect.define<{ from: number; to: number }>();
+
+/** Drop every external highlight. */
+export const clearExternalFlashEffect = StateEffect.define<null>();
+
+const externalFlashField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(value, transaction) {
+    let next = value.map(transaction.changes);
+    for (const effect of transaction.effects) {
+      if (effect.is(clearExternalFlashEffect)) {
+        next = Decoration.none;
+      }
+      if (effect.is(flashExternalEffect)) {
+        const ranges: Range<Decoration>[] = [];
+        const first = transaction.state.doc.lineAt(effect.value.from).number;
+        const last = transaction.state.doc.lineAt(effect.value.to).number;
+        for (let line = first; line <= last; line += 1) {
+          ranges.push(
+            Decoration.line({ class: "cm-lp-external" }).range(
+              transaction.state.doc.line(line).from,
+            ),
+          );
+        }
+        next = Decoration.set(ranges, true);
+      }
+    }
+    return next;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+
+export interface TextSplice {
+  /** Start of the replaced span in the old text. */
+  from: number;
+  /** End of the replaced span in the old text. */
+  to: number;
+  /** What replaces it. */
+  insert: string;
+}
+
+/**
+ * The single minimal replacement that turns `before` into `after`, or null when
+ * they are identical.
+ *
+ * Minimal matters twice over: CodeMirror maps the caret and the selection
+ * through the change, so replacing only what actually moved is what keeps the
+ * caret still when an agent appends a section somewhere else in the file; and
+ * the same span is what gets the fading highlight, so the user sees where the
+ * change landed rather than a whole-document flash.
+ */
+export function spliceBetween(before: string, after: string): TextSplice | null {
+  if (before === after) {
+    return null;
+  }
+  const shortest = Math.min(before.length, after.length);
+  let start = 0;
+  while (start < shortest && before[start] === after[start]) {
+    start += 1;
+  }
+  let endBefore = before.length;
+  let endAfter = after.length;
+  while (endBefore > start && endAfter > start && before[endBefore - 1] === after[endAfter - 1]) {
+    endBefore -= 1;
+    endAfter -= 1;
+  }
+  return { from: start, to: endBefore, insert: after.slice(start, endAfter) };
+}
+
+/** Paint the fading highlight over a range, then let it go. */
+export function flashExternal(view: EditorView, from: number, to: number): void {
+  view.dispatch({ effects: flashExternalEffect.of({ from, to }) });
+  setTimeout(() => {
+    view.dispatch({ effects: clearExternalFlashEffect.of(null) });
+  }, EXTERNAL_FLASH_MS);
+}
+
+const livePreviewTheme = EditorView.baseTheme({
+  ".cm-lp-strong": { fontWeight: "600" },
+  ".cm-lp-em": { fontStyle: "italic" },
+  ".cm-lp-strike": { textDecoration: "line-through" },
+  ".cm-lp-code": {
+    fontFamily: "var(--font-mono, ui-monospace, monospace)",
+    backgroundColor: "var(--muted)",
+    borderRadius: "3px",
+    padding: "0 3px",
+  },
+  ".cm-lp-link, .cm-lp-wikilink": { color: "var(--primary)", cursor: "pointer" },
+  ".cm-lp-h1": { fontSize: "1.5em", fontWeight: "600" },
+  ".cm-lp-h2": { fontSize: "1.3em", fontWeight: "600" },
+  ".cm-lp-h3": { fontSize: "1.15em", fontWeight: "600" },
+  ".cm-lp-h4, .cm-lp-h5, .cm-lp-h6": { fontWeight: "600" },
+  ".cm-lp-quote": {
+    borderLeft: "3px solid var(--border)",
+    paddingLeft: "0.75em",
+    color: "var(--muted-foreground)",
+  },
+  ".cm-lp-fence": {
+    fontFamily: "var(--font-mono, ui-monospace, monospace)",
+    backgroundColor: "var(--muted)",
+  },
+  ".cm-lp-image img": { maxWidth: "100%", borderRadius: "4px" },
+  ".cm-lp-image-missing, .cm-mermaid-error-message": {
+    color: "var(--muted-foreground)",
+    fontSize: "0.85em",
+  },
+  ".cm-mermaid-error-source, .cm-mermaid-block": {
+    fontFamily: "var(--font-mono, ui-monospace, monospace)",
+    whiteSpace: "pre-wrap",
+  },
+  // 1.2 s is long enough to notice and short enough not to become furniture.
+  ".cm-lp-external": {
+    backgroundColor: "color-mix(in oklch, var(--primary) 18%, transparent)",
+    transition: `background-color ${EXTERNAL_FLASH_MS}ms ease-out`,
+  },
+});
+
+/** The whole live-preview extension: decorations, the flash field and the theme. */
+export function livePreview(options: LivePreviewOptions): Extension {
+  const plugin = ViewPlugin.fromClass(
+    class {
+      decorations: DecorationSet;
+
+      constructor(view: EditorView) {
+        this.decorations = buildDecorations(view, options);
+      }
+
+      update(update: ViewUpdate): void {
+        // Selection changes matter as much as document changes here: moving the
+        // caret is what reveals and re-hides a line's source.
+        if (update.docChanged || update.selectionSet || update.viewportChanged) {
+          this.decorations = buildDecorations(update.view, options);
+        }
+      }
+    },
+    {
+      decorations: (value) => value.decorations,
+      eventHandlers: {
+        mousedown(event: MouseEvent) {
+          const target = event.target;
+          if (!(target instanceof HTMLElement)) {
+            return false;
+          }
+          const link = target.closest(`[${WIKILINK_ATTR}]`);
+          const name = link?.getAttribute(WIKILINK_ATTR);
+          if (name === null || name === undefined) {
+            return false;
+          }
+          event.preventDefault();
+          options.onOpenLink(name);
+          return true;
+        },
+      },
+    },
+  );
+  return [plugin, externalFlashField, livePreviewTheme];
+}

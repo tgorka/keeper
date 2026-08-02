@@ -955,6 +955,98 @@ pub fn set_recording_hotkey(data_dir: &Path, accelerator: &str) -> Result<(), Co
     set_setting(data_dir, HOTKEY_RECORDING_KEY, accelerator)
 }
 
+/// The `settings` key holding the optional OS-global Quick Capture hotkey
+/// accelerator (Phase 5, FR-101). A **third, independent** binding beside the
+/// summon and recording ones — it never touches either of their keys. Stored as
+/// an opaque accelerator string; absent ⇒ the empty string = **unset** (the
+/// shell registers nothing). `keeper-core` never parses it.
+const HOTKEY_CAPTURE_KEY: &str = "hotkey.capture";
+
+/// Read the OS-global Quick Capture hotkey accelerator (Phase 5, FR-101).
+/// Absent ⇒ the empty string, meaning **unset by default**: capture is a
+/// second-long interaction that only earns a global chord once the user asks
+/// for one, and a shipped default would be a chord stolen from whatever else
+/// the user had bound to it.
+pub fn get_capture_hotkey(data_dir: &Path) -> Result<String, CoreError> {
+    Ok(get_setting(data_dir, HOTKEY_CAPTURE_KEY)?.unwrap_or_default())
+}
+
+/// Write the OS-global Quick Capture hotkey accelerator (Phase 5, FR-101).
+/// Persists the opaque accelerator string under `hotkey.capture`; the empty
+/// string persists "unset" (the shell's clear path). The shell validates +
+/// registers with the OS *before* calling this; core only stores it.
+pub fn set_capture_hotkey(data_dir: &Path, accelerator: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, HOTKEY_CAPTURE_KEY, accelerator)
+}
+
+/// The `settings` key holding the id of the vault the notes surface is currently
+/// showing (Phase 5, FR-95). Every notes-flagged profile is resident at once, so
+/// this is a *selection*, not a mount point: switching vaults is a filter change
+/// in Rust and performs no filesystem work at all.
+const NOTES_ACTIVE_VAULT_KEY: &str = "notes.active_vault";
+
+/// Read the active vault id (Phase 5, FR-95). `None` when nothing has been
+/// selected yet, or when the stored value is blank — the shell then picks a
+/// default rather than showing an empty surface for a vault that is not there.
+/// A stale id for a profile that has since been unflagged also resolves to
+/// nothing on lookup, which is why this is not validated on read.
+pub fn get_active_vault(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, NOTES_ACTIVE_VAULT_KEY)?.filter(|value| !value.trim().is_empty()))
+}
+
+/// Write the active vault id (Phase 5, FR-95). Stored in the `settings` k/v table
+/// under `notes.active_vault`; the empty string persists "no selection".
+pub fn set_active_vault(data_dir: &Path, vault_id: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, NOTES_ACTIVE_VAULT_KEY, vault_id)
+}
+
+/// The `settings` key holding the Quick Capture panel's unsent text (Phase 5,
+/// FR-101). Persisted rather than held in the window, because the panel's whole
+/// promise is that closing it never loses what you typed — including across a
+/// quit, a crash or a relaunch.
+const NOTES_CAPTURE_BUFFER_KEY: &str = "notes.capture_buffer";
+
+/// Read the Quick Capture buffer (Phase 5, FR-101). Absent ⇒ the empty string:
+/// a panel opening for the first time and a panel whose text was committed are
+/// the same state, and neither is an error.
+pub fn get_capture_buffer(data_dir: &Path) -> Result<String, CoreError> {
+    Ok(get_setting(data_dir, NOTES_CAPTURE_BUFFER_KEY)?.unwrap_or_default())
+}
+
+/// Write the Quick Capture buffer (Phase 5, FR-101). The caller debounces; this
+/// stores verbatim, including the empty string that clears it after a commit.
+pub fn set_capture_buffer(data_dir: &Path, text: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, NOTES_CAPTURE_BUFFER_KEY, text)
+}
+
+/// Build the `settings` key that records the revision of one note this device has
+/// acknowledged (Phase 5, FR-113): `notes.read.<note_id>`.
+///
+/// Keyed by the note's stable id rather than its path, so acknowledging a note
+/// and then renaming it does not resurrect the unread dot. It lives in the
+/// existing k/v table rather than a new one because an acknowledgement is a
+/// device-local opinion — it must never sync, and the `settings` table is
+/// already the place keeper keeps opinions the other machine does not share.
+fn notes_read_mark_key(note_id: &str) -> String {
+    format!("notes.read.{note_id}")
+}
+
+/// Read the revision of `note_id` this device has acknowledged (Phase 5, FR-113).
+/// `None` means never acknowledged, which is what makes a note that arrives from
+/// an agent or another device unread on first sight.
+pub fn notes_read_mark_get(data_dir: &Path, note_id: &str) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, &notes_read_mark_key(note_id))?.filter(|rev| !rev.trim().is_empty()))
+}
+
+/// Record `rev` as the acknowledged revision of `note_id` (Phase 5, FR-113).
+///
+/// The caller passes the head revision the unread state was computed against, not
+/// "now": acknowledging anything else would clear the dot for bytes the user has
+/// not seen, and silently swallow the next agent edit that lands in the gap.
+pub fn notes_read_mark_set(data_dir: &Path, note_id: &str, rev: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, &notes_read_mark_key(note_id), rev)
+}
+
 /// The `settings` key holding the Undo-Send window in whole seconds (Story 8.3).
 /// Stored as a decimal string; absent / unparsable ⇒ the default of 10 s.
 const UNDO_SEND_WINDOW_KEY: &str = "undo_send.window";
@@ -2228,6 +2320,92 @@ mod tests {
         assert_eq!(
             get_global_hotkey(&dir).expect("summon binding untouched"),
             DEFAULT_GLOBAL_HOTKEY
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_hotkey_is_a_third_independent_binding() {
+        let dir = temp_dir();
+        // Unset by default, like the recording chord and unlike the summon one.
+        assert_eq!(get_capture_hotkey(&dir).expect("get absent hotkey"), "");
+        set_capture_hotkey(&dir, "Control+Alt+K").expect("set hotkey");
+        assert_eq!(
+            get_capture_hotkey(&dir).expect("get set hotkey"),
+            "Control+Alt+K"
+        );
+        // The empty string clears it back to unset.
+        set_capture_hotkey(&dir, "").expect("clear hotkey");
+        assert_eq!(get_capture_hotkey(&dir).expect("get cleared hotkey"), "");
+        // Neither of the other two bindings moved — three keys, three chords.
+        set_capture_hotkey(&dir, "Control+Alt+K").expect("set hotkey again");
+        assert_eq!(get_recording_hotkey(&dir).expect("recording untouched"), "");
+        assert_eq!(
+            get_global_hotkey(&dir).expect("summon untouched"),
+            DEFAULT_GLOBAL_HOTKEY
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_vault_is_absent_until_chosen_and_blank_reads_as_absent() {
+        let dir = temp_dir();
+        assert_eq!(get_active_vault(&dir).expect("get absent vault"), None);
+        set_active_vault(&dir, "vault-1").expect("set vault");
+        assert_eq!(
+            get_active_vault(&dir).expect("get set vault").as_deref(),
+            Some("vault-1")
+        );
+        // Clearing the selection reads as "nothing chosen", not as a vault whose
+        // id happens to be blank — the shell must fall back to a default rather
+        // than render an empty surface.
+        set_active_vault(&dir, "").expect("clear vault");
+        assert_eq!(get_active_vault(&dir).expect("get cleared vault"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_capture_buffer_survives_a_round_trip_and_clears_to_empty() {
+        let dir = temp_dir();
+        assert_eq!(get_capture_buffer(&dir).expect("get absent buffer"), "");
+        set_capture_buffer(&dir, "half a thought\nand a second line").expect("set buffer");
+        assert_eq!(
+            get_capture_buffer(&dir).expect("get set buffer"),
+            "half a thought\nand a second line",
+            "stored verbatim, newlines and all"
+        );
+        set_capture_buffer(&dir, "").expect("clear buffer after commit");
+        assert_eq!(get_capture_buffer(&dir).expect("get cleared buffer"), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_mark_is_per_note_and_absent_until_acknowledged() {
+        let dir = temp_dir();
+        // Never acknowledged is what makes an agent's note unread on first sight.
+        assert_eq!(
+            notes_read_mark_get(&dir, "note-a").expect("get absent mark"),
+            None
+        );
+        notes_read_mark_set(&dir, "note-a", "rev-1").expect("set mark");
+        assert_eq!(
+            notes_read_mark_get(&dir, "note-a")
+                .expect("get set mark")
+                .as_deref(),
+            Some("rev-1")
+        );
+        // Marks do not bleed between notes.
+        assert_eq!(
+            notes_read_mark_get(&dir, "note-b").expect("sibling untouched"),
+            None
+        );
+        // A later revision overwrites the acknowledgement.
+        notes_read_mark_set(&dir, "note-a", "rev-2").expect("advance mark");
+        assert_eq!(
+            notes_read_mark_get(&dir, "note-a")
+                .expect("get advanced mark")
+                .as_deref(),
+            Some("rev-2")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

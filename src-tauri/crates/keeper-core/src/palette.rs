@@ -31,6 +31,17 @@ const MAX_RESULTS_PER_GROUP: usize = 20;
 /// against 10k rooms is noise.
 const MIN_CHAT_QUERY_LEN: usize = 2;
 
+/// The category every notes action lives in (Phase 5).
+///
+/// The notes capability gates a whole *section*, not individual actions, so the
+/// gate reads this rather than a per-action flag on [`PaletteActionVm`]: adding a
+/// second capability boolean to a view model the frontend already renders would
+/// widen the IPC contract for a fact this module can answer itself. Naming the
+/// string once is what keeps the gate and the registry entries from drifting —
+/// a notes action that landed in some other category would silently survive on
+/// iOS, which is the exact bug FR-122 forbids.
+const NOTES_CATEGORY: &str = "Notes";
+
 /// One lightweight, non-secret projection of a room held in the [`PaletteIndex`]
 /// (Story 9.1). Carries only render + ranking data: the owning account id and hue,
 /// the room id, its display name (with a lowercased copy cached for scoring), the
@@ -153,7 +164,9 @@ impl PaletteIndex {
     /// `recording` gates the recording capability actions exactly as `open_chat`
     /// gates the open-chat ones: a `requires_recording` action is dropped entirely
     /// when the capability is off (Story 16.3), so it never appears on a platform
-    /// that cannot record.
+    /// that cannot record. `notes` does the same for the whole [`NOTES_CATEGORY`]
+    /// section (Phase 5, FR-122) — a build without folder sync has nowhere to put
+    /// a vault, so its notes verbs are absent rather than dead (AD-27).
     ///
     /// Each group is capped to [`MAX_RESULTS_PER_GROUP`]. Pure over the index — no
     /// I/O, no locks — so it is cheap and unit-testable.
@@ -163,6 +176,7 @@ impl PaletteIndex {
         mode: PaletteMode,
         open_chat: bool,
         recording: bool,
+        notes: bool,
     ) -> PaletteResultsVm {
         let needle = query.trim().to_lowercase();
 
@@ -170,10 +184,10 @@ impl PaletteIndex {
             PaletteMode::Action => PaletteResultsVm {
                 contacts: Vec::new(),
                 chats: Vec::new(),
-                actions: query_actions(&needle, open_chat, recording),
+                actions: query_actions(&needle, open_chat, recording, notes),
             },
             PaletteMode::Default => {
-                let actions = query_actions(&needle, open_chat, recording);
+                let actions = query_actions(&needle, open_chat, recording, notes);
                 // A whitespace-only raw query (e.g. "  ") normalizes to an empty
                 // needle here; `fuzzy_score("", ...)` would match every room, so treat
                 // an effectively-empty needle exactly like the short-query path.
@@ -298,8 +312,14 @@ fn subsequence_score(needle: &str, haystack: &str) -> Option<i32> {
 /// capped to [`MAX_RESULTS_PER_GROUP`].
 ///
 /// A `requires_recording` action is dropped entirely when `recording` is off (Story
-/// 16.3), mirroring the `requires_open_chat` / `open_chat` gate.
-fn query_actions(needle: &str, open_chat: bool, recording: bool) -> Vec<PaletteActionVm> {
+/// 16.3), mirroring the `requires_open_chat` / `open_chat` gate, and every action in
+/// [`NOTES_CATEGORY`] is dropped when `notes` is off (Phase 5, FR-122).
+fn query_actions(
+    needle: &str,
+    open_chat: bool,
+    recording: bool,
+    notes: bool,
+) -> Vec<PaletteActionVm> {
     let mut scored: Vec<(i32, PaletteActionVm)> = Vec::new();
     for action in palette_actions() {
         // An open-chat action is only offered when a chat is open.
@@ -308,6 +328,10 @@ fn query_actions(needle: &str, open_chat: bool, recording: bool) -> Vec<PaletteA
         }
         // A recording action is only offered when the recording capability is on.
         if action.requires_recording && !recording {
+            continue;
+        }
+        // The notes section is gated whole, by category (see `NOTES_CATEGORY`).
+        if !notes && action.category == NOTES_CATEGORY {
             continue;
         }
         let score = if needle.is_empty() {
@@ -491,6 +515,60 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             requires_recording: true,
             toggle_group: None,
         },
+        // --- Notes (Phase 5, FR-98/99/100/101/107/118): the whole section is
+        // dropped when the notes capability is off, gated by `NOTES_CATEGORY`
+        // rather than per action, because notes is one surface and a build
+        // without folder sync has nowhere to put a vault. Shortcut chips mirror
+        // the bindings the notes surfaces register; they are display-only labels
+        // here, as everywhere else in this registry.
+        action(
+            "notes-new",
+            "New Note",
+            NOTES_CATEGORY,
+            &["note", "write", "compose", "markdown"],
+            Some("⌘⌥N"),
+            false,
+        ),
+        action(
+            "notes-capture",
+            "Quick Capture",
+            NOTES_CATEGORY,
+            &["note", "capture", "scratch", "inbox", "jot"],
+            Some("⌘⌥K"),
+            false,
+        ),
+        action(
+            "notes-journal-today",
+            "Today's Journal",
+            NOTES_CATEGORY,
+            &["note", "journal", "daily", "today", "diary"],
+            Some("⌘⌥J"),
+            false,
+        ),
+        action(
+            "notes-open",
+            "Open Note",
+            NOTES_CATEGORY,
+            &["note", "find", "jump", "go to"],
+            Some("⌘P"),
+            false,
+        ),
+        action(
+            "notes-search",
+            "Search Notes",
+            NOTES_CATEGORY,
+            &["note", "find", "content", "full text", "grep"],
+            Some("⌘⇧F"),
+            false,
+        ),
+        action(
+            "notes-switch-vault",
+            "Switch Vault",
+            NOTES_CATEGORY,
+            &["note", "vault", "folder", "change vault"],
+            Some("⌘⌥V"),
+            false,
+        ),
         // --- Global actions (dialogs / commands) ---
         action(
             "new-chat",
@@ -670,6 +748,10 @@ const CATEGORY_ORDER: &[&str] = &[
     // vanishes with the `recording` flag off, so its position only matters on
     // desktop macOS ≥ 13.
     "Recording",
+    // The capability-gated notes verbs (Phase 5); like Recording, the whole
+    // category vanishes with its flag off, so this position only matters on a
+    // desktop build that has folder sync.
+    NOTES_CATEGORY,
     "Chat",
 ];
 
@@ -687,10 +769,14 @@ const CATEGORY_ORDER: &[&str] = &[
 /// `requires_recording` action is dropped before grouping, so the cheat sheet and
 /// native menu omit the recording action exactly as the palette does — the single
 /// registry keeps all three surfaces consistent without any per-platform logic.
-pub fn registry_sections(recording: bool) -> Vec<MenuSectionVm> {
+/// `notes` does the same for the whole [`NOTES_CATEGORY`] section (Phase 5,
+/// FR-122): with it off the section is absent from the cheat sheet and the native
+/// menu bar, not greyed out in them.
+pub fn registry_sections(recording: bool, notes: bool) -> Vec<MenuSectionVm> {
     let actions: Vec<PaletteActionVm> = palette_actions()
         .into_iter()
         .filter(|action| recording || !action.requires_recording)
+        .filter(|action| notes || action.category != NOTES_CATEGORY)
         .collect();
 
     // Preserve first-appearance order of categories, then sort by CATEGORY_ORDER
@@ -851,7 +937,7 @@ mod tests {
     #[test]
     fn default_filter_splits_chats_and_contacts() {
         let index = sample_index();
-        let results = index.query("al", PaletteMode::Default, false, false);
+        let results = index.query("al", PaletteMode::Default, false, false, false);
         // "al" matches Alice (contact), Alpha (chat), Algorithms (chat).
         assert!(results
             .contacts
@@ -880,12 +966,12 @@ mod tests {
     #[test]
     fn short_query_returns_no_rooms_but_top_actions() {
         let index = sample_index();
-        let results = index.query("a", PaletteMode::Default, false, false);
+        let results = index.query("a", PaletteMode::Default, false, false, false);
         assert!(results.contacts.is_empty());
         assert!(results.chats.is_empty());
         assert!(!results.actions.is_empty());
 
-        let empty = index.query("", PaletteMode::Default, false, false);
+        let empty = index.query("", PaletteMode::Default, false, false, false);
         assert!(empty.contacts.is_empty());
         assert!(empty.chats.is_empty());
         assert!(!empty.actions.is_empty());
@@ -894,7 +980,7 @@ mod tests {
     #[test]
     fn no_match_returns_top_actions_only() {
         let index = sample_index();
-        let results = index.query("zzqq", PaletteMode::Default, false, false);
+        let results = index.query("zzqq", PaletteMode::Default, false, false, false);
         assert!(results.contacts.is_empty());
         assert!(results.chats.is_empty());
         // Empty needle inside actions? No — "zzqq" matches no action either, so
@@ -907,14 +993,14 @@ mod tests {
         // The frontend's "no-match shows top actions" is served by the <2-char and
         // empty-needle path (top actions) — a real no-match keeps actions honest.
         let index = sample_index();
-        let results = index.query("", PaletteMode::Default, false, false);
+        let results = index.query("", PaletteMode::Default, false, false, false);
         assert!(!results.actions.is_empty());
     }
 
     #[test]
     fn action_mode_returns_only_actions() {
         let index = sample_index();
-        let results = index.query("arch", PaletteMode::Action, false, false);
+        let results = index.query("arch", PaletteMode::Action, false, false, false);
         assert!(results.contacts.is_empty());
         assert!(results.chats.is_empty());
         assert!(results.actions.iter().any(|a| a.id == "open-archive"));
@@ -924,7 +1010,7 @@ mod tests {
     fn action_mode_open_chat_actions_rank_first() {
         let index = sample_index();
         // Empty action-mode query with an open chat: open-chat actions come first.
-        let results = index.query("", PaletteMode::Action, true, false);
+        let results = index.query("", PaletteMode::Action, true, false, false);
         assert!(!results.actions.is_empty());
         // The first several actions must all be requires_open_chat.
         let first = &results.actions[0];
@@ -934,7 +1020,7 @@ mod tests {
             first.id
         );
         // And when no chat is open, open-chat actions are excluded entirely.
-        let closed = index.query("", PaletteMode::Action, false, false);
+        let closed = index.query("", PaletteMode::Action, false, false, false);
         assert!(closed.actions.iter().all(|a| !a.requires_open_chat));
     }
 
@@ -942,7 +1028,7 @@ mod tests {
     fn no_accounts_still_returns_actions() {
         let index = PaletteIndex::new();
         assert!(index.is_empty());
-        let results = index.query("al", PaletteMode::Default, false, false);
+        let results = index.query("al", PaletteMode::Default, false, false, false);
         assert!(results.contacts.is_empty());
         assert!(results.chats.is_empty());
         // Global actions are available even signed out.
@@ -968,8 +1054,8 @@ mod tests {
 
         // Action mode, empty needle → the whole (ungated) registry: recording on
         // includes each action, recording off drops each.
-        let on = index.query("", PaletteMode::Action, false, true);
-        let off = index.query("", PaletteMode::Action, false, false);
+        let on = index.query("", PaletteMode::Action, false, true, false);
+        let off = index.query("", PaletteMode::Action, false, false, false);
         for id in RECORDING_ACTION_IDS {
             assert!(
                 on.actions.iter().any(|a| a.id == id),
@@ -983,8 +1069,8 @@ mod tests {
 
         // A direct query honors the same gate for every recording action
         // ("record" fuzzy-matches all four titles/keywords).
-        let queried_on = index.query("record", PaletteMode::Action, false, true);
-        let queried_off = index.query("record", PaletteMode::Action, false, false);
+        let queried_on = index.query("record", PaletteMode::Action, false, true, false);
+        let queried_off = index.query("record", PaletteMode::Action, false, false, false);
         for id in RECORDING_ACTION_IDS {
             assert!(
                 queried_on.actions.iter().any(|a| a.id == id),
@@ -999,7 +1085,7 @@ mod tests {
         // The registry projection (both discovery surfaces) gates them too:
         // `open-recording` lives in Navigation, the verbs in their own
         // Recording section — present with the flag on…
-        let sections_on = registry_sections(true);
+        let sections_on = registry_sections(true, false);
         let all_on: Vec<&str> = sections_on
             .iter()
             .flat_map(|s| s.items.iter().map(|i| i.id.as_str()))
@@ -1020,7 +1106,7 @@ mod tests {
             "the three recording verbs share the Recording section"
         );
         // …and the whole category (plus the Navigation entry) vanishes off.
-        let sections_off = registry_sections(false);
+        let sections_off = registry_sections(false, false);
         assert!(
             !sections_off.iter().any(|s| s.category == "Recording"),
             "no Recording section when recording is off"
@@ -1037,6 +1123,110 @@ mod tests {
         }
     }
 
+    /// The six notes actions the registry ships (Phase 5, build contract §1).
+    const NOTES_ACTION_IDS: [&str; 6] = [
+        "notes-new",
+        "notes-capture",
+        "notes-journal-today",
+        "notes-open",
+        "notes-search",
+        "notes-switch-vault",
+    ];
+
+    #[test]
+    fn the_notes_section_is_present_iff_the_notes_capability_is_on() {
+        // FR-122: on a build without notes the surface is *absent*, not disabled
+        // — in the palette, the cheat sheet and the native menu alike, because
+        // all three read this one registry.
+        let index = sample_index();
+
+        let on = index.query("", PaletteMode::Action, false, false, true);
+        let off = index.query("", PaletteMode::Action, false, false, false);
+        for id in NOTES_ACTION_IDS {
+            assert!(
+                on.actions.iter().any(|a| a.id == id),
+                "{id} present when notes is on"
+            );
+            assert!(
+                !off.actions.iter().any(|a| a.id == id),
+                "{id} absent when notes is off"
+            );
+        }
+
+        // A direct query honors the same gate ("note" matches every title or
+        // keyword in the section).
+        let queried_on = index.query("note", PaletteMode::Action, false, false, true);
+        let queried_off = index.query("note", PaletteMode::Action, false, false, false);
+        for id in NOTES_ACTION_IDS {
+            assert!(
+                queried_on.actions.iter().any(|a| a.id == id),
+                "{id} matches a direct query when notes is on"
+            );
+            assert!(
+                !queried_off.actions.iter().any(|a| a.id == id),
+                "{id} never surfaces on a query when notes is off"
+            );
+        }
+
+        // The registry projection gates the whole category, and the two
+        // capability flags are independent of each other.
+        let sections_on = registry_sections(false, true);
+        let notes_section = sections_on
+            .iter()
+            .find(|s| s.category == NOTES_CATEGORY)
+            .expect("Notes section present when notes is on");
+        assert_eq!(
+            notes_section.items.len(),
+            NOTES_ACTION_IDS.len(),
+            "the whole section projects, and nothing else joins it"
+        );
+        assert!(
+            !sections_on.iter().any(|s| s.category == "Recording"),
+            "notes on does not drag the recording section in with it"
+        );
+        let sections_off = registry_sections(true, false);
+        assert!(
+            !sections_off.iter().any(|s| s.category == NOTES_CATEGORY),
+            "no Notes section when notes is off"
+        );
+        let all_off: Vec<&str> = sections_off
+            .iter()
+            .flat_map(|s| s.items.iter().map(|i| i.id.as_str()))
+            .collect();
+        for id in NOTES_ACTION_IDS {
+            assert!(
+                !all_off.contains(&id),
+                "registry projection omits {id} when notes is off"
+            );
+        }
+    }
+
+    #[test]
+    fn every_notes_action_carries_its_documented_shortcut_chip() {
+        // The chips are the contract's, and the cheat sheet is the only place a
+        // user learns them — a silently wrong label teaches a chord that does
+        // nothing.
+        let expected = [
+            ("notes-new", "⌘⌥N"),
+            ("notes-capture", "⌘⌥K"),
+            ("notes-journal-today", "⌘⌥J"),
+            ("notes-open", "⌘P"),
+            ("notes-search", "⌘⇧F"),
+            ("notes-switch-vault", "⌘⌥V"),
+        ];
+        let actions = palette_actions();
+        for (id, chip) in expected {
+            let action = actions
+                .iter()
+                .find(|a| a.id == id)
+                .unwrap_or_else(|| panic!("{id} is registered"));
+            assert_eq!(action.category, NOTES_CATEGORY, "{id} is in the section");
+            assert_eq!(action.shortcut.as_deref(), Some(chip), "{id} chip");
+            assert!(!action.requires_open_chat, "{id} does not need a chat");
+            assert!(!action.requires_recording, "{id} is not a recording action");
+        }
+    }
+
     #[test]
     fn set_account_rooms_replaces_wholesale() {
         let mut index = sample_index();
@@ -1046,7 +1236,7 @@ mod tests {
             vec![entry("acc-a", 0, "!only:x", "Only Room", false, 1)],
         );
         assert_eq!(index.len(), 3); // 1 (acc-a) + 2 (acc-b)
-        let results = index.query("only", PaletteMode::Default, false, false);
+        let results = index.query("only", PaletteMode::Default, false, false, false);
         assert_eq!(results.chats.len(), 1);
     }
 
@@ -1055,7 +1245,7 @@ mod tests {
         let mut index = sample_index();
         index.remove_account("acc-b");
         assert_eq!(index.len(), 3);
-        let results = index.query("zeta", PaletteMode::Default, false, false);
+        let results = index.query("zeta", PaletteMode::Default, false, false, false);
         assert!(results.chats.is_empty());
     }
 
@@ -1104,7 +1294,7 @@ mod tests {
 
     #[test]
     fn registry_sections_collapse_toggle_pairs_to_one_row() {
-        let sections = registry_sections(false);
+        let sections = registry_sections(false, false);
         let chat = sections
             .iter()
             .find(|s| s.category == "Chat")
@@ -1171,7 +1361,7 @@ mod tests {
     #[test]
     fn registry_sections_no_toggle_group_left_uncollapsed() {
         // Across ALL sections, every toggle group appears exactly once.
-        let sections = registry_sections(false);
+        let sections = registry_sections(false, false);
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for section in &sections {
             for item in &section.items {
@@ -1188,7 +1378,7 @@ mod tests {
 
     #[test]
     fn registry_sections_ordered_by_category() {
-        let sections = registry_sections(false);
+        let sections = registry_sections(false, false);
         let categories: Vec<&str> = sections.iter().map(|s| s.category.as_str()).collect();
         assert_eq!(
             categories,
@@ -1211,9 +1401,10 @@ mod tests {
         // Every registered action id is reachable through a section item: a
         // non-toggle action maps to its own item; a toggle action maps to its
         // group's collapsed item (by canonical id or by group membership). This
-        // proves the projection drops nothing. `recording` on so the recording
-        // action is included in both the sections and the `palette_actions()` set.
-        let sections = registry_sections(true);
+        // proves the projection drops nothing. Both capability flags are on so
+        // the gated Recording and Notes actions are in the sections and in the
+        // `palette_actions()` set alike.
+        let sections = registry_sections(true, true);
         let section_ids: Vec<String> = sections
             .iter()
             .flat_map(|s| s.items.iter().map(|i| i.id.clone()))
@@ -1354,7 +1545,7 @@ mod tests {
         let queries = ["ro", "roo", "chan", "number 1", "zzz"];
         for q in queries {
             let start = Instant::now();
-            let _ = index.query(q, PaletteMode::Default, true, false);
+            let _ = index.query(q, PaletteMode::Default, true, false, false);
             let elapsed = start.elapsed();
             assert!(
                 elapsed.as_millis() < 100,
@@ -1368,7 +1559,7 @@ mod tests {
         // "  " normalizes to an empty needle; it must NOT match every room (which a
         // bare `fuzzy_score("", ...)` would), and instead fall back to top actions.
         let index = sample_index();
-        let results = index.query("  ", PaletteMode::Default, false, false);
+        let results = index.query("  ", PaletteMode::Default, false, false, false);
         assert!(results.contacts.is_empty(), "whitespace matched contacts");
         assert!(results.chats.is_empty(), "whitespace matched chats");
         assert!(!results.actions.is_empty(), "top actions should still show");

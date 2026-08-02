@@ -243,8 +243,17 @@ pub fn commit_message(subject: &str, body: &str, provenance: &Provenance) -> Str
 /// document in one line of help text and stable enough that a profile written
 /// today still renders in a year. Only the SUBJECT is templatable — the trailer
 /// block is provenance, and a repository has to be able to trust its shape.
-pub const SUBJECT_PLACEHOLDERS: [&str; 6] = [
-    "profile", "device", "added", "modified", "deleted", "changed",
+///
+/// `notes` is the one entry this crate cannot give its own meaning to. A folder
+/// that holds notes commits them through this same engine, and a host that
+/// knows what a note is would render something note-shaped there; knowing what
+/// a note is is exactly what AD-40 keeps out of `keeper-sync`. So `{notes}`
+/// renders what `{changed}` renders. That is what makes the addition safe: the
+/// set stays closed, [`crate::profile::SyncProfile::validate`] accepts the
+/// placeholder on every profile rather than only on some of them, and a subject
+/// that names it can never come out blank.
+pub const SUBJECT_PLACEHOLDERS: [&str; 7] = [
+    "profile", "device", "added", "modified", "deleted", "changed", "notes",
 ];
 
 /// The `@device` qualifier for a commit subject, or `None` when this machine
@@ -412,7 +421,10 @@ pub fn change_subject(
             Piece::Placeholder("deleted") => {
                 let _ = write!(out, "{deleted}");
             }
-            Piece::Placeholder("changed") => {
+            // One arm for both names, because `{notes}` is not a second
+            // numbering scheme — see [`SUBJECT_PLACEHOLDERS`] for why this
+            // crate renders the count rather than a note-shaped summary.
+            Piece::Placeholder("changed" | "notes") => {
                 let _ = write!(out, "{}", added + modified + deleted);
             }
             Piece::Placeholder(unknown) => {
@@ -684,6 +696,30 @@ mod tests {
                 "{{{name}}} is documented but the validator refuses it"
             );
         }
+    }
+
+    /// `{notes}` is the seventh closed-set entry, named by the template a
+    /// notes-flagged profile ships. This crate has no notion of a note, so the
+    /// only honest rendering is the mechanical count — on every profile,
+    /// including one that holds no notes at all.
+    #[test]
+    fn the_notes_placeholder_renders_the_mechanical_change_count() {
+        assert!(SUBJECT_PLACEHOLDERS.contains(&"notes"));
+        assert_eq!(
+            unknown_subject_placeholder("notes({profile}): {notes}"),
+            None,
+            "a vault profile's shipped template must survive validation"
+        );
+        assert_eq!(
+            change_subject("notes({profile}): {notes}", "mind", None, 2, 1, 0),
+            "notes(mind): 3"
+        );
+        // Byte-identical to `{changed}`: two names for one number is a
+        // documented alias, two names for two numbers would be a trap.
+        assert_eq!(
+            change_subject("{notes}", "mind", None, 2, 1, 0),
+            change_subject("{changed}", "mind", None, 2, 1, 0)
+        );
     }
 
     #[test]

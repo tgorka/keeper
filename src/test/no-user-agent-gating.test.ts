@@ -86,7 +86,12 @@ describe("no user-agent / build-flag feature gating", () => {
       violations,
       `platform gating must come from the Rust capabilities handshake, never the browser or build flags:\n${violations.join("\n")}`,
     ).toEqual([]);
-  });
+    // A whole-tree read-and-regex, so its cost grows with the source tree rather
+    // than staying flat. Vitest's 5 s default is a budget for a unit test, not
+    // for a convention scan, and the Notes phase pushed this past it on a slow
+    // machine. The generous bound keeps it a correctness gate rather than a
+    // hardware one.
+  }, 60_000);
 
   it("the scanner actually sees the tree (sanity guard against an empty scan)", () => {
     // If the walk ever silently scanned nothing (moved dir, glob typo), the

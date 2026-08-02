@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "quick-capture",
+  "description": "Least-privilege capability for the quick-capture panel (AD-60, FR-101). Every capability file in this app is window-scoped, so a second window with no file of its own can invoke NOTHING — the panel would render and sit inert, which looks like a frontend bug and is not. It gets exactly three grants: `core:default` for channel/event delivery and the app's own invoke path, `core:window:allow-hide` so Escape can hide the panel, and `core:window:allow-set-focus` for the Linux compositor race the `keeper://notes-capture-shown` event exists to recover from. No opener, no dialog, no deep-link, no global-shortcut, no process, and no `core:window:allow-close` — the window is created once at startup and never destroyed, which is how NFR-27's 300 ms is met. The honest limit, stated so nobody plans around a fence that is not there: Tauri's ACL gates core and plugin commands, not the app's own `#[tauri::command]`s, so this file cannot by itself stop the capture webview from invoking `notes_delete`. The real containment is threefold — the panel loads a separate entry point that imports four IPC wrappers and nothing else, every notes command re-validates its arguments against the vault registry in Rust regardless of caller, and the panel's only privileged operation writes to a destination it does not choose.",
+  "windows": ["quick-capture"],
+  "platforms": ["macOS", "windows", "linux"],
+  "permissions": ["core:default", "core:window:allow-hide", "core:window:allow-set-focus"]
+}

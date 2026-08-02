@@ -27,6 +27,7 @@ const DESKTOP_CAPABILITIES = {
   revealInFileManager: true,
   recording: false,
   sync: false,
+  notes: false,
   overlayTitleBar: false,
 };
 

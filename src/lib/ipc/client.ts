@@ -79,6 +79,37 @@ export type { NavState } from "./gen/NavState";
 export type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 export type { NetworkVm } from "./gen/NetworkVm";
 export type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
+export type { NoteAttachmentVm } from "./gen/NoteAttachmentVm";
+export type { NoteBodyBatch } from "./gen/NoteBodyBatch";
+export type { NoteCadenceVm } from "./gen/NoteCadenceVm";
+export type { NoteChangeBatch } from "./gen/NoteChangeBatch";
+export type { NoteConflictChoiceReq } from "./gen/NoteConflictChoiceReq";
+export type { NoteConflictVm } from "./gen/NoteConflictVm";
+export type { NoteCreateReq } from "./gen/NoteCreateReq";
+export type { NoteDiffVm } from "./gen/NoteDiffVm";
+export type { NoteFlag } from "./gen/NoteFlag";
+export type { NoteFolderVm } from "./gen/NoteFolderVm";
+export type { NoteHunkVm } from "./gen/NoteHunkVm";
+export type { NoteIndexProgressVm } from "./gen/NoteIndexProgressVm";
+export type { NoteLinkTargetVm } from "./gen/NoteLinkTargetVm";
+export type { NoteListOp } from "./gen/NoteListOp";
+export type { NoteListVm } from "./gen/NoteListVm";
+export type { NoteQueryCheckVm } from "./gen/NoteQueryCheckVm";
+export type { NoteQueryReq } from "./gen/NoteQueryReq";
+export type { NoteRefVm } from "./gen/NoteRefVm";
+export type { NoteRevisionVm } from "./gen/NoteRevisionVm";
+export type { NoteRowVm } from "./gen/NoteRowVm";
+export type { NoteSearchBatch } from "./gen/NoteSearchBatch";
+export type { NoteSearchHitVm } from "./gen/NoteSearchHitVm";
+export type { NoteSearchReq } from "./gen/NoteSearchReq";
+export type { NoteSpaceReq } from "./gen/NoteSpaceReq";
+export type { NoteSpaceVm } from "./gen/NoteSpaceVm";
+export type { NoteTagNodeVm } from "./gen/NoteTagNodeVm";
+export type { NoteTagTreeVm } from "./gen/NoteTagTreeVm";
+export type { NoteTemplateVm } from "./gen/NoteTemplateVm";
+export type { NoteVaultSettingsReq } from "./gen/NoteVaultSettingsReq";
+export type { NoteVaultVm } from "./gen/NoteVaultVm";
+export type { NoteWriteVm } from "./gen/NoteWriteVm";
 export type { NotificationPermission } from "./gen/NotificationPermission";
 export type { NotifyTarget } from "./gen/NotifyTarget";
 export type { OutboxVm } from "./gen/OutboxVm";
@@ -160,6 +191,32 @@ import type { IncognitoVm } from "./gen/IncognitoVm";
 import type { MenuSectionVm } from "./gen/MenuSectionVm";
 import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 import type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
+import type { NoteAttachmentVm } from "./gen/NoteAttachmentVm";
+import type { NoteBodyBatch } from "./gen/NoteBodyBatch";
+import type { NoteChangeBatch } from "./gen/NoteChangeBatch";
+import type { NoteConflictChoiceReq } from "./gen/NoteConflictChoiceReq";
+import type { NoteConflictVm } from "./gen/NoteConflictVm";
+import type { NoteCreateReq } from "./gen/NoteCreateReq";
+import type { NoteDiffVm } from "./gen/NoteDiffVm";
+import type { NoteFlag } from "./gen/NoteFlag";
+import type { NoteFolderVm } from "./gen/NoteFolderVm";
+import type { NoteIndexProgressVm } from "./gen/NoteIndexProgressVm";
+import type { NoteLinkTargetVm } from "./gen/NoteLinkTargetVm";
+import type { NoteListVm } from "./gen/NoteListVm";
+import type { NoteQueryCheckVm } from "./gen/NoteQueryCheckVm";
+import type { NoteQueryReq } from "./gen/NoteQueryReq";
+import type { NoteRefVm } from "./gen/NoteRefVm";
+import type { NoteRevisionVm } from "./gen/NoteRevisionVm";
+import type { NoteRowVm } from "./gen/NoteRowVm";
+import type { NoteSearchBatch } from "./gen/NoteSearchBatch";
+import type { NoteSearchReq } from "./gen/NoteSearchReq";
+import type { NoteSpaceReq } from "./gen/NoteSpaceReq";
+import type { NoteSpaceVm } from "./gen/NoteSpaceVm";
+import type { NoteTagTreeVm } from "./gen/NoteTagTreeVm";
+import type { NoteTemplateVm } from "./gen/NoteTemplateVm";
+import type { NoteVaultSettingsReq } from "./gen/NoteVaultSettingsReq";
+import type { NoteVaultVm } from "./gen/NoteVaultVm";
+import type { NoteWriteVm } from "./gen/NoteWriteVm";
 import type { OutboxVm } from "./gen/OutboxVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
@@ -2825,4 +2882,645 @@ export async function copyStatus(id: string): Promise<CopyJobVm> {
  */
 export async function copyCancel(id: string): Promise<void> {
   await invoke<void>("copy_cancel", { id });
+}
+
+// ---------------------------------------------------------------------------
+// Notes (Phase 5, FR-94..FR-124)
+//
+// A vault is a notes-flagged sync profile plus a subfolder (AD-54), so every one
+// of these rejects with `unsupported` where folder sync cannot run, and the UI
+// gates the whole surface on `CapabilitiesVm.notes` rather than offering an
+// action that cannot work. Nothing large crosses here (AD-58): the list carries
+// row view models windowed to what is on screen, a note BODY arrives only over a
+// `Channel`, and attachment bytes never cross in either direction — paste and
+// drop are payload-free because Rust reads the clipboard and Tauri hands Rust
+// the dropped paths.
+//
+// Notes subscriptions resolve with a `String` id rather than the `number` the
+// older streams use, so they route through `subscribeWithStringId` below instead
+// of `subscribe`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Open a `Channel` for a notes stream and resolve with its Rust subscription id.
+ *
+ * The twin of {@link subscribe} for the notes commands, which key their
+ * subscriptions by string. The `onmessage`-before-`invoke` ordering is the same
+ * load-bearing rule and for the same reason: every notes stream opens with a
+ * snapshot emitted from a spawned task, and a handler armed after the
+ * id-returning command resolves would miss it.
+ */
+async function subscribeWithStringId<TBatch>(
+  cmd: string,
+  onBatch: (batch: TBatch) => void,
+  args?: Record<string, unknown>,
+): Promise<string> {
+  const channel = new Channel<TBatch>();
+  channel.onmessage = onBatch;
+  return await invoke<string>(cmd, { ...args, channel });
+}
+
+/**
+ * Every notes-flagged sync profile, with its index state and unread count
+ * (FR-94, FR-95, AD-54). The vault list IS a filter over the profile list, so
+ * there is nothing else to read and no second registry to keep in step.
+ *
+ * Rejects with: `unsupported` (no folder sync on this build), `internal`.
+ */
+export async function notesVaults(): Promise<NoteVaultVm[]> {
+  return await invoke<NoteVaultVm[]>("notes_vaults");
+}
+
+/**
+ * Flag a synced folder as a notes vault, or unflag it (FR-94).
+ *
+ * `config` absent unflags; unflagging removes no files and moves nothing —
+ * keeper only forgets that the folder held a vault.
+ *
+ * Rejects with: `invalidInput` (a subfolder that is empty, absolute, escapes
+ * with `..`, or is `.obsidian`), `unsupported`, `internal`.
+ */
+export async function notesVaultFlag(
+  profileId: string,
+  config: NoteVaultSettingsReq | null,
+): Promise<NoteVaultVm> {
+  return await invoke<NoteVaultVm>("notes_vault_flag", { profileId, config });
+}
+
+/**
+ * Save one vault's four knobs — subfolder, journal template, default template
+ * and sync cadence (FR-120). Cadence values below the engine's floors are
+ * clamped in Rust, so the returned VM is what is actually in force.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesVaultSettingsSave(
+  vaultId: string,
+  settings: NoteVaultSettingsReq,
+): Promise<NoteVaultVm> {
+  return await invoke<NoteVaultVm>("notes_vault_settings_save", { vaultId, settings });
+}
+
+/**
+ * The vault everything vault-scoped resolves against, or `null` when nothing is
+ * selected or the stored id no longer names a flagged profile.
+ *
+ * Rust owns this rather than the webview because the tray's New Note, Today's
+ * Journal and recent slots, and the capture window's commit, all run with no
+ * main window open at all. A second selection held only in a store would send
+ * those writes into a different vault than the one on screen.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesVaultActive(): Promise<string | null> {
+  return await invoke<string | null>("notes_vault_active");
+}
+
+/**
+ * Switch the active vault (FR-95). A filter change, not a navigation (UX-DR41):
+ * the note open in the editor stays open when it belongs to the new vault.
+ *
+ * Rejects with: `invalidInput` (unknown vault), `unsupported`, `internal`.
+ */
+export async function notesVaultSetActive(vaultId: string): Promise<void> {
+  await invoke<void>("notes_vault_set_active", { vaultId });
+}
+
+/**
+ * Drop a vault's `.keeper/index.json` cache and cold-scan it again (FR-96,
+ * AD-57). The index is a cache, never a database: rebuilding it is a supported
+ * repair and loses nothing, because every field in it is derived from files the
+ * user owns. Progress streams on the index channel.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesIndexRebuild(vaultId: string): Promise<void> {
+  await invoke<void>("notes_index_rebuild", { vaultId });
+}
+
+/**
+ * One window of the filtered note list (FR-103, AD-58). `query` carries every
+ * filter axis — text, tag chips, space, origin, flags — plus `offset`/`limit`,
+ * and the returned {@link NoteListVm} carries `total` alongside the window so a
+ * scrollbar can be honest about 10 000 rows without shipping them.
+ *
+ * Rows are view models. A row never carries a body; a body is a `Channel`
+ * (see {@link notesOpen}).
+ *
+ * Rejects with: `invalidInput` (a malformed space query), `unsupported`,
+ * `internal`.
+ */
+export async function notesList(vaultId: string, query: NoteQueryReq): Promise<NoteListVm> {
+  return await invoke<NoteListVm>("notes_list", { vaultId, query });
+}
+
+/**
+ * The vault's hierarchical tag tree with per-node counts (FR-104). Counts are of
+ * the UNFILTERED vault, so a node never appears to shrink as chips are added — a
+ * count that changes meaning mid-interaction is a lie.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesTagTree(vaultId: string): Promise<NoteTagTreeVm> {
+  return await invoke<NoteTagTreeVm>("notes_tag_tree", { vaultId });
+}
+
+/**
+ * One level of the physical folder tree (FR-106, UX-DR38) — the lens that is
+ * always one click away, so a virtual row can always be traced to a real path.
+ *
+ * Rejects with: `invalidInput` (a directory outside the vault), `unsupported`,
+ * `internal`.
+ */
+export async function notesTree(vaultId: string, relDir: string): Promise<NoteFolderVm> {
+  return await invoke<NoteFolderVm>("notes_tree", { vaultId, relDir });
+}
+
+/**
+ * Every space in the vault (FR-105) — ordinary notes under `spaces/`, each
+ * carrying a saved query. A space whose query does not parse comes back with its
+ * `error` set rather than being dropped: it is an agent-writable plain note, so
+ * a broken one is expected and must not break the sidebar.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesSpaces(vaultId: string): Promise<NoteSpaceVm[]> {
+  return await invoke<NoteSpaceVm[]>("notes_spaces", { vaultId });
+}
+
+/**
+ * Write or update a space note (FR-105). This is what "save this filter as a
+ * space" produces, and it produces an ordinary markdown note — so the
+ * organisation syncs, diffs and can be edited by hand or by an agent.
+ *
+ * Rejects with: `invalidInput` (an unparseable query), `unsupported`, `internal`.
+ */
+export async function notesSpaceSave(vaultId: string, space: NoteSpaceReq): Promise<NoteRefVm> {
+  return await invoke<NoteRefVm>("notes_space_save", { vaultId, space });
+}
+
+/**
+ * Parse a space query without running it — what underlines the offending token
+ * while a query is being typed. Never rejects on a bad query: an unparseable
+ * query is a {@link NoteQueryCheckVm} with `ok: false` and a located message,
+ * because a parse failure is a state of the field, not a failed command.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesSpaceValidate(query: string): Promise<NoteQueryCheckVm> {
+  return await invoke<NoteQueryCheckVm>("notes_space_validate", { query });
+}
+
+/**
+ * Create a note (FR-98). Every field of `req` is optional-shaped because there
+ * is no dialog anywhere in this path (UX-DR35): a title comes from the first
+ * line if it is not supplied, and the destination is a rule rather than a
+ * question.
+ *
+ * Rejects with: `invalidInput` (an illegal name), `unsupported`, `internal`.
+ */
+export async function notesCreate(vaultId: string, req: NoteCreateReq): Promise<NoteRefVm> {
+  return await invoke<NoteRefVm>("notes_create", { vaultId, req });
+}
+
+/**
+ * Open today's journal entry, creating it from the vault's journal template if
+ * it does not exist yet (FR-99). Idempotent — twice in a day is one note.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesJournalToday(vaultId: string): Promise<NoteRefVm> {
+  return await invoke<NoteRefVm>("notes_journal_today", { vaultId });
+}
+
+/**
+ * Every `templates/*.md` in the vault (FR-100). An empty vault answers with an
+ * empty list, never an error — keeper creates `templates/` lazily, on first use,
+ * because an empty scaffold in someone's existing vault is exactly the "keeper
+ * moved my stuff" failure FR-121 forbids.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesTemplates(vaultId: string): Promise<NoteTemplateVm[]> {
+  return await invoke<NoteTemplateVm[]>("notes_templates", { vaultId });
+}
+
+/**
+ * Open a note's body as a stream (AD-58) and resolve with the subscription id.
+ *
+ * A body is never a command return value. The stream opens with a full
+ * `Reset { rev, text }` snapshot and then delivers what happened to the document
+ * — an external write merged in, a divergence to review, a rename, a deletion —
+ * so an agent writing into the open note is a diff applied to a live buffer
+ * rather than a poll that destroys the cursor.
+ *
+ * Rejects with: `invalidInput` (unknown note), `unsupported`, `internal`.
+ */
+export async function notesOpen(
+  vaultId: string,
+  noteId: string,
+  onBatch: (batch: NoteBodyBatch) => void,
+): Promise<string> {
+  return await subscribeWithStringId<NoteBodyBatch>("notes_open", onBatch, { vaultId, noteId });
+}
+
+/**
+ * Close one body subscription, aborting its backend producer. Idempotent — an
+ * unknown id is a no-op.
+ */
+export async function notesClose(subscriptionId: string): Promise<void> {
+  await invoke<void>("notes_close", { subscriptionId });
+}
+
+/**
+ * Report the editor's current buffer text to Rust — the dirty-text heartbeat the
+ * three-way merge needs.
+ *
+ * Rust holds `base` (what it last wrote or last delivered) and `theirs` (the new
+ * disk bytes); this is what keeps `mine` current, so an external write arriving
+ * mid-edit can be merged instead of refused. Sent after a typing pause and
+ * immediately on blur, never per keystroke.
+ *
+ * Rejects with: `invalidInput` (unknown subscription), `unsupported`, `internal`.
+ */
+export async function notesBufferReport(
+  subscriptionId: string,
+  text: string,
+  rev: string,
+): Promise<void> {
+  await invoke<void>("notes_buffer_report", { subscriptionId, text, rev });
+}
+
+/**
+ * Flush the buffer to disk. `baseRev` is the revision the buffer opened at: when
+ * it is older than what is on disk, Rust writes the disk bytes out as an
+ * AD-43-shaped conflict copy FIRST and the buffer second, so saving over a
+ * divergence loses neither side (NFR-30). The returned
+ * {@link NoteWriteVm} names the copy when one was made.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesSave(
+  subscriptionId: string,
+  text: string,
+  baseRev: string,
+): Promise<NoteWriteVm> {
+  return await invoke<NoteWriteVm>("notes_save", { subscriptionId, text, baseRev });
+}
+
+/**
+ * Retitle a note and rename its file (FR-97). Links keep resolving because they
+ * resolve through the note's ULID `id`, not its filename.
+ *
+ * Rejects with: `invalidInput` (an illegal name), `unsupported`, `internal`.
+ */
+export async function notesRename(
+  vaultId: string,
+  noteId: string,
+  title: string,
+): Promise<NoteRefVm> {
+  return await invoke<NoteRefVm>("notes_rename", { vaultId, noteId, title });
+}
+
+/**
+ * Set or clear `pinned` / `archived` in a note's frontmatter (FR-119). The write
+ * touches that one key and leaves every other byte identical — the FR-121
+ * guarantee is what makes editing someone's own file acceptable at all.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesSetFlag(
+  vaultId: string,
+  noteId: string,
+  flag: NoteFlag,
+  on: boolean,
+): Promise<void> {
+  await invoke<void>("notes_set_flag", { vaultId, noteId, flag, on });
+}
+
+/**
+ * Move a note to `.keeper/trash/` and stage the removal (NFR-30). Never an
+ * unlink — a delete keeper cannot undo is a delete keeper should not offer.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesDelete(vaultId: string, noteId: string): Promise<void> {
+  await invoke<void>("notes_delete", { vaultId, noteId });
+}
+
+/**
+ * Run a bounded parallel content scan over the vault, streaming hits as they are
+ * found (FR-118), and resolve with the subscription id.
+ *
+ * It reads the files rather than an index, which is the whole argument for not
+ * shipping a search engine at this size: a note written a millisecond ago is
+ * matched, because there is nothing to invalidate.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesSearch(
+  vaultId: string,
+  req: NoteSearchReq,
+  onBatch: (batch: NoteSearchBatch) => void,
+): Promise<string> {
+  return await subscribeWithStringId<NoteSearchBatch>("notes_search", onBatch, { vaultId, req });
+}
+
+/**
+ * Wikilink autocomplete candidates for a `[[` prefix (FR-108), ranked in Rust.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesLinkTargets(
+  vaultId: string,
+  prefix: string,
+): Promise<NoteLinkTargetVm[]> {
+  return await invoke<NoteLinkTargetVm[]>("notes_link_targets", { vaultId, prefix });
+}
+
+/**
+ * The notes that link TO this one (FR-108), projected from the link graph.
+ * Derived, never stored.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesBacklinks(vaultId: string, noteId: string): Promise<NoteRowVm[]> {
+  return await invoke<NoteRowVm[]>("notes_backlinks", { vaultId, noteId });
+}
+
+/**
+ * A note's revision history (FR-114, AD-63), projected from the commit trailers
+ * `keeper-sync` already writes. keeper keeps no parallel history store, so a
+ * vault whose profile has never committed answers with an honest empty list
+ * rather than an error.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesHistory(
+  vaultId: string,
+  noteId: string,
+  limit: number,
+): Promise<NoteRevisionVm[]> {
+  return await invoke<NoteRevisionVm[]>("notes_history", { vaultId, noteId, limit });
+}
+
+/**
+ * A unified diff between two revisions of one note. `toRev` absent diffs against
+ * the working tree.
+ *
+ * Rejects with: `invalidInput` (unknown revision), `unsupported`, `internal`.
+ */
+export async function notesDiff(
+  vaultId: string,
+  noteId: string,
+  fromRev: string,
+  toRev: string | null,
+): Promise<NoteDiffVm> {
+  return await invoke<NoteDiffVm>("notes_diff", { vaultId, noteId, fromRev, toRev });
+}
+
+/**
+ * Acknowledge a revision, clearing the note's unread mark and — when it was the
+ * last one — the tray dot (FR-113).
+ *
+ * The mark is local state (the last revision the user accepted), compared
+ * against the head revision that touched the path, so it survives a restart
+ * without keeper writing read state into a file that would then sync.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesMarkRead(vaultId: string, noteId: string, rev: string): Promise<void> {
+  await invoke<void>("notes_mark_read", { vaultId, noteId, rev });
+}
+
+/**
+ * Every unresolved conflict in the vault (FR-116) — a Syncthing-shaped conflict
+ * copy recognised by name and bound back to its canonical note, so it is a row
+ * in the list rather than litter to find on disk.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesConflicts(vaultId: string): Promise<NoteConflictVm[]> {
+  return await invoke<NoteConflictVm[]>("notes_conflicts", { vaultId });
+}
+
+/**
+ * Resolve a conflict by keeping one side or a merged body. The resolved body is
+ * written as one new revision and the conflict copy is deleted only after that
+ * write is acked (NFR-30) — there is no path by which either side is dropped
+ * without the user choosing it.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesResolveConflict(
+  vaultId: string,
+  noteId: string,
+  choice: NoteConflictChoiceReq,
+): Promise<NoteRefVm> {
+  return await invoke<NoteRefVm>("notes_resolve_conflict", { vaultId, noteId, choice });
+}
+
+/**
+ * Write the clipboard's image into `attachments/` and answer with the embed
+ * (FR-110). No payload crosses IPC in either direction (AD-58): Rust reads the
+ * system clipboard itself, so the webview never holds the bytes it is asking
+ * keeper to write.
+ *
+ * Rejects with: `invalidInput` (no image on the clipboard), `unsupported`,
+ * `internal`.
+ */
+export async function notesAttachmentPaste(
+  vaultId: string,
+  noteId: string,
+): Promise<NoteAttachmentVm> {
+  return await invoke<NoteAttachmentVm>("notes_attachment_paste", { vaultId, noteId });
+}
+
+/**
+ * Import dropped files into `attachments/` and answer with their embeds
+ * (FR-110). `paths` come from Tauri's own window drag-drop event, which hands
+ * Rust real paths — they are never composed in JavaScript.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesAttachmentDrop(
+  vaultId: string,
+  noteId: string,
+  paths: string[],
+): Promise<NoteAttachmentVm[]> {
+  return await invoke<NoteAttachmentVm[]>("notes_attachment_drop", { vaultId, noteId, paths });
+}
+
+/**
+ * The persisted quick-capture buffer (FR-101). Durable registry storage, not the
+ * vault and not the index — a capture buffer is the one thing in this phase that
+ * is not disposable, so it survives dismissal, a crash and a reboot.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesCaptureBuffer(): Promise<string> {
+  return await invoke<string>("notes_capture_buffer");
+}
+
+/**
+ * Persist the capture buffer. Debounced by the caller; cleared by exactly one
+ * event, a write acknowledgement.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesCaptureBufferSave(text: string): Promise<void> {
+  await invoke<void>("notes_capture_buffer_save", { text });
+}
+
+/**
+ * Write the captured text into the active vault as an ordinary note and clear
+ * the buffer (FR-101).
+ *
+ * Rejects with: `invalidInput` (no vault flagged), `unsupported`, `internal` —
+ * and a rejection is what keeps the panel open with the text intact, because the
+ * one thing capture may never do is swallow words.
+ */
+export async function notesCaptureCommit(text: string): Promise<NoteRefVm> {
+  return await invoke<NoteRefVm>("notes_capture_commit", { text });
+}
+
+/**
+ * Subscribe to the vault's list changes (AD-58) and resolve with the
+ * subscription id. Opens with a `Reset` snapshot of the current window, then
+ * diffs — coalesced in Rust to at most one message per 250 ms, so a 500-file
+ * agent run is about four messages a second and not five hundred.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesSubscribeChanges(
+  vaultId: string,
+  onBatch: (batch: NoteChangeBatch) => void,
+): Promise<string> {
+  return await subscribeWithStringId<NoteChangeBatch>("notes_subscribe_changes", onBatch, {
+    vaultId,
+  });
+}
+
+/**
+ * Unsubscribe exactly one changes subscription, aborting its backend producer.
+ * Idempotent — an unknown id is a no-op.
+ */
+export async function notesUnsubscribeChanges(subscriptionId: string): Promise<void> {
+  await invoke<void>("notes_unsubscribe_changes", { subscriptionId });
+}
+
+/**
+ * Subscribe to cold-scan progress for one vault (FR-96) and resolve with the
+ * subscription id. Opens with the current phase, so a subscriber that arrives
+ * mid-scan is not left staring at nothing.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function notesSubscribeIndex(
+  vaultId: string,
+  onProgress: (progress: NoteIndexProgressVm) => void,
+): Promise<string> {
+  return await subscribeWithStringId<NoteIndexProgressVm>("notes_subscribe_index", onProgress, {
+    vaultId,
+  });
+}
+
+/**
+ * Show the quick-capture panel, positioned on the display holding the pointer
+ * (FR-101, AD-60). Desktop only.
+ *
+ * The window is created hidden at startup with its textarea already focused, so
+ * this focuses nothing and the first keystroke is never dropped (NFR-27).
+ *
+ * Rejects with: `unsupported` (non-desktop), `internal`.
+ */
+export async function notesCaptureShow(): Promise<void> {
+  await invoke<void>("notes_capture_show");
+}
+
+/**
+ * Hide the quick-capture panel. `commit` true is the Escape contract — write the
+ * buffer, clear it, hide, and answer with the note written; `commit` false hides
+ * and leaves the buffer intact.
+ *
+ * Resolves with `null` when nothing was written: an empty buffer (keeper never
+ * creates an empty note) or no vault flagged (the text stays durable in the
+ * buffer, per FR-101). Neither is an error. A write that FAILS rejects, and the
+ * panel must then stay open with the text untouched.
+ *
+ * Rejects with: `unsupported` (non-desktop), `internal`.
+ */
+export async function notesCaptureHide(commit: boolean): Promise<NoteRefVm | null> {
+  return await invoke<NoteRefVm | null>("notes_capture_hide", { commit });
+}
+
+/**
+ * Reveal a note's real path in the OS file manager (UX-DR38). Desktop only.
+ *
+ * Every row in every lens can do this, and that is deliberate: the failure mode
+ * of a virtual-folder system is that people stop believing they know where their
+ * files are, and then stop trusting the tool with them.
+ *
+ * Rejects with: `invalidInput`, `unsupported` (non-desktop), `internal`.
+ */
+export async function notesReveal(vaultId: string, noteId: string): Promise<void> {
+  await invoke<void>("notes_reveal", { vaultId, noteId });
+}
+
+/**
+ * Open a file a note links to with the OS handler (FR-109). Desktop only. The
+ * path may point anywhere inside the profile root, not only inside the vault —
+ * and nowhere outside it.
+ *
+ * Rejects with: `invalidInput` (a path outside the profile root),
+ * `unsupported` (non-desktop), `internal`.
+ */
+export async function notesOpenFile(vaultId: string, relPath: string): Promise<void> {
+  await invoke<void>("notes_open_file", { vaultId, relPath });
+}
+
+/**
+ * The Tauri event the shell emits when the tray asks the main window to open a
+ * note — New Note, Today's Journal, or one of the five recent slots. Must match
+ * the constant in `keeper/src/notes_ipc.rs`.
+ */
+export const NOTES_OPEN_NOTE_EVENT = "keeper://notes-open-note";
+
+/**
+ * The Tauri event the shell emits when the tray's unread item is chosen: open
+ * the Notes view on that vault with the origin chip active.
+ */
+export const NOTES_SHOW_UNREAD_EVENT = "keeper://notes-show-unread";
+
+/**
+ * The Tauri event the shell emits after the capture panel is shown, so the
+ * capture entry point can re-assert focus after a Linux compositor race.
+ */
+export const NOTES_CAPTURE_SHOWN_EVENT = "keeper://notes-capture-shown";
+
+/**
+ * Subscribe to the tray's open-a-note event. Resolves with an unlisten function;
+ * registering is best-effort and graceful outside a Tauri webview (jsdom in
+ * tests), so a failure leaves the bridge inert rather than crashing the shell.
+ */
+export async function listenNotesOpenNote(onOpen: (ref: NoteRefVm) => void): Promise<() => void> {
+  return await listen<NoteRefVm>(NOTES_OPEN_NOTE_EVENT, (event) => {
+    onOpen(event.payload);
+  });
+}
+
+/** Subscribe to the tray's show-unread event, which carries the vault id. */
+export async function listenNotesShowUnread(
+  onShow: (vaultId: string) => void,
+): Promise<() => void> {
+  return await listen<string>(NOTES_SHOW_UNREAD_EVENT, (event) => {
+    onShow(event.payload);
+  });
+}
+
+/** Subscribe to the capture-shown event (payload-free). */
+export async function listenNotesCaptureShown(onShown: () => void): Promise<() => void> {
+  return await listen<null>(NOTES_CAPTURE_SHOWN_EVENT, () => {
+    onShown();
+  });
 }

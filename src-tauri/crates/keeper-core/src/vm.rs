@@ -119,6 +119,13 @@ pub struct CapabilitiesVm {
     /// engine cannot be constructed at all — and every sync surface stays
     /// absent rather than failing when pressed (AD-27, "no dead buttons").
     pub sync: bool,
+    /// Notes (Phase 5, FR-122) can run here: `sync && desktop`, computed in the
+    /// shell like every other flag in this struct. It sits beside `sync` because
+    /// it is strictly narrower — a vault is a folder keeper already syncs plus a
+    /// flag, so a build without folder sync has nowhere to put one, and iOS gets
+    /// `false` for both. When it is `false` every notes affordance is **absent**
+    /// from the DOM rather than disabled, which is the whole of FR-122.
+    pub notes: bool,
     /// The window's title bar is a transparent overlay over the webview, so the
     /// native window controls float over page content (Story 34.2, AD-34-2):
     /// `true` only on desktop macOS, the only platform where `tauri.conf.json`'s
@@ -214,6 +221,13 @@ pub enum IpcErrorCode {
     /// the core (never surfaced to the UI), so this code exists only to keep the
     /// error funnel exhaustive. Serializes as `"signalDispatchFailed"`.
     SignalDispatchFailed,
+    /// A notes operation was handed something malformed: unreadable frontmatter,
+    /// a title that cannot become a filename, a space query that does not parse,
+    /// or a template with a broken placeholder (Phase 5). Retriable in the only
+    /// sense that matters — the input is what is wrong, so fixing the text fixes
+    /// the call, which is why these do not funnel to `internal`. Serializes as
+    /// `"notesInvalid"`.
+    NotesInvalid,
 }
 
 /// The account's live server-side key-backup posture, mapped from the SDK

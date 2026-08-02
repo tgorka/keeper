@@ -10,7 +10,7 @@
 //! TOML config (Story 30.2). The same table must mean the same thing in all
 //! three, so defaults live here and nowhere else.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -130,6 +130,172 @@ pub const DEFAULT_POLL_INTERVAL_MS: u64 = 15_000;
 /// tree on every 1 Hz supervisor tick, on a pendrive or over a network mount.
 pub const MIN_POLL_INTERVAL_MS: u64 = 2_000;
 
+/// Where a vault lives inside a notes-flagged folder, by default (AD-54).
+pub const DEFAULT_NOTES_SUBFOLDER: &str = "notes";
+/// Where a journal entry for a given day is written, by default (FR-99).
+///
+/// The same string as `keeper_core::notes::naming::DEFAULT_JOURNAL_TEMPLATE`,
+/// spelled again rather than imported: AD-40 keeps this crate core-free. The
+/// alternative — leaving the field empty and letting whichever host read the
+/// row fill it in — would make one JSON blob mean two different things
+/// depending on which binary opened it, which is exactly what this module's
+/// "defaults live here and nowhere else" rule exists to prevent.
+pub const DEFAULT_JOURNAL_TEMPLATE: &str = "journal/{yyyy}/{yyyy}-{mm}-{dd}.md";
+/// Default quiet time after the last edit before a note is committed.
+///
+/// Long enough that a burst of typing is one commit rather than one per
+/// keystroke run, short enough that a thought captured and abandoned is on the
+/// other machine before the lid is shut (AD-62).
+pub const DEFAULT_COMMIT_IDLE_MS: u64 = 2_000;
+/// Floor on the idle window. Below roughly half a second the debounce stops
+/// debouncing, and unreadable history plus an unbounded push queue is the
+/// outcome AD-62 rejected commit-on-every-save to avoid.
+pub const MIN_COMMIT_IDLE_MS: u64 = 500;
+/// Default deadline between a notes commit and the push that carries it.
+pub const DEFAULT_PUSH_INTERVAL_MS: u64 = 30_000;
+/// Floor on the push deadline. Each push is a network round trip; under five
+/// seconds a laptop on a flaky link spends its battery on retries rather than
+/// on getting the bytes across.
+pub const MIN_PUSH_INTERVAL_MS: u64 = 5_000;
+
+/// When a notes-flagged profile commits, and when it pushes (FR-115, AD-62).
+///
+/// A knob on the profile rather than a scheduler of its own: the 1 Hz
+/// supervisor already ticks with exactly the resolution a 2 s idle window
+/// needs, and two schedulers over one working tree is how concurrent index
+/// locks happen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotesCadence {
+    /// Quiet time after the last edit before the note is committed.
+    pub commit_idle_ms: u64,
+    /// How long a commit may sit locally before it is pushed.
+    pub push_interval_ms: u64,
+    /// Push as soon as the window loses focus, without waiting the interval
+    /// out. Leaving is the strongest available signal that these bytes are
+    /// wanted somewhere else.
+    pub push_on_blur: bool,
+}
+
+impl Default for NotesCadence {
+    fn default() -> Self {
+        Self {
+            commit_idle_ms: DEFAULT_COMMIT_IDLE_MS,
+            push_interval_ms: DEFAULT_PUSH_INTERVAL_MS,
+            push_on_blur: true,
+        }
+    }
+}
+
+/// The notes flag on a profile, and everything it configures (AD-54, FR-120).
+///
+/// `Some` on a [`SyncProfile`] means "this synced folder contains a vault", and
+/// `subfolder` says where inside it. A vault is therefore not an object with a
+/// lifetime of its own: the vault list is a filter over the profile list and
+/// the vault id *is* the profile id, so there is no picker, no second path to
+/// validate, no import and no migration.
+///
+/// This crate stores the flag and understands nothing behind it. Markdown,
+/// frontmatter, links and the index are `keeper-core`'s; the engine sees a
+/// folder with files in it, exactly as it does for every other profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotesConfig {
+    /// The vault root, relative to `local_path`. Never empty, never absolute,
+    /// never escaping and never an Obsidian configuration folder — see
+    /// [`SyncProfile::validate`] for why each of those is refused rather than
+    /// corrected.
+    #[serde(default = "default_subfolder")]
+    pub subfolder: String,
+    /// Vault-relative path template for a day's journal entry.
+    #[serde(default = "default_journal_template")]
+    pub journal_template: String,
+    /// Vault-relative path of the template a new note starts from, if any.
+    #[serde(default)]
+    pub default_template: Option<String>,
+    #[serde(default)]
+    pub cadence: NotesCadence,
+}
+
+impl Default for NotesConfig {
+    fn default() -> Self {
+        Self {
+            subfolder: DEFAULT_NOTES_SUBFOLDER.to_owned(),
+            journal_template: DEFAULT_JOURNAL_TEMPLATE.to_owned(),
+            default_template: None,
+            cadence: NotesCadence::default(),
+        }
+    }
+}
+
+impl NotesConfig {
+    /// The subfolder and cadence rules, split out of [`SyncProfile::validate`]
+    /// because they are about these fields and not about the profile.
+    ///
+    /// Every rule here REFUSES rather than corrects, which is the opposite of
+    /// what `poll_interval_ms` does with a value below its floor. The reason is
+    /// that the two fields have different histories: a stored zero poll
+    /// interval is a row written when the field meant nothing (DW-116) and no
+    /// human ever chose it, whereas `notes` is absent from every profile
+    /// written before it existed and `#[serde(default)]` gives every profile
+    /// that does mention it a working cadence. So a value below the floor here
+    /// is something a person typed, and a person who typed it is looking at the
+    /// field — which is the moment to say so.
+    fn validate(&self) -> Result<()> {
+        let subfolder = self.subfolder.trim();
+        if subfolder.is_empty() {
+            return Err(SyncError::Config(
+                "notes subfolder must not be empty: a vault is a folder inside the profile, \
+                 never the profile root"
+                    .into(),
+            ));
+        }
+        // `Path::join` with an absolute right-hand side DISCARDS the left one,
+        // so an absolute subfolder would not fail loudly — `vault_root` would
+        // quietly point somewhere outside the synced folder entirely. Tested as
+        // a string as well as through `is_absolute`, because absoluteness is
+        // platform-shaped (`C:\x` and `\\server\share` are absolute only to
+        // Windows) and one profile row has to mean the same thing on every
+        // machine that reads it.
+        if Path::new(subfolder).is_absolute()
+            || subfolder.starts_with('/')
+            || subfolder.starts_with('\\')
+        {
+            return Err(SyncError::Config(format!(
+                "notes subfolder must be relative to the profile folder, got {subfolder}"
+            )));
+        }
+        let component = |part: &str| subfolder.split(['/', '\\']).any(|c| c == part);
+        if component("..") {
+            return Err(SyncError::Config(format!(
+                "notes subfolder must not escape the profile folder: {subfolder}"
+            )));
+        }
+        // FR-121: keeper never reads, writes or walks an Obsidian configuration
+        // folder. Nothing keeper constructs names it, but "we never generate
+        // that path" is not the same as "that path cannot be configured", and
+        // pointing a vault root at it would put every one of keeper's writes
+        // inside somebody else's application state.
+        if component(".obsidian") {
+            return Err(SyncError::Config(format!(
+                "notes subfolder must not name .obsidian; keeper never reads or writes an \
+                 Obsidian configuration folder: {subfolder}"
+            )));
+        }
+        if self.cadence.commit_idle_ms < MIN_COMMIT_IDLE_MS {
+            return Err(SyncError::Config(format!(
+                "notes commit idle window must be at least {MIN_COMMIT_IDLE_MS} ms"
+            )));
+        }
+        if self.cadence.push_interval_ms < MIN_PUSH_INTERVAL_MS {
+            return Err(SyncError::Config(format!(
+                "notes push interval must be at least {MIN_PUSH_INTERVAL_MS} ms"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// One folder bound to one repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -231,6 +397,16 @@ pub struct SyncProfile {
     /// Whether watch mode is armed.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// This folder contains a notes vault, and where inside it (AD-54).
+    ///
+    /// `#[serde(default)]` here IS the migration. A profile persists as one
+    /// JSON blob per row, so a row written by a keeper that had never heard of
+    /// notes simply has no `notes` key; it loads as `None`, which means exactly
+    /// what it should — not a vault. There is no SQL change, no schema bump and
+    /// nothing to run on upgrade, and a row written by a newer keeper still
+    /// loads on an older one, which is what makes rolling back safe.
+    #[serde(default)]
+    pub notes: Option<NotesConfig>,
 }
 
 fn default_lfs_threshold() -> u64 {
@@ -244,6 +420,12 @@ fn default_poll_interval_ms() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_subfolder() -> String {
+    DEFAULT_NOTES_SUBFOLDER.to_owned()
+}
+fn default_journal_template() -> String {
+    DEFAULT_JOURNAL_TEMPLATE.to_owned()
 }
 
 impl SyncProfile {
@@ -276,6 +458,7 @@ impl SyncProfile {
             commit_subject_template: String::new(),
             author_override: None,
             enabled: true,
+            notes: None,
         }
     }
 
@@ -302,6 +485,19 @@ impl SyncProfile {
     /// (AD-34-8).
     pub fn effective_poll_interval_ms(&self) -> u64 {
         self.poll_interval_ms.max(MIN_POLL_INTERVAL_MS)
+    }
+
+    /// The vault root — `local_path` joined with the notes subfolder — or
+    /// `None` when this profile is not a vault.
+    ///
+    /// The one place the two halves are put together, so "where is the vault"
+    /// has a single answer even though the flag and the folder are stored
+    /// apart. [`Self::validate`] has already refused a subfolder that is
+    /// absolute or escaping, so the join cannot leave `local_path`.
+    pub fn vault_root(&self) -> Option<PathBuf> {
+        self.notes
+            .as_ref()
+            .map(|notes| self.local_path.join(notes.subfolder.trim()))
     }
 
     /// Keychain key for this profile's remote credential. Never the secret.
@@ -362,6 +558,9 @@ impl SyncProfile {
             return Err(SyncError::Config(format!(
                 "unknown commit subject placeholder {{{unknown}}}; keeper knows {known}"
             )));
+        }
+        if let Some(notes) = &self.notes {
+            notes.validate()?;
         }
         Ok(())
     }
@@ -501,5 +700,146 @@ mod tests {
         let before = p.secret_key();
         p.name = "renamed".to_owned();
         assert_eq!(before, p.secret_key());
+    }
+
+    /// A profile persists as one JSON blob per row, so `#[serde(default)]` IS
+    /// the migration — there is no SQL to run and nothing to backfill. This is
+    /// the blob a 0.6.5 keeper wrote, every key it emitted and not one more:
+    /// it must load as "not a vault" and validate clean, or upgrading would
+    /// strand every existing folder.
+    #[test]
+    fn a_profile_row_written_before_notes_existed_still_loads() {
+        let v065 = r#"{
+            "id": "01JOLD", "name": "tgdrive", "localPath": "/home/u/tgdrive",
+            "remoteUrl": "https://git.example/u/tgdrive.git", "branch": "main",
+            "direction": "bidirectional", "lane": "main",
+            "subpaths": [], "excludes": [], "removable": false, "volumeId": null,
+            "lfsMode": "materialize", "lfsThresholdBytes": 4194304,
+            "lfsPruneLocal": false, "lfsNever": [],
+            "settleMs": 5000, "pollIntervalMs": 15000, "tags": [],
+            "commitSubjectTemplate": "", "authorOverride": null, "enabled": true
+        }"#;
+        let parsed: SyncProfile = serde_json::from_str(v065).expect("a 0.6.5 row still loads");
+        assert_eq!(parsed.notes, None, "an absent key means: not a vault");
+        assert_eq!(parsed.vault_root(), None);
+        assert!(parsed.validate().is_ok(), "and it is still a valid profile");
+
+        // The other direction too: a row this keeper writes for a non-vault
+        // folder round-trips to the same thing, so rolling back a release
+        // cannot turn `notes: null` into a parse failure.
+        let round = serde_json::to_string(&parsed).expect("encode");
+        let back: SyncProfile = serde_json::from_str(&round).expect("decode");
+        assert_eq!(parsed, back);
+    }
+
+    #[test]
+    fn flagging_a_profile_puts_the_vault_in_a_subfolder_of_it() {
+        let mut p = profile();
+        p.notes = Some(NotesConfig::default());
+        assert_eq!(
+            p.vault_root(),
+            Some(PathBuf::from("/home/u/tgdrive/notes")),
+            "the default vault is `notes/` inside the folder keeper already syncs"
+        );
+        assert!(p.validate().is_ok());
+
+        let notes = p.notes.as_mut().expect("just flagged");
+        notes.subfolder = "work/journal".to_owned();
+        assert_eq!(
+            p.vault_root(),
+            Some(PathBuf::from("/home/u/tgdrive/work/journal"))
+        );
+    }
+
+    #[test]
+    fn a_notes_subfolder_that_leaves_the_profile_folder_is_refused() {
+        // Every one of these would put keeper's writes outside the synced
+        // folder — and an ABSOLUTE one silently, because `Path::join` drops the
+        // left-hand side rather than failing.
+        for bad in ["", "   ", "/etc/vault", "../../elsewhere", "a/../../etc"] {
+            let mut p = profile();
+            p.notes = Some(NotesConfig {
+                subfolder: bad.to_owned(),
+                ..NotesConfig::default()
+            });
+            assert!(p.validate().is_err(), "{bad:?} must be refused");
+        }
+        // FR-121: keeper never reads, writes or walks an Obsidian configuration
+        // folder, at the vault root or below it.
+        for bad in [".obsidian", "vault/.obsidian", ".obsidian/notes"] {
+            let mut p = profile();
+            p.notes = Some(NotesConfig {
+                subfolder: bad.to_owned(),
+                ..NotesConfig::default()
+            });
+            let err = p.validate().expect_err("an .obsidian component is refused");
+            assert!(
+                err.to_string().contains(".obsidian"),
+                "the message must say which folder it means: {err}"
+            );
+        }
+    }
+
+    /// The floors REFUSE rather than clamp, unlike `poll_interval_ms`. Nothing
+    /// can carry a below-floor cadence by accident — the field did not exist
+    /// before this release and `#[serde(default)]` fills in a working one — so
+    /// a value under the floor is one a person typed, while looking at the
+    /// field that is about to reject it.
+    #[test]
+    fn a_cadence_faster_than_its_floors_is_refused() {
+        let mut p = profile();
+        p.notes = Some(NotesConfig::default());
+        assert!(p.validate().is_ok(), "the defaults are inside the floors");
+
+        for cadence in [
+            NotesCadence {
+                commit_idle_ms: 0,
+                ..NotesCadence::default()
+            },
+            NotesCadence {
+                commit_idle_ms: MIN_COMMIT_IDLE_MS - 1,
+                ..NotesCadence::default()
+            },
+            NotesCadence {
+                push_interval_ms: MIN_PUSH_INTERVAL_MS - 1,
+                ..NotesCadence::default()
+            },
+        ] {
+            let mut p = profile();
+            p.notes = Some(NotesConfig {
+                cadence,
+                ..NotesConfig::default()
+            });
+            assert!(
+                p.validate().is_err(),
+                "a cadence under the floor is refused"
+            );
+        }
+
+        // Exactly at the floor is a choice, not a mistake.
+        let mut edge = profile();
+        edge.notes = Some(NotesConfig {
+            cadence: NotesCadence {
+                commit_idle_ms: MIN_COMMIT_IDLE_MS,
+                push_interval_ms: MIN_PUSH_INTERVAL_MS,
+                push_on_blur: false,
+            },
+            ..NotesConfig::default()
+        });
+        assert!(edge.validate().is_ok());
+    }
+
+    #[test]
+    fn a_notes_config_fills_in_every_key_it_is_not_given() {
+        // The settings form sends what the user touched; the rest has to mean
+        // the documented default rather than an empty string.
+        let sparse: NotesConfig = serde_json::from_str("{}").expect("parse");
+        assert_eq!(sparse, NotesConfig::default());
+        assert_eq!(sparse.subfolder, DEFAULT_NOTES_SUBFOLDER);
+        assert_eq!(sparse.journal_template, DEFAULT_JOURNAL_TEMPLATE);
+        assert_eq!(sparse.default_template, None);
+        assert_eq!(sparse.cadence.commit_idle_ms, DEFAULT_COMMIT_IDLE_MS);
+        assert_eq!(sparse.cadence.push_interval_ms, DEFAULT_PUSH_INTERVAL_MS);
+        assert!(sparse.cadence.push_on_blur);
     }
 }

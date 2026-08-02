@@ -592,6 +592,13 @@ pub enum CoreError {
     #[error(transparent)]
     Recording(#[from] RecordingError),
 
+    /// A notes-domain rule refused: malformed frontmatter, an unparseable space
+    /// query, a bad template or note name, or an unknown note/vault (Phase 5,
+    /// AD-55). The shell's funnel splits these — the first four are
+    /// `InvalidInput`, the last two `Internal`.
+    #[error(transparent)]
+    Notes(#[from] crate::notes::NotesError),
+
     /// A requested capability is not supported on this platform/build. Honest,
     /// non-panicking signal used by not-yet-wired [`crate::platform::Platform`]
     /// ports.

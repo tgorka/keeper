@@ -14,6 +14,7 @@
  * actions when a chat is open). Ranking/filtering is never done here; the Rust
  * `palette_query` is authoritative per query.
  */
+import { createNote, openJournalToday, showCapture } from "@/hooks/use-notes-actions";
 import {
   archiveRoom,
   chatNotifyModeSet,
@@ -35,6 +36,8 @@ import { startRecordingWithCurrentSelections, stopRecording } from "@/lib/record
 import { addAccountStore } from "@/lib/stores/add-account";
 import { exportStore } from "@/lib/stores/export";
 import { newChatStore } from "@/lib/stores/new-chat";
+import { notesFiltersStore } from "@/lib/stores/notes-filters";
+import { notesVaultsStore } from "@/lib/stores/notes-vaults";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import type { RoomSelection } from "@/lib/stores/rooms";
 import { searchStore } from "@/lib/stores/search";
@@ -86,6 +89,41 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
     } catch (error) {
       console.warn("command-palette: could not reveal the recordings folder", error);
     }
+  },
+
+  // --- Notes verbs (Epic 37, FR-117, UX-DR42) --- registry-gated on the
+  // `notes` capability in Rust, so these ids only reach dispatch where a vault
+  // can exist. Each routes through the SAME module the ⌘⌥ cluster and the row
+  // controls use, so the palette, the cheat sheet, the native menu and the keys
+  // provably do one thing.
+  "notes-new": async () => {
+    // The view first: a note created behind whatever is on screen is a note the
+    // user has to go looking for.
+    primaryViewStore.getState().setView("notes");
+    await createNote();
+  },
+  // The in-app twin of the global capture hotkey, and the reason that hotkey is
+  // never a single point of failure on a compositor that hands out no global
+  // shortcuts.
+  "notes-capture": () => showCapture(),
+  "notes-journal-today": async () => {
+    primaryViewStore.getState().setView("notes");
+    await openJournalToday();
+  },
+  // Open Note… and Search Notes both land on the vault's one find surface. There
+  // is exactly one search field, and two entries pretending to be two surfaces
+  // would be the drift UX-DR42 exists to prevent.
+  "notes-open": () => {
+    primaryViewStore.getState().setView("notes");
+    notesFiltersStore.getState().requestSearchFocus();
+  },
+  "notes-search": () => {
+    primaryViewStore.getState().setView("notes");
+    notesFiltersStore.getState().requestSearchFocus();
+  },
+  "notes-switch-vault": () => {
+    primaryViewStore.getState().setView("notes");
+    notesVaultsStore.getState().requestSwitcherOpen();
   },
 
   // --- Global actions (dialogs / commands) ---

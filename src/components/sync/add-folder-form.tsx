@@ -60,11 +60,24 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import type { SyncProfileVm } from "@/lib/ipc/client";
 // The credential calls are made straight from the form rather than through the
 // mirror store: none of them change anything the store mirrors, and the read
 // belongs to one open of one form rather than to state worth keeping in sync.
-import { syncClearCredential, syncGetCredential, syncSetCredential } from "@/lib/ipc/client";
+// The notes flag is the exception — it DOES change what the vault mirror holds,
+// so it is followed by a refresh of that mirror.
+import {
+  notesVaultFlag,
+  syncClearCredential,
+  syncGetCredential,
+  syncSetCredential,
+} from "@/lib/ipc/client";
+import {
+  ensureNotesVaultsHydrated,
+  notesVaultsStore,
+  refreshNoteVaults,
+} from "@/lib/stores/notes-vaults";
 import {
   SYNC_DEFAULT_BRANCH,
   SYNC_DEFAULT_LANE,
@@ -153,6 +166,43 @@ export const SYNC_TAGS_NOTE =
 export const SYNC_AUTHOR_LABEL = "Commit author";
 export const SYNC_AUTHOR_NOTE =
   "Name <email>, an address, or just a name. Left empty, commits are authored by this device.";
+
+/**
+ * The notes-vault control (Epic 35, Story 37.1, FR-94, FR-120, FR-121, AD-54).
+ *
+ * This switch IS the whole of "make this a notes vault": a vault is not a
+ * configured object, it is a synced folder carrying a notes config, so flagging
+ * is the only configuration a vault requires. There is no vault picker, no path
+ * field and no import flow anywhere in the product, and the absence is the
+ * design — reintroducing one would be a regression.
+ *
+ * The subfolder field appears only once the switch is on, because a subfolder
+ * for a folder that is not a vault is a question about nothing. It is prefilled
+ * with keeper's real default rather than left empty, so the common case is
+ * already answered and the resolved path can be shown underneath it.
+ */
+export const SYNC_NOTES_LABEL = "This folder is a notes vault";
+export const SYNC_NOTES_NOTE =
+  "keeper keeps markdown notes in a subfolder of this folder and syncs them with everything else here. Obsidian reads the same files unchanged.";
+export const SYNC_NOTES_SUBFOLDER_LABEL = "Notes subfolder";
+
+/** keeper's default vault subfolder — mirrors `NotesConfig::default_subfolder`. */
+export const SYNC_NOTES_DEFAULT_SUBFOLDER = "notes";
+
+/**
+ * The three promises the card makes about what keeper will and will not touch
+ * (FR-121), rendered as lines rather than as a link: a docs link for a claim
+ * about someone's own files is a claim they have to go and check.
+ */
+export const SYNC_NOTES_GUARANTEES = [
+  "`.obsidian/` is never read or written",
+  "`.keeper/` holds the index cache and is added to this folder's ignore rules, so it never syncs",
+  "keeper never moves a file you did not ask it to move",
+] as const;
+
+/** Reported when the folder was stored but the notes flag was not. */
+export const SYNC_NOTES_FAILED_PREFIX =
+  "The folder was saved, but it was not flagged as a notes vault: ";
 
 /**
  * The access-token field (Story 32.7, AD-S7; Story 34.4, AD-34-7; Story 34.12,
@@ -282,6 +332,15 @@ interface SyncFormValues {
    * of a stored secret, and emptying it is how that secret is removed.
    */
   token: string;
+  /**
+   * Whether this folder holds a notes vault (FR-94). Unlike every other field
+   * here it is not part of `SyncProfileReq`: flagging is a second write, to
+   * `notes_vault_flag`, keyed by the profile id — so like the access token it
+   * can only happen once the profile has one.
+   */
+  notesVault: boolean;
+  /** Where inside the folder the vault lives; only meaningful when flagged. */
+  notesSubfolder: string;
 }
 
 const EMPTY_FORM: SyncFormValues = {
@@ -301,6 +360,8 @@ const EMPTY_FORM: SyncFormValues = {
   commitSubjectTemplate: "",
   authorOverride: "",
   token: "",
+  notesVault: false,
+  notesSubfolder: SYNC_NOTES_DEFAULT_SUBFOLDER,
 };
 
 /**
@@ -334,6 +395,11 @@ function formValuesFor(profile: SyncProfileVm): SyncFormValues {
     commitSubjectTemplate: profile.commitSubjectTemplate,
     authorOverride: profile.authorOverride ?? "",
     token: "",
+    // Both are seeded from the vault mirror once it has been read, not from the
+    // profile: `SyncProfileVm` carries no notes field, and `NoteVaultVm` is
+    // where "this folder is a vault, and here is its subfolder" actually lives.
+    notesVault: false,
+    notesSubfolder: SYNC_NOTES_DEFAULT_SUBFOLDER,
   };
 }
 
@@ -555,6 +621,55 @@ export function AddFolderForm({
     };
   }, [profileId]);
 
+  /**
+   * What the notes flag currently IS on disk, as against what the form shows.
+   *
+   * A save writes the flag only when these two disagree, so a folder that is not
+   * a vault — and was not one when the form opened — never touches the notes
+   * subsystem on its way through Save.
+   */
+  const [storedNotesVault, setStoredNotesVault] = useState(false);
+  const [storedNotesSubfolder, setStoredNotesSubfolder] = useState(SYNC_NOTES_DEFAULT_SUBFOLDER);
+
+  /**
+   * Seed the notes controls from the vault mirror as an edit form opens
+   * (Story 37.1, FR-94).
+   *
+   * Whether a folder is a vault is not on `SyncProfileVm` — a vault is a
+   * notes-flagged profile, and `notes_vaults` is the read that projects that.
+   * So the switch starts off and is corrected once the mirror answers, into
+   * fields the user has not touched, on the same "an answer must not overwrite
+   * what was just typed" rule the keychain read above follows.
+   */
+  useEffect(() => {
+    if (profileId === undefined) {
+      return;
+    }
+    let abandoned = false;
+    void (async () => {
+      await ensureNotesVaultsHydrated();
+      if (abandoned) {
+        return;
+      }
+      const vault = notesVaultsStore
+        .getState()
+        .vaults?.find((candidate) => candidate.profileId === profileId);
+      if (vault === undefined) {
+        return;
+      }
+      setStoredNotesVault(true);
+      setStoredNotesSubfolder(vault.subfolder);
+      setForm((live) =>
+        live.notesVault || live.notesSubfolder !== SYNC_NOTES_DEFAULT_SUBFOLDER
+          ? live
+          : { ...live, notesVault: true, notesSubfolder: vault.subfolder },
+      );
+    })();
+    return () => {
+      abandoned = true;
+    };
+  }, [profileId]);
+
   /** Open the OS-native directory picker; a cancellation writes nothing. */
   const pickFolder = async () => {
     try {
@@ -590,6 +705,11 @@ export function AddFolderForm({
     // means. The field on its own cannot tell "remove it" from "keeper never
     // found out what is there".
     const credential = credentialWrite(stored, form.token);
+    // Read off the form before anything is written, for the same reason the
+    // credential decision is: the add branch resets the form to a blank draft
+    // partway through, and reading these after that would send the defaults.
+    const notesVault = form.notesVault;
+    const notesSubfolder = form.notesSubfolder.trim();
     try {
       const saved = await saveSyncProfile({
         // Present updates that profile, absent creates one — the only field
@@ -640,6 +760,51 @@ export function AddFolderForm({
       // folder — is what keeps its card from sitting stale for a poll
       // interval. Never throws.
       await refreshSyncDetail(saved.id);
+      // A third write, to a third place: the notes flag lives on the profile's
+      // `notes` config and is set through `notes_vault_flag`, which — like the
+      // keychain — needs an id the profile only has once it is stored. Its
+      // failure is its own sentence for the same reason: the folder IS saved by
+      // now, and reporting "save failed" would send the user back to redo
+      // changes the engine already took.
+      //
+      // Only when the setting actually moved. Saving a folder that is not a
+      // vault, and was not one a moment ago, must not reach into the notes
+      // subsystem at all: an unconditional call would couple every folder save
+      // to a second subsystem's availability, for a write that is a no-op.
+      const notesMoved =
+        notesVault !== storedNotesVault ||
+        (notesVault && notesSubfolder !== storedNotesSubfolder);
+      if (notesMoved) {
+        try {
+          await notesVaultFlag(
+            saved.id,
+            notesVault
+              ? {
+                  subfolder: notesSubfolder,
+                  // The form shows one knob, so it expresses one knob. The rest
+                  // are `null` — "not expressed" — because a form that does not
+                  // show a setting must never reset it (AD-34-9). The other
+                  // three live in this folder's card under Vault settings.
+                  journalTemplate: null,
+                  defaultTemplate: null,
+                  cadence: null,
+                }
+              : null,
+          );
+          // The switcher, the sidebar entry and the pane all read the vault
+          // mirror, so a folder that just became a vault has to show up in it
+          // without waiting for a remount.
+          await refreshNoteVaults();
+          // The baseline moves with the write, so a second Save of an untouched
+          // form is a no-op rather than a repeat of the same flag.
+          setStoredNotesVault(notesVault);
+          setStoredNotesSubfolder(notesSubfolder);
+        } catch (raw) {
+          setError(`${SYNC_NOTES_FAILED_PREFIX}${syncErrorMessage(raw)}`);
+          onSaved?.(saved, false);
+          return;
+        }
+      }
       if (credential.kind === "none") {
         onSaved?.(saved, true);
         return;
@@ -786,6 +951,54 @@ export function AddFolderForm({
           </SelectContent>
         </Select>
       </div>
+      {/* The notes flag (FR-94, AD-54). Above Advanced rather than inside it:
+          it is the whole of what makes a folder a vault, and burying the one
+          decision the feature needs behind a disclosure would be the "vault
+          setup" flow the design exists to delete. */}
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={`${fieldId}-notes`}>{SYNC_NOTES_LABEL}</Label>
+        <Switch
+          id={`${fieldId}-notes`}
+          checked={form.notesVault}
+          disabled={disabled || saving}
+          onCheckedChange={(checked) => setForm((live) => ({ ...live, notesVault: checked }))}
+        />
+      </div>
+      <p className="text-muted-foreground text-xs">{SYNC_NOTES_NOTE}</p>
+      {form.notesVault && (
+        <>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-notes-subfolder`}>{SYNC_NOTES_SUBFOLDER_LABEL}</Label>
+            <Input
+              id={`${fieldId}-notes-subfolder`}
+              className="w-56"
+              // Prefilled with keeper's real default rather than left blank: the
+              // common answer is already given, and the resolved path below can
+              // then be a fact instead of a preview of a guess.
+              placeholder={SYNC_NOTES_DEFAULT_SUBFOLDER}
+              value={form.notesSubfolder}
+              disabled={disabled || saving}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, notesSubfolder: event.target.value }))
+              }
+            />
+          </div>
+          {form.localPath !== "" && (
+            <p className="truncate font-mono text-muted-foreground text-xs">
+              {`${form.localPath}/${form.notesSubfolder.trim() === "" ? SYNC_NOTES_DEFAULT_SUBFOLDER : form.notesSubfolder.trim()}`}
+            </p>
+          )}
+          {/* Three lines, not a docs link: these are claims about the user's own
+              files, and a claim you have to go and look up is a claim. */}
+          <ul className="flex flex-col gap-0.5">
+            {SYNC_NOTES_GUARANTEES.map((line) => (
+              <li key={line} className="text-muted-foreground text-xs">
+                {line}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
       <Button
         type="button"
         variant="ghost"

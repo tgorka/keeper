@@ -3,6 +3,7 @@ import {
   FolderSync,
   Inbox,
   MessageSquare,
+  NotebookPen,
   Radio,
   Settings,
   Video,
@@ -28,9 +29,10 @@ interface SidebarView {
 }
 
 /** The always-present nav entries, in order. The capability-gated Recording entry
- * (Story 16.3) and Sync entry (Story 32.5) are spliced in before Settings only
- * when their capability is on — never a dead button on a platform that cannot
- * record (AD-27) or a machine with no usable `git` (AD-41). */
+ * (Story 16.3), Sync entry (Story 32.5) and Notes entry (Story 37.1) are spliced
+ * in before Settings only when their capability is on — never a dead button on a
+ * platform that cannot record (AD-27), a machine with no usable `git` (AD-41), or
+ * a build with no folder sync to hold a vault (FR-122). */
 const BASE_VIEWS: SidebarView[] = [
   { label: "Chats", icon: MessageSquare },
   { label: "Archive", icon: Archive },
@@ -43,6 +45,12 @@ const RECORDING_VIEW: SidebarView = { label: "Recording", icon: Video };
 
 /** The capability-gated Sync nav entry (Story 32.5, AD-S1). */
 const SYNC_VIEW: SidebarView = { label: "Sync", icon: FolderSync };
+
+/** The capability-gated Notes nav entry (Story 37.1, FR-122). Absent — not
+ * disabled — where the capability is off: the iOS shell and any desktop build
+ * without folder sync render no notes surface at all, because a greyed row that
+ * answers "unsupported on this platform" is a worse answer than no row. */
+const NOTES_VIEW: SidebarView = { label: "Notes", icon: NotebookPen };
 
 /** Settings sits last, after every primary-view entry. */
 const SETTINGS_VIEW: SidebarView = { label: "Settings", icon: Settings };
@@ -90,11 +98,15 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
   // Folder sync needs a usable `git` (Story 32.5, AD-41): the Sync nav entry is
   // present only when the flag is on, for the same reason.
   const sync = useCapabilitiesStore((s) => s.capabilities.sync);
+  // A vault is a folder keeper already syncs (AD-54), so notes exists only where
+  // folder sync does (Story 37.1, FR-122) — the entry is absent, not disabled.
+  const notes = useCapabilitiesStore((s) => s.capabilities.notes);
   // Splice the gated entries in before Settings, each only when supported.
   const views: SidebarView[] = [
     ...BASE_VIEWS,
     ...(recording ? [RECORDING_VIEW] : []),
     ...(sync ? [SYNC_VIEW] : []),
+    ...(notes ? [NOTES_VIEW] : []),
     SETTINGS_VIEW,
   ];
 
@@ -131,7 +143,9 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                             ? () => primaryViewStore.getState().setView("recording")
                             : view.label === "Sync"
                               ? () => primaryViewStore.getState().setView("sync")
-                              : undefined;
+                              : view.label === "Notes"
+                                ? () => primaryViewStore.getState().setView("notes")
+                                : undefined;
               // Reflect the active primary view on every entry.
               const active =
                 (view.label === "Chats" && primaryView === "inbox") ||
@@ -140,6 +154,7 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                 (view.label === "Bridges" && primaryView === "bridges") ||
                 (view.label === "Recording" && primaryView === "recording") ||
                 (view.label === "Sync" && primaryView === "sync") ||
+                (view.label === "Notes" && primaryView === "notes") ||
                 (view.label === "Settings" && primaryView === "settings");
               // The Bridges entry carries the worst-state health roll-up dot (Story
               // 6.1): shown only when at least one bridge reports non-null health.

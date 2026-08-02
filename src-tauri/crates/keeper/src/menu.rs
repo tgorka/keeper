@@ -26,7 +26,7 @@
 use keeper_core::palette::registry_sections;
 use keeper_core::vm::MenuItemVm;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 /// The event a native menu click emits, carrying the clicked item's canonical id as
 /// its payload. `keeper://kebab-case` per the epic event-naming convention.
@@ -97,8 +97,15 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // --- One generated submenu per registry category (single source of truth). ---
     // Pass the recording capability so the native menu omits the recording action
     // when screen recording is unavailable (Story 16.3), staying in lockstep with
-    // the palette and cheat sheet.
-    for section in registry_sections(crate::macos_version::recording_supported()) {
+    // the palette and cheat sheet. The notes capability rides the same seam
+    // (Story 36.2): with notes off the Notes menu is absent, not greyed out
+    // (AD-27), and with it on the six actions carry the same titles and shortcut
+    // labels here as in the palette, the ⌘? sheet and the tray (UX-DR42).
+    //
+    // Read through the shell's own capability probe rather than a `cfg!`, because
+    // notes needs a usable `git` and that is a runtime fact (AD-41).
+    let notes = notes_capability(app);
+    for section in registry_sections(crate::macos_version::recording_supported(), notes) {
         // Each generated item's id IS its canonical registry dispatch id; no
         // accelerator is bound (the JS hooks own every binding).
         let mut items: Vec<MenuItem<R>> = Vec::with_capacity(section.items.len());
@@ -121,6 +128,26 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 
     menu.append(&window_menu)?;
     Ok(menu)
+}
+
+/// Whether the generated menu set includes the Notes submenu (FR-122).
+///
+/// The native menu bar is macOS-only, so this is only ever asked on desktop; the
+/// probe lives in `ipc.rs` beside the capability handshake it derives from, so the
+/// menu and `CapabilitiesVm.notes` cannot answer differently.
+fn notes_capability<R: Runtime>(app: &AppHandle<R>) -> bool {
+    #[cfg(desktop)]
+    {
+        // The probe needs the concrete handle the app actually runs with; a
+        // generically-typed test runtime has no sync engine and no notes either.
+        app.try_state::<crate::ipc::AppState>()
+            .is_some_and(|state| crate::ipc::notes_available(&state))
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = app;
+        false
+    }
 }
 
 /// Handle a native menu click: emit [`MENU_ACTION_EVENT`] with the clicked item's

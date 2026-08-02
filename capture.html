@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- The quick-capture panel's own document (AD-60, NFR-27). Deliberately
+         thinner than index.html: no icon, no viewport gymnastics, no theme
+         bootstrap. The window is undecorated and always-on-top, so there is no
+         chrome to lay out, and the 300 ms budget is spent on one thing only —
+         getting a focused textarea in front of the caret. -->
+    <title>keeper — quick note</title>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/capture-main.tsx"></script>
+  </body>
+</html>
