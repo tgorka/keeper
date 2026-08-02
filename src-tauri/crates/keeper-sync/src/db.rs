@@ -14,6 +14,8 @@
 
 use std::path::{Path, PathBuf};
 
+use std::collections::BTreeSet;
+
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -622,6 +624,32 @@ pub fn outstanding_count(conn: &Connection, profile_id: &str, kind: &str) -> Res
         |r| r.get(0),
     )?;
     Ok(n.max(0) as u32)
+}
+
+/// Every LFS oid any journal unit still references, whatever its kind or state.
+///
+/// The question prune asks is not "how many" but "which", and it must be
+/// conservative in one direction only: an oid that is listed here is refused,
+/// so a payload this fails to parse must never silently drop out. Unknown
+/// shapes are therefore skipped without erroring — a unit whose payload is not
+/// JSON, or carries no `oid`, cannot be an LFS transfer and cannot pin an
+/// object — while a parse that succeeds contributes its oid regardless of kind
+/// or state. Parked, pending and in-flight all pin equally: the engine
+/// re-cleans an object it still owes, so releasing one would be undone anyway.
+pub fn referenced_oids(conn: &Connection, profile_id: &str) -> Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare("SELECT payload FROM journal WHERE profile_id = ?1")?;
+    let rows = stmt.query_map((profile_id,), |r| r.get::<_, String>(0))?;
+    let mut out = BTreeSet::new();
+    for payload in rows {
+        let Ok(payload) = payload else { continue };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        if let Some(oid) = value.get("oid").and_then(|v| v.as_str()) {
+            out.insert(oid.to_owned());
+        }
+    }
+    Ok(out)
 }
 
 /// How many units of one kind are still being *worked* on — parked excluded.

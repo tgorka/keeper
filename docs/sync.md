@@ -77,6 +77,7 @@ reports names a profile. Profiles run concurrently and fail independently.
 | `lfsMode` | `materialize`, `pointerOnly`, or `disabled` |
 | `lfsThresholdBytes` | Files at or above this are tracked through LFS (default 4 MiB) |
 | `lfsNever` | Globs that never go through LFS, whatever their size (default none) |
+| `lfsPruneLocal` | Release local LFS objects once the remote holds them (default false) |
 | `settleMs` | Quiescence window (see §4) |
 | `tags` | Extra `Keeper-Tag:` provenance trailers |
 
@@ -274,6 +275,36 @@ Files at or above `lfsThresholdBytes` (default 4 MiB) are tracked automatically:
 keeper maintains `.gitattributes` and commits it with provenance. The bytes move
 through keeper's own LFS client, streamed and hashed in a single pass, never
 buffered.
+
+### The second local copy, and `lfsPruneLocal`
+
+On the machine where content originates every LFS file exists **twice**: once in
+the worktree, and once in `<git-dir>/lfs/objects` as the byte-identical object
+the clean path streamed there to compute the pointer. That copy is unavoidable
+at stage time — the bytes have to be read and hashed — but it is not needed
+forever. Measured on a 211 GB archive: 215 GB of worktree content plus 215 GB of
+store objects on one 920 GB drive.
+
+`lfsPruneLocal = true` releases it at the end of a successful sync. An object is
+released only when **all** of these hold:
+
+1. **The journal references no transfer for it.** Not an inference from ref
+   positions — keeper's own durable record of what it still owes. This also
+   keeps prune from fighting the engine, which re-cleans an object it still owes
+   an upload for (observed: delete one mid-upload and it is back within a
+   minute).
+2. **The worktree still holds the real content**, at the recorded length and not
+   pointer text. This is what makes the release cheap to undo — the object is not
+   the only local copy, the *file* is — and it is the condition `git lfs prune`
+   cannot express, which is why its known failure mode (deleting objects for
+   staged files, git-lfs#5636) cannot occur here.
+3. **Nothing else is running.** It happens after the upload queue has drained to
+   quiescence and after the push, never between them.
+
+The honest trade: the drive stops being self-sufficient. Every file is still
+there, but restoring one the worktree later loses now needs the network. Off by
+default for that reason. A failure to release is logged and never fails the
+sync — reclaiming space is housekeeping.
 
 ### The rule is recorded per extension — which is why `lfsNever` exists
 
@@ -786,4 +817,5 @@ changing is cheap to keep watched.
 5. **A `git` binary is required** (see §1).
 6. **No automatic history pruning.** Sync churn grows a repository; `git gc` is
    available but shrinking history is a destructive operation keeper will not
-   perform on its own.
+   perform on its own. `lfsPruneLocal` is not this: it releases *local object
+   copies* the remote already holds and never touches history.

@@ -176,6 +176,21 @@ pub struct SyncProfile {
     pub lfs_mode: LfsMode,
     #[serde(default = "default_lfs_threshold")]
     pub lfs_threshold_bytes: u64,
+    /// Release local LFS objects once the remote holds them.
+    ///
+    /// On the machine where content originates every LFS file exists twice —
+    /// worktree and object store — because the clean path has to read the bytes
+    /// to compute the pointer. Measured on a 211 GB archive that is 215 GB of
+    /// worktree plus 215 GB of store on one 920 GB drive.
+    ///
+    /// Off by default, and the default is the honest one: turning this on trades
+    /// a self-sufficient local copy for a smaller one. The drive keeps every
+    /// file — only the redundant second copy goes — but restoring a file the
+    /// worktree later loses then needs the network.
+    ///
+    /// See [`crate::lfs::prune`] for the three conditions an object must meet.
+    #[serde(default)]
+    pub lfs_prune_local: bool,
     /// Globs that must never be routed through LFS, whatever their size.
     ///
     /// The size rule alone is right for a media folder and wrong for a mixed
@@ -254,6 +269,7 @@ impl SyncProfile {
             lfs_mode: LfsMode::Materialize,
             lfs_threshold_bytes: DEFAULT_LFS_THRESHOLD_BYTES,
             lfs_never: Vec::new(),
+            lfs_prune_local: false,
             settle_ms: DEFAULT_SETTLE_MS,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             tags: Vec::new(),
