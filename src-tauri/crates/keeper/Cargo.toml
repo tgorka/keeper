@@ -85,6 +85,19 @@ tauri-plugin-autostart = { workspace = true }
 tauri-plugin-updater = { workspace = true }
 tauri-plugin-process = { workspace = true }
 
+# Linux credential store. The workspace catalog entry turns on `apple-native`
+# only, so on a Linux target keyring resolves to its MOCK store — an in-memory
+# map that accepts every write and loses it, which surfaces one screen later as
+# "no stored session for this account" (observed on the agent-desktop XFCE
+# container, 2026-08-02). `linux-native` selects the kernel keyutils backend:
+# pure Rust (`linux-keyutils`, MIT/Apache — passes `cargo deny check`), no
+# D-Bus, no Secret Service daemon, so it also works headless, in a container
+# and in CI. Its limit is honest and recorded in
+# docs/constraints-and-limitations.md: keyutils keys live in the session
+# keyring, so a reboot ends the session and keeper asks for a fresh login.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["linux-native"] }
+
 # iOS-only keychain fallback (Story 12.3, AD-29). Spike verdict: keyring's `apple-native`
 # iOS backend calls `set_generic_password` with no options and exposes no accessibility
 # API, so it cannot pin `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. iOS therefore

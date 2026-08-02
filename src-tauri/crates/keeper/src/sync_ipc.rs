@@ -1333,8 +1333,10 @@ mod tests {
 
     /// A field no request can express, which `parse_req` must therefore never
     /// touch. `enabled` moves only through pause/resume, `volumeId` is minted by
-    /// the engine on first sight of the media, and `id` names the row.
-    const PRESERVED: [&str; 3] = ["id", "volumeId", "enabled"];
+    /// the engine on first sight of the media, `id` names the row, and the two
+    /// LFS knobs (`lfsNever`, `lfsPruneLocal`) are configured through
+    /// `keeper-syncd`'s profile file with no slot in the app's form.
+    const PRESERVED: [&str; 5] = ["id", "volumeId", "enabled", "lfsNever", "lfsPruneLocal"];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
         match serde_json::to_value(profile).expect("a profile serializes") {
@@ -1367,6 +1369,8 @@ mod tests {
         let mut prior = parse_req(&req(), None).expect("valid");
         prior.enabled = false;
         prior.volume_id = Some("01VOLUME".into());
+        prior.lfs_never = vec!["*.psd".into()];
+        prior.lfs_prune_local = true;
 
         // An edit that moves every field it CAN move, so nothing below passes by
         // standing still.

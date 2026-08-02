@@ -685,7 +685,11 @@ pub fn run() {
             // view. The kept notification backend has NO per-notification click callback,
             // so this is deliberately coarse — never exact-message routing (deferred to
             // Epic 11).
-            #[cfg(desktop)]
+            //
+            // `RunEvent::Reopen` is an Apple-platform variant (there is no dock on
+            // Linux/Windows), so this arm is gated on macOS specifically rather than on
+            // `desktop` — the wider gate does not compile on the Linux desktop target.
+            #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => {
                 tray::show_main_window(app_handle);
                 ipc::emit_notify_navigate(app_handle);

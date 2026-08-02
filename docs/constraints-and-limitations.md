@@ -47,6 +47,39 @@ risk sections.
 - **E-mail, AI-bot client, terminal client** are future-phase items tracked in the PRD's
   post-MVP section, not storied yet.
 
+## Linux desktop (verified 2026-08-02 on Ubuntu 26.04 + XFCE/ayatana)
+
+keeper builds and runs on `x86_64-unknown-linux-gnu` and was exercised end to end against a
+self-hosted Synapse (login, MSC4186 probe, sync supervisor, tray). What is different there,
+and why:
+
+- **Secrets live in the kernel session keyring, not a vault.** The Linux build selects
+  keyring's `linux-native` (keyutils) backend: no D-Bus, no Secret Service daemon, so it
+  works headless, in containers and in CI. The cost is scope — keyutils keys belong to the
+  login session, so ending the session or rebooting drops the access token and keeper asks
+  for a fresh login. Moving to `linux-native-sync-persistent` (keyutils backed by a Secret
+  Service) would survive a reboot but requires gnome-keyring/KWallet to be running, which a
+  container does not have.
+- **The tray glyph is repainted, not templated.** `icon_as_template` is macOS-only, so the
+  authored monochrome-black template would be a black-on-black silhouette on the default
+  dark panel. Off macOS `tray::tray_glyph` repaints the same shape in the brand tone with a
+  one-pixel contrast halo. State still reads from SHAPE, never colour.
+- **A tray menu cannot be replaced once set.** Documented Tauri/ayatana behaviour: the menu
+  installed when the tray is created is the menu the user gets, and only its item *content*
+  can change afterwards. Recording is macOS-only so its menu never appears here, but any new
+  tray affordance must be present in the first-built menu (AD-61).
+- **No tray click events.** `TrayIconEvent` and `show_menu_on_left_click` are unsupported on
+  Linux; every tray affordance must be a menu item.
+- **Global shortcuts are X11-only in practice.** Registration succeeds under X11; Wayland
+  compositors without the global-shortcuts portal refuse it, and keeper logs
+  `hotkey: OS refused to register global shortcut` and carries on without one.
+- **No recorder sidecar.** `keeper-rec` is Apple-Silicon macOS only, so `externalBin` is
+  emptied by `tauri.linux.conf.json` and `CapabilitiesVm.recording` is false.
+- **`$XDG_RUNTIME_DIR/tray-icon` must be writable by the app's user.** The tray backend
+  writes the icon there; a directory left behind by another user (e.g. a root-run RustDesk
+  in the same container) makes the tray fail with `Permission denied` — logged at `warn`,
+  non-fatal, no tray.
+
 ## Audited `unsafe` FFI inventory (shell crate only)
 
 Policy (2026-07-11): `unsafe_code` stays denied workspace-wide; the `keeper` shell crate may

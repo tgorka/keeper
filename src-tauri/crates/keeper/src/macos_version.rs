@@ -15,6 +15,11 @@
 /// Splits on `.` and parses the first component (e.g. `"14.5"` → `14`,
 /// `"10.16"` → `10`). Returns `None` for an empty or non-numeric string, so a
 /// malformed probe result degrades to the safe-hide default rather than panicking.
+///
+/// Only the macOS probe (and the unit tests, which run everywhere) call this, so a
+/// non-Apple build would otherwise carry it as dead code — a hard error under
+/// `clippy -D warnings` on the Linux shell.
+#[cfg(any(target_os = "macos", test))]
 pub fn parse_macos_major(v: &str) -> Option<u32> {
     v.trim().split('.').next()?.parse::<u32>().ok()
 }

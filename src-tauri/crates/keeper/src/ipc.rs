@@ -490,7 +490,11 @@ fn record_last_notify_target(target: &NotifyTarget) {
 
 /// Read the "last notification target" recorded at dispatch (Story 10.4), for the coarse
 /// navigate emit on app activation. A poisoned lock recovers to the stored value.
-#[cfg(desktop)]
+///
+/// Apple-platform only: the sole caller is the `RunEvent::Reopen` (dock re-activation)
+/// arm, a variant that exists nowhere else. A `desktop` gate would leave this dead on
+/// the Linux/Windows shells, where `-D warnings` turns dead code into a build failure.
+#[cfg(target_os = "macos")]
 pub fn last_notify_target() -> NotifyTarget {
     match last_notify_target_slot().lock() {
         Ok(slot) => slot.clone(),
@@ -503,7 +507,7 @@ pub fn last_notify_target() -> NotifyTarget {
 /// its KIND to a coarse view (Message → Inbox, Bridge → Bridges). Once consumed the
 /// target is reset to [`NotifyTarget::None`] so a later plain dock-click does not re-emit
 /// a stale landing.
-#[cfg(desktop)]
+#[cfg(target_os = "macos")]
 pub const NOTIFY_NAVIGATE_EVENT: &str = "notify://navigate";
 
 /// Emit the coarse navigate event to the main window from the last recorded notification
@@ -512,7 +516,7 @@ pub const NOTIFY_NAVIGATE_EVENT: &str = "notify://navigate";
 /// A [`NotifyTarget::None`] (no notification since the last activation, e.g. a plain
 /// dock-click) is a no-op — only Message/Bridge targets emit. Best-effort: a missing
 /// window or an emit failure is logged at `warn`, never a panic.
-#[cfg(desktop)]
+#[cfg(target_os = "macos")]
 pub fn emit_notify_navigate(app: &tauri::AppHandle) {
     use tauri::{Emitter, Manager};
 

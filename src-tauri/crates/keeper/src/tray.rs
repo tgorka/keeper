@@ -61,14 +61,15 @@ const DISMISS_ERROR_ID: &str = "tray-dismiss-error";
 
 /// The bundled record-dot menu-bar icon shown while a recording is live (Story
 /// 18.1; template rendering Story 21.4). Decoded per transition via
-/// [`Image::from_bytes`] (the `image-png` tauri feature) — a decode failure
-/// just keeps the current icon.
+/// [`tray_glyph`] — a decode failure just keeps the current icon.
 ///
 /// All three tray glyphs are macOS TEMPLATE images (monochrome black + alpha,
 /// the brand speech-bubble mark from the app icon): the menu bar colors them
 /// white/black per appearance and highlights them natively, so states must
 /// read from glyph SHAPE — bubble outline = idle, filled dot in the bubble =
-/// recording, filled bubble with a punched-out exclamation = error.
+/// recording, filled bubble with a punched-out exclamation = error. Off macOS
+/// no tray host recolours anything, so [`tray_glyph`] repaints the same shape
+/// for the panel; the shape-not-colour rule holds on every platform.
 const RECORDING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-recording-template.png");
 
 /// The bundled error badge shown while a failed session holds the tray (Story
@@ -104,6 +105,122 @@ const SYNC_UPDOWN_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-updown-te
 const SYNC_REFRESH_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-refresh-template.png");
 const SYNC_PAUSED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-paused-template.png");
 const SYNC_WARNING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-warning-template.png");
+
+/// The colour the authored glyph is repainted in on every platform that is not
+/// macOS — the keeper mark's bright tone, chosen because it separates from both
+/// a dark and a light panel.
+#[cfg(not(target_os = "macos"))]
+const PANEL_GLYPH_RGB: [u8; 3] = [0x3E, 0xCF, 0xAE];
+
+/// The one-pixel contrast halo grown around the repainted glyph — the mark's
+/// deep tone. On a dark panel it disappears into the background; on a light one
+/// it is what stops the bright mark dissolving into white.
+#[cfg(not(target_os = "macos"))]
+const PANEL_HALO_RGB: [u8; 3] = [0x06, 0x23, 0x1C];
+
+/// How opaque an authored pixel must be to grow a halo. Below this the glyph is
+/// already fading out and an outline would only thicken it.
+#[cfg(not(target_os = "macos"))]
+const PANEL_HALO_THRESHOLD: u8 = 96;
+
+/// Decode a bundled glyph for the tray, adapting it to the host's tray host.
+///
+/// On macOS the glyphs are TEMPLATE images: monochrome black + alpha, which the
+/// menu bar recolours per appearance and inverts on highlight. Black is the
+/// correct authoring colour there, so the bytes are used verbatim.
+///
+/// Nowhere else. `icon_as_template` is documented macOS-only and is silently
+/// ignored by every other backend, so an ayatana/StatusNotifier panel or the
+/// Windows notification area blits the authored PNG as-is — and a pure-black
+/// mark on the default dark panel is a black-on-black silhouette. Off macOS the
+/// same authored SHAPE is therefore repainted at decode time in the brand tone
+/// with a contrast halo, which reads on a light panel and a dark one without
+/// authoring a second icon set or guessing the panel's theme. Colour still
+/// carries no information: every state continues to read from the shape.
+#[cfg(target_os = "macos")]
+fn tray_glyph(png: &[u8]) -> Option<Image<'static>> {
+    Image::from_bytes(png).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tray_glyph(png: &[u8]) -> Option<Image<'static>> {
+    let decoded = Image::from_bytes(png).ok()?;
+    let (width, height) = (decoded.width(), decoded.height());
+    let painted = paint_for_panel(decoded.rgba(), width, height);
+    Some(Image::new_owned(painted, width, height))
+}
+
+/// Repaint a monochrome template glyph for a tray host that does not recolour
+/// it: every authored pixel becomes [`PANEL_GLYPH_RGB`] at its original alpha,
+/// and every transparent pixel touching a sufficiently opaque one becomes a
+/// [`PANEL_HALO_RGB`] outline pixel carrying the strongest neighbouring alpha.
+///
+/// Pure and total: a buffer whose length does not match `width * height * 4` is
+/// returned unchanged rather than panicking, because a cosmetic glyph must never
+/// be able to take the tray down.
+#[cfg(not(target_os = "macos"))]
+fn paint_for_panel(src: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    if src.len() != w * h * 4 {
+        return src.to_vec();
+    }
+    let alpha_at = |x: usize, y: usize| src[(y * w + x) * 4 + 3];
+    let mut out = vec![0u8; src.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            let alpha = src[i + 3];
+            if alpha > 0 {
+                out[i..i + 3].copy_from_slice(&PANEL_GLYPH_RGB);
+                out[i + 3] = alpha;
+                continue;
+            }
+            // Transparent: grow the halo from the strongest opaque neighbour.
+            let mut halo = 0u8;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        continue;
+                    }
+                    let neighbour = alpha_at(nx as usize, ny as usize);
+                    if neighbour >= PANEL_HALO_THRESHOLD {
+                        halo = halo.max(neighbour);
+                    }
+                }
+            }
+            if halo > 0 {
+                out[i..i + 3].copy_from_slice(&PANEL_HALO_RGB);
+                out[i + 3] = halo;
+            }
+        }
+    }
+    out
+}
+
+/// Install a glyph on a live tray.
+///
+/// macOS `isTemplate` is a property of the IMAGE, not of the tray, so it has to
+/// be re-asserted on every swap or the glyph falls back to plain-alpha
+/// rendering. Off macOS the flag is deliberately NOT asserted: [`tray_glyph`]
+/// hands back a coloured image there, and claiming template rendering for it
+/// would become a lie the day a backend implements the flag.
+///
+/// Returns whether the glyph actually reached the OS — the icon is cosmetic, so
+/// a decode or set failure keeps whatever is already up, but a caller that
+/// memoises what it pushed must not memoise a glyph that never landed.
+fn set_tray_glyph(tray: &TrayIcon, png: &[u8]) -> bool {
+    let Some(image) = tray_glyph(png) else {
+        return false;
+    };
+    if let Err(error) = tray.set_icon(Some(image)) {
+        tracing::warn!(%error, "tray: could not set the tray glyph");
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    let _ = tray.set_icon_as_template(true);
+    true
+}
 
 /// The live tray, if menu-bar presence is currently on. `None` means no tray is
 /// shown (the default). Guarded by a `Mutex` since the Settings toggle command,
@@ -320,14 +437,18 @@ fn build_tray(app: &AppHandle) -> Option<TrayIcon> {
             DISMISS_ERROR_ID => dismiss_recording_error(app),
             _ => {}
         });
-    // The idle template ring (Story 21.4): monochrome + alpha, flagged as a
-    // template so macOS renders it white/black per menu-bar appearance like
-    // every native icon. A decode failure falls back to the app icon.
-    match Image::from_bytes(IDLE_ICON_PNG) {
-        Ok(icon) => {
-            builder = builder.icon(icon).icon_as_template(true);
+    // The idle ring (Story 21.4): the authored monochrome + alpha template on
+    // macOS, repainted for the panel everywhere else (see `tray_glyph`). A
+    // decode failure falls back to the app icon.
+    match tray_glyph(IDLE_ICON_PNG) {
+        Some(icon) => {
+            builder = builder.icon(icon);
+            #[cfg(target_os = "macos")]
+            {
+                builder = builder.icon_as_template(true);
+            }
         }
-        Err(_) => {
+        None => {
             if let Some(icon) = app.default_window_icon().cloned() {
                 builder = builder.icon(icon);
             }
@@ -571,16 +692,8 @@ fn render_recording(
         return;
     }
     // idle → recording transition: record-dot icon + recording menu.
-    match Image::from_bytes(RECORDING_ICON_PNG) {
-        Ok(icon) => {
-            // macOS `isTemplate` is a property of the IMAGE — re-assert it on
-            // every swap or the glyph falls back to plain-alpha rendering.
-            if let Err(error) = tray.set_icon(Some(icon)) {
-                tracing::warn!(%error, "tray: could not set the record-dot icon");
-            }
-            let _ = tray.set_icon_as_template(true);
-        }
-        Err(error) => tracing::warn!(%error, "tray: could not decode the record-dot icon"),
+    if !set_tray_glyph(tray, RECORDING_ICON_PNG) {
+        tracing::warn!("tray: could not install the record-dot glyph");
     }
     // A menu build/install failure leaves `status_item` unset, so the next
     // tick simply retries the transition.
@@ -613,16 +726,8 @@ fn render_error(
         return;
     }
     let reason = snapshot.error.as_deref().unwrap_or("unknown error");
-    match Image::from_bytes(ERROR_ICON_PNG) {
-        Ok(icon) => {
-            // macOS `isTemplate` is a property of the IMAGE — re-assert it on
-            // every swap or the glyph falls back to plain-alpha rendering.
-            if let Err(error) = tray.set_icon(Some(icon)) {
-                tracing::warn!(%error, "tray: could not set the error badge icon");
-            }
-            let _ = tray.set_icon_as_template(true);
-        }
-        Err(error) => tracing::warn!(%error, "tray: could not decode the error badge icon"),
+    if !set_tray_glyph(tray, ERROR_ICON_PNG) {
+        tracing::warn!("tray: could not install the error badge glyph");
     }
     let Some(menu) = build_error_menu(app, &format_error_line(reason)) else {
         return;
@@ -650,11 +755,9 @@ fn restore_idle(app: &AppHandle, tray: &TrayIcon) {
         return;
     }
     // The icon is cosmetic — a failure here does not desync the flag/menu.
-    let idle = Image::from_bytes(IDLE_ICON_PNG).ok();
-    if let Err(error) = tray.set_icon(idle) {
-        tracing::warn!(%error, "tray: could not restore the idle icon");
+    if !set_tray_glyph(tray, IDLE_ICON_PNG) {
+        tracing::warn!("tray: could not restore the idle glyph");
     }
-    let _ = tray.set_icon_as_template(true);
     store_rendered_mode(tray.id(), None, false);
 }
 
@@ -893,6 +996,109 @@ mod tests {
         assert_eq!(error.width(), recording.width());
         assert_eq!(error.height(), recording.height());
         assert_ne!(ERROR_ICON_PNG, RECORDING_ICON_PNG);
+    }
+
+    /// Byte offset of pixel `(x, y)` in a `width`-wide RGBA8 buffer. Spelling it
+    /// out keeps the fixtures readable and keeps `clippy::identity_op` off the
+    /// literal `(1 * 3 + 1) * 4` shape.
+    #[cfg(not(target_os = "macos"))]
+    fn px(x: usize, y: usize, width: usize) -> usize {
+        (y * width + x) * 4
+    }
+
+    /// AD-61: off macOS nothing recolours the tray glyph, so the authored
+    /// black-on-alpha template is repainted at decode time. The body takes the
+    /// brand tone at its original alpha — a pure-black glyph on a dark panel is
+    /// the defect this exists to prevent.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn panel_repaint_recolours_the_body_and_keeps_its_alpha() {
+        // 3x3, one opaque pixel dead centre, everything else transparent.
+        let mut src = vec![0u8; 3 * 3 * 4];
+        src[px(1, 1, 3) + 3] = 200;
+        let out = paint_for_panel(&src, 3, 3);
+
+        let centre = px(1, 1, 3);
+        assert_eq!(&out[centre..centre + 3], &PANEL_GLYPH_RGB);
+        assert_eq!(out[centre + 3], 200, "body alpha is preserved");
+    }
+
+    /// The halo is what keeps the repainted glyph legible on a LIGHT panel: the
+    /// eight neighbours of an opaque pixel become outline, and nothing further
+    /// out is touched.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn panel_repaint_grows_a_one_pixel_halo_and_no_more() {
+        let mut src = vec![0u8; 5 * 5 * 4];
+        src[px(2, 2, 5) + 3] = 255;
+        let out = paint_for_panel(&src, 5, 5);
+
+        for (x, y) in [
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (1, 2),
+            (3, 2),
+            (1, 3),
+            (2, 3),
+            (3, 3),
+        ] {
+            let i = px(x, y, 5);
+            assert_eq!(&out[i..i + 3], &PANEL_HALO_RGB, "halo at ({x},{y})");
+            assert_eq!(out[i + 3], 255, "halo alpha at ({x},{y})");
+        }
+        // Two pixels out is still empty — the outline never thickens.
+        let far = px(0, 0, 5);
+        assert_eq!(&out[far..far + 4], &[0, 0, 0, 0]);
+    }
+
+    /// A faint pixel is already fading out; outlining it would only thicken the
+    /// stroke, which the 44x44-at-~22px downscale cannot afford.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn panel_repaint_does_not_halo_faint_pixels() {
+        let mut src = vec![0u8; 3 * 3 * 4];
+        src[px(1, 1, 3) + 3] = PANEL_HALO_THRESHOLD - 1;
+        let out = paint_for_panel(&src, 3, 3);
+
+        let corner = px(0, 0, 3);
+        assert_eq!(&out[corner..corner + 4], &[0, 0, 0, 0]);
+    }
+
+    /// A cosmetic glyph must never be able to take the tray down: a buffer that
+    /// does not match the declared geometry comes back untouched.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn panel_repaint_passes_through_a_mismatched_buffer() {
+        let src = vec![7u8; 9];
+        assert_eq!(paint_for_panel(&src, 3, 3), src);
+    }
+
+    /// Every shipped glyph survives the panel repaint at its authored geometry —
+    /// the real assets, not a synthetic buffer.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn every_shipped_glyph_repaints_for_the_panel() {
+        for bytes in [
+            IDLE_ICON_PNG,
+            RECORDING_ICON_PNG,
+            ERROR_ICON_PNG,
+            SYNC_ARMED_ICON_PNG,
+            SYNC_UP_ICON_PNG,
+            SYNC_DOWN_ICON_PNG,
+            SYNC_UPDOWN_ICON_PNG,
+            SYNC_REFRESH_ICON_PNG,
+            SYNC_PAUSED_ICON_PNG,
+            SYNC_WARNING_ICON_PNG,
+        ] {
+            let authored = Image::from_bytes(bytes).expect("glyph decodes");
+            let painted = tray_glyph(bytes).expect("glyph repaints");
+            assert_eq!(painted.width(), authored.width());
+            assert_eq!(painted.height(), authored.height());
+            // The repaint must actually change something, or the panel still
+            // gets a black-on-black silhouette.
+            assert_ne!(painted.rgba(), authored.rgba());
+        }
     }
 
     #[test]
@@ -1263,19 +1469,12 @@ pub fn apply_sync_state(app: &AppHandle, state: TraySyncState, line: &str) {
 
 /// Decode and install a sync glyph, reporting whether it landed.
 ///
-/// The icon is cosmetic — a decode or set failure keeps whatever glyph is
+/// A thin alias over [`set_tray_glyph`] kept for the call site's vocabulary:
+/// the icon is cosmetic, so a decode or set failure keeps whatever glyph is
 /// already up rather than desyncing the menu that was just installed — but the
 /// caller must not memoise a glyph that never reached the OS.
 fn push_sync_glyph(tray: &TrayIcon, glyph: &'static [u8]) -> bool {
-    let Ok(image) = Image::from_bytes(glyph) else {
-        return false;
-    };
-    if let Err(error) = tray.set_icon(Some(image)) {
-        tracing::warn!(%error, "tray: could not set the sync icon");
-        return false;
-    }
-    let _ = tray.set_icon_as_template(true);
-    true
+    set_tray_glyph(tray, glyph)
 }
 
 /// Store the held sync line and the memo of what actually reached the tray,
