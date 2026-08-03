@@ -67,12 +67,7 @@ import type { SyncProfileVm } from "@/lib/ipc/client";
 // belongs to one open of one form rather than to state worth keeping in sync.
 // The notes flag is the exception — it DOES change what the vault mirror holds,
 // so it is followed by a refresh of that mirror.
-import {
-  notesVaultFlag,
-  syncClearCredential,
-  syncGetCredential,
-  syncSetCredential,
-} from "@/lib/ipc/client";
+import { syncClearCredential, syncGetCredential, syncSetCredential } from "@/lib/ipc/client";
 import {
   ensureNotesVaultsHydrated,
   notesVaultsStore,
@@ -199,10 +194,6 @@ export const SYNC_NOTES_GUARANTEES = [
   "`.keeper/` holds the index cache and is added to this folder's ignore rules, so it never syncs",
   "keeper never moves a file you did not ask it to move",
 ] as const;
-
-/** Reported when the folder was stored but the notes flag was not. */
-export const SYNC_NOTES_FAILED_PREFIX =
-  "The folder was saved, but it was not flagged as a notes vault: ";
 
 /**
  * The access-token field (Story 32.7, AD-S7; Story 34.4, AD-34-7; Story 34.12,
@@ -749,6 +740,15 @@ export function AddFolderForm({
         // string is a value here rather than an omission: it IS keeper's own
         // mechanical subject.
         commitSubjectTemplate: form.commitSubjectTemplate.trim(),
+        // The vault flag rides the profile save rather than a second command:
+        // `notes` IS a field on the profile, so writing it here keeps the folder
+        // and its vault-ness atomic and saves a round trip. Always expressed,
+        // because the switch is always on screen — `null` would mean "this form
+        // does not show it", which would be untrue here (AD-34-9).
+        notes: notesVault,
+        // Only when the switch is on: the subfolder box is revealed with it, and
+        // an unflagged save must not reset a subfolder the user chose earlier.
+        notesSubfolder: notesVault ? notesSubfolder : null,
       });
       if (!editing) {
         setForm(EMPTY_FORM);
@@ -760,50 +760,17 @@ export function AddFolderForm({
       // folder — is what keeps its card from sitting stale for a poll
       // interval. Never throws.
       await refreshSyncDetail(saved.id);
-      // A third write, to a third place: the notes flag lives on the profile's
-      // `notes` config and is set through `notes_vault_flag`, which — like the
-      // keychain — needs an id the profile only has once it is stored. Its
-      // failure is its own sentence for the same reason: the folder IS saved by
-      // now, and reporting "save failed" would send the user back to redo
-      // changes the engine already took.
-      //
-      // Only when the setting actually moved. Saving a folder that is not a
-      // vault, and was not one a moment ago, must not reach into the notes
-      // subsystem at all: an unconditional call would couple every folder save
-      // to a second subsystem's availability, for a write that is a no-op.
-      const notesMoved =
+      // The switcher, the sidebar entry and the Notes pane all read the vault
+      // mirror, and only a folder whose vault-ness actually moved can change it.
+      // A folder that is not a vault, and was not one a moment ago, must not
+      // reach into the notes subsystem at all.
+      if (
         notesVault !== storedNotesVault ||
-        (notesVault && notesSubfolder !== storedNotesSubfolder);
-      if (notesMoved) {
-        try {
-          await notesVaultFlag(
-            saved.id,
-            notesVault
-              ? {
-                  subfolder: notesSubfolder,
-                  // The form shows one knob, so it expresses one knob. The rest
-                  // are `null` — "not expressed" — because a form that does not
-                  // show a setting must never reset it (AD-34-9). The other
-                  // three live in this folder's card under Vault settings.
-                  journalTemplate: null,
-                  defaultTemplate: null,
-                  cadence: null,
-                }
-              : null,
-          );
-          // The switcher, the sidebar entry and the pane all read the vault
-          // mirror, so a folder that just became a vault has to show up in it
-          // without waiting for a remount.
-          await refreshNoteVaults();
-          // The baseline moves with the write, so a second Save of an untouched
-          // form is a no-op rather than a repeat of the same flag.
-          setStoredNotesVault(notesVault);
-          setStoredNotesSubfolder(notesSubfolder);
-        } catch (raw) {
-          setError(`${SYNC_NOTES_FAILED_PREFIX}${syncErrorMessage(raw)}`);
-          onSaved?.(saved, false);
-          return;
-        }
+        (notesVault && notesSubfolder !== storedNotesSubfolder)
+      ) {
+        setStoredNotesVault(notesVault);
+        setStoredNotesSubfolder(notesSubfolder);
+        await refreshNoteVaults();
       }
       if (credential.kind === "none") {
         onSaved?.(saved, true);

@@ -406,13 +406,23 @@ pub struct SyncProfileReq {
 
 /// Mint an opaque, sortable, collision-free id.
 ///
-/// ULID-shaped — a 48-bit millisecond timestamp in Crockford base32 followed by
-/// randomness — so ids sort by creation and read like the engine's own, without
-/// pulling a second copy of the `ulid` crate into the shell.
+/// A real ULID: a 48-bit millisecond timestamp in Crockford base32 followed by
+/// 80 bits of randomness, 26 characters in total, so ids sort by creation and
+/// read like the engine's own without pulling a second copy of the `ulid` crate
+/// into the shell.
 ///
-/// Randomness comes from `RandomState`, which the standard library seeds once
-/// per process from the OS. This only has to avoid collision between things a
-/// human or an agent creates in one vault; it is not a security boundary, so a
+/// The length is load-bearing rather than cosmetic. Notes validate their
+/// frontmatter `id` against the ULID shape (`notes_vault::is_ulid`) and index a
+/// note whose id is not one under a path-derived identity instead. This
+/// generator emitted 22 characters until 2026-08-03, so every note keeper wrote
+/// failed keeper's own check: the note was indexed by path, flagged
+/// `unstable_identity`, and could not be opened by the id its own frontmatter
+/// carried.
+///
+/// Randomness comes from two independently seeded `RandomState` hashers — the
+/// standard library seeds each from the OS — because one 64-bit hash is short of
+/// the 80 bits the format wants. This only has to avoid collision between things
+/// a human or an agent creates in one vault; it is not a security boundary, so a
 /// CSPRNG would be theatre.
 ///
 /// Shared with the notes surface (Phase 5), which needs exactly the same thing for
@@ -429,18 +439,23 @@ pub(crate) fn new_ulid() -> String {
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default();
 
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(millis);
-    let entropy = hasher.finish();
+    let entropy = |salt: u64| {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(millis ^ salt);
+        hasher.finish()
+    };
+    let (high, low) = (entropy(0), entropy(u64::MAX));
 
     let mut out = String::with_capacity(26);
     // 10 characters = 50 bits, covering the 48-bit timestamp.
     for i in (0..10).rev() {
         out.push(ALPHABET[((millis >> (i * 5)) & 0x1f) as usize] as char);
     }
-    // 12 characters = 60 bits of the 64-bit hash.
-    for i in (0..12).rev() {
-        out.push(ALPHABET[((entropy >> (i * 5)) & 0x1f) as usize] as char);
+    // 16 characters = 80 bits, taken 8 from each hasher.
+    for source in [high, low] {
+        for i in (0..8).rev() {
+            out.push(ALPHABET[((source >> (i * 5)) & 0x1f) as usize] as char);
+        }
     }
     out
 }
@@ -1727,12 +1742,20 @@ mod tests {
             "an empty override falls back to the device identity"
         );
     }
+
+    /// The generator's SHAPE is a contract, not a detail. Notes validate a
+    /// frontmatter `id` against the ULID form and index a note whose id is not
+    /// one under a path-derived identity instead — so when this emitted 22
+    /// characters, every note keeper wrote failed keeper's own check and could
+    /// not be opened by the id its own frontmatter carried. Observed on the
+    /// agent-desktop run of 2026-08-03; the length assertion below is what stops
+    /// it coming back.
     #[test]
     fn minted_ids_are_unique_sortable_and_shaped_like_a_ulid() {
         let ids: std::collections::BTreeSet<String> = (0..500).map(|_| new_ulid()).collect();
         assert_eq!(ids.len(), 500, "ids must not collide");
         for id in &ids {
-            assert_eq!(id.len(), 22);
+            assert_eq!(id.len(), 26, "a ULID is 26 characters: {id}");
             assert!(
                 id.bytes()
                     .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b)),

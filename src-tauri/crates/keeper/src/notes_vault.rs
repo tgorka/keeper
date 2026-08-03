@@ -264,13 +264,31 @@ pub fn refresh(app: &AppHandle) {
 
 /// Resolve one profile into a vault, or `None` when it is not one.
 ///
-/// The root is canonicalized here and nowhere else. A vault whose folder is
-/// absent — an unmounted volume, a folder the user moved — canonicalizes to
-/// nothing and is skipped **without discarding anything**: a missing folder is
-/// not evidence of a deletion (AD-48), and the next refresh adopts it back.
+/// The root is canonicalized here and nowhere else, and the two ways it can be
+/// missing are not the same thing:
+///
+/// - **The synced folder itself is gone** — an unmounted volume, a folder the
+///   user moved. Skipped without discarding anything: a missing folder is not
+///   evidence of a deletion (AD-48), and the next refresh adopts it back.
+/// - **The synced folder is there and only the subfolder is not.** That is the
+///   ordinary first run: the user flagged a folder a moment ago and nothing has
+///   written a note into it yet. Creating the directory is not "keeper moved my
+///   files" (FR-121) — it is the folder the user just asked for, and refusing to
+///   make it would leave the Notes view saying there is no vault while the
+///   Sync view says there is one.
 fn register_one(profile: &SyncProfile) -> Option<Vault> {
     let config = profile.notes.clone()?;
     let root = profile.vault_root()?;
+    if !root.exists() && profile.local_path.is_dir() {
+        if let Err(error) = std::fs::create_dir_all(&root) {
+            tracing::warn!(
+                profile = %profile.id,
+                path = %root.display(),
+                %error,
+                "notes: could not create the vault folder"
+            );
+        }
+    }
     let canonical = match root.canonicalize() {
         Ok(canonical) => canonical,
         Err(error) => {

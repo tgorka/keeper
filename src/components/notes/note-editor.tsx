@@ -48,6 +48,14 @@ type EditorMode = "edit" | "history" | "conflict";
 interface EditorRuntime {
   /** Adopt text that came from outside this buffer, minimally and unrecorded. */
   applyExternal: (text: string) => void;
+  /**
+   * Put the caret at a byte offset, clamped.
+   *
+   * Separate from `applyExternal` because the two happen at different moments:
+   * the document arrives over the channel, and the caret hint has to be applied
+   * after it — the editor is constructed before either exists.
+   */
+  placeCaret: (at: number) => void;
   focus: () => void;
   destroy: () => void;
 }
@@ -199,6 +207,22 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
           // the chunk lands. Later revisions arrive through the reconcile
           // effect below rather than by rebuilding the editor.
           doc: notesEditorStore.getState().text,
+          // Where Rust asked for the caret, clamped to the document. This is not
+          // cosmetic: a note opens with its frontmatter block at the top, and the
+          // default offset 0 sits IN FRONT of that block, so the first character
+          // typed lands above `---` and splits the document in two. Rust sends
+          // the body offset (and a template's `{{cursor}}` where it declared
+          // one); absent a hint the caret goes to the end, which is where a
+          // person continuing a note wants it anyway.
+          selection: {
+            anchor: Math.max(
+              0,
+              Math.min(
+                notesEditorStore.getState().cursor ?? notesEditorStore.getState().text.length,
+                notesEditorStore.getState().text.length,
+              ),
+            ),
+          },
           extensions: [
             view.EditorView.lineWrapping,
             commands.history(),
@@ -293,10 +317,27 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
           });
           preview.flashExternal(editorView, splice.from, splice.from + splice.insert.length);
         },
+        placeCaret: (at: number) => {
+          const clamped = Math.max(0, Math.min(at, editorView.state.doc.length));
+          editorView.dispatch({
+            selection: { anchor: clamped },
+            annotations: [
+              state.Transaction.remote.of(true),
+              state.Transaction.addToHistory.of(false),
+            ],
+          });
+        },
         focus: () => editorView.focus(),
         destroy: () => editorView.destroy(),
       };
       editorView.focus();
+      // The document almost never exists yet when this chunk lands — the channel
+      // delivers `Reset` after the lazy import resolves — so the caret hint is
+      // consumed here, once the runtime is able to act on it.
+      const opening = notesEditorStore.getState().cursor;
+      if (opening !== null) {
+        runtimeRef.current.placeCaret(opening);
+      }
     })();
 
     return () => {
@@ -306,9 +347,16 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
     };
   }, [vaultId, noteId]);
 
+  // The opening `Reset` usually lands AFTER the editor chunk, so this is the
+  // effect that actually gets to honour the caret hint: the document has just
+  // been spliced in, and only now is there anything to put a caret into.
+  const openingCursor = body.cursor;
   useEffect(() => {
     runtimeRef.current?.applyExternal(base);
-  }, [base]);
+    if (openingCursor !== null) {
+      runtimeRef.current?.placeCaret(openingCursor);
+    }
+  }, [base, openingCursor]);
 
   useEffect(() => {
     if (mode === "edit") {

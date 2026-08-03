@@ -1411,3 +1411,34 @@ Body text that must not move.
         assert_eq!(&source[body..], "body\n");
     }
 }
+
+#[cfg(test)]
+mod authored_block_tests {
+    use super::*;
+
+    /// The exact block keeper writes for a note it authors, observed on the
+    /// agent-desktop run of 2026-08-03. The timestamps matter: an unquoted
+    /// RFC 3339 value carries four colons and a `+`, and a scanner that splits a
+    /// line on every colon rather than the first would lose `id` — which the
+    /// index keys on, so the note becomes unopenable by the very id its own
+    /// frontmatter carries.
+    #[test]
+    fn a_keeper_authored_block_round_trips_its_own_keys() {
+        let source = "---\n\
+                      id: 01KZ2MG27SXP9C6MGX40KT\n\
+                      created: 2026-08-03T01:41:00.281700134+00:00\n\
+                      updated: 2026-08-03T01:41:00.281711405+00:00\n\
+                      ---\n\
+                      \n\
+                      Vault as a lens\n";
+        let (fm, body) = Frontmatter::parse(source);
+
+        assert_eq!(fm.as_string("id"), Some("01KZ2MG27SXP9C6MGX40KT"));
+        assert_eq!(
+            fm.as_string("created"),
+            Some("2026-08-03T01:41:00.281700134+00:00"),
+            "an RFC 3339 value keeps every colon after the first"
+        );
+        assert_eq!(&source[body..], "\nVault as a lens\n");
+    }
+}

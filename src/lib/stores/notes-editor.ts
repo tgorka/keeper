@@ -52,6 +52,16 @@ export interface NotesEditorState {
   dirty: boolean;
   /** The note's vault-relative path, updated in place by a `renamed` batch. */
   path: string | null;
+  /**
+   * Where Rust wants the caret on the next mount, as a byte offset into `text`.
+   *
+   * Load-bearing rather than a nicety: a note opens with its frontmatter block at
+   * the top, and a caret at offset 0 sits *in front of* that block, so the first
+   * thing the user types lands above `---` and splits the document. Rust sends
+   * the body offset (and a template's `{{cursor}}` where it declared one); the
+   * editor consumes this once and clears it.
+   */
+  cursor: number | null;
   /** An external revision awaiting the user's decision, or null. */
   pending: NotePending | null;
   /** Set by a `gone` batch: the note is no longer on disk. */
@@ -79,6 +89,7 @@ const EMPTY: NotesEditorState = {
   text: "",
   dirty: false,
   path: null,
+  cursor: null,
   pending: null,
   gone: false,
   saving: false,
@@ -122,6 +133,7 @@ export function applyBodyBatch(batch: NoteBodyBatch): void {
           text: batch.text,
           rev: batch.rev,
           dirty: false,
+          cursor: batch.cursor,
           pending: null,
           gone: false,
           error: null,

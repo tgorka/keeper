@@ -1624,3 +1624,38 @@ reason: `gitPath = ""` in TOML deserializes to `Some(PathBuf::from(""))`, and ta
   `GitRequest::from_setting(Option<&str>)` that answers `search` or `explicit` — and have both hosts
   call it instead of filtering for themselves.
 status: open
+
+## DW-N1 — the editor caret opens in front of the frontmatter block
+
+**Status:** open. **Found:** 2026-08-03, agent-desktop XFCE run, Phase 5 smoke test.
+**Severity:** cosmetic on disk, confusing on screen. Not data loss — see the guard below.
+
+**What happens.** Open a freshly created note and type: the first keystroke lands at document
+offset 0, which is *in front of* the opening `---`. The buffer becomes
+`<typing>---\nid: …\n---\n` and the block is no longer frontmatter.
+
+**What already stops it hurting.** `notes_ipc::restore_block` re-attaches the base's block on
+every save, so the file on disk is always valid: `id` and `created` survive, the note stays
+openable by its id, and Obsidian reads it. The residue is a duplicated block sitting in the
+note's *body*, which the user then has to delete by hand.
+
+**What was tried.** `notes_open` sends the body offset as `NoteBodyBatch::Reset.cursor` (verified
+in the log: `cursor=Some(129)` for a 130-byte note), the store carries it, and `note-editor.tsx`
+applies it both at `EditorState.create` and in the reconcile effect. The caret still lands at 0,
+so something after those two points resets the selection — the `mode === "edit"` focus effect and
+CodeMirror's own initial-focus behaviour are the two candidates, neither yet ruled out.
+
+**The fix worth making instead.** Stop putting frontmatter in the editor buffer at all. FR-107 and
+UX-DR40 already say the block renders as a typed *properties panel*, not as source in the editor:
+
+- `notes_open` sends the BODY only (`&text[body_offset..]`), and `cursor` becomes redundant.
+- `notes_save` re-attaches the block — which `restore_block` already does, so the repair path
+  becomes the normal path.
+- `properties-panel.tsx` needs the whole document rather than the buffer, so the body channel
+  grows a `frontmatter` field or the panel gets its own read.
+- Every `NoteBodyBatch` variant carrying text (`External`, `Diverged`) needs the same treatment.
+
+That is a genuine design correction, not a patch: it makes typing above the block *unrepresentable*
+rather than repaired, and it deletes the caret-hint machinery. It was not done in this pass because
+the properties panel parses the buffer for its fields, so the change is wider than could be verified
+here.

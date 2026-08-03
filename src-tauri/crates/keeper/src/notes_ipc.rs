@@ -57,6 +57,17 @@ use crate::notes_vault::{self, HeadRevision, Vault};
 /// second half of the NFR-29 budget.
 const CHANGE_BATCH_MS: u64 = 250;
 
+/// What a note with no title and no first line is called, in the list and in its
+/// filename. Deliberately a word rather than a date: a date is what the filename
+/// prefix already says, and repeating it tells the reader nothing.
+const UNTITLED: &str = "Untitled";
+
+/// How long a by-id lookup will wait for the reconciler to absorb a note that
+/// was written moments ago. Two coalescing windows plus slack: long enough that
+/// open-after-create never loses the race, short enough that a genuinely unknown
+/// id is still an immediate answer rather than a hang.
+const ENTRY_SETTLE: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// How many rows a list window carries when a caller does not say.
 const DEFAULT_LIMIT: u32 = 60;
 
@@ -114,6 +125,39 @@ fn entry_of(vault_id: &str, note_id: &str) -> Result<IndexEntry, IpcError> {
         .by_id(note_id)
         .cloned()
         .ok_or_else(|| notes_error(NotesError::NotFound(note_id.to_owned())))
+}
+
+/// The same lookup, for a caller that may be asking about a note written moments
+/// ago (`notes_open` right after `notes_create`).
+///
+/// The reconciler is the index's only mutator and it coalesces, so a write and
+/// the index knowing about it are separated by up to one coalescing window. A
+/// caller that just created a note would otherwise be told its own note does not
+/// exist — the race we watched happen on the agent-desktop run of 2026-08-03.
+/// So a miss waits for the index to change rather than failing on the first
+/// look, bounded so a genuinely unknown id still answers promptly.
+async fn entry_of_soon(vault_id: &str, note_id: &str) -> Result<IndexEntry, IpcError> {
+    if let Ok(entry) = entry_of(vault_id, note_id) {
+        return Ok(entry);
+    }
+    let Some(mut index) = notes_vault::subscribe_index(vault_id) else {
+        return entry_of(vault_id, note_id);
+    };
+    let deadline = tokio::time::Instant::now() + ENTRY_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        if tokio::time::timeout(remaining, index.changed())
+            .await
+            .is_err()
+        {
+            break;
+        }
+        index.mark_unchanged();
+        if let Ok(entry) = entry_of(vault_id, note_id) {
+            return Ok(entry);
+        }
+    }
+    entry_of(vault_id, note_id)
 }
 
 /// The engine, for the commands that write a profile.
@@ -955,8 +999,12 @@ fn create_note(vault: &Vault, req: &NoteCreateReq, capture: bool) -> Result<Note
         .clone()
         .filter(|title| !title.trim().is_empty())
         .unwrap_or_else(|| naming::title_from_body(&body_source));
+    // A note with neither a title nor a first line is `Untitled`, not today's
+    // date: `note_filename` already prefixes the date, so a date-shaped title
+    // produced `2026-08-03-2026-08-03.md` — a name that says the same thing twice
+    // and says nothing about the note. The first line the user types retitles it.
     let title = if title.trim().is_empty() {
-        today()
+        UNTITLED.to_owned()
     } else {
         title
     };
@@ -1225,15 +1273,21 @@ pub async fn notes_open(
     channel: Channel<NoteBodyBatch>,
 ) -> Result<String, IpcError> {
     let vault = vault_of(&vault_id)?;
-    let entry = entry_of(&vault_id, &note_id)?;
+    let entry = entry_of_soon(&vault_id, &note_id).await?;
     let text = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
     let rev = notes_vault::content_rev(&text);
+
+    // Land the caret after the frontmatter block, never in front of it. A caret at
+    // offset 0 puts the first character the user types ABOVE the opening `---`,
+    // which splits the document into a stray block and an orphaned body —
+    // observed on the agent-desktop run of 2026-08-03.
+    let cursor = u32::try_from(Frontmatter::parse(&text).1).ok();
 
     channel
         .send(NoteBodyBatch::Reset {
             rev: rev.clone(),
             text: text.clone(),
-            cursor: None,
+            cursor,
         })
         .map_err(|error| {
             notes_error(NotesError::NotFound(format!(
@@ -1348,6 +1402,32 @@ pub async fn notes_buffer_report(
     Ok(())
 }
 
+/// Put the base's frontmatter block back at the head of a buffer that lost it.
+///
+/// Returns `text` untouched in every ordinary case: when it already opens with a
+/// block, or when the base had none to restore. The one case it repairs is a
+/// buffer whose block has been pushed off the front — which is what an editor
+/// caret sitting in front of `---` produces, and which would otherwise persist as
+/// a document with a stray block in the middle of it.
+///
+/// The base's block is authoritative because keeper wrote it: `id` and `created`
+/// live there, and losing them costs the note its identity, its links and its
+/// unread marks.
+fn restore_block(text: &str, base: &str) -> String {
+    let (_, text_body) = Frontmatter::parse(text);
+    if text_body > 0 {
+        // The buffer has its own block at the front. Nothing to repair.
+        return text.to_owned();
+    }
+    let (_, base_body) = Frontmatter::parse(base);
+    if base_body == 0 {
+        return text.to_owned();
+    }
+    // Everything the buffer holds becomes the body under the block it lost. The
+    // block already ends in a newline, so the two join without one being invented.
+    format!("{}{}", &base[..base_body], text.trim_start_matches('\n'))
+}
+
 /// Save a note (FR-112, NFR-30).
 ///
 /// A `base_rev` older than what is on disk means the other side changed since the
@@ -1372,6 +1452,16 @@ pub async fn notes_save(
     } else {
         notes_vault::write_conflict_copy(&vault, &rel, &disk)
     };
+
+    // keeper owns the frontmatter block, so a buffer that arrives without the one
+    // its base had is a DAMAGED buffer, not an instruction to move the block. That
+    // happens for real: a caret that lands in front of `---` puts the user's first
+    // keystroke above the block, and persisting it verbatim would split the note
+    // into a stray block and an orphaned body — observed on the agent-desktop run
+    // of 2026-08-03. Re-attaching the base's block is the repair, and it is the
+    // write path's half of the FR-121 guarantee: the block keeper wrote is the
+    // block that stays.
+    let text = restore_block(&text, &lock_body(&sub).base);
 
     // `updated` is rewritten on every keeper-authored save; `created` never is.
     let stamped = Frontmatter::set_in(&text, "updated", FieldValue::Str(now_local()));
@@ -2286,6 +2376,49 @@ mod tests {
         assert!(!matches_filter(&note, &filter("nothing here"), None));
         // An empty needle is not a filter.
         assert!(matches_filter(&note, &filter("   "), None));
+    }
+
+    /// A buffer that arrives with keeper's frontmatter block pushed off the front
+    /// is repaired, not persisted. This is the write path's half of FR-121: the
+    /// block keeper wrote is the block that stays, and `id` in particular is what
+    /// the note's links, pins and unread marks all hang from.
+    #[test]
+    fn a_buffer_that_lost_its_block_is_repaired_rather_than_written() {
+        let base = "---\nid: 01KZ3J05WAFCNG61J8B2G95BAJ\ncreated: 2026-08-03T10:16:37+00:00\n---\n";
+        // What a caret in front of `---` produces: the typing lands above the block.
+        let damaged = format!("Vault as a lens\n\nThe folder is the database.{base}");
+
+        let repaired = restore_block(&damaged, base);
+
+        assert!(
+            repaired.starts_with("---\nid: 01KZ3J05WAFCNG61J8B2G95BAJ"),
+            "the block goes back to the front: {repaired}"
+        );
+        assert!(
+            repaired.contains("Vault as a lens"),
+            "and not one byte the user typed is lost: {repaired}"
+        );
+        assert_eq!(
+            repaired.matches("id: 01KZ3J05WAFCNG61J8B2G95BAJ").count(),
+            2,
+            "the trailing copy is body text now; only the leading block is frontmatter"
+        );
+    }
+
+    /// The ordinary case is a no-op, byte for byte. A repair that rewrote healthy
+    /// documents would be worse than the bug it fixes.
+    #[test]
+    fn a_healthy_buffer_passes_through_untouched() {
+        let base = "---\nid: 01AAA\n---\nold body\n";
+        let edited = "---\nid: 01AAA\n---\nnew body\n";
+        assert_eq!(restore_block(edited, base), edited);
+
+        // A note that never had a block does not acquire one here; `set_in` is what
+        // adds a block, and only for a key it was asked to write.
+        assert_eq!(
+            restore_block("just a body\n", "also just a body\n"),
+            "just a body\n"
+        );
     }
 
     #[test]

@@ -87,6 +87,14 @@ export interface UseNotesBody {
   saving: boolean;
   /** Whether the note has left the disk under us. */
   gone: boolean;
+  /**
+   * Where Rust asked for the caret on the opening `Reset`, or null.
+   *
+   * The editor consumes it once the document exists: a note opens with its
+   * frontmatter at the top, and a caret at 0 would put the first keystroke above
+   * the block.
+   */
+  cursor: number | null;
   /** Adopt an edit and arm the heartbeat and the write. */
   onEdit: (text: string) => void;
   /** Write the buffer now (blur, ⌘S, close). */
@@ -99,6 +107,7 @@ export function useNotesBody(vaultId: string | null, noteId: string | null): Use
   const pending = useNotesEditorStore((state) => state.pending);
   const saving = useNotesEditorStore((state) => state.saving);
   const gone = useNotesEditorStore((state) => state.gone);
+  const cursor = useNotesEditorStore((state) => state.cursor);
   const reportTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -187,5 +196,5 @@ export function useNotesBody(vaultId: string | null, noteId: string | null): Use
     };
   }, [vaultId, noteId]);
 
-  return { text, dirty, pending, saving, gone, onEdit, save };
+  return { text, dirty, pending, saving, gone, cursor, onEdit, save };
 }
