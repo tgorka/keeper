@@ -280,6 +280,11 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     private var sessionStarted = false
     /// Set on `mediaQueue` when a stop began — later samples are dropped.
     private var stopping = false
+    /// Set by `stop()` on the MAIN thread the first time the host asks. The host
+    /// asks twice on an ordinary clean shutdown — the `stop` request, then EOF
+    /// when it closes our stdin — and a second teardown would finalize a writer
+    /// whose first finalize is still in flight.
+    private var stopRequested = false
     /// PTS of the current segment's anchor frame — the elapsed-time base for
     /// the duration-cap fallback. Host-clock timeline, shared by all segments.
     private var segmentStartPTS = CMTime.invalid
@@ -1841,8 +1846,19 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// Stop cleanly: emit `stopping`, stop the stream, finish the current
     /// writer (which finalizes its `moov` — an ordinary playable `.mov`), wait
     /// for any in-flight retired-writer finalize, emit `finalized`, and exit.
-    /// Safe to call once; later samples are dropped via `stopping`.
+    /// Later samples are dropped via `stopping`.
+    ///
+    /// **Idempotent by latch**, because the host has two ways to ask: an explicit
+    /// `stop` request and then EOF on stdin when it closes the pipe behind it
+    /// (`main.swift`'s EOF branch calls this too). A second entry used to reach
+    /// `finishWriting` on a writer whose first finalize was still in flight,
+    /// which AVFoundation answers with an uncatchable
+    /// `NSInternalInconsistencyException` — the sidecar aborted at the end of an
+    /// otherwise perfect recording. Only a mic-only session could show it: every
+    /// other shape returned early at the `guard let stream` above it.
     func stop() {
+        guard !stopRequested else { return }
+        stopRequested = true
         emitEvent(["event": "state", "state": "stopping"])
         // Story 19.4: a device removal during teardown must not fire the
         // mic-loss path into a winding-down engine (the `stopping` flag also
@@ -1892,11 +1908,10 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             }
             self.cameraSession = nil
         }
-        guard let stream else {
-            // Stop before capture ever started: nothing to finalize.
-            emitEvent(["event": "error", "message": "stop before capture started"])
-            exit(0)
-        }
+        // Late samples are dropped from here on, and the two repeating timers
+        // have nothing left to do. Enqueued BEFORE the finalize below on the
+        // same serial queue, so both stop paths — with an SCStream and without
+        // one — see `stopping` set before anything finalizes.
         mediaQueue.async {
             self.stopping = true
             // Story 19.4: the silence-fill has nothing more to pad.
@@ -1905,6 +1920,20 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             // Story 20.5: the idle heartbeat has nothing more to keep warm.
             self.heartbeatTimer?.cancel()
             self.heartbeatTimer = nil
+        }
+        guard let stream else {
+            // NO SCStream: either the stop arrived before capture ever started,
+            // or this is a microphone-only audio-only session (Story 21.3),
+            // which never builds one — the mic `AVCaptureSession` or the 22.7
+            // voice-processing unit is the whole capture. Treating both as
+            // "nothing to finalize" reported a bogus `error` after a perfectly
+            // good recording AND abandoned the writer without its final `moov`,
+            // on every mic-only session there has ever been. `finishAndExit`
+            // already tells the two apart: it needs `sessionStarted` and a
+            // writer still `.writing`, and emits the honest
+            // "no frames were captured before stop" when neither holds.
+            mediaQueue.async { self.finishAndExit() }
+            return
         }
         stream.stopCapture { _ in
             // A stop error is irrelevant here — finalize whatever was written.
