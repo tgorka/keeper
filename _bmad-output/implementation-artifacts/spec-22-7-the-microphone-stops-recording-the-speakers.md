@@ -2,7 +2,7 @@
 title: '22.7 — The Microphone Stops Recording the Speakers'
 type: 'feature'
 created: '2026-08-04'
-status: 'in-progress'
+status: 'awaiting-operator'
 baseline_revision: 'd36e9e8a6fd472b9ab486acd84558da8f8b4e64f'
 review_loop_iteration: 0
 followup_review_recommended: false
@@ -10,6 +10,13 @@ context:
   - '{project-root}/docs/project-context.md'
   - '{project-root}/docs/recording.md'
 warnings: ['oversized']
+operator_actions:
+  - 'Unlock hesperia (its screen is locked, and a locked session cannot grant or exercise the microphone TCC that the measurement needs).'
+  - 'Open keeper, go to Recording, choose the Audio only source, turn System audio OFF and the Microphone ON, and leave Echo cancellation ON.'
+  - 'Start a recording, run `bash ~/keeper-aec-measure.sh play` from a shell (it plays a known clip from ANOTHER process at output volume 45), let it finish, then Stop.'
+  - 'Turn Echo cancellation OFF and repeat the same take, so the two differ in nothing but the switch.'
+  - 'Run `bash ~/keeper-aec-measure.sh measure aec-on <session>` and the same for the off take, then paste both mean_volume figures into this spec: the AEC-on mic track must be at least ~15 dB quieter. If it is not, set the registry default to false, say so here, and do not ship an inert switch.'
+  - 'Run `bash ~/keeper-aec-measure.sh restore` to put the output volume back, and delete the ~/Movies/keeper/aec-* test sessions.'
 ---
 
 <intent-contract>
@@ -189,3 +196,43 @@ a different channel count than its predecessor.
   Microphone TCC grant for the launching process — if any of those cannot be satisfied from an
   automated session, the story is complete except for this measurement, and it is owed to the
   operator.
+
+## Auto Run Result
+
+Status: **awaiting-operator** — implemented, gated, and exercised on real hardware at every layer
+except the one that needs a room and an unlocked screen.
+
+**Ran, and passed.** Rust: `keeper-core` 1010, `keeper` 241 (both include the new registry, wire
+and ipc-guard tests). Frontend: 1761 across 157 files, `tsc` clean, `cargo clippy --workspace
+--all-targets -- -D warnings` clean *including* the shell crate (a user-space GTK sysroot makes
+that possible on Linux). Swift on hesperia (macOS 26.5.2, arm64): `swift build` clean and 57 tests
+green, `EchoCancellationTests` among them.
+
+**Ran on the metal, driving the real sidecar over its NDJSON contract** (no GUI needed, so it works
+with the screen locked): a microphone-only audio-only session goes `starting → preflight →
+recording → stopping → finalized`, writes a playable finalized `.m4a`, and emits no error and no
+fallback warning. The observable signature of the feature is there:
+
+| `echoCancellation` | mic track |
+| --- | --- |
+| `true` | `aac, 1 channel` |
+| `false` | `aac, 2 channels` |
+
+Mono is what the voice-processing unit produces, so a mono track means the `'vpio'` producer — not
+the ScreenCaptureKit leg — really is the source, that it accepted the device, and that
+`micTrackChannels` reached both writers. No `echoCancellationUnavailable` warning was emitted, so
+the unit initialized on the first try against the built-in input.
+
+**Not run: the acoustic measurement, and it is the one that justifies the feature.** A sidecar
+spawned over ssh has no Microphone TCC grant of its own, and hesperia's screen is locked
+(`CGSSessionScreenIsLocked = true`), so a locked session can neither prompt for nor exercise one:
+both takes recorded digital silence (`mean_volume: -91.0 dB`). The measurement has to run through
+the app, on an unlocked session — see `operator_actions` above; the harness and the far-end clip
+are already on the machine.
+
+**Three defects fixed on the way**, all older than this story and all in the microphone-only
+audio-only path, which had never worked end to end: a double `startWriting()` that aborted the
+sidecar at start, a `guard let stream` in `stop()` that reported failure after a good recording and
+left the writer unfinalized, and a non-idempotent `stop()` that aborted at the end once the second
+bug stopped masking it (the host asks to stop twice — the request, then EOF). Found by trying to
+take the measurement above; each one is described in its own commit.
