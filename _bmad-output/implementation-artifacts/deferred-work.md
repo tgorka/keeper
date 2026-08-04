@@ -1685,7 +1685,15 @@ real save assembly against a real file on disk and asserts the saved note has ex
 `id`, a surviving `created`, and the keystroke at the top of the body. 236 keeper tests, 1755
 frontend tests, workspace clippy clean. **Not** exercised: a human typing in the running app — Xvfb
 cannot start in this container (the X server hardcodes `/usr/bin/xkbcomp`, which is absent and
-unwritable), so the on-device confirmation belongs to the next hesperia run.
+unwritable).
+
+deployed 2026-08-04 to hesperia (macOS 26.5.2, arm64) with the new `scripts/install-macos.sh`, built
+from these exact sources (the four changed files' checksums matched across the rsync). The app boots,
+restores both accounts, syncs both folders and renders the Notes surface. The typing check still did
+not happen there either, for a different and better reason: hesperia has **no vault flagged** ("No
+notes vault yet. Flag a folder you already sync and it becomes one."), and which of someone's synced
+folders becomes a vault is their decision, not a smoke test's. One flagged folder and one typed
+character closes this.
 
 ## DW-N2 — `recorder::tests::fetch_request_screen_recording_round_trips_the_fake_sidecar` is flaky under parallel test threads
 
