@@ -1627,17 +1627,18 @@ status: open
 
 ## DW-N1 — the editor caret opens in front of the frontmatter block
 
-**Status:** open. **Found:** 2026-08-03, agent-desktop XFCE run, Phase 5 smoke test.
+**Status:** done 2026-08-04, by the design correction below. **Found:** 2026-08-03,
+agent-desktop XFCE run, Phase 5 smoke test.
 **Severity:** cosmetic on disk, confusing on screen. Not data loss — see the guard below.
 
 **What happens.** Open a freshly created note and type: the first keystroke lands at document
 offset 0, which is *in front of* the opening `---`. The buffer becomes
 `<typing>---\nid: …\n---\n` and the block is no longer frontmatter.
 
-**What already stops it hurting.** `notes_ipc::restore_block` re-attaches the base's block on
-every save, so the file on disk is always valid: `id` and `created` survive, the note stays
-openable by its id, and Obsidian reads it. The residue is a duplicated block sitting in the
-note's *body*, which the user then has to delete by hand.
+**What stopped it hurting until it was fixed.** `notes_ipc::restore_block` re-attached the base's
+block on every save, so the file on disk was always valid: `id` and `created` survived, the note
+stayed openable by its id, and Obsidian read it. The residue was a duplicated block sitting in the
+note's *body*, which the user then had to delete by hand.
 
 **What was tried.** `notes_open` sends the body offset as `NoteBodyBatch::Reset.cursor` (verified
 in the log: `cursor=Some(129)` for a 130-byte note), the store carries it, and `note-editor.tsx`
@@ -1656,6 +1657,47 @@ UX-DR40 already say the block renders as a typed *properties panel*, not as sour
 - Every `NoteBodyBatch` variant carrying text (`External`, `Diverged`) needs the same treatment.
 
 That is a genuine design correction, not a patch: it makes typing above the block *unrepresentable*
-rather than repaired, and it deletes the caret-hint machinery. It was not done in this pass because
-the properties panel parses the buffer for its fields, so the change is wider than could be verified
-here.
+rather than repaired, and it deletes the caret-hint machinery.
+
+**resolution (2026-08-04).** Done as written, plus the two things the sketch had not accounted for:
+
+- `NoteBodyBatch::Reset | External | Diverged` each carry `frontmatter` beside the body; the body is
+  `&text[body_offset..]` and holds no fence at all. `split_note` / `join_note` in `notes_ipc` are the
+  only seam, and they are exact inverses (tested byte for byte, BOM and blank line included).
+- `notes_save(subscription_id, text, base_rev, frontmatter: Option<String>)`: `text` is the body,
+  `frontmatter` is `Some` only for the properties panel, and absent it the block keeper last
+  delivered stands. `restore_block` and its heuristic are deleted — a body that opens with `---`
+  (a thematic break on line one) is body text now, where the old repair would have mistaken it for
+  frontmatter and dropped the note's `id`.
+- `NoteWriteVm` gained `frontmatter`, because every save stamps `updated` and the panel would
+  otherwise render the timestamp it sent rather than the one that landed.
+- `NoteConflictChoiceReq::Merged.text` is a body too; `notes_resolve_conflict` re-attaches the
+  canonical note's block, so a hand-merge cannot cost the note its identity either.
+- `cursor` was NOT deleted. It stopped being a workaround and became the thing it was documented as:
+  a template's `{{cursor}}`, which `templates::expand` has always computed and both create paths
+  threw away (`let (expanded, _cursor)`). It is now stashed per note id at create and **taken** by
+  `notes_open`, which is the PRD's "creating from a template places the caret at the caret
+  placeholder, or at the end of the document when none is present" — an acceptance that had never
+  actually held. Bounded at 256 unopened hints.
+
+Verified: `typing_at_the_first_offset_cannot_disturb_the_block` drives the real `create_note` and the
+real save assembly against a real file on disk and asserts the saved note has exactly one block, one
+`id`, a surviving `created`, and the keystroke at the top of the body. 236 keeper tests, 1755
+frontend tests, workspace clippy clean. **Not** exercised: a human typing in the running app — Xvfb
+cannot start in this container (the X server hardcodes `/usr/bin/xkbcomp`, which is absent and
+unwritable), so the on-device confirmation belongs to the next hesperia run.
+
+## DW-N2 — `recorder::tests::fetch_request_screen_recording_round_trips_the_fake_sidecar` is flaky under parallel test threads
+
+**Status:** open. **Found:** 2026-08-04, running `cargo test -p keeper --lib` on Linux.
+**Severity:** a false red in CI and in the pre-push hook. No product defect.
+
+**What happens.** The test writes a `#!/bin/sh` fake sidecar with `FakeSidecar::write` and executes
+it immediately. With the default test-thread fan-out the execve raced the writer's own file handle
+and failed with `Text file busy (os error 26)`; the same test passes every time with
+`--test-threads=1`. Two `FakeSidecar::write` calls in the same loop (`request-true`, `request-false`)
+make the window easy to hit on a slow container filesystem.
+
+**The fix.** Close the file explicitly (drop the handle) before `execve`, or `fsync` and re-`stat` it,
+in `FakeSidecar::write` — one place, and every sidecar test inherits it. Not done here because it is
+in `recorder.rs`, which this change does not touch, and a test-harness fix deserves its own diff.

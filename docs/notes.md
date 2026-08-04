@@ -66,6 +66,12 @@ Three tiers, and the tier says who may write a key.
 | | `cssclasses` | Read only so it is preserved. Never interpreted. |
 | yours | anything else | Parsed, indexed, queryable through `field:`, editable in the properties panel, and preserved byte-for-byte by any write that does not target it. |
 
+**The block is never in the editor.** The body is what you type in; the frontmatter renders above it
+as the properties panel, with a control per key. So there is no `---` in the buffer to type in front
+of, and the caret at the top of a note is the top of its *text*. keeper re-joins the two on every
+write, which is why editing a property and editing a paragraph are one save and cannot overwrite each
+other.
+
 ## Spaces and the query language
 
 A space is a saved query, stored as an ordinary note under `spaces/` — so it syncs, it has

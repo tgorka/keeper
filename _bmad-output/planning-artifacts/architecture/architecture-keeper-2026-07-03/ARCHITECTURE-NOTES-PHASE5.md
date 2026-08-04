@@ -804,8 +804,8 @@ snapshot/reset batch before any diff. All DTOs live in `keeper_core::notes::vm`,
 | `notes_templates` | `(vault_id: String) -> Vec<NoteTemplateVm>` | FR-100. |
 | `notes_open` | `(vault_id: String, note_id: String, channel: Channel<NoteBodyBatch>) -> String` | Returns a subscription id; opens with `Reset` (AD-58). |
 | `notes_close` | `(subscription_id: String) -> ()` | |
-| `notes_buffer_report` | `(subscription_id: String, text: String, rev: String) -> ()` | The editor's dirty-text heartbeat; see Concurrency. |
-| `notes_save` | `(subscription_id: String, text: String, base_rev: String) -> NoteWriteVm` | Explicit save/flush. A `base_rev` older than disk triggers the conflict-copy path (NFR-30). |
+| `notes_buffer_report` | `(subscription_id: String, text: String, rev: String) -> ()` | The editor's dirty-text heartbeat; `text` is the body. See Concurrency. |
+| `notes_save` | `(subscription_id: String, text: String, base_rev: String, frontmatter: Option<String>) -> NoteWriteVm` | Explicit save/flush. `text` is the **body**; `frontmatter` is `Some` only from the properties panel, and absent it the block keeper last delivered stands (FR-121). A `base_rev` older than disk triggers the conflict-copy path (NFR-30). |
 | `notes_rename` | `(vault_id: String, note_id: String, title: String) -> NoteRefVm` | Retitles and renames the file; `id` keeps links intact (FR-97). |
 | `notes_set_flag` | `(vault_id: String, note_id: String, flag: NoteFlag, on: bool) -> ()` | `pinned` / `archived` (FR-119). |
 | `notes_delete` | `(vault_id: String, note_id: String) -> ()` | Moves to `.keeper/trash/` and stages the removal. Never an unlink. |
@@ -816,7 +816,7 @@ snapshot/reset batch before any diff. All DTOs live in `keeper_core::notes::vm`,
 | `notes_diff` | `(vault_id: String, note_id: String, from_rev: String, to_rev: Option<String>) -> NoteDiffVm` | `to_rev: None` = working tree. |
 | `notes_mark_read` | `(vault_id: String, note_id: String, rev: String) -> ()` | Clears the unread mark and the tray dot (FR-113). |
 | `notes_conflicts` | `(vault_id: String) -> Vec<NoteConflictVm>` | FR-116. |
-| `notes_resolve_conflict` | `(vault_id: String, note_id: String, choice: NoteConflictChoiceReq) -> NoteRefVm` | `{ TakeMine \| TakeTheirs \| Merged { text } }`; deletes the conflict copy. |
+| `notes_resolve_conflict` | `(vault_id: String, note_id: String, choice: NoteConflictChoiceReq) -> NoteRefVm` | `{ TakeMine \| TakeTheirs \| Merged { text } }`, where `text` is a **body** and the canonical note's block is re-attached; deletes the conflict copy. |
 | `notes_attachment_paste` | `(vault_id: String, note_id: String) -> NoteAttachmentVm` | Rust reads the clipboard image; **no payload crosses IPC** (AD-58). |
 | `notes_attachment_drop` | `(vault_id: String, note_id: String, paths: Vec<String>) -> Vec<NoteAttachmentVm>` | Paths come from Tauri's own drag-drop event, not from JS. |
 | `notes_capture_buffer` | `() -> String` | |

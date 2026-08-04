@@ -34,7 +34,7 @@ import { BacklinksPanel } from "./backlinks-panel";
 import { ConflictResolver } from "./conflict-resolver";
 import { NoteDiffBar } from "./note-diff-bar";
 import { NoteHistoryPanel } from "./note-history-panel";
-import { PropertiesPanel, readFrontmatter } from "./properties-panel";
+import { PropertiesPanel } from "./properties-panel";
 
 /** What the editor pane is showing. */
 type EditorMode = "edit" | "history" | "conflict";
@@ -70,11 +70,10 @@ function tagPaths(nodes: readonly NoteTagNodeVm[], into: string[] = []): string[
 }
 
 /** The note's title: its first body line, `#` stripped (FR-98). Derived from
- *  the buffer rather than a list row so it tracks what is being typed. */
+ *  the buffer rather than a list row so it tracks what is being typed — and the
+ *  buffer is the body, so there is no block to step over. */
 export function deriveTitle(text: string): string {
-  const parsed = readFrontmatter(text);
-  const body = parsed.block === null ? text : text.slice(parsed.block.to);
-  for (const line of body.split("\n")) {
+  for (const line of text.split("\n")) {
     const trimmed = line.trim();
     if (trimmed !== "") {
       return trimmed.replace(/^#+\s*/, "");
@@ -150,6 +149,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
   const body = useNotesBody(vaultId, noteId);
   const base = useNotesEditorStore((state) => state.base);
   const rev = useNotesEditorStore((state) => state.rev);
+  const frontmatter = useNotesEditorStore((state) => state.frontmatter);
   const path = useNotesEditorStore((state) => state.path);
   const subscriptionId = useNotesEditorStore((state) => state.subscriptionId);
   const savedAtMs = useNotesEditorStore((state) => state.savedAtMs);
@@ -207,13 +207,10 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
           // the chunk lands. Later revisions arrive through the reconcile
           // effect below rather than by rebuilding the editor.
           doc: notesEditorStore.getState().text,
-          // Where Rust asked for the caret, clamped to the document. This is not
-          // cosmetic: a note opens with its frontmatter block at the top, and the
-          // default offset 0 sits IN FRONT of that block, so the first character
-          // typed lands above `---` and splits the document in two. Rust sends
-          // the body offset (and a template's `{{cursor}}` where it declared
-          // one); absent a hint the caret goes to the end, which is where a
-          // person continuing a note wants it anyway.
+          // A template's `{{cursor}}`, clamped to the document. Absent a hint the
+          // caret goes to the end, which is where a person continuing a note wants
+          // it — and offset 0 is now simply the first character of the body, since
+          // the frontmatter block is not in this buffer at all.
           selection: {
             anchor: Math.max(
               0,
@@ -365,8 +362,9 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
   }, [mode]);
 
   const adoptPanelWrite = useCallback((text: string, write: NoteWriteVm) => {
-    // A property edit goes straight to disk, so its result becomes the editor's
-    // new base and the reconcile effect splices it into the buffer.
+    // A property edit goes straight to disk, and it writes the buffer with it, so
+    // its result is the editor's new base and the block Rust hands back — `updated`
+    // stamped — is the block the panel now renders.
     markSaved(text, write);
   }, []);
 
@@ -421,7 +419,8 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
 
       {showProperties && mode === "edit" ? (
         <PropertiesPanel
-          text={body.text}
+          frontmatter={frontmatter}
+          body={body.text}
           subscriptionId={subscriptionId}
           baseRev={rev}
           onSaved={adoptPanelWrite}

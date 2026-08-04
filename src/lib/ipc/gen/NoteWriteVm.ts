@@ -13,6 +13,14 @@ rev: string,
  */
 path: string, 
 /**
+ * The frontmatter block as it now stands on disk, in the same space as
+ * [`NoteBodyBatch`]'s. Returned rather than assumed because every save
+ * rewrites `updated`, so the block the caller sent is never quite the block
+ * that landed — and the properties panel would otherwise show a stale
+ * timestamp until the next external write.
+ */
+frontmatter: string, 
+/**
  * The conflict copy written before the save, when the save was based on a
  * revision older than disk. An ordinary tracked file, so it becomes a
  * conflict row and a commit like anything else — nothing is lost, and the

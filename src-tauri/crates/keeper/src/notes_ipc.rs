@@ -196,12 +196,31 @@ struct BodySub {
     state: Mutex<BodyState>,
 }
 
+/// Split a note into its frontmatter block and its body.
+///
+/// The block is `source[..body_offset]` — fences, any byte-order mark and the
+/// newline after the closing fence included — so the two halves concatenated are
+/// the source again, byte for byte. An empty block means the note has none.
+fn split_note(source: &str) -> (&str, &str) {
+    let (_, body_offset) = Frontmatter::parse(source);
+    source.split_at(body_offset)
+}
+
+/// Put a document back together from a block and a body.
+fn join_note(frontmatter: &str, body: &str) -> String {
+    let mut out = String::with_capacity(frontmatter.len() + body.len());
+    out.push_str(frontmatter);
+    out.push_str(body);
+    out
+}
+
 /// What Rust holds for a live editor.
 ///
-/// `base` is the exact bytes keeper last wrote or last delivered as a `Reset` —
-/// **never re-read from disk**, which is what makes it a true common ancestor and
-/// what makes the clean/dirty distinction meaningful (AD-58). `mine` is the
-/// buffer, kept current by `notes_buffer_report`.
+/// `base` is the exact bytes keeper last wrote or last delivered — the whole
+/// document, block included — and is **never re-read from disk**, which is what
+/// makes it a true common ancestor and what makes the clean/dirty distinction
+/// meaningful (AD-58). `mine` is the editor's buffer, which is the **body alone**,
+/// kept current by `notes_buffer_report`.
 struct BodyState {
     rel: String,
     base: String,
@@ -210,9 +229,17 @@ struct BodyState {
 }
 
 impl BodyState {
-    /// Whether the editor has unsaved edits.
+    /// The block and the body of `base`.
+    fn split(&self) -> (&str, &str) {
+        split_note(&self.base)
+    }
+
+    /// Whether the editor has unsaved edits. Body against body: the block is not
+    /// the editor's to change, so it can never be what makes a buffer dirty.
     fn is_dirty(&self) -> bool {
-        self.mine.as_ref().is_some_and(|mine| mine != &self.base)
+        self.mine
+            .as_ref()
+            .is_some_and(|mine| mine.as_str() != self.split().1)
     }
 }
 
@@ -228,6 +255,45 @@ static SUBSCRIPTIONS: LazyLock<Mutex<HashMap<String, Subscription>>> =
 /// the default window until the first `notes_list` arrives, then follows it.
 static LAST_QUERY: LazyLock<Mutex<HashMap<String, NoteQueryReq>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Where the caret goes the first time a freshly created note is opened.
+///
+/// A template may declare a `{{cursor}}`, and the offset expansion reports is only
+/// useful to the command that opens the note *next* — `notes_open`, milliseconds
+/// later. Keyed by note id (a ULID, unique across vaults) and **taken** on open,
+/// so the hint applies exactly once and the same note opened again tomorrow gets
+/// the ordinary caret at the end. Offsets are into the BODY, which is what the
+/// body channel carries.
+static PENDING_CARET: LazyLock<Mutex<HashMap<String, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How many unopened caret hints are worth keeping. A note created and never
+/// opened would otherwise hold its hint for the life of the process, so an agent
+/// creating notes from a `{{cursor}}` template in bulk is what this bounds. A
+/// dropped hint costs a caret position, never a byte.
+const MAX_PENDING_CARETS: usize = 256;
+
+/// Remember where a template asked for the caret in a note just created.
+fn remember_caret(note_id: &str, body_offset: usize) {
+    let Ok(at) = u32::try_from(body_offset) else {
+        return;
+    };
+    let mut pending = PENDING_CARET
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if pending.len() >= MAX_PENDING_CARETS {
+        pending.clear();
+    }
+    pending.insert(note_id.to_owned(), at);
+}
+
+/// Take the caret a template asked for, if this note has one waiting.
+fn take_caret(note_id: &str) -> Option<u32> {
+    PENDING_CARET
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(note_id)
+}
 
 fn subscriptions() -> MutexGuard<'static, HashMap<String, Subscription>> {
     SUBSCRIPTIONS
@@ -1009,10 +1075,13 @@ fn create_note(vault: &Vault, req: &NoteCreateReq, capture: bool) -> Result<Note
         title
     };
 
-    // A template is expanded through the pure core, cursor offset included.
-    let body = match template_source(vault, req) {
+    // A template is expanded through the pure core, caret offset included. The
+    // offset is into the expanded body, which is exactly the space the body channel
+    // speaks in — one `\n` away, because the document keeper writes puts a blank
+    // line between the block and the body.
+    let (body, caret) = match template_source(vault, req) {
         Some(template) => {
-            let (expanded, _cursor) = templates::expand(
+            let (expanded, caret) = templates::expand(
                 &template,
                 &templates::TemplateCtx {
                     title: title.clone(),
@@ -1021,12 +1090,12 @@ fn create_note(vault: &Vault, req: &NoteCreateReq, capture: bool) -> Result<Note
                 },
             );
             if body_source.trim().is_empty() {
-                expanded
+                (expanded, caret)
             } else {
-                format!("{expanded}\n{body_source}")
+                (format!("{expanded}\n{body_source}"), caret)
             }
         }
-        None => body_source,
+        None => (body_source, None),
     };
 
     let dest = req
@@ -1068,6 +1137,12 @@ fn create_note(vault: &Vault, req: &NoteCreateReq, capture: bool) -> Result<Note
     }
     let front = Frontmatter::serialise_new(&pairs);
     notes_vault::write_note(vault, &rel, &format!("{front}\n{body}")).map_err(notes_error)?;
+    // Only now that the note exists: the caret hint is for whoever opens it, and a
+    // hint for a note that was never written would sit there forever. `+ 1` is the
+    // blank line between the block and the body, which is the body's first byte.
+    if let Some(at) = caret {
+        remember_caret(&id, at + 1);
+    }
     Ok(NoteRefVm {
         vault_id: vault.id.clone(),
         id,
@@ -1161,9 +1236,9 @@ pub async fn notes_journal_today(vault_id: String) -> Result<NoteRefVm, IpcError
 fn create_journal(vault: &Vault, rel: &str, req: &NoteCreateReq) -> Result<NoteRefVm, IpcError> {
     let id = crate::sync_ipc::new_ulid();
     let title = req.title.clone().unwrap_or_else(today);
-    let body = match template_source(vault, req) {
+    let (body, caret) = match template_source(vault, req) {
         Some(template) => {
-            let (expanded, _cursor) = templates::expand(
+            let (expanded, caret) = templates::expand(
                 &template,
                 &templates::TemplateCtx {
                     title: title.clone(),
@@ -1171,9 +1246,9 @@ fn create_journal(vault: &Vault, rel: &str, req: &NoteCreateReq) -> Result<NoteR
                     now_local: now_local(),
                 },
             );
-            expanded
+            (expanded, caret)
         }
-        None => format!("# {title}\n"),
+        None => (format!("# {title}\n"), None),
     };
     let front = Frontmatter::serialise_new(&[
         ("id".to_owned(), FieldValue::Str(id.clone())),
@@ -1181,6 +1256,9 @@ fn create_journal(vault: &Vault, rel: &str, req: &NoteCreateReq) -> Result<NoteR
         ("updated".to_owned(), FieldValue::Str(now_local())),
     ]);
     notes_vault::write_note(vault, rel, &format!("{front}\n{body}")).map_err(notes_error)?;
+    if let Some(at) = caret {
+        remember_caret(&id, at + 1);
+    }
     Ok(NoteRefVm {
         vault_id: vault.id.clone(),
         id,
@@ -1266,6 +1344,12 @@ pub async fn notes_delete(vault_id: String, note_id: String) -> Result<(), IpcEr
 /// The channel opens with a full `Reset` and then carries diffs for the life of
 /// the subscription: an external write arrives as `External` on a clean buffer and
 /// as `Diverged` on a dirty one, a rename as `Renamed`, a delete as `Gone`.
+///
+/// The frontmatter block is sent **beside** the body, never inside it: the editor
+/// buffer holds the body alone, the block renders as the typed properties panel
+/// (FR-107), and `notes_save` re-joins them. That is what makes "the first
+/// keystroke lands above `---`" — observed on the agent-desktop run of 2026-08-03
+/// — a shape this code cannot produce rather than a case it has to repair.
 #[tauri::command]
 pub async fn notes_open(
     vault_id: String,
@@ -1276,18 +1360,17 @@ pub async fn notes_open(
     let entry = entry_of_soon(&vault_id, &note_id).await?;
     let text = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
     let rev = notes_vault::content_rev(&text);
-
-    // Land the caret after the frontmatter block, never in front of it. A caret at
-    // offset 0 puts the first character the user types ABOVE the opening `---`,
-    // which splits the document into a stray block and an orphaned body —
-    // observed on the agent-desktop run of 2026-08-03.
-    let cursor = u32::try_from(Frontmatter::parse(&text).1).ok();
+    let (frontmatter, body) = split_note(&text);
 
     channel
         .send(NoteBodyBatch::Reset {
             rev: rev.clone(),
-            text: text.clone(),
-            cursor,
+            frontmatter: frontmatter.to_owned(),
+            text: body.to_owned(),
+            // A template's `{{cursor}}`, once, and nothing else: without a hint the
+            // editor puts the caret at the end of the body, which is where someone
+            // continuing a note wants it.
+            cursor: take_caret(&note_id),
         })
         .map_err(|error| {
             notes_error(NotesError::NotFound(format!(
@@ -1348,21 +1431,29 @@ async fn watch_body(sub: Arc<BodySub>) {
         if state.rev == rev {
             continue;
         }
+        let (block, body) = split_note(&text);
+        let (block, body) = (block.to_owned(), body.to_owned());
         if state.is_dirty() {
             // Never applied over unsaved edits. The editor raises its inline diff
             // bar; the user's buffer is untouched and `base` still names the true
             // common ancestor.
             state.rev = rev.clone();
             drop(state);
-            let _ = sub
-                .channel
-                .send(NoteBodyBatch::Diverged { rev, theirs: text });
+            let _ = sub.channel.send(NoteBodyBatch::Diverged {
+                rev,
+                frontmatter: block,
+                theirs: body,
+            });
         } else {
-            state.base = text.clone();
+            state.base = text;
             state.rev = rev.clone();
             state.mine = None;
             drop(state);
-            let _ = sub.channel.send(NoteBodyBatch::External { rev, text });
+            let _ = sub.channel.send(NoteBodyBatch::External {
+                rev,
+                frontmatter: block,
+                text: body,
+            });
         }
     }
 }
@@ -1384,7 +1475,8 @@ pub async fn notes_close(subscription_id: String) -> Result<(), IpcError> {
 ///
 /// Sent after 400 ms of typing idle and immediately on blur, so Rust always knows
 /// whether the buffer diverges from what it last delivered — which is what decides
-/// `External` against `Diverged` when a write lands underneath.
+/// `External` against `Diverged` when a write lands underneath. `text` is the
+/// **body**, in the same space as the channel's.
 #[tauri::command]
 pub async fn notes_buffer_report(
     subscription_id: String,
@@ -1402,33 +1494,29 @@ pub async fn notes_buffer_report(
     Ok(())
 }
 
-/// Put the base's frontmatter block back at the head of a buffer that lost it.
+/// The bytes a save writes: the editor's body under the block that owns it, with
+/// `updated` stamped.
 ///
-/// Returns `text` untouched in every ordinary case: when it already opens with a
-/// block, or when the base had none to restore. The one case it repairs is a
-/// buffer whose block has been pushed off the front — which is what an editor
-/// caret sitting in front of `---` produces, and which would otherwise persist as
-/// a document with a stray block in the middle of it.
-///
-/// The base's block is authoritative because keeper wrote it: `id` and `created`
-/// live there, and losing them costs the note its identity, its links and its
-/// unread marks.
-fn restore_block(text: &str, base: &str) -> String {
-    let (_, text_body) = Frontmatter::parse(text);
-    if text_body > 0 {
-        // The buffer has its own block at the front. Nothing to repair.
-        return text.to_owned();
-    }
-    let (_, base_body) = Frontmatter::parse(base);
-    if base_body == 0 {
-        return text.to_owned();
-    }
-    // Everything the buffer holds becomes the body under the block it lost. The
-    // block already ends in a newline, so the two join without one being invented.
-    format!("{}{}", &base[..base_body], text.trim_start_matches('\n'))
+/// Named so the composition is testable on its own — `notes_save` cannot be called
+/// without a live subscription, and this is the part of it that decides what lands
+/// on disk. `updated` is rewritten on every keeper-authored save; `created` never
+/// is, because `set_in` touches one key's span and nothing else (FR-121).
+fn save_document(frontmatter: &str, body: &str) -> String {
+    Frontmatter::set_in(
+        &join_note(frontmatter, body),
+        "updated",
+        FieldValue::Str(now_local()),
+    )
 }
 
 /// Save a note (FR-112, NFR-30).
+///
+/// `text` is the **body**. The editor never holds the frontmatter block, so this is
+/// where the two halves are re-joined: `frontmatter` is `Some` only when the
+/// properties panel rewrote the block, and absent it the block keeper last
+/// delivered stands, byte for byte. That is the write half of FR-121 — every key
+/// the user did not edit survives — and it is why a caret at offset 0 can no longer
+/// cost a note its `id`.
 ///
 /// A `base_rev` older than what is on disk means the other side changed since the
 /// editor opened: the disk bytes are written aside as an AD-43-shaped conflict
@@ -1440,6 +1528,7 @@ pub async fn notes_save(
     subscription_id: String,
     text: String,
     base_rev: String,
+    frontmatter: Option<String>,
 ) -> Result<NoteWriteVm, IpcError> {
     let sub = body_sub(&subscription_id)?;
     let vault = vault_of(&sub.vault_id)?;
@@ -1453,20 +1542,16 @@ pub async fn notes_save(
         notes_vault::write_conflict_copy(&vault, &rel, &disk)
     };
 
-    // keeper owns the frontmatter block, so a buffer that arrives without the one
-    // its base had is a DAMAGED buffer, not an instruction to move the block. That
-    // happens for real: a caret that lands in front of `---` puts the user's first
-    // keystroke above the block, and persisting it verbatim would split the note
-    // into a stray block and an orphaned body — observed on the agent-desktop run
-    // of 2026-08-03. Re-attaching the base's block is the repair, and it is the
-    // write path's half of the FR-121 guarantee: the block keeper wrote is the
-    // block that stays.
-    let text = restore_block(&text, &lock_body(&sub).base);
-
-    // `updated` is rewritten on every keeper-authored save; `created` never is.
-    let stamped = Frontmatter::set_in(&text, "updated", FieldValue::Str(now_local()));
+    let stamped = {
+        let state = lock_body(&sub);
+        save_document(
+            frontmatter.as_deref().unwrap_or_else(|| state.split().0),
+            &text,
+        )
+    };
     notes_vault::write_note(&vault, &rel, &stamped).map_err(notes_error)?;
     let rev = notes_vault::content_rev(&stamped);
+    let block = split_note(&stamped).0.to_owned();
     {
         let mut state = lock_body(&sub);
         state.base = stamped;
@@ -1476,6 +1561,7 @@ pub async fn notes_save(
     Ok(NoteWriteVm {
         rev,
         path: rel,
+        frontmatter: block,
         conflict_copy,
     })
 }
@@ -1677,7 +1763,13 @@ pub async fn notes_resolve_conflict(
             notes_vault::write_note(&vault, &entry.path, &theirs).map_err(notes_error)?;
         }
         NoteConflictChoiceReq::Merged { text } => {
-            notes_vault::write_note(&vault, &entry.path, &text).map_err(notes_error)?;
+            // The resolver aligns bodies, so what comes back is a body. The block on
+            // the canonical note is keeper's, and it survives the resolution — losing
+            // it would cost the note its `id` and every link, pin and unread mark
+            // hanging off it.
+            let canonical = notes_vault::read_note(&vault, &entry.path).unwrap_or_default();
+            let merged = join_note(split_note(&canonical).0, &text);
+            notes_vault::write_note(&vault, &entry.path, &merged).map_err(notes_error)?;
         }
     }
     notes_vault::trash_note(&vault, &copy)
@@ -2310,6 +2402,90 @@ mod tests {
         }
     }
 
+    /// A vault rooted at a real scratch directory, following `notes_vault`'s
+    /// convention — `tempfile` is not a dependency of this crate.
+    fn test_vault(tag: &str) -> Vault {
+        let root = std::env::temp_dir().join(format!(
+            "keeper-ipc-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
+        std::fs::create_dir_all(&root).expect("vault root");
+        let root = root.canonicalize().expect("canonical vault root");
+        Vault {
+            id: "01VAULT".to_owned(),
+            name: "mind".to_owned(),
+            root: root.clone(),
+            local_path: root,
+            config: NotesConfig::default(),
+            excludes: Arc::new(keeper_sync::exclude::ExcludeSet::new(&[]).expect("excludes")),
+        }
+    }
+
+    /// The bug DW-N1 named, driven through the real create and save code against a
+    /// real file: create a note, type at the very first offset the editor can
+    /// produce, save.
+    ///
+    /// Under the old shape the editor buffer opened with `---` at offset 0, so this
+    /// keystroke landed ABOVE the block and the saved file carried a stray block in
+    /// its body. Now the buffer is the body alone: offset 0 is the body's first byte,
+    /// and the block cannot be reached from the editor at all.
+    #[test]
+    fn typing_at_the_first_offset_cannot_disturb_the_block() {
+        let vault = test_vault("caret");
+        let created = create_note(
+            &vault,
+            &NoteCreateReq {
+                title: Some("Vault as a lens".to_owned()),
+                body: None,
+                template: None,
+                dest: None,
+                tags: Vec::new(),
+            },
+            false,
+        )
+        .expect("create the note");
+
+        // What `notes_open` delivers.
+        let opened = notes_vault::read_note(&vault, &created.path).expect("read the new note");
+        let (block, body) = split_note(&opened);
+        assert!(
+            block.contains(&format!("id: {}", created.id)),
+            "block: {block:?}"
+        );
+        assert!(!body.contains("---"), "the editor gets no fence: {body:?}");
+
+        // The keystroke that used to break the note, at the only offset that could.
+        let typed = format!("The folder is the database.{body}");
+        let saved = save_document(block, &typed);
+        notes_vault::write_note(&vault, &created.path, &saved).expect("save the note");
+
+        let on_disk = notes_vault::read_note(&vault, &created.path).expect("re-read the note");
+        let (kept, kept_body) = split_note(&on_disk);
+        assert_eq!(
+            on_disk.matches("---\n").count(),
+            2,
+            "exactly one block, opened and closed once: {on_disk:?}"
+        );
+        assert_eq!(
+            kept.matches(&format!("id: {}", created.id)).count(),
+            1,
+            "the id is in the block, once: {on_disk:?}"
+        );
+        assert!(
+            kept.contains("created:"),
+            "and `created` survived the write: {kept:?}"
+        );
+        assert!(
+            kept_body.starts_with("The folder is the database."),
+            "the keystroke landed at the top of the BODY: {kept_body:?}"
+        );
+
+        std::fs::remove_dir_all(&vault.root).ok();
+    }
+
     fn row(id: &str, title: &str) -> NoteRowVm {
         NoteRowVm {
             id: id.to_owned(),
@@ -2378,46 +2554,72 @@ mod tests {
         assert!(matches_filter(&note, &filter("   "), None));
     }
 
-    /// A buffer that arrives with keeper's frontmatter block pushed off the front
-    /// is repaired, not persisted. This is the write path's half of FR-121: the
-    /// block keeper wrote is the block that stays, and `id` in particular is what
-    /// the note's links, pins and unread marks all hang from.
+    /// The editor never sees a `---`, which is what makes "the first keystroke
+    /// landed above the block" unrepresentable rather than repaired. The split has
+    /// to be lossless for that to be safe, so this is the property that matters:
+    /// block + body is the document, byte for byte.
     #[test]
-    fn a_buffer_that_lost_its_block_is_repaired_rather_than_written() {
-        let base = "---\nid: 01KZ3J05WAFCNG61J8B2G95BAJ\ncreated: 2026-08-03T10:16:37+00:00\n---\n";
-        // What a caret in front of `---` produces: the typing lands above the block.
-        let damaged = format!("Vault as a lens\n\nThe folder is the database.{base}");
+    fn a_note_splits_into_a_block_and_a_body_and_joins_back_byte_for_byte() {
+        let note = "---\nid: 01KZ3J05WAFCNG61J8B2G95BAJ\ncreated: 2026-08-03T10:16:37+00:00\n---\n\nVault as a lens\n\nThe folder is the database.\n";
 
-        let repaired = restore_block(&damaged, base);
+        let (block, body) = split_note(note);
 
-        assert!(
-            repaired.starts_with("---\nid: 01KZ3J05WAFCNG61J8B2G95BAJ"),
-            "the block goes back to the front: {repaired}"
-        );
-        assert!(
-            repaired.contains("Vault as a lens"),
-            "and not one byte the user typed is lost: {repaired}"
-        );
         assert_eq!(
-            repaired.matches("id: 01KZ3J05WAFCNG61J8B2G95BAJ").count(),
-            2,
-            "the trailing copy is body text now; only the leading block is frontmatter"
+            block,
+            "---\nid: 01KZ3J05WAFCNG61J8B2G95BAJ\ncreated: 2026-08-03T10:16:37+00:00\n---\n"
         );
+        // The body opens with the blank line the writer put between the two, and
+        // holds no fence at all: there is nothing for a caret to land in front of.
+        assert_eq!(body, "\nVault as a lens\n\nThe folder is the database.\n");
+        assert!(!body.contains("---"), "the body carries no fence: {body:?}");
+        assert_eq!(join_note(block, body), note);
     }
 
-    /// The ordinary case is a no-op, byte for byte. A repair that rewrote healthy
-    /// documents would be worse than the bug it fixes.
+    /// A note that never had a block is all body, and joining adds nothing. Writing
+    /// one back must not invent frontmatter it did not have — `set_in` is the only
+    /// thing that adds a block, and only for a key it was asked to write.
     #[test]
-    fn a_healthy_buffer_passes_through_untouched() {
-        let base = "---\nid: 01AAA\n---\nold body\n";
-        let edited = "---\nid: 01AAA\n---\nnew body\n";
-        assert_eq!(restore_block(edited, base), edited);
+    fn a_note_without_a_block_is_all_body() {
+        let (block, body) = split_note("just a body\n");
+        assert_eq!(block, "");
+        assert_eq!(body, "just a body\n");
+        assert_eq!(join_note(block, body), "just a body\n");
+    }
 
-        // A note that never had a block does not acquire one here; `set_in` is what
-        // adds a block, and only for a key it was asked to write.
+    /// The block the editor cannot reach is the block a save keeps. A body that
+    /// opens with a fence of its own — a thematic break the user typed on line one —
+    /// is body text, and joining must not let it pass for frontmatter that replaces
+    /// keeper's.
+    #[test]
+    fn joining_keeps_keepers_block_even_when_the_body_starts_with_a_fence() {
+        let block = "---\nid: 01AAA\n---\n";
+        let joined = join_note(block, "---\nnot frontmatter\n");
+
+        assert!(
+            joined.starts_with(block),
+            "keeper's block leads: {joined:?}"
+        );
+        let (kept, body) = split_note(&joined);
         assert_eq!(
-            restore_block("just a body\n", "also just a body\n"),
-            "just a body\n"
+            kept, block,
+            "and it is still the frontmatter after the join"
+        );
+        assert_eq!(body, "---\nnot frontmatter\n");
+    }
+
+    /// A template's `{{cursor}}` is the only caret hint there is, it survives the
+    /// hop from create to open, and it is spent once.
+    #[test]
+    fn a_caret_hint_is_taken_exactly_once() {
+        let note = "01KCARET0000000000000000TEST";
+        assert_eq!(take_caret(note), None, "no hint before a create");
+
+        remember_caret(note, 17);
+        assert_eq!(take_caret(note), Some(17));
+        assert_eq!(
+            take_caret(note),
+            None,
+            "reopening the note gets the ordinary caret at the end"
         );
     }
 
@@ -2555,11 +2757,15 @@ mod tests {
         assert_eq!(clamp_limit(-5.0), MAX_LIMIT);
     }
 
+    /// Dirtiness is a body-against-body question. `base` is the whole document,
+    /// `mine` is the editor's buffer, and the block between them is not the editor's
+    /// to change — so a buffer holding exactly the delivered body is clean, block or
+    /// no block.
     #[test]
     fn a_dirty_buffer_is_the_one_that_differs_from_what_we_delivered() {
         let mut state = BodyState {
             rel: "a.md".to_owned(),
-            base: "hello".to_owned(),
+            base: "---\nid: 01AAA\n---\nhello".to_owned(),
             rev: "5-x".to_owned(),
             mine: None,
         };
@@ -2567,8 +2773,12 @@ mod tests {
         state.mine = Some("hello".to_owned());
         assert!(
             !state.is_dirty(),
-            "a buffer identical to what we delivered is not dirty"
+            "a buffer identical to the body we delivered is not dirty"
         );
+        // The whole document is NOT what the editor holds: a buffer that somehow
+        // carried the block would be a buffer that had diverged.
+        state.mine = Some(state.base.clone());
+        assert!(state.is_dirty());
         state.mine = Some("hello world".to_owned());
         assert!(state.is_dirty());
     }

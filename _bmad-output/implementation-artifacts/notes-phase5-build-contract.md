@@ -248,13 +248,18 @@ Every type below derives `Debug, Clone, Serialize, Deserialize, TS` with
 `NoteSpaceVm { id, name, query, sort, limit, error: Option<String> }`
 `NoteQueryCheckVm { ok, message: Option<String>, token_index: Option<u32>, span: Option<(u32,u32)> }`
 `NoteTemplateVm { name, path }`
-`NoteBodyBatch` — `#[serde(tag = "kind", rename_all = "camelCase")]` enum:
-  `Reset { rev, text, cursor: Option<u32> } | External { rev, text } | Diverged { rev, theirs } | Renamed { path } | Gone`
+`NoteBodyBatch` — `#[serde(tag = "kind", rename_all = "camelCase")]` enum. Every variant carrying
+  text carries the **body** (no `---`), with its block beside it, because the block is not in the
+  editor buffer (FR-107, and the fix for DW-N1):
+  `Reset { rev, frontmatter, text, cursor: Option<u32> } | External { rev, frontmatter, text } |
+  Diverged { rev, frontmatter, theirs } | Renamed { path } | Gone`.
+  `cursor` is a byte offset into `text`, set only when the note's template declared a `{{cursor}}`.
 `NoteChangeBatch { vault_id, ops: Vec<NoteListOp> }`, `NoteListOp` — `#[serde(tag = "op",
   rename_all = "camelCase", rename_all_fields = "camelCase")]`, matching `RoomListOp`/`TimelineOp`/
   `InboxOp`, which are the same index-diff shape:
   `Reset { rows, total } | Upsert { index, row } | Remove { id }`
-`NoteWriteVm { rev, path, conflict_copy: Option<String> }`
+`NoteWriteVm { rev, path, frontmatter, conflict_copy: Option<String> }` — `frontmatter` is the block
+  as it landed, `updated` already stamped.
 `NoteRevisionVm { rev, when_ms, device, origin, source, subject }`
 `NoteDiffVm { from_rev, to_rev: Option<String>, hunks: Vec<NoteHunkVm> }` / `NoteHunkVm { old_start, old_lines, new_start, new_lines, text }`
 `NoteConflictVm { id, path, mine_rev, theirs_path }`

@@ -3158,14 +3158,24 @@ export async function notesBufferReport(
  * divergence loses neither side (NFR-30). The returned
  * {@link NoteWriteVm} names the copy when one was made.
  *
+ * `text` is the **body** — the editor never holds the frontmatter block. Pass
+ * `frontmatter` only to rewrite the block itself, which is the properties panel's
+ * job; `null` keeps the block Rust last delivered, byte for byte.
+ *
  * Rejects with: `invalidInput`, `unsupported`, `internal`.
  */
 export async function notesSave(
   subscriptionId: string,
   text: string,
   baseRev: string,
+  frontmatter: string | null = null,
 ): Promise<NoteWriteVm> {
-  return await invoke<NoteWriteVm>("notes_save", { subscriptionId, text, baseRev });
+  return await invoke<NoteWriteVm>("notes_save", {
+    subscriptionId,
+    text,
+    baseRev,
+    frontmatter,
+  });
 }
 
 /**

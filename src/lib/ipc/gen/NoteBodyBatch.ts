@@ -7,20 +7,43 @@
  * describes what happened to the note *underneath* the editor — an agent's
  * write, another device's checkout, a rename — so the webview never has to poll
  * and never has to guess whether its buffer is still the truth.
+ *
+ * **The frontmatter block travels beside the body, never inside it.** Every
+ * variant that carries text carries the body only, with the block it belongs to
+ * in `frontmatter`. That split is what FR-107 asks for — the block renders as a
+ * typed properties panel, not as YAML in the editor — and it is also what makes
+ * the caret bug unrepresentable: there is no `---` in the buffer for a caret to
+ * land in front of, so typing at offset 0 can no longer push the block into the
+ * body. Rust owns the block; the editor owns the body; a save re-joins them.
  */
 export type NoteBodyBatch = { "kind": "reset", 
 /**
  * The revision these bytes are.
  */
-rev: string, text: string, 
+rev: string, 
 /**
- * Where to put the caret, as a byte offset — used by templates that
- * declare a `{{cursor}}`. No `#[ts(type)]` override here: `u32` already
- * emits `number`, and forcing it would erase the `| null` the option
- * actually carries.
+ * The `---` block verbatim — fences and trailing newline included — or
+ * empty when the note has none.
  */
-cursor: number | null, } | { "kind": "external", rev: string, text: string, } | { "kind": "diverged", rev: string, 
+frontmatter: string, 
 /**
- * The bytes now on disk.
+ * The body: every byte after the block.
+ */
+text: string, 
+/**
+ * Where to put the caret, as a byte offset **into `text`**, set only
+ * when the template this note was created from declared a `{{cursor}}`.
+ * `None` leaves the choice to the editor, which is the end of the body —
+ * where someone continuing a note wants it. No `#[ts(type)]` override
+ * here: `u32` already emits `number`, and forcing it would erase the
+ * `| null` the option actually carries.
+ */
+cursor: number | null, } | { "kind": "external", rev: string, frontmatter: string, text: string, } | { "kind": "diverged", rev: string, 
+/**
+ * The block on disk, which the user adopts along with `theirs`.
+ */
+frontmatter: string, 
+/**
+ * The body now on disk.
  */
 theirs: string, } | { "kind": "renamed", path: string, } | { "kind": "gone" };

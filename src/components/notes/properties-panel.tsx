@@ -9,9 +9,14 @@
  * every single write.
  *
  * So editing one property splices exactly that property's value span back into
- * the document the user already has, and every other byte in the file is
- * carried through untouched. An unknown key keeper has never heard of survives
- * a hundred edits to the keys beside it.
+ * the block the user already has, and every other byte in it is carried through
+ * untouched. An unknown key keeper has never heard of survives a hundred edits to
+ * the keys beside it.
+ *
+ * The panel is also the **only** surface that rewrites the block: it is not in the
+ * editor buffer, so the body and the block are written together and neither can
+ * overwrite the other. Offsets here are into the block, which is why the block
+ * arrives on its own rather than as the head of a document.
  *
  * The reader below deliberately understands only the Obsidian property subset —
  * scalars, block lists, flow lists — which is the same subset
@@ -80,8 +85,11 @@ function unquote(raw: string): { text: string; quoted: boolean } {
 /**
  * Read the leading `---` block.
  *
+ * Takes either a block on its own — which is what the body channel delivers — or a
+ * whole document, because a leading block is a leading block either way.
+ *
  * Offsets, not values, are the output that matters: they are what lets a write
- * touch one span and leave the rest of the file alone.
+ * touch one span and leave the rest of the block alone.
  */
 export function readFrontmatter(source: string): ParsedFrontmatter {
   const empty: ParsedFrontmatter = { block: null, entries: [], unparsed: false };
@@ -229,29 +237,43 @@ export function addProperty(source: string, key: string, value: string): string 
 }
 
 export interface PropertiesPanelProps {
-  /** The whole note document, frontmatter and body. */
-  text: string;
+  /** The note's frontmatter block, verbatim, or `""` when it has none. */
+  frontmatter: string;
+  /**
+   * The editor's buffer.
+   *
+   * A property write is a write of the whole note, so the body goes with it —
+   * sending the block alone would drop whatever the user has typed since the last
+   * autosave.
+   */
+  body: string;
   /** The body subscription every write goes through. Null disables editing. */
   subscriptionId: string | null;
   /** The revision the buffer opened at. */
   baseRev: string;
-  /** Adopt the rewritten document once Rust has acknowledged the write. */
-  onSaved: (text: string, write: NoteWriteVm) => void;
+  /** Adopt the write once Rust has acknowledged it. */
+  onSaved: (body: string, write: NoteWriteVm) => void;
 }
 
-export function PropertiesPanel({ text, subscriptionId, baseRev, onSaved }: PropertiesPanelProps) {
-  const parsed = readFrontmatter(text);
+export function PropertiesPanel({
+  frontmatter,
+  body,
+  subscriptionId,
+  baseRev,
+  onSaved,
+}: PropertiesPanelProps) {
+  const parsed = readFrontmatter(frontmatter);
   const [newKey, setNewKey] = useState("");
   const [failure, setFailure] = useState<string | null>(null);
 
-  const write = (next: string): void => {
+  const write = (nextBlock: string): void => {
     if (subscriptionId === null) {
       return;
     }
-    void notesSave(subscriptionId, next, baseRev)
+    void notesSave(subscriptionId, body, baseRev, nextBlock)
       .then((result) => {
         setFailure(null);
-        onSaved(next, result);
+        onSaved(body, result);
       })
       .catch(() => {
         // Said out loud, because the control has already moved and a silent
@@ -268,7 +290,7 @@ export function PropertiesPanel({ text, subscriptionId, baseRev, onSaved }: Prop
           disk rather than rewriting them.
         </p>
         <pre className="mt-1 overflow-x-auto font-mono text-[11px]">
-          {parsed.block === null ? text.slice(0, 400) : text.slice(0, parsed.block.to)}
+          {frontmatter.slice(0, 400)}
         </pre>
       </section>
     );
@@ -281,7 +303,7 @@ export function PropertiesPanel({ text, subscriptionId, baseRev, onSaved }: Prop
           <span className="w-32 shrink-0 truncate text-muted-foreground">{entry.key}</span>
           <PropertyControl
             entry={entry}
-            onChange={(value) => write(spliceProperty(text, entry, value))}
+            onChange={(value) => write(spliceProperty(frontmatter, entry, value))}
           />
         </div>
       ))}
@@ -298,7 +320,7 @@ export function PropertiesPanel({ text, subscriptionId, baseRev, onSaved }: Prop
           variant="ghost"
           disabled={newKey.trim() === ""}
           onClick={() => {
-            write(addProperty(text, newKey.trim(), ' ""'));
+            write(addProperty(frontmatter, newKey.trim(), ' ""'));
             setNewKey("");
           }}
         >

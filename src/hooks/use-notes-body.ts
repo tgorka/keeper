@@ -77,7 +77,7 @@ function flushBuffer(): void {
 }
 
 export interface UseNotesBody {
-  /** The buffer. */
+  /** The buffer: the note's body. */
   text: string;
   /** Whether the buffer has diverged from what Rust holds. */
   dirty: boolean;
@@ -90,9 +90,8 @@ export interface UseNotesBody {
   /**
    * Where Rust asked for the caret on the opening `Reset`, or null.
    *
-   * The editor consumes it once the document exists: a note opens with its
-   * frontmatter at the top, and a caret at 0 would put the first keystroke above
-   * the block.
+   * Only ever a template's `{{cursor}}`. The editor consumes it once the document
+   * exists; without one the caret goes to the end of the body.
    */
   cursor: number | null;
   /** Adopt an edit and arm the heartbeat and the write. */

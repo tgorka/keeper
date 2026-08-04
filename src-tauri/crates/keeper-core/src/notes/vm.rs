@@ -242,32 +242,52 @@ pub struct NoteTemplateVm {
 /// describes what happened to the note *underneath* the editor — an agent's
 /// write, another device's checkout, a rename — so the webview never has to poll
 /// and never has to guess whether its buffer is still the truth.
+///
+/// **The frontmatter block travels beside the body, never inside it.** Every
+/// variant that carries text carries the body only, with the block it belongs to
+/// in `frontmatter`. That split is what FR-107 asks for — the block renders as a
+/// typed properties panel, not as YAML in the editor — and it is also what makes
+/// the caret bug unrepresentable: there is no `---` in the buffer for a caret to
+/// land in front of, so typing at offset 0 can no longer push the block into the
+/// body. Rust owns the block; the editor owns the body; a save re-joins them.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 #[ts(export)]
 pub enum NoteBodyBatch {
-    /// The full current text. Opens every subscription, and re-opens one after a
+    /// The note as it stands. Opens every subscription, and re-opens one after a
     /// change the editor can adopt wholesale.
     Reset {
         /// The revision these bytes are.
         rev: String,
+        /// The `---` block verbatim — fences and trailing newline included — or
+        /// empty when the note has none.
+        frontmatter: String,
+        /// The body: every byte after the block.
         text: String,
-        /// Where to put the caret, as a byte offset — used by templates that
-        /// declare a `{{cursor}}`. No `#[ts(type)]` override here: `u32` already
-        /// emits `number`, and forcing it would erase the `| null` the option
-        /// actually carries.
+        /// Where to put the caret, as a byte offset **into `text`**, set only
+        /// when the template this note was created from declared a `{{cursor}}`.
+        /// `None` leaves the choice to the editor, which is the end of the body —
+        /// where someone continuing a note wants it. No `#[ts(type)]` override
+        /// here: `u32` already emits `number`, and forcing it would erase the
+        /// `| null` the option actually carries.
         cursor: Option<u32>,
     },
     /// Someone else changed the note and the local buffer is clean, so the new
     /// text can be applied in one `external`-annotated transaction without
     /// polluting the user's undo history.
-    External { rev: String, text: String },
+    External {
+        rev: String,
+        frontmatter: String,
+        text: String,
+    },
     /// Someone else changed the note and the local buffer is dirty in a way that
     /// overlaps. Never auto-applied: the editor raises the inline diff bar and the
     /// user decides (UX-DR40).
     Diverged {
         rev: String,
-        /// The bytes now on disk.
+        /// The block on disk, which the user adopts along with `theirs`.
+        frontmatter: String,
+        /// The body now on disk.
         theirs: String,
     },
     /// The note moved. Its id is unchanged, so the editor retargets rather than
@@ -320,6 +340,12 @@ pub struct NoteWriteVm {
     pub rev: String,
     /// The note's path after the write (a retitle can move it).
     pub path: String,
+    /// The frontmatter block as it now stands on disk, in the same space as
+    /// [`NoteBodyBatch`]'s. Returned rather than assumed because every save
+    /// rewrites `updated`, so the block the caller sent is never quite the block
+    /// that landed — and the properties panel would otherwise show a stale
+    /// timestamp until the next external write.
+    pub frontmatter: String,
     /// The conflict copy written before the save, when the save was based on a
     /// revision older than disk. An ordinary tracked file, so it becomes a
     /// conflict row and a commit like anything else — nothing is lost, and the
@@ -541,7 +567,9 @@ pub enum NoteConflictChoiceReq {
     TakeMine,
     /// Keep the other side's copy.
     TakeTheirs,
-    /// Keep text the user merged by hand.
+    /// Keep text the user merged by hand. The **body** only, in the same space as
+    /// [`NoteBodyBatch`]'s text: the resolver aligns bodies, and the canonical
+    /// note's frontmatter block is re-attached by the write.
     Merged { text: String },
 }
 
@@ -590,11 +618,18 @@ mod tests {
         // enums the frontend already applies (RoomListOp/TimelineOp/InboxOp).
         let reset = NoteBodyBatch::Reset {
             rev: "r1".to_owned(),
+            frontmatter: "---\nid: 01AAA\n---\n".to_owned(),
             text: "hello".to_owned(),
             cursor: Some(3),
         };
         let json = serde_json::to_string(&reset).expect("serialize body batch");
         assert!(json.contains("\"kind\":\"reset\""), "json: {json}");
+        // The block is its own field, so the body the editor gets holds no `---`.
+        assert!(
+            json.contains("\"frontmatter\":\"---\\nid: 01AAA\\n---\\n\""),
+            "json: {json}"
+        );
+        assert!(json.contains("\"text\":\"hello\""), "json: {json}");
 
         let gone = serde_json::to_string(&NoteBodyBatch::Gone).expect("serialize gone");
         assert_eq!(gone, "{\"kind\":\"gone\"}");

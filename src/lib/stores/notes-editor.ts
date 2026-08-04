@@ -5,12 +5,18 @@
  * webview's picture of it. Three texts matter and the names are worth keeping
  * straight:
  *
- * - **`base`** — the exact text Rust last delivered or last acknowledged as
+ * - **`base`** — the exact body Rust last delivered or last acknowledged as
  *   written. It is the revision the buffer opened at, and it is what a save
  *   carries as `baseRev` so Rust can tell a clean overwrite from a divergence.
  * - **`text`** — the buffer. Equal to `base` while the note is clean.
  * - **`pending`** — an external revision the buffer could not silently absorb.
  *   Non-null is precisely the condition that raises the inline diff bar.
+ *
+ * All three are the note's **body**. The frontmatter block is a fourth field,
+ * `frontmatter`, and it is never part of the buffer: it renders as the typed
+ * properties panel (FR-107), the panel is the only thing that rewrites it, and
+ * Rust re-joins the two on every save. A caret therefore has no `---` to land in
+ * front of, which is the whole reason for the split.
  *
  * The one rule the reducer encodes, and the reason it lives here rather than in
  * a component: **a clean buffer applies an external write live; a dirty buffer
@@ -33,8 +39,10 @@ export interface NotePending {
   kind: NotePendingKind;
   /** The revision the arriving text belongs to. */
   rev: string;
-  /** The arriving text, whole. */
+  /** The arriving body, whole. */
   text: string;
+  /** The block that arrived with it, adopted along with the body. */
+  frontmatter: string;
 }
 
 export interface NotesEditorState {
@@ -42,24 +50,31 @@ export interface NotesEditorState {
   noteId: string | null;
   /** The body subscription id, needed by every write. Null until `notes_open` resolves. */
   subscriptionId: string | null;
-  /** The text Rust last delivered or acknowledged. */
+  /** The body Rust last delivered or acknowledged. */
   base: string;
   /** The revision `base` belongs to. */
   rev: string;
-  /** The buffer. */
+  /** The buffer: the body, and never the block. */
   text: string;
+  /**
+   * The note's frontmatter block, verbatim — fences and trailing newline
+   * included — or empty when it has none.
+   *
+   * Rust's, not the editor's. It arrives beside every body, the properties panel
+   * is the only surface that rewrites it, and a save that does not name a new one
+   * keeps it byte for byte (FR-121).
+   */
+  frontmatter: string;
   /** Whether the buffer has diverged from `base` locally. */
   dirty: boolean;
   /** The note's vault-relative path, updated in place by a `renamed` batch. */
   path: string | null;
   /**
-   * Where Rust wants the caret on the next mount, as a byte offset into `text`.
+   * Where Rust wants the caret once the document exists, as a byte offset into
+   * `text`, or null for "wherever the editor would put it" — the end of the body.
    *
-   * Load-bearing rather than a nicety: a note opens with its frontmatter block at
-   * the top, and a caret at offset 0 sits *in front of* that block, so the first
-   * thing the user types lands above `---` and splits the document. Rust sends
-   * the body offset (and a template's `{{cursor}}` where it declared one); the
-   * editor consumes this once and clears it.
+   * Set only when the template the note was created from declared a `{{cursor}}`.
+   * The editor consumes it once.
    */
   cursor: number | null;
   /** An external revision awaiting the user's decision, or null. */
@@ -87,6 +102,7 @@ const EMPTY: NotesEditorState = {
   base: "",
   rev: "",
   text: "",
+  frontmatter: "",
   dirty: false,
   path: null,
   cursor: null,
@@ -131,6 +147,7 @@ export function applyBodyBatch(batch: NoteBodyBatch): void {
         return {
           base: batch.text,
           text: batch.text,
+          frontmatter: batch.frontmatter,
           rev: batch.rev,
           dirty: false,
           cursor: batch.cursor,
@@ -140,11 +157,31 @@ export function applyBodyBatch(batch: NoteBodyBatch): void {
         };
       case "external":
         if (state.dirty) {
-          return { pending: { kind: "external", rev: batch.rev, text: batch.text } };
+          return {
+            pending: {
+              kind: "external",
+              rev: batch.rev,
+              text: batch.text,
+              frontmatter: batch.frontmatter,
+            },
+          };
         }
-        return { base: batch.text, text: batch.text, rev: batch.rev, pending: null };
+        return {
+          base: batch.text,
+          text: batch.text,
+          frontmatter: batch.frontmatter,
+          rev: batch.rev,
+          pending: null,
+        };
       case "diverged":
-        return { pending: { kind: "diverged", rev: batch.rev, text: batch.theirs } };
+        return {
+          pending: {
+            kind: "diverged",
+            rev: batch.rev,
+            text: batch.theirs,
+            frontmatter: batch.frontmatter,
+          },
+        };
       case "renamed":
         return { path: batch.path };
       case "gone":
@@ -163,7 +200,8 @@ export function editBuffer(text: string): void {
   }));
 }
 
-/** Take the arrived revision: it becomes the buffer and the new base. */
+/** Take the arrived revision: its body becomes the buffer and the new base, and
+ *  its block comes with it — accepting half a document would be a lie. */
 export function acceptPending(): void {
   notesEditorStore.setState((state) => {
     if (state.pending === null) {
@@ -172,6 +210,7 @@ export function acceptPending(): void {
     return {
       base: state.pending.text,
       text: state.pending.text,
+      frontmatter: state.pending.frontmatter,
       rev: state.pending.rev,
       dirty: false,
       pending: null,
@@ -196,10 +235,13 @@ export function beginSave(): void {
   notesEditorStore.setState({ saving: true, error: null });
 }
 
-/** A write was acknowledged: `text` is now what is on disk. */
+/** A write was acknowledged: `text` is now the body on disk, and `write` names the
+ *  block that landed with it — `updated` having been stamped, it is not quite the
+ *  block anyone sent. */
 export function markSaved(text: string, write: NoteWriteVm): void {
   notesEditorStore.setState((state) => ({
     base: text,
+    frontmatter: write.frontmatter,
     rev: write.rev,
     path: write.path,
     dirty: state.text !== text,

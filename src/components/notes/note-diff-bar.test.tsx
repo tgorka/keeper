@@ -18,10 +18,18 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 const OPENED = "alpha\nbeta\n";
+/** The block the note opened with. It travels beside the body, never in it. */
+const BLOCK = "---\nid: 01AAA\nupdated: 2026-08-03T10:00:00+00:00\n---\n";
 
 function openClean(): void {
   beginOpenNote("vault-1", "note-1");
-  applyBodyBatch({ kind: "reset", rev: "rev-1", text: OPENED, cursor: null });
+  applyBodyBatch({
+    kind: "reset",
+    rev: "rev-1",
+    frontmatter: BLOCK,
+    text: OPENED,
+    cursor: null,
+  });
 }
 
 /** Deliver a batch the way the channel would, after the surface is mounted. */
@@ -42,7 +50,7 @@ describe("NoteDiffBar", () => {
     openClean();
     render(<NoteDiffBar />);
 
-    deliver({ kind: "external", rev: "rev-2", text: `${OPENED}gamma\n` });
+    deliver({ kind: "external", rev: "rev-2", frontmatter: BLOCK, text: `${OPENED}gamma\n` });
 
     expect(screen.queryByRole("status")).toBeNull();
     expect(notesEditorStore.getState().text).toBe(`${OPENED}gamma\n`);
@@ -54,7 +62,12 @@ describe("NoteDiffBar", () => {
     editBuffer(`${OPENED}mine\n`);
     render(<NoteDiffBar />);
 
-    deliver({ kind: "external", rev: "rev-2", text: `${OPENED}theirs\nagain\n` });
+    deliver({
+      kind: "external",
+      rev: "rev-2",
+      frontmatter: BLOCK,
+      text: `${OPENED}theirs\nagain\n`,
+    });
 
     const bar = screen.getByRole("status");
     expect(bar).toHaveTextContent("Changed on disk");
@@ -65,7 +78,14 @@ describe("NoteDiffBar", () => {
     openClean();
     editBuffer(`${OPENED}mine\n`);
     render(<NoteDiffBar />);
-    deliver({ kind: "external", rev: "rev-2", text: `${OPENED}theirs\n` });
+    // The arriving revision changed a property as well as the body, so accepting
+    // it has to adopt both halves.
+    deliver({
+      kind: "external",
+      rev: "rev-2",
+      frontmatter: "---\nid: 01AAA\nupdated: 2026-08-04T09:00:00+00:00\n---\n",
+      text: `${OPENED}theirs\n`,
+    });
 
     fireEvent.click(screen.getByRole("button", { name: "Accept" }));
 
@@ -73,6 +93,7 @@ describe("NoteDiffBar", () => {
     const state = notesEditorStore.getState();
     expect(state.text).toBe(`${OPENED}theirs\n`);
     expect(state.rev).toBe("rev-2");
+    expect(state.frontmatter).toBe("---\nid: 01AAA\nupdated: 2026-08-04T09:00:00+00:00\n---\n");
     expect(state.dirty).toBe(false);
     // Accept is the only path that clears the unread mark (UX-DR39), and it
     // acknowledges the revision the body stream delivered — never a guess.
@@ -83,7 +104,7 @@ describe("NoteDiffBar", () => {
     openClean();
     editBuffer(`${OPENED}mine\n`);
     render(<NoteDiffBar />);
-    deliver({ kind: "external", rev: "rev-2", text: `${OPENED}theirs\n` });
+    deliver({ kind: "external", rev: "rev-2", frontmatter: BLOCK, text: `${OPENED}theirs\n` });
 
     fireEvent.click(screen.getByRole("button", { name: "Keep mine" }));
     expect(notesMarkRead).not.toHaveBeenCalled();
@@ -93,6 +114,7 @@ describe("NoteDiffBar", () => {
     // The base revision deliberately does NOT move: the next save carries the
     // stale rev, which is what makes Rust keep the other side (NFR-30).
     expect(state.rev).toBe("rev-1");
+    expect(state.frontmatter).toBe(BLOCK);
     expect(state.dirty).toBe(true);
   });
 
@@ -101,10 +123,15 @@ describe("NoteDiffBar", () => {
     editBuffer(`${OPENED}mine\n`);
     render(<NoteDiffBar onResolve={() => {}} />);
 
-    deliver({ kind: "external", rev: "rev-2", text: `${OPENED}theirs\n` });
+    deliver({ kind: "external", rev: "rev-2", frontmatter: BLOCK, text: `${OPENED}theirs\n` });
     expect(screen.queryByRole("button", { name: "Resolve" })).toBeNull();
 
-    deliver({ kind: "diverged", rev: "rev-3", theirs: `${OPENED}other\n` });
+    deliver({
+      kind: "diverged",
+      rev: "rev-3",
+      frontmatter: BLOCK,
+      theirs: `${OPENED}other\n`,
+    });
     expect(screen.getByRole("button", { name: "Resolve" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Take theirs" })).toBeInTheDocument();
   });
