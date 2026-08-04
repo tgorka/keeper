@@ -14,6 +14,7 @@ import { SettingsPane } from "@/components/layout/settings-pane";
 import { SIDEBAR_WIDTH_CLASS, SidebarPane } from "@/components/layout/sidebar-pane";
 import { SyncPane } from "@/components/layout/sync-pane";
 import { VerifyBanner } from "@/components/layout/verify-banner";
+import { NotesPane } from "@/components/notes/notes-pane";
 import { SearchOverlay } from "@/components/search/search-overlay";
 import { DeviceVerificationDialog } from "@/components/settings/device-verification-dialog";
 import { KeyBackupDialog } from "@/components/settings/key-backup-dialog";
@@ -30,6 +31,7 @@ import { useGlobalHotkey } from "@/hooks/use-global-hotkey";
 import { useKeyBackupStatuses } from "@/hooks/use-key-backup-statuses";
 import { useMenuActions } from "@/hooks/use-menu-actions";
 import { useNewChatShortcut } from "@/hooks/use-new-chat-shortcut";
+import { useNotesShortcut } from "@/hooks/use-notes-shortcut";
 import { useQuickSwitcher } from "@/hooks/use-quick-switcher";
 import { useRecordingHotkey } from "@/hooks/use-recording-hotkey";
 import { useRecordingShortcut } from "@/hooks/use-recording-shortcut";
@@ -72,6 +74,10 @@ export function AppShell() {
   // Wire ⌘5 to the Recording surface (Story 16.3); a no-op unless the recording
   // capability is on (desktop macOS ≥ 13.0).
   useRecordingShortcut();
+  // Wire ⌘6 to the Notes view and the ⌘⌥ notes verb cluster (Story 37.1); every
+  // chord self-gates on the `notes` capability, so none of them is a dead key
+  // where notes cannot exist.
+  useNotesShortcut();
   // Wire ⌘3 to the Approval Pane (Story 7.3).
   useApprovalShortcut();
   // Wire ⌘K to toggle the command palette (Story 9.1).
@@ -117,6 +123,9 @@ export function AppShell() {
   // Folder sync needs a usable `git` (Story 32.5, AD-41): same rule, so a stale
   // "sync" primary-view can never show the pane where sync cannot run.
   const sync = useCapabilitiesStore((s) => s.capabilities.sync);
+  // A notes vault is a folder keeper already syncs (AD-54, FR-122): same rule, so
+  // a stale "notes" primary-view can never show the pane where no vault can exist.
+  const notes = useCapabilitiesStore((s) => s.capabilities.notes);
   // Where the platform floats the window controls over the webview (desktop macOS,
   // via the macOS-only `titleBarStyle`/`hiddenTitle` keys) the app owes the window
   // its own drag region; under a real title bar the same band would be empty space
@@ -212,6 +221,8 @@ export function AppShell() {
                 <RecordingPane />
               ) : sync && primaryView === "sync" ? (
                 <SyncPane />
+              ) : notes && primaryView === "notes" ? (
+                <NotesPane />
               ) : primaryView === "bridges" ? (
                 <BridgesPane />
               ) : primaryView === "approval" ? (

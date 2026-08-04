@@ -700,9 +700,10 @@ impl AccountManager {
         mode: PaletteMode,
         open_chat: bool,
         recording: bool,
+        notes: bool,
     ) -> PaletteResultsVm {
         let index = self.palette.lock().await;
-        index.query(query, mode, open_chat, recording)
+        index.query(query, mode, open_chat, recording, notes)
     }
 
     /// Kick every live account's sync loop (Story 13.6: pull-to-refresh and the

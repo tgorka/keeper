@@ -211,6 +211,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     effectivePollIntervalMs: 15_000,
     tags: [],
     commitSubjectTemplate: "",
+    notes: false,
+    notesSubfolder: null,
     authorOverride: null,
     enabled: true,
     ...over,

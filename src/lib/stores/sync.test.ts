@@ -64,6 +64,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     effectivePollIntervalMs: 15_000,
     tags: [],
     commitSubjectTemplate: "",
+    notes: false,
+    notesSubfolder: null,
     authorOverride: null,
     enabled: true,
     ...over,
@@ -199,6 +201,8 @@ describe("actions", () => {
       tags: [],
       authorOverride: null,
       commitSubjectTemplate: null,
+      notes: false,
+      notesSubfolder: null,
     });
 
     expect(result).toEqual(saved);
@@ -228,6 +232,8 @@ describe("actions", () => {
         tags: [],
         authorOverride: null,
         commitSubjectTemplate: null,
+        notes: false,
+        notesSubfolder: null,
       }),
     ).rejects.toMatchObject({ message: "local path must be absolute" });
     // A rejected write is the caller's to surface; it is not a read failure.

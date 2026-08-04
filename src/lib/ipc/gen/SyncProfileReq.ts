@@ -40,4 +40,18 @@ authorOverride: string | null,
  * IS the default. An unknown placeholder is refused with a message naming
  * it, before the profile is stored.
  */
-commitSubjectTemplate: string | null, };
+commitSubjectTemplate: string | null, 
+/**
+ * Flag or unflag this folder as a notes vault. `None` leaves the flag alone,
+ * so a form that does not show it cannot clear it (AD-34-9) — which matters
+ * more here than for most fields, because clearing it would make a whole
+ * vault disappear from the UI on the next unrelated save.
+ */
+notes: boolean | null, 
+/**
+ * The vault subfolder to pin. Only meaningful together with `notes`, and
+ * `None` keeps whatever is stored — including when `notes: Some(true)` is
+ * re-sent for an already-flagged folder, which must not reset a subfolder the
+ * user changed.
+ */
+notesSubfolder: string | null, };

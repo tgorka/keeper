@@ -1624,3 +1624,88 @@ reason: `gitPath = ""` in TOML deserializes to `Some(PathBuf::from(""))`, and ta
   `GitRequest::from_setting(Option<&str>)` that answers `search` or `explicit` — and have both hosts
   call it instead of filtering for themselves.
 status: open
+
+## DW-N1 — the editor caret opens in front of the frontmatter block
+
+**Status:** done 2026-08-04, by the design correction below. **Found:** 2026-08-03,
+agent-desktop XFCE run, Phase 5 smoke test.
+**Severity:** cosmetic on disk, confusing on screen. Not data loss — see the guard below.
+
+**What happens.** Open a freshly created note and type: the first keystroke lands at document
+offset 0, which is *in front of* the opening `---`. The buffer becomes
+`<typing>---\nid: …\n---\n` and the block is no longer frontmatter.
+
+**What stopped it hurting until it was fixed.** `notes_ipc::restore_block` re-attached the base's
+block on every save, so the file on disk was always valid: `id` and `created` survived, the note
+stayed openable by its id, and Obsidian read it. The residue was a duplicated block sitting in the
+note's *body*, which the user then had to delete by hand.
+
+**What was tried.** `notes_open` sends the body offset as `NoteBodyBatch::Reset.cursor` (verified
+in the log: `cursor=Some(129)` for a 130-byte note), the store carries it, and `note-editor.tsx`
+applies it both at `EditorState.create` and in the reconcile effect. The caret still lands at 0,
+so something after those two points resets the selection — the `mode === "edit"` focus effect and
+CodeMirror's own initial-focus behaviour are the two candidates, neither yet ruled out.
+
+**The fix worth making instead.** Stop putting frontmatter in the editor buffer at all. FR-107 and
+UX-DR40 already say the block renders as a typed *properties panel*, not as source in the editor:
+
+- `notes_open` sends the BODY only (`&text[body_offset..]`), and `cursor` becomes redundant.
+- `notes_save` re-attaches the block — which `restore_block` already does, so the repair path
+  becomes the normal path.
+- `properties-panel.tsx` needs the whole document rather than the buffer, so the body channel
+  grows a `frontmatter` field or the panel gets its own read.
+- Every `NoteBodyBatch` variant carrying text (`External`, `Diverged`) needs the same treatment.
+
+That is a genuine design correction, not a patch: it makes typing above the block *unrepresentable*
+rather than repaired, and it deletes the caret-hint machinery.
+
+**resolution (2026-08-04).** Done as written, plus the two things the sketch had not accounted for:
+
+- `NoteBodyBatch::Reset | External | Diverged` each carry `frontmatter` beside the body; the body is
+  `&text[body_offset..]` and holds no fence at all. `split_note` / `join_note` in `notes_ipc` are the
+  only seam, and they are exact inverses (tested byte for byte, BOM and blank line included).
+- `notes_save(subscription_id, text, base_rev, frontmatter: Option<String>)`: `text` is the body,
+  `frontmatter` is `Some` only for the properties panel, and absent it the block keeper last
+  delivered stands. `restore_block` and its heuristic are deleted — a body that opens with `---`
+  (a thematic break on line one) is body text now, where the old repair would have mistaken it for
+  frontmatter and dropped the note's `id`.
+- `NoteWriteVm` gained `frontmatter`, because every save stamps `updated` and the panel would
+  otherwise render the timestamp it sent rather than the one that landed.
+- `NoteConflictChoiceReq::Merged.text` is a body too; `notes_resolve_conflict` re-attaches the
+  canonical note's block, so a hand-merge cannot cost the note its identity either.
+- `cursor` was NOT deleted. It stopped being a workaround and became the thing it was documented as:
+  a template's `{{cursor}}`, which `templates::expand` has always computed and both create paths
+  threw away (`let (expanded, _cursor)`). It is now stashed per note id at create and **taken** by
+  `notes_open`, which is the PRD's "creating from a template places the caret at the caret
+  placeholder, or at the end of the document when none is present" — an acceptance that had never
+  actually held. Bounded at 256 unopened hints.
+
+Verified: `typing_at_the_first_offset_cannot_disturb_the_block` drives the real `create_note` and the
+real save assembly against a real file on disk and asserts the saved note has exactly one block, one
+`id`, a surviving `created`, and the keystroke at the top of the body. 236 keeper tests, 1755
+frontend tests, workspace clippy clean. **Not** exercised: a human typing in the running app — Xvfb
+cannot start in this container (the X server hardcodes `/usr/bin/xkbcomp`, which is absent and
+unwritable).
+
+deployed 2026-08-04 to hesperia (macOS 26.5.2, arm64) with the new `scripts/install-macos.sh`, built
+from these exact sources (the four changed files' checksums matched across the rsync). The app boots,
+restores both accounts, syncs both folders and renders the Notes surface. The typing check still did
+not happen there either, for a different and better reason: hesperia has **no vault flagged** ("No
+notes vault yet. Flag a folder you already sync and it becomes one."), and which of someone's synced
+folders becomes a vault is their decision, not a smoke test's. One flagged folder and one typed
+character closes this.
+
+## DW-N2 — `recorder::tests::fetch_request_screen_recording_round_trips_the_fake_sidecar` is flaky under parallel test threads
+
+**Status:** open. **Found:** 2026-08-04, running `cargo test -p keeper --lib` on Linux.
+**Severity:** a false red in CI and in the pre-push hook. No product defect.
+
+**What happens.** The test writes a `#!/bin/sh` fake sidecar with `FakeSidecar::write` and executes
+it immediately. With the default test-thread fan-out the execve raced the writer's own file handle
+and failed with `Text file busy (os error 26)`; the same test passes every time with
+`--test-threads=1`. Two `FakeSidecar::write` calls in the same loop (`request-true`, `request-false`)
+make the window easy to hit on a slow container filesystem.
+
+**The fix.** Close the file explicitly (drop the handle) before `execve`, or `fsync` and re-`stat` it,
+in `FakeSidecar::write` — one place, and every sidecar test inherits it. Not done here because it is
+in `recorder.rs`, which this change does not touch, and a test-harness fix deserves its own diff.

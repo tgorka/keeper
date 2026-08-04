@@ -16,6 +16,16 @@ mod macos_version;
 mod media_protocol;
 #[cfg(desktop)]
 mod menu;
+// The `keeper-note://` asset scheme (AD-59). Desktop-only with the rest of notes:
+// a vault is a synced folder, and iOS has no folder sync to put one in.
+#[cfg(desktop)]
+mod note_protocol;
+#[cfg(desktop)]
+mod notes_ipc;
+#[cfg(desktop)]
+mod notes_vault;
+#[cfg(desktop)]
+mod notes_window;
 mod recorder;
 #[cfg(desktop)]
 mod sync;
@@ -151,7 +161,21 @@ pub fn run() {
         // IPC. The handler runs the async SDK fetch off-thread.
         .register_asynchronous_uri_scheme_protocol("keeper-media", |ctx, request, responder| {
             media_protocol::handle(ctx.app_handle().clone(), &request, responder);
-        })
+        });
+    // Vault-local assets — pasted images, embedded attachments, linked files —
+    // reach the webview only over this scheme and never as base64 over IPC (AD-58,
+    // AD-59). A second handler rather than an overload of `keeper-media://`, which
+    // resolves against the Matrix media cache: putting user-file path handling
+    // inside the code path that serves decrypted message media would make one bug
+    // there worse than two handlers.
+    #[cfg(desktop)]
+    let builder = builder.register_asynchronous_uri_scheme_protocol(
+        "keeper-note",
+        |ctx, request, responder| {
+            note_protocol::handle(ctx.app_handle().clone(), &request, responder);
+        },
+    );
+    let builder = builder
         .setup(|app| {
             // Forward every incoming `keeper://oauth/callback` deep link to the
             // OAuth-callback registry, which matches it to its in-flight OIDC
@@ -215,6 +239,17 @@ pub fn run() {
             // Best-effort exactly like the summon install above.
             #[cfg(desktop)]
             hotkey::install_recording(app.handle());
+
+            // Register the optional OS-global Quick Capture hotkey (Story 36.3,
+            // FR-101): a THIRD independent binding under `hotkey.capture`, unset
+            // by default. Its press handler raises the pre-created capture panel
+            // straight from Rust — NFR-27's 300 ms bar has no room for an IPC
+            // round trip in front of `show()` — and never touches the main
+            // window. Best-effort like the two above: a compositor that hands out
+            // no global shortcuts (Wayland) leaves the tray's Quick Capture item
+            // and the in-app ⌘⌥K as the two paths that always work.
+            #[cfg(desktop)]
+            hotkey::install_capture(app.handle());
 
             // Store the app handle for the desktop notifier port (Story 10.1) so
             // `Platform::notify` can post native notifications from the sync loop, and
@@ -282,6 +317,14 @@ pub fn run() {
                         // on a transition.
                         let (sync_state, sync_line) = ipc::sync_tray_snapshot(&handle);
                         tray::apply_sync_state(&handle, sync_state, &sync_line);
+                        // Notes rides the same clock, deliberately (AD-62): a 1 Hz
+                        // tick has exactly the resolution a 2 s idle-commit needs,
+                        // and two schedulers over one git repository is how you get
+                        // concurrent index locks. The tray labels and the cadence
+                        // are both evaluated here, and each writes only on a
+                        // change.
+                        tray::apply_notes_state(&handle, &notes_ipc::tray_snapshot(&handle));
+                        notes_vault::cadence_tick();
                     }
                 });
             }
@@ -347,6 +390,14 @@ pub fn run() {
                 let state = app.state::<ipc::AppState>();
                 sync::start_supervisor(std::sync::Arc::clone(&state.platform));
             }
+
+            // Build the vault registry and tap the engine's watcher (Epic 35,
+            // AD-54/AD-56). After the supervisor, because the tap is the engine's
+            // and there is nothing to subscribe to before it exists; a machine
+            // with no usable `git` has no engine, therefore no vaults, and this
+            // returns quietly — `CapabilitiesVm.notes` is already false there.
+            #[cfg(desktop)]
+            notes_vault::start(app.handle());
 
             Ok(())
         });
@@ -578,9 +629,62 @@ pub fn run() {
         copy_ipc::copy_start,
         copy_ipc::copy_status,
         copy_ipc::copy_cancel,
+        notes_ipc::notes_vaults,
+        notes_ipc::notes_vault_flag,
+        notes_ipc::notes_vault_settings_save,
+        notes_ipc::notes_vault_active,
+        notes_ipc::notes_vault_set_active,
+        notes_ipc::notes_index_rebuild,
+        notes_ipc::notes_list,
+        notes_ipc::notes_tag_tree,
+        notes_ipc::notes_tree,
+        notes_ipc::notes_spaces,
+        notes_ipc::notes_space_save,
+        notes_ipc::notes_space_validate,
+        notes_ipc::notes_create,
+        notes_ipc::notes_journal_today,
+        notes_ipc::notes_templates,
+        notes_ipc::notes_open,
+        notes_ipc::notes_close,
+        notes_ipc::notes_buffer_report,
+        notes_ipc::notes_save,
+        notes_ipc::notes_rename,
+        notes_ipc::notes_set_flag,
+        notes_ipc::notes_delete,
+        notes_ipc::notes_search,
+        notes_ipc::notes_link_targets,
+        notes_ipc::notes_backlinks,
+        notes_ipc::notes_history,
+        notes_ipc::notes_diff,
+        notes_ipc::notes_mark_read,
+        notes_ipc::notes_conflicts,
+        notes_ipc::notes_resolve_conflict,
+        notes_ipc::notes_attachment_paste,
+        notes_ipc::notes_attachment_drop,
+        notes_ipc::notes_capture_buffer,
+        notes_ipc::notes_capture_buffer_save,
+        notes_ipc::notes_capture_commit,
+        notes_ipc::notes_subscribe_changes,
+        notes_ipc::notes_unsubscribe_changes,
+        notes_ipc::notes_subscribe_index,
+        notes_ipc::notes_capture_show,
+        notes_ipc::notes_capture_hide,
+        notes_ipc::notes_reveal,
+        notes_ipc::notes_open_file,
     );
+    // The notes surface is desktop-only, but the five commands that touch a window
+    // or a file manager have `Unsupported` twins so the handler list is identical
+    // on every target and `cargo check --target aarch64-apple-ios` stays green
+    // (AD-27, AD-33). The rest of the notes commands are absent on iOS by
+    // construction: `CapabilitiesVm.notes` is false there, so nothing calls them.
     #[cfg(not(desktop))]
-    let builder = keeper_with_commands!(builder);
+    let builder = keeper_with_commands!(
+        builder,
+        ipc::notes_capture_show,
+        ipc::notes_capture_hide,
+        ipc::notes_reveal,
+        ipc::notes_open_file,
+    );
     // Window-close (⌘W / red button) hides the main window instead of destroying it
     // (Story 10.3, FR-53): the process keeps every account's `SyncService` and the
     // notification pipeline alive so background behavior is byte-for-byte identical to
@@ -589,11 +693,24 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder.on_window_event(|window, event| {
         if window.label() == "main" {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                if let Err(error) = window.hide() {
-                    tracing::warn!(%error, "could not hide main window on close; leaving it open");
+            match event {
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    if let Err(error) = window.hide() {
+                        tracing::warn!(%error, "could not hide main window on close");
+                    }
+                    // The window going away is the strongest available signal that
+                    // the other machine wants these bytes, so it force-flushes every
+                    // notes vault (FR-115, AD-62). A commit needs no network; a push
+                    // that cannot complete is a journal row (AD-49), so nothing here
+                    // can block the close.
+                    notes_vault::flush();
                 }
+                // Losing focus is the weaker version of the same signal, and it is
+                // the one that fires when the user switches app without hiding
+                // anything. `push_on_blur` decides whether it reaches the network.
+                WindowEvent::Focused(false) => notes_vault::flush(),
+                _ => {}
             }
         }
     });
@@ -657,6 +774,14 @@ pub fn run() {
                     // `kill_on_drop`) if it hangs. Bounded — quit is never stuck.
                     ipc::finalize_recording_for_quit(&state);
                 }
+                // Flush every notes vault before the supervisor is signalled
+                // (FR-115, AD-62): quitting mid-typing must not lose the note. The
+                // wait is bounded, and bounding it is safe precisely because the
+                // commit already happened locally and an outstanding push is a
+                // journal row the next launch drains — the work is queued, not
+                // dropped.
+                #[cfg(desktop)]
+                notes_vault::flush_for_quit();
                 // Ask the sync supervisor to stop before the account teardown
                 // below: the engine finishes the unit it holds and leaves its
                 // journal row intact, so an interrupted push is re-driven next
@@ -685,7 +810,11 @@ pub fn run() {
             // view. The kept notification backend has NO per-notification click callback,
             // so this is deliberately coarse — never exact-message routing (deferred to
             // Epic 11).
-            #[cfg(desktop)]
+            //
+            // `RunEvent::Reopen` is an Apple-platform variant (there is no dock on
+            // Linux/Windows), so this arm is gated on macOS specifically rather than on
+            // `desktop` — the wider gate does not compile on the Linux desktop target.
+            #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => {
                 tray::show_main_window(app_handle);
                 ipc::emit_notify_navigate(app_handle);

@@ -40,3 +40,44 @@ if (!globalThis.ResizeObserver) {
     disconnect() {}
   };
 }
+
+// jsdom performs no layout, so every element reports a 0x0 bounding rect. A
+// virtualised list asks the scroll element how tall it is and renders a window
+// of that height, which means an unshimmed jsdom renders exactly zero rows and
+// every assertion about the note list fails for a reason that has nothing to do
+// with the component.
+//
+// The shim answers with one screen — and ONLY when the real answer is all
+// zeros, so any test that arranges a real geometry still sees its own numbers.
+const VIEWPORT = { width: 1024, height: 768 };
+const measure = Element.prototype.getBoundingClientRect;
+Element.prototype.getBoundingClientRect = function shimmedRect(this: Element): DOMRect {
+  const real = measure.call(this);
+  if (real.width !== 0 || real.height !== 0 || real.x !== 0 || real.y !== 0) {
+    return real;
+  }
+  return {
+    ...VIEWPORT,
+    x: 0,
+    y: 0,
+    top: 0,
+    left: 0,
+    right: VIEWPORT.width,
+    bottom: VIEWPORT.height,
+    toJSON: () => ({}),
+  } as DOMRect;
+};
+
+// The same absence, through the other door: `@tanstack/react-virtual` sizes its
+// window from the scroll element's `offsetWidth`/`offsetHeight`, and jsdom's
+// getters are hard-coded to 0 — so the list renders zero rows however generous
+// the bounding rect is. Defining them here (configurable, and only as a
+// fallback of last resort) is what makes a virtualised list assertable at all.
+for (const dimension of ["offsetWidth", "offsetHeight"] as const) {
+  Object.defineProperty(HTMLElement.prototype, dimension, {
+    configurable: true,
+    get(this: HTMLElement) {
+      return dimension === "offsetWidth" ? VIEWPORT.width : VIEWPORT.height;
+    },
+  });
+}

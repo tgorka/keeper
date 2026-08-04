@@ -12,10 +12,10 @@ import { createStore } from "zustand/vanilla";
 /**
  * Which primary window the shell renders: the Unified Inbox, the Archive, the
  * Bridges surface (Story 6.1), the Approval Pane (Story 7.3), the Recording
- * view (Story 16.3), the Sync view (Story 32.5), or Settings. "inbox"/"archive"
- * pick which window the chat-list pane shows; "bridges", "approval",
- * "recording", "sync" and "settings" each replace the chat-list + conversation
- * cluster entirely.
+ * view (Story 16.3), the Sync view (Story 32.5), the Notes view (Story 37.1),
+ * or Settings. "inbox"/"archive" pick which window the chat-list pane shows;
+ * "bridges", "approval", "recording", "sync", "notes" and "settings" each
+ * replace the chat-list + conversation cluster entirely.
  *
  * Settings joined this list rather than staying a dialog because it is a place
  * you go and stay, not a question you answer and dismiss — and a modal covers the
@@ -29,6 +29,7 @@ export type PrimaryView =
   | "approval"
   | "recording"
   | "sync"
+  | "notes"
   | "settings";
 
 export interface PrimaryViewState {

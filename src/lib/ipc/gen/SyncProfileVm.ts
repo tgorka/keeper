@@ -44,4 +44,19 @@ commitSubjectTemplate: string,
  * or a bare display name. `None` keeps the device identity and its
  * non-routable `sync@<device-id>.keeper.invalid` address.
  */
-authorOverride: string | null, enabled: boolean, };
+authorOverride: string | null, enabled: boolean, 
+/**
+ * Whether this folder contains a notes vault (FR-94, AD-54).
+ *
+ * A vault is not a configured object: it is this flag plus a subfolder, so
+ * the vault list IS a filter over the profile list and there is no second
+ * registry to keep consistent with the first.
+ */
+notes: boolean, 
+/**
+ * Where inside the folder the vault lives, when it is one. `None` when it is
+ * not — the form then shows the real default (`notes/`) rather than a blank
+ * box, so what it displays is the value that would actually be in force
+ * (AD-34-8).
+ */
+notesSubfolder: string | null, };

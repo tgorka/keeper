@@ -110,6 +110,17 @@ pub struct SyncProfileVm {
     /// non-routable `sync@<device-id>.keeper.invalid` address.
     pub author_override: Option<String>,
     pub enabled: bool,
+    /// Whether this folder contains a notes vault (FR-94, AD-54).
+    ///
+    /// A vault is not a configured object: it is this flag plus a subfolder, so
+    /// the vault list IS a filter over the profile list and there is no second
+    /// registry to keep consistent with the first.
+    pub notes: bool,
+    /// Where inside the folder the vault lives, when it is one. `None` when it is
+    /// not — the form then shows the real default (`notes/`) rather than a blank
+    /// box, so what it displays is the value that would actually be in force
+    /// (AD-34-8).
+    pub notes_subfolder: Option<String>,
 }
 
 impl From<&SyncProfile> for SyncProfileVm {
@@ -136,6 +147,8 @@ impl From<&SyncProfile> for SyncProfileVm {
             commit_subject_template: p.commit_subject_template.clone(),
             author_override: p.author_override.clone(),
             enabled: p.enabled,
+            notes: p.notes.is_some(),
+            notes_subfolder: p.notes.as_ref().map(|notes| notes.subfolder.clone()),
         }
     }
 }
@@ -377,18 +390,45 @@ pub struct SyncProfileReq {
     /// it, before the profile is stored.
     #[serde(default)]
     pub commit_subject_template: Option<String>,
+    /// Flag or unflag this folder as a notes vault. `None` leaves the flag alone,
+    /// so a form that does not show it cannot clear it (AD-34-9) — which matters
+    /// more here than for most fields, because clearing it would make a whole
+    /// vault disappear from the UI on the next unrelated save.
+    #[serde(default)]
+    pub notes: Option<bool>,
+    /// The vault subfolder to pin. Only meaningful together with `notes`, and
+    /// `None` keeps whatever is stored — including when `notes: Some(true)` is
+    /// re-sent for an already-flagged folder, which must not reset a subfolder the
+    /// user changed.
+    #[serde(default)]
+    pub notes_subfolder: Option<String>,
 }
 
-/// Mint an opaque, sortable, collision-free profile id.
+/// Mint an opaque, sortable, collision-free id.
 ///
-/// ULID-shaped — a 48-bit millisecond timestamp in Crockford base32 followed by
-/// randomness — so ids sort by creation and read like the engine's own, without
-/// pulling a second copy of the `ulid` crate into the shell.
+/// A real ULID: a 48-bit millisecond timestamp in Crockford base32 followed by
+/// 80 bits of randomness, 26 characters in total, so ids sort by creation and
+/// read like the engine's own without pulling a second copy of the `ulid` crate
+/// into the shell.
 ///
-/// Randomness comes from `RandomState`, which the standard library seeds once
-/// per process from the OS. This only has to avoid collision between profiles a
-/// human creates; it is not a security boundary, so a CSPRNG would be theatre.
-fn new_profile_id() -> String {
+/// The length is load-bearing rather than cosmetic. Notes validate their
+/// frontmatter `id` against the ULID shape (`notes_vault::is_ulid`) and index a
+/// note whose id is not one under a path-derived identity instead. This
+/// generator emitted 22 characters until 2026-08-03, so every note keeper wrote
+/// failed keeper's own check: the note was indexed by path, flagged
+/// `unstable_identity`, and could not be opened by the id its own frontmatter
+/// carried.
+///
+/// Randomness comes from two independently seeded `RandomState` hashers — the
+/// standard library seeds each from the OS — because one 64-bit hash is short of
+/// the 80 bits the format wants. This only has to avoid collision between things
+/// a human or an agent creates in one vault; it is not a security boundary, so a
+/// CSPRNG would be theatre.
+///
+/// Shared with the notes surface (Phase 5), which needs exactly the same thing for
+/// note ids, temp-file names and trash directories — one generator rather than two
+/// that could drift in shape.
+pub(crate) fn new_ulid() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -399,18 +439,23 @@ fn new_profile_id() -> String {
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default();
 
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(millis);
-    let entropy = hasher.finish();
+    let entropy = |salt: u64| {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(millis ^ salt);
+        hasher.finish()
+    };
+    let (high, low) = (entropy(0), entropy(u64::MAX));
 
     let mut out = String::with_capacity(26);
     // 10 characters = 50 bits, covering the 48-bit timestamp.
     for i in (0..10).rev() {
         out.push(ALPHABET[((millis >> (i * 5)) & 0x1f) as usize] as char);
     }
-    // 12 characters = 60 bits of the 64-bit hash.
-    for i in (0..12).rev() {
-        out.push(ALPHABET[((entropy >> (i * 5)) & 0x1f) as usize] as char);
+    // 16 characters = 80 bits, taken 8 from each hasher.
+    for source in [high, low] {
+        for i in (0..8).rev() {
+            out.push(ALPHABET[((source >> (i * 5)) & 0x1f) as usize] as char);
+        }
     }
     out
 }
@@ -582,7 +627,7 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
         // collision-free opaque string satisfies the contract, and the engine
         // treats it as entirely opaque.
         None => SyncProfile::new(
-            req.id.clone().unwrap_or_else(new_profile_id),
+            req.id.clone().unwrap_or_else(new_ulid),
             &req.name,
             &req.local_path,
             &req.remote_url,
@@ -627,10 +672,45 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
     if let Some(template) = req.commit_subject_template.as_ref() {
         profile.commit_subject_template = template.trim().to_owned();
     }
+    // The notes flag, under the same rule as everything above it: `prior` is the
+    // base, so flagging a vault cannot reset a knob the form did not show, and a
+    // request that says nothing about notes leaves an existing vault exactly as it
+    // is. Unflagging removes no files — it is a flag write and nothing else
+    // (AD-54).
+    match req.notes {
+        Some(true) => {
+            let mut config = profile.notes.clone().unwrap_or_default();
+            if let Some(subfolder) = notes_subfolder(req) {
+                config.subfolder = subfolder;
+            }
+            profile.notes = Some(config);
+        }
+        Some(false) => profile.notes = None,
+        // Not expressed: a subfolder edit on its own still lands, so the vault
+        // settings form can move the subfolder without re-asserting the flag.
+        None => {
+            if let (Some(config), Some(subfolder)) = (profile.notes.as_mut(), notes_subfolder(req))
+            {
+                config.subfolder = subfolder;
+            }
+        }
+    }
     // Validate here so a bad profile is rejected at the edge with an actionable
     // message rather than deep inside the engine.
     profile.validate().map_err(|err| sync_ipc_error(&err))?;
     Ok(profile)
+}
+
+/// The subfolder a request expresses, normalised — or `None` when it expresses
+/// none.
+///
+/// Trimmed of whitespace and of leading and trailing slashes, because a form field
+/// commonly carries `notes/` and `SyncProfile::validate` refuses an absolute path.
+/// An empty string after trimming is not an expression: the caller sent a blank
+/// box, and the stored value (or the `notes` default) is the right answer.
+fn notes_subfolder(req: &SyncProfileReq) -> Option<String> {
+    let trimmed = req.notes_subfolder.as_ref()?.trim().trim_matches('/');
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 fn engine_of(state: &AppState) -> Result<Arc<keeper_sync::engine::Engine>, IpcError> {
@@ -1303,6 +1383,8 @@ mod tests {
             tags: vec![],
             author_override: None,
             commit_subject_template: None,
+            notes: None,
+            notes_subfolder: None,
         }
     }
 
@@ -1312,7 +1394,7 @@ mod tests {
     /// struct: the bug is a lost KEY, and serde is what decides what a key is.
     ///
     /// A field the request has a slot for.
-    const EXPRESSED: [&str; 16] = [
+    const EXPRESSED: [&str; 17] = [
         "name",
         "localPath",
         "remoteUrl",
@@ -1329,12 +1411,15 @@ mod tests {
         "tags",
         "authorOverride",
         "commitSubjectTemplate",
+        "notes",
     ];
 
     /// A field no request can express, which `parse_req` must therefore never
     /// touch. `enabled` moves only through pause/resume, `volumeId` is minted by
-    /// the engine on first sight of the media, and `id` names the row.
-    const PRESERVED: [&str; 3] = ["id", "volumeId", "enabled"];
+    /// the engine on first sight of the media, `id` names the row, and the two
+    /// LFS knobs (`lfsNever`, `lfsPruneLocal`) are configured through
+    /// `keeper-syncd`'s profile file with no slot in the app's form.
+    const PRESERVED: [&str; 5] = ["id", "volumeId", "enabled", "lfsNever", "lfsPruneLocal"];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
         match serde_json::to_value(profile).expect("a profile serializes") {
@@ -1367,6 +1452,8 @@ mod tests {
         let mut prior = parse_req(&req(), None).expect("valid");
         prior.enabled = false;
         prior.volume_id = Some("01VOLUME".into());
+        prior.lfs_never = vec!["*.psd".into()];
+        prior.lfs_prune_local = true;
 
         // An edit that moves every field it CAN move, so nothing below passes by
         // standing still.
@@ -1390,6 +1477,9 @@ mod tests {
         edit.tags = vec!["drive".into()];
         edit.author_override = Some("Ada <ada@example.org>".into());
         edit.commit_subject_template = Some("{profile}: {changed}".into());
+        // Flagging the folder as a vault moves `notes` from `None` to `Some`.
+        edit.notes = Some(true);
+        edit.notes_subfolder = Some("second-brain".into());
         let merged = parse_req(&edit, Some(&prior)).expect("valid");
 
         let before = json_fields(&prior);
@@ -1436,6 +1526,72 @@ mod tests {
                  not change it"
             );
         }
+    }
+
+    /// The notes flag under the same rule, spelled out because its failure mode is
+    /// the loudest one in the phase: a save from a form that does not show the flag
+    /// would make an entire vault — its list, its tray section, its capture
+    /// destination — disappear from the UI, while every file stayed exactly where
+    /// it was. Silent and baffling, which is why it gets its own assertion.
+    #[test]
+    fn a_save_that_says_nothing_about_notes_leaves_a_vault_flagged() {
+        let mut prior = parse_req(&req(), None).expect("valid");
+        prior.notes = Some(keeper_sync::profile::NotesConfig {
+            subfolder: "second-brain".into(),
+            ..Default::default()
+        });
+
+        // A form with no notes control at all.
+        let merged = parse_req(&req(), Some(&prior)).expect("valid");
+        let notes = merged.notes.expect("the vault flag survives a save");
+        assert_eq!(
+            notes.subfolder, "second-brain",
+            "and so does the subfolder the user chose"
+        );
+
+        // A subfolder edit on its own lands without re-asserting the flag.
+        let mut edit = req();
+        edit.notes_subfolder = Some("/vault/".into());
+        let moved = parse_req(&edit, Some(&prior)).expect("valid");
+        assert_eq!(
+            moved.notes.expect("still a vault").subfolder,
+            "vault",
+            "the slashes a form field carries are trimmed, since an absolute \
+             subfolder is refused by validate"
+        );
+
+        // An explicit unflag is the one thing that clears it.
+        let mut unflag = req();
+        unflag.notes = Some(false);
+        assert!(parse_req(&unflag, Some(&prior))
+            .expect("valid")
+            .notes
+            .is_none());
+
+        // A blank subfolder box is not an expression: the stored value wins.
+        let mut blank = req();
+        blank.notes = Some(true);
+        blank.notes_subfolder = Some("   ".into());
+        assert_eq!(
+            parse_req(&blank, Some(&prior))
+                .expect("valid")
+                .notes
+                .expect("still a vault")
+                .subfolder,
+            "second-brain"
+        );
+
+        // Flagging a folder that was never a vault gets the shipped default.
+        let mut fresh = req();
+        fresh.notes = Some(true);
+        assert_eq!(
+            parse_req(&fresh, None)
+                .expect("valid")
+                .notes
+                .expect("now a vault")
+                .subfolder,
+            keeper_sync::profile::NotesConfig::default().subfolder
+        );
     }
 
     /// The concrete case AD-34-9 was written for, spelled out beside the general
@@ -1586,12 +1742,20 @@ mod tests {
             "an empty override falls back to the device identity"
         );
     }
+
+    /// The generator's SHAPE is a contract, not a detail. Notes validate a
+    /// frontmatter `id` against the ULID form and index a note whose id is not
+    /// one under a path-derived identity instead — so when this emitted 22
+    /// characters, every note keeper wrote failed keeper's own check and could
+    /// not be opened by the id its own frontmatter carried. Observed on the
+    /// agent-desktop run of 2026-08-03; the length assertion below is what stops
+    /// it coming back.
     #[test]
     fn minted_ids_are_unique_sortable_and_shaped_like_a_ulid() {
-        let ids: std::collections::BTreeSet<String> = (0..500).map(|_| new_profile_id()).collect();
+        let ids: std::collections::BTreeSet<String> = (0..500).map(|_| new_ulid()).collect();
         assert_eq!(ids.len(), 500, "ids must not collide");
         for id in &ids {
-            assert_eq!(id.len(), 22);
+            assert_eq!(id.len(), 26, "a ULID is 26 characters: {id}");
             assert!(
                 id.bytes()
                     .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b)),
@@ -1600,9 +1764,9 @@ mod tests {
         }
         // The timestamp prefix makes them sort by creation, which is what makes
         // a profile list stable without a separate ordering column.
-        let first = new_profile_id();
+        let first = new_ulid();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        assert!(new_profile_id() > first);
+        assert!(new_ulid() > first);
     }
 
     #[test]

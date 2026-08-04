@@ -15,6 +15,20 @@ export default defineConfig(async () => ({
     },
   },
 
+  // Two entry points, not one (AD-60). `index.html` is the app; `capture.html`
+  // is the quick-capture panel's own document, loaded by the statically
+  // declared `quick-capture` window. Keeping them separate is what keeps the
+  // NFR-27 budget honest: the capture bundle imports neither the editor nor
+  // mermaid, so the panel paints without touching either lazy chunk.
+  build: {
+    rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, "index.html"),
+        capture: path.resolve(__dirname, "capture.html"),
+      },
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

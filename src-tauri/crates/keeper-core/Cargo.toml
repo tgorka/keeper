@@ -41,3 +41,10 @@ ulid = { workspace = true }
 # Random per-account SDK-store passphrase generation (Story 2.6, at-rest encryption).
 # matrix-sdk 0.18 already resolves rand 0.8 transitively; permissive (MIT/Apache).
 rand = "0.8"
+# The `path:` predicate of the space query language (Phase 5, FR-105). The
+# architecture specifies a globset glob, and `keeper-sync`'s tier-0 exclusion
+# already resolves the same workspace version, so this pulls no new crate into
+# the tree. `Unlicense OR MIT` — the MIT arm satisfies the licence firewall, and
+# it drags in neither tauri nor gix, so `check:core-tauri-free` and
+# `check:core-sync-free` stay green.
+globset = { workspace = true }

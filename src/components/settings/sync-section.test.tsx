@@ -132,6 +132,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     effectivePollIntervalMs: 15_000,
     tags: [],
     commitSubjectTemplate: "",
+    notes: false,
+    notesSubfolder: null,
     authorOverride: null,
     enabled: true,
     ...over,
@@ -568,6 +570,8 @@ describe("SyncSection add-profile form", () => {
         tags: [],
         authorOverride: null,
         commitSubjectTemplate: "",
+        notes: false,
+        notesSubfolder: null,
       }),
     );
     // Nothing was typed into the token field, so the keychain was left alone.

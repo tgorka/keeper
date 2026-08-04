@@ -164,6 +164,101 @@ pub fn install_recording<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// The Quick Capture global-shortcut press handler (Story 36.3, FR-101, NFR-27):
+/// toggle the capture panel on `Pressed`.
+///
+/// It raises the window **from Rust** rather than emitting an event for the
+/// webview to act on, which is the whole of NFR-27: the path is
+/// `set_position` → `show` → `set_focus`, three synchronous calls under 5 ms, with
+/// no IPC round trip in front of them. `notes_window::show` emits
+/// `keeper://notes-capture-shown` afterwards so the panel can re-assert focus if
+/// a Linux compositor took it away.
+///
+/// A second press hides it again — the same chord that summons a scratchpad is
+/// the one a hand reaches for to dismiss it, and this mirrors what the summon
+/// hotkey already does for the main window. Hiding here is `commit: false`: the
+/// buffer is already persisted by the panel's own debounce, so nothing is lost,
+/// and dismissing with the summon key must not be a way to accidentally publish
+/// a half-written thought. Escape is the key that commits.
+///
+/// It deliberately does not touch the main window: capture exists so a thought
+/// can be caught without leaving the app you are in.
+pub(crate) fn on_capture_shortcut_event<R: Runtime>(
+    app: &AppHandle<R>,
+    _shortcut: &Shortcut,
+    event: ShortcutEvent,
+) {
+    if event.state != ShortcutState::Pressed {
+        return;
+    }
+    if crate::notes_window::is_visible(app) {
+        crate::notes_window::hide(app);
+    } else {
+        crate::notes_window::show(app);
+    }
+}
+
+/// The pure register-or-nothing decision for the capture hotkey, identical in
+/// shape to [`recording_shortcut`]: the empty string is the **unset** default, so
+/// keeper registers nothing until a user assigns a chord. Factored out so the
+/// decision is unit-testable without an app.
+pub(crate) fn capture_shortcut(accelerator: &str) -> Option<Shortcut> {
+    if accelerator.is_empty() {
+        return None;
+    }
+    parse(accelerator)
+}
+
+/// Register the persisted Quick Capture accelerator with the OS at startup (Story
+/// 36.3). Reads `hotkey.capture` (absent/empty ⇒ unset: register **nothing**),
+/// parses it, and attaches [`on_capture_shortcut_event`].
+///
+/// Best-effort exactly like the other two installs. A registration failure is not
+/// a dead end for the feature and must not be presented as one: the tray's Quick
+/// Capture item and the in-app `⌘⌥K` both still work, which is why the phase's
+/// headline affordance never rests on a single global shortcut (UX-DR43).
+pub fn install_capture<R: Runtime>(app: &AppHandle<R>) {
+    let data_dir = match app.state::<crate::ipc::AppState>().platform.data_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(%error, "hotkey: could not resolve data dir; capture hotkey inactive");
+            return;
+        }
+    };
+    let accelerator = match keeper_core::registry::get_capture_hotkey(&data_dir) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "hotkey: could not read stored capture accelerator; capture hotkey inactive"
+            );
+            return;
+        }
+    };
+    let Some(shortcut) = capture_shortcut(&accelerator) else {
+        if accelerator.is_empty() {
+            tracing::debug!("hotkey: capture hotkey unset; registering nothing");
+        } else {
+            tracing::warn!(
+                accelerator,
+                "hotkey: stored capture accelerator is malformed; capture hotkey inactive"
+            );
+        }
+        return;
+    };
+    match app
+        .global_shortcut()
+        .on_shortcut(shortcut, on_capture_shortcut_event)
+    {
+        Ok(()) => {
+            tracing::info!(accelerator, "hotkey: registered global capture shortcut");
+        }
+        Err(error) => {
+            tracing::warn!(%error, accelerator, "hotkey: OS refused to register capture shortcut");
+        }
+    }
+}
+
 /// Register the persisted-or-default accelerator with the OS at startup (Story 9.4).
 ///
 /// Reads the stored accelerator (absent ⇒ [`DEFAULT_HOTKEY`]), parses it, and attaches
@@ -292,6 +387,21 @@ mod tests {
         // Malformed input also registers nothing (logged as a warning upstream).
         assert!(recording_shortcut("Foo+").is_none());
         assert!(recording_shortcut("NotAKey").is_none());
+    }
+
+    #[test]
+    fn capture_shortcut_unset_registers_nothing_and_valid_parses() {
+        // The same unset-by-default rule as the recording hotkey (Story 36.3):
+        // keeper ships no capture chord, so nothing registers until a user picks
+        // one — and the tray item plus the in-app twin still work meanwhile.
+        assert!(
+            capture_shortcut("").is_none(),
+            "unset (empty) must register nothing"
+        );
+        assert!(capture_shortcut("Control+Alt+N").is_some());
+        assert!(capture_shortcut("Super+Alt+K").is_some());
+        assert!(capture_shortcut("Foo+").is_none());
+        assert!(capture_shortcut("NotAKey").is_none());
     }
 
     #[test]

@@ -59,16 +59,81 @@ const SHOW_RECORDING_ID: &str = "tray-show-recording";
 /// acknowledges the terminal failed session back to idle, releasing the hold.
 const DISMISS_ERROR_ID: &str = "tray-dismiss-error";
 
+/// The menu item ids for the notes section (Story 36.7, FR-102, AD-61).
+///
+/// Every one of them exists in the menu built at tray creation and never in a
+/// replacement menu: a Linux tray menu cannot be swapped after it is set, so an
+/// affordance absent from the first menu can never appear. Labels mutate on the
+/// retained handles in [`NotesItems`]; the slot count is fixed forever.
+const NOTE_NEW_ID: &str = "tray-note-new";
+const NOTE_CAPTURE_ID: &str = "tray-note-capture";
+const NOTE_JOURNAL_ID: &str = "tray-note-journal";
+const NOTE_UNREAD_ID: &str = "tray-note-unread";
+
+/// The five recent-note slots, in order. Five exist from the first build whether
+/// or not five notes do — fewer touched notes means disabled slots, not a shorter
+/// menu.
+const NOTE_RECENT_IDS: [&str; 5] = [
+    "tray-note-recent-0",
+    "tray-note-recent-1",
+    "tray-note-recent-2",
+    "tray-note-recent-3",
+    "tray-note-recent-4",
+];
+
+/// How many recent slots the menu carries, for the composer that fills them.
+pub const NOTE_RECENT_SLOTS: usize = NOTE_RECENT_IDS.len();
+
+/// How many characters of a note title a slot label carries.
+const NOTE_TITLE_CAP: usize = 40;
+
+/// The label a recent slot with no note shows.
+const NOTE_EMPTY_SLOT: &str = "\u{2014}";
+
+/// What the tray should currently say about notes — composed in Rust, so the
+/// tray, the palette and the window can never word the same fact differently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotesTray {
+    /// The active vault, when there is one. `None` means no folder is flagged,
+    /// which is a legible state and not a disabled section: New Note and Today's
+    /// Journal stay enabled and open Settings → Sync, because the action is
+    /// achievable.
+    pub vault_id: Option<String>,
+    /// The five most recently touched notes, newest first: `(note id, title)`.
+    pub recent: Vec<(String, String)>,
+    /// How many notes in the active vault are unread (FR-113).
+    pub unread: u32,
+    /// Whether the global capture shortcut is actually registered. When it is
+    /// not, the item's label says so — the truth belongs where the user is, not
+    /// only where they configured it (UX-DR43).
+    pub hotkey_registered: bool,
+}
+
+/// The retained notes menu items, held so their labels can be mutated.
+///
+/// `set_text` and `set_enabled` only — never `set_menu` (AD-61). Cloned handles
+/// are cheap and the mutation dispatches to the main thread internally, which is
+/// why the tray lock is never held across one.
+#[derive(Clone)]
+struct NotesItems {
+    new_note: MenuItem<Wry>,
+    capture: MenuItem<Wry>,
+    journal: MenuItem<Wry>,
+    recent: Vec<MenuItem<Wry>>,
+    unread: MenuItem<Wry>,
+}
+
 /// The bundled record-dot menu-bar icon shown while a recording is live (Story
 /// 18.1; template rendering Story 21.4). Decoded per transition via
-/// [`Image::from_bytes`] (the `image-png` tauri feature) — a decode failure
-/// just keeps the current icon.
+/// [`tray_glyph`] — a decode failure just keeps the current icon.
 ///
 /// All three tray glyphs are macOS TEMPLATE images (monochrome black + alpha,
 /// the brand speech-bubble mark from the app icon): the menu bar colors them
 /// white/black per appearance and highlights them natively, so states must
 /// read from glyph SHAPE — bubble outline = idle, filled dot in the bubble =
-/// recording, filled bubble with a punched-out exclamation = error.
+/// recording, filled bubble with a punched-out exclamation = error. Off macOS
+/// no tray host recolours anything, so [`tray_glyph`] repaints the same shape
+/// for the panel; the shape-not-colour rule holds on every platform.
 const RECORDING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-recording-template.png");
 
 /// The bundled error badge shown while a failed session holds the tray (Story
@@ -105,6 +170,122 @@ const SYNC_REFRESH_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-refresh-
 const SYNC_PAUSED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-paused-template.png");
 const SYNC_WARNING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-warning-template.png");
 
+/// The colour the authored glyph is repainted in on every platform that is not
+/// macOS — the keeper mark's bright tone, chosen because it separates from both
+/// a dark and a light panel.
+#[cfg(not(target_os = "macos"))]
+const PANEL_GLYPH_RGB: [u8; 3] = [0x3E, 0xCF, 0xAE];
+
+/// The one-pixel contrast halo grown around the repainted glyph — the mark's
+/// deep tone. On a dark panel it disappears into the background; on a light one
+/// it is what stops the bright mark dissolving into white.
+#[cfg(not(target_os = "macos"))]
+const PANEL_HALO_RGB: [u8; 3] = [0x06, 0x23, 0x1C];
+
+/// How opaque an authored pixel must be to grow a halo. Below this the glyph is
+/// already fading out and an outline would only thicken it.
+#[cfg(not(target_os = "macos"))]
+const PANEL_HALO_THRESHOLD: u8 = 96;
+
+/// Decode a bundled glyph for the tray, adapting it to the host's tray host.
+///
+/// On macOS the glyphs are TEMPLATE images: monochrome black + alpha, which the
+/// menu bar recolours per appearance and inverts on highlight. Black is the
+/// correct authoring colour there, so the bytes are used verbatim.
+///
+/// Nowhere else. `icon_as_template` is documented macOS-only and is silently
+/// ignored by every other backend, so an ayatana/StatusNotifier panel or the
+/// Windows notification area blits the authored PNG as-is — and a pure-black
+/// mark on the default dark panel is a black-on-black silhouette. Off macOS the
+/// same authored SHAPE is therefore repainted at decode time in the brand tone
+/// with a contrast halo, which reads on a light panel and a dark one without
+/// authoring a second icon set or guessing the panel's theme. Colour still
+/// carries no information: every state continues to read from the shape.
+#[cfg(target_os = "macos")]
+fn tray_glyph(png: &[u8]) -> Option<Image<'static>> {
+    Image::from_bytes(png).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tray_glyph(png: &[u8]) -> Option<Image<'static>> {
+    let decoded = Image::from_bytes(png).ok()?;
+    let (width, height) = (decoded.width(), decoded.height());
+    let painted = paint_for_panel(decoded.rgba(), width, height);
+    Some(Image::new_owned(painted, width, height))
+}
+
+/// Repaint a monochrome template glyph for a tray host that does not recolour
+/// it: every authored pixel becomes [`PANEL_GLYPH_RGB`] at its original alpha,
+/// and every transparent pixel touching a sufficiently opaque one becomes a
+/// [`PANEL_HALO_RGB`] outline pixel carrying the strongest neighbouring alpha.
+///
+/// Pure and total: a buffer whose length does not match `width * height * 4` is
+/// returned unchanged rather than panicking, because a cosmetic glyph must never
+/// be able to take the tray down.
+#[cfg(not(target_os = "macos"))]
+fn paint_for_panel(src: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    if src.len() != w * h * 4 {
+        return src.to_vec();
+    }
+    let alpha_at = |x: usize, y: usize| src[(y * w + x) * 4 + 3];
+    let mut out = vec![0u8; src.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            let alpha = src[i + 3];
+            if alpha > 0 {
+                out[i..i + 3].copy_from_slice(&PANEL_GLYPH_RGB);
+                out[i + 3] = alpha;
+                continue;
+            }
+            // Transparent: grow the halo from the strongest opaque neighbour.
+            let mut halo = 0u8;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        continue;
+                    }
+                    let neighbour = alpha_at(nx as usize, ny as usize);
+                    if neighbour >= PANEL_HALO_THRESHOLD {
+                        halo = halo.max(neighbour);
+                    }
+                }
+            }
+            if halo > 0 {
+                out[i..i + 3].copy_from_slice(&PANEL_HALO_RGB);
+                out[i + 3] = halo;
+            }
+        }
+    }
+    out
+}
+
+/// Install a glyph on a live tray.
+///
+/// macOS `isTemplate` is a property of the IMAGE, not of the tray, so it has to
+/// be re-asserted on every swap or the glyph falls back to plain-alpha
+/// rendering. Off macOS the flag is deliberately NOT asserted: [`tray_glyph`]
+/// hands back a coloured image there, and claiming template rendering for it
+/// would become a lie the day a backend implements the flag.
+///
+/// Returns whether the glyph actually reached the OS — the icon is cosmetic, so
+/// a decode or set failure keeps whatever is already up, but a caller that
+/// memoises what it pushed must not memoise a glyph that never landed.
+fn set_tray_glyph(tray: &TrayIcon, png: &[u8]) -> bool {
+    let Some(image) = tray_glyph(png) else {
+        return false;
+    };
+    if let Err(error) = tray.set_icon(Some(image)) {
+        tracing::warn!(%error, "tray: could not set the tray glyph");
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    let _ = tray.set_icon_as_template(true);
+    true
+}
+
 /// The live tray, if menu-bar presence is currently on. `None` means no tray is
 /// shown (the default). Guarded by a `Mutex` since the Settings toggle command,
 /// startup, and the ~1 Hz recording tick all touch it.
@@ -139,6 +320,14 @@ struct TrayState {
     /// idle mark and has to be painted once, whatever the engine happens to be
     /// reporting at that moment.
     sync_memo: Option<SyncMemo>,
+    /// The notes items of whichever menu is currently installed (Story 36.7).
+    ///
+    /// `None` means the installed menu has none — either the notes capability is
+    /// off, in which case it is `None` for the process lifetime, or a recording
+    /// or error rendering displaced them, in which case the idle restore brings
+    /// them back. A `MenuItem` no longer in an installed menu would have the next
+    /// tick `set_text` into nothing.
+    notes: Option<NotesItems>,
 }
 
 /// The single tray slot (see [`TrayState`]).
@@ -233,17 +422,76 @@ fn menu_item(app: &AppHandle, id: &str, label: &str, enabled: bool) -> Option<Me
     }
 }
 
-/// Build the idle tray menu: "Show keeper" + "Quit" (Story 10.3).
-fn build_idle_menu(app: &AppHandle) -> Option<Menu<Wry>> {
+/// Build the notes section's items, or `None` when the capability is off.
+///
+/// Built once per menu and then only mutated (AD-61). Every label starts at its
+/// empty-state wording rather than blank, so a tray built before the first index
+/// publish reads correctly instead of showing five unexplained gaps.
+fn build_notes_items(app: &AppHandle, enabled: bool) -> Option<NotesItems> {
+    if !enabled {
+        // Omitted at build time on a build where notes is absent, which is
+        // correct — and, because the menu is built once, omitted forever.
+        return None;
+    }
+    let recent: Vec<MenuItem<Wry>> = NOTE_RECENT_IDS
+        .iter()
+        .map(|id| menu_item(app, id, NOTE_EMPTY_SLOT, false))
+        .collect::<Option<Vec<_>>>()?;
+    Some(NotesItems {
+        new_note: menu_item(app, NOTE_NEW_ID, "New Note", true)?,
+        capture: menu_item(app, NOTE_CAPTURE_ID, "Quick Capture", true)?,
+        journal: menu_item(app, NOTE_JOURNAL_ID, "Today\u{2019}s Journal", true)?,
+        recent,
+        unread: menu_item(app, NOTE_UNREAD_ID, NOTE_NO_UNREAD, false)?,
+    })
+}
+
+/// Append the notes section to a menu under construction.
+///
+/// Order is fixed by UX-DR39/AD-61: the three verbs, a separator, the five recent
+/// slots, a separator, the unread line, a separator — all **above** the existing
+/// status block and Show/Quit.
+fn add_notes_section<'a>(
+    builder: MenuBuilder<'a, Wry, AppHandle>,
+    items: Option<&'a NotesItems>,
+) -> MenuBuilder<'a, Wry, AppHandle> {
+    let Some(items) = items else {
+        return builder;
+    };
+    let mut builder = builder
+        .items(&[&items.new_note, &items.capture, &items.journal])
+        .separator();
+    for slot in &items.recent {
+        builder = builder.item(slot);
+    }
+    builder.separator().item(&items.unread).separator()
+}
+
+/// Build the idle tray menu: the notes section, then "Show keeper" + "Quit"
+/// (Story 10.3, Story 36.7).
+fn build_idle_menu(app: &AppHandle) -> Option<(Menu<Wry>, Option<NotesItems>)> {
+    let notes = build_notes_items(app, notes_capability(app));
     let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
     let quit = menu_item(app, QUIT_ID, "Quit", true)?;
-    match MenuBuilder::new(app).items(&[&show, &quit]).build() {
-        Ok(menu) => Some(menu),
+    let builder = add_notes_section(MenuBuilder::new(app), notes.as_ref());
+    match builder.items(&[&show, &quit]).build() {
+        Ok(menu) => Some((menu, notes)),
         Err(error) => {
             tracing::warn!(%error, "tray: could not build tray menu");
             None
         }
     }
+}
+
+/// The label the unread line shows when there is nothing to read.
+const NOTE_NO_UNREAD: &str = "No unread note changes";
+
+/// Whether this build shows notes at all (FR-122).
+///
+/// Read once per menu build rather than cached, because the menu is built rarely
+/// and a stale capability would be baked in for the process lifetime.
+fn notes_capability(app: &AppHandle) -> bool {
+    crate::ipc::notes_capability(app)
 }
 
 /// Build the error-hold tray menu (Story 18.4): the disabled
@@ -305,8 +553,8 @@ fn build_recording_menu(app: &AppHandle, line: &str) -> Option<(Menu<Wry>, MenuI
 /// too (Story 18.1) — it is registered on the tray, not a menu, so it survives
 /// every `set_menu` swap. Best-effort — on a menu/tray build failure it logs at
 /// `warn` and leaves no tray (the app keeps running).
-fn build_tray(app: &AppHandle) -> Option<TrayIcon> {
-    let menu = build_idle_menu(app)?;
+fn build_tray(app: &AppHandle) -> Option<(TrayIcon, Option<NotesItems>)> {
+    let (menu, notes) = build_idle_menu(app)?;
     let mut builder = TrayIconBuilder::new()
         .menu(&menu)
         .show_menu_on_left_click(true)
@@ -318,23 +566,39 @@ fn build_tray(app: &AppHandle) -> Option<TrayIcon> {
             STOP_ID => stop_recording(app),
             OPEN_FOLDER_ID => open_recordings_folder(app),
             DISMISS_ERROR_ID => dismiss_recording_error(app),
-            _ => {}
+            // The notes section (Story 36.7). Routed through the same single
+            // router, which is registered on the tray rather than on a menu and
+            // therefore survives every `set_menu` — so click routing needed no
+            // new mechanism.
+            NOTE_NEW_ID => crate::notes_ipc::tray_new_note(app),
+            NOTE_CAPTURE_ID => crate::notes_window::show(app),
+            NOTE_JOURNAL_ID => crate::notes_ipc::tray_journal_today(app),
+            NOTE_UNREAD_ID => crate::notes_ipc::tray_show_unread(app),
+            id => {
+                if let Some(slot) = NOTE_RECENT_IDS.iter().position(|recent| *recent == id) {
+                    crate::notes_ipc::tray_open_recent(app, slot);
+                }
+            }
         });
-    // The idle template ring (Story 21.4): monochrome + alpha, flagged as a
-    // template so macOS renders it white/black per menu-bar appearance like
-    // every native icon. A decode failure falls back to the app icon.
-    match Image::from_bytes(IDLE_ICON_PNG) {
-        Ok(icon) => {
-            builder = builder.icon(icon).icon_as_template(true);
+    // The idle ring (Story 21.4): the authored monochrome + alpha template on
+    // macOS, repainted for the panel everywhere else (see `tray_glyph`). A
+    // decode failure falls back to the app icon.
+    match tray_glyph(IDLE_ICON_PNG) {
+        Some(icon) => {
+            builder = builder.icon(icon);
+            #[cfg(target_os = "macos")]
+            {
+                builder = builder.icon_as_template(true);
+            }
         }
-        Err(_) => {
+        None => {
             if let Some(icon) = app.default_window_icon().cloned() {
                 builder = builder.icon(icon);
             }
         }
     }
     match builder.build(app) {
-        Ok(tray) => Some(tray),
+        Ok(tray) => Some((tray, notes)),
         Err(error) => {
             tracing::warn!(%error, "tray: could not build tray icon");
             None
@@ -356,12 +620,13 @@ pub fn set_tray_presence(app: &AppHandle, enabled: bool) {
     let mut guard = tray_guard();
     if enabled {
         // Replace any existing tray so a re-enable never leaks a second icon.
-        *guard = tray.map(|icon| TrayState {
+        *guard = tray.map(|(icon, notes)| TrayState {
             icon,
             status_item: None,
             error_rendered: false,
             sync_item: None,
             sync_memo: None,
+            notes,
         });
     } else {
         // Dropping the handle removes the tray icon.
@@ -517,7 +782,7 @@ pub fn apply_recording_state(app: &AppHandle, snapshot: &RecordingStatusVm) {
 /// the exact prior configuration. Best-effort: a build failure warns (inside
 /// [`build_tray`]) and the next ~1 Hz tick retries.
 fn force_present(app: &AppHandle, snapshot: &RecordingStatusVm) {
-    let Some(icon) = build_tray(app) else {
+    let Some((icon, notes)) = build_tray(app) else {
         return;
     };
     let stored = {
@@ -529,6 +794,7 @@ fn force_present(app: &AppHandle, snapshot: &RecordingStatusVm) {
                 error_rendered: false,
                 sync_item: None,
                 sync_memo: None,
+                notes,
             });
             FORCED_PRESENCE.store(true, Ordering::Relaxed);
             true
@@ -571,16 +837,8 @@ fn render_recording(
         return;
     }
     // idle → recording transition: record-dot icon + recording menu.
-    match Image::from_bytes(RECORDING_ICON_PNG) {
-        Ok(icon) => {
-            // macOS `isTemplate` is a property of the IMAGE — re-assert it on
-            // every swap or the glyph falls back to plain-alpha rendering.
-            if let Err(error) = tray.set_icon(Some(icon)) {
-                tracing::warn!(%error, "tray: could not set the record-dot icon");
-            }
-            let _ = tray.set_icon_as_template(true);
-        }
-        Err(error) => tracing::warn!(%error, "tray: could not decode the record-dot icon"),
+    if !set_tray_glyph(tray, RECORDING_ICON_PNG) {
+        tracing::warn!("tray: could not install the record-dot glyph");
     }
     // A menu build/install failure leaves `status_item` unset, so the next
     // tick simply retries the transition.
@@ -613,16 +871,8 @@ fn render_error(
         return;
     }
     let reason = snapshot.error.as_deref().unwrap_or("unknown error");
-    match Image::from_bytes(ERROR_ICON_PNG) {
-        Ok(icon) => {
-            // macOS `isTemplate` is a property of the IMAGE — re-assert it on
-            // every swap or the glyph falls back to plain-alpha rendering.
-            if let Err(error) = tray.set_icon(Some(icon)) {
-                tracing::warn!(%error, "tray: could not set the error badge icon");
-            }
-            let _ = tray.set_icon_as_template(true);
-        }
-        Err(error) => tracing::warn!(%error, "tray: could not decode the error badge icon"),
+    if !set_tray_glyph(tray, ERROR_ICON_PNG) {
+        tracing::warn!("tray: could not install the error badge glyph");
     }
     let Some(menu) = build_error_menu(app, &format_error_line(reason)) else {
         return;
@@ -642,7 +892,7 @@ fn render_error(
 /// is still installed (which would strand it for the app lifetime, since a
 /// terminal state with no `status_item` re-enters neither branch).
 fn restore_idle(app: &AppHandle, tray: &TrayIcon) {
-    let Some(menu) = build_idle_menu(app) else {
+    let Some((menu, notes)) = build_idle_menu(app) else {
         return;
     };
     if let Err(error) = tray.set_menu(Some(menu)) {
@@ -650,12 +900,14 @@ fn restore_idle(app: &AppHandle, tray: &TrayIcon) {
         return;
     }
     // The icon is cosmetic — a failure here does not desync the flag/menu.
-    let idle = Image::from_bytes(IDLE_ICON_PNG).ok();
-    if let Err(error) = tray.set_icon(idle) {
-        tracing::warn!(%error, "tray: could not restore the idle icon");
+    if !set_tray_glyph(tray, IDLE_ICON_PNG) {
+        tracing::warn!("tray: could not restore the idle glyph");
     }
-    let _ = tray.set_icon_as_template(true);
     store_rendered_mode(tray.id(), None, false);
+    // The fresh menu carries fresh notes handles; the labels the last tick
+    // computed are re-applied to them so a restore does not blank the section
+    // until something changes.
+    adopt_notes_items(tray.id(), notes);
 }
 
 /// Store the rendered-mode flags — the recording status-line item and the
@@ -677,7 +929,34 @@ fn store_rendered_mode(tray_id: &TrayIconId, item: Option<MenuItem<Wry>>, error_
             state.error_rendered = error_rendered;
             state.sync_item = None;
             state.sync_memo = None;
+            // The recording and error menus carry no notes section, so the held
+            // handles are no longer in any installed menu. The idle restore
+            // re-adopts fresh ones.
+            state.notes = None;
         }
+    }
+}
+
+/// Adopt the notes handles of a freshly installed menu and repaint them from the
+/// last model this process composed.
+///
+/// A menu build mints new `MenuItem`s, so the labels the previous tick wrote live
+/// on handles that are no longer on screen. Re-applying the retained model is what
+/// keeps the section correct across an install without a `set_menu` refresh loop.
+fn adopt_notes_items(tray_id: &TrayIconId, notes: Option<NotesItems>) {
+    let model = {
+        let mut guard = tray_guard();
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        if state.icon.id() != tray_id {
+            return;
+        }
+        state.notes = notes.clone();
+        notes_model().clone()
+    };
+    if let Some(items) = notes {
+        paint_notes(&items, &model);
     }
 }
 
@@ -893,6 +1172,109 @@ mod tests {
         assert_eq!(error.width(), recording.width());
         assert_eq!(error.height(), recording.height());
         assert_ne!(ERROR_ICON_PNG, RECORDING_ICON_PNG);
+    }
+
+    /// Byte offset of pixel `(x, y)` in a `width`-wide RGBA8 buffer. Spelling it
+    /// out keeps the fixtures readable and keeps `clippy::identity_op` off the
+    /// literal `(1 * 3 + 1) * 4` shape.
+    #[cfg(not(target_os = "macos"))]
+    fn px(x: usize, y: usize, width: usize) -> usize {
+        (y * width + x) * 4
+    }
+
+    /// AD-61: off macOS nothing recolours the tray glyph, so the authored
+    /// black-on-alpha template is repainted at decode time. The body takes the
+    /// brand tone at its original alpha — a pure-black glyph on a dark panel is
+    /// the defect this exists to prevent.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn panel_repaint_recolours_the_body_and_keeps_its_alpha() {
+        // 3x3, one opaque pixel dead centre, everything else transparent.
+        let mut src = vec![0u8; 3 * 3 * 4];
+        src[px(1, 1, 3) + 3] = 200;
+        let out = paint_for_panel(&src, 3, 3);
+
+        let centre = px(1, 1, 3);
+        assert_eq!(&out[centre..centre + 3], &PANEL_GLYPH_RGB);
+        assert_eq!(out[centre + 3], 200, "body alpha is preserved");
+    }
+
+    /// The halo is what keeps the repainted glyph legible on a LIGHT panel: the
+    /// eight neighbours of an opaque pixel become outline, and nothing further
+    /// out is touched.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn panel_repaint_grows_a_one_pixel_halo_and_no_more() {
+        let mut src = vec![0u8; 5 * 5 * 4];
+        src[px(2, 2, 5) + 3] = 255;
+        let out = paint_for_panel(&src, 5, 5);
+
+        for (x, y) in [
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (1, 2),
+            (3, 2),
+            (1, 3),
+            (2, 3),
+            (3, 3),
+        ] {
+            let i = px(x, y, 5);
+            assert_eq!(&out[i..i + 3], &PANEL_HALO_RGB, "halo at ({x},{y})");
+            assert_eq!(out[i + 3], 255, "halo alpha at ({x},{y})");
+        }
+        // Two pixels out is still empty — the outline never thickens.
+        let far = px(0, 0, 5);
+        assert_eq!(&out[far..far + 4], &[0, 0, 0, 0]);
+    }
+
+    /// A faint pixel is already fading out; outlining it would only thicken the
+    /// stroke, which the 44x44-at-~22px downscale cannot afford.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn panel_repaint_does_not_halo_faint_pixels() {
+        let mut src = vec![0u8; 3 * 3 * 4];
+        src[px(1, 1, 3) + 3] = PANEL_HALO_THRESHOLD - 1;
+        let out = paint_for_panel(&src, 3, 3);
+
+        let corner = px(0, 0, 3);
+        assert_eq!(&out[corner..corner + 4], &[0, 0, 0, 0]);
+    }
+
+    /// A cosmetic glyph must never be able to take the tray down: a buffer that
+    /// does not match the declared geometry comes back untouched.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn panel_repaint_passes_through_a_mismatched_buffer() {
+        let src = vec![7u8; 9];
+        assert_eq!(paint_for_panel(&src, 3, 3), src);
+    }
+
+    /// Every shipped glyph survives the panel repaint at its authored geometry —
+    /// the real assets, not a synthetic buffer.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn every_shipped_glyph_repaints_for_the_panel() {
+        for bytes in [
+            IDLE_ICON_PNG,
+            RECORDING_ICON_PNG,
+            ERROR_ICON_PNG,
+            SYNC_ARMED_ICON_PNG,
+            SYNC_UP_ICON_PNG,
+            SYNC_DOWN_ICON_PNG,
+            SYNC_UPDOWN_ICON_PNG,
+            SYNC_REFRESH_ICON_PNG,
+            SYNC_PAUSED_ICON_PNG,
+            SYNC_WARNING_ICON_PNG,
+        ] {
+            let authored = Image::from_bytes(bytes).expect("glyph decodes");
+            let painted = tray_glyph(bytes).expect("glyph repaints");
+            assert_eq!(painted.width(), authored.width());
+            assert_eq!(painted.height(), authored.height());
+            // The repaint must actually change something, or the panel still
+            // gets a black-on-black silhouette.
+            assert_ne!(painted.rgba(), authored.rgba());
+        }
     }
 
     #[test]
@@ -1133,16 +1515,24 @@ fn dwelled(reported: TraySyncState) -> TraySyncState {
     }
 }
 
-/// Build the sync tray menu: a disabled status line, then Show and Quit.
-fn build_sync_menu(app: &AppHandle, line: &str) -> Option<(Menu<Wry>, MenuItem<Wry>)> {
+/// Build the sync tray menu: the notes section, a disabled status line, then Show
+/// and Quit.
+///
+/// The notes items are here too, and not only in the idle menu, because this menu
+/// replaces that one on the first sync tick — on macOS, where `set_menu` works.
+/// Omitting them here would make the section vanish the moment a folder started
+/// syncing, which is most of the time.
+fn build_sync_menu(
+    app: &AppHandle,
+    line: &str,
+) -> Option<(Menu<Wry>, MenuItem<Wry>, Option<NotesItems>)> {
+    let notes = build_notes_items(app, notes_capability(app));
     let status = menu_item(app, SYNC_STATUS_ID, line, false)?;
     let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
     let quit = menu_item(app, QUIT_ID, "Quit", true)?;
-    match MenuBuilder::new(app)
-        .items(&[&status, &show, &quit])
-        .build()
-    {
-        Ok(menu) => Some((menu, status)),
+    let builder = add_notes_section(MenuBuilder::new(app), notes.as_ref());
+    match builder.items(&[&status, &show, &quit]).build() {
+        Ok(menu) => Some((menu, status, notes)),
         Err(error) => {
             tracing::warn!(%error, "tray: could not build the sync menu");
             None
@@ -1239,13 +1629,16 @@ pub fn apply_sync_state(app: &AppHandle, state: TraySyncState, line: &str) {
         // First sync tick since the tray went idle: install the menu once. It
         // is built around this line, so no separate text write is owed.
         None => {
-            let Some((menu, item)) = build_sync_menu(app, line) else {
+            let Some((menu, item, notes)) = build_sync_menu(app, line) else {
                 return;
             };
             if let Err(error) = tray.set_menu(Some(menu)) {
                 tracing::warn!(%error, "tray: could not install the sync menu");
                 return;
             }
+            // Fresh menu, fresh notes handles: adopt them and repaint from the
+            // retained model, exactly as the idle restore does.
+            adopt_notes_items(tray.id(), notes);
             (item, true)
         }
     };
@@ -1263,19 +1656,157 @@ pub fn apply_sync_state(app: &AppHandle, state: TraySyncState, line: &str) {
 
 /// Decode and install a sync glyph, reporting whether it landed.
 ///
-/// The icon is cosmetic — a decode or set failure keeps whatever glyph is
+/// A thin alias over [`set_tray_glyph`] kept for the call site's vocabulary:
+/// the icon is cosmetic, so a decode or set failure keeps whatever glyph is
 /// already up rather than desyncing the menu that was just installed — but the
 /// caller must not memoise a glyph that never reached the OS.
 fn push_sync_glyph(tray: &TrayIcon, glyph: &'static [u8]) -> bool {
-    let Ok(image) = Image::from_bytes(glyph) else {
-        return false;
-    };
-    if let Err(error) = tray.set_icon(Some(image)) {
-        tracing::warn!(%error, "tray: could not set the sync icon");
-        return false;
+    set_tray_glyph(tray, glyph)
+}
+
+/// The last notes model this process composed, so a freshly installed menu can be
+/// repainted from it.
+///
+/// A module `static` rather than a [`TrayState`] field because it survives the
+/// slot's build/drop cycle: the model describes the vault, not the menu-bar item,
+/// and a tray toggled off and on again should come back saying the same thing.
+static NOTES_MODEL: Mutex<Option<NotesTray>> = Mutex::new(None);
+
+fn notes_slot() -> MutexGuard<'static, Option<NotesTray>> {
+    NOTES_MODEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The last composed model, or the empty one.
+fn notes_model() -> NotesTray {
+    notes_slot().clone().unwrap_or_default()
+}
+
+/// Render the notes section from the composed model (Story 36.7, AD-61).
+///
+/// Called by the same ~1 Hz tick that drives recording and sync. Two rules:
+///
+/// 1. **Never `set_menu`.** Labels move through `set_text` and enablement through
+///    `set_enabled` on the retained handles, so an open menu is not closed by an
+///    update and Linux — where the menu cannot be replaced at all — behaves
+///    identically to macOS.
+/// 2. **A write happens on a change, never on a tick.** The model is diffed
+///    against the last one this process pushed, and a tick that would say the same
+///    thing returns without touching the OS.
+pub fn apply_notes_state(app: &AppHandle, model: &NotesTray) {
+    let _ = app;
+    {
+        let mut slot = notes_slot();
+        if slot.as_ref() == Some(model) {
+            return;
+        }
+        *slot = Some(model.clone());
     }
-    let _ = tray.set_icon_as_template(true);
-    true
+    // Clone the handles out and mutate lock-free: every `MenuItem` call blocks on
+    // an internal main-thread dispatch, and `set_tray_presence` — which can run
+    // ON the main thread — takes the same lock.
+    let items = {
+        let guard = tray_guard();
+        guard.as_ref().and_then(|state| state.notes.clone())
+    };
+    if let Some(items) = items {
+        paint_notes(&items, model);
+    }
+}
+
+/// Push one model onto one set of retained handles. Best-effort throughout: a
+/// failed label write leaves the previous text, which is stale rather than wrong,
+/// and the next change retries.
+fn paint_notes(items: &NotesItems, model: &NotesTray) {
+    // With no vault the two create verbs stay ENABLED: choosing them opens
+    // Settings → Sync, because the action is achievable and a disabled row that
+    // explains nothing is worse than a row that takes you where you need to go.
+    set_label(&items.new_note, &new_note_label(model));
+    set_label(&items.capture, &capture_label(model));
+    set_label(&items.journal, &journal_label(model));
+
+    for (slot, item) in items.recent.iter().enumerate() {
+        match model.recent.get(slot) {
+            Some((_, title)) => {
+                set_label(item, &truncate_title(title));
+                set_enabled(item, true);
+            }
+            None => {
+                set_label(item, NOTE_EMPTY_SLOT);
+                set_enabled(item, false);
+            }
+        }
+    }
+
+    set_label(&items.unread, &unread_label(model.unread));
+    set_enabled(&items.unread, model.unread > 0);
+}
+
+fn set_label(item: &MenuItem<Wry>, label: &str) {
+    if let Err(error) = item.set_text(label) {
+        tracing::warn!(%error, "tray: could not update a notes menu label");
+    }
+}
+
+fn set_enabled(item: &MenuItem<Wry>, enabled: bool) {
+    if let Err(error) = item.set_enabled(enabled) {
+        tracing::warn!(%error, "tray: could not update a notes menu item's state");
+    }
+}
+
+/// `New Note`, or the honest wording when there is nowhere to put one yet.
+fn new_note_label(model: &NotesTray) -> String {
+    if model.vault_id.is_some() {
+        "New Note".to_owned()
+    } else {
+        "New Note\u{2026} (no vault yet)".to_owned()
+    }
+}
+
+/// `Quick Capture`, carrying the registration failure in words when the global
+/// shortcut did not take (UX-DR43): the truth belongs where the user is.
+fn capture_label(model: &NotesTray) -> String {
+    if model.hotkey_registered {
+        "Quick Capture".to_owned()
+    } else {
+        "Quick Capture \u{2014} hotkey unavailable".to_owned()
+    }
+}
+
+fn journal_label(model: &NotesTray) -> String {
+    if model.vault_id.is_some() {
+        "Today\u{2019}s Journal".to_owned()
+    } else {
+        "Today\u{2019}s Journal\u{2026} (no vault yet)".to_owned()
+    }
+}
+
+/// The unread line's wording. Singular is spelled out rather than pluralised with
+/// a bracketed `(s)`, because this is a sentence a person reads.
+fn unread_label(unread: u32) -> String {
+    match unread {
+        0 => NOTE_NO_UNREAD.to_owned(),
+        1 => "1 note changed by your agent".to_owned(),
+        many => format!("{many} notes changed by your agent"),
+    }
+}
+
+/// A note title, capped for the menu.
+///
+/// Truncated on a character boundary and marked with an ellipsis, so a long title
+/// cannot stretch the menu to the width of the screen and a cut is visible as a
+/// cut. Pure.
+fn truncate_title(title: &str) -> String {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return NOTE_EMPTY_SLOT.to_owned();
+    }
+    if trimmed.chars().count() <= NOTE_TITLE_CAP {
+        return trimmed.to_owned();
+    }
+    let kept: String = trimmed.chars().take(NOTE_TITLE_CAP - 1).collect();
+    format!("{}\u{2026}", kept.trim_end())
 }
 
 /// Store the held sync line and the memo of what actually reached the tray,

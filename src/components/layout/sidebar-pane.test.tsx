@@ -337,6 +337,49 @@ describe("SidebarPane sync entry (Story 32.5)", () => {
   });
 });
 
+describe("SidebarPane notes entry (Story 37.1)", () => {
+  it("omits the Notes entry entirely when the notes capability is off", () => {
+    renderSidebar();
+    // Absent, not disabled (FR-122). A greyed row that answers "unsupported on
+    // this platform" is a worse answer than no row: there is no vault to reach
+    // on a build with no folder sync, so there is nothing to offer.
+    expect(screen.queryByRole("button", { name: "Notes" })).not.toBeInTheDocument();
+  });
+
+  it("shows the Notes entry only when the notes capability is on", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, notes: true });
+    renderSidebar();
+    expect(screen.getByRole("button", { name: "Notes" })).toBeInTheDocument();
+  });
+
+  it("switches the primary view to notes when the Notes entry is clicked", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, notes: true });
+    renderSidebar();
+    expect(primaryViewStore.getState().view).toBe("inbox");
+
+    fireEvent.click(screen.getByRole("button", { name: "Notes" }));
+
+    expect(primaryViewStore.getState().view).toBe("notes");
+    expect(screen.getByRole("button", { name: "Notes" })).toHaveAttribute("aria-current", "page");
+  });
+
+  it("places Notes after Sync and before Settings", () => {
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true, sync: true, notes: true });
+    renderSidebar();
+
+    const labels = screen
+      .getAllByRole("button")
+      .map((button) => button.textContent)
+      .filter(
+        (label) =>
+          label === "Recording" || label === "Sync" || label === "Notes" || label === "Settings",
+      );
+    expect(labels).toEqual(["Recording", "Sync", "Notes", "Settings"]);
+  });
+});
+
 describe("SidebarPane settings", () => {
   it("switches to the Settings view rather than opening a dialog", () => {
     primaryViewStore.getState().setView("inbox");

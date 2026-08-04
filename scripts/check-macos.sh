@@ -50,12 +50,16 @@ CARGO_ENV='export PATH="$HOME/.cargo/bin:$PATH" CARGO_PROFILE_DEV_DEBUG=0 CARGO_
 # Excluded on purpose:
 #   target/, node_modules/  — rebuilt remotely; copying them is slower than
 #                             compiling and would clobber the remote cache.
-#   .git/                   — the gate checks the working tree, not history.
+#   .git                    — the gate checks the working tree, not history. No
+#                             trailing slash: in a git WORKTREE `.git` is a file
+#                             holding an absolute path that exists only here, and
+#                             copying it makes every git call on the remote fail
+#                             with "not a git repository".
 #   binaries/               — the sidecar is built remotely by Xcode; a Linux
 #                             copy would be the wrong architecture.
 say "syncing working tree"
 rsync -az --delete \
-  --exclude '.git/' \
+  --exclude '.git' \
   --exclude 'node_modules/' \
   --exclude 'target/' \
   --exclude 'dist/' \

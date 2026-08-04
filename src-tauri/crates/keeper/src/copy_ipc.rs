@@ -401,6 +401,8 @@ mod tests {
             outcome: CopyOutcome::Failed {
                 reason: "changed while reading".to_owned(),
             },
+            // A file that never finished reading has no digest to report.
+            sha256: None,
         });
         assert_eq!(failed.outcome, "failed");
         assert_eq!(failed.reason.as_deref(), Some("changed while reading"));
@@ -409,6 +411,7 @@ mod tests {
             path: "b.txt".to_owned(),
             bytes: 4,
             outcome: CopyOutcome::Collision,
+            sha256: None,
         });
         assert_eq!(collided.outcome, "collision");
         assert_eq!(

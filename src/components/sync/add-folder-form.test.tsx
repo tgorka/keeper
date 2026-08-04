@@ -100,6 +100,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     effectivePollIntervalMs: 15_000,
     tags: [],
     commitSubjectTemplate: "",
+    notes: false,
+    notesSubfolder: null,
     authorOverride: null,
     enabled: true,
     ...over,
@@ -277,6 +279,8 @@ describe("AddFolderForm editing an existing folder", () => {
       effectivePollIntervalMs: 45_000,
       tags: ["field"],
       commitSubjectTemplate: "",
+      notes: false,
+      notesSubfolder: null,
       authorOverride: "Ada <ada@example.org>",
       ...over,
     });
@@ -335,6 +339,8 @@ describe("AddFolderForm editing an existing folder", () => {
         tags: ["field"],
         authorOverride: "Ada <ada@example.org>",
         commitSubjectTemplate: "",
+        notes: false,
+        notesSubfolder: null,
       }),
     );
   });
@@ -612,6 +618,8 @@ describe("AddFolderForm numeric knobs (Story 34.5, AD-34-8)", () => {
           pollIntervalMs: 15_000,
           lfsThresholdBytes: 4 * 1024 * 1024,
           commitSubjectTemplate: "",
+          notes: false,
+          notesSubfolder: null,
         }),
       ),
     );
@@ -632,6 +640,8 @@ describe("AddFolderForm numeric knobs (Story 34.5, AD-34-8)", () => {
         expect.objectContaining({
           pollIntervalMs: 45_000,
           commitSubjectTemplate: "backup {profile}: {changed} files",
+          notes: false,
+          notesSubfolder: null,
         }),
       ),
     );
@@ -650,6 +660,8 @@ describe("AddFolderForm numeric knobs (Story 34.5, AD-34-8)", () => {
           pollIntervalMs: 45_000,
           effectivePollIntervalMs: 45_000,
           commitSubjectTemplate: "backup {profile}",
+          notes: false,
+          notesSubfolder: null,
         })}
       />,
     );

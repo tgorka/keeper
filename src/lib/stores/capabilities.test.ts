@@ -16,6 +16,7 @@ const desktopCapabilities: CapabilitiesVm = {
   revealInFileManager: true,
   recording: true,
   sync: true,
+  notes: true,
   overlayTitleBar: true,
 };
 
@@ -37,6 +38,7 @@ describe("capabilitiesStore", () => {
       revealInFileManager: false,
       recording: false,
       sync: false,
+      notes: false,
       overlayTitleBar: false,
     });
   });

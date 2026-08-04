@@ -23,6 +23,7 @@ use keeper_core::error::{
     MediaError, PlatformError, RecordingError, SendError, SignalError, TimelineError,
     VerificationError,
 };
+use keeper_core::notes::NotesError;
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
 use keeper_core::recording::{
@@ -490,7 +491,11 @@ fn record_last_notify_target(target: &NotifyTarget) {
 
 /// Read the "last notification target" recorded at dispatch (Story 10.4), for the coarse
 /// navigate emit on app activation. A poisoned lock recovers to the stored value.
-#[cfg(desktop)]
+///
+/// Apple-platform only: the sole caller is the `RunEvent::Reopen` (dock re-activation)
+/// arm, a variant that exists nowhere else. A `desktop` gate would leave this dead on
+/// the Linux/Windows shells, where `-D warnings` turns dead code into a build failure.
+#[cfg(target_os = "macos")]
 pub fn last_notify_target() -> NotifyTarget {
     match last_notify_target_slot().lock() {
         Ok(slot) => slot.clone(),
@@ -503,7 +508,7 @@ pub fn last_notify_target() -> NotifyTarget {
 /// its KIND to a coarse view (Message → Inbox, Bridge → Bridges). Once consumed the
 /// target is reset to [`NotifyTarget::None`] so a later plain dock-click does not re-emit
 /// a stale landing.
-#[cfg(desktop)]
+#[cfg(target_os = "macos")]
 pub const NOTIFY_NAVIGATE_EVENT: &str = "notify://navigate";
 
 /// Emit the coarse navigate event to the main window from the last recorded notification
@@ -512,7 +517,7 @@ pub const NOTIFY_NAVIGATE_EVENT: &str = "notify://navigate";
 /// A [`NotifyTarget::None`] (no notification since the last activation, e.g. a plain
 /// dock-click) is a no-op — only Message/Bridge targets emit. Best-effort: a missing
 /// window or an emit failure is logged at `warn`, never a panic.
-#[cfg(desktop)]
+#[cfg(target_os = "macos")]
 pub fn emit_notify_navigate(app: &tauri::AppHandle) {
     use tauri::{Emitter, Manager};
 
@@ -1184,6 +1189,22 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         // arrives in a later recording story (16.3+). Until then, an internal,
         // non-retriable error.
         CoreError::Recording(_) => (IpcErrorCode::Internal, false),
+        // Notes (Phase 5). The split is the one the phase's build contract fixes,
+        // and it is a real distinction rather than a formality: a malformed name,
+        // space query, template or frontmatter block is something the CALLER can
+        // fix, so it is `InvalidInput` and the surface can say what to change. A
+        // missing note or an unknown vault is not — by the time a notes command
+        // runs, both ids came from a view model keeper itself produced, so either
+        // one means the index and the caller disagree, which is internal.
+        CoreError::Notes(
+            NotesError::Frontmatter { .. }
+            | NotesError::Name(_)
+            | NotesError::Query { .. }
+            | NotesError::Template(_),
+        ) => (IpcErrorCode::NotesInvalid, false),
+        CoreError::Notes(NotesError::NotFound(_) | NotesError::VaultUnknown(_)) => {
+            (IpcErrorCode::Internal, false)
+        }
     };
     IpcError {
         code,
@@ -1311,7 +1332,85 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // only a desktop macOS build floats the window controls over the webview and
         // needs the app to supply its own drag region and traffic-light clearance.
         overlay_title_bar: cfg!(all(desktop, target_os = "macos")),
+        // Notes (Story 35.2, FR-122, AD-54): a vault IS a synced folder, so notes
+        // cannot be available where folder sync is not. `sync && desktop` — which
+        // on iOS is `false` twice over, and the whole surface is then absent
+        // rather than disabled (AD-27).
+        notes: notes_available(&state),
     })
+}
+
+/// Whether this build and this machine can show notes (FR-122).
+///
+/// Derived from the same `git` resolution `CapabilitiesVm.sync` reports, because a
+/// vault is a folder keeper syncs: a machine whose `git` the engine refuses has no
+/// sync surface and must not get a notes surface over an engine that never opened.
+pub(crate) fn notes_available(state: &AppState) -> bool {
+    cfg!(desktop) && git_report(state).state == SyncGitState::Ok
+}
+
+/// The same answer for a caller that holds an app handle rather than the state —
+/// the tray, which decides at menu-build time whether the notes section exists at
+/// all (AD-61: a section omitted from the first menu can never appear).
+#[cfg(desktop)]
+pub fn notes_capability(app: &tauri::AppHandle) -> bool {
+    use tauri::Manager as _;
+
+    notes_available(&app.state::<AppState>())
+}
+
+/// The mobile twins of the four desktop-only notes commands (AD-27, AD-33).
+///
+/// They live here rather than in `notes_ipc`, because that module is
+/// `#[cfg(desktop)]` in full — it links `keeper-sync`, which iOS must never pull —
+/// so a twin inside it would not exist on the target it exists for. This is where
+/// every other mobile stub in the shell already lives (`reveal_path`,
+/// `hotkey_get`, `launch_at_login_get`), and keeping them together is what makes
+/// the `invoke_handler` list identical on every target: a phone gets an honest
+/// `unsupported` rather than an `invoke` rejection the frontend would have to
+/// special-case.
+///
+/// The rest of the notes surface is absent on iOS by construction rather than by
+/// stub: `CapabilitiesVm.notes` is `false` there, so no notes surface renders and
+/// nothing calls the other commands (FR-122).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_show() -> Result<(), IpcError> {
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_capture_hide`.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_hide(
+    commit: bool,
+) -> Result<Option<keeper_core::notes::vm::NoteRefVm>, IpcError> {
+    let _ = commit;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_reveal`.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_reveal(vault_id: String, note_id: String) -> Result<(), IpcError> {
+    let _ = (vault_id, note_id);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "revealing a note in the file manager is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_open_file`.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_open_file(vault_id: String, rel_path: String) -> Result<(), IpcError> {
+    let _ = (vault_id, rel_path);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "opening a linked file is desktop-only".to_owned(),
+    )))
 }
 
 /// The tray's folder-sync snapshot, re-exported so the ~1 Hz tick reaches it
@@ -3535,11 +3634,13 @@ pub async fn palette_query(
     open_chat: bool,
 ) -> Result<PaletteResultsVm, IpcError> {
     // The recording capability gates the `open-recording` action out of the palette
-    // (and thus the cheat sheet + native menu) when unavailable (Story 16.3).
+    // (and thus the cheat sheet + native menu) when unavailable (Story 16.3); the
+    // notes capability does the same for the whole Notes section (FR-122, AD-27).
     let recording = crate::macos_version::recording_supported();
+    let notes = notes_available(&state);
     Ok(state
         .accounts
-        .palette_query(&query, mode, open_chat, recording)
+        .palette_query(&query, mode, open_chat, recording, notes)
         .await)
 }
 
@@ -3552,11 +3653,15 @@ pub async fn palette_query(
 /// discovery surfaces provably never drift (UX-DR15). Pure and stateless — never
 /// fails.
 #[tauri::command]
-pub fn cheat_sheet_sections() -> Result<Vec<MenuSectionVm>, IpcError> {
+pub fn cheat_sheet_sections(state: State<'_, AppState>) -> Result<Vec<MenuSectionVm>, IpcError> {
     // Gate the recording action out of the cheat sheet when the capability is off
-    // (Story 16.3), keeping it in lockstep with the palette and native menu.
+    // (Story 16.3), keeping it in lockstep with the palette and native menu. The
+    // notes gate rides the same mechanism (Story 36.2): six actions declared once
+    // reach the palette, the ⌘? sheet, the native menu bar and the tray, so the
+    // four cannot drift (UX-DR42).
     Ok(keeper_core::palette::registry_sections(
         crate::macos_version::recording_supported(),
+        notes_available(&state),
     ))
 }
 

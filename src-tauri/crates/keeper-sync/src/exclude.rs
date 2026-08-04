@@ -133,6 +133,15 @@ pub const BUILTIN_EXCLUDES: &[&str] = &[
     "**/.git/**",
     ".keeper-sync/**",
     "**/.keeper-sync/**",
+    // keeper's own per-folder cache. Unlike the two above it can sit at any
+    // depth — it belongs to whatever subfolder it describes, not to the profile
+    // root — so it takes the name-plus-subtree pairing the regenerable trees
+    // use rather than the anchored form. Its contents are machine state
+    // (entries are validated against a local inode number), rebuildable from
+    // the folder itself, and committing them would sync a cache that is only
+    // ever true on the machine that wrote it.
+    ".keeper",
+    "**/.keeper/**",
 ];
 
 /// The compiled tier-0 filter for one profile.
@@ -356,6 +365,7 @@ mod tests {
             ".TemporaryItems",
             ".Trashes",
             ".DocumentRevisions-V100",
+            ".keeper",
         ] {
             assert!(
                 BUILTIN_EXCLUDES.contains(&name),
@@ -366,6 +376,29 @@ mod tests {
                 BUILTIN_EXCLUDES.contains(&subtree.as_str()),
                 "{name} needs {subtree} too, or every file inside it is synced"
             );
+        }
+    }
+
+    /// keeper's own cache directory is machine state living inside a tree the
+    /// user syncs, so tier 0 has to make it invisible wherever it sits — at the
+    /// profile root or several levels down, since it belongs to the subfolder
+    /// it describes rather than to the profile.
+    #[test]
+    fn keepers_own_cache_directory_is_excluded_wherever_it_sits() {
+        let set = default_set();
+        for path in [
+            ".keeper",
+            ".keeper/index.json",
+            "sub/.keeper",
+            "sub/.keeper/index.json",
+            "sub/.keeper/trash/01JABCDEF/draft.md",
+        ] {
+            assert!(excluded(&set, path), "{path} is keeper's own cache");
+        }
+        // The name is claimed exactly, not as a prefix: a user file that merely
+        // begins with it stays visible, like every other rule in the corpus.
+        for path in ["sub/.keeperrc", "keeper/index.json"] {
+            assert!(!excluded(&set, path), "{path} is the user's file");
         }
     }
 
