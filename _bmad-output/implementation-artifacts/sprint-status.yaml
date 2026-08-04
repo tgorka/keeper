@@ -215,6 +215,11 @@ development_status:
   22-4-microphone-track-in-the-webcam-file: done
   22-5-debug-mode-event-and-error-logs-on-disk: done
   22-6-file-based-config-overrides: done
+  # Field report 2026-08-04: recording without headphones puts the far end on the
+  # mic track a second time, delayed — audible as reverb. Epic 22 is the home for
+  # user-requested recording follow-ups, so the AEC fix is 22-7 rather than a new
+  # epic. Requirement + the measurement that must justify it: epics.md, Story 22.7.
+  22-7-the-microphone-stops-recording-the-speakers: backlog
 
   # Phase 4 — Folder Sync (Epics 23–31, added 2026-07-25)
   epic-23: in-progress
