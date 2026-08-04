@@ -4388,6 +4388,10 @@ pub async fn recording_start(
     let mic_on = microphone_enabled.unwrap_or(false);
     let microphone = mic_on.then_some(MicSelection {
         device_id: microphone_device_id,
+        // Story 22.7: filled from the registry below, once the data dir is
+        // resolved — the ephemeral card carries the device pick, the persisted
+        // setting carries the processing.
+        echo_cancellation: keeper_core::registry::RECORDING_ECHO_CANCELLATION_DEFAULT,
     });
     // Story 20.1: the Webcam card's ephemeral camera selection, resolved by
     // the identical rule — off unless explicitly enabled, device id `None` →
@@ -4596,6 +4600,17 @@ pub async fn recording_start(
     let codec = keeper_core::registry::get_recording_codec(&data_dir).map_err(to_ipc_error)?;
     let scale_percent =
         keeper_core::registry::get_recording_scale_percent(&data_dir).map_err(to_ipc_error)?;
+    // Story 22.7: the persisted echo-cancellation switch (on by default), read
+    // HERE like every other setting — the sidecar binds the voice-processing
+    // unit once at Start, so a later edit applies to the next session only.
+    // Folded into the mic selection so the key can only ever reach a mic-on
+    // wire, and only when the mic block itself is emitted.
+    let echo_cancellation =
+        keeper_core::registry::get_recording_echo_cancellation(&data_dir).map_err(to_ipc_error)?;
+    let microphone = microphone.map(|mic| MicSelection {
+        echo_cancellation,
+        ..mic
+    });
     let params = SessionParams {
         // Seeding `screen-0000.mov` lets 17.1's `nextSegmentPath` produce
         // `screen-0001.mov`, … inside the folder with no Swift change.
@@ -5462,7 +5477,23 @@ fn read_recording_settings(data_dir: &Path) -> Result<RecordingSettingsVm, IpcEr
         codec: keeper_core::registry::get_recording_codec(data_dir).map_err(to_ipc_error)?,
         scale_percent: keeper_core::registry::get_recording_scale_percent(data_dir)
             .map_err(to_ipc_error)?,
+        echo_cancellation: keeper_core::registry::get_recording_echo_cancellation(data_dir)
+            .map_err(to_ipc_error)?,
     })
+}
+
+/// The rejection a `recording_settings_set` earns for trying to change echo
+/// cancellation while a Recording Session is live (Story 22.7).
+///
+/// Not retriable: the answer does not change until the session ends. Shared
+/// with the guard's test so the message the UI shows is asserted, not guessed.
+fn echo_cancellation_locked_error() -> IpcError {
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: "echo cancellation cannot be changed while a recording is running".to_owned(),
+        account_id: None,
+        retriable: false,
+    }
 }
 
 /// Persist the recording settings (Story 17.5 + 19.5, FR-72): clamp/normalize
@@ -5482,24 +5513,55 @@ pub async fn recording_settings_set(
     settings: RecordingSettingsVm,
 ) -> Result<RecordingSettingsVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    off_async_runtime(move || -> Result<RecordingSettingsVm, IpcError> {
-        keeper_core::registry::set_recording_segment_mb(&data_dir, settings.segment_mb)
+    // Story 22.7: echo cancellation binds the sidecar's microphone producer
+    // once, at Start — a mid-session change could not take effect, and writing
+    // it anyway would leave the switch showing a value the running recording
+    // does not have. Snapshot liveness here (the `recording_run` guard is not
+    // `Send`, so it cannot cross into the blocking hop) and reject BEFORE any
+    // write below. Only a CHANGED value is refused: an unrelated edit that
+    // round-trips the same echo-cancellation value applies normally.
+    let session_live =
+        live_snapshot(&state.recording_run).is_some_and(|(snapshot, _)| snapshot.state.is_live());
+    off_async_runtime(move || write_recording_settings(&data_dir, &settings, session_live)).await?
+}
+
+/// The blocking body of [`recording_settings_set`]: the Story 22.7 liveness
+/// guard, then every write, then the effective re-read — in one hop, so no
+/// other command can observe a half-written settings row from between them.
+///
+/// Split out so the guard is unit-testable without an `AppState`: `session_live`
+/// is the caller's snapshot of "a Recording Session is running right now"
+/// (`live_snapshot` + `RecordingUiState::is_live`).
+fn write_recording_settings(
+    data_dir: &Path,
+    settings: &RecordingSettingsVm,
+    session_live: bool,
+) -> Result<RecordingSettingsVm, IpcError> {
+    // Reject BEFORE any write: a rejected request must leave the settings table
+    // byte-for-byte as it was, not half-applied with only the echo row refused.
+    if session_live {
+        let stored = keeper_core::registry::get_recording_echo_cancellation(data_dir)
             .map_err(to_ipc_error)?;
-        keeper_core::registry::set_recording_duration_cap_minutes(
-            &data_dir,
-            settings.duration_cap_minutes,
-        )
+        if stored != settings.echo_cancellation {
+            return Err(echo_cancellation_locked_error());
+        }
+    }
+    keeper_core::registry::set_recording_segment_mb(data_dir, settings.segment_mb)
         .map_err(to_ipc_error)?;
-        keeper_core::registry::set_recording_destination_dir(&data_dir, &settings.destination_dir)
-            .map_err(to_ipc_error)?;
-        keeper_core::registry::set_recording_fps(&data_dir, settings.fps).map_err(to_ipc_error)?;
-        keeper_core::registry::set_recording_codec(&data_dir, &settings.codec)
-            .map_err(to_ipc_error)?;
-        keeper_core::registry::set_recording_scale_percent(&data_dir, settings.scale_percent)
-            .map_err(to_ipc_error)?;
-        read_recording_settings(&data_dir)
-    })
-    .await?
+    keeper_core::registry::set_recording_duration_cap_minutes(
+        data_dir,
+        settings.duration_cap_minutes,
+    )
+    .map_err(to_ipc_error)?;
+    keeper_core::registry::set_recording_destination_dir(data_dir, &settings.destination_dir)
+        .map_err(to_ipc_error)?;
+    keeper_core::registry::set_recording_fps(data_dir, settings.fps).map_err(to_ipc_error)?;
+    keeper_core::registry::set_recording_codec(data_dir, &settings.codec).map_err(to_ipc_error)?;
+    keeper_core::registry::set_recording_scale_percent(data_dir, settings.scale_percent)
+        .map_err(to_ipc_error)?;
+    keeper_core::registry::set_recording_echo_cancellation(data_dir, settings.echo_cancellation)
+        .map_err(to_ipc_error)?;
+    read_recording_settings(data_dir)
 }
 
 /// Read whether the one-time iOS no-background-sync disclosure has been shown
@@ -6926,6 +6988,204 @@ mod tests {
             let run = guard.as_ref().expect("slot retained");
             assert_eq!(status_lock(&run.status).state, state, "state untouched");
         }
+    }
+
+    // --- Story 22.7: echo cancellation ------------------------------------
+
+    /// A throwaway data dir for the registry-backed settings tests.
+    fn settings_temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "keeper-ipc-echo-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the test data dir");
+        dir
+    }
+
+    /// The VM a fresh install reads, with `destination_dir` filled from the
+    /// same resolver the read path uses (it is echoed back, never clamped).
+    fn settings_vm(dir: &Path, echo_cancellation: bool) -> RecordingSettingsVm {
+        let mut vm = read_recording_settings(dir).expect("read the effective settings");
+        vm.echo_cancellation = echo_cancellation;
+        vm
+    }
+
+    /// Story 22.7: a fresh install reads echo cancellation ON, and a write
+    /// round-trips through the registry into the effective VM.
+    #[test]
+    fn recording_settings_read_and_write_carry_echo_cancellation() {
+        let dir = settings_temp_dir();
+        assert!(
+            read_recording_settings(&dir)
+                .expect("fresh read")
+                .echo_cancellation,
+            "a fresh install must read echo cancellation on"
+        );
+
+        let off = settings_vm(&dir, false);
+        let effective =
+            write_recording_settings(&dir, &off, false).expect("write with no live session");
+        assert!(
+            !effective.echo_cancellation,
+            "the effective VM must reflect the write"
+        );
+        assert!(
+            !read_recording_settings(&dir)
+                .expect("re-read")
+                .echo_cancellation
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Story 22.7: while a session is LIVE, a request that CHANGES echo
+    /// cancellation is rejected before any write — not one row moves, not even
+    /// the unrelated ones in the same request.
+    #[test]
+    fn recording_settings_set_rejects_a_changed_echo_cancellation_while_live() {
+        let dir = settings_temp_dir();
+        let before = read_recording_settings(&dir).expect("baseline read");
+        assert!(before.echo_cancellation, "baseline is on");
+
+        let mut request = settings_vm(&dir, false);
+        // A co-edited field in the SAME request must not sneak through.
+        request.fps = 60;
+        let error = write_recording_settings(&dir, &request, true)
+            .expect_err("a changed echo cancellation must be rejected while live");
+        assert_eq!(error.code, IpcErrorCode::Internal);
+        assert!(!error.retriable, "the answer cannot change until stop");
+        assert_eq!(
+            error.message, "echo cancellation cannot be changed while a recording is running",
+            "the honest message the UI shows"
+        );
+
+        let after = read_recording_settings(&dir).expect("post-rejection read");
+        assert_eq!(after, before, "a rejected request must write NOTHING");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Story 22.7: while live, a request that leaves echo cancellation ALONE
+    /// applies normally — the guard refuses a change, not every edit.
+    #[test]
+    fn recording_settings_set_applies_other_fields_while_live() {
+        let dir = settings_temp_dir();
+        let mut request = settings_vm(&dir, true);
+        request.fps = 60;
+        request.codec = "hevc".to_owned();
+
+        let effective = write_recording_settings(&dir, &request, true)
+            .expect("an unchanged echo value applies");
+        assert_eq!(effective.fps, 60);
+        assert_eq!(effective.codec, "hevc");
+        assert!(effective.echo_cancellation, "unchanged, and still on");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Story 22.7: only a live session locks the switch. A settled slot
+    /// (finalized/failed/recovered) and no slot at all both allow the change —
+    /// the liveness snapshot `recording_settings_set` takes is exactly
+    /// `live_snapshot` + `is_live`.
+    #[test]
+    fn only_a_live_session_locks_echo_cancellation() {
+        for state in [
+            RecordingUiState::Preflight,
+            RecordingUiState::Recording,
+            RecordingUiState::Rotating,
+            RecordingUiState::Stopping,
+        ] {
+            let slot = run_slot_in(state, None);
+            assert!(
+                live_snapshot(&slot).is_some_and(|(s, _)| s.state.is_live()),
+                "{state:?} must lock the switch"
+            );
+        }
+        for state in [
+            RecordingUiState::Finalized,
+            RecordingUiState::Recovered,
+            RecordingUiState::Failed,
+        ] {
+            let slot = run_slot_in(state, None);
+            assert!(
+                !live_snapshot(&slot).is_some_and(|(s, _)| s.state.is_live()),
+                "{state:?} must NOT lock the switch"
+            );
+        }
+        let empty: Mutex<Option<RecordingRun>> = Mutex::new(None);
+        assert!(!live_snapshot(&empty).is_some_and(|(s, _)| s.state.is_live()));
+    }
+
+    /// Story 22.7: `recording_start` populates `MicSelection.echo_cancellation`
+    /// from the registry, so the persisted switch is what reaches the wire —
+    /// and the key rides ONLY inside the mic block.
+    #[test]
+    fn start_time_mic_selection_takes_echo_cancellation_from_the_registry() {
+        let dir = settings_temp_dir();
+        for stored in [true, false] {
+            keeper_core::registry::set_recording_echo_cancellation(&dir, stored)
+                .expect("persist the switch");
+            let echo_cancellation =
+                keeper_core::registry::get_recording_echo_cancellation(&dir).expect("read back");
+            assert_eq!(echo_cancellation, stored);
+
+            // The exact composition `recording_start` performs.
+            let microphone = Some(MicSelection {
+                device_id: None,
+                echo_cancellation: keeper_core::registry::RECORDING_ECHO_CANCELLATION_DEFAULT,
+            })
+            .map(|mic| MicSelection {
+                echo_cancellation,
+                ..mic
+            });
+            assert_eq!(
+                microphone.as_ref().map(|mic| mic.echo_cancellation),
+                Some(stored)
+            );
+
+            let wire: serde_json::Value =
+                serde_json::from_str(&keeper_core::recording::start_recording_request(
+                    1,
+                    &keeper_core::recording::SessionParams {
+                        output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
+                        display_id: None,
+                        application: None,
+                        system_audio: true,
+                        microphone,
+                        camera: None,
+                        segment_mb: 500,
+                        max_segment_seconds: 1800,
+                        fps: 30,
+                        codec: "h264".to_owned(),
+                        scale_percent: 100,
+                        audio_only: false,
+                    },
+                ))
+                .expect("request is JSON");
+            assert_eq!(wire["params"]["echoCancellation"], stored);
+        }
+
+        // A mic-off session carries no echo key at all, whatever is stored.
+        let wire: serde_json::Value =
+            serde_json::from_str(&keeper_core::recording::start_recording_request(
+                2,
+                &keeper_core::recording::SessionParams {
+                    output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
+                    display_id: None,
+                    application: None,
+                    system_audio: true,
+                    microphone: None,
+                    camera: None,
+                    segment_mb: 500,
+                    max_segment_seconds: 1800,
+                    fps: 30,
+                    codec: "h264".to_owned(),
+                    scale_percent: 100,
+                    audio_only: false,
+                },
+            ))
+            .expect("request is JSON");
+        assert!(wire["params"].get("echoCancellation").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Acknowledge with no session at all is a quiet no-op (idempotent dismiss).

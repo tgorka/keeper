@@ -7,9 +7,16 @@ vi.mock("@/lib/ipc/client", () => ({
   // Imported by the recording-source store module (not called here — the
   // Audio card never polls; the Source card owns the poll).
   listRecordingSources: vi.fn(),
+  // Story 22.7: the persisted echo-cancellation setting the card hydrates
+  // from and commits through (the shared recording-settings mirror).
+  recordingSettingsGet: vi.fn(),
+  recordingSettingsSet: vi.fn(),
 }));
 
 import {
+  ECHO_CANCELLATION_COST_NOTE,
+  ECHO_CANCELLATION_LABEL,
+  ECHO_CANCELLATION_SWITCH_TESTID,
   MIC_DEFAULT_DEVICE_LABEL,
   MIC_DEVICE_SELECT_TESTID,
   MIC_OFF_NOTE,
@@ -18,7 +25,12 @@ import {
   MIC_SWITCH_TESTID,
   RecordingAudioControls,
 } from "@/components/recording/recording-audio-controls";
-import { requestMicrophonePermission } from "@/lib/ipc/client";
+import {
+  type RecordingSettingsVm,
+  recordingSettingsGet,
+  recordingSettingsSet,
+  requestMicrophonePermission,
+} from "@/lib/ipc/client";
 import { resetRecordingAudioForTest, systemAudioEnabled } from "@/lib/stores/recording-audio";
 import {
   micDeviceId,
@@ -26,19 +38,38 @@ import {
   resetRecordingMicForTest,
   setMicDeviceId,
 } from "@/lib/stores/recording-mic";
+import { resetRecordingSettingsForTest } from "@/lib/stores/recording-settings";
 import { recordingSourceStore, resetRecordingSourceForTest } from "@/lib/stores/recording-source";
 
 const mockRequestMic = vi.mocked(requestMicrophonePermission);
+const mockSettingsGet = vi.mocked(recordingSettingsGet);
+const mockSettingsSet = vi.mocked(recordingSettingsSet);
+
+/** The effective VM a fresh install reads — echo cancellation ON (Story 22.7). */
+const DEFAULT_SETTINGS: RecordingSettingsVm = {
+  segmentMb: 500,
+  durationCapMinutes: 30,
+  destinationDir: "/Users/dev/Movies/keeper",
+  fps: 30,
+  codec: "h264",
+  scalePercent: 100,
+  echoCancellation: true,
+};
 
 beforeEach(() => {
   mockRequestMic.mockReset();
   mockRequestMic.mockResolvedValue("granted");
+  mockSettingsGet.mockReset();
+  mockSettingsGet.mockResolvedValue(DEFAULT_SETTINGS);
+  mockSettingsSet.mockReset();
+  mockSettingsSet.mockImplementation(async (settings) => settings);
 });
 
 afterEach(() => {
   resetRecordingAudioForTest();
   resetRecordingMicForTest();
   resetRecordingSourceForTest();
+  resetRecordingSettingsForTest();
   vi.clearAllMocks();
 });
 
@@ -246,6 +277,88 @@ describe("RecordingAudioControls", () => {
     setMicDeviceId("X");
     render(<RecordingAudioControls />);
     expect(micDeviceId()).toBe("X");
+  });
+
+  // --- Echo cancellation (Story 22.7) -------------------------------------
+
+  /** Render with the mic enabled and the persisted settings hydrated — the
+   * only state in which the echo-cancellation switch is interactive. */
+  async function renderWithLiveMic(active = true) {
+    render(<RecordingAudioControls active={active} />);
+    fireEvent.click(screen.getByTestId(MIC_SWITCH_TESTID));
+    await waitFor(() => expect(mockSettingsGet).toHaveBeenCalled());
+    const toggle = screen.getByTestId(ECHO_CANCELLATION_SWITCH_TESTID);
+    return toggle;
+  }
+
+  it("renders the echo-cancellation switch ON by default with the honest cost note", async () => {
+    const toggle = await renderWithLiveMic();
+
+    await waitFor(() => expect(toggle).toBeEnabled());
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByText(ECHO_CANCELLATION_LABEL)).toBeInTheDocument();
+    // The costs are never hidden: mono + non-defeatable noise suppression.
+    expect(screen.getByText(new RegExp(ECHO_CANCELLATION_COST_NOTE))).toBeInTheDocument();
+  });
+
+  it("is disabled until the settings hydration lands (never a fake value)", () => {
+    // The first render happens before `recordingSettingsGet` resolves.
+    render(<RecordingAudioControls />);
+    fireEvent.click(screen.getByTestId(MIC_SWITCH_TESTID));
+    expect(screen.getByTestId(ECHO_CANCELLATION_SWITCH_TESTID)).toBeDisabled();
+  });
+
+  it("turning it off persists through recordingSettingsSet and reads back off", async () => {
+    mockSettingsSet.mockResolvedValue({ ...DEFAULT_SETTINGS, echoCancellation: false });
+    const toggle = await renderWithLiveMic();
+    await waitFor(() => expect(toggle).toBeEnabled());
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(mockSettingsSet).toHaveBeenCalledTimes(1));
+    expect(mockSettingsSet).toHaveBeenCalledWith({
+      ...DEFAULT_SETTINGS,
+      echoCancellation: false,
+    });
+    // The mirror now shows the EFFECTIVE (Rust-confirmed) value.
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+  });
+
+  it("a rejected write reverts the switch to the last confirmed value", async () => {
+    // The live-session guard: `recording_settings_set` refuses a CHANGED echo
+    // cancellation while a recording runs, and writes nothing.
+    mockSettingsSet.mockRejectedValue({
+      code: "internal",
+      message: "echo cancellation cannot be changed while a recording is running",
+    });
+    const toggle = await renderWithLiveMic();
+    await waitFor(() => expect(toggle).toBeEnabled());
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(mockSettingsSet).toHaveBeenCalledTimes(1));
+    // Optimism is rolled back — the UI never claims an unsaved value.
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+  });
+
+  it("is disabled while the card is not active (a live session owns the mic)", async () => {
+    const toggle = await renderWithLiveMic(false);
+
+    // Hydration landed and the mic is on, so `active: false` is the only
+    // reason left for the control to be inert.
+    await waitFor(() => expect(mockSettingsGet).toHaveBeenCalled());
+    expect(toggle).toBeDisabled();
+  });
+
+  it("is disabled while the microphone is off (there is no feed to process)", async () => {
+    const toggle = await renderWithLiveMic();
+    await waitFor(() => expect(toggle).toBeEnabled());
+
+    // Turning the mic back off greys the echo switch with it.
+    fireEvent.click(screen.getByTestId(MIC_SWITCH_TESTID));
+
+    expect(micEnabled()).toBe(false);
+    expect(toggle).toBeDisabled();
   });
 
   it("never touches the default (null) selection, even with no devices enumerated", () => {

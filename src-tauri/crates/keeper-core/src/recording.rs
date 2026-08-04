@@ -659,6 +659,14 @@ pub struct MicSelection {
     /// The selected input device's unique id, or `None` for the system default
     /// input.
     pub device_id: Option<String>,
+    /// Whether the sidecar should produce this session's microphone through
+    /// the OS voice-processing (acoustic-echo-cancelling) path (Story 22.7) —
+    /// read from the registry at Start, `true` by default. Rides the wire as
+    /// `echoCancellation` INSIDE the mic block, so a mic-off session's request
+    /// is byte-for-byte unchanged. A sidecar that cannot honour it degrades to
+    /// the plain mic with a non-fatal `warning`; the host never fails a start
+    /// over it.
+    pub echo_cancellation: bool,
 }
 
 /// The camera selection of one capture session (Story 20.1, FR-70, AD-37) —
@@ -773,6 +781,12 @@ pub fn start_recording_request(id: u64, params: &SessionParams) -> String {
         if let Some(device_id) = &microphone.device_id {
             wire["micDeviceId"] = device_id.clone().into();
         }
+        // Acoustic echo cancellation (Story 22.7): emitted ONLY here, inside
+        // the mic block, so a mic-off session's wire keeps carrying no audio
+        // knobs at all. Additive like every field before it —
+        // `PROTOCOL_VERSION` stays 1 — but the first whose absent-default is
+        // `true` sidecar-side, so an older host can never silently disable it.
+        wire["echoCancellation"] = microphone.echo_cancellation.into();
     }
     // The webcam source (Story 20.1): additive fields, absent entirely while
     // the camera is off so the pre-20.1 wire stays byte-for-byte unchanged.
@@ -2668,6 +2682,73 @@ mod tests {
             wire["params"].get("micDeviceId").is_none(),
             "a mic-off session must not carry micDeviceId"
         );
+        // Story 22.7: the echo-cancellation key lives INSIDE the mic block, so
+        // a mic-off wire must not carry it either — the sidecar's absent-default
+        // is `true`, and a mic-off session has nothing to cancel.
+        assert!(
+            wire["params"].get("echoCancellation").is_none(),
+            "a mic-off session must not carry echoCancellation"
+        );
+    }
+
+    #[test]
+    fn start_recording_request_carries_echo_cancellation_on() {
+        // Story 22.7: the mic on with echo cancellation on (the default) —
+        // `echoCancellation: true` rides beside `micEnabled`.
+        let params = SessionParams {
+            output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
+            display_id: None,
+            application: None,
+            system_audio: true,
+            microphone: Some(MicSelection {
+                device_id: None,
+                echo_cancellation: true,
+            }),
+            camera: None,
+            segment_mb: 500,
+            max_segment_seconds: 1800,
+            fps: 30,
+            codec: "h264".to_owned(),
+            scale_percent: 100,
+            audio_only: false,
+        };
+        let line = start_recording_request(17, &params);
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
+        assert_eq!(wire["params"]["micEnabled"], true);
+        assert_eq!(wire["params"]["echoCancellation"], true);
+    }
+
+    #[test]
+    fn start_recording_request_carries_echo_cancellation_off() {
+        // Story 22.7: turning the switch off threads `false` all the way to the
+        // wire — the sidecar then runs today's mic path verbatim, warning-free.
+        // Explicit `false` matters: an ABSENT key means ON sidecar-side, so the
+        // off state must never be expressed by omission.
+        let params = SessionParams {
+            output_path: "/tmp/keeper-rec/screen-0000.mov".to_owned(),
+            display_id: None,
+            application: None,
+            system_audio: true,
+            microphone: Some(MicSelection {
+                device_id: Some("MIC".to_owned()),
+                echo_cancellation: false,
+            }),
+            camera: None,
+            segment_mb: 500,
+            max_segment_seconds: 1800,
+            fps: 30,
+            codec: "h264".to_owned(),
+            scale_percent: 100,
+            audio_only: false,
+        };
+        let line = start_recording_request(18, &params);
+        let wire: serde_json::Value = serde_json::from_str(&line).expect("request is JSON");
+        assert_eq!(wire["params"]["micEnabled"], true);
+        assert_eq!(wire["params"]["micDeviceId"], "MIC");
+        assert_eq!(
+            wire["params"]["echoCancellation"], false,
+            "off must be carried explicitly, never by omission"
+        );
     }
 
     #[test]
@@ -2679,7 +2760,10 @@ mod tests {
             display_id: None,
             application: None,
             system_audio: true,
-            microphone: Some(MicSelection { device_id: None }),
+            microphone: Some(MicSelection {
+                device_id: None,
+                echo_cancellation: true,
+            }),
             camera: None,
             segment_mb: 500,
             max_segment_seconds: 1800,
@@ -2711,6 +2795,7 @@ mod tests {
             system_audio: false,
             microphone: Some(MicSelection {
                 device_id: Some("X".to_owned()),
+                echo_cancellation: true,
             }),
             camera: None,
             segment_mb: 500,
@@ -2840,6 +2925,7 @@ mod tests {
             system_audio: false,
             microphone: Some(MicSelection {
                 device_id: Some("MIC".to_owned()),
+                echo_cancellation: true,
             }),
             camera: Some(CameraSelection {
                 device_id: Some("CAM".to_owned()),

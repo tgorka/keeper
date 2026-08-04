@@ -1390,6 +1390,38 @@ pub fn set_recording_scale_percent(data_dir: &Path, percent: u32) -> Result<(), 
     )
 }
 
+/// The `settings` key holding the acoustic-echo-cancellation switch (Story
+/// 22.7). Stored with the registry's `"1"`/`"0"` boolean convention; absent /
+/// unrecognized ⇒ the default of ON — only a literal `"0"` turns it off.
+///
+/// Deliberately the inverse of every other recording toggle's absent-default:
+/// recording on speakers puts audible reverb on the microphone track, and a
+/// fresh install must not ship that. Passed to the sidecar as the additive
+/// `echoCancellation` start param, emitted only inside the mic block.
+const RECORDING_ECHO_CANCELLATION_KEY: &str = "recording.echo_cancellation";
+
+/// The default acoustic-echo-cancellation state (Story 22.7): ON.
+pub const RECORDING_ECHO_CANCELLATION_DEFAULT: bool = true;
+
+/// Read the acoustic-echo-cancellation switch (Story 22.7). Absent, empty, or
+/// any value other than `"0"` ⇒ `true` — the same read-side normalization every
+/// other recording setting applies, so a hand-edited `config.json` with a
+/// garbage value degrades to the documented default instead of erroring.
+pub fn get_recording_echo_cancellation(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, RECORDING_ECHO_CANCELLATION_KEY)?.as_deref() != Some("0"))
+}
+
+/// Write the acoustic-echo-cancellation switch (Story 22.7), persisting the
+/// registry's `"1"`/`"0"` convention. Applies to the next Recording Session
+/// only — the sidecar binds the voice-processing unit once, at Start.
+pub fn set_recording_echo_cancellation(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        RECORDING_ECHO_CANCELLATION_KEY,
+        if enabled { "1" } else { "0" },
+    )
+}
+
 /// The `settings` key holding an explicit path to the `git` binary folder sync
 /// drives (Story 34.14). Stored as the raw absolute path string; absent / empty
 /// ⇒ automatic resolution, which is the default and what almost every install
@@ -2846,6 +2878,45 @@ mod tests {
         for out_of_set in [0, 1, 9, 11, 14, 16, 29, 31, 45, 59, 61, 120, u32::MAX] {
             assert_eq!(normalize_recording_fps(out_of_set), 30);
         }
+    }
+
+    #[test]
+    fn recording_echo_cancellation_defaults_on_and_round_trips() {
+        // Story 22.7: the first recording toggle whose absent-default is ON —
+        // a fresh install must not ship a reverb-laden mic track, so only a
+        // literal `"0"` turns it off and every other stored value reads as on.
+        let dir = temp_dir();
+        assert_eq!(
+            get_recording_echo_cancellation(&dir).expect("fresh install default"),
+            RECORDING_ECHO_CANCELLATION_DEFAULT,
+            "no stored row must read as the documented default"
+        );
+        assert!(
+            get_recording_echo_cancellation(&dir).expect("fresh install default"),
+            "and that default is ON"
+        );
+
+        set_recording_echo_cancellation(&dir, false).expect("set off");
+        assert!(!get_recording_echo_cancellation(&dir).expect("read off"));
+        set_recording_echo_cancellation(&dir, true).expect("set on");
+        assert!(get_recording_echo_cancellation(&dir).expect("read on"));
+
+        // Read-side normalization, like fps/codec: a hand-edited `config.json`
+        // (which imports verbatim) can leave anything here — everything but
+        // `"0"` degrades to the documented default rather than erroring.
+        for garbage in ["maybe", "", "true", "false", "1", "2", "off"] {
+            set_setting(&dir, RECORDING_ECHO_CANCELLATION_KEY, garbage).expect("set garbage");
+            assert!(
+                get_recording_echo_cancellation(&dir).expect("read garbage"),
+                "stored {garbage:?} must read as on"
+            );
+        }
+        set_setting(&dir, RECORDING_ECHO_CANCELLATION_KEY, "0").expect("set raw 0");
+        assert!(
+            !get_recording_echo_cancellation(&dir).expect("read raw 0"),
+            "only a literal \"0\" turns echo cancellation off"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

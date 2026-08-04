@@ -192,6 +192,30 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// stop with the rest.
     private var micSessionRuntimeObserver: NSObjectProtocol?
 
+    // MARK: - Acoustic echo cancellation (Story 22.7)
+
+    /// The `'vpio'` echo-cancelling microphone producer (Story 22.7), or `nil`
+    /// while echo cancellation is off/unavailable. A THIRD mic source behind
+    /// the same `micEnabled` branch: when it runs, the mic does NOT ride the
+    /// SCStream at all and every sample reaches the writers through the one
+    /// `appendMicSample` seam exactly as before.
+    private var voiceProcessingMic: VoiceProcessingMic?
+    /// Whether the voice-processing producer is the live mic source. Decided
+    /// at capture start and only ever cleared (a failed fallback restart), so
+    /// the SCStream mic leg can never be attached behind its back.
+    private var echoCancellationActive = false
+    /// The mic AAC track's channel count for BOTH writers (screen + camera),
+    /// decided ONCE at capture start: 1 while echo cancellation is active (the
+    /// canceller is a mono, voice-band processor), else the historical 2.
+    /// Never re-decided — a mid-session fallback that changed it would hand
+    /// the rotation a segment whose mic track has a different channel count
+    /// than its predecessor.
+    private var micTrackChannels = 2
+    /// Set on `mediaQueue` once the one-per-session `echoReferenceStale`
+    /// warning has been emitted (the default output device changed and the
+    /// unit is deliberately NOT re-initialized).
+    private var echoReferenceStaleWarned = false
+
     // MARK: - Webcam state (Story 20.1, FR-70, AD-37)
 
     /// Whether the camera source is enabled (Story 20.1) — the session then
@@ -306,10 +330,13 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// before it reaches the stream configuration. Emits `preflight`
     /// immediately, then `recording` (with the path) once frames are flowing,
     /// or a single honest `error` line on any failure — including a vanished
-    /// application pid.
+    /// application pid. `echoCancellation` (Story 22.7) asks for the mic to be
+    /// produced by the `'vpio'` voice-processing unit instead of the SCStream —
+    /// on by default, and degrading to this same path with a `warning` whenever
+    /// the unit cannot run.
     func start(
         path: String, displayId: UInt32?, applicationPid: Int32?, applicationBundleId: String?,
-        systemAudio: Bool, micEnabled: Bool, micDeviceId: String?,
+        systemAudio: Bool, micEnabled: Bool, micDeviceId: String?, echoCancellation: Bool,
         cameraEnabled: Bool, cameraDeviceId: String?,
         segmentMB: Int, maxSegmentSeconds: Int, fps: Int,
         codec: String, scalePercent: Int, audioOnly: Bool
@@ -329,7 +356,9 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                         throw CaptureError(
                             "an audio-only session needs system audio or the microphone")
                     }
-                    try self.beginAudioOnlyMicSession(path: path, micDeviceId: micDeviceId)
+                    try self.beginAudioOnlyMicSession(
+                        path: path, micDeviceId: micDeviceId,
+                        echoCancellation: echoCancellation)
                     return
                 }
                 // Shareable-content enumeration is the real TCC/SCK gate: an
@@ -386,7 +415,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                     try self.beginCapture(
                         display: display, application: app, path: path,
                         systemAudio: systemAudio, micEnabled: micEnabled,
-                        micDeviceId: micDeviceId, cameraEnabled: cameraEnabled,
+                        micDeviceId: micDeviceId, echoCancellation: echoCancellation,
+                        cameraEnabled: cameraEnabled,
                         cameraDeviceId: cameraDeviceId, fps: fps,
                         scalePercent: scalePercent)
                     return
@@ -409,6 +439,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 try self.beginCapture(
                     display: display, application: nil, path: path, systemAudio: systemAudio,
                     micEnabled: micEnabled, micDeviceId: micDeviceId,
+                    echoCancellation: echoCancellation,
                     cameraEnabled: cameraEnabled, cameraDeviceId: cameraDeviceId, fps: fps,
                     scalePercent: scalePercent)
             } catch {
@@ -464,7 +495,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
 
     private func beginCapture(
         display: SCDisplay, application: SCRunningApplication?, path: String, systemAudio: Bool,
-        micEnabled: Bool, micDeviceId: String?, cameraEnabled: Bool, cameraDeviceId: String?,
+        micEnabled: Bool, micDeviceId: String?, echoCancellation: Bool,
+        cameraEnabled: Bool, cameraDeviceId: String?,
         fps: Int, scalePercent: Int
     ) throws {
         // Capture at the display's true pixel size (SCDisplay reports points),
@@ -485,7 +517,13 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             // any audio removal then warns rather than silently gapping.
             activeMicDeviceId = micDeviceId ?? AVCaptureDevice.default(for: .audio)?.uniqueID
             installMicDisconnectObserver()
+            // Story 22.7: the echo-cancelling producer is stood up BEFORE the
+            // first writer, because whether it runs decides the mic track's
+            // channel count for every segment of this session.
+            echoCancellationActive = startVoiceProcessingMic(
+                requested: echoCancellation, deviceId: micDeviceId)
         }
+        micTrackChannels = echoCancellationActive ? 1 : 2
 
         let first = try makeSegmentWriter(path: path, index: 0)
 
@@ -519,7 +557,11 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             config.sampleRate = 48_000
             config.channelCount = 2
         }
-        if micEnabled {
+        // Story 22.7: with echo cancellation live the mic must NOT also ride
+        // the SCStream — the `'vpio'` unit owns the input device and is this
+        // session's only mic producer. A second in-stream mic leg would double
+        // the track and defeat the canceller.
+        if micEnabled && !echoCancellationActive {
             if #available(macOS 15.0, *) {
                 // Story 19.3 (AD-36): on macOS 15+ the mic rides the SAME
                 // SCStream — `.microphone` samples arrive through the one
@@ -543,7 +585,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         if systemAudio {
             try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: mediaQueue)
         }
-        if micEnabled {
+        if micEnabled && !echoCancellationActive {
             if #available(macOS 15.0, *) {
                 // The `.microphone` output delivers on the same serial
                 // `mediaQueue` as every other sample — writer state stays
@@ -719,19 +761,122 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// Screen Recording TCC is never demanded); the 13-14-style parallel
     /// `AVCaptureSession` mic path alone feeds the writer, and the session
     /// anchors on the first mic sample via `appendMicSample`'s audio-only leg.
-    private func beginAudioOnlyMicSession(path: String, micDeviceId: String?) throws {
+    private func beginAudioOnlyMicSession(
+        path: String, micDeviceId: String?, echoCancellation: Bool
+    ) throws {
         wantsAudio = false
         wantsMic = true
         activeMicDeviceId = micDeviceId ?? AVCaptureDevice.default(for: .audio)?.uniqueID
         installMicDisconnectObserver()
+        // Story 22.7: the same third producer, before the writer — the mic
+        // track's channel count is fixed for the whole session by this answer.
+        echoCancellationActive = startVoiceProcessingMic(
+            requested: echoCancellation, deviceId: micDeviceId)
+        micTrackChannels = echoCancellationActive ? 1 : 2
         let first = try makeSegmentWriter(path: path, index: 0)
-        guard first.writer.startWriting() || first.writer.status == .writing else {
-            throw CaptureError("could not start the audio writer")
+        // `makeSegmentWriter` has ALREADY started this writer. Calling
+        // `startWriting()` a second time raises an ObjC
+        // `NSInternalInconsistencyException`, which Swift cannot catch — the
+        // sidecar aborts with SIGABRT and the app reports "recording sidecar
+        // failed", which is what a mic-only audio-only session did on every
+        // build until 2026-08-04. The `|| status == .writing` that was here
+        // could never save it: the left operand throws before the right one is
+        // evaluated. So assert the state instead of re-asserting the action.
+        guard first.writer.status == .writing else {
+            throw CaptureError(
+                "could not start the audio writer: \(first.writer.error.map(String.init(describing:)) ?? "unknown")"
+            )
         }
         mediaQueue.async { [self] in current = first }
-        try startMicCaptureSession(deviceId: micDeviceId)
+        if !echoCancellationActive {
+            try startMicCaptureSession(deviceId: micDeviceId)
+        }
         // `recording` is emitted by the first anchored mic sample (the honest
         // moment audio is actually flowing), not here.
+    }
+
+    // MARK: - Acoustic echo cancellation (Story 22.7)
+
+    /// Stand up the `'vpio'` echo-cancelling microphone producer when the
+    /// session asked for it and the hardware allows it. Returns whether it is
+    /// the live mic source; `false` means today's mic path runs verbatim.
+    ///
+    /// Every rejection is NON-FATAL by contract: an aggregate input, a -66784
+    /// `kAUVoiceIOErr_UnexpectedNumberOfInputChannels`, or any other setup
+    /// `OSStatus` yields one honest `echoCancellationUnavailable` warning and
+    /// the plain mic — never a failed, silent, or half-written recording. The
+    /// branch itself is `EchoCancellation.decide`'s (Foundation-only,
+    /// unit-tested); this function only performs its side effects.
+    private func startVoiceProcessingMic(requested: Bool, deviceId: String?) -> Bool {
+        // The pre-flight fact: an aggregate input device can never host the
+        // unit (it builds its own private aggregate), and probing costs no TCC
+        // prompt and no hardware start.
+        var decision = EchoCancellation.decide(
+            requested: requested,
+            isAggregateInput: requested && VoiceProcessingMic.isAggregateInput(uid: deviceId),
+            initStatus: EchoCancellation.okStatus)
+        if decision.useVoiceProcessing {
+            switch attachVoiceProcessingMic(deviceId: deviceId) {
+            case .success:
+                return true
+            case .failure(let error):
+                decision = EchoCancellation.decide(
+                    requested: true, isAggregateInput: false, initStatus: error.status)
+            }
+        }
+        if let code = decision.warningCode, let message = decision.warningMessage {
+            emitEvent(["event": "warning", "code": code, "message": message])
+        }
+        return false
+    }
+
+    /// Build, start and retain one voice-processing producer feeding the single
+    /// `appendMicSample` seam on `mediaQueue`. Shared by the capture-start path
+    /// and the mic-loss fallback, so the recovered feed comes up echo-cancelled
+    /// through exactly the same code.
+    private func attachVoiceProcessingMic(deviceId: String?)
+        -> Result<Void, VoiceProcessingError>
+    {
+        let producer = VoiceProcessingMic(
+            deviceUID: deviceId,
+            sink: { [weak self] buffer in
+                guard let self else { return }
+                // The realtime input thread hands off here; writer state stays
+                // confined to the one serial media queue, like every source.
+                self.mediaQueue.async { self.appendMicSample(buffer) }
+            },
+            onOutputDeviceChanged: { [weak self] in
+                self?.warnEchoReferenceStale()
+            })
+        do {
+            try producer.start()
+            voiceProcessingMic = producer
+            return .success(())
+        } catch let error as VoiceProcessingError {
+            producer.stop()
+            return .failure(error)
+        } catch {
+            producer.stop()
+            return .failure(
+                VoiceProcessingError(stage: "starting echo cancellation", status: -1))
+        }
+    }
+
+    /// Emit the one-per-session `echoReferenceStale` warning (Story 22.7) — on
+    /// `mediaQueue`. The unit is deliberately NOT re-initialized: the echo
+    /// reference is bound at initialize time, and tearing the unit down
+    /// mid-session would cut the mic track for a device swap the user can hear
+    /// for themselves. Honesty over a broken seam.
+    private func warnEchoReferenceStale() {
+        mediaQueue.async { [self] in
+            guard !stopping, !echoReferenceStaleWarned else { return }
+            echoReferenceStaleWarned = true
+            emitEvent([
+                "event": "warning",
+                "code": EchoCancellation.staleReferenceCode,
+                "message": EchoCancellation.staleReferenceMessage,
+            ])
+        }
     }
 
     private func makeSegmentWriter(path: String, index: Int) throws -> SegmentWriter {
@@ -789,12 +934,16 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             // premixed — stock players play the tracks together, editors can
             // separate them. The writer's internal converter adapts the
             // device's native format (e.g. a mono mic) to this output shape.
+            // Story 22.7: `micTrackChannels` is 1 while echo cancellation is
+            // active (the canceller is a mono, voice-band processor) and the
+            // historical 2 otherwise — fixed once at capture start, so every
+            // segment of a session carries the same mic track shape.
             let input = AVAssetWriterInput(
                 mediaType: .audio,
                 outputSettings: [
                     AVFormatIDKey: kAudioFormatMPEG4AAC,
                     AVSampleRateKey: 48_000,
-                    AVNumberOfChannelsKey: 2,
+                    AVNumberOfChannelsKey: micTrackChannels,
                     AVEncoderBitRateKey: 192_000,
                 ])
             input.expectsMediaDataInRealTime = true
@@ -1029,6 +1178,28 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             micSession = nil
             DispatchQueue.global(qos: .userInitiated).async { dead.stopRunning() }
         }
+        // Story 22.7: an echo-cancelled session recovers echo-cancelled. The
+        // dead unit is disposed and a FRESH one is bound to the system default
+        // input — the mic track's channel count is untouched either way
+        // (decided once at capture start), so the rotation never sees a
+        // segment whose shape changed mid-session. Only if that restart fails
+        // does the session drop to the plain mic, with the honest warning.
+        if echoCancellationActive {
+            voiceProcessingMic?.stop()
+            voiceProcessingMic = nil
+            switch attachVoiceProcessingMic(deviceId: nil) {
+            case .success:
+                activeMicDeviceId = AVCaptureDevice.default(for: .audio)?.uniqueID
+                return
+            case .failure:
+                echoCancellationActive = false
+                emitEvent([
+                    "event": "warning",
+                    "code": EchoCancellation.warningCode,
+                    "message": EchoCancellation.unavailableMessage,
+                ])
+            }
+        }
         do {
             try startMicCaptureSession(deviceId: nil)
         } catch {
@@ -1239,7 +1410,9 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 bitRate: 4_000_000))
         // Story 22.4: when the mic source is on, the camera file carries the
         // mic as its OWN separate AAC track too (never premixed) — a webcam
-        // clip is then self-contained for talking-head use.
+        // clip is then self-contained for talking-head use. Story 22.7: the
+        // same `micTrackChannels` the screen writer uses, so the camera file's
+        // mic track is byte-for-byte the same processed audio.
         var cameraMicInput: AVAssetWriterInput?
         if wantsMic {
             let mic = AVAssetWriterInput(
@@ -1247,7 +1420,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 outputSettings: [
                     AVFormatIDKey: kAudioFormatMPEG4AAC,
                     AVSampleRateKey: 48_000,
-                    AVNumberOfChannelsKey: 2,
+                    AVNumberOfChannelsKey: micTrackChannels,
                     AVEncoderBitRateKey: 192_000,
                 ])
             mic.expectsMediaDataInRealTime = true
@@ -1693,6 +1866,13 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             // Story 19.4 (closes the 19.3 deferred gap): drop the handle so no
             // later path can touch a wound-down session.
             self.micSession = nil
+        }
+        // Story 22.7: stop and dispose the voice-processing unit and remove its
+        // default-output-device listener, so no realtime callback and no
+        // hardware notification can fire into a winding-down engine.
+        if let voiceProcessingMic {
+            voiceProcessingMic.stop()
+            self.voiceProcessingMic = nil
         }
         // Story 20.1: the camera teardown mirrors the mic's — observers gone
         // first (a removal during teardown must not fire the camera-loss path

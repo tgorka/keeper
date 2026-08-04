@@ -30,6 +30,7 @@ vi.mock("@/lib/ipc/client", () => ({
       fps: 30,
       codec: "h264",
       scalePercent: 100,
+      echoCancellation: true,
     }),
   ),
   recordingSettingsSet: vi.fn((vm: unknown) => Promise.resolve(vm)),

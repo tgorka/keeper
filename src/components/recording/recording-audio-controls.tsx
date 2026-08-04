@@ -20,9 +20,18 @@
  * denied → Start is blocked while the mic stays enabled (Story 20.2 — the
  * pre-flight row names it), with the System Settings fix path.
  *
- * Both rows are bound to ephemeral stores ({@link recording-audio.ts},
+ * Those two rows are bound to ephemeral stores ({@link recording-audio.ts},
  * {@link recording-mic.ts}) — per-session, never persisted, never mirrored
  * into Settings → Recording. Destination/fps (19.5) stay out of scope.
+ *
+ * The Echo cancellation row (Story 22.7) is the one exception: a PERSISTED
+ * setting on the shared `recording-settings` mirror, default **on**, sitting
+ * under the device picker because it is a property of the mic feed. It states
+ * both costs plainly (a mono mic track, non-defeatable voice-band noise
+ * suppression) and that it applies to the next Recording Session — the sidecar
+ * binds the voice-processing unit once, at Start. It greys out until hydration
+ * lands, while the mic is off, and while the card is not `active` (a live
+ * session already bound its processor, and the setter rejects a change).
  */
 import { useEffect, useRef, useState } from "react";
 import { Label } from "@/components/ui/label";
@@ -43,6 +52,12 @@ import {
   useMicDeviceId,
   useMicEnabled,
 } from "@/lib/stores/recording-mic";
+import {
+  applyRecordingSettings,
+  ensureRecordingSettingsHydrated,
+  recordingSettingsStore,
+  useRecordingSettings,
+} from "@/lib/stores/recording-settings";
 import { useRecordingSources } from "@/lib/stores/recording-source";
 
 /** The Switch's label (recording voice: content-audio, not a device). */
@@ -92,6 +107,24 @@ export const MIC_SWITCH_TESTID = "mic-switch";
 /** Test id for the mic device Select trigger. */
 export const MIC_DEVICE_SELECT_TESTID = "mic-device-select";
 
+/** The echo-cancellation Switch's label (Story 22.7). */
+export const ECHO_CANCELLATION_LABEL = "Echo cancellation";
+
+/** The honest caption: what it buys, and what it costs. */
+export const ECHO_CANCELLATION_CAPTION =
+  "Stops the microphone from re-recording what your speakers are playing.";
+
+/** The costs, stated plainly — this is not a free switch. */
+export const ECHO_CANCELLATION_COST_NOTE =
+  "The microphone track becomes mono and gets voice-band noise suppression that can't be " +
+  "turned off separately.";
+
+/** Honest scope note: the sidecar binds the processor once, at Start. */
+export const ECHO_CANCELLATION_NEXT_SESSION_NOTE = "Applies to the next Recording Session.";
+
+/** Test id for the echo-cancellation switch control. */
+export const ECHO_CANCELLATION_SWITCH_TESTID = "echo-cancellation-switch";
+
 /** Sentinel `Select` value for the system default input (`micDeviceId: null`)
  * — Radix Select item values must be non-empty strings, and no real device id
  * collides with this reserved token. */
@@ -119,6 +152,14 @@ export function RecordingAudioControls({
   const deviceId = useMicDeviceId();
   const sources = useRecordingSources();
   const microphones = sources?.microphones ?? [];
+  // Story 22.7: echo cancellation is a PERSISTED pre-recording setting (unlike
+  // the ephemeral mic toggle beside it), so it binds to the same shared
+  // `recording-settings` mirror Settings → Recording and the Advanced group
+  // use — editing it here and there stays in lockstep.
+  const settings = useRecordingSettings();
+  useEffect(() => {
+    void ensureRecordingSettingsHydrated();
+  }, []);
 
   // Pre-Start reconciliation (Story 19.4): a specifically-selected mic that
   // vanished from the live enumeration falls back to "System default input"
@@ -173,6 +214,24 @@ export function RecordingAudioControls({
       // Disabling drops any prior outcome; the next enable re-requests fresh.
       setMicPermission(null);
     }
+  };
+
+  // The switch is inert unless it can honestly do something: not before the
+  // first hydration lands (no fake value is ever displayed), not while the mic
+  // is off (there is no mic feed to process), and not while the card is
+  // inactive — the live session already bound its processor at Start, and the
+  // setter rejects a changed value outright.
+  const echoDisabled = settings === null || !micOn || !active;
+
+  /** Persist the echo-cancellation switch via the shared optimistic-mirror
+   * store. Reads the LIVE store value (not the render snapshot) so this commit
+   * never clobbers a co-setting edited concurrently on a sibling surface. */
+  const onEchoToggle = (checked: boolean) => {
+    const live = recordingSettingsStore.getState().settings;
+    if (live === null || checked === live.echoCancellation) {
+      return;
+    }
+    void applyRecordingSettings({ ...live, echoCancellation: checked });
   };
 
   return (
@@ -236,6 +295,25 @@ export function RecordingAudioControls({
           ))}
         </SelectContent>
       </Select>
+      {/* Echo cancellation (Story 22.7): the one persisted setting on this
+          card. Sits under the device picker because it is a property of the
+          mic feed, and greys out for the same reasons the picker does. */}
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex flex-col gap-0.5">
+          <Label htmlFor="echo-cancellation-toggle">{ECHO_CANCELLATION_LABEL}</Label>
+          <p className="text-muted-foreground text-xs">{ECHO_CANCELLATION_CAPTION}</p>
+        </div>
+        <Switch
+          id="echo-cancellation-toggle"
+          data-testid={ECHO_CANCELLATION_SWITCH_TESTID}
+          checked={settings?.echoCancellation ?? true}
+          disabled={echoDisabled}
+          onCheckedChange={onEchoToggle}
+        />
+      </div>
+      <p className="text-muted-foreground text-xs">
+        {ECHO_CANCELLATION_COST_NOTE} {ECHO_CANCELLATION_NEXT_SESSION_NOTE}
+      </p>
       {!micOn && <p className="text-muted-foreground text-xs">{MIC_OFF_NOTE}</p>}
       {micOn && micPermission === "granted" && (
         <p className="text-muted-foreground text-xs" role="status">
