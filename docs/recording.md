@@ -42,6 +42,14 @@ The honest costs, all of them:
 - **Voice-band noise suppression comes with it** and cannot be turned off
   separately. Automatic gain control *is* turned off — a recorder must not ride
   your voice level up and down under the far end.
+- **Your own voice can come out quieter, and loud speakers make it worse.** A
+  canceller subtracts what it can estimate and then suppresses whatever is left,
+  and that second stage cannot tell leftover echo from you talking at the same
+  moment as the far end. With automatic gain control deliberately off there is
+  nothing adding the level back, so on loud speakers the effect is a voice that
+  ducks under the far end. If a recording sounds too quiet rather than too
+  echoey, that is this — turn the switch off for that session, or use headphones
+  and leave it off, which removes the echo path entirely.
 - The microphone is captured at the **device's native sample rate** when the
   unit declines to convert; the written track is AAC either way.
 - **Aggregate input devices are not supported** — the unit builds its own

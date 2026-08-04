@@ -11,12 +11,14 @@ context:
   - '{project-root}/docs/recording.md'
 warnings: ['oversized']
 operator_actions:
-  - 'Unlock hesperia (its screen is locked, and a locked session cannot grant or exercise the microphone TCC that the measurement needs).'
-  - 'Open keeper, go to Recording, choose the Audio only source, turn System audio OFF and the Microphone ON, and leave Echo cancellation ON.'
-  - 'Start a recording, run `bash ~/keeper-aec-measure.sh play` from a shell (it plays a known clip from ANOTHER process at output volume 45), let it finish, then Stop.'
-  - 'Turn Echo cancellation OFF and repeat the same take, so the two differ in nothing but the switch.'
-  - 'Run `bash ~/keeper-aec-measure.sh measure aec-on <session>` and the same for the off take, then paste both mean_volume figures into this spec: the AEC-on mic track must be at least ~15 dB quieter. If it is not, set the registry default to false, say so here, and do not ship an inert switch.'
-  - 'Run `bash ~/keeper-aec-measure.sh restore` to put the output volume back, and delete the ~/Movies/keeper/aec-* test sessions.'
+  - 'Unlock hesperia (its screen is locked, and a locked session can neither grant nor exercise the microphone TCC the measurement needs).'
+  - 'Open keeper, go to Recording, choose the Audio only source, turn System audio OFF and the Microphone ON, and leave Echo cancellation ON. Speakers, no headphones.'
+  - 'Start the recording, then run `bash ~/keeper-aec-measure.sh cue` in a shell and follow its prompts: 10 s silent while it plays the far end, 10 s counting aloud with nothing playing, 10 s counting aloud WHILE it plays. Stop the recording when it says done.'
+  - 'Run `bash ~/keeper-aec-measure.sh windows aec-on`.'
+  - 'Turn Echo cancellation OFF and repeat the identical take, then `bash ~/keeper-aec-measure.sh windows aec-off`.'
+  - 'Paste all six figures into the Auto Run Result. Window 1 (far end only) must be at least ~15 dB lower with AEC on — that is the echo going away. Windows 2 and 3 (your voice alone, then your voice over the far end) must stay within a few dB — a big drop there means the unit is attenuating rather than cancelling, i.e. a mute with a nicer name.'
+  - 'If windows 2/3 DO drop materially: re-enable the unit AGC in VoiceProcessingMic.start (kAUVoiceIOProperty_VoiceProcessingEnableAGC = 1, which Apple leaves on and this story deliberately turned off), rebuild the sidecar, measure again, and choose between pumping room tone and a quiet voice with both sets of numbers written down. Do not ship the switch on by default until one of the two is acceptable.'
+  - 'Run `bash ~/keeper-aec-measure.sh restore` and delete the ~/Movies/keeper/aec-* test sessions.'
 ---
 
 <intent-contract>
@@ -236,3 +238,21 @@ sidecar at start, a `guard let stream` in `stop()` that reported failure after a
 left the writer unfinalized, and a non-idempotent `stop()` that aborted at the end once the second
 bug stopped masking it (the host asks to stop twice — the request, then EOF). Found by trying to
 take the measurement above; each one is described in its own commit.
+
+**The open risk, named by the owner before any measurement existed: the feature could "work" by
+being too quiet.** Two mechanisms, both real, both pointing the same way on speakers:
+
+1. **The residual-echo suppressor is most aggressive during double talk.** A canceller subtracts a
+   linear estimate of the echo and then a nonlinear stage suppresses what is left. That stage cannot
+   tell "residual echo" from "near-end speech arriving at the same moment", so the louder the
+   speakers, the more it clamps — and the operator's voice is what gets clamped.
+2. **This story turned the unit's AGC OFF on purpose**, and Apple ships it ON. The reasoning stands
+   for a recorder (AGC rides room tone up and down between phrases), but it also removes the makeup
+   gain VPIO's own design assumes sits after the suppressor. Net effect on speakers: quieter voice
+   than the unprocessed mic path delivers today.
+
+The first version of this spec's measurement could not have caught either one: it played the far end
+into silence and compared one number, which a canceller and a mute produce identically. The
+acceptance and the harness are now a three-window take — far end alone, voice alone, both at once —
+precisely so "the echo went away" and "the microphone went away" cannot be confused, and so the
+AGC decision is settled by six figures rather than by taste.

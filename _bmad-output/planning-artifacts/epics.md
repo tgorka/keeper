@@ -3415,15 +3415,30 @@ rotation and silence-fill depend on, so the story does NOT re-init — it emits 
 `warning` event naming the change, and the sticky-warning surface (19.4) shows it.
 
 **Acceptance (observable):**
-- **The measurement that justifies the feature, on hesperia, on speakers.** With
-  the mic on and AEC on, play a known clip from a *different process* (`afplay`)
-  while recording, then stop. The far end is loud and clear in the system-audio
-  track and at least ~15 dB down in the mic track relative to the same recording
-  made with AEC off. Both numbers recorded in the spec's result block. If the
-  reduction is absent, the premise above is wrong: say so, default the switch OFF,
-  and file the finding instead of shipping a switch that does nothing.
-- A recording made with AEC on plays back without the doubled far-end voice; the
-  user's own voice is unaffected in level and intelligibility.
+- **The measurement that justifies the feature, on hesperia, on speakers — and it
+  must be a THREE-WINDOW take, because a canceller and a mute are
+  indistinguishable from the far end alone.** One recording, three timed windows,
+  run twice (AEC on, AEC off), otherwise identical:
+  1. **far end only** — `afplay` a known clip from another process, the operator
+     silent. AEC on must put this at least ~15 dB below the AEC-off take. This is
+     the leakage the bug is made of.
+  2. **near end only** — the operator counts aloud, nothing playing. AEC on must
+     leave this within a few dB of the AEC-off take. A big drop here means the
+     unit is not cancelling, it is attenuating, and the feature is a mute with a
+     nicer name.
+  3. **both at once (double talk)** — the operator counts while the clip plays.
+     This is where a residual-echo suppressor is most aggressive and where "the
+     recording got too quiet on speakers" would show up. The operator's voice must
+     stay at a usable level, not duck under the far end.
+  All six figures go into the spec's result block. If (1) does not drop, the
+  premise is wrong. If (2) or (3) drops materially, the *cost* is wrong, and the
+  answer is not to ship it on by default: re-enable the unit's AGC
+  (`kAUVoiceIOProperty_VoiceProcessingEnableAGC`, which Apple leaves ON and this
+  story deliberately turned OFF), measure again, and choose between pumping room
+  tone and a quiet voice with the numbers in hand.
+- A recording made with AEC on plays back without the doubled far-end voice, and
+  the user's own voice is unaffected in level and intelligibility — which is
+  window (2) and (3) above, not an impression.
 - With the mic OFF the wire, the tracks and the file are byte-for-byte what they
   are today, AEC switch in either position.
 - The switch survives a restart, is disabled while a session is live, and reads as
