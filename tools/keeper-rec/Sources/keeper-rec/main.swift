@@ -432,12 +432,13 @@ while let line = readLine(strippingNewline: true) {
         // written as its own AAC track, never premixed (AD-36).
         let micEnabled = (params?["micEnabled"] as? Bool) ?? false
         let micDeviceId = params?["micDeviceId"] as? String
-        // Story 22.7: acoustic echo cancellation on the mic feed — additive,
-        // emitted by the host only inside the mic block, and the FIRST additive
-        // field whose absent-default is `true`. An older host that predates the
-        // switch must not silently disable it: the user-visible default is on,
-        // and every failure degrades to the plain mic path with a `warning`.
-        let echoCancellation = (params?["echoCancellation"] as? Bool) ?? true
+        // Story 22.7: acoustic echo cancellation on the mic feed — additive, and
+        // emitted by the host only inside the mic block. Absent ⇒ OFF, like every
+        // other additive field: the processing is opt-in (owner decision
+        // 2026-08-05), so an older host that predates the switch records the
+        // microphone exactly as it always did. Every failure of the unit degrades
+        // to that same plain mic path with a `warning`.
+        let echoCancellation = (params?["echoCancellation"] as? Bool) ?? false
         // Story 20.1: the optional webcam leg — off unless explicitly enabled
         // (absent `cameraEnabled` means off, preserving the pre-20.1 wire);
         // `cameraDeviceId` nil = the system default camera. The camera is

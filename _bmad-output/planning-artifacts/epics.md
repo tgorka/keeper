@@ -3392,13 +3392,22 @@ ScreenCaptureKit's PTS and the silence-fill (`Capture.swift:1067`) already use, 
 no clock conversion and no A/V drift.
 
 **The option, because the processing is not free.** A pre-recording switch beside
-the existing Microphone switch (`recording-audio-controls.tsx`), **on by default**,
-persisted like fps/codec/scale (`recording.echo_cancellation` in the settings
-table, a new `RecordingSettingsVm` field) rather than per-session, because it
-describes the user's room and hardware, not one recording. Settable only while no
-session is live, since VPIO is chosen at capture-start. It rides the wire as an
-additive `echoCancellation` key and is the **first** start field whose Swift-side
-absent-default is `true` — an older host must not silently disable it.
+the existing Microphone switch (`recording-audio-controls.tsx`), persisted like
+fps/codec/scale (`recording.echo_cancellation` in the settings table, a new
+`RecordingSettingsVm` field) rather than per-session, because it describes the
+user's room and hardware, not one recording. Settable only while no session is
+live, since VPIO is chosen at capture-start. It rides the wire as an additive
+`echoCancellation` key.
+
+> **Shipped OFF by default** (owner decision, 2026-08-05, after five recordings on
+> hesperia). This paragraph originally said *on* by default, on the reasoning that
+> a fresh install must not ship a reverb-laden mic track. What the measurements
+> then showed is that both halves of the trade are real: the far end does drop
+> ~24 dB, and the track does become mono with voice-band noise suppression that
+> cannot be turned off separately. The reverb happens only on speakers and
+> headphones remove it with no processing at all, so the processing is the thing
+> that should be asked for. Absent therefore means OFF on the wire too, like every
+> other additive field — an older sidecar records the plain microphone.
 
 Honest costs, which the story documents in `docs/recording.md` rather than hides:
 VPIO runs **mono only** (Chromium: *"it also only runs in mono"*,

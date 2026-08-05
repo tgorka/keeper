@@ -784,8 +784,9 @@ pub fn start_recording_request(id: u64, params: &SessionParams) -> String {
         // Acoustic echo cancellation (Story 22.7): emitted ONLY here, inside
         // the mic block, so a mic-off session's wire keeps carrying no audio
         // knobs at all. Additive like every field before it —
-        // `PROTOCOL_VERSION` stays 1 — but the first whose absent-default is
-        // `true` sidecar-side, so an older host can never silently disable it.
+        // `PROTOCOL_VERSION` stays 1 — and, like every field before it, absent
+        // means OFF sidecar-side: the processing is opt-in (owner decision
+        // 2026-08-05), so an older sidecar records the plain microphone.
         wire["echoCancellation"] = microphone.echo_cancellation.into();
     }
     // The webcam source (Story 20.1): additive fields, absent entirely while

@@ -219,12 +219,14 @@ development_status:
   # mic track a second time, delayed — audible as reverb. Epic 22 is the home for
   # user-requested recording follow-ups, so the AEC fix is 22-7 rather than a new
   # epic. Requirement + the measurement that must justify it: epics.md, Story 22.7.
-  # Implemented, gated and exercised on hesperia at every layer except the one
-  # that needs a room: the acoustic A/B could not run because the Mac's screen is
-  # locked and an ssh-spawned sidecar has no microphone grant, so both takes were
-  # digital silence. The spec carries the operator steps; the mono-vs-stereo mic
-  # track already proves the voice-processing unit is the live producer.
-  22-7-the-microphone-stops-recording-the-speakers: awaiting-operator
+  # Measured on hesperia 2026-08-04 through the app: the far end drops ~24 dB out
+  # of the mic track, so Apple's voice-processing unit does cancel another
+  # process's playback — the premise held. The owner then recorded five sessions
+  # of their own on 2026-08-05 and decided the switch ships OFF: the cancellation
+  # is real but it costs a mono track and non-defeatable voice-band noise
+  # suppression, and headphones remove the reverb without any processing. Opt-in,
+  # documented, with the numbers in the spec.
+  22-7-the-microphone-stops-recording-the-speakers: done
 
   # Phase 4 — Folder Sync (Epics 23–31, added 2026-07-25)
   epic-23: in-progress

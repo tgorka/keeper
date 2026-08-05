@@ -53,7 +53,7 @@ const DEFAULT_SETTINGS: RecordingSettingsVm = {
   fps: 30,
   codec: "h264",
   scalePercent: 100,
-  echoCancellation: true,
+  echoCancellation: false,
 };
 
 beforeEach(() => {
@@ -291,11 +291,14 @@ describe("RecordingAudioControls", () => {
     return toggle;
   }
 
-  it("renders the echo-cancellation switch ON by default with the honest cost note", async () => {
+  it("renders the echo-cancellation switch OFF by default with the honest cost note", async () => {
     const toggle = await renderWithLiveMic();
 
     await waitFor(() => expect(toggle).toBeEnabled());
-    expect(toggle).toHaveAttribute("aria-checked", "true");
+    // Opt-in (owner decision 2026-08-05): the cancellation works, but it costs a
+    // mono track and non-defeatable voice-band noise suppression, so a fresh
+    // install records the microphone exactly as it always did.
+    expect(toggle).toHaveAttribute("aria-checked", "false");
     expect(screen.getByText(ECHO_CANCELLATION_LABEL)).toBeInTheDocument();
     // The costs are never hidden: mono + non-defeatable noise suppression.
     expect(screen.getByText(new RegExp(ECHO_CANCELLATION_COST_NOTE))).toBeInTheDocument();
@@ -308,8 +311,8 @@ describe("RecordingAudioControls", () => {
     expect(screen.getByTestId(ECHO_CANCELLATION_SWITCH_TESTID)).toBeDisabled();
   });
 
-  it("turning it off persists through recordingSettingsSet and reads back off", async () => {
-    mockSettingsSet.mockResolvedValue({ ...DEFAULT_SETTINGS, echoCancellation: false });
+  it("turning it on persists through recordingSettingsSet and reads back on", async () => {
+    mockSettingsSet.mockResolvedValue({ ...DEFAULT_SETTINGS, echoCancellation: true });
     const toggle = await renderWithLiveMic();
     await waitFor(() => expect(toggle).toBeEnabled());
 
@@ -318,10 +321,10 @@ describe("RecordingAudioControls", () => {
     await waitFor(() => expect(mockSettingsSet).toHaveBeenCalledTimes(1));
     expect(mockSettingsSet).toHaveBeenCalledWith({
       ...DEFAULT_SETTINGS,
-      echoCancellation: false,
+      echoCancellation: true,
     });
     // The mirror now shows the EFFECTIVE (Rust-confirmed) value.
-    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
   });
 
   it("a rejected write reverts the switch to the last confirmed value", async () => {
@@ -338,7 +341,7 @@ describe("RecordingAudioControls", () => {
 
     await waitFor(() => expect(mockSettingsSet).toHaveBeenCalledTimes(1));
     // Optimism is rolled back — the UI never claims an unsaved value.
-    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
   });
 
   it("is disabled while the card is not active (a live session owns the mic)", async () => {

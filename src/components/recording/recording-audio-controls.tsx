@@ -306,7 +306,7 @@ export function RecordingAudioControls({
         <Switch
           id="echo-cancellation-toggle"
           data-testid={ECHO_CANCELLATION_SWITCH_TESTID}
-          checked={settings?.echoCancellation ?? true}
+          checked={settings?.echoCancellation ?? false}
           disabled={echoDisabled}
           onCheckedChange={onEchoToggle}
         />
