@@ -3333,6 +3333,128 @@ imported over the settings table (file wins), enabling hand-edited /
 version-controlled setups; the path and key list are documented in
 docs/recording.md. Malformed files are reported loudly and skipped.
 
+### Story 22.7: The Microphone Stops Recording the Speakers
+
+**Field report (2026-08-04, the owner, on hesperia):** recording *without
+headphones* puts audible echo/reverb on the recording.
+
+**The mechanism, and why it is a design consequence rather than a bug in one
+line of code.** A session writes two never-premixed AAC tracks (AD-36): system
+audio from ScreenCaptureKit (`excludesCurrentProcessAudio = true`, which excludes
+only *keeper's own* sounds) and the microphone on its own track. On speakers the
+mic legitimately re-captures whatever the speakers are playing — the far end of a
+call, the video being watched — a few milliseconds late and coloured by the room.
+Play the two tracks together and every far-end word arrives twice: once clean,
+once as a smeared copy. That is the reverb. Headphones remove the acoustic path,
+which is exactly why it only happens without them.
+
+**The fix is acoustic echo cancellation on the mic feed, and macOS ships one.**
+`kAudioUnitSubType_VoiceProcessingIO` ('vpio', `kAudioUnitType_Output`,
+AUComponent.h: *"Available on macOS"*, bus 0 = output/reference, bus 1 = mic) is
+the same unit Zoom-class apps use. Its echo reference is **the output device's
+mix, not just this process's own render** — Apple's `AVAudioIONode` header says it
+takes out "any of the audio that is played *from the device*", and it obtains that
+by building a private aggregate device spanning the input and output devices.
+Chromium ships exactly this shape as its `kMacSystemEchoCanceller`: it binds bus 0
+to the default *output* device (`output_device_id_for_aec_`), feeds bus 0 a render
+callback that emits nothing but `kAudioUnitRenderAction_OutputIsSilence`, and gets
+processed mic input out of bus 1
+(`media/audio/apple/audio_low_latency_input.cc:157-164, 196-205, 513-556`). Since
+keeper does not render the far end — another app does — that property is the whole
+reason this works here, and it is the one premise the story must MEASURE rather
+than assume (see Acceptance).
+
+Not viable, with reasons, so they are not relitigated in the story:
+`SCStreamConfiguration` has no echo/voice-processing knob in macOS 15 or 26 (its
+entire audio surface is `capturesAudio`, `sampleRate`, `channelCount`,
+`excludesCurrentProcessAudio`, `captureMicrophone`, `microphoneCaptureDeviceID`) —
+so **AEC means this session's mic does not ride the SCStream**;
+`AVCaptureDevice.preferredMicrophoneMode` / `activeMicrophoneMode` are
+`class, readonly` (Control-Center-only, not settable by an app); Apple ships no
+offline/effect-unit echo canceller, because AEC needs a time-aligned far-end
+reference and an adaptive filter; and WebRTC's AEC3 needs a far-end signal the app
+owns, which keeper does not have.
+
+**The shape.** A THIRD producer behind the existing `micEnabled` branch, feeding
+the one seam every mic leg already uses — `appendMicSample` (`Capture.swift:886`),
+with `micPTSLowerBound`, the 19.4 silence-fill, the 22.4 camera mirror and the
+rotation split all untouched. The precedent is `startMicCaptureSession`
+(`Capture.swift:826`), which has run an out-of-SCStream mic feed on macOS 13-14
+since 19.3. When AEC is on: skip `config.captureMicrophone`, do not attach the
+`.microphone` stream output, run the 'vpio' unit instead — bus 1 pinned to the
+picked `micDeviceId` (or the default input) via
+`kAudioOutputUnitProperty_CurrentDevice`, bus 0 to the default output device,
+`kAUVoiceIOProperty_VoiceProcessingEnableAGC = 0` (AEC and noise suppression yes,
+automatic gain control **no** — AGC pumps room tone, which is wrong for a
+recorder), and every captured buffer turned into a `CMSampleBuffer` whose PTS is
+`CMClockMakeHostTimeFromSystemUnits(timestamp.mHostTime)` — the same host clock
+ScreenCaptureKit's PTS and the silence-fill (`Capture.swift:1067`) already use, so
+no clock conversion and no A/V drift.
+
+**The option, because the processing is not free.** A pre-recording switch beside
+the existing Microphone switch (`recording-audio-controls.tsx`), **on by default**,
+persisted like fps/codec/scale (`recording.echo_cancellation` in the settings
+table, a new `RecordingSettingsVm` field) rather than per-session, because it
+describes the user's room and hardware, not one recording. Settable only while no
+session is live, since VPIO is chosen at capture-start. It rides the wire as an
+additive `echoCancellation` key and is the **first** start field whose Swift-side
+absent-default is `true` — an older host must not silently disable it.
+
+Honest costs, which the story documents in `docs/recording.md` rather than hides:
+VPIO runs **mono only** (Chromium: *"it also only runs in mono"*,
+`audio_low_latency_input.cc:959-962`), so with AEC on the mic track is mono where
+it is stereo today; its noise suppression is voice-band and not separately
+defeatable, so music through the mic will be degraded — that is what the switch is
+for; it requires the device's native rate (48 kHz on Apple silicon, matching
+`config.sampleRate` already); and it cannot run on an aggregate input device
+(BlackHole/Loopback) because it creates one itself. VPIO binds its reference at
+init and does **not** follow a mid-session output-device change: swapping to
+AirPods 20 minutes in leaves the canceller referencing the old device. Re-initing
+mid-recording would put a discontinuity into a track whose PTS monotonicity the
+rotation and silence-fill depend on, so the story does NOT re-init — it emits a
+`warning` event naming the change, and the sticky-warning surface (19.4) shows it.
+
+**Acceptance (observable):**
+- **The measurement that justifies the feature, on hesperia, on speakers — and it
+  must be a THREE-WINDOW take, because a canceller and a mute are
+  indistinguishable from the far end alone.** One recording, three timed windows,
+  run twice (AEC on, AEC off), otherwise identical:
+  1. **far end only** — `afplay` a known clip from another process, the operator
+     silent. AEC on must put this at least ~15 dB below the AEC-off take. This is
+     the leakage the bug is made of.
+  2. **near end only** — the operator counts aloud, nothing playing. AEC on must
+     leave this within a few dB of the AEC-off take. A big drop here means the
+     unit is not cancelling, it is attenuating, and the feature is a mute with a
+     nicer name.
+  3. **both at once (double talk)** — the operator counts while the clip plays.
+     This is where a residual-echo suppressor is most aggressive and where "the
+     recording got too quiet on speakers" would show up. The operator's voice must
+     stay at a usable level, not duck under the far end.
+  All six figures go into the spec's result block. If (1) does not drop, the
+  premise is wrong. If (2) or (3) drops materially, the *cost* is wrong, and the
+  answer is not to ship it on by default: re-enable the unit's AGC
+  (`kAUVoiceIOProperty_VoiceProcessingEnableAGC`, which Apple leaves ON and this
+  story deliberately turned OFF), measure again, and choose between pumping room
+  tone and a quiet voice with the numbers in hand.
+- A recording made with AEC on plays back without the doubled far-end voice, and
+  the user's own voice is unaffected in level and intelligibility — which is
+  window (2) and (3) above, not an impression.
+- With the mic OFF the wire, the tracks and the file are byte-for-byte what they
+  are today, AEC switch in either position.
+- The switch survives a restart, is disabled while a session is live, and reads as
+  on for a fresh install.
+- An aggregate input device, or `AudioUnitInitialize` returning
+  `kAUVoiceIOErr_UnexpectedNumberOfInputChannels (-66784)`, falls back to today's
+  mic path with a `warning` event — never a failed or silent recording.
+- Mic hot-unplug (19.4) still warns, silence-fills and falls back with AEC on, and
+  the fallback comes up with AEC still applied.
+- The mic track in `camera-####.mov` (22.4) carries the same processed audio.
+
+**Must not:** premix the tracks; enable AGC; enable other-audio ducking (it would
+attenuate the far end in the system-audio track keeper is recording at the same
+time); re-initialize the unit mid-session; make the Screen Recording or Microphone
+TCC prompts fire twice; change anything about a mic-off session.
+
 ---
 
 # Phase 4 — Folder Sync (appended 2026-07-25)

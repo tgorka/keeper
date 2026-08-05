@@ -37,6 +37,13 @@ let package = Package(
                 // dependency. Explicit link keeps the build reproducible under
                 // stricter/explicit-linking toolchains.
                 .linkedFramework("AppKit"),
+                // Story 22.7: AudioToolbox provides the
+                // `kAudioUnitSubType_VoiceProcessingIO` ('vpio') echo-cancelling
+                // microphone unit; CoreAudio provides the default-output-device
+                // query and the aggregate-transport probe that decide whether
+                // that unit can run. Both live only in VoiceProcessingMic.swift.
+                .linkedFramework("AudioToolbox"),
+                .linkedFramework("CoreAudio"),
             ]
         ),
         // Unit tests for the pure, Foundation-only logic (Rotation.swift,
@@ -65,6 +72,12 @@ let package = Package(
                 .linkedFramework("CoreMedia"),
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("VideoToolbox"),
+                // Story 22.7: the test target links the executable, which now
+                // carries the voice-processing microphone producer — keep the
+                // explicit-linking parity so `swift test` builds under
+                // stricter/explicit-linking toolchains too.
+                .linkedFramework("AudioToolbox"),
+                .linkedFramework("CoreAudio"),
             ]
         ),
     ]

@@ -1709,3 +1709,24 @@ make the window easy to hit on a slow container filesystem.
 **The fix.** Close the file explicitly (drop the handle) before `execve`, or `fsync` and re-`stat` it,
 in `FakeSidecar::write` — one place, and every sidecar test inherits it. Not done here because it is
 in `recorder.rs`, which this change does not touch, and a test-harness fix deserves its own diff.
+
+## DW-N3 — a finished recording reports "Saved 0 segments · 0 MB"
+
+**Status:** open. **Found:** 2026-08-04 on hesperia, driving two real sessions through the app for
+story 22.7's echo measurement.
+**Severity:** cosmetic, but it reads as data loss to the person who just recorded something.
+
+**What happens.** Stop a session that wrote exactly one segment and the completion card says
+`Saved 0 segments · 0 MB` while pointing at a folder that holds a perfectly good 583 KB
+`audio-0000.m4a`. Every single-segment recording says this.
+
+**Why.** By the Story 17.1 contract the FINAL segment deliberately emits no `segmentClosed` — while
+the host is Stopping that would be an illegal transition, and `finalized` is its closure signal
+instead (`Capture.swift` `finishAndExit`). The host counts `segmentClosed` events, so a session
+whose only segment is the final one counts zero. A session long enough to rotate reports N-1.
+
+**The fix.** The host should reconcile the session folder at `finalized` rather than trust the event
+count — the terminal disk reconcile already exists for the recovery path (Story 17.3), so this is
+about calling it on the ordinary stop path too, or having `finalized` carry the final segment's path
+and bytes. Not done here because it is host-side accounting in `recorder.rs`/`ipc.rs`, orthogonal to
+22.7's audio path, and it deserves its own diff and its own test.

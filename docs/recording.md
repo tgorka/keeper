@@ -21,6 +21,50 @@ egress-diff gate in CI), has no telemetry, and writes only where you point it.
 - **Audio only** — pick "Audio only (no video)" as the source to record just
   system audio and/or the microphone into `audio-####.m4a` segments.
 
+## Audio processing
+
+**Echo cancellation** (on by default, under the microphone picker) stops the
+microphone from re-recording what your speakers are playing. Without it, a
+session recorded on speakers carries the far end twice — once clean in the
+system-audio track and once, a few milliseconds late and coloured by the room,
+in your microphone track. That is what the reverb on speaker recordings is.
+Headphones hide the problem; this switch fixes it.
+
+It runs your microphone through macOS's own voice-processing unit, whose echo
+reference is the **output device's** mix — so it removes audio that *other*
+apps play, not just keeper's (keeper plays nothing into the recording).
+
+The honest costs, all of them:
+
+- The **microphone track becomes mono**. The canceller is a mono, voice-band
+  processor; there is no stereo output to be had. System audio is untouched and
+  stays stereo — the two tracks are still never premixed.
+- **Voice-band noise suppression comes with it** and cannot be turned off
+  separately. Automatic gain control *is* turned off — a recorder must not ride
+  your voice level up and down under the far end.
+- **Your own voice can come out quieter, and loud speakers make it worse.** A
+  canceller subtracts what it can estimate and then suppresses whatever is left,
+  and that second stage cannot tell leftover echo from you talking at the same
+  moment as the far end. With automatic gain control deliberately off there is
+  nothing adding the level back, so on loud speakers the effect is a voice that
+  ducks under the far end. If a recording sounds too quiet rather than too
+  echoey, that is this — turn the switch off for that session, or use headphones
+  and leave it off, which removes the echo path entirely.
+- The microphone is captured at the **device's native sample rate** when the
+  unit declines to convert; the written track is AAC either way.
+- **Aggregate input devices are not supported** — the unit builds its own
+  private aggregate and cannot span another one. keeper falls back to the plain
+  microphone and says so.
+- **The echo reference does not follow a mid-session output change.** Swap to
+  AirPods while recording and keeper warns once rather than re-initializing (a
+  re-init would cut the microphone track); the cancellation keeps using the
+  output it started with.
+
+Every failure degrades to the ordinary microphone path with a warning — never a
+failed, silent, or half-written recording. The switch is read at Start, so
+changes apply to the **next Recording Session**, and it cannot be changed while
+a recording is running.
+
 ## Where recordings go
 
 Each Recording Session creates one folder inside your chosen destination
@@ -81,6 +125,7 @@ Example:
   "recording.segment_mb": 250,
   "recording.duration_cap_minutes": 15,
   "recording.destination_dir": "/Users/you/Movies/keeper-dev",
+  "recording.echo_cancellation": false,
   "debug.mode": true
 }
 ```
@@ -97,7 +142,8 @@ Known recording keys: `recording.codec` (`h264` | `hevc`),
 `recording.scale_percent` (`100` | `75` | `50` | `25`), `recording.fps`
 (`30` | `60`), `recording.segment_mb` (100–5000),
 `recording.duration_cap_minutes` (1–600), `recording.destination_dir`
-(absolute path), `debug.mode` (bool).
+(absolute path), `recording.echo_cancellation` (bool, **default true** — only a
+stored `"0"`/`false` turns it off), `debug.mode` (bool).
 
 ## Out of scope (honest verdicts)
 

@@ -46,4 +46,14 @@ codec: string,
  * native pixel resolution, normalized on read/write; the sidecar's
  * `scalePercent` (dimensions rounded to even pixels Swift-side).
  */
-scalePercent: number, };
+scalePercent: number, 
+/**
+ * Acoustic echo cancellation on the microphone feed (Story 22.7): `true`
+ * (the default) runs the mic through macOS's voice-processing unit, whose
+ * echo reference is the OUTPUT DEVICE's mix — so what the speakers play
+ * stops being re-recorded by the microphone. Costs a mono mic track and
+ * non-defeatable voice-band noise suppression. Read at every
+ * `recording_start`; the sidecar's `echoCancellation`, emitted only when
+ * the mic is on.
+ */
+echoCancellation: boolean, };
