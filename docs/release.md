@@ -85,11 +85,31 @@ bunx tauri signer generate --ci -p "<password>" -w /tmp/keeper-updater.key
 3. Delete the local key file. Then cut a release and **install it by hand once on every machine** —
    older builds cannot verify the new key.
 
-**Producing a release, today.** `bun run release:macos v<version>` on the Mac, from Terminal.app
-(codesign needs the login keychain; over ssh it fails with `errSecInternalComponent`). It builds
-signed via `build-macos-signed.sh`, packs the `.app` as the updater payload, signs it with the key
-from 1Password, composes `latest.json`, uploads all four assets to the release, and then fetches
-`releases/latest/download/latest.json` to prove the app can see it.
+**Producing a release, today.** `bun run release:macos v<version>` on the Mac, in a **GUI session**
+— Terminal.app, not a bare ssh shell. Two steps read the login keychain and a non-GUI session
+cannot: `codesign` fails with `errSecInternalComponent`, and `gh`, whose token lives in the keyring,
+fails with `401 Unauthorized`. The script builds signed via `build-macos-signed.sh`, packs the
+`.app` as the updater payload, signs it with the key from 1Password, composes `latest.json`, uploads
+all four assets to the release, and then fetches `releases/latest/download/latest.json` to prove the
+app can see it.
+
+**Driving it from the Linux box.** The keychain rule is about the *session*, not the machine, so an
+ssh command that lands inside the GUI session works — which is how v0.6.5 was published:
+
+```sh
+rsync -az --delete --exclude .git --exclude node_modules/ --exclude target/ ./ hesperia:keeper-check/
+ssh hesperia 'osascript -e '"'"'tell application "Terminal" to do script "cd ~/keeper-check && scripts/release-macos.sh v0.6.5 2>&1 | tee /tmp/release.log"'"'"''
+ssh hesperia 'tail -f /tmp/release.log'   # ~11 minutes: sidecar, vite, cargo release, sign, upload
+```
+
+The script passes `--repo` explicitly because that synced copy has no `.git`, and `gh` without a
+repository to infer reports "release not found" rather than saying it cannot tell.
+
+**State as of 2026-08-05.** `v0.6.5` carries the dmg, `keeper_0.6.5_aarch64.app.tar.gz`, its `.sig`
+and `latest.json`; the endpoint returns 200 and names `0.6.5`. The channel is closed for good only
+once every install runs a build carrying the rotated pubkey `F73E48FF43358CDF` — `hesperia`'s
+`/Applications/keeper.app` does; anything installed before this release does not, and will fail
+signature verification instead of the old fetch error until it is replaced from the dmg by hand.
 
 CI would do this instead if it could: `tauri-action` reads the two secrets above and, with
 `bundle.createUpdaterArtifacts: true`, produces the artifacts itself. It cannot, because the

@@ -13,8 +13,16 @@
 # a valid release JSON from the remote": the updater fetches
 # `releases/latest/download/latest.json` and gets GitHub's 404.
 #
-# RUN FROM Terminal.app ON THE MAC. `codesign` needs the login keychain, and a
-# non-GUI session (ssh) fails with `errSecInternalComponent` instead of signing.
+# RUN IT IN A GUI SESSION ON THE MAC — Terminal.app, not a bare ssh shell. Two
+# steps reach into the login keychain and a non-GUI session cannot: `codesign`
+# fails with `errSecInternalComponent`, and `gh` — whose token lives in the
+# keyring — fails with `401 Unauthorized`. Driving the release from another
+# machine therefore means landing the command *in* that GUI session:
+#
+#   ssh mac 'osascript -e '"'"'tell application "Terminal" to do script
+#     "cd ~/keeper-check && scripts/release-macos.sh v0.6.5 2>&1 | tee /tmp/release.log"'"'"''
+#
+# then poll /tmp/release.log over ssh. That is how v0.6.5 was published.
 #
 # Usage:
 #   scripts/release-macos.sh v0.6.5              # build, sign, upload everything
@@ -32,6 +40,11 @@ TAG="${1:?usage: release-macos.sh <tag> [--no-upload]}"
 UPLOAD=1
 [ "${2:-}" = "--no-upload" ] && UPLOAD=0
 VERSION="${TAG#v}"
+
+# Named, not inferred: this script is usually run from an rsync'd copy of the
+# tree with no `.git` (see the ssh recipe above), where `gh` cannot work out the
+# repository and reports the misleading "release not found" instead.
+REPO="${KEEPER_RELEASE_REPO:-tgorka/keeper}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -121,12 +134,12 @@ fi
 # `--clobber` because a re-run must replace an asset rather than fail on it, and
 # because a stale dmg beside fresh notes is how a release ships a lie.
 say "uploading to $TAG"
-gh release upload "$TAG" "$DMG" "$TARBALL" "$TARBALL.sig" "$MANIFEST" --clobber ||
+gh release upload "$TAG" --repo "$REPO" "$DMG" "$TARBALL" "$TARBALL.sig" "$MANIFEST" --clobber ||
   fail "upload failed — is the release published and gh authenticated?"
 
 say "verifying the endpoint the app fetches"
 sleep 2
-if curl -sSfL "https://github.com/tgorka/keeper/releases/latest/download/latest.json" |
+if curl -sSfL "https://github.com/$REPO/releases/latest/download/latest.json" |
   python3 -c "import json,sys; d=json.load(sys.stdin); print('latest.json says version', d['version'])"; then
   say "done"
 else
