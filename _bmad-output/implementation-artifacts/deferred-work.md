@@ -1730,3 +1730,68 @@ count — the terminal disk reconcile already exists for the recovery path (Stor
 about calling it on the ordinary stop path too, or having `finalized` carry the final segment's path
 and bytes. Not done here because it is host-side accounting in `recorder.rs`/`ipc.rs`, orthogonal to
 22.7's audio path, and it deserves its own diff and its own test.
+
+## DW-N4 — the in-app updater is broken for every install, and publishing v0.6.5 is what broke it
+
+**Status:** open, needs an owner decision (key placement or release policy). **Found:** 2026-08-05,
+owner clicked Update and got `Update failed: Could not fetch a valid release JSON from the remote`.
+**Severity:** every installed copy of keeper, on every version. The update button cannot succeed.
+
+**What happens.** The app fetches the endpoint baked into `tauri.conf.json`
+(`plugins.updater.endpoints`): `https://github.com/tgorka/keeper/releases/latest/download/latest.json`.
+Verified from hesperia — it returns **HTTP 404, `Not Found`, 9 bytes**. The Tauri updater plugin
+cannot parse that as a manifest, so it reports the string above. The message is accurate and useless:
+it names the parse, not the missing file.
+
+**Why, and it is a regression rather than a misconfiguration.** `latest.json` is attached to
+v0.4.2, v0.5.0 and **v0.6.1**, each beside its `keeper_<ver>_aarch64.app.tar.gz` and `.sig` — those
+releases came out of CI when `tauri-action` still ran, so the update channel used to work.
+Publishing **v0.6.5** moved `/releases/latest/` to a release whose only assets are the four
+`keeper-syncd-*` binaries, and `latest/download/latest.json` resolves against the newest
+non-prerelease release only. So an incomplete release did not merely fail to improve the channel —
+it took the working one away from users still on 0.6.1.
+
+**Why CI cannot fix it.** The release workflow's second step, `Apple signing material must be
+present`, fails: the repository has exactly two secrets — `TAURI_SIGNING_PRIVATE_KEY` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — and none of the seven Apple ones. The job therefore dies
+before `tauri-action` runs, which is what would have produced the dmg, the tarball, the `.sig` and
+`latest.json`. And the gate cannot be satisfied as written: three of its seven secrets are
+notarization credentials from a **paid** Apple Developer Program, which decision D-1
+(`docs/constraints-and-limitations.md`) says this project does not have. As written, that job can
+never pass, so no release can ever be produced by CI.
+
+**Why a local build cannot fix it either.** `scripts/build-macos-signed.sh` deliberately passes
+`createUpdaterArtifacts: false`, because signing the updater payload needs the minisign private key
+whose public half is baked into every build (fingerprint `76BB33F2B735A5E9`, committed in `4b6b60f`
+"Provision real updater keypair"). That key exists **only** as a GitHub Actions secret — it is not in
+the 1Password vault this fleet uses and not on hesperia. A secret only CI can read, in a CI job that
+can never run, is a key nobody can use.
+
+**The three ways out, and the recommendation.**
+
+1. **Relax the gate to signed-but-not-notarized, and give CI the certificate.** The gate's own
+   argument is about *ad-hoc* signatures: an ad-hoc identity is a `cdhash` that changes every build,
+   so TCC grants and keychain items break. A free **Apple Development** certificate has an
+   identity-based designated requirement and does not have that defect — it is what
+   `build-macos-signed.sh` already verifies and what every recent local build ships. Notarization
+   only removes the first-open right-click, which every release note has told users to do anyway. So
+   require the four certificate secrets (`APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
+   `APPLE_SIGNING_IDENTITY`, `KEYCHAIN_PASSWORD`), drop the three notarization ones from the gate,
+   and CI can build, sign, and emit the updater artifacts with the key it already holds.
+   **Recommended:** it restores the channel, keeps the ad-hoc ban, and needs no new key material
+   beyond exporting the existing certificate as a `.p12`.
+2. **Put the updater private key where a human can read it** (the 1Password vault), and produce the
+   artifacts from the Mac. `~/keeper-release-dmg.sh` on hesperia already does the whole sequence when
+   `TAURI_SIGNING_PRIVATE_KEY` is exported: build signed, tar the `.app`, `tauri signer sign` it,
+   compose `latest.json`, upload all three. Note this contradicts `docs/release.md`, which mandates
+   the key exist only in GitHub secrets — a rule worth revisiting on its own, because a key that
+   exists in exactly one unreadable place cannot be rotated or recovered.
+3. **Immediate mitigation, one field:** mark v0.6.5 a pre-release. `/releases/latest/` skips
+   pre-releases, so the endpoint resolves to v0.6.1 again and the error disappears — an installed
+   0.6.5 then reads "up to date" (0.6.1 is older, so nothing is offered) and an installed 0.6.1 sees
+   its own version. Honest about nothing being installable, and reversible the moment (1) or (2)
+   lands.
+
+**Also worth fixing whichever way this goes:** the app should not hand the plugin's parse error to
+the user. "Could not fetch a valid release JSON from the remote" describes the parser's disappointment;
+what the person needs is "this release has no update manifest" or "no newer version is published".
