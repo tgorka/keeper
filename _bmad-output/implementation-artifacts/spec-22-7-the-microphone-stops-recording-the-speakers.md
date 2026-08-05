@@ -225,12 +225,34 @@ the ScreenCaptureKit leg — really is the source, that it accepted the device, 
 `micTrackChannels` reached both writers. No `echoCancellationUnavailable` warning was emitted, so
 the unit initialized on the first try against the built-in input.
 
-**Not run: the acoustic measurement, and it is the one that justifies the feature.** A sidecar
-spawned over ssh has no Microphone TCC grant of its own, and hesperia's screen is locked
-(`CGSSessionScreenIsLocked = true`), so a locked session can neither prompt for nor exercise one:
-both takes recorded digital silence (`mean_volume: -91.0 dB`). The measurement has to run through
-the app, on an unlocked session — see `operator_actions` above; the harness and the far-end clip
-are already on the machine.
+**Measured on 2026-08-04 17:05–17:08 local, hesperia unlocked, built-in speakers and built-in
+mic, driven through the app** (both takes: Audio-only source, system audio off, mic on, `afplay`
+playing the same clip from another process for 10 s starting ~2 s in, output volume 45). Two takes
+differing in nothing but the switch:
+
+| window | AEC **off** | AEC **on** | Δ mean |
+| --- | --- | --- | --- |
+| far end playing (2–12 s) | mean **−36.6** dB, max −18.6 | mean **−60.4** dB, max −36.0 | **−23.8 dB** |
+| nothing playing (14–22 s) | mean **−38.9** dB, max −17.9 | mean **−65.4** dB, max −42.0 | **−26.5 dB** |
+| whole take | mean −38.8 dB, max −17.9 (2 ch) | mean −61.0 dB, max −31.7 (1 ch) | −22.2 dB |
+
+**The premise holds: the far end is 24 dB down in the microphone track.** Apple's voice-processing
+unit does cancel audio a DIFFERENT process played through the speakers — keeper renders nothing,
+and the leakage still collapsed. That was the one assumption the whole story rested on, and it is
+now a number rather than an inference from Chromium's source.
+
+**And the owner's worry is NOT resolved by these two takes — the data is ambiguous in exactly the
+way they predicted.** The second window had nothing playing, so what dropped by 26.5 dB there was
+room tone: the *same* order as the far-end reduction. Two readings that move together cannot
+separate "cancelled the echo" from "attenuated the microphone", because **neither take contains a
+near-end voice.** A 26 dB drop in ambient is normal for a VoIP-grade noise suppressor and would be
+welcome; it is also exactly what a 25 dB across-the-board attenuation looks like. Nothing here
+distinguishes them.
+
+**Still owed, and it is 20 seconds of a human counting aloud:** windows 2 and 3 of
+`keeper-aec-measure.sh` (voice alone, then voice over the far end). If the voice holds within a few
+dB of the AEC-off take, the feature is a canceller and ships on by default. If the voice drops like
+the room tone did, it is an attenuator, and the AGC decision reopens (see `operator_actions`).
 
 **Three defects fixed on the way**, all older than this story and all in the microphone-only
 audio-only path, which had never worked end to end: a double `startWriting()` that aborted the
