@@ -7012,27 +7012,28 @@ mod tests {
         vm
     }
 
-    /// Story 22.7: a fresh install reads echo cancellation ON, and a write
-    /// round-trips through the registry into the effective VM.
+    /// Story 22.7: a fresh install reads echo cancellation OFF (owner decision
+    /// 2026-08-05 — the processing is opt-in), and a write round-trips through
+    /// the registry into the effective VM.
     #[test]
     fn recording_settings_read_and_write_carry_echo_cancellation() {
         let dir = settings_temp_dir();
         assert!(
-            read_recording_settings(&dir)
+            !read_recording_settings(&dir)
                 .expect("fresh read")
                 .echo_cancellation,
-            "a fresh install must read echo cancellation on"
+            "a fresh install must read echo cancellation off"
         );
 
-        let off = settings_vm(&dir, false);
+        let on = settings_vm(&dir, true);
         let effective =
-            write_recording_settings(&dir, &off, false).expect("write with no live session");
+            write_recording_settings(&dir, &on, false).expect("write with no live session");
         assert!(
-            !effective.echo_cancellation,
+            effective.echo_cancellation,
             "the effective VM must reflect the write"
         );
         assert!(
-            !read_recording_settings(&dir)
+            read_recording_settings(&dir)
                 .expect("re-read")
                 .echo_cancellation
         );
@@ -7046,9 +7047,9 @@ mod tests {
     fn recording_settings_set_rejects_a_changed_echo_cancellation_while_live() {
         let dir = settings_temp_dir();
         let before = read_recording_settings(&dir).expect("baseline read");
-        assert!(before.echo_cancellation, "baseline is on");
+        assert!(!before.echo_cancellation, "baseline is off");
 
-        let mut request = settings_vm(&dir, false);
+        let mut request = settings_vm(&dir, true);
         // A co-edited field in the SAME request must not sneak through.
         request.fps = 60;
         let error = write_recording_settings(&dir, &request, true)
@@ -7070,7 +7071,7 @@ mod tests {
     #[test]
     fn recording_settings_set_applies_other_fields_while_live() {
         let dir = settings_temp_dir();
-        let mut request = settings_vm(&dir, true);
+        let mut request = settings_vm(&dir, false);
         request.fps = 60;
         request.codec = "hevc".to_owned();
 
@@ -7078,7 +7079,7 @@ mod tests {
             .expect("an unchanged echo value applies");
         assert_eq!(effective.fps, 60);
         assert_eq!(effective.codec, "hevc");
-        assert!(effective.echo_cancellation, "unchanged, and still on");
+        assert!(!effective.echo_cancellation, "unchanged, and still off");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

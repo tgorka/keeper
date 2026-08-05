@@ -23,16 +23,23 @@ egress-diff gate in CI), has no telemetry, and writes only where you point it.
 
 ## Audio processing
 
-**Echo cancellation** (on by default, under the microphone picker) stops the
+**Echo cancellation** (**off by default**, under the microphone picker) stops the
 microphone from re-recording what your speakers are playing. Without it, a
 session recorded on speakers carries the far end twice — once clean in the
 system-audio track and once, a few milliseconds late and coloured by the room,
 in your microphone track. That is what the reverb on speaker recordings is.
-Headphones hide the problem; this switch fixes it.
+Headphones remove the problem entirely; this switch is for when you cannot use
+them.
 
 It runs your microphone through macOS's own voice-processing unit, whose echo
 reference is the **output device's** mix — so it removes audio that *other*
-apps play, not just keeper's (keeper plays nothing into the recording).
+apps play, not just keeper's (keeper plays nothing into the recording). Measured
+on an Apple-silicon Mac with the built-in speakers and mic: the far end drops
+about **24 dB** out of the microphone track. It works.
+
+It is nevertheless **opt-in**, because it is not free — read the costs below and
+decide per setup. The reverb only happens on speakers, so the first answer is
+headphones, and this switch is the second.
 
 The honest costs, all of them:
 
@@ -125,7 +132,7 @@ Example:
   "recording.segment_mb": 250,
   "recording.duration_cap_minutes": 15,
   "recording.destination_dir": "/Users/you/Movies/keeper-dev",
-  "recording.echo_cancellation": false,
+  "recording.echo_cancellation": true,
   "debug.mode": true
 }
 ```
@@ -142,8 +149,8 @@ Known recording keys: `recording.codec` (`h264` | `hevc`),
 `recording.scale_percent` (`100` | `75` | `50` | `25`), `recording.fps`
 (`30` | `60`), `recording.segment_mb` (100–5000),
 `recording.duration_cap_minutes` (1–600), `recording.destination_dir`
-(absolute path), `recording.echo_cancellation` (bool, **default true** — only a
-stored `"0"`/`false` turns it off), `debug.mode` (bool).
+(absolute path), `recording.echo_cancellation` (bool, **default false** — only a
+stored `"1"`/`true` turns it on), `debug.mode` (bool).
 
 ## Out of scope (honest verdicts)
 

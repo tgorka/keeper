@@ -33,7 +33,7 @@ const DEFAULTS: RecordingSettingsVm = {
   fps: 30,
   codec: "h264",
   scalePercent: 100,
-  echoCancellation: true,
+  echoCancellation: false,
 };
 
 beforeEach(() => {

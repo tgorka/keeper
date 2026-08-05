@@ -2,7 +2,7 @@
 title: '22.7 — The Microphone Stops Recording the Speakers'
 type: 'feature'
 created: '2026-08-04'
-status: 'awaiting-operator'
+status: 'done'
 baseline_revision: 'd36e9e8a6fd472b9ab486acd84558da8f8b4e64f'
 review_loop_iteration: 0
 followup_review_recommended: false
@@ -278,3 +278,39 @@ into silence and compared one number, which a canceller and a mute produce ident
 acceptance and the harness are now a three-window take — far end alone, voice alone, both at once —
 precisely so "the echo went away" and "the microphone went away" cannot be confused, and so the
 AGC decision is settled by six figures rather than by taste.
+
+## Decision, 2026-08-05 — the switch ships OFF
+
+The owner recorded five sessions of their own on hesperia (screen + system audio +
+mic + camera, HEVC) and settled it. The mic track's channel count records which
+way each take ran, and the levels record what it cost:
+
+| take | mic track | mic mean | mic peak |
+| --- | --- | --- | --- |
+| 00.45.21 | 1 ch — **AEC on** | −38.3 dB | **−10.0 dB** |
+| 00.47.26 | 2 ch — AEC off | −32.5 dB | −8.7 dB |
+| 00.49.44 | 2 ch — AEC off | −44.2 dB | −12.7 dB |
+| 00.51.27 | 1 ch — **AEC on** | −43.2 dB | −16.5 dB |
+
+Worth recording because it answers the "is it just quieter?" question with a
+voice in the room rather than a tone: **the peaks survive** (−10.0 vs −8.7 dB on
+the loud pair), while the mean falls. That is the shape of a canceller plus a
+noise suppressor — speech through, floor down — not of a blanket attenuator. The
+22.4 mirror also checks out: `camera-0000.mov`'s mic track matches the screen
+file's to 0.1 dB in every take.
+
+**And the switch still ships off**, by the owner's call after listening. The
+reasoning is sound and worth keeping: the cancellation is genuine (~24 dB off the
+far end, measured), but it is not free — the track becomes mono and carries
+voice-band noise suppression that cannot be disabled separately, which is a
+quality change on every recording, whereas the reverb it fixes happens only on
+speakers. Headphones remove the echo path with no processing at all. So the
+processing is opt-IN: `RECORDING_ECHO_CANCELLATION_DEFAULT = false`, only a
+literal `"1"` reads as on, absent means off on the wire too (an older sidecar
+records the plain mic), and `docs/recording.md` states both the 24 dB and the
+costs so the choice is informed.
+
+What that leaves genuinely unmeasured, and now unimportant: the double-talk window
+(voice *while* the far end plays). It only matters to someone who turns the switch
+on, the AGC escape hatch is documented in `operator_actions` if they find it
+wanting, and no default rides on it any more.
