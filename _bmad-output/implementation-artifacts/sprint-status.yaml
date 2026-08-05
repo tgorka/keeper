@@ -334,6 +334,35 @@ development_status:
   34-19-the-app-binary-can-be-the-lfs-filter: done
   epic-34-retrospective: optional
 
+  # Phase 6 — Recording x Sync (Epics 40-42, added 2026-08-05). Owner ask of
+  # 2026-08-05: a configurable recording folder NAME (not only the root), date-first
+  # and nested by year; recordings bound to a sync profile and a subfolder; a closed
+  # segment synced without waiting on the quiescence gate; and the recordings archive
+  # with notes and tags. Spine: product-inputs-recording-sync-2026-08-05.md.
+  # Epics 35-39 (Notes, Phase 5) are tracked in their own planning artifacts and are
+  # deliberately not restated here.
+  epic-40: backlog
+  40-1-the-path-template-rendered-purely: backlog
+  40-2-the-template-is-a-setting-and-the-preview-is-the-manual: backlog
+  40-3-recording-start-uses-it-and-the-session-gets-an-identity: backlog
+  40-4-retitle-moves-the-folder-not-the-identity: backlog
+  epic-40-retrospective: optional
+  epic-41: backlog
+  41-1-a-profile-can-say-it-holds-recordings: backlog
+  41-2-choosing-where-recordings-live-once: backlog
+  41-3-partial-while-writing-final-on-close: backlog
+  41-4-the-gate-learns-the-word-finished: backlog
+  41-5-committed-at-close-pushed-on-policy: backlog
+  41-6-durability-you-can-read: backlog
+  epic-41-retrospective: optional
+  epic-42: backlog
+  42-1-a-session-is-a-row: backlog
+  42-2-searchable-sessions: backlog
+  42-3-the-recordings-browser: backlog
+  42-4-the-note-stub-at-the-only-moment-it-will-be-written: backlog
+  42-5-one-tag-vocabulary: backlog
+  epic-42-retrospective: optional
+
 # Phase 4 state as of 2026-07-25 — what is actually true, not what was planned.
 #
 # NOTE on the Forgejo claim below (added 2026-07-25): story 31-4 is NOT done.

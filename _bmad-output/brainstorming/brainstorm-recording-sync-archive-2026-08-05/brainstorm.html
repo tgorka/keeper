@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Brainstorm · Recording destinations, sync integration &amp; a processable archive · 2026-08-05</title><meta name="description" content="BMAD brainstorming keepsake: 101 ideas across 7 techniques on recording destinations, sync integration and a processable recording archive."><style>
+*,*::before,*::after{box-sizing:border-box}
+:root{
+  --bg:#06080a; --panel:#0b0f14; --panel2:#0e141b; --sunk:#080b0f;
+  --line:#18212c; --line2:#25313f;
+  --txt:#c6d4e1; --dim:#7b8da0; --dim2:#4e6070;
+  --amber:#ffb454; --cyan:#56d4dd; --orange:#ff9a5b; --red:#ff5f56;
+  --green:#7ee787; --violet:#c39bd8; --blue:#7aa2ff;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono","Liberation Mono",monospace;
+}
+html{scroll-behavior:smooth}
+body{
+  margin:0; background:var(--bg); color:var(--txt);
+  font-family:var(--mono); font-size:13.5px; line-height:1.62;
+  -webkit-font-smoothing:antialiased; overflow-x:hidden;
+}
+body::before{
+  content:""; position:fixed; inset:0; z-index:9998; pointer-events:none;
+  background:repeating-linear-gradient(180deg,rgba(255,255,255,.028) 0 1px,transparent 1px 3px);
+  mix-blend-mode:overlay;
+}
+body::after{
+  content:""; position:fixed; inset:0; z-index:9997; pointer-events:none;
+  background:radial-gradient(ellipse at 50% 30%,transparent 45%,rgba(0,0,0,.55) 100%);
+}
+.wrap{max-width:1180px;margin:0 auto;padding:0 22px 120px}
+code{font-family:var(--mono);font-size:.94em;color:#e7d7a8;background:rgba(255,180,84,.07);
+  border:1px solid rgba(255,180,84,.14);border-radius:3px;padding:0 4px;white-space:nowrap}
+a{color:var(--cyan)}
+
+/* ---------- top HUD ---------- */
+.hud{position:fixed;top:0;left:0;right:0;z-index:9999;background:rgba(6,8,10,.94);
+  border-bottom:1px solid var(--line);backdrop-filter:blur(6px)}
+.hud .row{max-width:1180px;margin:0 auto;padding:7px 22px;display:flex;align-items:center;gap:14px;
+  font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim)}
+.rec{display:inline-flex;align-items:center;gap:7px;color:var(--red);font-weight:700}
+.rec i{width:8px;height:8px;border-radius:50%;background:var(--red);display:block;
+  box-shadow:0 0 8px var(--red);animation:blink 1.6s steps(1,end) infinite}
+@keyframes blink{0%,60%{opacity:1}61%,100%{opacity:.18}}
+.hud .slug{color:var(--dim2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.hud .tc{color:var(--amber);letter-spacing:.18em;font-variant-numeric:tabular-nums}
+.prog{height:2px;background:var(--line);position:relative}
+.prog i{position:absolute;inset:0 100% 0 0;background:linear-gradient(90deg,var(--red),var(--amber),var(--cyan));
+  transition:right .12s linear}
+
+/* ---------- rail ---------- */
+.rail{position:fixed;right:14px;top:50%;transform:translateY(-50%);z-index:9990;
+  display:flex;flex-direction:column;gap:9px;align-items:flex-end}
+.rail a{display:flex;align-items:center;gap:7px;text-decoration:none;color:var(--dim2);
+  font-size:9.5px;letter-spacing:.14em;opacity:.55;transition:opacity .2s,color .2s}
+.rail a b{width:16px;height:2px;background:currentColor;display:block;transition:width .2s}
+.rail a.on{opacity:1;color:var(--amber)}
+.rail a.on b{width:26px}
+.rail a:hover{opacity:1;color:var(--txt)}
+@media(max-width:1560px){.rail a span{display:none}.rail{right:9px}}
+@media(max-width:1270px){.rail{display:none}}
+
+/* ---------- timecode strip ---------- */
+.tcstrip{height:26px;margin:0;position:relative;border-top:1px solid var(--line);
+  border-bottom:1px solid var(--line);background:
+   repeating-linear-gradient(90deg,var(--line2) 0 1px,transparent 1px 12px),
+   repeating-linear-gradient(90deg,rgba(255,180,84,.5) 0 1px,transparent 1px 120px),
+   linear-gradient(180deg,#0a0e12,#070a0d)}
+.tcstrip span{position:absolute;top:5px;font-size:9px;letter-spacing:.12em;color:var(--dim2)}
+
+/* ---------- slate / header ---------- */
+header.slate{padding:78px 0 0}
+.clap{height:22px;background:repeating-linear-gradient(115deg,#e8eef5 0 26px,#0a0e12 26px 52px);
+  border:1px solid var(--line2);border-bottom:none;opacity:.82}
+.slatebody{border:1px solid var(--line2);background:
+   linear-gradient(180deg,var(--panel2),var(--sunk));padding:26px 24px 22px}
+h1{margin:0 0 4px;font-size:clamp(21px,3.5vw,34px);line-height:1.16;letter-spacing:-.01em;color:#eaf2fa;font-weight:700}
+h1 .em{color:var(--amber)}
+.subhead{color:var(--dim);font-size:12.5px;max-width:78ch;margin:12px 0 0}
+.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:1px;margin-top:22px;
+  background:var(--line);border:1px solid var(--line)}
+.meta div{background:var(--sunk);padding:9px 11px}
+.meta k{display:block;font-size:9.5px;letter-spacing:.16em;color:var(--dim2);text-transform:uppercase}
+.meta v{display:block;font-size:12px;color:var(--txt);margin-top:3px}
+.counters{display:flex;flex-wrap:wrap;gap:1px;margin-top:1px;background:var(--line);border:1px solid var(--line);border-top:none}
+.counters div{background:var(--sunk);padding:11px 16px;flex:1 1 120px;text-align:center}
+.counters b{display:block;font-size:26px;color:var(--amber);line-height:1;font-variant-numeric:tabular-nums}
+.counters s{display:block;text-decoration:none;font-size:9.5px;letter-spacing:.16em;color:var(--dim2);margin-top:6px}
+
+/* ---------- generic section ---------- */
+section{margin-top:66px;scroll-margin-top:60px}
+.shead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:6px}
+.tno{font-size:11px;letter-spacing:.2em;color:var(--acc,var(--amber));border:1px solid currentColor;
+  padding:2px 7px;border-radius:2px;flex:none}
+h2{margin:0;font-size:19px;letter-spacing:.03em;color:#e6eef7;font-weight:700}
+.scount{font-size:10.5px;letter-spacing:.14em;color:var(--dim2)}
+.srule{flex:1 1 60px;height:1px;background:linear-gradient(90deg,var(--acc,var(--line2)),transparent);min-width:30px;align-self:center;opacity:.55}
+.skind{font-size:9.5px;letter-spacing:.18em;color:var(--acc,var(--amber));opacity:.75}
+.lede{color:var(--dim);font-size:12.5px;margin:0 0 20px;max-width:82ch}
+
+.rise{opacity:0;transform:translateY(14px);transition:opacity .5s ease,transform .5s ease}
+.rise.in{opacity:1;transform:none}
+@media(prefers-reduced-motion:reduce){.rise{opacity:1;transform:none;transition:none}
+ .rec i{animation:none}}
+
+/* ---------- grounding ---------- */
+.seams{display:grid;gap:1px;background:var(--line);border:1px solid var(--line)}
+.seam{background:var(--panel);padding:13px 16px;display:grid;grid-template-columns:64px 1fr;gap:14px;align-items:start}
+.seam em{font-style:normal;font-size:9.5px;letter-spacing:.14em;color:var(--cyan);
+  border-left:2px solid var(--cyan);padding-left:7px;display:block;margin-top:3px}
+.seam p{margin:0;color:var(--txt);font-size:12.7px}
+.probe{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.probe span{font-size:10px;letter-spacing:.13em;color:var(--dim);border:1px dashed var(--line2);padding:4px 9px}
+.probe span b{color:var(--green);font-weight:400}
+
+/* ---------- T1 filmstrip + tree ---------- */
+.tree{background:var(--sunk);border:1px solid var(--line);padding:16px 18px;margin-bottom:22px;overflow-x:auto}
+.tree pre{margin:0;font-size:12px;line-height:1.75;color:var(--dim);white-space:pre}
+.tree pre b{color:var(--amber);font-weight:400}
+.tree pre u{text-decoration:none;color:var(--green)}
+.tree pre i{font-style:normal;color:var(--dim2)}
+.tree .cap{font-size:9.5px;letter-spacing:.16em;color:var(--dim2);margin-bottom:10px}
+.strip{border-top:1px solid var(--line2);border-bottom:1px solid var(--line2);
+  padding:14px 0;background:linear-gradient(180deg,rgba(255,180,84,.02),transparent)}
+.strip::before,.strip::after{content:"";display:block;height:9px;
+  background:repeating-linear-gradient(90deg,transparent 0 8px,#0f1620 8px 20px);
+  border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.strip::before{margin-bottom:14px}.strip::after{margin-top:14px}
+.frames{display:grid;grid-template-columns:repeat(auto-fill,minmax(305px,1fr));gap:12px;padding:0 2px}
+.frame{background:var(--panel);border:1px solid var(--line);padding:11px 13px 13px;position:relative}
+.frame:hover{border-color:rgba(255,180,84,.42)}
+.frame .fh{display:flex;justify-content:space-between;gap:8px;font-size:9.5px;letter-spacing:.13em;
+  color:var(--dim2);border-bottom:1px dashed var(--line);padding-bottom:6px;margin-bottom:8px}
+.frame .fh b{color:var(--amber);font-weight:400}
+.frame .tag{display:inline-block;font-size:9.5px;letter-spacing:.1em;color:var(--amber);
+  background:rgba(255,180,84,.08);border:1px solid rgba(255,180,84,.2);padding:1px 6px;margin-bottom:7px}
+.frame p{margin:0;font-size:12.5px}
+
+/* ---------- T2 morphological grid ---------- */
+.morph{border:1px solid var(--line);background:var(--line)}
+.mrow{display:grid;grid-template-columns:186px 1fr;gap:1px;margin-bottom:1px}
+.maxis{background:var(--sunk);padding:12px 12px;font-size:10px;letter-spacing:.15em;color:var(--cyan)}
+.maxis s{display:block;text-decoration:none;color:var(--dim2);letter-spacing:.1em;margin-top:4px;font-size:9px}
+.mcells{background:var(--line);display:grid;grid-template-columns:repeat(auto-fit,minmax(228px,1fr));gap:1px}
+.mcell{background:var(--panel);padding:10px 12px;font-size:12.3px;position:relative}
+.mcell .k{font-size:9.5px;letter-spacing:.15em;color:var(--dim2);display:block;margin-bottom:5px}
+.mcell.pick{background:linear-gradient(180deg,rgba(86,212,221,.10),rgba(86,212,221,.02));
+  box-shadow:inset 0 0 0 1px rgba(86,212,221,.45)}
+.mcell.pick .k{color:var(--cyan)}
+.mhead{background:var(--panel2);padding:13px 15px;font-size:12.4px;color:var(--txt);
+  border-left:2px solid var(--cyan);margin-bottom:1px}
+.mpick{margin-top:18px;border:1px solid rgba(86,212,221,.4);background:
+  linear-gradient(120deg,rgba(86,212,221,.09),transparent 70%);padding:15px 17px}
+.mpick .k{font-size:9.5px;letter-spacing:.18em;color:var(--cyan);display:block;margin-bottom:7px}
+
+/* ---------- T3 TRIZ ---------- */
+.triz{display:grid;gap:20px}
+.contra{border:1px solid var(--line);background:var(--panel);padding:0 0 14px}
+.cstate{padding:12px 16px;background:linear-gradient(90deg,rgba(255,95,86,.09),transparent 65%);
+  border-bottom:1px solid var(--line);font-size:12.6px}
+.cstate b{color:var(--orange);font-weight:400;letter-spacing:.14em;font-size:9.5px;display:block;margin-bottom:5px}
+.forces{display:grid;grid-template-columns:1fr 54px 1fr;align-items:center;gap:0;padding:16px 16px 6px}
+.force{border:1px solid var(--line2);background:var(--sunk);padding:10px 12px;font-size:11px;letter-spacing:.06em}
+.force.l{border-left:2px solid var(--red);text-align:right}
+.force.r{border-right:2px solid var(--blue)}
+.force s{display:block;text-decoration:none;font-size:9px;letter-spacing:.16em;color:var(--dim2);margin-bottom:4px}
+.clash{text-align:center;color:var(--orange);font-size:15px;letter-spacing:-.05em}
+.res{margin:12px 16px 0;border-left:2px solid var(--green);padding:2px 0 2px 14px;display:grid;gap:9px}
+.res p{margin:0;font-size:12.5px}
+.res p b{color:var(--green);font-weight:400;font-size:9.5px;letter-spacing:.15em;margin-right:8px}
+@media(max-width:720px){.forces{grid-template-columns:1fr;gap:8px}.force.l{text-align:left}
+ .clash{transform:rotate(90deg)}}
+
+/* ---------- T4 chaos cards ---------- */
+.deck{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
+.fcard{background:var(--panel);border:1px solid var(--line);position:relative;overflow:hidden}
+.fcard::before{content:"";position:absolute;inset:0 0 auto;height:2px;background:var(--st,var(--red))}
+.fcard .fb{padding:12px 14px 14px}
+.fcard h3{margin:0 0 3px;font-size:12px;letter-spacing:.11em;color:#f0f5fa;font-weight:700}
+.fcard .cid{font-size:9px;letter-spacing:.18em;color:var(--dim2)}
+.fcard p{margin:9px 0 0;font-size:12.3px;color:var(--txt)}
+.chip{float:right;font-size:8.5px;letter-spacing:.14em;padding:2px 7px;border:1px solid var(--st);
+  color:var(--st);border-radius:2px;margin-left:8px}
+.fcard .inj{font-size:9px;letter-spacing:.16em;color:var(--dim2);border-bottom:1px dashed var(--line);
+  padding:0 0 8px;margin-bottom:9px}
+
+/* ---------- T5 ecosystem ---------- */
+.band{display:grid;grid-template-columns:150px 1fr;gap:16px;padding:14px 0;border-top:1px solid var(--line)}
+.band:last-child{border-bottom:1px solid var(--line)}
+.bname{font-size:10px;letter-spacing:.15em;color:var(--bc,var(--green));position:relative;padding-left:14px}
+.bname::before{content:"";position:absolute;left:0;top:5px;bottom:2px;width:2px;background:currentColor;opacity:.7}
+.bname s{display:block;text-decoration:none;color:var(--dim2);letter-spacing:.1em;font-size:9px;margin-top:5px}
+.bitems{display:grid;gap:9px}
+.bitem{background:var(--panel);border:1px solid var(--line);padding:9px 12px;font-size:12.4px;
+  position:relative;padding-left:26px}
+.bitem::before{content:"◆";position:absolute;left:9px;top:9px;font-size:8px;color:var(--bc,var(--green));opacity:.8}
+@media(max-width:680px){.band{grid-template-columns:1fr;gap:8px}}
+
+/* ---------- T6 reversal ---------- */
+.flips{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
+.flip{background:var(--panel);border:1px solid var(--line);padding:12px 14px 13px;position:relative}
+.flip .was{color:var(--dim2);font-size:12.2px;text-decoration:line-through;text-decoration-color:rgba(195,155,216,.5)}
+.flip .lbl{font-size:9px;letter-spacing:.17em;color:var(--dim2);display:block;margin-bottom:4px}
+.flip .rot{color:var(--violet);font-size:13px;margin:9px 0 8px;letter-spacing:.3em}
+.flip .now{font-size:12.6px;color:#dfe8f2}
+.flip .lbl.b{color:var(--violet)}
+.flip:hover{border-color:rgba(195,155,216,.4)}
+
+/* ---------- T7 ladder ---------- */
+.ladder{position:relative;padding-left:96px}
+.ladder::before{content:"";position:absolute;left:52px;top:6px;bottom:6px;width:1px;
+  background:linear-gradient(180deg,var(--blue),rgba(122,162,255,.15))}
+.rung{position:relative;padding:0 0 22px}
+.rung .yr{position:absolute;left:-96px;width:88px;text-align:right;font-size:11px;letter-spacing:.12em;color:var(--blue)}
+.rung .yr s{display:block;text-decoration:none;font-size:9px;color:var(--dim2);letter-spacing:.1em;margin-top:3px}
+.rung::before{content:"";position:absolute;left:-46px;top:8px;width:38px;height:1px;background:var(--blue);opacity:.6}
+.rung::after{content:"";position:absolute;left:-49px;top:5px;width:7px;height:7px;border:1px solid var(--blue);
+  background:var(--bg);transform:rotate(45deg)}
+.rung .ritems{display:grid;gap:8px}
+.rung p{margin:0;background:var(--panel);border:1px solid var(--line);padding:9px 12px;font-size:12.4px}
+.rung.deep .yr,.rung.deep::before,.rung.deep::after{color:var(--amber);border-color:var(--amber);background-color:transparent}
+.rung.deep::before{background:var(--amber)}
+.rung.deep::after{background:var(--bg)}
+.backcast{margin-top:6px;border-top:1px dashed var(--line2);padding-top:18px}
+.backcast .bh{font-size:10px;letter-spacing:.18em;color:var(--amber);margin-bottom:12px}
+.bsteps{display:grid;gap:0}
+.bstep{position:relative;padding:10px 12px 10px 30px;background:var(--panel);border:1px solid var(--line);
+  font-size:12.4px;margin-bottom:0}
+.bstep+.bstep{border-top:none}
+.bstep::before{content:"↓";position:absolute;left:11px;top:9px;color:var(--amber);opacity:.75}
+@media(max-width:700px){.ladder{padding-left:0}.ladder::before{display:none}
+ .rung .yr{position:static;width:auto;text-align:left;margin-bottom:7px}
+ .rung::before,.rung::after{display:none}}
+
+/* ---------- convergence ---------- */
+.conv{border-top:2px solid var(--amber);padding-top:0;margin-top:80px}
+.convhead{background:linear-gradient(180deg,rgba(255,180,84,.10),transparent);padding:26px 22px 22px;
+  border:1px solid var(--line);border-top:none;text-align:center}
+.convhead h2{font-size:clamp(19px,3vw,27px);letter-spacing:.02em}
+.convhead p{color:var(--dim);font-size:12.4px;margin:10px auto 0;max-width:70ch}
+.clusters{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-top:26px}
+.cl{background:var(--panel);border:1px solid var(--line);padding:16px 17px 17px;position:relative;overflow:hidden}
+.cl .big{position:absolute;right:-8px;top:-26px;font-size:104px;font-weight:700;color:#fff;opacity:.032;line-height:1}
+.cl h3{margin:0 0 8px;font-size:13px;letter-spacing:.06em;color:var(--amber)}
+.cl h3 s{text-decoration:none;color:var(--dim2);letter-spacing:.2em;font-size:10px;margin-right:8px}
+.cl p{margin:0;font-size:12.4px;color:var(--txt);position:relative}
+.cl .cnt{display:block;margin-top:11px;font-size:9px;letter-spacing:.16em;color:var(--dim2)}
+
+.pipe{margin-top:30px;border:1px solid var(--line);background:var(--sunk);padding:18px 16px 20px}
+.pipe .cap{font-size:9.5px;letter-spacing:.18em;color:var(--dim2);margin-bottom:16px;text-align:center}
+.stages{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;justify-content:center}
+.stage{flex:1 1 120px;min-width:118px;border:1px solid var(--line2);background:var(--panel);
+  padding:11px 10px;text-align:center;position:relative}
+.stage+.stage{border-left:none}
+.stage b{display:block;font-size:10px;letter-spacing:.1em;color:var(--sc,var(--amber));font-weight:400}
+.stage s{display:block;text-decoration:none;font-size:9.5px;color:var(--dim2);margin-top:6px;line-height:1.5}
+.stage::after{content:"▸";position:absolute;right:-7px;top:50%;transform:translateY(-50%);
+  color:var(--dim2);font-size:11px;z-index:2;background:var(--sunk);padding:0 1px}
+.stage:last-child::after{display:none}
+@media(max-width:760px){.stage+.stage{border-left:1px solid var(--line2)}.stage::after{display:none}}
+
+.moscow{margin-top:34px;display:grid;gap:10px}
+.lane{display:grid;grid-template-columns:118px 1fr;border:1px solid var(--line);background:var(--panel)}
+.lane .lk{padding:14px 12px;font-size:12px;letter-spacing:.16em;color:var(--lc);
+  border-right:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.02),transparent);
+  display:flex;flex-direction:column;justify-content:center}
+.lane .lk s{display:block;text-decoration:none;font-size:9px;color:var(--dim2);letter-spacing:.12em;margin-top:5px}
+.lane ul{margin:0;padding:10px 14px;list-style:none;display:grid;gap:7px}
+.lane li{font-size:12.4px;position:relative;padding-left:18px}
+.lane li::before{content:"■";position:absolute;left:0;top:0;font-size:8px;color:var(--lc);opacity:.85}
+.lane.out li{color:var(--dim2);text-decoration:line-through;text-decoration-color:rgba(255,95,86,.35)}
+@media(max-width:620px){.lane{grid-template-columns:1fr}.lane .lk{border-right:none;border-bottom:1px solid var(--line)}}
+.why{margin-top:14px;border:1px dashed var(--line2);padding:13px 16px;font-size:12.3px;color:var(--dim)}
+.why b{color:var(--amber);font-weight:400;letter-spacing:.14em;font-size:9.5px;display:block;margin-bottom:6px}
+
+/* ---------- synthesis ---------- */
+.synth{margin-top:80px;border:1px solid var(--line2);background:
+  radial-gradient(ellipse at 15% 0%,rgba(255,180,84,.07),transparent 60%),
+  linear-gradient(180deg,var(--panel2),var(--sunk));padding:34px 30px 32px}
+.synth .cap{font-size:9.5px;letter-spacing:.24em;color:var(--amber);margin-bottom:18px}
+.synth p{font-size:clamp(13.5px,1.7vw,16.5px);line-height:1.72;color:#dde7f1;margin:0 0 16px;max-width:88ch}
+.synth p.key{border-left:2px solid var(--amber);padding-left:16px;color:#fff}
+.synth .hl{color:var(--amber)}
+.hats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1px;background:var(--line);
+  margin-top:24px;border:1px solid var(--line)}
+.hats div{background:var(--sunk);padding:13px 14px}
+.hats k{display:block;font-size:9.5px;letter-spacing:.16em;color:var(--amber)}
+.hats v{display:block;font-size:12px;color:var(--dim);margin-top:6px}
+footer{margin-top:60px;padding-top:18px;border-top:1px solid var(--line);
+  font-size:10px;letter-spacing:.14em;color:var(--dim2);display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap}
+</style></head><body><div class="hud"><div class="row"><span class="rec"><i></i>REC</span>
+<span class="slug">SESSION / BRAINSTORM / RECORDING DESTINATIONS, SYNC INTEGRATION, AND A PROCESSABLE RECORDING ARCH</span>
+<span class="tc" id="tc">00:00:00:00</span></div><div class="prog"><i id="pg"></i></div></div>
+<div class="rail" id="rail"></div>
+<div class="wrap">
+<header class="slate">
+  <div class="clap"></div>
+  <div class="slatebody">
+    <h1>Recording destinations, sync integration,<br>and an archive that <span class="em">still makes sense in ten years</span></h1>
+    <p class="subhead">Design the feature set: date-first session folders nested by year under a configurable root; recordings synced into a chosen sync profile and subfolder (tgdrive); a finalized segment reaching the drive promptly; plus the adjacent recording+sync+notes/tags archive features worth building</p>
+    <div class="meta">
+      <div><k>Session</k><v>brainstorm-recording-sync-archive</v></div>
+      <div><k>Date</k><v>2026-08-05</v></div>
+      <div><k>Stance</k><v>autonomous &mdash; ideate for me</v></div>
+      <div><k>Status</k><v style="color:var(--green)">complete</v></div>
+      <div><k>Last mark</k><v>2026-08-05T23:22</v></div>
+    </div>
+    <div class="counters">
+      <div><b>101</b><s>ideas logged</s></div>
+      <div><b>7</b><s>techniques</s></div>
+      <div><b>6</b><s>affinity clusters</s></div>
+      <div><b>4</b><s>MoSCoW tiers</s></div>
+      <div><b>5</b><s>code seams found</s></div>
+    </div>
+  </div>
+</header>
+<div class="tcstrip" style="margin-top:0"><span style="left:6px">00:00:00</span><span style="left:126px">00:30:00</span><span style="left:246px">01:00:00</span><span style="left:366px">01:30:00</span><span style="left:486px">02:00:00</span><span style="left:606px">02:30:00</span><span style="left:726px">03:00:00</span><span style="left:846px">03:30:00</span><span style="left:966px">04:00:00</span></div>
+<section id="ground" style="--acc:var(--cyan)"><div class="shead rise"><span class="tno">00</span><h2>Grounding pass</h2><span class="scount">5 insights</span><span class="srule"></span><span class="skind">BEFORE ANY IDEA</span></div><p class="lede rise">Grounded first: three read-only scouts mapped recording, sync and archive/notes before ideating. Everything below is anchored to a seam that already exists in the codebase &mdash; which is why the MUST list is reachable rather than aspirational.</p><div class="probe rise"><span>SCOUT 1 <b>recording</b></span><span>SCOUT 2 <b>sync</b></span><span>SCOUT 3 <b>archive / notes</b></span><span>MODE <b>read-only</b></span></div><div class="seams rise"><div class="seam"><em>HOST-SIDE</em><p>Session folder is created host-side in Rust (<code>keeper/src/ipc.rs</code> <code>recording_start</code>); the Swift sidecar only derives sibling segment paths from the one absolute path it is handed — so naming and nesting are a pure Rust change</p></div><div class="seam"><em>SETTINGS K/V</em><p><code>recording.destination_dir</code> already exists end to end (<code>keeper.db</code> settings k/v -&gt; <code>RecordingSettingsVm.destinationDir</code> -&gt; RecordingDestinationControls); the configurable ROOT is done, the NAME PATTERN is not</p></div><div class="seam"><em>THE SEAM</em><p><code>SegmentClosed{index,path,bytes,track,ptsStart,ptsEnd}</code> lands in the driver sink in <code>ipc.rs</code> after the Swift writer's finishWriting; nothing is notified — that closure is the one seam for sync-on-finalize</p></div><div class="seam"><em>PRECEDENT</em><p>SyncProfile already carries notes: Option&lt;NotesConfig&gt;{subfolder, <code>journal_template</code>, cadence} and <code>Engine::watch_tap</code> already fans watcher events out to <code>notes_vault::start</code> — recordings should copy that shape, not invent one</p></div><div class="seam"><em>THE GAP</em><p>No 'this path is finished, sync it now' API exists: <code>StabilityGate::is_stable</code> is the only gate, <code>note_close_write</code> (1s window) is private and Linux-only</p></div></div></section><section id="t1" style="--acc:var(--amber)"><div class="shead rise"><span class="tno">T1</span><h2>Job to Be Done</h2><span class="scount">15 ideas</span><span class="srule"></span><span class="skind">RETRIEVAL FRAME</span></div><p class="lede rise">Fifteen jobs on a strip of tape. Nobody hires a folder name for tidiness — they hire it to never lose a recording, and to find it later by what it was about.</p><div class="tree rise"><div class="cap">WHAT THE JOB LOOKS LIKE ON DISK &mdash; ONE TEMPLATE RENDERS ALL OF IT</div><pre>~/Recordings/                              <i>&larr; recording.destination_dir  (ships today)</i>
+&#9492;&#9472;&#9472; <b>2026/</b>                               <i>&larr; {yyyy} &mdash; the branch the default template grows</i>
+    &#9492;&#9472;&#9472; <b>2026-08-05 1432 standup/</b>        <i>&larr; {yyyy}-{mm}-{dd} {HH}{MM} {slug}   no colon, exFAT-safe</i>
+        &#9500;&#9472;&#9472; <u>segment-000.mp4</u>             <i>finished forever &mdash; assert, commit, push</i>
+        &#9500;&#9472;&#9472; segment-001.mp4<b>.partial</b>     <i>still being written &mdash; invisible to sync</i>
+        &#9500;&#9472;&#9472; <u>segments.ndjson</u>             <i>append-only ledger, one line per rotation</i>
+        &#9500;&#9472;&#9472; <u>manifest.json</u>               <i>written once at finalize, versioned, no absolute paths</i>
+        &#9492;&#9472;&#9472; <u>2026-08-05 1432 standup.md</u>  <i>note stub, tags, the post-meeting minute</i></pre></div><div class="strip rise"><div class="frames"><div class="frame"><div class="fh"><span>FRAME 01</span><b>00:00:14:00</b></div><span class="tag">THE REAL JOB</span><p>The job is not tidiness: it is never losing a recording and finding it later by what it was about — naming and placement are retrieval features</p></div><div class="frame"><div class="fh"><span>FRAME 02</span><b>00:00:51:07</b></div><span class="tag">SORT WITHOUT METADATA</span><p>Date-first folder names (2026-08-05 1432 standup) sort chronologically in Finder, ls and <code>Files.app</code> alike, with no metadata read</p></div><div class="frame"><div class="fh"><span>FRAME 03</span><b>00:01:28:14</b></div><span class="tag">ROOT HYGIENE</span><p>A year folder keeps the root listing small; Finder and any git status slow down long before a heavy recorder's tenth year</p></div><div class="frame"><div class="fh"><span>FRAME 04</span><b>00:02:05:21</b></div><span class="tag">DEPTH IS A CHOICE</span><p>Month nesting should be available but not default — 2026/08/ is right for someone recording daily, wrong for someone recording monthly</p></div><div class="frame"><div class="fh"><span>FRAME 05</span><b>00:02:42:04</b></div><span class="tag">TEMPLATE NOT FLAG</span><p>Express naming as a token template, not a boolean: <code>{yyyy}</code>/<code>{yyyy}</code>-<code>{mm}</code>-<code>{dd}</code> <code>{HH}</code><code>{MM}</code> <code>{slug}</code> makes year nesting fall out of the default template</p></div><div class="frame"><div class="fh"><span>FRAME 06</span><b>00:03:19:11</b></div><span class="tag">ONE VOCABULARY</span><p>Steal the token vocabulary already shipped in keeper-sync: <code>DEFAULT_JOURNAL_TEMPLATE</code> = journal/<code>{yyyy}</code>/<code>{yyyy}</code>-<code>{mm}</code>-<code>{dd}</code>.md — one convention across notes and recordings</p></div><div class="frame"><div class="fh"><span>FRAME 07</span><b>00:03:56:18</b></div><span class="tag">FILESYSTEM LAW</span><p>Time as 1432 or 14-32, never 14:32: a colon is illegal on exFAT, and removable-volume sync makes a FAT pendrive a real destination</p></div><div class="frame"><div class="fh"><span>FRAME 08</span><b>00:04:33:01</b></div><span class="tag">EMPTY TOKEN</span><p>An untitled session must collapse the <code>{slug}</code> token cleanly — no trailing separators, no 'Untitled' litter</p></div><div class="frame"><div class="fh"><span>FRAME 09</span><b>00:05:10:08</b></div><span class="tag">JOB 2 · IS IT SAFE?</span><p>Second job: 'is this recording safe off my laptop yet?' — a per-session sync state (local / staged / pushed / verified) answers it</p></div><div class="frame"><div class="fh"><span>FRAME 10</span><b>00:05:47:15</b></div><span class="tag">JOB 3 · HAND IT OVER</span><p>Third job: 'get the last hour to a colleague now' — that is a push-only lane and a URL, not a full bidirectional sync</p></div><div class="frame"><div class="fh"><span>FRAME 11</span><b>00:06:24:22</b></div><span class="tag">THE METRIC</span><p>The user's real deadline is 'before the laptop is lost': the metric to optimise is time-to-durable per segment, not throughput</p></div><div class="frame"><div class="fh"><span>FRAME 12</span><b>00:07:01:05</b></div><span class="tag">JUMP TO A MOMENT</span><p>Reviewing later means jumping to a moment — the ledger already stores ptsStart/ptsEnd per segment, so chapters are almost free</p></div><div class="frame"><div class="fh"><span>FRAME 13</span><b>00:07:38:12</b></div><span class="tag">NAME IT AFTERWARDS</span><p>Nobody names a folder before a meeting starts: naming must be editable afterwards, and the rename must move the folder, rewrite the manifest and git mv in one operation</p></div><div class="frame"><div class="fh"><span>FRAME 14</span><b>00:08:15:19</b></div><span class="tag">NO SECOND TOGGLE</span><p>If the destination is inside a synced tree, syncing must be automatic — a second 'also sync this' toggle is a job the user did not hire us for</p></div><div class="frame"><div class="fh"><span>FRAME 15</span><b>00:08:52:02</b></div><span class="tag">JOB 4 · LATER-ME</span><p>Job for later-me: 'what did we decide?' — that is a note keyed to the recording, not another video player</p></div></div></div></section><div class="tcstrip"><span style="left:6px">00:00:00</span><span style="left:126px">00:30:00</span><span style="left:246px">01:00:00</span><span style="left:366px">01:30:00</span><span style="left:486px">02:00:00</span><span style="left:606px">02:30:00</span><span style="left:726px">03:00:00</span><span style="left:846px">03:30:00</span><span style="left:966px">04:00:00</span></div><section id="t2" style="--acc:var(--cyan)"><div class="shead rise"><span class="tno">T2</span><h2>Morphological Analysis</h2><span class="scount">16 ideas</span><span class="srule"></span><span class="skind">PARAMETER MATRIX</span></div><p class="lede rise">Eight axes, one grid. Every cell is a shippable configuration; the highlighted cells are the path through the matrix this session recommends.</p><div class="morph rise"><div class="mhead">Parameters of the design space: root location x path template x year/month depth x per-session subfolder shape x sync profile x subfolder in repo x LFS mode x retention</div><div class="mrow"><div class="maxis">ROOT LOCATION<s>where the tree is rooted</s></div><div class="mcells"><div class="mcell"><span class="k">A</span>Root option A: a plain folder outside any repo (today) — simplest, syncs nothing</div><div class="mcell"><span class="k">B</span>Root option B: root IS a sync profile's <code>local_path</code> — recordings become just files in the repo, zero extra wiring</div><div class="mcell pick"><span class="k">C</span>Root option C: root is a subfolder of a profile (<code>profile.recordings.subfolder</code>, exactly like <code>NotesConfig.subfolder</code>) — the recommended shape</div><div class="mcell"><span class="k">D</span>Root option D: two roots — a fast scratch volume for live writing and a synced root the finished session is moved into on stop</div></div></div><div class="mrow"><div class="maxis">TEMPLATE DEPTH<s>how far the path nests</s></div><div class="mcells"><div class="mcell"><span class="k">0</span>Template depth 0: flat <code>{yyyy}</code>-<code>{mm}</code>-<code>{dd}</code> … — fine to year 3, painful after</div><div class="mcell pick"><span class="k">1</span>Template depth 1: <code>{yyyy}</code>/ — the default we want</div><div class="mcell"><span class="k">2</span>Template depth 2: <code>{yyyy}</code>/<code>{mm}</code>/ — an opt-in for daily recorders</div><div class="mcell"><span class="k">PER-PROFILE</span>Template depth by profile: a synced root may want <code>{yyyy}</code>/<code>{mm}</code> while a local scratch root stays flat — so the template belongs to the destination, not to the app</div></div></div><div class="mrow"><div class="maxis">SESSION FOLDER SHAPE<s>what sits beside the media</s></div><div class="mcells"><div class="mcell"><span class="k">A</span>Session folder shape A: one folder per session holding segments + manifest (today)</div><div class="mcell"><span class="k">B</span>Session folder shape B: session folder plus a sidecar .md note file next to it — the note is the thing notes-sync already knows how to render</div><div class="mcell"><span class="k">C</span>Session folder shape C: session folder inside, note file in a notes vault, linked by session id — better for note search, worse for a single self-contained artifact</div></div></div><div class="mrow"><div class="maxis">SYNC MAPPING<s>which profile takes it</s></div><div class="mcells"><div class="mcell"><span class="k">A / B</span>Sync mapping A: whole recordings root in one profile; mapping B: per-recording routing by tag (client work to one repo, personal to another)</div></div></div><div class="mrow"><div class="maxis">LFS MODE<s>how bytes travel</s></div><div class="mcells"><div class="mcell pick"><span class="k">POINTER-ONLY</span>LFS axis: mp4 segments are always over the 4 MiB threshold, so <code>lfs::stage::applies</code> auto-tracks <code>*.mp4</code> — the interesting cell is <code>lfs_mode</code> = PointerOnly on the laptop so old bytes can be pruned locally but stay on the remote</div></div></div><div class="mrow"><div class="maxis">RETENTION<s>what survives locally</s></div><div class="mcells"><div class="mcell pick"><span class="k">VERIFIED-ONLY</span>Retention axis crossed with sync state: prune locally only what is verified present on the remote — the matrix cell that makes a 500 GB/year habit survivable</div></div></div></div><div class="mpick rise"><span class="k">&#9670; UNTRIED CELL WORTH NAMING</span>Untried configuration worth naming: synced <code>manifest.json</code> + notes, LFS-pointer-only video — the searchable archive travels everywhere, the bytes stay where there is room</div></section><section id="t3" style="--acc:var(--orange)"><div class="shead rise"><span class="tno">T3</span><h2>TRIZ Contradiction</h2><span class="scount">15 ideas</span><span class="srule"></span><span class="skind">OPPOSING FORCES</span></div><p class="lede rise">Six contradictions. Each is two forces pulling the design apart, and the move that makes both of them true at once.</p><div class="triz"><div class="contra rise"><div class="cstate"><b>CONTRADICTION 01</b>The contradiction: syncing sooner improves durability but breaks the completeness gate, which exists precisely because a file being written must not be committed</div><div class="forces"><div class="force l"><s>FORCE A</s>SYNC SOONER<br><span style="color:var(--dim2)">durability rises with every second saved</span></div><div class="clash">&#8594;&#8592;</div><div class="force r"><s>FORCE B</s>WAIT FOR QUIESCENCE<br><span style="color:var(--dim2)">the completeness gate exists for a reason</span></div></div><div class="res"><p><b>SEGMENT IN TIME</b>Resolve it by segmenting in time, not by weakening the gate: a rotated segment is immutable forever, so it is not 'quiescent yet', it is FINISHED — a different fact</p><p><b>ASSERT, DON'T SHORTEN</b>So add an assertion API, not a shorter timer: <code>StabilityGate::note_finished(path)</code> marks a path complete from an authoritative producer and skips the settle window</p><p><b>NARROW AUTHORITY</b>Authority must be narrow: only a producer that owns the writer may assert, so the API takes a path the recording driver just closed, never user input</p><p><b>GENERALISE THE SIGNAL</b>The Linux <code>IN_CLOSE_WRITE</code> fast path already encodes this idea (<code>note_close_write</code>, 1s) — generalise it from an OS signal to a first-class producer signal, macOS included</p></div></div><div class="contra rise"><div class="cstate"><b>CONTRADICTION 02</b>Second contradiction: the user wants the file safe immediately, but pushing a 2 GB LFS object mid-meeting eats the uplink the meeting is running on</div><div class="forces"><div class="force l"><s>FORCE A</s>SAFE IMMEDIATELY<br><span style="color:var(--dim2)">the laptop could be lost at any minute</span></div><div class="clash">&#8594;&#8592;</div><div class="force r"><s>FORCE B</s>UPLINK IS IN USE<br><span style="color:var(--dim2)">the meeting is running on it right now</span></div></div><div class="res"><p><b>TWO SPEEDS</b>Win both with a two-speed policy: commit + LFS-stage locally at once (cheap, durable on the same disk), defer the push to a bandwidth window or session end</p></div></div><div class="contra rise"><div class="cstate"><b>CONTRADICTION 03</b>Third contradiction: one <code>manifest.json</code> per session must be re-written on every rotation, but rewriting the file the sync engine just committed causes churn and self-echo</div><div class="forces"><div class="force l"><s>FORCE A</s>ALWAYS-CURRENT MANIFEST<br><span style="color:var(--dim2)">one file, rewritten every rotation</span></div><div class="clash">&#8594;&#8592;</div><div class="force r"><s>FORCE B</s>NO CHURN, NO SELF-ECHO<br><span style="color:var(--dim2)">sync must not chase its own commit</span></div></div><div class="res"><p><b>APPEND-ONLY</b>Resolve by append-only: <code>segments.ndjson</code> grows by one line per rotation and never rewrites; <code>manifest.json</code> is written once at finalize</p></div></div><div class="contra rise"><div class="cstate"><b>CONTRADICTION 04</b>Fourth contradiction: the archive wants everything indexed, the drive wants nothing wasted — index metadata (tiny, always synced) separately from media (huge, optionally pointer-only)</div><div class="forces"><div class="force l"><s>FORCE A</s>INDEX EVERYTHING<br><span style="color:var(--dim2)">the archive wants total recall</span></div><div class="clash">&#8594;&#8592;</div><div class="force r"><s>FORCE B</s>WASTE NOTHING<br><span style="color:var(--dim2)">the drive wants none of it</span></div></div><div class="res"><p><b>RESOLVED IN PLACE</b>the statement carries its own move: index and media are separated, not traded off.</p></div></div><div class="contra rise"><div class="cstate"><b>CONTRADICTION 05</b>Fifth contradiction: a recording must survive a crash, but crash recovery scans orphaned segments AFTER restart, while sync may have already committed a half-written file</div><div class="forces"><div class="force l"><s>FORCE A</s>SURVIVE A CRASH<br><span style="color:var(--dim2)">recovery scans orphans after restart</span></div><div class="clash">&#8594;&#8592;</div><div class="force r"><s>FORCE B</s>SYNC IS ALREADY RUNNING<br><span style="color:var(--dim2)">it may commit a half-written file first</span></div></div><div class="res"><p><b>IN-PROGRESS MARKER</b>Resolve with an in-progress marker: write segments under a <code>.partial</code> suffix that tier-0 name exclusion already ignores, and rename on close — atomic rename is the completeness signal</p><p><b>SUFFIX RULE</b>A rename is also exactly what git sees as add+delete, so the exclusion pattern must be the SUFFIX rule, cheap and total</p></div></div><div class="contra rise"><div class="cstate"><b>CONTRADICTION 06</b>Sixth contradiction: the user wants a friendly editable title, git wants stable paths — resolve with an immutable session id inside the manifest and a mutable display title</div><div class="forces"><div class="force l"><s>FORCE A</s>A FRIENDLY, EDITABLE TITLE<br><span style="color:var(--dim2)">humans rename things later</span></div><div class="clash">&#8594;&#8592;</div><div class="force r"><s>FORCE B</s>STABLE PATHS<br><span style="color:var(--dim2)">git wants identity to hold still</span></div></div><div class="res"><p><b>ID INSIDE, TITLE OUTSIDE</b>Then a rename is a git mv of a folder whose identity never changed, and the archive row keeps pointing at the same session</p></div></div></div></section><div class="tcstrip"><span style="left:6px">00:00:00</span><span style="left:126px">00:30:00</span><span style="left:246px">01:00:00</span><span style="left:366px">01:30:00</span><span style="left:486px">02:00:00</span><span style="left:606px">02:30:00</span><span style="left:726px">03:00:00</span><span style="left:846px">03:30:00</span><span style="left:966px">04:00:00</span></div><section id="t4" style="--acc:var(--red)"><div class="shead rise"><span class="tno">T4</span><h2>Chaos Engineering</h2><span class="scount">15 ideas</span><span class="srule"></span><span class="skind">FAULT INJECTION</span></div><p class="lede rise">Fifteen faults fired into a running recorder. Each card is graded by what the system does when it lands — contained by design, needs a mitigation, or genuinely untested.</p><div class="deck"><div class="fcard rise" style="--st:var(--green)"><div class="fb"><span class="chip">CONTAINED</span><div class="cid">FAULT 01 · KILL -9</div><h3>SIGKILL DURING ROTATION</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">kill -9 during rotation: the <code>.partial</code> segment is never renamed, so sync never sees it and startup recovery finalises or discards it — the failure is contained by naming alone</p></div></div><div class="fcard rise" style="--st:var(--amber)"><div class="fb"><span class="chip">MITIGATE</span><div class="cid">FAULT 02 · ENOSPC</div><h3>DISK FULL MID-SEGMENT</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">Disk full mid-segment: the existing disk-space guard stops and finalises; the sync assertion must fire for what WAS written, not for the segment that failed</p></div></div><div class="fcard rise" style="--st:var(--amber)"><div class="fb"><span class="chip">MITIGATE</span><div class="cid">FAULT 03 · VOLUME ABSENCE</div><h3>PENDRIVE UNPLUGGED MID-PUSH</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">Pendrive unplugged mid-push: absence semantics already pause without deleting — but a recording still writing into an absent volume must fail loudly, not silently buffer</p></div></div><div class="fcard rise" style="--st:var(--amber)"><div class="fb"><span class="chip">MITIGATE</span><div class="cid">FAULT 04 · PROTECTED BRANCH</div><h3>REMOTE REJECTS THE PUSH</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">Remote rejects the push (protected branch): the session must still be marked locally durable, and the tray must say 'recorded, not pushed' rather than a generic error</p></div></div><div class="fcard rise" style="--st:var(--red)"><div class="fb"><span class="chip">UNTESTED</span><div class="cid">FAULT 05 · 40 GB DAY</div><h3>LFS UPLOAD DIES AT 90%</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">LFS object upload dies at 90%: resumable download exists, but a resumable UPLOAD is the untested leg for a 40 GB day</p></div></div><div class="fcard rise" style="--st:var(--blue)"><div class="fb"><span class="chip">INTERLOCK</span><div class="cid">FAULT 06 · ID COLLISION</div><h3>TWO MACHINES, ONE FOLDER</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">Two machines recording into the same synced folder at once: session ids must be device-scoped or the folder names collide on the same minute</p></div></div><div class="fcard rise" style="--st:var(--amber)"><div class="fb"><span class="chip">MITIGATE</span><div class="cid">FAULT 07 · WRONG YEAR</div><h3>CLOCK SKEW ACROSS DEVICES</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">Clock skew across devices: a date-first name from a machine with a wrong clock sorts into the wrong year — stamp the manifest with both local time and a monotonic device sequence</p></div></div><div class="fcard rise" style="--st:var(--amber)"><div class="fb"><span class="chip">MITIGATE</span><div class="cid">FAULT 08 · TREE CHANGES UNDER WRITER</div><h3>.gitattributes LANDS MID-RECORDING</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">The sync engine's own commit touches <code>.gitattributes</code> when the first mp4 appears; if that lands mid-recording the working tree changes under the recorder — write the LFS rule at session start, not at first segment</p></div></div><div class="fcard rise" style="--st:var(--blue)"><div class="fb"><span class="chip">INTERLOCK</span><div class="cid">FAULT 09 · INODE DRIFT</div><h3>FINDER RENAME WHILE RECORDING</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">A user renames the session folder in Finder while recording: the driver holds absolute paths, so writes keep landing in the moved folder while the UI shows the old one — detect via inode and refuse or follow, but never silently split a session</p></div></div><div class="fcard rise" style="--st:var(--blue)"><div class="fb"><span class="chip">INTERLOCK</span><div class="cid">FAULT 10 · DESTRUCTIVE PULL</div><h3>REMOTE DELETES AN ACTIVE SESSION</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">Sync pulls a remote deletion of a session the laptop is recording into — pause and warn; never let a pull delete an active session folder</p></div></div><div class="fcard rise" style="--st:var(--amber)"><div class="fb"><span class="chip">MITIGATE</span><div class="cid">FAULT 11 · 48 COMMITS / 24 GB</div><h3>4 HOUR SOAK × SYNC</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">The 4 h soak crossed with sync: 4 hours of 500 MB segments is ~48 commits and ~24 GB of LFS; the journal must not grow unbounded and the push must be batched</p></div></div><div class="fcard rise" style="--st:var(--amber)"><div class="fb"><span class="chip">MITIGATE</span><div class="cid">FAULT 12 · COLD BOOT</div><h3>BATTERY DIES, PUSH OUTSTANDING</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">Battery dies with segments committed but not pushed: on next boot the outstanding-upload gate (<code>lfs_uploads_outstanding</code>) must resume before any new pointer is published</p></div></div><div class="fcard rise" style="--st:var(--amber)"><div class="fb"><span class="chip">MITIGATE</span><div class="cid">FAULT 13 · TIER-4 VERIFY</div><h3>CORRUPTED SEGMENT</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">A corrupted segment (verify-on-read tier 4 catches it) must not be silently synced — quarantine it and mark the session degraded in the manifest</p></div></div><div class="fcard rise" style="--st:var(--amber)"><div class="fb"><span class="chip">MITIGATE</span><div class="cid">FAULT 14 · WEBCAM VS SCREEN</div><h3>TRACKS FINALISE OUT OF STEP</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">The webcam file and the screen file finalise at different instants; asserting each independently is right, but the session is only 'complete' when the ledger says every track closed</p></div></div><div class="fcard rise" style="--st:var(--blue)"><div class="fb"><span class="chip">INTERLOCK</span><div class="cid">FAULT 15 · DELIBERATE ABUSE</div><h3>ROOT AIMED AT THE NOTES VAULT</h3><div class="inj" style="margin-top:9px">BLAST RADIUS &amp; RESPONSE</div><p style="margin-top:0">Deliberate abuse: a user points the recordings root at the notes vault subfolder — validate for overlap the way <code>NotesConfig::validate</code> already refuses <code>.obsidian</code> and escaping subpaths</p></div></div></div></section><section id="t5" style="--acc:var(--green)"><div class="shead rise"><span class="tno">T5</span><h2>Ecosystem Thinking</h2><span class="scount">15 ideas</span><span class="srule"></span><span class="skind">TROPHIC MAP</span></div><p class="lede rise">The players arranged by trophic level. Producers make bytes at a furious rate; nothing currently eats them, nothing decomposes them, and the richest niche is completely unoccupied.</p><div class="rise"><div class="band" style="--bc:var(--green)"><div class="bname">PRODUCERS<s>who makes the bytes</s></div><div class="bitems"><div class="bitem">Map the players: the Swift recorder produces, the ledger accounts, the sync engine transports, the notes vault interprets, the archive remembers, the tray narrates</div><div class="bitem">Nobody currently eats the recorder's output — the manifest is written and never read back except for <code>meta.title</code>; that dead end is the whole opportunity</div></div></div><div class="band" style="--bc:var(--red)"><div class="bname">MISSING GUILD<s>the decomposers nobody built</s></div><div class="bitems"><div class="bitem">The decomposer is missing: nothing prunes, nothing summarises, nothing ages a recording out — an ecosystem without decay fills up and dies</div><div class="bitem">Decay policy as a first-class citizen: keep media 90 days locally, keep metadata and notes forever — the archive stays complete while the disk stays sane</div></div></div><div class="band" style="--bc:var(--cyan)"><div class="bname">SYMBIOSIS<s>two species, one vocabulary</s></div><div class="bitems"><div class="bitem">The obvious symbiosis: <code>notes/tags.rs</code> already has a hierarchical tag tree and a tag: search predicate scoped to markdown vaults; recording tags are a raw comma-split string with no vocabulary</div><div class="bitem">Unify the vocabulary: one tag tree, two producers — a recording tagged client/acme shows up in the same TagTree sidebar as a note tagged client/acme</div><div class="bitem">The join key is a session id; a note referencing it makes the recording searchable by the note's full text, which the archive already indexes with FTS5 trigram</div><div class="bitem">A recording session and a Matrix room are natural partners — record a call, attach the session id to the room, and the archive can put transcript, chat and video on one timeline</div></div></div><div class="band" style="--bc:var(--violet)"><div class="bname">HABITAT & EMERGENCE<s>where a session comes to live</s></div><div class="bitems"><div class="bitem">Feed the archive a new row kind: a recordings table beside events, sharing the db and the FTS pattern rather than a second search engine</div><div class="bitem">Emergent surface: a Recordings browser that is really an archive query — filter by tag, participant, date range, sync state</div></div></div><div class="band" style="--bc:var(--amber)"><div class="bname">SIGNALLING<s>how the colony narrates itself</s></div><div class="bitems"><div class="bitem">Cross-pollination: the sync engine's provenance trailer already names the device that made a change; a recording commit therefore self-documents which machine recorded it</div><div class="bitem">The tray is the shared nervous system: recording state already wins the icon over sync state; extend the same composition to say 'recording, 2 segments awaiting push'</div></div></div><div class="band" style="--bc:var(--orange)"><div class="bname">PREDATION<s>what eats the archive</s></div><div class="bitems"><div class="bitem">Predator: disk pressure. Prey: old local bytes. Defence: LFS pointer-only + prune verified objects, which the ecosystem can do because the remote is the durable copy</div></div></div><div class="band" style="--bc:var(--blue)"><div class="bname">EMPTY NICHE<s>the unoccupied minute</s></div><div class="bitems"><div class="bitem">Niche nobody fills: the post-meeting minute — the moment the user is most willing to type two sentences of context, and the only moment they ever will</div><div class="bitem">So the finalize event should also open a tiny note stub prefilled with title, date, participants and tags, saved next to the session and synced with it</div></div></div></div></section><div class="tcstrip"><span style="left:6px">00:00:00</span><span style="left:126px">00:30:00</span><span style="left:246px">01:00:00</span><span style="left:366px">01:30:00</span><span style="left:486px">02:00:00</span><span style="left:606px">02:30:00</span><span style="left:726px">03:00:00</span><span style="left:846px">03:30:00</span><span style="left:966px">04:00:00</span></div><section id="t6" style="--acc:var(--violet)"><div class="shead rise"><span class="tno">T6</span><h2>Assumption Reversal</h2><span class="scount">13 ideas</span><span class="srule"></span><span class="skind">FLIP CARDS</span></div><p class="lede rise">Thirteen assumptions turned over. The struck line is what everyone believes; the bright line is what turns out to be true once you look at the seams.</p><div class="flips"><div class="flip rise"><span class="lbl">ASSUMPTION 01</span><div class="was">recordings live in one root</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">routing per session by tag — a client recording lands in the client's repo, personal ones stay local</div></div><div class="flip rise"><span class="lbl">ASSUMPTION 02</span><div class="was">the recorder chooses the path</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">the DESTINATION chooses the layout, and the recorder asks it for a path — which is what makes per-profile templates work</div></div><div class="flip rise"><span class="lbl">ASSUMPTION 03</span><div class="was">sync happens after recording</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">sync happens DURING, per finished segment — which is exactly the ask, and only safe because segments are immutable</div></div><div class="flip rise"><span class="lbl">ASSUMPTION 04</span><div class="was">a session is a folder</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">a session is a row, and the folder is one materialisation of it — that is what makes rename, move and prune tractable</div></div><div class="flip rise"><span class="lbl">ASSUMPTION 05</span><div class="was">the manifest is the record</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">the manifest is a cache of the record; the durable record is the append-only ledger plus the archive row</div></div><div class="flip rise"><span class="lbl">ASSUMPTION 06</span><div class="was">tags are strings on a session</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">tags are edges in one project-wide tag tree that both notes and recordings hang off</div></div><div class="flip rise"><span class="lbl">ASSUMPTION 07</span><div class="was">the user reviews recordings in a player</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">they review them in search results, and the video is the last resort</div></div><div class="flip rise"><span class="lbl">ASSUMPTION 08</span><div class="was">everything must sync</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">metadata always syncs, media syncs by policy — the cheap thing is the useful thing</div></div><div class="flip rise"><span class="lbl">ASSUMPTION 09</span><div class="was">the sync engine decides when a file is ready</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">a producer that owns the writer knows better and may say so</div></div><div class="flip rise"><span class="lbl">ASSUMPTION 10</span><div class="was">git is a bad fit for video</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">with LFS pointer-only and per-extension auto-tracking it is a perfect fit for an append-only archive of immutable segments</div></div><div class="flip rise"><span class="lbl">ASSUMPTION 11</span><div class="was">the year folder is for humans</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">it is for git and Finder performance; humans use search — so nest for the machine and surface for the human</div></div><div class="flip rise"><span class="lbl">ASSUMPTION 12</span><div class="was">naming needs a UI</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">naming needs a template string and one good default; the UI is a preview of the rendered path</div></div><div class="flip rise"><span class="lbl">ASSUMPTION 13</span><div class="was">a recording is a private artifact</div><div class="rot">&#10226;</div><span class="lbl b">REVERSED</span><div class="now">the push-only lane makes it a publishable one, with the provenance trailer as its signature</div></div></div></section><section id="t7" style="--acc:var(--blue)"><div class="shead rise"><span class="tno">T7</span><h2>Time Horizon Ladder</h2><span class="scount">12 ideas</span><span class="srule"></span><span class="skind">CLIMB, THEN BACKCAST</span></div><p class="lede rise">Climb the rungs to the anthropologist&#x27;s view, then walk the conclusion back down to the very first thing to build.</p><div class="ladder rise"><div class="rung"><div class="yr">YEAR 1<s>200 sessions / 400 GB</s></div><div class="ritems"><p>Year 1: 200 sessions, 400 GB — a flat root already hurts; the year folder and pointer-only mode are enough</p><p>Year 1 risk: the first 40 GB day teaches the user that a push during a meeting is unacceptable — the bandwidth window must exist early</p></div></div><div class="rung"><div class="yr">YEAR 3<s>1.5 TB / archive is the product</s></div><div class="ritems"><p>Year 3: 1.5 TB and the laptop can no longer hold it; local prune of verified objects becomes mandatory, and 'which sessions are local?' becomes a real UI question</p><p>Year 3: the archive is now the product — 'find the call where we agreed the API shape' matters more than any recording feature</p></div></div><div class="rung"><div class="yr">YEAR 5<s>5000 commits of media</s></div><div class="ritems"><p>Year 5: the repo has 5000 commits of pure media; git gc and shallow clones matter, and a second peer joining must be able to fetch metadata only</p></div></div><div class="rung deep"><div class="yr">YEAR 10<s>formats rot</s></div><div class="ritems"><p>Year 10: formats rot — HEVC of 2026 is fine, but the manifest must record codec, resolution and fps so a future transcoder knows what it has (the recording settings already carry all three)</p><p>Year 10: the tag tree is the only navigation left that still works; folder names are archaeology</p></div></div><div class="rung deep"><div class="yr">100 YEARS<s>the anthropologist</s></div><div class="ritems"><p>100 years / the anthropologist's view: what survives is the ndjson ledger and the markdown notes — plain text outlives every container format, which argues for writing metadata as text beside the media, not only in a database</p></div></div></div><div class="backcast rise"><div class="bh">&#8595; BACKCAST &mdash; WHAT THE 100-YEAR VIEW DEMANDS OF THE FIRST COMMIT</div><div class="bsteps"><div class="bstep">Backcast from that: the very first move is to make the session folder self-describing in plain text, because everything later reads it</div><div class="bstep">Near-term corollary: <code>manifest.json</code> must be stable, documented and versioned from day one, since it becomes the migration surface</div><div class="bstep">Ten-year corollary: never bake absolute paths into the manifest — a synced archive is opened on another machine by definition</div><div class="bstep">Retention as policy text in the profile, not code: <code>keep_media_days</code>, <code>keep_metadata_forever</code>, <code>prune_only_if_verified</code></div></div></div></section><section id="conv" class="conv"><div class="convhead rise"><h2>Convergence</h2><p>Divergence spent at 101 ideas; converging with affinity clustering, then MoSCoW because this is a build scope</p></div><div class="clusters"><div class="cl rise"><span class="big">A</span><h3><s>CLUSTER A</s>Path &amp; naming</h3><p>one token template renders the whole relative path, so year nesting is a default template rather than a flag</p><span class="cnt">PATH & NAMING · T1 T2 T6</span></div><div class="cl rise"><span class="big">B</span><h3><s>CLUSTER B</s>Sync binding</h3><p>recordings hang off a SyncProfile the way notes already do (<code>profile.recordings.subfolder</code>), validated against overlap and escape</p><span class="cnt">BINDING · T2 T5 T6</span></div><div class="cl rise"><span class="big">C</span><h3><s>CLUSTER C</s>Finalize to durable</h3><p><code>.partial</code> suffix while writing, atomic rename on close, a producer assertion that skips the settle window, commit now / push on policy</p><span class="cnt">DURABILITY · T3 T4</span></div><div class="cl rise"><span class="big">D</span><h3><s>CLUSTER D</s>Session as a row</h3><p>a recordings table + FTS beside the message archive, making sessions searchable and listable instead of write-only manifests</p><span class="cnt">RETRIEVAL · T5 T6 T7</span></div><div class="cl rise"><span class="big">E</span><h3><s>CLUSTER E</s>Notes &amp; tags</h3><p>one hierarchical tag vocabulary shared with notes, plus a prefilled note stub written at finalize when the user is still willing to type</p><span class="cnt">MEANING · T5 T6</span></div><div class="cl rise"><span class="big">F</span><h3><s>CLUSTER F</s>Lifecycle</h3><p>pointer-only media, prune only what the remote verifiably has, keep metadata forever</p><span class="cnt">DECAY · T2 T5 T7</span></div></div><div class="pipe rise"><div class="cap">CLUSTER C, DRAWN OUT: THE DURABILITY PIPELINE FOR ONE ROTATED SEGMENT</div><div class="stages"><div class="stage" style="--sc:var(--red)"><b>WRITE</b><s>.partial suffix</s></div><div class="stage" style="--sc:var(--orange)"><b>CLOSE</b><s>atomic rename</s></div><div class="stage" style="--sc:var(--amber)"><b>ASSERT</b><s>note_finished(path)</s></div><div class="stage" style="--sc:var(--green)"><b>COMMIT</b><s>+ LFS stage, local</s></div><div class="stage" style="--sc:var(--cyan)"><b>PUSH</b><s>bandwidth window</s></div><div class="stage" style="--sc:var(--blue)"><b>VERIFY</b><s>object on remote</s></div><div class="stage" style="--sc:var(--violet)"><b>PRUNE</b><s>local bytes only</s></div></div></div><div class="moscow"><div class="lane" style="--lc:var(--green)"><div class="lk">MUST<s>the four explicit asks</s></div><ul><li>path template with <code>{yyyy}</code> default nesting</li><li>recordings bound to a sync profile + subfolder</li><li><code>.partial</code> + assert-finished so a closed segment syncs without waiting on quiescence</li><li>commit immediately, push on a policy that never fights the meeting's uplink</li></ul></div><div class="lane" style="--lc:var(--cyan)"><div class="lk">SHOULD<s>what makes the archive worth having</s></div><ul><li>recordings table + FTS + a browser</li><li>note stub at finalize</li><li>unified tag tree</li><li>rename that moves folder, manifest and git in one operation</li></ul></div><div class="lane" style="--lc:var(--blue)"><div class="lk">COULD<s>after a month of real use</s></div><ul><li>retention/prune of verified objects</li><li>per-tag routing to different profiles</li><li>chapters from the segment ledger</li><li>linking a session to a Matrix room</li></ul></div><div class="lane out" style="--lc:var(--red)"><div class="lk">WON&#x27;T<s>out of scope, on purpose</s></div><ul><li>transcription or any AI processing</li><li>cross-device dedup</li><li>a public publishing lane</li></ul></div></div><div class="why rise"><b>DECISIVE REASONING</b>Decisive reasoning: MUSTs are the user's four explicit asks and are all reachable through seams that already exist (settings k/v, NotesConfig precedent, <code>watch_tap</code>, SegmentClosed sink); SHOULDs are what make the archive worth having; COULDs need policy choices best made after the first month of real use</div></section><section id="synth" class="synth rise"><div class="cap">&#9679; CLOSING SYNTHESIS</div><p>the four asks are one idea wearing four hats — a recording session must stop being a folder the app writes and forgets, and become an addressable, self-describing record whose path, durability, searchability and meaning are all derived from the same session identity. Naming is retrieval; sync binding is durability; the assert-finished seam is what makes durability prompt; the tag/note/archive layer is what makes the pile usable in year three.</p><p class="key"><span class="hl">The non-obvious link:</span> immutability is the key that unlocks the completeness gate — a rotated segment is not 'probably done', it is finished forever, which is a stronger claim than any quiescence timer can make, and it is the reason this can be safe rather than a hack.</p><div class="hats"><div><k>NAMING</k><v>is retrieval</v></div><div><k>SYNC BINDING</k><v>is durability</v></div><div><k>ASSERT-FINISHED</k><v>is what makes durability prompt</v></div><div><k>TAGS / NOTES / ARCHIVE</k><v>is what makes the pile usable in year three</v></div></div></section><footer><span>BMAD BRAINSTORMING SESSION · AUTONOMOUS STANCE · 101 IDEAS · 7 TECHNIQUES</span><span>KEEPER · RECORDING → SYNC → ARCHIVE</span><span>2026-08-05T23:22</span></footer></div><script>
+(function(){
+  var pg=document.getElementById('pg'), tc=document.getElementById('tc');
+  function onScroll(){
+    var h=document.documentElement, max=h.scrollHeight-h.clientHeight;
+    var p=max>0?(h.scrollTop||document.body.scrollTop)/max:0;
+    pg.style.right=(100-p*100).toFixed(2)+'%';
+  }
+  addEventListener('scroll',onScroll,{passive:true}); onScroll();
+  var t=0; setInterval(function(){ t++;
+    var f=t%25, s=Math.floor(t/25)%60, m=Math.floor(t/1500)%60, hh=Math.floor(t/90000);
+    tc.textContent=[hh,m,s,f].map(function(n){return (n<10?'0':'')+n;}).join(':');
+  },40);
+  var secs=[].slice.call(document.querySelectorAll('section[id]'));
+  var rail=document.getElementById('rail');
+  secs.forEach(function(s){
+    var a=document.createElement('a'); a.href='#'+s.id;
+    var h=s.querySelector('h2'); var n=s.querySelector('.tno');
+    a.innerHTML='<span>'+((n?n.textContent:'')+' '+(h?h.textContent:'')).trim().toUpperCase()+'</span><b></b>';
+    a.dataset.for=s.id; rail.appendChild(a);
+  });
+  var links={}; [].slice.call(rail.children).forEach(function(a){links[a.dataset.for]=a;});
+  if('IntersectionObserver' in window){
+    var io=new IntersectionObserver(function(es){es.forEach(function(e){
+      if(e.isIntersecting){e.target.classList.add('in'); io.unobserve(e.target);}});},{rootMargin:'0px 0px -8% 0px'});
+    [].slice.call(document.querySelectorAll('.rise')).forEach(function(n){io.observe(n);});
+    var io2=new IntersectionObserver(function(es){es.forEach(function(e){
+      var a=links[e.target.id]; if(!a)return;
+      if(e.isIntersecting){for(var k in links)links[k].classList.remove('on'); a.classList.add('on');}
+    });},{rootMargin:'-45% 0px -45% 0px'});
+    secs.forEach(function(s){io2.observe(s);});
+  } else {
+    [].slice.call(document.querySelectorAll('.rise')).forEach(function(n){n.classList.add('in');});
+  }
+})();
+</script></body></html>
