@@ -124,6 +124,7 @@ export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
 export type { RecordingDisplayVm } from "./gen/RecordingDisplayVm";
+export type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 export type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 export type { RecordingSettingsVm } from "./gen/RecordingSettingsVm";
 export type { RecordingSourcesVm } from "./gen/RecordingSourcesVm";
@@ -221,6 +222,7 @@ import type { OutboxVm } from "./gen/OutboxVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
+import type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 import type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 import type { RecordingSettingsVm } from "./gen/RecordingSettingsVm";
 import type { RecordingSourcesVm } from "./gen/RecordingSourcesVm";
@@ -2050,6 +2052,11 @@ export async function recoveredSessionAcknowledge(folder: string): Promise<void>
  * k/v table. The Rust getters default (500 MB / 30 min) and clamp defensively,
  * so the resolved VM always sits in the authored bounds. Both settings surfaces
  * hydrate their shared store from this.
+ *
+ * The read also carries the effective `pathTemplate` (Story 40.2), which is
+ * always concrete: an absent, blank *or* no-longer-parsing stored template
+ * degrades to the default rather than failing the read, so a hand-edited
+ * `config.json` can never make the settings read error.
  */
 export async function recordingSettingsGet(): Promise<RecordingSettingsVm> {
   return await invoke<RecordingSettingsVm>("recording_settings_get");
@@ -2084,11 +2091,48 @@ export async function syncListSettingsSet(
  * reject), writes both values, and resolves the effective (clamped) VM so the
  * UI never displays an unsaved value. A running session is unaffected — edits
  * apply to the next Recording Session only.
+ *
+ * `pathTemplate` (Story 40.2) is the one field here that is REJECTED rather
+ * than clamped: a template that does not parse rejects with the
+ * {@link IpcError} envelope (`code: "recordingTemplateInvalid"`, `retriable:
+ * false`) *before* any write, so not one settings row moves — including the
+ * unrelated ones sent in the same request. A blank template is legal: it clears
+ * the key, and the echoed VM carries the default.
  */
 export async function recordingSettingsSet(
   settings: RecordingSettingsVm,
 ): Promise<RecordingSettingsVm> {
   return await invoke<RecordingSettingsVm>("recording_settings_set", { settings });
+}
+
+/**
+ * Preview what a path template would name the next recording (Story 40.2,
+ * UX-DR45/UX-DR46): it renders the TYPED template — not the stored one —
+ * against the shell's clock and the EFFECTIVE destination root, so the line
+ * under the field cannot disagree with the folder a recording started now
+ * would actually create.
+ *
+ * Read-only in every sense: nothing is parsed into the settings table and
+ * nothing is written, which is what makes it safe to call per keystroke.
+ * Exactly one side of the VM is populated — `relativePath` + `absolutePath`
+ * for a template that parses, `problem` for one that does not (an unparseable
+ * template is the preview's most useful output, not a rejected promise).
+ *
+ * The sentences in `problem` are the Rust-authored 40.1 rejection reasons and
+ * are meant to be rendered verbatim: a TypeScript re-implementation of the
+ * render rules, the token vocabulary or their failure copy would be a second
+ * renderer — the exact drift AD-65 forbids. One round trip per keystroke, so
+ * the caller owns staleness and must drop every response but the newest typed
+ * text's.
+ */
+export async function recordingPathPreview(
+  template: string,
+  title?: string | null,
+): Promise<RecordingPathPreviewVm> {
+  return await invoke<RecordingPathPreviewVm>("recording_path_preview", {
+    template,
+    title: title ?? null,
+  });
 }
 
 /**

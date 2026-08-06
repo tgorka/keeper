@@ -228,6 +228,15 @@ pub enum IpcErrorCode {
     /// the call, which is why these do not funnel to `internal`. Serializes as
     /// `"notesInvalid"`.
     NotesInvalid,
+    /// A submitted recording path template did not parse (Story 40.2, Epic 40):
+    /// a `..` folder, a `:`, an unknown `{token}`, a last folder that can render
+    /// to nothing. The same reasoning `NotesInvalid` carries applies exactly —
+    /// the input is what is wrong, so fixing the text fixes the call, which is
+    /// why this does not funnel to `internal`. Non-retriable: resubmitting the
+    /// same template can only fail the same way. The message is 40.1's own
+    /// rejection sentence, rendered inline beside the field. Serializes as
+    /// `"recordingTemplateInvalid"`.
+    RecordingTemplateInvalid,
 }
 
 /// The account's live server-side key-backup posture, mapped from the SDK
@@ -2912,17 +2921,23 @@ impl RecordingStatusVm {
     }
 }
 
-/// The user-configurable recording settings (Story 17.5 + 19.5, FR-72): the
-/// segment size, the duration-cap rotation fallback, the destination folder,
-/// and the frame rate, as persisted in the `settings` k/v table
+/// The user-configurable recording settings (Story 17.5 + 19.5 + 40.2, FR-72):
+/// the segment size, the duration-cap rotation fallback, the destination
+/// folder, the path template, the frame rate, the codec, the capture scale and
+/// echo cancellation, as persisted in the `settings` k/v table
 /// (`recording.segment_mb` / `recording.duration_cap_minutes` /
-/// `recording.destination_dir` / `recording.fps`).
+/// `recording.destination_dir` / `recording.path_template` / `recording.fps` /
+/// `recording.codec` / `recording.scale_percent` /
+/// `recording.echo_cancellation`).
 ///
 /// All settings surfaces (Settings → Recording and the pre-record setup cards)
 /// render exactly this VM. The setter command normalizes (segment `100..=5000`
 /// MB, duration cap `1..=600` min, fps {10, 15, 30, 60}) and returns the effective VM,
-/// so the UI never displays an unsaved value. Read again at every
-/// `recording_start` — edits apply to the next Recording Session only.
+/// so the UI never displays an unsaved value. The path template is the one
+/// field that is REJECTED rather than normalized when it is wrong — a template
+/// is a specification, and rewriting one silently would hand the user a path
+/// they did not ask for. Read again at every `recording_start` — edits apply to
+/// the next Recording Session only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -2956,6 +2971,48 @@ pub struct RecordingSettingsVm {
     /// `recording_start`; the sidecar's `echoCancellation`, emitted only when
     /// the mic is on.
     pub echo_cancellation: bool,
+    /// The EFFECTIVE recording path template (Story 40.2, AD-65): the persisted
+    /// user choice when one exists and still parses, otherwise
+    /// [`DEFAULT_TEMPLATE`](crate::recording::path_template::DEFAULT_TEMPLATE).
+    /// Always a concrete, parseable template — never empty and never the unset
+    /// sentinel, so the "unset vs default" ambiguity never reaches the UI, and
+    /// a hand-edited `config.json` row that does not parse degrades here rather
+    /// than failing the whole settings read. Submitting one that does not parse
+    /// is rejected with `IpcErrorCode::RecordingTemplateInvalid` and writes
+    /// nothing; submitting a blank one clears the key, which reads back as the
+    /// default.
+    pub path_template: String,
+}
+
+/// What a path template would name the next recording — or why it would not
+/// name anything (Story 40.2, UX-DR45/UX-DR46).
+///
+/// The live preview under the template field IS the documentation for the
+/// template language, so everything printed there is composed in Rust and
+/// rendered verbatim: the path comes from the one renderer
+/// ([`PathTemplate::render`](crate::recording::path_template::PathTemplate::render))
+/// and the refusal comes from the one parser, so what the preview promises and
+/// what `recording_start` will do cannot drift. A second renderer in TypeScript
+/// is exactly what AD-65 forbids, and it could not produce these sentences.
+///
+/// The `summary`-or-`problem` shape is `SyncGitVm`'s: exactly one side is
+/// populated. `problem` present ⇒ the template did not parse, both paths are
+/// `None` (the preview never shows a path the template could not produce), and
+/// the surface disables its save. `problem` absent ⇒ both paths are present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingPathPreviewVm {
+    /// The rendered path beneath the destination root, e.g.
+    /// `2026/2026-08-05 1432 standup`. `None` when the template did not parse.
+    pub relative_path: Option<String>,
+    /// The absolute folder the next recording would use — the destination
+    /// surface's one line of truth (UX-DR46), resolved against the EFFECTIVE
+    /// destination root. `None` when the template did not parse.
+    pub absolute_path: Option<String>,
+    /// Why the template was refused, as a standalone sentence to print inline
+    /// beside the field. `None` when it parsed.
+    pub problem: Option<String>,
 }
 
 /// How many rows a folder card's lists show, folded and unfolded.

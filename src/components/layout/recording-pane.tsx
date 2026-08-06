@@ -411,7 +411,10 @@ export function RecordingPane() {
                   <CardTitle>{title}</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <RecordingDestinationControls />
+                  {/* This surface collects the next-session title, so its
+                      preview renders against it; Settings has no meta card and
+                      previews untitled. */}
+                  <RecordingDestinationControls withNextSessionTitle />
                 </CardContent>
               </Card>
             ) : title === "Advanced" ? (

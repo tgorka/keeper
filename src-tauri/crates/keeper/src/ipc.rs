@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Datelike, Local, Timelike};
 use keeper_core::account::AccountManager;
 use keeper_core::auth;
 use keeper_core::auth::BeeperFlowRegistry;
@@ -26,6 +27,7 @@ use keeper_core::error::{
 use keeper_core::notes::NotesError;
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
+use keeper_core::recording::path_template::{PathTemplate, RenderCtx, DEFAULT_TEMPLATE};
 use keeper_core::recording::{
     current_segment_bytes_on_disk, evaluate_destination, plan_disk_guard_action,
     recover_orphaned_sessions, resolve_recording_permission, resolve_screen_recording_access,
@@ -42,11 +44,11 @@ use keeper_core::vm::{
     ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError,
     IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
     NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
-    PaletteResultsVm, PingVm, Provider, RecordingPermissionVm, RecordingSettingsVm,
-    RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState,
-    RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm,
-    SearchHitVm, SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch, TypingBatch,
-    VerificationFlowVm,
+    PaletteResultsVm, PingVm, Provider, RecordingPathPreviewVm, RecordingPermissionVm,
+    RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm,
+    RecordingTargetVm, RecordingUiState, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
+    ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm,
+    TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -1181,6 +1183,16 @@ fn to_ipc_error(err: CoreError) -> IpcError {
         // message is the rejection's actionable, secret-free `Display`.
         CoreError::Recording(RecordingError::DestinationInvalid { .. }) => {
             (IpcErrorCode::Internal, true)
+        }
+        // A rejected recording path template (Story 40.2). NOT retriable: the
+        // request carried a template that cannot parse, so resubmitting it can
+        // only fail identically — the user edits the field, and the message is
+        // the parse reason telling them what to edit. Its own code rather than
+        // `internal` for the reason `NotesInvalid` carries: the input is what is
+        // wrong, and a surface that can name the fault must be able to tell this
+        // apart from a backend failure it should not blame the user for.
+        CoreError::Recording(RecordingError::TemplateInvalid { .. }) => {
+            (IpcErrorCode::RecordingTemplateInvalid, false)
         }
         // Other recording errors (Story 16.2) do not cross the IPC command surface
         // in this story — the recording session machine and its `keeper-rec` port
@@ -5142,6 +5154,34 @@ fn resolve_destination_dir(stored: Option<String>, data_dir: &Path) -> PathBuf {
         .join("keeper")
 }
 
+/// Resolve the EFFECTIVE recording path template (Story 40.2, AD-65): the
+/// persisted user choice when one exists and still parses, otherwise
+/// [`DEFAULT_TEMPLATE`]. The sibling of [`effective_destination_dir`], and it
+/// exists for the same reason — the UI always receives a concrete value, and
+/// "unset vs default" never reaches the frontend.
+fn effective_path_template(data_dir: &Path) -> Result<String, IpcError> {
+    let stored =
+        keeper_core::registry::get_recording_path_template(data_dir).map_err(to_ipc_error)?;
+    Ok(resolve_path_template(stored))
+}
+
+/// Resolve the effective template from the (already-fetched) persisted value.
+///
+/// Only a template that still PARSES is honored. A stored one that does not is
+/// not an error here: `import_config_file` writes every `config.json` key into
+/// the settings table verbatim and validates nothing, so a hand-edited row can
+/// hold anything at all — and a settings surface that refused to load because
+/// of it would leave the user with no way to fix the very field that broke it.
+/// Degrading to the documented default on READ is the rule the fps and codec
+/// getters already follow. The write path is where a bad template is refused,
+/// out loud, with its reason. Pure so the invariant is unit-tested without a
+/// registry/tempdir.
+fn resolve_path_template(stored: Option<String>) -> String {
+    stored
+        .filter(|raw| PathTemplate::parse(raw).is_ok())
+        .unwrap_or_else(|| DEFAULT_TEMPLATE.to_owned())
+}
+
 /// The startup orphan-recovery pass (Story 17.3, FR-73, AD-37): derive the
 /// current EFFECTIVE recordings destination (the same
 /// [`effective_destination_dir`] source of truth `recording_start` uses) and
@@ -5479,6 +5519,7 @@ fn read_recording_settings(data_dir: &Path) -> Result<RecordingSettingsVm, IpcEr
             .map_err(to_ipc_error)?,
         echo_cancellation: keeper_core::registry::get_recording_echo_cancellation(data_dir)
             .map_err(to_ipc_error)?,
+        path_template: effective_path_template(data_dir)?,
     })
 }
 
@@ -5496,12 +5537,16 @@ fn echo_cancellation_locked_error() -> IpcError {
     }
 }
 
-/// Persist the recording settings (Story 17.5 + 19.5, FR-72): clamp/normalize
-/// to the authored bounds (segment `100..=5000` MB, duration cap `1..=600` min,
-/// fps {10, 15, 30, 60} — clamp, not reject), write all four into the `settings` k/v
-/// table, and return the effective (re-read) VM so the UI never displays an
-/// unsaved value. The destination is persisted verbatim — it is validated at
-/// Start time by the pre-flight, not here. A running session is never mutated —
+/// Persist the recording settings (Story 17.5 + 19.5 + 40.2, FR-72):
+/// clamp/normalize to the authored bounds (segment `100..=5000` MB, duration
+/// cap `1..=600` min, fps {10, 15, 30, 60} — clamp, not reject), write every
+/// value into the `settings` k/v table, and return the effective (re-read) VM
+/// so the UI never displays an unsaved value. The destination is persisted
+/// verbatim — it is validated at Start time by the pre-flight, not here. The
+/// path template is the one field that is REJECTED rather than clamped: a
+/// template is a specification, so an unparseable one earns
+/// `IpcErrorCode::RecordingTemplateInvalid` carrying the parse reason, and
+/// nothing at all is written. A running session is never mutated —
 /// `recording_start` re-reads at start, so edits apply to the next Recording
 /// Session only. Failures funnel through [`to_ipc_error`].
 ///
@@ -5546,6 +5591,20 @@ fn write_recording_settings(
             return Err(echo_cancellation_locked_error());
         }
     }
+    // Story 40.2, same block for the same reason: the eight writes below are
+    // sequential, so a template refused halfway through would leave the table
+    // holding a new segment size, a new destination and the OLD template. Blank
+    // is not a refusal — it clears the key, and the effective read then returns
+    // `DEFAULT_TEMPLATE`, which is how "clearing the field restores the
+    // documented default" is spelled. Validated, never sanitised: nothing here
+    // rewrites the template into one that would have parsed.
+    if !settings.path_template.trim().is_empty() {
+        PathTemplate::parse(&settings.path_template).map_err(|reason| {
+            to_ipc_error(CoreError::Recording(RecordingError::TemplateInvalid {
+                reason,
+            }))
+        })?;
+    }
     keeper_core::registry::set_recording_segment_mb(data_dir, settings.segment_mb)
         .map_err(to_ipc_error)?;
     keeper_core::registry::set_recording_duration_cap_minutes(
@@ -5561,7 +5620,115 @@ fn write_recording_settings(
         .map_err(to_ipc_error)?;
     keeper_core::registry::set_recording_echo_cancellation(data_dir, settings.echo_cancellation)
         .map_err(to_ipc_error)?;
+    keeper_core::registry::set_recording_path_template(data_dir, &settings.path_template)
+        .map_err(to_ipc_error)?;
     read_recording_settings(data_dir)
+}
+
+/// Preview what a path template would name the next recording (Story 40.2,
+/// UX-DR45/UX-DR46).
+///
+/// Read-only in every sense: nothing is parsed into the settings table, nothing
+/// is written, and the answer is a projection of (template, title, now,
+/// destination root). The settings surface calls this on every keystroke, which
+/// is why it is a command at all — the *only* clock that names a session folder
+/// is [`chrono::Local::now`] in this crate ([`recording_start`] takes the same
+/// one), `keeper-core` is clock-free by contract, and a TypeScript renderer
+/// beside 40.1's would be a second implementation of the render rules that
+/// could not produce the parse-failure sentences either. One round trip buys
+/// the caller a preview that cannot disagree with the recording.
+///
+/// A template that does not parse is NOT an `Err`: the refusal is the preview's
+/// most useful output, and it belongs inline under the field rather than in a
+/// rejected promise. `Err` here means the data dir or the destination row could
+/// not be read at all.
+///
+/// `async` per AD-34-5 — a `keeper.db` read per keystroke has no business on the
+/// main thread.
+#[tauri::command]
+pub async fn recording_path_preview(
+    state: State<'_, AppState>,
+    template: String,
+    title: Option<String>,
+) -> Result<RecordingPathPreviewVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    // The clock is read HERE, on the way in, exactly as `recording_start` reads
+    // it: the preview's promise is "this is where a recording started now would
+    // land", and a clock read anywhere below this line would be the same one.
+    let ctx = preview_render_ctx(&Local::now(), title.as_deref());
+    off_async_runtime(move || -> Result<RecordingPathPreviewVm, IpcError> {
+        let root = effective_destination_dir(&data_dir)?;
+        Ok(compose_path_preview(&root, &template, &ctx))
+    })
+    .await?
+}
+
+/// The civil datetime + title the preview renders against.
+///
+/// `seq: 1` — the ordinal is 1-based and 1 adds nothing, so the preview shows
+/// the folder the FIRST recording of this minute gets, which is the one the
+/// user is about to make. Showing a collision suffix for a collision that has
+/// not happened would be a lie about the common case.
+///
+/// A blank title is `None`, not `Some("")`: the two render identically today,
+/// but `None` is what the untitled case actually is, and it is what
+/// `recording_start` passes.
+fn preview_render_ctx(now: &DateTime<Local>, title: Option<&str>) -> RenderCtx {
+    RenderCtx {
+        year: now.year(),
+        month: now.month(),
+        day: now.day(),
+        hour: now.hour(),
+        minute: now.minute(),
+        second: now.second(),
+        title: title
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned),
+        seq: 1,
+    }
+}
+
+/// Compose the preview from a destination root, a raw template and a context.
+///
+/// Pure — no clock, no registry, no filesystem — so every row of the story's
+/// matrix is a unit test with no tempdir behind it.
+///
+/// Blank in, default out: an emptied field previews [`DEFAULT_TEMPLATE`],
+/// because that is exactly what saving an emptied field stores. The rule lives
+/// here rather than in the frontend so there is one definition of it, and the
+/// preview can never promise something the save would not do.
+///
+/// The absolute path is built component by component rather than by joining the
+/// rendered string: a `RelativePath` is always `/`-separated, and pushing it
+/// whole would leave those separators verbatim inside a Windows path.
+fn compose_path_preview(root: &Path, template: &str, ctx: &RenderCtx) -> RecordingPathPreviewVm {
+    let source = if template.trim().is_empty() {
+        DEFAULT_TEMPLATE
+    } else {
+        template
+    };
+    match PathTemplate::parse(source) {
+        Ok(parsed) => {
+            let relative = parsed.render(ctx);
+            let mut absolute = root.to_path_buf();
+            for component in relative.components() {
+                absolute.push(component);
+            }
+            RecordingPathPreviewVm {
+                relative_path: Some(relative.as_str().to_owned()),
+                absolute_path: Some(absolute.to_string_lossy().into_owned()),
+                problem: None,
+            }
+        }
+        // Both paths stay `None`: a preview that showed a path beside the reason
+        // it cannot be used would be inviting the user to believe the path.
+        Err(reason) => RecordingPathPreviewVm {
+            relative_path: None,
+            absolute_path: None,
+            problem: Some(reason.to_string()),
+        },
+    }
 }
 
 /// Read whether the one-time iOS no-background-sync disclosure has been shown
@@ -7187,6 +7354,233 @@ mod tests {
             .expect("request is JSON");
         assert!(wire["params"].get("echoCancellation").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Story 40.2: the path template setting and its preview -------------
+
+    /// A fixed civil datetime for the preview tests, so the assertions name the
+    /// exact path rather than re-deriving it from the clock they are testing.
+    fn preview_ctx(title: Option<&str>) -> RenderCtx {
+        RenderCtx {
+            year: 2026,
+            month: 8,
+            day: 5,
+            hour: 14,
+            minute: 32,
+            second: 7,
+            title: title.map(str::to_owned),
+            seq: 1,
+        }
+    }
+
+    /// Story 40.2: a fresh install reads the documented default, never `""` and
+    /// never the unset sentinel; a stored template that parses is what the read
+    /// path returns.
+    #[test]
+    fn recording_settings_read_carries_the_effective_path_template() {
+        let dir = settings_temp_dir();
+        assert_eq!(
+            read_recording_settings(&dir)
+                .expect("fresh read")
+                .path_template,
+            DEFAULT_TEMPLATE,
+            "an unset template must reach the UI as the documented default"
+        );
+
+        keeper_core::registry::set_recording_path_template(&dir, "{yyyy}/{mm}/{dd} {slug}")
+            .expect("persist a template");
+        assert_eq!(
+            read_recording_settings(&dir)
+                .expect("read a stored template")
+                .path_template,
+            "{yyyy}/{mm}/{dd} {slug}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Story 40.2: `import_config_file` writes every `config.json` key verbatim
+    /// and validates nothing, so the READ path has to survive a template that
+    /// cannot parse — degrading to the default rather than failing the settings
+    /// surface the user would have to use to repair it.
+    #[test]
+    fn an_unparseable_stored_template_degrades_to_the_default_on_read() {
+        for stored in [
+            "../escape",
+            "/absolute/{yyyy}",
+            "{week}",
+            "{yyyy}/{slug}",
+            "",
+        ] {
+            assert_eq!(
+                resolve_path_template(Some(stored.to_owned())),
+                DEFAULT_TEMPLATE,
+                "{stored:?} must not survive as the effective template"
+            );
+        }
+        assert_eq!(resolve_path_template(None), DEFAULT_TEMPLATE);
+        // …and a template that DOES parse is honored verbatim.
+        assert_eq!(
+            resolve_path_template(Some("{yyyy}/rec-{slug} {HH}{MM}".to_owned())),
+            "{yyyy}/rec-{slug} {HH}{MM}"
+        );
+    }
+
+    /// Story 40.2: the whole point of putting the parse in the pre-write guard.
+    /// A rejected template must leave the table byte-for-byte as it was — not
+    /// the six unrelated rows that travelled in the same request either.
+    #[test]
+    fn recording_settings_set_rejects_a_bad_template_without_writing_anything() {
+        let dir = settings_temp_dir();
+        let before = read_recording_settings(&dir).expect("baseline read");
+
+        let mut request = before.clone();
+        request.path_template = "../{yyyy}".to_owned();
+        // Co-edited fields in the SAME request must not sneak through.
+        request.fps = 60;
+        request.segment_mb = 1000;
+
+        let error = write_recording_settings(&dir, &request, false)
+            .expect_err("a template that cannot parse must be refused");
+        assert_eq!(error.code, IpcErrorCode::RecordingTemplateInvalid);
+        assert!(
+            !error.retriable,
+            "resubmitting it can only fail the same way"
+        );
+        assert_eq!(
+            error.message, "a template cannot contain a \".\" or \"..\" folder",
+            "the message is 40.1's own sentence, printed inline beside the field"
+        );
+
+        let after = read_recording_settings(&dir).expect("post-rejection read");
+        assert_eq!(after, before, "a rejected request must write NOTHING");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Story 40.2: a template that parses round-trips, and a BLANK one clears
+    /// the key rather than storing an empty template — which is how "clearing
+    /// the field restores the documented default" is delivered.
+    #[test]
+    fn recording_settings_set_round_trips_a_template_and_clears_a_blank_one() {
+        let dir = settings_temp_dir();
+        let mut request = read_recording_settings(&dir).expect("baseline read");
+
+        request.path_template = "{yyyy}/{mm}/rec-{slug}".to_owned();
+        let effective = write_recording_settings(&dir, &request, false).expect("a valid template");
+        assert_eq!(effective.path_template, "{yyyy}/{mm}/rec-{slug}");
+
+        request.path_template = "   ".to_owned();
+        let cleared = write_recording_settings(&dir, &request, false).expect("a blank template");
+        assert_eq!(
+            cleared.path_template, DEFAULT_TEMPLATE,
+            "an emptied field restores the default, it does not store nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Story 40.2: the preview is the manual. Titled, untitled and blank-template
+    /// all compose the same way, and the absolute line is the destination root
+    /// with the rendered components beneath it.
+    #[test]
+    fn the_path_preview_composes_the_relative_and_absolute_lines() {
+        let root = Path::new("/Users/alice/Movies/keeper");
+
+        let titled = compose_path_preview(root, DEFAULT_TEMPLATE, &preview_ctx(Some("Standup")));
+        assert_eq!(
+            titled.relative_path.as_deref(),
+            Some("2026/2026-08-05 1432 standup")
+        );
+        assert_eq!(
+            titled.absolute_path.as_deref(),
+            Some("/Users/alice/Movies/keeper/2026/2026-08-05 1432 standup"),
+            "the one line of truth: the folder the next recording would use"
+        );
+        assert_eq!(titled.problem, None);
+
+        // Untitled collapses `{slug}` together with its separator — no trailing
+        // space, no "Untitled" placeholder.
+        let untitled = compose_path_preview(root, DEFAULT_TEMPLATE, &preview_ctx(None));
+        assert_eq!(
+            untitled.relative_path.as_deref(),
+            Some("2026/2026-08-05 1432")
+        );
+
+        // Blank in, default out — the same rule the save path applies, so the
+        // preview of an emptied field is the preview of what saving it stores.
+        for blank in ["", "   "] {
+            assert_eq!(
+                compose_path_preview(root, blank, &preview_ctx(Some("Standup"))),
+                titled,
+                "{blank:?} must preview the default template"
+            );
+        }
+
+        // A different root moves the absolute line and nothing else.
+        let elsewhere = compose_path_preview(
+            Path::new("/Volumes/Pendrive"),
+            "{yyyy}-{mm}-{dd}",
+            &preview_ctx(None),
+        );
+        assert_eq!(
+            elsewhere.absolute_path.as_deref(),
+            Some("/Volumes/Pendrive/2026-08-05")
+        );
+    }
+
+    /// Story 40.2: a template that does not parse previews its REASON and no
+    /// path at all — a path beside the reason it cannot be used would invite
+    /// the user to believe the path.
+    #[test]
+    fn the_path_preview_reports_the_parse_reason_and_no_path() {
+        let root = Path::new("/Users/alice/Movies/keeper");
+        for (template, reason) in [
+            (
+                "../{yyyy}",
+                "a template cannot contain a \".\" or \"..\" folder",
+            ),
+            (
+                "{HH}:{MM}",
+                "the character ':' cannot be used in a folder name",
+            ),
+            (
+                "{week}",
+                "{week} is not one of the tokens a template understands",
+            ),
+        ] {
+            let preview = compose_path_preview(root, template, &preview_ctx(Some("Standup")));
+            assert_eq!(
+                preview.problem.as_deref(),
+                Some(reason),
+                "{template} must preview its own rejection sentence"
+            );
+            assert_eq!(preview.relative_path, None, "{template}");
+            assert_eq!(preview.absolute_path, None, "{template}");
+        }
+    }
+
+    /// Story 40.2: the preview's clock is the shell's, read once on the way in,
+    /// and the ordinal is 1 — the folder the FIRST recording of this minute
+    /// gets, not a collision that has not happened.
+    #[test]
+    fn the_preview_context_mirrors_the_local_clock_at_seq_one() {
+        let now = Local::now();
+        let ctx = preview_render_ctx(&now, Some("  Standup  "));
+        assert_eq!(ctx.year, now.year());
+        assert_eq!(ctx.month, now.month());
+        assert_eq!(ctx.day, now.day());
+        assert_eq!(ctx.hour, now.hour());
+        assert_eq!(ctx.minute, now.minute());
+        assert_eq!(ctx.second, now.second());
+        assert_eq!(ctx.seq, 1, "the ordinal is 1-based and 1 adds nothing");
+        assert_eq!(
+            ctx.title.as_deref(),
+            Some("Standup"),
+            "the title arrives trimmed, exactly as `recording_start` trims it"
+        );
+
+        // A blank title is the untitled case, not a title that is empty.
+        for blank in [None, Some(""), Some("   ")] {
+            assert_eq!(preview_render_ctx(&now, blank).title, None, "{blank:?}");
+        }
     }
 
     /// Acknowledge with no session at all is a quiet no-op (idempotent dismiss).

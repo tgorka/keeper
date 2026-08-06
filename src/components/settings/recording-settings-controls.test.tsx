@@ -28,6 +28,7 @@ const DEFAULTS: RecordingSettingsVm = {
   codec: "h264",
   scalePercent: 100,
   echoCancellation: false,
+  pathTemplate: "{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM} {slug}",
 };
 
 beforeEach(() => {

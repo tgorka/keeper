@@ -6,6 +6,7 @@
 
 use thiserror::Error;
 
+use crate::recording::path_template::TemplateError;
 use crate::recording::SessionState;
 
 /// Errors originating in a [`crate::platform::Platform`] port implementation.
@@ -431,10 +432,16 @@ pub enum BridgeError {
 ///
 /// A secret-free taxonomy: no message ever contains a captured-media path, media
 /// bytes, token, or session material — only a non-secret description of a state or
-/// sidecar failure. Recording does not cross the IPC command surface in this story
-/// (a dedicated surface arrives in a later recording story), so all variants map to
-/// `IpcErrorCode::Internal` (non-retriable) in the shell's single funnel; the arm
-/// exists only to keep that funnel exhaustive.
+/// sidecar failure.
+///
+/// Most variants map to `IpcErrorCode::Internal` in the shell's single funnel,
+/// because the recording session machine is driven shell-side rather than from a
+/// command and a fault in it is nobody's input error. The exceptions are the two
+/// variants a *caller* can fix. [`RecordingError::TemplateInvalid`] carries its
+/// own code (`IpcErrorCode::RecordingTemplateInvalid`), because the surface that
+/// submitted the template has a field to point at; [`RecordingError::DestinationInvalid`]
+/// still funnels to `Internal` but as RETRIABLE, because the folder it names may
+/// simply not be mounted yet. Both say what is wrong with the submitted value.
 #[derive(Debug, Error)]
 pub enum RecordingError {
     /// A [`RecordingEvent`](crate::recording::RecordingEvent) was applied in a state
@@ -482,6 +489,20 @@ pub enum RecordingError {
     DestinationInvalid {
         /// The actionable, secret-free rejection cause.
         reason: DestinationRejection,
+    },
+
+    /// A submitted recording path template did not parse (Story 40.2): the
+    /// settings command ran it through
+    /// [`PathTemplate::parse`](crate::recording::path_template::PathTemplate::parse)
+    /// and refused it BEFORE writing anything, so the stored settings are
+    /// unchanged. `reason` is 40.1's own rejection, whose `Display` is written
+    /// as a standalone sentence for exactly this: the settings field prints it
+    /// inline, beside the input, with no heading and no modal around it.
+    /// Secret-free — it quotes only the template the user just typed.
+    #[error("{reason}")]
+    TemplateInvalid {
+        /// The parse failure, rendered verbatim as the user-facing sentence.
+        reason: TemplateError,
     },
 }
 
