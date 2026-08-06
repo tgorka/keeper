@@ -1260,6 +1260,36 @@ pub fn set_recording_destination_dir(data_dir: &Path, dir: &str) -> Result<(), C
     set_setting(data_dir, RECORDING_DESTINATION_DIR_KEY, dir)
 }
 
+/// The `settings` key holding the user's recording path template (Story 40.2,
+/// AD-65). Stored as the raw template string; absent / empty ⇒ no explicit
+/// choice — the SHELL resolves the effective default
+/// ([`DEFAULT_TEMPLATE`](crate::recording::path_template::DEFAULT_TEMPLATE)),
+/// exactly as it resolves the destination folder above.
+const RECORDING_PATH_TEMPLATE_KEY: &str = "recording.path_template";
+
+/// Read the user's recording path template (Story 40.2). `None` when the
+/// setting is absent or empty — "cleared" and "never set" are one state, and
+/// the caller (shell) resolves the effective default.
+///
+/// Deliberately no `PathTemplate::parse` here: the value is returned exactly as
+/// stored, and the shell decides what an unparseable one means. That keeps this
+/// getter total over a hand-edited `config.json` row (see
+/// [`import_config_file`], which writes every key verbatim), which is the same
+/// rule the fps and codec getters follow — a corrupted row degrades to the
+/// documented default on read, it never errors the settings surface.
+pub fn get_recording_path_template(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    let raw = get_setting(data_dir, RECORDING_PATH_TEMPLATE_KEY)?;
+    Ok(raw.filter(|v| !v.trim().is_empty()))
+}
+
+/// Write the user's recording path template (Story 40.2) verbatim under
+/// `recording.path_template`. Validation is the caller's: the settings command
+/// parses and REJECTS before it ever reaches this function, so a template that
+/// is stored is a template that parsed — and nothing is rewritten on the way in.
+pub fn set_recording_path_template(data_dir: &Path, template: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, RECORDING_PATH_TEMPLATE_KEY, template)
+}
+
 /// The `settings` key holding the recording frame rate (Story 19.5). Stored as
 /// a decimal string; absent / unparsable / out-of-set ⇒ the default of 30.
 /// Passed to the `keeper-rec` sidecar as `fps` on every `start`.
@@ -2810,6 +2840,42 @@ mod tests {
         assert_eq!(
             get_recording_destination_dir(&dir).expect("get blank"),
             None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Story 40.2: the template is a sibling key of the destination folder and
+    /// behaves exactly like it — verbatim round trip, blank ⇒ unset.
+    #[test]
+    fn recording_path_template_defaults_to_none_and_round_trips() {
+        let dir = temp_dir();
+        // Absent ⇒ `None`; the shell resolves `DEFAULT_TEMPLATE`.
+        assert_eq!(
+            get_recording_path_template(&dir).expect("get default"),
+            None
+        );
+        // Stored verbatim: the settings command already parsed it, and a
+        // template the user typed is a specification, not data to normalize.
+        set_recording_path_template(&dir, "{yyyy}/{mm}/{dd} {slug}").expect("set template");
+        assert_eq!(
+            get_recording_path_template(&dir).expect("get template"),
+            Some("{yyyy}/{mm}/{dd} {slug}".to_owned())
+        );
+        // "Cleared" and "never set" are one state, or a user who emptied the
+        // field would be left with an explicit empty template that renders
+        // nothing at all.
+        set_recording_path_template(&dir, "").expect("set empty");
+        assert_eq!(get_recording_path_template(&dir).expect("get empty"), None);
+        set_recording_path_template(&dir, "   ").expect("set blank");
+        assert_eq!(get_recording_path_template(&dir).expect("get blank"), None);
+        // A hand-edited `config.json` row that does not parse is still returned
+        // as stored: this getter is total, and the shell decides what an
+        // unparseable template means (it degrades to the default on read).
+        set_recording_path_template(&dir, "../escape").expect("set garbage");
+        assert_eq!(
+            get_recording_path_template(&dir).expect("get garbage"),
+            Some("../escape".to_owned()),
+            "the getter must never fail on a value the config import wrote unvalidated"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

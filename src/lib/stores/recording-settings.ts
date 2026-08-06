@@ -23,6 +23,10 @@ import {
   recordingSettingsGet,
   recordingSettingsSet,
 } from "@/lib/ipc/client";
+import { syncErrorMessage } from "@/lib/stores/sync";
+
+/** Last-resort message when a save rejection carries no readable sentence. */
+export const RECORDING_SETTINGS_UNKNOWN_ERROR = "keeper could not save these recording settings.";
 
 /** Default segment size in MB (mirrors the Rust registry default). */
 export const RECORDING_SEGMENT_MB_DEFAULT = 500;
@@ -47,6 +51,19 @@ export const RECORDING_CODEC_ALLOWED: readonly string[] = ["h264", "hevc"];
 
 /** The legal capture-scale set (Story 21.2) — mirror of the Rust normalization. */
 export const RECORDING_SCALE_ALLOWED: readonly number[] = [100, 75, 50, 25];
+
+/**
+ * The default recording path template (Story 40.2; mirrors the Rust
+ * `DEFAULT_TEMPLATE`).
+ *
+ * Safe to mirror because it is UI copy, not a rule: it is what the template
+ * field shows as its placeholder, which is honest precisely because a blank
+ * template falls back to this same default in Rust. It is never a second
+ * renderer — every rendered path, every fallback that actually decides
+ * anything, and every refusal sentence comes from Rust, over
+ * `recordingPathPreview` and `recordingSettingsSet`.
+ */
+export const RECORDING_PATH_TEMPLATE_DEFAULT = "{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM} {slug}";
 
 export interface RecordingSettingsState {
   /**
@@ -109,12 +126,20 @@ export async function ensureRecordingSettingsHydrated(): Promise<void> {
 }
 
 /**
- * Persist new segmentation settings (Story 17.5): optimistic mirror update,
- * then `recordingSettingsSet`; on success the mirror is replaced with the
- * effective (Rust-clamped) VM, on failure it reverts to the prior value — both
- * only when no newer write superseded this one.
+ * Persist new recording settings (Story 17.5): optimistic mirror update, then
+ * `recordingSettingsSet`; on success the mirror is replaced with the effective
+ * (Rust-clamped) VM, on failure it reverts to the prior value — both only when
+ * no newer write superseded this one.
+ *
+ * Resolves `null` when the write landed, or the Rust-authored refusal sentence
+ * when it was rejected (Story 40.2). The reason has to escape: `pathTemplate`
+ * is the first setting that can be REFUSED rather than clamped, and the field
+ * beside it has to print why — swallowing the rejection would leave the user
+ * looking at a reverted template with no explanation. Never rejects, so the
+ * `void applyRecordingSettings(...)` callers that have no field to print into
+ * stay correct.
  */
-export async function applyRecordingSettings(next: RecordingSettingsVm): Promise<void> {
+export async function applyRecordingSettings(next: RecordingSettingsVm): Promise<string | null> {
   writeId += 1;
   const id = writeId;
   // Revert to the last *confirmed* value, not the live (possibly optimistic)
@@ -127,10 +152,15 @@ export async function applyRecordingSettings(next: RecordingSettingsVm): Promise
       lastConfirmed = effective;
       recordingSettingsStore.getState().setSettings(effective);
     }
-  } catch {
+    return null;
+  } catch (raw) {
     if (id === writeId) {
       recordingSettingsStore.getState().setSettings(revertTo);
     }
+    // `syncErrorMessage`, never `String(raw)`: an IPC rejection is a
+    // `{ code, message }` object, and stringifying one prints
+    // "[object Object]" exactly where the Rust-authored reason belongs.
+    return syncErrorMessage(raw, RECORDING_SETTINGS_UNKNOWN_ERROR);
   }
 }
 
