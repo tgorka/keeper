@@ -301,6 +301,18 @@ macOS-generated `src/lib/ipc/gen/` back and found the committed tree identical �
 of `bindings:check` (`test:rust` itself still cannot run on Linux). Nothing about this story's
 verification is owed any more.
 
+**Installed and observed in the field.** `bun run install:macos` built the release bundle from these
+sources on hesperia and replaced `/Applications/keeper.app` (0.6.5, built 15:25 local). Read out of the
+running app's accessibility tree, the Destination card carries the new row: the field seeded with the
+effective template, the Rust-composed absolute line
+`/Users/tgorka/Movies/keeper/2026/2026-08-06 1526` — real clock, real destination root, untitled
+`{slug}` collapse with no trailing space — and `Save template` disabled while the text equals the
+effective value. Minutes later the machine's owner had used it: `keeper.db` holds
+`recording.path_template = {yyyy}/{yyyy}-{mm}-{dd} {HH}.{MM} {slug}`, a template only this story can
+write, and the card's preview rendered it against a typed session title as
+`/Users/tgorka/Movies/keeper/2026/2026-08-06 15.29 test`. Persisted setting → effective read → rendered
+preview, end to end on the metal.
+
 **Adversarial review.** Two independent read-only passes (spec-conformance and defect-hunting) over
 the uncommitted diff. Six findings were acted on: the preview not re-rooting on a folder change
 `[high]`; the Settings-dialog stale title `[medium]`; a write-path refusal never cleared by a later
