@@ -20,6 +20,8 @@
 //! no trait object). `is_available()` returns `false` (never an error) when the
 //! sidecar can't be resolved.
 
+pub mod path_template;
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 

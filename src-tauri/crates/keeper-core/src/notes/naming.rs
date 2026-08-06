@@ -28,12 +28,26 @@ const FALLBACK_SLUG: &str = "untitled";
 
 /// MS-DOS device names. Reserved on Windows in *every* directory, with or
 /// without an extension.
-const RESERVED_DEVICE_NAMES: [&str; 22] = [
+///
+/// Crate-visible because a recording folder is subject to exactly the same
+/// Windows rule as a note filename — see
+/// [`crate::recording::path_template`], which refuses to render one bare.
+pub(crate) const RESERVED_DEVICE_NAMES: [&str; 22] = [
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
     "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
-/// Fold a title into a filename-safe slug.
+/// Fold a title into a slug, with **no** fallback and **no** device-name
+/// escape: an emoji-only title folds to the empty string, and `"NUL"` folds to
+/// `"nul"`.
+///
+/// This is the whole slug algorithm minus the two decisions that only a
+/// *filename* has to make. [`slug`] adds them back; the recording path
+/// renderer ([`crate::recording::path_template`]) makes the opposite choice —
+/// an empty slug there collapses out of the path together with its separator,
+/// so a fallback word would be exactly the "Untitled" placeholder epic 40
+/// refuses. Sharing the fold is what stops one title from becoming two
+/// different names in one app.
 ///
 /// Lowercased and diacritic-folded through the same table [`crate::notes::search`]
 /// uses, so a title's slug matches what a searching user types. Letters and
@@ -46,7 +60,7 @@ const RESERVED_DEVICE_NAMES: [&str; 22] = [
 /// marks are dropped and precomposed Latin letters are folded to their base, and
 /// the two spellings of `café` therefore land on the same slug. That is the
 /// property NFC was wanted for.
-pub fn slug(title: &str) -> String {
+pub(crate) fn slug_stem(title: &str) -> String {
     let mut out = String::with_capacity(title.len());
     let mut gap = false;
 
@@ -75,6 +89,19 @@ pub fn slug(title: &str) -> String {
     while out.ends_with('-') {
         out.pop();
     }
+
+    out
+}
+
+/// Fold a title into a filename-safe slug: `slug_stem` (crate-private, so it is
+/// named here rather than linked), plus the two things a note *filename* cannot
+/// do without — a fallback word when the fold leaves nothing, and a suffix when
+/// the fold lands on an MS-DOS device name.
+///
+/// A note must always get a usable filename; refusing to name it would lose the
+/// note.
+pub fn slug(title: &str) -> String {
+    let mut out = slug_stem(title);
 
     if out.is_empty() {
         return FALLBACK_SLUG.to_owned();

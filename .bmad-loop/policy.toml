@@ -7,12 +7,20 @@ retrospective = "notify"     # never | notify | auto (auto unsupported in v1)
 [limits]
 max_review_cycles = 3
 max_dev_attempts = 2
-session_timeout_min = 90
+session_timeout_min = 480    # 90 was not enough for this repo: story 40-1's first dev attempt
+                             # was killed mid-implementation at exactly 90 min (run
+                             # 20260805-233225-8874), and its re-drive after the intent-gap
+                             # resolution was still verifying at 3h40m. A keeper story routinely
+                             # reads several thousand lines across two crates and runs cargo
+                             # gates over a workspace carrying matrix-sdk and gitoxide, where a
+                             # single `cargo test -p keeper-core` costs minutes.
 stop_without_result_nudges = 1
 dev_stall_grace_s = 600      # grace for a dev session that ended its turn awaiting a background process (e.g. a slow PlayMode/test run) before it is called stalled; each re-invocation resets it. 0 = fail fast on the first result-less Stop
 dev_stall_nudges = 2         # times an idle dev session is nudged awake on grace expiry before it is called stalled (bmad-loop has no background-completion re-invocation); pane output re-arms the grace window and a fresh Stop restores the budget. 0 = stall on grace expiry
 workflow_stall_nudges_cap = 3 # total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker. 0 = stall on first grace expiry
-max_tokens_per_story = 2000000
+max_tokens_per_story = 4000000 # raised with the timeout above: attempt 1 alone weighed 1.01M
+                               # (6.53M raw) inside the old 90-minute window, so the old 2M cap
+                               # would have become the next thing to kill a story mid-flight.
 cache_read_weight = 0.1      # cache reads bill at ~0.1x input on all vendors; 1.0 = count raw
 
 [verify]
