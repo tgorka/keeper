@@ -2,9 +2,10 @@
 title: 'Story 40.1: The Path Template, Rendered Purely'
 type: 'feature'
 created: '2026-08-05'
-status: in-progress
+status: 'done'
 blocking_condition: ''
 baseline_revision: '7615e3065968543d746e8fb58e18e39e28198f1d'
+final_revision: '520f54bd08a9a8dc26e26e1a52ffd1a6e6de1c96'
 review_loop_iteration: 4
 followup_review_recommended: false
 context:

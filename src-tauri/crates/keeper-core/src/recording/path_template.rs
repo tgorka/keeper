@@ -713,7 +713,7 @@ fn push_literal(current: &mut Vec<Segment>, literal: &mut String) {
 /// This is the narrow question: is the folder *literally* what the user wrote?
 /// Only the `.`/`..` and "nothing left" rejections need it that narrow, because
 /// only they read the text as characters the user typed rather than as a name
-/// that will exist. [`title_free_text`] asks the wider one.
+/// that will exist. [`title_free_render`] asks the wider one.
 fn typed_text(component: &[Segment]) -> Option<&str> {
     match component {
         [Segment::Literal(text)] => Some(text),

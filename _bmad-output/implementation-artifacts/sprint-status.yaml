@@ -1,5 +1,5 @@
 # generated: 2026-07-03
-# last_updated: 2026-07-30
+# last_updated: 2026-08-06
 # project: keeper
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-03
-last_updated: 2026-07-30
+last_updated: 2026-08-06
 project: keeper
 project_key: NOKEY
 tracking_system: file-system
@@ -341,8 +341,8 @@ development_status:
   # with notes and tags. Spine: product-inputs-recording-sync-2026-08-05.md.
   # Epics 35-39 (Notes, Phase 5) are tracked in their own planning artifacts and are
   # deliberately not restated here.
-  epic-40: backlog
-  40-1-the-path-template-rendered-purely: backlog
+  epic-40: in-progress
+  40-1-the-path-template-rendered-purely: done
   40-2-the-template-is-a-setting-and-the-preview-is-the-manual: backlog
   40-3-recording-start-uses-it-and-the-session-gets-an-identity: backlog
   40-4-retitle-moves-the-folder-not-the-identity: backlog
