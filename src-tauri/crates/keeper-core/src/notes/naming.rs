@@ -93,9 +93,10 @@ pub(crate) fn slug_stem(title: &str) -> String {
     out
 }
 
-/// Fold a title into a filename-safe slug: [`slug_stem`], plus the two things a
-/// note *filename* cannot do without — a fallback word when the fold leaves
-/// nothing, and a suffix when the fold lands on an MS-DOS device name.
+/// Fold a title into a filename-safe slug: `slug_stem` (crate-private, so it is
+/// named here rather than linked), plus the two things a note *filename* cannot
+/// do without — a fallback word when the fold leaves nothing, and a suffix when
+/// the fold lands on an MS-DOS device name.
 ///
 /// A note must always get a usable filename; refusing to name it would lose the
 /// note.

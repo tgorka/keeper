@@ -7,11 +7,13 @@ retrospective = "notify"     # never | notify | auto (auto unsupported in v1)
 [limits]
 max_review_cycles = 3
 max_dev_attempts = 2
-session_timeout_min = 240    # 90 was not enough for this repo: story 40-1's first dev attempt
+session_timeout_min = 480    # 90 was not enough for this repo: story 40-1's first dev attempt
                              # was killed mid-implementation at exactly 90 min (run
-                             # 20260805-233225-8874). A keeper story routinely reads several
-                             # thousand lines across two crates and runs cargo gates over a
-                             # workspace carrying matrix-sdk and gitoxide.
+                             # 20260805-233225-8874), and its re-drive after the intent-gap
+                             # resolution was still verifying at 3h40m. A keeper story routinely
+                             # reads several thousand lines across two crates and runs cargo
+                             # gates over a workspace carrying matrix-sdk and gitoxide, where a
+                             # single `cargo test -p keeper-core` costs minutes.
 stop_without_result_nudges = 1
 dev_stall_grace_s = 600      # grace for a dev session that ended its turn awaiting a background process (e.g. a slow PlayMode/test run) before it is called stalled; each re-invocation resets it. 0 = fail fast on the first result-less Stop
 dev_stall_nudges = 2         # times an idle dev session is nudged awake on grace expiry before it is called stalled (bmad-loop has no background-completion re-invocation); pane output re-arms the grace window and a fresh Stop restores the budget. 0 = stall on grace expiry

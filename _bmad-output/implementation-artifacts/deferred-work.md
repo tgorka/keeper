@@ -1795,3 +1795,36 @@ can never run, is a key nobody can use.
 **Also worth fixing whichever way this goes:** the app should not hand the plugin's parse error to
 the user. "Could not fetch a valid release JSON from the remote" describes the parser's disappointment;
 what the person needs is "this release has no update manifest" or "no newer version is published".
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-40-1-the-path-template-rendered-purely.md`
+  summary: Story 40.3's pre-flight must refuse a rendered path that lies inside an existing session
+    folder, because two different titles can nest one session in another under a template with a
+    collapsible interior component.
+  evidence: Measured against the committed renderer — `{yyyy}/{slug}/{mm}-{dd}` renders `2026/08-05`
+    for an untitled recording and `2026/08-05/08-05` for one titled `08-05`. The paths differ, so no
+    collision ordinal fires, yet the second session's media is written inside the first session's
+    folder and deleting either deletes both. The intent contract explicitly permits interior
+    components to collapse, so this cannot be closed in 40.1's renderer; it is a pre-flight check
+    where the filesystem is actually consulted.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-40-1-the-path-template-rendered-purely.md`
+  summary: Nothing bounds a template's depth or the total length of a rendered path, so a template
+    can direct story 40.3 to create arbitrarily deep trees or paths Windows cannot open.
+  evidence: `PathTemplate::parse` accepts a template of 60 `/` separators, which would have 40.3
+    create 60 nested directories; and `{yyyy}/{mm}/{dd}/{HH}/{MM}/{SS} {title}` with a long title
+    exceeds Windows' 260-character `MAX_PATH` without long-path opt-in — on a feature whose premise
+    is that the destination may be a synced or removable volume. The 255-byte cap this story adds is
+    per component and says nothing about the total.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-40-1-the-path-template-rendered-purely.md`
+  summary: Invisible codepoints outside Unicode category `Cf` can still name a recording folder, so
+    the "no folder the user cannot see" rule is only as wide as `Cf` — widening it is a decision
+    about which scripts stay usable, not a bug fix.
+  evidence: Story 40.1 added `Cf` to the illegal set and the table was verified complete for Unicode
+    16.0, but measured against `{title}/{yyyy}`: HANGUL FILLER `U+3164` (category `Lo`) renders
+    `ㅤ/2026`, BRAILLE PATTERN BLANK `U+2800` (`So`) renders `⠀/2026`, and a private-use `U+E000`
+    (`Co`) renders a tofu box — each a top-level directory in the destination root that the user
+    cannot see in Finder, type in a shell, or delete by name, from a title that may arrive from a
+    bridge or an agent. Variation selectors (`U+FE00`–`U+FE0F`, `Mn`) are in the same class.
+    Excluding `Lo` fillers wholesale would refuse characters that are legitimate in some scripts, so
+    the set to refuse is a product decision rather than a one-line widening.
