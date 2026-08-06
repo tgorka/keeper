@@ -280,15 +280,26 @@ reader knows it was a decision and not an accident.
 - `bun run check:core-tauri-free`, `bun run check:core-sync-free`, `bun run check:syncd-lean` — all
   exit 0. No `Cargo.toml`, `Cargo.lock` or `package.json` changed.
 
-**What could NOT be executed here.** The `keeper` crate's test binary does not LINK in this Linux
-container: GTK/webkit development libraries are absent (`-lgtk-3`, `-lwebkit2gtk-4.1`, … unresolved)
-and there is no privilege to install them. `cargo check` and `cargo clippy --all-targets` therefore
-type-check the six new `#[cfg(test)]` tests in `keeper/src/ipc.rs`
-(`recording_settings_read_carries_the_effective_path_template`, the degrade-on-read case, the
-write-rejection case, the round-trip/blank case, the two preview-composition cases and the clock
-mirror) but they were not RUN, and `bun run test:rust` / `bun run bindings:check` cannot complete for
-the same reason. `keeper-core`'s own tests — the registry round trip among them — did run. Running the
-full workspace suite on macOS remains owed before this story is called done on a release branch.
+**Run on the metal, on macOS, because Linux cannot link the shell.** The `keeper` crate's test binary
+does not LINK in the Linux container this was written in: GTK/webkit development libraries are absent
+(`-lgtk-3`, `-lwebkit2gtk-4.1`, … unresolved) with no privilege to install them, so `cargo check` and
+`cargo clippy --all-targets` type-check its `#[cfg(test)]` tests there but cannot run them. So the
+gate that matters ran where it can: `bun run check:rust:macos` on `hesperia` (macOS 26.5.2, arm64),
+which rsyncs these exact sources, builds the Swift `keeper-rec` sidecar, then runs `cargo fmt --check`,
+`cargo clippy --workspace --all-targets -- -D warnings` INCLUDING the shell crate, and
+`cargo test --workspace`. Result: **green**, and the seven tests this story added to `keeper/src/ipc.rs`
+all executed —
+`ipc::tests::recording_settings_read_carries_the_effective_path_template`,
+`ipc::tests::an_unparseable_stored_template_degrades_to_the_default_on_read`,
+`ipc::tests::recording_settings_set_rejects_a_bad_template_without_writing_anything`,
+`ipc::tests::recording_settings_set_round_trips_a_template_and_clears_a_blank_one`,
+`ipc::tests::the_path_preview_composes_the_relative_and_absolute_lines`,
+`ipc::tests::the_path_preview_reports_the_parse_reason_and_no_path` and
+`ipc::tests::the_preview_context_mirrors_the_local_clock_at_seq_one`. `keeper-core` reported 1074 unit
+tests green plus its integration binaries, `keeper-sync` 481, and the script's drift check rsynced the
+macOS-generated `src/lib/ipc/gen/` back and found the committed tree identical — which is the substance
+of `bindings:check` (`test:rust` itself still cannot run on Linux). Nothing about this story's
+verification is owed any more.
 
 **Adversarial review.** Two independent read-only passes (spec-conformance and defect-hunting) over
 the uncommitted diff. Six findings were acted on: the preview not re-rooting on a folder change
@@ -332,3 +343,6 @@ deliberate, precedented behaviour.
   lands, and the destination card grows the field, the live preview and the inline fault.
 - 2026-08-06 — Addressed six adversarial-review findings (one high, three medium, two low) and pinned
   the preview-race, surface-title, folder-refresh and refused-save contracts with five new tests.
+- 2026-08-06 — `bun run check:rust:macos` green on hesperia (macOS 26.5.2, arm64): the shell crate's
+  clippy and its seven new `ipc.rs` tests ran there, and the macOS-generated bindings match the
+  committed tree. The last owed verification is closed.
