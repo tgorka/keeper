@@ -27,12 +27,9 @@
 //! This is deliberately the same vocabulary the journal template already
 //! publishes for notes (AD-65): `{yyyy}`, `{yy}`, `{mm}` and `{dd}` mean here
 //! exactly what they mean in
-//! [`crate::notes::naming::journal_path`][journal] — its sibling, and the file
-//! to change in step with this one. A user who has written one template has
-//! learned both, and two vocabularies that drift apart would be a bug nobody
-//! files.
-//!
-//! [journal]: crate::notes::naming::journal_path
+//! [`crate::notes::naming::journal_path`] — its sibling, and the file to change
+//! in step with this one. A user who has written one template has learned both,
+//! and two vocabularies that drift apart would be a bug nobody files.
 //!
 //! # Guarantees
 //!
@@ -67,8 +64,12 @@ use crate::notes::naming::{slug_stem, RESERVED_DEVICE_NAMES};
 pub const DEFAULT_TEMPLATE: &str = "{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM} {slug}";
 
 /// Character cap on a rendered `{title}`. Long enough for a real meeting name,
-/// short enough that the component clears the 255-byte name limit even when
-/// every character is a 4-byte codepoint.
+/// short enough that a title in any ordinary script — together with the date
+/// prefix the default template puts in front of it — stays well inside the
+/// 255-byte name limit. It is a *character* cap, not a byte cap: 80 four-byte
+/// codepoints still exceed 255 bytes, and that pathological title is left for
+/// the filesystem to refuse by the name it was actually given, rather than
+/// silently reshaped here into a folder the user did not ask for.
 const TITLE_MAX_CHARS: usize = 80;
 
 /// What a component that folded onto an MS-DOS device name gains, so `nul`
