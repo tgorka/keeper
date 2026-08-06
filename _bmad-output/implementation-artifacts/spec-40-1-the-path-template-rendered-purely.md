@@ -38,6 +38,20 @@ its first consumers.
   anywhere; never absolute; no component that is empty, `.` or `..`; no leading/trailing separator;
   no leading/trailing space or `.` in any component; and a title can never introduce more path
   components than the template's own `/` separators.
+- **The final component always renders.** A template whose last path component is built
+  exclusively from tokens that may collapse (`{title}`, `{slug}`, `{seq}`) is rejected at parse
+  with `TemplateError::OptionalLeaf`, naming the component. This is the leaf-scoped sibling of
+  `MayRenderEmpty` and exists because the rendered path *is* the session folder: a leaf that
+  vanishes would silently promote a parent — the year directory — into a session folder, make the
+  collision ordinal rename that parent (`2026`, `2026 (2)`, …), and, with an explicit `{seq}` in a
+  collapsible leaf, make session 2 a *child* of session 1. The leaf must therefore contain at
+  least one always-rendering token or one literal character. Interior components may still
+  collapse and take their separator with them; only the leaf is constrained.
+- **The rendered leaf fits the filesystem.** The final component, *including* any collision
+  ordinal, is capped at 255 bytes — `NAME_MAX` on APFS, ext4 and exFAT alike. When a title would
+  exceed it the title token is truncated at a UTF-8 character boundary (never mid-codepoint) so
+  the ordinal always fits; the 80-character cap is a legibility rule, not a byte rule, and cannot
+  be one. Without this, the retry loop in 40.3 only ever lengthens a name it can never make legal.
 - Validation, not sanitisation: `parse` rejects with a typed reason and never rewrites. `render` is
   infallible — every decision was made at parse time.
 - The token table is documented in the module doc, and the doc states in prose that it is the same
@@ -68,9 +82,9 @@ Ctx below = 2026-08-05T14:32:07 unless stated. Template = `DEFAULT_TEMPLATE`
 | Title slugs to nothing | title `"!!!"` | same as untitled: the token collapses with its separator | none |
 | Collision, no `{seq}` in template | title `"Standup"`, seq 3 | `2026/2026-08-05 1432 standup (3)` — suffix on the final component only | none |
 | Collision, explicit `{seq}` | `{yyyy}-{mm}-{dd} {slug}{seq}`, seq 1 then 2 | `2026-08-05 standup` then `2026-08-05 standup (2)` | none |
-| Hostile title | template `{yyyy}/{title}`, title `"a/b:c"` | exactly 2 components; separators and `:` are stripped from the title, never rendered | none |
-| `{title}` vs `{slug}` | template `{title}` / `{slug}`, title `"Café Déjà Vu"` | `Café Déjà Vu` / `cafe-deja-vu` | none |
-| Reserved device name | template `{slug}`, title `"NUL"` | a non-reserved component (suffixed), never bare `nul` | none |
+| Hostile title | template `{yyyy}/{title} {HH}{MM}`, title `"a/b:c"` | exactly 2 components; separators and `:` are stripped from the title, never rendered | none |
+| `{title}` vs `{slug}` | template `{yyyy}-{title}` / `{yyyy}-{slug}`, title `"Café Déjà Vu"` | `2026-Café Déjà Vu` / `2026-cafe-deja-vu` | none |
+| Reserved device name | template `{slug}/{yyyy}`, title `"NUL"` | the interior component is suffixed (`nul-rec/2026`), never bare `nul` | none |
 | Parse: traversal | `../{yyyy}` | rejected | `TemplateError::ParentComponent` |
 | Parse: absolute | `/Users/x/{yyyy}` | rejected | `TemplateError::Absolute` |
 | Parse: illegal char | `{HH}:{MM}` | rejected | `TemplateError::IllegalCharacter { ch: ':' }` |
@@ -78,6 +92,10 @@ Ctx below = 2026-08-05T14:32:07 unless stated. Template = `DEFAULT_TEMPLATE`
 | Parse: unterminated | `{yyyy` | rejected | `TemplateError::Unterminated` |
 | Parse: empty / blank | `""`, `"   "` | rejected | `TemplateError::Empty` |
 | Parse: nothing guaranteed | `{slug}`, `{slug}/{title}` | rejected — could render to nothing at all | `TemplateError::MayRenderEmpty` |
+| Parse: optional leaf | `{yyyy}/{title}`, `{yyyy}/{mm}/{slug}`, `{yyyy}/{slug}{seq}` | rejected — the last component could render to nothing, so the session folder would become its own parent. Precedence: when *every* component is optional the reason stays `MayRenderEmpty`; `OptionalLeaf` names the case where earlier components would have rendered | `TemplateError::OptionalLeaf` |
+| Parse: leaf saved by a literal | `{yyyy}/rec-{slug}`, `{yyyy}/{slug} {HH}{MM}` | accepted — the leaf carries something that always renders | none |
+| Interior collapse still allowed | `{yyyy}/{slug}/{yyyy}-{mm}-{dd}`, title `None` | `2026/2026-08-05` — an interior component may vanish with its separator | none |
+| Long title, byte cap | 80-character Japanese title, seq 9 | the final component is ≤ 255 bytes including ` (9)`, truncated at a character boundary, never mid-codepoint | none |
 
 </intent-contract>
 

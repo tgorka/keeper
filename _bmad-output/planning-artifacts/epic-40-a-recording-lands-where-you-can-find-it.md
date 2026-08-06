@@ -68,6 +68,13 @@ optional title and a collision sequence — no clock, no filesystem, no `tauri`,
 removed. Rendering guarantees FR-127: no `:` anywhere, no component that is empty, `.` or `..`, no
 leading or trailing separator or space in any component, and a collapsed `{slug}` takes its
 adjacent separator with it. `DEFAULT_TEMPLATE` is `{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM} {slug}`.
+A collapsed *interior* component vanishes with its separator; a collapsed **leaf** is refused at
+parse (`TemplateError::OptionalLeaf`), because the rendered path is the session folder and a
+vanishing leaf silently promotes the year directory into one — the collision ordinal then renames
+that parent, and an explicit `{seq}` in a collapsible leaf makes session 2 a child of session 1.
+The leaf must carry one always-rendering token or one literal character, and the rendered leaf
+including its ordinal is capped at 255 bytes with the title truncated at a character boundary.
+(Decided 2026-08-06 resolving the story 40.1 review escalation; FR-127 carries the same words.)
 Document the token table in the module doc — it is the same table `keeper-sync` publishes for
 `journal_template`, and the doc says so (AD-65).
 AC: the default template with title "Standup" at 2026-08-05T14:32 renders exactly
