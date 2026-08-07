@@ -51,6 +51,28 @@ pub trait SyncPlatform: Send + Sync {
     /// passed while the process was not running.
     fn now_ms(&self) -> i64;
 
+    /// Minutes this machine's local wall clock is ahead of UTC, right now.
+    ///
+    /// [`Self::now_ms`] is deliberately UTC — an instant, comparable across
+    /// machines and across a suspend — but two things a person configures are
+    /// not instants at all. A recordings push window (`22:00`–`06:00`, see
+    /// [`crate::profile::PushPolicy::Window`]) is a *local wall-clock* range,
+    /// and reading it against UTC would open the quiet hours at the wrong
+    /// moment for everyone who is not on Greenwich.
+    ///
+    /// Provided rather than required, and this is the one method here with a
+    /// body, because every real host answers it identically — "whatever zone
+    /// this machine is in" — and `gix` already carries the zone database that
+    /// answers it. A required method would have made three implementations
+    /// write the same line. What the default cannot do is *lie*, which is
+    /// exactly what a test needs: [`TestPlatform`] overrides it so a window
+    /// test is the same test in Reykjavík and in Auckland.
+    ///
+    /// East of UTC is positive, matching git's own `+0200` sign convention.
+    fn utc_offset_minutes(&self) -> i32 {
+        machine_utc_offset_minutes()
+    }
+
     /// Free space on the volume holding `path`, in bytes.
     ///
     /// `None` means "could not determine" and callers MUST treat that as
@@ -82,6 +104,21 @@ pub trait SyncPlatform: Send + Sync {
     fn host_label(&self) -> String;
 }
 
+/// This machine's current UTC offset in minutes, east-positive.
+///
+/// Via `gix`, which already resolves the zone database for the commit
+/// signatures it writes, so this adds no dependency and no second idea of what
+/// time it is here. A machine whose zone cannot be resolved answers UTC, which
+/// is `gix`'s own fallback and the only answer available when the question has
+/// no data behind it.
+///
+/// Seconds are discarded rather than rounded: no political time zone has ever
+/// had a sub-minute offset since 1972, and the only consumer compares against
+/// an `HH:MM` a person typed.
+fn machine_utc_offset_minutes() -> i32 {
+    gix::date::Time::now_local_or_utc().offset / 60
+}
+
 /// An in-memory `SyncPlatform` for unit tests.
 ///
 /// Lives in the library rather than behind `#[cfg(test)]` so the sibling crates
@@ -95,6 +132,7 @@ pub struct TestPlatform {
     /// Notifications raised, so tests can assert the loud-failure contract.
     pub notifications: std::sync::Mutex<Vec<(String, String)>>,
     now_ms: std::sync::atomic::AtomicI64,
+    utc_offset_minutes: std::sync::atomic::AtomicI32,
     free_space: Option<u64>,
     git: Option<PathBuf>,
 }
@@ -106,6 +144,9 @@ impl TestPlatform {
             secrets: std::sync::Mutex::new(std::collections::HashMap::new()),
             notifications: std::sync::Mutex::new(Vec::new()),
             now_ms: std::sync::atomic::AtomicI64::new(1_700_000_000_000),
+            // UTC, so a test that reasons about wall-clock times reasons about
+            // the same ones on every machine that runs it.
+            utc_offset_minutes: std::sync::atomic::AtomicI32::new(0),
             free_space: Some(100 * 1024 * 1024 * 1024),
             git: Some(PathBuf::from("/usr/bin/git")),
         }
@@ -131,6 +172,17 @@ impl TestPlatform {
     pub fn advance_ms(&self, delta: i64) {
         self.now_ms
             .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Put the test machine in a zone, for the recordings push window.
+    ///
+    /// Settable rather than fixed at construction, and settable *while the
+    /// engine holds this platform*, because the interesting case is a session
+    /// that starts outside the quiet hours and ends inside them — which is one
+    /// clock and one zone, not two platforms.
+    pub fn set_utc_offset_minutes(&self, minutes: i32) {
+        self.utc_offset_minutes
+            .store(minutes, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Poison-tolerant lock: a panicking test must not cascade into every other
@@ -167,6 +219,11 @@ impl SyncPlatform for TestPlatform {
 
     fn now_ms(&self) -> i64 {
         self.now_ms.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn utc_offset_minutes(&self) -> i32 {
+        self.utc_offset_minutes
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn free_space(&self, _path: &Path) -> Option<u64> {
