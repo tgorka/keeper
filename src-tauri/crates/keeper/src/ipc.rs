@@ -47,11 +47,12 @@ use keeper_core::vm::{
     ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError,
     IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
     NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
-    PaletteResultsVm, PingVm, Provider, RecordingPathPreviewVm, RecordingPermissionVm,
-    RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm,
-    RecordingTargetVm, RecordingUiState, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
-    ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm,
-    TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
+    PaletteResultsVm, PingVm, Provider, RecordingDestinationKind, RecordingPathPreviewVm,
+    RecordingPermissionVm, RecordingProfileVm, RecordingSettingsVm, RecordingSourcesVm,
+    RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState, RemoteDraftVm,
+    ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm, SearchHitVm,
+    SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch, TypingBatch,
+    VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -2961,7 +2962,7 @@ fn nearest_existing_ancestor(path: &Path) -> PathBuf {
 #[tauri::command]
 pub fn recording_reveal_folder(state: State<'_, AppState>) -> Result<(), IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    let destination = effective_destination_dir(&data_dir)?;
+    let destination = effective_destination_dir(&data_dir, &state.platform);
     let target = nearest_existing_ancestor(&destination);
     tauri_plugin_opener::reveal_item_in_dir(&target).map_err(|e| {
         to_ipc_error(CoreError::Internal(format!(
@@ -5059,7 +5060,7 @@ pub async fn recording_start(
     // persists and mirrors both surfaces but only affects the next Recording
     // Session.
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    let directory = effective_destination_dir(&data_dir)?;
+    let directory = effective_destination_dir(&data_dir, &state.platform);
     // Best-effort pre-record recovery of any session a prior crash left stale
     // (Story 17.3, FR-73, AD-37): reconcile every orphaned `recording` manifest
     // under the recovery-scan lock (serialized against the detached startup pass
@@ -5748,16 +5749,365 @@ pub(crate) fn acknowledge_recording(state: &AppState) -> RecordingStatusVm {
     recording_snapshot(state)
 }
 
-/// Resolve the EFFECTIVE recording destination folder (Story 19.5): the
-/// persisted user choice when one exists, otherwise the default
-/// `dirs::video_dir()/keeper` (falling back to `<data_dir>/keeper` where Movies
-/// is absent). Resolution lives in the SHELL because `dirs::video_dir()` is a
-/// platform probe keeper-core must not hold — the UI always receives a concrete
-/// folder, and "unset vs default" ambiguity never reaches the frontend.
-fn effective_destination_dir(data_dir: &Path) -> Result<PathBuf, IpcError> {
-    let stored =
-        keeper_core::registry::get_recording_destination_dir(data_dir).map_err(to_ipc_error)?;
-    Ok(resolve_destination_dir(stored, data_dir))
+/// One sync profile, reduced to the four facts a recordings destination turns on
+/// (Story 41.2, FR-131).
+///
+/// `keeper-sync`'s `SyncProfile` is a thirty-field type that only exists on
+/// desktop; this is what the destination decision actually asks of it, mapped in
+/// exactly one place ([`destination_profile_row`]). That is what keeps the
+/// resolution and both of its refusals ordinary total functions: they compile on
+/// iOS, where there is no engine to ask at all, and every degrade path in this
+/// story is exercised in a test on a machine with no `git` — which is precisely
+/// the machine those paths are about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DestinationProfileRow {
+    /// The profile's opaque id — what the destination setting persists.
+    id: String,
+    /// The profile's human name, for the refusal sentences and the VM.
+    name: String,
+    /// The synced folder itself. A plain destination anywhere inside it would be
+    /// committed by this profile, which is the ambiguity the setter refuses.
+    local_path: PathBuf,
+    /// The profile's RESOLVED recordings root
+    /// ([`keeper_sync::SyncProfile::recordings_root`]), or `None` when it does
+    /// not say it holds recordings (Story 41.1's `recordings` block absent).
+    recordings_root: Option<PathBuf>,
+    /// Whether watch mode is armed. A paused profile is neither a destination nor
+    /// a collision — see [`enclosing_destination_profile`].
+    enabled: bool,
+}
+
+/// This machine's sync profiles, or the reason there are none to be had.
+///
+/// `Err` carries a sentence for a `warn` line rather than an [`IpcError`],
+/// because "there is no usable `git` on this machine" is not a failure of
+/// whatever asked: the destination degrades to the plain-folder answer and the
+/// recorder keeps working (NFR-34). Only the settings WRITE turns it into a
+/// refusal, and only for a submitted profile id it cannot verify.
+type DestinationProfileTable = Result<Vec<DestinationProfileRow>, String>;
+
+/// Why the destination resolution is asking for the profile table (Story 41.2),
+/// which decides what the answer is allowed to COST.
+///
+/// The two are not interchangeable. An explicit choice is a promise the user
+/// made, so resolving it may build the engine — a `keeper.db` read, a `git`
+/// probe and a `sync.db` open — because recording somewhere other than the folder
+/// they picked is not an option. The single-flagged-profile default is a
+/// convenience, so it uses an engine only if one is already open: on a machine
+/// with no usable `git` the engine can never be built, and `git_resolution`
+/// deliberately does not cache a refusal (so a `brew install git` takes effect
+/// without a relaunch), which would make every settings read — and every
+/// keystroke of the template preview, which resolves the same root — pay a full
+/// `PATH` search with a process spawn per candidate to be told the same thing
+/// again. The cost of that asymmetry is one narrow window: between boot and
+/// `start_supervisor` building the engine, the implicit default reads as the
+/// folder answer. Nothing is persisted from a read, so the window costs a fresh
+/// install's first pane paint and never a written destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileTableNeed {
+    /// Resolving an explicitly stored profile id, or validating a submission.
+    Chosen,
+    /// Looking for the implicit default with neither key set.
+    Default,
+}
+
+/// The recordings destination as a resolved DECISION rather than a path (Story
+/// 41.2, FR-131, UX-DR47): the absolute root, which of the two settings keys
+/// produced it, and the profile's id and name when a profile did.
+///
+/// Composed once, here, so no surface joins a `local_path` and a subfolder
+/// itself: `recording_start`, the recovery scans, the palette's reveal and the
+/// settings card all read the same answer, and none of them can disagree with
+/// where the recorder actually writes.
+struct RecordingDestination {
+    /// The absolute root recordings land under, whichever choice is in force.
+    root: PathBuf,
+    /// Which choice produced [`Self::root`].
+    kind: RecordingDestinationKind,
+    /// The chosen profile's id, under [`RecordingDestinationKind::Profile`] only.
+    profile_id: Option<String>,
+    /// The chosen profile's name, under [`RecordingDestinationKind::Profile`]
+    /// only. Resolved from the id on every read, never cached beside it, which is
+    /// what makes a rename show up with the same root.
+    profile_name: Option<String>,
+}
+
+/// The EFFECTIVE recordings destination (Story 41.2): the chosen sync profile's
+/// recordings root when that choice still resolves, otherwise Story 19.5's plain
+/// folder answer.
+///
+/// **Total on purpose, in both directions.** Every way a profile answer can fail
+/// — the id names no profile, names a paused one, names one that no longer says
+/// it holds recordings, or there is no engine to ask because this machine has no
+/// usable `git` — degrades to the plain-folder answer and says why at `warn`. A
+/// machine with no `git` still records, and a settings surface that refused to
+/// load because of a stale id would leave the user with no way to fix the very
+/// field that broke it. A `keeper.db` read failure degrades the same way for the
+/// same reason; the sibling getters in [`read_recording_settings`] still surface
+/// that fault, but the DESTINATION always has a concrete root.
+///
+/// Takes the profile table as a lazy closure rather than a platform, so it is
+/// called at most once and only when a profile id is actually stored: building
+/// the engine on a machine with no `git` re-searches `PATH` with a process spawn
+/// per candidate (a refusal is deliberately never cached), and the settings read
+/// runs on every visit to the Recording pane.
+fn effective_recording_destination(
+    data_dir: &Path,
+    profiles: &dyn Fn(ProfileTableNeed) -> DestinationProfileTable,
+) -> RecordingDestination {
+    let stored_dir = match keeper_core::registry::get_recording_destination_dir(data_dir) {
+        Ok(stored) => stored,
+        Err(error) => {
+            tracing::warn!(%error, "the recording destination folder could not be read; using the default folder");
+            None
+        }
+    };
+    let stored_profile = match keeper_core::registry::get_recording_destination_profile(data_dir) {
+        Ok(stored) => stored,
+        Err(error) => {
+            tracing::warn!(%error, "the recording destination profile could not be read; using the folder answer");
+            None
+        }
+    };
+    resolve_recording_destination(stored_dir, stored_profile, data_dir, profiles)
+}
+
+/// Resolve the destination from the (already-fetched) persisted values.
+///
+/// The precedence, and it is deterministic rather than a guess:
+///
+/// 1. A stored profile id that still resolves WINS. When the folder key is also
+///    set — a state the setter refuses to create, so a hand-edited `config.json`
+///    is the only way to reach it — the win is announced at `warn` instead of
+///    happening silently.
+/// 2. Neither key set, and EXACTLY ONE enabled, recordings-flagged profile
+///    exists ⇒ that profile, resolved, with nothing written. Flagging a folder as
+///    holding recordings is not something this app does to itself: it is done
+///    deliberately through `keeper-syncd`, and it is already the statement "the
+///    recordings live here", so honouring it is reading the user's answer rather
+///    than inventing one. Two or more is NOT a default — ambiguity resolved by
+///    coin toss would put someone's recordings on a remote they did not pick.
+/// 3. Everything else is the folder answer, and every degrade rule above wins
+///    over the default: a single flagged profile that is paused, gone, or
+///    unreadable is the folder answer with its `warn`.
+///
+/// Pure, so every row of the matrix that ends in a root is asserted without a
+/// registry, an engine, or a `git`.
+fn resolve_recording_destination(
+    stored_dir: Option<String>,
+    stored_profile_id: Option<String>,
+    data_dir: &Path,
+    profiles: &dyn Fn(ProfileTableNeed) -> DestinationProfileTable,
+) -> RecordingDestination {
+    let folder_key_set = stored_dir.is_some();
+    let folder = RecordingDestination {
+        root: resolve_destination_dir(stored_dir, data_dir),
+        kind: RecordingDestinationKind::Folder,
+        profile_id: None,
+        profile_name: None,
+    };
+    let Some(id) = stored_profile_id else {
+        // An explicitly chosen folder is an answer; only the absence of BOTH keys
+        // is the absence of one.
+        if folder_key_set {
+            return folder;
+        }
+        return default_recording_destination(folder, profiles);
+    };
+    if folder_key_set {
+        tracing::warn!(
+            profile = %id,
+            "both recording destination keys are set; the synced folder wins and the next write clears the other"
+        );
+    }
+    let rows = match profiles(ProfileTableNeed::Chosen) {
+        Ok(rows) => rows,
+        Err(reason) => {
+            tracing::warn!(
+                %reason,
+                profile = %id,
+                "the synced folders cannot be read, so the chosen one cannot be resolved; recording into the plain folder instead"
+            );
+            return folder;
+        }
+    };
+    let Some(row) = rows.into_iter().find(|row| row.id == id) else {
+        tracing::warn!(
+            profile = %id,
+            "the chosen synced folder is no longer set up on this machine; recording into the plain folder instead"
+        );
+        return folder;
+    };
+    if !row.enabled {
+        tracing::warn!(
+            profile = %id,
+            "the chosen synced folder is paused, so nothing recorded there would be committed; recording into the plain folder instead"
+        );
+        return folder;
+    }
+    let Some(root) = row.recordings_root else {
+        tracing::warn!(
+            profile = %id,
+            "the chosen synced folder no longer says it holds recordings; recording into the plain folder instead"
+        );
+        return folder;
+    };
+    RecordingDestination {
+        root,
+        kind: RecordingDestinationKind::Profile,
+        profile_id: Some(row.id),
+        profile_name: Some(row.name),
+    }
+}
+
+/// The destination when the owner has chosen nothing at all (Story 41.2, the
+/// `tgdrive` case): the one folder that says it holds recordings, if there is
+/// exactly one.
+///
+/// **Nothing is written.** This is a RESOLUTION, so the settings keys stay empty
+/// and the first explicit choice writes as usual. That is what makes it honest:
+/// the card renders the profile answer with its consequence because that IS where
+/// a recording started now would land, and no render has silently redirected
+/// anyone's recordings to a remote.
+///
+/// **Why exactly one.** With two flagged folders there is no default to be had —
+/// choosing between them here would be a coin toss with a push at the end of it,
+/// and the picker is right there. With none, the surface is exactly today's.
+fn default_recording_destination(
+    folder: RecordingDestination,
+    profiles: &dyn Fn(ProfileTableNeed) -> DestinationProfileTable,
+) -> RecordingDestination {
+    let rows = match profiles(ProfileTableNeed::Default) {
+        Ok(rows) => rows,
+        Err(reason) => {
+            tracing::debug!(
+                %reason,
+                "no synced folders to default to; recording into the plain folder"
+            );
+            return folder;
+        }
+    };
+    let mut flagged = rows.into_iter().filter_map(|row| {
+        let root = row.recordings_root.filter(|_| row.enabled)?;
+        Some((row.id, row.name, root))
+    });
+    let Some((id, name, root)) = flagged.next() else {
+        return folder;
+    };
+    if flagged.next().is_some() {
+        tracing::debug!(
+            "more than one synced folder holds recordings, so there is no default; recording into the plain folder until one is chosen"
+        );
+        return folder;
+    }
+    tracing::info!(
+        profile = %id,
+        "no destination has been chosen and exactly one synced folder holds recordings, so that is where recordings land"
+    );
+    RecordingDestination {
+        root,
+        kind: RecordingDestinationKind::Profile,
+        profile_id: Some(id),
+        profile_name: Some(name),
+    }
+}
+
+/// The EFFECTIVE destination ROOT for the callers that only need the folder —
+/// `recording_start`, the recovery scans, the retitle root, the palette's reveal
+/// and the template preview (Story 19.5, extended by Story 41.2).
+///
+/// Every one of them now sees the profile answer too, which is the whole point of
+/// the story: a destination the settings card resolves to a synced folder and the
+/// recorder resolves to something else would be two destinations. The platform is
+/// threaded in for the engine the resolution may need, exactly as Story 40.4's
+/// `sync_retitled_session` takes one.
+fn effective_destination_dir(data_dir: &Path, platform: &Arc<dyn Platform>) -> PathBuf {
+    effective_recording_destination(data_dir, &|need| destination_profile_table(platform, need))
+        .root
+}
+
+/// This machine's sync profiles, reduced to [`DestinationProfileRow`]s.
+///
+/// Routed through `crate::sync` exactly as Story 40.4's `sync_retitled_session`
+/// is: the engine cannot exist without a usable `git` (AD-41), which is a runtime
+/// fact rather than a build flag, and its absence is an answer here rather than a
+/// failure anyone must handle.
+///
+/// [`ProfileTableNeed`] decides whether the engine may be BUILT for this answer.
+/// A chosen destination is worth the probe; the implicit default is worth only an
+/// engine that is already open (`start_supervisor` opens one at boot on every
+/// machine where sync works at all).
+#[cfg(desktop)]
+fn destination_profile_table(
+    platform: &Arc<dyn Platform>,
+    need: ProfileTableNeed,
+) -> DestinationProfileTable {
+    let engine = match need {
+        ProfileTableNeed::Chosen => {
+            crate::sync::engine(Arc::clone(platform)).map_err(|error| error.to_string())?
+        }
+        ProfileTableNeed::Default => crate::sync::engine_if_open()
+            .ok_or_else(|| "no sync engine is open on this machine".to_owned())?,
+    };
+    let profiles = engine.list_profiles().map_err(|error| error.to_string())?;
+    Ok(profiles.iter().map(destination_profile_row).collect())
+}
+
+/// iOS has no folder sync at all (`keeper-sync` is not even linked there), so
+/// there is no synced folder to choose, none to default to, and none to collide
+/// with. An empty table is the truth on that platform, not a degrade — which is
+/// why this is `Ok`.
+#[cfg(not(desktop))]
+fn destination_profile_table(
+    platform: &Arc<dyn Platform>,
+    need: ProfileTableNeed,
+) -> DestinationProfileTable {
+    let _ = (platform, need);
+    Ok(Vec::new())
+}
+
+/// The one place a `SyncProfile` becomes a [`DestinationProfileRow`], so "where
+/// do this profile's recordings live" is asked of `keeper-sync` once
+/// ([`keeper_sync::SyncProfile::recordings_root`]) and never reimplemented.
+#[cfg(desktop)]
+fn destination_profile_row(profile: &keeper_sync::SyncProfile) -> DestinationProfileRow {
+    DestinationProfileRow {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+        local_path: profile.local_path.clone(),
+        recordings_root: profile.recordings_root(),
+        enabled: profile.enabled,
+    }
+}
+
+/// The enabled profile whose folder CONTAINS `path`, deepest match first (Story
+/// 41.2) — the collision the plain-folder refusal is about.
+///
+/// The shape of `crate::sync::profile_for_path` over the reduced rows, and it
+/// skips disabled profiles for that function's reason and one more: the
+/// resolution above degrades for a paused profile and the picker does not offer
+/// one, so `enabled` means exactly one thing everywhere in this story — a paused
+/// folder is neither a destination nor a collision. The trade-off is real and
+/// accepted: a folder chosen inside a paused profile's tree becomes ambiguous if
+/// that profile is ever resumed. The alternative refuses the folder while also
+/// refusing the profile it names, which is a dead end from this surface.
+fn enclosing_destination_profile<'a>(
+    rows: &'a [DestinationProfileRow],
+    path: &Path,
+) -> Option<&'a DestinationProfileRow> {
+    let mut deepest: Option<&'a DestinationProfileRow> = None;
+    for row in rows {
+        if !row.enabled || !path.starts_with(&row.local_path) {
+            continue;
+        }
+        let deeper = deepest.is_none_or(|held| {
+            row.local_path.components().count() > held.local_path.components().count()
+        });
+        if deeper {
+            deepest = Some(row);
+        }
+    }
+    deepest
 }
 
 /// Resolve the effective destination folder from the (already-fetched) persisted
@@ -5830,16 +6180,7 @@ pub(crate) fn recover_orphaned_recordings(state: &AppState) {
             return;
         }
     };
-    let base = match effective_destination_dir(&data_dir) {
-        Ok(base) => base,
-        Err(error) => {
-            tracing::warn!(
-                error = %error.message,
-                "startup recovery: could not resolve the destination dir (non-fatal)"
-            );
-            return;
-        }
-    };
+    let base = effective_destination_dir(&data_dir, &state.platform);
     let _scan = plain_lock(&state.recovery_scan);
     let is_active = |folder: &Path| plain_lock(&state.reserved_recording_folders).contains(folder);
     let recovered = recover_orphaned_sessions(&base, &is_active);
@@ -5933,9 +6274,10 @@ pub async fn recording_retitle(
     // a manifest write, any of which can be on a slow removable volume.
     let source = PathBuf::from(folder);
     let moving = source.clone();
+    let resolving = Arc::clone(&platform);
     let (manifest, destination) =
         off_async_runtime(move || -> Result<(SessionManifest, PathBuf), IpcError> {
-            let root = effective_destination_dir(&data_dir)?;
+            let root = effective_destination_dir(&data_dir, &resolving);
             let source = moving;
             // Not under the root ⇒ refused. The rendered destination is a path
             // relative to this root, so retitling a folder from elsewhere would
@@ -6205,11 +6547,12 @@ pub async fn recovered_sessions_list(
     state: State<'_, AppState>,
 ) -> Result<Vec<RecordingSummaryVm>, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let platform = Arc::clone(&state.platform);
     // `async` per AD-34-5, and the whole scan goes to the blocking pool as one
     // unit: two `keeper.db` reads plus a `read_dir` with a manifest load per
     // subfolder is the heaviest command the Recording pane issues.
     off_async_runtime(move || -> Result<Vec<RecordingSummaryVm>, IpcError> {
-        let base = effective_destination_dir(&data_dir)?;
+        let base = effective_destination_dir(&data_dir, &platform);
         let acknowledged = keeper_core::registry::get_recovered_sessions_acknowledged(&data_dir)
             .map_err(to_ipc_error)?;
         Ok(scan_recovered_sessions(&base, &acknowledged))
@@ -6492,24 +6835,19 @@ pub fn recovered_session_acknowledge(
     folder: String,
 ) -> Result<(), IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    latch_recovered_session_acknowledgement(&data_dir, Path::new(&folder))
+    latch_recovered_session_acknowledgement(&data_dir, &state.platform, Path::new(&folder))
 }
 
 /// The registry half of [`recovered_session_acknowledge`], split out so the
 /// "an environmental read failure is still a successful dismiss" rule is
 /// testable over a temp data dir without Tauri state.
 #[cfg(desktop)]
-fn latch_recovered_session_acknowledgement(data_dir: &Path, folder: &Path) -> Result<(), IpcError> {
-    let root = match effective_destination_dir(data_dir) {
-        Ok(root) => root,
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                "acknowledge recovered session: could not read the destination setting; skipping latch"
-            );
-            return Ok(());
-        }
-    };
+fn latch_recovered_session_acknowledgement(
+    data_dir: &Path,
+    platform: &Arc<dyn Platform>,
+    folder: &Path,
+) -> Result<(), IpcError> {
+    let root = effective_destination_dir(data_dir, platform);
     let Some(relative) = session_relative_key(&root, folder) else {
         tracing::warn!(
             folder = %folder.display(),
@@ -6585,7 +6923,13 @@ pub async fn recording_settings_get(
     state: State<'_, AppState>,
 ) -> Result<RecordingSettingsVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    off_async_runtime(move || read_recording_settings(&data_dir)).await?
+    let platform = Arc::clone(&state.platform);
+    off_async_runtime(move || {
+        read_recording_settings(&data_dir, &|need| {
+            destination_profile_table(&platform, need)
+        })
+    })
+    .await?
 }
 
 /// Read the folder-card list sizes (folded / unfolded).
@@ -6636,15 +6980,25 @@ pub async fn sync_list_settings_set(
 /// [`recording_settings_set`]'s re-read so there is exactly one definition of
 /// "effective settings" and the write path never returns a value the read path
 /// would not.
-fn read_recording_settings(data_dir: &Path) -> Result<RecordingSettingsVm, IpcError> {
+///
+/// `profiles` is the destination resolution's lazy view of this machine's synced
+/// folders (Story 41.2) — consulted only when a profile id is actually stored,
+/// and injected rather than derived from a platform so every degrade row is
+/// asserted without an engine.
+fn read_recording_settings(
+    data_dir: &Path,
+    profiles: &dyn Fn(ProfileTableNeed) -> DestinationProfileTable,
+) -> Result<RecordingSettingsVm, IpcError> {
+    let destination = effective_recording_destination(data_dir, profiles);
     Ok(RecordingSettingsVm {
         segment_mb: keeper_core::registry::get_recording_segment_mb(data_dir)
             .map_err(to_ipc_error)?,
         duration_cap_minutes: keeper_core::registry::get_recording_duration_cap_minutes(data_dir)
             .map_err(to_ipc_error)?,
-        destination_dir: effective_destination_dir(data_dir)?
-            .to_string_lossy()
-            .into_owned(),
+        destination_dir: destination.root.to_string_lossy().into_owned(),
+        destination_kind: destination.kind,
+        destination_profile_id: destination.profile_id,
+        destination_profile_name: destination.profile_name,
         fps: keeper_core::registry::get_recording_fps(data_dir).map_err(to_ipc_error)?,
         codec: keeper_core::registry::get_recording_codec(data_dir).map_err(to_ipc_error)?,
         scale_percent: keeper_core::registry::get_recording_scale_percent(data_dir)
@@ -6653,6 +7007,251 @@ fn read_recording_settings(data_dir: &Path) -> Result<RecordingSettingsVm, IpcEr
             .map_err(to_ipc_error)?,
         path_template: effective_path_template(data_dir)?,
     })
+}
+
+/// Why a submitted recordings destination is refused, in the words the surface
+/// prints (Story 41.2, UX-DR47).
+///
+/// One type so each sentence is written once and asserted in a test rather than
+/// guessed at — the same reason [`echo_cancellation_locked_error`] is a named
+/// function. Every message says what is wrong AND what to do next, and each of
+/// the ones about a synced folder NAMES it: a refusal that will not say which
+/// folder it collided with is the kind of message people file tickets about.
+///
+/// Built here rather than as a `keeper-core` `RecordingError` because a sync
+/// profile is something only the shell knows about (AD-40 keeps the two crates
+/// apart), and these sentences quote a profile's name.
+enum DestinationRefusal {
+    /// `kind: profile` with no id — a malformed submission, not a downgrade to
+    /// the folder choice: silently recording somewhere the user did not choose is
+    /// the whole failure mode this story exists to remove.
+    NoProfileChosen,
+    /// The id names no profile on this machine.
+    UnknownProfile,
+    /// The named profile is paused, so nothing recorded there would be committed.
+    PausedProfile(String),
+    /// The named profile does not say it holds recordings (Story 41.1's flag),
+    /// which is a thing only `keeper-syncd` sets — never this surface.
+    NotRecordingsProfile(String),
+    /// There is no engine to verify the id against (no usable `git`).
+    ProfilesUnreadable,
+    /// A plain folder inside a synced folder's tree that is not its recordings
+    /// root — the ambiguous case that would otherwise sync by accident.
+    /// `offers_recordings` picks the next step that actually exists.
+    InsideSyncedFolder {
+        /// The synced folder the choice would have collided with.
+        profile: String,
+        /// Whether that folder can be chosen as the destination instead.
+        offers_recordings: bool,
+    },
+}
+
+impl DestinationRefusal {
+    /// The sentence the settings surface renders verbatim beside the control.
+    fn message(&self) -> String {
+        match self {
+            Self::NoProfileChosen => {
+                "no synced folder was chosen — pick one, or record into a plain folder instead"
+                    .to_owned()
+            }
+            Self::UnknownProfile => {
+                "that synced folder is not set up on this machine — pick another destination"
+                    .to_owned()
+            }
+            Self::PausedProfile(profile) => format!(
+                "the synced folder \"{profile}\" is paused, so nothing recorded there would be committed — resume it, or pick another destination"
+            ),
+            Self::NotRecordingsProfile(profile) => format!(
+                "the synced folder \"{profile}\" doesn't hold recordings — pick one that does, or record into a plain folder instead"
+            ),
+            Self::ProfilesUnreadable => {
+                "the synced folders can't be read on this machine, so a synced destination can't be verified — record into a plain folder instead"
+                    .to_owned()
+            }
+            Self::InsideSyncedFolder {
+                profile,
+                offers_recordings: true,
+            } => format!(
+                "that folder is inside the synced folder \"{profile}\", so recordings there would be committed by it without anything saying so — choose the synced folder \"{profile}\" itself, or a folder outside it"
+            ),
+            Self::InsideSyncedFolder {
+                profile,
+                offers_recordings: false,
+            } => format!(
+                "that folder is inside the synced folder \"{profile}\", so recordings there would be committed by it without anything saying so — choose a folder outside it, or let \"{profile}\" say it holds recordings"
+            ),
+        }
+    }
+
+    /// Only "the synced folders could not be read" can succeed on a retry —
+    /// installing a usable `git` changes that answer. Every other refusal is a
+    /// statement about the submitted value, and resubmitting it fails the same way.
+    fn retriable(&self) -> bool {
+        matches!(self, Self::ProfilesUnreadable)
+    }
+
+    fn into_error(self) -> IpcError {
+        IpcError {
+            code: IpcErrorCode::RecordingDestinationRefused,
+            message: self.message(),
+            account_id: None,
+            retriable: self.retriable(),
+        }
+    }
+}
+
+/// Which settings key a submitted destination becomes (Story 41.2).
+///
+/// Exactly one variant, because exactly one key is ever in force: writing either
+/// clears the other, so the state the getter has to resolve profile-first cannot
+/// be created by this command at all.
+enum DestinationChoice {
+    /// Store this folder under `recording.destination_dir` (blank CLEARS it, which
+    /// reads back as the default root) and clear the profile key.
+    Folder(String),
+    /// Store this profile id under `recording.destination_profile_id` and clear
+    /// the folder key.
+    Profile(String),
+}
+
+/// Decide what a submitted destination becomes, or refuse it — BEFORE anything is
+/// written (Story 41.2, FR-131, UX-DR47).
+///
+/// `destination_kind` is the discriminator: under `Profile` the folder field is an
+/// answer this command produced rather than a question the user asked, and under
+/// `Folder` the id is. The two refusals are the ambiguities the epic refuses to
+/// let happen quietly — a profile that cannot hold recordings, and a folder that
+/// would be committed by a synced folder with nothing anywhere saying so — plus
+/// the one exception that is not ambiguous at all: a folder that IS a synced
+/// folder's recordings root is the same place as that profile's choice, and only
+/// one of the two carries the consequence, so it is normalised to the profile.
+fn destination_choice(
+    settings: &RecordingSettingsVm,
+    profiles: &dyn Fn(ProfileTableNeed) -> DestinationProfileTable,
+) -> Result<DestinationChoice, IpcError> {
+    match settings.destination_kind {
+        RecordingDestinationKind::Profile => {
+            let id = settings
+                .destination_profile_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| DestinationRefusal::NoProfileChosen.into_error())?;
+            // Unverifiable is refused here, unlike on the read side: storing a
+            // choice keeper cannot resolve would hand the user a destination that
+            // silently is not the one they picked.
+            let rows = profiles(ProfileTableNeed::Chosen).map_err(|reason| {
+                tracing::warn!(
+                    %reason,
+                    "recording settings: a synced destination cannot be verified, so it is refused"
+                );
+                DestinationRefusal::ProfilesUnreadable.into_error()
+            })?;
+            let row = rows
+                .iter()
+                .find(|row| row.id == id)
+                .ok_or_else(|| DestinationRefusal::UnknownProfile.into_error())?;
+            if !row.enabled {
+                return Err(DestinationRefusal::PausedProfile(row.name.clone()).into_error());
+            }
+            if row.recordings_root.is_none() {
+                return Err(DestinationRefusal::NotRecordingsProfile(row.name.clone()).into_error());
+            }
+            Ok(DestinationChoice::Profile(id.to_owned()))
+        }
+        RecordingDestinationKind::Folder => {
+            let submitted = settings.destination_dir.trim();
+            // Blank is not a refusal: it clears the key and the effective read
+            // returns the `~/Movies/keeper` default, which is both how a surface
+            // says "back to the default folder" and how it leaves a profile.
+            if submitted.is_empty() {
+                return Ok(DestinationChoice::Folder(String::new()));
+            }
+            // A machine with no usable `git` has no synced folders to collide
+            // with and must still be able to choose where it records (NFR-34), so
+            // here the missing table skips the check out loud rather than
+            // becoming a refusal.
+            let rows = match profiles(ProfileTableNeed::Chosen) {
+                Ok(rows) => rows,
+                Err(reason) => {
+                    tracing::warn!(
+                        %reason,
+                        "recording settings: the chosen folder could not be checked against the synced folders"
+                    );
+                    return Ok(DestinationChoice::Folder(submitted.to_owned()));
+                }
+            };
+            let folder = Path::new(submitted);
+            match enclosing_destination_profile(&rows, folder) {
+                Some(row) if row.recordings_root.as_deref() == Some(folder) => {
+                    tracing::info!(
+                        profile = %row.id,
+                        "recording settings: the chosen folder IS a synced folder's recordings root, so it is stored as that choice"
+                    );
+                    Ok(DestinationChoice::Profile(row.id.clone()))
+                }
+                Some(row) => Err(DestinationRefusal::InsideSyncedFolder {
+                    profile: row.name.clone(),
+                    offers_recordings: row.recordings_root.is_some(),
+                }
+                .into_error()),
+                None => Ok(DestinationChoice::Folder(submitted.to_owned())),
+            }
+        }
+    }
+}
+
+/// The recordings-flagged synced folders this machine can record into (Story
+/// 41.2, FR-131) — the destination picker's only data source.
+///
+/// Enabled AND flagged only, which is the same rule the resolution and the setter
+/// use: a folder that has not said it holds recordings is not a destination, and
+/// a paused one resolves to the plain folder anyway, so offering either would be
+/// offering a choice keeper would then quietly ignore (AD-27's "no dead buttons").
+///
+/// An empty list is a normal answer and never an error: on a machine with no
+/// usable `git`, no engine, or simply no flagged profile the surface renders
+/// exactly today's single folder chooser — no empty picker, no new copy.
+#[tauri::command]
+pub async fn recording_destination_profiles(
+    state: State<'_, AppState>,
+) -> Result<Vec<RecordingProfileVm>, IpcError> {
+    let platform = Arc::clone(&state.platform);
+    // `async` per AD-34-5: this opens `sync.db` and, on a machine whose `git` has
+    // never been resolved, probes for one — neither belongs on the main thread.
+    off_async_runtime(move || {
+        destination_profile_vms(&destination_profile_table(
+            &platform,
+            ProfileTableNeed::Chosen,
+        ))
+    })
+    .await
+}
+
+/// The picker rows for a profile table, dropping the ones that are not a
+/// destination. Split from the command so the filter is asserted without an
+/// engine.
+fn destination_profile_vms(table: &DestinationProfileTable) -> Vec<RecordingProfileVm> {
+    let rows = match table {
+        Ok(rows) => rows,
+        Err(reason) => {
+            tracing::warn!(
+                %reason,
+                "the synced folders could not be read, so the destination picker offers none"
+            );
+            return Vec::new();
+        }
+    };
+    rows.iter()
+        .filter(|row| row.enabled)
+        .filter_map(|row| {
+            Some(RecordingProfileVm {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                recordings_root: row.recordings_root.as_ref()?.to_string_lossy().into_owned(),
+            })
+        })
+        .collect()
 }
 
 /// The rejection a `recording_settings_set` earns for trying to change echo
@@ -6669,18 +7268,21 @@ fn echo_cancellation_locked_error() -> IpcError {
     }
 }
 
-/// Persist the recording settings (Story 17.5 + 19.5 + 40.2, FR-72):
-/// clamp/normalize to the authored bounds (segment `100..=5000` MB, duration
-/// cap `1..=600` min, fps {10, 15, 30, 60} — clamp, not reject), write every
-/// value into the `settings` k/v table, and return the effective (re-read) VM
-/// so the UI never displays an unsaved value. The destination is persisted
-/// verbatim — it is validated at Start time by the pre-flight, not here. The
-/// path template is the one field that is REJECTED rather than clamped: a
-/// template is a specification, so an unparseable one earns
-/// `IpcErrorCode::RecordingTemplateInvalid` carrying the parse reason, and
-/// nothing at all is written. A running session is never mutated —
-/// `recording_start` re-reads at start, so edits apply to the next Recording
-/// Session only. Failures funnel through [`to_ipc_error`].
+/// Persist the recording settings (Story 17.5 + 19.5 + 40.2 + 41.2, FR-72,
+/// FR-131): clamp/normalize to the authored bounds (segment `100..=5000` MB,
+/// duration cap `1..=600` min, fps {10, 15, 30, 60} — clamp, not reject), write
+/// every value into the `settings` k/v table, and return the effective (re-read)
+/// VM so the UI never displays an unsaved value.
+///
+/// Two fields are REJECTED rather than clamped, because both are specifications
+/// rather than data. An unparseable path template earns
+/// `IpcErrorCode::RecordingTemplateInvalid` carrying the parse reason. A
+/// destination that cannot become a single unambiguous decision earns
+/// `IpcErrorCode::RecordingDestinationRefused` naming what it lacks or what it
+/// would have collided with ([`destination_choice`]). Either way nothing at all
+/// is written. A running session is never mutated — `recording_start` re-reads at
+/// start, so edits apply to the next Recording Session only. Failures funnel
+/// through [`to_ipc_error`].
 ///
 /// `async` per AD-34-5, with the writes and the re-read in one blocking hop so no
 /// other command can observe a half-written settings row from between them.
@@ -6699,7 +7301,13 @@ pub async fn recording_settings_set(
     // round-trips the same echo-cancellation value applies normally.
     let session_live =
         live_snapshot(&state.recording_run).is_some_and(|(snapshot, _)| snapshot.state.is_live());
-    off_async_runtime(move || write_recording_settings(&data_dir, &settings, session_live)).await?
+    let platform = Arc::clone(&state.platform);
+    off_async_runtime(move || {
+        write_recording_settings(&data_dir, &settings, session_live, &|need| {
+            destination_profile_table(&platform, need)
+        })
+    })
+    .await?
 }
 
 /// The blocking body of [`recording_settings_set`]: the Story 22.7 liveness
@@ -6713,6 +7321,7 @@ fn write_recording_settings(
     data_dir: &Path,
     settings: &RecordingSettingsVm,
     session_live: bool,
+    profiles: &dyn Fn(ProfileTableNeed) -> DestinationProfileTable,
 ) -> Result<RecordingSettingsVm, IpcError> {
     // Reject BEFORE any write: a rejected request must leave the settings table
     // byte-for-byte as it was, not half-applied with only the echo row refused.
@@ -6737,6 +7346,13 @@ fn write_recording_settings(
             }))
         })?;
     }
+    // Story 41.2, in the same block and for the same reason, one step further:
+    // the destination is a DECISION, so what a submission MEANS is settled here,
+    // before any row moves. A refusal leaves the table untouched, and an accepted
+    // one names exactly one of the two keys — the other is cleared below, which is
+    // what makes "exactly one key in force" true by construction rather than by
+    // convention.
+    let choice = destination_choice(settings, profiles)?;
     keeper_core::registry::set_recording_segment_mb(data_dir, settings.segment_mb)
         .map_err(to_ipc_error)?;
     keeper_core::registry::set_recording_duration_cap_minutes(
@@ -6744,8 +7360,23 @@ fn write_recording_settings(
         settings.duration_cap_minutes,
     )
     .map_err(to_ipc_error)?;
-    keeper_core::registry::set_recording_destination_dir(data_dir, &settings.destination_dir)
-        .map_err(to_ipc_error)?;
+    // The losing key is CLEARED, not left behind: a stale folder beside a live
+    // profile choice is the ambiguous state the getter has to resolve
+    // profile-first, and this command is what keeps it unreachable.
+    match &choice {
+        DestinationChoice::Folder(dir) => {
+            keeper_core::registry::set_recording_destination_dir(data_dir, dir)
+                .map_err(to_ipc_error)?;
+            keeper_core::registry::set_recording_destination_profile(data_dir, "")
+                .map_err(to_ipc_error)?;
+        }
+        DestinationChoice::Profile(id) => {
+            keeper_core::registry::set_recording_destination_profile(data_dir, id)
+                .map_err(to_ipc_error)?;
+            keeper_core::registry::set_recording_destination_dir(data_dir, "")
+                .map_err(to_ipc_error)?;
+        }
+    }
     keeper_core::registry::set_recording_fps(data_dir, settings.fps).map_err(to_ipc_error)?;
     keeper_core::registry::set_recording_codec(data_dir, &settings.codec).map_err(to_ipc_error)?;
     keeper_core::registry::set_recording_scale_percent(data_dir, settings.scale_percent)
@@ -6754,7 +7385,7 @@ fn write_recording_settings(
         .map_err(to_ipc_error)?;
     keeper_core::registry::set_recording_path_template(data_dir, &settings.path_template)
         .map_err(to_ipc_error)?;
-    read_recording_settings(data_dir)
+    read_recording_settings(data_dir, profiles)
 }
 
 /// Preview what a path template would name the next recording (Story 40.2,
@@ -6788,8 +7419,9 @@ pub async fn recording_path_preview(
     // it: the preview's promise is "this is where a recording started now would
     // land", and a clock read anywhere below this line would be the same one.
     let ctx = preview_render_ctx(&Local::now(), title.as_deref());
+    let platform = Arc::clone(&state.platform);
     off_async_runtime(move || -> Result<RecordingPathPreviewVm, IpcError> {
-        let root = effective_destination_dir(&data_dir)?;
+        let root = effective_destination_dir(&data_dir, &platform);
         Ok(compose_path_preview(&root, &template, &ctx))
     })
     .await?
@@ -8103,7 +8735,8 @@ mod tests {
             write_session_with_id(&year, "keeper-rec x", session_id, ManifestStatus::Recovered);
         assert_eq!(scan_recovered_sessions(&base, &[]).len(), 1);
 
-        latch_recovered_session_acknowledgement(&data_dir, &folder).expect("latch the dismissal");
+        latch_recovered_session_acknowledgement(&data_dir, &resolution_platform(), &folder)
+            .expect("latch the dismissal");
         let acknowledged = keeper_core::registry::get_recovered_sessions_acknowledged(&data_dir)
             .expect("read the seen-set back");
         assert_eq!(
@@ -8139,7 +8772,8 @@ mod tests {
         let other = write_session(&base, "keeper-rec other", ManifestStatus::Recovered);
         assert_eq!(scan_recovered_sessions(&base, &[]).len(), 2);
 
-        latch_recovered_session_acknowledgement(&data_dir, &folder).expect("latch the dismissal");
+        latch_recovered_session_acknowledgement(&data_dir, &resolution_platform(), &folder)
+            .expect("latch the dismissal");
         let acknowledged = keeper_core::registry::get_recovered_sessions_acknowledged(&data_dir)
             .expect("read the seen-set back");
         assert_eq!(acknowledged, vec!["2026/keeper-rec legacy".to_owned()]);
@@ -8163,14 +8797,18 @@ mod tests {
         // The frontend drops the card from local state the moment it calls the
         // command, so a rejected dismiss shows as a success and then resurrects
         // the card later with no explanation. A data dir that is a FILE makes
-        // every `keeper.db` read fail.
+        // every `keeper.db` read fail — and since Story 41.2 the destination read
+        // degrades to the default root rather than erroring, so the latch is
+        // skipped one step later (the folder is not under that root) and the
+        // dismiss still succeeds. Either way it must never fail on the user.
         let root = scan_temp_dir("ack-no-db");
         let folder = write_session(&root, "keeper-rec x", ManifestStatus::Recovered);
         let data_dir = root.join("not-a-data-dir");
         std::fs::write(&data_dir, b"").expect("occupy the data-dir path with a file");
 
         assert!(
-            latch_recovered_session_acknowledgement(&data_dir, &folder).is_ok(),
+            latch_recovered_session_acknowledgement(&data_dir, &resolution_platform(), &folder)
+                .is_ok(),
             "an unreadable destination setting is a logged no-op, never a failed dismiss"
         );
 
@@ -8597,10 +9235,31 @@ mod tests {
         dir
     }
 
+    /// The empty profile table (Story 41.2), for every settings test that is not
+    /// about the destination CHOICE.
+    ///
+    /// Injected rather than derived from a platform so nothing here can reach a
+    /// real engine — which would open this machine's own `sync.db` as a side
+    /// effect of asserting a frame rate — and so the "no synced folders at all"
+    /// state, which is most machines, is the default every test runs under.
+    fn no_profiles(_need: ProfileTableNeed) -> DestinationProfileTable {
+        Ok(Vec::new())
+    }
+
+    /// A platform port for the call sites that resolve a destination ROOT.
+    ///
+    /// Only the engine leg needs one, and no test that uses this stores a
+    /// destination profile id, so the lazy profile table is never consulted; the
+    /// double keeps that explicit (its data dir is a path nothing is written to).
+    fn resolution_platform() -> Arc<dyn Platform> {
+        Arc::new(CapturingPlatform::new())
+    }
+
     /// The VM a fresh install reads, with `destination_dir` filled from the
     /// same resolver the read path uses (it is echoed back, never clamped).
     fn settings_vm(dir: &Path, echo_cancellation: bool) -> RecordingSettingsVm {
-        let mut vm = read_recording_settings(dir).expect("read the effective settings");
+        let mut vm =
+            read_recording_settings(dir, &no_profiles).expect("read the effective settings");
         vm.echo_cancellation = echo_cancellation;
         vm
     }
@@ -8612,21 +9271,21 @@ mod tests {
     fn recording_settings_read_and_write_carry_echo_cancellation() {
         let dir = settings_temp_dir();
         assert!(
-            !read_recording_settings(&dir)
+            !read_recording_settings(&dir, &no_profiles)
                 .expect("fresh read")
                 .echo_cancellation,
             "a fresh install must read echo cancellation off"
         );
 
         let on = settings_vm(&dir, true);
-        let effective =
-            write_recording_settings(&dir, &on, false).expect("write with no live session");
+        let effective = write_recording_settings(&dir, &on, false, &no_profiles)
+            .expect("write with no live session");
         assert!(
             effective.echo_cancellation,
             "the effective VM must reflect the write"
         );
         assert!(
-            read_recording_settings(&dir)
+            read_recording_settings(&dir, &no_profiles)
                 .expect("re-read")
                 .echo_cancellation
         );
@@ -8639,13 +9298,13 @@ mod tests {
     #[test]
     fn recording_settings_set_rejects_a_changed_echo_cancellation_while_live() {
         let dir = settings_temp_dir();
-        let before = read_recording_settings(&dir).expect("baseline read");
+        let before = read_recording_settings(&dir, &no_profiles).expect("baseline read");
         assert!(!before.echo_cancellation, "baseline is off");
 
         let mut request = settings_vm(&dir, true);
         // A co-edited field in the SAME request must not sneak through.
         request.fps = 60;
-        let error = write_recording_settings(&dir, &request, true)
+        let error = write_recording_settings(&dir, &request, true, &no_profiles)
             .expect_err("a changed echo cancellation must be rejected while live");
         assert_eq!(error.code, IpcErrorCode::Internal);
         assert!(!error.retriable, "the answer cannot change until stop");
@@ -8654,7 +9313,7 @@ mod tests {
             "the honest message the UI shows"
         );
 
-        let after = read_recording_settings(&dir).expect("post-rejection read");
+        let after = read_recording_settings(&dir, &no_profiles).expect("post-rejection read");
         assert_eq!(after, before, "a rejected request must write NOTHING");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8668,7 +9327,7 @@ mod tests {
         request.fps = 60;
         request.codec = "hevc".to_owned();
 
-        let effective = write_recording_settings(&dir, &request, true)
+        let effective = write_recording_settings(&dir, &request, true, &no_profiles)
             .expect("an unchanged echo value applies");
         assert_eq!(effective.fps, 60);
         assert_eq!(effective.codec, "hevc");
@@ -8806,7 +9465,7 @@ mod tests {
     fn recording_settings_read_carries_the_effective_path_template() {
         let dir = settings_temp_dir();
         assert_eq!(
-            read_recording_settings(&dir)
+            read_recording_settings(&dir, &no_profiles)
                 .expect("fresh read")
                 .path_template,
             DEFAULT_TEMPLATE,
@@ -8816,7 +9475,7 @@ mod tests {
         keeper_core::registry::set_recording_path_template(&dir, "{yyyy}/{mm}/{dd} {slug}")
             .expect("persist a template");
         assert_eq!(
-            read_recording_settings(&dir)
+            read_recording_settings(&dir, &no_profiles)
                 .expect("read a stored template")
                 .path_template,
             "{yyyy}/{mm}/{dd} {slug}"
@@ -8857,7 +9516,7 @@ mod tests {
     #[test]
     fn recording_settings_set_rejects_a_bad_template_without_writing_anything() {
         let dir = settings_temp_dir();
-        let before = read_recording_settings(&dir).expect("baseline read");
+        let before = read_recording_settings(&dir, &no_profiles).expect("baseline read");
 
         let mut request = before.clone();
         request.path_template = "../{yyyy}".to_owned();
@@ -8865,7 +9524,7 @@ mod tests {
         request.fps = 60;
         request.segment_mb = 1000;
 
-        let error = write_recording_settings(&dir, &request, false)
+        let error = write_recording_settings(&dir, &request, false, &no_profiles)
             .expect_err("a template that cannot parse must be refused");
         assert_eq!(error.code, IpcErrorCode::RecordingTemplateInvalid);
         assert!(
@@ -8877,7 +9536,7 @@ mod tests {
             "the message is 40.1's own sentence, printed inline beside the field"
         );
 
-        let after = read_recording_settings(&dir).expect("post-rejection read");
+        let after = read_recording_settings(&dir, &no_profiles).expect("post-rejection read");
         assert_eq!(after, before, "a rejected request must write NOTHING");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8888,19 +9547,657 @@ mod tests {
     #[test]
     fn recording_settings_set_round_trips_a_template_and_clears_a_blank_one() {
         let dir = settings_temp_dir();
-        let mut request = read_recording_settings(&dir).expect("baseline read");
+        let mut request = read_recording_settings(&dir, &no_profiles).expect("baseline read");
 
         request.path_template = "{yyyy}/{mm}/rec-{slug}".to_owned();
-        let effective = write_recording_settings(&dir, &request, false).expect("a valid template");
+        let effective = write_recording_settings(&dir, &request, false, &no_profiles)
+            .expect("a valid template");
         assert_eq!(effective.path_template, "{yyyy}/{mm}/rec-{slug}");
 
         request.path_template = "   ".to_owned();
-        let cleared = write_recording_settings(&dir, &request, false).expect("a blank template");
+        let cleared = write_recording_settings(&dir, &request, false, &no_profiles)
+            .expect("a blank template");
         assert_eq!(
             cleared.path_template, DEFAULT_TEMPLATE,
             "an emptied field restores the default, it does not store nothing"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Story 41.2: the destination is one resolved decision --------------
+
+    /// An enabled, recordings-flagged profile row rooted at `local`, with the
+    /// default `recordings` subfolder Story 41.1 authored.
+    fn flagged_row(id: &str, name: &str, local: &str) -> DestinationProfileRow {
+        DestinationProfileRow {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            local_path: PathBuf::from(local),
+            recordings_root: Some(PathBuf::from(local).join("recordings")),
+            enabled: true,
+        }
+    }
+
+    /// The `tgdrive` fixture the matrix names, as a one-row table.
+    fn tgdrive_table() -> DestinationProfileTable {
+        Ok(vec![flagged_row("tgd", "tgdrive", "/Volumes/tg")])
+    }
+
+    /// The effective settings, read against a hand-built profile table so every
+    /// degrade row is asserted on a machine with no `git` at all.
+    fn read_with(dir: &Path, table: DestinationProfileTable) -> RecordingSettingsVm {
+        read_recording_settings(dir, &|_| table.clone())
+            .expect("the destination read must never fail, whatever the profile answer is")
+    }
+
+    /// The plain-folder answer for `dir` — what every degrade must land on.
+    fn plain_answer(dir: &Path) -> String {
+        resolve_destination_dir(None, dir)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A submitted VM choosing the synced folder `id`.
+    fn profile_request(dir: &Path, id: Option<&str>) -> RecordingSettingsVm {
+        let mut vm = settings_vm(dir, false);
+        vm.destination_kind = RecordingDestinationKind::Profile;
+        vm.destination_profile_id = id.map(str::to_owned);
+        vm
+    }
+
+    /// A submitted VM choosing the plain folder `folder`.
+    fn folder_request(dir: &Path, folder: &str) -> RecordingSettingsVm {
+        let mut vm = settings_vm(dir, false);
+        vm.destination_kind = RecordingDestinationKind::Folder;
+        vm.destination_profile_id = None;
+        vm.destination_dir = folder.to_owned();
+        vm
+    }
+
+    /// Matrix rows 1 and 2: neither key set is today's default, and a plain folder
+    /// carries no profile name — the surface stays exactly today's surface.
+    #[test]
+    fn destination_reads_the_folder_answer_with_no_profile_chosen() {
+        let dir = settings_temp_dir();
+        let fresh = read_with(&dir, Ok(Vec::new()));
+        assert_eq!(fresh.destination_kind, RecordingDestinationKind::Folder);
+        assert_eq!(fresh.destination_dir, plain_answer(&dir));
+        assert!(Path::new(&fresh.destination_dir).is_absolute());
+        assert_eq!(fresh.destination_profile_id, None);
+        assert_eq!(fresh.destination_profile_name, None);
+
+        keeper_core::registry::set_recording_destination_dir(&dir, "/Users/x/Recordings")
+            .expect("persist a plain folder");
+        let chosen = read_with(&dir, tgdrive_table());
+        assert_eq!(chosen.destination_kind, RecordingDestinationKind::Folder);
+        assert_eq!(chosen.destination_dir, "/Users/x/Recordings");
+        assert_eq!(chosen.destination_profile_name, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Matrix rows 3 and 4: a flagged profile resolves to `<local_path>/recordings`
+    /// with its name, and a RENAME shows the new name against the same root —
+    /// which is what makes storing the id rather than the path load-bearing.
+    #[test]
+    fn destination_resolves_a_flagged_profile_and_follows_its_rename() {
+        let dir = settings_temp_dir();
+        keeper_core::registry::set_recording_destination_profile(&dir, "tgd")
+            .expect("choose the synced folder");
+
+        let chosen = read_with(&dir, tgdrive_table());
+        assert_eq!(chosen.destination_kind, RecordingDestinationKind::Profile);
+        assert_eq!(chosen.destination_dir, "/Volumes/tg/recordings");
+        assert_eq!(chosen.destination_profile_id.as_deref(), Some("tgd"));
+        assert_eq!(chosen.destination_profile_name.as_deref(), Some("tgdrive"));
+
+        let renamed = read_with(
+            &dir,
+            Ok(vec![flagged_row("tgd", "tg archive", "/Volumes/tg")]),
+        );
+        assert_eq!(
+            renamed.destination_profile_name.as_deref(),
+            Some("tg archive"),
+            "the name is resolved from the id on every read, never cached"
+        );
+        assert_eq!(
+            renamed.destination_dir, "/Volumes/tg/recordings",
+            "a rename does not move the recordings"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Matrix rows 5, 6 and 7: un-flagged behind our back, deleted, paused, and no
+    /// engine at all each degrade to the plain-folder answer — and the read
+    /// SUCCEEDS in every one of them. A machine with no `git` still records.
+    #[test]
+    fn destination_degrades_to_the_folder_answer_for_every_unusable_profile() {
+        let dir = settings_temp_dir();
+        keeper_core::registry::set_recording_destination_profile(&dir, "tgd")
+            .expect("choose the synced folder");
+        let plain = plain_answer(&dir);
+
+        let mut unflagged = flagged_row("tgd", "tgdrive", "/Volumes/tg");
+        unflagged.recordings_root = None;
+        let mut paused = flagged_row("tgd", "tgdrive", "/Volumes/tg");
+        paused.enabled = false;
+
+        for (label, table) in [
+            ("un-flagged behind our back", Ok(vec![unflagged])),
+            ("paused", Ok(vec![paused])),
+            ("deleted", Ok(Vec::new())),
+            (
+                "no engine (no usable git)",
+                Err("git is not available on this machine".to_owned()),
+            ),
+        ] {
+            let degraded = read_with(&dir, table);
+            assert_eq!(
+                degraded.destination_kind,
+                RecordingDestinationKind::Folder,
+                "{label}: the surface must fall back to the folder card"
+            );
+            assert_eq!(
+                degraded.destination_dir, plain,
+                "{label}: the resolved root must be the plain-path answer"
+            );
+            assert_eq!(
+                degraded.destination_profile_id, None,
+                "{label}: a name or id beside a folder kind would be a half-truth"
+            );
+            assert_eq!(degraded.destination_profile_name, None, "{label}");
+        }
+        // The choice itself is NOT rewritten by a read: a profile that comes back
+        // (a re-flagged folder, a remounted stick, an installed git) resolves again.
+        assert_eq!(
+            keeper_core::registry::get_recording_destination_profile(&dir).expect("read the key"),
+            Some("tgd".to_owned()),
+            "a degraded read is a degrade, not a silent unchoosing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Matrix row: both keys set — only reachable through a hand-edited
+    /// `config.json`, because the setter clears the loser. The profile wins,
+    /// deterministically, and the folder row is left alone until the next write.
+    #[test]
+    fn destination_resolves_profile_first_when_both_keys_are_set() {
+        let dir = settings_temp_dir();
+        keeper_core::registry::set_recording_destination_dir(&dir, "/Users/x/Recordings")
+            .expect("hand-edited folder row");
+        keeper_core::registry::set_recording_destination_profile(&dir, "tgd")
+            .expect("hand-edited profile row");
+
+        let resolved = read_with(&dir, tgdrive_table());
+        assert_eq!(resolved.destination_kind, RecordingDestinationKind::Profile);
+        assert_eq!(resolved.destination_dir, "/Volumes/tg/recordings");
+        assert_eq!(
+            resolved.destination_profile_name.as_deref(),
+            Some("tgdrive")
+        );
+
+        // And the next write settles it: one key in force, the other cleared.
+        let request = folder_request(&dir, "/Users/x/Recordings");
+        write_recording_settings(&dir, &request, false, &|_| tgdrive_table())
+            .expect("a folder outside every synced tree is accepted");
+        assert_eq!(
+            keeper_core::registry::get_recording_destination_profile(&dir).expect("profile key"),
+            None,
+            "the next write clears the loser"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One refusal row: what it is called, the profile id submitted, the profile
+    /// table the read sees, the fragments the message must contain, and whether
+    /// the refusal is retriable. Named because five-tuples are what
+    /// `clippy::type_complexity` is for.
+    type RefusalCase = (
+        &'static str,
+        Option<&'static str>,
+        DestinationProfileTable,
+        Vec<&'static str>,
+        bool,
+    );
+
+    /// Matrix rows: a profile id that is unknown, paused, not recordings-flagged,
+    /// missing, or unverifiable is REFUSED — each naming what it lacks — and
+    /// nothing at all is written.
+    #[test]
+    fn settings_set_refuses_a_profile_that_cannot_hold_recordings() {
+        let dir = settings_temp_dir();
+        let before = read_with(&dir, tgdrive_table());
+
+        let mut unflagged = flagged_row("tgd", "tgdrive", "/Volumes/tg");
+        unflagged.recordings_root = None;
+        let mut paused = flagged_row("tgd", "tgdrive", "/Volumes/tg");
+        paused.enabled = false;
+
+        let cases: Vec<RefusalCase> = vec![
+            (
+                "not recordings-flagged",
+                Some("tgd"),
+                Ok(vec![unflagged]),
+                vec!["tgdrive", "doesn't hold recordings"],
+                false,
+            ),
+            (
+                "paused",
+                Some("tgd"),
+                Ok(vec![paused]),
+                vec!["tgdrive", "paused"],
+                false,
+            ),
+            (
+                "unknown id",
+                Some("nope"),
+                tgdrive_table(),
+                vec!["not set up on this machine"],
+                false,
+            ),
+            (
+                "no id at all",
+                None,
+                tgdrive_table(),
+                vec!["no synced folder was chosen"],
+                false,
+            ),
+            (
+                "unverifiable (no usable git)",
+                Some("tgd"),
+                Err("git is not available on this machine".to_owned()),
+                vec!["can't be read on this machine"],
+                true,
+            ),
+        ];
+        for (label, id, table, expected, retriable) in cases {
+            let request = profile_request(&dir, id);
+            let error = write_recording_settings(&dir, &request, false, &|_| table.clone())
+                .expect_err(label);
+            assert_eq!(
+                error.code,
+                IpcErrorCode::RecordingDestinationRefused,
+                "{label}: the surface needs a code it can point at a control with"
+            );
+            assert_eq!(
+                error.retriable, retriable,
+                "{label}: only an unreadable engine can succeed on a retry"
+            );
+            for fragment in expected {
+                assert!(
+                    error.message.contains(fragment),
+                    "{label}: the refusal must say {fragment:?}, got {:?}",
+                    error.message
+                );
+            }
+            assert_eq!(
+                read_with(&dir, tgdrive_table()),
+                before,
+                "{label}: a refused request must write NOTHING"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Matrix row "ambiguous plain folder": a folder inside `tgdrive`'s tree that
+    /// is not its recordings root is refused, and the refusal NAMES tgdrive —
+    /// otherwise the user is told no with no way to find out why.
+    #[test]
+    fn settings_set_refuses_a_folder_inside_a_synced_tree_naming_the_profile() {
+        let dir = settings_temp_dir();
+        let before = read_with(&dir, tgdrive_table());
+
+        let request = folder_request(&dir, "/Volumes/tg/inbox");
+        let error = write_recording_settings(&dir, &request, false, &|_| tgdrive_table())
+            .expect_err("a folder inside a synced tree is the ambiguous case");
+        assert_eq!(error.code, IpcErrorCode::RecordingDestinationRefused);
+        assert!(
+            !error.retriable,
+            "resubmitting it can only fail the same way"
+        );
+        assert!(
+            error.message.contains("tgdrive"),
+            "the refusal must name the synced folder it would have collided with, got {:?}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains("choose the synced folder \"tgdrive\" itself"),
+            "a flagged collision must offer the choice that carries the consequence, got {:?}",
+            error.message
+        );
+        assert_eq!(
+            read_with(&dir, tgdrive_table()),
+            before,
+            "a refused request must write NOTHING"
+        );
+
+        // The same collision with a folder that does NOT hold recordings cannot
+        // offer that choice, so it names the other way out instead.
+        let mut unflagged = flagged_row("work", "work notes", "/Users/x/work");
+        unflagged.recordings_root = None;
+        let table = Ok(vec![unflagged]);
+        let inside = folder_request(&dir, "/Users/x/work/screencasts");
+        let error = write_recording_settings(&dir, &inside, false, &|_| table.clone())
+            .expect_err("an un-flagged synced folder still commits by accident");
+        assert!(
+            error.message.contains("work notes"),
+            "it must still name the folder, got {:?}",
+            error.message
+        );
+        assert!(
+            error.message.contains("choose a folder outside it"),
+            "with nothing to choose instead, the way out is named, got {:?}",
+            error.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Matrix row "the unambiguous exception": a plain folder that IS a profile's
+    /// recordings root is the same place as the profile choice, and only the
+    /// profile choice carries the consequence — so the submission is NORMALISED,
+    /// with the folder key cleared.
+    #[test]
+    fn settings_set_normalises_a_recordings_root_to_the_profile_choice() {
+        let dir = settings_temp_dir();
+        let request = folder_request(&dir, "/Volumes/tg/recordings");
+
+        let effective = write_recording_settings(&dir, &request, false, &|_| tgdrive_table())
+            .expect("the same place, said the other way, is not a refusal");
+        assert_eq!(
+            effective.destination_kind,
+            RecordingDestinationKind::Profile
+        );
+        assert_eq!(effective.destination_profile_id.as_deref(), Some("tgd"));
+        assert_eq!(
+            effective.destination_profile_name.as_deref(),
+            Some("tgdrive")
+        );
+        assert_eq!(effective.destination_dir, "/Volumes/tg/recordings");
+        assert_eq!(
+            keeper_core::registry::get_recording_destination_profile(&dir).expect("profile key"),
+            Some("tgd".to_owned()),
+            "the PROFILE choice is what is persisted"
+        );
+        assert_eq!(
+            keeper_core::registry::get_recording_destination_dir(&dir).expect("folder key"),
+            None,
+            "and the folder key is cleared, so exactly one is in force"
+        );
+        // A trailing separator is the same folder: `Path` compares components.
+        let with_slash = folder_request(&dir, "/Volumes/tg/recordings/");
+        let again = write_recording_settings(&dir, &with_slash, false, &|_| tgdrive_table())
+            .expect("a trailing separator names the same place");
+        assert_eq!(again.destination_kind, RecordingDestinationKind::Profile);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Matrix rows "plain folder outside every profile" and the invariant that
+    /// binds the two keys: whichever is written, the other is cleared, and a blank
+    /// folder submission clears the key back to the DEFAULT answer.
+    #[test]
+    fn settings_set_keeps_exactly_one_destination_key_in_force() {
+        let dir = settings_temp_dir();
+
+        let outside = folder_request(&dir, "/Users/x/Recordings");
+        let stored = write_recording_settings(&dir, &outside, false, &|_| tgdrive_table())
+            .expect("a folder outside every synced tree is accepted");
+        assert_eq!(stored.destination_kind, RecordingDestinationKind::Folder);
+        assert_eq!(stored.destination_dir, "/Users/x/Recordings");
+        assert_eq!(
+            keeper_core::registry::get_recording_destination_profile(&dir).expect("profile key"),
+            None
+        );
+
+        let synced = profile_request(&dir, Some("tgd"));
+        let chosen = write_recording_settings(&dir, &synced, false, &|_| tgdrive_table())
+            .expect("a flagged, enabled profile is accepted");
+        assert_eq!(chosen.destination_kind, RecordingDestinationKind::Profile);
+        assert_eq!(
+            keeper_core::registry::get_recording_destination_dir(&dir).expect("folder key"),
+            None,
+            "choosing a synced folder clears the plain folder"
+        );
+        assert_eq!(
+            keeper_core::registry::get_recording_destination_profile(&dir).expect("profile key"),
+            Some("tgd".to_owned())
+        );
+
+        // Blank clears BOTH keys, which is how a surface says "no opinion, use the
+        // default". What that default IS then depends on the machine, and both
+        // answers are asserted here: with one flagged synced folder it resolves to
+        // that folder (nothing written), and with none it is `~/Movies/keeper`.
+        let blank = folder_request(&dir, "   ");
+        let cleared = write_recording_settings(&dir, &blank, false, &|_| tgdrive_table())
+            .expect("a blank folder is not a refusal");
+        assert_eq!(
+            keeper_core::registry::get_recording_destination_dir(&dir).expect("folder key"),
+            None
+        );
+        assert_eq!(
+            keeper_core::registry::get_recording_destination_profile(&dir).expect("profile key"),
+            None,
+            "a blank submission leaves NEITHER key in force"
+        );
+        assert_eq!(
+            cleared.destination_kind,
+            RecordingDestinationKind::Profile,
+            "with one flagged synced folder, no opinion resolves to it"
+        );
+        assert_eq!(cleared.destination_dir, "/Volumes/tg/recordings");
+        assert_eq!(
+            read_with(&dir, Ok(Vec::new())).destination_dir,
+            plain_answer(&dir),
+            "and on a machine with no flagged folder the same cleared state is today's default"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A machine with no usable `git` must still be able to choose a plain folder:
+    /// the collision check is skipped out loud rather than becoming a refusal.
+    #[test]
+    fn settings_set_accepts_a_plain_folder_with_no_engine_to_check_against() {
+        let dir = settings_temp_dir();
+        let request = folder_request(&dir, "/Users/x/Recordings");
+        let stored = write_recording_settings(&dir, &request, false, &|_| {
+            Err("git is not available on this machine".to_owned())
+        })
+        .expect("capture never degrades because sync is unavailable");
+        assert_eq!(stored.destination_dir, "/Users/x/Recordings");
+        assert_eq!(stored.destination_kind, RecordingDestinationKind::Folder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Matrix rows "default when exactly one flagged profile exists" and "no
+    /// flagged profile": with NEITHER key set, the one folder that says it holds
+    /// recordings IS the destination — and nothing is persisted, so the first
+    /// explicit choice still writes as usual. Ambiguity is not a default, and a
+    /// paused folder is not one either.
+    #[test]
+    fn destination_defaults_to_the_only_folder_that_holds_recordings() {
+        let dir = settings_temp_dir();
+
+        // Exactly one flagged folder, beside decoys that are not destinations.
+        let mut unflagged = flagged_row("work", "work notes", "/Users/x/work");
+        unflagged.recordings_root = None;
+        let mut paused = flagged_row("old", "old stick", "/Volumes/old");
+        paused.enabled = false;
+        let one = Ok(vec![
+            unflagged,
+            flagged_row("tgd", "tgdrive", "/Volumes/tg"),
+            paused,
+        ]);
+
+        let defaulted = read_with(&dir, one);
+        assert_eq!(
+            defaulted.destination_kind,
+            RecordingDestinationKind::Profile
+        );
+        assert_eq!(defaulted.destination_dir, "/Volumes/tg/recordings");
+        assert_eq!(defaulted.destination_profile_id.as_deref(), Some("tgd"));
+        assert_eq!(
+            defaulted.destination_profile_name.as_deref(),
+            Some("tgdrive")
+        );
+        // The whole point: a READ persists nothing. Opening a pane must never
+        // redirect anyone's recordings to a remote.
+        assert_eq!(
+            keeper_core::registry::get_recording_destination_profile(&dir).expect("profile key"),
+            None,
+            "the default is resolved, never written"
+        );
+        assert_eq!(
+            keeper_core::registry::get_recording_destination_dir(&dir).expect("folder key"),
+            None
+        );
+
+        // Two flagged folders: no default. Choosing between them here would be a
+        // coin toss with a push at the end of it.
+        let two = Ok(vec![
+            flagged_row("tgd", "tgdrive", "/Volumes/tg"),
+            flagged_row("arc", "archive", "/Volumes/arc"),
+        ]);
+        let ambiguous = read_with(&dir, two);
+        assert_eq!(ambiguous.destination_kind, RecordingDestinationKind::Folder);
+        assert_eq!(ambiguous.destination_dir, plain_answer(&dir));
+        assert_eq!(ambiguous.destination_profile_name, None);
+
+        // One flagged folder, paused: not a destination, so not a default either.
+        let mut only_paused = flagged_row("tgd", "tgdrive", "/Volumes/tg");
+        only_paused.enabled = false;
+        let asleep = read_with(&dir, Ok(vec![only_paused]));
+        assert_eq!(asleep.destination_kind, RecordingDestinationKind::Folder);
+        assert_eq!(asleep.destination_dir, plain_answer(&dir));
+
+        // No engine at all is no default, and still not an error.
+        let no_engine = read_with(&dir, Err("no sync engine is open".to_owned()));
+        assert_eq!(no_engine.destination_kind, RecordingDestinationKind::Folder);
+        assert_eq!(no_engine.destination_dir, plain_answer(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The default asks for the profile table with a different NEED than a chosen
+    /// id does, because the two are allowed to cost different things: a chosen
+    /// destination may build the engine, the implicit default may not.
+    #[test]
+    fn the_default_never_asks_for_an_engine_it_may_build() {
+        let dir = settings_temp_dir();
+        let asked = Mutex::new(Vec::new());
+        let table = |need: ProfileTableNeed| -> DestinationProfileTable {
+            asked.lock().expect("lock").push(need);
+            tgdrive_table()
+        };
+
+        // Neither key set ⇒ the DEFAULT need.
+        let _ = read_recording_settings(&dir, &table).expect("read");
+        assert_eq!(
+            *asked.lock().expect("lock"),
+            vec![ProfileTableNeed::Default]
+        );
+
+        // An explicit choice ⇒ the CHOSEN need, which may pay for a `git` probe.
+        asked.lock().expect("lock").clear();
+        keeper_core::registry::set_recording_destination_profile(&dir, "tgd").expect("choose");
+        let _ = read_recording_settings(&dir, &table).expect("read");
+        assert_eq!(*asked.lock().expect("lock"), vec![ProfileTableNeed::Chosen]);
+
+        // An explicit folder answers without asking at all.
+        asked.lock().expect("lock").clear();
+        keeper_core::registry::set_recording_destination_profile(&dir, "").expect("clear");
+        keeper_core::registry::set_recording_destination_dir(&dir, "/Users/x/Recordings")
+            .expect("choose a folder");
+        let _ = read_recording_settings(&dir, &table).expect("read");
+        assert!(
+            asked.lock().expect("lock").is_empty(),
+            "a stored folder is an answer; nothing needs the synced folders to say so"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The picker's source: flagged AND enabled only, with the root RESOLVED here
+    /// so no surface joins a local path and a subfolder. No engine ⇒ an empty
+    /// list, never an error, so the card falls back to today's behaviour.
+    #[test]
+    fn destination_profiles_lists_only_the_folders_that_hold_recordings() {
+        let mut unflagged = flagged_row("work", "work notes", "/Users/x/work");
+        unflagged.recordings_root = None;
+        let mut paused = flagged_row("old", "old stick", "/Volumes/old");
+        paused.enabled = false;
+        let table = Ok(vec![
+            flagged_row("tgd", "tgdrive", "/Volumes/tg"),
+            unflagged,
+            paused,
+        ]);
+
+        let offered = destination_profile_vms(&table);
+        assert_eq!(offered.len(), 1, "only one folder holds recordings");
+        assert_eq!(offered[0].id, "tgd");
+        assert_eq!(offered[0].name, "tgdrive");
+        assert_eq!(offered[0].recordings_root, "/Volumes/tg/recordings");
+
+        assert!(
+            destination_profile_vms(&Err("git is not available".to_owned())).is_empty(),
+            "no engine offers no profiles, and is never an error"
+        );
+    }
+
+    /// The collision rule: deepest enabled folder wins (a profile inside another
+    /// profile's folder is the repository the file belongs to), and a paused folder
+    /// is not a collision at all.
+    #[test]
+    fn the_enclosing_profile_is_the_deepest_enabled_one() {
+        let outer = flagged_row("outer", "outer", "/Volumes/tg");
+        let inner = flagged_row("inner", "inner", "/Volumes/tg/nested");
+        let mut paused = flagged_row("paused", "paused", "/Volumes/paused");
+        paused.enabled = false;
+        let rows = vec![outer, inner, paused];
+
+        assert_eq!(
+            enclosing_destination_profile(&rows, Path::new("/Volumes/tg/nested/x"))
+                .map(|row| row.id.as_str()),
+            Some("inner")
+        );
+        assert_eq!(
+            enclosing_destination_profile(&rows, Path::new("/Volumes/tg/x"))
+                .map(|row| row.id.as_str()),
+            Some("outer")
+        );
+        assert_eq!(
+            enclosing_destination_profile(&rows, Path::new("/Volumes/paused/x")).map(|row| &row.id),
+            None,
+            "a paused folder is neither a destination nor a collision"
+        );
+        assert_eq!(
+            enclosing_destination_profile(&rows, Path::new("/Users/x/Recordings"))
+                .map(|row| &row.id),
+            None
+        );
+    }
+
+    /// The one place a profile becomes a destination row: the recordings root comes
+    /// from `keeper-sync` itself, so "where do this profile's recordings live" is
+    /// never reimplemented here.
+    #[test]
+    fn a_profile_row_takes_its_recordings_root_from_the_profile() {
+        let mut profile =
+            keeper_sync::SyncProfile::new("tgd", "tgdrive", "/Volumes/tg", "https://example/r.git");
+        assert_eq!(
+            destination_profile_row(&profile).recordings_root,
+            None,
+            "a profile that has not said it holds recordings is not a destination"
+        );
+
+        profile.recordings = Some(keeper_sync::profile::RecordingsConfig::default());
+        let row = destination_profile_row(&profile);
+        assert_eq!(row.id, "tgd");
+        assert_eq!(row.name, "tgdrive");
+        assert_eq!(row.local_path, PathBuf::from("/Volumes/tg"));
+        assert_eq!(
+            row.recordings_root,
+            profile.recordings_root(),
+            "one definition of the recordings root, and it is keeper-sync's"
+        );
+        assert!(row.enabled);
     }
 
     /// Story 40.2: the preview is the manual. Titled, untitled and blank-template
