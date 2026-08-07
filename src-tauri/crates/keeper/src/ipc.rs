@@ -7,7 +7,7 @@
 //! single Rust lifecycle entry point is self-contained. No business logic lives
 //! in either module — commands delegate to `keeper-core`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -27,14 +27,17 @@ use keeper_core::error::{
 use keeper_core::notes::NotesError;
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
-use keeper_core::recording::path_template::{PathTemplate, RenderCtx, DEFAULT_TEMPLATE};
+use keeper_core::recording::path_template::{
+    PathTemplate, RelativePath, RenderCtx, DEFAULT_TEMPLATE,
+};
 use keeper_core::recording::{
     current_segment_bytes_on_disk, evaluate_destination, plan_disk_guard_action,
     recover_orphaned_sessions, resolve_recording_permission, resolve_screen_recording_access,
-    resolve_source_access, session_bytes_on_disk, session_folder_name, ApplicationTarget,
-    CameraSelection, CaptureTarget, DiskGuardAction, DiskGuardLatch, ManifestStatus, MicSelection,
-    Recorder, RecordingEvent, RecordingSession, SegmentEntry, SessionDevices, SessionManifest,
-    SessionParams, SessionState, RECORDING_MIN_FREE_BYTES, RECORDING_WARN_FREE_BYTES,
+    resolve_source_access, session_bytes_on_disk, ApplicationTarget, CameraSelection,
+    CaptureTarget, DiskGuardAction, DiskGuardLatch, ManifestStatus, MicSelection, Recorder,
+    RecordingEvent, RecordingSession, SegmentEntry, SessionDevices, SessionManifest, SessionParams,
+    SessionState, RECORDING_MIN_FREE_BYTES, RECORDING_WARN_FREE_BYTES, RECOVERY_MAX_DEPTH,
+    RECOVERY_MAX_VISITS,
 };
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
@@ -230,25 +233,38 @@ fn plain_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// `abort()` (dropping the `run_session` future drops the guard). While
 /// reserved, the orphan-recovery pass's `is_active` predicate reports the
 /// folder live and skips it untouched.
+#[derive(Debug)]
 struct LiveFolderReservation {
     reserved: Arc<Mutex<HashSet<PathBuf>>>,
     folder: PathBuf,
+    /// Whether THIS guard is the one holding the entry (see [`Self::reserve`]).
+    owned: bool,
 }
 
 impl LiveFolderReservation {
     /// Insert `folder` into the reserved set and return the releasing guard.
+    ///
+    /// Only the guard that actually INSERTED releases the entry. Story 40.3's
+    /// collision retry reserves each candidate before trying it, and a candidate
+    /// that turns out to be taken is frequently a folder a still-live session
+    /// already reserved — an unconditional `remove` on that guard's `Drop` would
+    /// un-reserve someone else's live session, and the recovery pass would then
+    /// rewrite its manifest to `recovered` while it is still recording.
     fn reserve(reserved: &Arc<Mutex<HashSet<PathBuf>>>, folder: PathBuf) -> Self {
-        plain_lock(reserved).insert(folder.clone());
+        let owned = plain_lock(reserved).insert(folder.clone());
         Self {
             reserved: reserved.clone(),
             folder,
+            owned,
         }
     }
 }
 
 impl Drop for LiveFolderReservation {
     fn drop(&mut self) {
-        plain_lock(&self.reserved).remove(&self.folder);
+        if self.owned {
+            plain_lock(&self.reserved).remove(&self.folder);
+        }
     }
 }
 
@@ -4327,44 +4343,289 @@ fn resolve_capture_target(
     }
 }
 
-/// Start the (at most one) full-screen + system-audio recording session (Story
-/// 16.6 + 17.2, FR-68/FR-69/FR-71, AD-33/AD-37): create the per-session folder
-/// `~/Movies/keeper/keeper-rec <local timestamp>/` with its initial `recording`
-/// `manifest.json`, spawn the driver task (fresh `keeper-rec` child; NDJSON
-/// events fold through the platform-free session machine into the polled status
-/// snapshot AND the segment ledger), and return the initial snapshot. The
-/// sidecar writes `screen-0000.mov` (then `screen-0001.mov`, … on rotation)
-/// inside the folder. A still-live prior session is an honest error — never two
-/// capture children. Pre-spawn folder/manifest failures funnel through
-/// [`to_ipc_error`] (no session task exists yet); a mid-session manifest-write
-/// failure is logged only and never flips the live session to `failed` (the
-/// single-child start-guard keys off the snapshot).
-// Each parameter IS a named `invoke` payload key — the wire contract the
-// frontend `recordingStart` emits (Story 19.1/19.2/19.3/20.1 accreted one
-// optional source selection each). Grouping them into a struct would change
-// the wire to appease the lint (the registry.rs/notify.rs precedent).
-#[allow(clippy::too_many_arguments)]
-/// Sanitize a user session title into a filesystem-safe folder prefix (Story
-/// 21.5): strips path separators/colons/NULs and control characters, collapses
-/// whitespace, keeps Unicode, and caps the length so the full folder name stays
-/// well under filesystem limits. May return an empty string (caller falls back
-/// to the classic name).
-fn sanitize_session_title(title: &str) -> String {
-    let cleaned: String = title
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '\0' => ' ',
-            c if c.is_control() => ' ',
-            c => c,
-        })
-        .collect();
-    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed
-        .chars()
-        .take(80)
-        .collect::<String>()
-        .trim()
-        .to_owned()
+/// Start the (at most one) recording session (Story 16.6 + 17.2 + 40.3,
+/// FR-68/FR-69/FR-71/FR-127/FR-128/FR-145, AD-33/AD-37/AD-65/AD-73): render the
+/// `recording.path_template` setting into a per-session folder under the
+/// destination root, create it with its initial `recording` `manifest.json`,
+/// spawn the driver task (fresh `keeper-rec` child; NDJSON events fold through
+/// the platform-free session machine into the polled status snapshot AND the
+/// segment ledger), and return the initial snapshot. The sidecar writes
+/// `screen-0000.mov` (then `screen-0001.mov`, … on rotation) inside the folder.
+///
+/// The template is the namer, so the folder may NEST (`2026/2026-08-06 1536`),
+/// the collision ordinal is the template's own `{seq}` wherever it put it, and
+/// the path this creates is the path Settings → Recording previewed — same
+/// renderer, same clock read, no second implementation (AD-65).
+///
+/// The session also gains its immutable identity here (`meta.sessionId`), because
+/// the folder name is a label from story 40.4 onward and an archive row cannot be
+/// keyed on a label.
+///
+/// A still-live prior session is an honest error — never two capture children.
+/// Every fallible read happens BEFORE anything is created, and what an attempt
+/// did create it removes on the way out ([`SessionScaffold`]), so a failed start
+/// leaves no folder for the recovery pass to find. Pre-spawn failures funnel
+/// through [`to_ipc_error`] (no session task exists yet); a mid-session
+/// manifest-write failure is logged only and never flips the live session to
+/// `failed` (the single-child start-guard keys off the snapshot).
+/// How many collision ordinals one start will try before giving up.
+///
+/// The template decides where `{seq}` lands, so this is a bound on attempts, not
+/// on a suffix: 64 sessions rendering to the same path inside the same minute is
+/// not a collision any more, it is a loop somewhere, and failing with the path it
+/// tried says more than spinning until the disk fills.
+const SESSION_FOLDER_ATTEMPTS: u32 = 64;
+
+/// The civil datetime + title a START renders against, at one ordinal.
+///
+/// Deliberately built from [`preview_render_ctx`]: the preview's promise is
+/// "this is where a recording started now would land", and the only honest way
+/// to keep that true is for both to be the same context with the same clock
+/// read. Only `seq` differs — the preview shows ordinal 1 because that is the
+/// common case, while a start walks upward as it discovers collisions.
+fn start_render_ctx(now: &DateTime<Local>, title: Option<&str>, seq: u32) -> RenderCtx {
+    RenderCtx {
+        seq,
+        ..preview_render_ctx(now, title)
+    }
+}
+
+/// Join a rendered relative path onto the destination root.
+///
+/// Component by component, for the reason [`compose_path_preview`] does it that
+/// way: a [`RelativePath`] is always `/`-separated, and pushing it whole would
+/// leave those separators verbatim inside a Windows path.
+fn session_folder_path(root: &Path, relative: &RelativePath) -> PathBuf {
+    let mut folder = root.to_path_buf();
+    for component in relative.components() {
+        folder.push(component);
+    }
+    folder
+}
+
+/// What a start attempt created, so a failure can put the filesystem back.
+///
+/// A template may nest (`{yyyy}/…`), so a start can create directories that did
+/// not exist before it — and a start that then fails must not leave them behind.
+/// The unwind is deliberately narrow: deepest-first, `remove_dir` only (NEVER
+/// `remove_dir_all` on a folder the user chose), and only the directories THIS
+/// attempt created. A `2026/` that already held ten sessions is never a
+/// candidate, and one that is not empty refuses to be removed by the syscall
+/// itself rather than by a check that could race.
+struct SessionScaffold {
+    created: Vec<PathBuf>,
+    committed: bool,
+}
+
+impl SessionScaffold {
+    fn new() -> Self {
+        Self {
+            created: Vec::new(),
+            committed: false,
+        }
+    }
+
+    /// Record a directory this attempt brought into existence.
+    fn created(&mut self, dir: PathBuf) {
+        self.created.push(dir);
+    }
+
+    /// The session exists and is the caller's problem now — keep everything.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SessionScaffold {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for dir in self.created.iter().rev() {
+            // Errors are the expected case for a directory another session
+            // populated meanwhile, and there is nothing a failing start can do
+            // about it beyond not making it worse.
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
+/// The refusal for a rendered path the filesystem would not take.
+///
+/// Names the rendered RELATIVE path, which is the half the user authored and can
+/// fix; the absolute root is already on screen in the same card. Built here
+/// rather than through [`RecordingError::ManifestIo`] because that type's
+/// contract is to carry no path at all (`manifest_io`), and a pre-flight failure
+/// that does not say which path it tried is the kind of error people file a
+/// ticket about. Retriable: a full volume, a locked folder and a disconnected
+/// disk all clear without the user changing a thing.
+fn session_path_error(relative: &RelativePath, cause: &std::io::Error) -> IpcError {
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "the session folder \"{}\" could not be created under the destination: {cause}",
+            relative.as_str()
+        ),
+        account_id: None,
+        retriable: true,
+    }
+}
+
+/// This device's stable ULID, read the way sync reads it — once per process.
+///
+/// `sync.db`'s device row is the identity of the DEVICE, not of sync: it is what
+/// every commit's `Keeper-Device` trailer publishes, and minting a second one for
+/// recordings would be a second answer to "which machine made this". Read
+/// through `keeper_sync::db` directly rather than through `crate::sync::engine`,
+/// because engine construction legitimately fails without git and a machine with
+/// no git must still be able to record.
+///
+/// Cached, because the identity cannot change while the process lives and the
+/// uncached read is three bad things on the Record click: it opens and MIGRATES
+/// `sync.db` (which the running engine and `keeper-syncd` also write, with no
+/// busy timeout on this connection, so a sync tick could refuse a recording),
+/// and it forks `hostname` for a label `device_identity` only uses on the very
+/// first call this device ever makes.
+#[cfg(desktop)]
+fn device_ulid(data_dir: &Path) -> Result<String, IpcError> {
+    static DEVICE_ULID: OnceLock<String> = OnceLock::new();
+    if let Some(cached) = DEVICE_ULID.get() {
+        return Ok(cached.clone());
+    }
+    let conn = keeper_sync::db::open(data_dir).map_err(|err| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("the device identity could not be opened: {err}"),
+        account_id: None,
+        retriable: true,
+    })?;
+    // The label seeds the row only when this device has never had one, so it is
+    // computed here rather than above the cache check.
+    let identity = keeper_sync::db::device_identity(&conn, &crate::sync::read_host_label())
+        .map_err(|err| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("the device identity could not be read: {err}"),
+            account_id: None,
+            retriable: true,
+        })?;
+    Ok(DEVICE_ULID.get_or_init(|| identity.id).clone())
+}
+
+/// The mobile twin: there is no `sync.db` to read.
+///
+/// Folder sync is a desktop-only dependency, so `keeper_sync` is not even linked
+/// here — and neither is a recorder (`IosRecorder::is_available` is `false` and
+/// its `run_session` returns `Unsupported`). The refusal quotes that recorder's
+/// own sentence so the two paths are indistinguishable to a caller, and it now
+/// refuses before a session folder is created rather than after.
+#[cfg(not(desktop))]
+fn device_ulid(_data_dir: &Path) -> Result<String, IpcError> {
+    Err(to_ipc_error(CoreError::Unsupported(
+        if cfg!(target_os = "ios") {
+            "recording is not available on iOS".to_owned()
+        } else {
+            "recording is not available on this platform".to_owned()
+        },
+    )))
+}
+
+/// Create the session folder for one start, walking the template's ordinal.
+///
+/// The retry IS the template's `{seq}` (FR-128): the ordinal lands wherever the
+/// template put it instead of always at the end of the name, and the leaf's
+/// `create_dir` — not a prior `exists()` check — is what decides, so two starts
+/// racing inside the same minute cannot both win the same folder.
+///
+/// `make` is what turns a chosen folder into a manifest. The real caller passes
+/// [`SessionManifest::create_with_meta`]; taking it as a closure is what makes
+/// the retry, the unwind and the exhaustion refusal testable without an
+/// `AppState`, a sidecar or a clock.
+///
+/// Returns the manifest, its absolute folder, and the live-folder reservation —
+/// which is taken BEFORE each candidate is created (Story 17.3) so the
+/// orphan-recovery pass can never rewrite a manifest this start is about to own,
+/// and dropped again when an ordinal turns out to be taken.
+fn create_session_folder<F>(
+    reserved: &Arc<Mutex<HashSet<PathBuf>>>,
+    root: &Path,
+    template: &PathTemplate,
+    now: &DateTime<Local>,
+    title: Option<&str>,
+    mut make: F,
+) -> Result<(SessionManifest, PathBuf, LiveFolderReservation), IpcError>
+where
+    F: FnMut(PathBuf) -> Result<SessionManifest, RecordingError>,
+{
+    let mut last_relative: Option<RelativePath> = None;
+    for seq in 1..=SESSION_FOLDER_ATTEMPTS {
+        let relative = template.render(&start_render_ctx(now, title, seq));
+        let folder = session_folder_path(root, &relative);
+        let mut scaffold = SessionScaffold::new();
+        // A nesting template's intermediate directories are created here, one at
+        // a time, so the unwind knows exactly which ones this attempt brought
+        // into existence. `create_dir` per component rather than
+        // `create_dir_all`: the latter cannot tell "I made this" from "it was
+        // already here", and that difference is the only thing the unwind may
+        // act on.
+        let mut parent = root.to_path_buf();
+        let mut intermediates = relative.components().collect::<Vec<_>>();
+        intermediates.pop();
+        for component in intermediates {
+            parent.push(component);
+            match std::fs::create_dir(&parent) {
+                Ok(()) => scaffold.created(parent.clone()),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(session_path_error(&relative, &err)),
+            }
+        }
+        let reservation = LiveFolderReservation::reserve(reserved, folder.clone());
+        match make(folder.clone()) {
+            Ok(manifest) => {
+                scaffold.commit();
+                return Ok((manifest, folder, reservation));
+            }
+            // That ordinal is taken. Drop the reservation, let the scaffold
+            // remove only the directories this attempt created, and render the
+            // next one.
+            Err(RecordingError::SessionFolderExists) => {
+                drop(reservation);
+                last_relative = Some(relative);
+            }
+            Err(err) => {
+                // The leaf may exist with nothing usable in it; the scaffold
+                // takes it out along with the parents this attempt made, so a
+                // failed start leaves the destination as it found it.
+                scaffold.created(folder);
+                return Err(to_ipc_error(err.into()));
+            }
+        }
+    }
+    // Every ordinal was taken. Name the last path tried: with 64 siblings in
+    // place the template itself is the problem, and the user can only see that
+    // if the refusal says what it rendered.
+    let relative = last_relative
+        .unwrap_or_else(|| template.render(&start_render_ctx(now, title, SESSION_FOLDER_ATTEMPTS)));
+    Err(IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "the session folder \"{}\" already exists, and so did every alternative up to {}",
+            relative.as_str(),
+            SESSION_FOLDER_ATTEMPTS
+        ),
+        account_id: None,
+        retriable: false,
+    })
+}
+
+/// Mint a session's immutable identity: `<device ULID>-<session ULID>`.
+///
+/// Device-scoped by AD-73, so two machines recording into one synced folder in
+/// the same minute cannot collide however identical their rendered paths are.
+/// One scalar, because story 42 makes it a primary key; split on the single `-`
+/// to recover the device half, which Crockford's alphabet guarantees is
+/// unambiguous (it has no `-`); safe inside a markdown link and a shell word,
+/// because story 42 offers it as copyable text and as a `session:` link target.
+fn mint_session_id(data_dir: &Path) -> Result<String, IpcError> {
+    Ok(format!("{}-{}", device_ulid(data_dir)?, ulid::Ulid::new()))
 }
 
 #[tauri::command]
@@ -4435,13 +4696,16 @@ pub async fn recording_start(
     // (Story 17.3, FR-73, AD-37): reconcile every orphaned `recording` manifest
     // under the recovery-scan lock (serialized against the detached startup pass
     // — both `write` the same fixed `.manifest.json.tmp` per folder); the
-    // `is_active` predicate skips any reserved live folder. This runs BEFORE the
-    // `recording_run` start-guard is acquired, so its O(session-folders) blocking
-    // `read_dir`/`stat` scan never stalls stop/quit/tray, which contend on that
-    // slot (recording_snapshot's invariant: the slot is never held across
-    // blocking `read_dir`/`stat`). The new session's own folder does not exist
-    // yet, so the scan cannot see it; a recovery failure is logged in the core
-    // pass and must NEVER fail the start.
+    // `is_active` predicate skips any reserved live folder. Since Story 40.3 the
+    // template nests, so this is no longer a scan of the root's children but a
+    // descendant walk — bounded by `RECOVERY_MAX_DEPTH` levels and
+    // `RECOVERY_MAX_VISITS` directories, because the root is a folder the USER
+    // chose. It runs BEFORE the `recording_run` start-guard is acquired, so that
+    // bounded-but-real blocking `read_dir`/`stat` work never stalls
+    // stop/quit/tray, which contend on that slot (recording_snapshot's
+    // invariant: the slot is never held across blocking `read_dir`/`stat`). The
+    // new session's own folder does not exist yet, so the scan cannot see it; a
+    // recovery failure is logged in the core pass and must NEVER fail the start.
     {
         let _scan = plain_lock(&state.recovery_scan);
         let is_active =
@@ -4504,49 +4768,63 @@ pub async fn recording_start(
             reason,
         }))
     })?;
-    // The shell supplies the local timestamp (core is time-agnostic); the core
-    // derives + validates the fs-safe folder basename (Story 17.2).
-    let local_ts = chrono::Local::now().format("%Y-%m-%d %H.%M.%S").to_string();
-    // Story 21.5: an optional user title prefixes the folder name (sanitized:
-    // path-hostile characters stripped, Unicode kept, length-capped); absent or
-    // emptied-by-sanitization titles keep the classic `keeper-rec <ts>` name.
-    let title_trimmed = meta_title
+    // Every fallible READ happens here, above anything that touches the
+    // filesystem. It used to sit below the folder creation, which meant a
+    // registry hiccup returned an error while leaving a `recording` manifest on
+    // disk for the recovery pass to surface as an interrupted session that never
+    // started (Story 17.5 + 19.5, FR-72). The getters default + clamp/normalize,
+    // so a fresh install starts with the authored figures. Read once — a later
+    // edit never mutates a running session; it applies to the next one.
+    let segment_mb =
+        keeper_core::registry::get_recording_segment_mb(&data_dir).map_err(to_ipc_error)?;
+    let duration_cap_minutes = keeper_core::registry::get_recording_duration_cap_minutes(&data_dir)
+        .map_err(to_ipc_error)?;
+    let fps = keeper_core::registry::get_recording_fps(&data_dir).map_err(to_ipc_error)?;
+    // Story 21.1/21.2: codec + capture scale, normalized by the registry reads,
+    // carried as additive wire params (absent ⇒ h264 / 100 on older sidecars).
+    let codec = keeper_core::registry::get_recording_codec(&data_dir).map_err(to_ipc_error)?;
+    let scale_percent =
+        keeper_core::registry::get_recording_scale_percent(&data_dir).map_err(to_ipc_error)?;
+    // Story 22.7: the persisted echo-cancellation switch, read HERE like every
+    // other setting — the sidecar binds the voice-processing unit once at Start,
+    // so a later edit applies to the next session only. Folded into the mic
+    // selection so the key can only ever reach a mic-on wire, and only when the
+    // mic block itself is emitted.
+    let echo_cancellation =
+        keeper_core::registry::get_recording_echo_cancellation(&data_dir).map_err(to_ipc_error)?;
+    let microphone = microphone.map(|mic| MicSelection {
+        echo_cancellation,
+        ..mic
+    });
+    // Story 40.3: the template names the session, and the EFFECTIVE template is
+    // always concrete — absent, blank and unparseable all degrade to
+    // `DEFAULT_TEMPLATE` on read, so a start can never fail on what is stored.
+    // The parse below therefore cannot fail in practice; it is mapped rather
+    // than unwrapped because a start refusing with 40.1's own sentence is still
+    // better than a panic if that invariant ever breaks.
+    let template_source = effective_path_template(&data_dir)?;
+    let template = PathTemplate::parse(&template_source).map_err(|reason| {
+        to_ipc_error(CoreError::Recording(RecordingError::TemplateInvalid {
+            reason,
+        }))
+    })?;
+    // ONE clock read for the whole start, and it is the same context the preview
+    // builds (AD-65): a second `Local::now()` below this line could name a folder
+    // in the next minute and make the card's promise false by a hair.
+    let now = Local::now();
+    let title = meta_title
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .map(sanitize_session_title);
-    let base_name = match title_trimmed.as_deref().filter(|t| !t.is_empty()) {
-        Some(title) => format!("{title} {local_ts}"),
-        None => session_folder_name(&local_ts).map_err(|e| to_ipc_error(e.into()))?,
-    };
-    // The session folder must be UNIQUE — a same-second sequential restart must
-    // never reuse (and cross-write) the prior session's folder. Disambiguate
-    // with ` (2)`, ` (3)`, … until a fresh name is found; `SessionManifest::
-    // create` additionally refuses an existing directory outright.
-    let mut folder = directory.join(&base_name);
-    let mut suffix: u32 = 2;
-    while folder.exists() {
-        folder = directory.join(format!("{base_name} ({suffix})"));
-        suffix = suffix.saturating_add(1);
-    }
-    // Reserve the unique session folder BEFORE `SessionManifest::create`
-    // (Story 17.3): from this line until the driver task ends, the orphan-
-    // recovery pass sees this folder as live and never rewrites its manifest —
-    // closing the create-before-`RecordingRun`-install window a detached
-    // startup scan could otherwise race. The RAII guard unreserves on every
-    // exit path: a `?` early-return below, the driver task's end, or the quit
-    // kill-timeout's task abort.
-    let reservation =
-        LiveFolderReservation::reserve(&state.reserved_recording_folders, folder.clone());
-    // Create the folder + the initial `recording` manifest. This synchronous
-    // pre-spawn failure is a legitimate command error — no session task exists
-    // yet, so surfacing it cannot desync any start-guard.
-    // Story 21.5: optional session meta + the wall-clock start stamp
-    // (ISO-8601 with offset; the host owns clocks — core stays time-agnostic).
+        .map(str::to_owned);
+    // Story 21.5 + 22.3: the optional user metadata, trimmed, with blank entries
+    // dropped (a custom row needs a NAME; a blank value is legal) — plus the
+    // session's immutable identity, which is why the block is now ALWAYS written.
+    // It used to be omitted when the user typed nothing, and an omitted block
+    // would mean a session with no id at all.
+    let session_id = mint_session_id(&data_dir)?;
     let session_meta = {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-        // Story 22.3: tags (blank entries dropped) + custom name/value pairs
-        // (rows with a blank NAME dropped; blank values are legal).
         let tags = meta_tags
             .map(|list| {
                 list.into_iter()
@@ -4566,63 +4844,41 @@ pub async fn recording_start(
                     .collect::<Vec<_>>()
             })
             .filter(|list| !list.is_empty());
-        let meta = keeper_core::recording::SessionMeta {
+        keeper_core::recording::SessionMeta {
+            session_id: Some(session_id.clone()),
             title: clean(meta_title.clone()),
             participants: clean(meta_participants),
             note: clean(meta_note),
             tags,
             custom,
-        };
-        (meta.title.is_some()
-            || meta.participants.is_some()
-            || meta.note.is_some()
-            || meta.tags.is_some()
-            || meta.custom.is_some())
-        .then_some(meta)
+        }
     };
-    let manifest = SessionManifest::create_with_meta(
-        folder.clone(),
-        capture_target,
-        SessionDevices {
-            system_audio,
-            // Story 19.3: the mic leg is live — the manifest records whether
-            // this session captures a microphone track.
-            microphone: mic_on,
-            // Story 20.1: the camera leg is live — whether this session
-            // writes the separate `camera-####.mov` files.
-            camera: camera_on,
+    let devices = SessionDevices {
+        system_audio,
+        // Story 19.3: the mic leg is live — the manifest records whether this
+        // session captures a microphone track.
+        microphone: mic_on,
+        // Story 20.1: the camera leg is live — whether this session writes the
+        // separate `camera-####.mov` files.
+        camera: camera_on,
+    };
+    let started_at = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let (manifest, folder, reservation) = create_session_folder(
+        &state.reserved_recording_folders,
+        &directory,
+        &template,
+        &now,
+        title.as_deref(),
+        |folder| {
+            SessionManifest::create_with_meta(
+                folder,
+                capture_target.clone(),
+                devices,
+                Some(session_meta.clone()),
+                Some(started_at.clone()),
+            )
         },
-        session_meta,
-        Some(chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
-    )
-    .map_err(|e| to_ipc_error(e.into()))?;
-
-    // Read the segmentation + frame-rate settings at start time (Story 17.5 +
-    // 19.5, FR-72): the registry getters default + clamp/normalize, so a fresh
-    // install starts with the authored 500 MB / 30 min / 30 fps. Read once here
-    // — a later edit never mutates a running session; it applies to the next
-    // Recording Session only.
-    let segment_mb =
-        keeper_core::registry::get_recording_segment_mb(&data_dir).map_err(to_ipc_error)?;
-    let duration_cap_minutes = keeper_core::registry::get_recording_duration_cap_minutes(&data_dir)
-        .map_err(to_ipc_error)?;
-    let fps = keeper_core::registry::get_recording_fps(&data_dir).map_err(to_ipc_error)?;
-    // Story 21.1/21.2: codec + capture scale, normalized by the registry reads,
-    // carried as additive wire params (absent ⇒ h264 / 100 on older sidecars).
-    let codec = keeper_core::registry::get_recording_codec(&data_dir).map_err(to_ipc_error)?;
-    let scale_percent =
-        keeper_core::registry::get_recording_scale_percent(&data_dir).map_err(to_ipc_error)?;
-    // Story 22.7: the persisted echo-cancellation switch (on by default), read
-    // HERE like every other setting — the sidecar binds the voice-processing
-    // unit once at Start, so a later edit applies to the next session only.
-    // Folded into the mic selection so the key can only ever reach a mic-on
-    // wire, and only when the mic block itself is emitted.
-    let echo_cancellation =
-        keeper_core::registry::get_recording_echo_cancellation(&data_dir).map_err(to_ipc_error)?;
-    let microphone = microphone.map(|mic| MicSelection {
-        echo_cancellation,
-        ..mic
-    });
+    )?;
     let params = SessionParams {
         // Seeding `screen-0000.mov` lets 17.1's `nextSegmentPath` produce
         // `screen-0001.mov`, … inside the folder with no Swift change.
@@ -5274,10 +5530,13 @@ pub async fn recording_session_summary(folder: String) -> Result<RecordingSummar
 }
 
 /// List the crash-recovered sessions that still need surfacing (Story 20.3,
-/// FR-73): scan the effective recordings destination's immediate subdirectories
-/// for a `manifest.json` with `status == Recovered` whose folder basename is NOT
-/// in the persisted acknowledgement seen-set, map each to a
-/// [`RecordingSummaryVm`], and return them in a deterministic (basename) order.
+/// FR-73): walk the effective recordings destination's descendants (Story 40.3 —
+/// the template may nest) for a loadable `manifest.json` with `status ==
+/// Recovered` whose acknowledgement key ([`session_acknowledgement_key`] — the
+/// session's identity, or its root-relative path when it predates one) is NOT in
+/// the persisted seen-set, map each to a [`RecordingSummaryVm`], and return them
+/// in a deterministic (root-relative path) order — see
+/// [`scan_recovered_sessions`] for the guards.
 ///
 /// Disk is the single source of truth — this re-derives the recovered set from
 /// the on-disk `recovered` manifests Story 17.3 wrote (it also catches orphans
@@ -5303,67 +5562,223 @@ pub async fn recovered_sessions_list(
     .await?
 }
 
+/// The sort key, and the acknowledgement key of a pre-40.3 session, for a
+/// recovered session: `folder`'s path relative to the destination `root`,
+/// `/`-joined the way a rendered [`RelativePath`] writes one, so the key reads
+/// identically on every platform. `None` when `folder` is not under `root`,
+/// when it IS `root`, or when a component is not UTF-8 — none of which can name
+/// a session the scan produced.
+///
+/// **Why relative, not the basename** (Story 40.3): the default template nests,
+/// so `<root>/2026/x` and `<root>/2027/x` share a basename and a basename key
+/// would make them one entry — acknowledging either would silently suppress the
+/// other. **Why this stays backward compatible**: a flat session's root-relative
+/// path IS its basename, so every acknowledgement entry written before this
+/// story keeps matching exactly the session it was written for.
+#[cfg(desktop)]
+fn session_relative_key(root: &Path, folder: &Path) -> Option<String> {
+    let relative = folder.strip_prefix(root).ok()?;
+    let mut key = String::new();
+    for component in relative.components() {
+        let component = component.as_os_str().to_str()?;
+        if !key.is_empty() {
+            key.push('/');
+        }
+        key.push_str(component);
+    }
+    (!key.is_empty()).then_some(key)
+}
+
+/// The persisted acknowledgement key for a session whose manifest LOADED: its
+/// immutable `meta.sessionId` when it has one (Story 40.3), else its
+/// root-relative path.
+///
+/// **Why the id wins.** 40.3 mints the identity precisely because the folder
+/// path stopped being stable: 40.4 retitles a session by MOVING its folder, and
+/// a user can drag one into another subfolder today. A path-keyed dismissal is
+/// orphaned by either — the card comes back with nothing to explain it. The id
+/// is written once and never edited, so a dismissal keyed on it survives every
+/// move within the destination root.
+///
+/// **Why the path is still the fallback, not a migration.** A session recorded
+/// before this story has no `sessionId` at all, and a flat pre-40.3 session's
+/// root-relative path IS its basename — so those sessions keep the exact key
+/// the seen-set already holds for them, and every entry written before 40.3
+/// keeps suppressing exactly what it was written for.
+#[cfg(desktop)]
+fn session_acknowledgement_key<'a>(relative: &'a str, manifest: &'a SessionManifest) -> &'a str {
+    manifest
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.session_id.as_deref())
+        .unwrap_or(relative)
+}
+
 /// The pure, best-effort recovery scan behind [`recovered_sessions_list`] (Story
-/// 20.3): walk `base`'s immediate subdirectories, keep every folder whose
-/// `manifest.json` is `status == Recovered` and whose basename is not in
-/// `acknowledged`, map each to a [`RecordingSummaryVm`], and return them sorted
-/// by basename. Total and best-effort — a missing/unreadable base is `[]`, and
-/// any per-entry failure is logged and skipped, never aborting the scan.
-/// Extracted from the command so it is unit-testable over a temp dir without an
-/// `AppState`/registry.
+/// 20.3; nested since Story 40.3): walk the DESCENDANTS of `base`, keep every
+/// folder whose `manifest.json` loads as `status == Recovered` and whose
+/// [`session_acknowledgement_key`] is not in `acknowledged`, map each to a
+/// [`RecordingSummaryVm`], and return them sorted by root-relative path
+/// ([`session_relative_key`]) — a `/`-joined string, so the order is the same on
+/// every platform instead of following `read_dir`. Total and best-effort: a
+/// missing/unreadable `base` is `[]`, and any per-entry failure is logged and
+/// skipped, never aborting the scan. Extracted from the command so it is
+/// unit-testable over a temp dir without an `AppState`/registry.
+///
+/// **Why a walk.** Story 40.3 made `recording_start` render the path template,
+/// whose default nests a session under `{yyyy}/`; a scan of `base`'s immediate
+/// children would surface nothing at all after a crash. The guards are
+/// `keeper_core::recording::recover_orphaned_sessions`'s:
+/// - depth is counted in components below `base` (an immediate child is 1) and
+///   capped at [`RECOVERY_MAX_DEPTH`]: a directory at the cap is still a
+///   candidate, but nothing below it is ever read;
+/// - the whole walk is capped at [`RECOVERY_MAX_VISITS`] directories, so a root
+///   that is wide rather than deep is bounded too;
+/// - `DirEntry::file_type` decides — never `is_dir()`/metadata — so a symlink is
+///   skipped rather than followed out of the destination tree;
+/// - a name starting with `.` is skipped whole (`.Trash` and friends: never a
+///   session, never worth descending);
+/// - a directory whose `manifest.json` LOADS is the session: it is evaluated and
+///   never descended into, so a stray manifest inside a session cannot produce a
+///   second card. A `manifest.json` that does not load marks nothing — the
+///   directory is descended into as usual, so one unparseable file dropped in an
+///   intermediate folder cannot hide every session beneath it.
+///
+/// **What the two walks actually share** is the two constants above, imported
+/// from `keeper_core::recording` so the pass that MARKS a session `recovered`
+/// and this scan that SURFACES it can never disagree about how far they reach.
+/// The CODE is still duplicated, deliberately: the core's walk mutates
+/// (reconcile + rewrite, gated on an `is_active` predicate) and yields folders,
+/// this one is read-only, filters on the seen-set and yields view models, and
+/// the only common shape left — "list the candidate directories" — would be a
+/// new public core symbol carrying no behaviour. So the guards are spelled out
+/// here and checkable against the list above.
+///
+/// One guard genuinely diverges, and only one: this walk skips a directory whose
+/// name is not UTF-8, because its seen-set key must be a `String` and a card
+/// whose dismissal could never be stored is worse than no card. The core walk
+/// has no such gate — it recovers such a folder happily.
 #[cfg(desktop)]
 fn scan_recovered_sessions(base: &Path, acknowledged: &[String]) -> Vec<RecordingSummaryVm> {
-    let entries = match std::fs::read_dir(base) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(error) => {
-            tracing::warn!(%error, "recovered-sessions scan: could not read the destination dir");
-            return Vec::new();
-        }
-    };
+    scan_recovered_sessions_within(base, acknowledged, RECOVERY_MAX_VISITS)
+}
 
-    let mut summaries: Vec<RecordingSummaryVm> = Vec::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
+/// [`scan_recovered_sessions`] with its visit budget as an argument, so the
+/// budget's own behaviour is provable against a tree of a dozen directories
+/// rather than one of [`RECOVERY_MAX_VISITS`] — the same split
+/// `keeper_core::recording::recover_orphaned_sessions` makes. Every shipping
+/// caller goes through the entry point above, which passes the real budget.
+#[cfg(desktop)]
+fn scan_recovered_sessions_within(
+    base: &Path,
+    acknowledged: &[String],
+    max_visits: usize,
+) -> Vec<RecordingSummaryVm> {
+    // Iterative, over an explicit stack: the root is user-chosen, so how deep a
+    // recursive walk would go is not a question worth having (the caps bound the
+    // work either way). Each entry is a directory and its own depth below
+    // `base`, which is 0.
+    let mut pending: Vec<(PathBuf, usize)> = vec![(base.to_path_buf(), 0)];
+    // Keyed by the root-relative path, so the result is ordered by that key
+    // (deterministic across `read_dir` orders and platforms — nesting sorts by
+    // parent then leaf) without a second sort pass. The key is unique by
+    // construction: a walk visits each folder once. This is the SORT key only —
+    // the acknowledgement key is `session_acknowledgement_key`, which prefers
+    // the session id and is therefore not ordered by location.
+    let mut found: BTreeMap<String, RecordingSummaryVm> = BTreeMap::new();
+    // Directories examined so far, against `max_visits`. Depth bounds a deep
+    // root; this bounds a wide one — the two guards are independent, and a
+    // Photos library trips only this one.
+    let mut visits = 0usize;
+    'walk: while let Some((directory, depth)) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            // A missing base is "no recordings yet"; a missing subdirectory
+            // vanished mid-walk. Neither deserves a warning.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                tracing::warn!(%error, "recovered-sessions scan: skipping unreadable dir entry");
+                tracing::warn!(%error, "recovered-sessions scan: could not read a directory; skipping it");
                 continue;
             }
         };
-        // Only real directories are session folders (a `DirEntry` file type does
-        // not follow symlinks) — mirror the recovery pass's ownership rule.
-        match entry.file_type() {
-            Ok(file_type) if file_type.is_dir() => {}
-            Ok(_) => continue,
-            Err(error) => {
-                tracing::warn!(%error, "recovered-sessions scan: skipping entry with no file type");
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(%error, "recovered-sessions scan: skipping unreadable dir entry");
+                    continue;
+                }
+            };
+            // A `DirEntry` file type does not follow symlinks: a symlinked entry
+            // can point outside the destination tree, which the recovery pass
+            // refuses to rewrite — so this scan refuses to surface it.
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    tracing::warn!(%error, "recovered-sessions scan: skipping entry with no file type");
+                    continue;
+                }
+            };
+            if file_type.is_symlink() || !file_type.is_dir() {
                 continue;
             }
-        }
-        let folder = entry.path();
-        let Some(basename) = folder.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if acknowledged.iter().any(|seen| seen == basename) {
-            continue;
-        }
-        let manifest = match SessionManifest::load(&folder) {
-            Ok(manifest) => manifest,
-            // No/unreadable/malformed manifest is not a recovered session here.
-            Err(error) => {
-                tracing::debug!(%error, "recovered-sessions scan: skipping folder without a loadable manifest");
+            let file_name = entry.file_name();
+            // A name the seen-set could not hold is a name this scan cannot
+            // acknowledge — skip the subtree rather than surface a card whose
+            // dismissal would never stick.
+            let Some(name) = file_name.to_str() else {
+                tracing::debug!("recovered-sessions scan: skipping a non-UTF-8 directory name");
+                continue;
+            };
+            if name.starts_with('.') {
                 continue;
             }
-        };
-        if manifest.status != ManifestStatus::Recovered {
-            continue;
+            // The budget is spent on directories, and spent BEFORE the manifest
+            // probe: the probe is one of the `stat` calls it exists to bound.
+            // Tripping it truncates the scan rather than failing it — the cards
+            // already found still surface, and the warn names the budget so the
+            // log says which number to raise.
+            if visits == max_visits {
+                tracing::warn!(
+                    budget = max_visits,
+                    found = found.len(),
+                    "recovered-sessions scan: stopping the walk at its visit budget; listing what was found so far"
+                );
+                break 'walk;
+            }
+            visits += 1;
+            let folder = entry.path();
+            // A `manifest.json` only NOMINATES a session; the load decides. A
+            // manifest that LOADS is the session — evaluated here, never walked
+            // — and one that does not marks nothing, so the directory is walked
+            // like any other. Treating the probe as the answer made a stray file
+            // a lid: every real session beneath it stayed invisible.
+            if folder.join("manifest.json").is_file() {
+                match SessionManifest::load(&folder) {
+                    Ok(manifest) => {
+                        if let Some(relative) = session_relative_key(base, &folder) {
+                            let key = session_acknowledgement_key(&relative, &manifest);
+                            if manifest.status == ManifestStatus::Recovered
+                                && !acknowledged.iter().any(|entry| entry == key)
+                            {
+                                found.insert(relative, manifest_summary(&folder, &manifest));
+                            }
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "recovered-sessions scan: manifest did not load; walking the directory instead of treating it as a session");
+                    }
+                }
+            }
+            // Not a session: descend, unless its children would sit past the
+            // depth cap.
+            if depth + 1 < RECOVERY_MAX_DEPTH {
+                pending.push((folder, depth + 1));
+            }
         }
-        summaries.push(manifest_summary(&folder, &manifest));
     }
-    // Deterministic order across `read_dir` platforms: by folder basename.
-    summaries.sort_by(|a, b| a.session_folder.cmp(&b.session_folder));
-    summaries
+    found.into_values().collect()
 }
 
 /// Mobile stub for [`recovered_sessions_list`] (Story 20.3): recording is a
@@ -5378,10 +5793,29 @@ pub async fn recovered_sessions_list(
 }
 
 /// Acknowledge (dismiss) a surfaced recovery card (Story 20.3, FR-73): latch the
-/// session folder's **basename** into the persisted acknowledgement seen-set so
-/// [`recovered_sessions_list`] never surfaces it again on a later scan/restart. A
-/// one-way, idempotent, best-effort registry write — a failed write may let the
-/// card reappear next scan, but never throws mid-dismiss.
+/// session's acknowledgement key into the persisted seen-set so
+/// [`recovered_sessions_list`] never surfaces it again on a later scan/restart.
+/// One-way and idempotent.
+///
+/// The key is exactly the one [`scan_recovered_sessions`] compares
+/// ([`session_acknowledgement_key`]): the manifest's immutable `meta.sessionId`
+/// when it has one, else the folder's root-relative path
+/// ([`session_relative_key`], reduced against the [`effective_destination_dir`]
+/// root). Keying on the identity is what makes a dismissal survive Story 40.4's
+/// retitle-by-move (and a user dragging a session elsewhere under the root),
+/// which a path key would orphan — the card would return with nothing to
+/// explain it. Pre-40.3 sessions have no id and fall back to the path; since a
+/// flat session's root-relative path IS its basename, every entry written
+/// before 40.3 still suppresses exactly the session it was written for.
+///
+/// **It cannot fail on the user.** The frontend drops the card from local state
+/// the moment it calls this, so a rejection would show a successful dismiss and
+/// then resurrect the card later with no explanation. Everything this needs to
+/// READ is therefore best-effort: an unreadable destination setting, a `folder`
+/// that is not under the destination root (or has no components to reduce), and
+/// a manifest that will not load are each logged at `warn` and return `Ok(())`
+/// without latching. Only the registry WRITE itself can return an error — a
+/// genuine local-store failure, the one thing a retry could actually fix.
 #[cfg(desktop)]
 #[tauri::command]
 pub fn recovered_session_acknowledge(
@@ -5389,19 +5823,48 @@ pub fn recovered_session_acknowledge(
     folder: String,
 ) -> Result<(), IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    // The seen-set is keyed on the folder basename (what `scan_recovered_sessions`
-    // compares). A path with no final component (trailing slash / root-like) has
-    // no basename to latch — skip rather than store a full path the scan's
-    // basename comparison would never match (which would re-surface the card).
-    let Some(basename) = Path::new(&folder)
-        .file_name()
-        .and_then(|name| name.to_str())
-    else {
-        tracing::warn!(folder = %folder, "acknowledge recovered session: no basename; skipping latch");
+    latch_recovered_session_acknowledgement(&data_dir, Path::new(&folder))
+}
+
+/// The registry half of [`recovered_session_acknowledge`], split out so the
+/// "an environmental read failure is still a successful dismiss" rule is
+/// testable over a temp data dir without Tauri state.
+#[cfg(desktop)]
+fn latch_recovered_session_acknowledgement(data_dir: &Path, folder: &Path) -> Result<(), IpcError> {
+    let root = match effective_destination_dir(data_dir) {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "acknowledge recovered session: could not read the destination setting; skipping latch"
+            );
+            return Ok(());
+        }
+    };
+    let Some(relative) = session_relative_key(&root, folder) else {
+        tracing::warn!(
+            folder = %folder.display(),
+            "acknowledge recovered session: folder is not under the destination root; skipping latch"
+        );
         return Ok(());
     };
-    keeper_core::registry::add_recovered_session_acknowledged(&data_dir, basename)
-        .map_err(to_ipc_error)
+    // The manifest carries the key. Without it there is no honest key to store:
+    // latching the path would be wrong for any session that HAS an id (the scan
+    // would never compare it), and a folder whose manifest does not load is not
+    // one the scan can surface anyway.
+    let manifest = match SessionManifest::load(folder) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                folder = %folder.display(),
+                "acknowledge recovered session: manifest did not load; skipping latch"
+            );
+            return Ok(());
+        }
+    };
+    let key = session_acknowledgement_key(&relative, &manifest);
+    keeper_core::registry::add_recovered_session_acknowledged(data_dir, key).map_err(to_ipc_error)
 }
 
 /// Mobile stub for [`recovered_session_acknowledge`] (Story 20.3): recording is a
@@ -6799,6 +7262,293 @@ mod tests {
         let base = scan_temp_dir("missing");
         let missing = base.join("does-not-exist");
         assert!(scan_recovered_sessions(&missing, &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- Story 40.3: the template nests, so the scan walks and keys relative --
+
+    #[test]
+    fn scan_lists_a_nested_recovered_session() {
+        // The default template puts a session under `{yyyy}/`, so it is no
+        // longer an immediate child of the destination root.
+        let base = scan_temp_dir("nested");
+        let year = base.join("2026");
+        std::fs::create_dir_all(&year).expect("year dir");
+        let folder = write_session(&year, "keeper-rec x", ManifestStatus::Recovered);
+
+        let listed = scan_recovered_sessions(&base, &[]);
+        assert_eq!(listed.len(), 1, "a nested recovered session must surface");
+        assert_eq!(
+            listed[0].session_folder,
+            folder.to_string_lossy().into_owned()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_acknowledgement_is_keyed_on_the_root_relative_path() {
+        // Two sessions share a leaf under different years: a basename key would
+        // make them one entry, so dismissing either would swallow both.
+        let base = scan_temp_dir("relative-key");
+        let first_year = base.join("2026");
+        let second_year = base.join("2027");
+        std::fs::create_dir_all(&first_year).expect("2026");
+        std::fs::create_dir_all(&second_year).expect("2027");
+        let first = write_session(&first_year, "keeper-rec x", ManifestStatus::Recovered);
+        let second = write_session(&second_year, "keeper-rec x", ManifestStatus::Recovered);
+        assert_eq!(scan_recovered_sessions(&base, &[]).len(), 2);
+
+        // Exactly what `recovered_session_acknowledge` would latch for `first`.
+        let key = session_relative_key(&base, &first).expect("relative key");
+        assert_eq!(key, "2026/keeper-rec x");
+
+        let after = scan_recovered_sessions(&base, &[key]);
+        assert_eq!(
+            after.len(),
+            1,
+            "only the acknowledged session is suppressed"
+        );
+        assert_eq!(
+            after[0].session_folder,
+            second.to_string_lossy().into_owned()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_honours_a_pre_nesting_basename_acknowledgement() {
+        // Backward compatibility: every entry written before Story 40.3 is a
+        // bare basename. A flat session's root-relative path IS its basename,
+        // so the old entry still suppresses exactly what it was written for.
+        let base = scan_temp_dir("legacy-ack");
+        write_session(&base, "keeper-rec flat", ManifestStatus::Recovered);
+        write_session(&base, "keeper-rec other", ManifestStatus::Recovered);
+
+        let legacy = vec!["keeper-rec flat".to_owned()];
+        let after = scan_recovered_sessions(&base, &legacy);
+        assert_eq!(after.len(), 1);
+        assert!(after[0].session_folder.ends_with("keeper-rec other"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_ignores_dot_dirs_and_manifest_less_strays() {
+        let base = scan_temp_dir("strays");
+        // `.Trash` is the OS's, not the destination's: never descended into,
+        // so a deleted session cannot come back as a card.
+        let trashed = base.join(".Trash");
+        std::fs::create_dir_all(&trashed).expect(".Trash");
+        write_session(&trashed, "keeper-rec deleted", ManifestStatus::Recovered);
+        // A manifest-less tree is walked and ignored — no card, no error.
+        std::fs::create_dir_all(base.join("Screenshots").join("2026")).expect("stray tree");
+        let year = base.join("2026");
+        std::fs::create_dir_all(&year).expect("year dir");
+        write_session(&year, "keeper-rec real", ManifestStatus::Recovered);
+
+        let listed = scan_recovered_sessions(&base, &[]);
+        assert_eq!(listed.len(), 1, "only the real session surfaces");
+        assert!(listed[0].session_folder.ends_with("2026/keeper-rec real"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_stops_at_the_depth_cap() {
+        let base = scan_temp_dir("depth");
+        // Exactly at the cap (8 components below the root): still a candidate.
+        let at_cap = base.join("d1/d2/d3/d4/d5/d6/d7");
+        std::fs::create_dir_all(&at_cap).expect("at-cap parents");
+        write_session(&at_cap, "keeper-rec deep", ManifestStatus::Recovered);
+        // One component deeper: its parent is never read_dir'd.
+        let too_deep = base.join("e1/e2/e3/e4/e5/e6/e7/e8");
+        std::fs::create_dir_all(&too_deep).expect("too-deep parents");
+        write_session(&too_deep, "keeper-rec deeper", ManifestStatus::Recovered);
+
+        let listed = scan_recovered_sessions(&base, &[]);
+        assert_eq!(listed.len(), 1, "the cap is 8 components below the root");
+        assert!(listed[0].session_folder.ends_with("keeper-rec deep"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// [`write_session`] plus Story 40.3's immutable identity in the manifest.
+    fn write_session_with_id(
+        base: &Path,
+        name: &str,
+        session_id: &str,
+        status: ManifestStatus,
+    ) -> PathBuf {
+        let folder = base.join(name);
+        let mut manifest = SessionManifest::create_with_meta(
+            folder.clone(),
+            CaptureTarget::display(None),
+            SessionDevices {
+                system_audio: true,
+                microphone: false,
+                camera: false,
+            },
+            Some(keeper_core::recording::SessionMeta {
+                session_id: Some(session_id.to_owned()),
+                ..Default::default()
+            }),
+            None,
+        )
+        .expect("create session folder + manifest");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 100]).expect("segment");
+        manifest.reconcile_from_dir().expect("reconcile");
+        manifest.set_status(status);
+        manifest.write().expect("write manifest");
+        folder
+    }
+
+    /// A destination root plus its own `keeper.db` data dir, for the
+    /// acknowledge round-trips (the latch reads the destination back out of the
+    /// registry, so the two have to agree).
+    fn ack_temp_dirs(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = scan_temp_dir(tag);
+        let base = root.join("dest");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&base).expect("destination root");
+        keeper_core::registry::set_recording_destination_dir(&data_dir, &base.to_string_lossy())
+            .expect("persist the destination");
+        (root, base, data_dir)
+    }
+
+    #[test]
+    fn acknowledge_latches_the_session_id_and_survives_a_moved_folder() {
+        let (root, base, data_dir) = ack_temp_dirs("ack-id");
+        let year = base.join("2026");
+        std::fs::create_dir_all(&year).expect("year dir");
+        let session_id = "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM0000000000000000000A";
+        let folder =
+            write_session_with_id(&year, "keeper-rec x", session_id, ManifestStatus::Recovered);
+        assert_eq!(scan_recovered_sessions(&base, &[]).len(), 1);
+
+        latch_recovered_session_acknowledgement(&data_dir, &folder).expect("latch the dismissal");
+        let acknowledged = keeper_core::registry::get_recovered_sessions_acknowledged(&data_dir)
+            .expect("read the seen-set back");
+        assert_eq!(
+            acknowledged,
+            vec![session_id.to_owned()],
+            "the identity is latched, not the path the session happens to live at"
+        );
+        assert!(scan_recovered_sessions(&base, &acknowledged).is_empty());
+
+        // Story 40.4 retitles a session by MOVING its folder, and a user can
+        // drag one into another year today. A path-keyed dismissal would be
+        // orphaned by either and the card would come back unexplained.
+        let new_year = base.join("2027");
+        std::fs::create_dir_all(&new_year).expect("new year dir");
+        std::fs::rename(&folder, new_year.join("keeper-rec renamed")).expect("move the session");
+
+        assert!(
+            scan_recovered_sessions(&base, &acknowledged).is_empty(),
+            "a dismissal keyed on the session id survives the folder moving"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn acknowledge_falls_back_to_the_relative_path_without_a_session_id() {
+        // A session recorded before Story 40.3 has no identity to key on, so
+        // the root-relative path stays the key — and still round-trips.
+        let (root, base, data_dir) = ack_temp_dirs("ack-legacy");
+        let year = base.join("2026");
+        std::fs::create_dir_all(&year).expect("year dir");
+        let folder = write_session(&year, "keeper-rec legacy", ManifestStatus::Recovered);
+        let other = write_session(&base, "keeper-rec other", ManifestStatus::Recovered);
+        assert_eq!(scan_recovered_sessions(&base, &[]).len(), 2);
+
+        latch_recovered_session_acknowledgement(&data_dir, &folder).expect("latch the dismissal");
+        let acknowledged = keeper_core::registry::get_recovered_sessions_acknowledged(&data_dir)
+            .expect("read the seen-set back");
+        assert_eq!(acknowledged, vec!["2026/keeper-rec legacy".to_owned()]);
+
+        let after = scan_recovered_sessions(&base, &acknowledged);
+        assert_eq!(
+            after.len(),
+            1,
+            "only the acknowledged session is suppressed"
+        );
+        assert_eq!(
+            after[0].session_folder,
+            other.to_string_lossy().into_owned()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn acknowledge_survives_an_unreadable_destination_setting() {
+        // The frontend drops the card from local state the moment it calls the
+        // command, so a rejected dismiss shows as a success and then resurrects
+        // the card later with no explanation. A data dir that is a FILE makes
+        // every `keeper.db` read fail.
+        let root = scan_temp_dir("ack-no-db");
+        let folder = write_session(&root, "keeper-rec x", ManifestStatus::Recovered);
+        let data_dir = root.join("not-a-data-dir");
+        std::fs::write(&data_dir, b"").expect("occupy the data-dir path with a file");
+
+        assert!(
+            latch_recovered_session_acknowledgement(&data_dir, &folder).is_ok(),
+            "an unreadable destination setting is a logged no-op, never a failed dismiss"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_descends_past_an_unloadable_intermediate_manifest() {
+        let base = scan_temp_dir("stray-manifest");
+        let year = base.join("2026");
+        std::fs::create_dir_all(&year).expect("year dir");
+        // A truncated or hand-edited `manifest.json` in the year folder only
+        // NOMINATES a session; the load decides. Treating the probe as the
+        // answer made the file a lid: every real session beneath it stayed
+        // invisible, permanently.
+        std::fs::write(year.join("manifest.json"), b"{ not a manifest").expect("stray manifest");
+        let real = write_session(&year, "keeper-rec real", ManifestStatus::Recovered);
+
+        let listed = scan_recovered_sessions(&base, &[]);
+        assert_eq!(
+            listed.len(),
+            1,
+            "the session under the stray manifest still surfaces"
+        );
+        assert_eq!(
+            listed[0].session_folder,
+            real.to_string_lossy().into_owned()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_stops_at_its_visit_budget() {
+        // Depth cannot bound a root that is WIDE — a Movies library, a sync
+        // mount — so the walk spends a directory budget too, and truncates
+        // rather than failing when it runs out.
+        let base = scan_temp_dir("visits");
+        for name in ["a", "b", "c", "d"] {
+            write_session(
+                &base,
+                &format!("keeper-rec {name}"),
+                ManifestStatus::Recovered,
+            );
+        }
+        assert_eq!(scan_recovered_sessions(&base, &[]).len(), 4);
+
+        let truncated = scan_recovered_sessions_within(&base, &[], 2);
+        assert_eq!(
+            truncated.len(),
+            2,
+            "the budget is spent per directory examined, and stops the walk"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -8351,5 +9101,355 @@ mod tests {
             !ipc.retriable,
             "a best-effort signal failure is not retriable"
         );
+    }
+
+    use chrono::TimeZone;
+
+    // --- the template names the session (Story 40.3) -------------------------
+    //
+    // `recording_start` itself needs a Tauri `State` and a sidecar, so the part
+    // this story changes is exercised through `create_session_folder`, which is
+    // the whole naming decision: render, ordinal retry, intermediate creation and
+    // unwind. `make` stands in for `SessionManifest::create_with_meta` where a
+    // test wants a failure the filesystem will not produce on demand.
+
+    /// A fixed local instant, so a rendered name is a constant a test can assert.
+    fn start_at(hour: u32, minute: u32, second: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 8, 6, hour, minute, second)
+            .single()
+            .expect("an unambiguous local instant")
+    }
+
+    fn parsed(template: &str) -> PathTemplate {
+        PathTemplate::parse(template).expect("the template parses")
+    }
+
+    fn reserved_set() -> Arc<Mutex<HashSet<PathBuf>>> {
+        Arc::new(Mutex::new(HashSet::new()))
+    }
+
+    /// The real creator, with a session id in the metadata like a start has.
+    fn real_make(
+        session_id: &str,
+    ) -> impl FnMut(PathBuf) -> Result<SessionManifest, RecordingError> {
+        let meta = keeper_core::recording::SessionMeta {
+            session_id: Some(session_id.to_owned()),
+            ..Default::default()
+        };
+        move |folder| {
+            SessionManifest::create_with_meta(
+                folder,
+                CaptureTarget::display(None),
+                SessionDevices {
+                    system_audio: true,
+                    microphone: false,
+                    camera: false,
+                },
+                Some(meta.clone()),
+                Some("2026-08-06T15:36:22+02:00".to_owned()),
+            )
+        }
+    }
+
+    #[test]
+    fn the_default_template_nests_and_creates_the_year_on_demand() {
+        let root = scan_temp_dir("start-default");
+        let (_, folder, _reservation) = create_session_folder(
+            &reserved_set(),
+            &root,
+            &parsed(DEFAULT_TEMPLATE),
+            &start_at(15, 36, 22),
+            None,
+            real_make("01DEVICE-01SESSION"),
+        )
+        .expect("the session folder is created");
+        assert_eq!(folder, root.join("2026").join("2026-08-06 1536"));
+        assert!(
+            root.join("2026").is_dir(),
+            "the year folder is created on demand"
+        );
+        assert!(folder.join("manifest.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_start_lands_exactly_where_the_card_previewed() {
+        // The defect this story exists to fix: the field report's saved template
+        // previewed one path and the recorder created another. Both sides are
+        // asserted against each other here, not against a literal, so they cannot
+        // drift apart again without this failing.
+        let root = scan_temp_dir("start-preview");
+        let template = "{yyyy}/{yyyy}-{mm}-{dd} {HH}.{MM} {slug}";
+        let now = start_at(15, 36, 22);
+        let preview =
+            compose_path_preview(&root, template, &preview_render_ctx(&now, Some("Test")));
+        let (_, folder, _reservation) = create_session_folder(
+            &reserved_set(),
+            &root,
+            &parsed(template),
+            &now,
+            Some("Test"),
+            real_make("01DEVICE-01SESSION"),
+        )
+        .expect("the session folder is created");
+        assert_eq!(
+            preview.absolute_path.as_deref(),
+            Some(folder.to_string_lossy().as_ref()),
+            "the preview promised a different path than the start created"
+        );
+        assert_eq!(folder, root.join("2026").join("2026-08-06 15.36 test"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_starts_in_one_minute_get_two_folders() {
+        let root = scan_temp_dir("start-collision");
+        let reserved = reserved_set();
+        let now = start_at(15, 36, 22);
+        let (_, first, first_reservation) = create_session_folder(
+            &reserved,
+            &root,
+            &parsed(DEFAULT_TEMPLATE),
+            &now,
+            Some("Standup"),
+            real_make("01DEVICE-01FIRST"),
+        )
+        .expect("the first session folder");
+        // Same minute, same title, same template: only the ordinal can differ.
+        let (_, second, _second_reservation) = create_session_folder(
+            &reserved,
+            &root,
+            &parsed(DEFAULT_TEMPLATE),
+            &now,
+            Some("Standup"),
+            real_make("01DEVICE-01SECOND"),
+        )
+        .expect("the second session folder");
+        assert_ne!(first, second, "the second start reused the first folder");
+        assert!(first.is_dir() && second.is_dir());
+        // Against the renderer, not against a literal or a substring: the story's
+        // claim is that the ORDINAL decides the second name, and only asking the
+        // template for ordinal 2 can tell that apart from any other disambiguation.
+        assert_eq!(
+            second,
+            session_folder_path(
+                &root,
+                &parsed(DEFAULT_TEMPLATE).render(&start_render_ctx(&now, Some("Standup"), 2))
+            ),
+            "the second folder is the template's ordinal-2 render"
+        );
+        // The colliding attempt reserved the FIRST session's folder before it
+        // discovered the collision. Releasing that attempt's guard must not
+        // release the live session's reservation, or the recovery pass would
+        // rewrite a recording session's manifest underneath it.
+        assert!(
+            plain_lock(&reserved).contains(&first),
+            "the live session's folder was un-reserved by a colliding attempt"
+        );
+        drop(first_reservation);
+        assert!(
+            !plain_lock(&reserved).contains(&first),
+            "the owning guard did not release the reservation"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_exhausted_ordinal_refuses_and_names_the_path_it_tried() {
+        let root = scan_temp_dir("start-exhausted");
+        let template = parsed("rec{seq}");
+        let now = start_at(15, 36, 22);
+        // Occupy every ordinal this start would try.
+        for seq in 1..=SESSION_FOLDER_ATTEMPTS {
+            let taken = template.render(&start_render_ctx(&now, None, seq));
+            std::fs::create_dir_all(session_folder_path(&root, &taken)).expect("occupy");
+        }
+        let error = create_session_folder(
+            &reserved_set(),
+            &root,
+            &template,
+            &now,
+            None,
+            real_make("01DEVICE-01SESSION"),
+        )
+        .expect_err("every ordinal is taken");
+        let last = template.render(&start_render_ctx(&now, None, SESSION_FOLDER_ATTEMPTS));
+        assert!(
+            error.message.contains(last.as_str()),
+            "the refusal must name the path it tried, got: {}",
+            error.message
+        );
+        assert!(
+            !error.retriable,
+            "retrying the same 64 ordinals cannot help"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_root_refuses_and_leaves_nothing_behind() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scan_temp_dir("start-readonly");
+        let mut perms = std::fs::metadata(&root)
+            .expect("root metadata")
+            .permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&root, perms).expect("make the root read-only");
+        let outcome = create_session_folder(
+            &reserved_set(),
+            &root,
+            &parsed(DEFAULT_TEMPLATE),
+            &start_at(15, 36, 22),
+            None,
+            real_make("01DEVICE-01SESSION"),
+        );
+        // Restore BEFORE asserting: a failed assertion here would otherwise
+        // unwind past the restore and strand an unwritable directory in the temp
+        // root that no later run can clean up.
+        let mut restore = std::fs::metadata(&root)
+            .expect("root metadata")
+            .permissions();
+        restore.set_mode(0o755);
+        std::fs::set_permissions(&root, restore).expect("restore the root");
+        let error = outcome.expect_err("a read-only root cannot hold a session");
+        assert!(
+            error.message.contains("2026/2026-08-06 1536"),
+            "the refusal must name the rendered path, got: {}",
+            error.message
+        );
+        assert!(
+            !root.join("2026").exists(),
+            "a refused start left an intermediate directory behind"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_creation_unwinds_the_directories_it_made() {
+        let root = scan_temp_dir("start-unwind");
+        let error = create_session_folder(
+            &reserved_set(),
+            &root,
+            &parsed(DEFAULT_TEMPLATE),
+            &start_at(15, 36, 22),
+            None,
+            // The real creator's shape when the manifest write fails: the leaf
+            // exists, its manifest does not.
+            |folder: PathBuf| {
+                std::fs::create_dir(&folder).expect("the leaf is creatable");
+                Err(RecordingError::ManifestIo(
+                    "write manifest: disk lied".to_owned(),
+                ))
+            },
+        )
+        .expect_err("the manifest write failed");
+        assert!(error.message.contains("disk lied"));
+        assert!(
+            !root.join("2026").join("2026-08-06 1536").exists(),
+            "the leaf this attempt created was left behind"
+        );
+        assert!(
+            !root.join("2026").exists(),
+            "the year folder this attempt created was left behind"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pre_existing_parent_is_never_unwound() {
+        let root = scan_temp_dir("start-keep-parent");
+        // Two shapes of "this attempt did not create it": a year folder holding
+        // someone else's session, and an EMPTY one. The empty case is the one
+        // that matters — a non-empty directory is protected by `remove_dir`'s own
+        // ENOTEMPTY, so only the empty one can tell "never registered" apart from
+        // "registered and got lucky".
+        let occupied = root.join("2026");
+        std::fs::create_dir_all(occupied.join("an older session")).expect("older session");
+        let empty_root = scan_temp_dir("start-keep-empty-parent");
+        let empty_year = empty_root.join("2026");
+        std::fs::create_dir(&empty_year).expect("an empty year folder");
+        for (root, year) in [(&root, &occupied), (&empty_root, &empty_year)] {
+            let error = create_session_folder(
+                &reserved_set(),
+                root,
+                &parsed(DEFAULT_TEMPLATE),
+                &start_at(15, 36, 22),
+                None,
+                |_folder: PathBuf| {
+                    Err(RecordingError::ManifestIo(
+                        "write manifest: nope".to_owned(),
+                    ))
+                },
+            )
+            .expect_err("the manifest write failed");
+            assert!(error.message.contains("nope"));
+            assert!(
+                year.is_dir(),
+                "a directory this attempt did not create must never be removed: {year:?}"
+            );
+        }
+        assert!(
+            occupied.join("an older session").is_dir(),
+            "another session's folder must survive a failed start"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&empty_root);
+    }
+
+    #[test]
+    fn the_manifest_carries_the_session_id_and_never_the_destination_root() {
+        let root = scan_temp_dir("start-manifest");
+        let (_, folder, _reservation) = create_session_folder(
+            &reserved_set(),
+            &root,
+            &parsed(DEFAULT_TEMPLATE),
+            &start_at(15, 36, 22),
+            Some("Standup"),
+            real_make("01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KZAAAAAAAAAAAAAAAAAAAAAA"),
+        )
+        .expect("the session folder is created");
+        let text = std::fs::read_to_string(folder.join("manifest.json")).expect("manifest text");
+        assert!(
+            text.contains(
+                "\"sessionId\": \"01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KZAAAAAAAAAAAAAAAAAAAAAA\""
+            ),
+            "the manifest must carry the session identity: {text}"
+        );
+        assert!(
+            !text.contains(root.to_string_lossy().as_ref()),
+            "the manifest must stay portable — no absolute path: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn the_session_id_is_device_scoped_and_never_repeats() {
+        let data_dir = scan_temp_dir("start-identity");
+        let first = mint_session_id(&data_dir).expect("mint a session id");
+        let second = mint_session_id(&data_dir).expect("mint another session id");
+        let (first_device, first_session) = first
+            .split_once('-')
+            .expect("the id splits into device and session");
+        let (second_device, second_session) = second
+            .split_once('-')
+            .expect("the id splits into device and session");
+        assert_eq!(
+            first_device, second_device,
+            "the device half is this machine's identity and does not move"
+        );
+        assert_ne!(
+            first_session, second_session,
+            "each session gets its own ULID"
+        );
+        assert_eq!(first_device.len(), 26, "a ULID is 26 Crockford characters");
+        assert_eq!(first_session.len(), 26);
+        assert!(
+            first.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "the id is used in a markdown link and a shell word: {first}"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

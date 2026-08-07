@@ -2024,11 +2024,12 @@ export async function recordingSessionSummary(folder: string): Promise<Recording
 
 /**
  * List the crash-recovered sessions still needing a one-time notice (Story 20.3,
- * FR-73). The Rust core scans the effective recordings destination for
- * `manifest.json` with `status:"recovered"` whose folder basename is NOT in the
- * persisted acknowledgement seen-set, deterministically sorted. Best-effort: a
- * missing destination dir resolves an empty array; a per-entry failure is
- * skipped, never thrown. Resolves an array (empty when nothing is due).
+ * FR-73). The Rust core walks the effective recordings destination (Story 40.3 —
+ * the path template may nest sessions under it) for a loadable `manifest.json`
+ * with `status:"recovered"` whose acknowledgement key is NOT in the persisted
+ * seen-set, deterministically sorted. Best-effort: a missing destination dir
+ * resolves an empty array; a per-entry failure is skipped, never thrown.
+ * Resolves an array (empty when nothing is due).
  */
 export async function recoveredSessionsList(): Promise<RecordingSummaryVm[]> {
   return await invoke<RecordingSummaryVm[]>("recovered_sessions_list");
@@ -2036,11 +2037,17 @@ export async function recoveredSessionsList(): Promise<RecordingSummaryVm[]> {
 
 /**
  * Acknowledge (dismiss) a surfaced recovery card (Story 20.3, FR-73): the Rust
- * core latches the session folder's basename into the persisted seen-set so
+ * core latches the session's acknowledgement key — its immutable `meta.sessionId`
+ * since Story 40.3, or its destination-relative folder path for a session
+ * recorded before that — into the persisted seen-set so
  * {@link recoveredSessionsList} never surfaces it again on a later scan/restart.
- * A one-way, idempotent, best-effort registry write. `folder` is the session
- * folder path. Rejects with the {@link IpcError} envelope only on a write
- * failure (the card may then reappear next scan).
+ * Keying on the identity is what keeps a dismissal attached to the session when
+ * the folder is later moved or retitled. A one-way, idempotent registry write.
+ * `folder` is the session folder path. Every read the latch needs (the
+ * destination setting, the manifest) degrades to a logged no-op rather than a
+ * rejection, so a dismiss the user cannot retry differently never fails on them;
+ * rejects with the {@link IpcError} envelope only on a write failure (the card
+ * may then reappear next scan).
  */
 export async function recoveredSessionAcknowledge(folder: string): Promise<void> {
   await invoke<void>("recovered_session_acknowledge", { folder });

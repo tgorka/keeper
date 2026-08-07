@@ -605,19 +605,27 @@ pub fn set_ios_sync_disclosure_shown(data_dir: &Path) -> Result<(), CoreError> {
 }
 
 /// The `settings` key holding the recovered-session acknowledgement seen-set
-/// (Story 20.3, FR-73). A JSON array of session-folder **basenames** — every
-/// crash-recovered session the user has already been shown-and-dismissed. Absent
-/// ⇒ nothing acknowledged yet. Mirrors the one-time
+/// (Story 20.3, FR-73). A JSON array of opaque session **keys** — every
+/// crash-recovered session the user has already been shown-and-dismissed. The
+/// shell picks the key: since Story 40.3 a session mints an immutable
+/// `meta.sessionId` and that is what is stored, so a dismissal survives the
+/// folder being moved or retitled; a session without one (recorded before 40.3)
+/// is stored as its folder path relative to the destination root, which for a
+/// flat pre-40.3 session is exactly its basename — so entries written by older
+/// builds keep matching what they were written for. Absent ⇒ nothing
+/// acknowledged yet. Mirrors the one-time
 /// [`UI_IOS_SYNC_DISCLOSURE_SHOWN_KEY`] latch, but keyed as a set so multiple
 /// distinct recovered sessions each surface exactly once without overloading the
 /// wire-stable manifest `status`.
 const UI_RECOVERED_SESSIONS_ACKNOWLEDGED_KEY: &str = "ui.recovered_sessions_acknowledged";
 
-/// Read the acknowledged recovered-session basenames (Story 20.3, FR-73). Absent
-/// / unparseable ⇒ empty (nothing acknowledged — every recovered session is
-/// still due to surface). Stored as a JSON array in the `settings` k/v table
-/// under `ui.recovered_sessions_acknowledged`. The recovery-list scan filters
-/// these out so each session shows exactly once across restarts.
+/// Read the acknowledged recovered-session keys (Story 20.3, FR-73) — session
+/// ids, or root-relative folder paths for the sessions that predate Story
+/// 40.3's identity. Absent / unparseable ⇒ empty (nothing acknowledged — every
+/// recovered session is still due to surface). Stored as a JSON array in the
+/// `settings` k/v table under `ui.recovered_sessions_acknowledged`. The
+/// recovery-list scan filters these out so each session shows exactly once
+/// across restarts.
 pub fn get_recovered_sessions_acknowledged(data_dir: &Path) -> Result<Vec<String>, CoreError> {
     match get_setting(data_dir, UI_RECOVERED_SESSIONS_ACKNOWLEDGED_KEY)? {
         Some(raw) => match serde_json::from_str::<Vec<String>>(&raw) {
@@ -637,18 +645,23 @@ pub fn get_recovered_sessions_acknowledged(data_dir: &Path) -> Result<Vec<String
     }
 }
 
-/// Latch a recovered session's folder basename into the acknowledgement seen-set
-/// (Story 20.3, FR-73). Idempotent: a basename already present is a no-op (the
-/// stored array never accumulates duplicates), and the write is one-way — an
-/// acknowledged session never re-surfaces. Reads the current set, adds `session`
-/// if absent, and persists the JSON array back under
-/// `ui.recovered_sessions_acknowledged`.
-pub fn add_recovered_session_acknowledged(data_dir: &Path, session: &str) -> Result<(), CoreError> {
+/// Latch a recovered session's `key` into the acknowledgement seen-set (Story
+/// 20.3, FR-73). The key is the caller's to choose and opaque here — the shell
+/// passes the session's immutable `meta.sessionId` when it has one and its
+/// root-relative folder path otherwise, so a dismissal survives the folder being
+/// moved or retitled while a pre-40.3 flat session (whose relative path is its
+/// basename) keeps the key older builds already wrote.
+///
+/// Idempotent: a key already present is a no-op (the stored array never
+/// accumulates duplicates), and the write is one-way — an acknowledged session
+/// never re-surfaces. Reads the current set, adds `key` if absent, and persists
+/// the JSON array back under `ui.recovered_sessions_acknowledged`.
+pub fn add_recovered_session_acknowledged(data_dir: &Path, key: &str) -> Result<(), CoreError> {
     let mut acknowledged = get_recovered_sessions_acknowledged(data_dir)?;
-    if acknowledged.iter().any(|entry| entry == session) {
+    if acknowledged.iter().any(|entry| entry == key) {
         return Ok(());
     }
-    acknowledged.push(session.to_owned());
+    acknowledged.push(key.to_owned());
     let json = serde_json::to_string(&acknowledged).map_err(|e| {
         CoreError::Internal(format!(
             "could not serialize acknowledged recovered sessions: {e}"

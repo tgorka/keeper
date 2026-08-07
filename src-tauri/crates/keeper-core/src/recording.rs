@@ -1239,9 +1239,11 @@ pub struct SessionDevices {
 /// FR-71, AD-33) — the segment ledger that makes a session self-describing.
 ///
 /// Serialized shape (camelCase; see the story's Design Notes):
-/// `{ version, session, status, captureTarget, devices, segments }`. The folder
-/// path is runtime-only (`#[serde(skip)]`) — the manifest never persists an
-/// absolute path, keeping it portable.
+/// `{ version, session, status, captureTarget, devices, segments }`, plus the
+/// optional `meta` block — whose own optional `sessionId` (Story 40.3) is the
+/// session's stable identity, while `session` stays the folder's basename, a
+/// label. The folder path is runtime-only (`#[serde(skip)]`) — the manifest
+/// never persists an absolute path, keeping it portable.
 // (No `Eq`: the segment ledger carries `f64` PTS bounds since Story 17.4.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1276,11 +1278,26 @@ pub struct SessionManifest {
     folder: PathBuf,
 }
 
-/// Optional user-supplied session metadata (Story 21.5): all fields free-text
-/// and optional; absent fields are omitted from the serialized manifest.
+/// Per-session metadata (Story 21.5) — every field optional, absent ones
+/// omitted from the serialized manifest. All of it is user-supplied free text
+/// EXCEPT [`Self::session_id`], which the shell mints and nothing edits.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMeta {
+    /// The session's immutable identity (Story 40.3): `<device ULID>-<session
+    /// ULID>`, both Crockford (uppercase alphanumeric, `-`-free), so a split on
+    /// the single `-` recovers the device that made the recording.
+    ///
+    /// Minted shell-side — a ULID reads the clock and this module is clock-free
+    /// — and never rewritten afterwards. It is the session's handle precisely
+    /// because the folder name is not one: a retitle (Story 40.4) moves the
+    /// folder and leaves this byte-identical, and Story 42's archive rows are
+    /// keyed on it.
+    ///
+    /// Optional and additive on the wire ([`MANIFEST_VERSION`] stays 1): a
+    /// manifest written before this story still loads, and still recovers.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_id: Option<String>,
     /// A human title for the session (also drives the folder name host-side).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub title: Option<String>,
@@ -1317,10 +1334,13 @@ fn manifest_io(operation: &str, error: &std::io::Error) -> RecordingError {
 impl SessionManifest {
     /// Create the session folder and its initial `recording` manifest (Story
     /// 17.2). The folder must **not** pre-exist — `fs::create_dir` fails on an
-    /// existing directory, so a prior session's folder is never adopted (the
-    /// shell disambiguates the name on collision before calling this). Missing
-    /// *parent* directories (e.g. `~/Movies/keeper`) are created. Any real fs
-    /// failure surfaces as [`RecordingError::ManifestIo`].
+    /// existing directory, so a prior session's folder is never adopted. That
+    /// refusal is reported as [`RecordingError::SessionFolderExists`], which the
+    /// caller acts on: since Story 40.3 `recording_start` re-renders its path
+    /// template with the next `{seq}` ordinal and calls again, rather than
+    /// disambiguating a name up front. Missing *parent* directories (e.g.
+    /// `~/Movies/keeper`, or a nesting template's `2026/`) are created. Any
+    /// other fs failure surfaces as [`RecordingError::ManifestIo`].
     pub fn create(
         folder: PathBuf,
         capture_target: CaptureTarget,
@@ -1345,7 +1365,12 @@ impl SessionManifest {
         }
         // `create_dir` (NOT `create_dir_all`) — an already-existing session
         // folder is an error, never silently reused (same-second restart guard).
-        std::fs::create_dir(&folder).map_err(|e| manifest_io("create session folder", &e))?;
+        // `AlreadyExists` is the caller's retry signal, so it is typed here
+        // rather than left for the caller to recognise in an io message.
+        std::fs::create_dir(&folder).map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => RecordingError::SessionFolderExists,
+            _ => manifest_io("create session folder", &e),
+        })?;
         let session = folder
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -1420,14 +1445,29 @@ impl SessionManifest {
     /// reader polling the file sees the pre- or post-update manifest, never a
     /// torn one. A failure surfaces as [`RecordingError::ManifestIo`] and
     /// leaves the prior manifest intact (the rename never happened).
+    ///
+    /// **Neither failure leaves the temp file behind.** A full or failing disk
+    /// aborts `fs::write` itself, mid-file, and the partial dotfile that leaves
+    /// is load-bearing: Story 40.3's failed-start unwind removes the session
+    /// folder with `remove_dir`, never `remove_dir_all`, so any residue makes
+    /// the unwind a no-op and strands both the leaf and the directories the
+    /// template nested it under. So the temp is cleaned on BOTH branches, and
+    /// best-effort on each: the error the caller sees is always the write's or
+    /// the rename's, never the removal's.
     pub fn write(&self) -> Result<(), RecordingError> {
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| RecordingError::ManifestIo(format!("serialize manifest: {e}")))?;
         let tmp = self.folder.join(".manifest.json.tmp");
-        std::fs::write(&tmp, json).map_err(|e| manifest_io("write manifest temp file", &e))?;
+        std::fs::write(&tmp, json).map_err(|e| {
+            // The write aborted mid-file: a partial temp may exist. Remove it,
+            // so the "self-describing" session folder keeps no dotfile — and
+            // stays empty enough for a failed start's `remove_dir` unwind.
+            let _ = std::fs::remove_file(&tmp);
+            manifest_io("write manifest temp file", &e)
+        })?;
         std::fs::rename(&tmp, self.folder.join("manifest.json")).map_err(|e| {
-            // The rename never landed — clean up the temp so a failed final write
-            // doesn't litter the "self-describing" session folder with a dotfile.
+            // The rename never landed — the whole temp is still there. Same
+            // reasoning, same cleanup.
             let _ = std::fs::remove_file(&tmp);
             manifest_io("rename manifest into place", &e)
         })?;
@@ -1572,16 +1612,81 @@ impl SessionManifest {
     }
 }
 
-/// Scan `base_dir` for crash-orphaned sessions and recover each one (Story
-/// 17.3, FR-73, AD-37) — a platform-free, disk-authoritative, best-effort
-/// recovery pass. Returns the folders it marked `recovered` (sorted, so the
-/// list is deterministic across `read_dir` orders and platforms).
+/// How deep below the destination root a recovery walk descends, counted in
+/// path components (an immediate child of the root is depth 1). A session
+/// folder at depth 8 is still recovered; nothing below it is even read.
 ///
-/// For each immediate subdirectory of `base_dir` — **symlinked entries are
-/// skipped** via the `DirEntry` file type (which does not follow symlinks), so
-/// recovery never rewrites a manifest outside the destination tree — that
-/// holds a `manifest.json`, [`SessionManifest::load`] it; when its `status` is
-/// still [`ManifestStatus::Recording`] AND its `version` is within
+/// **This number is what makes a session reachable at all.** Both walks stop
+/// here — the salvage pass in [`recover_orphaned_sessions`], which MARKS a
+/// crashed session `recovered`, and the shell's scan that SURFACES it as a
+/// card — so a session written deeper than this is one a crash makes invisible
+/// forever, no matter how intact its folder is. That is why
+/// [`PathTemplate::parse`](path_template::PathTemplate::parse) refuses a
+/// template with more folders than this rather than letting the user record
+/// somewhere recovery cannot follow: one cap, imported by everything that has
+/// to agree with it, instead of three that can drift.
+///
+/// The cap exists because the destination root is a folder the USER chose — it
+/// may be the whole Movies library, or a sync mount with a hundred thousand
+/// files under it — and a startup pass must cost a bounded number of `read_dir`
+/// calls. Eight is well past any template's nesting (the deepest plausible one
+/// is `{yyyy}/{mm}/{dd}/…`) and far short of a tree worth crawling.
+pub const RECOVERY_MAX_DEPTH: usize = 8;
+
+/// How many directories one recovery walk examines before it stops and returns
+/// what it has already found.
+///
+/// Depth bounds how *deep* a walk goes, never how *wide*: eight levels of a
+/// destination root that happens to be a Photos library, an iCloud Drive, or a
+/// home directory is an unbounded number of `read_dir` and `stat` calls. And
+/// this pass is not only a startup pass — [`recover_orphaned_sessions`] also
+/// runs on the user's **Record click**, before capture begins, so an unbounded
+/// crawl is a Record button that hangs on a folder the user is perfectly
+/// entitled to have chosen.
+///
+/// Tripping it is not an error: the walk logs once and returns the sessions it
+/// found, which is strictly better than the nothing an aborted pass would
+/// return. Four thousand directories is far more than a recordings root
+/// accumulates in years of use, and a fraction of a second of `stat` calls.
+pub const RECOVERY_MAX_VISITS: usize = 4096;
+
+/// Scan `base_dir` for crash-orphaned sessions and recover each one (Story
+/// 17.3, FR-73, AD-37; nested since Story 40.3) — a platform-free,
+/// disk-authoritative, best-effort recovery pass. Returns the folders it marked
+/// `recovered` (sorted, so the list is deterministic across `read_dir` orders
+/// and platforms).
+///
+/// **The walk.** A session folder is no longer an immediate child of
+/// `base_dir`: the default path template starts with `{yyyy}/`, so sessions
+/// live at `<root>/2026/…`. The pass therefore walks descendants — iteratively,
+/// with an explicit worklist, so a pathological tree cannot grow the stack —
+/// under five guards:
+///
+/// - **Depth.** At most [`RECOVERY_MAX_DEPTH`] components below `base_dir`; a
+///   directory at the cap is examined but never descended into, so the pass
+///   costs a bounded number of `read_dir` calls on a root the user chose.
+/// - **Visits.** At most [`RECOVERY_MAX_VISITS`] directories examined in one
+///   pass; the budget bounds a root that is *wide* rather than deep, which
+///   depth alone cannot. Tripping it logs once at `warn` and returns the
+///   sessions found so far — a truncated salvage, never a failed one.
+/// - **A session is a directory whose manifest LOADS.** The `manifest.json`
+///   probe only nominates a candidate; [`SessionManifest::load`] decides. On a
+///   load the directory IS the session: it is salvaged and never walked, so a
+///   stray manifest a user copied inside one cannot surface as a second card.
+///   On a failure — a truncated write, a hand-edited file, a stray
+///   `manifest.json` in a year folder — it is logged and walked like any
+///   ordinary directory, because a file that is not a manifest must never hide
+///   every real session beneath it from salvage.
+/// - **Symlinks.** Skipped via the `DirEntry` file type, which does not follow
+///   them (unlike an `is_dir()`-style probe). Recovery must never rewrite a
+///   manifest outside the destination tree — and, walking recursively now, must
+///   never follow a cycle back into itself.
+/// - **Dot entries.** A name starting with `.` is skipped: `.Trash`,
+///   `.Spotlight-V100` and friends are the OS's, not the user's recordings, and
+///   a deleted session must stay deleted rather than be resurrected as a card.
+///
+/// For each session folder found, [`SessionManifest::load`] it; when its
+/// `status` is still [`ManifestStatus::Recording`] AND its `version` is within
 /// [`MANIFEST_VERSION`] AND `is_active` reports the folder inactive, rebuild
 /// the segment ledger from the on-disk `.mov` files
 /// ([`SessionManifest::reconcile_from_dir`] — disk is authoritative, the stale
@@ -1600,13 +1705,13 @@ impl SessionManifest {
 /// module firewall-clean — no shell or Apple types cross the seam.
 ///
 /// Best-effort and total: a missing `base_dir` is "no recordings yet" (silent
-/// empty list); an unreadable `base_dir` is logged and yields an empty list;
-/// an entry that is not a session dir, is symlinked, has no/unreadable/
-/// malformed manifest, is not `recording`, is a newer schema version, is
-/// reserved live, or whose per-folder reconcile/write fails is skipped (logged
-/// via `tracing`) — one bad entry NEVER aborts the scan, and the pass never
-/// propagates an error or panics. Because a recovered manifest is no longer
-/// `recording`, a second run is a no-op (idempotent).
+/// empty list); an unreadable directory is logged and contributes nothing; an
+/// entry that is not a directory, is symlinked, is a dot entry, is past the
+/// depth cap, is past the visit budget, is not `recording`, is a newer schema
+/// version, is reserved live, or whose per-folder reconcile/write fails is
+/// skipped (logged via `tracing`) — one bad entry NEVER aborts the walk, and
+/// the pass never propagates an error or panics. Because a recovered manifest
+/// is no longer `recording`, a second run is a no-op (idempotent).
 ///
 /// Firewall-clean: `std::fs` + serde + the bare predicate only — no shell, no
 /// Apple framework, no process API (enforced by
@@ -1615,93 +1720,120 @@ pub fn recover_orphaned_sessions(
     base_dir: &Path,
     is_active: &dyn Fn(&Path) -> bool,
 ) -> Vec<PathBuf> {
-    let entries = match std::fs::read_dir(base_dir) {
-        Ok(entries) => entries,
-        // A missing base dir means "no recordings yet" — not even worth a warn.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(error) => {
-            tracing::warn!(%error, "recovery: could not read the recordings base dir (non-fatal)");
-            return Vec::new();
-        }
-    };
+    recover_orphaned_sessions_within(base_dir, is_active, RECOVERY_MAX_VISITS)
+}
+
+/// [`recover_orphaned_sessions`] with its visit budget as an argument, so the
+/// budget's own behaviour can be proven against a tree of a dozen directories
+/// rather than one of [`RECOVERY_MAX_VISITS`]. Every shipping caller goes
+/// through the public entry point, which always passes the real budget.
+fn recover_orphaned_sessions_within(
+    base_dir: &Path,
+    is_active: &dyn Fn(&Path) -> bool,
+    max_visits: usize,
+) -> Vec<PathBuf> {
     let mut recovered = Vec::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
+    // Directories examined so far, against `max_visits`. Depth bounds a deep
+    // root; this bounds a wide one — the two guards are independent, and a
+    // Photos library trips only this one.
+    let mut visits = 0usize;
+    // An explicit worklist of (directory, its depth below `base_dir`) rather
+    // than recursion: the depth rides along with each directory, and a deep
+    // hand-made tree costs heap, never stack.
+    let mut pending = vec![(base_dir.to_path_buf(), 0usize)];
+    'walk: while let Some((dir, depth)) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // A missing directory means "no recordings yet" (or a directory
+            // that vanished mid-walk) — not even worth a warn.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                tracing::warn!(%error, "recovery: skipping unreadable base-dir entry");
+                tracing::warn!(%error, "recovery: could not read a recordings directory (non-fatal)");
                 continue;
             }
         };
-        // `DirEntry::file_type` does not follow symlinks (and costs no extra
-        // syscall on the platforms keeper ships on): a symlinked entry — which
-        // `is_dir()`-style probes would follow — must never be recovered, or
-        // the pass would rewrite a manifest OUTSIDE the destination tree.
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(error) => {
-                tracing::warn!(%error, "recovery: skipping entry with unreadable file type");
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(%error, "recovery: skipping unreadable directory entry");
+                    continue;
+                }
+            };
+            // `DirEntry::file_type` does not follow symlinks (and costs no
+            // extra syscall on the platforms keeper ships on): a symlinked
+            // entry — which `is_dir()`-style probes would follow — must never
+            // be recovered or descended into, or the walk would leave the
+            // destination tree, and could loop back into itself.
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    tracing::warn!(%error, "recovery: skipping entry with unreadable file type");
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
+                tracing::debug!("recovery: skipping symlinked entry");
                 continue;
             }
-        };
-        if file_type.is_symlink() {
-            tracing::debug!("recovery: skipping symlinked base-dir entry");
-            continue;
-        }
-        // Only immediate real subdirectories are session folders; a loose file
-        // is a stray, never a session.
-        if !file_type.is_dir() {
-            continue;
-        }
-        let folder = entry.path();
-        // A subdirectory without a `manifest.json` is not a session folder
-        // (`load` backstops a real session whose probe races with a warn).
-        if !folder.join("manifest.json").is_file() {
-            continue;
-        }
-        let mut manifest = match SessionManifest::load(&folder) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                // Unreadable / malformed manifest — skip this folder, never
-                // abort the scan of its siblings.
-                tracing::warn!(%error, "recovery: skipping folder with an unreadable manifest");
+            // Only real directories can be (or contain) session folders; a
+            // loose file is a stray.
+            if !file_type.is_dir() {
                 continue;
             }
-        };
-        // Only a still-`recording` manifest can be orphaned; a terminal
-        // (`finalized`/`recovered`/`failed`) session is read once and left
-        // untouched — this is what makes recovery idempotent.
-        if manifest.status != ManifestStatus::Recording {
-            continue;
+            // A dot entry is the OS's bookkeeping (`.Trash`, `.Spotlight-V100`)
+            // or a hidden folder the user deliberately tucked away — never a
+            // tree recovery should resurrect cards from.
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            // The budget is spent on directories, and spent BEFORE the manifest
+            // probe: the probe is one of the `stat` calls it exists to bound.
+            // Tripping it truncates the pass rather than failing it — the
+            // sessions already salvaged are salvaged, and the warn names the
+            // budget (never a path: core messages carry none) so the log says
+            // which number to raise.
+            if visits == max_visits {
+                tracing::warn!(
+                    budget = max_visits,
+                    recovered = recovered.len(),
+                    "recovery: stopping the walk at its visit budget; returning the sessions found so far"
+                );
+                break 'walk;
+            }
+            visits += 1;
+            let folder = entry.path();
+            // A `manifest.json` only NOMINATES a session; the load decides. A
+            // truncated write, a hand-edited file, or a stray manifest dropped
+            // into a year folder is not a session, and treating it as one — as
+            // the probe alone did — made it a lid: every real session beneath
+            // it stayed unwalked, unsalvaged and invisible, permanently. A
+            // manifest that LOADS is a session, salvaged and never walked (so a
+            // stray manifest a user copied inside one cannot surface as a
+            // second card); one that does not is logged and descended into like
+            // any ordinary directory.
+            if folder.join("manifest.json").is_file() {
+                match SessionManifest::load(&folder) {
+                    Ok(manifest) => {
+                        if let Some(folder) = salvage_session_folder(manifest, is_active) {
+                            recovered.push(folder);
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "recovery: unreadable manifest; walking the directory instead of treating it as a session"
+                        );
+                    }
+                }
+            }
+            // Not a session: descend, unless its children would sit past the
+            // depth cap.
+            if depth + 1 < RECOVERY_MAX_DEPTH {
+                pending.push((folder, depth + 1));
+            }
         }
-        // Never rewrite an unknown future schema.
-        if manifest.version > MANIFEST_VERSION {
-            tracing::warn!(
-                version = manifest.version,
-                "recovery: skipping newer-schema manifest"
-            );
-            continue;
-        }
-        // The live-session guard, consulted IMMEDIATELY before the salvage: a
-        // folder the shell has reserved belongs to a session that is live (or
-        // mid-start, or still landing its terminal write) — skip it untouched.
-        // A genuinely-crashed orphan is never reserved and still salvages.
-        if is_active(&folder) {
-            tracing::debug!("recovery: skipping reserved live session folder");
-            continue;
-        }
-        // Rebuild the ledger from disk (remux-free — only `manifest.json` is
-        // written), mark recovered, atomically rewrite.
-        if let Err(error) = manifest.reconcile_from_dir() {
-            tracing::warn!(%error, "recovery: skipping folder whose segment dir could not be read");
-            continue;
-        }
-        manifest.set_status(ManifestStatus::Recovered);
-        if let Err(error) = manifest.write() {
-            tracing::warn!(%error, "recovery: skipping folder whose manifest could not be rewritten");
-            continue;
-        }
-        recovered.push(folder);
     }
     // `read_dir` order is filesystem-defined; sort so the recovered list is
     // deterministic across runs and platforms.
@@ -1709,40 +1841,54 @@ pub fn recover_orphaned_sessions(
     recovered
 }
 
-/// Derive the fs-safe session folder basename `keeper-rec <local ts>` from the
-/// shell-supplied local-timestamp string (Story 17.2). Core is time-agnostic —
-/// it validates and formats, never generates the timestamp.
+/// Salvage one already-loaded session for [`recover_orphaned_sessions`],
+/// returning its folder when (and only when) the manifest was rewritten to
+/// [`ManifestStatus::Recovered`]. Every refusal is a silent-or-logged `None` —
+/// one bad session never aborts the walk that found it.
 ///
-/// Rejected (as [`RecordingError::ManifestIo`], message secret-free): an empty
-/// or all-whitespace timestamp; a path separator (`/`, `\`), a `:`, a NUL, or
-/// any control character; a leading dot (a hidden folder); and a trailing `.`
-/// or trailing space (some filesystems normalize these away, diverging the
-/// folder basename from `manifest.session`).
-pub fn session_folder_name(local_ts: &str) -> Result<String, RecordingError> {
-    if local_ts.trim().is_empty() {
-        return Err(RecordingError::ManifestIo(
-            "session timestamp is empty or all-whitespace".to_owned(),
-        ));
+/// The manifest arrives loaded because the LOAD is what identified this
+/// directory as a session in the first place: a directory whose `manifest.json`
+/// does not parse is walked, not salvaged, so the failure has to be handled
+/// where the walk can still descend.
+fn salvage_session_folder(
+    mut manifest: SessionManifest,
+    is_active: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    // Only a still-`recording` manifest can be orphaned; a terminal
+    // (`finalized`/`recovered`/`failed`) session is read once and left
+    // untouched — this is what makes recovery idempotent.
+    if manifest.status != ManifestStatus::Recording {
+        return None;
     }
-    if local_ts
-        .chars()
-        .any(|c| c == '/' || c == '\\' || c == ':' || c.is_control())
-    {
-        return Err(RecordingError::ManifestIo(
-            "session timestamp contains a path separator, colon, or control character".to_owned(),
-        ));
+    // Never rewrite an unknown future schema.
+    if manifest.version > MANIFEST_VERSION {
+        tracing::warn!(
+            version = manifest.version,
+            "recovery: skipping newer-schema manifest"
+        );
+        return None;
     }
-    if local_ts.starts_with('.') {
-        return Err(RecordingError::ManifestIo(
-            "session timestamp starts with a dot".to_owned(),
-        ));
+    // The live-session guard, consulted IMMEDIATELY before the salvage: a
+    // folder the shell has reserved belongs to a session that is live (or
+    // mid-start, or still landing its terminal write) — skip it untouched.
+    // A genuinely-crashed orphan is never reserved and still salvages.
+    if is_active(&manifest.folder) {
+        tracing::debug!("recovery: skipping reserved live session folder");
+        return None;
     }
-    if local_ts.ends_with('.') || local_ts.ends_with(' ') {
-        return Err(RecordingError::ManifestIo(
-            "session timestamp ends with a dot or space".to_owned(),
-        ));
+    // Rebuild the ledger from disk (remux-free — only `manifest.json` is
+    // written), mark recovered, atomically rewrite.
+    if let Err(error) = manifest.reconcile_from_dir() {
+        tracing::warn!(%error, "recovery: skipping folder whose segment dir could not be read");
+        return None;
     }
-    Ok(format!("keeper-rec {local_ts}"))
+    manifest.set_status(ManifestStatus::Recovered);
+    if let Err(error) = manifest.write() {
+        tracing::warn!(%error, "recovery: skipping folder whose manifest could not be rewritten");
+        return None;
+    }
+    // The folder moves out of the manifest, which is dropped here anyway.
+    Some(manifest.folder)
 }
 
 /// Extract the segment index from a filename stem's **trailing numeric run**
@@ -3937,32 +4083,6 @@ mod tests {
     }
 
     #[test]
-    fn session_folder_name_derives_and_rejects_unsafe_timestamps() {
-        assert_eq!(
-            session_folder_name("2026-07-17 14.23.45").expect("fs-safe timestamp"),
-            "keeper-rec 2026-07-17 14.23.45"
-        );
-        for bad in [
-            "",             // empty
-            "   ",          // all-whitespace
-            "\t \t",        // all-whitespace (tabs)
-            "2026/07/17",   // path separator
-            "2026\\07\\17", // backslash separator
-            "14:23:45",     // colon
-            "14.23\u{0}45", // NUL
-            "14.23\n45",    // control char
-            ".2026-07-17",  // leading dot (hidden folder)
-            "2026-07-17.",  // trailing dot (fs-normalized away)
-            "2026-07-17 ",  // trailing space (fs-normalized away)
-        ] {
-            assert!(
-                matches!(session_folder_name(bad), Err(RecordingError::ManifestIo(_))),
-                "timestamp {bad:?} must be rejected"
-            );
-        }
-    }
-
-    #[test]
     fn segment_index_from_stem_reads_the_trailing_numeric_run() {
         assert_eq!(segment_index_from_stem("screen-0000"), Some(0));
         assert_eq!(segment_index_from_stem("screen-0042"), Some(42));
@@ -3993,14 +4113,142 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_write_removes_its_temp_so_a_failed_start_can_unwind_the_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = fresh_temp_dir("write-fail-temp");
+        // The leaf as a start has just created it: empty, with the initial
+        // manifest still to be written.
+        std::fs::create_dir_all(&folder).expect("the leaf directory");
+        let manifest = SessionManifest {
+            version: MANIFEST_VERSION,
+            session: "keeper-rec unwind".to_owned(),
+            status: ManifestStatus::Recording,
+            capture_target: CaptureTarget::display(None),
+            devices: test_devices(),
+            segments: Vec::new(),
+            meta: None,
+            started_at: None,
+            ended_at: None,
+            folder: folder.clone(),
+        };
+        // Stand in for the disk that fills mid-write: `fs::write` fails on the
+        // temp file, at the same line an ENOSPC would, with a residue in the
+        // folder. (Read-only is the portable way to fail that one open; the
+        // branch under test is the same either way.)
+        let tmp = folder.join(".manifest.json.tmp");
+        std::fs::write(&tmp, b"a partial write").expect("temp residue");
+        let mut perms = std::fs::metadata(&tmp)
+            .expect("temp metadata")
+            .permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&tmp, perms).expect("read-only temp");
+
+        let error = manifest.write().expect_err("the temp write must fail");
+        assert!(
+            matches!(&error, RecordingError::ManifestIo(message)
+                if message.starts_with("write manifest temp file")),
+            "the caller sees the write's own failure, never the cleanup's: {error:?}"
+        );
+        assert!(!tmp.exists(), "a failed write must clean its own temp file");
+        // Which is the whole point: story 40.3's failed-start unwind is
+        // `remove_dir` on the leaf (never `remove_dir_all` on a folder the user
+        // chose), so a leftover dotfile would make the unwind a silent no-op
+        // and strand the leaf plus every directory the template nested it
+        // under.
+        std::fs::remove_dir(&folder)
+            .expect("the leaf is empty again, so the unwind's `remove_dir` succeeds");
+    }
+
+    #[test]
     fn create_refuses_an_existing_folder() {
         let folder = fresh_temp_dir("existing");
         std::fs::create_dir_all(&folder).expect("pre-existing folder");
         let result =
             SessionManifest::create(folder.clone(), CaptureTarget::display(None), test_devices());
         assert!(
-            matches!(result, Err(RecordingError::ManifestIo(_))),
-            "a prior session's folder must never be adopted"
+            matches!(result, Err(RecordingError::SessionFolderExists)),
+            "a prior session's folder must never be adopted, and the refusal must be the \
+             retryable typed signal rather than an opaque IO error"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn create_with_meta_reports_an_existing_folder_as_the_retry_signal() {
+        let folder = fresh_temp_dir("existing-meta");
+        std::fs::create_dir_all(&folder).expect("pre-existing folder");
+        let result = SessionManifest::create_with_meta(
+            folder.clone(),
+            CaptureTarget::display(None),
+            test_devices(),
+            Some(SessionMeta {
+                session_id: Some(
+                    "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM0000000000000000000A".to_owned(),
+                ),
+                ..SessionMeta::default()
+            }),
+            Some("2026-08-06T15:36:22+02:00".to_owned()),
+        );
+        // `SessionFolderExists`, NOT `ManifestIo`: the shell reads this as "that
+        // `{seq}` ordinal is taken" and re-renders, so it must be typed apart
+        // from a real filesystem failure.
+        match result {
+            Err(RecordingError::SessionFolderExists) => {}
+            other => panic!("expected SessionFolderExists, got {other:?}"),
+        }
+        // The refusal never adopted the folder: no manifest was written into it.
+        assert!(
+            !folder.join("manifest.json").exists(),
+            "a refused create must leave the pre-existing folder untouched"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_manifest_carrying_only_a_session_id_round_trips_and_stays_path_free() {
+        let folder = fresh_temp_dir("session-id");
+        let session_id = "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM11111111111111111111".to_owned();
+        let manifest = SessionManifest::create_with_meta(
+            folder.clone(),
+            CaptureTarget::display(None),
+            test_devices(),
+            // The untitled case: the `meta` block exists purely to carry the
+            // identity — every user-supplied field is absent.
+            Some(SessionMeta {
+                session_id: Some(session_id.clone()),
+                ..SessionMeta::default()
+            }),
+            None,
+        )
+        .expect("create session folder + initial manifest");
+        assert_eq!(manifest.version, MANIFEST_VERSION, "additive on the wire");
+
+        let raw = std::fs::read_to_string(folder.join("manifest.json")).expect("manifest on disk");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("parseable manifest");
+        assert_eq!(
+            value["meta"]["sessionId"], session_id,
+            "the identity serializes as camelCase `sessionId`"
+        );
+        // Only the identity is written — the absent free-text fields are omitted.
+        let meta_keys: Vec<&String> = value["meta"]
+            .as_object()
+            .expect("meta object")
+            .keys()
+            .collect();
+        assert_eq!(meta_keys, vec!["sessionId"]);
+        // The manifest stays portable: the destination root appears nowhere.
+        assert!(
+            !raw.contains(folder.to_string_lossy().as_ref()),
+            "the serialized manifest must contain no absolute path, got: {raw}"
+        );
+
+        let loaded = SessionManifest::load(&folder).expect("load round-trip");
+        assert_eq!(
+            loaded.meta,
+            Some(SessionMeta {
+                session_id: Some(session_id),
+                ..SessionMeta::default()
+            })
         );
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -4848,6 +5096,199 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn recover_finds_a_session_nested_under_the_templates_year_folder() {
+        let base = fresh_temp_dir("recover-nested");
+        // What the default template (`{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM}`) writes:
+        // the session is a GRANDCHILD of the destination root, not a child.
+        let folder = stale_session(&base, "2026/2026-08-06 1536", ManifestStatus::Recording, 3);
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert_eq!(
+            recovered,
+            vec![folder.clone()],
+            "a nested session must be recovered exactly like a flat one"
+        );
+        let reloaded = SessionManifest::load(&folder).expect("reload recovered manifest");
+        assert_eq!(reloaded.status, ManifestStatus::Recovered);
+        assert_eq!(
+            reloaded.segments,
+            vec![
+                screen_entry(0, "screen-0000.mov", 10),
+                screen_entry(1, "screen-0001.mov", 20),
+                screen_entry(2, "screen-0002.mov", 30),
+            ],
+            "nesting changes where the walk looks, not what it salvages"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_stops_at_the_depth_cap_without_erroring() {
+        let base = fresh_temp_dir("recover-deep");
+        // Ten components below the root — past the eight-component cap.
+        let deep = stale_session(
+            &base,
+            "a/b/c/d/e/f/g/h/i/deep",
+            ManifestStatus::Recording,
+            1,
+        );
+        // A session inside the cap, in the same tree, proves the walk kept
+        // going rather than bailing out at the deep branch.
+        let shallow = stale_session(&base, "a/b/shallow", ManifestStatus::Recording, 1);
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert_eq!(
+            recovered,
+            vec![shallow],
+            "nothing past the depth cap is reported, and the walk does not error"
+        );
+        assert_eq!(
+            SessionManifest::load(&deep).expect("reload deep").status,
+            ManifestStatus::Recording,
+            "a folder past the cap is never even read for rewriting"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_never_descends_into_a_session_folder() {
+        let base = fresh_temp_dir("recover-no-descend");
+        let folder = stale_session(&base, "2026/keeper-rec real", ManifestStatus::Recording, 1);
+        // A decoy session tucked INSIDE the real one. A session folder holds
+        // segments, not more sessions; walking into one would surface a second
+        // card for the same recording.
+        let decoy = folder.join("nested");
+        std::fs::create_dir_all(&decoy).expect("decoy folder");
+        std::fs::write(
+            decoy.join("manifest.json"),
+            std::fs::read(folder.join("manifest.json")).expect("copy the real manifest"),
+        )
+        .expect("decoy manifest");
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert_eq!(
+            recovered,
+            vec![folder],
+            "exactly one session is recovered — the decoy inside it is never walked to"
+        );
+        let reloaded = SessionManifest::load(&decoy).expect("reload decoy");
+        assert_eq!(
+            reloaded.status,
+            ManifestStatus::Recording,
+            "the decoy manifest must be left untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_skips_dot_directories() {
+        let base = fresh_temp_dir("recover-dotdir");
+        // A session the user deleted: the OS moved it under `.Trash`. Walking
+        // in would resurrect it as a recovery card.
+        let trashed = stale_session(&base, ".Trash/keeper-rec x", ManifestStatus::Recording, 1);
+        let good = stale_session(&base, "2026/keeper-rec kept", ManifestStatus::Recording, 1);
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert_eq!(recovered, vec![good], "a dot directory is never walked");
+        assert_eq!(
+            SessionManifest::load(&trashed)
+                .expect("reload trashed")
+                .status,
+            ManifestStatus::Recording,
+            "the trashed session's manifest must be byte-untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_walks_a_directory_whose_manifest_does_not_load() {
+        let base = fresh_temp_dir("recover-lid");
+        // The year folder the default template writes, holding a
+        // `manifest.json` that does not parse — a write a crash truncated, or a
+        // file a user dropped there. Treated as a session it becomes a LID: the
+        // real recording below it could never be salvaged again, by this pass
+        // or any later one.
+        let good = stale_session(&base, "2026/keeper-rec real", ManifestStatus::Recording, 2);
+        let lid = base.join("2026");
+        std::fs::write(lid.join("manifest.json"), b"{").expect("unloadable manifest");
+
+        let recovered = recover_orphaned_sessions(&base, &no_folder_is_active);
+        assert_eq!(
+            recovered,
+            vec![good.clone()],
+            "the directory is walked rather than mistaken for a session, so the session below it still recovers"
+        );
+        assert_eq!(
+            SessionManifest::load(&good)
+                .expect("reload the real session")
+                .status,
+            ManifestStatus::Recovered
+        );
+        // Walking on is the whole point: the walk logs the unloadable manifest
+        // and neither stops nor rewrites it.
+        assert_eq!(
+            std::fs::read(lid.join("manifest.json")).expect("the unloadable manifest's bytes"),
+            b"{",
+            "an unloadable manifest is logged and left byte-untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recover_stops_at_the_visit_budget_and_returns_what_it_found() {
+        let base = fresh_temp_dir("recover-visits");
+        // A destination root that turned out to be wide rather than deep — the
+        // Photos library the visit budget exists for. One session sits in the
+        // root itself and is therefore examined in the first `read_dir` pass,
+        // whatever order the filesystem lists it in; forty more sit one level
+        // down, where a truncated walk never reaches them.
+        let early = stale_session(&base, "keeper-rec early", ManifestStatus::Recording, 1);
+        let buried: Vec<_> = (0..40)
+            .map(|index| {
+                stale_session(
+                    &base,
+                    &format!("wide-{index:04}/keeper-rec buried"),
+                    ManifestStatus::Recording,
+                    1,
+                )
+            })
+            .collect();
+
+        // The real [`RECOVERY_MAX_VISITS`] would need a fixture of four
+        // thousand directories to exercise, so the budget's behaviour is proven
+        // through the private entry point the public one delegates to, with a
+        // budget of exactly the root's forty-one entries: everything in the
+        // root is examined, and the walk stops before descending anywhere.
+        let recovered = recover_orphaned_sessions_within(&base, &no_folder_is_active, 41);
+        assert_eq!(
+            recovered,
+            vec![early.clone()],
+            "the budget truncates the walk — what was already found is still returned, and nothing errors"
+        );
+        for folder in &buried {
+            assert_eq!(
+                SessionManifest::load(folder)
+                    .expect("reload a buried session")
+                    .status,
+                ManifestStatus::Recording,
+                "a session the budget cut the walk short of is left untouched"
+            );
+        }
+
+        // The same tree under the real budget: nothing about the fixture was
+        // unreachable, so the truncation above was the budget's doing and
+        // nothing else. `early` is already `recovered`, so this run returns
+        // exactly the forty the truncated one could not reach.
+        let mut expected = buried;
+        expected.sort();
+        assert_eq!(
+            recover_orphaned_sessions(&base, &no_folder_is_active),
+            expected
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // --- dependency firewall (AD-33) ---------------------------------------

@@ -479,6 +479,23 @@ pub enum RecordingError {
     #[error("recording manifest I/O failed: {0}")]
     ManifestIo(String),
 
+    /// The session folder the shell asked for already exists (Story 40.3):
+    /// [`SessionManifest::create`](crate::recording::SessionManifest::create)
+    /// creates the leaf with `create_dir`, never `create_dir_all`, so a prior
+    /// session's folder is refused rather than adopted and cross-written.
+    ///
+    /// Typed rather than folded into [`Self::ManifestIo`] because it is the one
+    /// creation failure the caller ACTS on: `recording_start` renders the path
+    /// template again with the next `{seq}` ordinal and retries, so "that
+    /// ordinal is taken" has to be distinguishable from "the filesystem said
+    /// no". The only alternative — matching on an `io::Error`'s display text —
+    /// would be a guess at a message no contract pins down.
+    ///
+    /// Carries no payload: the path is the caller's own render, it already has
+    /// it, and the manifest taxonomy never puts a filesystem path in a message.
+    #[error("the session folder already exists")]
+    SessionFolderExists,
+
     /// The destination folder failed the validate-on-Start pre-flight (Story
     /// 19.5): `recording_start` probed the chosen folder, the pure
     /// [`evaluate_destination`](crate::recording::evaluate_destination) decision

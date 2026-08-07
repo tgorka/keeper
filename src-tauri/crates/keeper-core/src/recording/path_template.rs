@@ -96,6 +96,18 @@
 //! - and a title can never introduce more components than the template's own
 //!   `/` count — a hostile title cannot deepen or escape the path.
 //!
+//! # Depth
+//!
+//! A template writes at most [`crate::recording::RECOVERY_MAX_DEPTH`] folders,
+//! and that number is **imported rather than repeated**: it is the depth the
+//! recovery walks descend. A session recorded deeper than they walk is one
+//! neither the salvage pass nor the recovered-card scan can ever reach, so the
+//! template that would have put it there is refused
+//! ([`TemplateError::TooDeep`]) instead — a legal-looking template whose only
+//! symptom is a recording lost by the crash it was supposed to survive is not a
+//! trade worth the extra folder. Raising the cap is one edit, in
+//! `recording.rs`, and the walks and this parser move together.
+//!
 //! # Purity
 //!
 //! No clock, no filesystem, no ambient state: the civil date-time, the title
@@ -242,6 +254,19 @@ pub enum TemplateError {
     SeqOutsideLeaf(
         /// The offending component, exactly as the user wrote it.
         String,
+    ),
+    /// More folders than a recovery walk descends. A session recorded below
+    /// [`crate::recording::RECOVERY_MAX_DEPTH`] folders is one neither the
+    /// salvage pass nor the card scan can reach, so a crash there loses it
+    /// silently and forever — the one template fault whose cost is invisible
+    /// until the day it matters. Refused at parse, where saying so is free.
+    #[error(
+        "a template can be at most {max} folders deep, and this one is {0}: a recording nested any deeper is one keeper could not find again after a crash",
+        max = crate::recording::RECOVERY_MAX_DEPTH
+    )]
+    TooDeep(
+        /// How many folders the template writes.
+        usize,
     ),
 }
 
@@ -488,6 +513,14 @@ impl PathTemplate {
                     return Err(TemplateError::ReservedComponent(describe(component)));
                 }
             }
+        }
+        // Asked once the loop above has established that every component IS a
+        // folder — an empty one is a doubled `/`, not a folder to count, and
+        // "look for a doubled slash" is the advice that reader can act on. What
+        // is counted here is folders, so the sentence that reports the count is
+        // true.
+        if components.len() > crate::recording::RECOVERY_MAX_DEPTH {
+            return Err(TemplateError::TooDeep(components.len()));
         }
         // `{seq}` renames the folder it sits in. That is the point in the leaf —
         // the folder that collided — and a bug anywhere above it, where the
@@ -1967,6 +2000,79 @@ mod tests {
             render("{yyyy}/{yyyy}-{mm}-{dd}{seq}", Some("Standup"), 2),
             "2026/2026-08-05 (2)"
         );
+    }
+
+    #[test]
+    fn parse_caps_the_template_at_the_recovery_walks_depth() {
+        use crate::recording::RECOVERY_MAX_DEPTH;
+
+        // Exactly the cap records where both recovery walks can still reach, so
+        // it parses.
+        let at_cap = (0..RECOVERY_MAX_DEPTH)
+            .map(|index| format!("f{index}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(
+            PathTemplate::parse(&at_cap).is_ok(),
+            "{RECOVERY_MAX_DEPTH} folders is still reachable, so it is legal: {at_cap}"
+        );
+
+        // One folder further and a crash there is unsalvageable: neither the
+        // salvage pass nor the card scan descends that far, so the recording is
+        // lost with no symptom at all. Refused where saying so is free.
+        assert_eq!(
+            PathTemplate::parse(&format!("{at_cap}/f{RECOVERY_MAX_DEPTH}")),
+            Err(TemplateError::TooDeep(RECOVERY_MAX_DEPTH + 1))
+        );
+        // It is the FOLDER count that is capped — nothing about tokens or
+        // length — so a template that looks entirely reasonable is refused the
+        // same way.
+        assert_eq!(
+            PathTemplate::parse("{yyyy}/{mm}/{dd}/{HH}/a/b/c/d/{slug}"),
+            Err(TemplateError::TooDeep(9))
+        );
+        // …and the count is a count of folders, so a doubled `/` is reported as
+        // the empty folder it is rather than swelling the depth.
+        assert_eq!(
+            PathTemplate::parse(&format!("{at_cap}//x")),
+            Err(TemplateError::EmptyComponent)
+        );
+    }
+
+    #[test]
+    fn the_depth_refusal_is_a_standalone_sentence_the_settings_card_can_print() {
+        use crate::recording::RECOVERY_MAX_DEPTH;
+
+        let message = TemplateError::TooDeep(RECOVERY_MAX_DEPTH + 1).to_string();
+        assert_eq!(
+            message,
+            format!(
+                "a template can be at most {RECOVERY_MAX_DEPTH} folders deep, and this one is {}: \
+                 a recording nested any deeper is one keeper could not find again after a crash",
+                RECOVERY_MAX_DEPTH + 1
+            )
+        );
+        // Inline copy: one line, no heading, no capital opening a sentence that
+        // is printed mid-card, nothing to trim, and both numbers present so the
+        // reader knows how much to cut.
+        assert!(!message.contains('\n'), "{message}");
+        assert_eq!(message.trim(), message, "{message}");
+        assert!(message.starts_with("a template"), "{message}");
+        assert!(
+            message.contains(&RECOVERY_MAX_DEPTH.to_string()),
+            "{message}"
+        );
+
+        // And it survives the settings command's rejection unchanged: 40.2
+        // wraps the reason in `TemplateInvalid`, whose own `Display` IS the
+        // reason, so what the field prints is this sentence and nothing else.
+        let reason = PathTemplate::parse("{yyyy}/{mm}/{dd}/{HH}/a/b/c/d/{slug}")
+            .expect_err("nine folders is past the cap");
+        let rejected = crate::error::RecordingError::TemplateInvalid {
+            reason: reason.clone(),
+        };
+        assert_eq!(rejected.to_string(), reason.to_string());
+        assert_eq!(rejected.to_string(), message);
     }
 
     #[test]

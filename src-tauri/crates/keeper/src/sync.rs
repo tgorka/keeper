@@ -267,7 +267,7 @@ pub fn configured_git_path(platform: &dyn Platform) -> Option<String> {
 }
 
 /// This machine's short name, for provenance trailers and conflict filenames.
-fn read_host_label() -> String {
+pub(crate) fn read_host_label() -> String {
     let raw = std::process::Command::new("hostname")
         .output()
         .ok()
