@@ -37,6 +37,12 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
+# One ULID per recording session (Story 40.3, AD-73): the session id's second
+# half, minted here because a ULID reads the clock and `keeper-core::recording`
+# is clock-free by contract. Already in the workspace catalog (keeper-core and
+# keeper-sync mint account, device, profile and volume ids from it), so this
+# resolves no new crate.
+ulid = { workspace = true }
 # Destination free-space probe for the recording validate-on-Start pre-flight
 # (Story 19.5, AD-33). Shell-only: keeper-core holds the pure decision fn
 # (`evaluate_destination`) and never a filesystem-probe dependency.

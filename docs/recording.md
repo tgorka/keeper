@@ -75,15 +75,38 @@ a recording is running.
 ## Where recordings go
 
 Each Recording Session creates one folder inside your chosen destination
-(default `~/Movies/keeper`):
+(default `~/Movies/keeper`), at a path the **path template** renders — so the
+tree normally nests:
 
 ```
-keeper-rec 2026-07-20 11.36.52/
-  manifest.json      # capture target, devices, segment ledger, status
-  screen-0000.mov    # H.264 + AAC (+ mic AAC) — plays anywhere
-  screen-0001.mov
-  camera-0000.mov    # only when the webcam is on
+~/Movies/keeper/                     # your chosen destination
+  2026/                              # the default template nests by year
+    2026-08-06 1536/                 # an untitled session
+    2026-08-06 1536 standup/         # the same minute, titled "Standup"
+      manifest.json    # capture target, devices, ledger, status, session id
+      screen-0000.mov  # H.264 + AAC (+ mic AAC) — plays anywhere
+      screen-0001.mov
+      camera-0000.mov  # only when the webcam is on
 ```
+
+**Settings → Recording** holds that template; its default is
+`{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM} {slug}`, which is why the year folder is
+there. keeper reads the clock **once** at Start and renders the template with
+the same renderer the settings card's preview uses, so the path the preview
+shows is the path a Start creates — byte for byte, because there is no second
+implementation to drift. The preview is also the entire manual instead of a
+token table: type a template and the card prints the absolute path the next
+recording would use, or the reason it refuses that template, before anything
+is saved. A stored template that is blank or no longer parses degrades to the
+default on read, so a Start never fails over one.
+
+Intermediate folders (`2026/`) are created on demand; the session folder
+itself is only ever **created**, never adopted. When the rendered path is
+already taken — two Starts inside the same minute — keeper retries with the
+next collision ordinal (` (2)`, ` (3)`, …), which lands where the template put
+`{seq}` or on the end of the last folder when the template does not mention
+it. Only that last folder is ever renamed, so a retry is always a sibling and
+never renames a year folder that holds other recordings.
 
 Long recordings rotate into new segments at the configured **segment size**
 (default 500 MB) or **duration cap** (default 30 minutes) — the handover is
@@ -91,14 +114,31 @@ gapless (the boundary is exactly one frame period, asserted by an automated
 CI gate against the manifest's capture-clock bounds). Segments are fragmented
 QuickTime files: a crash or power loss costs at most the last ~4 seconds, and
 an interrupted session is salvaged on the next launch ("A recording was
-interrupted" — with **Reveal in Finder**).
+interrupted" — with **Reveal in Finder**). That startup scan walks the whole
+destination tree rather than only its immediate children, so a session nested
+under `2026/` is found; it stops eight levels down and never descends into a
+folder that is itself a session.
 
 Recordings that end cleanly show "Saved N segments" with the session path.
 
-Before Start you can optionally describe the **next session** — title (also
-names the folder), participants, a program/session note, comma-separated
-tags, and free-form name/value fields. Everything lands in `manifest.json`
-only (local, zero egress), together with wall-clock start/end times.
+Before Start you can optionally describe the **next session** — title (which
+feeds the template's `{slug}` and `{title}`), participants, a program/session
+note, comma-separated tags, and free-form name/value fields. Everything lands
+in `manifest.json` only (local, zero egress), together with wall-clock
+start/end times.
+
+Every session also carries an identity of its own, in that same `meta` block:
+`sessionId`, the device's ULID joined to a freshly minted one —
+`01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDKP7WQ8F3M2T5V6X9YB0AC`. Both halves are
+Crockford ULIDs, so splitting on the single `-` recovers the device that made
+the recording (the same device id keeper's sync uses). It is minted at Start
+and never changes afterwards: the folder name is a label, and a label can move
+while the identity stays put.
+
+The manifest still holds **no absolute path**: `segments[].file` is a bare
+basename resolved against the folder the manifest sits in, and `session` is
+that folder's own basename. A session folder stays self-contained: copy or
+move it anywhere and it still describes itself.
 
 ## Debug mode (Settings → About)
 
@@ -149,8 +189,10 @@ Known recording keys: `recording.codec` (`h264` | `hevc`),
 `recording.scale_percent` (`100` | `75` | `50` | `25`), `recording.fps`
 (`30` | `60`), `recording.segment_mb` (100–5000),
 `recording.duration_cap_minutes` (1–600), `recording.destination_dir`
-(absolute path), `recording.echo_cancellation` (bool, **default false** — only a
-stored `"1"`/`true` turns it on), `debug.mode` (bool).
+(absolute path), `recording.path_template` (template string — one that does
+not parse degrades to the default on read), `recording.echo_cancellation`
+(bool, **default false** — only a stored `"1"`/`true` turns it on),
+`debug.mode` (bool).
 
 ## Out of scope (honest verdicts)
 
