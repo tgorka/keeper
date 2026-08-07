@@ -2,10 +2,10 @@
 title: 'Story 40.2: The Template Is a Setting, and the Preview Is the Manual'
 type: 'feature'
 created: '2026-08-06'
-status: 'review'
+status: 'done'
 blocking_condition: ''
 baseline_revision: '5e89824bd0d06d0e06baf5f7275a52f49ef3de1c'
-final_revision: ''
+final_revision: 'b02765ea0e9de0a2fc5d30a821908a34a10b9324'
 review_loop_iteration: 1
 followup_review_recommended: false
 context:
