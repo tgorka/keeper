@@ -156,11 +156,27 @@ impl LfsPolicy {
 /// with no extension gets an exact-path rule.
 pub fn pattern_for(path: &Path) -> String {
     match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) if !ext.is_empty() => format!("*.{ext}"),
+        Some(ext) if !ext.is_empty() => pattern_for_extension(ext),
         // Escape nothing: a leading `/` anchors the pattern at the repository
         // root, which is what an exact-path rule means in gitattributes.
         _ => format!("/{}", path.to_string_lossy().replace('\\', "/")),
     }
+}
+
+/// The `.gitattributes` pattern that covers every file with this extension.
+///
+/// Split out of [`pattern_for`] for the caller that has no file yet: a
+/// recording session writes its rule at session start (Story 41.5, FR-137), so
+/// the working tree does not change under a running recorder, and at that
+/// moment the only thing known about the segment is the extension it will
+/// carry. One function so that the rule the session writes and the rule the
+/// commit path would write are the same string by construction — two spellings
+/// would each be idempotent against themselves and duplicate against the other.
+///
+/// `ext` is bare (`mp4`), and a leading dot is tolerated because half the
+/// world's APIs return one.
+pub fn pattern_for_extension(ext: &str) -> String {
+    format!("*.{}", ext.trim().trim_start_matches('.'))
 }
 
 /// Ensure `.gitattributes` contains a rule for every pattern.

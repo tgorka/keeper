@@ -4144,8 +4144,8 @@ fn status_lock(status: &Mutex<RecordingStatusVm>) -> std::sync::MutexGuard<'_, R
 
 /// Fold one sidecar [`RecordingEvent`] through the platform-free machine into the
 /// shared status snapshot, and fire the Story 18.4 loud-failure/warning native
-/// notification **exactly on onset** — the driver sink's testable core (the
-/// closure in [`recording_start`] adds only the manifest/ledger side effects).
+/// notification **exactly on onset** — the driver sink's testable core
+/// ([`RecordingSink`] adds the ledger, the sync seam and the manifest write).
 ///
 /// Returns whether the machine accepted the event (`apply` succeeded); a rejected
 /// event (e.g. a second `Failed` against an already-terminal machine) changes
@@ -4405,31 +4405,6 @@ fn resolve_capture_target(
     }
 }
 
-/// Start the (at most one) recording session (Story 16.6 + 17.2 + 40.3,
-/// FR-68/FR-69/FR-71/FR-127/FR-128/FR-145, AD-33/AD-37/AD-65/AD-73): render the
-/// `recording.path_template` setting into a per-session folder under the
-/// destination root, create it with its initial `recording` `manifest.json`,
-/// spawn the driver task (fresh `keeper-rec` child; NDJSON events fold through
-/// the platform-free session machine into the polled status snapshot AND the
-/// segment ledger), and return the initial snapshot. The sidecar writes
-/// `screen-0000.mov` (then `screen-0001.mov`, … on rotation) inside the folder.
-///
-/// The template is the namer, so the folder may NEST (`2026/2026-08-06 1536`),
-/// the collision ordinal is the template's own `{seq}` wherever it put it, and
-/// the path this creates is the path Settings → Recording previewed — same
-/// renderer, same clock read, no second implementation (AD-65).
-///
-/// The session also gains its immutable identity here (`meta.sessionId`), because
-/// the folder name is a label from story 40.4 onward and an archive row cannot be
-/// keyed on a label.
-///
-/// A still-live prior session is an honest error — never two capture children.
-/// Every fallible read happens BEFORE anything is created, and what an attempt
-/// did create it removes on the way out ([`SessionScaffold`]), so a failed start
-/// leaves no folder for the recovery pass to find. Pre-spawn failures funnel
-/// through [`to_ipc_error`] (no session task exists yet); a mid-session
-/// manifest-write failure is logged only and never flips the live session to
-/// `failed` (the single-child start-guard keys off the snapshot).
 /// How many collision ordinals one start will try before giving up.
 ///
 /// The template decides where `{seq}` lands, so this is a bound on attempts, not
@@ -4997,6 +4972,555 @@ fn retitle_session_folder(
     })
 }
 
+/// When a committed segment is PUBLISHED (Story 41.5, FR-136, AD-70) — this
+/// session's copy of the destination profile's `PushPolicy`, read ONCE at start.
+///
+/// Platform-free for [`DestinationProfileRow`]'s reason: `keeper-sync`'s
+/// `PushPolicy` exists only on desktop, and what a driver sink needs of it is one
+/// question — is a segment that just closed worth asking about now?
+///
+/// A session-captured COPY rather than a per-segment read, because a policy the
+/// sink re-read would be a policy that can change mid-session: an edit made while
+/// a meeting is being recorded would start pushing gigabyte objects over the
+/// uplink that meeting runs on. The policy in force is the one that was in force
+/// when Record was pressed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SessionPushPolicy {
+    /// `PushPolicy::Immediate` — every committed segment is worth publishing now.
+    PerSegment,
+    /// `PushPolicy::SessionEnd` — the profile default, and the reason it is the
+    /// `Default` here too: it publishes nothing while the recorder runs, so every
+    /// degrade path (no engine, unreadable profile, no recordings block) lands on
+    /// the quiet answer rather than on someone's uplink.
+    #[default]
+    AtSessionEnd,
+    /// `PushPolicy::Window { .. }` — the engine owns the clock, so the sink asks
+    /// on every segment and whether this instant is inside the quiet hours is the
+    /// engine's answer, never a second implementation of the window here.
+    InQuietHours,
+}
+
+impl SessionPushPolicy {
+    /// Whether a segment that just committed is worth asking the engine about.
+    ///
+    /// `SessionEnd` is the only policy that answers no, and it answers no HERE
+    /// rather than inside the engine: an ask IS a policy read, and a policy read
+    /// per rotation is the surprise this story exists to prevent.
+    fn asks_at_segment(self) -> bool {
+        !matches!(self, Self::AtSessionEnd)
+    }
+}
+
+/// What is asking a profile to push (Story 41.5): one segment's commit, or the
+/// end of the session. Carried rather than inferred, so the engine's decision and
+/// its log line can both name the cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingPushTrigger {
+    /// A segment closed and its commit is due.
+    SegmentCommitted,
+    /// The session finalized — `manifest.json` is written and the folder is done.
+    SessionEnd,
+}
+
+/// Everything a recording session asks of the sync engine (Story 41.5), and
+/// nothing else.
+///
+/// A trait rather than an `Arc<Engine>` for two reasons. The engine is
+/// desktop-only while this sink is not, so a recorder holding one would not
+/// compile on iOS; and an `Engine` can commit, push, pause and delete profiles,
+/// none of which a recorder may do (AD-68) — the inbound direction 41.4
+/// established is the whole point. Four questions is the surface, and the COUNTS
+/// this story's acceptance criteria are stated in are countable through it.
+///
+/// **Every method is total.** A refusal is a value, never a `?`: capture never
+/// degrades (NFR-34), so there is nothing here for a sink to propagate, nothing
+/// that can fail a command, and nothing that can stop a recorder.
+trait RecordingSyncPort: Send + Sync {
+    /// This profile's push policy, read once per session by
+    /// [`begin_recording_sync`]. Unreadable ⇒ [`SessionPushPolicy::AtSessionEnd`].
+    fn push_policy(&self, profile_id: &str) -> SessionPushPolicy;
+
+    /// Ensure this profile's `.gitattributes` carries the LFS rule for
+    /// `extension`, writing it at most once (FR-137). `Ok(true)` means this call
+    /// wrote it.
+    ///
+    /// The error is a sentence for a log line rather than a `SyncError`, for
+    /// [`DestinationProfileTable`]'s reason: the type has to exist on a platform
+    /// `keeper-sync` is not linked into.
+    fn ensure_lfs_rule(&self, profile_id: &str, extension: &str) -> Result<bool, String>;
+
+    /// Assert that `path` — a segment that just closed — will never be written
+    /// again (Story 41.4, FR-134). `false` means the assertion was dropped and
+    /// the file takes the ordinary settle window, which is exactly what would
+    /// have happened if this seam did not exist.
+    fn note_finished(&self, profile_id: &str, path: &Path) -> bool;
+
+    /// Ask this profile to push if its own policy says now.
+    ///
+    /// Returns nothing because it cannot honestly return anything: publishing an
+    /// LFS object that may be gigabytes is a network operation, and it must not
+    /// run on the driver task. The implementation hands it to the runtime and the
+    /// outcome is logged where it lands (NFR-32).
+    fn request_push(&self, profile_id: &str, trigger: RecordingPushTrigger);
+}
+
+/// The sync half of one recording session, resolved ONCE at start and carried
+/// into the driver task (Story 41.5).
+///
+/// `None` on a [`RecordingSink`] is a plain-folder destination, and it says so
+/// structurally: there is no profile to assert to, no policy to obey, and no
+/// engine call to make.
+struct RecordingSyncSession {
+    /// The destination profile's id — every call names it.
+    profile_id: String,
+    /// The profile's resolved recordings root. Carried so a path that cannot
+    /// possibly be inside it is never asserted: the engine refuses such an
+    /// assertion by contract (Story 41.4), and 48 refusals would be 48 warn lines
+    /// about a fact that was already known before the first rotation.
+    recordings_root: PathBuf,
+    /// The push policy in force for this session.
+    push: SessionPushPolicy,
+    /// The engine seam itself.
+    port: Arc<dyn RecordingSyncPort>,
+}
+
+/// Open the sync half of a session (Story 41.5): resolve the destination profile
+/// once, read the push policy in force, and write the session's LFS rule before a
+/// recorder exists.
+///
+/// **Why the rule is written here.** `.gitattributes` is a tracked file, so
+/// writing it IS a working-tree change; writing it on the first commit would
+/// change the tree under a running recorder, and a rotation is the worst moment
+/// to do that (FR-137). Written before the sidecar spawns, it is a change that
+/// happened while nothing was recording.
+///
+/// A plain-folder destination returns `None` without touching the port at all —
+/// there is nothing to ask a profile that is not there.
+fn begin_recording_sync(
+    destination: &RecordingDestination,
+    media_extension: &str,
+    port: Option<Arc<dyn RecordingSyncPort>>,
+) -> Option<RecordingSyncSession> {
+    let profile_id = destination.profile_id.clone()?;
+    // No engine means no usable `git` (AD-41), which is a degrade this epic is
+    // built to survive: the session records to disk and commits nothing.
+    let port = port?;
+    let push = port.push_policy(&profile_id);
+    match port.ensure_lfs_rule(&profile_id, media_extension) {
+        Ok(true) => tracing::info!(
+            profile = %profile_id,
+            extension = media_extension,
+            "recordings sync: this session's media LFS rule was written before capture started"
+        ),
+        Ok(false) => tracing::debug!(
+            profile = %profile_id,
+            extension = media_extension,
+            "recordings sync: this session's media LFS rule is already in place"
+        ),
+        // A missing rule costs LFS on this session's segments, not the session:
+        // they commit as ordinary blobs and the recorder never learns.
+        Err(reason) => tracing::warn!(
+            %reason,
+            profile = %profile_id,
+            extension = media_extension,
+            "recordings sync: the LFS rule could not be written; this session's segments commit without it"
+        ),
+    }
+    Some(RecordingSyncSession {
+        profile_id,
+        recordings_root: destination.root.clone(),
+        push,
+        port,
+    })
+}
+
+/// This session's seed segment name and the media extension whose LFS rule
+/// covers it (Story 21.3 + 41.5, FR-137).
+///
+/// One function, because the two must agree: the sidecar numbers its rotations
+/// from the name it is seeded with, so the extension every segment of this
+/// session carries is that name's — and a rule written for any other extension
+/// would cover nothing that exists.
+fn session_media_seed(audio_only: bool) -> (&'static str, &'static str) {
+    if audio_only {
+        ("audio-0000.m4a", "m4a")
+    } else {
+        ("screen-0000.mov", "mov")
+    }
+}
+
+/// The ledger line one sidecar event produces, if it produces one (Story 17.2).
+///
+/// Read BEFORE the event is applied, because `apply` consumes it. The basename
+/// comes from the sidecar-reported path (synthesized from the track and the index
+/// when absent — a `track:"camera"` line without a path must never fabricate a
+/// `screen-####` name, Story 20.1); `bytes`/`track` degrade to 0/`"screen"`. This
+/// is only the LIVE view — the terminal reconcile rebuilds the list
+/// authoritatively from disk.
+fn segment_ledger_entry(event: &RecordingEvent) -> Option<SegmentEntry> {
+    let RecordingEvent::SegmentClosed {
+        index,
+        path,
+        bytes,
+        track,
+        pts_start,
+        pts_end,
+    } = event
+    else {
+        return None;
+    };
+    Some(SegmentEntry {
+        index: *index,
+        file: path
+            .as_deref()
+            .and_then(|p| Path::new(p).file_name())
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                let stem = if track.as_deref() == Some("camera") {
+                    "camera"
+                } else {
+                    "screen"
+                };
+                format!("{stem}-{index:04}.mp4")
+            }),
+        bytes: bytes.unwrap_or(0),
+        track: track.clone().unwrap_or_else(|| "screen".to_owned()),
+        // Story 17.4 (NFR-22): the host-clock PTS bounds exist only in this
+        // event — the terminal disk reconcile preserves them by index (they
+        // cannot be re-read from the rebased segment files).
+        pts_start: *pts_start,
+        pts_end: *pts_end,
+    })
+}
+
+/// Everything one sidecar event does (Story 17.2 + 18.4 + 41.5): the snapshot
+/// fold, the segment ledger, the finished-path assertion, and — at a terminal —
+/// the session's single manifest write and its push.
+///
+/// A named type rather than the closure it used to be, because this story's
+/// acceptance criteria are stated in COUNTS — 48 ledger lines, ONE
+/// `.gitattributes` write, ONE `manifest.json` write, one push — and a closure
+/// built inside [`recording_start`] is reachable only through a Tauri `State` and
+/// a real `keeper-rec` child. Driving this directly with synthetic events is also
+/// the only way to run a four-hour session in a millisecond.
+struct RecordingSink {
+    /// The platform-free session machine every event folds through.
+    machine: RecordingSession,
+    /// This session's manifest — written ONCE, at [`Self::finalize`].
+    manifest: SessionManifest,
+    /// The snapshot the status poll, the tray tick and the disk guard read.
+    status: Arc<Mutex<RecordingStatusVm>>,
+    /// The notification port for the Story 18.4 fault/warning triad.
+    platform: Arc<dyn Platform>,
+    /// The destination profile this session commits into (Story 41.5), or `None`
+    /// for a plain folder.
+    sync: Option<RecordingSyncSession>,
+}
+
+impl RecordingSink {
+    /// Fold one sidecar event.
+    ///
+    /// A rejected event (the machine's `apply` said no — a second `Failed`
+    /// against an already-terminal session) does nothing at all: the ledger, the
+    /// assertion and the manifest are consequences of a transition that did not
+    /// happen.
+    fn handle(&mut self, event: RecordingEvent) {
+        // Story 22.5: while debug mode is on, every sidecar event lands as one
+        // timestamped line in the session's `events.log` (beside
+        // `manifest.json`) — the raw stream a bug report needs. Gated and
+        // best-effort inside the helper; zero cost while off.
+        if crate::debug_log::enabled() {
+            crate::debug_log::session_event(self.manifest.folder(), &format!("{event:?}"));
+        }
+        let segment = segment_ledger_entry(&event);
+        // Machine + snapshot fold, plus the Story 18.4 onset-deduped fault/
+        // warning notification (see `fold_recording_event`).
+        if !fold_recording_event(
+            &mut self.machine,
+            &self.status,
+            self.platform.as_ref(),
+            event,
+        ) {
+            return;
+        }
+        if let Some(entry) = segment {
+            // The absolute path is built from the ledger entry, before it moves
+            // into the ledger: what is asserted is then exactly the line that was
+            // recorded, never a second guess at the name. The segment lives in
+            // the session folder by construction — the sidecar writes nowhere
+            // else — so joining the folder is a fact, not a search.
+            let path = self.manifest.folder().join(&entry.file);
+            self.manifest.record_segment(entry);
+            self.commit_finished_segment(&path);
+        }
+        if matches!(
+            self.machine.state(),
+            SessionState::Finalized | SessionState::Recovered | SessionState::Failed
+        ) {
+            self.finalize();
+        }
+    }
+
+    /// Hand one closed segment to the destination profile (Story 41.5, FR-136):
+    /// assert that it is finished, then ask for a push if this session's policy
+    /// publishes per segment.
+    ///
+    /// **Never slow, never fallible.** The assertion is a `try_send` into a
+    /// bounded queue and the push is handed to the runtime, because this runs on
+    /// the driver task that also folds every event into the live snapshot: a sink
+    /// that waited on the network would stall the status the tray, the banner and
+    /// the disk guard read. Committing is the engine's next pass, not this call.
+    ///
+    /// A plain-folder destination reaches none of it.
+    fn commit_finished_segment(&self, path: &Path) {
+        let Some(sync) = self.sync.as_ref() else {
+            return;
+        };
+        // The engine refuses an assertion outside the profile's recordings root
+        // by contract (Story 41.4). Refusing it here too keeps a misplaced
+        // session from spending a warn line per rotation on a fact that was true
+        // before the first one.
+        if !path.starts_with(&sync.recordings_root) {
+            tracing::debug!(
+                profile = %sync.profile_id,
+                "recordings sync: this session is not inside the profile's recordings root, so its segments take the ordinary settle window"
+            );
+            return;
+        }
+        sync.port.note_finished(&sync.profile_id, path);
+        if sync.push.asks_at_segment() {
+            sync.port
+                .request_push(&sync.profile_id, RecordingPushTrigger::SegmentCommitted);
+        }
+    }
+
+    /// The end of the session: the ONE `manifest.json` write, then the policy's
+    /// push (Story 41.5, FR-146).
+    ///
+    /// **Why the manifest is written here and nowhere else.** It used to be
+    /// rewritten on every event, so a four-hour session rewrote its metadata 48
+    /// times under a recorder that was still running — and for a synced
+    /// destination that is 48 working-tree changes, each one a commit saying
+    /// nothing new about a segment that was already committed. The manifest a
+    /// live folder needs is already there: `create_with_meta` wrote it, status
+    /// `recording`, before the sidecar spawned, which is precisely what the
+    /// recovery pass keys off. The price is that a crash mid-session loses the
+    /// host-clock PTS bounds of the segments it had closed (they exist only in
+    /// the events, and the recovery reconcile rebuilds the ledger from the files
+    /// on disk); the segments themselves are never at risk, and FR-146 makes
+    /// that trade deliberately.
+    ///
+    /// Best-effort, like every write this sink makes: a failure is LOGGED ONLY.
+    /// It must never change `machine` state or force the snapshot to `Failed`,
+    /// because the single-child start-guard keys off that snapshot and a false
+    /// `Failed` would let a second `keeper-rec` child spawn.
+    fn finalize(&mut self) {
+        self.manifest
+            .set_status(ManifestStatus::from_state(self.machine.state()));
+        // Story 21.5: the wall-clock end stamp rides the terminal manifest write
+        // (ISO-8601 with offset, host-owned clock).
+        self.manifest
+            .set_ended_at(chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+        // EVERY terminal rebuilds the segment list from disk — disk is
+        // authoritative (final segment, DW-992 backfill, real sizes) — before the
+        // final write.
+        if let Err(error) = self.manifest.reconcile_from_dir() {
+            tracing::warn!(
+                %error,
+                "recording manifest: terminal disk reconcile failed; \
+                 writing the event-fed view instead"
+            );
+        }
+        if let Err(error) = self.manifest.write() {
+            tracing::warn!(
+                %error,
+                "recording manifest: the terminal atomic write failed; the folder stays \
+                 exactly as the recovery pass will find it (session unaffected)"
+            );
+        }
+        // The session's own push, whatever the policy says: `SessionEnd`
+        // publishes here and only here, `Immediate` has published every segment
+        // already and this publishes the manifest's commit, `Window` waits for
+        // its hours. Which of those happens is the engine's decision — this only
+        // says the session is over.
+        if let Some(sync) = self.sync.as_ref() {
+            sync.port
+                .request_push(&sync.profile_id, RecordingPushTrigger::SessionEnd);
+        }
+    }
+}
+
+/// Story 41.1's `PushPolicy`, reduced to the one question a sink asks of it.
+///
+/// **Exhaustive by construction — no `_` arm**, for the reason
+/// `sync_ipc`'s error mapping has none: which answer a new policy variant gets is
+/// a decision about someone's uplink, and `_` would make it silently.
+#[cfg(desktop)]
+impl From<&keeper_sync::profile::PushPolicy> for SessionPushPolicy {
+    fn from(policy: &keeper_sync::profile::PushPolicy) -> Self {
+        match policy {
+            keeper_sync::profile::PushPolicy::Immediate => Self::PerSegment,
+            keeper_sync::profile::PushPolicy::SessionEnd => Self::AtSessionEnd,
+            keeper_sync::profile::PushPolicy::Window { .. } => Self::InQuietHours,
+        }
+    }
+}
+
+/// The engine seam itself (Story 41.5): a [`RecordingSyncPort`] over this
+/// process's one `Engine` plus the Story 41.4 assertion tap.
+///
+/// Deliberately thin. Every method is a translation — an `Engine` call, its error
+/// into a sentence, its outcome into the one fact a sink can act on — because the
+/// decisions belong on one side or the other: the policy in the engine, the
+/// swallowing in the sink.
+#[cfg(desktop)]
+struct EngineRecordingSync {
+    engine: Arc<keeper_sync::engine::Engine>,
+    /// Minted once, at session start. Cheap to clone and it outlives nothing: a
+    /// send after the engine is gone is a dropped message, never a dangling
+    /// handle (Story 41.4).
+    tap: keeper_sync::engine::FinishedTap,
+}
+
+#[cfg(desktop)]
+impl RecordingSyncPort for EngineRecordingSync {
+    fn push_policy(&self, profile_id: &str) -> SessionPushPolicy {
+        let profiles = match self.engine.list_profiles() {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    profile = %profile_id,
+                    "recordings sync: the push policy could not be read, so nothing is published until this session ends"
+                );
+                return SessionPushPolicy::default();
+            }
+        };
+        profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .and_then(|profile| profile.recordings.as_ref())
+            .map(|recordings| SessionPushPolicy::from(&recordings.push))
+            .unwrap_or_default()
+    }
+
+    fn ensure_lfs_rule(&self, profile_id: &str, extension: &str) -> Result<bool, String> {
+        self.engine
+            .ensure_lfs_rule(profile_id, extension)
+            .map_err(|error| error.to_string())
+    }
+
+    fn note_finished(&self, profile_id: &str, path: &Path) -> bool {
+        // The tap warns on its own dropped assertion (Story 41.4), and a dropped
+        // assertion costs a settle window and nothing else — there is nothing to
+        // add here and nothing to handle.
+        self.tap.note_finished(profile_id, path)
+    }
+
+    fn request_push(&self, profile_id: &str, trigger: RecordingPushTrigger) {
+        let engine = Arc::clone(&self.engine);
+        let profile_id = profile_id.to_owned();
+        let engine_trigger = match trigger {
+            RecordingPushTrigger::SegmentCommitted => {
+                keeper_sync::engine::PushTrigger::SegmentCommitted
+            }
+            RecordingPushTrigger::SessionEnd => keeper_sync::engine::PushTrigger::SessionEnd,
+        };
+        // SPAWNED, never awaited: the caller is a driver sink on a capture path
+        // and a push is an upload — of an object that can be gigabytes. The
+        // driver task also folds every sidecar event into the live snapshot, so
+        // awaiting here would put the recording's own status behind the network.
+        tauri::async_runtime::spawn(async move {
+            match engine
+                .push_recordings_if_due(&profile_id, engine_trigger)
+                .await
+            {
+                Ok(true) => tracing::info!(
+                    profile = %profile_id,
+                    ?trigger,
+                    "recordings sync: the profile pushed"
+                ),
+                Ok(false) => tracing::debug!(
+                    profile = %profile_id,
+                    ?trigger,
+                    "recordings sync: the push policy says not now, so the commits stay local until it does"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    profile = %profile_id,
+                    ?trigger,
+                    "recordings sync: the push was refused; the segments are committed locally and a later push publishes them"
+                ),
+            }
+        });
+    }
+}
+
+/// This process's engine seam for a recording session, or `None` when there is no
+/// engine to be had (Story 41.5).
+///
+/// `crate::sync::engine` caches, so this is a slot read on every start after the
+/// first. A failure means no usable `git` (AD-41) — a degrade, not an error: the
+/// session records to disk, the destination resolution has already said why
+/// nothing is synced, and Record still works on a machine that never had git.
+#[cfg(desktop)]
+fn recording_sync_port(platform: &Arc<dyn Platform>) -> Option<Arc<dyn RecordingSyncPort>> {
+    match crate::sync::engine(Arc::clone(platform)) {
+        Ok(engine) => {
+            let tap = engine.finished_tap();
+            Some(Arc::new(EngineRecordingSync { engine, tap }))
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "recordings sync: there is no sync engine on this machine, so this session is recorded to disk only"
+            );
+            None
+        }
+    }
+}
+
+/// iOS links no `keeper-sync` at all, so there is no engine to seam onto — and no
+/// synced destination either ([`destination_profile_table`] answers with an empty
+/// table there), which is why this `None` is never even consulted.
+#[cfg(not(desktop))]
+fn recording_sync_port(_platform: &Arc<dyn Platform>) -> Option<Arc<dyn RecordingSyncPort>> {
+    None
+}
+
+/// Start the (at most one) recording session (Story 16.6 + 17.2 + 40.3,
+/// FR-68/FR-69/FR-71/FR-127/FR-128/FR-145, AD-33/AD-37/AD-65/AD-73): render the
+/// `recording.path_template` setting into a per-session folder under the
+/// destination root, create it with its initial `recording` `manifest.json`,
+/// spawn the driver task (fresh `keeper-rec` child; NDJSON events fold through
+/// the platform-free session machine into the polled status snapshot AND the
+/// segment ledger), and return the initial snapshot. The sidecar writes
+/// `screen-0000.mov` (then `screen-0001.mov`, … on rotation) inside the folder.
+///
+/// The template is the namer, so the folder may NEST (`2026/2026-08-06 1536`),
+/// the collision ordinal is the template's own `{seq}` wherever it put it, and
+/// the path this creates is the path Settings → Recording previewed — same
+/// renderer, same clock read, no second implementation (AD-65).
+///
+/// The session also gains its immutable identity here (`meta.sessionId`), because
+/// the folder name is a label from story 40.4 onward and an archive row cannot be
+/// keyed on a label.
+///
+/// A still-live prior session is an honest error — never two capture children.
+/// Every fallible read happens BEFORE anything is created, and what an attempt
+/// did create it removes on the way out ([`SessionScaffold`]), so a failed start
+/// leaves no folder for the recovery pass to find. Pre-spawn failures funnel
+/// through [`to_ipc_error`] (no session task exists yet); once the driver task
+/// exists nothing it does can fail the session — the terminal manifest write, the
+/// finished-path assertion and the push are all logged-only, and none of them
+/// flips the live session to `failed` (the single-child start-guard keys off the
+/// snapshot).
+///
+/// Story 41.5: when the destination resolves to a recordings-flagged profile, the
+/// session also carries a sync half — the profile's LFS rule is written here,
+/// before the sidecar spawns, and every closed segment is asserted to that
+/// profile from the sink. A plain folder carries none of it.
 #[tauri::command]
 // The command mirrors the wire: each optional capture selection + the three
 // optional meta fields arrive as separate IPC args (Tauri flattens the invoke
@@ -5060,7 +5584,15 @@ pub async fn recording_start(
     // persists and mirrors both surfaces but only affects the next Recording
     // Session.
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    let directory = effective_destination_dir(&data_dir, &state.platform);
+    // Story 41.2 + 41.5: the destination is a resolved DECISION, and the whole
+    // decision is read HERE, once. `directory` is its root — what the template
+    // renders under, what the disk guard probes — and the profile half is what
+    // the driver task commits into. Re-resolving either per segment would let a
+    // settings edit repoint a running session (AD-25).
+    let destination = effective_recording_destination(&data_dir, &|need| {
+        destination_profile_table(&state.platform, need)
+    });
+    let directory = destination.root.clone();
     // Best-effort pre-record recovery of any session a prior crash left stale
     // (Story 17.3, FR-73, AD-37): reconcile every orphaned `recording` manifest
     // under the recovery-scan lock (serialized against the detached startup pass
@@ -5248,20 +5780,25 @@ pub async fn recording_start(
             )
         },
     )?;
+    // Story 21.3: an audio-only session seeds `audio-0000.m4a`; the classic video
+    // session keeps `screen-0000.mov` (17.1's `nextSegmentPath` then numbers
+    // rotations either way). The extension beside it is this session's media
+    // extension — the one the LFS rule has to cover.
+    let (seed_name, media_extension) = session_media_seed(audio_only);
+    // Story 41.5: open this session's sync half — destination profile, push
+    // policy, LFS rule — BEFORE any sidecar exists, so the one working-tree
+    // change it makes happens while nothing is recording (FR-137). `None` for a
+    // plain folder and for a machine with no engine: both record to disk and
+    // commit nothing, which is the degrade this epic is built around (NFR-34).
+    let sync = begin_recording_sync(
+        &destination,
+        media_extension,
+        recording_sync_port(&state.platform),
+    );
     let params = SessionParams {
         // Seeding `screen-0000.mov` lets 17.1's `nextSegmentPath` produce
         // `screen-0001.mov`, … inside the folder with no Swift change.
-        output_path: folder
-            // Story 21.3: an audio-only session seeds `audio-0000.m4a`; the
-            // classic video session keeps `screen-0000.mov` (17.1's
-            // `nextSegmentPath` then numbers rotations either way).
-            .join(if audio_only {
-                "audio-0000.m4a"
-            } else {
-                "screen-0000.mov"
-            })
-            .to_string_lossy()
-            .into_owned(),
+        output_path: folder.join(seed_name).to_string_lossy().into_owned(),
         // Story 19.1: an application target wins; otherwise the selected display
         // (or `None` = main display, the unchanged 16.6 path).
         display_id: target_display_id,
@@ -5313,111 +5850,17 @@ pub async fn recording_start(
     // the quit kill-timeout's force-kill lever (see `RecordingRun::driver`).
     let driver = tauri::async_runtime::spawn(async move {
         // Fold sidecar events through the platform-free machine into the shared
-        // snapshot as they arrive (live — unlike `drive_session`'s buffered replay).
-        let mut machine = RecordingSession::new();
-        let mut manifest = manifest;
-        // Warn at most once per session on a manifest-write failure: a persistent
-        // fault (read-only volume, deleted folder) would otherwise spam the log on
-        // every event across an hours-long recording. Non-fatal either way.
-        let mut manifest_write_warned = false;
-        let sink_status = task_status.clone();
-        let sink_platform = task_platform.clone();
-        let sink = Box::new(move |event: RecordingEvent| {
-            // Story 22.5: while debug mode is on, every sidecar event lands as
-            // one timestamped line in the session's `events.log` (beside
-            // `manifest.json`) — the raw stream a bug report needs. Gated and
-            // best-effort inside the helper; zero cost while off.
-            if crate::debug_log::enabled() {
-                crate::debug_log::session_event(manifest.folder(), &format!("{event:?}"));
-            }
-            // Capture the ledger entry before `apply` consumes the event: the
-            // basename comes from the sidecar-reported path (synthesized from
-            // the track + index when absent — a `track:"camera"` line without
-            // a path must never fabricate a `screen-####` name, Story 20.1);
-            // `bytes`/`track` degrade to 0/"screen". This is only the LIVE
-            // view — the terminal reconcile rebuilds the list authoritatively
-            // from disk.
-            let segment = match &event {
-                RecordingEvent::SegmentClosed {
-                    index,
-                    path,
-                    bytes,
-                    track,
-                    pts_start,
-                    pts_end,
-                } => Some(SegmentEntry {
-                    index: *index,
-                    file: path
-                        .as_deref()
-                        .and_then(|p| Path::new(p).file_name())
-                        .and_then(|name| name.to_str())
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| {
-                            let stem = if track.as_deref() == Some("camera") {
-                                "camera"
-                            } else {
-                                "screen"
-                            };
-                            format!("{stem}-{index:04}.mp4")
-                        }),
-                    bytes: bytes.unwrap_or(0),
-                    track: track.clone().unwrap_or_else(|| "screen".to_owned()),
-                    // Story 17.4 (NFR-22): the host-clock PTS bounds exist only
-                    // in this event — the terminal disk reconcile preserves
-                    // them by index (they cannot be re-read from the rebased
-                    // segment files).
-                    pts_start: *pts_start,
-                    pts_end: *pts_end,
-                }),
-                _ => None,
-            };
-            // Machine + snapshot fold, plus the Story 18.4 onset-deduped fault/
-            // warning notification (see `fold_recording_event`).
-            if fold_recording_event(&mut machine, &sink_status, sink_platform.as_ref(), event) {
-                // Segment ledger + manifest (Story 17.2). Best-effort by
-                // design: a mid-session write/reconcile failure is LOGGED ONLY
-                // — it must never change `machine` state or force the snapshot
-                // to `Failed`, because capture is still live and the
-                // single-child start-guard keys off the snapshot (a false
-                // `Failed` would let a second `keeper-rec` child spawn). The
-                // last good manifest stays on disk.
-                if let Some(entry) = segment {
-                    manifest.record_segment(entry);
-                }
-                manifest.set_status(ManifestStatus::from_state(machine.state()));
-                if matches!(
-                    machine.state(),
-                    SessionState::Finalized | SessionState::Recovered | SessionState::Failed
-                ) {
-                    // Story 21.5: the wall-clock end stamp rides the terminal
-                    // manifest write (ISO-8601 with offset, host-owned clock).
-                    manifest.set_ended_at(
-                        chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
-                    );
-                    // EVERY terminal rebuilds the segment list from disk —
-                    // disk is authoritative (final segment, DW-992 backfill,
-                    // real sizes) — before the final write.
-                    if let Err(error) = manifest.reconcile_from_dir() {
-                        tracing::warn!(
-                            %error,
-                            "recording manifest: terminal disk reconcile failed; \
-                             writing the event-fed view instead"
-                        );
-                    }
-                }
-                if let Err(error) = manifest.write() {
-                    if !manifest_write_warned {
-                        manifest_write_warned = true;
-                        tracing::warn!(
-                            %error,
-                            "recording manifest: atomic write failed; the last good \
-                             manifest stays on disk and further write failures this \
-                             session are suppressed (session unaffected)"
-                        );
-                    }
-                }
-            }
-        }) as Box<dyn FnMut(RecordingEvent) + Send>;
+        // snapshot as they arrive (live — unlike `drive_session`'s buffered
+        // replay), and hand every closed segment to the destination profile.
+        let mut sink_state = RecordingSink {
+            machine: RecordingSession::new(),
+            manifest,
+            status: task_status.clone(),
+            platform: task_platform.clone(),
+            sync,
+        };
+        let sink = Box::new(move |event: RecordingEvent| sink_state.handle(event))
+            as Box<dyn FnMut(RecordingEvent) + Send>;
 
         let outcome = recorder
             .run_session(
@@ -12144,5 +12587,433 @@ mod tests {
             &source,
             &destination
         ));
+    }
+
+    // --- Story 41.5: committed at close, pushed on policy -------------------
+
+    /// One call a session made on the engine seam, kept in the order it was made
+    /// so a test can assert both the COUNT and what came last.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SyncCall {
+        PushPolicy,
+        EnsureLfsRule(String),
+        NoteFinished(PathBuf),
+        Push(RecordingPushTrigger),
+    }
+
+    /// A counting [`RecordingSyncPort`] double — the test seam this story needs.
+    ///
+    /// The whole acceptance criteria is stated in counts (48 commits, ONE
+    /// `.gitattributes` write, ONE `manifest.json` write, one push), and every one
+    /// of them is a call the sink either makes or does not. A real `Engine` would
+    /// answer the same questions with a git repository, a `sync.db` and a remote
+    /// attached; this answers them with a vector.
+    struct CountingSyncPort {
+        policy: SessionPushPolicy,
+        /// An engine that says no to everything: the LFS rule cannot be written
+        /// and every assertion is dropped. The recorder must not be able to tell.
+        refuses: bool,
+        calls: Mutex<Vec<SyncCall>>,
+    }
+
+    impl CountingSyncPort {
+        fn new(policy: SessionPushPolicy) -> Self {
+            Self {
+                policy,
+                refuses: false,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A refusing engine reports the default policy, because that is what a
+        /// profile it cannot read degrades to.
+        fn refusing() -> Self {
+            Self {
+                policy: SessionPushPolicy::default(),
+                refuses: true,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, call: SyncCall) {
+            self.calls.lock().expect("lock sync calls").push(call);
+        }
+
+        fn calls(&self) -> Vec<SyncCall> {
+            self.calls.lock().expect("lock sync calls").clone()
+        }
+
+        fn count(&self, want: &SyncCall) -> usize {
+            self.calls().iter().filter(|call| *call == want).count()
+        }
+
+        fn assertions(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|call| matches!(call, SyncCall::NoteFinished(_)))
+                .count()
+        }
+
+        fn pushes(&self, trigger: RecordingPushTrigger) -> usize {
+            self.count(&SyncCall::Push(trigger))
+        }
+    }
+
+    impl RecordingSyncPort for CountingSyncPort {
+        fn push_policy(&self, _profile_id: &str) -> SessionPushPolicy {
+            self.record(SyncCall::PushPolicy);
+            self.policy
+        }
+
+        fn ensure_lfs_rule(&self, _profile_id: &str, extension: &str) -> Result<bool, String> {
+            self.record(SyncCall::EnsureLfsRule(extension.to_owned()));
+            if self.refuses {
+                Err("this profile has no working tree".to_owned())
+            } else {
+                Ok(true)
+            }
+        }
+
+        fn note_finished(&self, _profile_id: &str, path: &Path) -> bool {
+            self.record(SyncCall::NoteFinished(path.to_path_buf()));
+            !self.refuses
+        }
+
+        fn request_push(&self, _profile_id: &str, trigger: RecordingPushTrigger) {
+            self.record(SyncCall::Push(trigger));
+        }
+    }
+
+    /// A destination that resolved to a recordings-flagged profile whose
+    /// recordings root is `root`.
+    fn profile_destination(root: &Path) -> RecordingDestination {
+        RecordingDestination {
+            root: root.to_path_buf(),
+            kind: RecordingDestinationKind::Profile,
+            profile_id: Some("profile-1".to_owned()),
+            profile_name: Some("tgdrive".to_owned()),
+        }
+    }
+
+    /// A plain-folder destination — the same root, no profile behind it.
+    fn folder_destination(root: &Path) -> RecordingDestination {
+        RecordingDestination {
+            root: root.to_path_buf(),
+            kind: RecordingDestinationKind::Folder,
+            profile_id: None,
+            profile_name: None,
+        }
+    }
+
+    /// A sink over a real session folder, with the start manifest REMOVED.
+    ///
+    /// `recording_start` writes `manifest.json` once before the sidecar spawns
+    /// (`create_with_meta`) and the sink writes it once at finalize. Deleting the
+    /// first one turns "how many times does a session write its metadata" into a
+    /// question about a file that either exists or does not — a stronger answer
+    /// than a counter the production path would have to carry for the tests.
+    fn recording_sink_in(folder: &Path, sync: Option<RecordingSyncSession>) -> RecordingSink {
+        let manifest = SessionManifest::create(
+            folder.to_path_buf(),
+            CaptureTarget::display(None),
+            SessionDevices {
+                system_audio: true,
+                microphone: false,
+                camera: false,
+            },
+        )
+        .expect("create session folder + manifest");
+        std::fs::remove_file(folder.join("manifest.json")).expect("clear the start manifest");
+        RecordingSink {
+            machine: RecordingSession::new(),
+            manifest,
+            status: Arc::new(Mutex::new(RecordingStatusVm::idle())),
+            platform: Arc::new(CapturingPlatform::new()),
+            sync,
+        }
+    }
+
+    /// Close one segment the way a rotation does: the sidecar renames the file
+    /// onto its final name (Story 41.3) and only then reports it.
+    fn close_segment(sink: &mut RecordingSink, index: u32) {
+        let path = sink
+            .manifest
+            .folder()
+            .join(format!("screen-{index:04}.mov"));
+        std::fs::write(&path, vec![7u8; 64]).expect("segment file");
+        sink.handle(RecordingEvent::SegmentClosed {
+            index,
+            path: Some(path.to_string_lossy().into_owned()),
+            bytes: Some(64),
+            track: Some("screen".to_owned()),
+            pts_start: Some(f64::from(index)),
+            pts_end: Some(f64::from(index) + 1.0),
+        });
+    }
+
+    /// A four-hour session, synthetically: preflight, capture, `rotations` closed
+    /// segments, stop, finalize. 48 rotations is the AC's session; a real sidecar
+    /// would take four hours to say the same thing.
+    fn drive_synthetic_session(sink: &mut RecordingSink, rotations: u32) {
+        sink.handle(RecordingEvent::PreflightStarted);
+        sink.handle(RecordingEvent::CaptureStarted);
+        for index in 0..rotations {
+            close_segment(sink, index);
+        }
+        sink.handle(RecordingEvent::Stopping);
+        sink.handle(RecordingEvent::Finalized);
+    }
+
+    /// The AC's counters in one session (FR-137, FR-146): 48 rotations produce 48
+    /// ledger lines and 48 assertions, ONE `.gitattributes` write and ONE
+    /// `manifest.json` write — the metadata of a live session is not rewritten
+    /// under the recorder that is still filling the folder.
+    #[test]
+    fn a_forty_eight_rotation_session_writes_one_lfs_rule_one_manifest_and_asserts_every_segment() {
+        let root = scan_temp_dir("rec-41-5-counts");
+        let folder = root.join("keeper-rec session");
+        let port = Arc::new(CountingSyncPort::new(SessionPushPolicy::AtSessionEnd));
+        let sync = begin_recording_sync(&profile_destination(&root), "mov", Some(port.clone()))
+            .expect("a profile destination opens the sync seam");
+        let mut sink = recording_sink_in(&folder, Some(sync));
+
+        // The rule is written at START, before a single event is folded — the
+        // working tree does not change under a running recorder.
+        assert_eq!(port.count(&SyncCall::EnsureLfsRule("mov".to_owned())), 1);
+        assert_eq!(
+            port.count(&SyncCall::PushPolicy),
+            1,
+            "the policy in force is read once, at start"
+        );
+
+        sink.handle(RecordingEvent::PreflightStarted);
+        sink.handle(RecordingEvent::CaptureStarted);
+        for index in 0..48 {
+            close_segment(&mut sink, index);
+        }
+
+        assert_eq!(
+            sink.manifest.segments.len(),
+            48,
+            "one ledger line per closed segment"
+        );
+        assert_eq!(
+            port.assertions(),
+            48,
+            "one finished-path assertion per closed segment"
+        );
+        assert_eq!(
+            port.count(&SyncCall::EnsureLfsRule("mov".to_owned())),
+            1,
+            "48 rotations must not touch `.gitattributes` again"
+        );
+        assert!(
+            !folder.join("manifest.json").exists(),
+            "a live session rewrote its metadata mid-recording"
+        );
+
+        sink.handle(RecordingEvent::Stopping);
+        sink.handle(RecordingEvent::Finalized);
+
+        let written = SessionManifest::load(&folder).expect("the finalized manifest");
+        assert!(matches!(written.status, ManifestStatus::Finalized));
+        assert_eq!(
+            written.segments.len(),
+            48,
+            "the one write carries every segment"
+        );
+        assert_eq!(
+            written.segments[7].pts_start,
+            Some(7.0),
+            "the terminal reconcile kept the host-clock bounds by index"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The default policy publishes nothing during the meeting (FR-136, AD-70):
+    /// durability is immediate, publication waits for the session to end.
+    #[test]
+    fn the_default_session_end_policy_asks_for_no_push_until_the_session_ends() {
+        let root = scan_temp_dir("rec-41-5-session-end");
+        let folder = root.join("keeper-rec session");
+        let port = Arc::new(CountingSyncPort::new(SessionPushPolicy::AtSessionEnd));
+        let sync = begin_recording_sync(&profile_destination(&root), "mov", Some(port.clone()))
+            .expect("the sync seam");
+        let mut sink = recording_sink_in(&folder, Some(sync));
+
+        sink.handle(RecordingEvent::PreflightStarted);
+        sink.handle(RecordingEvent::CaptureStarted);
+        for index in 0..48 {
+            close_segment(&mut sink, index);
+        }
+        assert_eq!(
+            port.pushes(RecordingPushTrigger::SegmentCommitted),
+            0,
+            "no push may be asked for while the recorder is running"
+        );
+        assert_eq!(port.pushes(RecordingPushTrigger::SessionEnd), 0);
+
+        sink.handle(RecordingEvent::Stopping);
+        sink.handle(RecordingEvent::Finalized);
+
+        assert_eq!(
+            port.pushes(RecordingPushTrigger::SessionEnd),
+            1,
+            "exactly one push, and only once the session ended"
+        );
+        assert_eq!(port.pushes(RecordingPushTrigger::SegmentCommitted), 0);
+        assert_eq!(
+            port.calls().last(),
+            Some(&SyncCall::Push(RecordingPushTrigger::SessionEnd)),
+            "the session's last word to the engine is its push"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The two policies that publish mid-session ask on every committed segment.
+    ///
+    /// `Immediate` means now; `Window` means the engine's clock decides, and the
+    /// only way it can decide is to be asked — the window is never evaluated here
+    /// (a second implementation of the quiet hours is how two answers happen).
+    #[test]
+    fn a_policy_that_publishes_mid_session_asks_at_every_closed_segment() {
+        for policy in [
+            SessionPushPolicy::PerSegment,
+            SessionPushPolicy::InQuietHours,
+        ] {
+            let root = scan_temp_dir("rec-41-5-mid-session");
+            let folder = root.join("keeper-rec session");
+            let port = Arc::new(CountingSyncPort::new(policy));
+            let sync = begin_recording_sync(&profile_destination(&root), "mov", Some(port.clone()))
+                .expect("the sync seam");
+            let mut sink = recording_sink_in(&folder, Some(sync));
+            drive_synthetic_session(&mut sink, 48);
+
+            assert_eq!(
+                port.pushes(RecordingPushTrigger::SegmentCommitted),
+                48,
+                "{policy:?}: one push request per committed segment"
+            );
+            assert_eq!(
+                port.pushes(RecordingPushTrigger::SessionEnd),
+                1,
+                "{policy:?}: the finalized manifest's own commit is still published once"
+            );
+            assert_eq!(port.assertions(), 48, "{policy:?}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A plain folder is not a synced folder, and the sink must not treat it like
+    /// one: no assertion, no push, no engine call at all — while the recording
+    /// itself is exactly as complete.
+    #[test]
+    fn a_plain_folder_destination_makes_no_engine_call_at_all() {
+        let root = scan_temp_dir("rec-41-5-folder");
+        let folder = root.join("keeper-rec session");
+        let port = Arc::new(CountingSyncPort::new(SessionPushPolicy::PerSegment));
+        assert!(
+            begin_recording_sync(&folder_destination(&root), "mov", Some(port.clone())).is_none(),
+            "there is no profile to open a seam onto"
+        );
+
+        let mut sink = recording_sink_in(&folder, None);
+        drive_synthetic_session(&mut sink, 48);
+
+        assert!(
+            port.calls().is_empty(),
+            "a plain folder asked the engine for something: {:?}",
+            port.calls()
+        );
+        let written = SessionManifest::load(&folder).expect("the finalized manifest");
+        assert_eq!(
+            written.segments.len(),
+            48,
+            "the ledger is the recorder's own"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The epic's posture in one test (NFR-34): an engine that refuses everything
+    /// — the LFS rule fails, every assertion is dropped — costs the recording
+    /// nothing. Not one ledger line, not the finalize, not the manifest.
+    #[test]
+    fn an_engine_that_refuses_everything_does_not_cost_a_single_ledger_line() {
+        let root = scan_temp_dir("rec-41-5-refusing");
+        let folder = root.join("keeper-rec session");
+        let port = Arc::new(CountingSyncPort::refusing());
+        let sync = begin_recording_sync(&profile_destination(&root), "mov", Some(port.clone()))
+            .expect("the seam opens even against an engine that refuses everything");
+        let mut sink = recording_sink_in(&folder, Some(sync));
+        drive_synthetic_session(&mut sink, 48);
+
+        let written = SessionManifest::load(&folder).expect("the finalized manifest");
+        assert_eq!(written.segments.len(), 48);
+        assert!(matches!(written.status, ManifestStatus::Finalized));
+        assert_eq!(
+            status_lock(&sink.status).state,
+            RecordingUiState::Finalized,
+            "a refused sync must never surface as a failed session"
+        );
+        assert_eq!(
+            port.count(&SyncCall::EnsureLfsRule("mov".to_owned())),
+            1,
+            "a refused rule is not retried per rotation"
+        );
+        assert_eq!(port.assertions(), 48, "every segment is still asserted");
+        assert_eq!(
+            port.pushes(RecordingPushTrigger::SessionEnd),
+            1,
+            "the session still says it ended; the engine still decides what that costs"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The matrix's "assertion refused" row, answered before the engine has to: a
+    /// session folder outside the profile's recordings root asserts nothing, takes
+    /// the ordinary settle path, and records exactly as usual.
+    #[test]
+    fn a_session_outside_the_recordings_root_asserts_nothing_and_still_records() {
+        let root = scan_temp_dir("rec-41-5-outside");
+        let recordings_root = root.join("recordings");
+        std::fs::create_dir_all(&recordings_root).expect("recordings root");
+        let folder = root.join("elsewhere");
+        let port = Arc::new(CountingSyncPort::new(SessionPushPolicy::PerSegment));
+        let sync = begin_recording_sync(
+            &profile_destination(&recordings_root),
+            "mov",
+            Some(port.clone()),
+        )
+        .expect("the sync seam");
+        let mut sink = recording_sink_in(&folder, Some(sync));
+        drive_synthetic_session(&mut sink, 3);
+
+        assert_eq!(
+            port.assertions(),
+            0,
+            "a path the engine would refuse is never asserted"
+        );
+        assert_eq!(
+            port.pushes(RecordingPushTrigger::SegmentCommitted),
+            0,
+            "nothing was committed here, so there is nothing to publish per segment"
+        );
+        let written = SessionManifest::load(&folder).expect("the finalized manifest");
+        assert_eq!(written.segments.len(), 3, "the recording is unaffected");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FR-137's rule covers "the session's media extension", so the seed name and
+    /// the extension named beside it have to be the same fact.
+    #[test]
+    fn the_session_seed_name_carries_the_extension_its_lfs_rule_names() {
+        for audio_only in [false, true] {
+            let (name, extension) = session_media_seed(audio_only);
+            assert_eq!(
+                Path::new(name).extension().and_then(|ext| ext.to_str()),
+                Some(extension),
+                "{name} does not carry .{extension}"
+            );
+        }
     }
 }
