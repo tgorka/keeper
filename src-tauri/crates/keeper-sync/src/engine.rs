@@ -1162,6 +1162,55 @@ impl Engine {
             .ok_or_else(|| SyncError::Journal("gate vanished after insert".to_owned()))
     }
 
+    /// Declare that `paths` arrived in this profile by **rename** and are
+    /// therefore already settled (Story 40.4, FR-129).
+    ///
+    /// git stores no rename metadata; it infers one at diff time, and
+    /// `git log --follow` can only see the inference when the disappearance and
+    /// the arrival share a commit. The gate would not let them:
+    /// [`Self::collect_stable_changes`] admits a deletion unconditionally — no
+    /// file is left to sample — while every moved file arrives at an absolute
+    /// path tier 2 has never observed, and an unobserved path is `Settling` by
+    /// construction. One move would become a deletion commit now and an
+    /// addition commit a settle window later, with the history severed between
+    /// them. Priming the destinations first is what collapses the two into one.
+    ///
+    /// Deliberately inert beyond that: no walk, no `git status`, no commit, no
+    /// network. It records gate state and mirrors it to `file_state` the same
+    /// way the walk does, so a restart between the move and the sync does not
+    /// silently drop the prime; the in-memory gate remains authoritative, as it
+    /// is for every other entry ([`StabilityGate::import`] lets it win).
+    ///
+    /// Paths outside the profile are skipped rather than refused, so a caller
+    /// may hand over whatever a walk of the moved folder found without
+    /// pre-filtering it, and the return value is how many were actually primed
+    /// — [`StabilityGate::prime_stable`] also declines excluded and unstattable
+    /// paths.
+    pub fn prime_moved_paths(&self, profile_id: &str, paths: &[PathBuf]) -> Result<usize> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
+            return Err(SyncError::Config(format!(
+                "no such sync profile: {profile_id}"
+            )));
+        };
+        let now = self.platform.now_ms();
+        let (primed, pending) = {
+            let mut gates = Self::lock(&self.gates);
+            let gate = self.ensure_gate(&mut gates, &profile)?;
+            let mut primed = 0usize;
+            for path in paths {
+                if path.starts_with(&profile.local_path) && gate.prime_stable(path, now) {
+                    primed += 1;
+                }
+            }
+            (primed, gate.export())
+        };
+        // Outside the gate lock, exactly as the walk does it: every other
+        // profile's scan queues behind that lock and a SQLite transaction has
+        // no business holding it.
+        self.with_db(|conn| db::save_file_state(conn, &profile.id, &pending))?;
+        Ok(primed)
+    }
+
     /// Execute every journal unit that is ready for this profile.
     ///
     /// Shared by the supervisor and by `sync_once`: a one-shot sync that
@@ -5621,6 +5670,100 @@ mod tests {
              the size that moved"
         );
         assert_eq!(rows.len(), 4, "earlier entries are kept, not replaced");
+    }
+
+    /// Story 40.4: a retitle MOVES a session folder, and `git log --follow`
+    /// can only reach the pre-rename history when the disappearance and the
+    /// arrival share a commit — git stores no rename metadata and infers one
+    /// from content at diff time.
+    ///
+    /// The control half is the bug the priming API exists for, asserted rather
+    /// than described: the deletion goes out at once (nothing is left to
+    /// sample) while the arrival is an absolute path tier 2 has never observed,
+    /// so one move becomes two commits a settle window apart.
+    #[tokio::test]
+    async fn priming_a_moved_file_commits_the_delete_and_the_add_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        // Byte-identical, because a rename is only inferable from content: two
+        // files that differ would prove nothing about `--follow` either way.
+        let bytes = b"one recording segment, byte for byte";
+        std::fs::write(p.local_path.join("cold.bin"), bytes).expect("write");
+        std::fs::write(p.local_path.join("warm.bin"), bytes).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 2);
+
+        // Control — no prime. Two commits, and the history is severed between
+        // them.
+        std::fs::rename(
+            p.local_path.join("cold.bin"),
+            p.local_path.join("cold-retitled.bin"),
+        )
+        .expect("rename");
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("cold move"),
+            1,
+            "an unprimed move commits its deletion alone"
+        );
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("cold arrival"),
+            1,
+            "and its arrival a whole settle window later, in a second commit"
+        );
+
+        // Primed — one commit carrying both halves.
+        let moved = p.local_path.join("warm-retitled.bin");
+        std::fs::rename(p.local_path.join("warm.bin"), &moved).expect("rename");
+        assert_eq!(
+            engine
+                .prime_moved_paths(&p.id, std::slice::from_ref(&moved))
+                .expect("prime"),
+            1
+        );
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("warm move"),
+            2,
+            "a primed move commits the deletion and the arrival as one change"
+        );
+
+        // The count above is one `stage_and_commit` call, so both paths are in
+        // one commit by construction. This is what that commit actually said.
+        let rows = engine.activity(&p.id, 2).await.expect("activity");
+        let mut latest: Vec<(ActivityKind, String)> =
+            rows.iter().map(|r| (r.kind, r.path.clone())).collect();
+        latest.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            latest,
+            vec![
+                (ActivityKind::Added, "warm-retitled.bin".to_owned()),
+                (ActivityKind::Deleted, "warm.bin".to_owned()),
+            ],
+            "both halves of the move, recorded against the same commit"
+        );
+        assert!(
+            rows.iter().all(|r| r.ts_ms == platform.now_ms()),
+            "and at the same instant — the clock never advanced between them"
+        );
+
+        // Paths outside the profile are skipped rather than refused, so a
+        // caller may hand over whatever a walk found.
+        assert_eq!(
+            engine
+                .prime_moved_paths(&p.id, &[dir.path().join("elsewhere.bin")])
+                .expect("prime"),
+            0
+        );
     }
 
     #[tokio::test]

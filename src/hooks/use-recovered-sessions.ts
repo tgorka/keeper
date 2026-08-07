@@ -13,6 +13,12 @@
  * noise never flashes a card away or invents one); a failed acknowledge still
  * drops the card locally (best-effort latch — it may reappear next scan, which
  * is the honest fallback the Rust side documents).
+ *
+ * Story 40.4: a listed session can be RENAMED from its card, which moves the
+ * folder every entry is keyed on. `retitled` re-points the entry immediately so
+ * a dismissal lands on the path whose manifest still loads, and a dismissed
+ * folder is remembered for the mount so an in-flight re-scan cannot re-list the
+ * card the user just dismissed.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RecordingSummaryVm } from "@/lib/ipc/client";
@@ -27,14 +33,25 @@ export interface UseRecoveredSessions {
    * finalizes so a fresh salvage surfaces without a remount). */
   refresh: () => void;
   /** Acknowledge (dismiss) a recovery card: latch the one-time notice and drop
-   * the session from local state immediately. */
+   * the session from local state immediately. Pass the folder the session is at
+   * NOW — after a rename that is the post-move path, and it is the only one
+   * whose manifest still loads (Story 40.4). */
   acknowledge: (folder: string) => void;
+  /** Adopt the summary a listed session's rename resolved (Story 40.4): the
+   * entry is replaced in place, so the list describes the session by where it
+   * is now — before the disk re-scan lands, and even if that scan fails. */
+  retitled: (folder: string, summary: RecordingSummaryVm) => void;
 }
 
 export function useRecoveredSessions(): UseRecoveredSessions {
   const [sessions, setSessions] = useState<RecordingSummaryVm[]>([]);
   const recording = useCapabilitiesStore((s) => s.capabilities.recording);
   const mounted = useRef(true);
+  // Folders already dismissed in this mount. A dismissal is one-time, but the
+  // latch is a round trip and a re-scan can be in flight when it happens (a
+  // rename fires one) — without this the resolving scan would re-list the very
+  // card the user just dismissed.
+  const dismissed = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     mounted.current = true;
@@ -52,7 +69,7 @@ export function useRecoveredSessions(): UseRecoveredSessions {
     void recoveredSessionsList()
       .then((list) => {
         if (mounted.current) {
-          setSessions(list);
+          setSessions(list.filter((session) => !dismissed.current.has(session.sessionFolder)));
         }
       })
       .catch(() => {
@@ -68,11 +85,18 @@ export function useRecoveredSessions(): UseRecoveredSessions {
   const acknowledge = useCallback((folder: string) => {
     // Drop the card locally first (best-effort UX): the notice is one-time, so a
     // failed latch at worst re-surfaces it on a later scan — never a stuck card.
+    dismissed.current.add(folder);
     setSessions((prev) => prev.filter((session) => session.sessionFolder !== folder));
     void recoveredSessionAcknowledge(folder).catch(() => {
       // Best-effort latch (the Rust write is one-way, idempotent).
     });
   }, []);
 
-  return { sessions, refresh, acknowledge };
+  const retitled = useCallback((folder: string, summary: RecordingSummaryVm) => {
+    setSessions((prev) =>
+      prev.map((session) => (session.sessionFolder === folder ? summary : session)),
+    );
+  }, []);
+
+  return { sessions, refresh, acknowledge, retitled };
 }
