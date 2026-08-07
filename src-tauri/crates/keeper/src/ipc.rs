@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Datelike, Local, Timelike};
+use chrono::{DateTime, Datelike, FixedOffset, Local, TimeZone, Timelike};
 use keeper_core::account::AccountManager;
 use keeper_core::auth;
 use keeper_core::auth::BeeperFlowRegistry;
@@ -257,6 +257,29 @@ impl LiveFolderReservation {
             folder,
             owned,
         }
+    }
+
+    /// Move this guard's claim from the folder it holds onto `folder`, under a
+    /// single lock acquisition.
+    ///
+    /// Story 40.4's retitle renames the folder it claimed. The instant `rename`
+    /// returns, the claim names a path the retitle no longer owns: a start that
+    /// reoccupies the vacated name gets a non-owning guard (the entry is still
+    /// here), and this guard's `Drop` then un-reserves that live session for the
+    /// rest of its life. Taking the new claim and releasing the old one as one
+    /// indivisible step is what keeps a claim held on either side of the rename
+    /// with no window between them.
+    fn repoint(&mut self, folder: PathBuf) {
+        let owned = {
+            let mut reserved = plain_lock(&self.reserved);
+            let owned = reserved.insert(folder.clone());
+            if self.owned {
+                reserved.remove(&self.folder);
+            }
+            owned
+        };
+        self.folder = folder;
+        self.owned = owned;
     }
 }
 
@@ -4286,6 +4309,44 @@ pub(crate) fn acknowledge_recording_slot(slot: &Mutex<Option<RecordingRun>>) -> 
     terminal
 }
 
+/// Follow a retitled session's folder in the kept status snapshot (Story 40.4):
+/// if the slot's `output_path` is exactly `from`, rewrite it to `to`.
+///
+/// **Why the shell has to do this.** The slot survives the session it describes
+/// — `recording_stop` leaves the terminal snapshot in place so the summary card
+/// can render it, and the frontend re-adopts `recording_status().output_path`
+/// on every remount. A retitle moves that folder, so leaving the snapshot alone
+/// hands the surface a path that no longer exists: the summary fetch fails
+/// against it, Reveal-in-Finder opens nothing, and the card silently reverts to
+/// the dead folder the next time the pane mounts.
+///
+/// Deliberately narrow. Only `output_path`, because that is the one field that
+/// names a location; only on an EXACT match, because a slot describing a
+/// different session must not be dragged along by a retitle of this one; and
+/// never for a live session, which [`retitle_session_folder`] refuses before
+/// anything moves (a live folder is in the reservation set). Returns whether the
+/// snapshot was repointed, so a caller can log the miss rather than assume.
+///
+/// Takes the slot rather than the whole state ([`acknowledge_recording_slot`]'s
+/// convention) so it is unit-testable without an `AppState`.
+#[cfg(desktop)]
+pub(crate) fn repoint_recording_slot_output(
+    slot: &Mutex<Option<RecordingRun>>,
+    from: &Path,
+    to: &Path,
+) -> bool {
+    let guard = slot_lock(slot);
+    let Some(run) = guard.as_ref() else {
+        return false;
+    };
+    let mut snapshot = status_lock(&run.status);
+    if snapshot.output_path.as_deref().map(Path::new) != Some(from) {
+        return false;
+    }
+    snapshot.output_path = Some(to.to_string_lossy().into_owned());
+    true
+}
+
 /// The current Unix epoch in milliseconds (0 on a pre-1970 clock — never a panic).
 /// `pub(crate)` since Story 18.1: the tray's status line derives elapsed from the
 /// same clock the driver task stamps `started_at_epoch_ms` with.
@@ -4383,7 +4444,10 @@ const SESSION_FOLDER_ATTEMPTS: u32 = 64;
 /// to keep that true is for both to be the same context with the same clock
 /// read. Only `seq` differs — the preview shows ordinal 1 because that is the
 /// common case, while a start walks upward as it discovers collisions.
-fn start_render_ctx(now: &DateTime<Local>, title: Option<&str>, seq: u32) -> RenderCtx {
+///
+/// Generic in the zone for [`preview_render_ctx`]'s reason: a start reads
+/// `Local`, while Story 40.4's retitle renders a stamp's OWN offset.
+fn start_render_ctx<Tz: TimeZone>(now: &DateTime<Tz>, title: Option<&str>, seq: u32) -> RenderCtx {
     RenderCtx {
         seq,
         ..preview_render_ctx(now, title)
@@ -4448,6 +4512,37 @@ impl Drop for SessionScaffold {
             let _ = std::fs::remove_dir(dir);
         }
     }
+}
+
+/// Bring a rendered path's PARENT directories into existence, registering only
+/// the ones THIS attempt created with `scaffold`.
+///
+/// A nesting template's intermediate directories are created one at a time, so
+/// the unwind knows exactly which ones this attempt brought into existence.
+/// `create_dir` per component rather than `create_dir_all`: the latter cannot
+/// tell "I made this" from "it was already here", and that difference is the
+/// only thing the unwind may act on.
+///
+/// Shared by the start and Story 40.4's retitle, so a nesting template's
+/// intermediates are created — and unwound — identically whichever one puts a
+/// session there.
+fn create_session_intermediates(
+    root: &Path,
+    relative: &RelativePath,
+    scaffold: &mut SessionScaffold,
+) -> Result<(), IpcError> {
+    let mut parent = root.to_path_buf();
+    let mut intermediates = relative.components().collect::<Vec<_>>();
+    intermediates.pop();
+    for component in intermediates {
+        parent.push(component);
+        match std::fs::create_dir(&parent) {
+            Ok(()) => scaffold.created(parent.clone()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(session_path_error(relative, &err)),
+        }
+    }
+    Ok(())
 }
 
 /// The refusal for a rendered path the filesystem would not take.
@@ -4560,23 +4655,7 @@ where
         let relative = template.render(&start_render_ctx(now, title, seq));
         let folder = session_folder_path(root, &relative);
         let mut scaffold = SessionScaffold::new();
-        // A nesting template's intermediate directories are created here, one at
-        // a time, so the unwind knows exactly which ones this attempt brought
-        // into existence. `create_dir` per component rather than
-        // `create_dir_all`: the latter cannot tell "I made this" from "it was
-        // already here", and that difference is the only thing the unwind may
-        // act on.
-        let mut parent = root.to_path_buf();
-        let mut intermediates = relative.components().collect::<Vec<_>>();
-        intermediates.pop();
-        for component in intermediates {
-            parent.push(component);
-            match std::fs::create_dir(&parent) {
-                Ok(()) => scaffold.created(parent.clone()),
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(err) => return Err(session_path_error(&relative, &err)),
-            }
-        }
+        create_session_intermediates(root, &relative, &mut scaffold)?;
         let reservation = LiveFolderReservation::reserve(reserved, folder.clone());
         match make(folder.clone()) {
             Ok(manifest) => {
@@ -4626,6 +4705,295 @@ where
 /// because story 42 offers it as copyable text and as a `session:` link target.
 fn mint_session_id(data_dir: &Path) -> Result<String, IpcError> {
     Ok(format!("{}-{}", device_ulid(data_dir)?, ulid::Ulid::new()))
+}
+
+/// The typed refusal for a retitle of a session whose folder is claimed by
+/// something else (Story 40.4).
+///
+/// **Why one message for two states.** The reservation set holds paths, not
+/// reasons, so a claim it refuses is either a live recording or another retitle
+/// of the same session already in flight — and the shell cannot tell which
+/// without a second registry that would have to be kept in step with this one.
+/// Rather than mint a second wire code for a state the surface would treat
+/// identically, the sentence is worded to be TRUE in both: "stop the recording
+/// first" is a lie to the second retitler, and there is nothing for them to
+/// stop.
+///
+/// Typed rather than `Internal`, because the surface has something useful to say
+/// and "internal error" would send the user looking for a fault instead. Not
+/// retriable: while a recording runs nothing clears, and the driver and the
+/// sidecar hold absolute paths into that folder, so moving it underneath them
+/// would break the very session the user is recording.
+#[cfg(desktop)]
+fn recording_session_live_error() -> IpcError {
+    IpcError {
+        code: IpcErrorCode::RecordingSessionLive,
+        message: "this session's folder is busy — it is still recording, or it is already being renamed; finish that before renaming it".to_owned(),
+        account_id: None,
+        retriable: false,
+    }
+}
+
+/// The refusal for a retitle whose manifest rewrite failed AND whose folder
+/// could not be moved back (Story 40.4).
+///
+/// Distinct from the manifest-write error it replaces because the two describe
+/// different worlds. "The manifest could not be written" implies the session is
+/// still where the caller left it; on this path it is not — the rename landed,
+/// the rewrite did not, and the move back failed too. The card repaints from the
+/// path it asked about, so an error that does not name the new one leaves it
+/// painting a folder that no longer exists and a Reveal that cannot resolve.
+/// Names the ABSOLUTE location, because that is the only thing the user can act
+/// on. Retriable: the folder is intact at the new path, and a retitle aimed
+/// there rewrites the manifest as soon as whatever blocked the write clears.
+#[cfg(desktop)]
+fn retitle_stranded_error(destination: &Path, cause: &IpcError) -> IpcError {
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "the session folder was moved to \"{}\", but its manifest could not be rewritten there and it could not be moved back: {}",
+            destination.display(),
+            cause.message
+        ),
+        account_id: None,
+        retriable: true,
+    }
+}
+
+/// The instant a retitle re-renders against: the session's OWN start, in the
+/// offset that start was written in.
+///
+/// Never the clock. A session recorded last Tuesday must not migrate into this
+/// week's folder because it was renamed today, so the only honest input is the
+/// `started_at` stamp `recording_start` wrote (RFC 3339 with its offset, Story
+/// 21.5) — and it is returned as the `FixedOffset` it carries, NOT converted to
+/// the machine's current zone. The offset in the stamp is the one the machine
+/// was in when it named the folder, so reading the six civil fields off it
+/// reproduces exactly the numbers the start rendered from. Converting to `Local`
+/// first would re-render a session stamped `2026-01-01T00:30:00+02:00` as
+/// `2025-12-31 2230` on a machine that has since moved zones — a different YEAR
+/// folder, and a retitle that no longer agrees with a fresh start about where
+/// the session belongs.
+///
+/// A manifest that predates that stamp has no start at all. The folder's own
+/// modification time is the closest honest answer, and taking it is LOGGED: a
+/// session that lands in a surprising month must have a reason on record, and a
+/// silent fall back to `now` would be exactly the migration this function
+/// exists to prevent. There is no stored offset for that case, so the local one
+/// is the only reading available.
+#[cfg(desktop)]
+fn session_start_instant(
+    manifest: &SessionManifest,
+    folder: &Path,
+) -> Result<DateTime<FixedOffset>, IpcError> {
+    match manifest.started_at.as_deref() {
+        Some(stamp) => match DateTime::parse_from_rfc3339(stamp) {
+            Ok(started_at) => return Ok(started_at),
+            // A stamp that does not parse is a corrupt manifest, not an old one,
+            // so it is `warn` where an absent stamp is `debug`.
+            Err(error) => tracing::warn!(
+                %error,
+                "retitle: the manifest's start stamp does not parse; falling back to the folder's modification time"
+            ),
+        },
+        None => tracing::debug!(
+            "retitle: the manifest carries no start stamp; falling back to the folder's modification time"
+        ),
+    }
+    let modified = folder
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("the session's start time could not be determined: {error}"),
+            account_id: None,
+            retriable: true,
+        })?;
+    Ok(DateTime::<Local>::from(modified).fixed_offset())
+}
+
+/// Point a manifest at the folder it now lives in, with its new title.
+///
+/// The order is load-bearing: [`SessionManifest::write`] targets the manifest's
+/// own folder, so the rebind has to happen before the write or the retitled
+/// manifest lands back in the folder the session just left. `retitle` trims and
+/// treats blank as cleared, which is the same rule [`preview_render_ctx`]
+/// applies to the title it renders from — so the stored title and the folder
+/// that title named can never disagree.
+#[cfg(desktop)]
+fn rewrite_retitled_manifest(
+    manifest: &mut SessionManifest,
+    destination: &Path,
+    title: Option<&str>,
+) -> Result<(), IpcError> {
+    manifest.retitle(title.map(str::to_owned));
+    manifest.rebind_folder(destination.to_path_buf());
+    manifest.write().map_err(|err| to_ipc_error(err.into()))
+}
+
+/// Whether two paths name the SAME directory on disk, not merely the same
+/// bytes.
+///
+/// Story 40.4's in-place branch turns on "the render landed where the session
+/// already is", and a byte comparison answers that question wrong on a
+/// case-insensitive volume: `…1432 Standup` and `…1432 standup` are unequal
+/// `PathBuf`s and the SAME directory on APFS, so a case-only retitle would skip
+/// the in-place branch, collide with itself on `create_dir` and take a
+/// permanent ` (2)` suffix. `canonicalize` resolves each component through the
+/// filesystem, which is what corrects the case (and any symlink) on the
+/// platforms that fold it. A destination that does not exist yet cannot
+/// canonicalize — the normal case — and is correctly not the source.
+#[cfg(desktop)]
+fn is_same_directory(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Move a finished session to where the CURRENT template renders its new title,
+/// and leave its identity where it is (Story 40.4).
+///
+/// The whole retitle decision, with no `AppState`, no sidecar and no clock in
+/// it, so every row of the story's matrix is a test over a temp root.
+///
+/// The naming is [`create_session_folder`]'s, deliberately: the same effective
+/// template, the same [`start_render_ctx`], the same ordinal walk and the same
+/// [`SessionScaffold`] unwind. Only the instant (the session's own start, not
+/// `now`) and the title differ, which is what makes a retitle and a fresh start
+/// of the same session agree on where it belongs.
+///
+/// Returns the rewritten manifest and its new absolute folder — the same folder
+/// when the render lands on the one the session already occupies.
+#[cfg(desktop)]
+fn retitle_session_folder(
+    reserved: &Arc<Mutex<HashSet<PathBuf>>>,
+    root: &Path,
+    template: &PathTemplate,
+    folder: &Path,
+    title: Option<&str>,
+) -> Result<(SessionManifest, PathBuf), IpcError> {
+    // Claim the folder in the live set, and let the CLAIM be the live check:
+    // `reserve` reports whether THIS guard inserted the entry, so a folder a
+    // live (or starting) session — or another retitle of the same session —
+    // already holds is refused as one indivisible compare-and-set instead of a
+    // `contains` that a start could win the instant after it read `false`. A
+    // claim is held for the whole move (repointed onto the destination at the
+    // rename, never released across it), which also keeps the orphan-recovery
+    // pass from reconciling and rewriting this manifest from under the rename.
+    let mut claim = LiveFolderReservation::reserve(reserved, folder.to_path_buf());
+    if !claim.owned {
+        return Err(recording_session_live_error());
+    }
+    // A folder whose manifest does not load is not a session, and a retitle is
+    // the wrong tool for whatever it is: the manifest is both the thing being
+    // rewritten and the only place the start instant and the identity live.
+    let mut manifest = SessionManifest::load(folder).map_err(|err| to_ipc_error(err.into()))?;
+    let started_at = session_start_instant(&manifest, folder)?;
+    let mut last_relative: Option<RelativePath> = None;
+    for seq in 1..=SESSION_FOLDER_ATTEMPTS {
+        let relative = template.render(&start_render_ctx(&started_at, title, seq));
+        let destination = session_folder_path(root, &relative);
+        // The render landed on the folder the session already occupies — a
+        // template with no title in it, a title that slugs to the same thing,
+        // the same title again, or a case-only change on a volume that folds
+        // case. There is nothing to move, and `create_dir` here would only
+        // report a collision against the session itself. The manifest is
+        // rebound to `folder`, not to the render: on a folding volume the two
+        // differ in case and only `folder` is the name the directory actually
+        // has, so the `session` label cannot drift away from the disk.
+        if destination == folder || is_same_directory(&destination, folder) {
+            rewrite_retitled_manifest(&mut manifest, folder, title)?;
+            return Ok((manifest, folder.to_path_buf()));
+        }
+        let mut scaffold = SessionScaffold::new();
+        create_session_intermediates(root, &relative, &mut scaffold)?;
+        match std::fs::create_dir(&destination) {
+            // The leaf is registered with the scaffold even though the move is
+            // about to fill it: `remove_dir` refuses a non-empty directory, so an
+            // unwind can never take the session with it, and every failure below
+            // therefore leaves the destination exactly as this attempt found it.
+            Ok(()) => scaffold.created(destination.clone()),
+            // That ordinal is taken. `create_dir` — never a prior `exists()` —
+            // is what decided, so two retitles racing for one name cannot both
+            // win it; the loser walks to the next ordinal.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_relative = Some(relative);
+                continue;
+            }
+            Err(err) => return Err(session_path_error(&relative, &err)),
+        }
+        // The `create_dir` above is the arbiter — it is what serialises two
+        // retitles racing for one name, and it is a syscall rather than a check
+        // so neither can win it twice. `remove_dir` here is a separate concern:
+        // POSIX `rename(2)` replaces an empty directory, but Windows
+        // `MoveFileExW` refuses `MOVEFILE_REPLACE_EXISTING` for a directory at
+        // all, so the target has to NOT exist when the rename runs. Taking the
+        // claim first and dropping it only once this attempt is committed to the
+        // rename on the next line is what keeps the arbitration while making the
+        // move portable.
+        if let Err(err) = std::fs::remove_dir(&destination) {
+            return Err(session_path_error(&relative, &err));
+        }
+        // The rename is what keeps the media untouched: one directory entry
+        // moves, no byte of the session is read or copied.
+        if let Err(err) = std::fs::rename(folder, &destination) {
+            // The leaf is gone again, so the scaffold's `remove_dir` would only
+            // fail on it; the intermediates this attempt made still unwind.
+            return Err(session_path_error(&relative, &err));
+        }
+        // The source is vacated. A claim left pointing at it would un-reserve a
+        // start that reoccupies the name the moment this guard drops, so the
+        // claim moves onto the destination as one locked step — the session is
+        // reserved on both sides of the rename and unreserved on neither.
+        claim.repoint(destination.clone());
+        if let Err(error) = rewrite_retitled_manifest(&mut manifest, &destination, title) {
+            // The session is at the new path with its old manifest inside it. Put
+            // it back, so a refused retitle is a retitle that did not happen
+            // rather than a folder whose name and manifest disagree. The scaffold
+            // then takes out the (now empty again) leaf and the intermediates.
+            match std::fs::rename(&destination, folder) {
+                Ok(()) => claim.repoint(folder.to_path_buf()),
+                // The move happened and cannot be undone: the session is
+                // somewhere the caller was never told about. Saying "the
+                // manifest could not be written" here would be a true sentence
+                // about a false world — the card would keep painting the old
+                // folder, which no longer exists.
+                Err(unwind) => {
+                    tracing::error!(
+                        %unwind,
+                        destination = %destination.display(),
+                        "retitle: the manifest write failed and the folder could not be moved back"
+                    );
+                    scaffold.commit();
+                    return Err(retitle_stranded_error(&destination, &error));
+                }
+            }
+            return Err(error);
+        }
+        scaffold.commit();
+        return Ok((manifest, destination));
+    }
+    // Every ordinal was taken. Name the last path tried, exactly as a start
+    // does: with 64 siblings in place the template is the problem, and the user
+    // can only see that if the refusal says what it rendered.
+    let relative = last_relative.unwrap_or_else(|| {
+        template.render(&start_render_ctx(
+            &started_at,
+            title,
+            SESSION_FOLDER_ATTEMPTS,
+        ))
+    });
+    Err(IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "the session folder \"{}\" already exists, and so did every alternative up to {}",
+            relative.as_str(),
+            SESSION_FOLDER_ATTEMPTS
+        ),
+        account_id: None,
+        retriable: false,
+    })
 }
 
 #[tauri::command]
@@ -5529,6 +5897,293 @@ pub async fn recording_session_summary(folder: String) -> Result<RecordingSummar
     )))
 }
 
+/// Retitle a finished session by MOVING its folder (Story 40.4, FR-129).
+///
+/// Since Story 40.3 the template names the session and `meta.sessionId` is the
+/// handle, which is what makes this possible at all: the folder is re-rendered
+/// from the SAME effective template against the session's OWN start instant with
+/// the new title, `manifest.json`'s title and `session` label follow it, and the
+/// identity is not touched. A blank (or absent) title clears the title and moves
+/// the session back to the name an untitled session would have had.
+///
+/// Two refusals, both before anything moves: a session whose folder is in the
+/// live-reservation set ([`recording_session_live_error`] — the driver and the
+/// sidecar hold absolute paths into it), and a folder that is not under the
+/// effective destination root, because a retitle moves a session WITHIN its root
+/// and the rendered destination is only meaningful relative to that root.
+///
+/// Returns the summary of the NEW folder, so the card that asked for the retitle
+/// can repaint from the answer instead of re-deriving the path it hoped for —
+/// and the kept status snapshot follows the move too
+/// ([`repoint_recording_slot_output`]), because that snapshot is what the
+/// frontend re-adopts on every remount and a stale one would put the card back
+/// on a folder that no longer exists.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_retitle(
+    state: State<'_, AppState>,
+    folder: String,
+    title: Option<String>,
+) -> Result<RecordingSummaryVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let platform = Arc::clone(&state.platform);
+    let reserved = Arc::clone(&state.reserved_recording_folders);
+    // `async` per AD-34-5, and the whole move goes to the blocking pool as one
+    // unit: two registry reads, a manifest load, a directory create, a rename and
+    // a manifest write, any of which can be on a slow removable volume.
+    let source = PathBuf::from(folder);
+    let moving = source.clone();
+    let (manifest, destination) =
+        off_async_runtime(move || -> Result<(SessionManifest, PathBuf), IpcError> {
+            let root = effective_destination_dir(&data_dir)?;
+            let source = moving;
+            // Not under the root ⇒ refused. The rendered destination is a path
+            // relative to this root, so retitling a folder from elsewhere would
+            // MOVE it into the recordings destination — a different operation
+            // than the one the user asked for. `session_relative_key` is the same
+            // reduction the recovery scan keys on, and it also rejects the root
+            // itself, which is not a session either.
+            if session_relative_key(&root, &source).is_none() {
+                return Err(IpcError {
+                    code: IpcErrorCode::Internal,
+                    message: format!(
+                        "\"{}\" is not inside the recordings destination, so it cannot be retitled",
+                        source.display()
+                    ),
+                    account_id: None,
+                    retriable: false,
+                });
+            }
+            // The EFFECTIVE template, read now rather than remembered from the
+            // start: a retitle names the session the way a start today would.
+            // `effective_path_template` only ever returns one that parses, so the
+            // refusal below is unreachable — and an honest error beats a panic if
+            // that invariant ever breaks.
+            let template_source = effective_path_template(&data_dir)?;
+            let template = PathTemplate::parse(&template_source).map_err(|reason| {
+                to_ipc_error(CoreError::Recording(RecordingError::TemplateInvalid {
+                    reason,
+                }))
+            })?;
+            retitle_session_folder(&reserved, &root, &template, &source, title.as_deref())
+        })
+        .await??;
+    // The live-session refusal happens inside the move, so anything the slot
+    // still names here is a FINISHED session — the terminal snapshot
+    // `recording_stop` left behind for the summary card to render. Repoint it
+    // only when it names the folder that actually moved; a slot describing some
+    // other session is none of this retitle's business.
+    if source != destination {
+        repoint_recording_slot_output(&state.recording_run, &source, &destination);
+    }
+    // Detached, never awaited (Story 40.4). The leg below is a whole sync cycle
+    // — commit, pull, LFS drain, push — and awaiting it would make Save sit out
+    // a network timeout against an unreachable remote for a rename that has
+    // ALREADY succeeded on disk and is the answer being returned on the very
+    // next line. The spec's "profile paused or offline ⇒ the rename still
+    // succeeded locally and is returned" row is exactly this.
+    let moved = destination.clone();
+    tauri::async_runtime::spawn(async move { sync_retitled_session(platform, moved).await });
+    Ok(manifest_summary(&destination, &manifest))
+}
+
+/// How deep below a retitled session folder the prime walk descends.
+///
+/// A session folder holds its segments and its `manifest.json`, and any nesting
+/// is the recorder's own — one or two levels at most. The cap only has to stop a
+/// pathological tree (a user-planted symlink farm is already excluded by the
+/// symlink skip) from turning a rename into an unbounded walk.
+#[cfg(desktop)]
+const RETITLE_PRIME_MAX_DEPTH: usize = 8;
+
+/// How many entries the prime walk visits before it stops.
+///
+/// An hour of rotated segments is in the hundreds, so this is far above any real
+/// session; tripping it is logged, and the only consequence is that the files
+/// past the budget serve an ordinary settle window and the move splits into two
+/// commits — the same outcome as no priming at all.
+#[cfg(desktop)]
+const RETITLE_PRIME_MAX_VISITS: usize = 50_000;
+
+/// Every regular file under a just-moved session folder, absolute.
+///
+/// Iterative over an explicit stack, bounded on depth and on visits, and
+/// symlink-skipping: a symlinked entry can point outside the session (or at its
+/// own ancestor), and declaring a path settled is a claim about bytes this move
+/// actually carried. Total and best-effort — an unreadable directory or entry is
+/// logged at debug and skipped, because a file that is missed is only a file
+/// that settles the slow way.
+#[cfg(desktop)]
+fn moved_session_files(folder: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut pending: Vec<(PathBuf, usize)> = vec![(folder.to_path_buf(), 0)];
+    let mut visits = 0usize;
+    'walk: while let Some((directory, depth)) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::debug!(%error, "retitle: a moved directory could not be listed for priming");
+                continue;
+            }
+        };
+        for entry in entries {
+            if visits == RETITLE_PRIME_MAX_VISITS {
+                tracing::warn!(
+                    budget = RETITLE_PRIME_MAX_VISITS,
+                    "retitle: stopping the prime walk at its visit budget; the rest of the move may commit separately"
+                );
+                break 'walk;
+            }
+            visits += 1;
+            let Ok(entry) = entry else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if depth < RETITLE_PRIME_MAX_DEPTH {
+                    pending.push((entry.path(), depth + 1));
+                }
+                continue;
+            }
+            files.push(entry.path());
+        }
+    }
+    files
+}
+
+/// Hand a retitled session's move to sync as ONE commit (Story 40.4) —
+/// best-effort, and never able to fail the rename that already happened.
+///
+/// **Why sync is poked here at all.** git records no rename metadata; it infers
+/// one at diff time from content, which is all `git log --follow` needs — but
+/// only if the disappearance and the arrival are in the SAME commit. Left to the
+/// watcher they would not be: `collect_stable_changes` admits a deletion at once
+/// (there is no file left to sample) while every moved file arrives at an
+/// absolute path the stability gate has never observed — and an unobserved path
+/// is `Settling` by construction, because one sample is not two. The next tick
+/// would commit the delete alone, the add would land a window later, and
+/// `--follow` stops at the split.
+///
+/// **Why priming, and not merely syncing now.** Triggering a sync is not enough
+/// on its own for exactly that reason: a single pass would still hold every
+/// arrival. So the destination's files are declared already-settled first
+/// ([`keeper_sync::Engine::prime_moved_paths`]) — which is the truth, since a
+/// renamed file has been quiet for as long as it existed under its old name —
+/// and only then is the sync triggered. One pass, both halves, one commit.
+///
+/// **The one gap this does not close.** A supervisor tick that walks the tree
+/// in the window between the rename and the prime still sees a bare deletion,
+/// and commits it alone. Nothing here can prevent that — the engine decides
+/// when to walk (`Engine::scan_due`: a watcher wake, an elapsed settle window,
+/// or the paced backstop), and by the time this code runs the rename has
+/// already happened. The window is the walk plus one `sync.db` transaction —
+/// single-digit milliseconds for a session folder — against a watcher whose
+/// debouncer holds a rename event for `DEFAULT_DEBOUNCE_MS` (500 ms) before a
+/// 1 Hz tick can act on it, so losing the race needs a volume slow enough, or a
+/// session large enough, to spend half a second listing a directory. Closing it
+/// outright would take an engine-side barrier declared BEFORE the rename — a
+/// per-profile hold that makes the walk skip the profile until the move is
+/// announced complete — which is a change to the scan schedule, not to this
+/// leg. Losing costs `--follow` across this one rename and nothing else.
+///
+/// **Why every failure is swallowed.** The rename has already succeeded locally
+/// and has already been returned to the caller. No git, no engine, no profile, a
+/// paused profile, an unreachable remote or a sync error are each logged and
+/// dropped — a folder that was renamed must never be reported as a failure, and
+/// the next scheduled sync still picks the change up (as two commits, which
+/// costs `--follow` and nothing else).
+#[cfg(desktop)]
+async fn sync_retitled_session(platform: Arc<dyn Platform>, folder: PathBuf) {
+    let engine = match crate::sync::engine(platform) {
+        Ok(engine) => engine,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "retitle: no sync engine, so a synced move commits on the next sync instead"
+            );
+            return;
+        }
+    };
+    let profile = match crate::sync::profile_for_path(engine.as_ref(), &folder) {
+        Ok(Some(profile)) => profile,
+        Ok(None) => {
+            tracing::debug!(
+                "retitle: the session is not inside a synced folder; nothing to commit"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "retitle: the sync profiles could not be read");
+            return;
+        }
+    };
+    // The walk and the prime are both synchronous disk work (a `read_dir` per
+    // level, an `lstat` per file, one short `sync.db` transaction), so they go
+    // to the blocking pool rather than occupying a runtime worker on a slow
+    // removable volume.
+    let priming = {
+        let engine = Arc::clone(&engine);
+        let profile_id = profile.id.clone();
+        tokio::task::spawn_blocking(move || {
+            let files = moved_session_files(&folder);
+            engine.prime_moved_paths(&profile_id, &files)
+        })
+        .await
+    };
+    match priming {
+        Ok(Ok(primed)) => tracing::debug!(
+            profile = %profile.id,
+            primed,
+            "retitle: the moved files are declared settled, so the move can commit as one change"
+        ),
+        // Both failures cost the single commit and nothing else, so the sync is
+        // still worth running: two commits beat an uncommitted move.
+        Ok(Err(error)) => tracing::warn!(
+            %error,
+            profile = %profile.id,
+            "retitle: the moved files could not be primed; the move may commit as two commits"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            profile = %profile.id,
+            "retitle: the prime task failed; the move may commit as two commits"
+        ),
+    }
+    match engine
+        .sync_once(&profile.id, keeper_sync::provenance::SyncSource::Manual)
+        .await
+    {
+        Ok(outcome) => tracing::info!(
+            profile = %profile.id,
+            committed = outcome.committed.is_some(),
+            "retitle: the move was handed to sync as one change"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            profile = %profile.id,
+            "retitle: a later sync will commit the move (as two commits)"
+        ),
+    }
+}
+
+/// Mobile stub for [`recording_retitle`] (Story 40.4): recording is a
+/// desktop-only surface — an honest `Unsupported` (`retriable: false`).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_retitle(
+    state: State<'_, AppState>,
+    folder: String,
+    title: Option<String>,
+) -> Result<RecordingSummaryVm, IpcError> {
+    let _ = (state, folder, title);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "retitling a recording session is desktop-only".to_owned(),
+    )))
+}
+
 /// List the crash-recovered sessions that still need surfacing (Story 20.3,
 /// FR-73): walk the effective recordings destination's descendants (Story 40.3 —
 /// the template may nest) for a loadable `manifest.json` with `status ==
@@ -5566,8 +6221,9 @@ pub async fn recovered_sessions_list(
 /// recovered session: `folder`'s path relative to the destination `root`,
 /// `/`-joined the way a rendered [`RelativePath`] writes one, so the key reads
 /// identically on every platform. `None` when `folder` is not under `root`,
-/// when it IS `root`, or when a component is not UTF-8 — none of which can name
-/// a session the scan produced.
+/// when it IS `root`, when a component is not UTF-8, or when a component is
+/// anything but a plain name — none of which can name a session the scan
+/// produced.
 ///
 /// **Why relative, not the basename** (Story 40.3): the default template nests,
 /// so `<root>/2026/x` and `<root>/2027/x` share a basename and a basename key
@@ -5575,12 +6231,25 @@ pub async fn recovered_sessions_list(
 /// other. **Why this stays backward compatible**: a flat session's root-relative
 /// path IS its basename, so every acknowledgement entry written before this
 /// story keeps matching exactly the session it was written for.
+///
+/// **Why `..` is refused** (Story 40.4): `strip_prefix` is lexical and
+/// `Path::components` preserves `ParentDir`, so `<root>/../../elsewhere/thing`
+/// strips to a non-empty relative path and would pass a containment check built
+/// on "is this `Some`". 40.4 is the first caller that acts DESTRUCTIVELY on the
+/// answer — it renames the folder it was handed into the recordings root — and
+/// "a retitle moves a session within its root, never between roots" cannot be
+/// enforced by a guard three dots defeat. Requiring every component to be
+/// `Normal` also drops a `.`, which would otherwise key the same session two
+/// ways.
 #[cfg(desktop)]
 fn session_relative_key(root: &Path, folder: &Path) -> Option<String> {
     let relative = folder.strip_prefix(root).ok()?;
     let mut key = String::new();
     for component in relative.components() {
-        let component = component.as_os_str().to_str()?;
+        let std::path::Component::Normal(component) = component else {
+            return None;
+        };
+        let component = component.to_str()?;
         if !key.is_empty() {
             key.push('/');
         }
@@ -6136,7 +6805,14 @@ pub async fn recording_path_preview(
 /// A blank title is `None`, not `Some("")`: the two render identically today,
 /// but `None` is what the untitled case actually is, and it is what
 /// `recording_start` passes.
-fn preview_render_ctx(now: &DateTime<Local>, title: Option<&str>) -> RenderCtx {
+///
+/// Generic in the timezone, because the six civil numbers are read off whatever
+/// zone the `DateTime` already carries. The preview and the start pass a
+/// `Local` clock read; Story 40.4's retitle passes the `FixedOffset` its own
+/// `startedAt` stamp was written in, so a session re-renders the civil fields
+/// the machine saw AT THE START rather than the ones the machine's current zone
+/// maps that instant to.
+fn preview_render_ctx<Tz: TimeZone>(now: &DateTime<Tz>, title: Option<&str>) -> RenderCtx {
     RenderCtx {
         year: now.year(),
         month: now.month(),
@@ -9451,5 +10127,725 @@ mod tests {
             "the id is used in a markdown link and a shell word: {first}"
         );
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // --- a retitle moves the folder, not the identity (Story 40.4) -----------
+    //
+    // `recording_retitle` needs a Tauri `State`, a registry and a sync engine, so
+    // the part this story decides is exercised through `retitle_session_folder`:
+    // the live claim, the re-render at the session's OWN instant, the ordinal
+    // walk, the `create_dir` + `rename` move, the manifest rewrite and the
+    // scaffold unwind.
+
+    /// A fixed local instant on an arbitrary day, for the sessions whose start is
+    /// not the one [`start_at`] pins.
+    fn local_at(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .expect("an unambiguous local instant")
+    }
+
+    /// A creator that stamps the manifest with `started_at` the way
+    /// `recording_start` does, so a retitle re-renders against a KNOWN instant
+    /// whatever zone the test machine is in.
+    fn make_started_at(
+        session_id: &str,
+        started_at: &DateTime<Local>,
+    ) -> impl FnMut(PathBuf) -> Result<SessionManifest, RecordingError> {
+        let meta = keeper_core::recording::SessionMeta {
+            session_id: Some(session_id.to_owned()),
+            ..Default::default()
+        };
+        let stamp = started_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        move |folder| {
+            SessionManifest::create_with_meta(
+                folder,
+                CaptureTarget::display(None),
+                SessionDevices {
+                    system_audio: true,
+                    microphone: false,
+                    camera: false,
+                },
+                Some(meta.clone()),
+                Some(stamp.clone()),
+            )
+        }
+    }
+
+    /// Put a finished session on disk the way a completed recording leaves one:
+    /// named from `named_at`, stamped `started_at`, titled, with one 100-byte
+    /// screen segment in its ledger (the file that must ride along on a move).
+    fn seed_session(
+        root: &Path,
+        template: &PathTemplate,
+        named_at: &DateTime<Local>,
+        started_at: &DateTime<Local>,
+        title: Option<&str>,
+        session_id: &str,
+    ) -> PathBuf {
+        let (mut manifest, folder, _reservation) = create_session_folder(
+            &reserved_set(),
+            root,
+            template,
+            named_at,
+            title,
+            make_started_at(session_id, started_at),
+        )
+        .expect("the session folder is created");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 100]).expect("segment");
+        manifest.reconcile_from_dir().expect("reconcile");
+        manifest.retitle(title.map(str::to_owned));
+        manifest.set_status(ManifestStatus::Finalized);
+        manifest.write().expect("write manifest");
+        folder
+    }
+
+    /// The session id every retitle test asserts is byte-identical afterwards.
+    const RETITLE_ID: &str = "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KZAAAAAAAAAAAAAAAAAAAAAA";
+
+    #[cfg(desktop)]
+    #[test]
+    fn a_retitle_moves_the_folder_and_never_the_identity() {
+        let root = scan_temp_dir("retitle-identity");
+        let template = parsed(DEFAULT_TEMPLATE);
+        let at = local_at(2026, 8, 5, 14, 32);
+        let folder = seed_session(&root, &template, &at, &at, None, RETITLE_ID);
+        let (manifest, moved) =
+            retitle_session_folder(&reserved_set(), &root, &template, &folder, Some("Standup"))
+                .expect("the retitle");
+        // Against the renderer, not a literal: the story's claim is that the
+        // TEMPLATE decides where a retitled session lands.
+        assert_eq!(
+            moved,
+            session_folder_path(
+                &root,
+                &template.render(&start_render_ctx(&at, Some("Standup"), 1))
+            )
+        );
+        assert_eq!(moved, root.join("2026").join("2026-08-05 1432 standup"));
+        assert!(!folder.exists(), "the session was left in its old folder");
+        assert!(
+            moved.join("screen-0000.mov").is_file(),
+            "the media did not ride along"
+        );
+        assert_eq!(
+            manifest.folder(),
+            moved,
+            "the manifest still points at the old folder"
+        );
+        // Byte-identical, read back off disk: the identity is the one thing a
+        // retitle may not touch.
+        let text = std::fs::read_to_string(moved.join("manifest.json")).expect("manifest text");
+        assert!(
+            text.contains(&format!("\"sessionId\": \"{RETITLE_ID}\"")),
+            "the identity moved with the folder: {text}"
+        );
+        assert_eq!(
+            manifest
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.title.as_deref()),
+            Some("Standup")
+        );
+        // The `session` label follows the folder — it is a label, and a retitle is
+        // the one place it is allowed to change.
+        assert_eq!(
+            Some(manifest.session.as_str()),
+            moved.file_name().and_then(|name| name.to_str())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn naming_renaming_and_clearing_land_on_the_rendered_paths() {
+        let root = scan_temp_dir("retitle-titles");
+        let template = parsed(DEFAULT_TEMPLATE);
+        let at = local_at(2026, 8, 5, 14, 32);
+        let untitled = seed_session(&root, &template, &at, &at, None, RETITLE_ID);
+        assert_eq!(untitled, root.join("2026").join("2026-08-05 1432"));
+        let rendered = |title: Option<&str>| {
+            session_folder_path(&root, &template.render(&start_render_ctx(&at, title, 1)))
+        };
+
+        let (_, named) = retitle_session_folder(
+            &reserved_set(),
+            &root,
+            &template,
+            &untitled,
+            Some("Standup"),
+        )
+        .expect("name an untitled session");
+        assert_eq!(named, rendered(Some("Standup")));
+        assert_eq!(named, root.join("2026").join("2026-08-05 1432 standup"));
+
+        let (_, renamed) =
+            retitle_session_folder(&reserved_set(), &root, &template, &named, Some("Retro"))
+                .expect("rename a titled session");
+        assert_eq!(renamed, rendered(Some("Retro")));
+        assert!(
+            renamed.join("screen-0000.mov").is_file(),
+            "the media did not ride along the second move"
+        );
+
+        // Clearing moves it back to the name an untitled session has, and leaves
+        // no title in the manifest at all.
+        let (cleared_manifest, cleared) =
+            retitle_session_folder(&reserved_set(), &root, &template, &renamed, Some(""))
+                .expect("clear the title");
+        assert_eq!(cleared, rendered(None));
+        assert_eq!(
+            cleared, untitled,
+            "a cleared title renders the untitled name"
+        );
+        assert_eq!(
+            cleared_manifest
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.title.as_deref()),
+            None
+        );
+        let text = std::fs::read_to_string(cleared.join("manifest.json")).expect("manifest text");
+        assert!(
+            !text.contains("\"title\""),
+            "a cleared title must not be serialized at all: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn a_retitle_that_renders_the_current_folder_moves_nothing_and_still_retitles() {
+        let root = scan_temp_dir("retitle-in-place");
+        // No `{slug}`/`{title}` anywhere in this template, so every title renders
+        // the folder the session already occupies.
+        let template = parsed("{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM}");
+        let at = local_at(2026, 8, 5, 14, 32);
+        let folder = seed_session(&root, &template, &at, &at, Some("Standup"), RETITLE_ID);
+        let (manifest, moved) =
+            retitle_session_folder(&reserved_set(), &root, &template, &folder, Some("Retro"))
+                .expect("the retitle");
+        assert_eq!(moved, folder, "nothing renders elsewhere, so nothing moves");
+        assert!(folder.join("screen-0000.mov").is_file());
+        assert_eq!(
+            manifest
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.title.as_deref()),
+            Some("Retro"),
+            "the title must be rewritten even when the folder does not move"
+        );
+        let text = std::fs::read_to_string(folder.join("manifest.json")).expect("manifest text");
+        assert!(
+            text.contains("\"title\": \"Retro\""),
+            "the rewritten title never reached disk: {text}"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("2026"))
+                .expect("read the year")
+                .count(),
+            1,
+            "a retitle that moves nothing created a second folder"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn a_colliding_retitle_takes_the_next_ordinal_and_leaves_the_occupant_alone() {
+        let root = scan_temp_dir("retitle-collision");
+        let template = parsed(DEFAULT_TEMPLATE);
+        let at = local_at(2026, 8, 5, 14, 32);
+        let folder = seed_session(&root, &template, &at, &at, None, RETITLE_ID);
+        // Ordinal 1 for the new title is already somebody else's folder.
+        let occupied = session_folder_path(
+            &root,
+            &template.render(&start_render_ctx(&at, Some("Standup"), 1)),
+        );
+        std::fs::create_dir_all(&occupied).expect("occupy ordinal 1");
+        std::fs::write(occupied.join("keep.txt"), b"not yours").expect("marker");
+        let (_, moved) =
+            retitle_session_folder(&reserved_set(), &root, &template, &folder, Some("Standup"))
+                .expect("the retitle");
+        assert_eq!(
+            moved,
+            session_folder_path(
+                &root,
+                &template.render(&start_render_ctx(&at, Some("Standup"), 2))
+            ),
+            "the move must take the template's ordinal 2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(occupied.join("keep.txt")).expect("marker"),
+            "not yours",
+            "the occupying folder was written into"
+        );
+        assert_eq!(
+            std::fs::read_dir(&occupied)
+                .expect("read the occupant")
+                .count(),
+            1,
+            "the session was moved inside the occupied folder"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn a_live_session_is_refused_and_not_one_byte_moves() {
+        let root = scan_temp_dir("retitle-live");
+        let template = parsed(DEFAULT_TEMPLATE);
+        let at = local_at(2026, 8, 5, 14, 32);
+        let folder = seed_session(&root, &template, &at, &at, None, RETITLE_ID);
+        let before = std::fs::read_to_string(folder.join("manifest.json")).expect("manifest text");
+        // Exactly what a live (or starting) session holds — the same set the
+        // recovery pass's `is_active` predicate reads.
+        let reserved = reserved_set();
+        plain_lock(&reserved).insert(folder.clone());
+        let error = retitle_session_folder(&reserved, &root, &template, &folder, Some("Standup"))
+            .expect_err("a recording session cannot be renamed");
+        assert_eq!(error.code, IpcErrorCode::RecordingSessionLive);
+        assert!(
+            !error.retriable,
+            "nothing clears while the session is still recording"
+        );
+        assert!(folder.is_dir(), "the live session's folder moved");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("manifest.json")).expect("manifest text"),
+            before,
+            "the live session's manifest was rewritten"
+        );
+        assert!(
+            !session_folder_path(
+                &root,
+                &template.render(&start_render_ctx(&at, Some("Standup"), 1))
+            )
+            .exists(),
+            "the refused retitle created its destination anyway"
+        );
+        // The refusal must not release the reservation it found: that entry
+        // belongs to the live session, and dropping it would let the recovery
+        // pass rewrite a recording manifest.
+        assert!(
+            plain_lock(&reserved).contains(&folder),
+            "the refused retitle un-reserved a live session"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn a_folder_with_no_manifest_is_not_a_session() {
+        let root = scan_temp_dir("retitle-not-a-session");
+        let template = parsed(DEFAULT_TEMPLATE);
+        let folder = root.join("2026").join("just a folder");
+        std::fs::create_dir_all(&folder).expect("a folder that is not a session");
+        let error =
+            retitle_session_folder(&reserved_set(), &root, &template, &folder, Some("Standup"))
+                .expect_err("a folder without a manifest is not a session");
+        assert!(
+            error.message.contains("session manifest"),
+            "the refusal must say what it could not read, got: {}",
+            error.message
+        );
+        assert!(folder.is_dir(), "the folder was moved anyway");
+        assert_eq!(
+            std::fs::read_dir(root.join("2026"))
+                .expect("read the year")
+                .count(),
+            1,
+            "the refusal created something under the root"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn an_exhausted_retitle_refuses_and_names_the_path_it_tried() {
+        let root = scan_temp_dir("retitle-exhausted");
+        let template = parsed(DEFAULT_TEMPLATE);
+        let at = local_at(2026, 8, 5, 14, 32);
+        let folder = seed_session(&root, &template, &at, &at, None, RETITLE_ID);
+        for seq in 1..=SESSION_FOLDER_ATTEMPTS {
+            let taken = template.render(&start_render_ctx(&at, Some("Standup"), seq));
+            std::fs::create_dir_all(session_folder_path(&root, &taken)).expect("occupy");
+        }
+        let error =
+            retitle_session_folder(&reserved_set(), &root, &template, &folder, Some("Standup"))
+                .expect_err("every ordinal is taken");
+        let last = template.render(&start_render_ctx(
+            &at,
+            Some("Standup"),
+            SESSION_FOLDER_ATTEMPTS,
+        ));
+        assert!(
+            error.message.contains(last.as_str()),
+            "the refusal must name the path it tried, got: {}",
+            error.message
+        );
+        assert!(
+            !error.retriable,
+            "retrying the same 64 ordinals cannot help"
+        );
+        assert!(
+            folder.join("manifest.json").is_file(),
+            "the session must stay exactly where it is"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(all(unix, desktop))]
+    #[test]
+    fn a_failed_move_unwinds_the_directories_it_made() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let root = scan_temp_dir("retitle-unwind");
+        // Root ignores a directory's write bit, so the read-only parent below
+        // would not stop `rename` and the test would hard-fail on the
+        // environment rather than on the behaviour it defends (a root container
+        // is a common CI default once this crate links on Linux). The owner of a
+        // file this process just created IS this process's effective uid, so no
+        // new dependency is needed to tell; an unreadable root is not root, and
+        // running the test is the safe reading of that.
+        if std::fs::metadata(&root).is_ok_and(|metadata| metadata.uid() == 0) {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        // The title names the PARENT here, so the destination's intermediate is one
+        // this attempt must create while the source sits in a DIFFERENT directory —
+        // which is what makes the rename, rather than the create, the failure: a
+        // rename has to unlink the entry from the source's parent.
+        let template = parsed("{slug}-rec/{yyyy}-{mm}-{dd} {HH}{MM}");
+        let at = local_at(2026, 8, 5, 14, 32);
+        let folder = seed_session(&root, &template, &at, &at, Some("One"), RETITLE_ID);
+        assert_eq!(folder, root.join("one-rec").join("2026-08-05 1432"));
+        let source_parent = root.join("one-rec");
+        let mut perms = std::fs::metadata(&source_parent)
+            .expect("parent metadata")
+            .permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&source_parent, perms)
+            .expect("make the source's parent read-only");
+        let outcome =
+            retitle_session_folder(&reserved_set(), &root, &template, &folder, Some("Two"));
+        // Restore BEFORE asserting: a failed assertion here would otherwise unwind
+        // past the restore and strand an unwritable directory in the temp root that
+        // no later run can clean up.
+        let mut restore = std::fs::metadata(&source_parent)
+            .expect("parent metadata")
+            .permissions();
+        restore.set_mode(0o755);
+        std::fs::set_permissions(&source_parent, restore).expect("restore the parent");
+        let error = outcome.expect_err("the rename cannot unlink from a read-only parent");
+        assert!(
+            error.message.contains("two-rec/2026-08-05 1432"),
+            "the refusal must name the rendered path, got: {}",
+            error.message
+        );
+        assert!(
+            !root.join("two-rec").exists(),
+            "the intermediates this attempt created were left behind"
+        );
+        assert!(
+            folder.join("manifest.json").is_file(),
+            "the session must stay exactly where it is"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn the_retitle_renders_against_the_sessions_own_start_instant() {
+        let root = scan_temp_dir("retitle-own-instant");
+        let template = parsed(DEFAULT_TEMPLATE);
+        // The folder was named in August; the manifest says the session started in
+        // May. A session renamed today must not migrate into today's folder.
+        let named_at = local_at(2026, 8, 5, 14, 32);
+        let started_at = local_at(2026, 5, 2, 9, 10);
+        let folder = seed_session(&root, &template, &named_at, &started_at, None, RETITLE_ID);
+        assert_eq!(folder, root.join("2026").join("2026-08-05 1432"));
+        let (_, moved) =
+            retitle_session_folder(&reserved_set(), &root, &template, &folder, Some("Standup"))
+                .expect("the retitle");
+        assert_eq!(
+            moved,
+            session_folder_path(
+                &root,
+                &template.render(&start_render_ctx(&started_at, Some("Standup"), 1))
+            ),
+            "the re-render must use the manifest's instant, not the clock"
+        );
+        assert_eq!(moved, root.join("2026").join("2026-05-02 0910 standup"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `unix` because the SETUP is not portable, not the behaviour: pushing a
+    /// DIRECTORY's mtime into the past needs `File::open` on that directory,
+    /// which `futimens` accepts for the owner on ext4 and APFS alike but which
+    /// Windows refuses outright (a directory handle needs
+    /// `FILE_FLAG_BACKUP_SEMANTICS`, and `set_times` there wants write access).
+    /// The same `unix` gate the sibling unwind test carries.
+    #[cfg(all(unix, desktop))]
+    #[test]
+    fn a_session_with_no_start_stamp_falls_back_to_the_folders_modification_time() {
+        let root = scan_temp_dir("retitle-no-stamp");
+        let template = parsed(DEFAULT_TEMPLATE);
+        let at = local_at(2026, 8, 5, 14, 32);
+        let folder = seed_session(&root, &template, &at, &at, None, RETITLE_ID);
+        // A pre-Story-21.5 manifest: no `startedAt` at all. It must still retitle,
+        // and it must land where the folder's own mtime renders — never `now`.
+        let mut manifest = SessionManifest::load(&folder).expect("load the seeded manifest");
+        manifest.started_at = None;
+        manifest.write().expect("write the stampless manifest");
+        // The write above set the folder's mtime to ~now, which is precisely the
+        // value a `Local::now()` fallback would produce — so the mtime is pushed
+        // into a DIFFERENT month before the retitle runs. Without this the test
+        // passes identically against the fallback the spec forbids.
+        let modified = local_at(2026, 5, 2, 9, 10);
+        std::fs::File::open(&folder)
+            .expect("open the session folder")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(SystemTime::from(modified))
+                    .set_modified(SystemTime::from(modified)),
+            )
+            .expect("push the folder's mtime into the past");
+        let (_, moved) =
+            retitle_session_folder(&reserved_set(), &root, &template, &folder, Some("Standup"))
+                .expect("a stampless session still retitles");
+        // A literal, like its sibling: rendering the assertion through the same
+        // `start_render_ctx` the implementation uses would pin nothing.
+        assert_eq!(
+            moved,
+            root.join("2026").join("2026-05-02 0910 standup"),
+            "the fallback must be the folder's modification time"
+        );
+        let now = Local::now();
+        assert_ne!(
+            moved,
+            session_folder_path(
+                &root,
+                &template.render(&start_render_ctx(&now, Some("Standup"), 1))
+            ),
+            "the fallback landed the session in the CURRENT month, i.e. it read the clock"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Story 40.4: the re-render must read the six civil fields off the OFFSET
+    /// the stamp carries, not off the machine's current zone. Every other retitle
+    /// test builds its stamp from `Local`, so all of them round-trip by
+    /// construction and none can see this; the stamp here is built with an
+    /// explicit `FixedOffset` for exactly that reason.
+    #[cfg(desktop)]
+    #[test]
+    fn the_re_render_uses_the_stamps_own_offset_not_the_machines_zone() {
+        let root = scan_temp_dir("retitle-stamp-offset");
+        let template = parsed(DEFAULT_TEMPLATE);
+        let named_at = local_at(2026, 8, 5, 14, 32);
+        let folder = seed_session(&root, &template, &named_at, &named_at, None, RETITLE_ID);
+        // 00:30 on New Year's Day at +14:00 — the easternmost offset in use, so
+        // every other zone reads this instant as the PREVIOUS year (UTC sees
+        // 2025-12-31 1030). Converting to `Local` first therefore renders a
+        // different year folder on any machine east of nowhere, which is the
+        // migration this pins shut.
+        let stamped = FixedOffset::east_opt(14 * 3600)
+            .expect("+14:00")
+            .with_ymd_and_hms(2026, 1, 1, 0, 30, 0)
+            .single()
+            .expect("an unambiguous instant");
+        let mut manifest = SessionManifest::load(&folder).expect("load the seeded manifest");
+        manifest.started_at = Some(stamped.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+        manifest.write().expect("write the re-stamped manifest");
+        let (_, moved) =
+            retitle_session_folder(&reserved_set(), &root, &template, &folder, Some("Standup"))
+                .expect("the retitle");
+        assert_eq!(
+            moved,
+            root.join("2026").join("2026-01-01 0030 standup"),
+            "the re-render must use the stamp's own offset, not this machine's zone"
+        );
+        assert!(
+            !root.join("2025").exists(),
+            "the retitle re-rendered in the machine's zone and migrated the session across a year"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Story 40.4: on a volume that folds case, `…1432 Standup` and
+    /// `…1432 standup` are the SAME directory, so a case-only retitle must take
+    /// the in-place branch. A byte comparison of the two `PathBuf`s does not,
+    /// and `create_dir` then collides with the session's own folder and hands it
+    /// a permanent ` (2)` suffix.
+    ///
+    /// Adapted rather than skipped where the filesystem is case-sensitive (this
+    /// repo's Linux CI, ext4): there the render is a genuinely different folder
+    /// and the move is correct, so that branch asserts the move. Both branches
+    /// assert the ordinal was NOT bumped, which is the defect either way.
+    #[cfg(desktop)]
+    #[test]
+    fn a_case_only_retitle_never_takes_an_ordinal() {
+        let root = scan_temp_dir("retitle-case-only");
+        // `{title}` preserves case where `{slug}` folds it, so this is the only
+        // template shape that can render a case-only change at all.
+        let template = parsed("{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM} {title}");
+        let at = local_at(2026, 8, 5, 14, 32);
+        let folder = seed_session(&root, &template, &at, &at, Some("Standup"), RETITLE_ID);
+        assert_eq!(folder, root.join("2026").join("2026-08-05 1432 Standup"));
+        let folds_case = root.join("2026").join("2026-08-05 1432 STANDUP").is_dir();
+        let (manifest, moved) =
+            retitle_session_folder(&reserved_set(), &root, &template, &folder, Some("standup"))
+                .expect("the retitle");
+        if folds_case {
+            assert_eq!(
+                moved, folder,
+                "a case-only retitle must not move the folder"
+            );
+        } else {
+            assert_eq!(
+                moved,
+                root.join("2026").join("2026-08-05 1432 standup"),
+                "on a case-sensitive volume the render IS a different folder"
+            );
+        }
+        assert!(
+            !root
+                .join("2026")
+                .join("2026-08-05 1432 standup (2)")
+                .exists(),
+            "the retitle collided with the session's own folder and took an ordinal"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("2026"))
+                .expect("read the year")
+                .count(),
+            1,
+            "a case-only retitle left a second session folder behind"
+        );
+        assert_eq!(
+            manifest
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.title.as_deref()),
+            Some("standup"),
+            "the new title must be stored even when nothing moves"
+        );
+        // The label names the directory that actually exists, whichever branch ran.
+        assert_eq!(
+            Some(manifest.session.as_str()),
+            moved.file_name().and_then(|name| name.to_str())
+        );
+        assert!(moved.join("screen-0000.mov").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Story 40.4: a claim that stays on the vacated source would un-reserve a
+    /// start that reoccupies the name the moment the retitle's guard drops.
+    #[test]
+    fn a_repointed_claim_releases_the_path_it_left() {
+        let reserved = reserved_set();
+        let source = PathBuf::from("/tmp/keeper-claim/source");
+        let destination = PathBuf::from("/tmp/keeper-claim/destination");
+        let mut claim = LiveFolderReservation::reserve(&reserved, source.clone());
+        assert!(claim.owned);
+        claim.repoint(destination.clone());
+        assert!(
+            claim.owned,
+            "the destination was free, so this guard owns it"
+        );
+        assert!(
+            !plain_lock(&reserved).contains(&source),
+            "the vacated source is still reserved"
+        );
+        assert!(
+            plain_lock(&reserved).contains(&destination),
+            "the destination the session moved to is not reserved"
+        );
+        drop(claim);
+        assert!(
+            plain_lock(&reserved).is_empty(),
+            "dropping the repointed guard must release the destination, not the source"
+        );
+
+        // A guard that never owned its entry still must not remove someone
+        // else's on the way past — repointing only ever releases what it held.
+        let held = LiveFolderReservation::reserve(&reserved, source.clone());
+        let mut borrowed = LiveFolderReservation::reserve(&reserved, source.clone());
+        assert!(!borrowed.owned);
+        borrowed.repoint(destination.clone());
+        assert!(
+            plain_lock(&reserved).contains(&source),
+            "repointing a non-owning guard un-reserved the holder's folder"
+        );
+        drop(borrowed);
+        drop(held);
+        assert!(plain_lock(&reserved).is_empty());
+    }
+
+    /// Story 40.4: the lexical `strip_prefix` behind the "inside the destination
+    /// root" guard preserves `..`, so a folder OUTSIDE the root would strip to a
+    /// non-empty relative path and pass a `is_some()` containment check — and the
+    /// retitle would then rename it INTO the root.
+    #[cfg(desktop)]
+    #[test]
+    fn a_relative_key_refuses_a_path_that_climbs_out_of_the_root() {
+        let root = Path::new("/tmp/keeper-root");
+        assert_eq!(
+            session_relative_key(root, &root.join("2026").join("session")),
+            Some("2026/session".to_owned())
+        );
+        assert_eq!(
+            session_relative_key(root, &root.join("..").join("..").join("elsewhere")),
+            None,
+            "a ..-bearing path is not inside the root, however it strips"
+        );
+        assert_eq!(
+            session_relative_key(root, &root.join("2026").join("..").join("session")),
+            None,
+            "a .. anywhere in the path defeats the containment check"
+        );
+        assert_eq!(
+            session_relative_key(root, &root.join(".").join("session")),
+            Some("session".to_owned()),
+            "a leading `.` is dropped by `components`, so it keys the same session"
+        );
+        assert_eq!(session_relative_key(root, root), None);
+    }
+
+    /// Story 40.4: the kept status snapshot is what the frontend re-adopts on
+    /// every remount, so a retitle that leaves it naming the old folder hands the
+    /// card a path that no longer exists.
+    #[cfg(desktop)]
+    #[test]
+    fn a_retitle_repoints_the_kept_status_snapshot_only_on_an_exact_match() {
+        let slot = run_slot_in(RecordingUiState::Finalized, None);
+        let source = PathBuf::from("/tmp/keeper-rec/2026-08-05 1432");
+        let destination = PathBuf::from("/tmp/keeper-rec/2026-08-05 1432 standup");
+        status_lock(&slot_lock(&slot).as_ref().expect("the slot").status.clone()).output_path =
+            Some(source.to_string_lossy().into_owned());
+
+        // A slot describing a DIFFERENT session is none of this retitle's
+        // business, even though it is in the same root.
+        assert!(!repoint_recording_slot_output(
+            &slot,
+            Path::new("/tmp/keeper-rec/2026-08-05 1500"),
+            &destination
+        ));
+        assert!(repoint_recording_slot_output(&slot, &source, &destination));
+        let snapshot = live_snapshot(&slot).expect("the slot").0;
+        assert_eq!(
+            snapshot.output_path.as_deref(),
+            Some(destination.to_string_lossy().as_ref()),
+            "the snapshot still names the folder the session moved out of"
+        );
+
+        // An empty slot has nothing to follow, and says so rather than panicking.
+        let empty: Mutex<Option<RecordingRun>> = Mutex::new(None);
+        assert!(!repoint_recording_slot_output(
+            &empty,
+            &source,
+            &destination
+        ));
     }
 }

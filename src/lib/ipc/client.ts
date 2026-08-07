@@ -2023,6 +2023,43 @@ export async function recordingSessionSummary(folder: string): Promise<Recording
 }
 
 /**
+ * Rename a finished session (Story 40.4) — the affordance on the completion /
+ * recovery card. The title is the manifest's `meta.title` (Story 21.5, the only
+ * title there has ever been), and setting it MOVES the session on disk: Rust
+ * re-renders the effective path template against the session's OWN start
+ * instant with the new title, `create_dir`s the rendered leaf, `fs::rename`s
+ * the session onto it, and rewrites `manifest.json`'s title and its `session`
+ * label. The identity does NOT move — `meta.sessionId` is byte-identical
+ * afterwards, so everything latched on it (a recovery dismissal) stays attached
+ * to the session it was about.
+ *
+ * `folder` is the session folder as it stands NOW; `title` is the new title, or
+ * `null` to clear it (which moves the session back to its untitled path). A
+ * rendered path that is already taken gets the template's next `{seq}` ordinal
+ * — the existing folder is never touched — and a session that renders to the
+ * folder it already occupies is rewritten in place, moving nothing.
+ *
+ * Resolves the summary of the session AT ITS NEW LOCATION: `sessionFolder` is
+ * the folder it now occupies, and the caller MUST re-render from it. The path
+ * it was called with no longer exists, so a Reveal in Finder still aimed at the
+ * old one opens nothing.
+ *
+ * Rejects with the {@link IpcError} envelope, and these refusals are the user's
+ * to read, not the caller's to swallow: a session that is still recording is
+ * refused with code `recordingSessionLive` (the driver and the sidecar hold
+ * absolute paths), and "stop the recording first" is the only way out of it.
+ * An exhausted ordinal run, a folder with no loadable manifest, and a folder
+ * outside the recordings destination are refused the same way — with nothing
+ * moved either.
+ */
+export async function recordingRetitle(
+  folder: string,
+  title: string | null,
+): Promise<RecordingSummaryVm> {
+  return await invoke<RecordingSummaryVm>("recording_retitle", { folder, title });
+}
+
+/**
  * List the crash-recovered sessions still needing a one-time notice (Story 20.3,
  * FR-73). The Rust core walks the effective recordings destination (Story 40.3 —
  * the path template may nest sessions under it) for a loadable `manifest.json`

@@ -1403,6 +1403,58 @@ impl SessionManifest {
         &self.folder
     }
 
+    /// Set (or clear) the user's title for this session (Story 40.4) — the
+    /// caller then [`Self::write`]s.
+    ///
+    /// **This method is the seam that keeps two facts apart.** The title is a
+    /// label the user owns and may change as often as they like; the identity
+    /// is [`SessionMeta::session_id`], minted once and never rewritten. A
+    /// retitle therefore touches `meta.title` and nothing else — most
+    /// pointedly not `session_id`, which Story 42's archive rows are keyed on.
+    ///
+    /// The title is trimmed, and a title that is empty (or all whitespace)
+    /// clears it, exactly as `None` does: "untitled" has one representation,
+    /// the absent field, so the folder a cleared session re-renders to is the
+    /// same folder an untitled one would have got. A pre-40.3 manifest carries
+    /// no `meta` block at all; rather than drop the title on the floor, one is
+    /// minted to hold it — but only for a title worth holding, so clearing a
+    /// never-titled session still serializes no empty `meta` object.
+    pub fn retitle(&mut self, title: Option<String>) {
+        let title = title
+            .map(|title| title.trim().to_owned())
+            .filter(|title| !title.is_empty());
+        if let Some(meta) = &mut self.meta {
+            meta.title = title;
+        } else if title.is_some() {
+            self.meta = Some(SessionMeta {
+                title,
+                ..SessionMeta::default()
+            });
+        }
+    }
+
+    /// Point this manifest at a folder it has been moved to (Story 40.4): the
+    /// runtime-only `#[serde(skip)]` path, so a subsequent [`Self::write`] or
+    /// [`Self::reconcile_from_dir`] operates on the new location rather than
+    /// the vacated one, **and** the persisted [`Self::session`] label, which is
+    /// the folder's basename.
+    ///
+    /// **`session` is a LABEL, not the identity.** It is set once at create
+    /// ([`Self::create_with_meta`]), rewritten HERE, and nowhere else in the
+    /// tree — because a retitle is the only thing that legitimately moves a
+    /// session, so this is the only place the basename can go stale. The thing
+    /// that must *not* move is [`SessionMeta::session_id`], and this method
+    /// never reads it.
+    pub fn rebind_folder(&mut self, folder: PathBuf) {
+        // Derived the same way `create_with_meta` derives it, so a moved
+        // session's label is byte-identical to a fresh start's at that path.
+        self.session = folder
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.folder = folder;
+    }
+
     /// Append one segment to the ledger — the **live** incremental view an
     /// external reader sees during recording. The event-fed list can be
     /// incomplete or wrong (a suppressed `segmentClosed`, a `bytes` fallback);
@@ -4251,6 +4303,184 @@ mod tests {
             })
         );
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn retitle_mints_a_meta_block_on_a_manifest_that_has_none() {
+        let folder = fresh_temp_dir("retitle-mint");
+        let mut manifest = test_manifest(folder.clone());
+        assert!(
+            manifest.meta.is_none(),
+            "the fixture must be a pre-40.3 manifest with no meta block at all"
+        );
+        let before: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(folder.join("manifest.json")).expect("manifest on disk"),
+        )
+        .expect("parseable manifest");
+
+        manifest.retitle(Some("  Standup  ".to_owned()));
+        manifest.write().expect("rewrite the retitled manifest");
+        let loaded = SessionManifest::load(&folder).expect("load round-trip");
+
+        // The block was minted to hold the (trimmed) title rather than the
+        // title being dropped on the floor — and it holds nothing else.
+        assert_eq!(
+            loaded.meta,
+            Some(SessionMeta {
+                title: Some("Standup".to_owned()),
+                ..SessionMeta::default()
+            })
+        );
+        let mut after: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(folder.join("manifest.json")).expect("manifest on disk"),
+        )
+        .expect("parseable manifest");
+        assert_eq!(after["meta"]["title"], "Standup");
+        // Strip the one key the retitle owns: everything else is untouched.
+        after
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("meta");
+        assert_eq!(
+            after, before,
+            "a retitle rewrites the title and nothing else"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn retitle_clears_the_title_and_leaves_the_identity_alone() {
+        let folder = fresh_temp_dir("retitle-clear");
+        let session_id = "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM22222222222222222222".to_owned();
+        let mut manifest = SessionManifest::create_with_meta(
+            folder.clone(),
+            CaptureTarget::display(None),
+            test_devices(),
+            Some(SessionMeta {
+                session_id: Some(session_id.clone()),
+                title: Some("Retro".to_owned()),
+                ..SessionMeta::default()
+            }),
+            None,
+        )
+        .expect("create session folder + initial manifest");
+
+        // `None` and an all-whitespace title are the same instruction: clear
+        // it. "Untitled" has exactly one representation, the absent field, so
+        // both re-render to the folder an untitled session would have got.
+        for cleared in [None, Some("   ".to_owned())] {
+            manifest.retitle(Some("Retro".to_owned()));
+            manifest.retitle(cleared);
+            manifest.write().expect("rewrite the cleared manifest");
+            let loaded = SessionManifest::load(&folder).expect("load round-trip");
+            assert_eq!(
+                loaded.meta,
+                Some(SessionMeta {
+                    session_id: Some(session_id.clone()),
+                    ..SessionMeta::default()
+                }),
+                "clearing drops the title and leaves the identity byte-identical"
+            );
+            let raw = std::fs::read_to_string(folder.join("manifest.json")).expect("on disk");
+            assert!(
+                !raw.contains("\"title\""),
+                "a cleared title is omitted from the wire, got: {raw}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn rebind_folder_relabels_and_repoints_without_touching_the_identity() {
+        let root = fresh_temp_dir("rebind");
+        let session_id = "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM33333333333333333333".to_owned();
+        let old = root.join("2026").join("2026-08-05 1432");
+        let mut manifest = SessionManifest::create_with_meta(
+            old.clone(),
+            CaptureTarget::display(None),
+            test_devices(),
+            Some(SessionMeta {
+                session_id: Some(session_id.clone()),
+                ..SessionMeta::default()
+            }),
+            Some("2026-08-05T14:32:07+02:00".to_owned()),
+        )
+        .expect("create session folder + initial manifest");
+        assert_eq!(manifest.session, "2026-08-05 1432");
+
+        // The shell moves the folder first; the manifest is told about it
+        // afterwards, and then rewritten in its new home.
+        let new = root.join("2026").join("2026-08-05 1432 standup");
+        std::fs::rename(&old, &new).expect("move the session folder");
+        manifest.retitle(Some("Standup".to_owned()));
+        manifest.rebind_folder(new.clone());
+        manifest.write().expect("rewrite the moved manifest");
+
+        // The runtime path was rebound, not merely the label: the write landed
+        // in the NEW folder, and the old one is not there to catch it.
+        assert_eq!(manifest.folder(), new.as_path());
+        assert!(!old.exists(), "the session no longer lives at its old path");
+        let loaded = SessionManifest::load(&new).expect("load from the new folder");
+        assert_eq!(
+            loaded.session, "2026-08-05 1432 standup",
+            "the label follows the basename"
+        );
+        assert_eq!(
+            loaded
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.session_id.as_deref()),
+            Some(session_id.as_str()),
+            "the identity never moves"
+        );
+        assert_eq!(
+            loaded.meta.as_ref().and_then(|meta| meta.title.as_deref()),
+            Some("Standup")
+        );
+        // The re-render uses the session's own start instant, so it must have
+        // ridden along untouched.
+        assert_eq!(
+            loaded.started_at.as_deref(),
+            Some("2026-08-05T14:32:07+02:00")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_retitled_and_rebound_manifest_still_serializes_no_absolute_path() {
+        let root = fresh_temp_dir("rebind-portable");
+        let old = root.join("2026").join("2026-08-05 1432");
+        let mut manifest = SessionManifest::create_with_meta(
+            old.clone(),
+            CaptureTarget::display(None),
+            test_devices(),
+            Some(SessionMeta {
+                session_id: Some(
+                    "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM44444444444444444444".to_owned(),
+                ),
+                ..SessionMeta::default()
+            }),
+            Some("2026-08-05T14:32:07+02:00".to_owned()),
+        )
+        .expect("create session folder + initial manifest");
+
+        let new = root.join("2026").join("2026-08-05 1432 standup");
+        std::fs::rename(&old, &new).expect("move the session folder");
+        manifest.retitle(Some("Standup".to_owned()));
+        manifest.rebind_folder(new.clone());
+        manifest.write().expect("rewrite the moved manifest");
+
+        // Rebinding stores an absolute path in a `#[serde(skip)]` field, and a
+        // moved session is exactly when that would leak: the manifest stays
+        // portable, carrying the basename label and nothing rooted.
+        let raw = std::fs::read_to_string(new.join("manifest.json")).expect("manifest on disk");
+        for path in [root.as_path(), old.as_path(), new.as_path()] {
+            assert!(
+                !raw.contains(path.to_string_lossy().as_ref()),
+                "the serialized manifest must contain no absolute path, got: {raw}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

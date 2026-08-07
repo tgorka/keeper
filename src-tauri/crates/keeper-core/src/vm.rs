@@ -237,6 +237,17 @@ pub enum IpcErrorCode {
     /// rejection sentence, rendered inline beside the field. Serializes as
     /// `"recordingTemplateInvalid"`.
     RecordingTemplateInvalid,
+    /// A recording session could not be retitled because its folder is claimed
+    /// (Story 40.4, Epic 40): the shell holds every live session's folder in its
+    /// reservation set, and a retitle takes a claim on the folder it is about to
+    /// move, so the refusal covers both "it is still recording" and "another
+    /// rename of it is already running" — the set holds paths, not reasons.
+    /// Mapped to this code rather than letting it funnel to `internal`. Not
+    /// retriable *while the recording runs*: the driver and the sidecar hold
+    /// absolute paths into the folder, so nothing can move until the session
+    /// stops, and the surface needs to say what is holding the folder rather
+    /// than "internal error". Serializes as `"recordingSessionLive"`.
+    RecordingSessionLive,
 }
 
 /// The account's live server-side key-backup posture, mapped from the SDK

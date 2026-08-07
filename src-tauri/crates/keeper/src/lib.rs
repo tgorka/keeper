@@ -594,6 +594,7 @@ pub fn run() {
                 ipc::sync_list_settings_set,
                 ipc::recording_settings_set,
                 ipc::recording_session_summary,
+                ipc::recording_retitle,
                 ipc::recovered_sessions_list,
                 ipc::recovered_session_acknowledge
             ])
