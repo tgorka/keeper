@@ -2,11 +2,11 @@
 title: 'Story 40.3: `recording_start` Uses It, and the Session Gets an Identity'
 type: 'feature'
 created: '2026-08-06'
-status: 'in-progress'
+status: 'review'
 blocking_condition: ''
 baseline_revision: '272b00493353f421e992983a7c361231cba16101'
 final_revision: ''
-review_loop_iteration: 0
+review_loop_iteration: 1
 followup_review_recommended: false
 context:
   - '{project-root}/docs/project-context.md'
