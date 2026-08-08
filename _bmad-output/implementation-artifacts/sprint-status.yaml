@@ -1,5 +1,5 @@
 # generated: 2026-07-03
-# last_updated: 2026-08-06
+# last_updated: 2026-08-08
 # project: keeper
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-03
-last_updated: 2026-08-06
+last_updated: 2026-08-08
 project: keeper
 project_key: NOKEY
 tracking_system: file-system
@@ -370,6 +370,36 @@ development_status:
   42-4-the-note-stub-at-the-only-moment-it-will-be-written: review
   42-5-one-tag-vocabulary: review
   epic-42-retrospective: optional
+
+  # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
+  # is implemented, gated and open as a stacked PR; none is `done`, because in
+  # this repo `done` means the PR merged and the ledger closed, and the stack has
+  # not landed yet. The three epics therefore stay `in-progress` rather than being
+  # marked from optimism.
+  #
+  # The stack, bottom to top (stack #52 on GitHub):
+  #   #51  feat/story-41-6-durability-you-can-read -> main   (40.4 + all of epic 41)
+  #   #50  42.1  a session is a row
+  #   #53  42.2  searchable sessions
+  #   #54  42.3  the recordings browser
+  #   #55  42.4  the note stub
+  #   #56  42.5  one tag vocabulary
+  #
+  # NOTE on #51, because it is the one thing here that is not obvious: PRs #44-#48
+  # each merged into the branch BELOW them rather than into `main`, so `main` stood
+  # at #43 while five stories accumulated on a feature branch. #51 is the PR that
+  # puts them on `main`; nothing else in this stack can land until it does.
+  #
+  # Verified on hesperia (macOS 26.5, arm64) against the full stack — the only host
+  # that can compile the Tauri shell crate: fmt, clippy --workspace -D warnings,
+  # cargo test --workspace, and the generated-binding drift check (160 files).
+  # On Linux: 1200 keeper-core tests, 1871 frontend tests across 164 files, the
+  # 10 000-session recordings search gate, and the three dependency-boundary checks.
+  #
+  # 42.1 was reviewed adversarially before it was committed and the first pass came
+  # back `incorrect`; what that found is recorded above. 42.2-42.5 were built
+  # against specs written from that lesson, and every one of them carries its
+  # Design Notes.
 
 # Phase 4 state as of 2026-07-25 — what is actually true, not what was planned.
 #
