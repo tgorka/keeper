@@ -2,7 +2,7 @@
 title: 'Story 41.7: Recording Into a Synced Folder You Can Choose'
 type: 'feature'
 created: '2026-08-08'
-status: 'in-progress'
+status: 'review'
 blocking_condition: ''
 baseline_revision: '13db998'
 final_revision: ''
@@ -102,12 +102,12 @@ a destination, and when a recording is about to start.
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] The recordings switch + subfolder field, mirroring the notes-vault control.
-- [ ] The save path writes and clears the `recordings` block; validation refusals surface verbatim.
-- [ ] `DestinationProfileRow` carries removability and volume status.
-- [ ] An absent volume refuses the start, naming the volume, before any file is created.
-- [ ] The destination card says a folder is on removable media, and says when it is not attached.
-- [ ] Tests: every matrix row.
+- [x] The recordings switch + subfolder field, mirroring the notes-vault control.
+- [x] The save path writes and clears the `recordings` block; validation refusals surface verbatim.
+- [x] `DestinationProfileRow` carries removability and volume status.
+- [x] An absent volume refuses the start, naming the volume, before any file is created.
+- [x] The destination card says a folder is on removable media, and says when it is not attached.
+- [x] Tests: every matrix row.
 
 **Acceptance Criteria:**
 - Flagging a synced folder in the app makes it appear in the Recording destination picker, with no
@@ -120,4 +120,47 @@ a destination, and when a recording is about to start.
 
 ## Design Notes
 
-(Written at the end of implementation.)
+**TypeScript never spells `recordings`.** The default subfolder is resolved in Rust and threaded
+through as `SyncProfileVm.recordings_subfolder`, a value always in force — the AD-34-8 idiom
+`effective_settle_ms` already uses. That is deliberately unlike `notes_subfolder`, whose `Option`
+forced `SYNC_NOTES_DEFAULT_SUBFOLDER` into the frontend as a second spelling of a Rust constant. One
+constant, one place.
+
+**An empty box means two different things, and the form says which.** Adding: omission, so
+`RecordingsConfig::default()` stands. Editing: a deliberate clear, sent as `""` so the validator can
+refuse it in its own words. The same idiom the `authorOverride` field already uses.
+
+**Whitespace only.** The subfolder is trimmed of whitespace and nothing else — notes'
+`trim_matches('/')` would turn `/tmp` into `tmp` and make a refused save succeed against a folder
+nobody named. The refusal is the answer; correcting the input to make the save work is not.
+
+**Removability IS the `Option`.** `DestinationProfileRow.volume: Option<DestinationVolume>` makes
+"not removable but its volume is absent" unrepresentable rather than merely unlikely. `Unexpected`
+folds `VolumeStatus::Foreign` and an unreadable marker together because both take the same action
+from the person holding the drive — look at what is plugged in — while `Absent` takes a different
+one.
+
+**No second attachment test.** The status comes from `volume::scan`, not from an `exists()` on the
+mountpoint. A path check cannot tell an absent drive from a foreign one, which is precisely why story
+27.3 built the marker.
+
+**An absent volume refuses; it does not redirect.** Story 41.2's three degrades — gone, paused,
+unflagged — all mean "this is not a destination any more". A pendrive in a drawer means "this
+destination is fine and is not here right now", and quietly landing a recording somewhere other than
+where the card said is the one outcome this story must not add. The refusal fires before the
+pre-record recovery pass and long before `create_dir_all`, so nothing is created; it names the drive,
+because `merope is not attached` is actionable and an `EPERM` on a path is not; and it is
+non-retriable, because nothing keeper does can attach a drive.
+
+**Names are memoized, statuses never are.** The map is structurally incapable of remembering
+"absent" — the one value that could survive a replug and keep a plugged-in drive failing. `volume::scan`
+runs fresh on every read, which is what makes a replug need no other action.
+
+**A hypothesis tested and disproved, recorded so nobody re-derives it.** A detached drive was expected
+to let `create_dir_all` mint a decoy directory on the boot disk under `/Volumes` and block the real
+drive from remounting. On macOS `/Volumes` is `root:wheel` and `mkdir` is refused, so the pre-existing
+failure was an `EPERM` naming a path: a bad diagnosis, not data loss. The fix is scoped to the
+diagnosis accordingly.
+
+**Choosing an unplugged drive is still allowed.** The choice is good; the drive is in a drawer. Only
+starting a recording is refused.
