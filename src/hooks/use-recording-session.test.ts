@@ -32,6 +32,7 @@ const RECORDING: RecordingStatusVm = {
   onDiskBytes: 0,
   currentSegmentBytes: 0,
   segmentCapMb: 500,
+  durability: { state: "local", detail: null },
 };
 
 const FAILED: RecordingStatusVm = {

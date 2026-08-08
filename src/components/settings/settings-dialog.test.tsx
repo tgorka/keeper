@@ -33,6 +33,9 @@ vi.mock("@/lib/ipc/client", () => ({
       echoCancellation: false,
     }),
   ),
+  // Story 41.2: the Destination card asks which synced folders are flagged on
+  // mount. No flagged profile is this suite's world — today's card.
+  recordingDestinationProfiles: vi.fn(() => Promise.resolve([])),
   recordingSettingsSet: vi.fn((vm: unknown) => Promise.resolve(vm)),
   hotkeyGet: vi.fn(() =>
     Promise.resolve({

@@ -58,8 +58,8 @@ pub use copy::{
 pub use credential::AccessToken;
 pub use db::{ActivityEntry, ActivityKind, ActivityRow, DeliveryState};
 pub use engine::{
-    Engine, FinishedTap, ParkedUnit, PendingFile, PendingReason, ProblemReport, SyncOutcome,
-    VerifyReport,
+    Engine, FinishedTap, ParkedUnit, PathDurability, PendingFile, PendingReason, ProblemReport,
+    SyncOutcome, VerifyReport,
 };
 pub use error::{Result, SyncError};
 pub use git::resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};

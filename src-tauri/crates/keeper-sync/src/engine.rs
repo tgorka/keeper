@@ -41,7 +41,7 @@ use crate::exclude::ExcludeSet;
 use crate::git::{self, cli::GitCli};
 use crate::lfs;
 use crate::platform::SyncPlatform;
-use crate::profile::{LfsMode, ProfileState, SyncDirection, SyncLane, SyncProfile};
+use crate::profile::{LfsMode, ProfileState, PushPolicy, SyncDirection, SyncLane, SyncProfile};
 use crate::progress::{
     ProgressSink, RateMeter, SyncPhase, SyncProgress, SyncStatus, TransferTally,
 };
@@ -70,6 +70,94 @@ pub struct SyncOutcome {
     pub bytes: u64,
     /// Conflict copies created during this run, as repository-relative paths.
     pub conflicts: Vec<String>,
+}
+
+/// What is asking for a recordings push (Story 41.5, FR-136).
+///
+/// The policy is on the profile and the moment is the caller's, so the two
+/// have to meet somewhere: this is that argument. It is deliberately not a
+/// boolean — `push_now(profile, true)` at a call site says nothing about which
+/// of the two moments in a recording session it is, and those two moments are
+/// the entire content of [`PushPolicy`](crate::profile::PushPolicy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushTrigger {
+    /// A segment just closed and was committed. Frequent — once a rotation,
+    /// so 48 times in a four-hour session.
+    SegmentCommitted,
+    /// The session finalized. Once, and the last chance this session has to
+    /// publish anything.
+    SessionEnd,
+}
+
+/// What one profile's engine has actually done, as counts (Story 41.5).
+///
+/// Epic 41's acceptance is stated in counts and not in inspection — 48
+/// commits, ONE `.gitattributes` write, one push — because that is what
+/// distinguishes the intended behaviour from the failure it is guarding
+/// against. A recorder that rewrites `.gitattributes` per rotation still
+/// produces a correct tree; it just changes the working tree under a running
+/// recorder 47 more times than it should, and only a count can see that.
+///
+/// Process-lifetime and per profile, like [`Engine::transferred`], and for the
+/// same reason: the work being counted is reached through call paths that
+/// share no return value — a commit from the supervisor's tick, a push drained
+/// from the journal, an attribute write from either the session-start rule or
+/// the commit path's own staging. A caller reads the snapshot before and after
+/// and subtracts.
+///
+/// Not persisted. These count what *this process* did, which is exactly the
+/// question a session asks; a restart mid-session has bigger news to report
+/// than a reset counter.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineCounters {
+    /// Commit objects this engine created for the profile.
+    pub commits: u64,
+    /// Times `.gitattributes` was actually rewritten — by
+    /// [`Engine::ensure_lfs_rule`] or by the commit path's LFS staging. A
+    /// no-op call counts nothing, which is the whole point of counting.
+    pub attribute_writes: u64,
+    /// Pushes *attempted*: the count rises when `git push` is invoked, whether
+    /// or not the remote was there to answer. Attempts rather than successes,
+    /// because "we pushed once at session end" is a claim about what the
+    /// engine did, and an unreachable remote must not make it read as though
+    /// the policy never fired.
+    pub pushes: u64,
+}
+
+/// How safe one recorded file already is, read locally (Story 41.6, FR-138).
+///
+/// Three facts and a sentence, in the order durability is actually acquired:
+/// the bytes are in a commit, the commit is on the remote, the remote's copy
+/// has been re-read and matched. Each is a strictly stronger promise than the
+/// one before it, so a consumer can reduce them to one word by taking the
+/// highest that holds — which is what the recording surface does.
+///
+/// Everything here is answered from this machine: the whole point is that a
+/// banner polling at ~1 Hz while a capture runs can ask "would what I have
+/// recorded so far survive this laptop being dropped?" without a network round
+/// trip and without slowing the recorder down by a millisecond.
+///
+/// Not persisted, and deliberately not cached: it is a *reading* of the
+/// repository and the engine's own health, so it cannot go stale or disagree
+/// with the thing it describes (AD-S3, the same rule
+/// [`ProblemReport`] follows).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathDurability {
+    /// The path's bytes are in a commit, and the file on disk still matches
+    /// what that commit recorded.
+    pub committed: bool,
+    /// The commit carrying it has reached the remote — see
+    /// [`Engine::path_durability`] for the one approximation in that sentence.
+    pub pushed: bool,
+    /// The stored content has been re-read and matched. Reserved for
+    /// [`Engine::verify`]; never guessed here.
+    pub verified: bool,
+    /// The last failure the engine recorded for this folder, in the words it
+    /// recorded — the reason a rejected push is "recorded, not pushed" rather
+    /// than a generic sync error.
+    pub problem: Option<String>,
 }
 
 /// Result of a verification pass (Story 25.6).
@@ -415,6 +503,13 @@ pub struct Engine {
     /// engine nobody asserts to (`keeper-syncd`, every test that is not about
     /// this) allocates no channel, and its drain is one relaxed load per tick.
     finished_tap: OnceLock<FinishedQueue>,
+    /// What this engine has done per profile, as counts ([`EngineCounters`]).
+    ///
+    /// A `HashMap` behind a mutex rather than atomics on the struct because
+    /// the counts are per profile and the set of profiles is not known at
+    /// construction. Contention is nil: three increments per commit at the
+    /// most, against locks the same call already takes for the journal.
+    counters: Mutex<HashMap<String, EngineCounters>>,
 }
 
 /// One remembered answer from `git-lfs-authenticate`, with its own deadline.
@@ -486,6 +581,7 @@ impl Engine {
             lfs_ssh_credentials: Mutex::new(HashMap::new()),
             watch_tap: OnceLock::new(),
             finished_tap: OnceLock::new(),
+            counters: Mutex::new(HashMap::new()),
         };
         engine.seed_status()?;
         Ok(engine)
@@ -1466,6 +1562,614 @@ impl Engine {
         // assertion. See [`Self::prime_moved_paths`], which shares the shape.
         self.with_db(|conn| db::save_file_state(conn, &profile.id, &pending))?;
         Ok(noted)
+    }
+
+    /// Ensure this profile's `.gitattributes` carries the LFS rule for
+    /// `extension` (Story 41.5, FR-137).
+    ///
+    /// Returns whether it wrote. A second call for the same extension writes
+    /// nothing and returns `false`, and so does a call for an extension a
+    /// human already tracked by hand, however they spelled the line —
+    /// [`lfs::stage::ensure_attributes`] owns that judgement and this adds no
+    /// second opinion.
+    ///
+    /// # Why an extension, and why now rather than at first commit
+    ///
+    /// The commit path already writes this rule: [`lfs::stage::prepare`] adds
+    /// one for every path it routes through LFS, and a recording would get its
+    /// rule the moment the first segment was committed. That is precisely the
+    /// problem. A running recorder must not have the working tree change
+    /// underneath it: a `.gitattributes` rewritten forty minutes into a session
+    /// is a diff the user did not make and a commit nobody asked for, arriving
+    /// while the thing it governs is still being written. Called once at
+    /// session start, this moves that single write to the one moment where it
+    /// is expected, and the commit path then finds nothing to add for the rest
+    /// of the session — the count is one, not one plus forty-seven no-ops.
+    ///
+    /// The extension is all the session knows at that point. There is no file
+    /// yet, and the rule is per-extension anyway
+    /// ([`lfs::stage::pattern_for_extension`]), so nothing is lost.
+    ///
+    /// # What is a refusal
+    ///
+    /// `Ok(false)` and a `warn` — never an `Err` — for every condition the
+    /// caller could not have known and cannot act on: an unknown profile, a
+    /// paused one, one with LFS switched off, an extension that is not one, a
+    /// folder that is not there (an unplugged drive), or a filesystem that
+    /// refused the write. Each of them costs the session its LFS rule and
+    /// nothing else: the commit path still writes one when the first segment
+    /// is committed, which is where this started. A recorder is never handed
+    /// an error, because there is no error it could usefully handle while a
+    /// capture is running (NFR-31).
+    ///
+    /// `Err` is reserved for what the two sibling APIs reserve it for — a
+    /// `sync.db` that will not answer, which is the engine being broken rather
+    /// than this request being refused.
+    pub fn ensure_lfs_rule(&self, profile_id: &str, extension: &str) -> Result<bool> {
+        let ext = extension.trim().trim_start_matches('.');
+        // A gitattributes line is whitespace-separated, so an extension holding
+        // a space would not write the rule it reads as — it would write a
+        // pattern and then garbage where the attributes belong, and every later
+        // idempotence check against it would miss. A separator is refused for
+        // the same reason `pattern_for` anchors a path rule: `*.a/b` is not an
+        // extension, whatever produced it.
+        if ext.is_empty() || ext.contains(['/', '\\']) || ext.chars().any(char::is_whitespace) {
+            tracing::warn!(
+                profile_id,
+                extension,
+                "not a usable file extension, so no LFS rule was written; the commit path will \
+                 write one when the first segment lands"
+            );
+            return Ok(false);
+        }
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
+            tracing::warn!(
+                profile_id,
+                extension = ext,
+                "an LFS rule was asked for against a profile that does not exist"
+            );
+            return Ok(false);
+        };
+        if !profile.enabled {
+            tracing::warn!(
+                profile = profile.name,
+                extension = ext,
+                "this folder is paused, so its working tree is left exactly as the user left it"
+            );
+            return Ok(false);
+        }
+        if profile.lfs_mode == LfsMode::Disabled {
+            tracing::warn!(
+                profile = profile.name,
+                extension = ext,
+                "LFS is switched off for this folder, so an LFS rule would promise something \
+                 nothing here will honour"
+            );
+            return Ok(false);
+        }
+        // Cheaper and more specific than a volume probe, and it is the
+        // condition that actually matters: `ensure_attributes` writes into this
+        // directory. An unplugged drive, a folder the user moved, and a profile
+        // whose clone has not happened yet all arrive here as the same answer,
+        // and all three want the same one-line warning rather than a failure.
+        if !profile.local_path.is_dir() {
+            tracing::warn!(
+                profile = profile.name,
+                path = %profile.local_path.display(),
+                extension = ext,
+                "the folder is not there, so no LFS rule was written"
+            );
+            return Ok(false);
+        }
+        let pattern = lfs::stage::pattern_for_extension(ext);
+        match lfs::stage::ensure_attributes(&profile.local_path, std::slice::from_ref(&pattern)) {
+            Ok(false) => Ok(false),
+            Ok(true) => {
+                self.bump_counters(&profile.id, |counters| counters.attribute_writes += 1);
+                tracing::info!(
+                    profile = profile.name,
+                    pattern,
+                    "recorded the session's LFS rule before the recorder started writing"
+                );
+                Ok(true)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    pattern,
+                    error = %err,
+                    "could not record the session's LFS rule; the commit path will write it when \
+                     the first segment lands"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Publish this profile's recordings now, if its own push policy says now
+    /// (Story 41.5, FR-136, AD-70).
+    ///
+    /// `trigger` is the moment asking; [`PushPolicy`](crate::profile::PushPolicy)
+    /// is the answer the folder gives:
+    ///
+    /// * [`Immediate`](crate::profile::PushPolicy::Immediate) — both moments.
+    /// * [`SessionEnd`](crate::profile::PushPolicy::SessionEnd), the default —
+    ///   only [`PushTrigger::SessionEnd`]. Committing is local, cheap and
+    ///   already done; sending a multi-gigabyte object mid-meeting eats the
+    ///   uplink the meeting runs on.
+    /// * [`Window`](crate::profile::PushPolicy::Window) — either moment, but
+    ///   only inside the quiet hours. Outside them the commits simply
+    ///   accumulate, which is the point: they are durable already.
+    ///
+    /// Returns whether anything was published. `Ok(false)` covers both "the
+    /// policy says not now" and "it said now and the attempt did not land",
+    /// because to the caller — a recorder — those are the same instruction:
+    /// carry on, nothing is lost. What was *attempted* is a different question
+    /// and a different observation point: [`EngineCounters::pushes`].
+    ///
+    /// # Nothing is stranded by a refusal
+    ///
+    /// Every segment is committed regardless, and the supervisor's own scan
+    /// enqueues a `Push` for a profile whose branch is ahead of its remote
+    /// ([`Self::has_unpushed_commits`]). So a session that never reached its
+    /// remote leaves ordinary unpushed commits, and the ordinary path drains
+    /// them when the remote returns. That is why this can afford to be total.
+    ///
+    /// # What it reuses, deliberately
+    ///
+    /// [`Self::do_push`], with the same reservation and the same volume gate
+    /// the supervisor takes. Not a second push path: `do_push` is where the
+    /// `lfs_uploads_outstanding` gate lives, and that gate is the one thing
+    /// that must never be bypassed — a push that publishes a pointer whose
+    /// object has not landed is the failure nobody observes until a peer
+    /// clones a tree of text stubs (Story 34.15).
+    ///
+    /// # What is a refusal
+    ///
+    /// `Ok(false)` and a log line for an unknown profile, a profile that holds
+    /// no recordings, a paused one, a pull-only one, an absent volume, a
+    /// profile already busy with another operation, and any failure of the
+    /// push itself — an unreachable remote, a rejected ref, an upload still
+    /// outstanding. A failure that says something about the folder's health is
+    /// reported through [`Self::record_failure`], exactly as the supervisor
+    /// reports its own, so a folder that has silently stopped publishing still
+    /// says so in the tray.
+    ///
+    /// `Err`, as with [`Self::ensure_lfs_rule`], only for a `sync.db` that will
+    /// not answer.
+    pub async fn push_recordings_if_due(
+        &self,
+        profile_id: &str,
+        trigger: PushTrigger,
+    ) -> Result<bool> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
+            tracing::warn!(
+                profile_id,
+                "a recordings push was asked for against a profile that does not exist"
+            );
+            return Ok(false);
+        };
+        let Some(recordings) = profile.recordings.as_ref() else {
+            tracing::warn!(
+                profile = profile.name,
+                "a recordings push was asked for against a folder that holds no recordings"
+            );
+            return Ok(false);
+        };
+        if !profile.enabled {
+            tracing::info!(
+                profile = profile.name,
+                "this folder is paused, so nothing is published; the commits are here and the \
+                 resume publishes them"
+            );
+            return Ok(false);
+        }
+        if !profile.direction.pushes() {
+            tracing::info!(
+                profile = profile.name,
+                "this folder never pushes, so a recording lives here and nowhere else"
+            );
+            return Ok(false);
+        }
+        if !self.recordings_push_is_due(&profile, &recordings.push, trigger) {
+            return Ok(false);
+        }
+        // The same gate `tick_profile` takes, before anything touches the
+        // filesystem: a detached drive is indistinguishable from a mass
+        // deletion once a walk starts, and `do_push` starts with a walk (AD-48).
+        match self.volume_ready(&profile) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    profile = profile.name,
+                    "the volume this folder lives on is not attached, so nothing is published; \
+                     the segments are committed when it returns"
+                );
+                return Ok(false);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    error = %err,
+                    "could not tell whether this folder's volume is attached, so nothing is \
+                     published"
+                );
+                return Ok(false);
+            }
+        }
+        let Some(_reservation) = self.reserve(&profile.id) else {
+            // One operation per profile is not negotiable — two on one working
+            // tree race on the index — and whatever holds it is doing this
+            // work anyway, or the supervisor's next scan will.
+            tracing::info!(
+                profile = profile.name,
+                "this folder is already syncing, so the recordings push rides along with it"
+            );
+            return Ok(false);
+        };
+        // `Watch`, because that is what this is: not a person asking, but the
+        // engine acting on a policy the folder carries. A recorder-triggered
+        // push does exactly what the supervisor's own pass does, and a commit
+        // it creates should not claim otherwise (AD-34-12).
+        match self.do_push(&profile, SyncSource::Watch, None).await {
+            Ok(()) => {
+                tracing::info!(
+                    profile = profile.name,
+                    trigger = ?trigger,
+                    "published this folder's recordings"
+                );
+                Ok(true)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    trigger = ?trigger,
+                    error = %err,
+                    "the recordings push did not land; the commits are local and the next pass \
+                     publishes them"
+                );
+                // Health is the supervisor's channel and this failure belongs
+                // in it: a folder that keeps failing to publish must stop
+                // calling itself healthy, however the push was triggered.
+                self.record_failure(&profile, &err);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Does this policy fire for this trigger, right now?
+    ///
+    /// Split out so the decision is one readable match rather than a condition
+    /// buried in the middle of the guards, and so the window arithmetic —
+    /// [`within_quiet_window`], which is where the wrapping midnight case
+    /// lives — is reached from exactly one place.
+    fn recordings_push_is_due(
+        &self,
+        profile: &SyncProfile,
+        policy: &PushPolicy,
+        trigger: PushTrigger,
+    ) -> bool {
+        match policy {
+            PushPolicy::Immediate => true,
+            PushPolicy::SessionEnd => {
+                let due = trigger == PushTrigger::SessionEnd;
+                if !due {
+                    tracing::debug!(
+                        profile = profile.name,
+                        "this folder publishes at the end of the session, so the segment is \
+                         committed and stays here for now"
+                    );
+                }
+                due
+            }
+            PushPolicy::Window {
+                quiet_from,
+                quiet_to,
+            } => {
+                let now = self.platform.now_ms();
+                let offset = self.platform.utc_offset_minutes();
+                match within_quiet_window(now, offset, quiet_from, quiet_to) {
+                    Some(true) => true,
+                    Some(false) => {
+                        tracing::debug!(
+                            profile = profile.name,
+                            quiet_from,
+                            quiet_to,
+                            "outside this folder's quiet hours, so the commits accumulate"
+                        );
+                        false
+                    }
+                    // `RecordingsConfig::validate` refuses an unparseable
+                    // window, so this is a row edited outside keeper. Refusing
+                    // to push is the conservative reading — the alternative is
+                    // saturating a metered uplink at noon on the strength of a
+                    // value nobody can read.
+                    None => {
+                        tracing::warn!(
+                            profile = profile.name,
+                            quiet_from,
+                            quiet_to,
+                            "this folder's quiet hours cannot be read, so nothing is published \
+                             until they are corrected"
+                        );
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /// How durable one recorded file already is, on this machine, right now
+    /// (Story 41.6, FR-138).
+    ///
+    /// The recording surface polls its own status at ~1 Hz while a capture is
+    /// running, and this is the answer it carries: local, committed, pushed.
+    /// So the two hard constraints are that it never touches the network and
+    /// never costs the recorder anything. Both are met by refusing to ask any
+    /// question whose honest answer needs a remote: what this returns is the
+    /// last thing this machine *knows*, which is also the only thing a person
+    /// asking "would this survive the laptop being dropped?" can act on.
+    ///
+    /// # What each field reuses, and what it costs
+    ///
+    /// * `committed` — `HEAD` plus the uncommitted set. The tree lookup goes
+    ///   first because it is one object read per path component and it is the
+    ///   whole answer for every segment of a session that has not been
+    ///   committed yet, which is the state a poll spends most of its time in.
+    ///   Only once `HEAD` carries the path is the second half worth its
+    ///   syscalls: [`git::repo::status_paths`], the same gitoxide walk
+    ///   [`Self::pending`] and [`Self::collect_stable_changes`] already use, so
+    ///   "uncommitted" means here exactly what the Pending list means by it and
+    ///   there is no second opinion to disagree with. That walk is the
+    ///   expensive part of this call — it stats every tracked file and dirwalks
+    ///   for untracked ones, bounded by the tree rather than by the session —
+    ///   and no `git` process is spawned for it.
+    /// * `pushed` — [`Self::has_unpushed_commits`], the same local ancestry
+    ///   question the supervisor asks on every tick, guarded by the
+    ///   remote-tracking ref existing. The guard is not decoration: that
+    ///   helper deliberately answers "no unpushed commits" when the question is
+    ///   unanswerable, so the push leg decides rather than the caller, and a
+    ///   durability read must not inherit that optimism and report an
+    ///   unfetched branch as published. It costs one `git merge-base
+    ///   --is-ancestor`, and only for a path that is already committed.
+    /// * `verified` — always `false`. Nothing local can answer it:
+    ///   [`Self::verify`] re-reads content and returns a [`VerifyReport`] to
+    ///   its caller without recording anything per path, so the field is
+    ///   reserved for that pass to fill in rather than guessed here. A
+    ///   guessed `verified` would be the one word in the set that promises
+    ///   something nobody checked.
+    /// * `problem` — the sentence [`Self::record_failure`] recorded, read from
+    ///   the same in-memory snapshot [`Self::problems`] surfaces. Free: one map
+    ///   lookup, no I/O, and no second store to keep in step.
+    ///
+    /// # The approximations, stated
+    ///
+    /// * **`pushed` is branch-level, not path-level.** A per-path answer means
+    ///   asking the remote which commits it has, and that is a network round
+    ///   trip this call may not make. So the claim made is the one the local
+    ///   clone can prove: this path is in a commit, and this branch has no
+    ///   commits the remote-tracking ref lacks. It is the honest reading of
+    ///   "would this survive?" — a session whose branch is fully published has
+    ///   published every segment in it — and it is conservative in the
+    ///   direction that matters: a later uncommitted segment cannot make an
+    ///   earlier one read as pushed, because `committed` gates `pushed`, while
+    ///   an unpushed later commit correctly drags the whole branch back to
+    ///   `committed`. The caller keeps a floor precisely so that
+    ///   retreat is never shown to a person mid-session.
+    /// * **`pushed` asks about `profile.branch`**, which is the branch
+    ///   `has_unpushed_commits` asks about. A worktree lane publishes a
+    ///   different branch ([`Self::lane_branch`]) and would read as unpushed
+    ///   here; recordings are not a lane, and inventing a second ancestry
+    ///   query for a combination the product does not offer would be two
+    ///   answers where one is needed.
+    /// * **`problem` is the profile's last recorded *permanent* failure, not a
+    ///   push-specific one.** That is the engine's only record of a failure in
+    ///   words, and a refused push is one — a rejected ref classifies as
+    ///   [`SyncError::Diverged`], which is permanent and lands there verbatim.
+    ///   A failure still being retried deliberately carries no sentence yet
+    ///   (`record_failure`'s policy, not this one), which is right: work that
+    ///   is about to be retried is not something to hand a recorder words
+    ///   about.
+    ///
+    /// # What is a refusal
+    ///
+    /// Total, like [`Self::note_finished_path`] and [`Self::ensure_lfs_rule`]:
+    /// everything `false` with no problem and one `debug` line for an unknown
+    /// profile, a folder that holds no recordings, a paused one, and a path
+    /// outside the recordings root. A capture must never fail because a status
+    /// query did (NFR-31), so a git read that fails is a `warn` and the same
+    /// all-`false` answer — the caller holds the last known state, so nothing
+    /// it shows regresses on a blip.
+    ///
+    /// `Err`, as with its siblings, only for a `sync.db` that will not answer.
+    ///
+    /// Blocking, and cheap enough to be called inline; a caller on an async
+    /// runtime with a very large tree should still hand it to `spawn_blocking`,
+    /// the way [`Self::pending`] does with the same walk.
+    pub fn path_durability(&self, profile_id: &str, path: &Path) -> Result<PathDurability> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
+            tracing::debug!(
+                profile_id,
+                path = %path.display(),
+                "a durability read asked about a profile that does not exist"
+            );
+            return Ok(PathDurability::default());
+        };
+        let Some(root) = profile.recordings_root() else {
+            tracing::debug!(
+                profile = profile.name,
+                path = %path.display(),
+                "a durability read asked about a folder that holds no recordings"
+            );
+            return Ok(PathDurability::default());
+        };
+        if !profile.enabled {
+            tracing::debug!(
+                profile = profile.name,
+                "this folder is paused, so what is on the drive is all there is to say"
+            );
+            return Ok(PathDurability::default());
+        }
+        // The same boundary [`Self::note_finished_path`] enforces, for the same
+        // reason: `Path::starts_with` compares components, so a `..` would walk
+        // straight through it and let a caller ask about someone else's file.
+        if !path.is_absolute()
+            || path.components().any(|c| c == Component::ParentDir)
+            || !path.starts_with(&root)
+        {
+            tracing::debug!(
+                profile = profile.name,
+                path = %path.display(),
+                root = %root.display(),
+                "a durability read asked about a path outside this folder's recordings"
+            );
+            return Ok(PathDurability::default());
+        }
+        let Ok(rela) = path.strip_prefix(&profile.local_path) else {
+            // Unreachable while the recordings root is inside the folder, and
+            // answered rather than asserted: nothing on a poll path a recorder
+            // depends on is worth a panic.
+            tracing::debug!(
+                profile = profile.name,
+                path = %path.display(),
+                "a durability read asked about a path that is not inside this folder"
+            );
+            return Ok(PathDurability::default());
+        };
+
+        // Read first, and from memory, so the reason survives every early
+        // return below: a folder whose publication is refused must be able to
+        // say why even when nothing else can be read.
+        let mut durability = PathDurability {
+            problem: Self::lock(&self.status)
+                .get(&profile.id)
+                .and_then(|snapshot| snapshot.error.clone()),
+            ..PathDurability::default()
+        };
+
+        // `pending`'s own guard, for `pending`'s own reason: a folder that is
+        // not a repository yet has nothing git can classify, and making one is
+        // a clone. [`Self::open_repo`] would do exactly that — it clones or
+        // adopts — which is a network call and a write to the user's folder,
+        // and neither belongs anywhere near a 1 Hz poll.
+        if !profile.local_path.join(".git").exists() {
+            tracing::debug!(
+                profile = profile.name,
+                "this folder is not a repository yet, so the recording is on this disk only"
+            );
+            return Ok(durability);
+        }
+        let repo = match git::repo::open(&profile.local_path, profile.removable) {
+            Ok(repo) => repo,
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    error = %err,
+                    "could not read this folder's repository, so its durability is unknown; \
+                     the last known state stands"
+                );
+                return Ok(durability);
+            }
+        };
+
+        // `HEAD` before the walk: this is the cheap half, and it is the whole
+        // answer while a session is still local.
+        let in_head = match repo.head_tree() {
+            Ok(tree) => match tree.lookup_entry_by_path(rela) {
+                Ok(entry) => entry.is_some(),
+                Err(err) => {
+                    tracing::warn!(
+                        profile = profile.name,
+                        path = %rela.display(),
+                        error = %err,
+                        "could not look this recording up in the committed tree"
+                    );
+                    return Ok(durability);
+                }
+            },
+            // An unborn branch is the ordinary state of a session's first
+            // minutes, not a failure — the same reading
+            // [`git::repo::head_commit_id`] takes.
+            Err(err) => {
+                tracing::debug!(
+                    profile = profile.name,
+                    error = %err,
+                    "nothing is committed on this branch yet"
+                );
+                false
+            }
+        };
+        if !in_head {
+            return Ok(durability);
+        }
+
+        let status = match git::repo::status_paths(&repo) {
+            Ok(status) => status,
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    error = %err,
+                    "could not read this folder's status, so the recording's durability is \
+                     unknown; the last known state stands"
+                );
+                return Ok(durability);
+            }
+        };
+        // A path in `HEAD` that the status walk also names has moved since the
+        // commit — staged again, edited again, or deleted — so the commit no
+        // longer describes what is on the drive.
+        let uncommitted = [
+            &status.added,
+            &status.modified,
+            &status.deleted,
+            &status.untracked,
+        ]
+        .into_iter()
+        .any(|bucket| bucket.iter().any(|candidate| candidate == rela));
+        durability.committed = !uncommitted;
+        if uncommitted {
+            return Ok(durability);
+        }
+
+        // Nothing has ever been fetched or pushed on this branch, so there is
+        // provably no remote copy to be part of.
+        let tracking = format!("refs/remotes/origin/{}", profile.branch);
+        if repo.find_reference(&tracking).is_err() {
+            tracing::debug!(
+                profile = profile.name,
+                tracking,
+                "this branch has never reached the remote, so its commits are here only"
+            );
+            return Ok(durability);
+        }
+        match self.has_unpushed_commits(&profile) {
+            Ok(unpushed) => durability.pushed = !unpushed,
+            Err(err) => tracing::warn!(
+                profile = profile.name,
+                error = %err,
+                "could not tell whether this folder's commits have reached the remote"
+            ),
+        }
+        Ok(durability)
+    }
+
+    /// What this engine has done for one profile since it opened.
+    ///
+    /// See [`EngineCounters`] for why the acceptance of a recording session is
+    /// stated in counts at all. A profile the engine has done nothing for
+    /// answers all zeroes rather than nothing, because "no commits yet" and
+    /// "no such profile" are the same answer to every question a count can be
+    /// asked.
+    pub fn counters(&self, profile_id: &str) -> EngineCounters {
+        Self::lock(&self.counters)
+            .get(profile_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn bump_counters(&self, profile_id: &str, f: impl FnOnce(&mut EngineCounters)) {
+        let mut counters = Self::lock(&self.counters);
+        f(counters.entry(profile_id.to_owned()).or_default());
     }
 
     /// Execute every journal unit that is ready for this profile.
@@ -2481,6 +3185,7 @@ impl Engine {
         event.current = Self::first_staged(&staged);
         self.publish(event);
         self.commit(profile, &staged, source, push_unit)?;
+        self.bump_counters(&profile.id, |counters| counters.commits += 1);
         // The commit is durable, so every staged path landed. Reporting it
         // leaves the bar full rather than stranded mid-way when the phase
         // changes underneath it.
@@ -2585,6 +3290,11 @@ impl Engine {
         let working = Self::working_branch(profile);
         let refspec = format!("refs/heads/{working}:refs/heads/{working}");
         let credential = self.credential(profile)?;
+        // Counted where the invocation is, not where it returns: an attempt
+        // against an unreachable remote is still this policy firing, and a
+        // session that claims "one push at the end" has to be able to show it
+        // even when that push failed (Story 41.5).
+        self.bump_counters(&profile.id, |counters| counters.pushes += 1);
         tokio::task::spawn_blocking(move || {
             git.push(&repo_path, "origin", &refspec, credential.as_ref())
         })
@@ -2871,6 +3581,7 @@ impl Engine {
         // are pointers.
         let mut staged = staged.clone();
         if staging.attributes_changed {
+            self.bump_counters(&profile.id, |counters| counters.attribute_writes += 1);
             let attributes = PathBuf::from(".gitattributes");
             if !staged.added.contains(&attributes) && !staged.modified.contains(&attributes) {
                 staged.added.push(attributes);
@@ -4264,6 +4975,59 @@ impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         Engine::lock(&self.engine.busy).remove(&self.profile_id);
     }
+}
+
+/// Is the local wall clock inside the quiet window `from`..`to` right now?
+///
+/// `now_ms` is UTC — the only clock the engine has, deliberately
+/// ([`SyncPlatform::now_ms`]) — and `offset_minutes` is what turns it into the
+/// clock on the wall the person was looking at when they typed `22:00`
+/// ([`SyncPlatform::utc_offset_minutes`]). Doing that conversion here rather
+/// than asking for a local timestamp keeps the one clock the engine trusts
+/// injectable, which is what makes a window test the same test in every zone.
+///
+/// **Wrapping is the normal case.** `22:00`–`06:00` is one window across
+/// midnight, not two, because that is the shape a person configures; a rule
+/// written as `from <= t < to` alone would silently never open for it.
+/// `from > to` therefore means "the window wraps", which is the only reading
+/// available once equality is refused at validation.
+///
+/// Half-open, `[from, to)`, for the reason every other range in this codebase
+/// is: a window ending at `06:00` and one starting at `06:00` must not both
+/// claim that instant.
+///
+/// `None` for a window that cannot be parsed. That cannot come from
+/// [`RecordingsConfig::validate`](crate::profile::RecordingsConfig::validate),
+/// which refuses it, so it means a row edited outside keeper — and the caller
+/// treats it as closed rather than guessing.
+fn within_quiet_window(now_ms: i64, offset_minutes: i32, from: &str, to: &str) -> Option<bool> {
+    let from = minute_of_day(from)?;
+    let to = minute_of_day(to)?;
+    let local_ms = now_ms.saturating_add(i64::from(offset_minutes) * 60_000);
+    // `rem_euclid`, not `%`: a local clock west of UTC in the first hours of
+    // 1970 is a negative millisecond count, and `%` would answer with a
+    // negative minute-of-day that compares below every window.
+    let minute = (local_ms.rem_euclid(86_400_000) / 60_000) as u16;
+    Some(if from <= to {
+        minute >= from && minute < to
+    } else {
+        minute >= from || minute < to
+    })
+}
+
+/// `HH:MM` as minutes since local midnight.
+///
+/// A second parser beside
+/// [`validate_quiet_time`](crate::profile::RecordingsConfig::validate)'s, and
+/// deliberately so: that one exists to reject a value while a person is
+/// looking at the field, this one to read a value already stored, and the
+/// stored value may predate the rules or have been edited by hand. Both refuse
+/// the same set; neither corrects anything.
+fn minute_of_day(hhmm: &str) -> Option<u16> {
+    let (hours, minutes) = hhmm.trim().split_once(':')?;
+    let hours: u16 = hours.parse().ok()?;
+    let minutes: u16 = minutes.parse().ok()?;
+    (hours < 24 && minutes < 60).then_some(hours * 60 + minutes)
 }
 
 /// UTC `yyyymmdd-hhmmss` for a conflict filename.
@@ -7605,6 +8369,931 @@ mod tests {
             paths,
             vec!["notes.md"],
             "only the user's own file is waiting; got {paths:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Story 41.5 — committed at close, pushed on policy
+    // -----------------------------------------------------------------------
+
+    /// A folder that holds recordings, bound to a remote a test may reach.
+    ///
+    /// `remote` is a path rather than a URL because the only remote a test is
+    /// allowed to touch is a bare repository on disk — and because the same
+    /// path, not yet initialized, is exactly what an unreachable remote looks
+    /// like.
+    fn recordings_profile(dir: &Path, remote: &Path, push: PushPolicy) -> SyncProfile {
+        let mut p = adoptable(dir);
+        p.remote_url = remote.to_string_lossy().into_owned();
+        p.recordings = Some(crate::profile::RecordingsConfig {
+            push,
+            ..crate::profile::RecordingsConfig::default()
+        });
+        std::fs::create_dir_all(p.recordings_root().expect("a recordings root"))
+            .expect("create the recordings root");
+        p
+    }
+
+    /// Close one segment: write it and assert it finished, as the sink does.
+    ///
+    /// Committing is deliberately left to the caller — which of the two things
+    /// commits a segment (the supervisor's pass, or the push itself) is what
+    /// half of these tests are about.
+    fn close_segment(engine: &Engine, p: &SyncProfile, name: &str, bytes: usize) -> PathBuf {
+        let path = p.recordings_root().expect("a recordings root").join(name);
+        // Filled from its own name, so two segments are two LFS objects. Equal
+        // content would be one oid, one journal unit after `enqueue_unique`
+        // dedups them, and a count that silently measured something else.
+        let content: Vec<u8> = name.bytes().cycle().take(bytes).collect();
+        std::fs::write(&path, content).expect("write a segment");
+        assert!(
+            engine.note_finished_path(&p.id, &path).expect("assert"),
+            "a closed segment inside the recordings root is assertable (Story 41.4)"
+        );
+        path
+    }
+
+    /// Push the index's mtime past the worktree's, so a just-committed LFS
+    /// entry is not *racily clean* on the next pass.
+    ///
+    /// Everything in a test happens inside one wall-clock second, which is
+    /// exactly git's racily-clean condition: the entry is re-read regardless of
+    /// its stat, and re-reading an LFS entry goes through `filter.lfs.clean` —
+    /// which under `cargo test` is the libtest harness, answering a filter
+    /// request with its own argument-parser error. In production the index is
+    /// always written after the file was last touched, so this restores the
+    /// ordinary state rather than arranging a special one. A second of sleeping
+    /// per rotation would say the same thing far more slowly.
+    fn unrace_the_index(p: &SyncProfile) {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(p.local_path.join(".git").join("index"))
+            .and_then(|index| index.set_modified(later))
+            .expect("age the index past the worktree");
+    }
+
+    /// Has this branch reached the remote?
+    fn published(remote: &Path, branch: &str) -> bool {
+        gix::open(remote)
+            .expect("open the remote")
+            .find_reference(&format!("refs/heads/{branch}"))
+            .is_ok()
+    }
+
+    /// Move the injected clock forward to the next `hour:minute` LOCAL.
+    ///
+    /// Forward only, because the platform clock only advances — which is also
+    /// what makes "the session started at noon and ended at 23:00" one
+    /// continuous session rather than two fixtures.
+    fn advance_to_local(platform: &TestPlatform, hour: i64, minute: i64) {
+        let target = (hour * 60 + minute) * 60_000;
+        let local = platform.now_ms() + i64::from(platform.utc_offset_minutes()) * 60_000;
+        platform.advance_ms((target - local.rem_euclid(86_400_000)).rem_euclid(86_400_000));
+    }
+
+    /// FR-137: the working tree must not change under a running recorder, so
+    /// the session's LFS rule is written once at the start and no rotation
+    /// rewrites it.
+    #[test]
+    fn the_session_lfs_rule_is_written_once_and_no_segment_commit_rewrites_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = recordings_profile(dir.path(), dir.path(), PushPolicy::SessionEnd);
+        // Low enough that a segment is genuinely an LFS candidate: without
+        // that, the commit path would consult `ensure_attributes` with no
+        // patterns at all and this test would prove nothing.
+        p.lfs_threshold_bytes = 1024;
+        engine.upsert_profile(&p).expect("upsert");
+
+        // Session start.
+        assert!(
+            engine.ensure_lfs_rule(&p.id, "mp4").expect("rule"),
+            "the first call is the one write this session gets"
+        );
+        let attributes = p.local_path.join(".gitattributes");
+        let written = std::fs::read(&attributes).expect("read .gitattributes");
+        assert!(
+            String::from_utf8_lossy(&written).contains("*.mp4 filter=lfs"),
+            "the rule has to be the one git reads, got: {}",
+            String::from_utf8_lossy(&written)
+        );
+
+        // Idempotent to the byte, including the spelling with the dot on it.
+        assert!(!engine.ensure_lfs_rule(&p.id, "mp4").expect("rule"));
+        assert!(!engine.ensure_lfs_rule(&p.id, ".mp4").expect("rule"));
+        assert_eq!(
+            std::fs::read(&attributes).expect("read"),
+            written,
+            "a second call must not touch the file at all"
+        );
+        assert_eq!(engine.counters(&p.id).attribute_writes, 1);
+
+        // The rule itself is committed, once, before anything is recorded.
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        // Now a segment closes. Its extension is the one the rule covers and it
+        // is over the threshold, so this is precisely the commit that WOULD
+        // have written `.gitattributes` had the session not already done it.
+        let segment = close_segment(&engine, &p, "clip.mp4", 4_096);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("commit the segment"),
+            1,
+            "the segment, and nothing else"
+        );
+        assert_eq!(
+            engine.counters(&p.id).attribute_writes,
+            1,
+            "a rotation must not rewrite the working tree"
+        );
+        assert_eq!(
+            std::fs::read(&attributes).expect("read"),
+            written,
+            "byte-identical: the rule was already there"
+        );
+        assert!(segment.exists());
+        assert_eq!(
+            engine.counters(&p.id).commits,
+            2,
+            "one commit for the rule at session start, one for the segment"
+        );
+    }
+
+    /// Every refusal `ensure_lfs_rule` can make is a log line and `Ok(false)`,
+    /// because a recorder has nothing useful to do with an error (NFR-31).
+    #[test]
+    fn an_lfs_rule_that_cannot_be_written_is_refused_rather_than_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = recordings_profile(dir.path(), dir.path(), PushPolicy::SessionEnd);
+        let attributes = p.local_path.join(".gitattributes");
+
+        // Nothing stored under that id at all.
+        assert!(
+            !engine
+                .ensure_lfs_rule("01NOSUCHPROFILE", "mp4")
+                .expect("no such profile"),
+            "a profile that does not exist is refused, not failed"
+        );
+
+        engine.upsert_profile(&p).expect("upsert");
+        for extension in ["", ".", "   ", "mp 4", "a/b"] {
+            assert!(
+                !engine.ensure_lfs_rule(&p.id, extension).expect("refused"),
+                "{extension:?} is not an extension and must not reach .gitattributes"
+            );
+        }
+
+        engine.set_enabled(&p.id, false).expect("pause");
+        assert!(
+            !engine.ensure_lfs_rule(&p.id, "mp4").expect("paused"),
+            "a paused folder's working tree is left exactly as the user left it"
+        );
+        engine.set_enabled(&p.id, true).expect("resume");
+
+        let mut without_lfs = p.clone();
+        without_lfs.lfs_mode = LfsMode::Disabled;
+        engine.upsert_profile(&without_lfs).expect("upsert");
+        assert!(
+            !engine.ensure_lfs_rule(&p.id, "mp4").expect("lfs off"),
+            "an LFS rule would promise something this folder will not honour"
+        );
+
+        // The folder itself is gone — an unplugged drive, from here.
+        engine.upsert_profile(&p).expect("upsert");
+        std::fs::remove_dir_all(&p.local_path).expect("unplug");
+        assert!(!engine.ensure_lfs_rule(&p.id, "mp4").expect("no folder"));
+
+        assert!(
+            !attributes.exists(),
+            "not one of those refusals may have written a thing"
+        );
+        assert_eq!(engine.counters(&p.id).attribute_writes, 0);
+    }
+
+    /// FR-136: the default policy holds everything until the session ends, so
+    /// the meeting keeps the uplink it is running on.
+    #[tokio::test]
+    async fn the_default_policy_publishes_once_at_session_end_and_never_before() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = recordings_profile(dir.path(), &remote, PushPolicy::SessionEnd);
+        engine.upsert_profile(&p).expect("upsert");
+
+        for rotation in 0..3 {
+            close_segment(&engine, &p, &format!("clip-{rotation}.mkv"), 512);
+            assert_eq!(
+                engine
+                    .commit_local(&p, SyncSource::Watch, None)
+                    .expect("commit at close"),
+                1,
+                "durability is not the thing being deferred: every close commits"
+            );
+            assert!(
+                !engine
+                    .push_recordings_if_due(&p.id, PushTrigger::SegmentCommitted)
+                    .await
+                    .expect("policy"),
+                "rotation {rotation} must not publish"
+            );
+        }
+        assert_eq!(engine.counters(&p.id).commits, 3);
+        assert_eq!(engine.counters(&p.id).pushes, 0, "not one attempt");
+        assert!(!published(&remote, &p.branch));
+
+        assert!(
+            engine
+                .push_recordings_if_due(&p.id, PushTrigger::SessionEnd)
+                .await
+                .expect("finalize"),
+            "and at the end it publishes"
+        );
+        assert_eq!(engine.counters(&p.id).pushes, 1, "exactly one");
+        assert_eq!(
+            engine.counters(&p.id).commits,
+            3,
+            "the finalize push has nothing left to commit"
+        );
+        assert!(published(&remote, &p.branch));
+    }
+
+    /// Epic 41's headline acceptance, in the counts it is stated in: a
+    /// four-hour session of 48 rotations is 48 commits, ONE `.gitattributes`
+    /// write, one push, and a journal that does not grow with the session.
+    ///
+    /// The `manifest.json` half of that count is the shell's (FR-146); this is
+    /// everything the engine is accountable for.
+    #[tokio::test]
+    async fn a_four_hour_session_commits_every_rotation_and_writes_the_rule_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = recordings_profile(dir.path(), &remote, PushPolicy::SessionEnd);
+        // A recorded segment is a large file, which is the whole reason the
+        // session writes an LFS rule at all. Below the threshold the rule would
+        // govern paths keeper stages as ordinary blobs, and this test would be
+        // measuring a configuration nobody records with.
+        p.lfs_threshold_bytes = 1024;
+        engine.upsert_profile(&p).expect("upsert");
+
+        // Session start: the one moment the working tree is allowed to change.
+        assert!(engine.ensure_lfs_rule(&p.id, "mkv").expect("rule"));
+
+        // Four hours at five minutes a segment.
+        const ROTATIONS: u64 = 48;
+        let mut committed_paths = 0;
+        for rotation in 0..ROTATIONS {
+            close_segment(&engine, &p, &format!("clip-{rotation:02}.mkv"), 4_096);
+            platform.advance_ms(5 * 60_000);
+            let paths = engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("commit at close");
+            assert!(paths >= 1, "rotation {rotation} must commit as it closes");
+            committed_paths += paths;
+            // The session's own rule makes every `*.mkv` a filtered path, so a
+            // racily-clean entry would send git to `filter.lfs.clean` — the
+            // libtest harness, here — 48 times over. See `unrace_the_index`.
+            unrace_the_index(&p);
+            assert_eq!(
+                engine.counters(&p.id).commits,
+                rotation + 1,
+                "one commit per rotation, never a batch"
+            );
+            assert!(
+                !engine
+                    .push_recordings_if_due(&p.id, PushTrigger::SegmentCommitted)
+                    .await
+                    .expect("policy"),
+                "and must not publish mid-session"
+            );
+        }
+        assert_eq!(
+            committed_paths,
+            ROTATIONS + 1,
+            "48 segments and the session's one rule — the rule rides in whichever \
+             commit follows its own settle window, and in no other"
+        );
+
+        let counters = engine.counters(&p.id);
+        assert_eq!(counters.commits, ROTATIONS, "one commit per rotation");
+        assert_eq!(
+            counters.attribute_writes, 1,
+            "the working tree changed once, at the start, and never under the recorder"
+        );
+        assert_eq!(counters.pushes, 0, "nothing published during the meeting");
+        assert_eq!(
+            engine.pending_for(&p.id).expect("pending"),
+            ROTATIONS as u32,
+            "one upload per segment and not one row more: the journal tracks the \
+             work, never the rotations"
+        );
+
+        // The objects go before the pointers that name them, which is the gate
+        // the finalize push is waiting on (Story 34.15). Drained to quiescence
+        // the way `sync_once` does it — one call claims `CLAIM_LIMIT` — and
+        // bounded by a strictly decreasing count rather than by hope.
+        let mut previous = u32::MAX;
+        loop {
+            engine
+                .drain_journal(&p, false, SyncSource::Watch)
+                .await
+                .expect("drain");
+            let outstanding = engine.lfs_uploads_outstanding(&p).expect("count");
+            if outstanding == 0 || outstanding >= previous {
+                break;
+            }
+            previous = outstanding;
+        }
+        assert_eq!(engine.lfs_uploads_outstanding(&p).expect("count"), 0);
+
+        assert!(
+            engine
+                .push_recordings_if_due(&p.id, PushTrigger::SessionEnd)
+                .await
+                .expect("finalize"),
+            "and the whole session goes out once, at the end"
+        );
+        let counters = engine.counters(&p.id);
+        assert_eq!(counters.pushes, 1);
+        assert_eq!(counters.commits, ROTATIONS, "finalize commits nothing new");
+        assert_eq!(counters.attribute_writes, 1);
+        assert!(published(&remote, &p.branch));
+    }
+
+    /// `Immediate` is the opposite trade: one push per rotation, for the person
+    /// who wants the bytes off this machine before the lid can be shut on it.
+    #[tokio::test]
+    async fn the_immediate_policy_publishes_every_segment_as_it_closes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = recordings_profile(dir.path(), &remote, PushPolicy::Immediate);
+        engine.upsert_profile(&p).expect("upsert");
+
+        for rotation in 0..3 {
+            close_segment(&engine, &p, &format!("clip-{rotation}.mkv"), 512);
+            assert!(
+                engine
+                    .push_recordings_if_due(&p.id, PushTrigger::SegmentCommitted)
+                    .await
+                    .expect("policy"),
+                "rotation {rotation} publishes as it closes"
+            );
+            assert_eq!(engine.counters(&p.id).pushes, rotation + 1);
+            // The push commits what it is about to publish, so each rotation is
+            // its own commit rather than a batch at the end.
+            assert_eq!(engine.counters(&p.id).commits, rotation + 1);
+        }
+        assert!(published(&remote, &p.branch));
+    }
+
+    /// `Window` reads the LOCAL wall clock, and the commits simply accumulate
+    /// outside it.
+    #[tokio::test]
+    async fn a_quiet_window_holds_the_commits_until_the_window_opens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = recordings_profile(
+            dir.path(),
+            &remote,
+            PushPolicy::Window {
+                quiet_from: "22:00".to_owned(),
+                quiet_to: "06:00".to_owned(),
+            },
+        );
+        engine.upsert_profile(&p).expect("upsert");
+
+        // A meeting in the middle of the working day, on a machine three hours
+        // east of UTC — so the answer cannot come from the UTC clock alone.
+        platform.set_utc_offset_minutes(180);
+        advance_to_local(&platform, 14, 0);
+        for rotation in 0..3 {
+            close_segment(&engine, &p, &format!("clip-{rotation}.mkv"), 512);
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("commit at close");
+            assert!(
+                !engine
+                    .push_recordings_if_due(&p.id, PushTrigger::SegmentCommitted)
+                    .await
+                    .expect("policy"),
+                "14:00 is not in the quiet hours"
+            );
+        }
+        assert!(
+            !engine
+                .push_recordings_if_due(&p.id, PushTrigger::SessionEnd)
+                .await
+                .expect("policy"),
+            "and neither is the end of a session held during the day"
+        );
+        assert_eq!(engine.counters(&p.id).commits, 3, "the commits accumulate");
+        assert_eq!(engine.counters(&p.id).pushes, 0);
+        assert!(!published(&remote, &p.branch));
+
+        // The evening comes.
+        advance_to_local(&platform, 23, 0);
+        assert!(
+            engine
+                .push_recordings_if_due(&p.id, PushTrigger::SegmentCommitted)
+                .await
+                .expect("policy"),
+            "inside the window the accumulated work goes out"
+        );
+        assert_eq!(engine.counters(&p.id).pushes, 1);
+        assert!(published(&remote, &p.branch));
+    }
+
+    /// A remote that is not there for the whole session costs nothing but the
+    /// publication, and the outstanding work drains when it comes back — with
+    /// the pointer-ahead-of-its-object gate applying throughout (Story 34.15).
+    #[tokio::test]
+    async fn an_unreachable_remote_costs_the_push_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Deliberately not initialized: this is what an unreachable remote
+        // looks like from here.
+        let remote = dir.path().join("remote.git");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = recordings_profile(dir.path(), &remote, PushPolicy::Immediate);
+        p.lfs_threshold_bytes = 1024;
+        engine.upsert_profile(&p).expect("upsert");
+
+        let mut segments = Vec::new();
+        for rotation in 0..2 {
+            segments.push(close_segment(
+                &engine,
+                &p,
+                &format!("clip-{rotation}.mp4"),
+                4_096,
+            ));
+            assert!(
+                !engine
+                    .push_recordings_if_due(&p.id, PushTrigger::SegmentCommitted)
+                    .await
+                    .expect("a dead remote is not an error the recorder handles"),
+                "rotation {rotation} cannot publish"
+            );
+            unrace_the_index(&p);
+        }
+        assert_eq!(
+            engine.counters(&p.id).commits,
+            2,
+            "every segment is committed locally regardless"
+        );
+        assert_eq!(
+            engine.counters(&p.id).pushes,
+            0,
+            "the outstanding objects hold the push before it is even attempted, \
+             so no pointer can be published ahead of its object"
+        );
+        assert_eq!(engine.lfs_uploads_outstanding(&p).expect("count"), 2);
+        assert!(
+            segments.iter().all(|path| path.exists()),
+            "and nothing is deleted while the remote is away"
+        );
+
+        // The remote returns. The objects go first — that is the gate — and
+        // only then does the branch.
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        engine
+            .drain_journal(&p, false, SyncSource::Watch)
+            .await
+            .expect("drain");
+        assert_eq!(engine.lfs_uploads_outstanding(&p).expect("count"), 0);
+        assert!(
+            engine
+                .push_recordings_if_due(&p.id, PushTrigger::SessionEnd)
+                .await
+                .expect("finalize"),
+            "the session's work drains on reconnect"
+        );
+        assert_eq!(engine.counters(&p.id).pushes, 1);
+        assert!(published(&remote, &p.branch));
+
+        let store = lfs::local::remote_store(&p.remote_url).expect("a filesystem remote");
+        let repo = engine.open_repo(&p).expect("open");
+        for rotation in 0..2 {
+            let rela = PathBuf::from(format!("recordings/clip-{rotation}.mp4"));
+            let pointer =
+                lfs::stage::indexed_pointer(&repo, &rela).expect("every segment is a pointer");
+            assert!(
+                store.contains(&pointer.oid, pointer.size),
+                "the published pointer's object has to be on the remote too: {}",
+                store.object_path(&pointer.oid).display()
+            );
+        }
+    }
+
+    /// A paused profile and an unplugged drive are refusals, not failures, and
+    /// neither one loses a segment (AD-48, NFR-31).
+    #[tokio::test]
+    async fn a_paused_profile_and_an_absent_volume_refuse_and_delete_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = recordings_profile(dir.path(), &remote, PushPolicy::Immediate);
+        engine.upsert_profile(&p).expect("upsert");
+        let segment = close_segment(&engine, &p, "clip.mkv", 512);
+
+        engine.set_enabled(&p.id, false).expect("pause");
+        assert!(
+            !engine
+                .push_recordings_if_due(&p.id, PushTrigger::SessionEnd)
+                .await
+                .expect("a paused folder is not an error"),
+            "a paused folder publishes nothing and says so"
+        );
+        assert_eq!(engine.counters(&p.id).pushes, 0);
+        assert!(segment.exists(), "pausing is not deleting");
+        assert!(!published(&remote, &p.branch));
+
+        // Resumed, but the drive it lives on is gone: `removable` with no
+        // marker anywhere above the folder is exactly an unplugged stick.
+        engine.set_enabled(&p.id, true).expect("resume");
+        let mut removable = p.clone();
+        removable.removable = true;
+        engine.upsert_profile(&removable).expect("upsert");
+        assert!(
+            !engine
+                .push_recordings_if_due(&p.id, PushTrigger::SessionEnd)
+                .await
+                .expect("an absent volume is not an error either"),
+            "an unplugged drive publishes nothing and says so"
+        );
+        assert_eq!(engine.counters(&p.id).pushes, 0);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::MediaAbsent
+        );
+        assert!(
+            segment.exists(),
+            "an unplugged drive must never be read as a deletion"
+        );
+    }
+
+    /// The quiet window is local wall-clock, half-open, and wraps midnight —
+    /// which is the shape people actually configure.
+    #[test]
+    fn a_quiet_window_wraps_midnight_and_follows_the_local_clock() {
+        /// `hh:mm` on the epoch's own day, in UTC milliseconds.
+        fn utc(hour: i64, minute: i64) -> i64 {
+            (hour * 60 + minute) * 60_000
+        }
+        let wrapping = |now: i64, offset: i32| within_quiet_window(now, offset, "22:00", "06:00");
+
+        assert_eq!(wrapping(utc(23, 0), 0), Some(true), "after midnight's eve");
+        assert_eq!(wrapping(utc(2, 0), 0), Some(true), "and after midnight");
+        assert_eq!(wrapping(utc(22, 0), 0), Some(true), "the start is inside");
+        assert_eq!(wrapping(utc(6, 0), 0), Some(false), "the end is not");
+        assert_eq!(wrapping(utc(12, 0), 0), Some(false), "the middle of a day");
+
+        // The same instant, read on two different wall clocks. This is the
+        // whole reason the offset is a port method rather than an assumption.
+        assert_eq!(wrapping(utc(20, 0), 0), Some(false), "20:00 in London");
+        assert_eq!(wrapping(utc(20, 0), 180), Some(true), "23:00 in Istanbul");
+
+        // A window that does not wrap is read as written.
+        let plain = |now: i64| within_quiet_window(now, 0, "01:00", "05:00");
+        assert_eq!(plain(utc(3, 0)), Some(true));
+        assert_eq!(plain(utc(0, 30)), Some(false));
+        assert_eq!(plain(utc(6, 0)), Some(false));
+
+        // West of UTC before the epoch: the local millisecond count is
+        // negative, and a `%` here would answer with a negative minute-of-day
+        // that compares below every window ever configured.
+        assert_eq!(
+            within_quiet_window(-1, -300, "18:00", "19:00"),
+            Some(true),
+            "one millisecond before the epoch, five hours west, is 18:59 local"
+        );
+
+        // Unreadable rather than guessed. `RecordingsConfig::validate` refuses
+        // all of these, so reaching one means a row edited outside keeper.
+        for bad in ["", "noon", "24:00", "12:60", "12", "12:0x"] {
+            assert_eq!(
+                within_quiet_window(utc(23, 0), 0, bad, "06:00"),
+                None,
+                "{bad:?} says nothing about when to push"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Story 41.6 — durability you can read
+    // -----------------------------------------------------------------------
+
+    /// A second folder bound to the SAME remote.
+    ///
+    /// The cheapest honest way to make a remote that has moved on without this
+    /// folder, which is all a rejected push is: two unrelated histories aimed
+    /// at one branch. Nothing here fakes a git answer — the second push is
+    /// refused by real git for the real reason.
+    fn rival_profile(dir: &Path, remote: &Path) -> SyncProfile {
+        let mut p = recordings_profile(dir, remote, PushPolicy::Immediate);
+        p.id = "01JTESTRIVAL".to_owned();
+        p.name = "rival".to_owned();
+        p.local_path = dir.join("rival");
+        std::fs::create_dir_all(p.recordings_root().expect("a recordings root"))
+            .expect("the rival's recordings root");
+        p
+    }
+
+    /// FR-138: the state a recording surface reads advances local → committed
+    /// → pushed, from local facts only.
+    #[tokio::test]
+    async fn a_segment_reads_local_then_committed_then_pushed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = recordings_profile(dir.path(), &remote, PushPolicy::SessionEnd);
+        engine.upsert_profile(&p).expect("upsert");
+
+        // A segment that has just closed is on this disk and nowhere else.
+        let first = close_segment(&engine, &p, "clip-0.mkv", 512);
+        let local = engine.path_durability(&p.id, &first).expect("read");
+        assert_eq!(
+            local,
+            PathDurability::default(),
+            "an uncommitted segment promises nothing beyond the drive it is on"
+        );
+
+        // Committed at close (Story 41.5) is the first real promise.
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("commit at close"),
+            1
+        );
+        let committed = engine.path_durability(&p.id, &first).expect("read");
+        assert!(committed.committed, "the segment is in a commit now");
+        assert!(
+            !committed.pushed,
+            "and nothing has been published, so it must not claim to be"
+        );
+        assert!(!committed.verified);
+        assert_eq!(committed.problem, None, "nothing has gone wrong");
+
+        // Published. The claim is branch-level, and the branch is now on the
+        // remote, so the segment it carries is too.
+        assert!(
+            engine
+                .push_recordings_if_due(&p.id, PushTrigger::SessionEnd)
+                .await
+                .expect("finalize"),
+            "the session-end push publishes"
+        );
+        assert!(published(&remote, &p.branch));
+        let pushed = engine.path_durability(&p.id, &first).expect("read");
+        assert!(
+            pushed.committed && pushed.pushed,
+            "the segment's commit has reached the remote: {pushed:?}"
+        );
+        assert!(
+            !pushed.verified,
+            "`verified` is the verification pass's word, never guessed from a push"
+        );
+
+        // Mid-session mix: the next segment closes and is not committed yet.
+        // The engine reports each path honestly — the never-regress floor is
+        // the surface's job, and it can only keep a floor if the readings
+        // underneath it are true.
+        let second = close_segment(&engine, &p, "clip-1.mkv", 512);
+        let fresh = engine.path_durability(&p.id, &second).expect("read");
+        assert!(
+            !fresh.committed && !fresh.pushed,
+            "a segment that just closed is local, whatever its predecessors reached"
+        );
+        let older = engine.path_durability(&p.id, &first).expect("read");
+        assert!(
+            older.committed && older.pushed,
+            "and a segment already on the remote does not stop being on it: {older:?}"
+        );
+    }
+
+    /// A recording whose publication was refused reads "committed", and the
+    /// reason is available in the words the engine recorded — not as a generic
+    /// sync error, and never as a failure of the recording.
+    #[tokio::test]
+    async fn a_rejected_push_stays_committed_and_carries_the_recorded_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+
+        // Someone else's history gets to the branch first.
+        let rival = rival_profile(dir.path(), &remote);
+        engine.upsert_profile(&rival).expect("upsert the rival");
+        close_segment(&engine, &rival, "theirs.mkv", 512);
+        assert!(
+            engine
+                .push_recordings_if_due(&rival.id, PushTrigger::SessionEnd)
+                .await
+                .expect("the rival publishes"),
+            "the remote has to hold work this folder does not, or nothing is rejected"
+        );
+
+        // Now our own session records and tries to publish.
+        let p = recordings_profile(dir.path(), &remote, PushPolicy::Immediate);
+        engine.upsert_profile(&p).expect("upsert");
+        let segment = close_segment(&engine, &p, "ours.mkv", 512);
+        assert!(
+            !engine
+                .push_recordings_if_due(&p.id, PushTrigger::SegmentCommitted)
+                .await
+                .expect("a refused push is not an error the recorder handles"),
+            "the remote refuses this push"
+        );
+
+        let durability = engine.path_durability(&p.id, &segment).expect("read");
+        assert!(
+            durability.committed,
+            "the recording did not fail — its publication did: {durability:?}"
+        );
+        assert!(!durability.pushed, "and it is not on the remote");
+        let problem = durability
+            .problem
+            .expect("a refused publication must be able to say why");
+        assert_eq!(
+            Some(problem.clone()),
+            engine.status(&p.id).expect("status").error,
+            "verbatim: the sentence the engine recorded, not a second wording of it"
+        );
+        assert!(
+            problem.to_ascii_lowercase().contains("failed to push"),
+            "the reason has to be git's own account of the refused publication — the recording \
+             did not fail — got: {problem}"
+        );
+        // The recording itself is untouched by any of it.
+        assert!(segment.exists());
+    }
+
+    /// Every refusal is `Ok` with nothing claimed, because a durability read
+    /// runs on the poll path of a live capture (NFR-31).
+    #[test]
+    fn a_durability_read_refuses_rather_than_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = recordings_profile(dir.path(), dir.path(), PushPolicy::SessionEnd);
+        let root = p.recordings_root().expect("a recordings root");
+
+        // Nothing stored under that id at all.
+        assert_eq!(
+            engine
+                .path_durability("01NOSUCHPROFILE", &root.join("clip.mkv"))
+                .expect("no such profile"),
+            PathDurability::default()
+        );
+
+        // The same folder with its recordings block removed, the way
+        // `an_lfs_rule_that_cannot_be_written_is_refused_rather_than_failed`
+        // removes LFS: there is no recordings root to be inside, so there is no
+        // promise to make about anything in it.
+        let mut without_recordings = p.clone();
+        without_recordings.recordings = None;
+        engine.upsert_profile(&without_recordings).expect("upsert");
+        assert_eq!(
+            engine
+                .path_durability(&p.id, &root.join("clip.mkv"))
+                .expect("no recordings"),
+            PathDurability::default()
+        );
+
+        engine.upsert_profile(&p).expect("upsert");
+        // Outside the recordings root: elsewhere in the folder, outside the
+        // folder, relative, and reaching back out with `..`.
+        for outside in [
+            p.local_path.join("notes.md"),
+            dir.path().join("elsewhere/clip.mkv"),
+            PathBuf::from("clip.mkv"),
+            root.join("../notes.md"),
+        ] {
+            assert_eq!(
+                engine
+                    .path_durability(&p.id, &outside)
+                    .expect("outside is a refusal, not an error"),
+                PathDurability::default(),
+                "{} must be refused",
+                outside.display()
+            );
+        }
+
+        // Paused: what is on the drive is all there is to say.
+        engine.set_enabled(&p.id, false).expect("pause");
+        assert_eq!(
+            engine
+                .path_durability(&p.id, &root.join("clip.mkv"))
+                .expect("paused"),
+            PathDurability::default()
+        );
+    }
+
+    /// The read is local-only: a folder whose remote is not there answers
+    /// exactly as fast and exactly as honestly as one whose remote is.
+    ///
+    /// Proved the way this module proves offline behaviour elsewhere — a remote
+    /// that was never initialized, which is what an unreachable one looks like
+    /// from here — plus a wall-clock bound, because "cheap on a 1 Hz poll" is
+    /// the constraint and a call that reached out would spend its timeout here.
+    #[test]
+    fn a_durability_read_answers_promptly_with_the_remote_unreachable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Deliberately not initialized, and a host that resolves to nothing:
+        // any attempt to consult the remote would either fail or hang, and both
+        // are visible in what this asserts.
+        let unreachable = dir.path().join("never-created.git");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut p = recordings_profile(dir.path(), &unreachable, PushPolicy::SessionEnd);
+        p.remote_url = "https://git.invalid/x/y.git".to_owned();
+        engine.upsert_profile(&p).expect("upsert");
+        let segment = close_segment(&engine, &p, "clip.mkv", 512);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("commit at close"),
+            1
+        );
+
+        // Ten reads, the poll rate of ten seconds of recording.
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            let durability = engine.path_durability(&p.id, &segment).expect("read");
+            assert!(
+                durability.committed,
+                "the commit is local, so an absent remote cannot make it unknown"
+            );
+            assert!(
+                !durability.pushed,
+                "and nothing may be claimed about a remote nobody has spoken to"
+            );
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "ten reads took {elapsed:?}; a read that consults the remote cannot be polled"
+        );
+        assert_eq!(
+            engine.counters(&p.id).pushes,
+            0,
+            "reading durability must never publish anything"
         );
     }
 }

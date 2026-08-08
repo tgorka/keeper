@@ -96,6 +96,21 @@ impl SyncPlatform for ShellSyncPlatform {
             .unwrap_or(0)
     }
 
+    fn utc_offset_minutes(&self) -> i32 {
+        // Overridden rather than left to the port's default (Story 41.5): the
+        // default reads the zone through `gix`, whose local-time lookup falls
+        // back to UTC when it cannot determine one — and inside a heavily
+        // threaded desktop app that fallback is the likely branch, not the
+        // unlikely one. A `PushPolicy::Window` of `22:00`–`06:00` evaluated in
+        // UTC is a window that opens at the wrong time of night for everyone
+        // east or west of it.
+        //
+        // `chrono::Local` is already the shell's only clock — it names every
+        // session folder and stamps every manifest — so this is that same
+        // answer, not a second one.
+        chrono::Local::now().offset().local_minus_utc() / 60
+    }
+
     fn free_space(&self, path: &Path) -> Option<u64> {
         // Fail-open, matching the recording disk guard: refusing to sync
         // because a statvfs failed is worse than running out of space and
@@ -514,6 +529,31 @@ mod tests {
         assert!(
             !label.contains('.'),
             "expected a short label, got {label:?}"
+        );
+    }
+
+    /// Story 41.5: a `PushPolicy::Window` is an `HH:MM` a person typed on the
+    /// clock on their wall, so the offset the engine converts it with has to be
+    /// the same offset the shell stamps a session with — in MINUTES, and with
+    /// git's sign convention (east of UTC positive).
+    ///
+    /// The expectation is read back out of the RFC 3339 stamp `recording_start`
+    /// writes rather than recomputed, so a seconds-for-minutes slip or an
+    /// inverted sign fails here instead of opening someone's quiet window at
+    /// two in the afternoon.
+    #[test]
+    fn the_window_offset_is_the_one_the_shell_stamps_sessions_with() {
+        let stamped = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        let parsed = chrono::DateTime::parse_from_rfc3339(&stamped).expect("the session stamp");
+        let platform = ShellSyncPlatform::new(Arc::new(CapturingPlatform::new()));
+        assert_eq!(
+            platform.utc_offset_minutes(),
+            parsed.offset().local_minus_utc() / 60
+        );
+        assert!(
+            (-720..=840).contains(&platform.utc_offset_minutes()),
+            "a real zone offset, not seconds: {}",
+            platform.utc_offset_minutes()
         );
     }
 

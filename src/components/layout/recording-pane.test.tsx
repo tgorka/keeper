@@ -39,6 +39,9 @@ vi.mock("@/lib/ipc/client", () => ({
       fps: 30,
     }),
   ),
+  // Story 41.2: the Destination card asks which synced folders are flagged on
+  // mount. No flagged profile is this suite's world — today's card.
+  recordingDestinationProfiles: vi.fn(() => Promise.resolve([])),
   recordingSettingsSet: vi.fn((vm: unknown) => Promise.resolve(vm)),
   // The completion / recovery cards (Story 20.3): the summary fetch, the
   // cross-restart recovery scan, the acknowledgement latch, and Reveal.
@@ -174,6 +177,7 @@ const IDLE_STATUS: RecordingStatusVm = {
   onDiskBytes: 0,
   currentSegmentBytes: 0,
   segmentCapMb: 0,
+  durability: { state: "local", detail: null },
 };
 
 const RECORDING_STATUS: RecordingStatusVm = {
@@ -186,6 +190,7 @@ const RECORDING_STATUS: RecordingStatusVm = {
   onDiskBytes: 412_000_000,
   currentSegmentBytes: 100_000_000,
   segmentCapMb: 500,
+  durability: { state: "local", detail: null },
 };
 
 const GRANTED: RecordingPermissionVm = {
