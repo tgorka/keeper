@@ -1403,22 +1403,37 @@ impl Provider {
     }
 }
 
-/// The kind of a network egress destination (Story 11.2, NFR-11).
+/// The kind of a network egress destination (Story 11.2, NFR-11; Story 23.7).
 ///
 /// Classifies each entry in the [`EgressEndpointVm`] list the Settings → About
 /// surface renders so the frontend can label it honestly without re-deriving the
 /// classification. `Homeserver` is an account's Matrix homeserver; `Beeper` is the
 /// `api.beeper.com` login/service endpoint present exactly when a Beeper account
-/// exists; `Update` is the signed-update endpoint the app checks. Serializes to
-/// `"homeserver" | "beeper" | "update"`.
+/// exists; `GitRemote` is the host of one folder-sync profile's remote repository;
+/// `Update` is the signed-update endpoint the app checks. Serializes to
+/// `"homeserver" | "beeper" | "gitRemote" | "update"`.
+///
+/// The container rename is `camelCase` rather than `lowercase` (Story 23.7) so a
+/// multi-word variant reads as `gitRemote` on the wire, matching every other
+/// multi-word IPC enum in this module (e.g. [`IpcErrorCode`]). The three
+/// pre-existing single-word variants serialize identically under either rule, so
+/// this changed no existing wire value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub enum EgressKind {
     /// A Matrix homeserver an account is signed into.
     Homeserver,
     /// Beeper's `api.beeper.com` service endpoint (present iff a Beeper account exists).
     Beeper,
+    /// The remote *host* of a folder-sync profile's repository (Story 23.7).
+    ///
+    /// The host alone, never the full remote URL: a remote URL carries a path, can
+    /// carry a username, and — in a profile whose token was stored in the URL
+    /// instead of the keychain — a credential. An egress disclosure answers "where
+    /// do bytes go", and the host is the whole of that answer; the rest is only
+    /// material to leak onto a screen the user may be sharing.
+    GitRemote,
     /// The signed auto-update endpoint (`plugins.updater.endpoints`).
     Update,
 }
@@ -1428,16 +1443,21 @@ pub enum EgressKind {
 ///
 /// The Settings → About surface renders the full set of these — computed by
 /// `egress::compute_egress` from the accounts registry (each homeserver, plus
-/// `api.beeper.com` when a Beeper account exists) and the shared update endpoint —
+/// `api.beeper.com` when a Beeper account exists), the live folder-sync profile
+/// set (each distinct remote host, Story 23.7) and the shared update endpoint —
 /// so keeper's egress claim is verifiable rather than asserted. Never fabricated,
-/// never stale-cached: it is read from the same registry the session-restore path
-/// uses on each open. `url` is the destination shown; `label` is a short honest
-/// caption; `kind` classifies it for rendering.
+/// never stale-cached: both the registry rows and the profile rows are read on
+/// each open, from the same stores the session-restore and sync paths use, so
+/// adding or removing an account or a profile changes this list immediately.
+/// `url` is the destination shown; `label` is a short honest caption; `kind`
+/// classifies it for rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct EgressEndpointVm {
-    /// The destination URL (or the raw stored homeserver string when unparseable).
+    /// The destination shown: a homeserver URL (the raw stored string when it is
+    /// unparseable), a fixed service endpoint, or — for [`EgressKind::GitRemote`] —
+    /// the bare host of a sync remote, never its full URL.
     pub url: String,
     /// The classification of this destination.
     pub kind: EgressKind,

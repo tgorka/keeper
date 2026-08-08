@@ -11,13 +11,21 @@ import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stor
 
 /**
  * The honest disclosure of what the egress list is and the no-telemetry invariant
- * (Story 11.2, NFR-11, UX-DR17). Sentence case, no exclamation marks (project voice).
+ * (Story 11.2, NFR-11, UX-DR17; Story 23.7). Sentence case, no exclamation marks
+ * (project voice).
+ *
  * Note the GitHub asset CDN: the update *check* hits github.com (listed), but the
  * update *download* is redirected to GitHub's release CDN (githubusercontent.com), so
  * the copy discloses it rather than claiming the listed hosts are exhaustive.
+ *
+ * The sentence names folder-sync profiles alongside accounts because the list now
+ * derives from both (Story 23.7). It has to: a sync remote's row shows a bare host
+ * with no scheme and no path, and a person reading "computed from your live
+ * accounts" beside `github.com` would reasonably conclude the list had invented an
+ * entry. Naming the second input is what makes the row legible as a disclosure.
  */
 const EGRESS_HONESTY_SENTENCE =
-  "These are the servers keeper connects to, computed from your live accounts — nothing else. keeper has no telemetry, analytics, or crash reporting. App-update files are delivered by GitHub's release CDN (githubusercontent.com).";
+  "These are the servers keeper connects to, computed from your live accounts and folder-sync profiles — nothing else. A folder-sync entry shows the remote's host only, never the repository path or any credential. keeper has no telemetry, analytics, or crash reporting. App-update files are delivered by GitHub's release CDN (githubusercontent.com).";
 
 /**
  * The honest copy for the signed-update control (Story 11.2, NFR-12). Explains that
