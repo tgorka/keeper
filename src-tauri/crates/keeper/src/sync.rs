@@ -27,7 +27,7 @@ use keeper_core::platform::Platform;
 use keeper_core::vm::NotifyTarget;
 use keeper_sync::engine::Engine;
 use keeper_sync::git::resolve::{GitRequest, GitResolution};
-use keeper_sync::{Result as SyncResult, SyncError, SyncPlatform};
+use keeper_sync::{Result as SyncResult, SyncError, SyncPlatform, SyncProfile};
 
 /// Bridges the engine's port onto the shell's existing [`Platform`].
 ///
@@ -329,6 +329,34 @@ pub fn engine_if_open() -> Option<Arc<Engine>> {
 /// `Engine::set_credential` that the engine has no use for.
 pub fn sync_platform(platform: Arc<dyn Platform>) -> ShellSyncPlatform {
     ShellSyncPlatform::new(platform)
+}
+
+/// The enabled sync profile whose folder CONTAINS `path`, if any.
+///
+/// The engine resolves a profile by id and by nothing else (`sync_once`,
+/// `rescan`, `activity` all take one), so a caller that only knows a PATH has no
+/// way to ask "is this inside a synced folder" without this. Story 40.4's
+/// retitle is that caller: it has just moved a recording and needs the profile —
+/// if there is one — that must commit both halves of the move together.
+///
+/// Deepest match wins. Nothing forbids a profile inside another profile's
+/// folder, and the innermost one is the repository the file actually belongs to.
+/// Disabled profiles are skipped: a paused folder has no repository work to hand
+/// it, and reporting one would only produce a sync call that refuses.
+pub fn profile_for_path(engine: &Engine, path: &Path) -> SyncResult<Option<SyncProfile>> {
+    let mut deepest: Option<SyncProfile> = None;
+    for profile in engine.list_profiles()? {
+        if !profile.enabled || !path.starts_with(&profile.local_path) {
+            continue;
+        }
+        let deeper = deepest.as_ref().is_none_or(|held| {
+            profile.local_path.components().count() > held.local_path.components().count()
+        });
+        if deeper {
+            deepest = Some(profile);
+        }
+    }
+    Ok(deepest)
 }
 
 /// The live supervisor's stop signal, if one is running.

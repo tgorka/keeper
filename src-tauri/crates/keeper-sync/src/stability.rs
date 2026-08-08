@@ -287,6 +287,66 @@ impl StabilityGate {
         );
     }
 
+    /// Record `path` as having *already* been quiet long enough that the very
+    /// next [`Self::verdict`] returns [`StabilityVerdict::Stable`] — the rename
+    /// escape hatch (Story 40.4).
+    ///
+    /// Tier 2 measures quiescence from the first moment it *saw* a path. That
+    /// is the right question for a file being written and the wrong one for a
+    /// file that was **renamed**: its bytes have been finished for as long as
+    /// they existed under the old name, and there is no writer left to wait
+    /// for. Treating the arrival as brand new is not merely a delay — it splits
+    /// one move into a deletion commit now (a deletion has nothing to sample,
+    /// so it is never held) and an addition commit a window later, and
+    /// `git log --follow` cannot see across that split, because git infers a
+    /// rename only from a disappearance and an arrival inside the SAME commit.
+    ///
+    /// The entry is backdated by [`SETTLE_CEILING_MS`] rather than by the
+    /// settle window, because the window is not the only thing that would hold
+    /// it: `verdict` also refuses a file whose own mtime is younger than the
+    /// window, and a move is routinely accompanied by a rewrite of one file in
+    /// it (the retitle rewrites `manifest.json`). The ceiling is the one
+    /// condition `verdict` checks before any other, so a ceiling-aged entry
+    /// clears regardless of mtime.
+    ///
+    /// What comes out is an ordinary [`Entry`], reached by the ordinary path:
+    /// `verdict` cannot tell a primed entry from one that has genuinely been
+    /// pending since the ceiling, and neither can [`Self::export`], so a prime
+    /// survives a restart exactly like any other episode.
+    ///
+    /// The file is sampled here rather than left for the next observation,
+    /// because [`Self::is_stable`] restarts the run whenever the sample it
+    /// takes differs from `last` — an entry holding a guessed tuple would prime
+    /// nothing. Returns whether an entry was recorded: an excluded path, or one
+    /// that cannot be stat-ed (it vanished again, or it is unreadable), is left
+    /// alone rather than treated as an error, since the gate's ordinary
+    /// fail-closed handling is the correct answer for both.
+    pub fn prime_stable(&mut self, path: &Path, now_ms: i64) -> bool {
+        let relative = path.strip_prefix(&self.root).unwrap_or(path);
+        if self.excludes.is_excluded(relative) {
+            return false;
+        }
+        let Ok(Some(sample)) = FileSample::of(path) else {
+            return false;
+        };
+        let ceiling = i64::try_from(SETTLE_CEILING_MS).unwrap_or(i64::MAX);
+        let quiet_since_ms = now_ms.saturating_sub(ceiling);
+        // Replaces any existing entry outright: whatever tier 2 remembered
+        // about this path described the bytes that used to be here, and a
+        // rename has just put different ones in their place.
+        self.entries.insert(
+            path.to_path_buf(),
+            Entry {
+                last: sample,
+                unchanged_since_ms: quiet_since_ms,
+                pending_since_ms: quiet_since_ms,
+                close_write: false,
+            },
+        );
+        self.pending_close_write.remove(path);
+        true
+    }
+
     /// Tier 2's answer for an already-observed path.
     ///
     /// `Stable` requires the tuple to have been identical across two
@@ -937,6 +997,60 @@ mod tests {
             ceiling.verdict(&log, 60_001, SETTLE),
             StabilityVerdict::Settling { .. }
         ));
+    }
+
+    /// The asymmetry Story 40.4 turns on: a renamed file must clear tier 2 on
+    /// the FIRST look, because the scan that sees its arrival is the same scan
+    /// that sees its old name disappear, and only one commit can hold both.
+    #[test]
+    fn a_primed_path_is_stable_on_its_first_look_while_an_unprimed_twin_settles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let moved = dir.path().join("moved.bin");
+        let fresh = dir.path().join("fresh.bin");
+        std::fs::write(&moved, b"the same bytes under a new name").expect("write");
+        std::fs::write(&fresh, b"the same bytes under a new name").expect("write");
+        let mut g = StabilityGate::new(
+            dir.path(),
+            ExcludeSet::new(&[]).expect("corpus compiles"),
+            SETTLE,
+        );
+        // The real wall clock, not an injected epoch: both files were written a
+        // moment ago, so `verdict`'s mtime arm is live and the future-mtime
+        // hatch is not — which is exactly the case a prime has to beat, since a
+        // retitle rewrites `manifest.json` as it moves the folder.
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after 1970")
+                .as_millis(),
+        )
+        .expect("milliseconds since 1970 fit in an i64");
+
+        assert!(g.prime_stable(&moved, now_ms), "a real file is primeable");
+        assert_eq!(
+            g.is_stable(&moved, now_ms),
+            StabilityVerdict::Stable,
+            "a primed path must clear on the very first look"
+        );
+        assert!(matches!(
+            g.is_stable(&fresh, now_ms),
+            StabilityVerdict::Settling { .. }
+        ));
+
+        // Nothing about the primed entry is special-cased in `verdict`: it went
+        // through `is_stable`, which ends the episode like any other stable
+        // path, so only the settling twin is still held.
+        assert_eq!(g.tracked(), 1);
+
+        // A prime is a claim about bytes that exist. Neither an absent path nor
+        // an excluded one is primed, and neither is an error.
+        assert!(!g.prime_stable(&dir.path().join("nope.bin"), now_ms));
+        let mut excluding = StabilityGate::new(
+            dir.path(),
+            ExcludeSet::new(&["*.bin".to_owned()]).expect("pattern compiles"),
+            SETTLE,
+        );
+        assert!(!excluding.prime_stable(&moved, now_ms));
     }
 
     #[test]
