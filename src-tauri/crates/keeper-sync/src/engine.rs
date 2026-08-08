@@ -46,6 +46,7 @@ use crate::progress::{
     ProgressSink, RateMeter, SyncPhase, SyncProgress, SyncStatus, TransferTally,
 };
 use crate::provenance::{commit_message, Provenance, SyncSource};
+use crate::sparse::SparseCone;
 use crate::stability::{FileSample, StabilityGate, StabilityVerdict};
 use crate::volume::{self, VolumeMarker, VolumeStatus};
 use crate::watch::{FolderWatcher, WatchConfig, WatchEvent};
@@ -2789,7 +2790,14 @@ impl Engine {
         let git_dir = profile.local_path.join(".git");
         if git_dir.exists() {
             match self.open_existing_repo(profile, trust_full) {
-                Ok(repo) => return Ok(repo),
+                Ok(repo) => {
+                    // Not folded into `open_existing_repo`: a failure there is
+                    // read as "this folder is not a usable repository" and can
+                    // fall through to re-creating it, and a cone that could not
+                    // be applied is not that. It must surface as itself.
+                    self.reconcile_sparse_cone(profile, &repo)?;
+                    return Ok(repo);
+                }
                 Err(err) => {
                     // A kill inside `gix::init` — the first thing `adopt` does
                     // — leaves a `.git` that exists and is not a repository:
@@ -2870,11 +2878,81 @@ impl Engine {
             git::repo::adopt(&profile.local_path, &profile.remote_url, &profile.branch)?
         };
         git::repo::enforce_local_config_with_filter(&repo, self.filter_program.as_deref())?;
-        if !profile.subpaths.is_empty() {
-            self.git
-                .sparse_set(&profile.local_path, &profile.subpaths)?;
-        }
+        self.reconcile_sparse_cone(profile, &repo)?;
         Ok(repo)
+    }
+
+    /// Make the working tree match the profile's `subpaths[]` (Story 27.2,
+    /// AD-47).
+    ///
+    /// Runs on **every** open, not only after a clone. The cone is profile
+    /// configuration and the user can change it at any time: before this, a
+    /// profile that gained subpaths after its first sync stayed a full checkout
+    /// forever, and one that lost them stayed narrow forever, because the only
+    /// call site was the branch that clones.
+    ///
+    /// Three things happen here, in this order, and the order matters.
+    ///
+    /// 1. The `index.sparse=false` invariant is re-checked *first*, and
+    ///    unconditionally — including for a profile with no subpaths at all,
+    ///    which is exactly the profile nobody would think to check. See
+    ///    [`git::repo::clear_worktree_sparse_override`] for how a `false` in
+    ///    `.git/config` stops being the effective value.
+    /// 2. The cone is applied, but only when it actually differs from what git
+    ///    already has. `sparse-checkout set` re-reads the tree and re-stats the
+    ///    working copy; doing that on every sync tick would keep a pendrive
+    ///    (AD-48) permanently awake for no change at all.
+    /// 3. The invariant is re-checked *after* any mutation, because
+    ///    `git sparse-checkout` is the very command that creates the
+    ///    worktree-scoped configuration a shadowing `index.sparse` lives in.
+    ///    Skipping this would mean the one AC that matters — `gix::status`
+    ///    clean immediately after a sparse materialization — is verified
+    ///    against a state keeper never actually leaves behind.
+    ///
+    /// Emptying `subpaths[]` returns the profile to a full checkout rather than
+    /// leaving it silently narrow. `sparse-checkout disable` restores the files
+    /// it was hiding; it deletes nothing.
+    fn reconcile_sparse_cone(&self, profile: &SyncProfile, repo: &gix::Repository) -> Result<()> {
+        if git::repo::clear_worktree_sparse_override(repo)? {
+            tracing::warn!(
+                profile = %profile.id,
+                "sync: cleared an index.sparse=true a worktree config was shadowing; \
+                 gix cannot read a sparse index"
+            );
+        }
+
+        let cone = SparseCone::new(&profile.subpaths);
+        let applied = git::repo::sparse_patterns(repo)?;
+        let mutated = match (&applied, cone.is_full()) {
+            // Full checkout wanted, full checkout in place.
+            (None, true) => false,
+            (Some(_), true) => {
+                tracing::info!(
+                    profile = profile.name,
+                    "restoring the full checkout: this profile no longer names subpaths"
+                );
+                self.git.sparse_disable(&profile.local_path)?;
+                true
+            }
+            (Some(patterns), false) if cone.is_already_applied(patterns) => false,
+            (_, false) => {
+                tracing::info!(
+                    profile = profile.name,
+                    roots = %cone.roots().join(", "),
+                    "materializing the profile's cone through the git shim"
+                );
+                self.git.sparse_set(&profile.local_path, cone.roots())?;
+                true
+            }
+        };
+
+        if mutated && git::repo::clear_worktree_sparse_override(repo)? {
+            tracing::warn!(
+                profile = %profile.id,
+                "sync: the sparse-checkout left index.sparse shadowed; cleared it"
+            );
+        }
+        Ok(())
     }
 
     /// The `.git`-already-exists path: open it, pin the configuration the
@@ -4275,6 +4353,21 @@ impl Engine {
     /// Runs after a download and after applying remote changes. Objects that
     /// are not in the store yet are queued for transfer instead — so a partial
     /// fetch materializes what it can and returns for the rest.
+    ///
+    /// # The profile's `subpaths[]` filter the transfer, not just the checkout
+    ///
+    /// This is the second consumer of the cone (Story 27.2), and the one that
+    /// actually saves bytes. A cone sparse-checkout on its own reduces no LFS
+    /// traffic whatsoever, because git-lfs is entirely sparse-checkout-unaware
+    /// — it is the `fetchinclude`/`fetchexclude` idiom Story 25.5 names, driven
+    /// off the same list the checkout was, so the two can never drift.
+    ///
+    /// Filtering here rather than relying on the paths simply being absent is
+    /// deliberate. A tracked file outside the cone can still be sitting in the
+    /// working tree: `sparse-checkout set` refuses to remove one that has local
+    /// modifications and says so ("the following paths are not up to date and
+    /// were left despite sparse patterns"). Left unfiltered, that one stale
+    /// pointer would pull down the gigabytes the profile exists to avoid.
     fn materialize_pending(
         &self,
         profile: &SyncProfile,
@@ -4284,7 +4377,11 @@ impl Engine {
             return Ok(());
         }
         let repo = self.open_repo(profile)?;
-        let tracked = git::repo::tracked_paths(&repo)?;
+        let cone = SparseCone::new(&profile.subpaths);
+        let tracked: Vec<PathBuf> = git::repo::tracked_paths(&repo)?
+            .into_iter()
+            .filter(|path| cone.includes(path))
+            .collect();
         let pending = lfs::stage::pending_smudges(&profile.local_path, &tracked)?;
         if pending.is_empty() {
             return Ok(());
@@ -4294,9 +4391,10 @@ impl Engine {
         let mut materialized = 0usize;
         for smudge in &pending {
             if store.contains(&smudge.pointer.oid, smudge.pointer.size) {
-                // Pointer-only mode leaves excluded content as a pointer on
-                // purpose; it is the only lever that reduces LFS traffic,
-                // because git-lfs is entirely sparse-checkout-unaware.
+                // Pointer-only mode leaves content as a pointer on purpose: it
+                // is the whole-profile lever, where `subpaths[]` above is the
+                // per-path one. Both exist because git-lfs is entirely
+                // sparse-checkout-unaware.
                 if profile.lfs_mode == LfsMode::PointerOnly {
                     continue;
                 }
@@ -6130,6 +6228,287 @@ mod tests {
         engine
             .commit_local(p, SyncSource::Watch, None)
             .expect("second pass commits")
+    }
+
+    /// A committed fixture with content at the root and in three directories.
+    ///
+    /// Every file is tiny on purpose. `Engine::open` registers
+    /// `filter.lfs.clean` as `std::env::current_exe()`, which under `cargo test`
+    /// is the libtest harness; staying far below `lfs_threshold_bytes` keeps
+    /// `.gitattributes` unwritten and that filter unreachable, so these tests
+    /// measure the sparse cone and nothing else.
+    fn committed_tree(engine: &Engine, platform: &TestPlatform, dir: &Path) -> SyncProfile {
+        let p = adoptable(dir);
+        for path in [
+            "README.md",
+            "docs/d.md",
+            "media/NOTES.md",
+            "media/video/v.txt",
+            "media/audio/a.txt",
+        ] {
+            let target = p.local_path.join(path);
+            std::fs::create_dir_all(target.parent().expect("a parent")).expect("fixture dir");
+            std::fs::write(&target, path.as_bytes()).expect("fixture file");
+        }
+        engine.upsert_profile(&p).expect("upsert");
+        assert!(
+            commit_after_settling(engine, platform, &p) > 0,
+            "the fixture must actually be committed, or nothing below is sparse"
+        );
+        let repo = engine.open_repo(&p).expect("open the fixture");
+        assert!(
+            git::repo::status_paths(&repo).expect("status").is_empty(),
+            "the fixture must start clean, or no assertion about a clean sparse \
+             materialization proves anything"
+        );
+        p
+    }
+
+    /// Every file in the working tree, repository-relative and sorted.
+    fn materialized(root: &Path) -> Vec<String> {
+        fn walk(root: &Path, at: &Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(at).expect("read dir") {
+                let path = entry.expect("dir entry").path();
+                if path.file_name().is_some_and(|name| name == ".git") {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else {
+                    out.push(
+                        path.strip_prefix(root)
+                            .expect("under the root")
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Story 27.2's acceptance criterion, both halves of it.
+    ///
+    /// The second half is the one that bites. A cone checkout leaves the index
+    /// holding every path — the out-of-cone ones flagged `SKIP_WORKTREE` — while
+    /// the working tree holds only some of them, and any disagreement between
+    /// those two views reports as a tree full of deletions. It reads clean only
+    /// because AD-47 pairs the cone with a **non-sparse** index: `gix::status`
+    /// skips a `SKIP_WORKTREE` entry, and hard-fails outright on an index that
+    /// is genuinely sparse.
+    #[test]
+    fn a_profile_scoped_to_one_directory_materializes_only_it_and_reads_clean() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = committed_tree(&engine, &platform, dir.path());
+
+        p.subpaths = vec!["media/video".to_owned()];
+        let repo = engine.open_repo(&p).expect("opening applies the cone");
+
+        assert_eq!(
+            materialized(&p.local_path),
+            [
+                // Cone mode keeps every root file and every file on the way in
+                // to a cone root; see `crate::sparse` for why the LFS filter has
+                // to agree with that and not with the narrower reading.
+                "README.md",
+                "media/NOTES.md",
+                "media/video/v.txt",
+            ],
+            "docs/ and media/audio/ must be gone"
+        );
+        assert!(
+            git::repo::status_paths(&repo).expect("status").is_empty(),
+            "the acceptance criterion: a sparse materialization reads clean"
+        );
+    }
+
+    /// The invariant Story 24.1 established and Story 27.2 restates, checked
+    /// where it is actually decided.
+    ///
+    /// `git sparse-checkout` moves the repository to worktree-scoped
+    /// configuration, and `.git/config.worktree` outranks `.git/config` for both
+    /// git and gitoxide. So "it is written in `.git/config`" is not the same
+    /// claim as "it is false", and only the second one keeps `gix::status`
+    /// working.
+    #[test]
+    fn the_sparse_index_stays_disabled_across_a_sparse_checkout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = committed_tree(&engine, &platform, dir.path());
+        p.subpaths = vec!["media/video".to_owned()];
+        engine.open_repo(&p).expect("open");
+
+        // Compared with the whitespace removed: what matters is that the key is
+        // durably in the local scope, not how gix chose to indent it.
+        let text = std::fs::read_to_string(p.local_path.join(".git/config")).expect("read config");
+        let squashed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squashed.contains("sparse=false"),
+            "index.sparse must still be written in .git/config itself: {text}"
+        );
+        let reopened = git::repo::open(&p.local_path, true).expect("reopen");
+        assert_eq!(
+            reopened.config_snapshot().boolean("index.sparse"),
+            Some(false),
+            "and it must still be the effective value once the worktree scope is loaded"
+        );
+        assert_eq!(
+            reopened.config_snapshot().boolean("core.sparseCheckout"),
+            Some(true),
+            "the fixture must really be sparse, or this proves nothing"
+        );
+    }
+
+    /// Widening the cone brings the added directory back.
+    ///
+    /// The regression this locks down is not the widening itself but *where* the
+    /// cone is applied: it used to run only on the branch that clones, so a
+    /// profile whose subpaths changed after its first sync kept the cone it was
+    /// born with for the rest of its life.
+    #[test]
+    fn widening_the_cone_materializes_the_added_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = committed_tree(&engine, &platform, dir.path());
+        p.subpaths = vec!["media/video".to_owned()];
+        engine.open_repo(&p).expect("narrow");
+        assert!(!p.local_path.join("docs/d.md").exists());
+
+        p.subpaths = vec!["media/video".to_owned(), "docs".to_owned()];
+        let repo = engine.open_repo(&p).expect("widen");
+
+        assert_eq!(
+            materialized(&p.local_path),
+            [
+                "README.md",
+                "docs/d.md",
+                "media/NOTES.md",
+                "media/video/v.txt"
+            ]
+        );
+        assert!(
+            git::repo::status_paths(&repo).expect("status").is_empty(),
+            "a widened cone reads clean too"
+        );
+    }
+
+    /// Emptying `subpaths[]` returns the profile to a full checkout.
+    ///
+    /// Without this the field is one-way: a user could narrow a profile and
+    /// never get their folder back, because nothing would ever run
+    /// `sparse-checkout disable`.
+    #[test]
+    fn clearing_the_subpaths_restores_the_full_checkout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = committed_tree(&engine, &platform, dir.path());
+        let before = materialized(&p.local_path);
+        p.subpaths = vec!["media/video".to_owned()];
+        engine.open_repo(&p).expect("narrow");
+
+        p.subpaths.clear();
+        let repo = engine.open_repo(&p).expect("widen to everything");
+
+        assert_eq!(materialized(&p.local_path), before);
+        assert!(git::repo::status_paths(&repo).expect("status").is_empty());
+    }
+
+    /// Narrowing removes only what git can put back, and says so about the rest.
+    ///
+    /// Removing `docs/d.md` is not data loss: it is committed, its bytes are in
+    /// the object database, and re-widening restores them exactly — that is what
+    /// [`widening_the_cone_materializes_the_added_directory`] proves. What is
+    /// *not* recoverable is content git has never seen, and git refuses to
+    /// remove that: it leaves the untracked file where it is and prints
+    /// "directory 'docs/' contains untracked files, but is not in the
+    /// sparse-checkout cone".
+    ///
+    /// So the file that survives here is the whole point. If a future git — or a
+    /// future keeper that reached for `--force` or swept the directory itself —
+    /// ever deleted it, this test fails, and it should.
+    #[test]
+    fn narrowing_the_cone_never_removes_untracked_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = committed_tree(&engine, &platform, dir.path());
+        let scratch = p.local_path.join("docs/NEVER-COMMITTED.md");
+        std::fs::write(&scratch, b"the user's own, and git has never seen it").expect("scratch");
+
+        p.subpaths = vec!["media/video".to_owned()];
+        engine.open_repo(&p).expect("narrow");
+
+        assert_eq!(
+            std::fs::read(&scratch).expect("untracked content must survive a narrowing"),
+            b"the user's own, and git has never seen it"
+        );
+        assert_eq!(
+            materialized(&p.local_path),
+            [
+                "README.md",
+                // The only removal, and it is restorable from HEAD.
+                "docs/NEVER-COMMITTED.md",
+                "media/NOTES.md",
+                "media/video/v.txt",
+            ],
+            "docs/d.md is the only thing that may leave the working tree"
+        );
+    }
+
+    /// An unchanged cone must not be re-applied.
+    ///
+    /// `sparse-checkout set` re-reads the tree and re-stats the working copy,
+    /// and the repository is opened on every sync tick — on a removable drive
+    /// (AD-48) that is the difference between a background daemon and a device
+    /// that never spins down.
+    ///
+    /// Observed through a comment planted in the pattern file: keeper's reader
+    /// ignores comments, so the cone still reads as applied and no `git` runs;
+    /// git's writer does not preserve them, so a re-apply would wipe it. Nothing
+    /// here depends on timing.
+    #[test]
+    fn an_unchanged_cone_is_not_re_applied_on_every_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = committed_tree(&engine, &platform, dir.path());
+        p.subpaths = vec!["media/video".to_owned()];
+        engine.open_repo(&p).expect("apply the cone");
+
+        let patterns = p.local_path.join(".git/info/sparse-checkout");
+        let planted = format!(
+            "# planted by the test\n{}",
+            std::fs::read_to_string(&patterns).expect("read patterns")
+        );
+        std::fs::write(&patterns, &planted).expect("plant");
+
+        engine.open_repo(&p).expect("re-open with the same cone");
+
+        assert_eq!(
+            std::fs::read_to_string(&patterns).expect("read patterns"),
+            planted,
+            "the same cone must not be handed to `git sparse-checkout set` again"
+        );
     }
 
     /// The scan consults the LFS guard and honours a "this is real work"
