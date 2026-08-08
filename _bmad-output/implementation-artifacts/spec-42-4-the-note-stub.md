@@ -2,10 +2,10 @@
 title: 'Story 42.4: The Note Stub, at the Only Moment It Will Be Written'
 type: 'feature'
 created: '2026-08-08'
-status: 'review'
+status: 'done'
 blocking_condition: ''
 baseline_revision: '824d76f'
-final_revision: ''
+final_revision: '553ff2795fa058ec46416ad557a205f9d73955e3'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:

@@ -2,10 +2,12 @@
 title: 'The access token can be revealed'
 type: 'feature'
 created: '2026-07-28'
-status: 'review'
+status: 'done'
 superseded_in_part_by: 'spec-34-12-the-access-token-arrives-in-the-field.md'
 superseded_on: '2026-08-08'
 baseline_revision: '5c40a22'
+final_revision: '1ef0854eb2eda88a9036f7c5aa74e7216623decf'
+
 ---
 
 > **Superseded in part by Story 34.12 — read this before auditing anything below.**

@@ -2,10 +2,10 @@
 title: 'Story 42.2: Searchable Sessions'
 type: 'feature'
 created: '2026-08-08'
-status: 'review'
+status: 'done'
 blocking_condition: ''
 baseline_revision: 'a95cb85'
-final_revision: ''
+final_revision: '6d2b8f20f939e7155ef0052e43700305672459af'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:

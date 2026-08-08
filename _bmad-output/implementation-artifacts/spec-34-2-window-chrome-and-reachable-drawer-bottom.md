@@ -2,7 +2,7 @@
 title: 'Give the window back its 96 px, and let the drawer reach its own bottom'
 type: 'bugfix'
 created: '2026-07-28'
-status: 'review'
+status: 'done'
 review_loop_iteration: 0
 baseline_revision: '5c40a22'
 followup_review_recommended: true
@@ -13,6 +13,8 @@ warnings:
     version can reach. The epic''s proposed fallback (drop `titleBarStyle`/`hiddenTitle`) is
     rejected here with source citations because it would make the overhang by-design rather
     than anomalous. Escalation path and the runtime discriminator are in Design Notes.'
+final_revision: '1ef0854eb2eda88a9036f7c5aa74e7216623decf'
+
 ---
 
 <intent-contract>

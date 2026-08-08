@@ -229,14 +229,14 @@ development_status:
   22-7-the-microphone-stops-recording-the-speakers: done
 
   # Phase 4 — Folder Sync (Epics 23–31, added 2026-07-25)
-  epic-23: in-progress
+  epic-23: done
   23-1-keeper-sync-crate-workspace-wiring-and-license-firewall: done
   23-2-syncplatform-port-and-syncerror-taxonomy: done
   23-3-sync-db-profiles-work-journal-and-file-state-cache: done
   23-4-device-identity-and-provenance-trailer-composer: done
   23-5-git-binary-probe-and-capabilities-sync-flag: done
   23-6-structured-logging-and-the-xdg-log-path-branch: done
-  23-7-egress-disclosure-for-git-remotes: review
+  23-7-egress-disclosure-for-git-remotes: done
   epic-23-retrospective: optional
   epic-24: done
   24-1-repository-lifecycle-open-and-clone-with-mandatory-overrides: done
@@ -263,9 +263,9 @@ development_status:
   26-5-tier-4-verify-on-read-and-the-sf-dataless-guard: done
   26-6-the-scheduler-journal-supervisor-backoff-and-offline: done
   epic-26-retrospective: optional
-  epic-27: in-progress
+  epic-27: done
   27-1-concurrent-multi-profile-supervision: done
-  27-2-sparse-profiles-subpath-selection: review
+  27-2-sparse-profiles-subpath-selection: done
   27-3-removable-volume-identity: done
   27-4-absence-semantics-pause-never-delete-resume: done
   27-5-profile-import-export-and-config-json-overrides: done
@@ -276,13 +276,13 @@ development_status:
   28-3-one-way-lanes-push-only-never-force: done
   28-4-pull-request-handoff-to-a-human: done
   epic-28-retrospective: optional
-  epic-29: in-progress
+  epic-29: done
   29-1-sync-view-models-commands-and-progress-streaming: done
   29-2-tray-sync-glyphs-and-one-composed-tray-decision: done
   29-3-tray-status-line-and-menu-actions: done
   29-4-settings-sync-profiles-add-and-edit: done
   29-5-in-app-progress-and-the-warning-banner: done
-  29-6-notifications-exactly-once-on-onset: review
+  29-6-notifications-exactly-once-on-onset: done
   epic-29-retrospective: optional
   epic-30: done
   30-1-the-bin-crate-and-its-syncplatform: done
@@ -293,28 +293,28 @@ development_status:
   epic-30-retrospective: optional
   epic-31: in-progress
   31-1-scale-envelope-100000-files: done
-  31-2-durability-matrix-kill9-unplug-network-loss: review
+  31-2-durability-matrix-kill9-unplug-network-loss: done
   31-3-large-blob-memory-ceiling: done
   31-4-live-forgejo-integration: in-progress
   31-5-cross-host-field-test: done
   31-6-docs-sync-md-and-phase-acceptance: done
   epic-31-retrospective: optional
-  epic-34: in-progress
-  34-1-tray-glyph-stops-repainting-itself: review
-  34-2-one-titlebar-inset-and-a-drawer-that-scrolls: review
-  34-3-window-stays-draggable-on-the-recording-tab: review
-  34-4-access-token-can-be-revealed: review
-  34-5-machine-name-commit-subject-and-hidden-knobs: review
-  34-6-activity-says-what-changed-and-how-big: review
-  34-7-discard-an-add-remove-a-folder-clear-the-secret: review
-  34-8-progress-you-can-watch: review
-  34-9-files-sync-when-they-land: review
-  34-10-sync-now-proves-it-ran: review
+  epic-34: done
+  34-1-tray-glyph-stops-repainting-itself: done
+  34-2-one-titlebar-inset-and-a-drawer-that-scrolls: done
+  34-3-window-stays-draggable-on-the-recording-tab: done
+  34-4-access-token-can-be-revealed: done
+  34-5-machine-name-commit-subject-and-hidden-knobs: done
+  34-6-activity-says-what-changed-and-how-big: done
+  34-7-discard-an-add-remove-a-folder-clear-the-secret: done
+  34-8-progress-you-can-watch: done
+  34-9-files-sync-when-they-land: done
+  34-10-sync-now-proves-it-ran: done
   # 34-11..34-13 have specs on disk and shipped in 2dcd018/92437ee/1be95be but
   # were never added here, so sprint-status has been under-reporting the epic.
-  34-11-a-kill-during-a-ref-update-must-not-strand-a-folder: review
-  34-12-the-access-token-arrives-in-the-field: review
-  34-13-the-index-can-recognise-its-own-lfs-pointers: review
+  34-11-a-kill-during-a-ref-update-must-not-strand-a-folder: done
+  34-12-the-access-token-arrives-in-the-field: done
+  34-13-the-index-can-recognise-its-own-lfs-pointers: done
   # 34-14..34-19 have specs (DW-123, closed 2026-07-29) and are now through
   # code-review: an adversarial pass over the six (four review layers — two
   # blind hunters, an edge-case hunter and an acceptance auditor — plus a docs
@@ -341,21 +341,21 @@ development_status:
   # with notes and tags. Spine: product-inputs-recording-sync-2026-08-05.md.
   # Epics 35-39 (Notes, Phase 5) are tracked in their own planning artifacts and are
   # deliberately not restated here.
-  epic-40: in-progress
+  epic-40: done
   40-1-the-path-template-rendered-purely: done
   40-2-the-template-is-a-setting-and-the-preview-is-the-manual: done
   40-3-recording-start-uses-it-and-the-session-gets-an-identity: done
-  40-4-retitle-moves-the-folder-not-the-identity: review
+  40-4-retitle-moves-the-folder-not-the-identity: done
   epic-40-retrospective: optional
-  epic-41: in-progress
-  41-1-a-profile-can-say-it-holds-recordings: review
-  41-2-choosing-where-recordings-live-once: review
-  41-3-partial-while-writing-final-on-close: review
-  41-4-the-gate-learns-the-word-finished: review
-  41-5-committed-at-close-pushed-on-policy: review
-  41-6-durability-you-can-read: review
+  epic-41: done
+  41-1-a-profile-can-say-it-holds-recordings: done
+  41-2-choosing-where-recordings-live-once: done
+  41-3-partial-while-writing-final-on-close: done
+  41-4-the-gate-learns-the-word-finished: done
+  41-5-committed-at-close-pushed-on-policy: done
+  41-6-durability-you-can-read: done
   epic-41-retrospective: optional
-  epic-42: in-progress
+  epic-42: done
   # 42.1 went through an adversarial pass (an acceptance auditor against all 11
   # I/O-matrix rows and the 4 ACs, plus a defect hunter) before it was committed.
   # Verdict on the first pass was `incorrect`: two panics reachable from any
@@ -364,11 +364,11 @@ development_status:
   # unimplemented, and a rebuild that nulled the three columns no manifest
   # carries. All are fixed here, and the macOS gate — the only one that compiles
   # the shell crate — is green.
-  42-1-a-session-is-a-row: review
-  42-2-searchable-sessions: review
-  42-3-the-recordings-browser: review
-  42-4-the-note-stub-at-the-only-moment-it-will-be-written: review
-  42-5-one-tag-vocabulary: review
+  42-1-a-session-is-a-row: done
+  42-2-searchable-sessions: done
+  42-3-the-recordings-browser: done
+  42-4-the-note-stub-at-the-only-moment-it-will-be-written: done
+  42-5-one-tag-vocabulary: done
   epic-42-retrospective: optional
 
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
@@ -554,3 +554,27 @@ development_status:
 # pure function or a hand-placed input while the risk lives in the impure shell.
 # 34-11 is the counter-example and the model — it SIGKILLs a real binary and
 # validates that its own fixture reached the states it claims to cover.
+
+# ── 2026-08-08: the ledger closed for everything that merged ──────────────────
+#
+# All eleven PRs of stack #63 are on main (13db998). The 29 stories that were
+# `review` are now `done` with `final_revision` stamped into their specs, and the
+# seven epics whose every story is done are marked done: 23, 27, 29, 34, 40, 41,
+# 42.
+#
+# Two deliberate non-changes, so the next reader does not think they were missed:
+#
+#   epic-31 stays `in-progress`. 31-4 (live Forgejo) needs one access token for
+#   the makistack instance, supplied out of band; self-registration is disabled
+#   and no credential for it exists on any dev host. Nothing else about it is
+#   missing, and it is the only story in the tracker an agent cannot move.
+#
+#   epics 1-20 keep the `backlog` word they have carried since they were written,
+#   even though every story under them is `done`. That is a pre-existing
+#   inconsistency between this file's own status definitions and how the epic
+#   lines were maintained, and flipping ~15 epics inside a commit about phase 6
+#   would bury a real change under a bulk edit. Worth its own pass.
+#
+# 23-7, 27-2, 29-6 and 31-2 have no spec file on disk: they were implemented from
+# their epic paragraph and its AC, which was the contract for them. Their
+# `final_revision` therefore lives only here and in the commit messages.
