@@ -409,6 +409,15 @@ pub struct Engine {
     gates: Mutex<HashMap<String, StabilityGate>>,
     /// Profiles with an operation in flight (the one-per-profile rule).
     busy: Mutex<HashMap<String, ()>>,
+    /// Untracked entries already reported as unsyncable nested repositories.
+    ///
+    /// The refusal in [`Self::expand_untracked`] is a standing fact about the
+    /// tree, not an event: git reports a nested repository as one collapsed
+    /// entry on every single walk, so a folder holding a few dozen of them
+    /// re-derived and re-logged the identical warning once per walk, forever.
+    /// On one real profile that was 178,000 of the last 200,000 log lines and
+    /// a 1.2 GB log. Keyed by `(profile id, path)` and said once.
+    collapsed_reported: Mutex<HashSet<(String, PathBuf)>>,
     /// Consecutive transient failures per profile.
     ///
     /// A transient error is retried and, on its own, is not worth alarming
@@ -568,6 +577,7 @@ impl Engine {
             status: Mutex::new(HashMap::new()),
             gates: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
+            collapsed_reported: Mutex::new(HashSet::new()),
             transient_failures: Mutex::new(HashMap::new()),
             next_scan_ms: Mutex::new(HashMap::new()),
             // `current_exe` is the daemon in a CLI run and the app binary in a
@@ -2379,7 +2389,7 @@ impl Engine {
         let claimed = self.with_db(|conn| db::claim_ready(conn, &profile.id, now, CLAIM_LIMIT))?;
         if claimed.is_empty() {
             if scan_when_idle {
-                self.scan_and_enqueue(profile)?;
+                self.scan_and_enqueue(profile, source)?;
             }
             return Ok(());
         }
@@ -2599,9 +2609,10 @@ impl Engine {
     /// walked yet in this process, and the count seeded at open stands until the
     /// first walk measures a real one.
     fn refresh_pending(&self, profile_id: &str) {
+        let now = self.platform.now_ms();
         let settling = Self::lock(&self.gates)
             .get(profile_id)
-            .map(|gate| gate.tracked() as u32);
+            .map(|gate| gate.tracked(now) as u32);
         if let Ok(pending) = self.pending_for(profile_id) {
             if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
                 snapshot.pending = pending;
@@ -3619,12 +3630,16 @@ impl Engine {
     /// `node_modules/`, build output or a `.env` went to the remote in full.
     ///
     /// `status_paths` now asks the dirwalk to emit untracked content file by
-    /// file, so git decides what is ignored and a directory never reaches here.
-    /// If one somehow does, it is skipped and logged rather than walked: not
-    /// syncing a folder is visible and recoverable, whereas publishing a
-    /// secret because a walk ignored `.gitignore` is neither.
-    fn expand_untracked(root: &Path, entries: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    /// file, so git decides what is ignored. A **nested repository** still
+    /// arrives collapsed and always will — its files belong to that repository,
+    /// not to this one, and git will not list them — so the refusal is a
+    /// standing property of the tree rather than an anomaly. It is returned
+    /// rather than logged here: this is called on both the commit walk and
+    /// every UI poll, and logging inside it reported the same folders on every
+    /// pass. [`Self::report_collapsed`] says each one once.
+    fn expand_untracked(root: &Path, entries: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         let mut out = Vec::with_capacity(entries.len());
+        let mut collapsed = Vec::new();
         for rela in entries {
             if rela.components().any(|c| c.as_os_str() == ".git") {
                 continue;
@@ -3637,17 +3652,38 @@ impl Engine {
                 Err(err) => return Err(SyncError::io("stat untracked entry", absolute, err)),
             };
             if metadata.is_dir() {
-                tracing::warn!(
-                    path = %rela.display(),
-                    "sync: skipping a collapsed untracked directory — git should have listed its \
-                     files individually, and walking it here would ignore .gitignore"
-                );
+                collapsed.push(rela.clone());
                 continue;
             }
             out.push(rela.clone());
         }
         out.sort();
-        Ok(out)
+        Ok((out, collapsed))
+    }
+
+    /// Warn about each collapsed untracked directory once per profile.
+    ///
+    /// Once, because the condition does not change between walks and the folder
+    /// is not going to start syncing: the honest report is a fact stated on
+    /// discovery, not a metronome. The set is never pruned — a repository that
+    /// stops being nested becomes an ordinary file entry that never reaches
+    /// here again, and a few dozen remembered paths cost less than one line of
+    /// the log they replace.
+    fn report_collapsed(&self, profile_id: &str, collapsed: &[PathBuf]) {
+        if collapsed.is_empty() {
+            return;
+        }
+        let mut reported = Self::lock(&self.collapsed_reported);
+        for rela in collapsed {
+            if reported.insert((profile_id.to_owned(), rela.clone())) {
+                tracing::warn!(
+                    path = %rela.display(),
+                    "sync: skipping an untracked directory git reported collapsed — it is its own \
+                     repository, so its files are not this folder's to commit, and walking it here \
+                     would ignore .gitignore"
+                );
+            }
+        }
     }
 
     /// Walk the working tree and keep only what the completeness gate passes.
@@ -3686,13 +3722,14 @@ impl Engine {
         // simultaneous `&mut` borrows of one field would not compile.
         let mut new_paths: Vec<PathBuf> = Vec::new();
         let mut changed_paths: Vec<PathBuf> = Vec::new();
-        // gitoxide's dirwalk reports untracked content with `CollapseDirectory`,
-        // so a brand-new folder arrives as ONE entry naming the directory. The
-        // commit path can only stage regular files and symlinks, so a collapsed
-        // entry has to be expanded here — otherwise every new subdirectory
-        // raises "only regular files and symlinks can be synchronized" forever
-        // and nothing inside it ever syncs.
-        let untracked = Self::expand_untracked(&profile.local_path, &status.untracked)?;
+        // gitoxide's dirwalk reports untracked content file by file, but a
+        // nested repository still arrives as ONE entry naming the directory.
+        // The commit path can only stage regular files and symlinks, so those
+        // are separated out here — otherwise every one of them raises "only
+        // regular files and symlinks can be synchronized" forever.
+        let (untracked, collapsed) =
+            Self::expand_untracked(&profile.local_path, &status.untracked)?;
+        self.report_collapsed(&profile.id, &collapsed);
         let groups: [(&Vec<PathBuf>, bool); 3] = [
             (&status.added, true),
             (&untracked, true),
@@ -5018,7 +5055,9 @@ impl Engine {
                         .filter(|rela| !filter.is_excluded(rela.as_path()))
                         .cloned()
                         .collect();
-                    let untracked = Self::expand_untracked(&repo_path, &candidates)?;
+                    // The poll reports what is waiting; the commit walk owns
+                    // saying why a nested repository never will be.
+                    let (untracked, _collapsed) = Self::expand_untracked(&repo_path, &candidates)?;
                     Ok((status, untracked))
                 },
             )
@@ -5137,8 +5176,18 @@ impl Engine {
         }
     }
 
-    /// Queue the work a profile needs, based on what the tree looks like now.
-    fn scan_and_enqueue(&self, profile: &SyncProfile) -> Result<()> {
+    /// Commit whatever has settled and queue the work a profile needs.
+    ///
+    /// It commits rather than merely looking because **the walk is not a
+    /// query**: [`StabilityGate::is_stable`] forgets a path the instant it
+    /// reports `Stable`, so a scan that walked and then discarded the result
+    /// consumed the very verdict the commit leg was waiting to act on. The
+    /// path re-entered the gate as a first observation on the next pass, its
+    /// settle episode restarted, and on a tree walked once a second it never
+    /// survived long enough to be committed at all — the folder sat at "N
+    /// waiting for writes to stop" forever, with the wait perpetually reading
+    /// "under a minute so far" because it genuinely had just begun. Again.
+    fn scan_and_enqueue(&self, profile: &SyncProfile, source: SyncSource) -> Result<()> {
         let now = self.platform.now_ms();
         // The walk this function is about to do answers whatever the watcher
         // reported, so the wake is spent here rather than at the point the
@@ -5165,9 +5214,9 @@ impl Engine {
             // checking the former stranded work permanently: once a change was
             // committed the tree went clean, no push was ever queued, and the
             // local branch sat ahead of the remote forever.
-            let staged = self.collect_stable_changes(profile)?;
-            let unpushed = staged.is_empty() && self.has_unpushed_commits(profile)?;
-            if !staged.is_empty() || unpushed {
+            let committed = self.commit_local(profile, source, None)?;
+            let unpushed = committed == 0 && self.has_unpushed_commits(profile)?;
+            if committed > 0 || unpushed {
                 self.with_db(|conn| {
                     db::enqueue_unique(conn, &profile.id, &WorkKind::Push, now, now).map(drop)
                 })?;
@@ -5681,7 +5730,7 @@ mod tests {
         std::fs::write(root.join("sub/a.txt"), b"x").expect("write");
         std::fs::write(root.join(".git/objects/pack"), b"x").expect("write");
 
-        let expanded = Engine::expand_untracked(
+        let (expanded, collapsed) = Engine::expand_untracked(
             root,
             &[
                 PathBuf::from("top.txt"),
@@ -5696,6 +5745,11 @@ mod tests {
             vec![PathBuf::from("top.txt")],
             "files pass through; a directory is refused, not walked"
         );
+        assert_eq!(
+            collapsed,
+            vec![PathBuf::from("sub")],
+            "the refusal is reported to the caller rather than logged per walk"
+        );
     }
 
     #[test]
@@ -5703,9 +5757,10 @@ mod tests {
         // The walk and the expansion are not atomic; a deleted file in between
         // is an ordinary outcome, not an error.
         let dir = tempfile::tempdir().expect("tempdir");
-        let expanded =
+        let (expanded, collapsed) =
             Engine::expand_untracked(dir.path(), &[PathBuf::from("gone.txt")]).expect("expand");
         assert!(expanded.is_empty());
+        assert!(collapsed.is_empty(), "a path that is gone is not a refusal");
     }
 
     #[test]
@@ -8179,6 +8234,61 @@ mod tests {
             1
         );
         assert!(engine.pending(&p.id).await.expect("pending").is_empty());
+    }
+
+    /// The scan is not a query, and treating it as one lost the file.
+    ///
+    /// [`StabilityGate::is_stable`] ends a path's episode the instant it
+    /// answers `Stable` — reading the verdict consumes it. `scan_and_enqueue`
+    /// walked the tree only to decide whether to queue a push and then threw
+    /// the staged set away, so the one pass on which a file finally settled was
+    /// the pass that spent its verdict and committed nothing. The file was
+    /// untracked again on the next walk: a first observation, with a brand-new
+    /// window. On a tree scanned more often than its settle window it never
+    /// survived to a commit at all, and the folder sat at "N waiting for writes
+    /// to stop" indefinitely with every wait honestly reading "under a minute
+    /// so far", because each one had genuinely just started.
+    #[tokio::test]
+    async fn a_scan_commits_what_settled_rather_than_spending_the_verdict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("segment-000.mov"), b"a closed segment").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        // With an empty journal the scan is the ONLY thing the supervisor runs,
+        // so it is the only thing that ever advances an episode. That is what
+        // makes discarding its result fatal rather than merely wasteful.
+        engine
+            .scan_and_enqueue(&p, SyncSource::Watch)
+            .expect("the first scan opens the episode");
+        assert_eq!(
+            engine.pending(&p.id).await.expect("pending").len(),
+            1,
+            "one observation is not two: the segment is still inside its window"
+        );
+
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        engine
+            .scan_and_enqueue(&p, SyncSource::Watch)
+            .expect("the window has elapsed");
+
+        assert!(
+            engine.pending(&p.id).await.expect("pending").is_empty(),
+            "the pass that settles a file must be the pass that commits it"
+        );
+        assert!(
+            engine
+                .activity(&p.id, 10)
+                .await
+                .expect("activity")
+                .iter()
+                .any(|entry| entry.path == "segment-000.mov"),
+            "and the commit is real — an emptied gate is not a synced file"
+        );
     }
 
     #[tokio::test]
