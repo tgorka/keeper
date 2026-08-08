@@ -33,6 +33,16 @@
  * session-captured cap, captioned `segment N · used / cap MB`, hidden when the
  * cap is 0 (defensive — no NaN/∞ fraction).
  *
+ * The durability line (Story 41.6, UX-DR48): one quiet line under the live row
+ * naming what has happened to what is already recorded — "on this Mac" →
+ * "committed" → "on the drive" — in the recorder's words, never git's. It is a
+ * pure projection of the Rust-owned `status.durability`, which is the session's
+ * never-regressing FLOOR: no high-water mark is kept here, because a second
+ * floor in the UI would be a second source of truth about a promise only the
+ * engine can keep. A push the remote refused reads "recorded, not pushed" with
+ * the Rust-authored reason on the line itself (`title` + `sr-only`) — never a
+ * toast, a modal, or a generic sync error, and never a stop.
+ *
  * Accessibility: recording state is announced **assertively** via a dedicated
  * `sr-only` live region keyed on state + segment (so it fires on
  * start/stop/rotation, never once per second); the ticking mono line is kept out
@@ -42,7 +52,7 @@
 import { Button } from "@/components/ui/button";
 import { isLiveRecording } from "@/hooks/use-recording-session";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
-import type { RecordingStatusVm } from "@/lib/ipc/client";
+import type { RecordingDurabilityVm, RecordingStatusVm } from "@/lib/ipc/client";
 import { bytesToWholeMb, formatSize } from "@/lib/recording-format";
 import { cn } from "@/lib/utils";
 
@@ -58,6 +68,59 @@ export const BANNER_RESTART_LABEL = "Restart recording";
 /** The error variant's dismiss (acknowledge) label (Story 18.4). */
 export const BANNER_DISMISS_LABEL = "Dismiss";
 
+/** Durability, plain folder or nothing committed yet: the bytes exist here and
+ * nowhere else, and the line promises nothing further (Story 41.6). */
+export const DURABILITY_LOCAL_LABEL = "on this Mac";
+
+/** Durability, the segments are in a commit — local, cheap, already survived
+ * the app. The recorder's word for it, not a repo's. */
+export const DURABILITY_COMMITTED_LABEL = "committed";
+
+/** Durability, the commit reached the remote: the thing the user actually asked
+ * "would this survive?" about. Shared by `pushed` and `verified`. */
+export const DURABILITY_PUSHED_LABEL = "on the drive";
+
+/** Durability, a publication the remote refused (state stays `committed`): the
+ * recording did not fail, its publication did, and the line says exactly that. */
+export const DURABILITY_REJECTED_LABEL = "recorded, not pushed";
+
+/** Test id for the one durability line. */
+export const BANNER_DURABILITY_TESTID = "recording-durability";
+
+/**
+ * The one word for a session's durability floor, or `null` when there is no
+ * honest word to print.
+ *
+ * `verified` reads the same as `pushed`: the extra certainty the engine has is
+ * not a different promise to the person recording — the recording is on the
+ * drive either way, and a fourth word would draw a distinction only git cares
+ * about. `committed` carrying a reason is a refused publication rather than a
+ * further step, so it reads "recorded, not pushed": the reason is the reason,
+ * never the headline.
+ */
+export function durabilityLabel(durability: RecordingDurabilityVm): string | null {
+  if (durability.state === "committed" && durability.detail !== null) {
+    return DURABILITY_REJECTED_LABEL;
+  }
+  switch (durability.state) {
+    case "local":
+      return DURABILITY_LOCAL_LABEL;
+    case "committed":
+      return DURABILITY_COMMITTED_LABEL;
+    case "pushed":
+    case "verified":
+      return DURABILITY_PUSHED_LABEL;
+    default: {
+      // Exhaustiveness guard: a new `RecordingDurabilityState` variant added
+      // without a word above is a compile error, not a mislabelled promise.
+      // Runtime-safe fallback: print nothing rather than guess a state.
+      const _exhaustive: never = durability.state;
+      void _exhaustive;
+      return null;
+    }
+  }
+}
+
 export interface ActiveRecordingBannerProps {
   /** The live session snapshot (the enriched Rust-owned view model). */
   status: RecordingStatusVm;
@@ -70,6 +133,15 @@ export interface ActiveRecordingBannerProps {
   /** Acknowledge the failed session back to idle (Story 18.4 Dismiss). */
   onDismiss: () => void;
 }
+
+/**
+ * The durability field as the ~1 Hz poll can actually deliver it. The Rust VM
+ * makes it required, and a `RecordingStatusVm` widens to this for free — the
+ * point is the `?`: a snapshot serialized before the field existed (an in-flight
+ * `recording_status` across an update) is a value the compiler tracks, not an
+ * unchecked cast at the one place it is read.
+ */
+type PolledDurability = { readonly durability?: RecordingDurabilityVm };
 
 /** One decimal megabyte, in bytes — the meter denominator's unit (`10^6`). */
 const BYTES_PER_MB = 1_000_000;
@@ -151,6 +223,22 @@ export function ActiveRecordingBanner({
   // same one the denied-permission captions use).
   const warning = status.warning;
 
+  // Story 41.6: the durability line. `status.durability` is the session's
+  // never-regressing floor, computed in Rust from the ledger and the engine —
+  // rendered exactly as given, with no high-water mark kept here (a second floor
+  // in the UI would be a second source of truth about a promise only the engine
+  // can keep, and would outlive the truth the moment Rust degraded).
+  //
+  // Read through {@link PolledDurability} so the absent case is a value the
+  // compiler tracks: `recording_status` is polled at ~1 Hz, so a snapshot
+  // serialized before this field existed can still be in flight across an
+  // update. No field, no line — never a guessed "on this Mac".
+  const { durability }: PolledDurability = status;
+  const durabilityWord = durability === undefined ? null : durabilityLabel(durability);
+  // The Rust-authored reason a push was refused, printed verbatim (the UI has no
+  // business paraphrasing a remote's refusal).
+  const durabilityReason = durability?.detail ?? null;
+
   return (
     <div
       data-slot="active-recording-banner"
@@ -198,6 +286,31 @@ export function ActiveRecordingBanner({
         >
           <span aria-hidden="true">⚠</span>
           {warning}
+        </p>
+      )}
+
+      {/* The durability line: quiet by design — muted, small, and outside every
+          live region. It changes as segments commit and push, and announcing
+          each transition would be the recorder shouting about its own
+          bookkeeping while the user is mid-meeting. Amber and destructive are
+          both spoken for here (the warning line, the failure variant), and a
+          refused push is neither — the words carry the news. */}
+      {durabilityWord !== null && (
+        <p
+          data-testid={BANNER_DURABILITY_TESTID}
+          className="mt-1.5 truncate text-muted-foreground text-xs"
+          // The reason where the repo already puts a full string it does not
+          // want to shout: on the line it explains (the Destination card's path
+          // and preview, the sync card's file rows). No modal, no toast, no
+          // second alert line, and nothing to dismiss.
+          title={durabilityReason ?? undefined}
+        >
+          <span>{durabilityWord}</span>
+          {/* A `title` is hover-only truth; assistive tech gets the same
+              sentence read out beside the word, the way the sync card's
+              `sr-only` clarifier keeps a title-carried path from being a path
+              from nowhere. */}
+          {durabilityReason !== null && <span className="sr-only">{` — ${durabilityReason}`}</span>}
         </p>
       )}
 

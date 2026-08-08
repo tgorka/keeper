@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -39,6 +39,9 @@ vi.mock("@/lib/ipc/client", () => ({
       fps: 30,
     }),
   ),
+  // Story 41.2: the Destination card asks which synced folders are flagged on
+  // mount. No flagged profile is this suite's world — today's card.
+  recordingDestinationProfiles: vi.fn(() => Promise.resolve([])),
   recordingSettingsSet: vi.fn((vm: unknown) => Promise.resolve(vm)),
   // The completion / recovery cards (Story 20.3): the summary fetch, the
   // cross-restart recovery scan, the acknowledgement latch, and Reveal.
@@ -52,6 +55,8 @@ vi.mock("@/lib/ipc/client", () => ({
   ),
   recoveredSessionsList: vi.fn(() => Promise.resolve([])),
   recoveredSessionAcknowledge: vi.fn(() => Promise.resolve()),
+  // The summary card's inline rename (Story 40.4) — it MOVES the session.
+  recordingRetitle: vi.fn(),
   revealPath: vi.fn(() => Promise.resolve()),
 }));
 
@@ -70,6 +75,10 @@ import {
 import {
   RECOVERY_DISMISS_LABEL,
   REVEAL_IN_FINDER_LABEL,
+  SUMMARY_FOLDER_TESTID,
+  SUMMARY_RETITLE_EDIT_TESTID,
+  SUMMARY_RETITLE_FIELD_TESTID,
+  SUMMARY_RETITLE_SAVE_TESTID,
 } from "@/components/layout/recording-summary-card";
 import {
   BANNER_DISMISS_LABEL,
@@ -100,13 +109,19 @@ import {
   DURATION_CAP_LABEL,
   SEGMENT_SIZE_LABEL,
 } from "@/components/settings/recording-settings-controls";
-import type { RecordingPermissionVm, RecordingStatusVm } from "@/lib/ipc/client";
+import { clearRecordingSessionMove } from "@/hooks/use-recording-session";
+import type {
+  RecordingPermissionVm,
+  RecordingStatusVm,
+  RecordingSummaryVm,
+} from "@/lib/ipc/client";
 import {
   openCameraSettings,
   openMicrophoneSettings,
   openScreenRecordingSettings,
   recordingAcknowledge,
   recordingPermission,
+  recordingRetitle,
   recordingSessionSummary,
   recordingStart,
   recordingStatus,
@@ -139,6 +154,18 @@ const mockAcknowledge = vi.mocked(recordingAcknowledge);
 const mockRecoveredList = vi.mocked(recoveredSessionsList);
 const mockRecoveredAck = vi.mocked(recoveredSessionAcknowledge);
 const mockReveal = vi.mocked(revealPath);
+const mockRetitle = vi.mocked(recordingRetitle);
+
+/** Where a rename lands: the path template re-rendered with the new title. */
+const MOVED_FOLDER = "/Users/alice/Movies/keeper/2026/2026-07-19 1423 standup";
+
+/** The summary `recording_retitle` resolves — the session AT ITS NEW LOCATION. */
+const MOVED_SUMMARY = {
+  sessionFolder: MOVED_FOLDER,
+  screenSegmentCount: 3,
+  title: "Standup",
+  totalBytes: 412_000_000,
+};
 
 const IDLE_STATUS: RecordingStatusVm = {
   state: "idle",
@@ -150,6 +177,7 @@ const IDLE_STATUS: RecordingStatusVm = {
   onDiskBytes: 0,
   currentSegmentBytes: 0,
   segmentCapMb: 0,
+  durability: { state: "local", detail: null },
 };
 
 const RECORDING_STATUS: RecordingStatusVm = {
@@ -162,6 +190,7 @@ const RECORDING_STATUS: RecordingStatusVm = {
   onDiskBytes: 412_000_000,
   currentSegmentBytes: 100_000_000,
   segmentCapMb: 500,
+  durability: { state: "local", detail: null },
 };
 
 const GRANTED: RecordingPermissionVm = {
@@ -211,6 +240,11 @@ beforeEach(() => {
   mockRecoveredAck.mockResolvedValue(undefined);
   mockReveal.mockReset();
   mockReveal.mockResolvedValue(undefined);
+  mockRetitle.mockReset();
+  mockRetitle.mockResolvedValue(MOVED_SUMMARY);
+  // The post-rename folder outlives the pane by design (Story 40.4) — it is
+  // module state, so it must be cleared between cases.
+  clearRecordingSessionMove();
   // Reveal is capability-gated (Story 20.3): default ON for the base cases.
   capabilitiesStore
     .getState()
@@ -726,6 +760,132 @@ describe("RecordingPane", () => {
     await waitFor(() =>
       expect(screen.queryByText(/A recording was interrupted/)).not.toBeInTheDocument(),
     );
+  });
+
+  it("a remounted pane paints the folder the rename moved the session to", async () => {
+    // Story 40.4: `recording_retitle` moves the folder on disk but leaves the
+    // Rust session snapshot naming the path the session finalized at, and the
+    // Recording view is unmounted outright on every primary-view switch. The
+    // move must therefore outlive the card that made it — otherwise the next
+    // mount re-adopts a dead path, re-issues a failing summary fetch, and
+    // points Reveal in Finder at a folder that no longer exists.
+    mockFetch.mockResolvedValue(GRANTED);
+    mockStatus.mockResolvedValue({ ...RECORDING_STATUS, state: "finalized" });
+    const { unmount } = render(<RecordingPane />);
+
+    expect(await screen.findByText(/Saved 3 segments · 412 MB/)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_EDIT_TESTID));
+    fireEvent.change(screen.getByTestId(SUMMARY_RETITLE_FIELD_TESTID), {
+      target: { value: "Standup" },
+    });
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_SAVE_TESTID));
+    await waitFor(() =>
+      expect(mockRetitle).toHaveBeenCalledWith(RECORDING_STATUS.outputPath, "Standup"),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId(SUMMARY_FOLDER_TESTID).textContent).toBe(MOVED_FOLDER),
+    );
+
+    // ⌘1 and back.
+    unmount();
+    mockSummary.mockResolvedValue(MOVED_SUMMARY);
+    render(<RecordingPane />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId(SUMMARY_FOLDER_TESTID).textContent).toBe(MOVED_FOLDER),
+    );
+    // The summary is re-fetched for the live path, never the invalidated one.
+    expect(mockSummary).toHaveBeenCalledWith(MOVED_FOLDER);
+    expect(screen.queryByText(RECORDING_STATUS.outputPath ?? "")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: REVEAL_IN_FINDER_LABEL }));
+    await waitFor(() => expect(mockReveal).toHaveBeenCalledWith(MOVED_FOLDER));
+  });
+
+  it("a renamed in-app-recovered session still renders exactly once", async () => {
+    // The de-dup between the in-app `recovered` terminal card and the disk scan
+    // is by folder, and a rename changes it on one side before the other.
+    const OTHER_FOLDER = "/Users/alice/Movies/keeper/keeper-rec 2026-07-18 09.00.00";
+    mockFetch.mockResolvedValue(GRANTED);
+    mockStatus.mockResolvedValue({ ...RECORDING_STATUS, state: "recovered" });
+    mockRecoveredList.mockResolvedValue([
+      {
+        sessionFolder: RECORDING_STATUS.outputPath ?? "",
+        screenSegmentCount: 3,
+        title: null,
+        totalBytes: 412_000_000,
+      },
+    ]);
+    render(<RecordingPane />);
+
+    // One card: the scan's entry is the session the terminal already shows.
+    await waitFor(() => expect(screen.getAllByTestId(SUMMARY_FOLDER_TESTID)).toHaveLength(1));
+
+    // The re-scan the rename fires sees the session at its new path, plus an
+    // unrelated orphan — whose appearance proves the re-scan has landed.
+    mockRecoveredList.mockResolvedValue([
+      MOVED_SUMMARY,
+      {
+        sessionFolder: OTHER_FOLDER,
+        screenSegmentCount: 1,
+        title: null,
+        totalBytes: 1_000_000,
+      },
+    ]);
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_EDIT_TESTID));
+    fireEvent.change(screen.getByTestId(SUMMARY_RETITLE_FIELD_TESTID), {
+      target: { value: "Standup" },
+    });
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_SAVE_TESTID));
+
+    await screen.findByText(OTHER_FOLDER);
+    expect(screen.getAllByTestId(SUMMARY_FOLDER_TESTID).map((node) => node.textContent)).toEqual([
+      MOVED_FOLDER,
+      OTHER_FOLDER,
+    ]);
+  });
+
+  it("dismissing a renamed recovery card latches its new path and survives the re-scan", async () => {
+    const ORPHAN: RecordingSummaryVm = {
+      sessionFolder: "/Users/alice/Movies/keeper/keeper-rec recovered",
+      screenSegmentCount: 2,
+      title: null,
+      totalBytes: 200_000_000,
+    };
+    mockFetch.mockResolvedValue(GRANTED);
+    mockStatus.mockResolvedValue(IDLE_STATUS);
+    mockRecoveredList.mockResolvedValue([ORPHAN]);
+    render(<RecordingPane />);
+    await screen.findByText(ORPHAN.sessionFolder);
+
+    // Hold the re-scan the rename fires, so the dismissal happens while it is
+    // still in flight — the ordering that used to resurrect the card.
+    let landRescan!: (list: RecordingSummaryVm[]) => void;
+    mockRecoveredList.mockReturnValueOnce(
+      new Promise<RecordingSummaryVm[]>((resolve) => {
+        landRescan = resolve;
+      }),
+    );
+
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_EDIT_TESTID));
+    fireEvent.change(screen.getByTestId(SUMMARY_RETITLE_FIELD_TESTID), {
+      target: { value: "Standup" },
+    });
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_SAVE_TESTID));
+    await waitFor(() =>
+      expect(screen.getByTestId(SUMMARY_FOLDER_TESTID).textContent).toBe(MOVED_FOLDER),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: RECOVERY_DISMISS_LABEL }));
+    // The latch lands on the folder whose manifest still loads. The pre-rename
+    // path loads nothing, so latching there dismisses nothing at all.
+    await waitFor(() => expect(mockRecoveredAck).toHaveBeenCalledWith(MOVED_FOLDER));
+    expect(mockRecoveredAck).not.toHaveBeenCalledWith(ORPHAN.sessionFolder);
+
+    // The held re-scan lands, still listing the session at its new path.
+    await act(async () => {
+      landRescan([MOVED_SUMMARY]);
+    });
+    expect(screen.queryByTestId(SUMMARY_FOLDER_TESTID)).not.toBeInTheDocument();
   });
 
   it("a failed start surfaces the banner error variant (not a header note)", async () => {

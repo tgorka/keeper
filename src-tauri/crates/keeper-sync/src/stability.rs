@@ -17,6 +17,16 @@
 //!   again. This is the only actual proof in the whole gate, and it is the
 //!   reason the other three are allowed to be approximations.
 //!
+//! # The producer's assertion (Story 41.4)
+//!
+//! One caller can know more than tier 2 can measure. A process that owns the
+//! writer and has just closed a file is not guessing that the bytes are quiet;
+//! it knows they are final. [`StabilityGate::note_finished`] is where that
+//! claim enters, and it skips **tier 2 and nothing else**: tier 0 still hides
+//! an excluded path, tier 3 can still veto, and tier 4 still reads every byte,
+//! because "the writing is over" and "the bytes are correct" are different
+//! statements and only the second one is a proof.
+//!
 //! # The iCloud hazard
 //!
 //! Orthogonal to all four tiers, and mandatory: on macOS a file may be a
@@ -285,6 +295,136 @@ impl StabilityGate {
                 close_write,
             },
         );
+    }
+
+    /// Record `path` as having *already* been quiet long enough that the very
+    /// next [`Self::verdict`] returns [`StabilityVerdict::Stable`] — the rename
+    /// escape hatch (Story 40.4).
+    ///
+    /// Tier 2 measures quiescence from the first moment it *saw* a path. That
+    /// is the right question for a file being written and the wrong one for a
+    /// file that was **renamed**: its bytes have been finished for as long as
+    /// they existed under the old name, and there is no writer left to wait
+    /// for. Treating the arrival as brand new is not merely a delay — it splits
+    /// one move into a deletion commit now (a deletion has nothing to sample,
+    /// so it is never held) and an addition commit a window later, and
+    /// `git log --follow` cannot see across that split, because git infers a
+    /// rename only from a disappearance and an arrival inside the SAME commit.
+    ///
+    /// The entry is backdated by [`SETTLE_CEILING_MS`] rather than by the
+    /// settle window, because the window is not the only thing that would hold
+    /// it: `verdict` also refuses a file whose own mtime is younger than the
+    /// window, and a move is routinely accompanied by a rewrite of one file in
+    /// it (the retitle rewrites `manifest.json`). The ceiling is the one
+    /// condition `verdict` checks before any other, so a ceiling-aged entry
+    /// clears regardless of mtime.
+    ///
+    /// What comes out is an ordinary [`Entry`], reached by the ordinary path:
+    /// `verdict` cannot tell a primed entry from one that has genuinely been
+    /// pending since the ceiling, and neither can [`Self::export`], so a prime
+    /// survives a restart exactly like any other episode.
+    ///
+    /// The file is sampled here rather than left for the next observation,
+    /// because [`Self::is_stable`] restarts the run whenever the sample it
+    /// takes differs from `last` — an entry holding a guessed tuple would prime
+    /// nothing. Returns whether an entry was recorded: an excluded path, or one
+    /// that cannot be stat-ed (it vanished again, or it is unreadable), is left
+    /// alone rather than treated as an error, since the gate's ordinary
+    /// fail-closed handling is the correct answer for both.
+    pub fn prime_stable(&mut self, path: &Path, now_ms: i64) -> bool {
+        self.declare_settled(path, now_ms)
+    }
+
+    /// An authoritative producer asserts that `path` is **finished** — the
+    /// next [`Self::verdict`] returns [`StabilityVerdict::Stable`] without the
+    /// settle window (Story 41.4, FR-134, AD-67).
+    ///
+    /// Tier 2 asks whether anything has changed lately. That is a proxy, and
+    /// for a rotated recording segment it is both too slow and strictly weaker
+    /// than the truth: `keeper-rec` closed the file with `finishWriting` and
+    /// will never touch those bytes again. Such a file is not quiescent, it is
+    /// over, and only the process that owns the writer can say so. Waiting five
+    /// seconds to guess at what one caller already knows is not caution, it is
+    /// a worse answer arriving later. This generalises
+    /// [`Self::note_close_write`], which is the same insight taken from the
+    /// kernel where the kernel volunteers it (Linux `IN_CLOSE_WRITE`) — except
+    /// that a close is not a promise (git, `dd conv=notrunc` and WAL writers
+    /// all close and reopen) so that one only shortens the window, while a
+    /// producer naming its own finished output is a promise and skips it.
+    ///
+    /// **Exactly one tier is skipped, and the other three are untouched:**
+    ///
+    /// * **Tier 0 still hides the path.** An excluded name — a `.partial`
+    ///   mid-rotation above all — is not made visible by asserting it, and the
+    ///   assertion is simply declined (`false`).
+    /// * **Tier 2 is skipped.** That is the whole feature.
+    /// * **Tier 3** never approved anything anyway; it can still veto.
+    /// * **Tier 4 still reads the file.** This is a claim about *writing being
+    ///   over*, not about the bytes being correct, and verify-on-read remains
+    ///   the only proof in the gate.
+    ///
+    /// # How this differs from [`Self::prime_stable`]
+    ///
+    /// Same mechanism, different warrant, and they are not interchangeable. A
+    /// **primed** path has been quiet for as long as it existed somewhere else:
+    /// it arrived by rename, the evidence is the file's own history under its
+    /// old name, and the reason to skip the wait is that a move must not split
+    /// into two commits. A **finished** path may have been created a
+    /// millisecond ago and have no history at all: the evidence is the word of
+    /// the process holding the writer, and the reason to skip the wait is that
+    /// the wait would be measuring a writer that has already let go.
+    ///
+    /// Idempotent — asserting twice re-samples and re-declares, which lands on
+    /// the same state as asserting once — and, because what it records is an
+    /// ordinary [`Entry`], it survives [`Self::export`] and [`Self::import`]
+    /// like any other episode. A restart or a pause between the assertion and
+    /// the commit therefore does not lose it, which matters most exactly when
+    /// the profile is paused: the segment would otherwise wait out a window
+    /// that the pause made meaningless.
+    ///
+    /// Returns whether the assertion was recorded, and never an error: an
+    /// excluded or unstat-able path leaves the gate's ordinary fail-closed
+    /// handling in charge, which is the right answer for both, and a producer
+    /// that has just closed a file has nothing useful to do with an `Err`
+    /// (NFR-31).
+    pub fn note_finished(&mut self, path: &Path, now_ms: i64) -> bool {
+        self.declare_settled(path, now_ms)
+    }
+
+    /// The one mechanism behind [`Self::prime_stable`] and
+    /// [`Self::note_finished`]: record `path` as an entry that has already been
+    /// pending for the hard ceiling, so `verdict`'s very first condition
+    /// clears it.
+    ///
+    /// Deliberately not public. The two callers differ in what entitles them to
+    /// call it, and that distinction is the entire safety argument for skipping
+    /// tier 2 — a third caller with no claim of its own would be a way to make
+    /// the gate say `Stable` about anything (FR-135).
+    fn declare_settled(&mut self, path: &Path, now_ms: i64) -> bool {
+        let relative = path.strip_prefix(&self.root).unwrap_or(path);
+        if self.excludes.is_excluded(relative) {
+            return false;
+        }
+        let Ok(Some(sample)) = FileSample::of(path) else {
+            return false;
+        };
+        let ceiling = i64::try_from(SETTLE_CEILING_MS).unwrap_or(i64::MAX);
+        let quiet_since_ms = now_ms.saturating_sub(ceiling);
+        // Replaces any existing entry outright: whatever tier 2 remembered
+        // about this path describes bytes that are no longer the ones in
+        // question — a rename has just put different ones here, or the writer
+        // has just written the last of them.
+        self.entries.insert(
+            path.to_path_buf(),
+            Entry {
+                last: sample,
+                unchanged_since_ms: quiet_since_ms,
+                pending_since_ms: quiet_since_ms,
+                close_write: false,
+            },
+        );
+        self.pending_close_write.remove(path);
+        true
     }
 
     /// Tier 2's answer for an already-observed path.
@@ -937,6 +1077,211 @@ mod tests {
             ceiling.verdict(&log, 60_001, SETTLE),
             StabilityVerdict::Settling { .. }
         ));
+    }
+
+    /// The asymmetry Story 40.4 turns on: a renamed file must clear tier 2 on
+    /// the FIRST look, because the scan that sees its arrival is the same scan
+    /// that sees its old name disappear, and only one commit can hold both.
+    #[test]
+    fn a_primed_path_is_stable_on_its_first_look_while_an_unprimed_twin_settles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let moved = dir.path().join("moved.bin");
+        let fresh = dir.path().join("fresh.bin");
+        std::fs::write(&moved, b"the same bytes under a new name").expect("write");
+        std::fs::write(&fresh, b"the same bytes under a new name").expect("write");
+        let mut g = StabilityGate::new(
+            dir.path(),
+            ExcludeSet::new(&[]).expect("corpus compiles"),
+            SETTLE,
+        );
+        // The real wall clock, not an injected epoch: both files were written a
+        // moment ago, so `verdict`'s mtime arm is live and the future-mtime
+        // hatch is not — which is exactly the case a prime has to beat, since a
+        // retitle rewrites `manifest.json` as it moves the folder.
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after 1970")
+                .as_millis(),
+        )
+        .expect("milliseconds since 1970 fit in an i64");
+
+        assert!(g.prime_stable(&moved, now_ms), "a real file is primeable");
+        assert_eq!(
+            g.is_stable(&moved, now_ms),
+            StabilityVerdict::Stable,
+            "a primed path must clear on the very first look"
+        );
+        assert!(matches!(
+            g.is_stable(&fresh, now_ms),
+            StabilityVerdict::Settling { .. }
+        ));
+
+        // Nothing about the primed entry is special-cased in `verdict`: it went
+        // through `is_stable`, which ends the episode like any other stable
+        // path, so only the settling twin is still held.
+        assert_eq!(g.tracked(), 1);
+
+        // A prime is a claim about bytes that exist. Neither an absent path nor
+        // an excluded one is primed, and neither is an error.
+        assert!(!g.prime_stable(&dir.path().join("nope.bin"), now_ms));
+        let mut excluding = StabilityGate::new(
+            dir.path(),
+            ExcludeSet::new(&["*.bin".to_owned()]).expect("pattern compiles"),
+            SETTLE,
+        );
+        assert!(!excluding.prime_stable(&moved, now_ms));
+    }
+
+    /// Story 41.4's asymmetry, and the whole point of the assertion: the
+    /// producer's word about the segment it just closed beats the clock, and it
+    /// beats it for that path alone.
+    #[test]
+    fn a_finished_path_is_stable_at_once_while_an_unasserted_sibling_waits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let closed = dir.path().join("segment-000.mov");
+        let sibling = dir.path().join("notes.md");
+        std::fs::write(&closed, b"a rotated segment, finishWriting returned").expect("write");
+        std::fs::write(&sibling, b"something a human is still typing").expect("write");
+        let mut g = StabilityGate::new(
+            dir.path(),
+            ExcludeSet::new(&[]).expect("corpus compiles"),
+            SETTLE,
+        );
+        // The real wall clock, so `verdict`'s mtime arm is live: both files were
+        // written a moment ago, which is exactly the case an assertion has to
+        // beat — a segment is closed the instant after its last byte lands.
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after 1970")
+                .as_millis(),
+        )
+        .expect("milliseconds since 1970 fit in an i64");
+
+        assert!(
+            g.note_finished(&closed, now_ms),
+            "a real file is assertable"
+        );
+        assert_eq!(
+            g.is_stable(&closed, now_ms),
+            StabilityVerdict::Stable,
+            "the tier-2 window is skipped for the path the producer named"
+        );
+        assert!(
+            matches!(
+                g.is_stable(&sibling, now_ms),
+                StabilityVerdict::Settling { .. }
+            ),
+            "and for nothing else: an assertion is not a shorter window for the profile"
+        );
+
+        // An assertion is a claim about bytes that exist, and neither absent
+        // nor unstat-able is an error.
+        assert!(!g.note_finished(&dir.path().join("never-written.mov"), now_ms));
+    }
+
+    /// Tier 0 outranks the assertion. It has to: `.partial` is what the
+    /// recorder writes *while* the segment is open (AD-69), so a producer
+    /// asserting one would be asking the gate to commit a half-written file.
+    #[test]
+    fn an_asserted_partial_stays_excluded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let partial = dir.path().join("segment-001.mov.partial");
+        std::fs::write(&partial, b"still being written").expect("write");
+        let mut g = StabilityGate::new(
+            dir.path(),
+            ExcludeSet::new(&[]).expect("corpus compiles"),
+            SETTLE,
+        );
+
+        assert!(
+            !g.note_finished(&partial, 1_000),
+            "tier 0 declines the assertion rather than recording it"
+        );
+        assert_eq!(g.is_stable(&partial, 1_000), StabilityVerdict::Excluded);
+        assert_eq!(g.tracked(), 0, "an excluded path is never even pending");
+    }
+
+    /// A producer that retries, or two events for one close, must not produce a
+    /// different gate than one clean assertion did.
+    #[test]
+    fn asserting_the_same_path_twice_is_asserting_it_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let closed = dir.path().join("segment-002.mov");
+        std::fs::write(&closed, b"closed once, announced twice").expect("write");
+        let mut g = StabilityGate::new(
+            dir.path(),
+            ExcludeSet::new(&[]).expect("corpus compiles"),
+            SETTLE,
+        );
+
+        assert!(g.note_finished(&closed, 1_000));
+        let after_one = g.export();
+        assert!(g.note_finished(&closed, 1_000));
+        assert_eq!(
+            g.export(),
+            after_one,
+            "the second assertion changed nothing at all"
+        );
+
+        // And a late repeat neither duplicates the entry nor restarts a wait.
+        assert!(g.note_finished(&closed, 1_000 + SETTLE as i64));
+        assert_eq!(g.tracked(), 1);
+        assert_eq!(
+            g.is_stable(&closed, 1_000 + SETTLE as i64),
+            StabilityVerdict::Stable
+        );
+    }
+
+    /// The assertion has to outlive the process that received it. A segment
+    /// closed just before a restart — or just before the user paused the
+    /// profile — would otherwise wait out a window that nothing is writing in.
+    #[test]
+    fn a_finished_assertion_survives_export_and_import() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let closed = dir.path().join("segment-003.mov");
+        std::fs::write(&closed, b"asserted, then the process went away").expect("write");
+        let mut before = StabilityGate::new(
+            dir.path(),
+            ExcludeSet::new(&[]).expect("corpus compiles"),
+            SETTLE,
+        );
+        assert!(before.note_finished(&closed, 1_000));
+
+        let mut after = StabilityGate::new(
+            dir.path(),
+            ExcludeSet::new(&[]).expect("corpus compiles"),
+            SETTLE,
+        );
+        after.import(before.export());
+        assert_eq!(
+            after.is_stable(&closed, 1_000),
+            StabilityVerdict::Stable,
+            "what the durable store carried is an ordinary entry, and it clears"
+        );
+    }
+
+    /// The assertion is about writing being over, never about the bytes being
+    /// right — so tier 4 is untouched by it and still has the last word.
+    #[test]
+    fn an_asserted_path_still_has_to_survive_verify_on_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let closed = dir.path().join("segment-004.mov");
+        std::fs::write(&closed, b"present at the assertion, gone at the commit").expect("write");
+        let mut g = StabilityGate::new(
+            dir.path(),
+            ExcludeSet::new(&[]).expect("corpus compiles"),
+            SETTLE,
+        );
+        assert!(g.note_finished(&closed, 1_000));
+        assert_eq!(g.is_stable(&closed, 1_000), StabilityVerdict::Stable);
+
+        std::fs::remove_file(&closed).expect("remove");
+        assert!(
+            verify_while_reading(&closed).is_err(),
+            "tier 4 reads the file for itself; no assertion excuses it"
+        );
     }
 
     #[test]

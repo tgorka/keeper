@@ -123,9 +123,13 @@ export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
+export type { RecordingDestinationKind } from "./gen/RecordingDestinationKind";
 export type { RecordingDisplayVm } from "./gen/RecordingDisplayVm";
+export type { RecordingDurabilityState } from "./gen/RecordingDurabilityState";
+export type { RecordingDurabilityVm } from "./gen/RecordingDurabilityVm";
 export type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 export type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
+export type { RecordingProfileVm } from "./gen/RecordingProfileVm";
 export type { RecordingSettingsVm } from "./gen/RecordingSettingsVm";
 export type { RecordingSourcesVm } from "./gen/RecordingSourcesVm";
 export type { RecordingStatusVm } from "./gen/RecordingStatusVm";
@@ -224,6 +228,7 @@ import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 import type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 import type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
+import type { RecordingProfileVm } from "./gen/RecordingProfileVm";
 import type { RecordingSettingsVm } from "./gen/RecordingSettingsVm";
 import type { RecordingSourcesVm } from "./gen/RecordingSourcesVm";
 import type { RecordingStatusVm } from "./gen/RecordingStatusVm";
@@ -2023,6 +2028,43 @@ export async function recordingSessionSummary(folder: string): Promise<Recording
 }
 
 /**
+ * Rename a finished session (Story 40.4) — the affordance on the completion /
+ * recovery card. The title is the manifest's `meta.title` (Story 21.5, the only
+ * title there has ever been), and setting it MOVES the session on disk: Rust
+ * re-renders the effective path template against the session's OWN start
+ * instant with the new title, `create_dir`s the rendered leaf, `fs::rename`s
+ * the session onto it, and rewrites `manifest.json`'s title and its `session`
+ * label. The identity does NOT move — `meta.sessionId` is byte-identical
+ * afterwards, so everything latched on it (a recovery dismissal) stays attached
+ * to the session it was about.
+ *
+ * `folder` is the session folder as it stands NOW; `title` is the new title, or
+ * `null` to clear it (which moves the session back to its untitled path). A
+ * rendered path that is already taken gets the template's next `{seq}` ordinal
+ * — the existing folder is never touched — and a session that renders to the
+ * folder it already occupies is rewritten in place, moving nothing.
+ *
+ * Resolves the summary of the session AT ITS NEW LOCATION: `sessionFolder` is
+ * the folder it now occupies, and the caller MUST re-render from it. The path
+ * it was called with no longer exists, so a Reveal in Finder still aimed at the
+ * old one opens nothing.
+ *
+ * Rejects with the {@link IpcError} envelope, and these refusals are the user's
+ * to read, not the caller's to swallow: a session that is still recording is
+ * refused with code `recordingSessionLive` (the driver and the sidecar hold
+ * absolute paths), and "stop the recording first" is the only way out of it.
+ * An exhausted ordinal run, a folder with no loadable manifest, and a folder
+ * outside the recordings destination are refused the same way — with nothing
+ * moved either.
+ */
+export async function recordingRetitle(
+  folder: string,
+  title: string | null,
+): Promise<RecordingSummaryVm> {
+  return await invoke<RecordingSummaryVm>("recording_retitle", { folder, title });
+}
+
+/**
  * List the crash-recovered sessions still needing a one-time notice (Story 20.3,
  * FR-73). The Rust core walks the effective recordings destination (Story 40.3 —
  * the path template may nest sessions under it) for a loadable `manifest.json`
@@ -2140,6 +2182,29 @@ export async function recordingPathPreview(
     template,
     title: title ?? null,
   });
+}
+
+/**
+ * List the synced folders a recording destination may be pointed at (Story
+ * 41.2) — the profiles that are ENABLED and recordings-flagged (their
+ * `recordings` block is present, which only `keeper-syncd` writes), and
+ * nothing else. A profile that merely exists is not offered here, and hiding
+ * it in the picker is not the guard: `recording_settings_set` refuses an
+ * unflagged id outright.
+ *
+ * Resolves an EMPTY list rather than rejecting whenever folder sync cannot
+ * answer — no git on the machine, no engine, no profiles at all. That makes
+ * "nothing to offer" and "sync is unavailable" one code path for the caller:
+ * the destination card renders its plain folder chooser and says nothing new.
+ *
+ * `recordingsRoot` is the RESOLVED absolute root (`local_path` joined with the
+ * profile's recordings subfolder), composed by Rust. The caller NEVER joins
+ * paths: a second joiner in TypeScript would drift from the one that actually
+ * decides where a segment lands, and the resolved root is also what
+ * `RecordingSettingsVm.destinationDir` carries once a profile is chosen.
+ */
+export async function recordingDestinationProfiles(): Promise<RecordingProfileVm[]> {
+  return await invoke<RecordingProfileVm[]>("recording_destination_profiles");
 }
 
 /**

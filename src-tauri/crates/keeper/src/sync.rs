@@ -27,7 +27,7 @@ use keeper_core::platform::Platform;
 use keeper_core::vm::NotifyTarget;
 use keeper_sync::engine::Engine;
 use keeper_sync::git::resolve::{GitRequest, GitResolution};
-use keeper_sync::{Result as SyncResult, SyncError, SyncPlatform};
+use keeper_sync::{Result as SyncResult, SyncError, SyncPlatform, SyncProfile};
 
 /// Bridges the engine's port onto the shell's existing [`Platform`].
 ///
@@ -94,6 +94,21 @@ impl SyncPlatform for ShellSyncPlatform {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
             .unwrap_or(0)
+    }
+
+    fn utc_offset_minutes(&self) -> i32 {
+        // Overridden rather than left to the port's default (Story 41.5): the
+        // default reads the zone through `gix`, whose local-time lookup falls
+        // back to UTC when it cannot determine one — and inside a heavily
+        // threaded desktop app that fallback is the likely branch, not the
+        // unlikely one. A `PushPolicy::Window` of `22:00`–`06:00` evaluated in
+        // UTC is a window that opens at the wrong time of night for everyone
+        // east or west of it.
+        //
+        // `chrono::Local` is already the shell's only clock — it names every
+        // session folder and stamps every manifest — so this is that same
+        // answer, not a second one.
+        chrono::Local::now().offset().local_minus_utc() / 60
     }
 
     fn free_space(&self, path: &Path) -> Option<u64> {
@@ -331,6 +346,34 @@ pub fn sync_platform(platform: Arc<dyn Platform>) -> ShellSyncPlatform {
     ShellSyncPlatform::new(platform)
 }
 
+/// The enabled sync profile whose folder CONTAINS `path`, if any.
+///
+/// The engine resolves a profile by id and by nothing else (`sync_once`,
+/// `rescan`, `activity` all take one), so a caller that only knows a PATH has no
+/// way to ask "is this inside a synced folder" without this. Story 40.4's
+/// retitle is that caller: it has just moved a recording and needs the profile —
+/// if there is one — that must commit both halves of the move together.
+///
+/// Deepest match wins. Nothing forbids a profile inside another profile's
+/// folder, and the innermost one is the repository the file actually belongs to.
+/// Disabled profiles are skipped: a paused folder has no repository work to hand
+/// it, and reporting one would only produce a sync call that refuses.
+pub fn profile_for_path(engine: &Engine, path: &Path) -> SyncResult<Option<SyncProfile>> {
+    let mut deepest: Option<SyncProfile> = None;
+    for profile in engine.list_profiles()? {
+        if !profile.enabled || !path.starts_with(&profile.local_path) {
+            continue;
+        }
+        let deeper = deepest.as_ref().is_none_or(|held| {
+            profile.local_path.components().count() > held.local_path.components().count()
+        });
+        if deeper {
+            deepest = Some(profile);
+        }
+    }
+    Ok(deepest)
+}
+
 /// The live supervisor's stop signal, if one is running.
 ///
 /// Holding the sender here (rather than in `AppState`) keeps the whole
@@ -486,6 +529,31 @@ mod tests {
         assert!(
             !label.contains('.'),
             "expected a short label, got {label:?}"
+        );
+    }
+
+    /// Story 41.5: a `PushPolicy::Window` is an `HH:MM` a person typed on the
+    /// clock on their wall, so the offset the engine converts it with has to be
+    /// the same offset the shell stamps a session with — in MINUTES, and with
+    /// git's sign convention (east of UTC positive).
+    ///
+    /// The expectation is read back out of the RFC 3339 stamp `recording_start`
+    /// writes rather than recomputed, so a seconds-for-minutes slip or an
+    /// inverted sign fails here instead of opening someone's quiet window at
+    /// two in the afternoon.
+    #[test]
+    fn the_window_offset_is_the_one_the_shell_stamps_sessions_with() {
+        let stamped = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        let parsed = chrono::DateTime::parse_from_rfc3339(&stamped).expect("the session stamp");
+        let platform = ShellSyncPlatform::new(Arc::new(CapturingPlatform::new()));
+        assert_eq!(
+            platform.utc_offset_minutes(),
+            parsed.offset().local_minus_utc() / 60
+        );
+        assert!(
+            (-720..=840).contains(&platform.utc_offset_minutes()),
+            "a real zone offset, not seconds: {}",
+            platform.utc_offset_minutes()
         );
     }
 

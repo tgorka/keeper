@@ -1273,6 +1273,53 @@ pub fn set_recording_destination_dir(data_dir: &Path, dir: &str) -> Result<(), C
     set_setting(data_dir, RECORDING_DESTINATION_DIR_KEY, dir)
 }
 
+/// The `settings` key holding the id of the sync profile that holds this
+/// machine's recordings (Story 41.2, FR-131). Stored as the profile's opaque
+/// ULID; absent / empty ⇒ no profile choice, and the plain
+/// `recording.destination_dir` above is the one in force.
+///
+/// **Why the id and never the resolved path.** The destination is a DECISION,
+/// and a profile's name, its `local_path` and its recordings subfolder can all
+/// change under it — a cached string would name yesterday's folder after a
+/// rename. Resolving the id to an absolute root needs the sync engine, so, for
+/// exactly the reason the destination folder above needs a platform probe, the
+/// resolution happens in the SHELL: this crate stores which folder the user
+/// chose, not where it is today.
+const RECORDING_DESTINATION_PROFILE_KEY: &str = "recording.destination_profile_id";
+
+/// Read the chosen recordings sync profile id (Story 41.2). `None` when the
+/// setting is absent or empty — "cleared" and "never chosen" are one state, the
+/// same rule [`get_recording_destination_dir`] and
+/// [`get_recording_path_template`] follow.
+///
+/// No validation here, and none is possible: whether the id still names a
+/// profile that exists, is enabled and says it holds recordings is a `sync.db`
+/// fact this crate cannot see (AD-40 keeps `keeper-core` and `keeper-sync`
+/// apart). The shell answers it and degrades to the plain-path answer when it
+/// cannot, so a read of a stale id never fails — a machine with no `git` still
+/// records.
+pub fn get_recording_destination_profile(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    let raw = get_setting(data_dir, RECORDING_DESTINATION_PROFILE_KEY)?;
+    Ok(raw.filter(|v| !v.trim().is_empty()))
+}
+
+/// Write the chosen recordings sync profile id (Story 41.2) verbatim under
+/// `recording.destination_profile_id`; a blank value CLEARS the choice, which is
+/// how the shell puts a plain folder back in force — the same convention
+/// [`set_recording_path_template`] uses.
+///
+/// Nothing here touches the sibling `recording.destination_dir` row. "Exactly
+/// one key in force" is the settings command's invariant, enforced in one place
+/// together with the refusals that belong to it (a profile that does not hold
+/// recordings, a plain folder inside a synced tree); a setter that quietly
+/// cleared its neighbour would make that one rule into two, in two crates.
+pub fn set_recording_destination_profile(
+    data_dir: &Path,
+    profile_id: &str,
+) -> Result<(), CoreError> {
+    set_setting(data_dir, RECORDING_DESTINATION_PROFILE_KEY, profile_id)
+}
+
 /// The `settings` key holding the user's recording path template (Story 40.2,
 /// AD-65). Stored as the raw template string; absent / empty ⇒ no explicit
 /// choice — the SHELL resolves the effective default
@@ -1823,17 +1870,27 @@ pub fn get_account(data_dir: &Path, account_id: &str) -> Result<Option<AccountRo
 mod tests {
     use super::*;
 
+    /// A scratch directory no other test can land in.
+    ///
+    /// The pid plus a nanosecond stamp is NOT enough: two test threads that ask
+    /// inside the same clock tick get the same name, open the same SQLite file,
+    /// and then fail on whichever collision they reach first — a duplicate
+    /// migration column or a UNIQUE violation on a fixture inserted twice. Both
+    /// were observed on macOS under `cargo test --workspace`. The process-wide
+    /// counter is what makes the name unique per CALL, the way
+    /// `recording.rs`'s helper already does it.
     fn temp_dir() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
-        let unique = format!(
-            "keeper-registry-test-{}-{}",
+        dir.push(format!(
+            "keeper-registry-test-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
-        );
-        dir.push(unique);
+        ));
         dir
     }
 
@@ -2853,6 +2910,53 @@ mod tests {
         assert_eq!(
             get_recording_destination_dir(&dir).expect("get blank"),
             None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Story 41.2: the profile choice is a sibling key of the destination folder
+    /// and behaves exactly like it — verbatim round trip, blank ⇒ unset — and it
+    /// is deliberately INDEPENDENT of it: "exactly one key in force" is the
+    /// settings command's invariant, so neither setter here may clear the other.
+    #[test]
+    fn recording_destination_profile_defaults_to_none_and_round_trips() {
+        let dir = temp_dir();
+        assert_eq!(
+            get_recording_destination_profile(&dir).expect("get default"),
+            None,
+            "a fresh install has chosen no synced folder"
+        );
+        // Round-trip an opaque profile id verbatim: it is a ULID, not a path,
+        // and nothing here interprets it.
+        set_recording_destination_profile(&dir, "01J000000000000000000TGD").expect("set id");
+        assert_eq!(
+            get_recording_destination_profile(&dir).expect("get id"),
+            Some("01J000000000000000000TGD".to_owned())
+        );
+        // Blank clears the choice, which is how the shell puts a plain folder
+        // back in force.
+        set_recording_destination_profile(&dir, "").expect("set empty");
+        assert_eq!(
+            get_recording_destination_profile(&dir).expect("get empty"),
+            None
+        );
+        set_recording_destination_profile(&dir, "   ").expect("set blank");
+        assert_eq!(
+            get_recording_destination_profile(&dir).expect("get blank"),
+            None
+        );
+        // Both keys can be stored at once — a hand-edited `config.json` is
+        // exactly that state, and the getters must report it faithfully so the
+        // shell can resolve it profile-first out loud rather than guess.
+        set_recording_destination_dir(&dir, "/Users/x/Recordings").expect("set folder");
+        set_recording_destination_profile(&dir, "01J000000000000000000TGD").expect("set id again");
+        assert_eq!(
+            get_recording_destination_dir(&dir).expect("get folder"),
+            Some("/Users/x/Recordings".to_owned())
+        );
+        assert_eq!(
+            get_recording_destination_profile(&dir).expect("get id again"),
+            Some("01J000000000000000000TGD".to_owned())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

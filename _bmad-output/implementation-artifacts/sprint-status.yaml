@@ -345,15 +345,15 @@ development_status:
   40-1-the-path-template-rendered-purely: done
   40-2-the-template-is-a-setting-and-the-preview-is-the-manual: done
   40-3-recording-start-uses-it-and-the-session-gets-an-identity: done
-  40-4-retitle-moves-the-folder-not-the-identity: backlog
+  40-4-retitle-moves-the-folder-not-the-identity: review
   epic-40-retrospective: optional
-  epic-41: backlog
-  41-1-a-profile-can-say-it-holds-recordings: backlog
-  41-2-choosing-where-recordings-live-once: backlog
-  41-3-partial-while-writing-final-on-close: backlog
-  41-4-the-gate-learns-the-word-finished: backlog
-  41-5-committed-at-close-pushed-on-policy: backlog
-  41-6-durability-you-can-read: backlog
+  epic-41: in-progress
+  41-1-a-profile-can-say-it-holds-recordings: review
+  41-2-choosing-where-recordings-live-once: review
+  41-3-partial-while-writing-final-on-close: review
+  41-4-the-gate-learns-the-word-finished: review
+  41-5-committed-at-close-pushed-on-policy: review
+  41-6-durability-you-can-read: review
   epic-41-retrospective: optional
   epic-42: backlog
   42-1-a-session-is-a-row: backlog
