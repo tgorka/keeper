@@ -15018,22 +15018,30 @@ mod tests {
 
     /// A destination that resolved to a recordings-flagged profile whose
     /// recordings root is `root`.
+    ///
+    /// `volume: None` is the Story 41.7 answer for "a synced folder on a disk
+    /// that is always there": removability IS the `Option`, so a fixture that
+    /// says `None` is asserting the non-removable case rather than leaving a
+    /// field unset. The removable cases build their own destinations.
     fn profile_destination(root: &Path) -> RecordingDestination {
         RecordingDestination {
             root: root.to_path_buf(),
             kind: RecordingDestinationKind::Profile,
             profile_id: Some("profile-1".to_owned()),
             profile_name: Some("tgdrive".to_owned()),
+            volume: None,
         }
     }
 
-    /// A plain-folder destination — the same root, no profile behind it.
+    /// A plain-folder destination — the same root, no profile behind it, and so
+    /// no volume to be attached or not (Story 41.7).
     fn folder_destination(root: &Path) -> RecordingDestination {
         RecordingDestination {
             root: root.to_path_buf(),
             kind: RecordingDestinationKind::Folder,
             profile_id: None,
             profile_name: None,
+            volume: None,
         }
     }
 

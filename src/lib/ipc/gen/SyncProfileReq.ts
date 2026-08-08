@@ -54,4 +54,23 @@ notes: boolean | null,
  * re-sent for an already-flagged folder, which must not reset a subfolder the
  * user changed.
  */
-notesSubfolder: string | null, };
+notesSubfolder: string | null, 
+/**
+ * Flag or unflag this folder as holding recordings (Story 41.7, AD-66).
+ * `None` leaves the flag alone under exactly the rule `notes` follows above:
+ * a caller with no control for it must not be able to clear it, and clearing
+ * it would take a folder out of the Recording destination picker while every
+ * file stayed where it was.
+ */
+recordings: boolean | null, 
+/**
+ * The recordings subfolder to pin. `None` keeps whatever is stored — or,
+ * when this flags the folder for the first time, lets `RecordingsConfig`'s
+ * own default stand, which is how a form that shows an untouched box says
+ * "keeper picks".
+ *
+ * Unlike `notes_subfolder`, an explicit empty string is a value and NOT an
+ * omission: see [`recordings_subfolder`] for why nothing here is tidied up
+ * on the caller's behalf.
+ */
+recordingsSubfolder: string | null, };

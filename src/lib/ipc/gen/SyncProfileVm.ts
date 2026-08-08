@@ -59,4 +59,30 @@ notes: boolean,
  * box, so what it displays is the value that would actually be in force
  * (AD-34-8).
  */
-notesSubfolder: string | null, };
+notesSubfolder: string | null, 
+/**
+ * Whether this folder holds recordings (Story 41.1, AD-66).
+ *
+ * Beside the notes flag above and meaning the same kind of thing: a
+ * recordings root is not a configured object with a life of its own, it is
+ * this flag plus a subfolder on a profile that already exists. Story 41.7
+ * is what made it reachable — the block existed and nothing in the app
+ * could write one, so the destination picker 41.2 built never had a profile
+ * to offer.
+ */
+recordings: boolean, 
+/**
+ * The recordings subfolder that would be **in force**: the stored one when
+ * this folder holds recordings, and `RecordingsConfig`'s own default when it
+ * does not.
+ *
+ * Never `None`, which is the one place this deliberately does not mirror
+ * `notes_subfolder` directly above. That field is `None` for a folder that
+ * is not a vault, so the form has to prefill its box from a copy of the
+ * default it keeps in TypeScript (`SYNC_NOTES_DEFAULT_SUBFOLDER`) — a second
+ * spelling of a Rust constant, which is exactly the drift
+ * `keeper_sync::profile` spells its defaults once to prevent. Resolving it
+ * here instead means the form prefills from the value that would actually be
+ * used (AD-34-8) and never spells `recordings` at all.
+ */
+recordingsSubfolder: string, };
