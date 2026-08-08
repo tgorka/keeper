@@ -577,6 +577,10 @@ pub struct SyncProfile {
     /// Repository subpaths to materialize. Empty means the whole repository.
     /// Applied both as a cone sparse-checkout and as the LFS path filter,
     /// because git-lfs is sparse-checkout-unaware (AD-47).
+    ///
+    /// Both consumers read this list through [`crate::sparse::SparseCone`],
+    /// which is where "inside the cone" is defined — it is wider than it looks,
+    /// and the two must not disagree about it (Story 27.2).
     #[serde(default)]
     pub subpaths: Vec<String>,
     /// Additional tier-0 exclusion globs, on top of the built-in set.

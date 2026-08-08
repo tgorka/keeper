@@ -48,6 +48,7 @@ pub mod platform;
 pub mod profile;
 pub mod progress;
 pub mod provenance;
+pub mod sparse;
 pub mod stability;
 pub mod volume;
 pub mod watch;
@@ -67,6 +68,7 @@ pub use platform::SyncPlatform;
 pub use profile::{ProfileState, SyncDirection, SyncLane, SyncProfile};
 pub use progress::{SyncPhase, SyncProgress, SyncStatus};
 pub use provenance::{Provenance, SyncSource};
+pub use sparse::SparseCone;
 
 /// Version string stamped into provenance trailers and the LFS user agent.
 pub const AGENT: &str = concat!("keeper-sync/", env!("CARGO_PKG_VERSION"));

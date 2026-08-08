@@ -18,6 +18,9 @@
 //!   to this engine until the key is set. A non-sparse index carrying
 //!   `SKIP_WORKTREE` flags is fully understood, which is why AD-47 pairs cone
 //!   sparse-checkout with a non-sparse index rather than avoiding sparsity.
+//!   [`clear_worktree_sparse_override`] is the other half of that guarantee:
+//!   `.git/config` is not the last word once `git sparse-checkout` has switched
+//!   the repository to worktree-scoped configuration.
 
 use std::{
     num::NonZeroU32,
@@ -504,9 +507,7 @@ pub fn enforce_local_config_with_filter(
     filter_program: Option<&Path>,
 ) -> Result<()> {
     let path = repo.git_dir().join("config");
-    let mut config =
-        gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
-            .map_err(|err| SyncError::Git(format!("could not read {}: {err}", path.display())))?;
+    let mut config = read_config(&path, gix::config::Source::Local)?;
     config
         .set_raw_value("index.sparse", "false")
         .map_err(|err| SyncError::Git(format!("could not set index.sparse: {err}")))?;
@@ -555,26 +556,136 @@ pub fn enforce_local_config_with_filter(
             .map_err(|err| SyncError::Git(format!("could not set filter.lfs.required: {err}")))?;
     }
 
+    write_config_atomically(&config, &path)?;
+
+    Ok(())
+}
+
+/// Read one git configuration file, without following its include directives.
+///
+/// `source` is what decides precedence when gitoxide later merges scopes, so it
+/// has to name the file honestly: `Local` for `.git/config`, `Worktree` for
+/// `.git/config.worktree`.
+fn read_config(path: &Path, source: gix::config::Source) -> Result<gix::config::File> {
+    gix::config::File::from_path_no_includes(path.to_owned(), source)
+        .map_err(|err| SyncError::Git(format!("could not read {}: {err}", path.display())))
+}
+
+/// Replace a git configuration file with `config`, atomically.
+///
+/// Written tmp-then-rename: a torn `.git/config` is a bricked repository, and
+/// this runs on a pendrive that can be unplugged mid-write (AD-48).
+fn write_config_atomically(config: &gix::config::File, path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| SyncError::Config(format!("{} has no parent", path.display())))?;
-    // Written tmp-then-rename: a torn `.git/config` is a bricked repository,
-    // and this runs on a pendrive that can be unplugged mid-write (AD-48).
     let mut staged = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|source| SyncError::io("stage .git/config", parent.to_path_buf(), source))?;
+        .map_err(|source| SyncError::io("stage a git config", parent.to_path_buf(), source))?;
     config
         .write_to(&mut staged)
-        .map_err(|source| SyncError::io("write .git/config", path.clone(), source))?;
+        .map_err(|source| SyncError::io("write a git config", path.to_path_buf(), source))?;
     // A temp file is created 0600; keep whatever mode the repository already
     // used so a shared-group checkout does not silently become private.
-    if let Ok(metadata) = std::fs::metadata(&path) {
+    if let Ok(metadata) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(staged.path(), metadata.permissions());
     }
     staged
-        .persist(&path)
-        .map_err(|err| SyncError::io("replace .git/config", path.clone(), err.error))?;
-
+        .persist(path)
+        .map_err(|err| SyncError::io("replace a git config", path.to_path_buf(), err.error))?;
     Ok(())
+}
+
+/// The `.git/info/sparse-checkout` patterns in force, or `None` when the
+/// repository is not in sparse mode at all (Story 27.2).
+///
+/// The pattern *grammar* is deliberately not interpreted here: it belongs with
+/// [`crate::sparse`], which is also what decides the cone that produced it. This
+/// answers only the two questions gitoxide can — is sparse checkout switched on,
+/// and what does the file say.
+///
+/// "Switched on" is read from the effective configuration rather than from the
+/// file's existence, because `git sparse-checkout disable` leaves the pattern
+/// file exactly where it is and only flips `core.sparseCheckout` to false. A
+/// repository that was ever sparse keeps a stale, complete-looking pattern file
+/// forever, and reading that file alone would report a full checkout as narrow.
+pub fn sparse_patterns(repo: &gix::Repository) -> Result<Option<String>> {
+    if repo.config_snapshot().boolean("core.sparseCheckout") != Some(true) {
+        return Ok(None);
+    }
+    let path = repo.git_dir().join("info").join("sparse-checkout");
+    match std::fs::read_to_string(&path) {
+        Ok(patterns) => Ok(Some(patterns)),
+        // Sparse mode on with no patterns at all is a broken repository, not a
+        // full checkout. Reported as an empty cone so the caller re-applies the
+        // profile's own instead of concluding there is nothing to do.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Some(String::new())),
+        Err(err) => Err(SyncError::io(
+            "read the sparse-checkout patterns",
+            path,
+            err,
+        )),
+    }
+}
+
+/// Clear an `index.sparse` that a worktree-scoped configuration is shadowing,
+/// reporting whether anything had to change (Story 27.2, AD-47).
+///
+/// # Why `.git/config` is not the last word
+///
+/// `git sparse-checkout` switches the repository to **worktree-scoped
+/// configuration**: it writes `extensions.worktreeConfig = true` into
+/// `.git/config` and puts `core.sparseCheckout` into `.git/config.worktree`.
+/// That second file is loaded *after* `.git/config` by git and by gitoxide
+/// alike, so whatever it names wins.
+///
+/// `index.sparse` is one of the things it can name. `git sparse-checkout set
+/// --sparse-index` writes `index.sparse = true` there, and from that moment the
+/// `false` [`enforce_local_config`] wrote into `.git/config` is dead text: the
+/// effective value is `true`, git builds a genuinely sparse index, and
+/// `gix::status` hard-fails with `TreeIndexDiff(IsSparse)` on every sync
+/// afterwards — the exact failure the module docs open with, reached by a route
+/// that leaves the enforced key sitting there looking correct.
+///
+/// keeper's own shim never passes `--sparse-index`. But keeper does not own
+/// these folders alone: a human running plain `git` inside a synced folder is
+/// the documented case — [`enforce_local_config_with_filter`] registers the LFS
+/// filter for precisely that person — and one such command is all it takes. So
+/// AD-47's invariant is enforced where it is actually decided, not only where it
+/// was written.
+///
+/// The key is set to `false` rather than removed, which is also what git's own
+/// `sparse-checkout disable` writes there.
+pub fn clear_worktree_sparse_override(repo: &gix::Repository) -> Result<bool> {
+    let git_dir = repo.git_dir();
+    let path = git_dir.join("config.worktree");
+    if !path.exists() {
+        return Ok(false);
+    }
+    // The file is inert unless the extension names it, and enabling that
+    // extension is git's decision to make, never keeper's.
+    let local = read_config(&git_dir.join("config"), gix::config::Source::Local)?;
+    if local.boolean("extensions.worktreeConfig").ok().flatten() != Some(true) {
+        return Ok(false);
+    }
+
+    let mut config = read_config(&path, gix::config::Source::Worktree)?;
+    let shadowing = match config.boolean("index.sparse") {
+        // Not named here, so nothing is shadowed.
+        Ok(None) => false,
+        Ok(Some(sparse)) => sparse,
+        // Present but unparseable. git will not accept it either, and it is
+        // certainly not the `false` this engine requires.
+        Err(_) => true,
+    };
+    if !shadowing {
+        return Ok(false);
+    }
+
+    config
+        .set_raw_value("index.sparse", "false")
+        .map_err(|err| SyncError::Git(format!("could not set index.sparse: {err}")))?;
+    write_config_atomically(&config, &path)?;
+    Ok(true)
 }
 
 /// Repository-relative paths that differ between `HEAD`, the index and the
@@ -808,11 +919,7 @@ pub fn adopt(root: &Path, remote_url: &str, branch: &str) -> Result<gix::Reposit
     .map_err(|err| SyncError::Git(format!("could not set HEAD: {err}")))?;
 
     let config_path = repo.git_dir().join("config");
-    let mut config =
-        gix::config::File::from_path_no_includes(config_path.clone(), gix::config::Source::Local)
-            .map_err(|err| {
-            SyncError::Git(format!("could not read {}: {err}", config_path.display()))
-        })?;
+    let mut config = read_config(&config_path, gix::config::Source::Local)?;
     config
         .set_raw_value_by("remote", Some("origin".into()), "url", remote_url)
         .map_err(|err| SyncError::Git(format!("could not set remote.origin.url: {err}")))?;
@@ -825,17 +932,7 @@ pub fn adopt(root: &Path, remote_url: &str, branch: &str) -> Result<gix::Reposit
         )
         .map_err(|err| SyncError::Git(format!("could not set remote.origin.fetch: {err}")))?;
 
-    let parent = config_path
-        .parent()
-        .ok_or_else(|| SyncError::Config(format!("{} has no parent", config_path.display())))?;
-    let mut staged = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|source| SyncError::io("stage .git/config", parent.to_path_buf(), source))?;
-    config
-        .write_to(&mut staged)
-        .map_err(|source| SyncError::io("write .git/config", config_path.clone(), source))?;
-    staged
-        .persist(&config_path)
-        .map_err(|err| SyncError::io("replace .git/config", config_path.clone(), err.error))?;
+    write_config_atomically(&config, &config_path)?;
 
     // Reopen so the handle sees the remote and HEAD just written.
     open(root, false)
@@ -998,11 +1095,7 @@ fn first_entry_under(dir: &Path) -> Option<String> {
 /// the way it owns `index.sparse`.
 pub fn ensure_remote(repo: &gix::Repository, remote_url: &str) -> Result<bool> {
     let config_path = repo.git_dir().join("config");
-    let mut config =
-        gix::config::File::from_path_no_includes(config_path.clone(), gix::config::Source::Local)
-            .map_err(|err| {
-            SyncError::Git(format!("could not read {}: {err}", config_path.display()))
-        })?;
+    let mut config = read_config(&config_path, gix::config::Source::Local)?;
     let present = config
         .raw_value_by("remote", Some("origin".into()), "url")
         .map(|url| !url.is_empty())
@@ -1023,17 +1116,7 @@ pub fn ensure_remote(repo: &gix::Repository, remote_url: &str) -> Result<bool> {
         )
         .map_err(|err| SyncError::Git(format!("could not restore remote.origin.fetch: {err}")))?;
 
-    let parent = config_path
-        .parent()
-        .ok_or_else(|| SyncError::Config(format!("{} has no parent", config_path.display())))?;
-    let mut staged = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|source| SyncError::io("stage .git/config", parent.to_path_buf(), source))?;
-    config
-        .write_to(&mut staged)
-        .map_err(|source| SyncError::io("write .git/config", config_path.clone(), source))?;
-    staged
-        .persist(&config_path)
-        .map_err(|err| SyncError::io("replace .git/config", config_path.clone(), err.error))?;
+    write_config_atomically(&config, &config_path)?;
     Ok(true)
 }
 
@@ -1593,6 +1676,143 @@ mod tests {
             1,
             "a repeated call must overwrite, not append: {text}"
         );
+    }
+
+    /// Put a repository into the worktree-scoped configuration state
+    /// `git sparse-checkout` leaves behind, with `index.sparse` set to
+    /// `declared` in `.git/config.worktree`.
+    fn with_worktree_config(root: &std::path::Path, declared: Option<&str>) {
+        let config = root.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).expect("read config");
+        text.push_str("[extensions]\n\tworktreeConfig = true\n");
+        std::fs::write(&config, text).expect("write config");
+        let mut worktree = String::from("[core]\n\tsparseCheckout = true\n");
+        if let Some(declared) = declared {
+            worktree.push_str(&format!("[index]\n\tsparse = {declared}\n"));
+        }
+        std::fs::write(root.join(".git/config.worktree"), worktree).expect("write worktree config");
+    }
+
+    #[test]
+    fn an_index_sparse_a_worktree_config_shadows_is_cleared() {
+        // The whole point of the function: `.git/config` says false, the
+        // worktree scope says true, and true is what gix and git both act on —
+        // so `gix::status` hard-fails until this runs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        enforce_local_config(&repo).expect("enforce");
+        with_worktree_config(dir.path(), Some("true"));
+
+        let reopened = open(dir.path(), true).expect("reopen");
+        assert_eq!(
+            reopened.config_snapshot().boolean("index.sparse"),
+            Some(true),
+            "the fixture must reproduce the shadow, or this test proves nothing"
+        );
+
+        assert!(
+            clear_worktree_sparse_override(&reopened).expect("clear"),
+            "a shadowing true must be reported as changed"
+        );
+
+        let reopened = open(dir.path(), true).expect("reopen after the fix");
+        assert_eq!(
+            reopened.config_snapshot().boolean("index.sparse"),
+            Some(false),
+            "the effective value is what AD-47 constrains, not the one in .git/config"
+        );
+        assert_eq!(
+            reopened.config_snapshot().boolean("core.sparseCheckout"),
+            Some(true),
+            "the sparse checkout itself must survive: only the index format is keeper's"
+        );
+    }
+
+    #[test]
+    fn a_worktree_config_that_is_not_shadowing_is_left_untouched() {
+        // `sparse-checkout disable` writes `index.sparse = false` here itself,
+        // and every rewrite of this file is a write to a pendrive that may be
+        // pulled mid-sync (AD-48). Nothing is rewritten unless it is wrong.
+        for declared in [None, Some("false")] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let repo = gix::init(dir.path()).expect("init");
+            enforce_local_config(&repo).expect("enforce");
+            with_worktree_config(dir.path(), declared);
+            let path = dir.path().join(".git/config.worktree");
+            let before = std::fs::read_to_string(&path).expect("read worktree config");
+
+            let reopened = open(dir.path(), true).expect("reopen");
+            assert!(
+                !clear_worktree_sparse_override(&reopened).expect("clear"),
+                "{declared:?} shadows nothing and must report no change"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read worktree config"),
+                before,
+                "{declared:?} must not have been rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn a_worktree_config_the_extension_does_not_enable_is_inert() {
+        // Without `extensions.worktreeConfig` neither git nor gix ever loads the
+        // file, so nothing is shadowed and enabling the extension to "fix" a
+        // value nobody reads would be keeper making the repository sparse-aware
+        // on its own initiative.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        enforce_local_config(&repo).expect("enforce");
+        std::fs::write(
+            dir.path().join(".git/config.worktree"),
+            "[index]\n\tsparse = true\n",
+        )
+        .expect("write worktree config");
+
+        let reopened = open(dir.path(), true).expect("reopen");
+        assert!(!clear_worktree_sparse_override(&reopened).expect("clear"));
+        assert_eq!(
+            reopened.config_snapshot().boolean("index.sparse"),
+            Some(false),
+            "an unreferenced file cannot have changed the effective value"
+        );
+    }
+
+    #[test]
+    fn sparse_patterns_are_reported_only_while_sparse_checkout_is_switched_on() {
+        // `sparse-checkout disable` leaves the pattern file exactly where it
+        // was. Reading the file alone would report a full checkout as narrow
+        // forever, and the cone would never be re-applied after a re-widening.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        enforce_local_config(&repo).expect("enforce");
+        let info = dir.path().join(".git/info");
+        std::fs::create_dir_all(&info).expect("info dir");
+        std::fs::write(info.join("sparse-checkout"), "/*\n!/*/\n/docs/\n").expect("patterns");
+
+        let reopened = open(dir.path(), true).expect("reopen");
+        let stale = sparse_patterns(&reopened).expect("read");
+        assert_eq!(stale, None, "a stale pattern file is not a sparse checkout");
+
+        with_worktree_config(dir.path(), None);
+        let reopened = open(dir.path(), true).expect("reopen");
+        let patterns = sparse_patterns(&reopened).expect("read");
+        assert_eq!(patterns.as_deref(), Some("/*\n!/*/\n/docs/\n"));
+    }
+
+    #[test]
+    fn sparse_mode_with_no_pattern_file_reads_as_an_empty_cone_not_a_full_checkout() {
+        // Reported as `Some("")` so the caller re-applies the profile's cone.
+        // `None` would mean "full checkout, nothing to do", and the repository
+        // would sit in a broken sparse state indefinitely.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        enforce_local_config(&repo).expect("enforce");
+        with_worktree_config(dir.path(), None);
+
+        let reopened = open(dir.path(), true).expect("reopen");
+        let patterns = sparse_patterns(&reopened).expect("read");
+        assert_eq!(patterns.as_deref(), Some(""));
     }
 
     #[test]
