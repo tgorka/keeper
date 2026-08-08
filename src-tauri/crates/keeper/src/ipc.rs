@@ -10077,16 +10077,68 @@ pub async fn session_restore(state: State<'_, AppState>) -> Result<Vec<AccountVm
     auth::find_restorable_accounts(state.platform.as_ref()).map_err(to_ipc_error)
 }
 
+/// Every folder-sync profile's remote URL, handed to the pure `compute_egress` as
+/// plain data (Story 23.7).
+///
+/// Data rather than a type, because AD-40 keeps `keeper-core` free of `keeper-sync`:
+/// the crate that computes the disclosure cannot see a `SyncProfile`, so the shell
+/// — the one place that links both — projects the profile set down to the only
+/// field the disclosure needs. Read live on every call, never cached, which is what
+/// makes adding or removing a profile change the disclosed set immediately.
+///
+/// **A missing engine is not an error here.** The engine cannot exist without a
+/// usable `git` (AD-41), and without the engine no push, fetch or clone can happen
+/// in this process — so "no engine" and "no folder-sync egress" are the same fact,
+/// and an empty list is the honest answer rather than a swallowed failure. Failing
+/// the whole egress list on a machine that simply has no `git` would hide the
+/// account destinations too, which is strictly less honest.
+///
+/// **A failed profile read *is* an error.** Here the engine exists — sync is live —
+/// and we cannot say what it reaches. Returning a short list would present a partial
+/// disclosure as a complete one, the single thing this surface must never do, so the
+/// error propagates and Settings → About says it could not load the list.
+#[cfg(desktop)]
+fn sync_remote_urls(state: &AppState) -> Result<Vec<String>, IpcError> {
+    let engine = match crate::sync::engine(Arc::clone(&state.platform)) {
+        Ok(engine) => engine,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "egress: no folder-sync engine on this machine, so no sync remote is disclosed"
+            );
+            return Ok(Vec::new());
+        }
+    };
+    let profiles = match engine.list_profiles() {
+        Ok(profiles) => profiles,
+        Err(error) => return Err(crate::sync_ipc::sync_ipc_error(&error)),
+    };
+    Ok(profiles.into_iter().map(|p| p.remote_url).collect())
+}
+
+/// Mobile twin of [`sync_remote_urls`]: iOS links no folder-sync engine at all
+/// (`crate::sync` is `#[cfg(desktop)]` because `keeper-sync` must never reach that
+/// target), so there is no remote to disclose and the empty list is the whole truth
+/// — the same "iOS adds no new egress endpoints" claim `docs/egress.md` makes.
+#[cfg(not(desktop))]
+fn sync_remote_urls(state: &AppState) -> Result<Vec<String>, IpcError> {
+    let _ = state;
+    Ok(Vec::new())
+}
+
 /// Report the live set of network destinations keeper contacts (Story 11.2,
-/// NFR-11, UX-DR17). Reads the accounts registry from the same path
+/// NFR-11, UX-DR17; Story 23.7). Reads the accounts registry from the same path
 /// [`session_restore`] uses — `registry::list_accounts` — projects each row to its
-/// `(homeserver_url, Provider)`, and feeds them plus the shared
-/// [`EGRESS_UPDATE_ENDPOINT`] into the pure `compute_egress`. The result is
-/// rendered as UI under Settings → About so keeper's egress claim is verifiable,
-/// never asserted: each homeserver (deduped), `api.beeper.com` exactly when a
-/// Beeper account exists, and the update endpoint. A legacy row with no/unknown
-/// `provider` tag maps to [`Provider::Password`] — Beeper detection still catches
-/// it by host. Failures funnel through [`to_ipc_error`].
+/// `(homeserver_url, Provider)`, reads every folder-sync profile's remote via
+/// [`sync_remote_urls`], and feeds both plus the shared [`EGRESS_UPDATE_ENDPOINT`]
+/// into the pure `compute_egress`. The result is rendered as UI under Settings →
+/// About so keeper's egress claim is verifiable, never asserted: each homeserver
+/// (deduped), `api.beeper.com` exactly when a Beeper account exists, each distinct
+/// sync remote *host* (never the full remote URL — see `egress::remote_host`), and
+/// the update endpoint. A legacy row with no/unknown `provider` tag maps to
+/// [`Provider::Password`] — Beeper detection still catches it by host. Both inputs
+/// are read on every call, so adding or removing an account or a profile changes
+/// the disclosed set. Failures funnel through [`to_ipc_error`].
 #[tauri::command]
 pub async fn egress_list(state: State<'_, AppState>) -> Result<Vec<EgressEndpointVm>, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
@@ -10106,7 +10158,12 @@ pub async fn egress_list(state: State<'_, AppState>) -> Result<Vec<EgressEndpoin
             (row.homeserver_url, provider)
         })
         .collect();
-    Ok(compute_egress(&accounts, EGRESS_UPDATE_ENDPOINT))
+    let sync_remotes = sync_remote_urls(&state)?;
+    Ok(compute_egress(
+        &accounts,
+        &sync_remotes,
+        EGRESS_UPDATE_ENDPOINT,
+    ))
 }
 
 /// Subscribe to the merged unified inbox across every restorable account (FR-18,
