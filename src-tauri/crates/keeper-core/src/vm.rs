@@ -3026,6 +3026,54 @@ pub struct RecordingSummaryVm {
     pub title: Option<String>,
 }
 
+/// The note stub the stop surface presents (Story 42.4, FR-142).
+///
+/// Composed by [`crate::notes::recording_note::compose`] at finalize and written
+/// to disk by the shell, so by the time this VM exists there is a real file at
+/// [`Self::path`]. `None` on the summary side means only "no stub file for this
+/// session" — never written, or already dismissed — and the surface renders
+/// nothing. It is never an error: a stub that could not be written is logged,
+/// because finalize already succeeded and the recording is safe.
+///
+/// **`contents` is the file, not the composition.** After the user saves, this
+/// carries what is on disk, with [`Self::body_offset`] re-derived from that
+/// file's own frontmatter. Re-seeding an untouched draft from it can therefore
+/// never resurrect text the user deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingNoteStubVm {
+    /// The stub's absolute path on this machine: the save target, and what
+    /// Reveal opens. Absolute is correct *here* and forbidden inside the note
+    /// itself — FR-145 is a rule about what gets persisted and synced, and this
+    /// VM is neither (the sibling `sessionFolder` on the summary is absolute for
+    /// the same reason).
+    pub path: String,
+    /// `2026-08-08-quarterly-review.md` — the name, for display.
+    pub filename: String,
+    /// The whole file: frontmatter block, a blank separator line, then the body.
+    pub contents: String,
+    /// Where the body starts in [`Self::contents`], in **UTF-16 code units**.
+    ///
+    /// Not bytes. The surface splits `contents` at this index with
+    /// `String.prototype.slice`, renders only the tail in the textarea and saves
+    /// `head + draft` — so the user can never type inside the frontmatter, and
+    /// the block keeper authored comes back byte-identical. JavaScript indexes
+    /// strings in UTF-16 code units, so a byte offset would land mid-character
+    /// on any non-ASCII title and silently split the block in the wrong place.
+    /// Converted once, in Rust, from the composer's byte offset.
+    pub body_offset: u32,
+    /// `true` when the stub went into a notes vault subtree, `false` when it was
+    /// written beside the session folder. Both are real files at real paths;
+    /// this says whether the vault's index will pick it up.
+    pub in_vault: bool,
+    /// The session's immutable `<device ULID>-<session ULID>` (Story 40.3) — the
+    /// same id the stub's own `session:` field carries.
+    pub session_id: String,
+    /// The stub's path relative to the root it was written under, for display.
+    pub relative_path: String,
+}
+
 impl RecordingStatusVm {
     /// The boot/default snapshot: no session yet.
     pub fn idle() -> Self {

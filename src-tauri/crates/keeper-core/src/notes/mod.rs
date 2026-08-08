@@ -14,6 +14,7 @@ pub mod index;
 pub mod links;
 pub mod naming;
 pub mod query;
+pub mod recording_note;
 pub mod search;
 pub mod tags;
 pub mod templates;

@@ -58,6 +58,10 @@ vi.mock("@/lib/ipc/client", () => ({
   // The summary card's inline rename (Story 40.4) — it MOVES the session.
   recordingRetitle: vi.fn(),
   revealPath: vi.fn(() => Promise.resolve()),
+  // Story 42.4: the completion card resolves its note stub on mount. No stub
+  // is this suite's world — the pane's job is the summary, and it must render
+  // in full without one.
+  recordingNoteStub: vi.fn(() => Promise.resolve(null)),
 }));
 
 // The Destination card's folder chooser (Story 19.5) opens the OS-native
