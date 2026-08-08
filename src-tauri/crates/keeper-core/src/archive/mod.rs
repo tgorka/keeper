@@ -26,9 +26,11 @@ pub mod export;
 pub mod fts;
 mod ingest;
 pub mod recordings;
+pub mod recordings_fts;
 
 pub use fts::{search, SearchFilter};
 pub use recordings::{RecordingRow, RecordingSegmentRow};
+pub use recordings_fts::{search_recordings, RecordingFilter, RecordingHit};
 
 use std::path::{Path, PathBuf};
 

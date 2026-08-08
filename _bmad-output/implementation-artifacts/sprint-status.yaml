@@ -365,7 +365,7 @@ development_status:
   # carries. All are fixed here, and the macOS gate — the only one that compiles
   # the shell crate — is green.
   42-1-a-session-is-a-row: review
-  42-2-searchable-sessions: backlog
+  42-2-searchable-sessions: review
   42-3-the-recordings-browser: backlog
   42-4-the-note-stub-at-the-only-moment-it-will-be-written: backlog
   42-5-one-tag-vocabulary: backlog
