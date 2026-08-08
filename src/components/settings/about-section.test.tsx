@@ -64,6 +64,17 @@ const MIXED_EGRESS: EgressEndpointVm[] = [
   { url: UPDATE_ENDPOINT, kind: "update", label: "Signed app updates" },
 ];
 
+/**
+ * A fleet with one folder-sync profile: the account homeserver, the profile's remote
+ * HOST (never its URL — the Rust `compute_egress` reduces it, Story 23.7) and the
+ * update endpoint.
+ */
+const SYNC_EGRESS: EgressEndpointVm[] = [
+  { url: "https://matrix.example.org", kind: "homeserver", label: "Matrix homeserver" },
+  { url: "github.com", kind: "gitRemote", label: "Folder sync remote" },
+  { url: UPDATE_ENDPOINT, kind: "update", label: "Signed app updates" },
+];
+
 beforeEach(() => {
   mockEgress.mockReset();
   mockEgress.mockResolvedValue([]);
@@ -114,6 +125,52 @@ describe("AboutSection egress list", () => {
     });
     expect(screen.queryByText("https://api.beeper.com")).not.toBeInTheDocument();
     expect(screen.getByText(UPDATE_ENDPOINT)).toBeInTheDocument();
+  });
+
+  it("renders a folder-sync remote host beside the account destinations", async () => {
+    mockEgress.mockResolvedValue(SYNC_EGRESS);
+    render(<AboutSection open />);
+
+    await waitFor(() => {
+      expect(screen.getByText("github.com")).toBeInTheDocument();
+    });
+    expect(screen.getByText("Folder sync remote")).toBeInTheDocument();
+    expect(screen.getByText("https://matrix.example.org")).toBeInTheDocument();
+    expect(screen.getByText(UPDATE_ENDPOINT)).toBeInTheDocument();
+  });
+
+  it("drops the folder-sync row once that profile is gone", async () => {
+    // The list is re-read on every open and never cached in the component, which is
+    // what makes removing a profile remove its entry (Story 23.7 AC). A row that
+    // survived the profile would be a destination disclosed for a repository keeper
+    // no longer talks to.
+    mockEgress.mockResolvedValue(SYNC_EGRESS);
+    const withProfile = render(<AboutSection open />);
+    await waitFor(() => {
+      expect(screen.getByText("github.com")).toBeInTheDocument();
+    });
+    withProfile.unmount();
+
+    mockEgress.mockResolvedValue(NON_BEEPER_EGRESS);
+    render(<AboutSection open />);
+    await waitFor(() => {
+      expect(screen.getByText("https://matrix.example.org")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("github.com")).not.toBeInTheDocument();
+    expect(screen.queryByText("Folder sync remote")).not.toBeInTheDocument();
+  });
+
+  it("says the list is computed from accounts and folder-sync profiles, hosts only", async () => {
+    // The disclosure copy has to name both inputs: a bare `github.com` row under a
+    // sentence that only mentions accounts reads as a fabricated entry, and the
+    // host-only promise is the reason no repository path or token is on screen.
+    mockEgress.mockResolvedValue(SYNC_EGRESS);
+    render(<AboutSection open />);
+
+    const sentence = await screen.findByText(/These are the servers keeper connects to/);
+    expect(sentence).toHaveTextContent("folder-sync profiles");
+    expect(sentence).toHaveTextContent("host only");
+    expect(sentence).toHaveTextContent("no telemetry, analytics, or crash reporting");
   });
 
   it("renders an honest error line when the egress list cannot load", async () => {

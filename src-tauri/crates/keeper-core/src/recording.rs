@@ -1103,6 +1103,33 @@ const CAMERA_SEGMENT_STEM_PREFIX: &str = "camera-";
 /// Audio-only-track segment files are named `audio-####.m4a` (Story 21.3).
 const AUDIO_SEGMENT_STEM_PREFIX: &str = "audio-";
 
+/// The suffix `keeper-rec` writes an UNFINISHED segment under (Story 41.3,
+/// FR-133, AD-69): the writer's output file is `<name>.<ext>.partial` for the
+/// whole of its life, renamed onto `<name>.<ext>` — atomically, in the same
+/// directory — the instant `finishWriting` returns.
+///
+/// It is the only in-progress marker in the system: no lock file, no sidecar
+/// state file, nothing to fall out of step with the bytes. `keeper-sync`'s
+/// tier-0 corpus carries the matching `*.partial` name rule, so a segment
+/// mid-write is invisible to the commit path without the sync crate learning
+/// anything about recording; here it means the opposite thing — a name a
+/// finished session must never leave behind, and one the ledger never carries.
+pub const PARTIAL_SEGMENT_SUFFIX: &str = ".partial";
+
+/// Split a directory entry's file name into the name it will carry once
+/// finished and whether it is still being written (Story 41.3).
+///
+/// Everything downstream reasons about the FINAL name — `screen-0003.mov`
+/// decides the track and the index whether or not `.partial` is still on the
+/// end — so this one split is what keeps the suffix from having to be
+/// special-cased in each rule.
+fn split_partial_suffix(file: &str) -> (&str, bool) {
+    match file.strip_suffix(PARTIAL_SEGMENT_SUFFIX) {
+        Some(finished) => (finished, true),
+        None => (file, false),
+    }
+}
+
 /// The persisted `status` of a session manifest (Story 17.2). Lowercase on the
 /// wire: `"recording" | "finalized" | "recovered" | "failed"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1403,6 +1430,58 @@ impl SessionManifest {
         &self.folder
     }
 
+    /// Set (or clear) the user's title for this session (Story 40.4) — the
+    /// caller then [`Self::write`]s.
+    ///
+    /// **This method is the seam that keeps two facts apart.** The title is a
+    /// label the user owns and may change as often as they like; the identity
+    /// is [`SessionMeta::session_id`], minted once and never rewritten. A
+    /// retitle therefore touches `meta.title` and nothing else — most
+    /// pointedly not `session_id`, which Story 42's archive rows are keyed on.
+    ///
+    /// The title is trimmed, and a title that is empty (or all whitespace)
+    /// clears it, exactly as `None` does: "untitled" has one representation,
+    /// the absent field, so the folder a cleared session re-renders to is the
+    /// same folder an untitled one would have got. A pre-40.3 manifest carries
+    /// no `meta` block at all; rather than drop the title on the floor, one is
+    /// minted to hold it — but only for a title worth holding, so clearing a
+    /// never-titled session still serializes no empty `meta` object.
+    pub fn retitle(&mut self, title: Option<String>) {
+        let title = title
+            .map(|title| title.trim().to_owned())
+            .filter(|title| !title.is_empty());
+        if let Some(meta) = &mut self.meta {
+            meta.title = title;
+        } else if title.is_some() {
+            self.meta = Some(SessionMeta {
+                title,
+                ..SessionMeta::default()
+            });
+        }
+    }
+
+    /// Point this manifest at a folder it has been moved to (Story 40.4): the
+    /// runtime-only `#[serde(skip)]` path, so a subsequent [`Self::write`] or
+    /// [`Self::reconcile_from_dir`] operates on the new location rather than
+    /// the vacated one, **and** the persisted [`Self::session`] label, which is
+    /// the folder's basename.
+    ///
+    /// **`session` is a LABEL, not the identity.** It is set once at create
+    /// ([`Self::create_with_meta`]), rewritten HERE, and nowhere else in the
+    /// tree — because a retitle is the only thing that legitimately moves a
+    /// session, so this is the only place the basename can go stale. The thing
+    /// that must *not* move is [`SessionMeta::session_id`], and this method
+    /// never reads it.
+    pub fn rebind_folder(&mut self, folder: PathBuf) {
+        // Derived the same way `create_with_meta` derives it, so a moved
+        // session's label is byte-identical to a fresh start's at that path.
+        self.session = folder
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.folder = folder;
+    }
+
     /// Append one segment to the ledger — the **live** incremental view an
     /// external reader sees during recording. The event-fed list can be
     /// incomplete or wrong (a suppressed `segmentClosed`, a `bytes` fallback);
@@ -1499,6 +1578,14 @@ impl SessionManifest {
     /// backfill, an older sidecar). Since Story 20.1 both `screen-####` and
     /// `camera-####` files are ingested into the ONE segments vec,
     /// disambiguated by `track` (FR-73).
+    ///
+    /// **A `.partial` is never a ledger entry (Story 41.3).** The rebuild
+    /// ingests only finished names, so a segment still being written — and a
+    /// crash-orphaned one a recovery pass could not resolve — is skipped
+    /// rather than committed at whatever length it happens to have reached.
+    /// [`resolve_partial_segments`] runs BEFORE this on the recovery path and
+    /// either renames a usable one onto its final name (so this sees an
+    /// ordinary segment) or removes it (so this sees nothing).
     pub fn reconcile_from_dir(&mut self) -> Result<(), RecordingError> {
         let entries =
             std::fs::read_dir(&self.folder).map_err(|e| manifest_io("read session folder", &e))?;
@@ -1526,6 +1613,13 @@ impl SessionManifest {
                 tracing::warn!("manifest reconcile: skipping non-UTF-8 file name");
                 continue;
             };
+            // A `.partial` is refused here explicitly rather than by accident
+            // of its extension (Story 41.3): committing an in-progress segment
+            // to the ledger at whatever length it reached is exactly the
+            // corrupt-forever entry the suffix exists to prevent.
+            if file.ends_with(PARTIAL_SEGMENT_SUFFIX) {
+                continue;
+            }
             let is_segment_file =
                 path.extension()
                     .and_then(|ext| ext.to_str())
@@ -1687,13 +1781,16 @@ pub const RECOVERY_MAX_VISITS: usize = 4096;
 ///
 /// For each session folder found, [`SessionManifest::load`] it; when its
 /// `status` is still [`ManifestStatus::Recording`] AND its `version` is within
-/// [`MANIFEST_VERSION`] AND `is_active` reports the folder inactive, rebuild
-/// the segment ledger from the on-disk `.mov` files
+/// [`MANIFEST_VERSION`] AND `is_active` reports the folder inactive, resolve
+/// the `.partial` the crash left mid-write ([`resolve_partial_segments`] —
+/// finalised if its bytes are usable, removed if they are not, and the log
+/// says which), rebuild the segment ledger from the on-disk `.mov` files
 /// ([`SessionManifest::reconcile_from_dir`] — disk is authoritative, the stale
 /// event-fed list is discarded, never a bare status flip), mark the manifest
 /// [`ManifestStatus::Recovered`], and atomically rewrite ONLY `manifest.json`
 /// ([`SessionManifest::write`] — no segment file is ever opened for write, so
-/// recovery is remux-free).
+/// recovery is remux-free even when it publishes one: the finalise is a
+/// rename).
 ///
 /// **The live-session guard.** An on-disk `status:"recording"` cannot by
 /// itself distinguish a crashed orphan from a session that is *currently*
@@ -1876,8 +1973,29 @@ fn salvage_session_folder(
         tracing::debug!("recovery: skipping reserved live session folder");
         return None;
     }
+    // The crash left the segment it was writing under its `.partial` name
+    // (Story 41.3). Resolve those FIRST, so the rebuild below sees either an
+    // ordinary finished segment or nothing at all — never a name the ledger
+    // must not carry. Each outcome is logged, because "your last segment was
+    // saved" and "your last segment was empty and is gone" are different
+    // answers and a recovery that does not say which is not a recovery.
+    for resolved in resolve_partial_segments(&manifest.folder) {
+        match resolved.outcome {
+            PartialSegmentOutcome::Finalized => tracing::info!(
+                index = resolved.index,
+                track = resolved.track,
+                "recovery: finalised a crash-orphaned partial segment"
+            ),
+            PartialSegmentOutcome::Discarded => tracing::info!(
+                index = resolved.index,
+                track = resolved.track,
+                "recovery: discarded a partial segment with no usable media"
+            ),
+        }
+    }
     // Rebuild the ledger from disk (remux-free — only `manifest.json` is
-    // written), mark recovered, atomically rewrite.
+    // written, and the line above only ever RENAMED a segment file), mark
+    // recovered, atomically rewrite.
     if let Err(error) = manifest.reconcile_from_dir() {
         tracing::warn!(%error, "recovery: skipping folder whose segment dir could not be read");
         return None;
@@ -1889,6 +2007,230 @@ fn salvage_session_folder(
     }
     // The folder moves out of the manifest, which is dropped here anyway.
     Some(manifest.folder)
+}
+
+/// What [`resolve_partial_segments`] did with one crash-orphaned `.partial`
+/// (Story 41.3, FR-133).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialSegmentOutcome {
+    /// The file carried an initialised movie and at least one flushed
+    /// fragment, so it was renamed onto its final name and is now an ordinary
+    /// segment the rebuilt ledger carries.
+    Finalized,
+    /// The crash beat the writer's first fragment flush, so the file held no
+    /// decodable media at all and was removed. Nothing was lost that any
+    /// player could have opened.
+    Discarded,
+}
+
+/// One resolved `.partial` and which of the two things happened to it — the
+/// value the recovery pass logs, and the one a test can assert on without
+/// installing a `tracing` subscriber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialSegmentRecovery {
+    /// `"screen"`, `"camera"` or `"audio"` — the track its stem prefix names.
+    pub track: &'static str,
+    /// The segment index from the stem's trailing numeric run.
+    pub index: u32,
+    /// Finalised, or discarded.
+    pub outcome: PartialSegmentOutcome,
+}
+
+/// Finalise-or-discard every `.partial` a crash left in one session folder
+/// (Story 41.3, FR-133, AD-69) — the recovery half of the in-progress suffix.
+/// Returns what happened to each, in `read_dir` order, so the caller logs one
+/// honest line per file.
+///
+/// **Why either answer is right.** A segment is a fragmented movie: the writer
+/// lays down `ftyp`, then its first ~4 s fragment as `mdat`+`moov`, then a
+/// `mdat`+`moof` pair per flush, then a growing tail no index covers yet. The
+/// `moov` box is the whole of the initialisation — with it every flushed
+/// fragment plays as-is with no remux, and without it there is not a frame any
+/// player can find. So a `.partial` holding a complete `moov` is genuinely a
+/// finished-enough recording and is published under its final name; one
+/// without is genuinely nothing and is removed rather than left as debris the
+/// user has to interpret. The rename is the same atomic same-directory
+/// operation the sidecar performs, so recovery stays remux-free: no segment
+/// file is ever opened for write.
+///
+/// **Ownership is checked before anything is touched.** Only this session's
+/// own `screen-####.mov` / `camera-####.mov` / `audio-####.m4a` names — the
+/// exact rule [`SessionManifest::reconcile_from_dir`] applies — are ours to
+/// rename or delete. An unrelated `x.partial` a user happens to keep in the
+/// folder is left alone (it is excluded from sync, which is a nuisance; having
+/// it silently deleted would be a betrayal).
+///
+/// Best-effort and total, like every other step of the recovery pass: an
+/// unreadable folder or entry, a failed rename and a failed removal are each
+/// logged and skipped — the bytes stay on disk and one bad file never aborts
+/// the salvage that found it. A finished name that somehow already exists is
+/// never overwritten.
+pub fn resolve_partial_segments(folder: &Path) -> Vec<PartialSegmentRecovery> {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut resolved = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let (finished, is_partial) = split_partial_suffix(name);
+        if !is_partial {
+            continue;
+        }
+        let Some((track, index)) = session_segment_identity(Path::new(finished)) else {
+            continue;
+        };
+        // A directory (or anything that is not a plain file) named like a
+        // segment is not a segment.
+        if !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        let target = folder.join(finished);
+        if target.exists() {
+            // The finished segment is already there, so this `.partial` is not
+            // the one that produced it. Refuse to guess: overwriting would
+            // destroy a complete segment, and deleting would destroy bytes
+            // nothing else explains.
+            tracing::warn!(
+                index,
+                track,
+                "recovery: leaving a partial segment whose finished name already exists"
+            );
+            continue;
+        }
+        let outcome = if partial_segment_is_usable(&path) {
+            // Same directory, same filesystem: a rename, never a copy.
+            if let Err(error) = std::fs::rename(&path, &target) {
+                tracing::warn!(%error, index, track, "recovery: could not finalise a partial segment");
+                continue;
+            }
+            PartialSegmentOutcome::Finalized
+        } else {
+            if let Err(error) = std::fs::remove_file(&path) {
+                tracing::warn!(%error, index, track, "recovery: could not discard an unusable partial segment");
+                continue;
+            }
+            PartialSegmentOutcome::Discarded
+        };
+        resolved.push(PartialSegmentRecovery {
+            track,
+            index,
+            outcome,
+        });
+    }
+    resolved
+}
+
+/// How many top-level boxes [`partial_segment_is_usable`] will walk before it
+/// gives up. A real segment reaches its `moov` within the first handful; the
+/// cap only bounds a file whose box chain is adversarial or absurd.
+const MAX_SCANNED_BOXES: usize = 4096;
+
+/// Whether a crash-orphaned segment file holds media a player can open: a
+/// COMPLETE top-level `moov` box (Story 41.3).
+///
+/// Standard ISO-BMFF framing — a 32-bit big-endian size then a 4CC type, with
+/// `size == 1` meaning a 64-bit largesize follows and `size == 0` meaning the
+/// box runs to the end of the file. A torn tail (fewer than 8 readable header
+/// bytes, a size that overruns the file, or the unterminated `size == 0` form)
+/// ends the walk, which is exactly the shape a killed writer leaves: the
+/// growing `mdat` no `moof` indexes yet. Only boxes wholly contained in the
+/// file count, so a `moov` the crash cut in half is not a `moov`.
+///
+/// The two shapes, as an abandoned `AVAssetWriter` actually leaves them (box
+/// maps read off real output, macOS 26, `movieFragmentInterval` 4 s):
+///
+/// ```text
+/// killed before the first flush: ftyp/20 wide/8 mdat/0      → no moov, nothing to play
+/// killed after one flush:        ftyp/20 wide/8 mdat/5497 moov/1470 wide/8 mdat/4913 moof/636 mdat/0
+/// ```
+///
+/// The `moov` arrives WITH the first flushed fragment, which is why its
+/// presence is the whole test: before it there is not a frame any player can
+/// find, and after it every flushed fragment plays with no remux. The
+/// unterminated trailing `mdat/0` in both maps is the tail the crash dropped.
+///
+/// Reads only box headers and seeks over the payloads, so the cost is a
+/// handful of `read`s on a multi-gigabyte file.
+fn partial_segment_is_usable(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return false;
+    };
+    let mut offset: u64 = 0;
+    for _ in 0..MAX_SCANNED_BOXES {
+        let mut header = [0u8; 8];
+        if file.seek(SeekFrom::Start(offset)).is_err() || file.read_exact(&mut header).is_err() {
+            return false;
+        }
+        let mut size = u64::from(u32::from_be_bytes([
+            header[0], header[1], header[2], header[3],
+        ]));
+        let kind = &header[4..8];
+        let mut header_len: u64 = 8;
+        if size == 1 {
+            let mut largesize = [0u8; 8];
+            if file.read_exact(&mut largesize).is_err() {
+                return false;
+            }
+            size = u64::from_be_bytes(largesize);
+            header_len = 16;
+        } else if size == 0 {
+            // Unterminated: the box claims the rest of the file, which is the
+            // one thing a crash cannot promise. Nothing after it to read.
+            return false;
+        }
+        if size < header_len {
+            return false;
+        }
+        let Some(end) = offset.checked_add(size) else {
+            return false;
+        };
+        if end > length {
+            // Truncated mid-box — the tail a crash drops.
+            return false;
+        }
+        if kind == b"moov" {
+            return true;
+        }
+        offset = end;
+        if offset == length {
+            return false;
+        }
+    }
+    false
+}
+
+/// The `(track, index)` a file name denotes when it is one of THIS session's
+/// own segments, or `None` for anything else (Story 41.3).
+///
+/// The rule is [`SessionManifest::reconcile_from_dir`]'s, applied to a name the
+/// `.partial` suffix has already been stripped from: the recovery pass may
+/// rename or delete only files the ledger would have claimed anyway, or it
+/// would be resolving somebody else's. A stray `*.mov` a user dropped in the
+/// folder has no session stem prefix and is never claimed.
+fn session_segment_identity(file: &Path) -> Option<(&'static str, u32)> {
+    let extension = file.extension().and_then(|ext| ext.to_str())?;
+    if !(extension.eq_ignore_ascii_case("mov") || extension.eq_ignore_ascii_case("m4a")) {
+        return None;
+    }
+    let stem = file.file_stem().and_then(|stem| stem.to_str())?;
+    let track = if stem.starts_with(SEGMENT_STEM_PREFIX) {
+        "screen"
+    } else if stem.starts_with(CAMERA_SEGMENT_STEM_PREFIX) {
+        "camera"
+    } else if stem.starts_with(AUDIO_SEGMENT_STEM_PREFIX) {
+        "audio"
+    } else {
+        return None;
+    };
+    Some((track, segment_index_from_stem(stem)?))
 }
 
 /// Extract the segment index from a filename stem's **trailing numeric run**
@@ -1912,9 +2254,12 @@ pub fn segment_index_from_stem(stem: &str) -> Option<u32> {
 /// ([`SEGMENT_STEM_PREFIX`] plus a trailing numeric run), so the growing tray
 /// figure always matches what the eventual terminal manifest will report: a
 /// stray `*.mov` (a user drop, a future `camera-####.mov`), `manifest.json`,
-/// and directories never count. Best-effort and total — a missing/unreadable
-/// folder or entry contributes 0, never an error, never a panic (the figure is
-/// a convenience readout, not a ledger).
+/// and directories never count. The segment being written right now counts
+/// under its `.partial` name (Story 41.3): the suffix is what the tray figure
+/// is *about* — a total that stalled until each rename landed would step
+/// rather than climb. Best-effort and total — a missing/unreadable folder or
+/// entry contributes 0, never an error, never a panic (the figure is a
+/// convenience readout, not a ledger).
 pub fn session_bytes_on_disk(folder: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(folder) else {
         return 0;
@@ -1922,14 +2267,18 @@ pub fn session_bytes_on_disk(folder: &Path) -> u64 {
     let mut total: u64 = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_mov = path
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let name = Path::new(split_partial_suffix(name).0);
+        let is_mov = name
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"));
         if !is_mov {
             continue;
         }
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        let Some(stem) = name.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
         let is_session_stem =
@@ -1960,9 +2309,12 @@ pub fn session_bytes_on_disk(folder: &Path) -> u64 {
 /// Whereas [`session_bytes_on_disk`] sums *all* segments (the total size line),
 /// this returns only the length of the highest-index one — the segment capture
 /// is actively writing — so the figure naturally falls back toward ~0 at each
-/// gapless rotation as a fresh segment file starts. Best-effort and total: a
-/// missing/unreadable folder, no matching segment, or an unreadable entry
-/// contributes 0, never an error, never a panic.
+/// gapless rotation as a fresh segment file starts. The open segment is the
+/// `.partial` one (Story 41.3) — this readout is the one place that name is
+/// the *point*, since the meter measures a file precisely while it is being
+/// written. Best-effort and total: a missing/unreadable folder, no matching
+/// segment, or an unreadable entry contributes 0, never an error, never a
+/// panic.
 pub fn current_segment_bytes_on_disk(folder: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(folder) else {
         return 0;
@@ -1970,14 +2322,18 @@ pub fn current_segment_bytes_on_disk(folder: &Path) -> u64 {
     let mut current: Option<(u32, u64)> = None;
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_mov = path
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let name = Path::new(split_partial_suffix(name).0);
+        let is_mov = name
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"));
         if !is_mov {
             continue;
         }
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        let Some(stem) = name.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
         if !(stem.starts_with(SEGMENT_STEM_PREFIX) || stem.starts_with(AUDIO_SEGMENT_STEM_PREFIX)) {
@@ -4254,6 +4610,184 @@ mod tests {
     }
 
     #[test]
+    fn retitle_mints_a_meta_block_on_a_manifest_that_has_none() {
+        let folder = fresh_temp_dir("retitle-mint");
+        let mut manifest = test_manifest(folder.clone());
+        assert!(
+            manifest.meta.is_none(),
+            "the fixture must be a pre-40.3 manifest with no meta block at all"
+        );
+        let before: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(folder.join("manifest.json")).expect("manifest on disk"),
+        )
+        .expect("parseable manifest");
+
+        manifest.retitle(Some("  Standup  ".to_owned()));
+        manifest.write().expect("rewrite the retitled manifest");
+        let loaded = SessionManifest::load(&folder).expect("load round-trip");
+
+        // The block was minted to hold the (trimmed) title rather than the
+        // title being dropped on the floor — and it holds nothing else.
+        assert_eq!(
+            loaded.meta,
+            Some(SessionMeta {
+                title: Some("Standup".to_owned()),
+                ..SessionMeta::default()
+            })
+        );
+        let mut after: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(folder.join("manifest.json")).expect("manifest on disk"),
+        )
+        .expect("parseable manifest");
+        assert_eq!(after["meta"]["title"], "Standup");
+        // Strip the one key the retitle owns: everything else is untouched.
+        after
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("meta");
+        assert_eq!(
+            after, before,
+            "a retitle rewrites the title and nothing else"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn retitle_clears_the_title_and_leaves_the_identity_alone() {
+        let folder = fresh_temp_dir("retitle-clear");
+        let session_id = "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM22222222222222222222".to_owned();
+        let mut manifest = SessionManifest::create_with_meta(
+            folder.clone(),
+            CaptureTarget::display(None),
+            test_devices(),
+            Some(SessionMeta {
+                session_id: Some(session_id.clone()),
+                title: Some("Retro".to_owned()),
+                ..SessionMeta::default()
+            }),
+            None,
+        )
+        .expect("create session folder + initial manifest");
+
+        // `None` and an all-whitespace title are the same instruction: clear
+        // it. "Untitled" has exactly one representation, the absent field, so
+        // both re-render to the folder an untitled session would have got.
+        for cleared in [None, Some("   ".to_owned())] {
+            manifest.retitle(Some("Retro".to_owned()));
+            manifest.retitle(cleared);
+            manifest.write().expect("rewrite the cleared manifest");
+            let loaded = SessionManifest::load(&folder).expect("load round-trip");
+            assert_eq!(
+                loaded.meta,
+                Some(SessionMeta {
+                    session_id: Some(session_id.clone()),
+                    ..SessionMeta::default()
+                }),
+                "clearing drops the title and leaves the identity byte-identical"
+            );
+            let raw = std::fs::read_to_string(folder.join("manifest.json")).expect("on disk");
+            assert!(
+                !raw.contains("\"title\""),
+                "a cleared title is omitted from the wire, got: {raw}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn rebind_folder_relabels_and_repoints_without_touching_the_identity() {
+        let root = fresh_temp_dir("rebind");
+        let session_id = "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM33333333333333333333".to_owned();
+        let old = root.join("2026").join("2026-08-05 1432");
+        let mut manifest = SessionManifest::create_with_meta(
+            old.clone(),
+            CaptureTarget::display(None),
+            test_devices(),
+            Some(SessionMeta {
+                session_id: Some(session_id.clone()),
+                ..SessionMeta::default()
+            }),
+            Some("2026-08-05T14:32:07+02:00".to_owned()),
+        )
+        .expect("create session folder + initial manifest");
+        assert_eq!(manifest.session, "2026-08-05 1432");
+
+        // The shell moves the folder first; the manifest is told about it
+        // afterwards, and then rewritten in its new home.
+        let new = root.join("2026").join("2026-08-05 1432 standup");
+        std::fs::rename(&old, &new).expect("move the session folder");
+        manifest.retitle(Some("Standup".to_owned()));
+        manifest.rebind_folder(new.clone());
+        manifest.write().expect("rewrite the moved manifest");
+
+        // The runtime path was rebound, not merely the label: the write landed
+        // in the NEW folder, and the old one is not there to catch it.
+        assert_eq!(manifest.folder(), new.as_path());
+        assert!(!old.exists(), "the session no longer lives at its old path");
+        let loaded = SessionManifest::load(&new).expect("load from the new folder");
+        assert_eq!(
+            loaded.session, "2026-08-05 1432 standup",
+            "the label follows the basename"
+        );
+        assert_eq!(
+            loaded
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.session_id.as_deref()),
+            Some(session_id.as_str()),
+            "the identity never moves"
+        );
+        assert_eq!(
+            loaded.meta.as_ref().and_then(|meta| meta.title.as_deref()),
+            Some("Standup")
+        );
+        // The re-render uses the session's own start instant, so it must have
+        // ridden along untouched.
+        assert_eq!(
+            loaded.started_at.as_deref(),
+            Some("2026-08-05T14:32:07+02:00")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_retitled_and_rebound_manifest_still_serializes_no_absolute_path() {
+        let root = fresh_temp_dir("rebind-portable");
+        let old = root.join("2026").join("2026-08-05 1432");
+        let mut manifest = SessionManifest::create_with_meta(
+            old.clone(),
+            CaptureTarget::display(None),
+            test_devices(),
+            Some(SessionMeta {
+                session_id: Some(
+                    "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM44444444444444444444".to_owned(),
+                ),
+                ..SessionMeta::default()
+            }),
+            Some("2026-08-05T14:32:07+02:00".to_owned()),
+        )
+        .expect("create session folder + initial manifest");
+
+        let new = root.join("2026").join("2026-08-05 1432 standup");
+        std::fs::rename(&old, &new).expect("move the session folder");
+        manifest.retitle(Some("Standup".to_owned()));
+        manifest.rebind_folder(new.clone());
+        manifest.write().expect("rewrite the moved manifest");
+
+        // Rebinding stores an absolute path in a `#[serde(skip)]` field, and a
+        // moved session is exactly when that would leak: the manifest stays
+        // portable, carrying the basename label and nothing rooted.
+        let raw = std::fs::read_to_string(new.join("manifest.json")).expect("manifest on disk");
+        for path in [root.as_path(), old.as_path(), new.as_path()] {
+            assert!(
+                !raw.contains(path.to_string_lossy().as_ref()),
+                "the serialized manifest must contain no absolute path, got: {raw}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn reconcile_rebuilds_from_disk_backfills_and_overrides_stale_bytes() {
         let folder = fresh_temp_dir("reconcile");
         let mut manifest = test_manifest(folder.clone());
@@ -4772,6 +5306,254 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- crash-orphaned `.partial` segments (Story 41.3) -------------------
+
+    /// One top-level ISO-BMFF box: a 32-bit big-endian size, a 4CC type, then
+    /// a zeroed payload — the framing every segment file uses.
+    fn bmff_box(kind: &[u8; 4], payload: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + payload);
+        out.extend_from_slice(&((8 + payload) as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.resize(8 + payload, 0);
+        out
+    }
+
+    /// What a fragmented segment holds once its first ~4 s fragment has
+    /// flushed, in the box order an abandoned `AVAssetWriter` really produces:
+    /// `ftyp wide mdat moov`, then the next fragment and the tail the crash
+    /// dropped. The complete `moov` is the whole difference — with it every
+    /// flushed fragment plays as-is, no remux.
+    fn flushed_segment_bytes() -> Vec<u8> {
+        let mut out = bmff_box(b"ftyp", 12);
+        out.extend(bmff_box(b"wide", 0));
+        out.extend(bmff_box(b"mdat", 64));
+        out.extend(bmff_box(b"moov", 48));
+        out.extend(bmff_box(b"wide", 0));
+        out.extend(unterminated_mdat(32));
+        out
+    }
+
+    /// What a segment holds when the crash beat its first flush: `ftyp wide`
+    /// and the growing, unterminated `mdat`. No `moov`, so there is not a
+    /// frame any player can find — the file is worth nothing and is removed.
+    fn unflushed_segment_bytes() -> Vec<u8> {
+        let mut out = bmff_box(b"ftyp", 12);
+        out.extend(bmff_box(b"wide", 0));
+        out.extend(unterminated_mdat(100));
+        out
+    }
+
+    /// The `mdat/0` a writer leaves mid-fragment: size zero means "to the end
+    /// of the file", which is the one thing a crash cannot promise.
+    fn unterminated_mdat(payload: usize) -> Vec<u8> {
+        let mut out = 0u32.to_be_bytes().to_vec();
+        out.extend_from_slice(b"mdat");
+        out.resize(8 + payload, 0);
+        out
+    }
+
+    #[test]
+    fn recovery_finalises_a_usable_partial_and_the_ledger_carries_the_final_name() {
+        let base = fresh_temp_dir("recover-partial-usable");
+        let folder = stale_session(&base, "keeper-rec partial-ok", ManifestStatus::Recording, 2);
+        // The segment the crash interrupted: one fragment flushed, so its
+        // bytes are playable and the recording is genuinely on the drive.
+        let usable = flushed_segment_bytes();
+        std::fs::write(folder.join("screen-0002.mov.partial"), &usable).expect("partial");
+
+        assert_eq!(
+            recover_orphaned_sessions(&base, &no_folder_is_active),
+            vec![folder.clone()]
+        );
+
+        assert!(
+            !folder.join("screen-0002.mov.partial").exists(),
+            "a recovered session must not still carry an in-progress name"
+        );
+        assert_eq!(
+            std::fs::read(folder.join("screen-0002.mov")).expect("the finalised segment"),
+            usable,
+            "finalising is a rename — not one byte of the media may change"
+        );
+        let reloaded = SessionManifest::load(&folder).expect("reload recovered manifest");
+        assert_eq!(reloaded.status, ManifestStatus::Recovered);
+        assert_eq!(
+            reloaded.segments,
+            vec![
+                screen_entry(0, "screen-0000.mov", 10),
+                screen_entry(1, "screen-0001.mov", 20),
+                screen_entry(2, "screen-0002.mov", usable.len() as u64),
+            ],
+            "the salvaged segment enters the ledger under its FINAL name"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recovery_discards_a_partial_with_no_usable_media() {
+        let base = fresh_temp_dir("recover-partial-empty");
+        let folder = stale_session(
+            &base,
+            "keeper-rec partial-empty",
+            ManifestStatus::Recording,
+            2,
+        );
+        std::fs::write(
+            folder.join("screen-0002.mov.partial"),
+            unflushed_segment_bytes(),
+        )
+        .expect("partial");
+
+        assert_eq!(
+            recover_orphaned_sessions(&base, &no_folder_is_active),
+            vec![folder.clone()]
+        );
+
+        assert!(
+            !folder.join("screen-0002.mov.partial").exists(),
+            "an unusable partial is removed, not left as debris"
+        );
+        assert!(
+            !folder.join("screen-0002.mov").exists(),
+            "an unopenable file must never be published under a real segment name"
+        );
+        let reloaded = SessionManifest::load(&folder).expect("reload recovered manifest");
+        assert_eq!(
+            reloaded.segments,
+            vec![
+                screen_entry(0, "screen-0000.mov", 10),
+                screen_entry(1, "screen-0001.mov", 20),
+            ],
+            "the session keeps exactly what it really recorded"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The log line has to say WHICH of the two happened, and it is written
+    /// from this report — so asserting the report is asserting the log without
+    /// installing a subscriber.
+    #[test]
+    fn resolving_partials_reports_which_of_the_two_things_it_did() {
+        let folder = fresh_temp_dir("resolve-partials");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(
+            folder.join("screen-0003.mov.partial"),
+            flushed_segment_bytes(),
+        )
+        .expect("usable partial");
+        std::fs::write(
+            folder.join("camera-0003.mov.partial"),
+            unflushed_segment_bytes(),
+        )
+        .expect("unusable partial");
+
+        let mut resolved = resolve_partial_segments(&folder);
+        // `read_dir` order is not specified; the report's content is what
+        // matters, not the order the filesystem happened to hand them over in.
+        resolved.sort_by_key(|entry| entry.track);
+        assert_eq!(
+            resolved,
+            vec![
+                PartialSegmentRecovery {
+                    track: "camera",
+                    index: 3,
+                    outcome: PartialSegmentOutcome::Discarded,
+                },
+                PartialSegmentRecovery {
+                    track: "screen",
+                    index: 3,
+                    outcome: PartialSegmentOutcome::Finalized,
+                },
+            ]
+        );
+        assert!(folder.join("screen-0003.mov").is_file());
+        assert!(!folder.join("camera-0003.mov").exists());
+        assert!(!folder.join("camera-0003.mov.partial").exists());
+
+        // Idempotent: nothing is left for a second pass to resolve.
+        assert!(resolve_partial_segments(&folder).is_empty());
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Only files the ledger would have claimed are the recovery pass's to
+    /// rename or delete. A user's own `.partial` in a session folder is
+    /// already excluded from sync, which is a nuisance; having it silently
+    /// deleted would be a betrayal.
+    #[test]
+    fn resolving_partials_never_touches_a_file_that_is_not_a_segment() {
+        let folder = fresh_temp_dir("resolve-partials-foreign");
+        std::fs::create_dir_all(&folder).expect("folder");
+        for name in [
+            "notes.txt.partial",
+            "x.partial",
+            "screen-holiday.mov.partial",
+        ] {
+            std::fs::write(folder.join(name), b"the user's own bytes").expect("foreign file");
+        }
+
+        assert!(resolve_partial_segments(&folder).is_empty());
+        for name in [
+            "notes.txt.partial",
+            "x.partial",
+            "screen-holiday.mov.partial",
+        ] {
+            assert_eq!(
+                std::fs::read(folder.join(name)).expect("still there"),
+                b"the user's own bytes",
+                "{name} is not ours to resolve"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The last line of defence: even if a `.partial` survives every step
+    /// above, the rebuild must not write its name into the ledger. A
+    /// half-written file committed once is a corrupt file forever.
+    #[test]
+    fn the_rebuilt_ledger_never_carries_a_partial_name() {
+        let folder = fresh_temp_dir("reconcile-partial");
+        let mut manifest = test_manifest(folder.clone());
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 12]).expect("segment");
+        std::fs::write(folder.join("screen-0001.mov.partial"), vec![0u8; 999]).expect("partial");
+
+        manifest.reconcile_from_dir().expect("reconcile");
+
+        assert_eq!(
+            manifest.segments,
+            vec![screen_entry(0, "screen-0000.mov", 12)],
+            "only the finished segment is a ledger entry"
+        );
+        assert!(
+            folder.join("screen-0001.mov.partial").is_file(),
+            "the rebuild reads the folder; it never deletes from it"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The live readouts are the one place the in-progress name is the point:
+    /// the file being measured is precisely the one being written.
+    #[test]
+    fn the_size_readouts_count_the_segment_being_written() {
+        let folder = fresh_temp_dir("partial-size");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 100]).expect("closed segment");
+        std::fs::write(folder.join("screen-0001.mov.partial"), vec![0u8; 40])
+            .expect("open segment");
+
+        assert_eq!(
+            session_bytes_on_disk(&folder),
+            140,
+            "a total that ignored the open segment would step at each rotation \
+             instead of climbing"
+        );
+        assert_eq!(
+            current_segment_bytes_on_disk(&folder),
+            40,
+            "the segment meter measures the open segment, which is the partial one"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]

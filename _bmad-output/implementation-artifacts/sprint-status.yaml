@@ -1,5 +1,5 @@
 # generated: 2026-07-03
-# last_updated: 2026-08-06
+# last_updated: 2026-08-08
 # project: keeper
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-03
-last_updated: 2026-08-06
+last_updated: 2026-08-08
 project: keeper
 project_key: NOKEY
 tracking_system: file-system
@@ -345,23 +345,61 @@ development_status:
   40-1-the-path-template-rendered-purely: done
   40-2-the-template-is-a-setting-and-the-preview-is-the-manual: done
   40-3-recording-start-uses-it-and-the-session-gets-an-identity: done
-  40-4-retitle-moves-the-folder-not-the-identity: backlog
+  40-4-retitle-moves-the-folder-not-the-identity: review
   epic-40-retrospective: optional
-  epic-41: backlog
-  41-1-a-profile-can-say-it-holds-recordings: backlog
-  41-2-choosing-where-recordings-live-once: backlog
-  41-3-partial-while-writing-final-on-close: backlog
-  41-4-the-gate-learns-the-word-finished: backlog
-  41-5-committed-at-close-pushed-on-policy: backlog
-  41-6-durability-you-can-read: backlog
+  epic-41: in-progress
+  41-1-a-profile-can-say-it-holds-recordings: review
+  41-2-choosing-where-recordings-live-once: review
+  41-3-partial-while-writing-final-on-close: review
+  41-4-the-gate-learns-the-word-finished: review
+  41-5-committed-at-close-pushed-on-policy: review
+  41-6-durability-you-can-read: review
   epic-41-retrospective: optional
-  epic-42: backlog
-  42-1-a-session-is-a-row: backlog
-  42-2-searchable-sessions: backlog
-  42-3-the-recordings-browser: backlog
-  42-4-the-note-stub-at-the-only-moment-it-will-be-written: backlog
-  42-5-one-tag-vocabulary: backlog
+  epic-42: in-progress
+  # 42.1 went through an adversarial pass (an acceptance auditor against all 11
+  # I/O-matrix rows and the 4 ACs, plus a defect hunter) before it was committed.
+  # Verdict on the first pass was `incorrect`: two panics reachable from any
+  # on-disk manifest in the hand-rolled RFC 3339 parser, `rebuild_from_disk` with
+  # no production caller at all, matrix row 11 (a retitle repointing the row)
+  # unimplemented, and a rebuild that nulled the three columns no manifest
+  # carries. All are fixed here, and the macOS gate — the only one that compiles
+  # the shell crate — is green.
+  42-1-a-session-is-a-row: review
+  42-2-searchable-sessions: review
+  42-3-the-recordings-browser: review
+  42-4-the-note-stub-at-the-only-moment-it-will-be-written: review
+  42-5-one-tag-vocabulary: review
   epic-42-retrospective: optional
+
+  # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
+  # is implemented, gated and open as a stacked PR; none is `done`, because in
+  # this repo `done` means the PR merged and the ledger closed, and the stack has
+  # not landed yet. The three epics therefore stay `in-progress` rather than being
+  # marked from optimism.
+  #
+  # The stack, bottom to top (stack #52 on GitHub):
+  #   #51  feat/story-41-6-durability-you-can-read -> main   (40.4 + all of epic 41)
+  #   #50  42.1  a session is a row
+  #   #53  42.2  searchable sessions
+  #   #54  42.3  the recordings browser
+  #   #55  42.4  the note stub
+  #   #56  42.5  one tag vocabulary
+  #
+  # NOTE on #51, because it is the one thing here that is not obvious: PRs #44-#48
+  # each merged into the branch BELOW them rather than into `main`, so `main` stood
+  # at #43 while five stories accumulated on a feature branch. #51 is the PR that
+  # puts them on `main`; nothing else in this stack can land until it does.
+  #
+  # Verified on hesperia (macOS 26.5, arm64) against the full stack — the only host
+  # that can compile the Tauri shell crate: fmt, clippy --workspace -D warnings,
+  # cargo test --workspace, and the generated-binding drift check (160 files).
+  # On Linux: 1200 keeper-core tests, 1871 frontend tests across 164 files, the
+  # 10 000-session recordings search gate, and the three dependency-boundary checks.
+  #
+  # 42.1 was reviewed adversarially before it was committed and the first pass came
+  # back `incorrect`; what that found is recorded above. 42.2-42.5 were built
+  # against specs written from that lesson, and every one of them carries its
+  # Design Notes.
 
 # Phase 4 state as of 2026-07-25 — what is actually true, not what was planned.
 #

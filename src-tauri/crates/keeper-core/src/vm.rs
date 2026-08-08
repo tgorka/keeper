@@ -237,6 +237,32 @@ pub enum IpcErrorCode {
     /// rejection sentence, rendered inline beside the field. Serializes as
     /// `"recordingTemplateInvalid"`.
     RecordingTemplateInvalid,
+    /// A recording session could not be retitled because its folder is claimed
+    /// (Story 40.4, Epic 40): the shell holds every live session's folder in its
+    /// reservation set, and a retitle takes a claim on the folder it is about to
+    /// move, so the refusal covers both "it is still recording" and "another
+    /// rename of it is already running" — the set holds paths, not reasons.
+    /// Mapped to this code rather than letting it funnel to `internal`. Not
+    /// retriable *while the recording runs*: the driver and the sidecar hold
+    /// absolute paths into the folder, so nothing can move until the session
+    /// stops, and the surface needs to say what is holding the folder rather
+    /// than "internal error". Serializes as `"recordingSessionLive"`.
+    RecordingSessionLive,
+    /// A submitted recording destination was refused before anything was written
+    /// (Story 41.2, Epic 41, UX-DR47): a sync profile id that names no profile,
+    /// names a paused one, or names one that does not say it holds recordings;
+    /// or a plain folder that sits inside a synced folder's tree without being
+    /// that folder's recordings root — the ambiguous case that would otherwise
+    /// sync by accident, with nothing anywhere saying so.
+    ///
+    /// Its own code rather than `internal` for `RecordingTemplateInvalid`'s
+    /// reason: the surface that submitted the destination has a control to point
+    /// at, and the message names the synced folder it would have collided with.
+    /// Non-retriable in every case but one — resubmitting the same choice can
+    /// only fail the same way — while "the synced folders could not be read at
+    /// all" (no usable `git` on this machine) IS retriable, because installing
+    /// one changes the answer. Serializes as `"recordingDestinationRefused"`.
+    RecordingDestinationRefused,
 }
 
 /// The account's live server-side key-backup posture, mapped from the SDK
@@ -1377,22 +1403,37 @@ impl Provider {
     }
 }
 
-/// The kind of a network egress destination (Story 11.2, NFR-11).
+/// The kind of a network egress destination (Story 11.2, NFR-11; Story 23.7).
 ///
 /// Classifies each entry in the [`EgressEndpointVm`] list the Settings → About
 /// surface renders so the frontend can label it honestly without re-deriving the
 /// classification. `Homeserver` is an account's Matrix homeserver; `Beeper` is the
 /// `api.beeper.com` login/service endpoint present exactly when a Beeper account
-/// exists; `Update` is the signed-update endpoint the app checks. Serializes to
-/// `"homeserver" | "beeper" | "update"`.
+/// exists; `GitRemote` is the host of one folder-sync profile's remote repository;
+/// `Update` is the signed-update endpoint the app checks. Serializes to
+/// `"homeserver" | "beeper" | "gitRemote" | "update"`.
+///
+/// The container rename is `camelCase` rather than `lowercase` (Story 23.7) so a
+/// multi-word variant reads as `gitRemote` on the wire, matching every other
+/// multi-word IPC enum in this module (e.g. [`IpcErrorCode`]). The three
+/// pre-existing single-word variants serialize identically under either rule, so
+/// this changed no existing wire value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub enum EgressKind {
     /// A Matrix homeserver an account is signed into.
     Homeserver,
     /// Beeper's `api.beeper.com` service endpoint (present iff a Beeper account exists).
     Beeper,
+    /// The remote *host* of a folder-sync profile's repository (Story 23.7).
+    ///
+    /// The host alone, never the full remote URL: a remote URL carries a path, can
+    /// carry a username, and — in a profile whose token was stored in the URL
+    /// instead of the keychain — a credential. An egress disclosure answers "where
+    /// do bytes go", and the host is the whole of that answer; the rest is only
+    /// material to leak onto a screen the user may be sharing.
+    GitRemote,
     /// The signed auto-update endpoint (`plugins.updater.endpoints`).
     Update,
 }
@@ -1402,16 +1443,21 @@ pub enum EgressKind {
 ///
 /// The Settings → About surface renders the full set of these — computed by
 /// `egress::compute_egress` from the accounts registry (each homeserver, plus
-/// `api.beeper.com` when a Beeper account exists) and the shared update endpoint —
+/// `api.beeper.com` when a Beeper account exists), the live folder-sync profile
+/// set (each distinct remote host, Story 23.7) and the shared update endpoint —
 /// so keeper's egress claim is verifiable rather than asserted. Never fabricated,
-/// never stale-cached: it is read from the same registry the session-restore path
-/// uses on each open. `url` is the destination shown; `label` is a short honest
-/// caption; `kind` classifies it for rendering.
+/// never stale-cached: both the registry rows and the profile rows are read on
+/// each open, from the same stores the session-restore and sync paths use, so
+/// adding or removing an account or a profile changes this list immediately.
+/// `url` is the destination shown; `label` is a short honest caption; `kind`
+/// classifies it for rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct EgressEndpointVm {
-    /// The destination URL (or the raw stored homeserver string when unparseable).
+    /// The destination shown: a homeserver URL (the raw stored string when it is
+    /// unparseable), a fixed service endpoint, or — for [`EgressKind::GitRemote`] —
+    /// the bare host of a sync remote, never its full URL.
     pub url: String,
     /// The classification of this destination.
     pub kind: EgressKind,
@@ -2818,6 +2864,88 @@ impl RecordingUiState {
     }
 }
 
+/// How far this recording session's bytes have travelled beyond this Mac
+/// (Story 41.6, FR-138, UX-DR48).
+///
+/// The variants are declared least- to most-durable ON PURPOSE, and the derived
+/// `Ord` is load-bearing: the state a session reports is a FLOOR, and a floor is
+/// a `max` over everything the session has observed. Deriving the order from the
+/// declaration means the ranking cannot drift from a hand-written table that
+/// someone later forgets to extend.
+///
+/// The words a surface prints for these are the RECORDER's, never git's
+/// (UX-DR48): `Local` is "on this Mac", `Committed` is "committed",
+/// `Pushed`/`Verified` are "on the drive". A commit and a push are HOW it
+/// happened; what the person asked was whether the recording would survive the
+/// laptop being dropped. Only the enum tag crosses IPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum RecordingDurabilityState {
+    /// The bytes exist here and nowhere else. Either the destination is a plain
+    /// folder — which makes no further promise, and says so plainly — or a
+    /// profile destination has not committed anything yet.
+    Local,
+    /// The session's segments are in a commit in the destination profile. They
+    /// survive the recorder, the app and a power cut; they do not yet survive
+    /// the machine.
+    Committed,
+    /// That commit is on the remote. Branch-level, deliberately: whether THIS
+    /// path's objects are on the far side is a question only the network can
+    /// answer, and the poll path may not ask it — "the branch holding it has
+    /// nothing the remote lacks" is the strongest local truth there is.
+    Pushed,
+    /// The engine has verified the pushed objects.
+    ///
+    /// Reserved rather than reachable today: nothing the engine records locally
+    /// distinguishes a verified push from a push, so the derivation cannot
+    /// synthesise this — it is what the verification pass will report when it
+    /// records per-path results. The variant exists because the surface must not
+    /// have to change shape the day it does.
+    Verified,
+}
+
+/// The one durability reading a recording session carries (Story 41.6, FR-138,
+/// UX-DR48/UX-DR49).
+///
+/// **DERIVED, never stored.** It is computed on the `recording_status` poll from
+/// the destination and the engine's own local knowledge, so it cannot go stale
+/// or disagree with the thing it describes; nothing about durability is written
+/// to disk, and there is no second copy to reconcile. It rides the status the
+/// recording surface ALREADY polls at ~1 Hz rather than a stream of its own,
+/// because a second channel for a scalar that changes a handful of times per
+/// session would be a second thing that can be out of date.
+///
+/// `detail` is the Rust-authored reason a push has not happened — `"push
+/// rejected: non-fast-forward"`, a protected branch, an unreachable remote —
+/// present ONLY when there is such a problem. It exists so the surface can print
+/// the reason VERBATIM instead of inventing sync language of its own: a rejected
+/// push is not a failed recording, and "recorded, not pushed" plus the remote's
+/// own words is the honest reading. A healthy session carries `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingDurabilityVm {
+    /// How far this session's bytes have got — the session's floor, so it never
+    /// walks backwards while the session runs.
+    pub state: RecordingDurabilityState,
+    /// Why publication has not happened, in Rust's words, when it has not.
+    pub detail: Option<String>,
+}
+
+impl RecordingDurabilityVm {
+    /// The on-this-Mac reading: the honest answer for a plain-folder
+    /// destination, for a session that has committed nothing yet, and for the
+    /// idle snapshot. No problem is named because none has happened — nothing
+    /// was promised.
+    pub fn local() -> Self {
+        Self {
+            state: RecordingDurabilityState::Local,
+            detail: None,
+        }
+    }
+}
+
 /// The recording-session status snapshot the Recording view polls (Story 16.6,
 /// FR-68/FR-69/FR-71, UX-DR30).
 ///
@@ -2828,6 +2956,13 @@ impl RecordingUiState {
 /// holding the `screen-####.mp4` segments (Story 17.2 — not a single file; the
 /// tray sums it live and "Open Recordings Folder" reveals it), and `error` is
 /// the honest failure message on `failed` — never a silent reset.
+///
+/// `durability` (Story 41.6) is the one field here that is DERIVED rather than
+/// folded from a sidecar event: it is computed on each read of this snapshot
+/// from the session's destination and the engine's local knowledge, which is
+/// why it needs no new command and no new stream — the surface that asks
+/// "would what I have recorded survive?" is already asking this snapshot
+/// everything else it shows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -2875,6 +3010,13 @@ pub struct RecordingStatusVm {
     /// settings store, so a mid-session cap edit cannot skew a running meter); 0
     /// when there is no session.
     pub segment_cap_mb: u32,
+    /// How far this session's bytes have got beyond this Mac (Story 41.6,
+    /// FR-138) — the banner's one honest line and, when it names a problem,
+    /// the tray's warning-marked status line. DERIVED on every read (see the
+    /// type docs) and never stored, so it cannot disagree with the engine; a
+    /// session with no destination profile, and the idle snapshot, both read
+    /// [`RecordingDurabilityVm::local`].
+    pub durability: RecordingDurabilityVm,
 }
 
 /// The read-only end-of-session summary the completion / recovery cards render
@@ -2904,6 +3046,54 @@ pub struct RecordingSummaryVm {
     pub title: Option<String>,
 }
 
+/// The note stub the stop surface presents (Story 42.4, FR-142).
+///
+/// Composed by [`crate::notes::recording_note::compose`] at finalize and written
+/// to disk by the shell, so by the time this VM exists there is a real file at
+/// [`Self::path`]. `None` on the summary side means only "no stub file for this
+/// session" — never written, or already dismissed — and the surface renders
+/// nothing. It is never an error: a stub that could not be written is logged,
+/// because finalize already succeeded and the recording is safe.
+///
+/// **`contents` is the file, not the composition.** After the user saves, this
+/// carries what is on disk, with [`Self::body_offset`] re-derived from that
+/// file's own frontmatter. Re-seeding an untouched draft from it can therefore
+/// never resurrect text the user deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingNoteStubVm {
+    /// The stub's absolute path on this machine: the save target, and what
+    /// Reveal opens. Absolute is correct *here* and forbidden inside the note
+    /// itself — FR-145 is a rule about what gets persisted and synced, and this
+    /// VM is neither (the sibling `sessionFolder` on the summary is absolute for
+    /// the same reason).
+    pub path: String,
+    /// `2026-08-08-quarterly-review.md` — the name, for display.
+    pub filename: String,
+    /// The whole file: frontmatter block, a blank separator line, then the body.
+    pub contents: String,
+    /// Where the body starts in [`Self::contents`], in **UTF-16 code units**.
+    ///
+    /// Not bytes. The surface splits `contents` at this index with
+    /// `String.prototype.slice`, renders only the tail in the textarea and saves
+    /// `head + draft` — so the user can never type inside the frontmatter, and
+    /// the block keeper authored comes back byte-identical. JavaScript indexes
+    /// strings in UTF-16 code units, so a byte offset would land mid-character
+    /// on any non-ASCII title and silently split the block in the wrong place.
+    /// Converted once, in Rust, from the composer's byte offset.
+    pub body_offset: u32,
+    /// `true` when the stub went into a notes vault subtree, `false` when it was
+    /// written beside the session folder. Both are real files at real paths;
+    /// this says whether the vault's index will pick it up.
+    pub in_vault: bool,
+    /// The session's immutable `<device ULID>-<session ULID>` (Story 40.3) — the
+    /// same id the stub's own `session:` field carries.
+    pub session_id: String,
+    /// The stub's path relative to the root it was written under, for display.
+    pub relative_path: String,
+}
+
 impl RecordingStatusVm {
     /// The boot/default snapshot: no session yet.
     pub fn idle() -> Self {
@@ -2917,18 +3107,72 @@ impl RecordingStatusVm {
             on_disk_bytes: 0,
             current_segment_bytes: 0,
             segment_cap_mb: 0,
+            durability: RecordingDurabilityVm::local(),
         }
     }
 }
 
-/// The user-configurable recording settings (Story 17.5 + 19.5 + 40.2, FR-72):
-/// the segment size, the duration-cap rotation fallback, the destination
-/// folder, the path template, the frame rate, the codec, the capture scale and
-/// echo cancellation, as persisted in the `settings` k/v table
+/// Which kind of place the recordings destination is (Story 41.2, FR-131,
+/// UX-DR47).
+///
+/// The destination is a resolved DECISION, not a path, and this is the decision:
+/// a plain folder on this machine, or a sync profile that says it holds
+/// recordings. Exactly one of `recording.destination_dir` and
+/// `recording.destination_profile_id` is in force, and this is which — carried
+/// on the VM so a surface can state the CONSEQUENCE of the choice ("recordings
+/// here are committed and pushed by that folder") instead of offering sync as a
+/// second checkbox beside it. A second "also sync my recordings" toggle would be
+/// a second source of truth about something the destination already decides,
+/// which is exactly what UX-DR47 refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum RecordingDestinationKind {
+    /// A plain folder: `recording.destination_dir` (or the shell's default) is in
+    /// force, and nothing publishes what is recorded there.
+    Folder,
+    /// A recordings-flagged sync profile: `recording.destination_profile_id` is
+    /// in force, and that profile commits and pushes what is recorded there on
+    /// its own policy.
+    Profile,
+}
+
+/// One recordings-flagged sync profile, as the destination picker needs it
+/// (Story 41.2, FR-131).
+///
+/// Three fields and no more, because the picker asks exactly one question:
+/// "which synced folder should hold recordings, and where would they land?"
+/// `recordings_root` is RESOLVED here — `local_path` joined with the profile's
+/// recordings subfolder — for the same reason
+/// [`RecordingSettingsVm::destination_dir`] is: no surface anywhere joins a
+/// local path and a subfolder itself, so there is one definition of "where this
+/// profile's recordings live" and it lives in Rust.
+///
+/// Only flagged, enabled profiles are ever listed: a folder that has not said it
+/// holds recordings is not a destination, and a paused one is not one either
+/// (the resolution degrades to the plain-path answer for both, so offering them
+/// would be offering a choice keeper would then ignore).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingProfileVm {
+    /// The profile's opaque ULID — what the destination choice persists, so the
+    /// resolved root survives a rename of the folder or of the profile.
+    pub id: String,
+    /// The profile's human label, as the tray and commit subjects show it.
+    pub name: String,
+    /// The profile's RESOLVED recordings root, as an absolute path.
+    pub recordings_root: String,
+}
+
+/// The user-configurable recording settings (Story 17.5 + 19.5 + 40.2 + 41.2,
+/// FR-72, FR-131): the segment size, the duration-cap rotation fallback, the
+/// destination, the path template, the frame rate, the codec, the capture scale
+/// and echo cancellation, as persisted in the `settings` k/v table
 /// (`recording.segment_mb` / `recording.duration_cap_minutes` /
-/// `recording.destination_dir` / `recording.path_template` / `recording.fps` /
-/// `recording.codec` / `recording.scale_percent` /
-/// `recording.echo_cancellation`).
+/// `recording.destination_dir` / `recording.destination_profile_id` /
+/// `recording.path_template` / `recording.fps` / `recording.codec` /
+/// `recording.scale_percent` / `recording.echo_cancellation`).
 ///
 /// All settings surfaces (Settings → Recording and the pre-record setup cards)
 /// render exactly this VM. The setter command normalizes (segment `100..=5000`
@@ -2938,6 +3182,19 @@ impl RecordingStatusVm {
 /// is a specification, and rewriting one silently would hand the user a path
 /// they did not ask for. Read again at every `recording_start` — edits apply to
 /// the next Recording Session only.
+///
+/// **The destination is a decision, not a path** (Story 41.2, UX-DR47). Exactly
+/// one of the two destination keys is in force;
+/// [`Self::destination_kind`] says which, [`Self::destination_dir`] is the
+/// RESOLVED root either way, and on the way IN the kind is the discriminator:
+/// `Profile` reads [`Self::destination_profile_id`] and ignores the folder,
+/// `Folder` reads the folder and ignores the id, and every write clears the key
+/// that lost. Submitting a profile that does not hold recordings, or a plain
+/// folder inside a synced folder's tree, is refused with
+/// `IpcErrorCode::RecordingDestinationRefused` and writes nothing — except the
+/// one unambiguous case: a plain folder that IS a synced folder's recordings
+/// root is normalised to the PROFILE choice, because they are the same place and
+/// only one of them carries the consequence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -2947,11 +3204,47 @@ pub struct RecordingSettingsVm {
     /// Duration-cap rotation fallback in whole minutes (default 30; sent to the
     /// sidecar as `maxSegmentSeconds = minutes × 60`).
     pub duration_cap_minutes: u16,
-    /// The EFFECTIVE destination folder (Story 19.5): the persisted user choice
-    /// when one exists, otherwise the shell-resolved default
-    /// (`~/Movies/keeper`, falling back to the app data dir). Always a concrete
-    /// absolute path — the "unset vs default" ambiguity never reaches the UI.
+    /// The EFFECTIVE destination root (Story 19.5, Story 41.2), whichever choice
+    /// is in force: the chosen profile's resolved recordings root under
+    /// [`RecordingDestinationKind::Profile`], the persisted folder (or the
+    /// shell-resolved `~/Movies/keeper` default) under
+    /// [`RecordingDestinationKind::Folder`]. Always a concrete absolute path —
+    /// the "unset vs default" ambiguity never reaches the UI.
+    ///
+    /// It keeps this meaning across both kinds on purpose: `<local_path>` joined
+    /// with a profile's recordings subfolder is computed in ONE place, in Rust,
+    /// so no surface anywhere derives a destination and none of them can disagree
+    /// with where `recording_start` actually writes.
+    ///
+    /// On the way IN this is an input only under `Folder` — a folder the user
+    /// picked, or blank to clear the key and fall back to the default. Under
+    /// `Profile` it is ignored, because it is an answer rather than a question.
     pub destination_dir: String,
+    /// Which destination choice is in force (Story 41.2, UX-DR47), and the
+    /// discriminator the setter reads.
+    ///
+    /// This is what lets a surface state the CONSEQUENCE of the choice —
+    /// recordings in a synced folder are committed and pushed by that folder's
+    /// own policy — rather than offering sync as a checkbox beside the
+    /// destination. `Folder` and `Profile` are exhaustive because exactly one of
+    /// the two settings keys is ever in force.
+    pub destination_kind: RecordingDestinationKind,
+    /// The chosen sync profile's opaque id under
+    /// [`RecordingDestinationKind::Profile`], `None` under `Folder`.
+    ///
+    /// The ID is what persists (never the resolved path), so the destination
+    /// survives a rename of the profile or a move of its folder. A stored id that
+    /// no longer names a usable profile — deleted, paused, or no longer saying it
+    /// holds recordings — degrades to the folder answer on READ with a `warn`
+    /// line, and never fails the settings read: a machine with no `git` still
+    /// records.
+    pub destination_profile_id: Option<String>,
+    /// The chosen profile's human name under [`RecordingDestinationKind::Profile`],
+    /// `None` under `Folder`.
+    ///
+    /// Resolved from the id on every read rather than cached beside it, which is
+    /// what makes a rename show up here immediately with the same resolved root.
+    pub destination_profile_name: Option<String>,
     /// Capture frame rate (Story 19.5): 10, 15, 30 (default), or 60,
     /// normalized on read/write; the sidecar's `fps`.
     pub fps: u32,
@@ -3015,6 +3308,178 @@ pub struct RecordingPathPreviewVm {
     pub problem: Option<String>,
 }
 
+/// What the Recordings browser is looking for, crossing IPC into the
+/// `search_recordings` command (Story 42.3, FR-141, UX-DR50).
+///
+/// A deserialize-only input VM that mirrors Story 42.2's tauri-free
+/// `RecordingFilter` field for field — the command maps this INTO it, exactly
+/// as [`SearchFilterVm`] maps into `SearchFilter`, so the engine never learns
+/// what a `Vm` is. Every predicate is optional and every one of them ANDs:
+/// empty `query` is no text predicate at all, an empty `tags` list is
+/// unrestricted, and a `null` bound is unbounded. The default value of every
+/// field together is "every session, newest first", which is what the filter
+/// row means before anyone touches it.
+///
+/// `#[serde(default)]` on each optional so the frontend may omit what it is not
+/// filtering by, rather than being obliged to spell out seven `null`s to ask
+/// the broadest question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingFilterVm {
+    /// The user's free text over a session's title, participants, note, tags
+    /// and custom-field values (trigram `MATCH` at ≥3 Unicode scalar values, an
+    /// accelerated `LIKE` scan below that).
+    pub query: String,
+    /// Tags the session must carry, each matched hierarchically at the segment
+    /// boundary (`client/acme` matches `client/acme/renewal`, never
+    /// `client/acmecorp`). Several tags narrow; they never widen.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// A case-insensitive substring of the session's participants, or `null`
+    /// for any.
+    #[serde(default)]
+    pub participant: Option<String>,
+    /// Inclusive lower bound on the session's start (ms since the Unix epoch),
+    /// or `null` for unbounded below.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub start_ts: Option<i64>,
+    /// Inclusive upper bound on the session's start (ms since the Unix epoch),
+    /// or `null` for unbounded above.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub end_ts: Option<i64>,
+    /// Restrict to one durability state, as the wire word
+    /// [`RecordingDurabilityState`] serialises to, or `null` for any state.
+    #[serde(default)]
+    pub durability: Option<String>,
+    /// Restrict to sessions recorded under one destination profile, or `null`
+    /// for any (including sessions recorded to a plain folder).
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    /// Cap on the number of hits, or `null` for the engine's default. The
+    /// engine clamps this to `[1, 200]`, so a caller can never ask for an
+    /// unbounded scan.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub limit: Option<i64>,
+}
+
+/// One session the Recordings browser lists (Story 42.3, FR-141, UX-DR50).
+///
+/// Story 42.2's `RecordingHit` is the engine's answer; this is the ROW, and the
+/// two differ deliberately in three ways, each of which exists because the row
+/// renders it and the engine does not carry it:
+///
+/// - **Paths, both of them.** `relative_path` is what the index stores and what
+///   the surface prints as inert text where there is no file manager to reveal
+///   into; `absolute_path` is the same session folder joined onto the EFFECTIVE
+///   destination root by the command. No frontend surface ever joins a root and
+///   a subfolder itself (AD-65) — Rust composes the destination in one place, so
+///   Reveal cannot open a folder the recorder would not have written to.
+/// - **Duration and size**, because the row shows them. `duration_ms` is derived
+///   from the two stamps and `total_bytes` is summed from the session's
+///   `recording_segments` rows; neither is a column on the session row, and
+///   neither is worth a second copy that could go stale.
+/// - **Tags decoded.** The engine hands back the stored JSON text (the column is
+///   the truth, Story 42.1); a chip list is `string[]`, and decoding it once in
+///   Rust means the frontend never parses a database column.
+///
+/// Not carried: the note, the participants and the custom fields. All three are
+/// SEARCHABLE — a user remembers what they typed — but no row displays them,
+/// and a hit that carried every column would be a `RecordingRow` wearing a
+/// different name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingHitVm {
+    /// The session's immutable identity — the id the row's Copy action puts on
+    /// the clipboard, and the only handle that survives a Story 40.4 retitle.
+    pub session_id: String,
+    /// The session folder relative to the destination root, `/`-joined. What
+    /// the row prints when there is no file manager to reveal into.
+    pub relative_path: String,
+    /// The absolute session folder — [`Self::relative_path`] resolved against
+    /// the effective recordings destination by the command, and the Reveal
+    /// target. Current by construction: Story 42.1's row follows the session
+    /// through a retitle, so this is where the folder is NOW.
+    pub absolute_path: String,
+    /// The user's title for the session, or `null` for an untitled one (the row
+    /// then leads with its date and folder, never a blank line).
+    pub title: Option<String>,
+    /// Session start, ms since the Unix epoch; `null` for a pre-21.5 manifest
+    /// that carries no stamp.
+    #[ts(type = "number | null")]
+    pub started_ts: Option<i64>,
+    /// Session end, ms since the Unix epoch; `null` while the session runs or
+    /// when it was interrupted.
+    #[ts(type = "number | null")]
+    pub ended_ts: Option<i64>,
+    /// How long the session ran, in milliseconds — `ended_ts - started_ts`, and
+    /// `null` unless BOTH stamps are present. A session that has no end has no
+    /// duration yet, and "now minus the start" would be a different fact
+    /// (elapsed time) wearing this one's name, computed against a clock
+    /// `keeper-core` deliberately does not read.
+    #[ts(type = "number | null")]
+    pub duration_ms: Option<i64>,
+    /// The session's total on-disk size in bytes, summed over its
+    /// `recording_segments` rows. `0` for a session with no closed segment —
+    /// which is the honest reading, not a missing value: nothing was written.
+    #[ts(type = "number")]
+    pub total_bytes: i64,
+    /// How far the session's bytes have travelled, as epic 41's wire word — the
+    /// row's durability glyph.
+    pub durability: String,
+    /// The session's tags, canonical (Story 42.5): what
+    /// [`crate::notes::tags::normalise`] made of what the user typed, which is
+    /// also exactly what the sidebar's tag node is called. Empty when the
+    /// session has none, or when the column holds something that is not a JSON
+    /// array of strings. The session's `manifest.json` still holds the user's
+    /// own text — this is the index's reading of it.
+    pub tags: Vec<String>,
+    /// The absolute path of the file Play hands to the system handler: the
+    /// session's first screen segment, or its first segment of any track when
+    /// it captured no screen (an audio-only session still has something to
+    /// play). `null` when the session has no segment row at all — nothing was
+    /// written, so there is nothing to play, and the surface omits the action
+    /// rather than opening the folder and calling that playback.
+    pub playable_path: Option<String>,
+}
+
+/// The tag vocabulary a completion surface offers: every known tag, flat, with
+/// its count (Story 42.5, FR-143).
+///
+/// **Flat, where [`crate::notes::vm::NoteTagTreeVm`] is nested, and that is the
+/// only difference between them.** Both are projected from the same posting map
+/// in the same snapshot, so they can never disagree about what a tag is or how
+/// many things carry it. The tree exists because the sidebar renders a
+/// hierarchy; this exists because the recording metadata card's tag field is a
+/// plain text input, and the notes surface's existing affordance is a CodeMirror
+/// `CompletionSource` that a plain input cannot consume. Forking the vocabulary
+/// to give the card a completion is the one thing this story is about not doing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TagVocabularyVm {
+    /// Every tag path, ascending, each ancestor prefix its own entry.
+    pub entries: Vec<TagVocabularyEntryVm>,
+}
+
+/// One tag in the vocabulary (Story 42.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TagVocabularyEntryVm {
+    /// The full canonical tag path — `client/acme` — which is both what a
+    /// completion inserts and what a `tag:` query matches.
+    pub path: String,
+    /// How many things carry this tag or anything under it, summed over BOTH
+    /// producers: notes and recording sessions. The same number the sidebar
+    /// node shows, because it is the same number.
+    pub count: u32,
+}
+
 /// How many rows a folder card's lists show, folded and unfolded.
 ///
 /// One pair for every list on the card rather than one pair per list: a user
@@ -3069,6 +3534,61 @@ mod tests {
         assert_eq!(idle.on_disk_bytes, 0);
         assert_eq!(idle.current_segment_bytes, 0);
         assert_eq!(idle.segment_cap_mb, 0);
+        // Story 41.6: no session has promised anything, so the honest reading is
+        // "on this Mac" with nothing to explain.
+        assert_eq!(idle.durability, RecordingDurabilityVm::local());
+    }
+
+    /// Story 41.6: the four states are the frontend's string union, so their
+    /// camelCase wire names are the contract — a rename here silently breaks a
+    /// banner that switches on them.
+    #[test]
+    fn recording_durability_state_serializes_camel_case() {
+        for (state, wire) in [
+            (RecordingDurabilityState::Local, "\"local\""),
+            (RecordingDurabilityState::Committed, "\"committed\""),
+            (RecordingDurabilityState::Pushed, "\"pushed\""),
+            (RecordingDurabilityState::Verified, "\"verified\""),
+        ] {
+            let json = serde_json::to_string(&state).expect("serialize durability state");
+            assert_eq!(json, wire);
+            let back: RecordingDurabilityState =
+                serde_json::from_str(&json).expect("deserialize durability state");
+            assert_eq!(back, state);
+        }
+    }
+
+    /// The floor is a `max` over the declared order, so the order IS the
+    /// ranking — anything that reorders these variants changes what "never
+    /// regresses" means.
+    #[test]
+    fn recording_durability_state_orders_least_to_most_durable() {
+        use RecordingDurabilityState::*;
+        let mut states = [Verified, Local, Pushed, Committed];
+        states.sort();
+        assert_eq!(states, [Local, Committed, Pushed, Verified]);
+    }
+
+    /// The reason is a Rust-authored sentence carried verbatim, and it rides the
+    /// VM as `detail` — present only when publication is actually stuck.
+    #[test]
+    fn recording_durability_vm_carries_the_reason_verbatim() {
+        let stuck = RecordingDurabilityVm {
+            state: RecordingDurabilityState::Committed,
+            detail: Some("push rejected: non-fast-forward".to_owned()),
+        };
+        let json = serde_json::to_string(&stuck).expect("serialize durability");
+        assert_eq!(
+            json,
+            "{\"state\":\"committed\",\"detail\":\"push rejected: non-fast-forward\"}"
+        );
+        let back: RecordingDurabilityVm =
+            serde_json::from_str(&json).expect("deserialize durability");
+        assert_eq!(back, stuck);
+        assert_eq!(
+            serde_json::to_string(&RecordingDurabilityVm::local()).expect("serialize local"),
+            "{\"state\":\"local\",\"detail\":null}"
+        );
     }
 
     #[test]

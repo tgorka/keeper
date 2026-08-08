@@ -655,16 +655,22 @@ impl Parser<'_> {
 
 /// `tag:` with its optional `/*` descendants-only suffix.
 ///
-/// The value is normalised exactly as an indexed tag is, so `tag:#Project` finds
-/// `project`. Normalisation never rejects: an untypeable tag simply matches
-/// nothing, which is not the same class of mistake as an unknown key.
+/// The value is normalised exactly as an indexed tag is, and by the one function
+/// that defines what a tag is (Story 42.5) — so `tag:#Project` finds `project`,
+/// and `tag:Client/Acme ` finds the node a recording and a note now share.
+///
+/// Normalisation never rejects here: a term that is not a tag becomes the empty
+/// path, which no indexed tag equals and none descends from, so the predicate
+/// simply matches nothing. That is deliberately not the same class of mistake as
+/// an unknown key — `tag:---` is a search that finds nothing, not a query error.
+/// The empty path is used rather than a hand-folded copy of the term, because a
+/// second lowercase-and-trim here would be a second definition of a tag.
 fn tag_pred(value: &str) -> Pred {
     let (base, strict) = match value.strip_suffix("/*") {
         Some(base) => (base, true),
         None => (value, false),
     };
-    let path = crate::notes::tags::normalise(base)
-        .unwrap_or_else(|| base.trim().trim_start_matches('#').to_lowercase());
+    let path = crate::notes::tags::normalise(base).unwrap_or_default();
     Pred::Tag { path, strict }
 }
 
@@ -1238,6 +1244,28 @@ mod tests {
         // Which is what makes the documented exact-match idiom work.
         assert!(hit("tag:project -tag:project/*", &exact));
         assert!(!hit("tag:project -tag:project/*", &e));
+    }
+
+    #[test]
+    fn a_tag_term_is_read_as_the_one_vocabulary_and_a_non_tag_finds_nothing() {
+        // Story 42.5: the `tag:` term goes through the one normalisation, so a
+        // person typing what a recording's card showed them finds the node the
+        // sidebar calls `client/acme`.
+        let mut e = entry("a.md");
+        e.tags = vec!["client/acme".to_owned()];
+        for typed in [
+            "tag:Client/Acme",
+            "tag:#client/acme",
+            "tag:client//acme/",
+            "tag:CLIENT/ACME",
+        ] {
+            assert!(hit(typed, &e), "`{typed}` is the tag this note carries");
+        }
+        // A term that is not a tag matches nothing rather than matching
+        // everything — the empty path is not a wildcard.
+        assert!(!hit("tag:---", &e));
+        assert!(!hit("tag:///", &e));
+        assert!(!hit("tag:---/*", &e));
     }
 
     #[test]

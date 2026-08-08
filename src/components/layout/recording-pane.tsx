@@ -114,7 +114,8 @@ export function RecordingPane() {
     openCameraSettings,
     refresh,
   } = useRecordingPermission();
-  const { status, elapsed, start, stop, acknowledge } = useRecordingSession();
+  const { status, sessionFolders, elapsed, start, stop, acknowledge, adoptRetitled } =
+    useRecordingSession();
   const live = isLiveRecording(status);
   // The completion (finalized) and in-app recovery (recovered) terminals both
   // render the summary card from the on-disk manifest for the session folder
@@ -131,6 +132,7 @@ export function RecordingPane() {
     sessions: recoveredSessions,
     refresh: refreshRecovered,
     acknowledge: acknowledgeRecovered,
+    retitled: retitledRecovered,
   } = useRecoveredSessions();
   useEffect(() => {
     if (status.state === "finalized" || status.state === "recovered") {
@@ -278,6 +280,16 @@ export function RecordingPane() {
               title={terminalSummary?.title ?? null}
               screenSegmentCount={terminalSummary?.screenSegmentCount ?? null}
               totalBytes={terminalSummary?.totalBytes ?? null}
+              // Story 40.4: a rename MOVES the session, and this card's folder
+              // comes from the snapshot. Hand the move to the hook that owns the
+              // snapshot — the card's own override dies with this pane, which is
+              // unmounted on every primary-view switch, and the next mount would
+              // otherwise re-adopt the folder the rename invalidated (a Reveal
+              // that opens nothing and a summary fetch that always fails).
+              onRetitled={(summary) => {
+                adoptRetitled(summary);
+                refreshRecovered();
+              }}
             />
           )}
           {/* Cross-restart / prior-run orphan notices (Story 20.3, FR-73): one
@@ -285,10 +297,12 @@ export function RecordingPane() {
               on disk, each independently dismissable (dismiss latches the
               one-time notice). Hidden entirely while a session is live, and the
               current in-app `recovered` terminal (already shown above) is
-              filtered out so a just-salvaged session never double-renders. */}
+              filtered out so a just-salvaged session never double-renders — by
+              EVERY folder that session is known by, because a rename moves it
+              and a scan that predates the move still lists the old path. */}
           {!live &&
             recoveredSessions
-              .filter((session) => session.sessionFolder !== status.outputPath)
+              .filter((session) => !sessionFolders.includes(session.sessionFolder))
               .map((session) => (
                 <RecordingSummaryCard
                   key={session.sessionFolder}
@@ -297,8 +311,19 @@ export function RecordingPane() {
                   title={session.title}
                   screenSegmentCount={session.screenSegmentCount}
                   totalBytes={session.totalBytes}
-                  onDismiss={() => {
-                    acknowledgeRecovered(session.sessionFolder);
+                  // The card hands back the folder the session is at NOW; a
+                  // latch keyed on the path a rename invalidated loads no
+                  // manifest and dismisses nothing.
+                  onDismiss={(folder) => {
+                    acknowledgeRecovered(folder);
+                  }}
+                  // A rename moves the folder, and every entry in this list —
+                  // its key, and the path Dismiss latches — is that folder.
+                  // Adopt the move into the entry immediately (a re-scan is a
+                  // round trip, and may fail), then re-list from disk.
+                  onRetitled={(summary) => {
+                    retitledRecovered(session.sessionFolder, summary);
+                    refreshRecovered();
                   }}
                 />
               ))}

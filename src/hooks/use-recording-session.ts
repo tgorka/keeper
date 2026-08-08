@@ -16,14 +16,15 @@
  * a crash); a failed poll keeps the previous snapshot (transient IPC noise must
  * not flicker the UI back to idle mid-recording).
  */
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { RecordingStatusVm, RecordingTargetVm } from "@/lib/ipc/client";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm } from "@/lib/ipc/client";
 import {
   recordingAcknowledge,
   recordingStart,
   recordingStatus,
   recordingStop,
 } from "@/lib/ipc/client";
+import type { RecordingMetaWire } from "@/lib/stores/recording-meta";
 
 /** The states with a session worth polling (anything non-terminal, non-idle). */
 const LIVE_STATES: ReadonlyArray<RecordingStatusVm["state"]> = [
@@ -47,6 +48,11 @@ export const IDLE_RECORDING_STATUS: RecordingStatusVm = Object.freeze({
   onDiskBytes: 0,
   currentSegmentBytes: 0,
   segmentCapMb: 0,
+  // The durability floor (Story 41.6): nothing recorded yet, so nothing beyond
+  // this Mac is promised. The live snapshot carries the engine's reading.
+  // `as const` because `Object.freeze` would otherwise widen the state to
+  // `string` and lose the union the VM declares.
+  durability: { state: "local", detail: null } as const,
 });
 
 /** Whether a snapshot represents a live (pollable, stoppable) session. */
@@ -64,9 +70,39 @@ export function formatElapsed(elapsedMs: number): string {
   return hours > 0 ? `${hours}:${two(minutes)}:${two(seconds)}` : `${minutes}:${two(seconds)}`;
 }
 
+/**
+ * Where the current session moved to, if it was renamed (Story 40.4).
+ *
+ * Module level, deliberately: `recording_retitle` moves the folder on disk but
+ * does NOT update the Rust session snapshot, so `recording_status` keeps
+ * reporting the folder the session was at when it finalized. The Recording pane
+ * is unmounted outright on every primary-view switch, so per-mount state cannot
+ * carry the correction across the remount that re-adopts that stale snapshot —
+ * the card would paint a folder that no longer exists and Reveal in Finder
+ * would open nothing. The same reasoning the Restart path documents: what must
+ * survive a view remount lives outside the hook.
+ *
+ * This is not invented state. `to` is the `RecordingSummaryVm` the rename
+ * command itself resolved, and the projection is keyed on exact path equality,
+ * so it becomes a no-op the moment Rust reports the post-rename path itself.
+ */
+let sessionMove: { from: string; to: RecordingSummaryVm } | null = null;
+
+/** Drop the recorded move — a new session's folder is its own (and tests need a
+ * clean module between cases). */
+export function clearRecordingSessionMove(): void {
+  sessionMove = null;
+}
+
 export interface UseRecordingSession {
   /** The latest session snapshot (the idle default until a session exists). */
   status: RecordingStatusVm;
+  /** Every folder the current session is known by: its live `outputPath` plus,
+   * after a rename, the folder it moved AWAY from. A disk listing scanned
+   * before the rename still carries that older path, and a surface that would
+   * otherwise de-duplicate on `outputPath` alone must recognise it as the same
+   * session rather than render it twice (Story 40.4). Empty while idle. */
+  sessionFolders: readonly string[];
   /** The ticking `H:MM:SS` elapsed line, or `null` before capture starts. */
   elapsed: string | null;
   /** Start the session for the selected capture target (Story 19.1) — a display
@@ -83,13 +119,7 @@ export interface UseRecordingSession {
     micDeviceId?: string | null,
     cameraEnabled?: boolean,
     cameraDeviceId?: string | null,
-    meta?: {
-      title?: string;
-      participants?: string;
-      note?: string;
-      tags?: string[];
-      custom?: { name: string; value: string }[];
-    },
+    meta?: RecordingMetaWire,
   ) => Promise<void>;
   /** Request the graceful stop-and-finalize (idempotent). */
   stop: () => Promise<void>;
@@ -98,30 +128,50 @@ export interface UseRecordingSession {
    * idle (error/warning dropped — the tray hold releases too) and the returned
    * snapshot is adopted; a live session is a Rust-side no-op. */
   acknowledge: () => Promise<void>;
+  /** Adopt the summary a rename resolved (Story 40.4): the session is now at
+   * `summary.sessionFolder`, so the snapshot's `outputPath` — and every later
+   * snapshot that still names the folder it left — points there instead. The
+   * card that performed the rename hands this up; without it the move would
+   * live only in that card and die with the next pane unmount. */
+  adoptRetitled: (summary: RecordingSummaryVm) => void;
 }
 
 export function useRecordingSession(): UseRecordingSession {
   const [status, setStatus] = useState<RecordingStatusVm>(IDLE_RECORDING_STATUS);
   const [elapsed, setElapsed] = useState<string | null>(null);
   const mounted = useRef(true);
+  // Mirrors the rendered `outputPath` so `adoptRetitled` can key the move off
+  // the folder the session is at RIGHT NOW without re-creating itself (and the
+  // callbacks that close over it) on every snapshot.
+  const outputPathRef = useRef<string | null>(null);
+  outputPathRef.current = status.outputPath;
+
+  // Adopt a Rust snapshot, re-pointed onto the post-rename folder whenever it
+  // still names the one the session moved away from (see `sessionMove`).
+  const adopt = useCallback((vm: RecordingStatusVm) => {
+    if (!mounted.current) {
+      return;
+    }
+    setStatus(
+      sessionMove !== null && vm.outputPath === sessionMove.from
+        ? { ...vm, outputPath: sessionMove.to.sessionFolder }
+        : vm,
+    );
+  }, []);
 
   // On mount, adopt whatever session already exists (the view may have been
   // closed and reopened mid-recording — the session lives in Rust, not here).
   useEffect(() => {
     mounted.current = true;
     void recordingStatus()
-      .then((vm) => {
-        if (mounted.current) {
-          setStatus(vm);
-        }
-      })
+      .then(adopt)
       .catch(() => {
         // No runtime / early boot: keep the idle default.
       });
     return () => {
       mounted.current = false;
     };
-  }, []);
+  }, [adopt]);
 
   // Poll while live: 1 s cadence, stopped on any terminal state. A failed poll
   // keeps the previous snapshot (never flickers to idle mid-recording).
@@ -132,17 +182,13 @@ export function useRecordingSession(): UseRecordingSession {
     }
     const interval = setInterval(() => {
       void recordingStatus()
-        .then((vm) => {
-          if (mounted.current) {
-            setStatus(vm);
-          }
-        })
+        .then(adopt)
         .catch(() => {});
     }, 1000);
     return () => {
       clearInterval(interval);
     };
-  }, [live]);
+  }, [live, adopt]);
 
   // The ticking elapsed line, client-computed from the host start instant.
   const startedAt = status.startedAtEpochMs;
@@ -169,14 +215,11 @@ export function useRecordingSession(): UseRecordingSession {
       micDeviceId?: string | null,
       cameraEnabled?: boolean,
       cameraDeviceId?: string | null,
-      meta?: {
-        title?: string;
-        participants?: string;
-        note?: string;
-        tags?: string[];
-        custom?: { name: string; value: string }[];
-      },
+      meta?: RecordingMetaWire,
     ) => {
+      // A new session owns its own folder — the previous session's rename is
+      // no longer anything a snapshot needs projecting through.
+      sessionMove = null;
       try {
         const vm = await recordingStart(
           target,
@@ -227,5 +270,38 @@ export function useRecordingSession(): UseRecordingSession {
     }
   }, []);
 
-  return { status, elapsed, start, stop, acknowledge };
+  const adoptRetitled = useCallback((summary: RecordingSummaryVm) => {
+    const current = outputPathRef.current;
+    // Nothing to correct when there is no session, or when Rust already reports
+    // the folder the rename landed on.
+    if (current === null || current === summary.sessionFolder) {
+      return;
+    }
+    // Rust keeps reporting the folder the session finalized at, so a SECOND
+    // rename must stay keyed on that original path — it is what the next
+    // snapshot will name, not the intermediate folder we are moving off now.
+    sessionMove = {
+      from:
+        sessionMove !== null && sessionMove.to.sessionFolder === current
+          ? sessionMove.from
+          : current,
+      to: summary,
+    };
+    if (mounted.current) {
+      setStatus((prev) => ({ ...prev, outputPath: summary.sessionFolder }));
+    }
+  }, []);
+
+  const sessionFolders = useMemo(() => {
+    const folders: string[] = [];
+    if (status.outputPath !== null) {
+      folders.push(status.outputPath);
+    }
+    if (sessionMove !== null && sessionMove.to.sessionFolder === status.outputPath) {
+      folders.push(sessionMove.from);
+    }
+    return folders;
+  }, [status.outputPath]);
+
+  return { status, sessionFolders, elapsed, start, stop, acknowledge, adoptRetitled };
 }

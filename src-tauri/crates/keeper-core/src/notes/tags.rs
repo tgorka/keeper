@@ -1,4 +1,15 @@
-//! Tags: extraction, normalisation and the hierarchical tree (FR-104).
+//! Tags: extraction, normalisation and the hierarchical tree (FR-104, FR-143).
+//!
+//! **This module is the tag vocabulary, for every producer** (Story 42.5). Two
+//! things in keeper put tags into the tree — a note's frontmatter and inline
+//! `#a/b/c` tags, and a recording session's tag field — and until 42.5 they
+//! disagreed: notes came through [`normalise`], recordings were comma-split and
+//! trimmed and normalised nowhere, so `Client/Acme ` on a recording and
+//! `client/acme` on a note were two tags a person could spend an afternoon
+//! failing to reconcile. There is now one rule, stated once in [`normalise`]'s
+//! doc comment and applied by both producers through [`normalise_all`]. **If a
+//! rule about case, whitespace or slashes is ever restated outside this file,
+//! the second vocabulary is back.**
 //!
 //! A note's tags are the union of its frontmatter `tags` property and the
 //! inline `#a/b/c` tags in its body — Obsidian treats both as first-class, so a
@@ -20,16 +31,35 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::notes::frontmatter::Frontmatter;
 use crate::notes::line_bounds;
 
-/// Normalise one tag into its canonical form, or reject it.
+/// Normalise one tag into its canonical form, or reject it. **The one rule, for
+/// every producer** (Story 42.5, FR-143).
 ///
-/// Case-folded (Obsidian tags are case-insensitive and rendering two casings as
-/// two tags is the single most common tag-tree complaint), trimmed, a leading
-/// `#` removed, repeated and edge slashes collapsed, and internal whitespace
-/// folded to `-` rather than dropped — `tags: [my tag]` is a real thing people
-/// write in frontmatter, and silently discarding it loses data.
+/// Stated as rules rather than left to be discovered by reading the callers,
+/// because two callers reading it differently is the bug this function exists
+/// to close. Applied in this order:
 ///
-/// Rejects the empty tag and the all-punctuation tag: `#---` is a horizontal
-/// rule someone forgot to escape, not a category.
+/// 1. **Whitespace at the edges is not part of the tag.** The input is trimmed,
+///    so `Client/Acme ` and `Client/Acme` are the same tag.
+/// 2. **A leading `#` is punctuation, not a segment.** Any run of them is
+///    dropped, so the inline `#project` and the frontmatter `project` agree.
+/// 3. **Case does not distinguish tags.** Everything is lowercased. Obsidian
+///    tags are case-insensitive, and rendering two casings as two tags is the
+///    single most common tag-tree complaint.
+/// 4. **Interior whitespace folds to `-`, it is not dropped.** `my tag` becomes
+///    `my-tag`: `tags: [my tag]` is a real thing people write in frontmatter,
+///    and silently discarding it loses data. Whitespace adjacent to a `/` folds
+///    to nothing, because the slash is already a boundary — `a / b` is `a/b`.
+/// 5. **`/` separates segments and never produces an empty one.** A leading
+///    slash, a trailing slash and any doubled run collapse away, so `/a//b/`
+///    is `a/b`. There is no empty segment to file anything under.
+/// 6. **A tag that normalises to nothing is rejected**, and so is one with no
+///    alphanumeric character at all: `#---` is a horizontal rule someone forgot
+///    to escape, not a category. `None` means "this is not a tag" and the caller
+///    drops it — an empty tag is never stored.
+///
+/// One-way, by construction: the canonical form is what the index and the tree
+/// hold, and nothing here reverses it. What the user typed stays where the user
+/// typed it — in the note's frontmatter, and in the recording's `manifest.json`.
 pub fn normalise(tag: &str) -> Option<String> {
     let trimmed = tag.trim().trim_start_matches('#');
     let mut out = String::with_capacity(trimmed.len());
@@ -67,6 +97,52 @@ pub fn normalise(tag: &str) -> Option<String> {
         return None;
     }
     Some(out)
+}
+
+/// Normalise a whole tag field into the canonical list the index stores: each
+/// tag through [`normalise`], rejects dropped, duplicates collapsed (Story
+/// 42.5).
+///
+/// **The collapse is the point, not a tidy-up.** `Acme` and `acme` on one
+/// recording are one tag and must be counted once, or the sidebar's number
+/// stops being the number of things behind it. First-appearance order is kept
+/// rather than sorted: the caller's order is the order the user wrote, and a
+/// recording's chips have no reason to be alphabetised. (Note tags are sorted
+/// by [`note_tags`] instead, because a note's tags come from two places and
+/// "frontmatter first, body second" is not an order anyone chose.)
+pub fn normalise_all<'a>(tags: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in tags {
+        let Some(canonical) = normalise(tag) else {
+            continue;
+        };
+        if !out.contains(&canonical) {
+            out.push(canonical);
+        }
+    }
+    out
+}
+
+/// Split one comma-separated tag field into the tags the user meant, verbatim
+/// (Story 42.5).
+///
+/// **The one tokenisation.** The recording metadata card is a single text input
+/// whose separator is a comma, and until 42.5 the split lived in TypeScript
+/// while the trim lived again in Rust. It lives here now, beside the rule that
+/// canonicalises what it produces, so there is one answer to "where does one
+/// tag end and the next begin".
+///
+/// The tokens come out **as typed** — trimmed of the whitespace around the
+/// comma and with empty ones dropped, and nothing else. That is deliberate:
+/// this is what gets written into the session's `manifest.json`, which is the
+/// user's own text and must keep saying what they wrote. [`normalise_all`] is
+/// what the row and the index apply on top, at their boundary.
+pub fn split_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Every inline `#tag` in a body, normalised, deduplicated, in first-appearance
@@ -517,5 +593,115 @@ mod tests {
         let spans = code_spans(text);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0], (0, 27));
+    }
+
+    #[test]
+    fn every_rule_the_normalise_doc_comment_states_is_the_rule_it_applies() {
+        // Story 42.5: the doc comment is the contract two producers read, so
+        // each of its six numbered rules gets an assertion. A rule that stops
+        // being true here is a rule that lied to whoever implemented against it.
+        // 1. Edge whitespace is not part of the tag.
+        assert_eq!(normalise("Client/Acme "), Some("client/acme".to_owned()));
+        assert_eq!(normalise("\tclient/acme\n"), Some("client/acme".to_owned()));
+        // 2. A leading `#` — any run of them — is punctuation.
+        assert_eq!(normalise("##client"), Some("client".to_owned()));
+        // 3. Case does not distinguish tags.
+        assert_eq!(normalise("CLIENT/Acme"), normalise("client/acme"));
+        // 4. Interior whitespace folds to `-`; whitespace beside a `/` folds to
+        //    nothing, because the slash is already a boundary.
+        assert_eq!(normalise("my tag"), Some("my-tag".to_owned()));
+        assert_eq!(normalise("a  b"), Some("a-b".to_owned()));
+        assert_eq!(normalise("a / b"), Some("a/b".to_owned()));
+        // 5. `/` never produces an empty segment.
+        assert_eq!(normalise("/a//b/"), Some("a/b".to_owned()));
+        // 6. What normalises to nothing is not a tag.
+        assert_eq!(normalise("   "), None);
+        assert_eq!(normalise("///"), None);
+        assert_eq!(normalise("#---"), None);
+    }
+
+    #[test]
+    fn a_recording_tag_and_a_note_tag_normalise_to_one_string() {
+        // The AC1 pair, at the level of the rule. That they then land on ONE
+        // TREE NODE is asserted over the tree itself, in `notes::index`.
+        assert_eq!(normalise("Client/Acme "), normalise("client/acme"));
+    }
+
+    #[test]
+    fn promoting_the_rule_moved_no_existing_note_tag() {
+        // Story 42.5's blocking condition, frozen as a table. Normalisation
+        // became the vocabulary for a SECOND producer; it must not have become a
+        // different vocabulary for the first. Every pair here is a tag shape a
+        // vault already contains and the node it already resolved to, so a
+        // future tidy-up of the rule that would re-file somebody's notes fails
+        // here instead of shipping as a silent migration.
+        for (written, node) in [
+            ("#Project", "project"),
+            ("project/keeper", "project/keeper"),
+            ("  Project/Keeper  ", "project/keeper"),
+            ("a//b///c", "a/b/c"),
+            ("/leading/", "leading"),
+            ("my tag", "my-tag"),
+            ("日本語/ノート", "日本語/ノート"),
+            ("Q3-2026", "q3-2026"),
+            ("client/acme/renewal", "client/acme/renewal"),
+            ("some_tag", "some_tag"),
+        ] {
+            assert_eq!(
+                normalise(written).as_deref(),
+                Some(node),
+                "`{written}` must still file under `{node}`"
+            );
+        }
+        for rejected in ["", "#", "   ", "---", "///", "#___"] {
+            assert_eq!(
+                normalise(rejected),
+                None,
+                "`{rejected}` was never a tag and must still not be one"
+            );
+        }
+    }
+
+    #[test]
+    fn normalise_all_collapses_duplicates_and_drops_what_is_not_a_tag() {
+        // The matrix's duplicate-after-normalising row: `Acme` and `acme` on one
+        // recording are one tag, counted once.
+        assert_eq!(
+            normalise_all(["Acme", "acme", " ACME "]),
+            vec!["acme".to_owned()]
+        );
+        // The matrix's empty-after-normalising row: dropped, never stored as an
+        // empty tag.
+        assert_eq!(
+            normalise_all(["  ", "///", "client/acme", "#---"]),
+            vec!["client/acme".to_owned()]
+        );
+        assert!(normalise_all(["  ", "///"]).is_empty());
+        // First-appearance order, so a recording's chips stay in the order the
+        // person typed them.
+        assert_eq!(
+            normalise_all(["Renewal", "Client/Acme "]),
+            vec!["renewal".to_owned(), "client/acme".to_owned()]
+        );
+    }
+
+    #[test]
+    fn split_list_tokenises_the_card_field_and_canonicalises_nothing() {
+        // The one tokenisation. It must NOT normalise: what it returns is what
+        // `manifest.json` records, and the manifest is the user's own text.
+        assert_eq!(
+            split_list("Client/Acme , renewal"),
+            vec!["Client/Acme".to_owned(), "renewal".to_owned()]
+        );
+        // Blank tokens are not tags — a trailing comma is a typo, not an entry.
+        assert_eq!(
+            split_list("standup, ,q3,"),
+            vec!["standup".to_owned(), "q3".to_owned()]
+        );
+        assert!(split_list("   ").is_empty());
+        assert!(split_list("").is_empty());
+        // A tag with a comma in it cannot exist, and a tag with a space in it
+        // survives the split intact for `normalise` to fold.
+        assert_eq!(split_list("my tag"), vec!["my tag".to_owned()]);
     }
 }

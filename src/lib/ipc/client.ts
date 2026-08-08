@@ -123,9 +123,16 @@ export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
+export type { RecordingDestinationKind } from "./gen/RecordingDestinationKind";
 export type { RecordingDisplayVm } from "./gen/RecordingDisplayVm";
+export type { RecordingDurabilityState } from "./gen/RecordingDurabilityState";
+export type { RecordingDurabilityVm } from "./gen/RecordingDurabilityVm";
+export type { RecordingFilterVm } from "./gen/RecordingFilterVm";
+export type { RecordingHitVm } from "./gen/RecordingHitVm";
+export type { RecordingNoteStubVm } from "./gen/RecordingNoteStubVm";
 export type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 export type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
+export type { RecordingProfileVm } from "./gen/RecordingProfileVm";
 export type { RecordingSettingsVm } from "./gen/RecordingSettingsVm";
 export type { RecordingSourcesVm } from "./gen/RecordingSourcesVm";
 export type { RecordingStatusVm } from "./gen/RecordingStatusVm";
@@ -158,6 +165,8 @@ export type { SyncProfileReq } from "./gen/SyncProfileReq";
 export type { SyncProfileVm } from "./gen/SyncProfileVm";
 export type { SyncProgressVm } from "./gen/SyncProgressVm";
 export type { SyncStatusVm } from "./gen/SyncStatusVm";
+export type { TagVocabularyEntryVm } from "./gen/TagVocabularyEntryVm";
+export type { TagVocabularyVm } from "./gen/TagVocabularyVm";
 export type { TccPermission } from "./gen/TccPermission";
 export type { TimelineBatch } from "./gen/TimelineBatch";
 export type { TimelineItemVm } from "./gen/TimelineItemVm";
@@ -222,8 +231,12 @@ import type { OutboxVm } from "./gen/OutboxVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
+import type { RecordingFilterVm } from "./gen/RecordingFilterVm";
+import type { RecordingHitVm } from "./gen/RecordingHitVm";
+import type { RecordingNoteStubVm } from "./gen/RecordingNoteStubVm";
 import type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 import type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
+import type { RecordingProfileVm } from "./gen/RecordingProfileVm";
 import type { RecordingSettingsVm } from "./gen/RecordingSettingsVm";
 import type { RecordingSourcesVm } from "./gen/RecordingSourcesVm";
 import type { RecordingStatusVm } from "./gen/RecordingStatusVm";
@@ -245,6 +258,7 @@ import type { SyncProfileReq } from "./gen/SyncProfileReq";
 import type { SyncProfileVm } from "./gen/SyncProfileVm";
 import type { SyncProgressVm } from "./gen/SyncProgressVm";
 import type { SyncStatusVm } from "./gen/SyncStatusVm";
+import type { TagVocabularyVm } from "./gen/TagVocabularyVm";
 import type { TccPermission } from "./gen/TccPermission";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
@@ -716,6 +730,30 @@ export async function searchArchive(filter: SearchFilterVm): Promise<SearchHitVm
 }
 
 /**
+ * Search the recordings archive for the Recordings browser (FR-141, UX-DR50,
+ * Story 42.3). Runs fully offline against `archive.db` over a fresh read-only
+ * connection — never the recorder's writer, never a network call. Queries of 3+
+ * characters use the trigram index over each session's title, participants,
+ * note, tags and custom-field values; shorter ones fall back to an accelerated
+ * `LIKE` scan. Every {@link RecordingFilterVm} field is optional and they all
+ * narrow: an empty `query` is no text predicate, an empty `tags` list is
+ * unrestricted, and several tags AND together (each matched hierarchically, so
+ * `client/acme` matches `client/acme/renewal` and never `client/acmecorp`).
+ *
+ * Resolves with at most `limit` (default and maximum 200) {@link RecordingHitVm}
+ * rows, newest first, each carrying its absolute folder (composed in Rust from
+ * the effective recordings destination — never join one here), its duration, its
+ * summed size and its decoded tags. An empty array means "nothing matched";
+ * a machine that has never recorded has no `archive.db` and also resolves with
+ * `[]`, so the caller distinguishes the two facts by the filter it sent, not by
+ * an error. Rejects with the {@link IpcError} envelope only on a genuine archive
+ * failure.
+ */
+export async function searchRecordings(filter: RecordingFilterVm): Promise<RecordingHitVm[]> {
+  return await invoke<RecordingHitVm[]>("search_recordings", { filter });
+}
+
+/**
  * Start a background archive export (FR-35, AD-11, Story 5.5). Opens a `Channel`,
  * forwards each {@link ExportProgressVm} to `onProgress` in arrival order
  * (`running` heartbeats with live counts, then exactly one terminal
@@ -752,6 +790,24 @@ export async function cancelExport(exportId: number): Promise<void> {
  */
 export async function revealPath(path: string): Promise<void> {
   await invoke<void>("reveal_path", { path });
+}
+
+/**
+ * Hand a recording's file to the system's default handler — the Recordings
+ * browser's Play (FR-141, UX-DR50, Story 42.3). `path` MUST be absolute and is
+ * normally a row's `playablePath` (its `absolutePath` opens the session folder
+ * instead).
+ *
+ * The Rust core refuses anything that is not inside the recordings destination
+ * root, lexically and after resolving symlinks, before the opener ever sees it —
+ * a command that opened any path the webview named would be a file-disclosure
+ * primitive. Rejects with the {@link IpcError} envelope (`code: "internal"`,
+ * `retriable: false`) for a path outside the root, one that no longer resolves
+ * on disk (a session moved or deleted outside keeper), or an opener failure; on
+ * a build without recording support, `code: "unsupported"`.
+ */
+export async function recordingOpenPath(path: string): Promise<void> {
+  await invoke<void>("recording_open_path", { path });
 }
 
 /**
@@ -1876,7 +1932,7 @@ export async function recordingStart(
     title?: string;
     participants?: string;
     note?: string;
-    tags?: string[];
+    tags?: string;
     custom?: { name: string; value: string }[];
   },
 ): Promise<RecordingStatusVm> {
@@ -2023,6 +2079,92 @@ export async function recordingSessionSummary(folder: string): Promise<Recording
 }
 
 /**
+ * The note stub waiting for one session (Story 42.4, FR-142), or `null` when
+ * there is none.
+ *
+ * `null` is an ordinary answer, never a failure: a stub that could not be
+ * written was logged at finalize (the recording succeeded regardless), and a
+ * dismissed one is gone on purpose. The stop surface renders nothing in either
+ * case.
+ *
+ * `contents` is what the FILE holds, not what Rust would compose — so calling
+ * this after a save returns the user's own text, and re-seeding an untouched
+ * draft from it can never resurrect something they deleted. Split it at
+ * `bodyOffset` (UTF-16 code units, converted in Rust) to get keeper's
+ * frontmatter block and the editable body.
+ */
+export async function recordingNoteStub(folder: string): Promise<RecordingNoteStubVm | null> {
+  return await invoke<RecordingNoteStubVm | null>("recording_note_stub", { folder });
+}
+
+/**
+ * Save the note the user typed (Story 42.4).
+ *
+ * `contents` is the WHOLE file — the untouched `bodyOffset` head plus the edited
+ * body — because the frontend never owns keeper's frontmatter and must not be
+ * able to send back a mangled one.
+ *
+ * The one stub command whose errors are surfaced rather than logged: until this
+ * resolves the words exist only in the textarea, so the caller must print the
+ * {@link IpcError} sentence and keep the editor open rather than dismissing.
+ */
+export async function recordingNoteStubSave(folder: string, contents: string): Promise<void> {
+  await invoke<void>("recording_note_stub_save", { folder, contents });
+}
+
+/**
+ * Dismiss a stub, deleting it only if the user never touched it (Story 42.4).
+ * Resolves `true` when the file was deleted, `false` when it was kept.
+ *
+ * Nothing the caller passes can widen what this deletes: Rust recomposes the
+ * stub from the session's manifest and removes the file only when the bytes on
+ * disk are byte-identical to it. `false` is therefore a legitimate outcome, not
+ * an error — close the card and leave the file. Every uncertainty (unreadable
+ * file, failed delete, a stub already gone) also resolves `false`, because
+ * deleting a note somebody wrote is the one unrecoverable mistake here.
+ */
+export async function recordingNoteStubDismiss(folder: string): Promise<boolean> {
+  return await invoke<boolean>("recording_note_stub_dismiss", { folder });
+}
+
+/**
+ * Rename a finished session (Story 40.4) — the affordance on the completion /
+ * recovery card. The title is the manifest's `meta.title` (Story 21.5, the only
+ * title there has ever been), and setting it MOVES the session on disk: Rust
+ * re-renders the effective path template against the session's OWN start
+ * instant with the new title, `create_dir`s the rendered leaf, `fs::rename`s
+ * the session onto it, and rewrites `manifest.json`'s title and its `session`
+ * label. The identity does NOT move — `meta.sessionId` is byte-identical
+ * afterwards, so everything latched on it (a recovery dismissal) stays attached
+ * to the session it was about.
+ *
+ * `folder` is the session folder as it stands NOW; `title` is the new title, or
+ * `null` to clear it (which moves the session back to its untitled path). A
+ * rendered path that is already taken gets the template's next `{seq}` ordinal
+ * — the existing folder is never touched — and a session that renders to the
+ * folder it already occupies is rewritten in place, moving nothing.
+ *
+ * Resolves the summary of the session AT ITS NEW LOCATION: `sessionFolder` is
+ * the folder it now occupies, and the caller MUST re-render from it. The path
+ * it was called with no longer exists, so a Reveal in Finder still aimed at the
+ * old one opens nothing.
+ *
+ * Rejects with the {@link IpcError} envelope, and these refusals are the user's
+ * to read, not the caller's to swallow: a session that is still recording is
+ * refused with code `recordingSessionLive` (the driver and the sidecar hold
+ * absolute paths), and "stop the recording first" is the only way out of it.
+ * An exhausted ordinal run, a folder with no loadable manifest, and a folder
+ * outside the recordings destination are refused the same way — with nothing
+ * moved either.
+ */
+export async function recordingRetitle(
+  folder: string,
+  title: string | null,
+): Promise<RecordingSummaryVm> {
+  return await invoke<RecordingSummaryVm>("recording_retitle", { folder, title });
+}
+
+/**
  * List the crash-recovered sessions still needing a one-time notice (Story 20.3,
  * FR-73). The Rust core walks the effective recordings destination (Story 40.3 —
  * the path template may nest sessions under it) for a loadable `manifest.json`
@@ -2140,6 +2282,29 @@ export async function recordingPathPreview(
     template,
     title: title ?? null,
   });
+}
+
+/**
+ * List the synced folders a recording destination may be pointed at (Story
+ * 41.2) — the profiles that are ENABLED and recordings-flagged (their
+ * `recordings` block is present, which only `keeper-syncd` writes), and
+ * nothing else. A profile that merely exists is not offered here, and hiding
+ * it in the picker is not the guard: `recording_settings_set` refuses an
+ * unflagged id outright.
+ *
+ * Resolves an EMPTY list rather than rejecting whenever folder sync cannot
+ * answer — no git on the machine, no engine, no profiles at all. That makes
+ * "nothing to offer" and "sync is unavailable" one code path for the caller:
+ * the destination card renders its plain folder chooser and says nothing new.
+ *
+ * `recordingsRoot` is the RESOLVED absolute root (`local_path` joined with the
+ * profile's recordings subfolder), composed by Rust. The caller NEVER joins
+ * paths: a second joiner in TypeScript would drift from the one that actually
+ * decides where a segment lands, and the resolved root is also what
+ * `RecordingSettingsVm.destinationDir` carries once a profile is chosen.
+ */
+export async function recordingDestinationProfiles(): Promise<RecordingProfileVm[]> {
+  return await invoke<RecordingProfileVm[]>("recording_destination_profiles");
 }
 
 /**
@@ -3074,6 +3239,28 @@ export async function notesList(vaultId: string, query: NoteQueryReq): Promise<N
  */
 export async function notesTagTree(vaultId: string): Promise<NoteTagTreeVm> {
   return await invoke<NoteTagTreeVm>("notes_tag_tree", { vaultId });
+}
+
+/**
+ * The flat tag vocabulary — every known tag with its count (Story 42.5,
+ * FR-143). One list, both producers: a tag that exists only on notes and a tag
+ * that exists only on recordings are both in it, and a count is the sum of
+ * everything carrying that tag or anything under it.
+ *
+ * For the surfaces that cannot consume {@link notesTagTree}: the recording
+ * metadata card's tag field is a plain `<input>`, and the notes editor's
+ * existing affordance is a CodeMirror `CompletionSource`. This is the same
+ * vocabulary both of them offer, not a second one shaped for a text box.
+ *
+ * `vaultId` is optional — omit it on a surface that is not inside a vault (the
+ * recording card) and the active vault answers. An unknown vault, or no vault at
+ * all, resolves with `{ entries: [] }` rather than rejecting: a completion with
+ * nothing to offer is a usable outcome, an error in a tag field is not.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function tagsVocabulary(vaultId?: string): Promise<TagVocabularyVm> {
+  return await invoke<TagVocabularyVm>("tags_vocabulary", { vaultId: vaultId ?? null });
 }
 
 /**

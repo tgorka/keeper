@@ -46,8 +46,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use keeper_core::notes::frontmatter::{FieldValue, Frontmatter};
 use keeper_core::notes::index::{
-    link_key, IndexBuilder, IndexCache, IndexEntry, IndexSnapshot, NoteDelta, FIELD_DEVICE,
-    FIELD_ORIGIN, INDEX_SCHEMA,
+    link_key, IndexBuilder, IndexCache, IndexEntry, IndexSnapshot, NoteDelta, RecordingTagDelta,
+    FIELD_DEVICE, FIELD_ORIGIN, INDEX_SCHEMA,
 };
 use keeper_core::notes::vm::{
     NoteAttachmentVm, NoteCadenceVm, NoteDiffVm, NoteHunkVm, NoteIndexProgressVm, NoteRevisionVm,
@@ -174,6 +174,20 @@ enum Work {
     /// the reconciler stamps `keeper.origin` and `keeper.device` onto each
     /// entry's fields (which is where `origin:` reads them) and republishes.
     Heads(HashMap<String, HeadRevision>),
+    /// A recording session's canonical tags changed — the tag tree's second
+    /// producer reporting in (Story 42.5, FR-143).
+    ///
+    /// Broadcast to every vault, not routed to one, because a recording belongs
+    /// to the app rather than to a set of notes: there is one tag vocabulary and
+    /// every vault's sidebar shows it. The tags arrive already canonical, from
+    /// the archive row that normalised them at its own boundary.
+    RecordingTags {
+        /// The session's stable id (Story 40.3).
+        session_id: String,
+        /// Its canonical tags; empty means the session now carries none, which
+        /// still has to be absorbed so its old tags are given back.
+        tags: Vec<String>,
+    },
 }
 
 /// The process-wide registry.
@@ -391,6 +405,32 @@ pub fn is_indexed(id: &str) -> bool {
 pub fn touch(id: &str, paths: Vec<String>) {
     if let Some(slot) = registry().get(id) {
         let _ = slot.work.send(Work::Touched(paths));
+    }
+}
+
+/// Report one recording session's canonical tags to the tag tree (Story 42.5,
+/// FR-143).
+///
+/// **This is the recording producer's entry point, and there is no other.** The
+/// archive writes the session's row; this hands the same canonical tag list to
+/// every vault's reconciler, which credits it into the very posting map note
+/// upserts feed. Nothing keeps a second count, so nothing can drift out of step
+/// with the first.
+///
+/// Broadcast rather than routed: a recording is not in a vault, and a person
+/// with two vaults has one tag vocabulary, not two. Cheap by construction — a
+/// send per vault of a handful of short strings, and the reconciler's own work
+/// is O(this session's tags).
+///
+/// Best-effort like [`touch`]: a vault whose reconciler has gone is a dropped
+/// send, and the next cold start seeds the whole recording posting set from
+/// `archive.db` anyway.
+pub fn set_recording_tags(session_id: &str, tags: &[String]) {
+    for slot in registry().values() {
+        let _ = slot.work.send(Work::RecordingTags {
+            session_id: session_id.to_owned(),
+            tags: tags.to_vec(),
+        });
     }
 }
 
@@ -644,6 +684,18 @@ async fn reconcile(
                 cold_start(&app, &vault, &mut state, &index, &progress).await;
             }
             Some(Work::Heads(heads)) => stamp_heads(&vault, &mut state, heads, &index),
+            Some(Work::RecordingTags { session_id, tags }) => {
+                state
+                    .recording_tags
+                    .insert(session_id.clone(), tags.clone());
+                state
+                    .builder
+                    .apply_recording_tags(RecordingTagDelta::Upsert { session_id, tags });
+                // Sent, not `publish`ed: no note changed, so asking git for a
+                // fresh head projection would spend a subprocess to learn that
+                // every answer is the one already stamped on the entries.
+                let _ = index.send(state.builder.snapshot());
+            }
             // Every sender is gone: the vault was unflagged, or its root moved
             // and a fresh reconciler took over.
             None => return,
@@ -663,6 +715,15 @@ struct ReconcilerState {
     /// guess. Maintained incrementally: only the tokens the changed note gained
     /// or lost are touched.
     inbound: HashMap<String, HashSet<String>>,
+    /// Which recording session contributed which canonical tags, as this task
+    /// last heard it (Story 42.5). The recording producer's mirror of `entries`,
+    /// and kept for the same reason: a rescan rebuilds the builder from scratch,
+    /// and the recording postings have to be put back — they are not a fact
+    /// about this vault's files and a vault walk cannot rediscover them.
+    ///
+    /// Reseeded from `archive.db` by [`cold_start`], so this is a cache of a
+    /// derivation and never a second truth.
+    recording_tags: BTreeMap<String, Vec<String>>,
 }
 
 /// Load the cache, walk the vault, parse whatever the cache could not vouch for,
@@ -717,6 +778,19 @@ async fn cold_start(
     // The cold build seeds the builder from the whole entry set once, after the
     // orphan pass, so nothing needs re-projecting individually here.
     state.builder = IndexBuilder::from_entries(state.entries.values().cloned().collect());
+    // Story 42.5: the fresh builder has no recording postings, and a vault walk
+    // cannot find any — recordings are not files in this vault. Reseed them from
+    // `archive.db`, which is itself derived from the manifests, so a cold start
+    // and a live report produce the same tag counts.
+    state.recording_tags = recording_tag_seed(app).await;
+    for (session_id, tags) in &state.recording_tags {
+        state
+            .builder
+            .apply_recording_tags(RecordingTagDelta::Upsert {
+                session_id: session_id.clone(),
+                tags: tags.clone(),
+            });
+    }
 
     let snapshot = state.builder.snapshot();
     let _ = progress.send(NoteIndexProgressVm {
@@ -727,6 +801,40 @@ async fn cold_start(
     });
     publish(app, vault, index, snapshot);
     write_cache(vault, state);
+}
+
+/// Every indexed recording session's canonical tags, for [`cold_start`] (Story
+/// 42.5, FR-143).
+///
+/// Read-only, off the runtime, and quiet about every way it can come back empty:
+/// no data dir, a machine that has never recorded (no `archive.db` at all), a
+/// database that will not open. None of those is a notes failure, and a tag tree
+/// that shows only note tags is a smaller wrong answer than a vault that refuses
+/// to index.
+async fn recording_tag_seed(app: &AppHandle) -> BTreeMap<String, Vec<String>> {
+    let Ok(data_dir) = app.state::<crate::ipc::AppState>().platform.data_dir() else {
+        return BTreeMap::new();
+    };
+    let read = tokio::task::spawn_blocking(move || {
+        if !keeper_core::archive::db::db_path(&data_dir).exists() {
+            return BTreeMap::new();
+        }
+        let Ok(conn) = keeper_core::archive::db::open_readonly_archive_db(&data_dir) else {
+            return BTreeMap::new();
+        };
+        match keeper_core::archive::recordings::indexed_tags(&conn) {
+            Ok(rows) => rows.into_iter().collect(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "notes: could not read the recording tags; the tag tree shows note tags only"
+                );
+                BTreeMap::new()
+            }
+        }
+    })
+    .await;
+    read.unwrap_or_default()
 }
 
 /// Re-read a coalesced batch of paths and publish the result.
