@@ -125,6 +125,8 @@ export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
 export type { RecordingDestinationKind } from "./gen/RecordingDestinationKind";
 export type { RecordingDisplayVm } from "./gen/RecordingDisplayVm";
+export type { RecordingDurabilityState } from "./gen/RecordingDurabilityState";
+export type { RecordingDurabilityVm } from "./gen/RecordingDurabilityVm";
 export type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 export type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 export type { RecordingProfileVm } from "./gen/RecordingProfileVm";

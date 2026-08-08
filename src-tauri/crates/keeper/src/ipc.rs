@@ -47,12 +47,12 @@ use keeper_core::vm::{
     ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError,
     IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
     NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
-    PaletteResultsVm, PingVm, Provider, RecordingDestinationKind, RecordingPathPreviewVm,
-    RecordingPermissionVm, RecordingProfileVm, RecordingSettingsVm, RecordingSourcesVm,
-    RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState, RemoteDraftVm,
-    ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm, SearchHitVm,
-    SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch, TypingBatch,
-    VerificationFlowVm,
+    PaletteResultsVm, PingVm, Provider, RecordingDestinationKind, RecordingDurabilityState,
+    RecordingDurabilityVm, RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm,
+    RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm,
+    RecordingTargetVm, RecordingUiState, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
+    ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm,
+    TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -185,6 +185,16 @@ pub struct RecordingRun {
     /// captured for the same reason as the cap: a mid-session settings edit
     /// must never repoint a running guard at a different volume.
     destination_dir: PathBuf,
+    /// This session's durability reader (Story 41.6), or `None` for a
+    /// plain-folder destination — which is `local` by definition and has no
+    /// engine to ask. Session-captured beside the cap and the destination for
+    /// the same AD-25 reason: a mid-session settings edit must not repoint a
+    /// running session's durability at a profile it never wrote into.
+    ///
+    /// `Arc`'d because the ~1 Hz status read clones it out of this slot and
+    /// then releases the lock — the slot is never held across the read, exactly
+    /// as it is never held across the `read_dir`/`stat` half.
+    durability: Option<Arc<RecordingDurabilityReader>>,
 }
 
 /// Lock an optional-slot mutex, recovering a poisoned lock instead of propagating —
@@ -5022,19 +5032,50 @@ enum RecordingPushTrigger {
     SessionEnd,
 }
 
-/// Everything a recording session asks of the sync engine (Story 41.5), and
-/// nothing else.
+/// What the engine knows LOCALLY about one path's durability (Story 41.6,
+/// FR-138) — the four facts, and nothing derived.
+///
+/// A shell-local mirror of `keeper_sync::engine::PathDurability` for
+/// [`SessionPushPolicy`]'s reason: the type has to exist on a platform
+/// `keeper-sync` is not linked into, so the port stays platform-free and the
+/// mapping into a [`RecordingDurabilityVm`] is one total function that compiles
+/// and is tested on a machine with no `git` at all.
+///
+/// The three booleans are independent readings rather than one enum because
+/// that is how the engine holds them; collapsing them is the DERIVATION
+/// ([`durability_state`]), and doing it in exactly one place is what keeps the
+/// banner and the tray from ranking them differently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SegmentDurability {
+    /// The path is in a commit in this profile.
+    committed: bool,
+    /// That commit is on the remote.
+    pushed: bool,
+    /// The engine has verified the pushed objects.
+    verified: bool,
+    /// Why publication has not happened, in the engine's own words — a push the
+    /// remote refused, an unreachable remote. `None` when nothing is wrong.
+    problem: Option<String>,
+}
+
+/// Everything a recording session asks of the sync engine (Stories 41.5 +
+/// 41.6), and nothing else.
 ///
 /// A trait rather than an `Arc<Engine>` for two reasons. The engine is
 /// desktop-only while this sink is not, so a recorder holding one would not
 /// compile on iOS; and an `Engine` can commit, push, pause and delete profiles,
 /// none of which a recorder may do (AD-68) — the inbound direction 41.4
-/// established is the whole point. Four questions is the surface, and the COUNTS
-/// this story's acceptance criteria are stated in are countable through it.
+/// established is the whole point. Five questions is the whole surface: four a
+/// session ASKS while it records, and one — [`Self::path_durability`] — the
+/// status poll asks ABOUT what it recorded. The COUNTS 41.5's acceptance
+/// criteria are stated in are all countable through it, and so is 41.6's whole
+/// I/O matrix.
 ///
 /// **Every method is total.** A refusal is a value, never a `?`: capture never
 /// degrades (NFR-34), so there is nothing here for a sink to propagate, nothing
-/// that can fail a command, and nothing that can stop a recorder.
+/// that can fail a command, and nothing that can stop a recorder. The one
+/// `Result` is [`Self::path_durability`]'s, and its caller swallows it too — it
+/// exists so the degrade has a sentence to log.
 trait RecordingSyncPort: Send + Sync {
     /// This profile's push policy, read once per session by
     /// [`begin_recording_sync`]. Unreadable ⇒ [`SessionPushPolicy::AtSessionEnd`].
@@ -5062,6 +5103,18 @@ trait RecordingSyncPort: Send + Sync {
     /// run on the driver task. The implementation hands it to the runtime and the
     /// outcome is logged where it lands (NFR-32).
     fn request_push(&self, profile_id: &str, trigger: RecordingPushTrigger);
+
+    /// What the engine knows LOCALLY about `path` right now (Story 41.6,
+    /// FR-138) — is it committed, is that commit pushed, has it been verified,
+    /// and is there a recorded reason it has not been published.
+    ///
+    /// **Cheap and local-only, because this is on the ~1 Hz poll path.** It may
+    /// never do a network round trip: if the honest answer needs the wire, the
+    /// answer is the last thing keeper knows locally. `Err` is a transient read
+    /// failure — a sentence for one log line — and the caller degrades to the
+    /// last known state rather than propagating it, because a status poll must
+    /// not be able to fail.
+    fn path_durability(&self, profile_id: &str, path: &Path) -> Result<SegmentDurability, String>;
 }
 
 /// The sync half of one recording session, resolved ONCE at start and carried
@@ -5455,6 +5508,30 @@ impl RecordingSyncPort for EngineRecordingSync {
             }
         });
     }
+
+    fn path_durability(&self, profile_id: &str, path: &Path) -> Result<SegmentDurability, String> {
+        self.engine
+            .path_durability(profile_id, path)
+            .map(SegmentDurability::from)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The engine's own durability reading, mirrored into the platform-free shape
+/// (Story 41.6) — a field-for-field translation and nothing more, for the same
+/// reason [`SessionPushPolicy`]'s `From` is a translation: the decision (which
+/// state these four facts add up to) belongs in exactly one place, and that
+/// place is [`durability_state`], which compiles on a machine with no engine.
+#[cfg(desktop)]
+impl From<keeper_sync::engine::PathDurability> for SegmentDurability {
+    fn from(facts: keeper_sync::engine::PathDurability) -> Self {
+        Self {
+            committed: facts.committed,
+            pushed: facts.pushed,
+            verified: facts.verified,
+            problem: facts.problem,
+        }
+    }
 }
 
 /// This process's engine seam for a recording session, or `None` when there is no
@@ -5795,6 +5872,18 @@ pub async fn recording_start(
         media_extension,
         recording_sync_port(&state.platform),
     );
+    // Story 41.6: the same seam, asked the other way round. The sink pushes
+    // facts INTO the engine as it records; this reads one fact back out on the
+    // status poll. Minted here, from the session's own resolved profile, so a
+    // mid-session destination edit cannot repoint a running session's durability
+    // at a profile it never wrote into (AD-25) — and `None` for a plain folder,
+    // which is `local` by definition and asks nothing of anyone.
+    let durability = sync.as_ref().map(|sync| {
+        Arc::new(RecordingDurabilityReader::new(
+            sync.profile_id.clone(),
+            Arc::clone(&sync.port),
+        ))
+    });
     let params = SessionParams {
         // Seeding `screen-0000.mov` lets 17.1's `nextSegmentPath` produce
         // `screen-0001.mov`, … inside the folder with no Swift change.
@@ -5837,6 +5926,10 @@ pub async fn recording_start(
         on_disk_bytes: 0,
         current_segment_bytes: 0,
         segment_cap_mb: 0,
+        // Derived at every read (Story 41.6), never folded from an event: the
+        // stored snapshot carries the on-this-Mac reading and `with_disk_figures`
+        // replaces it with the engine's answer on each poll.
+        durability: RecordingDurabilityVm::local(),
     }));
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -5958,6 +6051,9 @@ pub async fn recording_start(
         // The volume the disk guard probes (Story 18.5) — the resolved
         // destination the pre-start gate just validated.
         destination_dir: directory,
+        // The session's durability reading (Story 41.6) — `None` for a plain
+        // folder, which never asks the engine anything.
+        durability,
     });
     Ok(snapshot)
 }
@@ -5988,41 +6084,52 @@ pub(crate) fn stop_active_recording(state: &AppState) {
 /// thread; this synchronous form exists for the callers that have no runtime to
 /// await on (the tray menu handler and `ExitRequested`).
 pub(crate) fn recording_snapshot(state: &AppState) -> RecordingStatusVm {
-    let Some((snapshot, segment_cap_mb)) = live_snapshot(&state.recording_run) else {
+    let Some((snapshot, segment_cap_mb, durability)) = live_snapshot(&state.recording_run) else {
         return RecordingStatusVm::idle();
     };
-    with_disk_figures(snapshot, segment_cap_mb)
+    with_disk_figures(snapshot, segment_cap_mb, durability.as_deref())
 }
 
 /// [`recording_snapshot`] for the `async` command path (Story 34.3, AD-34-5):
 /// byte-identical figures, with the `read_dir`/`stat` half on the blocking pool
 /// so a slow volume neither stalls the main thread (where macOS resolves
-/// `startDragging`) nor holds a runtime worker.
+/// `startDragging`) nor holds a runtime worker. Since Story 41.6 the durability
+/// read rides the same pool hop, for the same reason: it is a local index read,
+/// but it is still a read.
 async fn recording_snapshot_off_runtime(state: &AppState) -> Result<RecordingStatusVm, IpcError> {
-    let Some((snapshot, segment_cap_mb)) = live_snapshot(&state.recording_run) else {
+    let Some((snapshot, segment_cap_mb, durability)) = live_snapshot(&state.recording_run) else {
         return Ok(RecordingStatusVm::idle());
     };
-    off_async_runtime(move || with_disk_figures(snapshot, segment_cap_mb)).await
+    off_async_runtime(move || with_disk_figures(snapshot, segment_cap_mb, durability.as_deref()))
+        .await
 }
 
-/// The lock-held half of [`recording_snapshot`]: clone the driver-kept snapshot
-/// and capture the session cap, releasing the slot before returning. `None` ⇒ no
-/// session this app lifetime.
+/// The lock-held half of [`recording_snapshot`]: clone the driver-kept snapshot,
+/// capture the session cap and take a handle on the session's durability reader,
+/// releasing the slot before returning. `None` ⇒ no session this app lifetime.
 ///
 /// Split from the disk half so "never hold the `recording_run` slot across
 /// blocking `read_dir`/`stat` syscalls" (Story 18.3 — a slow/unreadable volume
 /// must not stall `stop`/`start`/quit, which contend on that slot) is enforced by
 /// the signature rather than by comment, and so the async path can keep the
 /// non-`Send` guard entirely on its own thread and hand owned values to the pool.
+/// The durability reader is `Arc`'d out for exactly that rule: asking the engine
+/// is a read too, and it must not happen under this lock either.
 /// Takes the slot rather than the whole state ([`acknowledge_recording_slot`]'s
 /// convention) so it is unit-testable without an `AppState`.
-fn live_snapshot(slot: &Mutex<Option<RecordingRun>>) -> Option<(RecordingStatusVm, u32)> {
+fn live_snapshot(
+    slot: &Mutex<Option<RecordingRun>>,
+) -> Option<(
+    RecordingStatusVm,
+    u32,
+    Option<Arc<RecordingDurabilityReader>>,
+)> {
     let guard = slot_lock(slot);
     let run = guard.as_ref()?;
     // Bind the clone first so the transient `status` MutexGuard drops before
     // `guard` (both released as this returns).
     let snapshot = status_lock(&run.status).clone();
-    Some((snapshot, run.segment_cap_mb))
+    Some((snapshot, run.segment_cap_mb, run.durability.clone()))
 }
 
 /// The disk half of [`recording_snapshot`]: enrich the driver-kept snapshot with
@@ -6031,14 +6138,138 @@ fn live_snapshot(slot: &Mutex<Option<RecordingRun>>) -> Option<(RecordingStatusV
 /// from this one shared read. The driver never maintains these on the stored
 /// snapshot; they are filled here best-effort — a missing/unreadable folder simply
 /// yields 0 (never an error).
-fn with_disk_figures(mut snapshot: RecordingStatusVm, segment_cap_mb: u32) -> RecordingStatusVm {
+///
+/// Story 41.6 adds the durability reading on the same terms: DERIVED here, on the
+/// snapshot the surface already polls, so it cannot go stale or disagree with the
+/// engine, and never stored anywhere. A `None` reader is a plain-folder
+/// destination — `local`, and no engine is asked at all, because there is no
+/// profile and therefore no further promise to make.
+fn with_disk_figures(
+    mut snapshot: RecordingStatusVm,
+    segment_cap_mb: u32,
+    durability: Option<&RecordingDurabilityReader>,
+) -> RecordingStatusVm {
     if let Some(folder) = snapshot.output_path.as_deref() {
         let folder = Path::new(folder);
         snapshot.on_disk_bytes = session_bytes_on_disk(folder);
         snapshot.current_segment_bytes = current_segment_bytes_on_disk(folder);
     }
     snapshot.segment_cap_mb = segment_cap_mb;
+    // The folder is read from the snapshot rather than captured at start, so a
+    // retitle (Story 40.4, `repoint_recording_slot_output`) moves the question
+    // with the session — the same reason the byte figures above take it from
+    // there. No folder yet ⇒ nothing to ask about, and `local` is the honest
+    // answer for a session that has written nothing.
+    snapshot.durability = match (durability, snapshot.output_path.as_deref()) {
+        (Some(reader), Some(folder)) => reader.read(Path::new(folder)),
+        _ => RecordingDurabilityVm::local(),
+    };
     snapshot
+}
+
+/// Collapse the engine's four local facts into the one state a person reads
+/// (Story 41.6, FR-138). The single definition of the ranking — the banner, the
+/// tray and the tests all come through here, so they cannot disagree.
+///
+/// Deliberately ordered strongest-first: `verified` implies `pushed` implies
+/// `committed` in the engine's own bookkeeping, and reading the strongest true
+/// fact means a partially-updated set can only ever be optimistic by one rung,
+/// never nonsense.
+fn durability_state(facts: &SegmentDurability) -> RecordingDurabilityState {
+    if facts.verified {
+        RecordingDurabilityState::Verified
+    } else if facts.pushed {
+        RecordingDurabilityState::Pushed
+    } else if facts.committed {
+        RecordingDurabilityState::Committed
+    } else {
+        RecordingDurabilityState::Local
+    }
+}
+
+/// One session's durability reading, kept as a FLOOR (Story 41.6, FR-138,
+/// NFR-34).
+///
+/// **Why a floor.** The line answers "would what I have recorded survive?", and
+/// that is a question about the worst case of everything already captured, not
+/// about the newest segment. A four-hour session pushes segment 3 and is still
+/// settling segment 4; reporting segment 4's `local` would walk the banner
+/// backwards and tell the person their recording became less safe, which is the
+/// opposite of what happened. So the state only ever climbs: `floor.max(observed)`.
+///
+/// The `detail` does NOT floor. It is the current reason publication is stuck,
+/// so it appears when a push is refused and disappears when a later one
+/// succeeds — a reason that latched forever would outlive the problem it names.
+///
+/// **Why it degrades instead of failing.** A transient engine read failure on a
+/// ~1 Hz poll must not blank the line, turn `pushed` back into `local`, or fail
+/// the command: capture never degrades (NFR-34), and neither does reading about
+/// it. The failure keeps the last known answer and spends exactly one `warn`
+/// line per outage — [`Self::degraded`] latches so an hour of failures is one
+/// line, not 3600, and clears on the next success so a NEW outage is heard.
+struct RecordingDurabilityReader {
+    /// The destination profile every question names.
+    profile_id: String,
+    /// The engine seam — the same one this session's sink commits through.
+    port: Arc<dyn RecordingSyncPort>,
+    /// The highest state this session has reached, plus the current reason
+    /// publication is stuck. Interior-mutable because the status read takes
+    /// `&self`: the reader is shared with the slot and read from the blocking
+    /// pool.
+    floor: Mutex<RecordingDurabilityVm>,
+    /// Whether the current outage has already been logged.
+    degraded: AtomicBool,
+}
+
+impl RecordingDurabilityReader {
+    /// Open a reader over one session's destination profile. The floor starts at
+    /// `local`, which is exactly true: nothing has been committed yet.
+    fn new(profile_id: String, port: Arc<dyn RecordingSyncPort>) -> Self {
+        Self {
+            profile_id,
+            port,
+            floor: Mutex::new(RecordingDurabilityVm::local()),
+            degraded: AtomicBool::new(false),
+        }
+    }
+
+    /// Ask the engine about `folder` and fold the answer into the floor,
+    /// returning what the surface should show. Never fails.
+    fn read(&self, folder: &Path) -> RecordingDurabilityVm {
+        let answer = self.port.path_durability(&self.profile_id, folder);
+        let mut floor = plain_lock(&self.floor);
+        match answer {
+            Ok(facts) => {
+                if self.degraded.swap(false, Ordering::Relaxed) {
+                    tracing::info!(
+                        profile = %self.profile_id,
+                        "recordings durability: the engine is answering again"
+                    );
+                }
+                let observed = durability_state(&facts);
+                if observed > floor.state {
+                    floor.state = observed;
+                }
+                floor.detail = facts.problem;
+            }
+            // The last known state IS the answer here. Anything else would be a
+            // worse lie than a slightly stale truth: `local` after `pushed`
+            // claims the recording got less safe, and an error on the poll path
+            // would blank a banner over a read that will very likely succeed a
+            // second from now.
+            Err(reason) => {
+                if !self.degraded.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        %reason,
+                        profile = %self.profile_id,
+                        state = ?floor.state,
+                        "recordings durability: the engine could not be read, so the last known state stands"
+                    );
+                }
+            }
+        }
+        floor.clone()
+    }
 }
 
 /// How long a confirmed quit waits for the live recording session to reach a
@@ -7743,7 +7974,7 @@ pub async fn recording_settings_set(
     // write below. Only a CHANGED value is refused: an unrelated edit that
     // round-trips the same echo-cancellation value applies normally.
     let session_live =
-        live_snapshot(&state.recording_run).is_some_and(|(snapshot, _)| snapshot.state.is_live());
+        live_snapshot(&state.recording_run).is_some_and(|(snapshot, ..)| snapshot.state.is_live());
     let platform = Arc::clone(&state.platform);
     off_async_runtime(move || {
         write_recording_settings(&data_dir, &settings, session_live, &|need| {
@@ -9627,6 +9858,9 @@ mod tests {
             driver: None,
             segment_cap_mb: 500,
             destination_dir: PathBuf::from("/tmp/keeper-ipc-test"),
+            // A settled/synthetic session with no destination profile behind it:
+            // `local`, and no engine is ever asked (Story 41.6).
+            durability: None,
         }))
     }
 
@@ -9792,7 +10026,7 @@ mod tests {
         ] {
             let slot = run_slot_in(state, None);
             assert!(
-                live_snapshot(&slot).is_some_and(|(s, _)| s.state.is_live()),
+                live_snapshot(&slot).is_some_and(|(s, ..)| s.state.is_live()),
                 "{state:?} must lock the switch"
             );
         }
@@ -9803,12 +10037,12 @@ mod tests {
         ] {
             let slot = run_slot_in(state, None);
             assert!(
-                !live_snapshot(&slot).is_some_and(|(s, _)| s.state.is_live()),
+                !live_snapshot(&slot).is_some_and(|(s, ..)| s.state.is_live()),
                 "{state:?} must NOT lock the switch"
             );
         }
         let empty: Mutex<Option<RecordingRun>> = Mutex::new(None);
-        assert!(!live_snapshot(&empty).is_some_and(|(s, _)| s.state.is_live()));
+        assert!(!live_snapshot(&empty).is_some_and(|(s, ..)| s.state.is_live()));
     }
 
     /// Story 22.7: `recording_start` populates `MicSelection.echo_cancellation`
@@ -10770,7 +11004,12 @@ mod tests {
         assert!(live_snapshot(&empty).is_none());
 
         let slot = run_slot_in(RecordingUiState::Recording, None);
-        let (live, segment_cap_mb) = live_snapshot(&slot).expect("a live slot yields its snapshot");
+        let (live, segment_cap_mb, durability) =
+            live_snapshot(&slot).expect("a live slot yields its snapshot");
+        assert!(
+            durability.is_none(),
+            "a run with no destination profile carries no durability reader"
+        );
         assert_eq!(live.state, RecordingUiState::Recording);
         // The cap is SESSION-captured on the run, not on the driver's snapshot, so
         // it has to travel out of the lock alongside it or the meter loses its
@@ -10795,7 +11034,7 @@ mod tests {
         std::fs::write(folder.join("screen-0000.mov"), vec![0u8; 40]).expect("segment");
         let mut recording = live.clone();
         recording.output_path = Some(folder.to_string_lossy().into_owned());
-        let enriched = with_disk_figures(recording, segment_cap_mb);
+        let enriched = with_disk_figures(recording, segment_cap_mb, None);
         assert_eq!(enriched.segment_cap_mb, 500);
         assert_eq!(enriched.on_disk_bytes, 40);
         assert_eq!(enriched.current_segment_bytes, 40);
@@ -10805,7 +11044,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&folder);
         let mut vanished = live.clone();
         vanished.output_path = Some(folder.to_string_lossy().into_owned());
-        let enriched = with_disk_figures(vanished, segment_cap_mb);
+        let enriched = with_disk_figures(vanished, segment_cap_mb, None);
         assert_eq!(enriched.segment_cap_mb, 500);
         assert_eq!(enriched.on_disk_bytes, 0);
         assert_eq!(enriched.current_segment_bytes, 0);
@@ -12599,6 +12838,10 @@ mod tests {
         EnsureLfsRule(String),
         NoteFinished(PathBuf),
         Push(RecordingPushTrigger),
+        /// Story 41.6: the status poll asking about a path. Recorded like every
+        /// other call so "a plain folder asks the engine nothing" stays one
+        /// assertion over one vector.
+        Durability(PathBuf),
     }
 
     /// A counting [`RecordingSyncPort`] double — the test seam this story needs.
@@ -12608,12 +12851,22 @@ mod tests {
     /// of them is a call the sink either makes or does not. A real `Engine` would
     /// answer the same questions with a git repository, a `sync.db` and a remote
     /// attached; this answers them with a vector.
+    ///
+    /// Story 41.6 adds a SCRIPT: the durability answers a session's polls get, in
+    /// order. That is what turns the story's I/O matrix into ordinary unit tests —
+    /// a protected-branch rejection, a network killed mid-session and a transient
+    /// read failure are all just the next row of a `Vec`, and none of them needs a
+    /// remote to refuse anything.
     struct CountingSyncPort {
         policy: SessionPushPolicy,
         /// An engine that says no to everything: the LFS rule cannot be written
         /// and every assertion is dropped. The recorder must not be able to tell.
         refuses: bool,
         calls: Mutex<Vec<SyncCall>>,
+        /// The scripted durability answers, one consumed per ask. The LAST row
+        /// repeats forever, because a script describes the CHANGES and a ~1 Hz
+        /// poll keeps asking long after the last one.
+        durability: Mutex<Vec<Result<SegmentDurability, String>>>,
     }
 
     impl CountingSyncPort {
@@ -12622,6 +12875,7 @@ mod tests {
                 policy,
                 refuses: false,
                 calls: Mutex::new(Vec::new()),
+                durability: Mutex::new(Vec::new()),
             }
         }
 
@@ -12632,6 +12886,17 @@ mod tests {
                 policy: SessionPushPolicy::default(),
                 refuses: true,
                 calls: Mutex::new(Vec::new()),
+                durability: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A port whose durability answers are these, in order.
+        fn scripted(answers: Vec<Result<SegmentDurability, String>>) -> Self {
+            Self {
+                policy: SessionPushPolicy::default(),
+                refuses: false,
+                calls: Mutex::new(Vec::new()),
+                durability: Mutex::new(answers),
             }
         }
 
@@ -12657,6 +12922,14 @@ mod tests {
         fn pushes(&self, trigger: RecordingPushTrigger) -> usize {
             self.count(&SyncCall::Push(trigger))
         }
+
+        /// How many times the status poll asked about durability.
+        fn durability_asks(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|call| matches!(call, SyncCall::Durability(_)))
+                .count()
+        }
     }
 
     impl RecordingSyncPort for CountingSyncPort {
@@ -12681,6 +12954,26 @@ mod tests {
 
         fn request_push(&self, _profile_id: &str, trigger: RecordingPushTrigger) {
             self.record(SyncCall::Push(trigger));
+        }
+
+        fn path_durability(
+            &self,
+            _profile_id: &str,
+            path: &Path,
+        ) -> Result<SegmentDurability, String> {
+            self.record(SyncCall::Durability(path.to_path_buf()));
+            let mut script = self.durability.lock().expect("lock durability script");
+            if script.len() > 1 {
+                script.remove(0)
+            } else {
+                // An empty script is an engine that knows nothing yet — which is
+                // the honest answer before the first commit, and what every
+                // Story 41.5 test (which never polls) would get.
+                script
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| Ok(SegmentDurability::default()))
+            }
         }
     }
 
@@ -13015,5 +13308,322 @@ mod tests {
                 "{name} does not carry .{extension}"
             );
         }
+    }
+
+    // --- Story 41.6: durability you can read --------------------------------
+
+    /// One engine answer, spelled as the facts the engine actually holds.
+    fn facts(committed: bool, pushed: bool, verified: bool) -> Result<SegmentDurability, String> {
+        Ok(SegmentDurability {
+            committed,
+            pushed,
+            verified,
+            problem: None,
+        })
+    }
+
+    /// The engine's reading of a session whose commits exist and whose push the
+    /// remote refused — the protected-branch and killed-network rows.
+    fn refused(reason: &str) -> Result<SegmentDurability, String> {
+        Ok(SegmentDurability {
+            committed: true,
+            pushed: false,
+            verified: false,
+            problem: Some(reason.to_owned()),
+        })
+    }
+
+    /// A run slot exactly as `recording_start` leaves one for a PROFILE
+    /// destination: a live snapshot naming the session folder, plus the
+    /// durability reader over the scripted port.
+    fn durability_slot(folder: &Path, port: Arc<CountingSyncPort>) -> Mutex<Option<RecordingRun>> {
+        let mut snapshot = RecordingStatusVm::idle();
+        snapshot.state = RecordingUiState::Recording;
+        snapshot.output_path = Some(folder.to_string_lossy().into_owned());
+        Mutex::new(Some(RecordingRun {
+            stop_tx: None,
+            status: Arc::new(Mutex::new(snapshot)),
+            driver: None,
+            segment_cap_mb: 500,
+            destination_dir: folder.to_path_buf(),
+            durability: Some(Arc::new(RecordingDurabilityReader::new(
+                "profile-1".to_owned(),
+                port,
+            ))),
+        }))
+    }
+
+    /// One turn of the ~1 Hz status poll, through the real two halves the
+    /// `recording_status` command runs — never the reader in isolation, so what
+    /// these tests assert is what the surface receives.
+    fn poll_durability(slot: &Mutex<Option<RecordingRun>>) -> RecordingDurabilityVm {
+        let (snapshot, cap, reader) = live_snapshot(slot).expect("a live slot");
+        with_disk_figures(snapshot, cap, reader.as_deref()).durability
+    }
+
+    /// The ranking, in one place: the strongest true fact wins. The last row is
+    /// the one that matters — a partially-updated set (pushed recorded before
+    /// committed) is optimistic by one rung rather than nonsense.
+    #[test]
+    fn durability_state_reads_the_strongest_true_fact() {
+        use RecordingDurabilityState::*;
+        let read = |c, p, v| {
+            durability_state(&SegmentDurability {
+                committed: c,
+                pushed: p,
+                verified: v,
+                problem: None,
+            })
+        };
+        assert_eq!(read(false, false, false), Local);
+        assert_eq!(read(true, false, false), Committed);
+        assert_eq!(read(true, true, false), Pushed);
+        assert_eq!(read(true, true, true), Verified);
+        assert_eq!(read(false, true, false), Pushed);
+        assert_eq!(read(false, false, true), Verified);
+        // The ordering the floor is a `max` over.
+        assert!(Local < Committed && Committed < Pushed && Pushed < Verified);
+    }
+
+    /// The matrix's four advancing rows, in the order a real rotation produces
+    /// them: nothing committed yet ⇒ `local`; the segment is in a commit ⇒
+    /// `committed`; the commit is on the remote ⇒ `pushed`; the engine verified
+    /// the objects ⇒ `verified`. One ask per poll, and no problem ever named.
+    #[test]
+    fn a_profile_session_advances_local_committed_pushed_verified() {
+        let folder = scan_temp_dir("rec-41-6-advance");
+        let port = Arc::new(CountingSyncPort::scripted(vec![
+            facts(false, false, false),
+            facts(true, false, false),
+            facts(true, true, false),
+            facts(true, true, true),
+        ]));
+        let slot = durability_slot(&folder, Arc::clone(&port));
+
+        for expected in [
+            RecordingDurabilityState::Local,
+            RecordingDurabilityState::Committed,
+            RecordingDurabilityState::Pushed,
+            RecordingDurabilityState::Verified,
+        ] {
+            let reading = poll_durability(&slot);
+            assert_eq!(reading.state, expected);
+            assert_eq!(reading.detail, None, "{expected:?} named a problem");
+        }
+        assert_eq!(port.durability_asks(), 4, "one ask per poll, no more");
+        assert_eq!(
+            port.calls()
+                .iter()
+                .filter(|call| !matches!(call, SyncCall::Durability(_)))
+                .count(),
+            0,
+            "reading durability must not commit, push or assert anything"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The question is asked about the SESSION FOLDER — taken from the snapshot,
+    /// so a retitle (Story 40.4) moves it with the session rather than leaving
+    /// the reader asking about a folder that no longer exists.
+    #[cfg(desktop)]
+    #[test]
+    fn the_durability_question_names_the_sessions_current_folder() {
+        let folder = scan_temp_dir("rec-41-6-folder");
+        let moved = folder.with_file_name("rec-41-6-folder standup");
+        let port = Arc::new(CountingSyncPort::scripted(vec![facts(true, false, false)]));
+        let slot = durability_slot(&folder, Arc::clone(&port));
+        poll_durability(&slot);
+
+        assert!(repoint_recording_slot_output(&slot, &folder, &moved));
+        poll_durability(&slot);
+
+        assert_eq!(
+            port.calls(),
+            vec![
+                SyncCall::Durability(folder.clone()),
+                SyncCall::Durability(moved),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The matrix's plain-folder row, and its "engine unavailable (no git)" row
+    /// with it: both leave the run with no reader, both read `local`, and
+    /// neither asks the engine a single question — there is no profile, so there
+    /// is no further promise to make.
+    #[test]
+    fn a_plain_folder_session_reads_local_and_never_asks_the_engine() {
+        let folder = scan_temp_dir("rec-41-6-plain");
+        let port = Arc::new(CountingSyncPort::scripted(vec![facts(true, true, true)]));
+        // What `recording_start` builds for a folder destination: no sync
+        // session, therefore no reader.
+        assert!(
+            begin_recording_sync(&folder_destination(&folder), "mov", Some(port.clone())).is_none()
+        );
+        let mut snapshot = RecordingStatusVm::idle();
+        snapshot.state = RecordingUiState::Recording;
+        snapshot.output_path = Some(folder.to_string_lossy().into_owned());
+        let slot = Mutex::new(Some(RecordingRun {
+            stop_tx: None,
+            status: Arc::new(Mutex::new(snapshot)),
+            driver: None,
+            segment_cap_mb: 500,
+            destination_dir: folder.clone(),
+            durability: None,
+        }));
+
+        for _ in 0..3 {
+            assert_eq!(
+                poll_durability(&slot),
+                RecordingDurabilityVm::local(),
+                "a plain folder is `local` and says so plainly"
+            );
+        }
+        assert_eq!(
+            port.durability_asks(),
+            0,
+            "a plain folder asked the engine about durability"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The matrix's mid-session-mix row, which is the whole reason the state is a
+    /// floor: segment 3 is pushed while segment 4 is still settling, and the
+    /// engine's answer for the folder drops back. The line must NOT walk
+    /// backwards — "would what I have recorded survive?" is a question about the
+    /// worst case of what is already captured, and that only ever improves.
+    #[test]
+    fn the_durability_floor_never_regresses_within_a_session() {
+        let folder = scan_temp_dir("rec-41-6-floor");
+        let port = Arc::new(CountingSyncPort::scripted(vec![
+            facts(true, true, false),
+            facts(true, false, false),
+            facts(false, false, false),
+            facts(true, false, false),
+        ]));
+        let slot = durability_slot(&folder, Arc::clone(&port));
+
+        assert_eq!(
+            poll_durability(&slot).state,
+            RecordingDurabilityState::Pushed
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                poll_durability(&slot).state,
+                RecordingDurabilityState::Pushed,
+                "a later segment still settling walked the session backwards"
+            );
+        }
+
+        // And it still CLIMBS: a floor is a `max`, not a latch on the first
+        // answer.
+        let climbing = Arc::new(CountingSyncPort::scripted(vec![facts(true, true, true)]));
+        let slot = durability_slot(&folder, climbing);
+        assert_eq!(
+            poll_durability(&slot).state,
+            RecordingDurabilityState::Verified
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The matrix's protected-branch and killed-network rows, which are the same
+    /// reading: the commits exist, the publication did not happen, and the
+    /// remote's own sentence is carried verbatim so no surface has to invent sync
+    /// language. The state stays `committed` — a refused push is not a failed
+    /// recording.
+    #[test]
+    fn a_refused_push_stays_committed_and_carries_the_reason_verbatim() {
+        let folder = scan_temp_dir("rec-41-6-refused");
+        let reason = "push rejected: protected branch main";
+        let port = Arc::new(CountingSyncPort::scripted(vec![
+            facts(true, false, false),
+            refused(reason),
+        ]));
+        let slot = durability_slot(&folder, port);
+
+        assert_eq!(poll_durability(&slot).detail, None);
+        let reading = poll_durability(&slot);
+        assert_eq!(reading.state, RecordingDurabilityState::Committed);
+        assert_eq!(
+            reading.detail.as_deref(),
+            Some(reason),
+            "the reason must reach the surface unedited"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The reason does NOT floor. It names what is wrong NOW, so a push that
+    /// succeeds later clears it — a latched reason would outlive the problem it
+    /// describes and leave the banner warning about a resolved outage forever.
+    #[test]
+    fn a_reason_clears_once_publication_succeeds_while_the_state_holds() {
+        let folder = scan_temp_dir("rec-41-6-reason-clears");
+        let port = Arc::new(CountingSyncPort::scripted(vec![
+            refused("push rejected: non-fast-forward"),
+            facts(true, true, false),
+        ]));
+        let slot = durability_slot(&folder, port);
+
+        assert!(poll_durability(&slot).detail.is_some());
+        let reading = poll_durability(&slot);
+        assert_eq!(reading.state, RecordingDurabilityState::Pushed);
+        assert_eq!(reading.detail, None, "a resolved problem kept warning");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The matrix's "engine query fails" row (NFR-34): a transient read failure
+    /// keeps the LAST KNOWN state — never `local` after `pushed`, never an error
+    /// on a poll the banner depends on — and spends exactly ONE log line on the
+    /// outage. The `degraded` latch is what makes that one line one line: it is
+    /// set by the first failure and cleared by the next success, so an hour of
+    /// failures is one `warn` and a SECOND outage is still heard.
+    #[test]
+    fn a_failed_engine_read_keeps_the_last_known_state_and_logs_once() {
+        let folder = scan_temp_dir("rec-41-6-degrade");
+        let port = Arc::new(CountingSyncPort::scripted(vec![
+            facts(true, true, false),
+            Err("the index is locked".to_owned()),
+            Err("the index is locked".to_owned()),
+            Err("the index is locked".to_owned()),
+            facts(true, true, false),
+        ]));
+        let reader = RecordingDurabilityReader::new("profile-1".to_owned(), port);
+
+        assert_eq!(reader.read(&folder).state, RecordingDurabilityState::Pushed);
+        assert!(!reader.degraded.load(Ordering::Relaxed));
+
+        for turn in 0..3 {
+            let reading = reader.read(&folder);
+            assert_eq!(
+                reading.state,
+                RecordingDurabilityState::Pushed,
+                "failure {turn} lost the last known state"
+            );
+            assert!(
+                reader.degraded.load(Ordering::Relaxed),
+                "the outage must latch after the first line"
+            );
+        }
+
+        assert_eq!(reader.read(&folder).state, RecordingDurabilityState::Pushed);
+        assert!(
+            !reader.degraded.load(Ordering::Relaxed),
+            "a recovered engine must be able to report a NEW outage"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The matrix's no-session rows: with nothing recording — an iOS build, a
+    /// build without the recording capability, or simply before the first start
+    /// — the snapshot is the honest idle default, and its durability is `local`
+    /// with nothing to explain.
+    #[test]
+    fn the_idle_snapshot_reads_local_with_no_reason() {
+        assert_eq!(
+            RecordingStatusVm::idle().durability,
+            RecordingDurabilityVm::local()
+        );
+        let empty: Mutex<Option<RecordingRun>> = Mutex::new(None);
+        assert!(live_snapshot(&empty).is_none());
     }
 }
