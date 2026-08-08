@@ -377,6 +377,21 @@ describe("isSyncStatusActive", () => {
     expect(isSyncStatusActive(statusVm())).toBe(false);
     expect(isSyncStatusActive(statusVm({ state: "paused" }))).toBe(false);
   });
+
+  it("is false for a folder the engine says has stopped, whatever the phase says", () => {
+    // Stories 34.8 and 34.10. `phase` is copied off the last streamed event, so
+    // a pass that ended without resetting it left every one of these drawing a
+    // bar and a rate over a folder that had stopped — a 401 under a half-full
+    // "pushing" bar being the case that named the defect. The engine no longer
+    // leaves the phase behind; this is the second lock on the same door, and it
+    // holds even for a phase no engine wrote.
+    for (const state of ["needsAttention", "offline", "mediaAbsent", "paused"]) {
+      expect(isSyncStatusActive(statusVm({ state, phase: "pushing" }))).toBe(false);
+      // Queued work does not resurrect it either: twelve changes waiting behind
+      // a rejected token are waiting, not moving.
+      expect(isSyncStatusActive(statusVm({ state, pending: 12 }))).toBe(false);
+    }
+  });
 });
 
 describe("syncProgressFraction", () => {

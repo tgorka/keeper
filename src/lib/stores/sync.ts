@@ -169,10 +169,48 @@ export function syncErrorMessage(raw: unknown, fallback: string = SYNC_UNKNOWN_E
 }
 
 /**
+ * The states in which nothing can be moving, whatever any other field says.
+ *
+ * Every one of them is the engine reporting that this folder has stopped:
+ * refused credentials, an unreachable remote, a detached volume, a human
+ * pausing it. None can coexist with a running leg, because `Engine::publish`
+ * writes `state = Syncing` for any active phase — so a live pass re-asserts a
+ * live state on its very next frame and this list costs it nothing.
+ */
+const SYNC_STOPPED_STATES: Record<string, true> = {
+  offline: true,
+  mediaAbsent: true,
+  paused: true,
+  needsAttention: true,
+};
+
+/**
  * Whether this profile is doing work, or has work queued — the fast-poll gate
  * and the condition under which a row shows its progress meter.
+ *
+ * The stopped states are checked first and are not overridable. This used to be
+ * `state === "syncing" || phase !== "idle" || pending > 0`, and the middle
+ * clause is what turned an engine bug into a visible lie: `phase` is copied
+ * verbatim off the last streamed event by `Engine::publish`, so asking it
+ * whether a folder is busy asks the *stream's* last word while claiming to
+ * consult the poll. A push refused with a 401 left `phase = "pushing"` behind a
+ * `needsAttention` state, and the card went on drawing a half-full bar and a
+ * frozen "4.1 MB/s" over a folder that had permanently stopped publishing —
+ * directly above the error saying so (Stories 34.8 and 34.10).
+ *
+ * The engine is where that was fixed, since the tray and `keeper-syncd status`
+ * read the same snapshot and a guard here would not have reached them. This
+ * stands beside it because the ordering `syncLiveFraction` and `syncLiveRate`
+ * already document in `sync-detail.ts` — the poll decides *whether*, the stream
+ * only refines *how far* — is true only if "whether" is answered by the poll's
+ * own verdict on the folder rather than by a field the stream wrote. A surface
+ * whose entire job is honesty should not be one forgotten assignment away from
+ * lying.
  */
 export function isSyncStatusActive(status: SyncStatusVm): boolean {
+  if (SYNC_STOPPED_STATES[status.state] === true) {
+    return false;
+  }
   return status.state === "syncing" || status.phase !== "idle" || status.pending > 0;
 }
 

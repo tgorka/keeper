@@ -493,3 +493,249 @@ fn a_pointer_staged_ahead_of_head_is_never_dismissed() {
         "the pointer is staged but not committed, so the next pass has to re-drive it"
     );
 }
+
+/// The blocking case from the Story 34.13 review: the guard must discriminate
+/// on the path's ROUTING, not on the blob's SHAPE.
+///
+/// A tracked TEXT file whose content is literally an LFS pointer is an
+/// everyday object — documentation about the format, a fixture, a pointer a
+/// peer committed with no smudge filter running. The guard first shipped
+/// asking `pointer_blob(...).is_some()`, "do these bytes parse as a pointer",
+/// which says yes to every one of them. A real edit landing inside git's race
+/// window at the same byte count was therefore dismissed — and dismissed again
+/// on every later scan, because git keeps reporting it. The user's work is
+/// then lost permanently, which is the same outcome the story's Design Note
+/// calls data-loss-class when arguing why the old length comparison had to go.
+///
+/// The state built here is exactly what git hands the guard inside that
+/// window: the entry's stat matches the file on disk, the staged blob parses
+/// as a pointer, `HEAD` records that blob, and the worktree bytes differ. Each
+/// of those is asserted, so nothing but `.gitattributes` routing is left to
+/// refuse — and the genuinely routed path in the same repository is dismissed
+/// in the same breath, so this is discrimination rather than a blanket
+/// refusal.
+#[test]
+fn an_ordinary_text_file_whose_blob_parses_as_a_pointer_is_never_dismissed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let payload = vec![42u8; 200_000];
+    // A repository that genuinely uses LFS: `.gitattributes` routes `*.mp4`
+    // and `clip.mp4` is a committed pointer.
+    commit_pointer_for_clip(root, &payload);
+
+    // ...alongside an ordinary tracked text file that merely *contains* one.
+    let doc = root.join("example-pointer.txt");
+    let text = Pointer::new("a".repeat(64), 12_345).render();
+    std::fs::write(&doc, text.as_bytes()).expect("write");
+    let repo = git::repo::open(root, false).expect("open");
+    let changes = git::commit::StagedChange {
+        added: vec![PathBuf::from("example-pointer.txt")],
+        ..Default::default()
+    };
+    commit(&repo, &changes, &std::collections::BTreeMap::new());
+
+    // The user corrects the oid the document quotes, which preserves the byte
+    // count. The entry is then re-stat'ed to what the file now is: that is
+    // precisely the racily-clean state, where git re-read the worktree despite
+    // the stat matching and found different bytes.
+    let edited = Pointer::new("b".repeat(64), 12_345).render();
+    assert_eq!(
+        edited.len(),
+        text.len(),
+        "the edit has to preserve the byte count, or the race window is not the subject"
+    );
+    std::fs::write(&doc, edited.as_bytes()).expect("edit");
+    let metadata = gix::index::fs::Metadata::from_path_no_follow(&doc).expect("lstat");
+    // Reopened so the index read below is the one the commit just wrote, not a
+    // snapshot this handle took before it.
+    let repo = git::repo::open(root, false).expect("reopen");
+    let shared = repo.index_or_empty().expect("index");
+    let mut index: gix::index::File = (**shared).clone();
+    index
+        .entry_mut_by_path_and_stage(
+            gix::bstr::BStr::new("example-pointer.txt"),
+            gix::index::entry::Stage::Unconflicted,
+        )
+        .expect("the document is indexed")
+        .stat = gix::index::entry::Stat::from_fs(&metadata).expect("stat convert");
+    index
+        .write(gix::index::write::Options::default())
+        .expect("write index");
+
+    let repo = git::repo::open(root, false).expect("reopen");
+    let index = repo.index_or_empty().expect("index");
+    let entry = index
+        .entry_by_path(gix::bstr::BStr::new("example-pointer.txt"))
+        .expect("the document is indexed");
+    let after = gix::index::fs::Metadata::from_path_no_follow(&doc).expect("lstat");
+    let worktree = gix::index::entry::Stat::from_fs(&after).expect("stat convert");
+    assert!(
+        worktree.matches(&entry.stat, repo.stat_options().expect("stat options")),
+        "the stat has to match, or the stat check would be what refuses and this \
+         test would prove nothing"
+    );
+    assert!(
+        stage::indexed_pointer(&repo, Path::new("example-pointer.txt")).is_some(),
+        "the blob has to parse as a pointer, or there is no defect to reproduce"
+    );
+    assert_ne!(
+        std::fs::read(&doc).expect("read"),
+        text.as_bytes(),
+        "the worktree has to hold the edit, or there is nothing to lose"
+    );
+
+    assert!(
+        !stage::is_false_modification(&repo, Path::new("example-pointer.txt"), &doc),
+        "an ordinary text file that merely looks like a pointer is not the pointer \
+         design, and dismissing its edit loses it on this scan and every later one"
+    );
+    assert!(
+        stage::is_false_modification(&repo, Path::new("clip.mp4"), &root.join("clip.mp4")),
+        "the LFS path the story was written for must still be dismissed"
+    );
+}
+
+/// The `.gitattributes` rule is what makes a dismissal legitimate, so removing
+/// it has to end the dismissal.
+///
+/// Nothing else moves between the two halves: the same file, the same stat,
+/// the same pointer blob, the same `HEAD`. Only the routing changes, which is
+/// what makes this the test that fails if `routed_through_lfs` is ever
+/// short-circuited to "yes".
+#[test]
+fn only_the_gitattributes_rule_makes_an_untouched_pointer_dismissible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let payload = vec![42u8; 200_000];
+    commit_pointer_for_clip(root, &payload);
+    let absolute = root.join("clip.mp4");
+
+    let repo = git::repo::open(root, false).expect("open");
+    assert!(
+        stage::is_false_modification(&repo, Path::new("clip.mp4"), &absolute),
+        "a genuinely routed, untouched pointer entry is dismissed — that is the story"
+    );
+
+    // The user stops routing `*.mp4` through LFS. The rule is rewritten rather
+    // than the file deleted on purpose: `Source::WorktreeThenIdMapping` falls
+    // back to the indexed `.gitattributes` when the worktree has none, and the
+    // committed copy still carries the rule.
+    let attributes = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
+    assert!(
+        attributes.contains("*.mp4 filter=lfs"),
+        "the fixture writes the rule this test removes"
+    );
+    let without: String = attributes
+        .lines()
+        .filter(|line| !line.starts_with("*.mp4 "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(root.join(".gitattributes"), without).expect("rewrite");
+
+    let repo = git::repo::open(root, false).expect("reopen");
+    assert!(
+        stage::indexed_pointer(&repo, Path::new("clip.mp4")).is_some(),
+        "the blob is untouched, so the blob's shape is not what changed"
+    );
+    assert!(
+        !stage::is_false_modification(&repo, Path::new("clip.mp4"), &absolute),
+        "with nothing routing it through LFS the path is ordinary, and an ordinary \
+         path's racily-clean report is a real edit"
+    );
+}
+
+/// An empty tracked file is not an LFS entry (Story 34.13 review, major).
+///
+/// `Pointer::parse` reads zero bytes as the *empty pointer* — the LFS spec's
+/// carve-out for empty files, and correct where it is, since `lfs::filter`
+/// depends on it. Inheriting it in `pointer_blob` was not: every empty tracked
+/// file in a repository shares the one empty blob, so `indexed_pointer`
+/// answered `Some` for all of them and the guard held a dismissible entry for
+/// each — one value away from the I/O matrix's "not a pointer | `None`".
+///
+/// Everything here is routed through LFS by a `*` rule so that routing cannot
+/// be what refuses; only the blob's emptiness can be.
+#[test]
+fn an_empty_tracked_file_is_not_an_lfs_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    init_repo(root);
+    std::fs::write(
+        root.join(".gitattributes"),
+        "* filter=lfs diff=lfs merge=lfs -text\n",
+    )
+    .expect("write attributes");
+    let absolute = root.join("empty.txt");
+    std::fs::write(&absolute, b"").expect("write");
+
+    let repo = git::repo::open(root, false).expect("open");
+    let changes = git::commit::StagedChange {
+        added: vec![PathBuf::from(".gitattributes"), PathBuf::from("empty.txt")],
+        ..Default::default()
+    };
+    commit(&repo, &changes, &std::collections::BTreeMap::new());
+
+    let repo = git::repo::open(root, false).expect("reopen");
+    assert!(
+        stage::indexed_pointer(&repo, Path::new("empty.txt")).is_none(),
+        "an empty blob is an empty file, not an LFS pointer"
+    );
+    assert!(
+        !stage::is_false_modification(&repo, Path::new("empty.txt"), &absolute),
+        "so there is no pointer design behind it for the guard to dismiss"
+    );
+}
+
+/// Routing that cannot be determined is never read as routed.
+///
+/// The unknown case has to err towards staging, because the two errors are not
+/// symmetric: declining to dismiss costs one re-clean whose identical pointer
+/// leaves the tree unchanged and produces no commit, while dismissing wrongly
+/// loses the user's edit for good.
+///
+/// `core.attributesFile` naming a home directory that cannot be resolved makes
+/// the attribute stack refuse to assemble at all, which is the one shape of
+/// "keeper cannot tell whether this path is routed through LFS" a test can
+/// arrange deterministically on both Linux and macOS. The fixture is proven
+/// dismissable first, so the refusal afterwards can only come from the answer
+/// having gone missing.
+#[test]
+fn a_path_whose_lfs_routing_cannot_be_determined_is_never_dismissed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let payload = vec![42u8; 200_000];
+    commit_pointer_for_clip(root, &payload);
+    let absolute = root.join("clip.mp4");
+
+    let repo = git::repo::open(root, false).expect("open");
+    assert!(
+        stage::is_false_modification(&repo, Path::new("clip.mp4"), &absolute),
+        "the fixture has to be dismissable, or the refusal below proves nothing"
+    );
+
+    let ok = std::process::Command::new("git")
+        .args([
+            "config",
+            "core.attributesFile",
+            "~keeper-nobody-34-13/attributes",
+        ])
+        .current_dir(root)
+        .status()
+        .expect("git config")
+        .success();
+    assert!(ok, "git config must succeed");
+
+    // `trust_full` so the repo-local `core.attributesFile` above is certainly
+    // honoured: gitoxide only reads repository-kind config keys at full trust
+    // (`gix::config::section::is_trusted`), and this test's whole subject is
+    // that key being consulted and failing.
+    let repo = git::repo::open(root, true).expect("reopen");
+    assert!(
+        stage::indexed_pointer(&repo, Path::new("clip.mp4")).is_some(),
+        "nothing about the blob changed, so the blob's shape is not what refuses"
+    );
+    assert!(
+        !stage::is_false_modification(&repo, Path::new("clip.mp4"), &absolute),
+        "an unanswerable routing question must never be read as routed"
+    );
+}

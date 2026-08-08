@@ -698,7 +698,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Forget a profile: its stored remote credential, then its rows, then the
+    /// Forget a profile: the secrets held for it, then its rows, then the
     /// in-memory state keyed by its id. The folder and its repository are left
     /// on disk untouched — removal is a configuration change, never a deletion
     /// of content.
@@ -708,23 +708,49 @@ impl Engine {
     /// profile id, so a secret that outlived its row could never be found
     /// again, let alone deleted: the two failure modes are not comparable. This
     /// ordering fails with the profile intact and the removal retryable; the
-    /// reverse would trade that for a permanent orphan. If the row delete then
-    /// fails, what is left is a profile whose token is gone — which reports
-    /// itself as an authentication failure on the next sync, and is fixed by
-    /// entering the token again or by removing the folder again.
+    /// reverse would trade that for a permanent orphan.
+    ///
+    /// **Two stores hold a secret for a profile, not one** — finding 1 of the
+    /// epic-34 review of Story 34.7. The keychain holds the token the user
+    /// pasted. `lfs_ssh_credentials` holds the `Authorization` header
+    /// `git-lfs-authenticate` minted from it, keyed by *remote and operation*
+    /// rather than by id, which is exactly why the id-keyed sweep below walks
+    /// straight past it. Left behind, it is a spendable credential for a folder
+    /// keeper no longer syncs, live until the expiry the server named or
+    /// `lfs::ssh::DEFAULT_TTL_MS` (ten minutes) when it named none. It is
+    /// dropped inside the block below for two reasons: the cache key is derived
+    /// from `remote_url`, which nothing can recover once the row is gone, and
+    /// doing it before the row delete means even a removal that fails halfway
+    /// has taken every secret with it.
+    ///
+    /// What a half-failed removal leaves, deliberately: if the row delete fails
+    /// after both secrets are gone, the profile is still there and still
+    /// removable — `remove_profile` is idempotent, and a `secret_delete` of an
+    /// absent secret succeeds by contract. Until it is retried the folder
+    /// reports an authentication failure on its next sync, which is the honest
+    /// symptom and is fixed by entering the token again. The status, gates,
+    /// watcher and journal rows are left alone in that case because the profile
+    /// genuinely still exists: a live row whose engine state was swept is a
+    /// worse thing to be left holding than a live row whose secret is gone.
     ///
     /// Lives here rather than in the Tauri command because the ordering above
-    /// is only a guarantee if the two deletes are one operation: split across
-    /// crates, every other caller of this function skips the first half.
-    /// `keeper-syncd` is exactly that caller — it removes profiles through this
-    /// engine and never goes near the IPC layer — and the read side of the same
-    /// secret already lives here (`Self::credential`).
+    /// is only a guarantee if the deletes are one operation: split across
+    /// crates, any second caller would have to re-derive it and would be free
+    /// to get it wrong. Today the only caller outside tests is
+    /// `sync_profile_remove` in `keeper`'s `sync_ipc`. An earlier version of
+    /// this comment named `keeper-syncd` as a second caller; it is not one and
+    /// never was — the daemon has no removal path at all, and its `reconcile`
+    /// deliberately *reports* a profile the config stopped naming rather than
+    /// deleting it (AD-48). The read side of the same secret already lives here
+    /// (`Self::credential`), which is the reason that does hold.
     pub fn remove_profile(&self, id: &str) -> Result<()> {
         // Read before deleting: after the row is gone there is nothing left to
         // ask for the key. A profile that is already absent has no secret to
         // delete, and the row deletes below stay idempotent either way.
         if let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? {
             self.platform.secret_delete(&profile.secret_key())?;
+            // The second store, and the one an id-keyed sweep cannot reach.
+            self.forget_ssh_credentials(&profile);
         }
         self.with_db(|conn| db::delete_profile(conn, id))?;
         Self::lock(&self.status).remove(id);
@@ -800,6 +826,39 @@ impl Engine {
         }
         let mut sinks = Self::lock(&self.sinks);
         sinks.retain(|(_, sink)| sink(event.clone()));
+    }
+
+    /// Retire whatever in-flight progress a profile's snapshot is still
+    /// carrying, leaving every other field alone.
+    ///
+    /// The snapshot is the authoritative channel — the tray reads it with no
+    /// webview attached, `keeper-syncd status` reads it from another process
+    /// entirely, and the window's `isSyncStatusActive` gates its bar on it — so
+    /// a phase left set after the work stopped is not a stale pixel. It is
+    /// three surfaces claiming a folder is busy. A push refused with a 401 sat
+    /// in `NeedsAttention` with `phase = Pushing` for the life of the process,
+    /// under a half-full bar and a frozen "4.1 MB/s", with the error text
+    /// directly below it (Story 34.8, Story 34.10).
+    ///
+    /// The counters go with the phase. Leaving `files_done` and `bytes_total`
+    /// behind an `Idle` phase would keep "4 of 9 files" available to any
+    /// surface that reads the numbers without consulting the phase first, which
+    /// is the same mistake one layer down.
+    ///
+    /// Nothing is published to the sinks, deliberately. [`Self::record_failure`]
+    /// runs per journal unit, so a failed unit followed by a healthy one would
+    /// emit an `Idle` frame between two live ones and blink the bar off and on;
+    /// and the streamed channel is only ever allowed to refine what the polled
+    /// snapshot already authorised, so clearing the snapshot is what actually
+    /// retires the claim on every surface.
+    fn clear_phase(&self, profile_id: &str) {
+        if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
+            snapshot.phase = SyncPhase::Idle;
+            snapshot.files_done = 0;
+            snapshot.files_total = None;
+            snapshot.bytes_done = 0;
+            snapshot.bytes_total = None;
+        }
     }
 
     fn set_state(&self, profile_id: &str, state: ProfileState) {
@@ -1229,36 +1288,95 @@ impl Engine {
     /// engine's own checkouts leave the tree clean against the new HEAD, so they
     /// cost at most one extra fruitless walk rather than a re-commit loop.
     ///
-    /// Everything drained here is also fanned out to [`Self::watch_tap`], which
-    /// is an observer and nothing more — see there for why a failure to deliver
-    /// is not a failure to sync.
+    /// # Tier 0 decides the wake, not just the walk (Story 34.9)
+    ///
+    /// Every drained path is put to the profile's own
+    /// [`StabilityGate::is_excluded`] before it is allowed to mean anything.
+    /// The watcher is armed `RecursiveMode::Recursive` over the profile root,
+    /// so it reports every write anywhere beneath it; tier 0 used to be
+    /// consulted only *downstream*, in `is_stable` and in [`Self::pending`].
+    /// A build writing continuously into `node_modules/`, `.venv/`,
+    /// `__pycache__/`, `.next/` or `.cache/` therefore set the wake on every
+    /// tick, made [`Self::scan_due`] true on every tick, and drove a full
+    /// `git status` re-stat of the tree once a second for as long as the build
+    /// ran — on a 100 000-file profile, the very cost `next_scan_ms` exists to
+    /// pace. An exclusion applied after the walk cannot suppress the walk it
+    /// was added to prevent, so it is applied here, at the seam where the wake
+    /// is decided.
+    ///
+    /// **`.git` is excluded here too, and deliberately so.** It needs no
+    /// special case: `BUILTIN_EXCLUDES` already carries `.git/**` and
+    /// `**/.git/**`, so asking the same set the walk asks is what makes the
+    /// engine's own commits, index writes, ref updates and LFS object writes
+    /// stop costing a fruitless walk each. Those writes are engine state by
+    /// definition — never user content, never committable — so there is no
+    /// input under `.git/` for which "look at the worktree now" is the right
+    /// answer, and the periodic rescan plus the paced backstop still cover
+    /// anything a filtered event might have stood in for. What is *not*
+    /// filtered, because tier 0's `.git` rules are subtree rules: an event on
+    /// the bare `.git` directory node itself. That is rare, harmless, and
+    /// costs at most the one walk it always did.
+    ///
+    /// A `.gitignore`d path is **not** filtered here, and that is also
+    /// deliberate: reading `.gitignore` at this seam would be a second
+    /// ignore engine beside git's, disagreeing with it at the margins, on the
+    /// hot path. `git status` stays the authority for those.
+    ///
+    /// Filtering here rather than downstream also keeps two other things
+    /// clean. Excluded close-writes no longer enter the gate's
+    /// `pending_close_write` set, where nothing consumes them (`is_stable`
+    /// answers `Excluded` before it would) and only a later
+    /// [`StabilityGate::retain`] on a paced walk swept them out. And the tap
+    /// no longer carries build noise, so a subscriber cannot be lagged out of
+    /// the broadcast channel — and into a full rescan — by a `node_modules`
+    /// storm it would have discarded anyway.
+    ///
+    /// Everything that survives the filter is also fanned out to
+    /// [`Self::watch_tap`], which is an observer and nothing more — see there
+    /// for why a failure to deliver is not a failure to sync.
     fn fold_watch_events(&self, profile: &SyncProfile) -> Result<()> {
-        let mut closed: Vec<PathBuf> = Vec::new();
-        let mut tapped: Vec<PathBuf> = Vec::new();
-        let tap = self.watch_tap.get();
-        let mut delivered = false;
+        // Two phases, and never both locks at once. `try_recv` never blocks, so
+        // the watcher map is held for exactly as long as it takes to move what
+        // is already queued — an IPC-thread `remove_profile` must not queue
+        // behind a tick, and matching a globset per path is not work to do
+        // under that lock.
+        let mut drained: Vec<WatchEvent> = Vec::new();
         {
             let mut watchers = Self::lock(&self.watchers);
             let Some(ProfileWatch::Live { events, .. }) = watchers.get_mut(&profile.id) else {
                 return Ok(());
             };
-            // `try_recv` never blocks, so the map is locked for exactly as long
-            // as it takes to move what is already queued.
-            while let Ok(WatchEvent { path, close_write }) = events.try_recv() {
-                delivered = true;
-                // The gate wants only the paths whose writer demonstrably let
-                // go; the tap wants all of them. Cloning only where both want
-                // the same path keeps an untapped engine — every daemon, every
-                // other test — allocating exactly what it did before the tap
-                // existed.
-                match (close_write, tap.is_some()) {
-                    (true, true) => {
-                        closed.push(path.clone());
-                        tapped.push(path);
-                    }
-                    (true, false) => closed.push(path),
-                    (false, true) => tapped.push(path),
-                    (false, false) => {}
+            while let Ok(event) = events.try_recv() {
+                drained.push(event);
+            }
+        }
+        // Nothing delivered: no gate is seeded and no wake is noted, exactly as
+        // before. The gate is only reached below because the exclusion lives on
+        // it, and seeding one costs a `file_state` read the walk would have paid
+        // moments later anyway.
+        if drained.is_empty() {
+            return Ok(());
+        }
+
+        let tap = self.watch_tap.get();
+        let mut tapped: Vec<PathBuf> = Vec::new();
+        let mut wake = false;
+        {
+            let mut gates = Self::lock(&self.gates);
+            let gate = self.ensure_gate(&mut gates, profile)?;
+            for WatchEvent { path, close_write } in drained {
+                if gate.is_excluded(&path) {
+                    continue;
+                }
+                wake = true;
+                if close_write {
+                    gate.note_close_write(&path);
+                }
+                // Only the tap wants a path beyond this point, so an untapped
+                // engine — every daemon, every other test — moves each survivor
+                // straight into the drop instead of into a vector.
+                if tap.is_some() {
+                    tapped.push(path);
                 }
             }
         }
@@ -1270,16 +1388,11 @@ impl Engine {
                 let _ = tap.send((profile.id.clone(), path));
             }
         }
-        if !delivered {
-            return Ok(());
-        }
-        self.note_watch_wake(&profile.id);
-        if !closed.is_empty() {
-            let mut gates = Self::lock(&self.gates);
-            let gate = self.ensure_gate(&mut gates, profile)?;
-            for path in &closed {
-                gate.note_close_write(path);
-            }
+        // A batch that was entirely excluded is a batch that says nothing: it
+        // must leave `scan_due` exactly as it found it, or the filter above buys
+        // nothing.
+        if wake {
+            self.note_watch_wake(&profile.id);
         }
         Ok(())
     }
@@ -2382,7 +2495,19 @@ impl Engine {
         Ok(())
     }
 
+    /// Record a failed unit or pass: retire the phase it was showing, then let
+    /// the retriability decide the state word.
+    ///
+    /// The [`Self::clear_phase`] call is **before** the match, deliberately. A
+    /// leg that raised is a leg that is no longer running, whatever the
+    /// retriability says about trying it again, so the arms below decide only
+    /// the word — and none of them can be the place a phase is forgotten. All
+    /// three arms that set a state used to leave `phase` untouched, which is
+    /// exactly how a folder that had permanently stopped publishing kept a
+    /// moving bar over its own error message; a fourth arm added here would
+    /// have repeated it, because remembering was the whole contract.
     fn record_failure(&self, profile: &SyncProfile, err: &SyncError) {
+        self.clear_phase(&profile.id);
         match err.retriability() {
             // Both deferred conditions wait on a condition rather than a clock,
             // but they are waiting on utterly different things and a user reads
@@ -2997,6 +3122,39 @@ impl Engine {
         Ok(self.token(profile)?.map(|token| token.git()))
     }
 
+    /// Fold one `(done, total)` report from gitoxide's progress tree into the
+    /// `Fetching` event, and time it.
+    ///
+    /// Named and clock-parameterised rather than left as a closure inside
+    /// [`Self::do_pull`] for [`crate::progress::TransferTally::fold_at`]'s
+    /// reason: this is one of only two places in the crate that stamp a
+    /// `bytes_per_second` (the other is `TransferTally::apply`, which the LFS
+    /// legs drive), so `SyncPhase::carries_rate`'s claim that `Fetching` carries
+    /// a rate is only worth anything if a test can drive this and watch a figure
+    /// appear. Inline in a `spawn_blocking`-fed closure it could not be, and the
+    /// stamping line could have been deleted with the suite still green
+    /// (Story 34.8, AD-34-13).
+    ///
+    /// The rate is measured off the high-water mark, never off `done`. `done`
+    /// belongs to whichever node ticked last and restarts at zero on each
+    /// phase, and its unit is that node's — objects while deltas resolve, not
+    /// bytes. The mark is the figure the caller already treats as bytes received
+    /// (see its `add_transferred` call), and it stays flat through a phase that
+    /// is not moving bytes, which is exactly when the meter should fall silent
+    /// rather than divide an object count by a second.
+    fn fold_fetch_progress(
+        event: &mut SyncProgress,
+        (done, total): (u64, u64),
+        fetched: &mut u64,
+        rate: &mut RateMeter,
+        now: Instant,
+    ) {
+        *fetched = (*fetched).max(done);
+        event.bytes_done = done;
+        event.bytes_total = (total > 0).then_some(total);
+        event.bytes_per_second = rate.observe(*fetched, now);
+    }
+
     /// Fetch and apply, returning the conflict copies the apply had to write.
     ///
     /// The paths are repository-relative and are the *copies*, never the
@@ -3071,20 +3229,9 @@ impl Engine {
                 &profile,
                 SyncPhase::Fetching,
                 report_rx,
-                |event, (done, total)| {
-                    fetched = fetched.max(done);
-                    event.bytes_done = done;
-                    event.bytes_total = (total > 0).then_some(total);
-                    // The rate is measured off the high-water mark, never off
-                    // `done`. `done` belongs to whichever node ticked last and
-                    // restarts at zero on each phase, and its unit is that
-                    // node's — objects while deltas resolve, not bytes. The mark
-                    // is the figure this function already treats as bytes
-                    // received (see `add_transferred` below), and it stays flat
-                    // through a phase that is not moving bytes, which is exactly
-                    // when the meter should fall silent rather than divide an
-                    // object count by a second.
-                    event.bytes_per_second = rate.observe(fetched, Instant::now());
+                |event, sample| {
+                    let now = Instant::now();
+                    Self::fold_fetch_progress(event, sample, &mut fetched, &mut rate, now);
                 },
                 fetching,
             )
@@ -4771,10 +4918,14 @@ impl Engine {
             Ok(report)
         })
         .await
-        .map_err(|err| SyncError::Journal(format!("verify task failed: {err}")))??;
+        .map_err(|err| SyncError::Journal(format!("verify task failed: {err}")));
 
+        // Published before the `?`, not after it. `verify` takes no reservation
+        // — it only reads — so it is the one pass `Reservation::drop` does not
+        // cover, and an unreadable tree used to leave `Verifying` on the tray
+        // and a bar on the card until the process ended (Story 34.8).
         self.publish(self.progress(&profile, SyncPhase::Idle));
-        Ok(report)
+        report?
     }
 
     // -----------------------------------------------------------------------
@@ -5125,7 +5276,8 @@ impl Engine {
 }
 
 /// Releases a profile's one-operation-at-a-time reservation on every exit path,
-/// including a panic — the `LiveFolderReservation` idiom from the shell.
+/// including a panic — the `LiveFolderReservation` idiom from the shell — and
+/// retires the progress phase with it, for the reason spelled out in `drop`.
 struct Reservation<'a> {
     engine: &'a Engine,
     profile_id: String,
@@ -5133,6 +5285,30 @@ struct Reservation<'a> {
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
+        // Before the reservation is released, and unconditionally.
+        //
+        // [`Engine::record_failure`] covers every failure the journal routes
+        // through it, but not every way a pass can end. `sync_once` calls it
+        // nowhere: `ensure_repo`, `commit_local`, `do_pull`, the drain loop and
+        // its own `do_push` all propagate with `?` straight past the tail that
+        // publishes `Idle`. The supervisor's own pass has no such tail at all:
+        // `tick_profile` returns straight out of `drain_journal`, and the only
+        // reset on that route is `refresh_pending`'s, which fires only when
+        // `pending == 0` — so a tick that drained one unit and left three
+        // queued kept its last phase whether it succeeded or not. And a panic
+        // unwinds through here without running any of it. Every one of those
+        // left the snapshot in whatever phase the last published event named.
+        //
+        // Holding this reservation *is* the definition of "a pass is running"
+        // for this profile, so releasing it is the one event true of every exit
+        // path — including the ones nobody has written yet. That is why the
+        // reset hangs off the drop rather than off the tails of the two
+        // functions that reserve (Story 34.8, Story 34.10).
+        //
+        // Ordering is load-bearing: the phase is cleared while this profile is
+        // still reserved, so a pass starting afterwards cannot have its first
+        // published frame wiped by this one's cleanup.
+        self.engine.clear_phase(&self.profile_id);
         Engine::lock(&self.engine.busy).remove(&self.profile_id);
     }
 }
@@ -5654,6 +5830,185 @@ mod tests {
         assert!(engine.reserve("p").is_some(), "released on drop");
     }
 
+    /// Put a profile's snapshot exactly where a live push leg leaves it:
+    /// mid-phase, with the numbers a determinate bar is drawn from. The rate
+    /// rides the streamed channel rather than the snapshot, but the window
+    /// gates it on this snapshot, so retiring these fields retires that too.
+    fn arrange_a_pass_in_flight(engine: &Engine, p: &SyncProfile) {
+        let mut event = engine.progress(p, SyncPhase::Pushing);
+        event.files_total = Some(9);
+        event.files_done = 4;
+        event.bytes_total = Some(4_000_000);
+        event.bytes_done = 1_800_000;
+        engine.publish(event);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.phase, SyncPhase::Pushing, "arranged");
+        assert_eq!(snapshot.state, ProfileState::Syncing, "arranged");
+    }
+
+    /// Assert that nothing on this snapshot still claims work is in flight.
+    fn assert_nothing_is_in_flight(engine: &Engine, p: &SyncProfile, arm: &str) {
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(
+            snapshot.phase,
+            SyncPhase::Idle,
+            "{arm}: the pass is over, so no phase may still name a running leg"
+        );
+        assert_eq!(snapshot.files_done, 0, "{arm}: a stale numerator");
+        assert_eq!(snapshot.files_total, None, "{arm}: a stale denominator");
+        assert_eq!(snapshot.bytes_done, 0, "{arm}: a stale byte count");
+        assert_eq!(snapshot.bytes_total, None, "{arm}: a stale byte total");
+    }
+
+    /// Stories 34.8 and 34.10: a failed pass leaves the error and nothing else.
+    ///
+    /// Every arm of `record_failure` set a state word and left `phase` alone, so
+    /// a folder that had permanently stopped publishing kept the last frame of
+    /// its own push on screen — a half-full bar and a frozen rate sitting
+    /// directly above the error text that says it stopped. The snapshot is
+    /// asserted rather than the render, because the snapshot is what the tray
+    /// and `keeper-syncd status` read: a frontend-only guard would have left two
+    /// surfaces telling the same lie.
+    #[test]
+    fn every_failure_arm_retires_the_phase_it_was_showing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let arms = [
+            // Permanent — the 401 this finding is named for. Nothing will move
+            // again on this folder until a human replaces the token.
+            (
+                "permanent",
+                SyncError::Auth {
+                    host: "git.invalid".to_owned(),
+                },
+                ProfileState::NeedsAttention,
+            ),
+            // Deferred — waiting on a volume, not on a clock.
+            (
+                "deferred",
+                SyncError::MediaAbsent,
+                ProfileState::MediaAbsent,
+            ),
+            // Transient-and-network, which reads as a state rather than a
+            // failure: the queue drains when connectivity returns (AD-49).
+            (
+                "offline",
+                SyncError::Network {
+                    host: "git.invalid".to_owned(),
+                    reason: "connection refused".to_owned(),
+                },
+                ProfileState::Offline,
+            ),
+            // The fourth arm, which nobody listed as a failure arm and which
+            // therefore had nothing keeping it honest either: a retriable blip
+            // leaves the profile syncing, but no leg is running between the
+            // failure and its backoff.
+            (
+                "transient",
+                SyncError::Git("could not write the index".to_owned()),
+                ProfileState::Syncing,
+            ),
+        ];
+
+        for (arm, err, expected) in arms {
+            arrange_a_pass_in_flight(&engine, &p);
+            engine.record_failure(&p, &err);
+            assert_eq!(
+                engine.status(&p.id).expect("status").state,
+                expected,
+                "{arm}: the state word still has to say what happened"
+            );
+            assert_nothing_is_in_flight(&engine, &p, arm);
+        }
+    }
+
+    /// Stories 34.8 and 34.10: the exits that never reach `record_failure`.
+    ///
+    /// `sync_once` propagates `ensure_repo`, `commit_local`, `do_pull` and
+    /// `do_push` with `?` and calls nothing on the way out, and a tick that
+    /// finishes with work still queued never reaches `refresh_pending`'s `Idle`
+    /// branch either. Releasing the reservation is the one event common to all
+    /// of them, which is the whole reason the reset lives on the guard: this
+    /// passes for a failure arm that has not been written yet.
+    #[test]
+    fn releasing_a_reservation_retires_the_phase_whatever_ended_the_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let reservation = engine.reserve(&p.id).expect("a free profile reserves");
+        arrange_a_pass_in_flight(&engine, &p);
+        // No `record_failure`, no `publish(Idle)`, no `refresh_pending`: this is
+        // the shape of a `?` returning straight out of the middle of a pass.
+        drop(reservation);
+
+        assert_nothing_is_in_flight(&engine, &p, "reservation released");
+        assert!(
+            engine.reserve(&p.id).is_some(),
+            "clearing the phase must not cost the release itself"
+        );
+    }
+
+    /// Story 34.8, AD-34-13: the fetch leg's half of `SyncPhase::carries_rate`.
+    ///
+    /// `Fetching` is one of only three phases the vocabulary says carries a
+    /// rate, and this fold is the only thing that stamps one there. It was
+    /// inline in `do_pull` behind a `spawn_blocking` channel, where no test
+    /// could reach it — so the stamping line could have been deleted with the
+    /// suite still green, and the phase would have joined `Pushing` in claiming
+    /// a figure nothing produces.
+    #[test]
+    fn the_fetch_leg_stamps_a_rate_off_the_high_water_mark() {
+        let t0 = Instant::now();
+        let mut fetched = 0u64;
+        let mut rate = RateMeter::default();
+        let mut event = SyncProgress::idle("p", "fixture");
+        event.phase = SyncPhase::Fetching;
+
+        // One sample is a point, not a rate, and the denominator is unknown
+        // while the remote is still negotiating.
+        Engine::fold_fetch_progress(&mut event, (0, 0), &mut fetched, &mut rate, t0);
+        assert_eq!(event.bytes_per_second, None);
+        assert_eq!(event.bytes_total, None, "a zero total is not a denominator");
+
+        // 6 MB over two seconds.
+        Engine::fold_fetch_progress(
+            &mut event,
+            (6_000_000, 20_000_000),
+            &mut fetched,
+            &mut rate,
+            t0 + std::time::Duration::from_millis(2_000),
+        );
+        assert_eq!(event.bytes_done, 6_000_000);
+        assert_eq!(event.bytes_total, Some(20_000_000));
+        assert_eq!(
+            event.bytes_per_second,
+            Some(3_000_000),
+            "the phase claims a rate, so this producer has to stamp one"
+        );
+
+        // The next node of gitoxide's tree starts its own counter at zero. The
+        // high-water mark holds, so the meter falls silent instead of dividing
+        // an object count by a second — and never walks the figure backwards.
+        Engine::fold_fetch_progress(
+            &mut event,
+            (12, 400),
+            &mut fetched,
+            &mut rate,
+            t0 + std::time::Duration::from_millis(4_500),
+        );
+        assert_eq!(fetched, 6_000_000, "the mark never walked back");
+        assert_eq!(event.bytes_per_second, None, "a stalled fetch has no rate");
+    }
+
     #[test]
     fn an_unknown_profile_is_an_error_not_a_panic() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5713,6 +6068,115 @@ mod tests {
             platform.secret_get(&other.secret_key()).expect("get"),
             Some("token-for-other".to_owned()),
             "and must take nobody else's"
+        );
+    }
+
+    /// A profile's secret lives in two stores, and only one of them is keyed by
+    /// the profile id (finding 1 of the epic-34 review of Story 34.7). The
+    /// sibling test above asserts through `SyncPlatform::secret_get` and so
+    /// cannot see the second store at all — it passed while a spendable
+    /// credential for the removed folder's remote stayed in this process.
+    #[test]
+    fn removing_a_profile_drops_the_lfs_credential_minted_for_its_remote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        // Only an ssh remote has a `git-lfs-authenticate` handshake behind it,
+        // so only an ssh remote can have one of these minted for it.
+        p.remote_url = "git@git.invalid:x/y.git".to_owned();
+        engine.upsert_profile(&p).expect("upsert");
+        let remote = lfs::ssh::SshRemote::parse(&p.remote_url).expect("an ssh remote");
+        Engine::lock(&engine.lfs_ssh_credentials).insert(
+            remote.cache_key(lfs::ssh::Operation::Download),
+            CachedSshAnswer {
+                answer: lfs::ssh::Answer::Granted(lfs::ssh::Credential {
+                    href: None,
+                    authorization: Some("Bearer minted-for-the-removed-folder".to_owned()),
+                    expires_in_secs: None,
+                }),
+                // Well inside its life: the claim under test is that removal
+                // takes it, not that the clock eventually does.
+                expires_ms: platform.now_ms() + 60_000,
+            },
+        );
+
+        engine.remove_profile(&p.id).expect("remove");
+
+        // Asserted against the map itself rather than through
+        // `cached_ssh_answer`, which reports an unpurged entry as absent once it
+        // expires and would therefore agree with a removal that purged nothing.
+        assert!(
+            Engine::lock(&engine.lfs_ssh_credentials).is_empty(),
+            "removal must take the minted LFS credential with it, not leave it to time out"
+        );
+    }
+
+    /// The removal's own failure path, which is the half the story is easiest to
+    /// get wrong: the rows fail *after* both secrets are gone (Story 34.7).
+    ///
+    /// The failure is injected in band — a `BEFORE DELETE` trigger that aborts —
+    /// because that is what a locked or corrupt database does to this statement,
+    /// and because the ordering under test is only observable when the second
+    /// half fails.
+    #[test]
+    fn a_removal_that_fails_at_the_rows_has_still_taken_both_secrets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.remote_url = "git@git.invalid:x/y.git".to_owned();
+        engine.upsert_profile(&p).expect("upsert");
+        platform
+            .secret_set(&p.secret_key(), "token-for-p")
+            .expect("store a credential");
+        let remote = lfs::ssh::SshRemote::parse(&p.remote_url).expect("an ssh remote");
+        Engine::lock(&engine.lfs_ssh_credentials).insert(
+            remote.cache_key(lfs::ssh::Operation::Upload),
+            CachedSshAnswer {
+                answer: lfs::ssh::Answer::Granted(lfs::ssh::Credential {
+                    href: None,
+                    authorization: Some("Bearer minted-for-the-removed-folder".to_owned()),
+                    expires_in_secs: None,
+                }),
+                expires_ms: platform.now_ms() + 60_000,
+            },
+        );
+        engine
+            .with_db(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER refuse_profile_delete BEFORE DELETE ON profiles \
+                     BEGIN SELECT RAISE(ABORT, 'the row delete failed'); END;",
+                )?;
+                Ok(())
+            })
+            .expect("install the trigger");
+
+        engine
+            .remove_profile(&p.id)
+            .expect_err("the row delete must fail");
+
+        // Both secrets are gone even though the removal did not complete, which
+        // is the deliberate direction to fail in: what is left is a profile that
+        // reports an authentication failure and can be removed again, never a
+        // secret with no profile left to name it.
+        assert_eq!(
+            platform.secret_get(&p.secret_key()).expect("get"),
+            None,
+            "a half-failed removal must still have taken the keychain secret"
+        );
+        assert!(
+            Engine::lock(&engine.lfs_ssh_credentials).is_empty(),
+            "and the minted credential with it — it is purged before the rows for exactly this"
+        );
+        let survivors = engine.list_profiles().expect("list");
+        assert!(
+            survivors.iter().any(|stored| stored.id == p.id),
+            "the profile itself survives, so the removal is retryable rather than lost"
         );
     }
 
@@ -8907,6 +9371,247 @@ mod tests {
         assert!(
             engine.watch_wake_pending(&p.id),
             "and the event still counted as a reason to walk"
+        );
+    }
+
+    /// Story 34.9 / AD-45: tier 0 decides the **wake**, not only the walk.
+    ///
+    /// The watcher is armed `RecursiveMode::Recursive` over the profile root,
+    /// so a build reports every byte it writes into `node_modules/`. Until this
+    /// filter existed, each of those events set the sticky wake, `scan_due` was
+    /// true on every 1 Hz tick, and the engine re-stat-ed the whole tree once a
+    /// second — driven by the five directory names this very story added to
+    /// `BUILTIN_EXCLUDES` *because* they are noise. Tier 0 was applied only in
+    /// `is_stable` and in `pending`, downstream of the walk, where it cannot
+    /// suppress the walk it was added to prevent.
+    ///
+    /// The assertion is on [`Engine::watch_wake_pending`] itself, and
+    /// deliberately not on a downstream effect: the wake is the thing that arms
+    /// the walk, and the walk is the whole cost.
+    #[test]
+    fn an_excluded_path_is_never_a_reason_to_walk_and_an_ordinary_one_still_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                // No sweep: this test owns no timers, and a rescan event would
+                // be a wake this test did not ask for.
+                rescan_interval_ms: 0,
+                force_poll: false,
+            },
+            tx.clone(),
+        )
+        .expect("a watcher arms over a real directory");
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+
+        // One row per tier-0 directory Story 34.9 added, at the depths a real
+        // build writes them, plus `.git/**` — which is in the same corpus, so
+        // asking it here is also what stops the engine's own commits, index
+        // writes, ref updates and LFS object writes from each costing a
+        // fruitless walk.
+        for relative in [
+            "node_modules/react/index.js",
+            ".venv/lib/python3.12/site-packages/pip/__init__.py",
+            "src/__pycache__/mod.cpython-312.pyc",
+            ".next/cache/webpack/client-development/0.pack",
+            ".cache/yarn/v6/npm-left-pad/node_modules/left-pad/index.js",
+            ".git/index",
+            ".git/refs/heads/main",
+            ".git/lfs/objects/ab/cd/abcdef0123456789",
+            "notes/.keeper/index.json",
+            "Downloads/film.mkv.crdownload",
+        ] {
+            tx.send(WatchEvent {
+                path: p.local_path.join(relative),
+                close_write: false,
+            })
+            .expect("the supervisor is listening");
+            engine.fold_watch_events(&p).expect("fold");
+            assert!(
+                !engine.watch_wake_pending(&p.id),
+                "{relative} is excluded, so no walk may be armed for it"
+            );
+        }
+
+        // A close-write is a fast path through the gate, never a way around
+        // tier 0: an excluded path that was closed for writing is still a path
+        // nothing will ever commit.
+        tx.send(WatchEvent {
+            path: p.local_path.join("node_modules/.package-lock.json"),
+            close_write: true,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        assert!(
+            !engine.watch_wake_pending(&p.id),
+            "a close-write does not exempt an excluded path"
+        );
+
+        // The control, through the same channel and the same drain. Without
+        // this the filter could be passing by refusing everything.
+        tx.send(WatchEvent {
+            path: p.local_path.join("src/main.rs"),
+            close_write: false,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        assert!(
+            engine.watch_wake_pending(&p.id),
+            "an ordinary change is still a reason to walk at once"
+        );
+    }
+
+    /// The two boundaries of the `.git` decision, pinned so neither drifts.
+    ///
+    /// Everything **under** `.git/` is excluded, because tier 0 already carries
+    /// `.git/**` and `**/.git/**` and there is no input down there for which
+    /// "walk the worktree now" is the right answer — it is engine state by
+    /// definition, never user content, never committable.
+    ///
+    /// The bare `.git` **directory node itself** is not excluded, because tier
+    /// 0's `.git` rules are subtree rules and deliberately so (`.gitignore` and
+    /// `.gitattributes` are sibling dotfiles that must stay visible). That is
+    /// the right answer anyway: `.git` appearing or vanishing is a
+    /// repository-level event, and looking then is exactly what adoption and
+    /// re-adoption need. It costs the one walk it always did.
+    ///
+    /// The profile root is the third case and the load-bearing one: a queue
+    /// overflow and the periodic sweep are both expressed as an event on the
+    /// root, so if the filter ever swallowed those the watcher would lose the
+    /// only coverage it has for its own dropped events.
+    #[test]
+    fn the_git_directorys_contents_are_filtered_but_the_root_and_the_git_node_are_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                rescan_interval_ms: 0,
+                force_poll: false,
+            },
+            tx.clone(),
+        )
+        .expect("a watcher arms over a real directory");
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+
+        tx.send(WatchEvent {
+            path: p.local_path.join(".git/objects/pack/pack-abc.idx"),
+            close_write: true,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        assert!(
+            !engine.watch_wake_pending(&p.id),
+            "our own object writes must not each buy a walk of the worktree"
+        );
+
+        // The rescan escalation: `fold_batch` expresses a dropped event queue
+        // as an event on the root, and the periodic sweep uses the same shape.
+        tx.send(WatchEvent {
+            path: p.local_path.clone(),
+            close_write: false,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        assert!(
+            engine.watch_wake_pending(&p.id),
+            "an overflow rescan is the one event that must never be filtered"
+        );
+
+        engine.clear_watch_wake(&p.id);
+        tx.send(WatchEvent {
+            path: p.local_path.join(".git"),
+            close_write: false,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        assert!(
+            engine.watch_wake_pending(&p.id),
+            "a repository appearing or vanishing is worth one look"
+        );
+    }
+
+    /// The reported pathology, at the cadence it actually happens at.
+    ///
+    /// Ten minutes of a build writing into the regenerable trees, one burst per
+    /// 1 Hz supervisor tick. The loop is the shape of
+    /// [`Engine::tick_profile`]: fold what the watcher delivered, ask
+    /// [`Engine::scan_due`], and let the walk spend the wake. The only walks
+    /// that may happen are the paced ones — 600 s at one every 15 s, plus the
+    /// walk a profile gets on first sight — so the count is exact rather than a
+    /// bound. Before the filter this counted 600: a full `git status` re-stat
+    /// of the tree every second for as long as the build ran.
+    #[test]
+    fn ten_minutes_of_excluded_write_bursts_cost_not_one_walk_beyond_the_paced_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.poll_interval_ms = 15_000;
+        engine.upsert_profile(&p).expect("upsert");
+
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                rescan_interval_ms: 0,
+                force_poll: false,
+            },
+            tx.clone(),
+        )
+        .expect("a watcher arms over a real directory");
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+
+        const TICKS: i64 = 600;
+        let mut walks = 0_usize;
+        for tick in 0..TICKS {
+            for name in [
+                "node_modules/.package-lock.json",
+                ".venv/lib/python3.12/site-packages/mod.py",
+                "src/__pycache__/build.cpython-312.pyc",
+                ".next/cache/webpack/0.pack",
+                ".cache/turbo/blob",
+            ] {
+                tx.send(WatchEvent {
+                    path: p.local_path.join(name),
+                    // Some of them close, the way a compiler's output does.
+                    close_write: tick % 3 == 0,
+                })
+                .expect("the supervisor is listening");
+            }
+            engine.fold_watch_events(&p).expect("fold");
+            if engine.scan_due(&p) {
+                walks += 1;
+                engine.clear_watch_wake(&p.id);
+            }
+            platform.advance_ms(TICK_MS as i64);
+        }
+
+        assert_eq!(
+            walks, 40,
+            "the build must not buy a single walk: 600 s of ticks at one paced \
+             walk every 15 s is 40, and every extra one is a full re-stat of \
+             the tree that nothing could ever have committed"
         );
     }
 

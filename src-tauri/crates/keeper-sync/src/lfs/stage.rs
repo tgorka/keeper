@@ -42,6 +42,14 @@ use crate::profile::{LfsMode, SyncProfile};
 /// `-text` stops any EOL conversion touching binary content.
 const ATTRIBUTE_SUFFIX: &str = "filter=lfs diff=lfs merge=lfs -text";
 
+/// The `filter` driver named in [`ATTRIBUTE_SUFFIX`], and the one `git lfs
+/// track` writes.
+///
+/// [`routed_through_lfs`] matches the path's resolved `filter` attribute
+/// against it, so the rule keeper *writes* and the rule keeper *reads back*
+/// are one constant rather than two literals free to drift apart.
+const LFS_FILTER_DRIVER: &str = "lfs";
+
 /// Marker keeper writes above the block it owns in `.gitattributes`.
 const MANAGED_HEADER: &str = "# keeper-sync: managed LFS rules — edit above this line";
 
@@ -275,8 +283,30 @@ fn index_key(rela: &Path) -> String {
 /// so it measures the gigabytes the pointer stands in for and never the ~130
 /// bytes actually staged. It therefore rejected precisely the entries this
 /// exists to recognise, and every real LFS file answered `None`.
+///
+/// # Why an EMPTY blob answers `None`, and why the refusal lives here
+///
+/// [`Pointer::parse`] answers `Some(empty pointer)` for zero bytes, and that
+/// is right where it is: the LFS spec carves empty files out of the format, so
+/// a zero-byte *pointer file* stands for the empty object, and `lfs::filter`
+/// depends on precisely that reading — it guards emptiness explicitly so an
+/// empty file still takes the store path instead of being re-emitted as
+/// nothing. Inheriting the carve-out **here** is what was wrong (Story 34.13
+/// review). The question this function asks is "is this git blob an LFS
+/// pointer", and every empty tracked file in the repository shares the one
+/// empty blob; answering `Some` made [`indexed_pointer`] call all of them LFS
+/// entries and handed [`is_false_modification`] a dismissible entry for each —
+/// one value away from the I/O-matrix row this story exists to establish
+/// ("Ordinary small file | blob = 5 bytes, not a pointer | `None`"), which has
+/// no row for the empty blob because nobody expected it to be one.
+///
+/// Refusing costs nothing: an empty worktree file has no content to route
+/// through LFS, so there is no pointer design for a racily-clean re-read to
+/// have rediscovered, and the guard below simply declines to dismiss it. It
+/// also saves loading the object at all, since the header already said zero.
 fn pointer_blob(repo: &gix::Repository, blob: gix::hash::ObjectId) -> Option<Pointer> {
-    if repo.find_header(blob).ok()?.size() > pointer::MAX_POINTER_BYTES as u64 {
+    let size = repo.find_header(blob).ok()?.size();
+    if size == 0 || size > pointer::MAX_POINTER_BYTES as u64 {
         return None;
     }
     Pointer::parse(&repo.find_object(blob).ok()?.data)
@@ -287,6 +317,10 @@ fn pointer_blob(repo: &gix::Repository, blob: gix::hash::ObjectId) -> Option<Poi
 /// Returns `None` for an ordinary file — the common case — after reading at
 /// most [`pointer::MAX_POINTER_BYTES`] of object data, so this is safe to call
 /// on any modified path.
+///
+/// An **empty** tracked file counts as ordinary here and answers `None`, even
+/// though `Pointer::parse` reads zero bytes as the empty pointer — see
+/// `pointer_blob` for why that carve-out stops at the blob layer.
 pub fn indexed_pointer(repo: &gix::Repository, rela: &Path) -> Option<Pointer> {
     let index = repo.index_or_empty().ok()?;
     let key = index_key(rela);
@@ -301,7 +335,7 @@ pub fn indexed_pointer(repo: &gix::Repository, rela: &Path) -> Option<Pointer> {
 /// the blob holds a pointer. That difference is the design, not an edit, and
 /// acting on it re-hashes the whole file to arrive back at the same pointer.
 ///
-/// Three things must hold before a report is dismissed, and none of them reads
+/// Four things must hold before a report is dismissed, and none of them reads
 /// the file's content:
 ///
 /// * The worktree's stat still matches the entry's. `gix::status` calls a path
@@ -313,13 +347,59 @@ pub fn indexed_pointer(repo: &gix::Repository, rela: &Path) -> Option<Pointer> {
 ///   edit that happened to preserve the byte count for good. The repository's
 ///   own `core.trustCtime` / `core.checkStat` settings are read rather than
 ///   assumed, so the comparison is the same one status made.
-/// * The staged blob is a pointer. For an ordinary blob, a racily-clean
-///   re-read finding different bytes is a real edit caught inside the race
-///   window, and swallowing it would lose the user's work.
+/// * `.gitattributes` routes the path through LFS — see `routed_through_lfs`
+///   and the section below.
+/// * The staged blob is a pointer. Routing says the path is *meant* to hold
+///   one; this says it actually does. An LFS-routed path whose blob is
+///   ordinary content — committed before the rule existed, or by a client that
+///   ignored it — has no pointer design for the re-read to have found, so a
+///   difference there is an edit like any other.
 /// * `HEAD` already records that same blob. `stage_and_commit` writes the
 ///   index before the commit so a crash between the two is re-driven on the
 ///   next pass (NFR-24); dismissing a path whose pointer is staged but not yet
 ///   committed would strand it until the file changed again.
+///
+/// # Why the path's ROUTING and not the blob's SHAPE (Story 34.13 review)
+///
+/// This guard first shipped asking a single question about LFS-ness —
+/// `pointer_blob(entry.id).is_some()`, "do these ~130 bytes parse as a
+/// pointer" — which is a fact about the blob's shape and says nothing about
+/// the path. A tracked TEXT file whose content is literally a pointer is an
+/// everyday object: documentation about the pointer format, a test fixture, a
+/// `.gitattributes` example, a pointer committed by a peer whose smudge filter
+/// never ran. Under the contract's Never clause ("do not suppress a
+/// modification for an ordinary (non-pointer) blob: for those, a racily-clean
+/// re-read finding different bytes is a real edit caught inside the race
+/// window") every one of those is ordinary; under the shape test every one of
+/// them was a pointer. A real edit to such a file landing in the race window
+/// at the same length was therefore dismissed — and dismissed again on every
+/// later scan, because git keeps reporting it. That is the identical
+/// permanent-loss shape the Design Note calls "a data-loss-class outcome"
+/// when arguing why the old length comparison had to go.
+///
+/// `.gitattributes` is where routing actually lives: it is what git itself
+/// consults to decide whether to run a filter, it is what [`ensure_attributes`]
+/// writes, it is versioned alongside the very commit that turned the path into
+/// a pointer, and it is what a peer's real `git-lfs` reads. The other
+/// candidate, [`LfsPolicy::from_profile`] — available in this module and so
+/// the tempting one — was rejected on three counts. It answers "would keeper
+/// route this path *now*", a prediction that drifts the instant the threshold
+/// or an `lfsNever` glob changes, leaving already-committed pointers claiming
+/// not to be LFS. It needs the file's size, and in the racily-clean case the
+/// worktree size is the number under suspicion. And the profile is not
+/// reachable from this signature, so the call site would have to thread it
+/// through to obtain a worse answer than the repository already holds.
+///
+/// # What happens when routing cannot be determined
+///
+/// Nothing is dismissed. An unreadable attribute configuration, a path the
+/// attribute stack cannot descend to, and simply no `filter` attribute at all
+/// each answer "not routed", so the report stands. Suppression is the only
+/// dangerous direction here: declining to dismiss costs one re-clean whose
+/// identical pointer leaves the tree unchanged and produces no commit, while
+/// dismissing wrongly loses the user's edit for good. That is the same rule
+/// the rest of this function already follows — every failure to read answers
+/// "this is a real modification".
 pub fn is_false_modification(repo: &gix::Repository, rela: &Path, absolute: &Path) -> bool {
     let Ok(index) = repo.index_or_empty() else {
         return false;
@@ -332,17 +412,66 @@ pub fn is_false_modification(repo: &gix::Repository, rela: &Path, absolute: &Pat
         return false;
     };
     // The stat comparison leads because it costs one `lstat` and it is what
-    // rejects an ordinary modified file, whose stat has moved. Both checks
-    // below reach into the object database, and this keeps them off the path
-    // every non-LFS modification takes.
+    // rejects an ordinary modified file, whose stat has moved. Everything
+    // below reads either `.gitattributes` or the object database, and this
+    // keeps all of it off the path every non-LFS modification takes.
     let unmoved = gix::index::fs::Metadata::from_path_no_follow(absolute)
         .ok()
         .and_then(|metadata| gix::index::entry::Stat::from_fs(&metadata).ok())
         .is_some_and(|worktree| worktree.matches(&entry.stat, options));
-    if !unmoved || pointer_blob(repo, entry.id).is_none() {
+    if !unmoved || !routed_through_lfs(repo, &index, &key, entry.mode) {
+        return false;
+    }
+    if pointer_blob(repo, entry.id).is_none() {
         return false;
     }
     head_records(repo, rela, entry.id)
+}
+
+/// Does `.gitattributes` route `key` through the LFS filter?
+///
+/// `key` is the slash-separated index key, which is also the spelling the
+/// attribute stack matches patterns against. `filter=lfs` is the assignment
+/// `git lfs track` writes and the one [`ATTRIBUTE_SUFFIX`] writes, so this
+/// asks the same question git asks when it decides whether a filter runs at
+/// all — which is what makes it a statement about the path rather than about
+/// the bytes that happen to be staged for it.
+///
+/// The worktree's `.gitattributes` wins over the indexed one
+/// (`Source::WorktreeThenIdMapping`) because this is the check-*in* direction:
+/// a rule the user has just added or just removed governs the next commit, and
+/// that is the source gitoxide names for exactly this case.
+///
+/// Every failure — unreadable `core.attributesFile`, an attribute stack that
+/// cannot descend to the path — answers `false`, i.e. "do not dismiss". See
+/// [`is_false_modification`] for why that is the only safe direction.
+fn routed_through_lfs(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    key: &str,
+    mode: gix::index::entry::Mode,
+) -> bool {
+    let source = gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping;
+    let Ok(mut stack) = repo.attributes_only(index, source) else {
+        return false;
+    };
+    // Only `filter` is collected, so the outcome holds one slot rather than
+    // one per attribute the repository happens to define.
+    let mut outcome = stack.selected_attribute_matches(["filter"]);
+    let Ok(platform) = stack.at_entry(gix::bstr::BStr::new(key.as_bytes()), Some(mode)) else {
+        return false;
+    };
+    // The returned bool only says whether some pattern matched at all, which
+    // is not the question: an explicitly unset or unspecified `filter` is a
+    // perfectly good "not routed". The resolved state is what decides.
+    platform.matching_attributes(&mut outcome);
+    // Bound to a local rather than returned as the block's tail expression:
+    // `iter_selected` borrows `outcome`, and a tail temporary is dropped AFTER
+    // the block's locals, so returning it directly outlives what it reads.
+    let routed = outcome.iter_selected().any(|attribute| {
+        attribute.assignment.state.as_bstr() == Some(gix::bstr::BStr::new(LFS_FILTER_DRIVER))
+    });
+    routed
 }
 
 /// Does `HEAD` already record `blob` for `rela`?

@@ -515,6 +515,36 @@ impl StabilityGate {
             .min()
     }
 
+    /// Whether tier 0 filters this path out entirely.
+    ///
+    /// Public because the *wake* has to ask this question too, and has to ask
+    /// it of the same compiled set the walk asks (Story 34.9, AD-45). Until
+    /// this existed, tier 0 was consulted only **downstream** of the walk —
+    /// here in [`Self::is_stable`] and in `Engine::pending` — while the
+    /// watcher event that decided whether to walk *at all* passed through
+    /// unfiltered. The recursive watcher sees every write anywhere under the
+    /// profile root, so a build writing continuously into `node_modules/`,
+    /// `.venv/`, `__pycache__/`, `.next/` or `.cache/` set the engine's watch
+    /// wake on every 1 Hz tick and drove a full `git status` re-stat of the
+    /// tree once a second, indefinitely — the exact pathology the paced
+    /// backstop exists to prevent, provoked by the very names tier 0 lists as
+    /// noise, and an exclusion applied after the walk cannot suppress the walk
+    /// it was added to prevent.
+    ///
+    /// Exposing the gate's own set rather than compiling a second one beside
+    /// it is deliberate: the profile's user-supplied `excludes` compile into
+    /// this set too, so a separate copy would be a second thing to keep in
+    /// step, and the failure mode of a drifted copy is a wake and a walk that
+    /// disagree about what is worth looking at.
+    ///
+    /// `path` may be absolute or already root-relative. The watcher deals in
+    /// absolute paths and the walk in relative ones, and `strip_prefix`
+    /// falling through leaves an already-relative path exactly as it was.
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        let relative = path.strip_prefix(&self.root).unwrap_or(path);
+        self.excludes.is_excluded(relative)
+    }
+
     /// The full gate for one path: tier 0, the iCloud guard, a fresh sample,
     /// then tier 2.
     ///
@@ -524,8 +554,7 @@ impl StabilityGate {
     /// drops it too. Callers driving `observe`/`verdict` by hand own that
     /// bookkeeping themselves through [`StabilityGate::forget`].
     pub fn is_stable(&mut self, path: &Path, now_ms: i64) -> StabilityVerdict {
-        let relative = path.strip_prefix(&self.root).unwrap_or(path);
-        if self.excludes.is_excluded(relative) {
+        if self.is_excluded(path) {
             return StabilityVerdict::Excluded;
         }
 
