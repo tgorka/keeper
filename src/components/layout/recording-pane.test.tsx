@@ -177,6 +177,7 @@ const IDLE_STATUS: RecordingStatusVm = {
   onDiskBytes: 0,
   currentSegmentBytes: 0,
   segmentCapMb: 0,
+  durability: { state: "local", detail: null },
 };
 
 const RECORDING_STATUS: RecordingStatusVm = {
@@ -189,6 +190,7 @@ const RECORDING_STATUS: RecordingStatusVm = {
   onDiskBytes: 412_000_000,
   currentSegmentBytes: 100_000_000,
   segmentCapMb: 500,
+  durability: { state: "local", detail: null },
 };
 
 const GRANTED: RecordingPermissionVm = {

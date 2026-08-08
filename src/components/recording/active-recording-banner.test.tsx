@@ -3,11 +3,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ActiveRecordingBanner,
   BANNER_DISMISS_LABEL,
+  BANNER_DURABILITY_TESTID,
   BANNER_RESTART_LABEL,
   BANNER_STOP_LABEL,
   BANNER_STOPPING_LABEL,
+  DURABILITY_COMMITTED_LABEL,
+  DURABILITY_LOCAL_LABEL,
+  DURABILITY_PUSHED_LABEL,
+  DURABILITY_REJECTED_LABEL,
 } from "@/components/recording/active-recording-banner";
-import type { RecordingStatusVm } from "@/lib/ipc/client";
+import type { RecordingDurabilityState, RecordingStatusVm } from "@/lib/ipc/client";
 
 /**
  * Mock `matchMedia` so `(prefers-reduced-motion: reduce)` reports `reduced`
@@ -37,6 +42,9 @@ const LIVE: RecordingStatusVm = {
   onDiskBytes: 412_000_000,
   currentSegmentBytes: 250_000_000,
   segmentCapMb: 500,
+  // Story 41.6: the session's durability floor. A fresh session with nothing
+  // committed yet is `local`, detail-free.
+  durability: { state: "local", detail: null },
 };
 
 /** The sticky mic-loss warning message the sidecar emits (Story 19.4). */
@@ -363,5 +371,114 @@ describe("ActiveRecordingBanner", () => {
     expect(live).toHaveTextContent("Recording, segment 3");
     // The ticking elapsed must never sit inside the live region.
     expect(live).not.toHaveTextContent("12:34");
+  });
+
+  // --- The durability line (Story 41.6) ------------------------------------
+
+  /** The remote's own refusal, Rust-authored and printed verbatim. */
+  const REJECTION_REASON = "push rejected: non-fast-forward";
+
+  it("renders the one durability word for every state (verified shares the pushed word)", () => {
+    mockReducedMotion(false);
+    const rows: [RecordingDurabilityState, string][] = [
+      ["local", DURABILITY_LOCAL_LABEL],
+      ["committed", DURABILITY_COMMITTED_LABEL],
+      ["pushed", DURABILITY_PUSHED_LABEL],
+      ["verified", DURABILITY_PUSHED_LABEL],
+    ];
+    for (const [state, word] of rows) {
+      const { unmount } = renderBanner({ durability: { state, detail: null } });
+      const line = screen.getByTestId(BANNER_DURABILITY_TESTID);
+      // Exactly the word, and no reason riding along on a healthy session.
+      expect(line).toHaveTextContent(word);
+      expect(line).not.toHaveAttribute("title");
+      unmount();
+    }
+  });
+
+  it("reads 'recorded, not pushed' with the remote's reason available on the line", () => {
+    // A refused publication is not a failed recording: the state stays
+    // `committed`, the word changes, and the reason is readable without leaving
+    // the banner — no modal, no toast, no generic sync error.
+    mockReducedMotion(false);
+    renderBanner({ durability: { state: "committed", detail: REJECTION_REASON } });
+    const line = screen.getByTestId(BANNER_DURABILITY_TESTID);
+    expect(screen.getByText(DURABILITY_REJECTED_LABEL)).toBeInTheDocument();
+    // Hover-readable…
+    expect(line).toHaveAttribute("title", REJECTION_REASON);
+    // …and read out to assistive tech, which has no hover.
+    expect(line).toHaveTextContent(REJECTION_REASON);
+    // Never escalated: no dialog, no alert, and Stop is still the only button.
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+  });
+
+  it("renders no durability line when the snapshot carries no durability", () => {
+    // Defensive: `recording_status` is polled at ~1 Hz, so a snapshot from
+    // before the field existed can land mid-update. No field, no line — never a
+    // guessed "on this Mac".
+    mockReducedMotion(false);
+    const { durability: _absent, ...older } = LIVE;
+    render(
+      <ActiveRecordingBanner
+        status={older as RecordingStatusVm}
+        elapsed="12:34"
+        onStop={vi.fn()}
+        onRestart={vi.fn()}
+        onDismiss={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId(BANNER_DURABILITY_TESTID)).not.toBeInTheDocument();
+    // The rest of the live banner is untouched by the missing field.
+    expect(screen.getByText(/12:34 · segment 3 · 412 MB/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: BANNER_STOP_LABEL })).toBeInTheDocument();
+  });
+
+  it("leaves the elapsed line, Stop, and the warning slot unchanged", () => {
+    // The line is an addition, not a rearrangement: everything the banner said
+    // before still says it, warning variant included.
+    mockReducedMotion(false);
+    renderBanner({
+      warning: MIC_WARNING,
+      durability: { state: "committed", detail: REJECTION_REASON },
+    });
+    expect(screen.getByText(/12:34 · segment 3 · 412 MB/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: BANNER_STOP_LABEL })).toBeEnabled();
+    // The mic-loss alert is still the alert; the durability line is not one.
+    expect(screen.getByRole("alert")).toHaveTextContent(MIC_WARNING);
+    expect(screen.getByText(DURABILITY_REJECTED_LABEL)).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Segment size" })).toBeInTheDocument();
+  });
+
+  it("keeps the durability word out of the assertive live region", () => {
+    // It advances as segments commit and push; announcing each transition would
+    // be the recorder shouting about its own bookkeeping mid-meeting.
+    mockReducedMotion(false);
+    const { container } = render(
+      <ActiveRecordingBanner
+        status={{ ...LIVE, durability: { state: "pushed", detail: null } }}
+        elapsed="12:34"
+        onStop={vi.fn()}
+        onRestart={vi.fn()}
+        onDismiss={vi.fn()}
+      />,
+    );
+    const live = container.querySelector('[aria-live="assertive"]');
+    expect(live).not.toHaveTextContent(DURABILITY_PUSHED_LABEL);
+    expect(screen.getByText(DURABILITY_PUSHED_LABEL)).toBeInTheDocument();
+  });
+
+  it("renders no durability line on the failure variant", () => {
+    // A failed session's banner is about the failure; a durability word beside
+    // it would be answering a question nobody is asking yet.
+    mockReducedMotion(false);
+    renderBanner({
+      state: "failed",
+      error: FAILED_REASON,
+      durability: { state: "committed", detail: null },
+    });
+    expect(screen.queryByTestId(BANNER_DURABILITY_TESTID)).not.toBeInTheDocument();
   });
 });

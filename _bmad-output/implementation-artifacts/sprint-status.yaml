@@ -353,7 +353,7 @@ development_status:
   41-3-partial-while-writing-final-on-close: review
   41-4-the-gate-learns-the-word-finished: review
   41-5-committed-at-close-pushed-on-policy: review
-  41-6-durability-you-can-read: backlog
+  41-6-durability-you-can-read: review
   epic-41-retrospective: optional
   epic-42: backlog
   42-1-a-session-is-a-row: backlog

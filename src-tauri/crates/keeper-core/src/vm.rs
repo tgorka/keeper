@@ -2844,6 +2844,88 @@ impl RecordingUiState {
     }
 }
 
+/// How far this recording session's bytes have travelled beyond this Mac
+/// (Story 41.6, FR-138, UX-DR48).
+///
+/// The variants are declared least- to most-durable ON PURPOSE, and the derived
+/// `Ord` is load-bearing: the state a session reports is a FLOOR, and a floor is
+/// a `max` over everything the session has observed. Deriving the order from the
+/// declaration means the ranking cannot drift from a hand-written table that
+/// someone later forgets to extend.
+///
+/// The words a surface prints for these are the RECORDER's, never git's
+/// (UX-DR48): `Local` is "on this Mac", `Committed` is "committed",
+/// `Pushed`/`Verified` are "on the drive". A commit and a push are HOW it
+/// happened; what the person asked was whether the recording would survive the
+/// laptop being dropped. Only the enum tag crosses IPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum RecordingDurabilityState {
+    /// The bytes exist here and nowhere else. Either the destination is a plain
+    /// folder — which makes no further promise, and says so plainly — or a
+    /// profile destination has not committed anything yet.
+    Local,
+    /// The session's segments are in a commit in the destination profile. They
+    /// survive the recorder, the app and a power cut; they do not yet survive
+    /// the machine.
+    Committed,
+    /// That commit is on the remote. Branch-level, deliberately: whether THIS
+    /// path's objects are on the far side is a question only the network can
+    /// answer, and the poll path may not ask it — "the branch holding it has
+    /// nothing the remote lacks" is the strongest local truth there is.
+    Pushed,
+    /// The engine has verified the pushed objects.
+    ///
+    /// Reserved rather than reachable today: nothing the engine records locally
+    /// distinguishes a verified push from a push, so the derivation cannot
+    /// synthesise this — it is what the verification pass will report when it
+    /// records per-path results. The variant exists because the surface must not
+    /// have to change shape the day it does.
+    Verified,
+}
+
+/// The one durability reading a recording session carries (Story 41.6, FR-138,
+/// UX-DR48/UX-DR49).
+///
+/// **DERIVED, never stored.** It is computed on the `recording_status` poll from
+/// the destination and the engine's own local knowledge, so it cannot go stale
+/// or disagree with the thing it describes; nothing about durability is written
+/// to disk, and there is no second copy to reconcile. It rides the status the
+/// recording surface ALREADY polls at ~1 Hz rather than a stream of its own,
+/// because a second channel for a scalar that changes a handful of times per
+/// session would be a second thing that can be out of date.
+///
+/// `detail` is the Rust-authored reason a push has not happened — `"push
+/// rejected: non-fast-forward"`, a protected branch, an unreachable remote —
+/// present ONLY when there is such a problem. It exists so the surface can print
+/// the reason VERBATIM instead of inventing sync language of its own: a rejected
+/// push is not a failed recording, and "recorded, not pushed" plus the remote's
+/// own words is the honest reading. A healthy session carries `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingDurabilityVm {
+    /// How far this session's bytes have got — the session's floor, so it never
+    /// walks backwards while the session runs.
+    pub state: RecordingDurabilityState,
+    /// Why publication has not happened, in Rust's words, when it has not.
+    pub detail: Option<String>,
+}
+
+impl RecordingDurabilityVm {
+    /// The on-this-Mac reading: the honest answer for a plain-folder
+    /// destination, for a session that has committed nothing yet, and for the
+    /// idle snapshot. No problem is named because none has happened — nothing
+    /// was promised.
+    pub fn local() -> Self {
+        Self {
+            state: RecordingDurabilityState::Local,
+            detail: None,
+        }
+    }
+}
+
 /// The recording-session status snapshot the Recording view polls (Story 16.6,
 /// FR-68/FR-69/FR-71, UX-DR30).
 ///
@@ -2854,6 +2936,13 @@ impl RecordingUiState {
 /// holding the `screen-####.mp4` segments (Story 17.2 — not a single file; the
 /// tray sums it live and "Open Recordings Folder" reveals it), and `error` is
 /// the honest failure message on `failed` — never a silent reset.
+///
+/// `durability` (Story 41.6) is the one field here that is DERIVED rather than
+/// folded from a sidecar event: it is computed on each read of this snapshot
+/// from the session's destination and the engine's local knowledge, which is
+/// why it needs no new command and no new stream — the surface that asks
+/// "would what I have recorded survive?" is already asking this snapshot
+/// everything else it shows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -2901,6 +2990,13 @@ pub struct RecordingStatusVm {
     /// settings store, so a mid-session cap edit cannot skew a running meter); 0
     /// when there is no session.
     pub segment_cap_mb: u32,
+    /// How far this session's bytes have got beyond this Mac (Story 41.6,
+    /// FR-138) — the banner's one honest line and, when it names a problem,
+    /// the tray's warning-marked status line. DERIVED on every read (see the
+    /// type docs) and never stored, so it cannot disagree with the engine; a
+    /// session with no destination profile, and the idle snapshot, both read
+    /// [`RecordingDurabilityVm::local`].
+    pub durability: RecordingDurabilityVm,
 }
 
 /// The read-only end-of-session summary the completion / recovery cards render
@@ -2943,6 +3039,7 @@ impl RecordingStatusVm {
             on_disk_bytes: 0,
             current_segment_bytes: 0,
             segment_cap_mb: 0,
+            durability: RecordingDurabilityVm::local(),
         }
     }
 }
@@ -3197,6 +3294,61 @@ mod tests {
         assert_eq!(idle.on_disk_bytes, 0);
         assert_eq!(idle.current_segment_bytes, 0);
         assert_eq!(idle.segment_cap_mb, 0);
+        // Story 41.6: no session has promised anything, so the honest reading is
+        // "on this Mac" with nothing to explain.
+        assert_eq!(idle.durability, RecordingDurabilityVm::local());
+    }
+
+    /// Story 41.6: the four states are the frontend's string union, so their
+    /// camelCase wire names are the contract — a rename here silently breaks a
+    /// banner that switches on them.
+    #[test]
+    fn recording_durability_state_serializes_camel_case() {
+        for (state, wire) in [
+            (RecordingDurabilityState::Local, "\"local\""),
+            (RecordingDurabilityState::Committed, "\"committed\""),
+            (RecordingDurabilityState::Pushed, "\"pushed\""),
+            (RecordingDurabilityState::Verified, "\"verified\""),
+        ] {
+            let json = serde_json::to_string(&state).expect("serialize durability state");
+            assert_eq!(json, wire);
+            let back: RecordingDurabilityState =
+                serde_json::from_str(&json).expect("deserialize durability state");
+            assert_eq!(back, state);
+        }
+    }
+
+    /// The floor is a `max` over the declared order, so the order IS the
+    /// ranking — anything that reorders these variants changes what "never
+    /// regresses" means.
+    #[test]
+    fn recording_durability_state_orders_least_to_most_durable() {
+        use RecordingDurabilityState::*;
+        let mut states = [Verified, Local, Pushed, Committed];
+        states.sort();
+        assert_eq!(states, [Local, Committed, Pushed, Verified]);
+    }
+
+    /// The reason is a Rust-authored sentence carried verbatim, and it rides the
+    /// VM as `detail` — present only when publication is actually stuck.
+    #[test]
+    fn recording_durability_vm_carries_the_reason_verbatim() {
+        let stuck = RecordingDurabilityVm {
+            state: RecordingDurabilityState::Committed,
+            detail: Some("push rejected: non-fast-forward".to_owned()),
+        };
+        let json = serde_json::to_string(&stuck).expect("serialize durability");
+        assert_eq!(
+            json,
+            "{\"state\":\"committed\",\"detail\":\"push rejected: non-fast-forward\"}"
+        );
+        let back: RecordingDurabilityVm =
+            serde_json::from_str(&json).expect("deserialize durability");
+        assert_eq!(back, stuck);
+        assert_eq!(
+            serde_json::to_string(&RecordingDurabilityVm::local()).expect("serialize local"),
+            "{\"state\":\"local\",\"detail\":null}"
+        );
     }
 
     #[test]

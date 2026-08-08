@@ -47,6 +47,11 @@ export const IDLE_RECORDING_STATUS: RecordingStatusVm = Object.freeze({
   onDiskBytes: 0,
   currentSegmentBytes: 0,
   segmentCapMb: 0,
+  // The durability floor (Story 41.6): nothing recorded yet, so nothing beyond
+  // this Mac is promised. The live snapshot carries the engine's reading.
+  // `as const` because `Object.freeze` would otherwise widen the state to
+  // `string` and lose the union the VM declares.
+  durability: { state: "local", detail: null } as const,
 });
 
 /** Whether a snapshot represents a live (pollable, stoppable) session. */
