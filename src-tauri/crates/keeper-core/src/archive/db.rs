@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
-use super::{fts, recordings};
+use super::{fts, recordings, recordings_fts};
 use crate::error::ArchiveError;
 
 /// Resolve the `archive.db` path under a data directory. The single canonical
@@ -97,6 +97,14 @@ pub fn open_archive_db(data_dir: &Path) -> Result<Connection, ArchiveError> {
     // the writer task ever owns has them, and so a session row never needs a
     // second open path of its own.
     recordings::ensure_recordings_schema(&conn)?;
+    // Story 42.2: and the search index over those rows, which must come AFTER
+    // the tables it indexes — it backfills every session that has no index entry
+    // yet, so an archive written by a build without it becomes searchable at the
+    // next open rather than at the next rebuild. Ensured here, on the writer's
+    // connection, because since 42.2 a row write also maintains that row's index
+    // entry inside the same transaction: a connection without this index is a
+    // connection no session can be written to.
+    recordings_fts::ensure_recordings_fts(&conn)?;
     Ok(conn)
 }
 

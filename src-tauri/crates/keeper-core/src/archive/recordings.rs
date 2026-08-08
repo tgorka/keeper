@@ -376,45 +376,63 @@ fn as_i64(value: u64) -> i64 {
 /// replace: SQLite evaluates the `VALUES` expressions before the replace
 /// deletes the conflicting row, so preserving costs no extra round trip, no
 /// read-modify-write race and — the rule of this module — no second connection.
+///
+/// **The row and its search index are one unit of work** (Story 42.2). The
+/// `INSERT OR REPLACE` above and the [`super::recordings_fts::index_recording`]
+/// call below run inside one [`in_transaction`], so a process that dies between
+/// them leaves neither half: a session whose row says "staffing review" and
+/// whose index still says "pricing review" is a bug, not a state this module is
+/// allowed to reach. The floor read is inside it too, which makes the
+/// read-modify-write of `durability` atomic rather than merely serialized.
+/// Reentrant by design — [`write_rebuilt_session`] calls this INSIDE its own
+/// transaction, and a whole rebuilt session still commits exactly once (see
+/// [`in_transaction`]).
+///
+/// The index write comes second because it describes the row: reading the
+/// searchable text off the [`RecordingRow`] the statement just wrote is what
+/// makes "exactly one index entry per session, always current" true for a
+/// replace as well as an insert.
 pub fn upsert_recording(conn: &Connection, row: &RecordingRow) -> Result<(), ArchiveError> {
-    let stored = stored_durability(conn, &row.session_id)?;
-    let durability = floored_durability(stored.as_deref(), &row.durability);
-    conn.execute(
-        "INSERT OR REPLACE INTO recordings(\
-            session_id, device_id, relative_path, root_kind, profile_id, started_ts, ended_ts, \
-            title, participants_json, note, tags_json, custom_json, codec, width, height, fps, \
-            durability, manifest_version\
-        ) VALUES (\
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-            COALESCE(?13, (SELECT codec FROM recordings WHERE session_id = ?1)), \
-            COALESCE(?14, (SELECT width FROM recordings WHERE session_id = ?1)), \
-            COALESCE(?15, (SELECT height FROM recordings WHERE session_id = ?1)), \
-            COALESCE(?16, (SELECT fps FROM recordings WHERE session_id = ?1)), \
-            ?17, ?18\
-        )",
-        rusqlite::params![
-            row.session_id,
-            row.device_id,
-            row.relative_path,
-            row.root_kind,
-            row.profile_id,
-            row.started_ts,
-            row.ended_ts,
-            row.title,
-            row.participants_json,
-            row.note,
-            row.tags_json,
-            row.custom_json,
-            row.codec,
-            row.width,
-            row.height,
-            row.fps,
-            durability,
-            row.manifest_version,
-        ],
-    )
-    .map_err(|e| ArchiveError::Sqlite(format!("could not write recording row: {e}")))?;
-    Ok(())
+    in_transaction(conn, "recording row", || {
+        let stored = stored_durability(conn, &row.session_id)?;
+        let durability = floored_durability(stored.as_deref(), &row.durability);
+        conn.execute(
+            "INSERT OR REPLACE INTO recordings(\
+                session_id, device_id, relative_path, root_kind, profile_id, started_ts, \
+                ended_ts, title, participants_json, note, tags_json, custom_json, codec, \
+                width, height, fps, durability, manifest_version\
+            ) VALUES (\
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+                COALESCE(?13, (SELECT codec FROM recordings WHERE session_id = ?1)), \
+                COALESCE(?14, (SELECT width FROM recordings WHERE session_id = ?1)), \
+                COALESCE(?15, (SELECT height FROM recordings WHERE session_id = ?1)), \
+                COALESCE(?16, (SELECT fps FROM recordings WHERE session_id = ?1)), \
+                ?17, ?18\
+            )",
+            rusqlite::params![
+                row.session_id,
+                row.device_id,
+                row.relative_path,
+                row.root_kind,
+                row.profile_id,
+                row.started_ts,
+                row.ended_ts,
+                row.title,
+                row.participants_json,
+                row.note,
+                row.tags_json,
+                row.custom_json,
+                row.codec,
+                row.width,
+                row.height,
+                row.fps,
+                durability,
+                row.manifest_version,
+            ],
+        )
+        .map_err(|e| ArchiveError::Sqlite(format!("could not write recording row: {e}")))?;
+        super::recordings_fts::index_recording(conn, row)
+    })
 }
 
 /// Write one segment row, replacing any row already keyed on
@@ -500,11 +518,27 @@ pub fn set_durability(
 /// `label` names the unit of work in the only two errors this adds of its own;
 /// whatever `write` returns propagates unchanged, so a SQLite failure inside a
 /// rebuilt session still surfaces as the error that raised it.
-fn in_transaction<T>(
+///
+/// **Reentrant, because Story 42.2 made these units of work nest.** Every write
+/// that touches a session row now also maintains that row's search index
+/// ([`super::recordings_fts`]), and both [`upsert_recording`] — which a caller
+/// may reach directly, in autocommit — and [`write_rebuilt_session`] — which
+/// wraps it in a transaction of its own, so a whole rebuilt session commits
+/// once — must be able to ask for one. SQLite has no nested `BEGIN`, so a
+/// second one would fail with "cannot start a transaction within a
+/// transaction". When a transaction is already active this therefore just runs
+/// `write`: the OUTER transaction is what makes the work atomic, which is the
+/// property being asked for either way. The one thing that must hold for that
+/// to be true is that an inner error propagates to the outer `in_transaction`
+/// rather than being swallowed, and every caller here does propagate it.
+pub(super) fn in_transaction<T>(
     conn: &Connection,
     label: &str,
     write: impl FnOnce() -> Result<T, ArchiveError>,
 ) -> Result<T, ArchiveError> {
+    if !conn.is_autocommit() {
+        return write();
+    }
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| ArchiveError::Sqlite(format!("could not begin {label}: {e}")))?;
     match write() {
@@ -540,6 +574,18 @@ fn in_transaction<T>(
 /// cache of the folders, so retitling a session it never saw is not a failure:
 /// the next [`rebuild_from_disk`] writes it at its new path anyway. Returns how
 /// many `recordings` rows moved — 0 or 1, since `session_id` is the key.
+///
+/// **This writes nothing to the search index, and that is a decision rather
+/// than an omission** (Story 42.2). A move rewrites paths, and a path is not
+/// searchable text: the index covers a session's title, participants, note,
+/// tags and custom values ([`super::recordings_fts::searchable_text`]), none of
+/// which a retitle-MOVE can change. The retitle that renames the session — the
+/// one that rewrites `meta.title` — arrives separately as an
+/// [`upsert_recording`], which does reindex, inside its own transaction. So the
+/// index entry this session already has stays exactly right, and reindexing
+/// here would cost a write to produce byte-identical text. The rule the story
+/// asks for still holds: every index write is inside the transaction of the row
+/// it describes, and this transaction describes no indexed column.
 pub fn move_session(
     conn: &Connection,
     session_id: &str,
@@ -605,6 +651,8 @@ pub fn move_session(
                 ArchiveError::Sqlite(format!("could not move recording segment row: {e}"))
             })?;
         }
+        // No index write: see this function's doc comment on why a move cannot
+        // change a session's searchable text.
         Ok(moved)
     })
 }
@@ -920,8 +968,10 @@ pub fn rebuild_from_disk_within(
 /// already claimed the session id, in which case the first one keeps it (see
 /// [`rebuild_from_disk`] on duplicates).
 ///
-/// The row and the ledger reconcile share one transaction, so a concurrent
-/// reader sees the session either wholly rebuilt or wholly untouched.
+/// The row, its search index entry and the ledger reconcile share one
+/// transaction, so a concurrent reader sees the session either wholly rebuilt or
+/// wholly untouched — and a rebuild that dies part way through cannot leave a
+/// row describing one thing and an index entry describing another (Story 42.2).
 fn write_rebuilt_session(
     conn: &Connection,
     root: &Path,
@@ -948,6 +998,9 @@ fn write_rebuilt_session(
         return Ok(false);
     }
     in_transaction(conn, "rebuilt recording session", || {
+        // Reindexes the session too, inside THIS transaction: `upsert_recording`
+        // owns that pairing and is reentrant, so a rebuilt session — row, index
+        // entry and ledger — still commits exactly once (see `in_transaction`).
         upsert_recording(conn, &row)?;
         // Drop only what the ledger has stopped listing — see the note on
         // [`rebuild_from_disk`] about why this is not a wholesale clear.
@@ -1191,11 +1244,18 @@ mod tests {
         dir
     }
 
-    /// An in-memory archive carrying the recording schema — enough for every
-    /// write test, and it never touches the filesystem.
+    /// An in-memory archive carrying the recording schema and its search index —
+    /// enough for every write test, and it never touches the filesystem.
+    ///
+    /// Both, in the order [`super::db::open_archive_db`] ensures them: since
+    /// Story 42.2 a row write also maintains that row's index entry, inside the
+    /// same transaction, so a connection without the index is a connection no
+    /// session can be written to.
     fn memory_db() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory archive");
         ensure_recordings_schema(&conn).expect("ensure recordings schema");
+        crate::archive::recordings_fts::ensure_recordings_fts(&conn)
+            .expect("ensure the recordings search index");
         conn
     }
 
