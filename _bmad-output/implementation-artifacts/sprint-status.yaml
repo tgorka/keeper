@@ -344,7 +344,7 @@ development_status:
   epic-40: in-progress
   40-1-the-path-template-rendered-purely: done
   40-2-the-template-is-a-setting-and-the-preview-is-the-manual: done
-  40-3-recording-start-uses-it-and-the-session-gets-an-identity: review
+  40-3-recording-start-uses-it-and-the-session-gets-an-identity: done
   40-4-retitle-moves-the-folder-not-the-identity: backlog
   epic-40-retrospective: optional
   epic-41: backlog
