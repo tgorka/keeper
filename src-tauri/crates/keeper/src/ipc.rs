@@ -6001,6 +6001,7 @@ impl RecordingArchiveSession {
     /// Send this session's row at start.
     fn started(&self, manifest: &SessionManifest) {
         if let Some(row) = self.row(manifest) {
+            self.report_tags(&row);
             self.port.record_started(row);
         }
     }
@@ -6008,8 +6009,29 @@ impl RecordingArchiveSession {
     /// Send the same row completed, at finalize.
     fn finalized(&self, manifest: &SessionManifest) {
         if let Some(row) = self.row(manifest) {
+            self.report_tags(&row);
             self.port.record_finalized(row);
         }
+    }
+
+    /// Hand this session's canonical tags to the tag tree's second producer
+    /// (Story 42.5, FR-143).
+    ///
+    /// The row's own `tags_json`, decoded — never the manifest's text — so the
+    /// tree counts exactly what the `recordings` row says and the two cannot
+    /// disagree about a tag. Called on both write paths for the same reason
+    /// `upsert_recording` is: a finalize replaces a start, and a session that
+    /// gained or lost a tag between them must be re-credited, which
+    /// [`keeper_core::notes::index::RecordingTagDelta::Upsert`] does by
+    /// retracting the previous list first.
+    ///
+    /// Desktop-only because the tag tree is: `notes_vault` does not exist on
+    /// iOS, where there is no notes surface and no sidebar to count into.
+    fn report_tags(&self, row: &RecordingRow) {
+        #[cfg(desktop)]
+        crate::notes_vault::set_recording_tags(&row.session_id, &row.tags());
+        #[cfg(not(desktop))]
+        let _ = row;
     }
 
     /// Send one closed segment's row. `folder` is the session folder the ledger
@@ -6105,7 +6127,11 @@ pub async fn recording_start(
     meta_title: Option<String>,
     meta_participants: Option<String>,
     meta_note: Option<String>,
-    meta_tags: Option<Vec<String>>,
+    // Story 42.5: the metadata card's tag field, exactly as typed — one
+    // comma-separated line, not a list. The split used to live in TypeScript
+    // and the trim again here, which made the frontend a second place that
+    // decided what a tag is; both now happen once, in `tags::split_list`.
+    meta_tags: Option<String>,
     meta_custom: Option<Vec<keeper_core::recording::SessionMetaField>>,
 ) -> Result<RecordingStatusVm, IpcError> {
     // Story 19.2: the Audio card's ephemeral per-session toggle. `None` (no
@@ -6292,13 +6318,14 @@ pub async fn recording_start(
     let session_id = mint_session_id(&data_dir)?;
     let session_meta = {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        // Story 42.5: one tokenisation, in the tag module, for the one field
+        // whose separator is a comma. What lands in `manifest.json` is still the
+        // user's own text — the canonical form is applied later, by
+        // `RecordingRow::from_manifest`, on the way into the index. The manifest
+        // says what they typed; the row says what it means.
         let tags = meta_tags
-            .map(|list| {
-                list.into_iter()
-                    .map(|t| t.trim().to_owned())
-                    .filter(|t| !t.is_empty())
-                    .collect::<Vec<_>>()
-            })
+            .as_deref()
+            .map(keeper_core::notes::tags::split_list)
             .filter(|list| !list.is_empty());
         let custom = meta_custom
             .map(|list| {

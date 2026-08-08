@@ -645,6 +645,7 @@ pub fn run() {
         notes_ipc::notes_index_rebuild,
         notes_ipc::notes_list,
         notes_ipc::notes_tag_tree,
+        notes_ipc::tags_vocabulary,
         notes_ipc::notes_tree,
         notes_ipc::notes_spaces,
         notes_ipc::notes_space_save,

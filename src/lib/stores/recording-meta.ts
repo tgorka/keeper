@@ -24,7 +24,15 @@ export interface RecordingMetaFields {
   participants: string;
   /** Optional program/session note. */
   note: string;
-  /** Comma-separated tags (Story 22.3) — split/trimmed on consume. */
+  /**
+   * The tags field, exactly as typed (Story 22.3; Story 42.5).
+   *
+   * Comma-separated by convention, but the convention is Rust's: this string
+   * travels to `keeper-core`'s tag module verbatim, which splits it and
+   * decides case, whitespace, separators and emptiness in the one place those
+   * rules live. Splitting or trimming per-tag here would be a second answer to
+   * "what is a tag", which is the whole thing Story 42.5 deletes.
+   */
   tags: string;
   /** Repeatable custom name/value rows (Story 22.3). */
   custom: RecordingMetaCustomRow[];
@@ -78,25 +86,35 @@ export const recordingMetaStore = create<RecordingMetaState>((set, get) => ({
 
 export const useRecordingMeta = recordingMetaStore;
 
-/** Imperative click-time read used by the Start/Restart paths: consumes the
- * fields (clearing the form) and maps empties to `undefined` so an untouched
- * form ships NO meta wire fields at all. */
-export function consumeRecordingMeta(): {
+/**
+ * The next-session metadata as it crosses the wire: every field optional, an
+ * absent one meaning "the form was untouched here, change nothing".
+ */
+export interface RecordingMetaWire {
   title?: string;
   participants?: string;
   note?: string;
-  tags?: string[];
+  /**
+   * The tags field exactly as typed (Story 42.5) — one string, commas and all.
+   * Rust splits and normalises it in the one place that rule lives, so no
+   * caller of this may treat it as a list.
+   */
+  tags?: string;
   custom?: RecordingMetaCustomRow[];
-} {
+}
+
+/** Imperative click-time read used by the Start/Restart paths: consumes the
+ * fields (clearing the form) and maps empties to `undefined` so an untouched
+ * form ships NO meta wire fields at all. */
+export function consumeRecordingMeta(): RecordingMetaWire {
   const taken = recordingMetaStore.getState().consume();
   const clean = (value: string) => {
     const trimmed = value.trim();
     return trimmed === "" ? undefined : trimmed;
   };
-  const tags = taken.tags
-    .split(",")
-    .map((tag) => tag.trim())
-    .filter((tag) => tag !== "");
+  // Story 42.5: the tag text ships whole. `clean` is the same emptiness rule
+  // the other three free-text fields get — an untouched field ships nothing —
+  // and NOT a per-tag normalisation: `Client/Acme , acme` leaves here intact.
   const custom = taken.custom
     .map((row) => ({ name: row.name.trim(), value: row.value.trim() }))
     .filter((row) => row.name !== "");
@@ -104,7 +122,7 @@ export function consumeRecordingMeta(): {
     title: clean(taken.title),
     participants: clean(taken.participants),
     note: clean(taken.note),
-    tags: tags.length > 0 ? tags : undefined,
+    tags: clean(taken.tags),
     custom: custom.length > 0 ? custom : undefined,
   };
 }

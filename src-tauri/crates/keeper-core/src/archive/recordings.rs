@@ -38,6 +38,7 @@ use rusqlite::Connection;
 use serde::Deserialize;
 
 use crate::error::ArchiveError;
+use crate::notes::tags;
 use crate::recording::{SegmentEntry, SessionManifest, RECOVERY_MAX_DEPTH, RECOVERY_MAX_VISITS};
 use crate::vm::RecordingDurabilityState;
 
@@ -81,7 +82,10 @@ pub struct RecordingRow {
     pub participants_json: Option<String>,
     /// The user's free-text note about the session.
     pub note: Option<String>,
-    /// The session's tags as a JSON array of strings.
+    /// The session's tags as a JSON array of strings, **normalised** — the
+    /// canonical form [`crate::notes::tags::normalise`] defines, deduplicated
+    /// (Story 42.5). The manifest still holds what the user typed; this column
+    /// holds what it means.
     pub tags_json: Option<String>,
     /// The session's custom name/value pairs as a JSON array of objects.
     pub custom_json: Option<String>,
@@ -719,6 +723,29 @@ impl RecordingRow {
     /// `durability` starts at [`RecordingDurabilityState::Local`], the honest
     /// floor for a fact no manifest carries; [`upsert_recording`] then keeps
     /// whatever stronger state the row already reached.
+    ///
+    /// **This is where a recording's tags enter the one vocabulary** (Story
+    /// 42.5, FR-143). `tags_json` is written through
+    /// [`crate::notes::tags::normalise_all`], so `Client/Acme ` on a recording
+    /// and `client/acme` on a note are the same tag everywhere downstream: the
+    /// `tag:` predicate, the search text, the browser's chips and the tag tree
+    /// all read this column and none of them normalises again. The manifest is
+    /// NOT touched — it keeps saying what the user typed, and this row says what
+    /// it means. A session whose tags all normalise away stores `NULL`, exactly
+    /// as a session that carried none does; an empty tag is never stored.
+    ///
+    /// Both write paths get this for free, which is the point of there being one
+    /// derivation: the live sink and [`rebuild_from_disk`] cannot disagree about
+    /// what a tag is, and rebuilding an archive recorded before 42.5 canonicalises
+    /// every row it rewrites without rewriting a single manifest.
+    ///
+    /// The `archive` → `notes::tags` dependency edge is taken deliberately, where
+    /// [`days_from_civil`] and [`super::recordings_fts::TAG_PREDICATE_SQL`]
+    /// decline theirs. Those duplicate a closed-form identity and a two-arm
+    /// prefix test — things that cannot drift because they are fixed for all
+    /// time. A tag vocabulary is the opposite: it is user-facing, it will change,
+    /// and two copies of it drifting apart is the exact defect this story exists
+    /// to delete.
     pub fn from_manifest(
         manifest: &SessionManifest,
         relative_path: String,
@@ -755,7 +782,9 @@ impl RecordingRow {
             note: meta.and_then(|m| m.note.clone()),
             tags_json: meta
                 .and_then(|m| m.tags.as_ref())
-                .and_then(|tags| serde_json::to_string(tags).ok()),
+                .map(|tags| tags::normalise_all(tags.iter().map(String::as_str)))
+                .filter(|tags| !tags.is_empty())
+                .and_then(|tags| serde_json::to_string(&tags).ok()),
             custom_json: meta
                 .and_then(|m| m.custom.as_ref())
                 .and_then(|custom| serde_json::to_string(custom).ok()),
@@ -767,6 +796,66 @@ impl RecordingRow {
             manifest_version: manifest.version,
         }
     }
+
+    /// This row's tags — the canonical list the tag tree's second producer
+    /// contributes (Story 42.5). See [`decode_tags`] for what an unreadable
+    /// column yields.
+    pub fn tags(&self) -> Vec<String> {
+        decode_tags(self.tags_json.as_deref())
+    }
+}
+
+/// Decode a stored `tags_json` column into the canonical tag list it holds
+/// (Story 42.5).
+///
+/// Already normalised by construction (see [`RecordingRow::from_manifest`]), so
+/// this only decodes. An absent column, or one holding something that is not a
+/// JSON array of strings, yields an empty list rather than an error: this feeds
+/// a sidebar count, and a hand-edited database must not be able to make the tag
+/// tree fail.
+fn decode_tags(tags_json: Option<&str>) -> Vec<String> {
+    tags_json
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default()
+}
+
+/// Every indexed session's canonical tags, for seeding the tag tree's second
+/// producer (Story 42.5, FR-143).
+///
+/// **A seed, not a second truth.** The tag tree maintains its recording postings
+/// incrementally, one finalized session at a time, exactly as it maintains its
+/// note postings — but a freshly started process has an empty tree and an
+/// archive full of sessions, so it needs the same cold read the note index does
+/// off disk. This is that read: `recordings` is itself derived from the
+/// manifests ([`rebuild_from_disk`]), so seeding from it is seeding from the
+/// truth one step removed, never from a parallel copy of the counts.
+///
+/// Sessions with no tags are omitted — they contribute nothing and a caller
+/// replacing its whole recording posting set should not carry them.
+pub fn indexed_tags(conn: &Connection) -> Result<Vec<(String, Vec<String>)>, ArchiveError> {
+    let mut statement = conn
+        .prepare("SELECT session_id, tags_json FROM recordings WHERE tags_json IS NOT NULL")
+        .map_err(|e| ArchiveError::Sqlite(format!("could not read the recording tags: {e}")))?;
+    let rows = statement
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| ArchiveError::Sqlite(format!("could not read the recording tags: {e}")))?;
+
+    let mut seeded: Vec<(String, Vec<String>)> = Vec::new();
+    for row in rows {
+        let (session_id, tags_json) = row.map_err(|e| {
+            ArchiveError::Sqlite(format!("could not read a recording tag row: {e}"))
+        })?;
+        // Decoded exactly the way the live path decodes it, so a seeded session
+        // and a reported one contribute the same list — including the shrug at a
+        // hand-edited column, which yields no tags rather than an error.
+        let tags = decode_tags(tags_json.as_deref());
+        if !tags.is_empty() {
+            seeded.push((session_id, tags));
+        }
+    }
+    Ok(seeded)
 }
 
 impl RecordingSegmentRow {
@@ -2539,5 +2628,131 @@ mod tests {
             "no column value starts with a path separator: {serialized}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_row_normalises_the_tags_its_manifest_keeps_verbatim() {
+        // Story 42.5's boundary, both halves at once: the row says what the tags
+        // MEAN and the manifest still says what the user TYPED. Normalising the
+        // manifest in place would be a rewrite of the user's own text, which the
+        // story forbids outright.
+        let root = temp_dir();
+        let folder = root.join("2026").join("renewal-call");
+        let typed = vec![
+            "Client/Acme ".to_owned(),
+            "client/acme".to_owned(),
+            "  ".to_owned(),
+            "Renewal".to_owned(),
+        ];
+        let manifest = SessionManifest::create_with_meta(
+            folder.clone(),
+            CaptureTarget::display(None),
+            SessionDevices {
+                system_audio: true,
+                microphone: false,
+                camera: false,
+            },
+            Some(SessionMeta {
+                session_id: Some("01DEVICE-01TAGGED".to_owned()),
+                title: Some("Renewal call".to_owned()),
+                participants: None,
+                note: None,
+                tags: Some(typed.clone()),
+                custom: None,
+            }),
+            Some("2026-08-08T10:00:00+01:00".to_owned()),
+        )
+        .expect("create the session folder");
+
+        let row =
+            RecordingRow::from_manifest(&manifest, "2026/renewal-call".to_owned(), "folder", None);
+        // Canonical, deduplicated (the two casings are one tag), and the tag
+        // that normalises to nothing is dropped rather than stored empty.
+        assert_eq!(
+            row.tags_json.as_deref(),
+            Some(r#"["client/acme","renewal"]"#)
+        );
+        assert_eq!(row.tags(), vec!["client/acme", "renewal"]);
+
+        // The manifest — in memory and on disk — is untouched.
+        assert_eq!(
+            manifest.meta.as_ref().and_then(|m| m.tags.clone()),
+            Some(typed),
+            "deriving a row must not edit the manifest it read"
+        );
+        let on_disk =
+            std::fs::read_to_string(folder.join("manifest.json")).expect("read the manifest back");
+        assert!(
+            on_disk.contains("Client/Acme "),
+            "the manifest still says what the user typed: {on_disk}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_session_whose_tags_all_normalise_away_stores_no_tags_column() {
+        // An empty tag is never stored — not as `[]`, not as `[""]`. A session
+        // that typed only punctuation is a session with no tags.
+        let root = temp_dir();
+        let folder = root.join("2026").join("blank-tags");
+        let manifest = SessionManifest::create_with_meta(
+            folder,
+            CaptureTarget::display(None),
+            SessionDevices {
+                system_audio: true,
+                microphone: false,
+                camera: false,
+            },
+            Some(SessionMeta {
+                session_id: Some("01DEVICE-02BLANK".to_owned()),
+                title: None,
+                participants: None,
+                note: None,
+                tags: Some(vec!["  ".to_owned(), "///".to_owned(), "#---".to_owned()]),
+                custom: None,
+            }),
+            None,
+        )
+        .expect("create the session folder");
+
+        let row =
+            RecordingRow::from_manifest(&manifest, "2026/blank-tags".to_owned(), "folder", None);
+        assert_eq!(row.tags_json, None);
+        assert!(row.tags().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn indexed_tags_reports_every_tagged_session_and_skips_the_rest() {
+        // The seed the tag tree cold-starts from. It must decode exactly what
+        // the live report decodes, and it must not carry sessions that
+        // contribute nothing.
+        let conn = memory_db();
+        let tagged = RecordingRow {
+            title: Some("Renewal call".to_owned()),
+            tags_json: Some(r#"["client/acme","renewal"]"#.to_owned()),
+            ..start_row("01DEVICE-01TAGGED")
+        };
+        upsert_recording(&conn, &tagged).expect("index the tagged session");
+        upsert_recording(&conn, &start_row("01DEVICE-02BARE")).expect("index an untagged session");
+        let broken = RecordingRow {
+            title: Some("Hand edited".to_owned()),
+            tags_json: Some("client/acme, renewal".to_owned()),
+            ..start_row("01DEVICE-03BROKEN")
+        };
+        upsert_recording(&conn, &broken).expect("index the hand-edited session");
+
+        let seeded = indexed_tags(&conn).expect("read the recording tags");
+        assert_eq!(
+            seeded,
+            vec![(
+                "01DEVICE-01TAGGED".to_owned(),
+                vec!["client/acme".to_owned(), "renewal".to_owned()]
+            )],
+            "the untagged session and the unreadable column contribute nothing, \
+             and neither is an error"
+        );
     }
 }

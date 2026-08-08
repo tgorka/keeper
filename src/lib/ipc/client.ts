@@ -165,6 +165,8 @@ export type { SyncProfileReq } from "./gen/SyncProfileReq";
 export type { SyncProfileVm } from "./gen/SyncProfileVm";
 export type { SyncProgressVm } from "./gen/SyncProgressVm";
 export type { SyncStatusVm } from "./gen/SyncStatusVm";
+export type { TagVocabularyEntryVm } from "./gen/TagVocabularyEntryVm";
+export type { TagVocabularyVm } from "./gen/TagVocabularyVm";
 export type { TccPermission } from "./gen/TccPermission";
 export type { TimelineBatch } from "./gen/TimelineBatch";
 export type { TimelineItemVm } from "./gen/TimelineItemVm";
@@ -256,6 +258,7 @@ import type { SyncProfileReq } from "./gen/SyncProfileReq";
 import type { SyncProfileVm } from "./gen/SyncProfileVm";
 import type { SyncProgressVm } from "./gen/SyncProgressVm";
 import type { SyncStatusVm } from "./gen/SyncStatusVm";
+import type { TagVocabularyVm } from "./gen/TagVocabularyVm";
 import type { TccPermission } from "./gen/TccPermission";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
@@ -1929,7 +1932,7 @@ export async function recordingStart(
     title?: string;
     participants?: string;
     note?: string;
-    tags?: string[];
+    tags?: string;
     custom?: { name: string; value: string }[];
   },
 ): Promise<RecordingStatusVm> {
@@ -3236,6 +3239,28 @@ export async function notesList(vaultId: string, query: NoteQueryReq): Promise<N
  */
 export async function notesTagTree(vaultId: string): Promise<NoteTagTreeVm> {
   return await invoke<NoteTagTreeVm>("notes_tag_tree", { vaultId });
+}
+
+/**
+ * The flat tag vocabulary — every known tag with its count (Story 42.5,
+ * FR-143). One list, both producers: a tag that exists only on notes and a tag
+ * that exists only on recordings are both in it, and a count is the sum of
+ * everything carrying that tag or anything under it.
+ *
+ * For the surfaces that cannot consume {@link notesTagTree}: the recording
+ * metadata card's tag field is a plain `<input>`, and the notes editor's
+ * existing affordance is a CodeMirror `CompletionSource`. This is the same
+ * vocabulary both of them offer, not a second one shaped for a text box.
+ *
+ * `vaultId` is optional — omit it on a surface that is not inside a vault (the
+ * recording card) and the active vault answers. An unknown vault, or no vault at
+ * all, resolves with `{ entries: [] }` rather than rejecting: a completion with
+ * nothing to offer is a usable outcome, an error in a tag field is not.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function tagsVocabulary(vaultId?: string): Promise<TagVocabularyVm> {
+  return await invoke<TagVocabularyVm>("tags_vocabulary", { vaultId: vaultId ?? null });
 }
 
 /**

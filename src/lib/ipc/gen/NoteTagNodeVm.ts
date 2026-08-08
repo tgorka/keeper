@@ -2,6 +2,9 @@
 
 /**
  * One node of the tag tree.
+ *
+ * Named `Note…` because it is served by the notes surface; its contents are
+ * not notes-only (Story 42.5).
  */
 export type NoteTagNodeVm = { 
 /**
@@ -13,7 +16,8 @@ name: string,
  */
 path: string, 
 /**
- * Distinct notes in this node's whole subtree, so the number the chip shows
- * is the number of rows clicking it produces.
+ * Distinct things in this node's whole subtree — notes AND recording
+ * sessions, summed (Story 42.5) — so the number the chip shows is the
+ * number of things behind it rather than the number of one kind of thing.
  */
 count: number, children: Array<NoteTagNodeVm>, };

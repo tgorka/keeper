@@ -17,6 +17,7 @@ import {
   setSpaceFilter,
   subscribe,
   subscribeInbox,
+  tagsVocabulary,
 } from "./client";
 
 // `vi.mock` is hoisted above imports, so the mock's dependencies must be created
@@ -350,5 +351,39 @@ describe("recordingStart camera args / requestCameraPermission (Story 20.1)", ()
     invokeMock.mockResolvedValueOnce("denied");
     await expect(requestCameraPermission()).resolves.toBe("denied");
     expect(invokeMock).toHaveBeenCalledWith("request_camera_permission", undefined);
+  });
+});
+
+describe("tagsVocabulary / the raw tag field (Story 42.5)", () => {
+  it("sends the tag field as the one line the user typed, not a split list", async () => {
+    // The comma-split used to live here, which made the frontend a second place
+    // that decided what a tag is. Rust owns both the split and the canonical
+    // form now, so this wrapper must pass the field through untouched.
+    invokeMock.mockResolvedValueOnce({ state: "preflight" });
+    await recordingStart(undefined, undefined, undefined, undefined, undefined, undefined, {
+      tags: "Client/Acme , renewal",
+    });
+    expect(invokeMock).toHaveBeenCalledWith(
+      "recording_start",
+      expect.objectContaining({ metaTags: "Client/Acme , renewal" }),
+    );
+  });
+
+  it("tagsVocabulary without a vault asks for the active one", async () => {
+    // The recording metadata card is not inside a vault; omitting the id is how
+    // it says so, and `null` is how Rust hears it.
+    invokeMock.mockResolvedValueOnce({ entries: [] });
+    await expect(tagsVocabulary()).resolves.toEqual({ entries: [] });
+    expect(invokeMock).toHaveBeenCalledWith("tags_vocabulary", { vaultId: null });
+  });
+
+  it("tagsVocabulary passes an explicit vault through", async () => {
+    invokeMock.mockResolvedValueOnce({
+      entries: [{ path: "client/acme", count: 5 }],
+    });
+    await expect(tagsVocabulary("v1")).resolves.toEqual({
+      entries: [{ path: "client/acme", count: 5 }],
+    });
+    expect(invokeMock).toHaveBeenCalledWith("tags_vocabulary", { vaultId: "v1" });
   });
 });

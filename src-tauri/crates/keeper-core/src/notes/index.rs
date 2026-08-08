@@ -179,12 +179,29 @@ pub struct IndexSnapshot {
     /// entries but never changes a path, so this map survives every insertion
     /// untouched.
     id_to_path: HashMap<String, String>,
-    /// `tag path → notes under it`, where every ancestor prefix is its own key.
-    /// A note tagged `project/keeper` increments `project` and `project/keeper`
-    /// once each, so a parent's count is the number of distinct notes in its
-    /// subtree — the number the tag chip promises when you click it, and the same
-    /// set the `tag:` predicate's segment-prefix rule matches.
+    /// `tag path → how many things are under it`, where every ancestor prefix is
+    /// its own key. Something tagged `project/keeper` increments `project` and
+    /// `project/keeper` once each, so a parent's count is the number of distinct
+    /// things in its subtree — the number the tag chip promises when you click
+    /// it, and the same set the `tag:` predicate's segment-prefix rule matches.
+    ///
+    /// **Two producers feed this, and the count is their sum** (Story 42.5,
+    /// FR-143). Notes arrive through [`Self::project`] / [`Self::retract`];
+    /// recording sessions arrive through [`Self::upsert_recording_tags`] /
+    /// [`Self::remove_recording_tags`]. Both go through the same
+    /// [`Self::credit_tags`] / [`Self::debit_tags`] pair over the same
+    /// [`tag_closure`], which is what makes them one vocabulary rather than two
+    /// that agree for a while. A node that says 7 means 7 things.
     tag_counts: BTreeMap<String, u32>,
+    /// `recording session id → the normalised tags that session contributes`.
+    ///
+    /// The recording producer's equivalent of `entries`: the builder needs the
+    /// PREVIOUS tag list of a session to retract it before crediting the new
+    /// one, or re-reporting an unchanged session would inflate every count it
+    /// touches. Sessions are hundreds, their tags a handful each, so this is a
+    /// few kilobytes — and it is the only reason a recording upsert stays
+    /// O(that session's tags) instead of O(archive).
+    recording_tags: BTreeMap<String, Vec<String>>,
     /// `link key → the ids of the notes that answer to that key`. A note answers
     /// to its id, its path, its path without `.md`, its filename stem and its
     /// title, so a wikilink written any of those ways resolves.
@@ -217,13 +234,16 @@ impl IndexSnapshot {
         self.entries.binary_search_by(|e| e.path.as_str().cmp(path))
     }
 
-    /// The hierarchical tag tree with counts (FR-104).
+    /// The hierarchical tag tree with counts (FR-104), over BOTH producers
+    /// (Story 42.5).
     ///
     /// Projected from the maintained `tag_counts` map, so this is O(distinct
-    /// tags) — hundreds — and never O(notes). Building it iteratively rather than
-    /// recursively is not style: tag paths come out of user files, and a
-    /// pathologically deep one must cost stack space we chose, not stack space it
-    /// chose.
+    /// tags) — hundreds — and never O(notes + recordings). Nothing here knows
+    /// which producer contributed what, and that is the design: the tree is the
+    /// vocabulary, and a count is the sum of everything behind it. Building it
+    /// iteratively rather than recursively is not style: tag paths come out of
+    /// user files, and a pathologically deep one must cost stack space we chose,
+    /// not stack space it chose.
     pub fn tag_tree(&self) -> Vec<TagNode> {
         let mut roots: Vec<TagNode> = Vec::new();
         // The chain of ancestors currently open, deepest last. `tag_counts` is a
@@ -323,9 +343,7 @@ impl IndexSnapshot {
     /// Add one entry to the posting lists. O(its own tags + links).
     fn project(&mut self, entry: &IndexEntry) {
         self.id_to_path.insert(entry.id.clone(), entry.path.clone());
-        for tag in tag_closure(&entry.tags) {
-            *self.tag_counts.entry(tag).or_insert(0) += 1;
-        }
+        self.credit_tags(&entry.tags);
         for key in entry.link_keys() {
             self.aliases
                 .entry(key)
@@ -349,7 +367,35 @@ impl IndexSnapshot {
         if self.id_to_path.get(&entry.id) == Some(&entry.path) {
             self.id_to_path.remove(&entry.id);
         }
-        for tag in tag_closure(&entry.tags) {
+        self.debit_tags(&entry.tags);
+        for key in entry.link_keys() {
+            discard_posting(&mut self.aliases, &key, &entry.id);
+        }
+        for target in &entry.links {
+            discard_posting(&mut self.link_sources, &link_key(target), &entry.id);
+        }
+    }
+
+    /// Add one thing's tags — and every ancestor of them — to `tag_counts`.
+    ///
+    /// **One of exactly two functions that may touch `tag_counts` upward.** Both
+    /// producers call it, which is what makes "the count is the sum" structural
+    /// rather than a thing two code paths remember to agree on.
+    fn credit_tags(&mut self, tags: &[String]) {
+        for tag in tag_closure(tags) {
+            *self.tag_counts.entry(tag).or_insert(0) += 1;
+        }
+    }
+
+    /// Take one thing's tags back out of `tag_counts`, retiring any key that
+    /// reaches zero.
+    ///
+    /// **The decrement path, shared by both producers.** Retiring the key rather
+    /// than leaving a zero is what makes "removing the last carrier of a tag
+    /// removes the tag from the tree" true — and, because ancestors are credited
+    /// separately, what lets a leaf go while a sibling keeps the parent alive.
+    fn debit_tags(&mut self, tags: &[String]) {
+        for tag in tag_closure(tags) {
             // Read, decide, then write — never hold a `get_mut` borrow across the
             // `remove` that retires the same key.
             let current = self.tag_counts.get(&tag).copied().unwrap_or(0);
@@ -359,12 +405,50 @@ impl IndexSnapshot {
                 self.tag_counts.insert(tag, current - 1);
             }
         }
-        for key in entry.link_keys() {
-            discard_posting(&mut self.aliases, &key, &entry.id);
+    }
+
+    /// Insert or replace one recording session's contribution to the tag tree
+    /// (Story 42.5).
+    ///
+    /// `tags` must already be canonical — the archive normalises at its own
+    /// boundary ([`crate::archive::recordings::RecordingRow::from_manifest`]),
+    /// and re-normalising here would be the second place the rule lives. What
+    /// this owns is the posting arithmetic, and it is the same arithmetic
+    /// [`Self::upsert`] does for a note: retract the previous version first, so
+    /// re-reporting an unchanged session is idempotent and a session that lost a
+    /// tag actually loses it.
+    ///
+    /// A session whose tags all normalise away is remembered with an empty list
+    /// rather than forgotten, so a later report that gives it tags still knows
+    /// there was nothing to retract.
+    fn upsert_recording_tags(&mut self, session_id: String, tags: Vec<String>) {
+        if let Some(previous) = self.recording_tags.get(&session_id).cloned() {
+            self.debit_tags(&previous);
         }
-        for target in &entry.links {
-            discard_posting(&mut self.link_sources, &link_key(target), &entry.id);
+        self.credit_tags(&tags);
+        self.recording_tags.insert(session_id, tags);
+    }
+
+    /// Drop one recording session's contribution. A session the index never saw
+    /// is a no-op, on [`Self::remove_path`]'s terms.
+    fn remove_recording_tags(&mut self, session_id: &str) {
+        if let Some(previous) = self.recording_tags.remove(session_id) {
+            self.debit_tags(&previous);
         }
+    }
+
+    /// Every known tag path with its count, ascending — the flat vocabulary a
+    /// completion surface offers (Story 42.5, FR-143).
+    ///
+    /// The same numbers [`Self::tag_tree`] projects, from the same map, because
+    /// a completion list that disagreed with the sidebar about what exists would
+    /// be the third vocabulary. Ancestors are included as their own entries, so
+    /// `client` is offered beside `client/acme`: a person narrowing by hand
+    /// wants the parent as much as the leaf.
+    pub fn tag_vocabulary(&self) -> impl Iterator<Item = (&str, u32)> + '_ {
+        self.tag_counts
+            .iter()
+            .map(|(path, count)| (path.as_str(), *count))
     }
 }
 
@@ -405,10 +489,12 @@ fn last_tag_segment(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Every tag path a note contributes to, including ancestors, deduped.
+/// Every tag path one thing contributes to, including ancestors, deduped.
 ///
 /// A note tagged both `project` and `project/keeper` contributes *one* to
-/// `project`, not two, which is why this is a set rather than a flat count.
+/// `project`, not two, which is why this is a set rather than a flat count. The
+/// recording producer counts through the very same closure (Story 42.5), so a
+/// session and a note tagged alike weigh exactly the same in every node.
 fn tag_closure(tags: &[String]) -> BTreeSet<String> {
     let mut closure = BTreeSet::new();
     for tag in tags {
@@ -471,6 +557,38 @@ pub enum NoteDelta {
     /// `broadcast` lag, a manual rebuild. Empties the index so the cold scan that
     /// follows starts from nothing rather than merging into stale state.
     Rescan,
+}
+
+/// One change to the tag tree's SECOND producer: the recording archive (Story
+/// 42.5, FR-143).
+///
+/// A sibling of [`NoteDelta`] rather than a variant of it, because a recording
+/// is not a note and never will be an [`IndexEntry`] — it has no vault-relative
+/// path, no body, no links. What the two share is the only thing they need to:
+/// the posting arithmetic on `tag_counts`, which both reach through
+/// [`IndexBuilder`] and nothing else. There is no parallel path into the counts
+/// for a recording to drift down.
+///
+/// The tags carried here are already canonical (see
+/// [`crate::notes::tags::normalise_all`]); the archive normalises at its own
+/// boundary and the index takes it at its word, because a second normalisation
+/// here would be a second place the rule lives.
+#[derive(Debug, Clone)]
+pub enum RecordingTagDelta {
+    /// A session appeared, or its tags changed. Keyed by session id: the list
+    /// replaces whatever that session last contributed.
+    Upsert {
+        /// The session's stable id (Story 40.3), which survives a retitle.
+        session_id: String,
+        /// The session's canonical tags, deduplicated.
+        tags: Vec<String>,
+    },
+    /// A session no longer contributes tags — it left the archive, or the index
+    /// is being reseeded and this one was not in the seed.
+    Remove {
+        /// The session that stopped contributing.
+        session_id: String,
+    },
 }
 
 /// The single mutator of one vault's index.
@@ -539,6 +657,24 @@ impl IndexBuilder {
     /// The current snapshot, cheap to hand to any number of readers.
     pub fn snapshot(&self) -> Arc<IndexSnapshot> {
         Arc::clone(&self.snapshot)
+    }
+
+    /// Absorb one change from the recording producer (Story 42.5).
+    ///
+    /// The counterpart of [`Self::apply`], and incremental on the same terms:
+    /// exactly the tag buckets this session touches are edited, so absorbing one
+    /// finalized recording costs O(its own tags) and never O(archive). This is
+    /// the ONLY way a recording reaches the tag tree.
+    pub fn apply_recording_tags(&mut self, delta: RecordingTagDelta) {
+        let snapshot = Arc::make_mut(&mut self.snapshot);
+        match delta {
+            RecordingTagDelta::Upsert { session_id, tags } => {
+                snapshot.upsert_recording_tags(session_id, tags);
+            }
+            RecordingTagDelta::Remove { session_id } => {
+                snapshot.remove_recording_tags(&session_id);
+            }
+        }
     }
 }
 
@@ -785,5 +921,224 @@ mod tests {
         assert!(json.contains("\"mtimeNs\":1"), "json was: {json}");
         let back: IndexCache = serde_json::from_str(&json).expect("deserialize cache");
         assert_eq!(back.entries, cache.entries);
+    }
+
+    // -----------------------------------------------------------------------
+    // Story 42.5: the tag tree's second producer
+    // -----------------------------------------------------------------------
+
+    /// Report one recording the way the archive does: through the one
+    /// normalisation, from the text the user actually typed.
+    fn record(builder: &mut IndexBuilder, session_id: &str, typed: &[&str]) {
+        builder.apply_recording_tags(RecordingTagDelta::Upsert {
+            session_id: session_id.to_owned(),
+            tags: crate::notes::tags::normalise_all(typed.iter().copied()),
+        });
+    }
+
+    /// A note tagged the way a vault does: through the same one normalisation.
+    fn note_tagged(id: &str, path: &str, typed: &[&str]) -> IndexEntry {
+        let mut e = entry(id, path, path);
+        e.tags = crate::notes::tags::normalise_all(typed.iter().copied());
+        e
+    }
+
+    #[test]
+    fn a_recording_and_a_note_tagged_differently_land_on_one_tree_node() {
+        // AC1, asserted over the TREE and not over the normaliser: a recording
+        // tagged `Client/Acme ` and a note tagged `client/acme` are one node
+        // carrying both, not two nodes carrying one each. This is the defect the
+        // whole story exists to delete.
+        let mut builder = IndexBuilder::from_entries(vec![note_tagged(
+            "n1",
+            "notes/renewal.md",
+            &["client/acme"],
+        )]);
+        record(&mut builder, "01DEVICE-01CALL", &["Client/Acme "]);
+
+        let tree = builder.snapshot().tag_tree();
+        let client = find(&tree, "client").expect("the `client` root exists");
+        assert_eq!(
+            client.children.len(),
+            1,
+            "one node under `client`, not one per casing: {:?}",
+            client.children.iter().map(|c| &c.path).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            find(&tree, "client/acme").map(|n| n.count),
+            Some(2),
+            "the note and the recording are both under it"
+        );
+    }
+
+    #[test]
+    fn a_tag_nodes_count_is_the_sum_of_every_producer_behind_it() {
+        // AC4 and the matrix's counts row: 2 notes and 3 recordings under
+        // `client/acme` is 5. A node that says 5 means 5 things.
+        let mut builder = IndexBuilder::from_entries(vec![
+            note_tagged("n1", "a.md", &["client/acme"]),
+            note_tagged("n2", "b.md", &["client/acme/renewal"]),
+        ]);
+        record(&mut builder, "s1", &["client/acme"]);
+        record(&mut builder, "s2", &["Client/Acme"]);
+        record(&mut builder, "s3", &["client/acme/renewal"]);
+
+        let tree = builder.snapshot().tag_tree();
+        assert_eq!(find(&tree, "client/acme").map(|n| n.count), Some(5));
+        // The matrix's hierarchy row: each ancestor is counted once per thing,
+        // so the parent is 5 as well — not 5 plus the two that named a child.
+        assert_eq!(find(&tree, "client").map(|n| n.count), Some(5));
+        assert_eq!(find(&tree, "client/acme/renewal").map(|n| n.count), Some(2));
+    }
+
+    #[test]
+    fn removing_the_last_recording_under_a_leaf_takes_the_leaf_and_leaves_the_parent() {
+        // AC3 and the matrix's last-recording-removed row. The sibling is what
+        // makes this a real test: a decrement that took the parent with the leaf
+        // would also pass an assertion that only checked the leaf.
+        let mut builder = IndexBuilder::new();
+        record(&mut builder, "s1", &["client/acme"]);
+        record(&mut builder, "s2", &["client/other"]);
+        assert!(find(&builder.snapshot().tag_tree(), "client/acme").is_some());
+
+        builder.apply_recording_tags(RecordingTagDelta::Remove {
+            session_id: "s1".to_owned(),
+        });
+
+        let tree = builder.snapshot().tag_tree();
+        assert!(
+            find(&tree, "client/acme").is_none(),
+            "the leaf's last carrier left, so the leaf left"
+        );
+        assert_eq!(
+            find(&tree, "client").map(|n| n.count),
+            Some(1),
+            "the sibling keeps the parent alive, at the sibling's count"
+        );
+        assert!(find(&tree, "client/other").is_some());
+
+        // And the last carrier of the parent takes the whole branch.
+        builder.apply_recording_tags(RecordingTagDelta::Remove {
+            session_id: "s2".to_owned(),
+        });
+        assert!(builder.snapshot().tag_tree().is_empty());
+    }
+
+    #[test]
+    fn a_note_keeps_a_tag_alive_after_its_last_recording_leaves() {
+        // The cross-producer half of AC3: the decrement is over ONE map, so a
+        // producer retracting its last carrier must not remove a tag the other
+        // producer still carries.
+        let mut builder =
+            IndexBuilder::from_entries(vec![note_tagged("n1", "a.md", &["client/acme"])]);
+        record(&mut builder, "s1", &["client/acme"]);
+        builder.apply_recording_tags(RecordingTagDelta::Remove {
+            session_id: "s1".to_owned(),
+        });
+
+        let tree = builder.snapshot().tag_tree();
+        assert_eq!(
+            find(&tree, "client/acme").map(|n| n.count),
+            Some(1),
+            "the note still carries it"
+        );
+    }
+
+    #[test]
+    fn re_reporting_a_session_replaces_its_tags_instead_of_adding_them() {
+        // Every recording is reported twice in the ordinary course of things —
+        // once at start and once at finalize — and rebuilds report it again.
+        // Without the retract-first, one session would count as three.
+        let mut builder = IndexBuilder::new();
+        record(&mut builder, "s1", &["client/acme"]);
+        record(&mut builder, "s1", &["client/acme"]);
+        assert_eq!(
+            find(&builder.snapshot().tag_tree(), "client/acme").map(|n| n.count),
+            Some(1),
+            "the same session reported twice is still one session"
+        );
+
+        // A session whose tags changed between the two reports gives the old one
+        // back rather than keeping both.
+        record(&mut builder, "s1", &["internal"]);
+        let tree = builder.snapshot().tag_tree();
+        assert!(
+            find(&tree, "client/acme").is_none(),
+            "the tag it no longer carries is gone"
+        );
+        assert_eq!(find(&tree, "internal").map(|n| n.count), Some(1));
+    }
+
+    #[test]
+    fn a_recording_whose_tags_all_normalise_away_contributes_no_node() {
+        // The matrix's empty-after-normalising row, at the producer's end: `  `
+        // and `///` are not tags, so they are not an empty node in the sidebar.
+        let mut builder = IndexBuilder::new();
+        record(&mut builder, "s1", &["  ", "///", "#---"]);
+        assert!(
+            builder.snapshot().tag_tree().is_empty(),
+            "nothing normalised, so nothing was counted"
+        );
+
+        // The session is still known, so giving it real tags later retracts
+        // nothing and counts once.
+        record(&mut builder, "s1", &["Acme", "acme"]);
+        assert_eq!(
+            find(&builder.snapshot().tag_tree(), "acme").map(|n| n.count),
+            Some(1),
+            "the duplicate collapsed before it was ever counted"
+        );
+    }
+
+    #[test]
+    fn the_flat_vocabulary_is_the_tree_by_another_projection() {
+        // The completion surface and the sidebar must never disagree about what
+        // exists or how many carry it, which is only guaranteed while both read
+        // the one posting map.
+        let mut builder =
+            IndexBuilder::from_entries(vec![note_tagged("n1", "a.md", &["client/acme/renewal"])]);
+        record(&mut builder, "s1", &["Client/Acme"]);
+        let snapshot = builder.snapshot();
+
+        let vocabulary: Vec<(String, u32)> = snapshot
+            .tag_vocabulary()
+            .map(|(path, count)| (path.to_owned(), count))
+            .collect();
+        assert_eq!(
+            vocabulary,
+            vec![
+                ("client".to_owned(), 2),
+                ("client/acme".to_owned(), 2),
+                ("client/acme/renewal".to_owned(), 1),
+            ],
+            "ancestors are offered too, ascending, with the tree's own counts"
+        );
+
+        let tree = snapshot.tag_tree();
+        for (path, count) in &vocabulary {
+            assert_eq!(
+                find(&tree, path).map(|n| n.count),
+                Some(*count),
+                "`{path}` disagrees between the vocabulary and the tree"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rescan_empties_the_recording_postings_with_everything_else() {
+        // `Rescan` means "everything I believe is suspect". Leaving recording
+        // postings behind would make the reconciler's reseed double them.
+        let mut builder = IndexBuilder::new();
+        record(&mut builder, "s1", &["client/acme"]);
+        builder.apply(NoteDelta::Rescan);
+        assert!(builder.snapshot().tag_tree().is_empty());
+
+        // And the emptied index has forgotten the session, so a reseed that
+        // reports it again counts it once rather than refusing to.
+        record(&mut builder, "s1", &["client/acme"]);
+        assert_eq!(
+            find(&builder.snapshot().tag_tree(), "client/acme").map(|n| n.count),
+            Some(1)
+        );
     }
 }
