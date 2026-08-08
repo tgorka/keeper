@@ -520,3 +520,37 @@ development_status:
 # EPIC 34 IS NOW AUDITED, and the audit is NOT clean. See deferred-work for the
 # entries it produced; the two blocking findings are recorded there and are not
 # fixed by this stack.
+
+# ── 2026-08-08: epic 34's thirteen unreviewed stories have now had their pass ──
+#
+# 34-1..34-13 shipped in 0.6.2/0.6.3 without a code-review pass, which is what
+# `review` has meant for them since. Four layers have now audited them against
+# their frozen intent-contracts — durability (34-9/11/13), a security review
+# (34-4/7/12), sync-visibility (34-5/6/8/10) and window-chrome (34-1/2/3):
+#
+#   VERDICT: 2 correct (34-11, 34-6), 11 incorrect.
+#
+# The same shape the 34-14..34-19 pass produced. Three blocking findings, all
+# user-affecting, all fixed in `fix/epic-34-review-findings` (#61):
+#
+#   34-9   the sticky wake re-armed a 1 Hz full-tree walk for exactly the
+#          directories the story added to tier 0 — the exclusion was applied
+#          downstream of the walk it existed to prevent.
+#   34-13  the LFS guard discriminated on the blob's SHAPE, not the path's
+#          ROUTING, so a tracked text file containing a pointer had real edits
+#          dismissed permanently.
+#   34-8/  a failed pass stranded `phase`, leaving a half-full bar and a frozen
+#   34-10  rate over a folder that had permanently stopped, directly above the
+#          error text 34-10 added.
+#
+# Everything not fixed is filed as DW-132..DW-161 with reasons a future reader
+# can act on. The ledger is now 157 entries, 125 open.
+#
+# These thirteen stay `review` until #61 merges, then they are `done` — the same
+# rule the 34-14..34-19 group followed after its own pass shipped as v0.6.4.
+#
+# The recurring lesson, worth writing down because it has now cost two rounds:
+# every story that came back `incorrect` asserts its central claim through a
+# pure function or a hand-placed input while the risk lives in the impure shell.
+# 34-11 is the counter-example and the model — it SIGKILLs a real binary and
+# validates that its own fixture reached the states it claims to cover.
