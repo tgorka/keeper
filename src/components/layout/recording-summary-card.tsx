@@ -27,8 +27,20 @@
  * still recording, an exhausted ordinal run) prints the Rust-authored sentence
  * beside the field it is about, with the typed text left standing to be
  * corrected — the same treatment the Destination card gives a refused template.
+ *
+ * Story 42.4 makes this the surface where a recording gets written about. The
+ * minute a session finalizes is the entire window in which anyone will note
+ * what it was FOR, and this card is what is on screen for that minute — so the
+ * composed note stub is presented inside it, cursor already in the body
+ * (UX-DR51), and Escape closes it. Only on the `completion` variant: a
+ * crash-salvaged session surfaces hours later, which is not that minute, and
+ * the recovery scan deliberately never resolves a stub for one. The stub is
+ * strictly additive — a session whose stub could not be written shows its
+ * summary exactly as before, because finalize already succeeded and this card
+ * must keep saying so.
  */
 import { useEffect, useId, useRef, useState } from "react";
+import { RecordingNoteStub } from "@/components/recording/recording-note-stub";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -373,6 +385,17 @@ export function RecordingSummaryCard({
             {effectiveFolder}
           </p>
         </div>
+        {/* The note stub (Story 42.4, UX-DR51) — after the outcome, before the
+            actions: what was saved is the first thing the user reads, and the
+            invitation to write about it is the next. Outside the live region
+            above for the same reason the rename editor is: a textarea inside an
+            aria-atomic `role="status"` re-announces the whole card on every
+            keystroke. Deliberately NOT keyed on the folder: a rename MOVES the
+            session (Story 40.4) and would remount the editor mid-sentence. The
+            stub itself carries the immutable session id, and the editor uses it
+            to tell "this session, re-resolved at its new path" from "a
+            different session in this slot". */}
+        {!recovered && <RecordingNoteStub folder={effectiveFolder} />}
         <div className="flex items-center gap-2">
           {canReveal && (
             <Button

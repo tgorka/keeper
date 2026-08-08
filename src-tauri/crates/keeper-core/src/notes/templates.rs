@@ -105,21 +105,29 @@ fn resolve(token: &str, ctx: &TemplateCtx, stamp: Option<&Stamp>) -> Resolved {
 
 /// A wall-clock instant, decomposed. No timezone maths happens here — the shell
 /// already resolved the offset, and this only ever reformats what it was given.
+///
+/// Crate-visible rather than private because Story 42.4's recording-note stub
+/// needs exactly this and nothing more: the manifest hands it `started_at` and
+/// `ended_at` as RFC 3339 strings whose offset the shell already applied, and
+/// the stub wants the calendar fields back out of them. Duplicating the slicing
+/// there would be a second parser for a format keeper itself writes — and the
+/// two would eventually disagree about what `2026-08-08T00:30:00+02:00` is the
+/// date of, which is the one thing a note's filename must not be wrong about.
 #[derive(Debug, Clone, Copy)]
-struct Stamp {
-    year: i32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-    second: u32,
+pub(crate) struct Stamp {
+    pub(crate) year: i32,
+    pub(crate) month: u32,
+    pub(crate) day: u32,
+    pub(crate) hour: u32,
+    pub(crate) minute: u32,
+    pub(crate) second: u32,
 }
 
 impl Stamp {
     /// Slice an RFC 3339 timestamp into fields. Deliberately positional: the
     /// format is fixed-width by specification, and a parser combinator here
     /// would be more code defending against inputs keeper itself produces.
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         let bytes = s.as_bytes();
         if bytes.len() < 10 || bytes[4] != b'-' || bytes[7] != b'-' {
             return None;

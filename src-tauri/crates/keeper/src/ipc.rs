@@ -27,6 +27,10 @@ use keeper_core::error::{
     MediaError, PlatformError, RecordingError, SendError, SignalError, TimelineError,
     VerificationError,
 };
+#[cfg(desktop)]
+use keeper_core::notes::frontmatter::Frontmatter;
+#[cfg(desktop)]
+use keeper_core::notes::recording_note::{self, NoteStub, SessionFacts};
 use keeper_core::notes::NotesError;
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
@@ -51,11 +55,11 @@ use keeper_core::vm::{
     IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
     NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
     PaletteResultsVm, PingVm, Provider, RecordingDestinationKind, RecordingDurabilityState,
-    RecordingDurabilityVm, RecordingFilterVm, RecordingHitVm, RecordingPathPreviewVm,
-    RecordingPermissionVm, RecordingProfileVm, RecordingSettingsVm, RecordingSourcesVm,
-    RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState, RemoteDraftVm,
-    ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm, SearchHitVm,
-    SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch, TypingBatch,
+    RecordingDurabilityVm, RecordingFilterVm, RecordingHitVm, RecordingNoteStubVm,
+    RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm, RecordingSettingsVm,
+    RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState,
+    RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm,
+    SearchHitVm, SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch, TypingBatch,
     VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
@@ -5575,6 +5579,18 @@ impl RecordingSink {
             sync.port
                 .request_push(&sync.profile_id, RecordingPushTrigger::SessionEnd);
         }
+        // Story 42.4 (FR-142): the minute the recording stops is the entire
+        // window in which anything will ever be written about it, so the note
+        // stub is composed and written HERE — after the manifest, because it is
+        // composed from the manifest's own reconciled facts rather than from a
+        // second reading of the session, and last, because it is the only thing
+        // in this method the session does not depend on. Best-effort throughout:
+        // see `write_recording_note_stub` for why a note that cannot be written
+        // is never a recording failure.
+        note_stub_at_finalize(
+            &self.manifest,
+            self.sync.as_ref().map(|sync| sync.profile_id.as_str()),
+        );
     }
 }
 
@@ -7460,6 +7476,621 @@ pub async fn recording_session_summary(folder: String) -> Result<RecordingSummar
     Err(to_ipc_error(CoreError::Unsupported(
         "recording session summaries are desktop-only".to_owned(),
     )))
+}
+
+// ---------------------------------------------------------------------------
+// The recording note stub (Story 42.4, FR-142)
+// ---------------------------------------------------------------------------
+
+/// The vault subtree a session's note stub is written into.
+///
+/// It cannot be the recordings folder, even when one profile holds both:
+/// `RecordingsConfig::validate` refuses a recordings root that overlaps the
+/// vault, so "written through the notes writer" necessarily means a SIBLING
+/// subtree of the vault, and this is it. That refusal is also what makes the
+/// join safe without a second containment check — the two roots provably do not
+/// nest.
+#[cfg(desktop)]
+const RECORDING_NOTES_DIR: &str = "recordings";
+
+/// How much of a candidate note is read to decide whether it is a session's
+/// stub. Frontmatter is the first thing in a file and keeper's own block is a
+/// few hundred bytes, so a note whose block does not fit in this is — by that
+/// very fact — not one keeper composed. The cap matters because the vault
+/// subtree is a real directory a user may put real notes in, and identifying one
+/// stub must not mean reading all of them.
+#[cfg(desktop)]
+const STUB_HEAD_BYTES: u64 = 8 * 1024;
+
+/// Where one session's stub lives, and what its paths are measured against.
+#[cfg(desktop)]
+struct StubDestination {
+    /// The directory holding the stub. Read for the taken-name set, and scanned
+    /// to find an existing stub.
+    dir: PathBuf,
+    /// What every relative path in and about the stub is relative to.
+    ///
+    /// The synced folder for a vault destination, the session folder's parent
+    /// otherwise. FR-145's anchor in both cases: the widest directory that gets
+    /// cloned to the other machine as one unit, so a note that points at its
+    /// recording still points at it there.
+    anchor: PathBuf,
+    /// The vault to write through, when the destination is one. `None` is not a
+    /// degrade — it is the ordinary plain-folder destination.
+    vault: Option<crate::notes_vault::Vault>,
+}
+
+/// Resolve where a session's stub goes.
+///
+/// Split from the registry lookup ([`session_vault`]) so the DECISION is a pure
+/// function of two values a test can hand it. The registry and the sync engine
+/// are process-wide singletons; a destination rule that could only be exercised
+/// through them would be a rule nothing ever checked.
+#[cfg(desktop)]
+fn stub_destination(beside: &Path, vault: Option<crate::notes_vault::Vault>) -> StubDestination {
+    match vault {
+        Some(vault) => StubDestination {
+            dir: vault.root.join(RECORDING_NOTES_DIR),
+            anchor: vault.local_path.clone(),
+            vault: Some(vault),
+        },
+        None => StubDestination {
+            dir: beside.to_path_buf(),
+            anchor: beside.to_path_buf(),
+            vault: None,
+        },
+    }
+}
+
+/// The indexed vault for a destination profile, if it is one.
+///
+/// The degrade the spec names is the middle case, and it is the reason this is
+/// not a bare registry lookup: a profile that IS flagged as a vault but has no
+/// indexed vault (the registry is rebuilt when the profile set changes, and a
+/// finalize can land before that) is a vault destination that did not resolve.
+/// That is logged and the stub goes beside the session folder — which is the
+/// spec's instruction, and the opposite of guessing at a vault root.
+///
+/// A profile that is simply not a vault is not a degrade and says nothing.
+#[cfg(desktop)]
+fn session_vault(profile_id: &str) -> Option<crate::notes_vault::Vault> {
+    if let Some(vault) = crate::notes_vault::vault(profile_id) {
+        return Some(vault);
+    }
+    let flagged = crate::sync::engine_if_open()
+        .and_then(|engine| engine.list_profiles().ok())
+        .is_some_and(|profiles| {
+            profiles
+                .iter()
+                .any(|profile| profile.id == profile_id && profile.notes.is_some())
+        });
+    if flagged {
+        tracing::warn!(
+            profile = %profile_id,
+            "recording note: this destination holds a notes vault but no indexed vault resolved \
+             for it, so the stub is written beside the session folder instead"
+        );
+    }
+    None
+}
+
+/// The enclosing sync profile's id for a session folder.
+///
+/// The commands have only a folder, where the sink has the session's own
+/// destination profile. The two agree by construction: Story 41.2 refuses a
+/// plain-folder destination that sits inside a synced profile's tree, so a
+/// session folder is inside a profile's tree exactly when that profile was its
+/// destination.
+#[cfg(desktop)]
+fn stub_profile_id(folder: &Path) -> Option<String> {
+    let engine = crate::sync::engine_if_open()?;
+    crate::sync::profile_for_path(&engine, folder)
+        .ok()
+        .flatten()
+        .map(|profile| profile.id)
+}
+
+/// The session's immutable identity (Story 40.3), or `None` for a manifest that
+/// predates it.
+///
+/// No identity means no stub. A `session:` link that was a guess — a path, or an
+/// id derived from one — would break at the first retitle, and the note would
+/// then point at nothing while looking like it pointed at something.
+#[cfg(desktop)]
+fn stub_session_id(manifest: &SessionManifest) -> Option<&str> {
+    manifest.meta.as_ref()?.session_id.as_deref()
+}
+
+/// An RFC 3339 stamp as epoch milliseconds.
+///
+/// The composer needs both this and the string it came from: the string carries
+/// the local calendar the note's date must be right about, this carries the
+/// absolute instant its duration must be measured from. Parsed here because
+/// `keeper-core` has no calendar library and is not acquiring one (AD-55).
+#[cfg(desktop)]
+fn stub_epoch_ms(stamp: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(stamp)
+        .ok()
+        .map(|at| at.timestamp_millis())
+}
+
+/// Compose one session's stub from its manifest. Pure but for reading the
+/// manifest it is handed — every byte of IO is in this module's callers.
+#[cfg(desktop)]
+fn compose_stub(
+    manifest: &SessionManifest,
+    dest: &StubDestination,
+    taken: &[String],
+) -> Option<NoteStub> {
+    let meta = manifest.meta.as_ref()?;
+    let session_id = meta.session_id.as_deref()?;
+    let relative_folder = relative_session_path(&dest.anchor, manifest.folder());
+    Some(recording_note::compose(
+        &SessionFacts {
+            session_id,
+            title: meta.title.as_deref(),
+            started_at: manifest.started_at.as_deref(),
+            ended_at: manifest.ended_at.as_deref(),
+            started_ms: manifest.started_at.as_deref().and_then(stub_epoch_ms),
+            ended_ms: manifest.ended_at.as_deref().and_then(stub_epoch_ms),
+            participants: meta.participants.as_deref(),
+            tags: meta.tags.as_deref().unwrap_or(&[]),
+            relative_folder: relative_folder.as_deref(),
+        },
+        taken,
+    ))
+}
+
+/// The file names already in the stub's directory — the set
+/// [`recording_note::compose`] picks a free name against.
+///
+/// **This directory read is the whole of AC5.** Two sessions stopped in the same
+/// minute share a minute-resolution stamp, so a stamp is not a name; only what
+/// is actually on disk can say which names are gone. Inside a vault this is
+/// `notes_vault::siblings`, the same helper `create_note` uses, so a stub and a
+/// hand-made note cannot disagree about whether a name is free.
+#[cfg(desktop)]
+fn stub_taken_names(dest: &StubDestination) -> Vec<String> {
+    match dest.vault.as_ref() {
+        Some(vault) => crate::notes_vault::siblings(vault, RECORDING_NOTES_DIR),
+        None => std::fs::read_dir(&dest.dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// The head of a file, capped at [`STUB_HEAD_BYTES`]. Lossy, because a cap can
+/// land mid-character and the only question being asked of these bytes is what
+/// the `session:` field says.
+#[cfg(desktop)]
+fn stub_head(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(STUB_HEAD_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
+    Some(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// The stub for `session_id` in one directory, found by reading the FRONTMATTER
+/// rather than by guessing the filename.
+///
+/// The filename carries a collision counter, so it is not derivable — but the
+/// `session:` field is exact, and it is the same field a retitle leaves alone.
+/// Sorted before choosing, so the impossible case of two files claiming one
+/// session resolves the same way on every run instead of following `read_dir`.
+#[cfg(desktop)]
+fn find_stub(dir: &Path, session_id: &str) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("md"))
+        .filter(|path| {
+            stub_head(path).is_some_and(|head| {
+                Frontmatter::parse(&head).0.as_string("session") == Some(session_id)
+            })
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// [`find_stub`] over both places a stub can be.
+///
+/// The resolved destination first, then beside the session folder. The second
+/// look is not redundancy for its own sake: a profile that gains or loses its
+/// notes flag between the finalize that wrote the stub and the card that shows
+/// it would otherwise orphan a real file the user can no longer dismiss.
+#[cfg(desktop)]
+fn locate_stub(folder: &Path, dest: &StubDestination, session_id: &str) -> Option<PathBuf> {
+    if let Some(found) = find_stub(&dest.dir, session_id) {
+        return Some(found);
+    }
+    let beside = folder.parent()?;
+    if beside == dest.dir {
+        return None;
+    }
+    find_stub(beside, session_id)
+}
+
+/// Write the stub's bytes, through the notes writer when it lands in a vault.
+///
+/// Through `notes_vault::write_note` is what makes the vault case appear in the
+/// notes index — the containment check, the parent creation and the atomic
+/// replace all come with it. Outside a vault there is no writer to reach and no
+/// index to appear in, so this is a plain write to a plain folder.
+///
+/// Both halves fail as a [`NotesError`], so a save that could not land reaches
+/// the surface through the same funnel as every other note write in the app
+/// rather than through a second mapping invented here. The message names the
+/// FILE, never the path: this also runs on the finalize path, where everything
+/// is logged.
+#[cfg(desktop)]
+fn write_stub(dest: &StubDestination, path: &Path, contents: &str) -> Result<(), NotesError> {
+    let in_vault = dest.vault.as_ref().and_then(|vault| {
+        let rel = relative_session_path(&vault.root, path)?;
+        Some((vault, rel))
+    });
+    if let Some((vault, rel)) = in_vault {
+        return crate::notes_vault::write_note(vault, &rel, contents);
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| NotesError::Name(format!("{name}: {error}")))?;
+    }
+    std::fs::write(path, contents).map_err(|error| NotesError::Name(format!("{name}: {error}")))
+}
+
+/// "This recording has no identity, so there is no note to file against it."
+///
+/// Shared by the two commands that must refuse rather than shrug: a save with
+/// nowhere to go loses the words, so it is an error, and the same sentence
+/// covers both places the identity can turn out to be missing.
+#[cfg(desktop)]
+fn no_session_identity() -> IpcError {
+    to_ipc_error(CoreError::Unsupported(
+        "this recording has no session identity, so a note cannot be filed against it".to_owned(),
+    ))
+}
+
+/// Project a stub on disk into the VM the stop surface renders.
+///
+/// `contents` is what the FILE holds, not what the composer would produce, so a
+/// stub the user has already saved comes back as they left it and a re-seeded
+/// draft can never resurrect text they deleted.
+#[cfg(desktop)]
+fn note_stub_vm(
+    path: &Path,
+    dest: &StubDestination,
+    session_id: &str,
+    contents: String,
+) -> RecordingNoteStubVm {
+    let (_, block_end) = Frontmatter::parse(&contents);
+    // The blank separator line belongs to the block, not to the prose — the same
+    // `+ 1` `create_note` applies to its caret hint. CRLF costs two, and a file
+    // rewritten without a separator (or without frontmatter at all) costs none,
+    // so this is measured rather than assumed.
+    let rest = &contents[block_end..];
+    let body = block_end
+        + if rest.starts_with("\r\n") {
+            2
+        } else if rest.starts_with('\n') {
+            1
+        } else {
+            0
+        };
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    RecordingNoteStubVm {
+        // UTF-16 code units, because the surface slices `contents` at this index
+        // with JavaScript string semantics. Converted here, once, so a non-ASCII
+        // title cannot split the block in the wrong place.
+        body_offset: contents[..body].encode_utf16().count() as u32,
+        // Never absolute, and never a placeholder: the surface prints this when
+        // a dismissal keeps the note. Falls back to the bare name for a stub
+        // found outside the anchor, which is still a true thing to call it.
+        relative_path: relative_session_path(&dest.anchor, path)
+            .unwrap_or_else(|| filename.clone()),
+        filename,
+        contents,
+        in_vault: dest.vault.is_some(),
+        session_id: session_id.to_owned(),
+        path: path.to_string_lossy().into_owned(),
+    }
+}
+
+/// Compose and write one session's stub at finalize — **best-effort, always**.
+///
+/// Every failure below is a log line and a return. Finalize has already
+/// succeeded by the time this runs: the segments are on disk, the manifest is
+/// written, the row is completed. A note that could not be written is a note
+/// that could not be written; turning it into a recording failure would tell the
+/// user their recording is at risk when it is not, and the snapshot the
+/// single-child start-guard keys off must never be moved by anything here.
+///
+/// A re-finalize leaves an existing stub alone. Not because a second write would
+/// fail, but because it would silently replace whatever the user had typed into
+/// the first — the one thing this story exists to capture.
+#[cfg(desktop)]
+fn write_recording_note_stub(manifest: &SessionManifest, dest: &StubDestination) {
+    let Some(session_id) = stub_session_id(manifest) else {
+        tracing::debug!(
+            "recording note: this session carries no identity, so no stub is composed — a \
+             `session:` link that was a guess would be worse than no note"
+        );
+        return;
+    };
+    if locate_stub(manifest.folder(), dest, session_id).is_some() {
+        tracing::debug!(
+            session = %session_id,
+            "recording note: this session already has a stub, so a second is not written"
+        );
+        return;
+    }
+    let taken = stub_taken_names(dest);
+    let Some(stub) = compose_stub(manifest, dest, &taken) else {
+        return;
+    };
+    let path = dest.dir.join(&stub.filename);
+    match write_stub(dest, &path, &stub.contents) {
+        Ok(()) => tracing::info!(
+            session = %session_id,
+            in_vault = dest.vault.is_some(),
+            "recording note: a note stub is waiting for this session"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            session = %session_id,
+            "recording note: the stub could not be written; the recording is finalized and \
+             untouched"
+        ),
+    }
+}
+
+/// The finalize hook: resolve the destination, then write. Desktop-only because
+/// a vault is a synced folder and iOS has neither.
+#[cfg(desktop)]
+fn note_stub_at_finalize(manifest: &SessionManifest, profile_id: Option<&str>) {
+    let Some(beside) = manifest.folder().parent() else {
+        tracing::warn!(
+            "recording note: this session folder has no parent, so there is nowhere to put a note \
+             beside it"
+        );
+        return;
+    };
+    let dest = stub_destination(beside, profile_id.and_then(session_vault));
+    write_recording_note_stub(manifest, &dest);
+}
+
+/// iOS records nothing and syncs no folders, so there is no session to write a
+/// note about.
+#[cfg(not(desktop))]
+fn note_stub_at_finalize(manifest: &SessionManifest, profile_id: Option<&str>) {
+    let _ = (manifest, profile_id);
+}
+
+/// Everything the three stub commands resolve before they can do anything.
+#[cfg(desktop)]
+struct StubLookup {
+    manifest: SessionManifest,
+    dest: StubDestination,
+    session_id: String,
+}
+
+/// Load a session folder and resolve where its stub would be. `None` when the
+/// session has no identity — such a session never had a stub, so every command
+/// answers "nothing here" rather than failing.
+#[cfg(desktop)]
+fn stub_lookup(folder: &Path) -> Result<Option<StubLookup>, IpcError> {
+    let manifest = SessionManifest::load(folder).map_err(|e| to_ipc_error(e.into()))?;
+    let Some(session_id) = stub_session_id(&manifest).map(str::to_owned) else {
+        return Ok(None);
+    };
+    let Some(beside) = folder.parent() else {
+        return Ok(None);
+    };
+    let dest = stub_destination(
+        beside,
+        stub_profile_id(folder).as_deref().and_then(session_vault),
+    );
+    Ok(Some(StubLookup {
+        manifest,
+        dest,
+        session_id,
+    }))
+}
+
+/// The note stub waiting for one session, or `None` when there is none (Story
+/// 42.4).
+///
+/// `None` is an ordinary answer, never an error: a stub that could not be
+/// written was logged at finalize, and a dismissed one is gone on purpose. The
+/// stop surface renders nothing in either case and the summary card stays whole.
+///
+/// `async` per AD-34-5 — this reads a directory that may be on a slow or
+/// removable volume.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_note_stub(folder: String) -> Result<Option<RecordingNoteStubVm>, IpcError> {
+    off_async_runtime(move || -> Result<Option<RecordingNoteStubVm>, IpcError> {
+        let folder = PathBuf::from(folder);
+        let Some(lookup) = stub_lookup(&folder)? else {
+            return Ok(None);
+        };
+        let Some(path) = locate_stub(&folder, &lookup.dest, &lookup.session_id) else {
+            return Ok(None);
+        };
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session = %lookup.session_id,
+                    "recording note: the stub exists but could not be read"
+                );
+                return Ok(None);
+            }
+        };
+        Ok(Some(note_stub_vm(
+            &path,
+            &lookup.dest,
+            &lookup.session_id,
+            contents,
+        )))
+    })
+    .await?
+}
+
+/// Save what the user typed (Story 42.4).
+///
+/// **The one command here whose errors are surfaced.** The words are in a
+/// textarea and nowhere else until this returns, so a swallowed failure would
+/// lose them — the exact opposite of the story's point. The stop surface prints
+/// the sentence and keeps the editor open.
+///
+/// A stub that has vanished under the surface is re-created rather than refused,
+/// for the same reason: the user's writing lands, whatever happened to the file
+/// keeper composed.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_note_stub_save(folder: String, contents: String) -> Result<(), IpcError> {
+    off_async_runtime(move || -> Result<(), IpcError> {
+        let folder = PathBuf::from(folder);
+        let lookup = stub_lookup(&folder)?.ok_or_else(no_session_identity)?;
+        let path = match locate_stub(&folder, &lookup.dest, &lookup.session_id) {
+            Some(path) => path,
+            None => {
+                let taken = stub_taken_names(&lookup.dest);
+                let stub = compose_stub(&lookup.manifest, &lookup.dest, &taken)
+                    .ok_or_else(no_session_identity)?;
+                lookup.dest.dir.join(stub.filename)
+            }
+        };
+        write_stub(&lookup.dest, &path, &contents).map_err(|error| to_ipc_error(error.into()))
+    })
+    .await?
+}
+
+/// Delete one stub if — and only if — the user never touched it. `true` when
+/// the file was deleted, `false` when it was kept.
+///
+/// # What authorises the deletion
+///
+/// One fact and nothing else: **the bytes on disk are byte-identical to the stub
+/// keeper itself composes for this session, recomposed here from the manifest.**
+/// Not a flag, not a hash the caller carries, not anything the frontend says —
+/// the command above passes only a folder, so no argument anyone could get wrong
+/// can widen what this deletes.
+///
+/// A hash stored alongside would be the obvious alternative, and it is worse in
+/// the way that matters: it is a second record of the truth, and it goes stale
+/// exactly when the file is edited outside keeper — which is the case where
+/// deleting is unrecoverable. Recomposition has no such state. Its cost is that
+/// a stub composed by an older keeper stops matching a newer one and becomes
+/// undismissable; that is the safe direction, and a dismissal happens seconds
+/// after finalize in the same build.
+///
+/// **Every uncertainty keeps the file.** Unreadable, absent frontmatter, a
+/// manifest that no longer composes, a failed delete: all `false`. Deleting a
+/// note somebody wrote is the one unrecoverable mistake available here, and an
+/// empty note left behind is merely untidy.
+///
+/// # Why this unlinks rather than trashing (NFR-30)
+///
+/// Every other vault deletion goes through `notes_vault::trash_note`, because it
+/// is removing bytes a person wrote. This one has proved, byte for byte, that
+/// nobody wrote anything: the file is exactly what keeper emitted. Trashing it
+/// would leave the empty note behind under another name, which is precisely the
+/// litter dismissing exists to prevent, and AC3 says no file remains.
+#[cfg(desktop)]
+fn dismiss_stub(lookup: &StubLookup, path: &Path) -> bool {
+    let Ok(on_disk) = std::fs::read_to_string(path) else {
+        tracing::warn!(
+            session = %lookup.session_id,
+            "recording note: the stub could not be read, so it is kept — a file keeper cannot \
+             see the contents of is never one it deletes"
+        );
+        return false;
+    };
+    // The name is irrelevant to the comparison, so the taken set is empty: only
+    // the contents decide, and a collision counter never reaches them.
+    let Some(composed) = compose_stub(&lookup.manifest, &lookup.dest, &[]) else {
+        return false;
+    };
+    if on_disk != composed.contents {
+        tracing::debug!(
+            session = %lookup.session_id,
+            "recording note: this stub is no longer what keeper composed, so it is kept"
+        );
+        return false;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                session = %lookup.session_id,
+                "recording note: the untouched stub could not be deleted, so it stays"
+            );
+            false
+        }
+    }
+}
+
+/// Dismiss the stub for one session (Story 42.4) — see [`dismiss_stub`] for what
+/// makes a deletion safe. `false` whenever the file is kept, including when
+/// there was never one to delete; the stop surface treats that as "close the
+/// card", never as a failure.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_note_stub_dismiss(folder: String) -> Result<bool, IpcError> {
+    off_async_runtime(move || -> Result<bool, IpcError> {
+        let folder = PathBuf::from(folder);
+        let Some(lookup) = stub_lookup(&folder)? else {
+            return Ok(false);
+        };
+        let Some(path) = locate_stub(&folder, &lookup.dest, &lookup.session_id) else {
+            return Ok(false);
+        };
+        Ok(dismiss_stub(&lookup, &path))
+    })
+    .await?
+}
+
+/// Mobile stubs for the Story 42.4 commands: recording is a desktop-only
+/// surface, and so is the vault a note would land in.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_note_stub(folder: String) -> Result<Option<RecordingNoteStubVm>, IpcError> {
+    let _ = folder;
+    Ok(None)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_note_stub_save(folder: String, contents: String) -> Result<(), IpcError> {
+    let _ = (folder, contents);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "recording notes are desktop-only".to_owned(),
+    )))
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_note_stub_dismiss(folder: String) -> Result<bool, IpcError> {
+    let _ = folder;
+    Ok(false)
 }
 
 /// Retitle a finished session by MOVING its folder (Story 40.4, FR-129).
@@ -14639,6 +15270,473 @@ mod tests {
         assert_eq!(
             completions[1].session_id, completions[0].session_id,
             "a duplicate finalize must key onto the same row, never a second one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- the recording note stub (Story 42.4) --------------------------------
+
+    /// A device half plus a session half, distinct per session so the two-in-a-
+    /// minute test is not secretly testing one session twice.
+    const STUB_SESSION_A: &str = "01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000";
+    const STUB_SESSION_B: &str = "01JQDEVICE0000000000000000-01JQSTUBBBBB00000000000000";
+
+    /// A sink over a session with a CHOSEN identity and title.
+    ///
+    /// [`recording_sink_indexed`] fixes both, which is right for the archive
+    /// tests and wrong here: a stub is found by its `session:` field, so two
+    /// sessions sharing one id would make the second look like a re-finalize of
+    /// the first and hide exactly the collision AC5 is about.
+    fn note_stub_sink(folder: &Path, session_id: &str, title: Option<&str>) -> RecordingSink {
+        let manifest = SessionManifest::create_with_meta(
+            folder.to_path_buf(),
+            CaptureTarget::display(None),
+            SessionDevices {
+                system_audio: true,
+                microphone: false,
+                camera: false,
+            },
+            Some(keeper_core::recording::SessionMeta {
+                session_id: Some(session_id.to_owned()),
+                title: title.map(str::to_owned),
+                participants: Some("Ada, Grace".to_owned()),
+                note: None,
+                tags: Some(vec!["standup".to_owned(), "eng".to_owned()]),
+                custom: None,
+            }),
+            Some(INDEXED_STARTED_AT.to_owned()),
+        )
+        .expect("create session folder + manifest");
+        RecordingSink {
+            machine: RecordingSession::new(),
+            manifest,
+            status: Arc::new(Mutex::new(RecordingStatusVm::idle())),
+            platform: Arc::new(CapturingPlatform::new()),
+            sync: None,
+            archive: None,
+        }
+    }
+
+    /// The `.md` names in a directory, sorted — what a human would see.
+    fn markdown_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read the stub directory")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".md"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A vault at `<local_path>/notes`, as the registry would hold one. Roots are
+    /// canonical there, so they are canonical here — on macOS `/var` is a symlink
+    /// to `/private/var`, and a test that skipped this would compare a path
+    /// against a prefix it does not literally start with.
+    fn stub_vault(local_path: &Path) -> crate::notes_vault::Vault {
+        let root = local_path.join("notes");
+        std::fs::create_dir_all(&root).expect("vault root");
+        crate::notes_vault::Vault {
+            id: "profile-under-test".to_owned(),
+            name: "tgdrive".to_owned(),
+            root,
+            local_path: local_path.to_path_buf(),
+            config: keeper_sync::profile::NotesConfig::default(),
+            excludes: Arc::new(
+                keeper_sync::exclude::ExcludeSet::new(&[]).expect("built-in excludes"),
+            ),
+        }
+    }
+
+    /// A canonical scratch root, so every `strip_prefix` in these tests compares
+    /// paths that were spelled the same way.
+    fn stub_temp_root(tag: &str) -> PathBuf {
+        scan_temp_dir(tag)
+            .canonicalize()
+            .expect("canonical scratch root")
+    }
+
+    /// AC1 at the seam that actually writes the file: stopping a recording leaves
+    /// exactly ONE stub, and its frontmatter round-trips through the notes parser
+    /// — every key read back unchanged, and the body offset exact to the byte.
+    /// Not "it parses".
+    #[test]
+    fn stopping_a_recording_leaves_one_stub_whose_frontmatter_round_trips() {
+        let root = stub_temp_root("rec-42-4-roundtrip");
+        let folder = root.join("keeper-rec session");
+        let mut sink = note_stub_sink(&folder, STUB_SESSION_A, Some("Weekly sync"));
+
+        drive_synthetic_session(&mut sink, 2);
+
+        assert_eq!(
+            markdown_names(&root),
+            vec!["2026-01-02-weekly-sync.md".to_owned()],
+            "one stub, named from the session's own title and start date"
+        );
+        let source = std::fs::read_to_string(root.join("2026-01-02-weekly-sync.md"))
+            .expect("the stub is on disk");
+        let (fm, body) = Frontmatter::parse(&source);
+
+        assert_eq!(fm.as_string("title"), Some("Weekly sync"));
+        assert_eq!(fm.as_string("date"), Some("2026-01-02"));
+        assert_eq!(fm.as_string("start"), Some("10:00"));
+        assert_eq!(fm.as_string("participants"), Some("Ada, Grace"));
+        assert_eq!(
+            fm.as_list("tags"),
+            Some(vec!["standup".to_owned(), "eng".to_owned()]),
+            "tags are carried as stored — 42.5 owns resolving them"
+        );
+        assert_eq!(
+            fm.as_string("session"),
+            Some(STUB_SESSION_A),
+            "the link carries the immutable identity a retitle leaves alone"
+        );
+        assert_eq!(
+            fm.as_string("recording"),
+            Some("keeper-rec session"),
+            "and the recording is named relative to the directory they share"
+        );
+        // The session ended when the sink said so, so these are asserted for
+        // presence rather than value — the composer's own tests fix the format.
+        assert!(fm.as_string("end").is_some(), "the end time is recorded");
+        assert!(fm.as_string("duration").is_some());
+        assert_eq!(
+            &source[body..],
+            "\n# Weekly sync\n\n",
+            "the body offset is exact and the prose is byte-identical"
+        );
+
+        // AC4, at the seam where an absolute path could actually get in: the
+        // shell knows one and the note must not.
+        assert!(
+            !source.contains(&root.to_string_lossy().into_owned()),
+            "the destination root reached the stub"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// AC5 through the real mechanism: the second stub's name comes from READING
+    /// the directory the first one is already in. Both sessions carry the same
+    /// title and the same minute-resolution start stamp, which is exactly the
+    /// input that would collide if a stamp were treated as a name.
+    #[test]
+    fn two_sessions_in_the_same_minute_get_two_stubs_and_neither_is_overwritten() {
+        let root = stub_temp_root("rec-42-4-collide");
+        let mut first = note_stub_sink(
+            &root.join("keeper-rec session a"),
+            STUB_SESSION_A,
+            Some("Weekly sync"),
+        );
+        let mut second = note_stub_sink(
+            &root.join("keeper-rec session b"),
+            STUB_SESSION_B,
+            Some("Weekly sync"),
+        );
+
+        drive_synthetic_session(&mut first, 1);
+        drive_synthetic_session(&mut second, 1);
+
+        assert_eq!(
+            markdown_names(&root),
+            vec![
+                "2026-01-02-weekly-sync-2.md".to_owned(),
+                "2026-01-02-weekly-sync.md".to_owned(),
+            ],
+            "the second stub took a free name instead of the first one's"
+        );
+        // And they are two different sessions' notes, not one written twice.
+        let one = std::fs::read_to_string(root.join("2026-01-02-weekly-sync.md")).expect("first");
+        let two =
+            std::fs::read_to_string(root.join("2026-01-02-weekly-sync-2.md")).expect("second");
+        assert_eq!(
+            Frontmatter::parse(&one).0.as_string("session"),
+            Some(STUB_SESSION_A)
+        );
+        assert_eq!(
+            Frontmatter::parse(&two).0.as_string("session"),
+            Some(STUB_SESSION_B)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The matrix's re-finalize row. What must survive is not the file but what
+    /// the user put in it, so the stub is edited first: a second write would be
+    /// invisible if the bytes were still keeper's own.
+    #[test]
+    fn a_re_finalize_leaves_an_existing_stub_alone_and_does_not_write_a_second() {
+        let root = stub_temp_root("rec-42-4-refinalize");
+        let folder = root.join("keeper-rec session");
+        let mut sink = note_stub_sink(&folder, STUB_SESSION_A, Some("Weekly sync"));
+
+        drive_synthetic_session(&mut sink, 1);
+        let path = root.join("2026-01-02-weekly-sync.md");
+        let composed = std::fs::read_to_string(&path).expect("the first stub");
+        let edited = format!("{composed}They agreed to ship on Friday.\n");
+        std::fs::write(&path, &edited).expect("the user types");
+
+        // The direct call the production path never makes (the machine rejects a
+        // second terminal event) — so the guard is proved rather than assumed.
+        sink.finalize();
+
+        assert_eq!(
+            markdown_names(&root),
+            vec!["2026-01-02-weekly-sync.md".to_owned()],
+            "a re-finalize wrote a second stub"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("still there"),
+            edited,
+            "a re-finalize overwrote what the user had written"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The matrix's write-failure row: logged, and never a recording failure.
+    /// The destination is a regular file, so `create_dir_all` refuses it on every
+    /// platform — a read-only volume would need root, and a permission bit does
+    /// not stop one.
+    #[test]
+    fn a_stub_that_cannot_be_written_is_swallowed_and_the_session_stays_finalized() {
+        let root = stub_temp_root("rec-42-4-writefail");
+        let folder = root.join("keeper-rec session");
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, b"not a directory").expect("the obstruction");
+        let mut sink = note_stub_sink(&folder, STUB_SESSION_A, Some("Weekly sync"));
+        sink.manifest
+            .set_ended_at("2026-01-02T11:00:00+02:00".to_owned());
+        sink.manifest.write().expect("terminal manifest");
+
+        let dest = StubDestination {
+            dir: blocked.clone(),
+            anchor: root.clone(),
+            vault: None,
+        };
+        // The whole assertion of "never surfaced": this returns nothing, so there
+        // is no failure for the recording path to react to.
+        write_recording_note_stub(&sink.manifest, &dest);
+
+        assert!(
+            markdown_names(&root).is_empty(),
+            "a stub appeared despite the write failing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&blocked).expect("still a file"),
+            "not a directory",
+            "the obstruction was clobbered"
+        );
+        assert!(
+            SessionManifest::load(&folder).is_ok(),
+            "the session is finalized and its manifest is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The vault branch. `RecordingsConfig::validate` refuses a recordings root
+    /// that overlaps the vault, so the stub lands in a SIBLING subtree — and this
+    /// asserts the negative too, because "in the vault" and "not in the
+    /// recordings folder" are two claims and only one of them is obvious.
+    #[test]
+    fn a_vault_destination_writes_into_a_notes_subtree_and_never_into_the_recordings_folder() {
+        let root = stub_temp_root("rec-42-4-vault");
+        let recordings = root.join("recordings");
+        std::fs::create_dir_all(&recordings).expect("recordings root");
+        let folder = recordings.join("keeper-rec session");
+        let mut sink = note_stub_sink(&folder, STUB_SESSION_A, Some("Weekly sync"));
+        sink.manifest
+            .set_ended_at("2026-01-02T11:00:00+02:00".to_owned());
+
+        let vault = stub_vault(&root);
+        let dest = stub_destination(&recordings, Some(vault.clone()));
+        write_recording_note_stub(&sink.manifest, &dest);
+
+        let landed = vault
+            .root
+            .join("recordings")
+            .join("2026-01-02-weekly-sync.md");
+        assert!(landed.is_file(), "the stub is in a subtree of the vault");
+        assert!(
+            markdown_names(&recordings).is_empty(),
+            "a note was written into the recordings folder the profile refuses to overlap"
+        );
+
+        let source = std::fs::read_to_string(&landed).expect("the stub");
+        let (fm, _) = Frontmatter::parse(&source);
+        assert_eq!(
+            fm.as_string("recording"),
+            Some("recordings/keeper-rec session"),
+            "inside a vault, the recording is named relative to the synced folder — the unit \
+             that gets cloned to the other machine"
+        );
+        assert!(
+            !source.contains(&root.to_string_lossy().into_owned()),
+            "the profile root reached the stub"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The plain-folder branch: beside the session folder, meaning in its parent
+    /// — which is also why two sessions can collide there at all.
+    #[test]
+    fn a_plain_folder_destination_writes_the_stub_beside_the_session_folder() {
+        let root = stub_temp_root("rec-42-4-beside");
+        let folder = root.join("keeper-rec session");
+        let mut sink = note_stub_sink(&folder, STUB_SESSION_A, Some("Weekly sync"));
+        sink.manifest
+            .set_ended_at("2026-01-02T11:00:00+02:00".to_owned());
+
+        let dest = stub_destination(&root, None);
+        assert_eq!(dest.dir, root, "beside means the parent, not inside");
+        write_recording_note_stub(&sink.manifest, &dest);
+
+        assert!(root.join("2026-01-02-weekly-sync.md").is_file());
+        assert!(
+            markdown_names(&folder).is_empty(),
+            "the stub went inside the session folder rather than beside it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The untitled row, end to end: a date for a title and never a blank
+    /// heading, with the filename saying the date once rather than twice.
+    #[test]
+    fn an_untitled_session_gets_a_dated_stub_with_a_real_heading() {
+        let root = stub_temp_root("rec-42-4-untitled");
+        let folder = root.join("keeper-rec 2026-01-02 10.00.00");
+        let mut sink = note_stub_sink(&folder, STUB_SESSION_A, None);
+
+        drive_synthetic_session(&mut sink, 1);
+
+        let source = std::fs::read_to_string(root.join("2026-01-02-untitled.md"))
+            .expect("an untitled session still gets a named stub");
+        let (fm, body) = Frontmatter::parse(&source);
+        assert_eq!(fm.as_string("title"), Some("2026-01-02"));
+        assert_eq!(&source[body..], "\n# 2026-01-02\n\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Dismiss deletes a stub nobody touched. `false` afterwards, because there
+    /// is nothing left to dismiss — the surface treats that as "already gone",
+    /// never as a failure.
+    #[test]
+    fn dismissing_an_untouched_stub_leaves_no_file() {
+        let root = stub_temp_root("rec-42-4-dismiss-clean");
+        let folder = root.join("keeper-rec session");
+        let mut sink = note_stub_sink(&folder, STUB_SESSION_A, Some("Weekly sync"));
+        drive_synthetic_session(&mut sink, 1);
+
+        let lookup = stub_lookup(&folder)
+            .expect("the manifest loads")
+            .expect("the session has an identity");
+        let path = locate_stub(&folder, &lookup.dest, &lookup.session_id).expect("the stub");
+
+        assert!(dismiss_stub(&lookup, &path), "an untouched stub is deleted");
+        assert!(!path.exists(), "AC3: no file remains");
+        assert!(
+            markdown_names(&root).is_empty(),
+            "and nothing was left behind under another name — no trash copy"
+        );
+        assert!(
+            locate_stub(&folder, &lookup.dest, &lookup.session_id).is_none(),
+            "a second dismissal has nothing to find"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The mistake this whole mechanism exists to make impossible. Every edit
+    /// below is one byte or one line away from what keeper composed, because a
+    /// check that only caught wholesale rewrites would not be a check.
+    #[test]
+    fn dismissing_a_stub_the_user_edited_keeps_the_file() {
+        let root = stub_temp_root("rec-42-4-dismiss-edited");
+        let folder = root.join("keeper-rec session");
+        let mut sink = note_stub_sink(&folder, STUB_SESSION_A, Some("Weekly sync"));
+        drive_synthetic_session(&mut sink, 1);
+
+        let lookup = stub_lookup(&folder)
+            .expect("the manifest loads")
+            .expect("the session has an identity");
+        let path = locate_stub(&folder, &lookup.dest, &lookup.session_id).expect("the stub");
+        let composed = std::fs::read_to_string(&path).expect("the stub");
+
+        for edit in [
+            format!("{composed}Ship on Friday.\n"),
+            format!("{composed} "),
+            composed.replace("# Weekly sync", "# Weekly sync (moved)"),
+        ] {
+            std::fs::write(&path, &edit).expect("the user types");
+            assert!(
+                !dismiss_stub(&lookup, &path),
+                "an edited stub was deleted: {edit:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("still there"),
+                edit,
+                "and it must be left exactly as they left it"
+            );
+        }
+
+        // The other direction, so the test above cannot be passing by refusing
+        // everything: restored to the composed bytes, it becomes deletable again.
+        std::fs::write(&path, &composed).expect("restore");
+        assert!(dismiss_stub(&lookup, &path));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The matrix's edit-then-save row, through the commands the surface calls.
+    /// Also the wiring proof: the getter, the writer and the dismisser agree
+    /// about which file they are all talking about.
+    #[tokio::test]
+    async fn the_stub_commands_read_save_and_then_refuse_to_delete_what_was_saved() {
+        let root = stub_temp_root("rec-42-4-commands");
+        let folder = root.join("keeper-rec session");
+        let mut sink = note_stub_sink(&folder, STUB_SESSION_A, Some("Weekly sync"));
+        drive_synthetic_session(&mut sink, 1);
+        let folder_arg = folder.to_string_lossy().into_owned();
+
+        let stub = recording_note_stub(folder_arg.clone())
+            .await
+            .expect("the getter succeeds")
+            .expect("a stub is waiting");
+        assert_eq!(stub.session_id, STUB_SESSION_A);
+        assert_eq!(stub.filename, "2026-01-02-weekly-sync.md");
+        assert_eq!(stub.relative_path, "2026-01-02-weekly-sync.md");
+        assert!(!stub.in_vault);
+        // The offset splits the file the way the surface splits it: block on one
+        // side, prose on the other, and no way to type into the block. Sliced in
+        // UTF-16 exactly as JavaScript would, so an offset that landed inside a
+        // surrogate pair fails here rather than in a textarea.
+        let units: Vec<u16> = stub.contents.encode_utf16().collect();
+        let head = String::from_utf16(&units[..stub.body_offset as usize])
+            .expect("the split lands on a character boundary");
+        assert!(
+            head.ends_with("---\n\n"),
+            "the head is keeper's block plus its separator: {head:?}"
+        );
+        let body = &stub.contents[head.len()..];
+        assert_eq!(body, "# Weekly sync\n\n");
+
+        recording_note_stub_save(folder_arg.clone(), format!("{head}{body}Ship on Friday.\n"))
+            .await
+            .expect("saving the user's words succeeds");
+
+        let saved = recording_note_stub(folder_arg.clone())
+            .await
+            .expect("the getter succeeds")
+            .expect("the stub is still there");
+        assert!(
+            saved.contents.ends_with("Ship on Friday.\n"),
+            "the getter returns what is on disk, not what would be composed"
+        );
+
+        assert!(
+            !recording_note_stub_dismiss(folder_arg)
+                .await
+                .expect("dismissing succeeds"),
+            "a saved note is kept"
+        );
+        assert!(
+            root.join("2026-01-02-weekly-sync.md").is_file(),
+            "and it is still on disk"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

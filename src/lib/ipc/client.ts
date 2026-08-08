@@ -129,6 +129,7 @@ export type { RecordingDurabilityState } from "./gen/RecordingDurabilityState";
 export type { RecordingDurabilityVm } from "./gen/RecordingDurabilityVm";
 export type { RecordingFilterVm } from "./gen/RecordingFilterVm";
 export type { RecordingHitVm } from "./gen/RecordingHitVm";
+export type { RecordingNoteStubVm } from "./gen/RecordingNoteStubVm";
 export type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 export type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 export type { RecordingProfileVm } from "./gen/RecordingProfileVm";
@@ -230,6 +231,7 @@ import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 import type { RecordingFilterVm } from "./gen/RecordingFilterVm";
 import type { RecordingHitVm } from "./gen/RecordingHitVm";
+import type { RecordingNoteStubVm } from "./gen/RecordingNoteStubVm";
 import type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 import type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 import type { RecordingProfileVm } from "./gen/RecordingProfileVm";
@@ -2071,6 +2073,55 @@ export interface RecordingSummaryVm {
  */
 export async function recordingSessionSummary(folder: string): Promise<RecordingSummaryVm> {
   return await invoke<RecordingSummaryVm>("recording_session_summary", { folder });
+}
+
+/**
+ * The note stub waiting for one session (Story 42.4, FR-142), or `null` when
+ * there is none.
+ *
+ * `null` is an ordinary answer, never a failure: a stub that could not be
+ * written was logged at finalize (the recording succeeded regardless), and a
+ * dismissed one is gone on purpose. The stop surface renders nothing in either
+ * case.
+ *
+ * `contents` is what the FILE holds, not what Rust would compose — so calling
+ * this after a save returns the user's own text, and re-seeding an untouched
+ * draft from it can never resurrect something they deleted. Split it at
+ * `bodyOffset` (UTF-16 code units, converted in Rust) to get keeper's
+ * frontmatter block and the editable body.
+ */
+export async function recordingNoteStub(folder: string): Promise<RecordingNoteStubVm | null> {
+  return await invoke<RecordingNoteStubVm | null>("recording_note_stub", { folder });
+}
+
+/**
+ * Save the note the user typed (Story 42.4).
+ *
+ * `contents` is the WHOLE file — the untouched `bodyOffset` head plus the edited
+ * body — because the frontend never owns keeper's frontmatter and must not be
+ * able to send back a mangled one.
+ *
+ * The one stub command whose errors are surfaced rather than logged: until this
+ * resolves the words exist only in the textarea, so the caller must print the
+ * {@link IpcError} sentence and keep the editor open rather than dismissing.
+ */
+export async function recordingNoteStubSave(folder: string, contents: string): Promise<void> {
+  await invoke<void>("recording_note_stub_save", { folder, contents });
+}
+
+/**
+ * Dismiss a stub, deleting it only if the user never touched it (Story 42.4).
+ * Resolves `true` when the file was deleted, `false` when it was kept.
+ *
+ * Nothing the caller passes can widen what this deletes: Rust recomposes the
+ * stub from the session's manifest and removes the file only when the bytes on
+ * disk are byte-identical to it. `false` is therefore a legitimate outcome, not
+ * an error — close the card and leave the file. Every uncertainty (unreadable
+ * file, failed delete, a stub already gone) also resolves `false`, because
+ * deleting a note somebody wrote is the one unrecoverable mistake here.
+ */
+export async function recordingNoteStubDismiss(folder: string): Promise<boolean> {
+  return await invoke<boolean>("recording_note_stub_dismiss", { folder });
 }
 
 /**

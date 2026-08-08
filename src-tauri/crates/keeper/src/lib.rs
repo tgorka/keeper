@@ -598,6 +598,9 @@ pub fn run() {
                 ipc::recording_settings_set,
                 ipc::recording_session_summary,
                 ipc::recording_retitle,
+                ipc::recording_note_stub,
+                ipc::recording_note_stub_save,
+                ipc::recording_note_stub_dismiss,
                 ipc::recovered_sessions_list,
                 ipc::recovered_session_acknowledge
             ])
