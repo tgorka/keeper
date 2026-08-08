@@ -1625,6 +1625,585 @@ reason: `gitPath = ""` in TOML deserializes to `Some(PathBuf::from(""))`, and ta
   call it instead of filtering for themselves.
 status: open
 
+### DW-132: The stale-ref-lock recovery's "a torn or half-written reference is not a state this can produce" argument holds for one competing writer, not two.
+
+origin: found by the epic-34 code review (durability layer) while auditing story 34-11, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/git/repo.rs:253-280 (the watch-not-age rule and its safety doc) + :202-243 (`release_stale_ref_locks`, wired into `open` at :73) + spec-34-11-a-kill-during-a-ref-update-must-not-strand-a-folder.md, which states the bound unconditionally
+reason: the doc reasons that removing a lock we watched for the full window cannot corrupt anything,
+  because a writer whose lock we unlinked fails its own rename with `ENOENT`. That is exactly true
+  with one other writer and false with two. Writer A holds an open fd on `HEAD.lock`; we unlink the
+  path; writer B now wins `O_EXCL` and creates a fresh `HEAD.lock`; A renames its own older, possibly
+  partial content over `HEAD`, publishing it as the reference value, and B's later rename is the one
+  that gets `ENOENT`. The result is a reference holding bytes no writer intended — the outcome the
+  argument says is unreachable.
+  It is second-order, and that is why it is deferred rather than fixed: reaching it requires our
+  judgement to already be wrong (a live writer that touched its lock file not once across the full 2 s
+  watch), and then a second writer arriving inside the microseconds between our `unlink` and A's
+  `rename`. Nothing observed, and story 34-11's real-SIGKILL matrix did not produce it. The cost of
+  leaving it is that both the spec and the source state the bound as unconditional, so the next person
+  to widen the recovery — shorten the window, extend it to a new lock class, run it somewhere other
+  than `open` — will widen it on an argument that does not carry the weight it claims. Fix, if it is
+  ever worth one: hold the recovery under a repository-wide advisory lock, or verify the lock file's
+  identity (dev/ino, or a content hash) between the last watch sample and the unlink, so the thing
+  removed is provably the thing watched. Correcting the stated bound in the doc is the cheap half and
+  should happen either way.
+status: open
+decision: correct the safety argument's stated bound rather than the code; revisit the code only if
+  the recovery is widened beyond the `open`-time, watched, per-lock shape it has today.
+
+### DW-133: The anti-hang refusal that stops a daemon spinning on a live writer's lock covers the commit path only; the fetch leg's remote-tracking ref update is unguarded, and the reasoning that makes that safe is written down nowhere.
+
+origin: found by the epic-34 code review (durability layer) while auditing story 34-11, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/git/commit.rs:316-319 (`ensure_head_unlocked`, placed immediately before `commit_as`) + src-tauri/crates/keeper-sync/src/git/repo.rs:349-366 (the refusal) + src-tauri/crates/keeper-sync/src/engine.rs:1893 (the fetch call site, which has no equivalent) + DW-120 (the upstream gix-ref loop this exists to avoid)
+reason: `release_stale_ref_locks` handles the ABANDONED lock everywhere — it walks all of `refs/`
+  recursively (repo.rs:220-247) and the durability matrix has a row for a remote-tracking lock. The
+  HELD case is different: recovery must not take a live writer's lock, so it returns, and the caller
+  has to refuse rather than walk into gitoxide's transaction, which is where DW-120's infinite loop
+  lives. `ensure_head_unlocked` performs that refusal for `HEAD` and the local branch, i.e. for the
+  commit path. `git::fetch` opens its own reference transaction over `refs/remotes/origin/<branch>`
+  and has no such pre-check. [INFERENCE] nothing has hung there because a remote-tracking edit is a
+  root edit with no `HEAD` deref, so gix-ref takes its clean-error path rather than the child-edit
+  loop that never advances its cursor — which means the fetch leg is safe by a property of gitoxide's
+  internals rather than by anything keeper does.
+  Deferred because there is no observed hang and the fix is not one line: either generalise
+  `ensure_head_unlocked` into an `ensure_refs_unlocked(paths)` called from both legs, or verify the
+  inference against gix-ref 0.66.0 and write it down beside the fetch call. The second is cheaper and
+  is the honest minimum — an invariant that holds because of an upstream implementation detail should
+  say so out loud, or the next gitoxide bump removes it silently and the symptom is a wedged daemon.
+status: open
+
+### DW-134: Stale-lock recovery watches each lock serially for a full 2 s at every `Repo::open`, and one sync pass opens the repository four times.
+
+origin: found by the epic-34 code review (durability layer) while auditing story 34-11, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/git/repo.rs:202-243 (`release_stale_ref_locks`) + :50-58 (the windows) + :73 (called unconditionally from `open`), against the four production callers: engine.rs:1819 (`open_repo`), :1893 (fetch), :3480 (prune), :3681 (status)
+reason: watch-don't-age is the right rule — a lock is stale because nobody touched it for a window,
+  not because it is old — but it is paid serially and unconditionally. Three abandoned locks cost one
+  `open` 3 x 2 s on the sync thread, and because every production entry into the repository goes
+  through `open` (which is the property that makes the recovery total, and is worth keeping), a
+  genuinely wedged repository pays that window up to four times inside a single tick. In the normal
+  case it costs nothing: a healthy repository has no locks to watch and the scan is a directory walk.
+  Not fixed because every cheap-looking fix trades away something real. Caching "this repository had
+  no locks" across opens within a tick reintroduces a staleness window exactly where crash-consistency
+  lives. Watching the locks concurrently makes the failure modes harder to reason about for a saving
+  measured in seconds-per-crash. Shortening the window weakens the liveness judgement that DW-132
+  already identifies as the load-bearing one. If this ever needs fixing the shape is a per-tick
+  recovery pass that runs once before the legs rather than inside each `open` — a restructuring of the
+  tick, not a tweak.
+status: open
+
+### DW-135: Story 34-9's headline claim — files sync when they land, in seconds rather than a poll interval — is proven by no automated test, and the one line in `tick_profile` that arms the watcher is asserted by nothing.
+
+origin: found by the epic-34 code review (durability layer) while auditing story 34-9, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/engine.rs:764 (the `ensure_watcher` call inside `tick_profile`) + the tests at :6464-6512 and :6710, which call `ensure_watcher` directly and hand-place `WatchEvent`s on the channel + spec-34-9-files-sync-when-they-land.md, whose Verification section opens "Not run here."
+reason: every watcher test in the crate reaches `ensure_watcher` by calling it, and every event test
+  puts the event on the channel by hand — deliberately, because the spec states that none of the tests
+  wait on filesystem event timing, which is a defensible choice for determinism. The consequence is
+  that the whole suite passes on a build where `tick_profile` never arms a watcher at all. The wiring
+  line is the only thing that makes the story true, and its only proof is a manual hesperia procedure
+  the spec says plainly was not run. Compare 34-11 in the same epic, which spawns the real
+  `keeper-syncd`, SIGKILLs it, and asserts the recovery out of stderr.
+  Deferred rather than fixed because what is missing is not a unit test. It is one integration test
+  that drives a real `Engine` over a real temp directory, writes a file, and asserts a commit appears
+  inside a bounded wall-clock deadline — the one shape the spec deliberately excluded, with the
+  flakiness budget that comes with it (inotify and FSEvents delivery latency, and a deadline generous
+  enough for a loaded CI box yet tight enough to fail a reverted `ensure_watcher`). That is real test
+  engineering, and it belongs beside `keeper-syncd/tests/durability_matrix.rs`, which already proves
+  the crate can afford a real-binary harness. Until it exists, "files sync when they land" is an
+  inspected property, not a defended one.
+status: open
+
+### DW-136: The watcher-lifecycle acceptance says both of a dropped watcher's threads are joined; the tests measure map cardinality, so a thread leak would be invisible to every one of them.
+
+origin: found by the epic-34 code review (durability layer) while auditing story 34-9, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/engine.rs:6464-6512 (pause, double-arm idempotence, resume, unknown profile, remove, root move, stop_all — all asserted through `armed_count`) + `watch::retire`, which hands teardown to a detached thread + spec-34-9's manual step 8 (`ls /proc/<pid>/task | wc -l`), also unrun
+reason: the acceptance criterion is about threads and the assertion is about a `HashMap`'s length.
+  `retire` detaching the teardown is what makes the gap real rather than pedantic: the map entry
+  disappears immediately, the threads exit whenever they exit, and a change that left one of them
+  blocked forever on a channel receive would keep every one of these tests green while a pause/resume
+  loop leaked two threads per cycle. The only check that would catch it is the manual thread count,
+  which nobody ran.
+  Deferred because asserting a join from outside needs a seam the type does not offer: `retire` would
+  have to return a handle, or `FolderWatcher` would have to expose an all-threads-exited signal a test
+  could await with a timeout. Either is small, but both change the public shape of the type for a
+  test, which deserves a deliberate decision rather than a drive-by. The alternative that costs
+  nothing structurally is a test that arms and retires N times and asserts the process thread count
+  returns to baseline — portable only on Linux, and precisely the manual step, automated.
+status: open
+
+### DW-137: After the wake filter lands, a build writing into a `.gitignore`d but not tier-0 directory (`target/`, `dist/`, `build/`) still sets the watch wake on every tick and still drives a 1 Hz `git status` over the whole tree.
+
+origin: residual of this batch's fix for story 34-9's blocking wake finding, reported by the fixing agent, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/engine.rs (`fold_watch_events`, the wake seam, which now filters through the profile's compiled `ExcludeSet`) + src-tauri/crates/keeper-sync/src/exclude.rs:104-117 (why `target`/`dist`/`build` are deliberately NOT tier-0 built-ins) and :132-133 (`.git/**`, which is) + DW-119, which owns that decision
+reason: the blocking finding was that the wake was set for ANY delivered event, so the five directory
+  names story 34-9 added to tier 0 could not suppress the 1 Hz re-stat they were added to prevent. The
+  fix routes the wake through the same `ExcludeSet` the stability gate uses, which closes tier 0 and
+  every per-profile pattern, and closes `.git/` for free. It cannot close `.gitignore`: consulting it
+  at this seam would put a second `.gitignore` reader in the engine, and the design's rule is that
+  `git status` is the single authority on ignore semantics. So the pathology survives for exactly the
+  names DW-119 argues must not become tier-0 built-ins — a Rust or Node build writing continuously
+  into `target/` or `dist/` wakes the engine every second, and each wake costs a full `git status`
+  that correctly finds nothing to commit.
+  Bounded and self-correcting, but the walk cost is real on a large tree, which is the entire reason
+  `next_scan_ms` exists. The resolution that does not violate the single-authority rule is to let a
+  user's own per-profile excludes cover it — they already flow into the same `ExcludeSet` — which
+  makes this a defaults-and-documentation question rather than a code one, and ties it to DW-119
+  rather than standing alone. One more uncovered case, recorded so it is not rediscovered: tier 0's
+  `.git` rules are subtree rules (`.git/**`), so an event on the bare `.git` directory node itself is
+  not matched and still wakes. Harmless and rare.
+status: open
+
+### DW-138: `EchoSuppressor` has no production callers; after this batch's doc correction it is a tested helper the shipped engine never uses.
+
+origin: residual of this batch's fix for story 34-9's EchoSuppressor finding, reported by the fixing agent, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/watch.rs — `EchoSuppressor`, `FolderWatcher::suppressor()`, the `is_suppressed` branch inside `fold_batch`, and the unit test over it. A grep for `EchoSuppressor::register` across `src-tauri` finds only tests.
+reason: the audit found three things tangled together — a module doc asserting as fact that the engine
+  registers paths before writing (it does not), a green test that reads as coverage of a live
+  invariant (it is not), and the type itself. The first two are corrected in this batch: the doc now
+  says the engine does not register, and the test is documented as a unit test of a helper production
+  does not use. The type stays, with zero callers, because story 34-9's spec deliberately declined to
+  wire registration: `git status` is authoritative about what changed, so an echo costs one fruitless
+  walk and never a wrong commit, and a suppressor the engine must keep in step with its own writes is
+  a second source of truth about the worktree.
+  Left open as a decision, not a defect. Two honest endings: delete the type and its test, on the
+  grounds that the argument against wiring it is unlikely to reverse and dead code carrying a test
+  reads as a feature; or keep it and record the condition under which it would be wired — a measured
+  echo cost the exclude filter cannot reach. What must not happen is that it sits unowned long enough
+  for someone to assume it is load-bearing, which is exactly how the module doc came to claim it was.
+status: open
+
+### DW-139: The racily-clean path the LFS false-modification guard exists to manage is exercised end to end on no platform, and the two integration tests that used to reach it were deleted.
+
+origin: found by the epic-34 code review (durability layer) while auditing story 34-13, 2026-08-07
+location: src-tauri/crates/keeper-sync/tests/lfs_roundtrip.rs (every remaining guard test asks `is_false_modification` on hand-built index state: no `status_paths`, no clock, no subprocess, no clean filter) + src-tauri/crates/keeper-sync/src/lfs/stage.rs (`is_false_modification`) + DW-121, the broken clean filter that makes the route unreachable on the shipping platform
+reason: the guard decides whether a path git reports as modified is a real edit or an artefact of a
+  racily-clean re-read. Every input that makes that question hard lives in the impure shell: git's own
+  racily-clean handling, the `filter.lfs.clean` subprocess, and per-platform `status` divergence — the
+  spec itself records Linux/ext4 and macOS/APFS disagreeing about an entry both agreed was racy. What
+  is tested, thoroughly, is the predicate's logic. What is tested nowhere is that the predicate is
+  reached with the inputs it was designed for, on the platform keeper ships to. The two tests that did
+  reach it were removed because DW-121 leaves the desktop clean filter failing on every invocation, so
+  the route cannot be driven from the app binary at all. This batch's fix narrows the guard's
+  discriminator to paths actually routed through LFS and adds tests over real on-disk repositories and
+  real `.gitattributes`, which is a genuine improvement — and still calls the predicate directly.
+  Deferred because it is downstream of DW-121: until the app binary answers `lfs clean`, an end-to-end
+  test on macOS has nothing to drive. The sequencing that closes it is DW-121 first, then one
+  integration test that commits an LFS-tracked file through a real repository with the filter
+  installed, touches it inside the same mtime second at the same size, runs a real `status_paths`, and
+  asserts the guard's verdict — on both a Linux and a macOS runner, because the divergence the spec
+  recorded is the whole reason a single-platform version of this test would mislead. Filed so that the
+  guard's REACHABILITY is not mistaken for its logic, which is well covered.
+status: open
+
+### DW-140: Whoever fixes DW-124 must not do it by re-staging — `is_false_modification` is designed to suppress exactly the signal a re-stage-based reconciler would look for.
+
+origin: found by the epic-34 code review (durability layer) while auditing story 34-13 against story 34-15's invariant, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/engine.rs:5068-5072 (the upload obligation is journaled to SQLite before the ref moves; proven at :5113-5141) + :1278 (the publish gate that holds the push until the object is on the remote) + src-tauri/crates/keeper-sync/src/lfs/stage.rs (`head_records`, which answers true for a committed pointer whose object was never uploaded) + DW-124, which owns the missing reconciliation
+reason: story 34-15's promise — a pointer is never published ahead of its object — holds because the
+  obligation is written down before the ref moves and read back from the journal, never re-derived
+  from the tree. Story 34-13's guard is safe under that regime: it dismisses a committed pointer whose
+  object is still owed, and dismissing it costs nothing, because the journal and not the working tree
+  is what drives the upload. The two facts compose into a hazard the moment the journal is not there —
+  `sync.db` lost or replaced, the profile removed and re-added, a machine restored from a backup
+  predating the commit. The tree still holds the pointer, the remote still lacks the object, and the
+  guard now prevents the scan from noticing, because `head_records` says HEAD already has this pointer
+  and the stat has not moved. Silence, permanently.
+  Not fixed here because the fix is DW-124's, not 34-13's: the recovery has to be a reconciliation
+  against the remote — do the objects these committed pointers name actually exist there? — which is
+  the same pass DW-124 needs for pointers committed with plain `git`. This entry exists to constrain
+  that fix. A reconciler built on "re-stage and see what git reports" cannot work, because this guard
+  is specifically built to keep git's report quiet. Note that this batch narrowed the guard to paths
+  genuinely routed through LFS, which shrinks the exposure to real LFS paths and does not remove it.
+status: open
+
+### DW-141: `last_sync_ms` lives only in the engine's in-memory status map, so a relaunch — or any `keeper-syncd status` invocation, which is a different process — reports "never synced" for a folder that has synced correctly for a week.
+
+origin: found by the epic-34 code review (visibility layer) while auditing story 34-10, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/engine.rs:1695-1700 (`mark_synced`, which writes only `Self::lock(&self.status)`) + :627-637 (`set_state`, its neighbour, which persists and says in a comment why) + src-tauri/crates/keeper-sync/src/db.rs, where `last_sync` has zero matches because no column exists + the tests at engine.rs:6632-6695, all three cases inside a single `Engine` instance
+reason: story 34-10 names as its own problem #2 that the UI cannot tell "never synced" from "synced,
+  nothing to do", then fixes only the half that lives in this process's memory. Its tests cannot see
+  the gap because they assert every case against one live `Engine`. The function two definitions above
+  already made the opposite choice for `state`, and explains it in a comment — "so a separate
+  `keeper-syncd status` invocation reports the truth rather than a fresh 'idle'" — which is the same
+  argument, about the same surface, for the field 34-10 added.
+  Deferred rather than fixed in this batch because it is a schema change, not a line: a `last_sync_ms`
+  column on the profile row, a migration in the `ensure_*_columns` style the crate already uses (with
+  DW-126's read-then-`ALTER` race applying to any new one), a write in `mark_synced`, a read at engine
+  open to seed the status map, and a test across two `Engine` instances over one `sync.db` — which is
+  the only test shape that could have caught this in the first place. Small, but it touches storage,
+  and it belongs with whoever next opens the schema.
+status: open
+
+### DW-142: The mechanical commit subject gained an `@device` qualifier that no spec or epic describes, while spec-34-5's I/O matrix still promises today's subject byte for byte.
+
+origin: found by the epic-34 code review (visibility layer) while auditing story 34-5, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/provenance.rs:451-479 (`mechanical_subject`) + :274-280 (`device_qualifier`) + :445-450 (the doc calling these bytes "a compatibility surface, not a detail") + src-tauri/crates/keeper-sync/src/git/commit.rs:294-304 (the call site) and :663-667 (a test comment reading "asserting the bare `sync(docs)` here would be asserting the bug") + spec-34-5-the-machine-name-the-commit-subject-and-the-knobs-that-were-hiding.md, whose I/O row promises `sync(p): 3 added, 1 modified, 1 deleted`, byte for byte
+reason: when the machine has been renamed, an empty subject template now renders
+  `sync(<profile>@<device>): …` rather than `sync(<profile>): …`. Grepping `_bmad-output` for
+  `device_qualifier` or `@device` returns nothing, so the shape appears in no planning artifact; the
+  only record that the change was intentional is a test comment saying the old form would be
+  "asserting the bug". Somebody decided the spec was wrong and left the decision in a test.
+  This is a spec-versus-code divergence, not a behavioural defect — the qualifier is arguably the
+  better product behaviour, since a subject naming the machine is more useful in a multi-device
+  history than one that does not. It is filed because these bytes are wire-visible in every repository
+  keeper touches, the code says so about itself, and `docs/sync.md` and the epic now disagree with
+  `git log`. The fix is a ruling, not a patch: amend the epic and 34-5's contract to describe the
+  qualifier and the condition under which it appears, or revert `mechanical_subject` to the documented
+  form and let the device name live only in the trailer. Whoever takes it should settle DW-143 in the
+  same sitting, because that is the same qualifier's input.
+status: open
+decision: needs an owner ruling — amend the artifacts or revert the bytes. It must not stay a test
+  comment.
+
+### DW-143: `device_qualifier` decides whether the machine "still answers to its hostname" by comparing against `Provenance.origin`, whose own doc says it may be a volume label.
+
+origin: found by the epic-34 code review (visibility layer) while auditing story 34-5, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/provenance.rs:73 (`origin` documented as "Hostname, or a volume label for a removable profile") + :274-280 (`device_qualifier`) + src-tauri/crates/keeper-sync/src/git/commit.rs:300 (the comparison) + the two live call sites, engine.rs:2019-2024 and :2600, which both pass `self.platform.host_label()`
+reason: nothing diverges today, because both callers pass a hostname. The hazard is that the field's
+  documented contract permits something else, and a caller honouring that doc would silently change
+  what the qualifier means: every commit on a removable profile would carry `@<volume label>`, and the
+  stated condition — "the user has renamed this machine" — would quietly become "this folder is on a
+  pendrive". Two documents disagree about one field and the code trusts the wrong one.
+  Deferred because it is latent and the right resolution depends on DW-142's ruling. If the qualifier
+  stays, the cheap fix is to correct `origin`'s doc to say it is the host label at these call sites,
+  or better, to pass the host label to `device_qualifier` explicitly rather than reading it out of a
+  struct field that means something wider. If the qualifier is reverted, this disappears with it.
+  Filed so the pair is settled together rather than one at a time.
+status: open
+
+### DW-144: A pure rename charges its bytes twice in the Activity list — a renamed 2 GB file reads as "Deleted 2 GB" plus "Added 2 GB".
+
+origin: found by the epic-34 code review (visibility layer) while auditing story 34-6, 2026-08-07. The story's verdict was `correct`; this is a sub-finding the reviewer asked be recorded so the behaviour is a decision rather than an accident.
+location: src-tauri/crates/keeper-sync/src/engine.rs — `record_commit_activity`, which walks `added`/`modified`/`deleted` only; `collect_stable_changes`, which measures the new path with `FileSample::of`; `removed_size`, which measures the old path from the index entry; and `ActivityKind`, which has no rename arm + spec-34-6-activity-says-what-changed-and-how-big.md, which never mentions renames
+reason: each row is individually true and no size is faked — the added row really did add those bytes
+  to the tree and the deleted row really did remove them — so this is not the defect class story 34-6
+  targets, which is a size that lies or a zero standing in for an unknown. It is a summing problem at
+  the human layer: the acceptance is about what a person can tell at a glance, and at a glance a
+  rename now reads as 4 GB of movement.
+  Not fixed because rename detection is a feature, not a repair. It wants a fifth `ActivityKind`, a
+  schema column for the old path, a detection pass over the staged change set (git's own similarity
+  detection, or an exact-oid match, which is the cheap and correct case for a pure rename), and a
+  render for it. That is a story. Until someone decides it is worth one, the honest reading of the
+  list is "what changed on disk", which is what it shows.
+status: open
+
+### DW-145: The "conflict is the only coloured row" rule in the Activity list is defended by no test; making all four rows destructive-toned would ship green.
+
+origin: found by the epic-34 code review (visibility layer) while auditing story 34-6, 2026-08-07. Story verdict `correct`; sub-finding.
+location: src/components/layout/sync-pane.tsx:373-378 (`ACTIVITY_KINDS`: three `text-muted-foreground`, conflict `text-destructive`) + src/components/layout/sync-pane.test.tsx:973-975 (`expect(new Set(glyphs).size).toBe(4)`, taken over the `class` attribute)
+reason: the only assertion in the area counts distinct glyph classes, and four distinct
+  `lucide-<name>` classes satisfy it on their own — the tone tokens live in the same attribute and are
+  never looked at. So the Design Notes' explicit rejection of "a scoreboard" in favour of a quiet log
+  is enforced by nobody: colouring every row `text-destructive` passes.
+  Deferred only because it is a one-test fix in a file three other agents were editing during this
+  batch, not because it is hard. The test to write asserts tone per kind rather than a count — three
+  rows carrying the muted token and the conflict row carrying the destructive one. Better still, have
+  it assert the RULE (exactly one kind is toned differently from the other three) rather than the
+  literal Tailwind tokens, because a token rename should not be what makes this red.
+status: open
+
+### DW-146: Every `keeper-sync` engine test opens with `let Ok(engine) = Engine::open(..) else { return; };`, so on a machine without a usable `git` the whole family reports green having exercised nothing.
+
+origin: found independently by two layers of the epic-34 code review (visibility and window chrome), 2026-08-07
+location: src-tauri/crates/keeper-sync/src/engine.rs:4142-4144, :5209, :6595 and their siblings — the idiom is crate-wide, not per-story. Among the assertions inside such bodies: the three-frame commit-progress test, the `Keeper-Source` trailer read-backs, the per-kind Activity size test, the device-rename round trip, and `a_scan_that_stages_nothing_reports_nothing`.
+reason: the guard exists for a real reason — `Engine::open` resolves a git binary, and a test box may
+  not have one — and a skipped test beats a failing one for a genuinely absent dependency. The problem
+  is that the skip is silent and indistinguishable from a pass. A CI runner with a shadowed, broken or
+  absent `git` prints the same green as one that ran every assertion, and several of epic 34's
+  strongest proofs live inside these bodies. This is the failure mode where a suite quietly stops
+  being evidence.
+  Deferred because the fix is a crate-wide convention change and should be made once, deliberately.
+  Either the harness asserts a usable git at suite start and hard-fails without one — correct for CI,
+  hostile on a contributor's box — or the skip goes through a helper that prints a loud skip line and
+  increments a counter, so a green run that exercised nothing looks different from one that did. The
+  second is the smaller change and matches how the rest of this repo treats honesty about what was and
+  was not run. Whoever takes it should convert every site in one pass; thirty half-converted skips are
+  worse than the current uniform one.
+status: open
+
+### DW-147: Opening a folder's Edit form pulls its access token out of the keychain into the webview even when the user never expands Advanced, so the read is wider than the surface that displays it.
+
+origin: found by the epic-34 security review while auditing stories 34-4 and 34-12, 2026-08-07. The broader question — whether `sync_get_credential` should be gated at all — was answered in this batch and declined, with the trust-model reasoning written into the command's own rustdoc under the heading "# Why this is not gated"; this is the narrower half that was not changed, and the rustdoc points here for it.
+location: src/components/sync/add-folder-form.tsx:573-614 (the mount effect, keyed on `profile?.id` alone, while the token field itself lives inside `{expanded && ...}`) + src-tauri/crates/keeper/src/sync_ipc.rs:1017-1038 (`sync_get_credential`, whose "# Why this is not gated" rustdoc is the decision record for the gating question and is not reopened here)
+reason: the trust-model question was settled: the webview is already trusted as the renderer, every
+  `#[tauri::command]` is equally reachable from it, and a gate on this one buys nothing against a
+  compromised renderer. That reasoning is now in the source and this entry does not reopen it. It does
+  not cover this point. The effect depends only on `profileId`, so the secret crosses IPC and lands in
+  JS memory on every Edit open — including the overwhelmingly common case where the user came to
+  rename the folder or change its cadence and never opens the section that shows a token.
+  `tokenVisible` is also mount-sticky rather than time-bounded, and hiding the keeper window via the
+  tray does not unmount the pane, so a revealed token stays legible across a hide/show cycle.
+  Deferred because it is a scope-tightening change with real UX consequences, and it is a form change
+  rather than an IPC gate. Keying the read on `expanded && profileId` makes the first expand of
+  Advanced asynchronous, which gives the field a visible empty-then-filled moment and forces the
+  existing `reading`/`unreadable` states to cover a sequence they were not written for (expand,
+  collapse, expand again). The cheaper variant is to keep the mount read and drop the value from state
+  when the disclosure collapses, which shortens the exposure without touching the load path — weaker,
+  because it still reads on an Edit open that never expands, but it is one line and it is honest about
+  what it buys. Worth doing either way: the principle that a secret is read when it is shown, not when
+  its container mounts, is cheap to hold and expensive to reintroduce. Whichever shape wins needs its
+  own tests, including one asserting that an Edit open which never expands issues no
+  `syncGetCredential` call.
+status: open
+
+### DW-148: `lfs::ssh::Credential` carries a live `Authorization` header value behind a derived `Debug`, opting out of the redaction idiom every other secret-carrying type in the crate follows.
+
+origin: found by the epic-34 security review, cross-cutting sweep over `Debug`/`Display`/`Serialize` on secret-carrying types, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/lfs/ssh.rs:254-275 (`#[derive(Debug)]` on `Credential` and on the `Answer` enum wrapping it) — contrast src-tauri/crates/keeper-sync/src/credential.rs:40-46 (`AccessToken`, hand-written, tested at :165-169), src-tauri/crates/keeper-sync/src/git/fetch.rs:62-75 (tested at :738-746), and `BatchClient` (tested at batch.rs:1119-1123 with the comment "AD-53: `BatchClient` ends up in `tracing` spans")
+reason: no live leak today. The reviewer found no `{:?}` on the type outside tests, `CachedSshAnswer`
+  has no `Debug`, and `Engine` is not `Debug`, so nothing currently formats it. The reason to record
+  it is that this crate has an explicit, tested convention for exactly this case — three sibling types
+  hand-write a redacting `Debug`, each naming NFR-26 or AD-53 as the reason, each pinned by a test
+  asserting the secret does not appear in the formatted output — and this type, which holds a
+  server-minted, immediately-spendable header value, silently opted out. The same module is otherwise
+  scrupulous: its `diagnostic` quotes ssh's stdout only up to the first `{`, precisely because a body
+  carries the minted `Authorization`, and there is a test for it. So this is an oversight, not a
+  judgement.
+  Deferred only because `lfs/ssh.rs` was outside every fix slice in this batch. The fix is about
+  fifteen lines and should copy the sibling shape exactly: a hand-written `Debug` withholding
+  `authorization` — and `href`, which is a URL that can itself carry userinfo — plus a test asserting
+  the token bytes do not appear in `format!("{:?}", ..)`. One `#[derive(Debug)]` on an enclosing type,
+  or one `tracing` field, is the whole distance between latent and real.
+status: open
+
+### DW-149: Two persistence sites survive profile removal that story 34-7's completeness enumeration did not reach — Notes vault rows, and a token the daemon reads from the environment.
+
+origin: raised by the epic-34 security review as explicitly outside story 34-7's audited scope, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/db.rs:308-320 (`delete_profile` clears journal, file_state, activity and profiles) + the `notes_vaults` rows keyed on profile id introduced by story 37.1 + src-tauri/crates/keeper-syncd/src/platform.rs (`secret_get` reads an environment variable ahead of its 0600 file store, and `secret_delete` cannot remove one)
+reason: story 34-7's load-bearing claim — remove a folder and its secret goes with it — was verified
+  and holds for the app. These are two sites the enumeration did not cover, and neither is a defect in
+  what 34-7 shipped. The first is a plain unanswered question: nobody has checked whether
+  `notes_vaults` rows outlive the profile they are keyed on. It is non-secret data, but it is the same
+  deletion-completeness question, and a stale vault row pointing at a profile id that no longer exists
+  is the kind of thing that surfaces as a baffling empty state months later. The second is arguably
+  correct rather than broken: under a `LoadCredential=`-style systemd deployment the operator supplies
+  the token out of band and it is not keeper's to delete — but it is still a place a token lives that
+  removal does not reach, and since the daemon has no removal path at all, nothing exercises it either
+  way.
+  Filed together because they are one question — what else is keyed on a profile id? — and the work is
+  one pass: enumerate every table and every store keyed on a profile, assert `delete_profile` covers
+  each, and write the answer down beside it so the next table added inherits the question. For the
+  daemon's environment fallback the resolution is documentation: say plainly that an operator-injected
+  secret is the operator's to withdraw.
+status: open
+
+### DW-150: `titlebar_drag_report` is a non-async `#[tauri::command]`, so the diagnostic for a titlebar drag performs two main-thread filesystem writes inside the very mouse-down the story exists to keep free.
+
+origin: found by the epic-34 code review (window-chrome layer) while auditing story 34-3, 2026-08-07
+location: src-tauri/crates/keeper/src/ipc.rs:6338 (`pub fn titlebar_drag_report` — neither `async` nor `#[tauri::command(async)]`) + src-tauri/crates/keeper/src/debug_log.rs:76-90 and :93-110 (`GatedMakeWriter` admits `WARN` to the file leg regardless of the toggle; `GatedWriter::write` does `create_dir_all` + `OpenOptions::open` + `write_all` per event) + src/lib/titlebar-drag.ts:66-77, which fires it twice per gesture + src-tauri/crates/keeper/src/ipc.rs:1258 (`off_async_runtime`, the helper the story's other seven commands use)
+reason: story 34-3 states the rule as AD-34-5 — no `#[tauri::command]` does filesystem work on the
+  main thread — and converts seven recording commands to satisfy it. The command it ADDED does not
+  satisfy it. By the exact Tauri rule the story quotes, a synchronous `pub fn` command runs on the
+  main thread, and this one's body is not inert: a `WARN` reaches the file leg unconditionally and
+  opens the log fresh per event. `beginTitleBarDrag` calls it once immediately after
+  `startWindowDragging()` and once on settle, so a titlebar mouse-down now costs two synchronous file
+  opens on the main thread, one of them potentially landing while `start_dragging` is inside a nested
+  AppKit drag loop.
+  Two harms, and the second is why this is worth an entry rather than a shrug. It violates the story's
+  own stated invariant, in the story's own new code. And it contaminates the instrument: the spec's
+  failure table reads "`issued` only, no settle ⇒ the Rust side never answered" as evidence of
+  main-thread blocking, and this probe is now itself a contributor to main-thread blocking, so the
+  diagnostic can indict the condition it creates. Not fixed in this batch because
+  `keeper/src/ipc.rs` was outside every fix slice. The fix is one line of signature plus the existing
+  helper — `pub async fn` with the body wrapped in `off_async_runtime`, or at minimum
+  `#[tauri::command(async)]` — and DW-156's convention test would keep it fixed.
+status: open
+
+### DW-151: The tray's "an unchanged tick writes nothing" early return can be deleted with the whole suite still green — four tests prove the pure diff, and nothing binds the diff to the renderer.
+
+origin: found by the epic-34 code review (window-chrome layer) while auditing story 34-1, 2026-08-07
+location: src-tauri/crates/keeper/src/tray.rs:1614-1617 (`if writes.is_empty() { return; }`) + :1445-1461 (`sync_writes`, the pure diff, which IS tested) + the four `sync_tray_tests` at :1955-2065 + DW-97, which owns the broader "tray and shell glue is manually validated only" gap that predates this story
+reason: story 34-1 exists because the tray repainted itself every second. The diff deciding whether to
+  repaint is pure and well tested; the line that acts on the diff is tested by nothing. Delete it and
+  `apply_sync_state` repaints on every tick again — precisely the defect the story was written to kill
+  — while four green tests continue to assert that `sync_writes` correctly reported there was nothing
+  to do. That is the failure shape worth naming: the pure core was extracted so it could be tested,
+  and the extraction moved the untestable part one layer up rather than shrinking it.
+  Genuinely hard, which is why it is deferred: `TrayIcon` cannot be constructed in a unit test, so
+  there is no way to observe "no OS write happened" without a seam. The honest remedy is to give
+  `apply_sync_state` one — a `&mut dyn FnMut(SyncWrite)` sink, or a small trait carrying the two
+  setter methods — so a test can drive the renderer with a scripted tick sequence and assert the sink
+  was called zero times. That is a modest refactor of a function that is otherwise lock-disciplined
+  and correct, and it would give DW-97's much broader gap its first foothold. What it should not be is
+  another pure-function test; there are already four.
+status: open
+
+### DW-152: Story 34-1's third acceptance criterion describes a rotating ring the shipped tray does not have, and names a test that does not exist.
+
+origin: found by the epic-34 code review (window-chrome layer) while auditing story 34-1, 2026-08-07
+location: spec-34-1-tray-glyph-stops-repainting-itself.md — AC 3, the `Transferring` I/O row, the Design Notes paragraph "Why the glyph identity is an address", and the named test `a_transfer_still_animates_through_the_memo` + src-tauri/crates/keeper/src/tray.rs:1373-1385 (`sync_glyph` takes no frame; `Transferring` maps to the single `SYNC_UPDOWN_ICON_PNG` at :1377) + :160-164, the doc recording that four direction glyphs replaced the ring and that the tray "no longer advances a frame counter"
+reason: the spec asserts the icon is written on every `Transferring` tick so the ring keeps turning,
+  and argues from that requirement to its central design point — that a memo keyed on state alone
+  would freeze the animation. There is no animation. A steady `Transferring` now writes nothing, which
+  is the correct product behaviour and is what the story wanted, and the design argument no longer has
+  a referent: state IS the key, in effect. The test the spec cites was never written; the nearest
+  existing one (`a_change_of_direction_repaints_the_icon`) proves a weaker property, that the three
+  direction glyphs are distinct assets.
+  Filed as a spec-versus-code divergence with no behavioural defect behind it. It matters because a
+  reviewer reading the frozen contract against the code reads a working feature as a regression —
+  which is exactly what happened during this audit — and because the next person to touch the memo
+  will reason from an argument about a frame counter that no longer exists. Fix: amend 34-1's contract
+  to describe the frame-free glyph set and drop the named test from its verification list, or mark the
+  AC superseded and point at tray.rs:160-164, currently the only accurate account of the decision.
+status: open
+
+### DW-153: The tray's `!installed` branch is unreachable in production, and a test asserts the state machine that would make it reachable.
+
+origin: found by the epic-34 code review (window-chrome layer) while auditing story 34-1, 2026-08-07
+location: src-tauri/crates/keeper/src/tray.rs:1458 (the `!installed` arm of `sync_writes`) + :930-931 (`store_rendered_mode` clears `sync_item` and `sync_memo` in the same two statements) + :1820-1821 (`store_sync_render` always writes both together) + the assertion at :2062-2064
+reason: `memo = Some` with `installed = false` cannot occur — the only code that drops the menu item
+  drops the memo in the same breath, at both sites. The real displacement path is `memo = None`, which
+  yields `SyncWrites::BOTH` and repaints, correctly. So the branch is harmless defensive code, and the
+  test covering it asserts a transition the type cannot reach.
+  Recorded rather than removed because the danger runs the other way. Someone simplifying
+  `store_rendered_mode` — dropping the memo clear because "clearing the item is what matters" — would
+  make the branch reachable, and would find a green test claiming the case is handled at exactly the
+  moment what the branch does needs re-deciding. Two honest endings: delete the branch and the test
+  together and let the invariant rest on the two statements that already enforce it, or keep both and
+  add a line to the test saying it documents a defended-against but unreachable state. The first is
+  cleaner; the second is safer if anyone doubts the pairing is exhaustive.
+status: open
+
+### DW-154: `BUSY_DWELL_TICKS` does not decay while recording owns the tray, so the first sync glyph after a recording ends can be up to three ticks stale.
+
+origin: found by the epic-34 code review (window-chrome layer) while auditing story 34-1, 2026-08-07
+location: src-tauri/crates/keeper/src/tray.rs:1584-1586 (the `recording_owns` early return) + :1580-1583 (the no-tray early return) + :1596 (`dwelled`, reached only past both) + spec-34-1's **Always** clause, which states `dwelled` is called once per tick
+reason: pre-existing — the early return predates story 34-1 and the story did not change it — and
+  small: the visible symptom is that the sync glyph shown immediately after a recording stops can
+  reflect a busy window that has already closed, for at most three seconds. The reason to write it
+  down is the spec clause. `dwelled` is called once per tick that the sync renderer actually reaches,
+  which during a recording is none of them, and an unstated exception like that is what the next
+  feature to add an early return will rely on without knowing it.
+  Deferred because the fix is not obviously "call `dwelled` before the early returns". The dwell
+  counter exists to hold a busy glyph on screen long enough to be seen, and whether it should decay
+  while the tray is showing something else depends on whether the dwell is about the glyph or about
+  the state. That is a product question worth thirty seconds of someone's attention and not worth
+  guessing at. Correct the **Always** clause either way; it is one sentence.
+status: open
+
+### DW-155: `render_recording` pushes `set_text` on every tick, unconditionally — the last per-tick OS write left on the tray after story 34-1.
+
+origin: found by the epic-34 code review (window-chrome layer) while auditing story 34-1, 2026-08-07
+location: src-tauri/crates/keeper/src/tray.rs:833-837 + spec-34-1 §Intent 1, which states "the recording renderer never did this — `render_recording` guards on the held `status_item`"
+reason: the guard the spec credits prevents a menu REBUILD, not a per-tick text write; the write
+  itself is unconditional. Mostly benign, because a recording's status line carries an elapsed time
+  and genuinely does change every second, so the memo story 34-1 built for the sync line would
+  suppress almost nothing here. Filed because the asymmetry is now the only one left on the tray, and
+  because the story's problem statement rests on a claim about this function that is not true —
+  anyone reasoning "the recording side already solved this, copy it" will find there is nothing to
+  copy.
+  Fix, if the tray's OS-write budget ever matters again: the same `SyncMemo` shape applied to the
+  recording line, which is cheap now that the pattern exists and would also cover a paused or
+  otherwise static recording state. Correct the spec's sentence regardless.
+status: open
+
+### DW-156: Story 34-3's two load-bearing tokens — the ACL grant that is the fix, and the `async` keyword on seven commands — are asserted by nothing.
+
+origin: found by the epic-34 code review (window-chrome layer) while auditing story 34-3, 2026-08-07
+location: src-tauri/crates/keeper/capabilities/desktop.json:15 (`core:window:allow-start-dragging`, the actual fix, unasserted) + src-tauri/crates/keeper/src/ipc.rs:5336, 5349, 5366, 5512, 5549, 5915, 6019 (the seven `async fn` commands; `the_snapshot_halves_compose_into_one_authoritative_read` exercises the halves directly and would pass unchanged if every one reverted to `pub fn`)
+reason: both are the same shape — a single token whose removal is compile-clean, behaviour-changing
+  and invisible to the suite — and both have named cheap remedies, which is why they are filed as one.
+  The capability grant is worth more. The spec's own failure table anticipates precisely the case
+  where the edit does not reach the built app (a stale `gen/schemas`, the wrong capability file), and
+  the symptom of that is silence: the window simply stops dragging, with the ACL denial visible only
+  in the app log. A three-line test that reads the JSON and asserts the permission string is present
+  turns a dropped or regenerated capability file into a red suite instead of a user's complaint. The
+  `async` half is harder, and honest about it: the repo already carries a source-level convention test
+  of the right shape (`src/test/no-user-agent-gating.test.ts`), so a scan asserting every
+  `#[tauri::command]` in the recording family is `async` or `#[tauri::command(async)]` is available —
+  and would, incidentally, have caught DW-150.
+  Deferred because `keeper/src/ipc.rs` and the capability file were outside every fix slice in this
+  batch. Take them together: one test file, two assertions, and DW-150 gets a guard rather than a
+  second occurrence.
+status: open
+
+### DW-157: The drawer-reaches-its-bottom acceptance is proven by DOM containment rather than reachability, and reachability is not provable in this harness at all.
+
+origin: found by the epic-34 code review (window-chrome layer) while auditing story 34-2, 2026-08-07. The story's verdict was `correct`; this records the bound on what its tests can show.
+location: src/components/layout/sidebar-pane.test.tsx:432-448 (containment: views and Spaces inside `[data-slot="scroll-area-viewport"]`, `Add account` outside it) and :450-458 (class pinning: `min-h-0` on the `<nav>`, `min-h-0 flex-1` on the scroller) + src/components/layout/sidebar-pane.tsx:116-270 + DW-118, the 56 px webview overhang that is the other half of the same user-visible outcome
+reason: the acceptance names a 600 px window height and a visible account footer. jsdom sets no height
+  and performs no layout, so neither is checked. What the tests do check is the right available proxy
+  and is not vacuous — moving the footer inside the scroller or the groups outside it fails, and
+  dropping either `min-h-0` fails. What passes anyway is a change that keeps every class and still
+  breaks reachability: an ancestor gaining `h-auto`, or the ScrollArea viewport losing its overflow.
+  Filed as a bounded, stated limitation rather than a defect, because the alternative would be
+  theatre. The only instrument that can settle it is the accessibility-tree re-measurement on a real
+  macOS window that DW-118 already uses — it measured `Add account` at y=1012 against a window bottom
+  of y=1000 — and that same measurement is the only thing that can separate this story's overflow fix
+  from DW-118's overhang. So the two belong to one check: whoever resolves DW-118 should re-measure
+  the footer's position at a small window height and record the number here, and if it lands on
+  screen, close this by citing the measurement rather than by writing a test that cannot see it.
+status: open
+
+### DW-158: The drag band's collapsed-rail width is untested, so a hard-coded width would restore the seam AD-34-3 exists to prevent, with a green suite.
+
+origin: found by the epic-34 code review (window-chrome layer) while auditing story 34-2, 2026-08-07
+location: src/components/layout/app-shell.tsx:195-198 (the band's drawer column switches on `sidebarCollapsed` between `SIDEBAR_WIDTH_CLASS.collapsed` (`w-12`) and `.expanded`) + src/components/layout/app-shell.test.tsx:170-214, where every band test renders expanded + src/components/layout/sidebar-pane.tsx:78 (`SIDEBAR_WIDTH_CLASS`, the single width source both sides read)
+reason: the story's structural achievement is that the width literal exists once and both the band and
+  the drawer read it, so the two columns cannot drift apart. The tests confirm the band paints per
+  column and that `pl-[78px]` is gone, but they only ever render the expanded rail. A regression that
+  restated a width inside the band — the precise thing AD-34-3 forbids — would show a mismatched seam
+  on the collapsed rail only, and every test would pass.
+  Deferred because it is one extra render in a file another slice was editing during this batch, not
+  because it is interesting. The test is: render with `sidebarCollapsed: true` and assert the band's
+  first column carries `w-12`. Better, assert it carries the same class the drawer root carries in the
+  same state, so the test pins the RULE — one source of width — rather than the current value.
+status: open
+
+### DW-159: The drag band's 28 px height is a bare `h-7` restated in prose one line below, with nothing keeping the two in step.
+
+origin: found by the epic-34 code review (window-chrome layer) while auditing story 34-2, 2026-08-07
+location: src/components/layout/app-shell.tsx:189 (`h-7`) and :191 (the biome-ignore comment, which describes "an empty 28px strip")
+reason: below the bar for an exported constant — one literal, one file, and the band is the only thing
+  that reserves the inset, which is the property the story was actually about. The defect is the prose
+  copy: change `h-7` and the comment lies silently, and a comment naming a pixel value is exactly what
+  the next reader will trust when deciding whether some other element has to match it. The fix is a
+  word rather than a refactor — have the comment say "the band's height, `h-7` above" instead of
+  restating the number. Recorded rather than done because `app-shell.tsx` was outside every fix slice
+  in this batch.
+status: open
+
+### DW-160: Story 34-3's acceptance list still reads as though its two refuted mechanisms closed the drag defect, and the one criterion left over from them is covered by nothing.
+
+origin: found by the epic-34 code review (window-chrome layer) while auditing story 34-3, 2026-08-07
+location: spec-34-3-the-window-stays-draggable-on-the-recording-tab.md — §Tasks & Acceptance (AC 1 and AC 2, unamended) against §Follow-up 2026-07-29, which refutes mechanisms A and C and names the ACL grant as the real cause; and AC 5, the `SelectContent` exit-animation removal in src/components/ui/select.tsx
+reason: this is the story whose premise was wrong twice, and the file records the correction honestly:
+  measurement refuted the Recording-tab-only framing, the follow-up says so, and the real fix — the
+  `core:window:allow-start-dragging` grant plus an app-owned band handler — is structural rather than
+  tab-scoped. Everything needed to correct the acceptance list is in the same file. Nothing points the
+  list at it, so the first thing the next reader sees still reads as though the `async` conversion and
+  the focus coalescing are what fixed the drag. Both are good changes on their own merit — a
+  `read_dir` on the main thread is a defect regardless — but they are not the fix, and the story's
+  title still says "on the Recording tab".
+  AC 5 travels with it: the `pointer-events` hardening has no test and should not get one. It is
+  Radix-internal behaviour, the follow-up refutes it as a cause, and a proxy assertion there would be
+  theatre. Recorded so the criterion is not later read as covered, because it is not. Fix: amend the
+  acceptance list to match the follow-up, reconsider the title, and mark AC 5 as defensive hardening
+  verified by inspection. Documentation only — no code should move.
+status: open
+
+### DW-161: The push leg draws a file-count bar with no transfer rate, because `git::cli::capture` runs the subprocess to completion and there is no streaming stderr to hang a meter on.
+
+origin: residual of this batch's fix for the epic-34 review's F4 (visibility layer, story 34-8), reported by the fixing agent, 2026-08-07
+location: src-tauri/crates/keeper-sync/src/git/cli.rs:313-353 (`capture`, which waits for the child and only then reads its output) + src-tauri/crates/keeper-sync/src/progress.rs (`SyncPhase::carries_rate`, now a total match over `Fetching`, `UploadingLfs`, `DownloadingLfs`) + src-tauri/crates/keeper-sync/src/engine.rs:1999 (`do_pull`'s fetch fold) and `TransferTally::apply`, the only two producers that stamp a figure + epic 34's AD-34-13, "Progress that cannot be rated is not progress"
+reason: F4 was that `SyncPhase::is_transferring` claimed `Pushing` carries a rate while no producer
+  ever stamped one, so a text-only folder pushing 200 MB drew a bar that moved and told the user
+  nothing — the exact complaint story 34-8 is named for, in the commonest case. It was fixed by
+  telling the truth rather than by inventing a number: `is_transferring` had zero callers repo-wide
+  and is replaced by `carries_rate`, a total match over the three phases that genuinely produce one.
+  `direction()` is deliberately unchanged, because a push really is bytes going up and the tray arrow
+  is right about that.
+  What remains is the underlying gap, and it is worth naming rather than leaving as an absence: an
+  ordinary `git push` still shows a file count and no rate. Stamping one means `git push --progress`
+  and a streaming parse of its stderr, and there is nowhere to put that today — `capture` runs the
+  child to completion and reads afterwards, so the whole git-CLI seam would need a streaming variant
+  (a spawned child with piped stderr, a line reader feeding the progress sink, and a decision about
+  what to do when the parse does not recognise git's output, which changes between versions and is
+  localised). That is a feature, not a review fix.
+  The reason this needs an entry rather than silence: AD-34-13 says progress that cannot be rated is
+  not progress, and the push leg is now a documented, tested exception to that decision. An exception
+  someone chose is fine; an exception nobody recorded becomes the precedent for the next one.
+status: open
+
 ## DW-N1 — the editor caret opens in front of the frontmatter block
 
 **Status:** done 2026-08-04, by the design correction below. **Found:** 2026-08-03,
@@ -1828,3 +2407,53 @@ what the person needs is "this release has no update manifest" or "no newer vers
     bridge or an agent. Variation selectors (`U+FE00`–`U+FE0F`, `Mn`) are in the same class.
     Excluding `Lo` fillers wholesale would refuse characters that are legitimate in some scripts, so
     the set to refuse is a product decision rather than a one-line widening.
+
+## Review passes recorded
+
+### Epic 34 — the thirteen unreviewed stories, audited 2026-08-07
+
+Thirteen epic-34 stories shipped in releases 0.6.2 and 0.6.3 without a code-review pass. They were
+audited on 2026-08-07 in four parallel read-only layers. Each layer read the story's frozen
+`<intent-contract>` and I/O matrix, located the implementing code and the proving test for every
+acceptance criterion, and judged the one question that matters: would that test FAIL if the
+behaviour were removed?
+
+- **durability** — 34-9, 34-11, 34-13. 34-11 `correct`; 34-9 and 34-13 `incorrect`.
+- **visibility** — 34-5, 34-6, 34-8, 34-10. 34-6 `correct`; 34-5, 34-8 and 34-10 `incorrect`.
+- **credentials** (security review) — 34-4, 34-7, 34-12. All three `incorrect`.
+- **window chrome** — 34-1, 34-2, 34-3. 34-2 `correct`; 34-1 and 34-3 `incorrect`.
+
+As returned by the layers that is 3 `correct` and 10 `incorrect`. The fix batch was briefed as 2 and
+11; the difference is 34-2, which the window-chrome layer passed while still recording DW-157,
+DW-158 and DW-159 against it. Noted so the discrepancy is not rediscovered as a third number.
+
+**Fixed in this batch, and therefore NOT in the ledger:** story 34-9's blocking wake finding (the
+watch wake was set for any delivered event, so tier 0 could not suppress the 1 Hz walk it was added
+to prevent) together with the `EchoSuppressor` module-doc claim and its misleading test; story
+34-13's blocking discriminator (the guard asked whether a blob parses as a pointer rather than
+whether the path is routed through LFS) and the empty-blob classification; the visibility layer's F1
+(a failed pass stranded `phase` in a busy state, leaving a bar and a frozen transfer rate on screen
+for a folder that had permanently stopped) and F4 (the `Pushing` phase carried no rate); and the
+credentials layer's three: the LFS ssh credential cache surviving `remove_profile`, the add path
+destroying the typed token before attempting to store it, the `remove_profile` rustdoc naming a
+`keeper-syncd` caller that does not exist, plus a supersession marker on spec-34-4, whose contract
+34-12 deliberately overrode.
+
+**Not fixed, filed here:** DW-132 through DW-161. Every other finding the four layers returned, plus
+three residuals the fixes themselves surfaced and their authors handed over — DW-137 (the wake filter
+cannot consult `.gitignore`, so `target/`/`dist/`/`build/` still wake the engine every tick), DW-138
+(`EchoSuppressor` keeps zero production callers) and DW-161 (F4 was resolved by removing the false
+claim that the push leg carries a rate, which leaves the push leg a documented exception to AD-34-13
+rather than an accident). Two findings were deliberately not filed because the ledger already owned
+them — DW-126 covers 34-6's `ensure_activity_columns` read-then-`ALTER` race, and DW-118 covers the
+56 px webview overhang that keeps story 34-2's drawer footer partly off-window regardless of its
+scroller fix. DW-120 and DW-121 are cited by the durability layer as known and are not re-reported;
+DW-116 and DW-117 were checked and are genuinely closed by stories 34-5 and 34-10.
+
+The pattern worth carrying forward, because it is the same one that produced the 34-14..34-19 group's
+holes: of the thirteen, only 34-11 tested its claim where the risk actually lives. Its
+`keeper-syncd/tests/durability_matrix.rs` spawns the real daemon, SIGKILLs it, and validates that its
+own fixture reached the interrupted states it claims to cover. Everywhere else the pure core is
+tested well and the impure shell is tested by a manual procedure the specs record as unrun — which is
+why DW-135, DW-139, DW-146, DW-151, DW-156 and DW-157 are all the same entry wearing different
+clothes: a load-bearing token that a green suite cannot see.

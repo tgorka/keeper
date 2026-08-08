@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
-use super::fts;
+use super::{fts, recordings, recordings_fts};
 use crate::error::ArchiveError;
 
 /// Resolve the `archive.db` path under a data directory. The single canonical
@@ -92,6 +92,19 @@ pub fn open_archive_db(data_dir: &Path) -> Result<Connection, ArchiveError> {
     // creation). Both are idempotent no-ops on re-open.
     backfill_missing_bodies(&conn)?;
     fts::ensure_fts(&conn)?;
+    // Story 42.1: the recording tables live in this same database, behind the
+    // same one writer. Created and additively migrated here so every connection
+    // the writer task ever owns has them, and so a session row never needs a
+    // second open path of its own.
+    recordings::ensure_recordings_schema(&conn)?;
+    // Story 42.2: and the search index over those rows, which must come AFTER
+    // the tables it indexes — it backfills every session that has no index entry
+    // yet, so an archive written by a build without it becomes searchable at the
+    // next open rather than at the next rebuild. Ensured here, on the writer's
+    // connection, because since 42.2 a row write also maintains that row's index
+    // entry inside the same transaction: a connection without this index is a
+    // connection no session can be written to.
+    recordings_fts::ensure_recordings_fts(&conn)?;
     Ok(conn)
 }
 
@@ -246,17 +259,32 @@ const DURABILITY_COLUMNS: &[(&str, &str)] = &[
     ("body", "TEXT"),
 ];
 
-/// Idempotently add the Story 5.2 durability columns to an existing `events`
-/// table (Story 5.2). Reads `PRAGMA table_info(events)` to learn which columns
-/// already exist and issues `ALTER TABLE … ADD COLUMN` only for the missing ones,
-/// so it is safe to run on a fresh DB (columns already present via `CREATE
-/// TABLE`), on a pre-5.1 DB (columns added, existing rows untouched), and again
-/// after that (a no-op). All columns are nullable — no row is rewritten.
-fn migrate_durability_columns(conn: &Connection) -> Result<(), ArchiveError> {
+/// Idempotently add missing nullable columns to an existing table — the
+/// archive's ONE additive-migration path (Story 5.2, generalized for Story
+/// 42.1's recording tables).
+///
+/// Reads `PRAGMA table_info(<table>)` to learn which columns already exist and
+/// issues `ALTER TABLE … ADD COLUMN` only for the missing ones, so it is safe on
+/// a fresh DB (columns already present via `CREATE TABLE`), on a DB from an
+/// earlier build (columns added, existing rows untouched), and again after that
+/// (a no-op). Every column it adds must be nullable — SQLite cannot add a
+/// `NOT NULL` column without a default — which is also why no existing row is
+/// ever rewritten.
+///
+/// `table` and the column names/types are compile-time constants owned by this
+/// crate, never user input, so composing them into the DDL (which SQLite cannot
+/// parameterize) introduces no injection surface. Identifiers are quoted so a
+/// column named after a keyword — `recording_segments`'s `"index"` shape — stays
+/// legal.
+pub(super) fn add_missing_columns(
+    conn: &Connection,
+    table: &str,
+    columns: &[(&str, &str)],
+) -> Result<(), ArchiveError> {
     let mut existing: Vec<String> = Vec::new();
     {
         let mut stmt = conn
-            .prepare("PRAGMA table_info(events)")
+            .prepare(&format!("PRAGMA table_info(\"{table}\")"))
             .map_err(|e| ArchiveError::Sqlite(format!("could not read table info: {e}")))?;
         let rows = stmt
             // `PRAGMA table_info` column 1 (`name`) is the column name.
@@ -268,13 +296,22 @@ fn migrate_durability_columns(conn: &Connection) -> Result<(), ArchiveError> {
             );
         }
     }
-    for (name, ty) in DURABILITY_COLUMNS {
+    for (name, ty) in columns {
         if !existing.iter().any(|c| c == name) {
-            conn.execute(&format!("ALTER TABLE events ADD COLUMN {name} {ty}"), [])
-                .map_err(|e| ArchiveError::Sqlite(format!("could not add column {name}: {e}")))?;
+            conn.execute(
+                &format!("ALTER TABLE \"{table}\" ADD COLUMN \"{name}\" {ty}"),
+                [],
+            )
+            .map_err(|e| ArchiveError::Sqlite(format!("could not add column {name}: {e}")))?;
         }
     }
     Ok(())
+}
+
+/// Idempotently add the Story 5.2 durability columns to an existing `events`
+/// table (Story 5.2), through the shared [`add_missing_columns`] helper.
+fn migrate_durability_columns(conn: &Connection) -> Result<(), ArchiveError> {
+    add_missing_columns(conn, "events", DURABILITY_COLUMNS)
 }
 
 /// Count the archived events for one account. A read helper for tests and
@@ -576,17 +613,27 @@ pub fn scoped_events_chronological(
 mod tests {
     use super::*;
 
+    /// A scratch directory no other test can land in.
+    ///
+    /// The pid plus a nanosecond stamp is NOT enough: two test threads that ask
+    /// inside the same clock tick get the same name, open the same SQLite file,
+    /// and then fail on whichever collision they reach first — a duplicate
+    /// migration column or a UNIQUE violation on a fixture inserted twice. Both
+    /// were observed on macOS under `cargo test --workspace`. The process-wide
+    /// counter is what makes the name unique per CALL, the way
+    /// `recording.rs`'s helper already does it.
     fn temp_dir() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
-        let unique = format!(
-            "keeper-archive-db-test-{}-{}",
+        dir.push(format!(
+            "keeper-archive-db-test-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
-        );
-        dir.push(unique);
+        ));
         dir
     }
 

@@ -48,6 +48,7 @@ pub mod platform;
 pub mod profile;
 pub mod progress;
 pub mod provenance;
+pub mod sparse;
 pub mod stability;
 pub mod volume;
 pub mod watch;
@@ -58,7 +59,8 @@ pub use copy::{
 pub use credential::AccessToken;
 pub use db::{ActivityEntry, ActivityKind, ActivityRow, DeliveryState};
 pub use engine::{
-    Engine, ParkedUnit, PendingFile, PendingReason, ProblemReport, SyncOutcome, VerifyReport,
+    Engine, FinishedTap, ParkedUnit, PathDurability, PendingFile, PendingReason, ProblemReport,
+    SyncOutcome, VerifyReport,
 };
 pub use error::{Result, SyncError};
 pub use git::resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};
@@ -66,6 +68,7 @@ pub use platform::SyncPlatform;
 pub use profile::{ProfileState, SyncDirection, SyncLane, SyncProfile};
 pub use progress::{SyncPhase, SyncProgress, SyncStatus};
 pub use provenance::{Provenance, SyncSource};
+pub use sparse::SparseCone;
 
 /// Version string stamped into provenance trailers and the LFS user agent.
 pub const AGENT: &str = concat!("keeper-sync/", env!("CARGO_PKG_VERSION"));

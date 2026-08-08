@@ -27,7 +27,7 @@ use keeper_core::platform::Platform;
 use keeper_core::vm::NotifyTarget;
 use keeper_sync::engine::Engine;
 use keeper_sync::git::resolve::{GitRequest, GitResolution};
-use keeper_sync::{Result as SyncResult, SyncError, SyncPlatform};
+use keeper_sync::{Result as SyncResult, SyncError, SyncPlatform, SyncProfile};
 
 /// Bridges the engine's port onto the shell's existing [`Platform`].
 ///
@@ -94,6 +94,21 @@ impl SyncPlatform for ShellSyncPlatform {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
             .unwrap_or(0)
+    }
+
+    fn utc_offset_minutes(&self) -> i32 {
+        // Overridden rather than left to the port's default (Story 41.5): the
+        // default reads the zone through `gix`, whose local-time lookup falls
+        // back to UTC when it cannot determine one — and inside a heavily
+        // threaded desktop app that fallback is the likely branch, not the
+        // unlikely one. A `PushPolicy::Window` of `22:00`–`06:00` evaluated in
+        // UTC is a window that opens at the wrong time of night for everyone
+        // east or west of it.
+        //
+        // `chrono::Local` is already the shell's only clock — it names every
+        // session folder and stamps every manifest — so this is that same
+        // answer, not a second one.
+        chrono::Local::now().offset().local_minus_utc() / 60
     }
 
     fn free_space(&self, path: &Path) -> Option<u64> {
@@ -331,6 +346,34 @@ pub fn sync_platform(platform: Arc<dyn Platform>) -> ShellSyncPlatform {
     ShellSyncPlatform::new(platform)
 }
 
+/// The enabled sync profile whose folder CONTAINS `path`, if any.
+///
+/// The engine resolves a profile by id and by nothing else (`sync_once`,
+/// `rescan`, `activity` all take one), so a caller that only knows a PATH has no
+/// way to ask "is this inside a synced folder" without this. Story 40.4's
+/// retitle is that caller: it has just moved a recording and needs the profile —
+/// if there is one — that must commit both halves of the move together.
+///
+/// Deepest match wins. Nothing forbids a profile inside another profile's
+/// folder, and the innermost one is the repository the file actually belongs to.
+/// Disabled profiles are skipped: a paused folder has no repository work to hand
+/// it, and reporting one would only produce a sync call that refuses.
+pub fn profile_for_path(engine: &Engine, path: &Path) -> SyncResult<Option<SyncProfile>> {
+    let mut deepest: Option<SyncProfile> = None;
+    for profile in engine.list_profiles()? {
+        if !profile.enabled || !path.starts_with(&profile.local_path) {
+            continue;
+        }
+        let deeper = deepest.as_ref().is_none_or(|held| {
+            profile.local_path.components().count() > held.local_path.components().count()
+        });
+        if deeper {
+            deepest = Some(profile);
+        }
+    }
+    Ok(deepest)
+}
+
 /// The live supervisor's stop signal, if one is running.
 ///
 /// Holding the sender here (rather than in `AppState`) keeps the whole
@@ -486,6 +529,31 @@ mod tests {
         assert!(
             !label.contains('.'),
             "expected a short label, got {label:?}"
+        );
+    }
+
+    /// Story 41.5: a `PushPolicy::Window` is an `HH:MM` a person typed on the
+    /// clock on their wall, so the offset the engine converts it with has to be
+    /// the same offset the shell stamps a session with — in MINUTES, and with
+    /// git's sign convention (east of UTC positive).
+    ///
+    /// The expectation is read back out of the RFC 3339 stamp `recording_start`
+    /// writes rather than recomputed, so a seconds-for-minutes slip or an
+    /// inverted sign fails here instead of opening someone's quiet window at
+    /// two in the afternoon.
+    #[test]
+    fn the_window_offset_is_the_one_the_shell_stamps_sessions_with() {
+        let stamped = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        let parsed = chrono::DateTime::parse_from_rfc3339(&stamped).expect("the session stamp");
+        let platform = ShellSyncPlatform::new(Arc::new(CapturingPlatform::new()));
+        assert_eq!(
+            platform.utc_offset_minutes(),
+            parsed.offset().local_minus_utc() / 60
+        );
+        assert!(
+            (-720..=840).contains(&platform.utc_offset_minutes()),
+            "a real zone offset, not seconds: {}",
+            platform.utc_offset_minutes()
         );
     }
 
@@ -748,11 +816,15 @@ mod tests {
 
     // --- Story 29.6: the desktop end of "notify exactly once, on onset" -----
     //
-    // The engine's half (at most one raise per `None -> Some` onset) is covered
-    // by `a_warning_notifies_once_per_onset_not_once_per_tick` in `keeper-sync`.
+    // The engine's half — one raise per `None -> Some` onset, and no raise
+    // while a warning stays up however its wording moves — is covered in
+    // `keeper-sync` by `a_warning_notifies_once_per_onset_not_once_per_tick`,
+    // `a_sustained_warning_whose_wording_moves_every_tick_still_notifies_once`
+    // and `a_long_run_of_transient_failures_notifies_once_however_long_it_runs`.
     // What follows covers the leg the engine cannot see: that the onset the
     // engine raised actually reaches the OS notifier, once, unaltered, and with
-    // the loud-failure posture AD-39 requires.
+    // the loud-failure posture AD-39 requires — untargeted, and unsilenceable
+    // by Do Not Disturb.
 
     /// A capturing [`Platform`] double recording every `(title, body, target)`
     /// posted through `notify` (mirrors `keeper-core::notify`'s test double).
@@ -764,19 +836,30 @@ mod tests {
     struct CapturingPlatform {
         calls: Mutex<Vec<(String, String, NotifyTarget)>>,
         fail: bool,
+        /// Where a suppression gate would have to look to find the global
+        /// Do-Not-Disturb flag. Real, and pointed at a registry tree with DND
+        /// switched on by [`CapturingPlatform::rooted`], so the bypass asserted
+        /// below is falsifiable rather than merely implied by the absence of an
+        /// argument.
+        data_dir: PathBuf,
     }
 
     impl CapturingPlatform {
         fn new() -> Self {
-            Self {
-                calls: Mutex::new(Vec::new()),
-                fail: false,
-            }
+            Self::rooted(Path::new("/tmp/keeper-sync-test"))
         }
         fn failing() -> Self {
             Self {
-                calls: Mutex::new(Vec::new()),
                 fail: true,
+                ..Self::new()
+            }
+        }
+        /// A double reading a real registry tree, for the DND-bypass test.
+        fn rooted(dir: &Path) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail: false,
+                data_dir: dir.to_path_buf(),
             }
         }
         /// The `(title, body)` of every posted notification (the target is
@@ -802,7 +885,7 @@ mod tests {
 
     impl Platform for CapturingPlatform {
         fn data_dir(&self) -> Result<PathBuf, CoreError> {
-            Ok(PathBuf::from("/tmp/keeper-sync-test"))
+            Ok(self.data_dir.clone())
         }
         fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
             Ok(())
@@ -869,6 +952,42 @@ mod tests {
         // untargeted path as recording faults rather than routed through a
         // click-through target that would make it a quiet, dismissible nudge.
         assert_eq!(notifier.targets(), vec![NotifyTarget::None]);
+    }
+
+    /// The bypass, asserted the way `keeper-core` asserts the recording triad's
+    /// (`recording_fault_bypasses_dnd_and_network_mute`): put the app in the
+    /// harshest suppression state it has, then show the post happening anyway.
+    ///
+    /// Global Do Not Disturb silences every chat notification and even the
+    /// bridge-disconnected alert, which returns early on
+    /// `NotifyConfig::dnd_enabled`. A stalled sync must not be silenced by it:
+    /// it is a local loss-risk condition and a loud failure under AD-39,
+    /// exactly like a recording fault, and the tray glyph and the AD-51 banner
+    /// fire regardless — so silencing this one leg would only desynchronise the
+    /// set, which is the reasoning `notify_recording_fault` already carries.
+    ///
+    /// The double's `data_dir` is a real registry tree with `notify.dnd_global`
+    /// written to `1`, which is what makes this falsifiable rather than a
+    /// restatement of the signature: the one plausible regression here is a
+    /// future "make sync consistent with the bridge alert" gate reading that
+    /// flag, and it would turn this red.
+    #[test]
+    fn a_warning_onset_bypasses_do_not_disturb_like_every_other_loud_failure() {
+        let dir = test_data_dir("dnd");
+        keeper_core::registry::set_dnd_global(&dir, true).expect("switch DND on");
+        let dnd = keeper_core::registry::get_dnd_global(&dir);
+        assert!(dnd.expect("read DND back"), "the fixture is in DND");
+        let notifier = Arc::new(CapturingPlatform::rooted(&dir));
+        let shell = ShellSyncPlatform::new(notifier.clone());
+
+        shell.notify(ONSET_TITLE, ONSET_BODY);
+
+        assert_eq!(
+            notifier.calls(),
+            vec![(ONSET_TITLE.to_owned(), ONSET_BODY.to_owned())],
+            "a stalled sync is a loud failure: DND does not silence it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

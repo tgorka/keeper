@@ -5,12 +5,19 @@
 // is suppressed for the file because the element sits inside a JSX `&&` child,
 // where no per-node suppression comment can be placed.
 /**
- * The TAGS lens (Epic 37, Story 37.3, FR-104).
+ * The TAGS lens (Epic 37, Story 37.3, FR-104; Story 42.5, FR-143).
  *
- * A hierarchical tree with per-node counts, built in Rust from the union of each
- * note's frontmatter `tags` and its inline `#a/b` tags. Tags arrive normalised —
- * lower-case, slash-separated, no leading `#` — so nothing here re-cases or
- * re-splits them: the tree is rendered, not derived.
+ * A hierarchical tree with per-node counts, built in Rust. Tags arrive
+ * normalised — lower-case, slash-separated, no leading `#` — so nothing here
+ * re-cases or re-splits them: the tree is rendered, not derived.
+ *
+ * **A count is the sum of every producer behind it (Story 42.5).** It was once
+ * the union of each note's frontmatter `tags` and its inline `#a/b` tags;
+ * recording tags now feed the same posting map through the same entry point,
+ * so a node reading 5 means 5 things — say 2 notes and 3 recordings — not 5
+ * notes and some recordings it declined to mention. Nothing on this side
+ * filters or re-adds: whatever Rust counted is what renders, which is why the
+ * sum arrives here for free and why the accessible name says "items".
  *
  * **The counts are of the unfiltered vault.** They do not shrink as chips are
  * added, and that is deliberate: a count that changes meaning mid-interaction is
@@ -81,7 +88,10 @@ function TagNode({
           type="button"
           // The count belongs in the accessible name, not in a visually adjacent
           // orphan a screen reader would read as a separate number.
-          aria-label={`Tag ${node.path}, ${node.count} notes, filter`}
+          // "items", not "notes": since Story 42.5 the number behind a node is
+          // notes plus recordings, and a name that says otherwise is the exact
+          // half-truth this story deleted.
+          aria-label={`Tag ${node.path}, ${node.count} items, filter`}
           aria-pressed={active}
           className={cn(
             "flex min-w-0 flex-1 items-center gap-1 rounded-md px-1.5 py-1 text-left outline-none",

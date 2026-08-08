@@ -1,5 +1,6 @@
 import {
   Archive,
+  Film,
   FolderSync,
   Inbox,
   MessageSquare,
@@ -42,6 +43,13 @@ const BASE_VIEWS: SidebarView[] = [
 
 /** The capability-gated Recording nav entry (Story 16.3). */
 const RECORDING_VIEW: SidebarView = { label: "Recording", icon: Video };
+
+/** The capability-gated Recordings browser entry (Story 42.3), sitting directly
+ * after the capture surface it browses the output of and gated on the SAME
+ * `recording` flag: a browser for recordings this build cannot make is a puzzle,
+ * so it is absent rather than empty. Two entries because the epic calls it a
+ * browser, and a browser buried under the capture settings is one nobody opens. */
+const RECORDINGS_VIEW: SidebarView = { label: "Recordings", icon: Film };
 
 /** The capability-gated Sync nav entry (Story 32.5, AD-S1). */
 const SYNC_VIEW: SidebarView = { label: "Sync", icon: FolderSync };
@@ -104,7 +112,10 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
   // Splice the gated entries in before Settings, each only when supported.
   const views: SidebarView[] = [
     ...BASE_VIEWS,
-    ...(recording ? [RECORDING_VIEW] : []),
+    // The capture surface and the browser over what it produced ride the one
+    // `recording` flag together (Story 42.3): where recordings cannot be made
+    // neither entry exists.
+    ...(recording ? [RECORDING_VIEW, RECORDINGS_VIEW] : []),
     ...(sync ? [SYNC_VIEW] : []),
     ...(notes ? [NOTES_VIEW] : []),
     SETTINGS_VIEW,
@@ -141,11 +152,13 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                           ? () => primaryViewStore.getState().setView("bridges")
                           : view.label === "Recording"
                             ? () => primaryViewStore.getState().setView("recording")
-                            : view.label === "Sync"
-                              ? () => primaryViewStore.getState().setView("sync")
-                              : view.label === "Notes"
-                                ? () => primaryViewStore.getState().setView("notes")
-                                : undefined;
+                            : view.label === "Recordings"
+                              ? () => primaryViewStore.getState().setView("recordings")
+                              : view.label === "Sync"
+                                ? () => primaryViewStore.getState().setView("sync")
+                                : view.label === "Notes"
+                                  ? () => primaryViewStore.getState().setView("notes")
+                                  : undefined;
               // Reflect the active primary view on every entry.
               const active =
                 (view.label === "Chats" && primaryView === "inbox") ||
@@ -153,6 +166,7 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
                 (view.label === "Approvals" && primaryView === "approval") ||
                 (view.label === "Bridges" && primaryView === "bridges") ||
                 (view.label === "Recording" && primaryView === "recording") ||
+                (view.label === "Recordings" && primaryView === "recordings") ||
                 (view.label === "Sync" && primaryView === "sync") ||
                 (view.label === "Notes" && primaryView === "notes") ||
                 (view.label === "Settings" && primaryView === "settings");

@@ -24,6 +24,9 @@ const DEFAULTS: RecordingSettingsVm = {
   // Story 19.5: the co-settings ride the same VM; a segment/duration edit must
   // carry them along unchanged.
   destinationDir: "/Users/alice/Movies/keeper",
+  destinationKind: "folder",
+  destinationProfileId: null,
+  destinationProfileName: null,
   fps: 30,
   codec: "h264",
   scalePercent: 100,

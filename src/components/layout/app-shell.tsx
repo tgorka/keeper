@@ -15,6 +15,7 @@ import { SIDEBAR_WIDTH_CLASS, SidebarPane } from "@/components/layout/sidebar-pa
 import { SyncPane } from "@/components/layout/sync-pane";
 import { VerifyBanner } from "@/components/layout/verify-banner";
 import { NotesPane } from "@/components/notes/notes-pane";
+import { RecordingsPane } from "@/components/recordings/recordings-pane";
 import { SearchOverlay } from "@/components/search/search-overlay";
 import { DeviceVerificationDialog } from "@/components/settings/device-verification-dialog";
 import { KeyBackupDialog } from "@/components/settings/key-backup-dialog";
@@ -118,7 +119,9 @@ export function AppShell() {
   const nativeMenuBar = useCapabilitiesStore((s) => s.capabilities.nativeMenuBar);
   // Screen recording is a desktop-macOS-≥13 capability (Story 16.3): the ⌘5
   // Recording view renders only when the flag is on, so a stale "recording"
-  // primary-view can never show the pane on a platform that cannot record.
+  // primary-view can never show the pane on a platform that cannot record. The
+  // Recordings browser (Story 42.3) rides the same flag for the same reason —
+  // a browser over sessions this build cannot record is a puzzle, not a surface.
   const recording = useCapabilitiesStore((s) => s.capabilities.recording);
   // Folder sync needs a usable `git` (Story 32.5, AD-41): same rule, so a stale
   // "sync" primary-view can never show the pane where sync cannot run.
@@ -219,6 +222,12 @@ export function AppShell() {
               <SidebarPane collapsed={sidebarCollapsed} />
               {recording && primaryView === "recording" ? (
                 <RecordingPane />
+              ) : recording && primaryView === "recordings" ? (
+                // Story 42.3: the browser over what capture produced, gated on
+                // the SAME `recording` capability as capture itself — a stale
+                // "recordings" primary-view can never show a browser for
+                // recordings this build cannot make.
+                <RecordingsPane />
               ) : sync && primaryView === "sync" ? (
                 <SyncPane />
               ) : notes && primaryView === "notes" ? (

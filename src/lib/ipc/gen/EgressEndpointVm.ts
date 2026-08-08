@@ -7,15 +7,20 @@ import type { EgressKind } from "./EgressKind";
  *
  * The Settings → About surface renders the full set of these — computed by
  * `egress::compute_egress` from the accounts registry (each homeserver, plus
- * `api.beeper.com` when a Beeper account exists) and the shared update endpoint —
+ * `api.beeper.com` when a Beeper account exists), the live folder-sync profile
+ * set (each distinct remote host, Story 23.7) and the shared update endpoint —
  * so keeper's egress claim is verifiable rather than asserted. Never fabricated,
- * never stale-cached: it is read from the same registry the session-restore path
- * uses on each open. `url` is the destination shown; `label` is a short honest
- * caption; `kind` classifies it for rendering.
+ * never stale-cached: both the registry rows and the profile rows are read on
+ * each open, from the same stores the session-restore and sync paths use, so
+ * adding or removing an account or a profile changes this list immediately.
+ * `url` is the destination shown; `label` is a short honest caption; `kind`
+ * classifies it for rendering.
  */
 export type EgressEndpointVm = { 
 /**
- * The destination URL (or the raw stored homeserver string when unparseable).
+ * The destination shown: a homeserver URL (the raw stored string when it is
+ * unparseable), a fixed service endpoint, or — for [`EgressKind::GitRemote`] —
+ * the bare host of a sync remote, never its full URL.
  */
 url: string, 
 /**

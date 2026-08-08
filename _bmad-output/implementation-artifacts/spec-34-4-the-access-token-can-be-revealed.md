@@ -3,8 +3,43 @@ title: 'The access token can be revealed'
 type: 'feature'
 created: '2026-07-28'
 status: 'review'
+superseded_in_part_by: 'spec-34-12-the-access-token-arrives-in-the-field.md'
+superseded_on: '2026-08-08'
 baseline_revision: '5c40a22'
 ---
+
+> **Superseded in part by Story 34.12 — read this before auditing anything below.**
+>
+> The owner ran what this story shipped and asked for a different shape. Story
+> 34.12 ("The access token arrives in the field") implemented it and records the
+> override under its own *"This overrides a recorded decision"* heading. Nothing
+> pointed back here, so an audit run against the `<intent-contract>` below —
+> which is frozen and therefore annotated rather than edited — read a live
+> contract the codebase is *required* to violate. That is what this marker
+> fixes; it was raised as a finding by the epic-34 security review of 34-4.
+>
+> **Dead against the current tree** (34.12 replaced them deliberately; do not
+> "fix" the code to satisfy them):
+>
+> * The **Never** rule "do not call `syncGetCredential` on mount, on expand, or
+>   from any store refresh". The edit form now reads the token in a `useEffect`
+>   keyed on `profile?.id` as it opens. AD-34-7 stands in the epic; 34.12 is the
+>   exception to it, not its repeal.
+> * The **"Show stored token"** action, and with it `revealStoredToken`, both
+>   "Clear token" buttons, and every matrix row and acceptance criterion naming
+>   them (matrix rows 3–7; acceptance criteria 2, 3 and — as a *separate*
+>   control — 4 and 5, whose outcomes survive only as the notes under the field:
+>   `SYNC_TOKEN_NONE_STORED_NOTE` and `SYNC_TOKEN_READ_FAILED_PREFIX`).
+> * "Field empty, no `placeholder`, `sync_get_credential` not called" on an
+>   opened edit form. The field now opens pre-filled and masked.
+>
+> **Still in force, and still verified:** `SyncProfileVm` carries no token, so
+> the polled profile list never carries a secret; the field is `type="password"`
+> until the eye is pressed and the reveal is mount-scoped; the eye is a real
+> `<button type="button">` with `aria-pressed` and a label named for the next
+> press; `sync_get_credential` itself, added here, is unchanged and is the
+> command 34.12 reads through. Its trust-model justification for being ungated
+> is recorded in its own rustdoc (`keeper/src/sync_ipc.rs`).
 
 <intent-contract>
 

@@ -121,3 +121,82 @@ func nextSegmentPath(from path: String) -> String {
     }
     return directory + stem + "-0001" + ext
 }
+
+/// The suffix a segment carries for the whole of the time it is being written
+/// (Story 41.3, FR-133, AD-69).
+///
+/// A segment is a half-written file until `finishWriting` returns, and a
+/// half-written file committed once is a corrupt file forever. Rather than
+/// teach the sync engine what a recording is, the writer marks the file
+/// itself: `keeper-sync`'s tier-0 name corpus already excludes `*.partial`, so
+/// an in-progress segment is invisible to every part of sync — the pending
+/// list, the commit path, the activity feed — wherever the destination
+/// happens to resolve. Nothing else marks it: no lock file, no state file,
+/// nothing that can fall out of step with the bytes.
+let partialSegmentSuffix = ".partial"
+
+/// The path a segment is WRITTEN to, given the path it will carry once closed
+/// (`…/screen-0003.mov` → `…/screen-0003.mov.partial`).
+///
+/// The suffix goes on the END of the whole filename rather than replacing the
+/// extension, so the final name is recovered by removing it and nothing has to
+/// guess what the media extension was.
+func partialSegmentPath(for finalPath: String) -> String {
+    finalPath + partialSegmentSuffix
+}
+
+/// A segment whose bytes are complete but which could not be published under
+/// its final name (Story 41.3).
+///
+/// Carries the `errno` the rename failed with. The bytes are still on disk
+/// under the temporary name — capture never degrades, and startup recovery
+/// finalises or discards what is left.
+struct SegmentPublishError: Error, CustomStringConvertible {
+    /// The stable wire code for the non-fatal `{"event":"warning",…}` this
+    /// raises (Story 41.3). Non-fatal by contract: the capture is unharmed and
+    /// keeps rolling — only the segment's *publication* failed.
+    static let warningCode = "segmentUnpublished"
+
+    /// The `errno` `rename(2)` set.
+    let code: Int32
+    /// The final basename that could not be taken (never the directory).
+    let name: String
+
+    var description: String {
+        "could not publish \(name): \(String(cString: strerror(code)))"
+    }
+
+    /// The honest warning line: nothing was lost, the bytes are simply still
+    /// under their temporary name, and startup recovery finalises or discards
+    /// them on the next run.
+    var warningMessage: String {
+        "\(description) — the segment is on disk under its temporary name and is "
+            + "resolved at next start; recording continues"
+    }
+}
+
+/// Publish a finished segment: move `<name>.<ext>.partial` onto
+/// `<name>.<ext>` (Story 41.3, FR-133).
+///
+/// **`rename(2)`, deliberately, and not `FileManager`.** The two paths differ
+/// only in the suffix, so they are always in the same directory on the same
+/// filesystem, where POSIX `rename` is atomic and inode-preserving: no reader
+/// can observe a partly-published file, and a multi-gigabyte segment is
+/// published in constant time. `FileManager.moveItem` promises neither, and a
+/// copy fallback would be both slow and a second chance to be interrupted —
+/// which is the very failure this whole suffix exists to prevent. There is
+/// therefore no fallback at all: a failure is reported and the bytes stay put.
+func publishSegment(from partialPath: String, to finalPath: String) throws {
+    var failure: Int32 = 0
+    let published = partialPath.withCString { source in
+        finalPath.withCString { destination in
+            if rename(source, destination) == 0 { return true }
+            failure = errno
+            return false
+        }
+    }
+    guard published else {
+        throw SegmentPublishError(
+            code: failure, name: (finalPath as NSString).lastPathComponent)
+    }
+}

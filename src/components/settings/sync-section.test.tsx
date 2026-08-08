@@ -710,7 +710,7 @@ describe("SyncSection advanced options (Story 32.7)", () => {
     expect(token).toHaveAttribute("type", "text");
   });
 
-  it("says the folder was added when only the keychain write failed", async () => {
+  it("keeps the typed token on screen when only the keychain write failed", async () => {
     mockSetCredential.mockRejectedValue({ code: "internal", message: "keychain refused" });
     await openAdvanced();
 
@@ -718,11 +718,17 @@ describe("SyncSection advanced options (Story 32.7)", () => {
     fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
 
     // Two writes, two outcomes: the profile exists, so "add failed" would be a
-    // lie that sends the user back to a form that can only reject as a duplicate.
+    // lie that sends the user back to a form that can only add the folder twice.
     expect(
       await screen.findByText(`${SYNC_TOKEN_FAILED_PREFIX}keychain refused`),
     ).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByLabelText(SYNC_NAME_LABEL)).toHaveValue(""));
+    // And the draft is NOT blanked, which is the whole point of holding the
+    // form open: the token in the box is the thing that failed to land, and a
+    // reset would send the user back to their forge for a second PAT. This
+    // asserted the opposite until the epic-34 review caught it (finding 2 of
+    // the 34-12 audit) — the reset used to run before the keychain write.
+    expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveValue("ghp_secret");
+    expect(screen.getByLabelText(SYNC_NAME_LABEL)).toHaveValue("notes");
   });
 });
 

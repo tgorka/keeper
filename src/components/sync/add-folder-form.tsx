@@ -520,10 +520,12 @@ const TOKEN_NOTES: Record<StoredToken["kind"], string> = {
  *   unknown, so a folder cannot be added against a list nobody has read yet.
  * @param onSaved - Called after a profile is created or updated, with `settled`
  *   false while the form is still showing something only it can show: a
- *   keychain failure, or — on a new folder — the acknowledgement whose Clear
- *   button is the only way to undo a stored token. A surface that hides the
- *   form on success must keep it mounted until `settled`, or it destroys the
- *   one place either is readable.
+ *   keychain failure, whose message and — on an add — whose still-typed token
+ *   live nowhere else. (It once also covered the stored-token acknowledgement
+ *   and its Clear button; Story 34.12 deleted both, so a keychain failure is
+ *   now the only unsettled ending.) A surface that hides the form on success
+ *   must keep it mounted until `settled`, or it destroys the one place that
+ *   failure is readable and the one field a retry can be driven from.
  * @param onCancel - Rendered as a Cancel button beside the submit. A surface
  *   that reveals the form behind an action passes this, so leaving changes
  *   nothing; one that keeps the form permanently on screen passes nothing.
@@ -559,6 +561,19 @@ export function AddFolderForm({
   );
   /** What the keychain said when the read failed, for the line that reports it. */
   const [readError, setReadError] = useState<string | null>(null);
+  /**
+   * The folder this add form already created, when its token did not follow it
+   * in (Story 34.12, finding 2 of the epic-34 review).
+   *
+   * An add whose profile write succeeded and whose keychain write failed leaves
+   * the form standing with the typed token still in it, because that token is
+   * the thing a retry has to deliver. But the folder now exists, so a retry
+   * must *finish* it rather than create a second folder pointing at the same
+   * path — which is precisely what a second `id: null` save would do. Holding
+   * the created id here turns every subsequent Save on this form into an update
+   * of that folder, and it is dropped again the moment a save completes whole.
+   */
+  const [createdId, setCreatedId] = useState<string | null>(null);
   /**
    * Whether the field shows what it holds. Mount-scoped on purpose: every
    * surface unmounts this form when it closes, so a reveal cannot outlive the
@@ -696,9 +711,10 @@ export function AddFolderForm({
     // means. The field on its own cannot tell "remove it" from "keeper never
     // found out what is there".
     const credential = credentialWrite(stored, form.token);
-    // Read off the form before anything is written, for the same reason the
-    // credential decision is: the add branch resets the form to a blank draft
-    // partway through, and reading these after that would send the defaults.
+    // Read off the form before anything is written, so the request cannot be
+    // changed by whatever the awaits below do to the fields: the add branch
+    // blanks the draft, but only once the whole save — profile *and* token —
+    // has landed.
     const notesVault = form.notesVault;
     const notesSubfolder = form.notesSubfolder.trim();
     try {
@@ -706,8 +722,10 @@ export function AddFolderForm({
         // Present updates that profile, absent creates one — the only field
         // that separates the two modes on the wire. The request carries no
         // `enabled`, and Rust merges an update onto the stored profile, so
-        // saving an edit to a paused folder leaves it paused.
-        id: profile?.id ?? null,
+        // saving an edit to a paused folder leaves it paused. `createdId`
+        // stands in for it after an add that got its folder stored but not its
+        // token, so the retry finishes that folder instead of adding another.
+        id: profile?.id ?? createdId,
         name: form.name.trim(),
         // Carried back unchanged on an edit: the engine binds a profile to this
         // path (and, on removable media, to a marker under it), which is why
@@ -750,10 +768,6 @@ export function AddFolderForm({
         // an unflagged save must not reset a subfolder the user chose earlier.
         notesSubfolder: notesVault ? notesSubfolder : null,
       });
-      if (!editing) {
-        setForm(EMPTY_FORM);
-        setTokenVisible(false);
-      }
       // `saveSyncProfile` re-reads the profile/status mirror, but the Sync
       // view's three per-folder lists are a *second* mirror on a deliberately
       // slower poll. Reading them here — from whichever surface saved the
@@ -772,50 +786,67 @@ export function AddFolderForm({
         setStoredNotesSubfolder(notesSubfolder);
         await refreshNoteVaults();
       }
-      if (credential.kind === "none") {
-        onSaved?.(saved, true);
-        return;
-      }
-      // A second write, to a different store, keyed by the profile id. Its
-      // failure is reported as its own thing: the profile is stored by now, and
-      // a blanket failure would be a lie.
-      try {
-        if (credential.kind === "clear") {
-          await syncClearCredential(saved.id);
-        } else {
-          await syncSetCredential(saved.id, credential.value);
+      // The keychain leg, when the decision above says there is one. A second
+      // write, to a different store, keyed by the profile id. Its failure is
+      // reported as its own thing: the profile is stored by now, and a blanket
+      // failure would be a lie.
+      if (credential.kind !== "none") {
+        try {
+          if (credential.kind === "clear") {
+            await syncClearCredential(saved.id);
+          } else {
+            await syncSetCredential(saved.id, credential.value);
+          }
+        } catch (raw) {
+          // A removal is only reachable from an edit form, since an add has no
+          // stored token to remove — but "not stored" would describe the
+          // opposite of what was attempted, so it gets its own wording.
+          let prefix = SYNC_TOKEN_FAILED_PREFIX;
+          if (credential.kind === "clear") {
+            prefix = SYNC_TOKEN_REMOVE_FAILED_PREFIX;
+          } else if (editing) {
+            prefix = SYNC_TOKEN_EDIT_FAILED_PREFIX;
+          }
+          setError(`${prefix}${syncErrorMessage(raw)}`);
+          // The folder exists and its token does not, so a retry has to finish
+          // *that* folder. Remembering its id is what stops the next Save from
+          // creating a second one — see `createdId`.
+          if (!editing) {
+            setCreatedId(saved.id);
+          }
+          // The profile is stored and the keychain is not, so the caller is
+          // told to keep the form up: the field still holds the value that has
+          // to get in, and hiding the form would take it away. That is only
+          // true because the add branch's reset is *below* this point — it ran
+          // above it once, which silently destroyed the typed token on every
+          // failed add and sent the user back to their forge for another PAT.
+          onSaved?.(saved, false);
+          return;
         }
-      } catch (raw) {
-        // A removal is only reachable from an edit form, since an add has no
-        // stored token to remove — but "not stored" would describe the opposite
-        // of what was attempted, so it gets its own wording.
-        let prefix = SYNC_TOKEN_FAILED_PREFIX;
-        if (credential.kind === "clear") {
-          prefix = SYNC_TOKEN_REMOVE_FAILED_PREFIX;
-        } else if (editing) {
-          prefix = SYNC_TOKEN_EDIT_FAILED_PREFIX;
+        if (editing) {
+          // The keychain now holds what the field holds, so the baseline moves
+          // with it. Otherwise a second Save of an untouched form would rewrite
+          // the same secret, and a save after a removal would try to remove it
+          // again. An add form is about to be reset to a blank draft for the
+          // next folder, whose baseline is still "nothing stored".
+          setStored(
+            credential.kind === "clear"
+              ? { kind: "absent" }
+              : { kind: "stored", value: credential.value },
+          );
+          setReadError(null);
+          // The secret is committed; there is no reason to leave it legible.
+          setTokenVisible(false);
         }
-        setError(`${prefix}${syncErrorMessage(raw)}`);
-        // The profile is stored and the keychain is not, so the caller is told
-        // to keep the form up: the field still holds the value that has to get
-        // in, and hiding the form would take it away.
-        onSaved?.(saved, false);
-        return;
       }
-      if (editing) {
-        // The keychain now holds what the field holds, so the baseline moves
-        // with it. Otherwise a second Save of an untouched form would rewrite
-        // the same secret, and a save after a removal would try to remove it
-        // again. An add form has already been reset to a blank draft for the
-        // next folder, whose baseline is still "nothing stored".
-        setStored(
-          credential.kind === "clear"
-            ? { kind: "absent" }
-            : { kind: "stored", value: credential.value },
-        );
-        setReadError(null);
-        // The secret is committed; there is no reason to leave it legible.
+      if (!editing) {
+        // Both stores now hold what this form was for, so the draft is spent:
+        // blank it for the next folder. Deliberately the last thing the add
+        // path does, so that every earlier `return` leaves the typed values —
+        // the token above all — where a retry can still reach them.
+        setForm(EMPTY_FORM);
         setTokenVisible(false);
+        setCreatedId(null);
       }
       onSaved?.(saved, true);
     } catch (raw) {

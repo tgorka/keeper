@@ -45,6 +45,7 @@ import {
   SYNC_SUBPATHS_LABEL,
   SYNC_TAGS_LABEL,
   SYNC_TOKEN_EDIT_NOTE,
+  SYNC_TOKEN_FAILED_PREFIX,
   SYNC_TOKEN_HIDE_LABEL,
   SYNC_TOKEN_LABEL,
   SYNC_TOKEN_NONE_STORED_NOTE,
@@ -231,6 +232,61 @@ describe("AddFolderForm", () => {
     // The add form has no stored token to describe, so it keeps the note that
     // says where the one being typed will go.
     expect(screen.getByText(SYNC_TOKEN_NOTE)).toBeInTheDocument();
+  });
+
+  it("keeps the typed token in the field when the keychain write fails on an add", async () => {
+    // The whole cost of getting this wrong is paid by the user: a token that is
+    // gone from the box has to be fetched from the forge again, because a PAT
+    // is shown once. The reset used to run before the keychain write, so every
+    // failed add destroyed it — finding 2 of the epic-34 review of Story 34.12.
+    mockSave.mockResolvedValue(profileVm());
+    mockSetCredential.mockRejectedValue({ code: "internal", message: "keychain refused" });
+    const onSaved = vi.fn();
+    render(<AddFolderForm onSaved={onSaved} />);
+    await fillRequired();
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    fireEvent.change(screen.getByLabelText(SYNC_TOKEN_LABEL), { target: { value: "ghp_secret" } });
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    expect(
+      await screen.findByText(`${SYNC_TOKEN_FAILED_PREFIX}keychain refused`),
+    ).toBeInTheDocument();
+    // Unsettled, so every surface keeps the form mounted — and the form still
+    // holds the value the failure was about, which is what makes that mounting
+    // worth anything.
+    expect(onSaved).toHaveBeenCalledWith(profileVm(), false);
+    expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveValue("ghp_secret");
+    expect(screen.getByLabelText(SYNC_NAME_LABEL)).toHaveValue("notes");
+  });
+
+  it("finishes the folder it already created when a failed add is retried", async () => {
+    // Keeping the draft is only half the fix: the folder exists now, so a
+    // second Save that still sent `id: null` would add it twice — two profiles,
+    // two watchers, one directory. The retry has to be an update.
+    mockSave.mockResolvedValue(profileVm());
+    mockSetCredential.mockRejectedValue({ code: "internal", message: "keychain refused" });
+    const onSaved = vi.fn();
+    render(<AddFolderForm onSaved={onSaved} />);
+    await fillRequired();
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    fireEvent.change(screen.getByLabelText(SYNC_TOKEN_LABEL), { target: { value: "ghp_secret" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    await screen.findByText(`${SYNC_TOKEN_FAILED_PREFIX}keychain refused`);
+    expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ id: null }));
+
+    mockSave.mockClear();
+    mockSetCredential.mockReset();
+    mockSetCredential.mockResolvedValue(undefined);
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() => expect(mockSetCredential).toHaveBeenCalledWith("p2", "ghp_secret"));
+    expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ id: "p2" }));
+    // Both stores hold it now, so the draft is finally spent and the next
+    // folder starts from an empty form.
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(profileVm(), true));
+    expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveValue("");
+    expect(screen.getByLabelText(SYNC_NAME_LABEL)).toHaveValue("");
   });
 
   it("shows exactly what was typed when the eye is pressed, and hides it again", () => {

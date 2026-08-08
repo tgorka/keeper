@@ -4685,6 +4685,20 @@ impl AccountManager {
         Ok(())
     }
 
+    /// The single app-wide archive writer handle, when one could be opened
+    /// (Story 42.1).
+    ///
+    /// Exposed because the archive is no longer only about Matrix events: a
+    /// recording session is a row too, and the shell's recording path has to
+    /// reach the SAME serialized writer this manager created — a second handle
+    /// would mean a second connection to `archive.db`, which is the one thing
+    /// the archive's design forbids. `None` is archiving disabled (the DB could
+    /// not be opened at startup); every caller treats that as "do not index",
+    /// never as an error.
+    pub fn archive(&self) -> Option<ArchiveHandle> {
+        self.archive.clone()
+    }
+
     /// Deliberately purge one account's local archive (Story 5.7, FR-6): its
     /// `events` rows and their `events_fts` entries, routed through the single
     /// serialized archive writer so it never competes with a second connection.

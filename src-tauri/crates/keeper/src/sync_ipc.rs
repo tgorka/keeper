@@ -764,12 +764,13 @@ pub async fn sync_profile_save(
 /// Forget a profile. The folder and its repository are left on disk untouched —
 /// removing a profile is a configuration change, never a deletion of content.
 ///
-/// The one thing it deletes outside `sync.db` is the profile's stored remote
-/// credential, which `Engine::remove_profile` clears before it touches a row
-/// (AD-34-14). That is not an exception to the sentence above: the secret is
-/// keeper's own configuration, it never lived in the folder, and its keychain
-/// key is derived from the profile id — so a secret that outlived its profile
-/// could never be found again.
+/// What it deletes outside `sync.db` is the profile's secrets, both of them:
+/// the stored remote credential, which `Engine::remove_profile` clears before
+/// it touches a row (AD-34-14), and the `Authorization` the engine minted from
+/// it over ssh for LFS, which is dropped in the same step. Neither is an
+/// exception to the sentence above: they are keeper's own configuration, they
+/// never lived in the folder, and the keychain key is derived from the profile
+/// id — so a secret that outlived its profile could never be found again.
 #[tauri::command]
 pub async fn sync_profile_remove(
     state: tauri::State<'_, AppState>,
@@ -1000,7 +1001,7 @@ pub async fn sync_retry_parked(
 /// which is the port's stated contract.
 ///
 /// Writing is the common direction, but not the only one: [`sync_get_credential`]
-/// reads the same key back when a person explicitly asks for it.
+/// reads the same key back — since Story 34.12, as an edit form opens.
 #[tauri::command]
 pub async fn sync_set_credential(
     state: tauri::State<'_, AppState>,
@@ -1014,13 +1015,55 @@ pub async fn sync_set_credential(
         .map_err(|err| sync_ipc_error(&err))
 }
 
-/// Read a profile's stored access token, on demand only.
+/// Read a profile's stored access token.
 ///
 /// Deliberately its own command rather than a field on [`SyncProfileVm`]
-/// (AD-34-7): loading a profile must not carry a secret to the frontend, so
-/// the token crosses the boundary only when someone asks for it by name. That
-/// keeps the keychain prompt — on the platforms that raise one — attached to a
-/// user action instead of to opening a form.
+/// (AD-34-7): loading the profile list must not carry a secret to the
+/// frontend, so the token crosses the boundary only for the one profile a
+/// caller names. Story 34.12 then made the edit form call this on mount, which
+/// overrode the second half of AD-34-7 — the read is no longer tied to a
+/// user's press, and the doc that said so was wrong from that story onward.
+///
+/// # Why this is not gated
+///
+/// The epic-34 security review (finding 4 against Story 34.12) asked for a
+/// user-presence check, a confirmation or a rate limit in front of this
+/// command, on the grounds that anything executing in the webview can call
+/// `sync_profiles` for the ids and then read every stored token. The
+/// observation is correct. The gate is still refused, and the reasoning is
+/// recorded here rather than left implicit:
+///
+/// * **Every `#[tauri::command]` in the invoke handler is equally reachable.**
+///   `capabilities/*.json` gates plugin permissions, not these functions. So a
+///   gate here would protect one command out of dozens, several of which are
+///   strictly more dangerous to the same attacker than a token read — most
+///   obviously `sync_profile_save`, which can repoint a folder's remote at a
+///   host of the attacker's choosing and let the next sync push the entire
+///   folder there. Hardening one read while that stays open buys nothing.
+/// * **The renderer is inside the trust boundary, by construction.** The
+///   webview loads `frontendDist` — keeper's own bundled assets — and no
+///   remote origin; no message, note or profile field is rendered as raw HTML
+///   (there is no `dangerouslySetInnerHTML` anywhere in `src/`). Script running
+///   in there means the bundle itself is compromised, and an attacker in that
+///   position already holds the notes, recordings and vaults the token merely
+///   fetches — and can plant a token of their own through
+///   `sync_set_credential`. The honest caveat: `tauri.conf.json` sets
+///   `"csp": null`, so nothing would constrain where such a script sent what it
+///   read. That is an argument for a CSP, which is a build-configuration
+///   change covering every command at once, not for a gate on this one.
+/// * **A prompt here would be theatre, not a control.** The platforms that
+///   raise a keychain prompt already raise it inside `secret_get`; a second,
+///   keeper-drawn confirmation would train the user to click through the real
+///   one. And a caller who can invoke commands can invoke them again, so a rate
+///   limit only slows an enumeration that has all day.
+///
+/// What genuinely limits exposure is not a gate but *how long the plaintext
+/// lives in the renderer*, which is a UI question Story 34.12 owns: the field
+/// is masked, the form unmounts on close, and no token reaches `SyncProfileVm`
+/// or any log. The one narrowing still worth having — the mount read fires on
+/// Edit even when the Advanced disclosure that shows the field is never opened,
+/// so the secret is pulled in wider than the surface that displays it — is a
+/// change to the form, not to this command, and is filed as DW-147.
 ///
 /// `Ok(None)` is the ordinary "no token stored" state rather than a failure: a
 /// profile on a public remote has none, and the caller needs to be able to say
@@ -1417,9 +1460,18 @@ mod tests {
     /// A field no request can express, which `parse_req` must therefore never
     /// touch. `enabled` moves only through pause/resume, `volumeId` is minted by
     /// the engine on first sight of the media, `id` names the row, and the two
-    /// LFS knobs (`lfsNever`, `lfsPruneLocal`) are configured through
-    /// `keeper-syncd`'s profile file with no slot in the app's form.
-    const PRESERVED: [&str; 5] = ["id", "volumeId", "enabled", "lfsNever", "lfsPruneLocal"];
+    /// LFS knobs (`lfsNever`, `lfsPruneLocal`) plus the recordings block
+    /// (`recordings`, Story 41.1) are configured through `keeper-syncd`'s profile
+    /// file with no slot in the app's form — `parse_req` keeps them because it
+    /// starts from `prior.clone()`, not because it copies them by name.
+    const PRESERVED: [&str; 6] = [
+        "id",
+        "volumeId",
+        "enabled",
+        "lfsNever",
+        "lfsPruneLocal",
+        "recordings",
+    ];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
         match serde_json::to_value(profile).expect("a profile serializes") {
@@ -1454,6 +1506,13 @@ mod tests {
         prior.volume_id = Some("01VOLUME".into());
         prior.lfs_never = vec!["*.psd".into()];
         prior.lfs_prune_local = true;
+        // Story 41.1's block, set to something a fresh profile never has, so the
+        // "nothing preserved moved" assertion below genuinely bites for it too.
+        prior.recordings = Some(keeper_sync::profile::RecordingsConfig {
+            subfolder: "sessions/raw".into(),
+            media: keeper_sync::profile::MediaPolicy::PointerOnly,
+            push: keeper_sync::profile::PushPolicy::Immediate,
+        });
 
         // An edit that moves every field it CAN move, so nothing below passes by
         // standing still.
@@ -2038,5 +2097,41 @@ mod tests {
         let err = open_failure(detached);
         assert_eq!(err.code, IpcErrorCode::Internal);
         assert!(!err.retriable);
+    }
+
+    /// The load-bearing half of AD-34-7, and the premise the refusal to gate
+    /// `sync_get_credential` rests on (finding 4 of the epic-34 review): the
+    /// token crosses the IPC boundary only for a profile a caller *names*, so
+    /// the two-second profile poll never carries one and a webview that never
+    /// invokes the read never holds a secret.
+    ///
+    /// Asserted against the serialized shape rather than the struct definition,
+    /// because it is the wire form that would leak: a `token` field added to
+    /// `SyncProfile` and forwarded here would compile, generate valid TS, and
+    /// put every folder's secret in the polled list.
+    #[test]
+    fn the_polled_profile_list_carries_no_field_that_could_hold_a_secret() {
+        let mut profile = SyncProfile::new("p1", "notes", "/Users/alice/notes", "u1");
+        profile.author_override = Some("Alice <alice@example.org>".into());
+        let vm = SyncProfileVm::from(&profile);
+        let json = serde_json::to_value(&vm).expect("a profile VM serializes");
+        let serde_json::Value::Object(fields) = json else {
+            panic!("a profile VM is a JSON object");
+        };
+        for name in fields.keys() {
+            let lowered = name.to_lowercase();
+            assert!(
+                !(lowered.contains("token")
+                    || lowered.contains("secret")
+                    || lowered.contains("credential")
+                    || lowered.contains("password")),
+                "`{name}` looks like a secret on the polled profile list; the keychain \
+                 read is a command of its own for exactly this reason (AD-34-7)"
+            );
+        }
+        // And the key the secret actually lives under is derivable but never
+        // carried: the VM has the id, and nothing more.
+        assert_eq!(profile.secret_key(), "sync/p1/credential");
+        assert!(fields.contains_key("id"));
     }
 }

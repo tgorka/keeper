@@ -2,7 +2,8 @@
 import type { NoteTagNodeVm } from "./NoteTagNodeVm";
 
 /**
- * The hierarchical tag tree with counts (FR-104).
+ * The hierarchical tag tree with counts (FR-104), over every producer of a tag
+ * (FR-143).
  */
 export type NoteTagTreeVm = { 
 /**

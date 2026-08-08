@@ -31,7 +31,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use keeper_core::vm::{RecordingStatusVm, RecordingUiState};
+use keeper_core::vm::{
+    RecordingDurabilityState, RecordingDurabilityVm, RecordingStatusVm, RecordingUiState,
+};
 use keeper_sync::progress::TraySyncState;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder};
@@ -969,6 +971,16 @@ fn adopt_notes_items(tray_id: &TrayIconId, notes: Option<NotesItems>) {
 /// mic hot-unplug) marks the line via [`format_warning_line`]: the session is
 /// still live (presence/`is_live` untouched, same recording icon), so the
 /// normal recording line stays and the warning rides on it.
+///
+/// Story 41.6 reduces durability into that SAME composition and adds nothing to
+/// it. A session that is recording fine says exactly what it says today — the
+/// menu bar is not the place to narrate a healthy publication, and the banner
+/// already carries the reading in full. What the tray owes the user is the
+/// exception: a session whose segments are on this Mac and whose push the remote
+/// refused rides the warning marker this tray already has for "still recording,
+/// something needs your attention", in the recorder's words plus the reason
+/// verbatim. Recording keeps the icon (Story 18.1) and sync still never forces
+/// presence — nothing here builds or holds a tray.
 fn status_line(snapshot: &RecordingStatusVm) -> String {
     let started_ms = match snapshot.state {
         RecordingUiState::Recording | RecordingUiState::Rotating | RecordingUiState::Stopping => {
@@ -990,10 +1002,40 @@ fn status_line(snapshot: &RecordingStatusVm) -> String {
         }
         None => "Starting…".to_owned(),
     };
-    match snapshot.warning.as_deref() {
-        Some(message) => format_warning_line(&base, message),
-        None => base,
+    // PRECEDENCE: a capture warning outranks a publication one. A lost
+    // microphone is about the recording being made right now; a refused push is
+    // about a recording that is already safely on this disk. Two markers on one
+    // line would read as one louder problem rather than two, so the more urgent
+    // one takes the line.
+    match (
+        snapshot.warning.as_deref(),
+        durability_warning(&snapshot.durability),
+    ) {
+        (Some(message), _) => format_warning_line(&base, message),
+        (None, Some(message)) => format_warning_line(&base, &message),
+        (None, None) => base,
     }
+}
+
+/// The durability reading the tray has something to say about, or `None`
+/// (Story 41.6, UX-DR48).
+///
+/// Only one reading qualifies: segments that are committed here but not
+/// published, with the reason the engine recorded. `local` is not a problem (a
+/// plain-folder destination promised nothing, and a session that has not
+/// committed yet is simply early), and `pushed`/`verified` are the good news the
+/// banner already carries — announcing either in the menu bar would be sync
+/// colonising a surface a recording forced into existence.
+///
+/// The words are the recorder's, never git's: "recorded, not pushed" is what
+/// happened, and the engine's own sentence follows it verbatim rather than being
+/// paraphrased into a generic sync error. Pure.
+fn durability_warning(durability: &RecordingDurabilityVm) -> Option<String> {
+    let reason = durability.detail.as_deref()?;
+    if durability.state >= RecordingDurabilityState::Pushed {
+        return None;
+    }
+    Some(format!("recorded, not pushed — {reason}"))
 }
 
 /// Compose the disabled error-hold status line (Story 18.4), naming the honest
@@ -1348,6 +1390,158 @@ mod tests {
             "⚠ Starting… — microphone disconnected — no microphone input"
         );
         assert!(snapshot.state.is_live(), "mic loss is still live/present");
+    }
+
+    // --- Story 41.6: durability, reduced into the existing composition ------
+
+    /// A live recording snapshot with the given durability reading.
+    fn recording_with(durability: RecordingDurabilityVm) -> RecordingStatusVm {
+        let mut snapshot = RecordingStatusVm::idle();
+        snapshot.state = RecordingUiState::Recording;
+        snapshot.durability = durability;
+        snapshot
+    }
+
+    /// A reading of segments that are committed here and whose push the remote
+    /// refused — the epic's "recorded, not pushed".
+    fn stuck(reason: &str) -> RecordingDurabilityVm {
+        RecordingDurabilityVm {
+            state: RecordingDurabilityState::Committed,
+            detail: Some(reason.to_owned()),
+        }
+    }
+
+    /// A healthy session's line is EXACTLY today's line. The menu bar does not
+    /// narrate a publication that is going fine — every state that is not a
+    /// stuck publication leaves the composition untouched.
+    #[test]
+    fn a_healthy_durability_reading_leaves_the_tray_line_unchanged() {
+        let today = status_line(&recording_with(RecordingDurabilityVm::local()));
+        assert_eq!(today, "Starting…");
+        for state in [
+            RecordingDurabilityState::Local,
+            RecordingDurabilityState::Committed,
+            RecordingDurabilityState::Pushed,
+            RecordingDurabilityState::Verified,
+        ] {
+            let snapshot = recording_with(RecordingDurabilityVm {
+                state,
+                detail: None,
+            });
+            assert_eq!(status_line(&snapshot), today, "{state:?}");
+        }
+        // A reason that arrives once publication already succeeded is not a
+        // problem to report either — the bytes are on the drive.
+        for state in [
+            RecordingDurabilityState::Pushed,
+            RecordingDurabilityState::Verified,
+        ] {
+            let snapshot = recording_with(RecordingDurabilityVm {
+                state,
+                detail: Some("push rejected: non-fast-forward".to_owned()),
+            });
+            assert_eq!(status_line(&snapshot), today, "{state:?}");
+        }
+    }
+
+    /// The killed-network and protected-branch rows: the tray marks the line
+    /// with the warning glyph it ALREADY has for a live session that needs
+    /// attention (Story 19.4's `⚠`), the recording line stays first because the
+    /// session is still recording, and the engine's sentence is carried verbatim
+    /// after the recorder's own words. No new glyph was needed or added.
+    #[test]
+    fn a_refused_push_rides_the_existing_warning_marker_with_the_reason() {
+        let snapshot = recording_with(stuck("push rejected: protected branch main"));
+        assert_eq!(
+            status_line(&snapshot),
+            "⚠ Starting… — recorded, not pushed — push rejected: protected branch main"
+        );
+        assert!(
+            snapshot.state.is_live(),
+            "a refused push is still a live recording"
+        );
+        assert!(
+            snapshot.error.is_none(),
+            "a refused push is not a failed session"
+        );
+    }
+
+    /// Precedence: a capture warning is about the recording being made right
+    /// now, a refused push is about one already safe on this disk. The capture
+    /// warning takes the line, and the line carries exactly one marker.
+    #[test]
+    fn a_capture_warning_outranks_a_publication_one() {
+        let mut snapshot = recording_with(stuck("push rejected: non-fast-forward"));
+        snapshot.warning = Some("microphone disconnected — no microphone input".to_owned());
+        let line = status_line(&snapshot);
+        assert_eq!(
+            line,
+            "⚠ Starting… — microphone disconnected — no microphone input"
+        );
+        assert_eq!(line.matches('⚠').count(), 1, "two markers read as one");
+    }
+
+    /// Only a stuck publication speaks. `local` promised nothing, and
+    /// `pushed`/`verified` are the banner's good news, not the menu bar's.
+    #[test]
+    fn durability_warning_speaks_only_for_a_stuck_publication() {
+        assert_eq!(durability_warning(&RecordingDurabilityVm::local()), None);
+        assert_eq!(
+            durability_warning(&RecordingDurabilityVm {
+                state: RecordingDurabilityState::Local,
+                detail: Some("no remote configured".to_owned()),
+            })
+            .as_deref(),
+            Some("recorded, not pushed — no remote configured"),
+        );
+        assert_eq!(
+            durability_warning(&stuck("boom")).as_deref(),
+            Some("recorded, not pushed — boom")
+        );
+        assert_eq!(
+            durability_warning(&RecordingDurabilityVm {
+                state: RecordingDurabilityState::Pushed,
+                detail: Some("stale".to_owned()),
+            }),
+            None
+        );
+    }
+
+    /// The epic's rule, unchanged: recording wins the icon and sync never forces
+    /// presence. Durability is not an input to [`decide_presence`] at all — a
+    /// refused push is not a session `error`, so it can neither build a tray, nor
+    /// drop one, nor swap the record dot for the error badge. The reduction is
+    /// confined to the status line.
+    #[test]
+    fn a_push_problem_never_changes_presence_or_the_recording_icon() {
+        use PresenceAction::*;
+        let snapshot = recording_with(stuck("push rejected: protected branch main"));
+        let has_error = snapshot.error.is_some();
+        for state in [
+            RecordingUiState::Recording,
+            RecordingUiState::Rotating,
+            RecordingUiState::Stopping,
+        ] {
+            assert_eq!(
+                decide_presence(state, has_error, true, false),
+                RenderRecording,
+                "{state:?} must keep rendering the recording tray"
+            );
+            assert_eq!(
+                decide_presence(state, has_error, false, false),
+                ForcePresent,
+                "{state:?}"
+            );
+        }
+        // And a settled session with a stuck push still tears the tray down the
+        // ordinary way — a publication problem must not hold the menu bar.
+        let mut settled = snapshot;
+        settled.state = RecordingUiState::Finalized;
+        assert_eq!(decide_presence(settled.state, false, true, true), DropTray);
+        assert_eq!(
+            decide_presence(settled.state, false, true, false),
+            RestoreIdle
+        );
     }
 }
 

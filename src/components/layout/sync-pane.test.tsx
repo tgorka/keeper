@@ -240,11 +240,19 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
   };
 }
 
+/**
+ * One streamed frame, shaped like one the engine can actually emit.
+ *
+ * `uploadingLfs`, not `pushing`: byte counters exist on the fetch leg and the
+ * LFS legs and nowhere else, and `RUST_TRANSFER_LINE` above is `Transferring`,
+ * which is the label of exactly these two phases — the old `pushing` default
+ * disagreed with the very line it was paired with (Story 34.8).
+ */
 function progressVm(over: Partial<SyncProgressVm> = {}): SyncProgressVm {
   return {
     profileId: "p1",
     profileName: "tgdrive",
-    phase: "pushing",
+    phase: "uploadingLfs",
     filesDone: 42,
     filesTotal: 310,
     bytesDone: 1_200_000_000,
@@ -550,9 +558,16 @@ describe("SyncPane profile header", () => {
     expect(screen.getByText("notes/today.md")).toBeInTheDocument();
   });
 
-  it("shows how fast and how far while a folder is working", async () => {
+  it("shows how fast and how far while a large file is on the wire", async () => {
+    // `uploadingLfs`, not `pushing`. Only three phases can carry a rate at all —
+    // `SyncPhase::carries_rate` — because only the fetch fold and the LFS
+    // transfer tally measure bytes; a plain `git push` is a captured subprocess
+    // whose byte counters nothing reads. This case used to set `phase:
+    // "pushing"` beside `bytesPerSecond: 4_100_000`, a pair the engine cannot
+    // produce, so it proved the renderer against an event that never arrives and
+    // would have passed on a gutted producer (Story 34.8).
     mockStatuses.mockResolvedValue([
-      statusVm({ state: "syncing", phase: "pushing", line: RUST_TRANSFER_LINE }),
+      statusVm({ state: "syncing", phase: "uploadingLfs", line: RUST_TRANSFER_LINE }),
     ]);
     render(<SyncPane />);
     await screen.findByText(RUST_TRANSFER_LINE);
@@ -560,6 +575,7 @@ describe("SyncPane profile header", () => {
     act(() => {
       emitProgress?.(
         progressVm({
+          phase: "uploadingLfs",
           fraction: 0.42,
           current: "clips/holiday.mov",
           filesDone: 3,
@@ -573,6 +589,53 @@ describe("SyncPane profile header", () => {
     // and the polled sentence above read as one quantity.
     expect(await screen.findByText("3/12 files · 4.1 MB/s")).toBeInTheDocument();
     expect(screen.getByText("clips/holiday.mov")).toBeInTheDocument();
+  });
+
+  it("claims nothing is in flight for a folder that has stopped", async () => {
+    // Stories 34.8 and 34.10. A push refused with a 401 parks the profile in
+    // `needsAttention`, and the engine now retires the phase with it — but this
+    // arranges the pre-fix snapshot on purpose, phase and all, because the card
+    // must not depend on the engine having remembered. A bar and a frozen rate
+    // sitting directly above "git.invalid rejected the access token" is the
+    // exact contradiction of 34-10's "a failed Sync shows only the error".
+    const refusal = "git.invalid rejected the access token — replace it with a current one";
+    mockStatuses.mockResolvedValue([
+      statusVm({
+        state: "needsAttention",
+        phase: "pushing",
+        pending: 0,
+        error: refusal,
+        needsAttention: true,
+        line: "tgdrive — needs attention",
+      }),
+    ]);
+    mockProblems.mockResolvedValue(problemsVm({ error: refusal }));
+    render(<SyncPane />);
+    await screen.findByText("tgdrive — needs attention");
+
+    // The last frame the engine sent before the refusal, still in the store.
+    // Asserted rather than assumed: a `null` sink would make every negative
+    // below pass for the wrong reason.
+    expect(emitProgress).not.toBeNull();
+    act(() => {
+      emitProgress?.(
+        progressVm({
+          fraction: 0.42,
+          current: "notes/today.md",
+          filesDone: 3,
+          filesTotal: 12,
+          bytesPerSecond: 4_100_000,
+        }),
+      );
+    });
+
+    // The error is on screen, and it is the only thing on screen claiming
+    // anything about this folder.
+    expect(await screen.findByText(refusal)).toBeInTheDocument();
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(screen.queryByText(/B\/s/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/3\/12 files/)).not.toBeInTheDocument();
+    expect(screen.queryByText("notes/today.md")).not.toBeInTheDocument();
   });
 
   it("never prints a rate of nothing", async () => {
@@ -1720,7 +1783,15 @@ describe("sync pane projections", () => {
 
   it("lets the poll decide whether a folder is working and the stream how far", () => {
     const idle = statusVm({ state: "idle", pending: 0 });
-    const busy = statusVm({ state: "syncing", phase: "pushing", bytesDone: 250, bytesTotal: 1000 });
+    // A phase that carries bytes at all: `pushing` publishes a file count and
+    // never a byte one, so a byte-counted snapshot under it is a shape the
+    // engine cannot produce (Story 34.8).
+    const busy = statusVm({
+      state: "syncing",
+      phase: "uploadingLfs",
+      bytesDone: 250,
+      bytesTotal: 1000,
+    });
     // No status at all, or a settled one: nothing to draw, whatever the stream said.
     expect(syncLiveFraction(undefined, progressVm({ fraction: 0.9 }))).toBeNull();
     expect(syncLiveFraction(idle, progressVm({ fraction: 0.9 }))).toBeNull();
@@ -1734,7 +1805,7 @@ describe("sync pane projections", () => {
 
   it("keeps a streamed rate behind the poll's verdict on whether work is happening", () => {
     const idle = statusVm({ state: "idle", pending: 0 });
-    const busy = statusVm({ state: "syncing", phase: "pushing" });
+    const busy = statusVm({ state: "syncing", phase: "uploadingLfs" });
     // A rate arriving between two polls must not be what makes a card look busy.
     expect(syncLiveRate(undefined, progressVm({ bytesPerSecond: 9_000_000 }))).toBeNull();
     expect(syncLiveRate(idle, progressVm({ bytesPerSecond: 9_000_000 }))).toBeNull();

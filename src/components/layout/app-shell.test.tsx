@@ -137,6 +137,28 @@ describe("AppShell", () => {
     expect(screen.queryByRole("region", { name: "Recording" })).not.toBeInTheDocument();
   });
 
+  // ── Recordings browser (Story 42.3) ────────────────────────────────────────
+  it("renders the Recordings browser for the recordings view when the capability is on", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true });
+    primaryViewStore.getState().setView("recordings");
+    render(<AppShell />);
+
+    expect(screen.getByRole("region", { name: "Recordings" })).toBeInTheDocument();
+    expect(screen.queryByText("Select a conversation to start reading.")).not.toBeInTheDocument();
+    // The browser is a sibling of the capture surface, not a tab inside it.
+    expect(screen.queryByRole("region", { name: "Recording" })).not.toBeInTheDocument();
+  });
+
+  it("does not render the Recordings browser when the recording capability is off", () => {
+    // A browser over recordings this build cannot make is a puzzle: the surface
+    // is ABSENT from the DOM, not empty and not disabled.
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: true });
+    primaryViewStore.getState().setView("recordings");
+    render(<AppShell />);
+
+    expect(screen.queryByRole("region", { name: "Recordings" })).not.toBeInTheDocument();
+  });
+
   // ── Sync view (Story 32.5) ─────────────────────────────────────────────────
   it("renders the Sync pane for the sync view when the capability is on", () => {
     capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });

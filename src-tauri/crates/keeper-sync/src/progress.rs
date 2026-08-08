@@ -62,19 +62,49 @@ impl SyncPhase {
         !matches!(self, Self::Idle)
     }
 
-    /// Whether bytes are actually crossing the network in this phase.
+    /// Whether a producer measures this phase's bytes, and therefore whether a
+    /// `bytes_per_second` figure can ever accompany it (Story 34.8, AD-34-13).
     ///
-    /// Split out from [`Self::is_active`] because the tray marks only real
-    /// movement: a scan or a commit is work too, but claiming a transfer over it
-    /// promises something that is not happening.
+    /// This replaces an `is_transferring` defined as `direction().is_some()` and
+    /// documented with "a push is bytes on the wire by any honest reading —
+    /// for a folder of text files it is *all* of them". True as physics, false
+    /// as a description of this program. `Pushing` is published by
+    /// `Engine::do_push` carrying a **file** count and nothing else, because the
+    /// push is `git push --porcelain` run through `git::cli::capture`, which
+    /// collects a finished process's output: the byte counters exist only in a
+    /// `--progress` stderr stream nothing in this crate reads. So the phase
+    /// AD-34-13 most obviously describes was the one phase that could never
+    /// satisfy it, and the predicate saying otherwise had no callers and no
+    /// test — nothing could disagree with it, so nothing did.
     ///
-    /// `Pushing` counts, which it did not before the tray learned direction. A
-    /// push is bytes on the wire by any honest reading — for a folder of text
-    /// files it is *all* of them, since only large objects go by LFS — and
-    /// leaving it out meant an upload in progress drew the same glyph as a
-    /// directory scan.
-    pub fn is_transferring(self) -> bool {
-        self.direction().is_some()
+    /// Two producers stamp the figure and they are the whole list:
+    /// `Engine::fold_fetch_progress` under `Fetching`, and
+    /// [`TransferTally::apply`], which the LFS legs drive under `UploadingLfs`
+    /// and `DownloadingLfs`. Neither is taken on trust:
+    /// `only_the_phases_with_a_byte_producer_claim_a_rate` asserts the set below
+    /// and drives the tally, and `the_fetch_leg_stamps_a_rate_off_the_high_water_mark`
+    /// in `engine.rs` drives the other. Gutting either producer, or widening
+    /// this answer to a phase without one, fails a test.
+    ///
+    /// Deliberately **not** [`Self::direction`]: a push really is bytes going
+    /// up and the tray's arrow is right to say so. "Which way" and "can we time
+    /// it" are different questions, and the old predicate answered the second
+    /// with the first. A `Pushing` folder therefore still draws a determinate
+    /// bar off its file count — an honest meter — with no rate beside it.
+    ///
+    /// Total rather than a `matches!`, for [`Self::direction`]'s reason: a phase
+    /// added later has to be classified here or the crate does not compile.
+    pub fn carries_rate(self) -> bool {
+        match self {
+            Self::Fetching | Self::UploadingLfs | Self::DownloadingLfs => true,
+            Self::Scanning
+            | Self::Applying
+            | Self::Staging
+            | Self::Committing
+            | Self::Pushing
+            | Self::Verifying
+            | Self::Idle => false,
+        }
     }
 
     /// Which way this phase is moving bytes, if it is moving any.
@@ -930,6 +960,83 @@ mod tests {
             progress.bytes_per_second, None,
             "a stalled retry has no rate"
         );
+    }
+
+    /// Story 34.8: [`SyncPhase::carries_rate`] is a claim about producers, so it
+    /// is checked against them rather than restated.
+    ///
+    /// Its predecessor `is_transferring` asserted that `Pushing` carries a rate
+    /// on the strength of a doc comment — with no callers and no test — so the
+    /// phase an ordinary text folder spends its whole push in drew a bar with no
+    /// rate while the vocabulary insisted otherwise, and the renderer test that
+    /// looked like coverage hand-injected a `(pushing, 4.1 MB/s)` pair the engine
+    /// cannot emit.
+    ///
+    /// The LFS half of the claim is driven here through the real producer.
+    /// The fetch half is driven in `engine.rs`'s
+    /// `the_fetch_leg_stamps_a_rate_off_the_high_water_mark`, next to the
+    /// producer it exercises.
+    #[test]
+    fn only_the_phases_with_a_byte_producer_claim_a_rate() {
+        for phase in [
+            SyncPhase::Fetching,
+            SyncPhase::UploadingLfs,
+            SyncPhase::DownloadingLfs,
+        ] {
+            assert!(
+                phase.carries_rate(),
+                "{} has a producer that measures bytes",
+                phase.label()
+            );
+        }
+        for phase in [
+            SyncPhase::Scanning,
+            SyncPhase::Applying,
+            SyncPhase::Staging,
+            SyncPhase::Committing,
+            SyncPhase::Pushing,
+            SyncPhase::Verifying,
+            SyncPhase::Idle,
+        ] {
+            assert!(
+                !phase.carries_rate(),
+                "nothing in this crate measures bytes in {}",
+                phase.label()
+            );
+        }
+
+        // A push is still bytes going up and the tray's arrow still says so.
+        // "Which way" and "can we time it" are separate questions; answering
+        // the second with the first is what produced the false claim.
+        assert_eq!(
+            SyncPhase::Pushing.direction(),
+            Some(TransferDirection::Up),
+            "a push has a direction even though nothing times it"
+        );
+
+        // And the producer behind the two phases that do claim one, driven
+        // rather than described: 4 MB across a two-second window.
+        let t0 = Instant::now();
+        let mut tally = TransferTally::default();
+        tally.fold_at(&started("a", 4_000_000), t0);
+        tally.fold_at(
+            &TransferEvent::Progress {
+                oid: "a".to_owned(),
+                bytes_done: 4_000_000,
+            },
+            at(t0, 2_000),
+        );
+        for phase in [SyncPhase::UploadingLfs, SyncPhase::DownloadingLfs] {
+            let mut progress = SyncProgress::idle("id", "n");
+            progress.phase = phase;
+            tally.apply(&mut progress);
+            assert_eq!(
+                progress.bytes_per_second,
+                Some(2_000_000),
+                "{} claims a rate, so its producer has to stamp one",
+                phase.label()
+            );
+        }
     }
 
     #[test]

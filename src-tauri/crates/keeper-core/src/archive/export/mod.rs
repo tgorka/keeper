@@ -501,10 +501,21 @@ mod tests {
     use super::*;
     use crate::archive::db::open_archive_db;
 
+    /// A scratch directory no other test can land in.
+    ///
+    /// The pid plus a nanosecond stamp is NOT enough: two test threads that ask
+    /// inside the same clock tick get the same name, open the same SQLite file,
+    /// and then fail on whichever collision they reach first — a duplicate
+    /// migration column or a UNIQUE violation on a fixture inserted twice. Both
+    /// were observed on macOS under `cargo test --workspace`. The process-wide
+    /// counter is what makes the name unique per CALL, the way
+    /// `recording.rs`'s helper already does it.
     fn temp_dir() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
         dir.push(format!(
-            "keeper-export-test-{}-{}",
+            "keeper-export-test-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

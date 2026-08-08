@@ -158,6 +158,13 @@ pub const DEFAULT_PUSH_INTERVAL_MS: u64 = 30_000;
 /// on getting the bytes across.
 pub const MIN_PUSH_INTERVAL_MS: u64 = 5_000;
 
+/// Where recordings live inside a recordings-flagged folder, by default
+/// (AD-66). Its own constant beside [`DEFAULT_NOTES_SUBFOLDER`] for the reason
+/// this module exists: one JSON blob has to mean the same thing to the app, to
+/// `keeper-syncd` and to whatever reads `sync.db` next, so the default is
+/// spelled once, here.
+pub const DEFAULT_RECORDINGS_SUBFOLDER: &str = "recordings";
+
 /// When a notes-flagged profile commits, and when it pushes (FR-115, AD-62).
 ///
 /// A knob on the profile rather than a scheduler of its own: the 1 Hz
@@ -296,6 +303,260 @@ impl NotesConfig {
     }
 }
 
+/// What this clone keeps of the recordings subtree (AD-66).
+///
+/// Distinct from the profile-wide [`LfsMode`] because the two answer different
+/// questions. `LfsMode` is about the whole repository; this is about one
+/// subtree, and a folder can very reasonably want its notes and its documents
+/// on disk while its video stays a pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MediaPolicy {
+    /// Keep the media bytes on this machine.
+    ///
+    /// The default, and the honest one, for the same reason `lfs_prune_local`
+    /// is off by default: it prefers a self-sufficient local copy to a smaller
+    /// one. This is also the machine the recorder writes to, so the bytes are
+    /// here regardless — the choice is only whether git keeps them too.
+    #[default]
+    Materialize,
+    /// Leave the recordings subtree as LFS pointer files on this clone.
+    ///
+    /// This exists for the phone-sized clone: the one that wants the session
+    /// list, the notes and the transcripts, and emphatically not forty
+    /// gigabytes of screen capture. It is a per-clone answer, which is why it
+    /// lives on the profile rather than in the repository.
+    PointerOnly,
+}
+
+/// When a committed recording is published (FR-136, AD-70).
+///
+/// Durability and publication are different promises, and only the first is
+/// cheap. Committing a closed segment is local and immediate, so it always
+/// happens at close; pushing is neither — a long session is a multi-gigabyte
+/// LFS object, and sending it while the meeting is still running eats the
+/// uplink the meeting runs on. So the push is a policy rather than a reflex,
+/// and it sits on the profile because the folder is what knows what its remote
+/// costs.
+///
+/// Internally tagged like [`crate::engine::PendingReason`] and
+/// [`crate::copy::CopyOutcome`], which is what keeps old blobs readable: a row
+/// written today carries `{"kind":"sessionEnd"}`, and a fourth policy added
+/// later neither renumbers nor reshapes it. `rename_all` renames the VARIANTS
+/// only — `rename_all_fields` is what reaches the payload of a struct variant,
+/// and without it `quiet_from` would cross the boundary as snake_case while
+/// every neighbouring field is camelCase.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+pub enum PushPolicy {
+    /// Push each segment as it is committed. For an uplink the recording does
+    /// not have to share, and for the person who wants the bytes off this
+    /// machine before the lid can be shut on it.
+    Immediate,
+    /// Hold every segment locally and push once, when the session finalizes.
+    ///
+    /// The default, and the reason the type exists: the meeting needs the
+    /// uplink more than the archive needs the head start. Nothing is at risk
+    /// while it waits — the segments are committed, which is the promise the
+    /// recorder actually made.
+    #[default]
+    SessionEnd,
+    /// Defer to quiet hours, as `HH:MM` local wall-clock times.
+    ///
+    /// The window wraps midnight, so `22:00`–`06:00` is one window and not two;
+    /// that is the shape a person actually wants, and refusing it would push
+    /// every metered link back onto `SessionEnd`.
+    Window {
+        quiet_from: String,
+        quiet_to: String,
+    },
+}
+
+/// The recordings flag on a profile, and everything it configures (AD-66).
+///
+/// `Some` on a [`SyncProfile`] means "this synced folder holds recordings", and
+/// `subfolder` says where inside it. This is [`NotesConfig`] applied a second
+/// time, deliberately: same `#[serde(default)]` migration, same
+/// refuse-rather-than-correct validation, and the same absence of an object
+/// with a lifetime of its own — the recordings root's identity *is* the profile
+/// id, so there is no picker, no second path to validate and nothing to import.
+///
+/// Absent is not "recordings with the defaults". A profile with no block holds
+/// no recordings, and nothing here writes a default block into one as a side
+/// effect of loading it: that would quietly nominate every synced folder on the
+/// machine as a recording destination on the first upgrade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingsConfig {
+    /// The recordings root, relative to `local_path`. Never empty, never
+    /// absolute, never escaping, and never overlapping this profile's notes
+    /// vault — see [`RecordingsConfig::validate`] for why each is refused
+    /// rather than corrected.
+    #[serde(default = "default_recordings_subfolder")]
+    pub subfolder: String,
+    #[serde(default)]
+    pub media: MediaPolicy,
+    #[serde(default)]
+    pub push: PushPolicy,
+}
+
+impl Default for RecordingsConfig {
+    fn default() -> Self {
+        Self {
+            subfolder: DEFAULT_RECORDINGS_SUBFOLDER.to_owned(),
+            media: MediaPolicy::default(),
+            push: PushPolicy::default(),
+        }
+    }
+}
+
+impl RecordingsConfig {
+    /// The subfolder, quiet-window and notes-overlap rules, split out of
+    /// [`SyncProfile::validate`] for the reason [`NotesConfig::validate`] is:
+    /// they are about these fields and not about the profile.
+    ///
+    /// The profile's notes block is passed IN rather than reached for, because
+    /// the rule this adds on top of the notes template is a rule about a pair.
+    /// One folder cannot be both a vault and a recordings root: two subsystems
+    /// would write the same tree, each with its own idea of what belongs in it,
+    /// and the first thing the user would notice is the notes indexer walking a
+    /// multi-gigabyte `.mp4`.
+    ///
+    /// Public where `NotesConfig::validate` is private, because this one takes
+    /// an argument the caller has to supply: checking a *candidate* block
+    /// against a stored profile is a thing the settings path does before there
+    /// is a `SyncProfile` to validate.
+    ///
+    /// Every rule REFUSES rather than corrects, exactly as the notes rules do
+    /// and for the same reason: no profile can carry a bad value by accident —
+    /// the field did not exist before this release and `#[serde(default)]` puts
+    /// a working one into every block that mentions it — so a bad value is one
+    /// a person typed while looking at the field that is about to reject it.
+    ///
+    /// One notes rule is deliberately absent: FR-121's `.obsidian` refusal is
+    /// about where a *vault* may point, and the overlap rule below already
+    /// keeps a recordings root out of the vault it would collide with.
+    pub fn validate(&self, notes: Option<&NotesConfig>) -> Result<()> {
+        let subfolder = self.subfolder.trim();
+        if subfolder.is_empty() {
+            return Err(SyncError::Config(
+                "recordings subfolder must not be empty: recordings live in a folder inside the \
+                 profile, never at the profile root"
+                    .into(),
+            ));
+        }
+        // `Path::join` with an absolute right-hand side DISCARDS the left one,
+        // so an absolute subfolder would not fail loudly — `recordings_root`
+        // would quietly point somewhere outside the synced folder entirely, and
+        // story 41.4's "is this path inside the recordings root" guard would
+        // start answering yes for paths the profile does not own. Tested as a
+        // string as well as through `is_absolute`, because absoluteness is
+        // platform-shaped (`C:\x` and `\\server\share` are absolute only to
+        // Windows) and one profile row has to mean the same thing on every
+        // machine that reads it.
+        if Path::new(subfolder).is_absolute()
+            || subfolder.starts_with('/')
+            || subfolder.starts_with('\\')
+        {
+            return Err(SyncError::Config(format!(
+                "recordings subfolder must be relative to the profile folder, got {subfolder}"
+            )));
+        }
+        if subfolder.split(['/', '\\']).any(|c| c == "..") {
+            return Err(SyncError::Config(format!(
+                "recordings subfolder must not escape the profile folder: {subfolder}"
+            )));
+        }
+        if let PushPolicy::Window {
+            quiet_from,
+            quiet_to,
+        } = &self.push
+        {
+            validate_quiet_time("quiet_from", quiet_from)?;
+            validate_quiet_time("quiet_to", quiet_to)?;
+            // Not a wrapping window and not a full day — just ambiguous. Rather
+            // than pick one of the two readings and be wrong half the time, say
+            // so while the person who typed it is still looking at the field.
+            if quiet_from == quiet_to {
+                return Err(SyncError::Config(format!(
+                    "recordings push window must not start and end at {quiet_from}: a window \
+                     that opens and closes at the same moment says nothing about when to push"
+                )));
+            }
+        }
+        if let Some(notes) = notes {
+            let vault = notes.subfolder.trim();
+            if subfolders_overlap(subfolder, vault) {
+                return Err(SyncError::Config(format!(
+                    "recordings subfolder {subfolder} overlaps notes subfolder {vault}: one \
+                     folder cannot be both a vault and a recordings root"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The path components of a profile-relative subfolder.
+///
+/// Empty and `.` components are dropped so `./a//b` compares as `a/b`, and both
+/// separators are honoured because one profile row is read on every platform.
+fn subfolder_components(subfolder: &str) -> impl Iterator<Item = &str> {
+    subfolder
+        .trim()
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+}
+
+/// Whether one profile-relative subfolder is the other, or contains it.
+///
+/// Component-wise, and that is the whole point: `rec` is a string prefix of
+/// `recordings` and is not an ancestor of it, so a rule written with
+/// `starts_with` would refuse an ordinary pair of sibling folders. Comparing
+/// components, one of the two runs out first and everything before that matched
+/// exactly, or it did not — which is containment in either direction, equality
+/// included, and nothing else.
+///
+/// ASCII-case-insensitive, unlike anything else in this file, because the check
+/// asks whether two subsystems would write the same tree and the volumes this
+/// ships on answer that question themselves: APFS and exFAT in their default
+/// configurations hold `Vault` and `vault` in one directory. ASCII only —
+/// full Unicode folding is filesystem-specific enough that guessing at it would
+/// be less honest than not trying.
+fn subfolders_overlap(a: &str, b: &str) -> bool {
+    subfolder_components(a)
+        .zip(subfolder_components(b))
+        .all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// One end of a [`PushPolicy::Window`], as a 24-hour local wall-clock time.
+///
+/// Refused rather than coerced, like every other field here: a window nobody
+/// can parse is a window that would silently never open, and a recording that
+/// is never pushed is exactly the failure this policy exists to schedule.
+fn validate_quiet_time(field: &'static str, value: &str) -> Result<()> {
+    let malformed = || {
+        SyncError::Config(format!(
+            "recordings push {field} must be a 24-hour HH:MM local time, got {value}"
+        ))
+    };
+    let (hours, minutes) = value.split_once(':').ok_or_else(malformed)?;
+    let two_digits = |part: &str| part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_digit());
+    if !two_digits(hours) || !two_digits(minutes) {
+        return Err(malformed());
+    }
+    let hours: u8 = hours.parse().map_err(|_| malformed())?;
+    let minutes: u8 = minutes.parse().map_err(|_| malformed())?;
+    if hours > 23 || minutes > 59 {
+        return Err(malformed());
+    }
+    Ok(())
+}
+
 /// One folder bound to one repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -316,6 +577,10 @@ pub struct SyncProfile {
     /// Repository subpaths to materialize. Empty means the whole repository.
     /// Applied both as a cone sparse-checkout and as the LFS path filter,
     /// because git-lfs is sparse-checkout-unaware (AD-47).
+    ///
+    /// Both consumers read this list through [`crate::sparse::SparseCone`],
+    /// which is where "inside the cone" is defined — it is wider than it looks,
+    /// and the two must not disagree about it (Story 27.2).
     #[serde(default)]
     pub subpaths: Vec<String>,
     /// Additional tier-0 exclusion globs, on top of the built-in set.
@@ -407,6 +672,18 @@ pub struct SyncProfile {
     /// loads on an older one, which is what makes rolling back safe.
     #[serde(default)]
     pub notes: Option<NotesConfig>,
+    /// This folder holds recordings, and where inside it (AD-66).
+    ///
+    /// `#[serde(default)]` here IS the migration, exactly as it is for `notes`
+    /// directly above and for the same reason: a row written by a keeper that
+    /// had never heard of recordings simply has no `recordings` key, so it
+    /// loads as `None` and says nothing. No SQL change, no schema bump, nothing
+    /// to run on upgrade, and a row written by this keeper still loads on the
+    /// older one.
+    ///
+    /// `None` is "holds no recordings", never "recordings with the defaults".
+    #[serde(default)]
+    pub recordings: Option<RecordingsConfig>,
 }
 
 fn default_lfs_threshold() -> u64 {
@@ -423,6 +700,9 @@ fn default_true() -> bool {
 }
 fn default_subfolder() -> String {
     DEFAULT_NOTES_SUBFOLDER.to_owned()
+}
+fn default_recordings_subfolder() -> String {
+    DEFAULT_RECORDINGS_SUBFOLDER.to_owned()
 }
 fn default_journal_template() -> String {
     DEFAULT_JOURNAL_TEMPLATE.to_owned()
@@ -459,6 +739,7 @@ impl SyncProfile {
             author_override: None,
             enabled: true,
             notes: None,
+            recordings: None,
         }
     }
 
@@ -498,6 +779,21 @@ impl SyncProfile {
         self.notes
             .as_ref()
             .map(|notes| self.local_path.join(notes.subfolder.trim()))
+    }
+
+    /// The recordings root — `local_path` joined with the recordings subfolder
+    /// — or `None` when this profile holds no recordings.
+    ///
+    /// Beside [`Self::vault_root`] and for the same reason: the flag and the
+    /// folder are stored apart, so "where do this profile's recordings live"
+    /// gets one answer rather than one per caller. [`Self::validate`] has
+    /// already refused a subfolder that is absolute or escaping, so the join
+    /// cannot leave `local_path` — which is what lets a caller treat this as
+    /// a boundary rather than a hint.
+    pub fn recordings_root(&self) -> Option<PathBuf> {
+        self.recordings
+            .as_ref()
+            .map(|recordings| self.local_path.join(recordings.subfolder.trim()))
     }
 
     /// Keychain key for this profile's remote credential. Never the secret.
@@ -561,6 +857,12 @@ impl SyncProfile {
         }
         if let Some(notes) = &self.notes {
             notes.validate()?;
+        }
+        // After the notes block, and given it: the overlap rule compares the
+        // two subfolders, and comparing against one that has not been checked
+        // yet would report the wrong problem.
+        if let Some(recordings) = &self.recordings {
+            recordings.validate(self.notes.as_ref())?;
         }
         Ok(())
     }
@@ -841,5 +1143,264 @@ mod tests {
         assert_eq!(sparse.cadence.commit_idle_ms, DEFAULT_COMMIT_IDLE_MS);
         assert_eq!(sparse.cadence.push_interval_ms, DEFAULT_PUSH_INTERVAL_MS);
         assert!(sparse.cadence.push_on_blur);
+    }
+
+    /// The same argument as the notes row above, one release later: the blob a
+    /// 0.6.5 keeper wrote has no `recordings` key, and it has to load as "holds
+    /// no recordings" and validate clean, or upgrading would strand every
+    /// existing folder.
+    #[test]
+    fn a_profile_row_written_before_recordings_existed_still_loads() {
+        let v065 = r#"{
+            "id": "01JOLD", "name": "tgdrive", "localPath": "/home/u/tgdrive",
+            "remoteUrl": "https://git.example/u/tgdrive.git", "branch": "main",
+            "direction": "bidirectional", "lane": "main",
+            "subpaths": [], "excludes": [], "removable": false, "volumeId": null,
+            "lfsMode": "materialize", "lfsThresholdBytes": 4194304,
+            "lfsPruneLocal": false, "lfsNever": [],
+            "settleMs": 5000, "pollIntervalMs": 15000, "tags": [],
+            "commitSubjectTemplate": "", "authorOverride": null, "enabled": true,
+            "notes": null
+        }"#;
+        let parsed: SyncProfile = serde_json::from_str(v065).expect("a 0.6.5 row still loads");
+        assert_eq!(
+            parsed.recordings, None,
+            "an absent key means: holds no recordings"
+        );
+        assert_eq!(parsed.recordings_root(), None);
+        assert!(parsed.validate().is_ok(), "and it is still a valid profile");
+
+        // And back: a row this keeper writes for a folder that holds no
+        // recordings round-trips to the same thing, so rolling back a release
+        // cannot turn `recordings: null` into a parse failure.
+        let round = serde_json::to_string(&parsed).expect("encode");
+        let back: SyncProfile = serde_json::from_str(&round).expect("decode");
+        assert_eq!(parsed, back);
+    }
+
+    /// The serialized form is asserted literally, not just round-tripped. A
+    /// round trip passes even if the enum's tagging changes underneath it —
+    /// and a tagging change is precisely what would make every stored blob
+    /// unreadable, which is the one failure `#[serde(default)]` cannot save us
+    /// from.
+    #[test]
+    fn a_configured_recordings_block_round_trips_including_its_push_variant() {
+        let configured = RecordingsConfig {
+            subfolder: "sessions/raw".to_owned(),
+            media: MediaPolicy::PointerOnly,
+            push: PushPolicy::Window {
+                quiet_from: "22:00".to_owned(),
+                quiet_to: "06:00".to_owned(),
+            },
+        };
+        let json = serde_json::to_string(&configured).expect("encode");
+        assert_eq!(
+            json,
+            r#"{"subfolder":"sessions/raw","media":"pointerOnly","push":{"kind":"window","quietFrom":"22:00","quietTo":"06:00"}}"#
+        );
+        let back: RecordingsConfig = serde_json::from_str(&json).expect("decode");
+        assert_eq!(configured, back);
+
+        // Through the profile blob, which is how it actually persists.
+        let mut p = profile();
+        p.recordings = Some(configured.clone());
+        assert!(p.validate().is_ok());
+        let round = serde_json::to_string(&p).expect("encode");
+        let back: SyncProfile = serde_json::from_str(&round).expect("decode");
+        assert_eq!(back.recordings, Some(configured));
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn a_recordings_config_fills_in_every_key_it_is_not_given() {
+        // The settings form sends what the user touched; the rest has to mean
+        // the documented default rather than an empty string.
+        let sparse: RecordingsConfig = serde_json::from_str("{}").expect("parse");
+        assert_eq!(sparse, RecordingsConfig::default());
+        assert_eq!(sparse.subfolder, DEFAULT_RECORDINGS_SUBFOLDER);
+        // The self-sufficient copy is the default, as it is for `lfs_prune_local`.
+        assert_eq!(sparse.media, MediaPolicy::Materialize);
+        // Pushing a multi-gigabyte object during the meeting eats the uplink
+        // the meeting runs on, so publication waits for the session to end.
+        assert_eq!(sparse.push, PushPolicy::SessionEnd);
+    }
+
+    #[test]
+    fn flagging_a_profile_puts_recordings_in_a_subfolder_of_it() {
+        let mut p = profile();
+        assert_eq!(p.recordings_root(), None, "unconfigured is not a root");
+
+        p.recordings = Some(RecordingsConfig::default());
+        assert_eq!(
+            p.recordings_root(),
+            Some(PathBuf::from("/home/u/tgdrive/recordings")),
+            "the default root is `recordings/` inside the folder keeper already syncs"
+        );
+        assert!(p.validate().is_ok());
+
+        let recordings = p.recordings.as_mut().expect("just flagged");
+        recordings.subfolder = "media/sessions".to_owned();
+        assert_eq!(
+            p.recordings_root(),
+            Some(PathBuf::from("/home/u/tgdrive/media/sessions"))
+        );
+    }
+
+    #[test]
+    fn a_recordings_subfolder_that_leaves_the_profile_folder_is_refused() {
+        // Every one of these would put a recorder's output outside the synced
+        // folder — and an ABSOLUTE one silently, because `Path::join` drops the
+        // left-hand side rather than failing.
+        for bad in ["", "   ", "/Users/x/rec", "../evil", "a/../..", ".."] {
+            let mut p = profile();
+            p.recordings = Some(RecordingsConfig {
+                subfolder: bad.to_owned(),
+                ..RecordingsConfig::default()
+            });
+            assert!(p.validate().is_err(), "{bad:?} must be refused");
+            // Refused at construction, not deferred to the first use.
+            assert!(
+                matches!(p.validate(), Err(SyncError::Config(_))),
+                "{bad:?} must be a typed config error"
+            );
+        }
+    }
+
+    /// One folder cannot be both a vault and a recordings root: the notes
+    /// indexer and the recorder would write the same tree. Symmetric, because
+    /// which one was configured first says nothing about which one is wrong.
+    #[test]
+    fn recordings_and_notes_may_not_overlap_in_either_direction() {
+        for (vault, rec) in [
+            ("vault", "vault"),
+            ("vault", "vault/rec"),
+            ("vault/notes", "vault"),
+        ] {
+            let mut p = profile();
+            p.notes = Some(NotesConfig {
+                subfolder: vault.to_owned(),
+                ..NotesConfig::default()
+            });
+            p.recordings = Some(RecordingsConfig {
+                subfolder: rec.to_owned(),
+                ..RecordingsConfig::default()
+            });
+            let err = p
+                .validate()
+                .expect_err("an overlapping pair must be refused");
+            let message = err.to_string();
+            assert!(
+                message.contains(vault) && message.contains(rec),
+                "the message must name both folders, got: {message}"
+            );
+        }
+    }
+
+    /// The overlap rule compares path COMPONENTS. Written with `starts_with` it
+    /// would read `rec` as an ancestor of `recordings` and refuse two ordinary
+    /// sibling folders.
+    #[test]
+    fn a_shared_name_prefix_is_not_an_overlap() {
+        for (vault, rec) in [
+            ("rec", "recordings"),
+            ("recordings", "rec"),
+            ("vault", "recordings"),
+            ("a/notes", "a/notebooks"),
+        ] {
+            let mut p = profile();
+            p.notes = Some(NotesConfig {
+                subfolder: vault.to_owned(),
+                ..NotesConfig::default()
+            });
+            p.recordings = Some(RecordingsConfig {
+                subfolder: rec.to_owned(),
+                ..RecordingsConfig::default()
+            });
+            assert!(
+                p.validate().is_ok(),
+                "{vault} and {rec} are siblings, not one inside the other"
+            );
+        }
+    }
+
+    #[test]
+    fn both_media_policies_and_every_push_policy_round_trip() {
+        for (policy, encoded) in [
+            (MediaPolicy::Materialize, r#""materialize""#),
+            (MediaPolicy::PointerOnly, r#""pointerOnly""#),
+        ] {
+            let json = serde_json::to_string(&policy).expect("encode");
+            assert_eq!(json, encoded);
+            let back: MediaPolicy = serde_json::from_str(&json).expect("decode");
+            assert_eq!(back, policy);
+        }
+
+        // Internally tagged, so a fourth policy added later leaves these blobs
+        // readable exactly as they are.
+        for (policy, encoded) in [
+            (PushPolicy::Immediate, r#"{"kind":"immediate"}"#),
+            (PushPolicy::SessionEnd, r#"{"kind":"sessionEnd"}"#),
+            (
+                PushPolicy::Window {
+                    quiet_from: "01:30".to_owned(),
+                    quiet_to: "05:45".to_owned(),
+                },
+                r#"{"kind":"window","quietFrom":"01:30","quietTo":"05:45"}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&policy).expect("encode");
+            assert_eq!(json, encoded);
+            let back: PushPolicy = serde_json::from_str(&json).expect("decode");
+            assert_eq!(back, policy);
+
+            let mut p = profile();
+            p.recordings = Some(RecordingsConfig {
+                push: policy,
+                ..RecordingsConfig::default()
+            });
+            assert!(p.validate().is_ok(), "{encoded} is a valid policy");
+        }
+    }
+
+    /// A window nobody can parse is a window that never opens, and a recording
+    /// that is never pushed is the failure the policy exists to schedule.
+    #[test]
+    fn a_malformed_quiet_window_is_refused() {
+        for (from, to) in [
+            ("2200", "06:00"),
+            ("22:00", "6:00"),
+            ("24:00", "06:00"),
+            ("22:60", "06:00"),
+            ("2a:00", "06:00"),
+            ("+2:00", "06:00"),
+            ("", "06:00"),
+            // Opens and closes at the same moment: not a wrapping window and
+            // not a full day, just ambiguous.
+            ("22:00", "22:00"),
+        ] {
+            let mut p = profile();
+            p.recordings = Some(RecordingsConfig {
+                push: PushPolicy::Window {
+                    quiet_from: from.to_owned(),
+                    quiet_to: to.to_owned(),
+                },
+                ..RecordingsConfig::default()
+            });
+            assert!(
+                matches!(p.validate(), Err(SyncError::Config(_))),
+                "{from:?}–{to:?} must be refused"
+            );
+        }
+
+        // Wrapping midnight is the normal case, and the boundaries are legal.
+        let mut p = profile();
+        p.recordings = Some(RecordingsConfig {
+            push: PushPolicy::Window {
+                quiet_from: "23:59".to_owned(),
+                quiet_to: "00:00".to_owned(),
+            },
+            ..RecordingsConfig::default()
+        });
+        assert!(p.validate().is_ok());
     }
 }
