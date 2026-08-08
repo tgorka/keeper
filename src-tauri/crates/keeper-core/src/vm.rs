@@ -3240,6 +3240,143 @@ pub struct RecordingPathPreviewVm {
     pub problem: Option<String>,
 }
 
+/// What the Recordings browser is looking for, crossing IPC into the
+/// `search_recordings` command (Story 42.3, FR-141, UX-DR50).
+///
+/// A deserialize-only input VM that mirrors Story 42.2's tauri-free
+/// `RecordingFilter` field for field — the command maps this INTO it, exactly
+/// as [`SearchFilterVm`] maps into `SearchFilter`, so the engine never learns
+/// what a `Vm` is. Every predicate is optional and every one of them ANDs:
+/// empty `query` is no text predicate at all, an empty `tags` list is
+/// unrestricted, and a `null` bound is unbounded. The default value of every
+/// field together is "every session, newest first", which is what the filter
+/// row means before anyone touches it.
+///
+/// `#[serde(default)]` on each optional so the frontend may omit what it is not
+/// filtering by, rather than being obliged to spell out seven `null`s to ask
+/// the broadest question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingFilterVm {
+    /// The user's free text over a session's title, participants, note, tags
+    /// and custom-field values (trigram `MATCH` at ≥3 Unicode scalar values, an
+    /// accelerated `LIKE` scan below that).
+    pub query: String,
+    /// Tags the session must carry, each matched hierarchically at the segment
+    /// boundary (`client/acme` matches `client/acme/renewal`, never
+    /// `client/acmecorp`). Several tags narrow; they never widen.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// A case-insensitive substring of the session's participants, or `null`
+    /// for any.
+    #[serde(default)]
+    pub participant: Option<String>,
+    /// Inclusive lower bound on the session's start (ms since the Unix epoch),
+    /// or `null` for unbounded below.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub start_ts: Option<i64>,
+    /// Inclusive upper bound on the session's start (ms since the Unix epoch),
+    /// or `null` for unbounded above.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub end_ts: Option<i64>,
+    /// Restrict to one durability state, as the wire word
+    /// [`RecordingDurabilityState`] serialises to, or `null` for any state.
+    #[serde(default)]
+    pub durability: Option<String>,
+    /// Restrict to sessions recorded under one destination profile, or `null`
+    /// for any (including sessions recorded to a plain folder).
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    /// Cap on the number of hits, or `null` for the engine's default. The
+    /// engine clamps this to `[1, 200]`, so a caller can never ask for an
+    /// unbounded scan.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub limit: Option<i64>,
+}
+
+/// One session the Recordings browser lists (Story 42.3, FR-141, UX-DR50).
+///
+/// Story 42.2's `RecordingHit` is the engine's answer; this is the ROW, and the
+/// two differ deliberately in three ways, each of which exists because the row
+/// renders it and the engine does not carry it:
+///
+/// - **Paths, both of them.** `relative_path` is what the index stores and what
+///   the surface prints as inert text where there is no file manager to reveal
+///   into; `absolute_path` is the same session folder joined onto the EFFECTIVE
+///   destination root by the command. No frontend surface ever joins a root and
+///   a subfolder itself (AD-65) — Rust composes the destination in one place, so
+///   Reveal cannot open a folder the recorder would not have written to.
+/// - **Duration and size**, because the row shows them. `duration_ms` is derived
+///   from the two stamps and `total_bytes` is summed from the session's
+///   `recording_segments` rows; neither is a column on the session row, and
+///   neither is worth a second copy that could go stale.
+/// - **Tags decoded.** The engine hands back the stored JSON text (the column is
+///   the truth, Story 42.1); a chip list is `string[]`, and decoding it once in
+///   Rust means the frontend never parses a database column.
+///
+/// Not carried: the note, the participants and the custom fields. All three are
+/// SEARCHABLE — a user remembers what they typed — but no row displays them,
+/// and a hit that carried every column would be a `RecordingRow` wearing a
+/// different name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingHitVm {
+    /// The session's immutable identity — the id the row's Copy action puts on
+    /// the clipboard, and the only handle that survives a Story 40.4 retitle.
+    pub session_id: String,
+    /// The session folder relative to the destination root, `/`-joined. What
+    /// the row prints when there is no file manager to reveal into.
+    pub relative_path: String,
+    /// The absolute session folder — [`Self::relative_path`] resolved against
+    /// the effective recordings destination by the command, and the Reveal
+    /// target. Current by construction: Story 42.1's row follows the session
+    /// through a retitle, so this is where the folder is NOW.
+    pub absolute_path: String,
+    /// The user's title for the session, or `null` for an untitled one (the row
+    /// then leads with its date and folder, never a blank line).
+    pub title: Option<String>,
+    /// Session start, ms since the Unix epoch; `null` for a pre-21.5 manifest
+    /// that carries no stamp.
+    #[ts(type = "number | null")]
+    pub started_ts: Option<i64>,
+    /// Session end, ms since the Unix epoch; `null` while the session runs or
+    /// when it was interrupted.
+    #[ts(type = "number | null")]
+    pub ended_ts: Option<i64>,
+    /// How long the session ran, in milliseconds — `ended_ts - started_ts`, and
+    /// `null` unless BOTH stamps are present. A session that has no end has no
+    /// duration yet, and "now minus the start" would be a different fact
+    /// (elapsed time) wearing this one's name, computed against a clock
+    /// `keeper-core` deliberately does not read.
+    #[ts(type = "number | null")]
+    pub duration_ms: Option<i64>,
+    /// The session's total on-disk size in bytes, summed over its
+    /// `recording_segments` rows. `0` for a session with no closed segment —
+    /// which is the honest reading, not a missing value: nothing was written.
+    #[ts(type = "number")]
+    pub total_bytes: i64,
+    /// How far the session's bytes have travelled, as epic 41's wire word — the
+    /// row's durability glyph.
+    pub durability: String,
+    /// The session's tags, decoded from the stored JSON array. Empty when the
+    /// session has none, or when the column holds something that is not a JSON
+    /// array of strings. Rendered and filtered exactly as stored — Story 42.5
+    /// is what normalises the vocabulary.
+    pub tags: Vec<String>,
+    /// The absolute path of the file Play hands to the system handler: the
+    /// session's first screen segment, or its first segment of any track when
+    /// it captured no screen (an audio-only session still has something to
+    /// play). `null` when the session has no segment row at all — nothing was
+    /// written, so there is nothing to play, and the surface omits the action
+    /// rather than opening the folder and calling that playback.
+    pub playable_path: Option<String>,
+}
+
 /// How many rows a folder card's lists show, folded and unfolded.
 ///
 /// One pair for every list on the card rather than one pair per list: a user

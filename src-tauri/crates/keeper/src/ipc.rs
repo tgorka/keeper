@@ -51,11 +51,12 @@ use keeper_core::vm::{
     IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
     NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
     PaletteResultsVm, PingVm, Provider, RecordingDestinationKind, RecordingDurabilityState,
-    RecordingDurabilityVm, RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm,
-    RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm,
-    RecordingTargetVm, RecordingUiState, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
-    ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm,
-    TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
+    RecordingDurabilityVm, RecordingFilterVm, RecordingHitVm, RecordingPathPreviewVm,
+    RecordingPermissionVm, RecordingProfileVm, RecordingSettingsVm, RecordingSourcesVm,
+    RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState, RemoteDraftVm,
+    ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm, SearchHitVm,
+    SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch, TypingBatch,
+    VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -2286,6 +2287,63 @@ pub fn search_archive(
         .map_err(to_ipc_error)
 }
 
+/// Search the recordings archive for the Recordings browser (Story 42.3,
+/// FR-141, UX-DR50).
+///
+/// [`search_archive`]'s shape, deliberately: this is the same question about a
+/// different table, and a user who has learned how search behaves in one
+/// surface has learned it in both. So — a fresh READ-ONLY `archive.db`
+/// connection per query (WAL admits concurrent readers, so browsing never
+/// touches the recorder's writer and works with no session and no network), the
+/// tauri-free Story 42.2 engine behind a `Vm` seam, and failures through the
+/// one [`to_ipc_error`] funnel.
+///
+/// **An absent `archive.db` is an empty result, not an error dialog.** A
+/// machine that has never recorded anything has no archive to open, and
+/// `SQLITE_OPEN_READ_ONLY` on a missing file is `SQLITE_CANTOPEN` — a
+/// first-run failure the user can neither understand nor act on. The frontend
+/// tells "nothing recorded yet" from "nothing matches this filter" from the
+/// filter it sent, which is the only place both facts are known.
+///
+/// The effective recordings destination (Story 41.2) is resolved here and each
+/// row's absolute path composed from it, so no frontend surface ever joins a
+/// root to a subfolder (AD-65) and Reveal cannot open a folder the recorder
+/// would not have written to.
+#[tauri::command]
+pub fn search_recordings(
+    state: State<'_, AppState>,
+    filter: RecordingFilterVm,
+) -> Result<Vec<RecordingHitVm>, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let destination_root = effective_destination_dir(&data_dir, &state.platform);
+    search_recordings_in(&data_dir, &destination_root, filter)
+}
+
+/// The whole of [`search_recordings`] except the two answers only the app state
+/// can give, so every rule above is asserted over a temp directory with no
+/// Tauri app, no registry and no `git` — including the first-run one, which is
+/// exactly the machine that has neither.
+fn search_recordings_in(
+    data_dir: &Path,
+    destination_root: &Path,
+    filter: RecordingFilterVm,
+) -> Result<Vec<RecordingHitVm>, IpcError> {
+    if !keeper_core::archive::db::db_path(data_dir).exists() {
+        return Ok(Vec::new());
+    }
+    let conn = keeper_core::archive::db::open_readonly_archive_db(data_dir)
+        .map_err(CoreError::from)
+        .map_err(to_ipc_error)?;
+    let domain_filter = keeper_core::archive::RecordingFilter::from(filter);
+    keeper_core::archive::recordings_fts::search_recording_vms(
+        &conn,
+        &domain_filter,
+        destination_root,
+    )
+    .map_err(CoreError::from)
+    .map_err(to_ipc_error)
+}
+
 /// Start a background archive export (Story 5.5, FR-35, AD-11).
 ///
 /// Registers a cancel flag, returns the `exportId` immediately, and spawns a
@@ -2484,6 +2542,85 @@ pub fn reveal_path(path: String) -> Result<(), IpcError> {
     let _ = path;
     Err(to_ipc_error(CoreError::Unsupported(
         "revealing a file in the OS file manager is desktop-only".to_owned(),
+    )))
+}
+
+/// Hand a recording's file to the system's default handler — the Recordings
+/// browser's Play (Story 42.3, FR-141, UX-DR50).
+///
+/// **The containment check comes first, and it is the whole point of this
+/// command existing rather than a bare `open_path` binding.** A command that
+/// opens whatever path the webview names is a file-disclosure primitive: an
+/// injected string is enough to launch the user's default application on any
+/// file the process can read. `notes_open_file` refuses for exactly that reason
+/// and re-derives its path before `opener` sees it; here the rule is "inside the
+/// recordings destination root, and nowhere else", which is where every path
+/// this surface can legitimately offer comes from.
+///
+/// Both halves of the codebase's containment idiom (AD-59), because either
+/// alone is defeatable. [`session_relative_key`] is the lexical half — under
+/// the root, and every component a plain name, so `..` cannot walk out — and
+/// the canonicalizing half catches what no string test can: a symlink planted
+/// inside the recordings folder that points somewhere else. Canonicalizing the
+/// root too is what keeps a destination that is itself reached through a
+/// symlink (`~/Movies` on a machine with a relocated home) from refusing every
+/// file under it.
+///
+/// A path that no longer resolves is refused here rather than at the opener,
+/// which is the honest answer for a session whose folder was moved or deleted
+/// outside keeper.
+#[cfg(desktop)]
+#[tauri::command]
+pub fn recording_open_path(state: State<'_, AppState>, path: String) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let root = effective_destination_dir(&data_dir, &state.platform);
+    let target = contained_recording_path(&root, &path)?;
+    tauri_plugin_opener::open_path(&target, None::<&str>).map_err(|error| {
+        to_ipc_error(CoreError::Internal(format!(
+            "could not open \"{path}\": {error}"
+        )))
+    })
+}
+
+/// The containment check [`recording_open_path`] refuses on, as a function of
+/// nothing but a root and a string — so the refusal is asserted over a temp
+/// directory, which is the only way a security rule is ever actually tested.
+/// Returns the resolved path to open.
+#[cfg(desktop)]
+fn contained_recording_path(root: &Path, path: &str) -> Result<PathBuf, IpcError> {
+    let refuse = |reason: &str| {
+        Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("\"{path}\" {reason}"),
+            account_id: None,
+            retriable: false,
+        })
+    };
+    let target = PathBuf::from(path);
+    if session_relative_key(root, &target).is_none() {
+        return refuse("is not inside the recordings destination, so it will not be opened");
+    }
+    let (Ok(canonical_root), Ok(canonical_target)) = (root.canonicalize(), target.canonicalize())
+    else {
+        return refuse("could not be resolved on disk, so there is nothing to open");
+    };
+    if !canonical_target.starts_with(&canonical_root) {
+        return refuse("resolves outside the recordings destination, so it will not be opened");
+    }
+    Ok(canonical_target)
+}
+
+/// Mobile stub for [`recording_open_path`] (Story 42.3): recording — and so the
+/// browser over it — is a desktop-only surface, and there is no system handler
+/// to hand a file to on iOS. An honest `Unsupported` (`retriable: false`)
+/// through the single [`to_ipc_error`] funnel; the `recording` capability is
+/// reported `false`, so the surface is absent before this can be invoked.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn recording_open_path(state: State<'_, AppState>, path: String) -> Result<(), IpcError> {
+    let _ = (state, path);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "opening a recording is desktop-only".to_owned(),
     )))
 }
 
@@ -14802,5 +14939,214 @@ mod tests {
             spy.writes()
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- the recordings browser (Story 42.3) --------------------------------
+
+    /// Index one session, with one 4 KiB screen segment, into a real
+    /// `archive.db` under `data_dir`.
+    fn index_browsable_session(data_dir: &Path, session_id: &str, title: &str) {
+        let conn = keeper_core::archive::db::open_archive_db(data_dir).expect("open the archive");
+        let row = keeper_core::archive::RecordingRow {
+            session_id: session_id.to_owned(),
+            device_id: None,
+            relative_path: format!("2026/{title}"),
+            root_kind: "folder".to_owned(),
+            profile_id: None,
+            started_ts: Some(1_000),
+            ended_ts: Some(61_000),
+            title: Some(title.to_owned()),
+            participants_json: None,
+            note: None,
+            tags_json: None,
+            custom_json: None,
+            codec: None,
+            width: None,
+            height: None,
+            fps: None,
+            durability: "local".to_owned(),
+            manifest_version: 1,
+        };
+        keeper_core::archive::recordings::upsert_recording(&conn, &row).expect("index the session");
+        keeper_core::archive::recordings::upsert_segment(
+            &conn,
+            &keeper_core::archive::RecordingSegmentRow {
+                session_id: session_id.to_owned(),
+                index: 0,
+                track: "screen".to_owned(),
+                relative_path: format!("2026/{title}/screen-0000.mov"),
+                bytes: 4_096,
+                pts_start: None,
+                pts_end: None,
+                closed_ts: None,
+            },
+        )
+        .expect("index the segment");
+    }
+
+    /// Story 42.3, matrix row 1: a machine that has never recorded — or never
+    /// synced — has no `archive.db` at all, and browsing it is an empty list,
+    /// not the `SQLITE_CANTOPEN` a read-only open of a missing file would
+    /// raise. This is `search_archive`'s rule and the first thing a fresh
+    /// install does.
+    #[test]
+    fn browsing_recordings_with_no_archive_yields_no_rows_and_no_error() {
+        let data_dir = scan_temp_dir("rec-42-3-no-archive");
+
+        let rows = search_recordings_in(
+            &data_dir,
+            &data_dir.join("Movies"),
+            RecordingFilterVm {
+                query: String::new(),
+                tags: Vec::new(),
+                participant: None,
+                start_ts: None,
+                end_ts: None,
+                durability: None,
+                profile_id: None,
+                limit: None,
+            },
+        )
+        .expect("an absent archive is an empty answer, never an error");
+
+        assert!(rows.is_empty());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 42.3: with an archive, the command answers the filter it was given
+    /// and resolves each row against the destination root the shell passed in —
+    /// the row's Reveal target, composed in Rust and nowhere else (AD-65).
+    #[test]
+    fn browsing_recordings_returns_rows_resolved_against_the_destination_root() {
+        let base = scan_temp_dir("rec-42-3-browse");
+        let data_dir = base.join("data");
+        let destination_root = base.join("Movies").join("keeper");
+        index_browsable_session(&data_dir, "01DEVICE-01STANDUP", "Standup");
+        let filter = |query: &str| RecordingFilterVm {
+            query: query.to_owned(),
+            tags: Vec::new(),
+            participant: None,
+            start_ts: None,
+            end_ts: None,
+            durability: None,
+            profile_id: None,
+            limit: None,
+        };
+
+        let rows = search_recordings_in(&data_dir, &destination_root, filter("standup"))
+            .expect("browse the archive");
+        let missing = search_recordings_in(&data_dir, &destination_root, filter("retrospective"))
+            .expect("browse the archive");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "01DEVICE-01STANDUP");
+        assert_eq!(rows[0].duration_ms, Some(60_000));
+        assert_eq!(rows[0].total_bytes, 4_096);
+        let expected_folder = destination_root.join("2026").join("Standup");
+        let expected_file = expected_folder
+            .join("screen-0000.mov")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(rows[0].absolute_path, expected_folder.to_string_lossy());
+        assert_eq!(
+            rows[0].playable_path.as_deref(),
+            Some(expected_file.as_str())
+        );
+        assert!(
+            missing.is_empty(),
+            "a filter that matches nothing is an empty list, not an error"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Story 42.3, the security-relevant one: a command that opened whatever
+    /// path the webview named would launch the user's default application on
+    /// any readable file. Every way out of the recordings root is refused —
+    /// a sibling directory, a `..` walk that lexically strips clean, and a
+    /// symlink inside the root that no string test can catch — and the refusal
+    /// is non-retriable, because retrying will not make it contained.
+    #[cfg(desktop)]
+    #[test]
+    fn opening_a_recording_refuses_every_path_outside_the_destination_root() {
+        let base = scan_temp_dir("rec-42-3-containment");
+        let root = base.join("Movies").join("keeper");
+        let session = root.join("2026").join("Standup");
+        std::fs::create_dir_all(&session).expect("the session folder");
+        let inside = session.join("screen-0000.mov");
+        std::fs::write(&inside, b"bytes").expect("the segment");
+        let secret = base.join("secret.txt");
+        std::fs::write(&secret, b"private").expect("the secret");
+
+        // The honest case still works, and resolves to the file itself.
+        assert_eq!(
+            contained_recording_path(&root, &inside.to_string_lossy())
+                .expect("a file inside the root is opened"),
+            inside.canonicalize().expect("canonical segment")
+        );
+
+        for outside in [
+            secret.to_string_lossy().into_owned(),
+            root.join("..")
+                .join("secret.txt")
+                .to_string_lossy()
+                .into_owned(),
+            session
+                .join("..")
+                .join("..")
+                .join("..")
+                .join("secret.txt")
+                .to_string_lossy()
+                .into_owned(),
+            "/etc/passwd".to_owned(),
+            root.to_string_lossy().into_owned(),
+        ] {
+            let refusal = contained_recording_path(&root, &outside)
+                .expect_err(&format!("{outside} was opened from outside the root"));
+            assert_eq!(refusal.code, IpcErrorCode::Internal);
+            assert!(!refusal.retriable);
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Story 42.3: the lexical half of the check cannot see a symlink, so the
+    /// canonicalizing half is what actually refuses one — a link planted inside
+    /// the recordings folder pointing at a file outside it passes every string
+    /// test there is.
+    #[cfg(all(desktop, unix))]
+    #[test]
+    fn opening_a_recording_refuses_a_symlink_that_escapes_the_destination_root() {
+        let base = scan_temp_dir("rec-42-3-symlink");
+        let root = base.join("Movies").join("keeper");
+        std::fs::create_dir_all(&root).expect("the root");
+        let secret = base.join("secret.txt");
+        std::fs::write(&secret, b"private").expect("the secret");
+        let link = root.join("escape.mov");
+        std::os::unix::fs::symlink(&secret, &link).expect("the planted symlink");
+
+        let refusal = contained_recording_path(&root, &link.to_string_lossy())
+            .expect_err("a symlink out of the root was followed");
+
+        assert_eq!(refusal.code, IpcErrorCode::Internal);
+        assert!(!refusal.retriable);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Story 42.3, matrix row 8: a session whose folder is gone — moved or
+    /// deleted outside keeper — is an honest refusal rather than a path handed
+    /// to the opener to fail on in its own words.
+    #[cfg(desktop)]
+    #[test]
+    fn opening_a_recording_that_no_longer_exists_is_refused_honestly() {
+        let base = scan_temp_dir("rec-42-3-gone");
+        let root = base.join("Movies").join("keeper");
+        std::fs::create_dir_all(&root).expect("the root");
+
+        let refusal = contained_recording_path(&root, &root.join("gone.mov").to_string_lossy())
+            .expect_err("a path that does not resolve was opened");
+
+        assert_eq!(refusal.code, IpcErrorCode::Internal);
+        assert!(!refusal.retriable);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
