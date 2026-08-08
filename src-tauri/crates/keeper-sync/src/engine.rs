@@ -813,31 +813,86 @@ impl Engine {
         }
     }
 
-    /// Record a sticky warning and notify exactly once on its onset.
+    /// Record a sticky warning and notify exactly once per onset (Story 29.6).
+    ///
+    /// **Onset means `None → Some` on the snapshot's `warning` — the presence
+    /// of a problem appearing, never its wording changing.** That distinction
+    /// is the entire story. The supervisor ticks at 1 Hz and three of the
+    /// callers below embed a number that moves with the condition they are
+    /// describing: [`Self::record_failure`]'s "sync has failed {n} times in a
+    /// row", the conflict count [`Self::do_pull`] reports, and the skipped-file
+    /// count on an iCloud-evicted tree. A rule keyed on the message *text*
+    /// therefore read every one of those ticks as a fresh onset and posted a
+    /// native notification for each — 3 600 an hour for a single folder that
+    /// stayed broken, which is the failure mode AD-51 calls a notification
+    /// storm and which trains a user to turn keeper's notifications off
+    /// entirely.
+    ///
+    /// Keying on presence makes "the state changed" and "a notification
+    /// happens" the same event by construction: the send site sits inside the
+    /// one branch that performs the transition, so there is no de-duplication
+    /// cache beside the state that could ever disagree with it. This mirrors
+    /// `fold_recording_event`'s `onset.then_some(message)` idiom in the shell
+    /// (Story 18.4's loud-failure triad), deliberately rather than inventing a
+    /// second way to spell the same rule.
+    ///
+    /// The **level** still drives every surface a user can re-read: the message
+    /// is written on every call, so a rising failure count, a growing conflict
+    /// tally, or a permanent error arriving over a transient run is on the
+    /// AD-51 banner and behind the tray glyph immediately. Only the native
+    /// toast is edge-triggered, because it is the one surface that cannot be
+    /// re-read and so must not be repeated. The `tracing::warn!` line is on the
+    /// same edge for the same reason — a per-tick log line is the same storm in
+    /// a different sink — and the Transient arm of [`Self::record_failure`]
+    /// already logs every individual failure at `warn` for diagnosis.
+    ///
+    /// The edge re-arms only when the warning is retired
+    /// ([`Self::clear_warning`] on any successful unit, or
+    /// [`Self::clear_watch_warning`] when a watcher arms), which is what makes
+    /// a cleared-then-recurring problem notify again: the `Some → None` write
+    /// *is* the reset, so no separate "already notified" flag can be left
+    /// stale behind it.
+    ///
+    /// A consequence worth naming: a *second, different* problem on a profile
+    /// that is already warning does not post its own toast. That is the right
+    /// trade at this cadence — the user has already been told this folder needs
+    /// attention and the banner carries the current wording — and the
+    /// alternative is exactly the text-keyed rule this replaces.
     ///
     /// The onset check and the notification are deliberately split: the
     /// notification is raised *after* the status lock is released, mirroring
     /// `fold_recording_event`'s discipline in the shell, because a notifier can
     /// block and holding a lock across it would stall the tray tick.
     fn warn(&self, profile_id: &str, profile_name: &str, message: String) {
-        let is_onset = {
+        let raised = {
             let mut status = Self::lock(&self.status);
             match status.get_mut(profile_id) {
                 Some(snapshot) => {
-                    let onset = snapshot.warning.as_deref() != Some(message.as_str());
-                    snapshot.warning = Some(message.clone());
-                    onset
+                    let onset = snapshot.warning.is_none();
+                    // Cloned only on the edge: the repeat path runs on every
+                    // tick a warning stays raised, and must not allocate a copy
+                    // of a message nobody is going to send.
+                    let raised = onset.then(|| message.clone());
+                    snapshot.warning = Some(message);
+                    raised
                 }
-                None => false,
+                None => None,
             }
         };
-        if is_onset {
+        if let Some(message) = raised {
             tracing::warn!(profile = profile_name, message = %message, "sync warning");
             self.platform
                 .notify(&format!("Sync — {profile_name}"), &message);
         }
     }
 
+    /// Retire this profile's problem surfaces after a successful unit.
+    ///
+    /// This is also the reset for [`Self::warn`]'s onset edge, and deliberately
+    /// the *only* one: because the edge is read off `warning` itself, wiping the
+    /// field is what re-arms it, so a cleared-then-recurring problem notifies
+    /// again (Story 29.6's second acceptance clause) without a separate
+    /// "already notified" flag that a future caller could forget to clear here.
     fn clear_warning(&self, profile_id: &str) {
         if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
             snapshot.warning = None;
@@ -1117,8 +1172,15 @@ impl Engine {
     ///
     /// `reason` is the watcher's own message, which for the one watcher failure
     /// a user can actually fix names the sysctl to raise. The text is otherwise
-    /// fixed on purpose: `warn` compares before it notifies, so a countdown or
-    /// any other changing number in here would defeat the once-per-onset rule.
+    /// fixed on purpose — not for [`Self::warn`]'s benefit, which keys its
+    /// notification on presence and no longer reads the wording at all, but for
+    /// the banner's: the level path below rewrites the line on every tick the
+    /// watcher is down, and Story 29.5 keys its announcement on the state
+    /// rather than the tick, so a countdown or any other moving number here
+    /// would turn one sticky line into a fresh announcement every second. Only
+    /// the opening words are matched when it is retired
+    /// ([`Self::clear_watch_warning`]), so the tail is free to say anything —
+    /// it just must not say something different each time.
     fn warn_watch_degraded(&self, profile: &SyncProfile, reason: &str, notify: bool) {
         let seconds = profile.effective_poll_interval_ms() / 1_000;
         let message = format!(
@@ -5627,6 +5689,177 @@ mod tests {
             .map(|n| n.len())
             .unwrap_or_default();
         assert_eq!(count, 2, "a recurrence after clearing must notify again");
+    }
+
+    /// Every notification the engine has posted, in order.
+    ///
+    /// [`SyncPlatform::notify`] is the only surface a notification is
+    /// observable on, so `TestPlatform`'s own recording is the spy for all of
+    /// Story 29.6 — a second test double could only ever disagree with the port
+    /// the shell and the daemon actually implement.
+    fn notifications_posted(platform: &TestPlatform) -> Vec<(String, String)> {
+        platform
+            .notifications
+            .lock()
+            .map(|posted| posted.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Story 29.6's headline, in the shape that actually broke: a warning that
+    /// stays raised while its **wording moves** is still one notification.
+    ///
+    /// The supervisor ticks at 1 Hz, so `TICKS` is an hour of a folder that
+    /// stayed broken. Several real warnings carry a number that moves with the
+    /// condition they describe — the consecutive-failure count, the conflict
+    /// tally — and an onset keyed on the message *text* read every one of those
+    /// ticks as a fresh onset. A text-keyed or level-triggered implementation
+    /// fails the first assertion below by three and a half thousand.
+    #[test]
+    fn a_sustained_warning_whose_wording_moves_every_tick_still_notifies_once() {
+        const TICKS: u32 = 3_600;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        for n in 1..=TICKS {
+            engine.warn(&p.id, &p.name, format!("sync has failed {n} times"));
+        }
+        let posted = notifications_posted(&platform);
+        assert_eq!(posted.len(), 1, "an hour of one warning is one toast");
+        assert_eq!(posted[0].0, "Sync — fixture", "the toast names the folder");
+        assert_eq!(posted[0].1, "sync has failed 1 times", "and is the onset's");
+
+        // The *level* still reaches every surface a user can re-read: the banner
+        // carries the latest wording, not the one that happened to notify. That
+        // half must not be sacrificed to win the assertion above — a warning
+        // that stops tracking its condition is AD-34-11's silent downgrade.
+        let shown = engine.status(&p.id).expect("status").warning;
+        assert_eq!(shown, Some(format!("sync has failed {TICKS} times")));
+
+        // And the edge re-arms on `Some → None`: the same condition returning
+        // after a clean run is a new event, not a suppressed duplicate.
+        engine.clear_warning(&p.id);
+        engine.warn(&p.id, &p.name, "sync has failed 1 times".to_owned());
+        let posted = notifications_posted(&platform);
+        assert_eq!(posted.len(), 2, "a cleared-then-recurring warning notifies");
+    }
+
+    /// The same guarantee through the caller that produces a moving message,
+    /// rather than through a test that hand-rolls one.
+    ///
+    /// [`Engine::record_failure`]'s transient arm embeds the consecutive count,
+    /// so every failure past the threshold reaches `warn` with different text —
+    /// the exact sequence that used to notify once per tick. The pre-existing
+    /// coverage stops at the threshold itself, where the bug is invisible
+    /// because only one message has been formatted yet.
+    #[test]
+    fn a_long_run_of_transient_failures_notifies_once_however_long_it_runs() {
+        const FAILURES: u32 = 3_600;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let err = SyncError::Git("could not write the index".to_owned());
+        for _ in 0..FAILURES {
+            engine.record_failure(&p, &err);
+        }
+
+        let posted = notifications_posted(&platform);
+        assert_eq!(posted.len(), 1, "an hour of failures is one toast");
+        let (title, body) = &posted[0];
+        assert_eq!(title, "Sync — fixture", "the toast names the folder");
+        let onset = TRANSIENT_FAILURES_BEFORE_WARNING;
+        assert!(
+            body.contains(&format!("failed {onset} times")),
+            "the toast carries the onset's own message, got: {body}"
+        );
+        let shown = engine.status(&p.id).expect("status").warning;
+        assert!(
+            shown.is_some_and(|line| line.contains(&format!("failed {FAILURES} times"))),
+            "the banner keeps counting up while the toast stays quiet"
+        );
+    }
+
+    /// Two folders going wrong are two onsets, each naming itself.
+    ///
+    /// The edge lives in each profile's own snapshot, so it cannot degenerate
+    /// into one process-wide "already warned" flag — which would silence the
+    /// second folder entirely, the failure mode this asserts against.
+    #[test]
+    fn two_profiles_that_both_go_wrong_each_notify_and_each_names_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let first = profile(dir.path());
+        let second = SyncProfile::new(
+            "01JTESTPROFILE2",
+            "second",
+            dir.path().join("other"),
+            "https://git.invalid/x/z.git",
+        );
+        engine.upsert_profile(&first).expect("upsert first");
+        engine.upsert_profile(&second).expect("upsert second");
+
+        engine.warn(&first.id, &first.name, "rename required".to_owned());
+        engine.warn(&second.id, &second.name, "the push was rejected".to_owned());
+        let posted = notifications_posted(&platform);
+        assert_eq!(posted.len(), 2, "two onsets are two events");
+        assert_eq!(posted[0].0, "Sync — fixture");
+        assert_eq!(posted[0].1, "rename required");
+        assert_eq!(posted[1].0, "Sync — second");
+        assert_eq!(posted[1].1, "the push was rejected");
+
+        // Both raised and both sustained: neither re-notifies, and one folder's
+        // raised warning suppresses nothing on the other.
+        engine.warn(&first.id, &first.name, "rename required".to_owned());
+        engine.warn(&second.id, &second.name, "the push was rejected".to_owned());
+        assert_eq!(notifications_posted(&platform).len(), 2);
+    }
+
+    /// A warning already raised when a subscriber attaches notifies **nobody** —
+    /// asserted deliberately, because it is the intended behaviour.
+    ///
+    /// A notification belongs to the onset, not to the observer: the toast is an
+    /// interruption, and interrupting someone about a condition that has been
+    /// true for the last twenty minutes because a window happened to open is
+    /// exactly the noise AD-51 keeps out of this subsystem. What a late arrival
+    /// gets instead is the level — `warning` on the polled snapshot, which the
+    /// AD-51 banner renders on its first paint — so nothing is missed. It is
+    /// also why the platform port is the notification's only sink: routing it
+    /// through the progress fan-out would turn every new subscriber into a
+    /// fresh notification for the same old problem.
+    #[test]
+    fn a_warning_already_raised_does_not_notify_a_late_subscriber() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        engine.warn(&p.id, &p.name, "rename required".to_owned());
+        assert_eq!(notifications_posted(&platform).len(), 1, "the onset posted");
+
+        let sink: ProgressSink = Box::new(|_| true);
+        let id = engine.subscribe(sink);
+        let posted = notifications_posted(&platform);
+        assert_eq!(posted.len(), 1, "attaching an observer is not an onset");
+
+        // What the late arrival reads instead, and why it misses nothing.
+        let shown = engine.status(&p.id).expect("status").warning;
+        assert_eq!(shown.as_deref(), Some("rename required"));
+        engine.unsubscribe(id);
     }
 
     #[test]

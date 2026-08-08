@@ -816,11 +816,15 @@ mod tests {
 
     // --- Story 29.6: the desktop end of "notify exactly once, on onset" -----
     //
-    // The engine's half (at most one raise per `None -> Some` onset) is covered
-    // by `a_warning_notifies_once_per_onset_not_once_per_tick` in `keeper-sync`.
+    // The engine's half — one raise per `None -> Some` onset, and no raise
+    // while a warning stays up however its wording moves — is covered in
+    // `keeper-sync` by `a_warning_notifies_once_per_onset_not_once_per_tick`,
+    // `a_sustained_warning_whose_wording_moves_every_tick_still_notifies_once`
+    // and `a_long_run_of_transient_failures_notifies_once_however_long_it_runs`.
     // What follows covers the leg the engine cannot see: that the onset the
     // engine raised actually reaches the OS notifier, once, unaltered, and with
-    // the loud-failure posture AD-39 requires.
+    // the loud-failure posture AD-39 requires — untargeted, and unsilenceable
+    // by Do Not Disturb.
 
     /// A capturing [`Platform`] double recording every `(title, body, target)`
     /// posted through `notify` (mirrors `keeper-core::notify`'s test double).
@@ -832,19 +836,30 @@ mod tests {
     struct CapturingPlatform {
         calls: Mutex<Vec<(String, String, NotifyTarget)>>,
         fail: bool,
+        /// Where a suppression gate would have to look to find the global
+        /// Do-Not-Disturb flag. Real, and pointed at a registry tree with DND
+        /// switched on by [`CapturingPlatform::rooted`], so the bypass asserted
+        /// below is falsifiable rather than merely implied by the absence of an
+        /// argument.
+        data_dir: PathBuf,
     }
 
     impl CapturingPlatform {
         fn new() -> Self {
-            Self {
-                calls: Mutex::new(Vec::new()),
-                fail: false,
-            }
+            Self::rooted(Path::new("/tmp/keeper-sync-test"))
         }
         fn failing() -> Self {
             Self {
-                calls: Mutex::new(Vec::new()),
                 fail: true,
+                ..Self::new()
+            }
+        }
+        /// A double reading a real registry tree, for the DND-bypass test.
+        fn rooted(dir: &Path) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail: false,
+                data_dir: dir.to_path_buf(),
             }
         }
         /// The `(title, body)` of every posted notification (the target is
@@ -870,7 +885,7 @@ mod tests {
 
     impl Platform for CapturingPlatform {
         fn data_dir(&self) -> Result<PathBuf, CoreError> {
-            Ok(PathBuf::from("/tmp/keeper-sync-test"))
+            Ok(self.data_dir.clone())
         }
         fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
             Ok(())
@@ -937,6 +952,42 @@ mod tests {
         // untargeted path as recording faults rather than routed through a
         // click-through target that would make it a quiet, dismissible nudge.
         assert_eq!(notifier.targets(), vec![NotifyTarget::None]);
+    }
+
+    /// The bypass, asserted the way `keeper-core` asserts the recording triad's
+    /// (`recording_fault_bypasses_dnd_and_network_mute`): put the app in the
+    /// harshest suppression state it has, then show the post happening anyway.
+    ///
+    /// Global Do Not Disturb silences every chat notification and even the
+    /// bridge-disconnected alert, which returns early on
+    /// `NotifyConfig::dnd_enabled`. A stalled sync must not be silenced by it:
+    /// it is a local loss-risk condition and a loud failure under AD-39,
+    /// exactly like a recording fault, and the tray glyph and the AD-51 banner
+    /// fire regardless — so silencing this one leg would only desynchronise the
+    /// set, which is the reasoning `notify_recording_fault` already carries.
+    ///
+    /// The double's `data_dir` is a real registry tree with `notify.dnd_global`
+    /// written to `1`, which is what makes this falsifiable rather than a
+    /// restatement of the signature: the one plausible regression here is a
+    /// future "make sync consistent with the bridge alert" gate reading that
+    /// flag, and it would turn this red.
+    #[test]
+    fn a_warning_onset_bypasses_do_not_disturb_like_every_other_loud_failure() {
+        let dir = test_data_dir("dnd");
+        keeper_core::registry::set_dnd_global(&dir, true).expect("switch DND on");
+        let dnd = keeper_core::registry::get_dnd_global(&dir);
+        assert!(dnd.expect("read DND back"), "the fixture is in DND");
+        let notifier = Arc::new(CapturingPlatform::rooted(&dir));
+        let shell = ShellSyncPlatform::new(notifier.clone());
+
+        shell.notify(ONSET_TITLE, ONSET_BODY);
+
+        assert_eq!(
+            notifier.calls(),
+            vec![(ONSET_TITLE.to_owned(), ONSET_BODY.to_owned())],
+            "a stalled sync is a loud failure: DND does not silence it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
