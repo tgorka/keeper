@@ -2,10 +2,10 @@
 title: 'Story 41.1: A Profile Can Say It Holds Recordings'
 type: 'feature'
 created: '2026-08-07'
-status: 'review'
+status: 'done'
 blocking_condition: ''
 baseline_revision: '8b3e0e2'
-final_revision: ''
+final_revision: '06e76e3a2622bd57bff5bcb8efb466c8e3741572'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:

@@ -2,8 +2,10 @@
 title: 'The access token arrives in the field'
 type: 'feature'
 created: '2026-07-29'
-status: 'review'
+status: 'done'
 baseline_revision: '88452c1'
+final_revision: '1ef0854eb2eda88a9036f7c5aa74e7216623decf'
+
 ---
 
 <intent-contract>

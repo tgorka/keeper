@@ -2,10 +2,10 @@
 title: 'Story 41.2: Choosing Where Recordings Live, Once'
 type: 'feature'
 created: '2026-08-07'
-status: 'review'
+status: 'done'
 blocking_condition: ''
 baseline_revision: '2265b83'
-final_revision: ''
+final_revision: '021a6116b64829f76f2303288c1d615e40997db4'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:

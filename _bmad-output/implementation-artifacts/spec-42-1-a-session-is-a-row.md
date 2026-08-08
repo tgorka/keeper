@@ -2,10 +2,10 @@
 title: 'Story 42.1: A Session Is a Row'
 type: 'feature'
 created: '2026-08-07'
-status: 'review'
+status: 'done'
 blocking_condition: ''
 baseline_revision: 'd600eeb'
-final_revision: ''
+final_revision: '79edd25b9266e476feb206b7ebf2b4a73151e5c0'
 review_loop_iteration: 1
 followup_review_recommended: false
 context:

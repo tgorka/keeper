@@ -2,10 +2,10 @@
 title: 'Story 42.3: The Recordings Browser'
 type: 'feature'
 created: '2026-08-08'
-status: 'review'
+status: 'done'
 blocking_condition: ''
 baseline_revision: '623c3c2'
-final_revision: ''
+final_revision: '7c63d187a85c6f328188460eca64c0fa67c09138'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:

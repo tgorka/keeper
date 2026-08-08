@@ -2,10 +2,10 @@
 title: 'Story 42.5: One Tag Vocabulary'
 type: 'feature'
 created: '2026-08-08'
-status: 'review'
+status: 'done'
 blocking_condition: ''
 baseline_revision: '79c9f09'
-final_revision: ''
+final_revision: '77d989378425101a938d55967a1564384db512c5'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:

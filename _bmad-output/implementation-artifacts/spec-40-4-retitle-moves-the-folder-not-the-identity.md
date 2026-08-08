@@ -2,10 +2,10 @@
 title: 'Story 40.4: Retitle Moves the Folder, Not the Identity'
 type: 'feature'
 created: '2026-08-07'
-status: 'review'
+status: 'done'
 blocking_condition: ''
 baseline_revision: 'bdcd55e121ce1b24c0ae7a7829623e9d3f1b6d12'
-final_revision: ''
+final_revision: 'd1b067275e041eacdadac0b23ed75b63e7a09b1c'
 review_loop_iteration: 1
 followup_review_recommended: false
 context:
