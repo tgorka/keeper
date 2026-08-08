@@ -36,6 +36,13 @@
  * resolved absolute root is composed in ONE place — Rust — and arrives as
  * `destinationDir` whichever kind is in force, so no line here ever joins a
  * profile's local path to a subfolder.
+ *
+ * Story 41.7 adds the one thing a synced folder on a pendrive has to say before
+ * Record is pressed: that it is on a drive, and — when the drive is out — that
+ * it is not here. A person choosing a pendrive should learn it is a pendrive
+ * from the card, not from a failed start. The state is Rust's (`volume::scan`
+ * against the volume marker, never an `exists()` on the mountpoint), and a
+ * destination that is not on removable media renders none of this copy at all.
  */
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import { useEffect, useId, useRef, useState } from "react";
@@ -55,6 +62,7 @@ import type {
   RecordingPathPreviewVm,
   RecordingProfileVm,
   RecordingSettingsVm,
+  RecordingVolumeVm,
 } from "@/lib/ipc/client";
 import { recordingDestinationProfiles, recordingPathPreview } from "@/lib/ipc/client";
 import { useRecordingMeta } from "@/lib/stores/recording-meta";
@@ -129,6 +137,34 @@ export function destinationSyncedNote(profileName: string): string {
   return `Recordings save here on this Mac, and ${profileName} commits and pushes them.`;
 }
 
+/**
+ * What a destination on removable media says for itself (Story 41.7), in the
+ * same declarative voice as {@link destinationSyncedNote}: a fact about where
+ * the recordings go, not an instruction and not a warning banner.
+ *
+ * One sentence per state rather than a removable line plus a conditional
+ * attached/detached line, because "merope is removable media." followed by
+ * "merope isn't attached." is two sentences saying one thing. Each state's
+ * sentence carries BOTH facts — that the folder is on a drive, and whether the
+ * drive is here.
+ *
+ * The name is Rust's, read from the volume's own marker. It is `null` when this
+ * run has never had that marker in front of it (a drive that was already out at
+ * launch), and then the drive is described rather than named — the card does
+ * not invent one out of the path.
+ */
+export function destinationVolumeNote(volume: RecordingVolumeVm): string {
+  const subject = volume.name ?? "This folder's drive";
+  switch (volume.state) {
+    case "attached":
+      return `${subject} is removable media, so this folder is only here while the drive is plugged in.`;
+    case "absent":
+      return `${subject} isn't attached, so a recording can't start until you plug it in.`;
+    case "unexpected":
+      return `${subject} isn't attached — a different volume is mounted in its place, so a recording can't start.`;
+  }
+}
+
 /** Test id for the two-way destination choice (Story 41.2). */
 export const DESTINATION_CHOICE_TESTID = "recording-destination-choice";
 
@@ -137,6 +173,9 @@ export const DESTINATION_PROFILE_SELECT_TESTID = "recording-destination-profile"
 
 /** Test id for the consequence sentence a synced destination prints. */
 export const DESTINATION_SYNCED_NOTE_TESTID = "recording-destination-synced-note";
+
+/** Test id for the removable-media sentence (Story 41.7). */
+export const DESTINATION_VOLUME_NOTE_TESTID = "recording-destination-volume-note";
 
 export function RecordingDestinationControls({
   withNextSessionTitle = false,
@@ -408,6 +447,11 @@ export function RecordingDestinationControls({
   const kind: RecordingDestinationKind = settings?.destinationKind ?? "folder";
   const syncedChoice = kind === "profile";
   const profileName = settings?.destinationProfileName ?? null;
+  // Story 41.7: present only when the destination is a synced folder on removable
+  // media. Read straight off the settings VM, which Rust re-scans on every read,
+  // so the sentence follows the drive in and out of the port with no other
+  // action here.
+  const volume: RecordingVolumeVm | null = settings?.destinationVolume ?? null;
   // A picker needs something to pick. Rust degrades an unusable profile to the
   // folder answer, so a synced kind with no list means the list itself could not
   // be read — and an empty select with no way out is worse than the plain
@@ -572,6 +616,16 @@ export function RecordingDestinationControls({
         )
       ) : (
         <p className="text-muted-foreground text-xs">{DESTINATION_LOCAL_ONLY_NOTE}</p>
+      )}
+      {/* The drive, when there is one. Its own line under the consequence
+          sentence rather than folded into it: whether recordings get pushed and
+          whether the folder is here right now are two different facts, and only
+          the second one changes when someone pulls a stick out. A destination on
+          an ordinary disk renders nothing here at all. */}
+      {syncedChoice && volume !== null && (
+        <p className="text-muted-foreground text-xs" data-testid={DESTINATION_VOLUME_NOTE_TESTID}>
+          {destinationVolumeNote(volume)}
+        </p>
       )}
     </div>
   );

@@ -138,6 +138,8 @@ export type { RecordingSourcesVm } from "./gen/RecordingSourcesVm";
 export type { RecordingStatusVm } from "./gen/RecordingStatusVm";
 export type { RecordingTargetVm } from "./gen/RecordingTargetVm";
 export type { RecordingUiState } from "./gen/RecordingUiState";
+export type { RecordingVolumeState } from "./gen/RecordingVolumeState";
+export type { RecordingVolumeVm } from "./gen/RecordingVolumeVm";
 export type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 export type { ReplyPreviewVm } from "./gen/ReplyPreviewVm";
 export type { ResolveSupportVm } from "./gen/ResolveSupportVm";

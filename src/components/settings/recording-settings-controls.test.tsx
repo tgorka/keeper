@@ -27,6 +27,7 @@ const DEFAULTS: RecordingSettingsVm = {
   destinationKind: "folder",
   destinationProfileId: null,
   destinationProfileName: null,
+  destinationVolume: null,
   fps: 30,
   codec: "h264",
   scalePercent: 100,

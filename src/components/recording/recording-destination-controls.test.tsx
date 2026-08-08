@@ -29,7 +29,9 @@ import {
   DESTINATION_TEMPLATE_PREVIEW_TESTID,
   DESTINATION_TEMPLATE_SAVE_TESTID,
   DESTINATION_TEMPLATE_TESTID,
+  DESTINATION_VOLUME_NOTE_TESTID,
   destinationSyncedNote,
+  destinationVolumeNote,
   RecordingDestinationControls,
 } from "@/components/recording/recording-destination-controls";
 import type {
@@ -61,6 +63,7 @@ const DEFAULTS: RecordingSettingsVm = {
   destinationKind: "folder",
   destinationProfileId: null,
   destinationProfileName: null,
+  destinationVolume: null,
   fps: 30,
   codec: "h264",
   scalePercent: 100,
@@ -84,6 +87,20 @@ const SYNCED: RecordingSettingsVm = {
   destinationKind: "profile",
   destinationProfileId: "tgdrive",
   destinationProfileName: "tgdrive",
+};
+
+/** Story 41.7: the same synced destination, on the pendrive the field report is
+ * about. Rust re-scans the volume on every settings read, so the fixtures differ
+ * only in the state the card is handed. */
+const SYNCED_ON_ATTACHED_DRIVE: RecordingSettingsVm = {
+  ...SYNCED,
+  destinationDir: "/Volumes/merope/tgdrive/recordings",
+  destinationVolume: { name: "merope", state: "attached" },
+};
+
+const SYNCED_ON_DETACHED_DRIVE: RecordingSettingsVm = {
+  ...SYNCED_ON_ATTACHED_DRIVE,
+  destinationVolume: { name: "merope", state: "absent" },
 };
 
 /** What Rust renders for the default template with no session title (the
@@ -526,6 +543,108 @@ describe("RecordingDestinationControls", () => {
     );
     expect(screen.queryByText(DESTINATION_LOCAL_ONLY_NOTE)).not.toBeInTheDocument();
     expect(mockSet).not.toHaveBeenCalled();
+  });
+
+  it("says a synced destination is on removable media before Record is pressed", async () => {
+    // Matrix row "removable destination, attached". Nothing has failed and
+    // nothing has been asked; the card volunteers that this folder lives on a
+    // drive, which is the whole point of putting it here rather than in an error.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED_ON_ATTACHED_DRIVE);
+    render(<RecordingDestinationControls />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).toHaveTextContent(
+        destinationVolumeNote({ name: "merope", state: "attached" }),
+      ),
+    );
+    expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).toHaveTextContent("merope");
+    // The consequence sentence is a different fact and stays put beside it.
+    expect(screen.getByTestId(DESTINATION_SYNCED_NOTE_TESTID)).toHaveTextContent(
+      destinationSyncedNote("tgdrive"),
+    );
+  });
+
+  it("says the drive is not attached, unprompted, while still naming the chosen folder", async () => {
+    // Matrix row "removable destination, detached, card open". Rust does NOT
+    // degrade to the plain folder here, so the card must keep naming the synced
+    // root — and say why a recording would not start.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED_ON_DETACHED_DRIVE);
+    render(<RecordingDestinationControls />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).toHaveTextContent(
+        destinationVolumeNote({ name: "merope", state: "absent" }),
+      ),
+    );
+    expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).toHaveTextContent("isn't attached");
+    expect(screen.getByTestId(DESTINATION_PATH_TESTID)).toHaveTextContent(
+      "/Volumes/merope/tgdrive/recordings",
+    );
+    expect(screen.getByTestId(DESTINATION_PATH_TESTID)).not.toHaveTextContent(
+      "/Users/alice/Movies/keeper",
+    );
+    expect(mockSet).not.toHaveBeenCalled();
+  });
+
+  it("says nothing about drives for a synced folder that is not on removable media", async () => {
+    // Matrix row "non-removable profile": no removable wording ANYWHERE. A
+    // sentence about drives on an ordinary folder is noise that teaches people
+    // to stop reading this card.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED);
+    render(<RecordingDestinationControls />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_SYNCED_NOTE_TESTID)).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId(DESTINATION_VOLUME_NOTE_TESTID)).not.toBeInTheDocument();
+    expect(screen.queryByText(/removable/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/attached/i)).not.toBeInTheDocument();
+  });
+
+  it("describes an unnamed drive rather than inventing a name for it", async () => {
+    // A drive that has been out since launch cannot be named: its name lives in
+    // a marker on the drive. The card says so instead of slicing "merope" out of
+    // the mountpoint, which is the guess Story 27.3 exists to forbid.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue({
+      ...SYNCED_ON_DETACHED_DRIVE,
+      destinationVolume: { name: null, state: "absent" },
+    });
+    render(<RecordingDestinationControls />);
+
+    const note = await screen.findByTestId(DESTINATION_VOLUME_NOTE_TESTID);
+    expect(note).toHaveTextContent("This folder's drive isn't attached");
+    expect(note).not.toHaveTextContent("merope");
+  });
+
+  it("stops saying the drive is missing once it comes back", async () => {
+    // Matrix row "volume returns": the card is a live read of a re-scanned
+    // state, not a latch that something has to clear.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED_ON_DETACHED_DRIVE);
+    const { unmount } = render(<RecordingDestinationControls />);
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).toHaveTextContent(
+        "isn't attached",
+      ),
+    );
+
+    unmount();
+    resetRecordingSettingsForTest();
+    mockGet.mockResolvedValue(SYNCED_ON_ATTACHED_DRIVE);
+    render(<RecordingDestinationControls />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).toHaveTextContent(
+        destinationVolumeNote({ name: "merope", state: "attached" }),
+      ),
+    );
+    expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).not.toHaveTextContent(
+      "isn't attached",
+    );
   });
 
   it("switches the destination between two synced folders through the picker", async () => {

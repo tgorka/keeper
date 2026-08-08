@@ -3165,6 +3165,56 @@ pub struct RecordingProfileVm {
     pub recordings_root: String,
 }
 
+/// Whether the recordings destination's volume is here right now (Story 41.7,
+/// AD-48).
+///
+/// The three answers `keeper-sync`'s `VolumeStatus` gives, reduced to what a
+/// surface can say a sentence about. Deliberately NOT a boolean: "a different
+/// stick is mounted where yours lives" and "no stick at all" take different
+/// actions from the person holding the drive, and collapsing them would make
+/// the card tell one of the two a lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum RecordingVolumeState {
+    /// The volume the profile is bound to is attached: recording into it works.
+    Attached,
+    /// No volume marker at or above the folder — the media is not attached.
+    /// A first-class state, not a fault (AD-48), and the one that makes
+    /// `recording_start` refuse rather than quietly record somewhere else.
+    Absent,
+    /// Something is mounted where this profile's volume lives, but it is not
+    /// provably that volume — a foreign marker, or one that could not be read.
+    /// Refused for the same reason `Absent` is, with a different sentence.
+    Unexpected,
+}
+
+/// The recordings destination's removable media, when it has any (Story 41.7).
+///
+/// Present ⇒ the destination's synced folder is on removable media; absent ⇒ it
+/// is on a disk that is always there, and no surface says anything about drives.
+/// Modelling removability as the OPTION rather than as a `removable: bool`
+/// beside a state is what makes "not removable, but the volume is absent"
+/// unrepresentable instead of merely unlikely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingVolumeVm {
+    /// What the volume calls itself: its marker's label — the mount point's own
+    /// name, `"merope"`, recorded when the volume was adopted. Never derived by
+    /// slicing the local path apart: a stick re-mounted somewhere else is the
+    /// same volume with the same name, and the path is the one thing about it
+    /// that moves.
+    ///
+    /// `null` when the shell has never had this volume's marker in front of it —
+    /// a drive that has been out since the app launched carries its own name
+    /// away with it. The card has an unnamed phrasing for that; it does not
+    /// invent a name.
+    pub name: Option<String>,
+    /// Whether that volume is attached right now.
+    pub state: RecordingVolumeState,
+}
+
 /// The user-configurable recording settings (Story 17.5 + 19.5 + 40.2 + 41.2,
 /// FR-72, FR-131): the segment size, the duration-cap rotation fallback, the
 /// destination, the path template, the frame rate, the codec, the capture scale
@@ -3245,6 +3295,16 @@ pub struct RecordingSettingsVm {
     /// Resolved from the id on every read rather than cached beside it, which is
     /// what makes a rename show up here immediately with the same resolved root.
     pub destination_profile_name: Option<String>,
+    /// The chosen profile's removable media (Story 41.7), `None` under `Folder`
+    /// and for a synced folder on a disk that is always there.
+    ///
+    /// Output only, and re-scanned on every read for the same reason the name
+    /// is re-resolved: the answer changes when someone plugs a drive in, and a
+    /// value cached beside the choice would say "not attached" about a stick
+    /// that is sitting in the port. This is what lets the card say a
+    /// destination is on removable media BEFORE Record is pressed, instead of
+    /// letting the person find out from a failure (AD-48).
+    pub destination_volume: Option<RecordingVolumeVm>,
     /// Capture frame rate (Story 19.5): 10, 15, 30 (default), or 60,
     /// normalized on read/write; the sidecar's `fps`.
     pub fps: u32,

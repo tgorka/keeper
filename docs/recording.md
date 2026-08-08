@@ -140,6 +140,48 @@ basename resolved against the folder the manifest sits in, and `session` is
 that folder's own basename. A session folder stays self-contained: copy or
 move it anywhere and it still describes itself.
 
+## Recording into a synced folder
+
+A recording destination does not have to be a plain folder. Any folder keeper
+already syncs can hold recordings, and then the Recording pane offers it as a
+destination — so a finished segment is already on the drive, with no copy step
+and no second place to look.
+
+Flagging it is one switch, in the same place as the notes one and worded the
+same way: Settings → Sync → a folder → *This folder holds recordings*. keeper
+puts them in a subfolder of that folder (`recordings/` by default) and syncs
+them with everything else there. There is no destination registry, no import
+and nothing else to configure — a synced folder holds recordings or it does
+not.
+
+The subfolder is yours to change, and keeper refuses rather than corrects: a
+subfolder that is empty, absolute, escapes the folder, or overlaps that
+folder's notes vault is rejected on save with the reason, because one folder
+cannot be both a vault and a recordings root without the notes indexer walking
+your video. Turning the switch off removes the flag and nothing else — no file
+moves, and a destination pointing at that folder falls back to the plain
+folder above.
+
+### When the synced folder is on a drive you unplug
+
+A synced folder marked as removable media — a pendrive, an external SSD — is a
+destination like any other, and the Destination card says so before you press
+Record: it names the drive and, when the drive is not plugged in, says that
+too. You find out from the card, not from a failed recording.
+
+With the drive out, pressing Record is **refused**, and the refusal names the
+drive (`merope is not attached`) rather than reporting a filesystem error about
+a path. Nothing is created anywhere: keeper does not quietly record into the
+plain folder instead, because a recording that lands somewhere other than where
+the card said is worse than one that does not start. Plug the drive back in and
+the next recording simply works — there is nothing to re-choose, clear or
+restart.
+
+keeper recognises the drive by the marker it wrote at the drive's root, not by
+the mount path, so a stick that comes back on a different mount point is still
+the same drive. If a *different* volume is mounted where yours belongs, that is
+refused too, with its own sentence — adopting it would sync a stranger's disk.
+
 ## Debug mode (Settings → About)
 
 Off by default. While on, keeper writes:

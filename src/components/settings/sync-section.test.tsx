@@ -134,6 +134,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     commitSubjectTemplate: "",
     notes: false,
     notesSubfolder: null,
+    recordings: false,
+    recordingsSubfolder: "recordings",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -572,6 +574,10 @@ describe("SyncSection add-profile form", () => {
         commitSubjectTemplate: "",
         notes: false,
         notesSubfolder: null,
+        // The recordings switch is off and untouched, so the save says "this
+        // folder holds none" and names no subfolder at all (Story 41.7).
+        recordings: false,
+        recordingsSubfolder: null,
       }),
     );
     // Nothing was typed into the token field, so the keychain was left alone.

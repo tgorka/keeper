@@ -15,7 +15,8 @@ use std::sync::Arc;
 use keeper_core::vm::{IpcError, IpcErrorCode};
 use keeper_sync::engine::{PendingReason, SyncOutcome};
 use keeper_sync::profile::{
-    LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS, DEFAULT_SETTLE_MS,
+    LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS,
+    DEFAULT_RECORDINGS_SUBFOLDER, DEFAULT_SETTLE_MS,
 };
 use keeper_sync::progress::{format_bytes, SyncPhase, SyncStatus};
 use keeper_sync::provenance::SyncSource;
@@ -121,6 +122,28 @@ pub struct SyncProfileVm {
     /// box, so what it displays is the value that would actually be in force
     /// (AD-34-8).
     pub notes_subfolder: Option<String>,
+    /// Whether this folder holds recordings (Story 41.1, AD-66).
+    ///
+    /// Beside the notes flag above and meaning the same kind of thing: a
+    /// recordings root is not a configured object with a life of its own, it is
+    /// this flag plus a subfolder on a profile that already exists. Story 41.7
+    /// is what made it reachable — the block existed and nothing in the app
+    /// could write one, so the destination picker 41.2 built never had a profile
+    /// to offer.
+    pub recordings: bool,
+    /// The recordings subfolder that would be **in force**: the stored one when
+    /// this folder holds recordings, and `RecordingsConfig`'s own default when it
+    /// does not.
+    ///
+    /// Never `None`, which is the one place this deliberately does not mirror
+    /// `notes_subfolder` directly above. That field is `None` for a folder that
+    /// is not a vault, so the form has to prefill its box from a copy of the
+    /// default it keeps in TypeScript (`SYNC_NOTES_DEFAULT_SUBFOLDER`) — a second
+    /// spelling of a Rust constant, which is exactly the drift
+    /// `keeper_sync::profile` spells its defaults once to prevent. Resolving it
+    /// here instead means the form prefills from the value that would actually be
+    /// used (AD-34-8) and never spells `recordings` at all.
+    pub recordings_subfolder: String,
 }
 
 impl From<&SyncProfile> for SyncProfileVm {
@@ -149,6 +172,14 @@ impl From<&SyncProfile> for SyncProfileVm {
             enabled: p.enabled,
             notes: p.notes.is_some(),
             notes_subfolder: p.notes.as_ref().map(|notes| notes.subfolder.clone()),
+            recordings: p.recordings.is_some(),
+            // The stored value, or the default that would be used if this folder
+            // were flagged right now. Resolved here rather than in the form, so
+            // `DEFAULT_RECORDINGS_SUBFOLDER` is spelled once in the whole product.
+            recordings_subfolder: p.recordings.as_ref().map_or_else(
+                || DEFAULT_RECORDINGS_SUBFOLDER.to_owned(),
+                |recordings| recordings.subfolder.clone(),
+            ),
         }
     }
 }
@@ -402,6 +433,23 @@ pub struct SyncProfileReq {
     /// user changed.
     #[serde(default)]
     pub notes_subfolder: Option<String>,
+    /// Flag or unflag this folder as holding recordings (Story 41.7, AD-66).
+    /// `None` leaves the flag alone under exactly the rule `notes` follows above:
+    /// a caller with no control for it must not be able to clear it, and clearing
+    /// it would take a folder out of the Recording destination picker while every
+    /// file stayed where it was.
+    #[serde(default)]
+    pub recordings: Option<bool>,
+    /// The recordings subfolder to pin. `None` keeps whatever is stored — or,
+    /// when this flags the folder for the first time, lets `RecordingsConfig`'s
+    /// own default stand, which is how a form that shows an untouched box says
+    /// "keeper picks".
+    ///
+    /// Unlike `notes_subfolder`, an explicit empty string is a value and NOT an
+    /// omission: see [`recordings_subfolder`] for why nothing here is tidied up
+    /// on the caller's behalf.
+    #[serde(default)]
+    pub recordings_subfolder: Option<String>,
 }
 
 /// Mint an opaque, sortable, collision-free id.
@@ -695,6 +743,34 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
             }
         }
     }
+    // The recordings flag (Story 41.7, AD-66) — the notes block directly above,
+    // applied a second time and deliberately not reinvented. `RecordingsConfig`
+    // and its validation shipped in Story 41.1 and the destination picker in
+    // 41.2, and neither was reachable, because no request could express this
+    // field: the app could read a recordings block written by `keeper-syncd` and
+    // could never write one. Unflagging REMOVES the block rather than storing an
+    // empty one, because `None` is "holds no recordings" and a default-filled
+    // block would nominate the folder as a destination nobody chose.
+    match req.recordings {
+        Some(true) => {
+            let mut config = profile.recordings.clone().unwrap_or_default();
+            if let Some(subfolder) = recordings_subfolder(req) {
+                config.subfolder = subfolder;
+            }
+            profile.recordings = Some(config);
+        }
+        Some(false) => profile.recordings = None,
+        // Not expressed: as for notes, a subfolder edit on its own still lands on
+        // a folder that already holds recordings, and says nothing about one that
+        // does not.
+        None => {
+            if let (Some(config), Some(subfolder)) =
+                (profile.recordings.as_mut(), recordings_subfolder(req))
+            {
+                config.subfolder = subfolder;
+            }
+        }
+    }
     // Validate here so a bad profile is rejected at the edge with an actionable
     // message rather than deep inside the engine.
     profile.validate().map_err(|err| sync_ipc_error(&err))?;
@@ -711,6 +787,26 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
 fn notes_subfolder(req: &SyncProfileReq) -> Option<String> {
     let trimmed = req.notes_subfolder.as_ref()?.trim().trim_matches('/');
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// The recordings subfolder a request expresses, or `None` when it expresses
+/// none.
+///
+/// Whitespace-trimmed and otherwise **verbatim**, which is the one way this does
+/// not copy [`notes_subfolder`] above (Story 41.7). Stripping slashes there is a
+/// convenience; here it would be a silent correction of the exact inputs
+/// `RecordingsConfig::validate` exists to refuse by name — `/tmp` would become
+/// `tmp`, and a save the owner should have been told about would succeed against
+/// a folder they did not name. An empty string is passed through for the same
+/// reason, so the validator gets to say "recordings subfolder must not be empty"
+/// itself rather than have the answer guessed at here.
+///
+/// `None` — the key absent from the request altogether — is still the AD-34-9
+/// omission that leaves whatever is stored alone.
+fn recordings_subfolder(req: &SyncProfileReq) -> Option<String> {
+    req.recordings_subfolder
+        .as_ref()
+        .map(|raw| raw.trim().to_owned())
 }
 
 fn engine_of(state: &AppState) -> Result<Arc<keeper_sync::engine::Engine>, IpcError> {
@@ -1428,6 +1524,8 @@ mod tests {
             commit_subject_template: None,
             notes: None,
             notes_subfolder: None,
+            recordings: None,
+            recordings_subfolder: None,
         }
     }
 
@@ -1437,7 +1535,7 @@ mod tests {
     /// struct: the bug is a lost KEY, and serde is what decides what a key is.
     ///
     /// A field the request has a slot for.
-    const EXPRESSED: [&str; 17] = [
+    const EXPRESSED: [&str; 18] = [
         "name",
         "localPath",
         "remoteUrl",
@@ -1455,23 +1553,22 @@ mod tests {
         "authorOverride",
         "commitSubjectTemplate",
         "notes",
+        // Moved out of PRESERVED by Story 41.7. It was preserved because the app
+        // had no control for it and `parse_req` must not touch what no form
+        // shows; it is expressed now because the Sync form has the switch, and
+        // that switch is the whole of what makes a folder a recording
+        // destination.
+        "recordings",
     ];
 
     /// A field no request can express, which `parse_req` must therefore never
     /// touch. `enabled` moves only through pause/resume, `volumeId` is minted by
     /// the engine on first sight of the media, `id` names the row, and the two
-    /// LFS knobs (`lfsNever`, `lfsPruneLocal`) plus the recordings block
-    /// (`recordings`, Story 41.1) are configured through `keeper-syncd`'s profile
-    /// file with no slot in the app's form — `parse_req` keeps them because it
-    /// starts from `prior.clone()`, not because it copies them by name.
-    const PRESERVED: [&str; 6] = [
-        "id",
-        "volumeId",
-        "enabled",
-        "lfsNever",
-        "lfsPruneLocal",
-        "recordings",
-    ];
+    /// LFS knobs (`lfsNever`, `lfsPruneLocal`) are configured through
+    /// `keeper-syncd`'s profile file with no slot in the app's form — `parse_req`
+    /// keeps them because it starts from `prior.clone()`, not because it copies
+    /// them by name.
+    const PRESERVED: [&str; 5] = ["id", "volumeId", "enabled", "lfsNever", "lfsPruneLocal"];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
         match serde_json::to_value(profile).expect("a profile serializes") {
@@ -1506,8 +1603,10 @@ mod tests {
         prior.volume_id = Some("01VOLUME".into());
         prior.lfs_never = vec!["*.psd".into()];
         prior.lfs_prune_local = true;
-        // Story 41.1's block, set to something a fresh profile never has, so the
-        // "nothing preserved moved" assertion below genuinely bites for it too.
+        // Story 41.1's block, set to something a fresh profile never has. It was
+        // a PRESERVED field until Story 41.7 gave the form a switch for it; the
+        // distinctive value stays, because it is now what makes the EXPRESSED
+        // assertion below bite — an edit has to move it OFF this value.
         prior.recordings = Some(keeper_sync::profile::RecordingsConfig {
             subfolder: "sessions/raw".into(),
             media: keeper_sync::profile::MediaPolicy::PointerOnly,
@@ -1539,6 +1638,10 @@ mod tests {
         // Flagging the folder as a vault moves `notes` from `None` to `Some`.
         edit.notes = Some(true);
         edit.notes_subfolder = Some("second-brain".into());
+        // And flagging it as a recordings root moves `recordings` to a subfolder
+        // that does not overlap the vault just configured above.
+        edit.recordings = Some(true);
+        edit.recordings_subfolder = Some("media/sessions".into());
         let merged = parse_req(&edit, Some(&prior)).expect("valid");
 
         let before = json_fields(&prior);
@@ -1650,6 +1753,192 @@ mod tests {
                 .expect("now a vault")
                 .subfolder,
             keeper_sync::profile::NotesConfig::default().subfolder
+        );
+    }
+
+    /// Story 41.7's whole point, at the layer that carries it: the switch writes
+    /// a real `recordings` block, and turning it off REMOVES the block rather
+    /// than storing an empty one. Before this, `RecordingsConfig` and the
+    /// destination picker both existed and neither was reachable, because no
+    /// request could express the field.
+    #[test]
+    fn flagging_a_folder_writes_a_recordings_block_and_unflagging_removes_it() {
+        // Flagging a folder that has never held recordings, with the subfolder
+        // box untouched: the block is written with the default that lives in
+        // Rust, and nowhere else.
+        let mut flag = req();
+        flag.recordings = Some(true);
+        let flagged = parse_req(&flag, None).expect("valid");
+        assert_eq!(
+            flagged
+                .recordings
+                .as_ref()
+                .expect("the folder now holds recordings")
+                .subfolder,
+            keeper_sync::profile::RecordingsConfig::default().subfolder
+        );
+        assert_eq!(
+            flagged.recordings_root(),
+            Some(std::path::PathBuf::from("/home/u/tgdrive/recordings")),
+            "which is what makes it offerable as a recording destination"
+        );
+
+        // A subfolder the owner chose is stored as given.
+        let mut custom = req();
+        custom.recordings = Some(true);
+        custom.recordings_subfolder = Some("media/screen-recordings".into());
+        assert_eq!(
+            parse_req(&custom, None)
+                .expect("valid")
+                .recordings
+                .expect("flagged")
+                .subfolder,
+            "media/screen-recordings"
+        );
+
+        // Unflagging clears the block. `None` is "holds no recordings", so a
+        // default-filled block left behind would keep the folder in the picker
+        // after the owner took it out.
+        let mut unflag = req();
+        unflag.recordings = Some(false);
+        let cleared = parse_req(&unflag, Some(&flagged)).expect("valid");
+        assert_eq!(cleared.recordings, None);
+        assert_eq!(cleared.recordings_root(), None);
+
+        // And a request that says nothing leaves the block exactly as it is —
+        // AD-34-9, the rule that kept `recordings` alive while it was unreachable
+        // and keeps a `keeper-syncd`-configured media/push policy alive now.
+        let mut daemon_configured = flagged.clone();
+        daemon_configured.recordings = Some(keeper_sync::profile::RecordingsConfig {
+            subfolder: "sessions/raw".into(),
+            media: keeper_sync::profile::MediaPolicy::PointerOnly,
+            push: keeper_sync::profile::PushPolicy::Immediate,
+        });
+        assert_eq!(
+            parse_req(&req(), Some(&daemon_configured))
+                .expect("valid")
+                .recordings,
+            daemon_configured.recordings,
+            "a form that does not show the flag cannot move it"
+        );
+
+        // Re-flagging an already-flagged folder keeps the policy fields the app
+        // has no control for; only the subfolder the form showed moves.
+        let mut refit = req();
+        refit.recordings = Some(true);
+        refit.recordings_subfolder = Some("sessions/final".into());
+        let refitted = parse_req(&refit, Some(&daemon_configured))
+            .expect("valid")
+            .recordings
+            .expect("still flagged");
+        assert_eq!(refitted.subfolder, "sessions/final");
+        assert_eq!(
+            refitted.media,
+            keeper_sync::profile::MediaPolicy::PointerOnly
+        );
+        assert_eq!(refitted.push, keeper_sync::profile::PushPolicy::Immediate);
+    }
+
+    /// Each refusal `RecordingsConfig::validate` owns, reaching the caller as its
+    /// own sentence rather than as a corrected save.
+    ///
+    /// The correction is the failure mode worth a test: `notes_subfolder` trims
+    /// slashes, so had this been written by copying it, `/tmp` would have been
+    /// quietly stored as `tmp` and the owner's recordings would land in a folder
+    /// they never named — a save that "worked" and put the files somewhere else.
+    #[test]
+    fn a_recordings_subfolder_the_validator_refuses_is_refused_in_its_own_words() {
+        let mut vault = parse_req(&req(), None).expect("valid");
+        vault.notes = Some(keeper_sync::profile::NotesConfig {
+            subfolder: "10-notes".into(),
+            ..Default::default()
+        });
+
+        for (subfolder, expected) in [
+            (
+                "",
+                "recordings subfolder must not be empty: recordings live in a folder inside the \
+                 profile, never at the profile root",
+            ),
+            (
+                "   ",
+                "recordings subfolder must not be empty: recordings live in a folder inside the \
+                 profile, never at the profile root",
+            ),
+            (
+                "/tmp",
+                "recordings subfolder must be relative to the profile folder, got /tmp",
+            ),
+            (
+                "../x",
+                "recordings subfolder must not escape the profile folder: ../x",
+            ),
+            (
+                "10-notes/rec",
+                "recordings subfolder 10-notes/rec overlaps notes subfolder 10-notes: one folder \
+                 cannot be both a vault and a recordings root",
+            ),
+        ] {
+            let mut bad = req();
+            bad.recordings = Some(true);
+            bad.recordings_subfolder = Some(subfolder.into());
+            let err = parse_req(&bad, Some(&vault))
+                .expect_err("a subfolder the validator refuses must not be stored");
+            assert_eq!(
+                // `SyncError::Config` prints as `invalid sync configuration: {0}`,
+                // and that envelope is the whole of what the boundary adds — the
+                // sentence inside it is the validator's, word for word, which is
+                // what the form puts on screen.
+                err.message,
+                format!("invalid sync configuration: {expected}"),
+                "the validator's own sentence has to reach the form unaltered, since it is the \
+                 only thing that says WHICH rule was broken"
+            );
+        }
+
+        // The control: the same folder, the same vault, a subfolder that breaks
+        // no rule. Without this the loop above would pass just as well if
+        // flagging were refused outright.
+        let mut fine = req();
+        fine.recordings = Some(true);
+        fine.recordings_subfolder = Some("20-recordings".into());
+        assert_eq!(
+            parse_req(&fine, Some(&vault))
+                .expect("a subfolder beside the vault is not an overlap")
+                .recordings
+                .expect("flagged")
+                .subfolder,
+            "20-recordings"
+        );
+    }
+
+    /// The VM answers "where would recordings go" for a folder that does not hold
+    /// any yet, which is what lets the form prefill its subfolder box without
+    /// keeping a TypeScript copy of `DEFAULT_RECORDINGS_SUBFOLDER`.
+    ///
+    /// The notes pair is the cautionary tale sitting right beside it:
+    /// `notes_subfolder` is `None` for a folder that is not a vault, so
+    /// `add-folder-form.tsx` spells `"notes"` itself, and the two copies are one
+    /// rename apart from disagreeing about where a vault lives.
+    #[test]
+    fn the_profile_vm_answers_where_recordings_would_go_before_a_folder_holds_any() {
+        let mut profile = parse_req(&req(), None).expect("valid");
+        let vm = SyncProfileVm::from(&profile);
+        assert!(!vm.recordings, "an unflagged folder holds no recordings");
+        assert_eq!(
+            vm.recordings_subfolder, DEFAULT_RECORDINGS_SUBFOLDER,
+            "and the form still learns the subfolder flagging it would use"
+        );
+
+        profile.recordings = Some(keeper_sync::profile::RecordingsConfig {
+            subfolder: "media/screen-recordings".into(),
+            ..Default::default()
+        });
+        let vm = SyncProfileVm::from(&profile);
+        assert!(vm.recordings);
+        assert_eq!(
+            vm.recordings_subfolder, "media/screen-recordings",
+            "once it holds them, the stored answer is the one in force"
         );
     }
 
