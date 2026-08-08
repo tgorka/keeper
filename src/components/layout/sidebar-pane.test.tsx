@@ -291,6 +291,56 @@ describe("SidebarPane recording entry (Story 16.3)", () => {
   });
 });
 
+describe("SidebarPane recordings entry (Story 42.3)", () => {
+  it("hides the Recordings entry when the recording capability is off (the default)", () => {
+    renderSidebar();
+    expect(screen.queryByRole("button", { name: "Recordings" })).not.toBeInTheDocument();
+  });
+
+  it("shows the Recordings entry on the same flag as the capture surface", () => {
+    // One flag, both entries: a browser for recordings this build cannot make
+    // would be a dead row answering a question nobody asked.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true });
+    renderSidebar();
+    expect(screen.getByRole("button", { name: "Recording" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Recordings" })).toBeInTheDocument();
+  });
+
+  it("switches the primary view to recordings when the Recordings entry is clicked", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true });
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Recordings" }));
+
+    expect(primaryViewStore.getState().view).toBe("recordings");
+    expect(screen.getByRole("button", { name: "Recordings" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    // The capture entry is a sibling, not the same row — it is not marked active.
+    expect(screen.getByRole("button", { name: "Recording" })).not.toHaveAttribute("aria-current");
+  });
+
+  it("places Recordings immediately after Recording, before Sync and Settings", () => {
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true, sync: true });
+    renderSidebar();
+
+    const labels = screen
+      .getAllByRole("button")
+      .map((button) => button.textContent)
+      .filter(
+        (label) =>
+          label === "Recording" ||
+          label === "Recordings" ||
+          label === "Sync" ||
+          label === "Settings",
+      );
+    expect(labels).toEqual(["Recording", "Recordings", "Sync", "Settings"]);
+  });
+});
+
 describe("SidebarPane sync entry (Story 32.5)", () => {
   it("hides the Sync entry when the sync capability is off (the default)", () => {
     renderSidebar();

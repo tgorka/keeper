@@ -44,10 +44,13 @@
 //! module reads rows and writes rows, and every instant it compares against
 //! arrives as a parameter.
 
-use rusqlite::Connection;
+use std::path::{Path, PathBuf};
+
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::ArchiveError;
 use crate::recording::SessionMetaField;
+use crate::vm::{RecordingFilterVm, RecordingHitVm};
 
 use super::recordings::{in_transaction, RecordingRow};
 
@@ -182,6 +185,25 @@ pub struct RecordingFilter {
     /// Cap on the number of hits; `None` is [`DEFAULT_LIMIT`]. Clamped to
     /// `[1, DEFAULT_LIMIT]`.
     pub limit: Option<i64>,
+}
+
+impl From<RecordingFilterVm> for RecordingFilter {
+    /// Map Story 42.3's IPC input VM onto this tauri-free engine filter,
+    /// mirroring [`super::fts::SearchFilter`]'s seam field for field. A pure
+    /// move: the shell decides nothing here, and the engine stays callable from
+    /// a test with no shell at all.
+    fn from(vm: RecordingFilterVm) -> Self {
+        RecordingFilter {
+            query: vm.query,
+            tags: vm.tags,
+            participant: vm.participant,
+            start_ts: vm.start_ts,
+            end_ts: vm.end_ts,
+            durability: vm.durability,
+            profile_id: vm.profile_id,
+            limit: vm.limit,
+        }
+    }
 }
 
 /// One session a search matched (Story 42.2).
@@ -638,6 +660,175 @@ pub fn search_recordings(
     Ok(hits)
 }
 
+/// Search the recordings archive and project the hits into the rows Story 42.3
+/// renders (FR-141, UX-DR50).
+///
+/// **Why this exists rather than a plain `From<RecordingHit>`.** Two of the
+/// three things a browser row shows are not on the hit and cannot be derived
+/// from it alone: the session's total size, which lives in its
+/// `recording_segments` rows, and the file Play hands to the system handler,
+/// which is one of those rows' paths. Both need this connection. The shell
+/// cannot read them itself — `keeper` has no `rusqlite` dependency and is not
+/// getting one for a `SUM` — so the projection lives here, one layer above
+/// [`search_recordings`], which it does not touch.
+///
+/// `destination_root` is the EFFECTIVE recordings destination, resolved by the
+/// shell (Story 41.2) and passed in rather than discovered: this crate reads no
+/// registry and knows no platform, and the row's absolute path must be the one
+/// the recorder would write to, composed exactly once (AD-65).
+///
+/// Two prepared statements, reused across every hit rather than one aggregate
+/// over the whole table: `recording_segments`' primary key begins with
+/// `session_id`, so each of the at most [`DEFAULT_LIMIT`] lookups is a keyed
+/// b-tree probe, where a `GROUP BY` over every segment ever recorded is a full
+/// scan whose cost grows with the archive instead of with the answer.
+pub fn search_recording_vms(
+    conn: &Connection,
+    filter: &RecordingFilter,
+    destination_root: &Path,
+) -> Result<Vec<RecordingHitVm>, ArchiveError> {
+    // An `archive.db` written before Story 42.1 has no `recordings` table at
+    // all, and a machine that has not re-opened the WRITER since upgrading
+    // still has one — nothing ensures the schema on a read-only connection, and
+    // nothing can. The browser must read that as "nothing recorded", exactly as
+    // it reads an absent database, rather than as `no such table: recordings`:
+    // it is the same fact for the same user, and the writer heals it the next
+    // time anything records. One `sqlite_master` probe per query, against a
+    // b-tree the connection has already opened.
+    let indexed: Option<bool> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recordings'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|e| {
+            ArchiveError::Sqlite(format!("could not probe for the recordings table: {e}"))
+        })?;
+    if indexed.is_none() {
+        return Ok(Vec::new());
+    }
+    let hits = search_recordings(conn, filter)?;
+    let mut total_bytes_stmt = conn
+        .prepare("SELECT COALESCE(SUM(bytes), 0) FROM recording_segments WHERE session_id = ?1")
+        .map_err(|e| ArchiveError::Sqlite(format!("could not prepare the segment sum: {e}")))?;
+    // Screen first, then the lowest index, then the track name so the answer is
+    // total: a session that captured no screen (an audio-only one) still has a
+    // file to hand to the system handler, and two tracks sharing index 0 cannot
+    // make the choice depend on which row SQLite visited first.
+    let mut playable_stmt = conn
+        .prepare(
+            "SELECT relative_path FROM recording_segments WHERE session_id = ?1 \
+             ORDER BY CASE track WHEN 'screen' THEN 0 ELSE 1 END, \"index\" ASC, track ASC \
+             LIMIT 1",
+        )
+        .map_err(|e| ArchiveError::Sqlite(format!("could not prepare the segment lookup: {e}")))?;
+    let mut vms = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let total_bytes: i64 = total_bytes_stmt
+            .query_row(rusqlite::params![&hit.session_id], |r| r.get(0))
+            .map_err(|e| {
+                ArchiveError::Sqlite(format!("could not sum a session's segment bytes: {e}"))
+            })?;
+        let playable_relative: Option<String> = playable_stmt
+            .query_row(rusqlite::params![&hit.session_id], |r| r.get(0))
+            .optional()
+            .map_err(|e| {
+                ArchiveError::Sqlite(format!("could not read a session's first segment: {e}"))
+            })?;
+        vms.push(recording_hit_vm(
+            hit,
+            destination_root,
+            total_bytes,
+            playable_relative.as_deref(),
+        ));
+    }
+    Ok(vms)
+}
+
+/// One hit, plus what only the database could add, as the row Story 42.3
+/// renders. Pure — every fact arrives as a parameter, so the derivations below
+/// are asserted without a connection.
+///
+/// **Duration is `ended - started`, and only when both stamps exist.** A
+/// session that is still running, or one a crash left without an end, has no
+/// duration — "now minus the start" is elapsed time, a different fact wearing
+/// this one's name, and read off a clock this crate deliberately does not own.
+/// A pair whose end precedes its start (a clock stepped backwards mid-session)
+/// yields `None` for the same reason: a negative duration is not a duration,
+/// and a row would rather say nothing than say minus four minutes.
+///
+/// **Tags are decoded on [`json_text_values`]' terms**, which is what makes the
+/// chips agree with [`TAG_PREDICATE_SQL`]: a column that is not a JSON array
+/// contributes its raw text as one tag there and as one chip here, so a
+/// hand-edited row filters by exactly what it displays. Empty strings are
+/// dropped — an empty chip narrows nothing and renders as a gap.
+fn recording_hit_vm(
+    hit: RecordingHit,
+    destination_root: &Path,
+    total_bytes: i64,
+    playable_relative: Option<&str>,
+) -> RecordingHitVm {
+    let duration_ms = hit
+        .started_ts
+        .zip(hit.ended_ts)
+        .map(|(started, ended)| ended - started)
+        .filter(|duration| *duration >= 0);
+    let tags = hit
+        .tags_json
+        .as_deref()
+        .map(json_text_values)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|tag| !tag.is_empty())
+        .collect();
+    RecordingHitVm {
+        absolute_path: path_string(&join_relative(destination_root, &hit.relative_path)),
+        playable_path: playable_relative
+            .map(|relative| path_string(&join_relative(destination_root, relative))),
+        session_id: hit.session_id,
+        relative_path: hit.relative_path,
+        title: hit.title,
+        started_ts: hit.started_ts,
+        ended_ts: hit.ended_ts,
+        duration_ms,
+        total_bytes,
+        durability: hit.durability,
+        tags,
+    }
+}
+
+/// Join a stored `/`-joined relative path onto the destination root, one
+/// component at a time.
+///
+/// Component-wise rather than `root.join(relative)` because the stored form is
+/// `/`-joined on every platform (Story 42.1) and Windows would otherwise be
+/// handed a single component with separators inside it.
+///
+/// `.` and `..` are dropped rather than walked. Nothing writes them — every
+/// stored path is a reduction over `Normal` components — but this function's
+/// answer is a path the shell then opens, and a composition that can climb out
+/// of the root is a file-disclosure primitive one bad row away. Dropping keeps
+/// the result inside the root by construction, and the shell's containment
+/// check still has the last word.
+fn join_relative(root: &Path, relative: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    for component in relative.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            continue;
+        }
+        path.push(component);
+    }
+    path
+}
+
+/// A path as the string that crosses IPC. Lossy, deliberately: a path with a
+/// non-UTF-8 component is a path the frontend cannot hold at all, and printing
+/// its replacement characters beats dropping the row that has one.
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 /// Escape SQL `LIKE` metacharacters (`\`, `%`, `_`) so a substring scan matches
 /// them literally. Paired with `ESCAPE '\'` in every `LIKE` clause here: the
 /// backslash escapes itself and the two wildcards, and nothing else is special.
@@ -666,7 +857,7 @@ mod tests {
 
     use crate::archive::recordings::{
         durability_label, ensure_recordings_schema, move_session, rebuild_from_disk,
-        upsert_recording,
+        upsert_recording, upsert_segment, RecordingSegmentRow,
     };
     use crate::recording::{
         CaptureTarget, SessionDevices, SessionManifest, SessionMeta, SessionMetaField,
@@ -1643,5 +1834,282 @@ mod tests {
             "a cap above the default is clamped to it, and five rows is under both"
         );
         assert_eq!(limited(None), 5, "no cap is the default cap");
+    }
+
+    /// Story 42.3: the input seam is a total field move. Every optional is
+    /// carried, because a filter that silently dropped one would narrow by less
+    /// than the user asked and look like a search bug rather than a mapping bug.
+    #[test]
+    fn the_filter_vm_seam_carries_every_field_including_the_optionals() {
+        let vm = RecordingFilterVm {
+            query: "standup".to_owned(),
+            tags: vec!["client/acme".to_owned(), "internal".to_owned()],
+            participant: Some("Ada".to_owned()),
+            start_ts: Some(1_000),
+            end_ts: Some(2_000),
+            durability: Some("pushed".to_owned()),
+            profile_id: Some("01PROFILE".to_owned()),
+            limit: Some(7),
+        };
+
+        assert_eq!(
+            RecordingFilter::from(vm),
+            RecordingFilter {
+                query: "standup".to_owned(),
+                tags: vec!["client/acme".to_owned(), "internal".to_owned()],
+                participant: Some("Ada".to_owned()),
+                start_ts: Some(1_000),
+                end_ts: Some(2_000),
+                durability: Some("pushed".to_owned()),
+                profile_id: Some("01PROFILE".to_owned()),
+                limit: Some(7),
+            }
+        );
+    }
+
+    /// Story 42.3: an unset VM maps to the engine's "every session, newest
+    /// first" filter — the question the browser asks before anyone types.
+    #[test]
+    fn an_empty_filter_vm_maps_to_the_unrestricted_engine_filter() {
+        let vm = RecordingFilterVm {
+            query: String::new(),
+            tags: Vec::new(),
+            participant: None,
+            start_ts: None,
+            end_ts: None,
+            durability: None,
+            profile_id: None,
+            limit: None,
+        };
+
+        assert_eq!(RecordingFilter::from(vm), RecordingFilter::default());
+    }
+
+    /// One segment row for `session_id`, sized `bytes`, filed under the
+    /// session's own relative path the way `recordings` stores one.
+    fn segment(session_id: &str, index: u32, track: &str, bytes: u64) -> RecordingSegmentRow {
+        RecordingSegmentRow {
+            session_id: session_id.to_owned(),
+            index,
+            track: track.to_owned(),
+            relative_path: format!("2026/{session_id}/{track}-{index:04}.mov"),
+            bytes,
+            pts_start: None,
+            pts_end: None,
+            closed_ts: None,
+        }
+    }
+
+    /// The rows the browser would render for an unrestricted filter.
+    fn browsed(conn: &Connection, root: &Path) -> Vec<RecordingHitVm> {
+        search_recording_vms(conn, &RecordingFilter::default(), root).expect("browse")
+    }
+
+    /// Story 42.3: the row's two derived figures. Duration is the span between
+    /// the stamps, and size is the sum over the session's segments — including
+    /// the camera track, because the row states what the session cost on disk.
+    #[test]
+    fn a_row_derives_its_duration_from_the_stamps_and_its_size_from_the_segments() {
+        let conn = memory_db();
+        let mut row = row_with_meta("01DEVICE-01FULL", 1_000, "Standup", "Ada", "notes", &[]);
+        row.ended_ts = Some(1_000 + 90_000);
+        upsert_recording(&conn, &row).expect("index the session");
+        upsert_segment(&conn, &segment("01DEVICE-01FULL", 0, "screen", 4_096)).expect("screen 0");
+        upsert_segment(&conn, &segment("01DEVICE-01FULL", 1, "screen", 2_048)).expect("screen 1");
+        upsert_segment(&conn, &segment("01DEVICE-01FULL", 0, "camera", 512)).expect("camera 0");
+
+        let rows = browsed(&conn, Path::new("/recordings"));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].duration_ms, Some(90_000));
+        assert_eq!(rows[0].total_bytes, 4_096 + 2_048 + 512);
+    }
+
+    /// Story 42.3, the two absences the matrix names. A session that is still
+    /// running has no end and therefore no duration — not zero, and not "now
+    /// minus the start", which is a clock this crate does not read. A session
+    /// with no closed segment has written nothing, and nothing is honestly
+    /// zero bytes and no file to play.
+    #[test]
+    fn a_running_session_has_no_duration_and_a_segmentless_one_has_no_size_or_file() {
+        let conn = memory_db();
+        upsert_recording(&conn, &bare_row("01DEVICE-01LIVE", Some(1_000)))
+            .expect("index the session");
+
+        let rows = browsed(&conn, Path::new("/recordings"));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].started_ts, Some(1_000));
+        assert_eq!(rows[0].ended_ts, None);
+        assert_eq!(
+            rows[0].duration_ms, None,
+            "a session that has not ended has no duration to state"
+        );
+        assert_eq!(rows[0].total_bytes, 0);
+        assert_eq!(
+            rows[0].playable_path, None,
+            "nothing was written, so there is no file to hand to the system handler"
+        );
+    }
+
+    /// Story 42.3: a clock that stepped backwards mid-session yields an end
+    /// before its start. A negative duration is not a duration, and the row
+    /// says nothing rather than "-4 minutes".
+    #[test]
+    fn an_end_stamp_before_its_start_yields_no_duration_rather_than_a_negative_one() {
+        let conn = memory_db();
+        let mut row = bare_row("01DEVICE-01SKEW", Some(5_000));
+        row.ended_ts = Some(4_000);
+        upsert_recording(&conn, &row).expect("index the session");
+
+        assert_eq!(
+            browsed(&conn, Path::new("/recordings"))[0].duration_ms,
+            None
+        );
+    }
+
+    /// Story 42.3: both paths are composed from the destination root the shell
+    /// resolved — component by component, so the stored `/`-joined form is a
+    /// path on every platform — and Play gets the SCREEN segment even when a
+    /// camera segment shares its index.
+    #[test]
+    fn the_row_resolves_its_folder_and_its_playable_file_under_the_destination_root() {
+        let conn = memory_db();
+        upsert_recording(&conn, &bare_row("01DEVICE-01PATH", Some(1_000))).expect("index");
+        upsert_segment(&conn, &segment("01DEVICE-01PATH", 0, "camera", 1)).expect("camera 0");
+        upsert_segment(&conn, &segment("01DEVICE-01PATH", 0, "screen", 2)).expect("screen 0");
+
+        let root = Path::new("/recordings");
+        let rows = browsed(&conn, root);
+
+        assert_eq!(rows[0].relative_path, "2026/01DEVICE-01PATH");
+        assert_eq!(
+            rows[0].absolute_path,
+            path_string(&root.join("2026").join("01DEVICE-01PATH"))
+        );
+        assert_eq!(
+            rows[0].playable_path,
+            Some(path_string(
+                &root
+                    .join("2026")
+                    .join("01DEVICE-01PATH")
+                    .join("screen-0000.mov")
+            )),
+            "the screen track is what Play opens, even though the camera segment shares index 0"
+        );
+    }
+
+    /// Story 42.3: a session that captured no screen still has something to
+    /// play. The ordering is total, so the answer cannot depend on which row
+    /// SQLite visited first.
+    #[test]
+    fn a_session_with_no_screen_track_plays_its_first_segment_of_any_track() {
+        let conn = memory_db();
+        upsert_recording(&conn, &bare_row("01DEVICE-01AUDIO", Some(1_000))).expect("index");
+        upsert_segment(&conn, &segment("01DEVICE-01AUDIO", 1, "audio", 8)).expect("audio 1");
+        upsert_segment(&conn, &segment("01DEVICE-01AUDIO", 0, "audio", 8)).expect("audio 0");
+
+        assert_eq!(
+            browsed(&conn, Path::new("/recordings"))[0].playable_path,
+            Some(path_string(Path::new(
+                "/recordings/2026/01DEVICE-01AUDIO/audio-0000.mov"
+            )))
+        );
+    }
+
+    /// Story 42.3: the chips are the decoded tag array, and they agree with
+    /// what the `tag:` predicate matches — an empty entry is neither a chip nor
+    /// a filter.
+    #[test]
+    fn the_row_decodes_its_tags_and_drops_the_empty_ones() {
+        let conn = memory_db();
+        let mut row = bare_row("01DEVICE-01TAGS", Some(1_000));
+        row.tags_json =
+            Some(serde_json::to_string(&["client/acme", "", "internal"]).expect("encode the tags"));
+        upsert_recording(&conn, &row).expect("index");
+        let mut untagged = bare_row("01DEVICE-02TAGS", Some(900));
+        untagged.tags_json = None;
+        upsert_recording(&conn, &untagged).expect("index the untagged session");
+
+        let rows = browsed(&conn, Path::new("/recordings"));
+
+        assert_eq!(rows[0].session_id, "01DEVICE-01TAGS");
+        assert_eq!(rows[0].tags, vec!["client/acme", "internal"]);
+        assert_eq!(rows[1].session_id, "01DEVICE-02TAGS");
+        assert!(
+            rows[1].tags.is_empty(),
+            "a session with no tags column has no chips, not one empty chip"
+        );
+    }
+
+    /// Story 42.3: the projection is a projection — it applies the filter it is
+    /// given and returns nothing when nothing matches, exactly as the engine
+    /// under it does.
+    #[test]
+    fn the_browser_projection_honours_the_filter_and_returns_no_rows_for_no_matches() {
+        let conn = memory_db();
+        upsert_recording(
+            &conn,
+            &row_with_meta("01DEVICE-01MATCH", 1_000, "Standup", "Ada", "notes", &[]),
+        )
+        .expect("index");
+
+        let matching = search_recording_vms(
+            &conn,
+            &RecordingFilter {
+                query: "standup".to_owned(),
+                ..RecordingFilter::default()
+            },
+            Path::new("/recordings"),
+        )
+        .expect("search");
+        let missing = search_recording_vms(
+            &conn,
+            &RecordingFilter {
+                query: "retrospective".to_owned(),
+                ..RecordingFilter::default()
+            },
+            Path::new("/recordings"),
+        )
+        .expect("search");
+
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].title.as_deref(), Some("Standup"));
+        assert!(missing.is_empty());
+    }
+
+    /// Story 42.3: a stored path can never compose out of the destination root.
+    /// Nothing writes `..` — every stored path is a reduction over plain
+    /// components — but this composition's answer is a path the shell then
+    /// opens, and "one bad row is a file-disclosure primitive" is not a
+    /// property worth having.
+    #[test]
+    fn a_relative_path_can_never_climb_out_of_the_destination_root() {
+        let root = Path::new("/recordings");
+
+        assert_eq!(
+            join_relative(root, "../../etc/passwd"),
+            root.join("etc").join("passwd")
+        );
+        assert_eq!(
+            join_relative(root, "2026//./x"),
+            root.join("2026").join("x")
+        );
+        assert_eq!(join_relative(root, ""), root);
+    }
+
+    /// Story 42.3: an `archive.db` from a build before Story 42.1 has no
+    /// recordings tables, and nothing can create them on a read-only
+    /// connection. That is "nothing recorded" to the person browsing, not
+    /// `no such table` in an error dialog.
+    #[test]
+    fn browsing_an_archive_that_predates_the_recordings_tables_yields_no_rows() {
+        let conn = Connection::open_in_memory().expect("open in-memory archive");
+
+        let rows =
+            search_recording_vms(&conn, &RecordingFilter::default(), Path::new("/recordings"))
+                .expect("an archive with no recordings tables is an empty answer, never an error");
+
+        assert!(rows.is_empty());
     }
 }

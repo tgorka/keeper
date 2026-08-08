@@ -127,6 +127,8 @@ export type { RecordingDestinationKind } from "./gen/RecordingDestinationKind";
 export type { RecordingDisplayVm } from "./gen/RecordingDisplayVm";
 export type { RecordingDurabilityState } from "./gen/RecordingDurabilityState";
 export type { RecordingDurabilityVm } from "./gen/RecordingDurabilityVm";
+export type { RecordingFilterVm } from "./gen/RecordingFilterVm";
+export type { RecordingHitVm } from "./gen/RecordingHitVm";
 export type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 export type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 export type { RecordingProfileVm } from "./gen/RecordingProfileVm";
@@ -226,6 +228,8 @@ import type { OutboxVm } from "./gen/OutboxVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
+import type { RecordingFilterVm } from "./gen/RecordingFilterVm";
+import type { RecordingHitVm } from "./gen/RecordingHitVm";
 import type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 import type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 import type { RecordingProfileVm } from "./gen/RecordingProfileVm";
@@ -721,6 +725,30 @@ export async function searchArchive(filter: SearchFilterVm): Promise<SearchHitVm
 }
 
 /**
+ * Search the recordings archive for the Recordings browser (FR-141, UX-DR50,
+ * Story 42.3). Runs fully offline against `archive.db` over a fresh read-only
+ * connection — never the recorder's writer, never a network call. Queries of 3+
+ * characters use the trigram index over each session's title, participants,
+ * note, tags and custom-field values; shorter ones fall back to an accelerated
+ * `LIKE` scan. Every {@link RecordingFilterVm} field is optional and they all
+ * narrow: an empty `query` is no text predicate, an empty `tags` list is
+ * unrestricted, and several tags AND together (each matched hierarchically, so
+ * `client/acme` matches `client/acme/renewal` and never `client/acmecorp`).
+ *
+ * Resolves with at most `limit` (default and maximum 200) {@link RecordingHitVm}
+ * rows, newest first, each carrying its absolute folder (composed in Rust from
+ * the effective recordings destination — never join one here), its duration, its
+ * summed size and its decoded tags. An empty array means "nothing matched";
+ * a machine that has never recorded has no `archive.db` and also resolves with
+ * `[]`, so the caller distinguishes the two facts by the filter it sent, not by
+ * an error. Rejects with the {@link IpcError} envelope only on a genuine archive
+ * failure.
+ */
+export async function searchRecordings(filter: RecordingFilterVm): Promise<RecordingHitVm[]> {
+  return await invoke<RecordingHitVm[]>("search_recordings", { filter });
+}
+
+/**
  * Start a background archive export (FR-35, AD-11, Story 5.5). Opens a `Channel`,
  * forwards each {@link ExportProgressVm} to `onProgress` in arrival order
  * (`running` heartbeats with live counts, then exactly one terminal
@@ -757,6 +785,24 @@ export async function cancelExport(exportId: number): Promise<void> {
  */
 export async function revealPath(path: string): Promise<void> {
   await invoke<void>("reveal_path", { path });
+}
+
+/**
+ * Hand a recording's file to the system's default handler — the Recordings
+ * browser's Play (FR-141, UX-DR50, Story 42.3). `path` MUST be absolute and is
+ * normally a row's `playablePath` (its `absolutePath` opens the session folder
+ * instead).
+ *
+ * The Rust core refuses anything that is not inside the recordings destination
+ * root, lexically and after resolving symlinks, before the opener ever sees it —
+ * a command that opened any path the webview named would be a file-disclosure
+ * primitive. Rejects with the {@link IpcError} envelope (`code: "internal"`,
+ * `retriable: false`) for a path outside the root, one that no longer resolves
+ * on disk (a session moved or deleted outside keeper), or an opener failure; on
+ * a build without recording support, `code: "unsupported"`.
+ */
+export async function recordingOpenPath(path: string): Promise<void> {
+  await invoke<void>("recording_open_path", { path });
 }
 
 /**
