@@ -46,10 +46,26 @@ pub const BUILTIN_EXCLUDES: &[&str] = &[
     // The classic tier-0 corpus. Present because these names are *promises*
     // from the writing application; absent from it are curl and wget, which
     // make no such promise (see the module docs).
-    "*.crdownload",     // Chrome, Chromium, Edge
-    "*.part",           // Firefox, wget --continue
-    "*.filepart",       // Firefox (legacy), Nextcloud desktop client
-    "*.partial",        // rclone, legacy IE/Edge
+    "*.crdownload", // Chrome, Chromium, Edge
+    "*.part",       // Firefox, wget --continue
+    "*.filepart",   // Firefox (legacy), Nextcloud desktop client
+    // `.partial` is also keeper's OWN in-progress marker (Story 41.3, AD-69):
+    // `keeper-rec` writes each segment as `<name>.<ext>.partial` and renames
+    // it onto its final name the instant `finishWriting` returns. A SUFFIX
+    // rule, deliberately, and not a glob over the recordings directory: git
+    // sees that rename as an add plus a delete, so nothing about the
+    // *directory* can hide the growing file — the name is the only thing that
+    // is true for the whole of its life, and it has to hold wherever the
+    // recording destination resolves, at whatever depth, in whichever profile.
+    // It is also all this crate ever learns about recording: one string, no
+    // notion of segments, rotation or ledgers.
+    //
+    // Deliberate consequence: an unrelated `x.partial` a user keeps in a
+    // synced folder is now excluded like any other tier-0 name — invisible to
+    // `Engine::pending`, never staged, never in the activity feed. That is a
+    // behaviour change for that one file, and it is the price of a rule that
+    // is total: nothing on disk distinguishes it from a segment mid-write.
+    "*.partial",        // rclone, legacy IE/Edge, and keeper-rec's in-progress segment
     "*.download",       // Safari, matched as a name...
     "**/*.download/**", // ...and as a subtree, because Safari's is a package
     // directory: without this rule the wrapper is skipped and every partial
@@ -402,6 +418,40 @@ mod tests {
         }
     }
 
+    /// A segment being written is `<name>.<ext>.partial`, and the recordings
+    /// root can sit anywhere inside a profile — so the suffix has to hold at
+    /// the profile root and at every depth below it, whatever the media
+    /// extension underneath. This is the whole of Story 41.3's sync side: if
+    /// it fails, a growing multi-gigabyte segment is staged mid-write.
+    #[test]
+    fn an_in_progress_recording_segment_is_excluded_at_any_depth() {
+        let set = default_set();
+        for path in [
+            "screen-0003.mov.partial",
+            "recordings/screen-0003.mov.partial",
+            "recordings/keeper-rec 2026-08-07 11-02-13/screen-0003.mov.partial",
+            "a/b/c/d/e/f/g/camera-0012.mov.partial",
+            "recordings/session/audio-0000.m4a.partial",
+        ] {
+            assert!(
+                excluded(&set, path),
+                "{path} is a segment mid-write; staging it commits a torn file forever"
+            );
+        }
+        // The final name — the only thing `SegmentClosed` ever carries — is an
+        // ordinary file the moment the rename lands. Excluding it too would
+        // mean recordings never sync at all.
+        for path in [
+            "recordings/session/screen-0003.mov",
+            "recordings/session/camera-0012.mov",
+            "recordings/session/audio-0000.m4a",
+            "notes/partial.md",   // the suffix anchors at the end...
+            "notes/partial/x.md", // ...of the basename, not of a directory
+        ] {
+            assert!(!excluded(&set, path), "{path} must stay visible");
+        }
+    }
+
     #[test]
     fn ordinary_files_with_similar_names_are_kept() {
         let set = default_set();
@@ -515,5 +565,8 @@ mod tests {
         assert!(BUILTIN_EXCLUDES.contains(&"*.crdownload"));
         assert!(BUILTIN_EXCLUDES.contains(&"**/*.download/**"));
         assert!(BUILTIN_EXCLUDES.contains(&".keeper.*.tmp"));
+        // Story 41.3 depends on this one entry existing verbatim: it is the
+        // only thing standing between a segment mid-write and the commit path.
+        assert!(BUILTIN_EXCLUDES.contains(&"*.partial"));
     }
 }

@@ -35,6 +35,18 @@
 // reported — an accepted Story 17.4 limitation (the NFR-22 CI gate runs on
 // generated fixtures that carry complete bounds).
 //
+// `.partial` while writing, final on close (Story 41.3, FR-133, AD-69): every
+// writer's output file is `<name>.<ext>.partial`, renamed onto `<name>.<ext>`
+// with an atomic same-directory `rename(2)` the instant `finishWriting`
+// returns — before a single line mentions the segment, so `segmentClosed.path`
+// and every `recording` path are the FINAL name and nothing downstream ever
+// learns the temporary one. That one suffix is what keeps a growing segment
+// out of sync's commit path (`keeper-sync` excludes `*.partial` at tier 0)
+// without teaching the sync engine anything about recording. A rename that
+// fails is a non-fatal `warning{code:"segmentUnpublished"}`: the bytes stay on
+// disk under the temporary name for startup recovery to finalise or discard,
+// the segment is simply not announced, and capture keeps rolling.
+//
 // `ptsStart`/`ptsEnd` (Story 17.4, NFR-22, coordinator-authorized 17.1
 // amendment) are the retiring segment's first/last appended video sample's
 // PTS in **original capture-clock seconds** — recorded HERE, before
@@ -97,7 +109,15 @@ private final class SegmentWriter {
     /// source is enabled. Rebuilt per segment like every other input, so the
     /// mic track survives rotation exactly like the system-audio track.
     let micInput: AVAssetWriterInput?
+    /// The path the segment will carry once it is closed — the ONLY path
+    /// anything outside this process ever learns (Story 41.3): it is what
+    /// `segmentClosed` and `recording` report, and what the next segment's
+    /// name is derived from.
     let path: String
+    /// The path the writer actually writes to: [`path`] plus the `.partial`
+    /// suffix. Renamed onto `path` the instant `finishWriting` returns, so a
+    /// growing segment is never a name sync can see.
+    let writePath: String
     let index: Int
 
     init(
@@ -109,6 +129,7 @@ private final class SegmentWriter {
         self.audioInput = audioInput
         self.micInput = micInput
         self.path = path
+        self.writePath = partialSegmentPath(for: path)
         self.index = index
     }
 }
@@ -675,7 +696,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         if !rotationInFlight {
             let elapsed = CMTimeSubtract(pts, segmentStartPTS).seconds
             if policy.shouldRotate(
-                observedBytes: onDiskBytes(atPath: current.path),
+                observedBytes: onDiskBytes(atPath: current.writePath),
                 elapsedSeconds: elapsed.isFinite ? elapsed : 0,
                 isKeyframe: true,
                 isFirstFrameOfSegment: !segmentHasVideo)
@@ -744,17 +765,25 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                     exit(0)
                 }
                 rotationInFlight = false
+                // The bytes are complete; publish them under the final name
+                // before anything is said about them (Story 41.3).
+                let published = publish(retiring)
                 if !stopping {
-                    var closed: [String: Any] = [
-                        "event": "segmentClosed",
-                        "index": retiring.index,
-                        "path": retiring.path,
-                        "bytes": onDiskBytes(atPath: retiring.path),
-                        "track": "audio",
-                    ]
-                    if let retiringPTSStart { closed["ptsStart"] = retiringPTSStart }
-                    if let retiringPTSEnd { closed["ptsEnd"] = retiringPTSEnd }
-                    emitEvent(closed)
+                    if published {
+                        var closed: [String: Any] = [
+                            "event": "segmentClosed",
+                            "index": retiring.index,
+                            "path": retiring.path,
+                            "bytes": onDiskBytes(atPath: retiring.path),
+                            "track": "audio",
+                        ]
+                        if let retiringPTSStart { closed["ptsStart"] = retiringPTSStart }
+                        if let retiringPTSEnd { closed["ptsEnd"] = retiringPTSEnd }
+                        emitEvent(closed)
+                    }
+                    // `recording` closes the rotation bracket either way: the
+                    // NEXT segment is live, and a host left in `rotating`
+                    // because a rename failed would be a stuck session.
                     emitEvent(["event": "state", "state": "recording", "path": next.path])
                 }
                 finalizeGroup.leave()
@@ -885,7 +914,9 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     }
 
     private func makeSegmentWriter(path: String, index: Int) throws -> SegmentWriter {
-        let url = URL(fileURLWithPath: path)
+        // Story 41.3: the writer's output is the `.partial` name for the whole
+        // of the segment's life; `path` is what it is renamed onto at close.
+        let url = URL(fileURLWithPath: partialSegmentPath(for: path))
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
 
@@ -1055,7 +1086,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             if !wantsAudio, !rotationInFlight {
                 let elapsed = CMTimeSubtract(anchorPTS, segmentStartPTS).seconds
                 if policy.shouldRotate(
-                    observedBytes: onDiskBytes(atPath: target.path),
+                    observedBytes: onDiskBytes(atPath: target.writePath),
                     elapsedSeconds: elapsed.isFinite ? elapsed : 0,
                     isKeyframe: true,
                     isFirstFrameOfSegment: false)
@@ -1400,7 +1431,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// `setupCamera` and for each screen-driven rotation on `mediaQueue`.
     private func makeCameraSegmentWriter(index: Int) throws -> SegmentWriter {
         let path = cameraSegmentPath(index: index)
-        let url = URL(fileURLWithPath: path)
+        let url = URL(fileURLWithPath: partialSegmentPath(for: path))
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
@@ -1507,7 +1538,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         // `ptsStart` is the boundary, like every rotated segment's.
         guard cameraSessionStarted, cameraSegmentHasVideo else {
             retiring.writer.cancelWriting()
-            try? FileManager.default.removeItem(atPath: retiring.path)
+            try? FileManager.default.removeItem(atPath: retiring.writePath)
             currentCamera = nil
             do {
                 let next = try makeCameraSegmentWriter(index: nextIndex)
@@ -1554,10 +1585,14 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         retiring.writer.finishWriting { [self] in
             mediaQueue.async { [self] in
                 if retiring.writer.status == .completed {
+                    // Publish before announcing, and publish even while
+                    // stopping (Story 41.3): the bytes are complete, so the
+                    // final name is theirs whether or not anyone is told.
+                    let published = publish(retiring)
                     // While stopping, the host is in `Stopping` — a
                     // segmentClosed now would be an illegal transition; the
                     // stop path owns all remaining signalling.
-                    if !stopping {
+                    if !stopping, published {
                         var closed: [String: Any] = [
                             "event": "segmentClosed",
                             "index": retiring.index,
@@ -1673,7 +1708,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             cameraSegmentHasVideo
         else {
             camera.writer.cancelWriting()
-            try? FileManager.default.removeItem(atPath: camera.path)
+            try? FileManager.default.removeItem(atPath: camera.writePath)
             return
         }
         let ptsStart = cameraSegmentFirstVideoPTS
@@ -1683,17 +1718,22 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         finalizeGroup.enter()
         camera.writer.finishWriting { [self] in
             mediaQueue.async { [self] in
-                if camera.writer.status == .completed, !stopping {
-                    var closed: [String: Any] = [
-                        "event": "segmentClosed",
-                        "index": camera.index,
-                        "path": camera.path,
-                        "bytes": onDiskBytes(atPath: camera.path),
-                        "track": "camera",
-                    ]
-                    if let ptsStart { closed["ptsStart"] = ptsStart }
-                    if let ptsEnd { closed["ptsEnd"] = ptsEnd }
-                    emitEvent(closed)
+                if camera.writer.status == .completed {
+                    // Publish whatever the camera leg managed to record, even
+                    // while stopping — the file is finished (Story 41.3).
+                    let published = publish(camera)
+                    if !stopping, published {
+                        var closed: [String: Any] = [
+                            "event": "segmentClosed",
+                            "index": camera.index,
+                            "path": camera.path,
+                            "bytes": onDiskBytes(atPath: camera.path),
+                            "track": "camera",
+                        ]
+                        if let ptsStart { closed["ptsStart"] = ptsStart }
+                        if let ptsEnd { closed["ptsEnd"] = ptsEnd }
+                        emitEvent(closed)
+                    }
                 }
                 finalizeGroup.leave()
             }
@@ -1707,6 +1747,39 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     private func onDiskBytes(atPath path: String) -> UInt64 {
         let attributes = try? FileManager.default.attributesOfItem(atPath: path)
         return (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+    }
+
+    /// Publish a just-finalized segment under its FINAL name (Story 41.3,
+    /// FR-133, AD-69) — on `mediaQueue`, immediately after `finishWriting`
+    /// reported `.completed` and before anything is emitted about the segment.
+    /// Returns whether the rename landed.
+    ///
+    /// Every caller must treat `false` as "this segment does not exist yet":
+    /// no `segmentClosed`, because its `path` is the final one and announcing
+    /// a file that is not there would put a name in the ledger that nothing
+    /// can open. The bytes are untouched under the temporary name, the failure
+    /// goes out on the non-fatal `warning` channel, and the session keeps
+    /// recording — capture never degrades for a publication problem (NFR-34).
+    /// Startup recovery finalises or discards what was left behind.
+    private func publish(_ segment: SegmentWriter) -> Bool {
+        do {
+            try publishSegment(from: segment.writePath, to: segment.path)
+            return true
+        } catch let error as SegmentPublishError {
+            emitEvent([
+                "event": "warning",
+                "code": SegmentPublishError.warningCode,
+                "message": error.warningMessage,
+            ])
+            return false
+        } catch {
+            emitEvent([
+                "event": "warning",
+                "code": SegmentPublishError.warningCode,
+                "message": "could not publish a finished segment: \(String(describing: error))",
+            ])
+            return false
+        }
     }
 
     /// Perform one gapless dual-writer handover at `keyframePTS` (Story 17.1),
@@ -1816,26 +1889,36 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                     exit(0)
                 }
                 rotationInFlight = false
+                // The `moov` is written, so these bytes are final: take the
+                // final name before a single line mentions the segment (Story
+                // 41.3). A failed rename leaves the file under its temporary
+                // name, warns, and skips only the announcement.
+                let published = publish(retiring)
                 // While stopping, the host is in `Stopping` — a segmentClosed
                 // or `recording` line now would be an illegal transition; the
                 // stop path owns all remaining signalling (`finalized`).
                 if !stopping {
-                    // Additive `ptsStart`/`ptsEnd` (Story 17.4, NFR-22): the
-                    // retiring segment's original capture-clock video bounds.
-                    // A rotation only ever retires a segment that appended
-                    // video (the policy never cuts a first frame), so the
-                    // bounds are present in practice; the host parser reads
-                    // them best-effort either way.
-                    var closed: [String: Any] = [
-                        "event": "segmentClosed",
-                        "index": retiring.index,
-                        "path": retiring.path,
-                        "bytes": onDiskBytes(atPath: retiring.path),
-                        "track": "screen",
-                    ]
-                    if let retiringPTSStart { closed["ptsStart"] = retiringPTSStart }
-                    if let retiringPTSEnd { closed["ptsEnd"] = retiringPTSEnd }
-                    emitEvent(closed)
+                    if published {
+                        // Additive `ptsStart`/`ptsEnd` (Story 17.4, NFR-22):
+                        // the retiring segment's original capture-clock video
+                        // bounds. A rotation only ever retires a segment that
+                        // appended video (the policy never cuts a first
+                        // frame), so the bounds are present in practice; the
+                        // host parser reads them best-effort either way.
+                        var closed: [String: Any] = [
+                            "event": "segmentClosed",
+                            "index": retiring.index,
+                            "path": retiring.path,
+                            "bytes": onDiskBytes(atPath: retiring.path),
+                            "track": "screen",
+                        ]
+                        if let retiringPTSStart { closed["ptsStart"] = retiringPTSStart }
+                        if let retiringPTSEnd { closed["ptsEnd"] = retiringPTSEnd }
+                        emitEvent(closed)
+                    }
+                    // The bracket closes either way: segment N+1 is already
+                    // recording, and a host stuck in `rotating` because a
+                    // rename failed would be a session that never ends.
                     emitEvent(["event": "state", "state": "recording", "path": next.path])
                 }
                 finalizeGroup.leave()
@@ -1956,7 +2039,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             if let camera = currentCamera {
                 currentCamera = nil
                 camera.writer.cancelWriting()
-                try? FileManager.default.removeItem(atPath: camera.path)
+                try? FileManager.default.removeItem(atPath: camera.writePath)
             }
             emitEvent([
                 "event": "error",
@@ -1980,10 +2063,19 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 camera.videoInput?.markAsFinished()
                 camera.micInput?.markAsFinished()
                 finalizeGroup.enter()
-                camera.writer.finishWriting { self.finalizeGroup.leave() }
+                camera.writer.finishWriting { [self] in
+                    mediaQueue.async { [self] in
+                        // No `segmentClosed` for a final segment (the host is
+                        // Stopping), but it still has to take its final name —
+                        // the terminal disk reconcile only sees published
+                        // files (Story 41.3).
+                        if camera.writer.status == .completed { _ = publish(camera) }
+                        finalizeGroup.leave()
+                    }
+                }
             } else {
                 camera.writer.cancelWriting()
-                try? FileManager.default.removeItem(atPath: camera.path)
+                try? FileManager.default.removeItem(atPath: camera.writePath)
             }
         }
         current.videoInput?.markAsFinished()
@@ -1994,8 +2086,14 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         // Wait for the final writer AND any still-running retired-writer
         // finalize before reporting — `exit` must never abandon a segment
         // mid-`moov`.
-        finalizeGroup.notify(queue: mediaQueue) {
+        finalizeGroup.notify(queue: mediaQueue) { [self] in
             if current.writer.status == .completed {
+                // The final segment gets no `segmentClosed` — `finalized` is
+                // its closure signal — so this rename is the only thing that
+                // ever gives it its real name (Story 41.3). A failure warns
+                // and leaves the bytes under the temporary one for recovery;
+                // the session still finalized, because it did.
+                _ = publish(current)
                 emitEvent(["event": "state", "state": "finalized"])
             } else {
                 emitEvent([
@@ -2032,7 +2130,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         if !rotationInFlight {
             let elapsed = CMTimeSubtract(pts, segmentStartPTS).seconds
             if policy.shouldRotate(
-                observedBytes: onDiskBytes(atPath: current.path),
+                observedBytes: onDiskBytes(atPath: current.writePath),
                 elapsedSeconds: elapsed.isFinite ? elapsed : 0,
                 isKeyframe: true,
                 isFirstFrameOfSegment: !segmentHasVideo)

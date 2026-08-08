@@ -25,7 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
@@ -196,6 +196,75 @@ const WATCH_DEGRADED_PREFIX: &str = "keeper cannot watch this folder for changes
 /// and more correct than making the engine wait for it.
 const WATCH_TAP_CAPACITY: usize = 1_024;
 
+/// How many unapplied "this path is finished" assertions
+/// [`Engine::finished_tap`] holds before it starts dropping them.
+///
+/// Small on purpose, and the opposite trade to [`WATCH_TAP_CAPACITY`]. A watch
+/// event is one of thousands per second and losing one costs a rescan; an
+/// assertion is one per closed segment — a few per hour, per recorder — and
+/// losing one costs a settle window. A queue this deep can only fill if
+/// nothing has drained it for hours, which means the supervisor is not
+/// running, which means the assertion had nothing to do anyway.
+const FINISHED_TAP_CAPACITY: usize = 64;
+
+/// The producer's end of the finished-path seam: "this absolute path, in this
+/// profile, is complete" (Story 41.4, AD-68).
+///
+/// The inbound sibling of [`Engine::watch_tap`], and it exists so that the
+/// direction of the dependency can stay the way that one established. A
+/// recorder holding an `Engine` would be a recording subsystem holding the git
+/// layer: it could commit, push, pause a profile or delete one, and every one
+/// of those is a thing it must never do. What it can do is state a fact about
+/// a file it just closed. This handle carries exactly that fact and nothing
+/// else, is cheap to clone, and outlives nothing — a send after the engine is
+/// gone is a dropped message, not a dangling reference.
+///
+/// Delivery is asynchronous by design: the assertion is applied by the
+/// supervisor's next tick, which is also the tick that would commit the file,
+/// so nothing is gained by making the producer wait for a lock the walk holds.
+#[derive(Clone, Debug)]
+pub struct FinishedTap {
+    tx: tokio::sync::mpsc::Sender<(String, PathBuf)>,
+}
+
+impl FinishedTap {
+    /// Assert that `path` — absolute, inside `profile_id`'s recordings root —
+    /// will never be written again.
+    ///
+    /// Returns whether the assertion was queued. A `false` is not a failure the
+    /// caller has to handle (NFR-31): every rejected assertion means only that
+    /// the file takes the ordinary settle path, which is what would have
+    /// happened if this seam did not exist. The recorder must never stop
+    /// recording over a sync detail, so there is nothing here to propagate.
+    pub fn note_finished(&self, profile_id: &str, path: impl Into<PathBuf>) -> bool {
+        // `try_send` rather than an await: the caller is a driver sink on a
+        // capture path, and the one thing it cannot do is block on the sync
+        // engine's cadence.
+        match self.tx.try_send((profile_id.to_owned(), path.into())) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    profile_id,
+                    %err,
+                    "a finished-path assertion was dropped; the file takes the ordinary settle window"
+                );
+                false
+            }
+        }
+    }
+}
+
+/// Both ends of the [`FinishedTap`] queue, held by the engine.
+///
+/// The receiver is behind its own mutex rather than owned by the supervisor
+/// loop because `run` is not the only thing that may drain it and because the
+/// sender has to be mintable from `&Engine`, which the loop's `&mut` receiver
+/// could never be.
+struct FinishedQueue {
+    tx: tokio::sync::mpsc::Sender<(String, PathBuf)>,
+    rx: Mutex<tokio::sync::mpsc::Receiver<(String, PathBuf)>>,
+}
+
 /// One profile's filesystem watcher, or the memory of it failing.
 ///
 /// A single map holds both so there is exactly one place that answers "does
@@ -335,6 +404,17 @@ pub struct Engine {
     /// and a `LazyLock` answers that question by initializing — there is no way
     /// to look without becoming the first caller.
     watch_tap: OnceLock<tokio::sync::broadcast::Sender<(String, PathBuf)>>,
+    /// The inbound queue behind [`Engine::finished_tap`], created by the first
+    /// producer that asks for a handle.
+    ///
+    /// A `OnceLock` for the same reason [`Self::watch_tap`] is one, and not the
+    /// `LazyLock` this codebase otherwise defaults to: the *fact* of
+    /// initialization is the signal. The drain asks "has any producer ever
+    /// taken a handle?" on every tick, and a `LazyLock` can only answer that
+    /// question by becoming the first caller. The payoff is the same too — an
+    /// engine nobody asserts to (`keeper-syncd`, every test that is not about
+    /// this) allocates no channel, and its drain is one relaxed load per tick.
+    finished_tap: OnceLock<FinishedQueue>,
 }
 
 /// One remembered answer from `git-lfs-authenticate`, with its own deadline.
@@ -405,6 +485,7 @@ impl Engine {
             watch_wake: Mutex::new(HashSet::new()),
             lfs_ssh_credentials: Mutex::new(HashMap::new()),
             watch_tap: OnceLock::new(),
+            finished_tap: OnceLock::new(),
         };
         engine.seed_status()?;
         Ok(engine)
@@ -722,6 +803,10 @@ impl Engine {
     }
 
     async fn tick(&self) -> Result<()> {
+        // Before the profile list, and outside the `enabled` filter below: an
+        // assertion for a paused profile still has to be recorded, or the
+        // segment waits out a settle window that the pause made meaningless.
+        self.drain_finished_assertions();
         let profiles = self.list_profiles()?;
         // A watcher must not outlive its profile (AD-34-11). Pausing one or
         // removing one is visible only from here: `tick_profile` never runs for
@@ -1076,6 +1161,87 @@ impl Engine {
             .subscribe()
     }
 
+    /// Mint a producer handle for asserting that a path is finished
+    /// (Story 41.4, AD-68).
+    ///
+    /// The inbound counterpart of [`Self::watch_tap`], and the *only* way a
+    /// producer reaches [`Self::note_finished_path`] from another subsystem.
+    /// The direction is the point: `watch_tap` established that the engine
+    /// hands out a channel rather than itself, and this keeps the recording
+    /// code on the far side of that line. A recorder holding an `Engine` could
+    /// commit, push, pause a profile or remove one; a recorder holding a
+    /// [`FinishedTap`] can state one fact about one file.
+    ///
+    /// What a producer may rely on:
+    ///
+    /// * **It never affects capture.** Every rejection — a full queue, an
+    ///   unknown profile, a path outside the recordings root — is a `warn` and
+    ///   the ordinary settle window, never an error to handle (NFR-31).
+    /// * **It is applied on the supervisor's next tick**, which is also the
+    ///   tick that would have walked the tree. An engine whose supervisor is
+    ///   not running applies nothing, and nothing was going to be committed
+    ///   there either.
+    /// * **It is bounded, and drops rather than blocks.** See
+    ///   [`FINISHED_TAP_CAPACITY`] for why the depth is small.
+    ///
+    /// Callable any number of times, from any thread, and before any profile
+    /// exists.
+    pub fn finished_tap(&self) -> FinishedTap {
+        let queue = self.finished_tap.get_or_init(|| {
+            let (tx, rx) = tokio::sync::mpsc::channel(FINISHED_TAP_CAPACITY);
+            FinishedQueue {
+                tx,
+                rx: Mutex::new(rx),
+            }
+        });
+        FinishedTap {
+            tx: queue.tx.clone(),
+        }
+    }
+
+    /// Apply everything producers have asserted since the last tick.
+    ///
+    /// Costs one relaxed load on an engine nobody has tapped, which is every
+    /// engine that is not hosting a recorder.
+    ///
+    /// The queue is emptied into a local vector before a single assertion is
+    /// applied, because applying one takes the gate lock and a SQLite
+    /// transaction: holding the receiver across that would make a producer's
+    /// `try_send` queue behind the engine's own disk I/O, which is exactly what
+    /// a non-blocking seam exists to avoid.
+    ///
+    /// A failed assertion is logged and skipped rather than returned. This runs
+    /// before the profile loop, and one malformed request must not cost every
+    /// profile its tick.
+    fn drain_finished_assertions(&self) {
+        let Some(queue) = self.finished_tap.get() else {
+            return;
+        };
+        let mut asserted: Vec<(String, PathBuf)> = Vec::new();
+        {
+            let mut rx = Self::lock(&queue.rx);
+            while let Ok(assertion) = rx.try_recv() {
+                asserted.push(assertion);
+            }
+        }
+        for (profile_id, path) in asserted {
+            match self.note_finished_path(&profile_id, &path) {
+                Ok(true) => tracing::debug!(
+                    profile_id,
+                    path = %path.display(),
+                    "a producer declared this path finished"
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::warn!(
+                    profile_id,
+                    path = %path.display(),
+                    %err,
+                    "a malformed finished-path assertion was discarded"
+                ),
+            }
+        }
+    }
+
     /// The watcher reported something no walk has answered yet.
     fn note_watch_wake(&self, profile_id: &str) {
         Self::lock(&self.watch_wake).insert(profile_id.to_owned());
@@ -1209,6 +1375,97 @@ impl Engine {
         // no business holding it.
         self.with_db(|conn| db::save_file_state(conn, &profile.id, &pending))?;
         Ok(primed)
+    }
+
+    /// Apply one producer's assertion that `path` is finished (Story 41.4,
+    /// FR-134, NFR-31).
+    ///
+    /// The guarded face of [`StabilityGate::note_finished`]: the path must be
+    /// absolute and must resolve inside *this* profile's
+    /// [`SyncProfile::recordings_root`]. That guard is the whole of the
+    /// authorisation story (FR-135). The gate skips its quiescence test on the
+    /// strength of the caller's claim, so the claim has to be bounded to the
+    /// tree the caller actually produces — a recorder is entitled to say that
+    /// the segment it just closed is complete, and entitled to say nothing
+    /// whatsoever about the user's spreadsheets in the same folder.
+    ///
+    /// # What is a refusal, and what is an error
+    ///
+    /// `Ok(false)` and a `warn` line — never an `Err` — for every condition the
+    /// producer could not have known and cannot act on:
+    ///
+    /// * an unknown profile id (it was removed between the close and the tick),
+    /// * a profile that holds no recordings root at all,
+    /// * a path somewhere else in the profile, or outside it entirely.
+    ///
+    /// All three mean the same thing to the file: it takes the ordinary settle
+    /// path, which is what it would have taken had this API never been called.
+    /// That is the NFR-31 contract in one sentence — the recorder is never
+    /// handed an error, because there is no error it could usefully handle
+    /// while a capture is running, and a sync detail must not become a failure
+    /// on the capture path.
+    ///
+    /// `Err` is reserved for a request that is malformed rather than merely
+    /// unusable: a relative path, or one containing a `..` component. Neither
+    /// can be checked against the recordings root — [`Path::starts_with`]
+    /// compares components and would happily accept
+    /// `<root>/../../etc/passwd` — so accepting them would turn the guard into
+    /// a suggestion. A producer cannot reach either state by accident: it names
+    /// files it created itself. They are programming errors, and they are the
+    /// one thing worth failing loudly for. [`Self::drain_finished_assertions`]
+    /// logs and discards them, so even here nothing reaches the recorder.
+    ///
+    /// A **paused** profile is deliberately not on either list. The assertion
+    /// is recorded exactly as it would be for a running one and mirrored to
+    /// `file_state`, so the resume honours it: losing it would make the segment
+    /// wait out a window that the pause itself made meaningless.
+    ///
+    /// Returns whether the gate recorded the assertion. `false` also covers the
+    /// two answers only the gate can give — the path is excluded by tier 0 (a
+    /// `.partial` mid-rotation), or it cannot be stat-ed.
+    pub fn note_finished_path(&self, profile_id: &str, path: &Path) -> Result<bool> {
+        if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+            return Err(SyncError::Config(format!(
+                "a finished-path assertion needs an absolute path with no `..`, got {}",
+                path.display()
+            )));
+        }
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
+            tracing::warn!(
+                profile_id,
+                path = %path.display(),
+                "finished path asserted against a profile that does not exist; the ordinary settle window applies"
+            );
+            return Ok(false);
+        };
+        let Some(root) = profile.recordings_root() else {
+            tracing::warn!(
+                profile_id,
+                path = %path.display(),
+                "finished path asserted against a profile that holds no recordings; the ordinary settle window applies"
+            );
+            return Ok(false);
+        };
+        if !path.starts_with(&root) {
+            tracing::warn!(
+                profile_id,
+                path = %path.display(),
+                root = %root.display(),
+                "finished path asserted outside the profile's recordings root; the ordinary settle window applies"
+            );
+            return Ok(false);
+        }
+        let now = self.platform.now_ms();
+        let (noted, pending) = {
+            let mut gates = Self::lock(&self.gates);
+            let gate = self.ensure_gate(&mut gates, &profile)?;
+            (gate.note_finished(path, now), gate.export())
+        };
+        // Outside the gate lock, and mirrored the way the walk mirrors it, so a
+        // restart between the close and the commit does not silently drop the
+        // assertion. See [`Self::prime_moved_paths`], which shares the shape.
+        self.with_db(|conn| db::save_file_state(conn, &profile.id, &pending))?;
+        Ok(noted)
     }
 
     /// Execute every journal unit that is ready for this profile.
@@ -5766,6 +6023,255 @@ mod tests {
         );
     }
 
+    /// A profile that holds recordings, with its root already on disk.
+    ///
+    /// The default [`crate::profile::RecordingsConfig`] is what story 41.2
+    /// hands an owner with a single recordings-flagged profile, so a test built
+    /// on it is testing the shape the product actually ships.
+    fn recording_profile(dir: &Path) -> (SyncProfile, PathBuf) {
+        let mut p = adoptable(dir);
+        p.recordings = Some(crate::profile::RecordingsConfig::default());
+        let root = p
+            .recordings_root()
+            .expect("a recordings profile has a recordings root");
+        std::fs::create_dir_all(&root).expect("recordings root");
+        (p, root)
+    }
+
+    /// The one-tick proof (Story 41.4, FR-134).
+    ///
+    /// The property is a *count*, not a duration: the injected clock is never
+    /// advanced anywhere in this test, so a segment that needed the settle
+    /// window could not reach it however many passes it were given, and the
+    /// budget below fails the test on the second pass rather than hanging.
+    /// Elapsed time is deliberately not asserted on — it would pass on a fast
+    /// machine and fail on a loaded one, and it is not what the story claims.
+    ///
+    /// The control half in the same profile is what makes it an assertion about
+    /// the *assertion* rather than about the gate being lenient.
+    #[tokio::test]
+    async fn a_finished_segment_commits_on_the_next_pass_and_an_unasserted_one_waits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (p, root) = recording_profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        // Control: an ordinary rotated segment nobody vouched for. Two passes
+        // and a whole settle window, which is the latency this story exists to
+        // remove.
+        let unasserted = root.join("segment-000.mov");
+        std::fs::write(&unasserted, b"a segment the recorder never announced").expect("write");
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("first pass"),
+            0,
+            "one observation is not two: the unasserted segment is held"
+        );
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("second pass, still inside the window"),
+            0,
+            "and no number of passes inside the window will free it"
+        );
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the window has elapsed"),
+            1
+        );
+
+        // The assertion, delivered the way the recorder delivers it: through a
+        // handle that is not an `Engine` (AD-68), applied by the drain the tick
+        // runs before it walks anything.
+        let finished = root.join("segment-001.mov");
+        std::fs::write(&finished, b"finishWriting returned; these bytes are final").expect("write");
+        let tap = engine.finished_tap();
+        assert!(
+            tap.note_finished(&p.id, &finished),
+            "the assertion is queued"
+        );
+        engine.drain_finished_assertions();
+
+        let clock_at_assertion = platform.now_ms();
+        /// One. That is the whole claim.
+        const PASS_BUDGET: u32 = 1;
+        let mut passes = 0u32;
+        let committed = loop {
+            passes += 1;
+            assert!(
+                passes <= PASS_BUDGET,
+                "an asserted segment must commit on the pass that follows the assertion; \
+                 this one was still held after {} pass(es)",
+                passes - 1
+            );
+            let landed = engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("a pass over the tree");
+            if landed > 0 {
+                break landed;
+            }
+        };
+        assert_eq!((passes, committed), (1, 1));
+        assert_eq!(
+            platform.now_ms(),
+            clock_at_assertion,
+            "and it got there without a millisecond of settle window"
+        );
+    }
+
+    /// The guard is the authorisation story (FR-135): the producer may vouch
+    /// for its own output and for nothing else. Every refusal here is `Ok`,
+    /// because a recorder mid-capture has nothing to do with an error (NFR-31);
+    /// only a request the engine cannot interpret at all is an `Err`.
+    #[tokio::test]
+    async fn a_finished_assertion_is_refused_unless_it_names_this_profile_s_recordings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (p, root) = recording_profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        // Inside the profile, outside the recordings root. The interesting
+        // case: the producer can reach the file, and still may not vouch for it.
+        let elsewhere = p.local_path.join("taxes.ods");
+        std::fs::write(&elsewhere, b"not the recorder's to declare finished").expect("write");
+        assert!(
+            !engine
+                .note_finished_path(&p.id, &elsewhere)
+                .expect("a refusal is not an error the recorder has to handle"),
+            "a path outside the recordings root is refused"
+        );
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("first pass"),
+            0,
+            "and it did not become stable early — it is on the ordinary path"
+        );
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the window has elapsed"),
+            1,
+            "which it walks to the end, exactly as if nothing had been asserted"
+        );
+
+        // A profile that was removed between the close and the tick.
+        assert!(!engine
+            .note_finished_path("01JNOSUCHPROFILEXXXXXXXXXX", &root.join("segment-000.mov"))
+            .expect("an unknown profile degrades, it does not fail"));
+
+        // A profile that holds no recordings at all has no root to be inside of.
+        let mut plain = profile(dir.path());
+        plain.id = "01JPLAINPROFILEXXXXXXXXXXX".to_owned();
+        plain.local_path = dir.path().join("plain");
+        std::fs::create_dir_all(&plain.local_path).expect("work dir");
+        engine.upsert_profile(&plain).expect("upsert");
+        assert!(!engine
+            .note_finished_path(&plain.id, &plain.local_path.join("segment-000.mov"))
+            .expect("a non-recordings profile degrades too"));
+
+        // Malformed, and the only thing here worth an `Err`: neither can be
+        // checked against the root, since `starts_with` compares components and
+        // would accept the second one.
+        assert!(engine
+            .note_finished_path(&p.id, Path::new("segment-000.mov"))
+            .is_err());
+        assert!(engine
+            .note_finished_path(&p.id, &root.join("../../etc/passwd"))
+            .is_err());
+    }
+
+    /// A `.partial` is what the recorder writes *while* the segment is open
+    /// (AD-69). Tier 0 outranks the assertion, and an engine that let a
+    /// producer talk it out of an exclusion would commit a half-written file.
+    #[tokio::test]
+    async fn an_asserted_partial_is_still_invisible_to_the_engine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (p, root) = recording_profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let partial = root.join("segment-000.mov.partial");
+        std::fs::write(&partial, b"mid-rotation, still open").expect("write");
+        assert!(
+            !engine
+                .note_finished_path(&p.id, &partial)
+                .expect("an excluded path is not an error either"),
+            "tier 0 declines the assertion"
+        );
+
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("a pass over the tree"),
+            0,
+            "and the file stays out of the commit however long it sits there"
+        );
+    }
+
+    /// Losing the assertion across a pause would be the worst place to lose it:
+    /// the segment would wait out a settle window that the pause itself made
+    /// meaningless, on top of however long the pause lasted.
+    #[tokio::test]
+    async fn a_paused_profile_records_a_finished_assertion_and_honours_it_on_resume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (p, root) = recording_profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        // One ordinary commit first, so the repository exists and the pause
+        // below is the only thing that changes.
+        std::fs::write(p.local_path.join("readme.md"), b"a folder with a history").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        engine.set_enabled(&p.id, false).expect("pause");
+        let finished = root.join("segment-000.mov");
+        std::fs::write(&finished, b"closed while the profile was paused").expect("write");
+        assert!(
+            engine
+                .note_finished_path(&p.id, &finished)
+                .expect("a paused profile is not a refusal"),
+            "a pause suspends syncing, not the producer's knowledge"
+        );
+
+        engine.set_enabled(&p.id, true).expect("resume");
+        assert!(
+            !Engine::lock(&engine.gates).contains_key(&p.id),
+            "resuming drops the in-memory gate, so what follows can only have \
+             come back from `file_state`"
+        );
+
+        let clock_at_resume = platform.now_ms();
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the first pass after the resume"),
+            1,
+            "the assertion survived the pause and the gate rebuild"
+        );
+        assert_eq!(
+            platform.now_ms(),
+            clock_at_resume,
+            "with no settle window waited out on the far side"
+        );
+    }
+
     #[tokio::test]
     async fn a_commit_that_turned_out_empty_records_nothing() {
         // `stage_and_commit` returns `None` when every staged path is
@@ -5856,6 +6362,99 @@ mod tests {
                 path: "sub/deeper/x.txt".to_owned(),
                 reason: PendingReason::Untracked,
             }]
+        );
+    }
+
+    /// Story 41.3: while a rotation is in flight the destination holds a
+    /// growing `<name>.mov.partial` beside the segments already closed. The
+    /// in-progress one has to be invisible everywhere at once — the pending
+    /// list, the index, the commit, the activity feed — because a
+    /// half-written file committed once is a corrupt file forever, and
+    /// because a segment that showed as "1 file pending" for the length of a
+    /// meeting would read as sync being broken.
+    ///
+    /// The whole mechanism is one tier-0 name rule, so this is also the proof
+    /// that the sync crate needs to know nothing else about recording: the
+    /// rename at the end is the only event, and the next commit picks the
+    /// segment up as an ordinary file.
+    #[tokio::test]
+    async fn a_segment_still_being_written_is_never_pending_and_never_committed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        // Exactly where recordings land: a session folder nested under the
+        // profile's recordings root, so the rule is exercised at depth.
+        let session = p
+            .local_path
+            .join("recordings")
+            .join("keeper-rec 2026-08-07 11.02.13");
+        std::fs::create_dir_all(&session).expect("session folder");
+        std::fs::write(session.join("screen-0000.mov"), b"a segment that closed").expect("closed");
+        std::fs::write(session.join("screen-0001.mov.partial"), b"still growing").expect("open");
+        engine.upsert_profile(&p).expect("upsert");
+        engine.ensure_repo(&p).expect("adopt");
+
+        let closed = "recordings/keeper-rec 2026-08-07 11.02.13/screen-0000.mov";
+        assert_eq!(
+            engine.pending(&p.id).await.expect("pending"),
+            vec![PendingFile {
+                path: closed.to_owned(),
+                reason: PendingReason::Untracked,
+            }],
+            "only the finished segment is waiting; the one being written is not a file sync has an opinion about"
+        );
+
+        assert_eq!(
+            commit_after_settling(&engine, &platform, &p),
+            1,
+            "the commit carries the closed segment and nothing else"
+        );
+        let tracked = {
+            let repo = engine.open_repo(&p).expect("open");
+            git::repo::tracked_paths(&repo).expect("index")
+        };
+        assert!(
+            !tracked
+                .iter()
+                .any(|path| path.to_string_lossy().ends_with(".partial")),
+            "the index must never hold a segment mid-write, got {tracked:?}"
+        );
+        let activity = engine.activity(&p.id, 50).await.expect("activity");
+        assert!(
+            !activity.iter().any(|row| row.path.ends_with(".partial")),
+            "the activity feed reports what synced, and a partial never syncs"
+        );
+
+        // The rename the sidecar performs the instant `finishWriting` returns:
+        // same bytes, same inode, a name sync can finally see.
+        std::fs::rename(
+            session.join("screen-0001.mov.partial"),
+            session.join("screen-0001.mov"),
+        )
+        .expect("publish the finished segment");
+        assert_eq!(
+            commit_after_settling(&engine, &platform, &p),
+            1,
+            "once published it is an ordinary file, committed like any other"
+        );
+        let tracked = {
+            let repo = engine.open_repo(&p).expect("open");
+            git::repo::tracked_paths(&repo).expect("index")
+        };
+        assert!(
+            tracked
+                .iter()
+                .any(|path| path.to_string_lossy().ends_with("screen-0001.mov")),
+            "the published segment is tracked, got {tracked:?}"
+        );
+        assert!(
+            !tracked
+                .iter()
+                .any(|path| path.to_string_lossy().ends_with(".partial")),
+            "and its temporary name never entered the repository at all"
         );
     }
 
