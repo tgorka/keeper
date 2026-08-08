@@ -15,6 +15,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, FixedOffset, Local, TimeZone, Timelike};
 use keeper_core::account::AccountManager;
+use keeper_core::archive::recordings::{
+    fallback_session_id, relative_session_path, RecordingRow, RecordingSegmentRow,
+};
 use keeper_core::auth;
 use keeper_core::auth::BeeperFlowRegistry;
 use keeper_core::demo::snapshot_then_diff;
@@ -5269,6 +5272,10 @@ struct RecordingSink {
     /// The destination profile this session commits into (Story 41.5), or `None`
     /// for a plain folder.
     sync: Option<RecordingSyncSession>,
+    /// The archive half of this session (Story 42.1), or `None` when the app has
+    /// no `archive.db` open. Shared with the status path's durability reader —
+    /// same session, same row, one place that knows how to describe it.
+    archive: Option<Arc<RecordingArchiveSession>>,
 }
 
 impl RecordingSink {
@@ -5304,6 +5311,23 @@ impl RecordingSink {
             // the session folder by construction — the sidecar writes nowhere
             // else — so joining the folder is a fact, not a search.
             let path = self.manifest.folder().join(&entry.file);
+            // Story 42.1: the index learns the same closed segment the ledger is
+            // about to record and 41.5 is about to assert — one row per (session,
+            // index, track), path RELATIVE to the destination root. Sent from
+            // `&entry` before the move so the row and the ledger line describe
+            // the same bytes with no second guess and no clone. Best-effort like
+            // both of its neighbours: a message on a channel, never a rotation
+            // the recorder can notice.
+            if let Some(archive) = self.archive.as_ref() {
+                // The host clock, read here rather than passed in, because a
+                // close time is a fact about when THIS host saw the rotation —
+                // the PTS bounds beside it are the capture clock's answer.
+                archive.segment(
+                    self.manifest.folder(),
+                    &entry,
+                    Local::now().timestamp_millis(),
+                );
+            }
             self.manifest.record_segment(entry);
             self.commit_finished_segment(&path);
         }
@@ -5391,6 +5415,19 @@ impl RecordingSink {
                 "recording manifest: the terminal atomic write failed; the folder stays \
                  exactly as the recovery pass will find it (session unaffected)"
             );
+        }
+        // Story 42.1: the session's row is completed here, from the manifest that
+        // was just reconciled and written — so the row and the folder say the
+        // same thing about the same session, and the row's `ended_ts` is the
+        // stamp the manifest carries rather than a second clock read.
+        //
+        // `INSERT OR REPLACE` on the session id, so this REPLACES the start row
+        // rather than adding a second. That also makes a duplicate finalize
+        // harmless, but it is not a licence to send two: the sink cannot produce
+        // one (the machine rejects a second terminal event, so `handle` returns
+        // before reaching here), and this is the only call site.
+        if let Some(archive) = self.archive.as_ref() {
+            archive.finalized(&self.manifest);
         }
         // The session's own push, whatever the policy says: `SessionEnd`
         // publishes here and only here, `Immediate` has published every segment
@@ -5564,6 +5601,305 @@ fn recording_sync_port(platform: &Arc<dyn Platform>) -> Option<Arc<dyn Recording
 #[cfg(not(desktop))]
 fn recording_sync_port(_platform: &Arc<dyn Platform>) -> Option<Arc<dyn RecordingSyncPort>> {
     None
+}
+
+// --- Story 42.1: a session is a row --------------------------------------
+
+/// The archive seam for one recording session (Story 42.1): the four writes the
+/// recording path makes into `archive.db`, and nothing else.
+///
+/// A trait rather than a bare [`keeper_core::archive::ArchiveHandle`], for the
+/// same reason [`RecordingSyncPort`] is one: this story's acceptance criteria are
+/// COUNTS — one insert per start, one row per closed segment, one completion per
+/// finalize, one update per durability MOVE — and a count is only assertable
+/// against something a test can hold. The real implementation forwards to the
+/// app's one serialized writer; a test's forwards to a `Vec`.
+///
+/// Every method returns `()`, and that is the contract rather than an omission:
+/// the index is a cache of what the session folders already say, so nothing it
+/// does may reach a recorder. A closed channel, a full queue and a failed write
+/// are all logged inside the writer half and never travel back up here.
+trait RecordingArchivePort: Send + Sync {
+    /// The session's row at start: identity, place, `started_ts`.
+    fn record_started(&self, row: RecordingRow);
+    /// One closed segment's row.
+    fn record_segment(&self, row: RecordingSegmentRow);
+    /// The same session row, completed at finalize (`INSERT OR REPLACE` on the
+    /// session id, so this replaces the start row rather than adding a second).
+    fn record_finalized(&self, row: RecordingRow);
+    /// The session's durability, sent when (and only when) 41.6's floor climbed.
+    fn record_durability(&self, session_id: &str, state: RecordingDurabilityState);
+    /// The session's new home after a Story 40.4 retitle moved the folder. Only
+    /// the path travels: the row is keyed on identity, and the codec and frame
+    /// rate it also holds live in no manifest, so a retitle has nothing else
+    /// truthful to say.
+    fn record_moved(&self, session_id: &str, relative_path: &str);
+}
+
+/// The real seam: the app's single serialized archive writer (Story 42.1).
+///
+/// Four forwards and nothing else. [`keeper_core::archive::ArchiveHandle`] is
+/// already non-blocking (an unbounded channel) and already swallows a closed
+/// channel with an ids-only log line, so there is no decision left for this
+/// layer to make — which is exactly why the recording path may call it from a
+/// driver task that is also folding sidecar events.
+struct WriterChannelArchive(keeper_core::archive::ArchiveHandle);
+
+impl RecordingArchivePort for WriterChannelArchive {
+    fn record_started(&self, row: RecordingRow) {
+        self.0.recording_started(row);
+    }
+
+    fn record_segment(&self, row: RecordingSegmentRow) {
+        self.0.recording_segment(row);
+    }
+
+    fn record_finalized(&self, row: RecordingRow) {
+        self.0.recording_finalized(row);
+    }
+
+    fn record_durability(&self, session_id: &str, state: RecordingDurabilityState) {
+        self.0.recording_durability(session_id, state);
+    }
+
+    fn record_moved(&self, session_id: &str, relative_path: &str) {
+        self.0
+            .recording_moved(session_id.to_owned(), relative_path.to_owned());
+    }
+}
+
+/// This process's archive seam, or `None` when there is no `archive.db` to write
+/// into (Story 42.1).
+///
+/// The handle comes from [`AccountManager`], which opened the ONE writer for this
+/// process at construction. The recording path deliberately has no handle of its
+/// own: a second one would mean a second connection to `archive.db`, and one
+/// writer is the whole premise of the archive's design.
+fn recording_archive_port(state: &AppState) -> Option<Arc<dyn RecordingArchivePort>> {
+    match state.accounts.archive() {
+        Some(handle) => Some(Arc::new(WriterChannelArchive(handle))),
+        None => {
+            // Not an error and not a degrade worth a second line per session:
+            // the database is derivable from the folders, so an unindexed
+            // session is one `rebuild_from_disk` away from being indexed.
+            tracing::warn!(
+                "recordings archive: this app has no archive database open, so this session records without being indexed"
+            );
+            None
+        }
+    }
+}
+
+/// Repoint a retitled session's row at the folder it just moved to (Story 42.1,
+/// matrix row 11).
+///
+/// A retitle is not a session, so it does not open a [`RecordingArchiveSession`]:
+/// it has no codec, no frame rate and no live durability to speak for, and the
+/// only thing that changed is where the folder is. Sending the path alone is
+/// what keeps a retitle from writing nulls over the two columns that exist in no
+/// manifest.
+///
+/// Silent about a session outside the destination root — the retitle command
+/// already refused that case before the move, so reaching it here would mean the
+/// root moved under us mid-call, and an index that declines to store an absolute
+/// path has nothing to add to a log the rename already wrote.
+#[cfg(desktop)]
+fn index_retitled_session(
+    state: &AppState,
+    root: &Path,
+    destination: &Path,
+    manifest: &SessionManifest,
+) {
+    let Some(port) = recording_archive_port(state) else {
+        return;
+    };
+    index_retitled_session_on(port.as_ref(), root, destination, manifest);
+}
+
+/// [`index_retitled_session`] with the seam passed in rather than resolved — the
+/// whole decision, and the half worth testing.
+///
+/// Split out for the reason the rest of this story's seams are: the behaviour is
+/// "which id, which path, and when nothing is sent at all", and none of that
+/// needs an `AppState`, a registry or an `archive.db` to be true.
+fn index_retitled_session_on(
+    port: &dyn RecordingArchivePort,
+    root: &Path,
+    destination: &Path,
+    manifest: &SessionManifest,
+) {
+    let Some(relative_path) = relative_session_path(root, destination) else {
+        tracing::debug!(
+            destination = %destination.display(),
+            "recordings archive: a retitled session outside the destination root is not repointed (a row may hold no absolute path)"
+        );
+        return;
+    };
+    // The same identity rule the row was written under, so the update finds the
+    // row the start created: `meta.session_id` when Story 40.3 minted one, and
+    // the path-derived fallback otherwise. For a legacy session the fallback is
+    // derived from the NEW path and therefore matches nothing — see the caller.
+    let session_id = manifest
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.session_id.clone())
+        .unwrap_or_else(|| fallback_session_id(&relative_path));
+    port.record_moved(&session_id, &relative_path);
+}
+
+/// The archive half of one recording session, resolved ONCE at start and shared
+/// by the driver task's sink and the status path's durability reader (Story
+/// 42.1).
+///
+/// It carries what every row needs and the recording path would otherwise
+/// re-derive per write: the session's identity, the destination root that every
+/// stored path is relative to, and the two encode settings `manifest.json` does
+/// not record. Session-captured for AD-25's reason — a mid-session settings edit
+/// must not change what a running session's rows say about where it went or how
+/// it was encoded.
+struct RecordingArchiveSession {
+    /// The writer seam itself.
+    port: Arc<dyn RecordingArchivePort>,
+    /// `<device ULID>-<session ULID>` (Story 40.3): the row's key, and the reason
+    /// a retitle can move the folder without orphaning the row. Held because a
+    /// durability update names the session and nothing else — the row writes take
+    /// it from the manifest, which is where it also came from.
+    session_id: String,
+    /// The destination root every stored path is relative to. FR-145's rule
+    /// extended to the index: a relative row survives the folder being retitled
+    /// and the tree being cloned onto another machine.
+    root: PathBuf,
+    /// Which kind of destination that root is — `"folder"` or `"profile"`.
+    root_kind: &'static str,
+    /// The destination profile, when the root is one.
+    profile_id: Option<String>,
+    /// The video codec this session encodes with and the frame rate it captures
+    /// at. Carried because `manifest.json` records NEITHER — they are settings
+    /// this start read, and the row is the only place they are ever written
+    /// down. (A rebuild can only reproduce what the folders say, so it sends
+    /// them as `None` — and the write preserves whatever the live path already
+    /// stored rather than nulling it, which is what keeps these two facts alive
+    /// across a reindex.)
+    codec: String,
+    fps: u32,
+}
+
+impl RecordingArchiveSession {
+    /// Open the archive half from the resolved destination and the identity the
+    /// start just minted.
+    fn open(
+        port: Arc<dyn RecordingArchivePort>,
+        session_id: String,
+        destination: &RecordingDestination,
+        codec: String,
+        fps: u32,
+    ) -> Self {
+        Self {
+            session_id,
+            root: destination.root.clone(),
+            // Exhaustive, no `_` arm: which word a new destination kind is filed
+            // under is a decision about how a person will later find their
+            // recordings, and `_` would make it silently.
+            root_kind: match destination.kind {
+                RecordingDestinationKind::Folder => "folder",
+                RecordingDestinationKind::Profile => "profile",
+            },
+            profile_id: destination.profile_id.clone(),
+            port,
+            codec,
+            fps,
+        }
+    }
+
+    /// Build this session's row from the manifest as it currently stands.
+    ///
+    /// The manifest is the whole input on purpose: [`RecordingRow::from_manifest`]
+    /// is the SAME constructor `rebuild_from_disk` calls after reading a
+    /// `manifest.json` off disk, so a live row and a rebuilt row are identical
+    /// rather than merely similar. Only the two things a manifest cannot carry are
+    /// set afterwards.
+    ///
+    /// `None` when the folder is not under the destination root: no column may
+    /// hold an absolute path, and a row that cannot say where the session is would
+    /// be worse than no row.
+    fn row(&self, manifest: &SessionManifest) -> Option<RecordingRow> {
+        let relative_path = self.relative(manifest.folder())?;
+        let mut row = RecordingRow::from_manifest(
+            manifest,
+            relative_path,
+            self.root_kind,
+            self.profile_id.as_deref(),
+        );
+        row.codec = Some(self.codec.clone());
+        row.fps = Some(self.fps);
+        // `durability` is left exactly as the constructor set it (`local`). The
+        // floor lives on the status path (Story 41.6), so the sink cannot know how
+        // far this session got — and does not have to: `upsert_recording` applies
+        // the same never-regressing floor, so a session that reached `pushed` is
+        // not walked back by its own finalize.
+        //
+        // `width`/`height` are left null for a plainer reason: nothing in this app
+        // knows a session's encoded frame size. The sidecar never reports it and
+        // the manifest has no video block, so the honest answer is "unknown" until
+        // a later story probes the media itself.
+        Some(row)
+    }
+
+    /// Send this session's row at start.
+    fn started(&self, manifest: &SessionManifest) {
+        if let Some(row) = self.row(manifest) {
+            self.port.record_started(row);
+        }
+    }
+
+    /// Send the same row completed, at finalize.
+    fn finalized(&self, manifest: &SessionManifest) {
+        if let Some(row) = self.row(manifest) {
+            self.port.record_finalized(row);
+        }
+    }
+
+    /// Send one closed segment's row. `folder` is the session folder the ledger
+    /// line's basename lives in; `closed_ts` is when this host saw it close.
+    ///
+    /// The row is built by [`RecordingSegmentRow::from_entry`] from the SAME
+    /// [`SegmentEntry`] the ledger is about to record, so the row and the ledger
+    /// line cannot disagree about a segment, and the relative path is joined the
+    /// one way `rebuild_from_disk` joins it.
+    fn segment(&self, folder: &Path, entry: &SegmentEntry, closed_ts: i64) {
+        let Some(session_relative_path) = self.relative(folder) else {
+            return;
+        };
+        let mut row =
+            RecordingSegmentRow::from_entry(&self.session_id, &session_relative_path, entry);
+        // The one thing a manifest cannot carry, so the one thing the constructor
+        // leaves unset: a manifest records no per-segment close time, which is why
+        // a rebuilt row has none and a live one does.
+        row.closed_ts = Some(closed_ts);
+        self.port.record_segment(row);
+    }
+
+    /// Send the session's new durability. Called only where the floor moved.
+    fn durability(&self, state: RecordingDurabilityState) {
+        self.port.record_durability(&self.session_id, state);
+    }
+
+    /// `path` relative to the destination root, or `None` with one debug line.
+    ///
+    /// Debug rather than warn, for [`RecordingSink::commit_finished_segment`]'s
+    /// reason turned inside out: a session recording outside its own destination
+    /// root is already visible in that path's logs, and the index has nothing to
+    /// add beyond declining to store an absolute path.
+    fn relative(&self, path: &Path) -> Option<String> {
+        let relative = relative_session_path(&self.root, path);
+        if relative.is_none() {
+            tracing::debug!(
+                session = %self.session_id,
+                "recordings archive: this path is not under the destination root, so it is not indexed (a row may hold no absolute path)"
+            );
+        }
+        relative
+    }
 }
 
 /// Start the (at most one) recording session (Story 16.6 + 17.2 + 40.3,
@@ -5872,6 +6208,33 @@ pub async fn recording_start(
         media_extension,
         recording_sync_port(&state.platform),
     );
+    // Story 42.1: open this session's archive half and insert its row. HERE,
+    // because a row needs both halves of what has just become true: the folder
+    // exists (so there is a path to describe) and the destination is resolved (so
+    // there is a root to describe it RELATIVE to, which is what lets the row
+    // survive a retitle moving the folder or the tree being cloned onto another
+    // machine). `None` when the app has no `archive.db` open — the index is a
+    // cache of what the folders already say, so a session that cannot be indexed
+    // still records, and `rebuild_from_disk` can add it later.
+    //
+    // `codec` is cloned rather than read back off `params` below because the row
+    // must be sent before the driver task and the durability reader are built,
+    // and both of them take the archive half.
+    let archive = recording_archive_port(&state).map(|port| {
+        let archive = Arc::new(RecordingArchiveSession::open(
+            port,
+            session_id.clone(),
+            &destination,
+            codec.clone(),
+            fps,
+        ));
+        // The row is built from the manifest `create_with_meta` just wrote, not
+        // from the pieces it was built out of, so the row and the folder say the
+        // same thing about the same session — and so the row a rebuild would
+        // derive from that file is the row written here.
+        archive.started(&manifest);
+        archive
+    });
     // Story 41.6: the same seam, asked the other way round. The sink pushes
     // facts INTO the engine as it records; this reads one fact back out on the
     // status poll. Minted here, from the session's own resolved profile, so a
@@ -5882,6 +6245,7 @@ pub async fn recording_start(
         Arc::new(RecordingDurabilityReader::new(
             sync.profile_id.clone(),
             Arc::clone(&sync.port),
+            archive.clone(),
         ))
     });
     let params = SessionParams {
@@ -5939,6 +6303,11 @@ pub async fn recording_start(
     // native-notification leg: the sink and the run-failure fallback both
     // dispatch through it on an `error`/`warning` onset.
     let task_platform = state.platform.clone();
+    // The archive half rides in beside them (Story 42.1): the sink writes this
+    // session's segment rows and its completion. The durability reader built
+    // above holds the other `Arc` — one session, one row, two writers of it —
+    // so this is the last use and moves rather than clones.
+    let task_archive = archive;
     // The handle is stored into the run slot below (Story 18.2): aborting it is
     // the quit kill-timeout's force-kill lever (see `RecordingRun::driver`).
     let driver = tauri::async_runtime::spawn(async move {
@@ -5951,6 +6320,7 @@ pub async fn recording_start(
             status: task_status.clone(),
             platform: task_platform.clone(),
             sync,
+            archive: task_archive,
         };
         let sink = Box::new(move |event: RecordingEvent| sink_state.handle(event))
             as Box<dyn FnMut(RecordingEvent) + Send>;
@@ -6219,17 +6589,26 @@ struct RecordingDurabilityReader {
     floor: Mutex<RecordingDurabilityVm>,
     /// Whether the current outage has already been logged.
     degraded: AtomicBool,
+    /// The archive half of this session (Story 42.1), or `None` when the app has
+    /// no `archive.db` open. The same [`Arc`] the sink holds: the row the sink
+    /// created is the row this updates.
+    archive: Option<Arc<RecordingArchiveSession>>,
 }
 
 impl RecordingDurabilityReader {
     /// Open a reader over one session's destination profile. The floor starts at
     /// `local`, which is exactly true: nothing has been committed yet.
-    fn new(profile_id: String, port: Arc<dyn RecordingSyncPort>) -> Self {
+    fn new(
+        profile_id: String,
+        port: Arc<dyn RecordingSyncPort>,
+        archive: Option<Arc<RecordingArchiveSession>>,
+    ) -> Self {
         Self {
             profile_id,
             port,
             floor: Mutex::new(RecordingDurabilityVm::local()),
             degraded: AtomicBool::new(false),
+            archive,
         }
     }
 
@@ -6249,6 +6628,17 @@ impl RecordingDurabilityReader {
                 let observed = durability_state(&facts);
                 if observed > floor.state {
                     floor.state = observed;
+                    // Story 42.1: the index learns the advance HERE, and only
+                    // here. This `>` IS the floor moving — it is the single
+                    // assignment in the app that changes a live session's
+                    // durability, so entering this branch is how the send site
+                    // knows the state actually climbed rather than merely being
+                    // observed again. A ~1 Hz poll of a settled session takes the
+                    // other path and writes nothing; a session that walks
+                    // local → committed → pushed sends exactly three updates.
+                    if let Some(archive) = self.archive.as_ref() {
+                        archive.durability(observed);
+                    }
                 }
                 floor.detail = facts.problem;
             }
@@ -6854,7 +7244,10 @@ pub(crate) fn recover_orphaned_recordings(state: &AppState) {
             return;
         }
     };
-    let base = effective_destination_dir(&data_dir, &state.platform);
+    let destination = effective_recording_destination(&data_dir, &|need| {
+        destination_profile_table(&state.platform, need)
+    });
+    let base = destination.root.clone();
     let _scan = plain_lock(&state.recovery_scan);
     let is_active = |folder: &Path| plain_lock(&state.reserved_recording_folders).contains(folder);
     let recovered = recover_orphaned_sessions(&base, &is_active);
@@ -6862,6 +7255,26 @@ pub(crate) fn recover_orphaned_recordings(state: &AppState) {
         tracing::info!(
             count = recovered.len(),
             "startup recovery marked orphaned session(s) recovered"
+        );
+    }
+    // Story 42.1: the same pass, for the index. The recovery walk above has just
+    // reconciled every manifest under this root, so this is the moment those
+    // manifests are most worth replaying into rows — and startup is the only
+    // moment nothing is recording, so a walk that rewrites rows cannot race a
+    // session that is appending to them.
+    //
+    // Sent, not called: the writer owns the one connection to `archive.db`, and
+    // a rebuild is exactly the operation that must not open a second. Nothing
+    // waits on it — a boot that cannot index is a boot whose folders are still
+    // the truth.
+    if let Some(archive) = state.accounts.archive() {
+        archive.rebuild_recordings(
+            base,
+            match destination.kind {
+                RecordingDestinationKind::Folder => "folder".to_owned(),
+                RecordingDestinationKind::Profile => "profile".to_owned(),
+            },
+            destination.profile_id.clone(),
         );
     }
 }
@@ -6949,8 +7362,8 @@ pub async fn recording_retitle(
     let source = PathBuf::from(folder);
     let moving = source.clone();
     let resolving = Arc::clone(&platform);
-    let (manifest, destination) =
-        off_async_runtime(move || -> Result<(SessionManifest, PathBuf), IpcError> {
+    let (manifest, destination, root) = off_async_runtime(
+        move || -> Result<(SessionManifest, PathBuf, PathBuf), IpcError> {
             let root = effective_destination_dir(&data_dir, &resolving);
             let source = moving;
             // Not under the root ⇒ refused. The rendered destination is a path
@@ -6981,9 +7394,12 @@ pub async fn recording_retitle(
                     reason,
                 }))
             })?;
-            retitle_session_folder(&reserved, &root, &template, &source, title.as_deref())
-        })
-        .await??;
+            let (manifest, destination) =
+                retitle_session_folder(&reserved, &root, &template, &source, title.as_deref())?;
+            Ok((manifest, destination, root))
+        },
+    )
+    .await??;
     // The live-session refusal happens inside the move, so anything the slot
     // still names here is a FINISHED session — the terminal snapshot
     // `recording_stop` left behind for the summary card to render. Repoint it
@@ -6992,6 +7408,20 @@ pub async fn recording_retitle(
     if source != destination {
         repoint_recording_slot_output(&state.recording_run, &source, &destination);
     }
+    // Story 42.1, matrix row 11: the row follows the session, so the move has to
+    // reach the index too. Only the path is sent — `session_id` is the row's key
+    // precisely so a retitle can move the folder without orphaning it, and the
+    // codec and frame rate the row also carries exist in no manifest, so
+    // rebuilding a whole row from what a retitle knows would write nulls over
+    // them.
+    //
+    // Best-effort, and after the rename rather than around it: the folder has
+    // already moved on disk, and the index is a cache of what the folders say.
+    // A pre-Story-40.3 session, whose id is derived FROM its path
+    // (`fallback_session_id`), mints a different id at the new location and so
+    // updates nothing — the consequence that function documents, and a stale row
+    // for a legacy session is a smaller wrong than refusing the rename.
+    index_retitled_session(&state, &root, &destination, &manifest);
     // Detached, never awaited (Story 40.4). The leg below is a whole sync cycle
     // — commit, pull, LFS drain, push — and awaiting it would make Save sit out
     // a network timeout against an unreachable remote for a rename that has
@@ -13006,7 +13436,22 @@ mod tests {
     /// question about a file that either exists or does not — a stronger answer
     /// than a counter the production path would have to carry for the tests.
     fn recording_sink_in(folder: &Path, sync: Option<RecordingSyncSession>) -> RecordingSink {
-        let manifest = SessionManifest::create(
+        recording_sink_indexed(folder, sync, None)
+    }
+
+    /// [`recording_sink_in`], plus the Story 42.1 archive half a session carries
+    /// when the app has an `archive.db` open.
+    ///
+    /// The manifest is created WITH metadata here (unlike the 41.5 path it
+    /// replaced) because a completion row is supposed to carry the session's
+    /// title, participants, note, tags and custom fields — a sink over a
+    /// meta-less manifest could only ever prove that nulls arrive.
+    fn recording_sink_indexed(
+        folder: &Path,
+        sync: Option<RecordingSyncSession>,
+        archive: Option<Arc<RecordingArchiveSession>>,
+    ) -> RecordingSink {
+        let manifest = SessionManifest::create_with_meta(
             folder.to_path_buf(),
             CaptureTarget::display(None),
             SessionDevices {
@@ -13014,6 +13459,8 @@ mod tests {
                 microphone: false,
                 camera: false,
             },
+            Some(indexed_meta()),
+            Some(INDEXED_STARTED_AT.to_owned()),
         )
         .expect("create session folder + manifest");
         std::fs::remove_file(folder.join("manifest.json")).expect("clear the start manifest");
@@ -13023,6 +13470,7 @@ mod tests {
             status: Arc::new(Mutex::new(RecordingStatusVm::idle())),
             platform: Arc::new(CapturingPlatform::new()),
             sync,
+            archive,
         }
     }
 
@@ -13337,6 +13785,16 @@ mod tests {
     /// destination: a live snapshot naming the session folder, plus the
     /// durability reader over the scripted port.
     fn durability_slot(folder: &Path, port: Arc<CountingSyncPort>) -> Mutex<Option<RecordingRun>> {
+        durability_slot_indexed(folder, port, None)
+    }
+
+    /// [`durability_slot`], plus the Story 42.1 archive half the reader updates
+    /// when the floor climbs.
+    fn durability_slot_indexed(
+        folder: &Path,
+        port: Arc<CountingSyncPort>,
+        archive: Option<Arc<RecordingArchiveSession>>,
+    ) -> Mutex<Option<RecordingRun>> {
         let mut snapshot = RecordingStatusVm::idle();
         snapshot.state = RecordingUiState::Recording;
         snapshot.output_path = Some(folder.to_string_lossy().into_owned());
@@ -13349,6 +13807,7 @@ mod tests {
             durability: Some(Arc::new(RecordingDurabilityReader::new(
                 "profile-1".to_owned(),
                 port,
+                archive,
             ))),
         }))
     }
@@ -13587,7 +14046,7 @@ mod tests {
             Err("the index is locked".to_owned()),
             facts(true, true, false),
         ]));
-        let reader = RecordingDurabilityReader::new("profile-1".to_owned(), port);
+        let reader = RecordingDurabilityReader::new("profile-1".to_owned(), port, None);
 
         assert_eq!(reader.read(&folder).state, RecordingDurabilityState::Pushed);
         assert!(!reader.degraded.load(Ordering::Relaxed));
@@ -13625,5 +14084,723 @@ mod tests {
         );
         let empty: Mutex<Option<RecordingRun>> = Mutex::new(None);
         assert!(live_snapshot(&empty).is_none());
+    }
+
+    // --- Story 42.1: a session is a row -------------------------------------
+
+    /// A session id exactly as Story 40.3 mints one: `<device>-<session>`, both
+    /// halves Crockford and therefore `-`-free.
+    const INDEXED_SESSION_ID: &str = "01JQDEVICE0000000000000000-01JQSESSION000000000000000";
+
+    /// The device half of [`INDEXED_SESSION_ID`], spelled out rather than derived,
+    /// so a broken split is a failing test and not a matching bug.
+    const INDEXED_DEVICE_ID: &str = "01JQDEVICE0000000000000000";
+
+    /// The wall-clock start every indexed test session carries.
+    ///
+    /// Deliberately a date in the PAST, and never today's: `finalize` stamps
+    /// `endedAt` from the real clock, so a fixture whose start is in the future
+    /// produces a completed row that ended before it began. Today's date did
+    /// exactly that — the suite runs on a macOS host west of UTC, where
+    /// 10:00+02:00 on the current day is still hours away — and the assertion
+    /// below would have started passing on its own a few hours later, which is
+    /// the worst way for a test to be wrong.
+    const INDEXED_STARTED_AT: &str = "2026-01-02T10:00:00+02:00";
+
+    /// The metadata an indexed test session carries, covering every column the
+    /// completion row is supposed to fill: two plain-text fields, a free-text
+    /// one, a tag list and a custom pair.
+    fn indexed_meta() -> keeper_core::recording::SessionMeta {
+        keeper_core::recording::SessionMeta {
+            session_id: Some(INDEXED_SESSION_ID.to_owned()),
+            title: Some("Weekly sync".to_owned()),
+            participants: Some("Ada, Grace".to_owned()),
+            note: Some("recorded for the archive".to_owned()),
+            tags: Some(vec!["standup".to_owned(), "eng".to_owned()]),
+            custom: Some(vec![keeper_core::recording::SessionMetaField {
+                name: "room".to_owned(),
+                value: "Blue".to_owned(),
+            }]),
+        }
+    }
+
+    /// One write a session made into the archive, in the order it was made.
+    ///
+    /// The row types carry `PartialEq`, so whole-row equality is available — but
+    /// the assertions that matter here are counts and individual columns (is the
+    /// path relative? does the root kind name the folder case?), which is what the
+    /// accessors below are shaped for.
+    #[derive(Debug, Clone, PartialEq)]
+    enum ArchiveWrite {
+        Started(RecordingRow),
+        Segment(RecordingSegmentRow),
+        Finalized(RecordingRow),
+        Durability(String, RecordingDurabilityState),
+        Moved(String, String),
+    }
+
+    /// A [`RecordingArchivePort`] that writes into a `Vec` (Story 42.1).
+    ///
+    /// The story's acceptance is stated in counts — one insert per start, one row
+    /// per closed segment, one completion per finalize, one update per durability
+    /// MOVE — and a count needs something to count. A real
+    /// [`keeper_core::archive::ArchiveHandle`] would answer the same questions
+    /// with a channel, a writer task and a SQLite file; this answers them on the
+    /// same seam the production path calls.
+    #[derive(Default)]
+    struct ArchiveSpy {
+        writes: Mutex<Vec<ArchiveWrite>>,
+    }
+
+    impl ArchiveSpy {
+        fn writes(&self) -> Vec<ArchiveWrite> {
+            self.writes.lock().expect("lock archive writes").clone()
+        }
+
+        fn push(&self, write: ArchiveWrite) {
+            self.writes.lock().expect("lock archive writes").push(write);
+        }
+
+        /// The start inserts, in order.
+        fn starts(&self) -> Vec<RecordingRow> {
+            self.writes()
+                .into_iter()
+                .filter_map(|write| match write {
+                    ArchiveWrite::Started(row) => Some(row),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The completion upserts, in order.
+        fn completions(&self) -> Vec<RecordingRow> {
+            self.writes()
+                .into_iter()
+                .filter_map(|write| match write {
+                    ArchiveWrite::Finalized(row) => Some(row),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The segment rows, in the order the rotations closed.
+        fn segments(&self) -> Vec<RecordingSegmentRow> {
+            self.writes()
+                .into_iter()
+                .filter_map(|write| match write {
+                    ArchiveWrite::Segment(row) => Some(row),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The durability updates, in the order the floor climbed.
+        fn durability_updates(&self) -> Vec<(String, RecordingDurabilityState)> {
+            self.writes()
+                .into_iter()
+                .filter_map(|write| match write {
+                    ArchiveWrite::Durability(session_id, state) => Some((session_id, state)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The retitle repoints, in order: `(session_id, relative_path)`.
+        fn moves(&self) -> Vec<(String, String)> {
+            self.writes()
+                .into_iter()
+                .filter_map(|write| match write {
+                    ArchiveWrite::Moved(session_id, relative_path) => {
+                        Some((session_id, relative_path))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    impl RecordingArchivePort for ArchiveSpy {
+        fn record_started(&self, row: RecordingRow) {
+            self.push(ArchiveWrite::Started(row));
+        }
+
+        fn record_segment(&self, row: RecordingSegmentRow) {
+            self.push(ArchiveWrite::Segment(row));
+        }
+
+        fn record_finalized(&self, row: RecordingRow) {
+            self.push(ArchiveWrite::Finalized(row));
+        }
+
+        fn record_durability(&self, session_id: &str, state: RecordingDurabilityState) {
+            self.push(ArchiveWrite::Durability(session_id.to_owned(), state));
+        }
+
+        fn record_moved(&self, session_id: &str, relative_path: &str) {
+            self.push(ArchiveWrite::Moved(
+                session_id.to_owned(),
+                relative_path.to_owned(),
+            ));
+        }
+    }
+
+    /// An archive whose writer channel is closed: every send is accepted and goes
+    /// nowhere, which is precisely what
+    /// [`keeper_core::archive::ArchiveHandle`] does once its task has ended.
+    ///
+    /// It counts the attempts rather than the writes, because the port contract is
+    /// infallible by design — the only failure a caller can express is that the
+    /// write went nowhere, and the only thing worth proving is that every send
+    /// SITE still ran and the recorder could not tell.
+    #[derive(Default)]
+    struct DroppingArchive {
+        attempts: Mutex<usize>,
+    }
+
+    impl DroppingArchive {
+        fn attempts(&self) -> usize {
+            *self.attempts.lock().expect("lock dropped attempts")
+        }
+
+        fn drop_one(&self) {
+            *self.attempts.lock().expect("lock dropped attempts") += 1;
+        }
+    }
+
+    impl RecordingArchivePort for DroppingArchive {
+        fn record_started(&self, _row: RecordingRow) {
+            self.drop_one();
+        }
+
+        fn record_segment(&self, _row: RecordingSegmentRow) {
+            self.drop_one();
+        }
+
+        fn record_finalized(&self, _row: RecordingRow) {
+            self.drop_one();
+        }
+
+        fn record_durability(&self, _session_id: &str, _state: RecordingDurabilityState) {
+            self.drop_one();
+        }
+
+        fn record_moved(&self, _session_id: &str, _relative_path: &str) {
+            self.drop_one();
+        }
+    }
+
+    /// The archive half `recording_start` builds, over an arbitrary port.
+    fn archive_session(
+        port: Arc<dyn RecordingArchivePort>,
+        destination: &RecordingDestination,
+    ) -> Arc<RecordingArchiveSession> {
+        Arc::new(RecordingArchiveSession::open(
+            port,
+            INDEXED_SESSION_ID.to_owned(),
+            destination,
+            "hevc".to_owned(),
+            30,
+        ))
+    }
+
+    /// The matrix's session-start row: one insert, and every path in it RELATIVE
+    /// to the destination root — which is what lets a retitle move the folder and
+    /// a clone carry the tree onto another machine without invalidating the row.
+    #[test]
+    fn a_session_start_indexes_exactly_one_row_with_a_relative_path() {
+        let root = scan_temp_dir("rec-42-1-start");
+        // The template nests since Story 40.3, so the relative path is a path and
+        // not a basename — the case a `file_name()` shortcut would get wrong.
+        let folder = root.join("2026").join("2026-01-02 1000");
+        std::fs::create_dir_all(root.join("2026")).expect("the template's year level");
+        let spy = Arc::new(ArchiveSpy::default());
+        let archive = archive_session(spy.clone(), &profile_destination(&root));
+        let sink = recording_sink_indexed(&folder, None, Some(archive.clone()));
+
+        archive.started(&sink.manifest);
+
+        let rows = spy.starts();
+        assert_eq!(rows.len(), 1, "a start is one insert");
+        assert_eq!(spy.writes().len(), 1, "a start writes nothing else");
+        let row = &rows[0];
+        assert_eq!(row.session_id, INDEXED_SESSION_ID);
+        assert_eq!(row.device_id.as_deref(), Some(INDEXED_DEVICE_ID));
+        assert_eq!(row.relative_path, "2026/2026-01-02 1000");
+        assert!(
+            !Path::new(&row.relative_path).is_absolute(),
+            "an absolute path reached a column"
+        );
+        assert!(
+            !row.relative_path.contains(&*root.to_string_lossy()),
+            "the row carries the machine's own root: {}",
+            row.relative_path
+        );
+        assert_eq!(row.root_kind, "profile");
+        assert_eq!(row.profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(
+            row.started_ts,
+            Some(
+                DateTime::parse_from_rfc3339(INDEXED_STARTED_AT)
+                    .expect("the fixture stamp parses")
+                    .timestamp_millis()
+            ),
+            "the row's start is the manifest's own stamp, in epoch ms"
+        );
+        assert_eq!(
+            row.ended_ts, None,
+            "a session that just began has not ended"
+        );
+        assert_eq!(row.title.as_deref(), Some("Weekly sync"));
+        assert_eq!(
+            row.participants_json.as_deref(),
+            Some(r#""Ada, Grace""#),
+            "participants is free text, stored as the JSON string it is"
+        );
+        assert_eq!(row.note.as_deref(), Some("recorded for the archive"));
+        assert_eq!(row.tags_json.as_deref(), Some(r#"["standup","eng"]"#));
+        assert_eq!(
+            row.custom_json.as_deref(),
+            Some(r#"[{"name":"room","value":"Blue"}]"#)
+        );
+        assert_eq!(row.codec.as_deref(), Some("hevc"));
+        assert_eq!(row.fps, Some(30));
+        assert_eq!(
+            row.durability, "local",
+            "a session that has just begun is on this Mac and nowhere else"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The AC's four-hour session, counted: 48 rotations are 48 segment rows and
+    /// not one extra insert. The sink indexes segments and the completion; the
+    /// session's insert belongs to the start path and the sink must not repeat it.
+    #[test]
+    fn forty_eight_rotations_index_forty_eight_segment_rows_and_no_extra_insert() {
+        let root = scan_temp_dir("rec-42-1-rotations");
+        let folder = root.join("keeper-rec session");
+        let spy = Arc::new(ArchiveSpy::default());
+        let archive = archive_session(spy.clone(), &profile_destination(&root));
+        let port = Arc::new(CountingSyncPort::new(SessionPushPolicy::AtSessionEnd));
+        let sync = begin_recording_sync(&profile_destination(&root), "mov", Some(port.clone()))
+            .expect("the sync seam");
+        let mut sink = recording_sink_indexed(&folder, Some(sync), Some(archive));
+
+        sink.handle(RecordingEvent::PreflightStarted);
+        sink.handle(RecordingEvent::CaptureStarted);
+        for index in 0..48 {
+            close_segment(&mut sink, index);
+        }
+
+        let segments = spy.segments();
+        assert_eq!(segments.len(), 48, "one row per closed segment");
+        assert_eq!(
+            spy.starts().len(),
+            0,
+            "the sink inserted a session row; that is the start path's write"
+        );
+        assert_eq!(
+            spy.completions().len(),
+            0,
+            "a live session was completed mid-recording"
+        );
+        assert_eq!(
+            segments[7].relative_path, "keeper-rec session/screen-0007.mov",
+            "a segment row must name the file relative to the destination root"
+        );
+        assert_eq!(segments[7].index, 7);
+        assert_eq!(segments[7].track, "screen");
+        assert_eq!(segments[7].bytes, 64);
+        assert_eq!(segments[7].pts_start, Some(7.0));
+        assert_eq!(segments[7].pts_end, Some(8.0));
+        assert!(
+            segments[7].closed_ts.is_some_and(|ts| ts > 0),
+            "a closed segment is stamped with when this host saw it close"
+        );
+        assert_eq!(segments[7].session_id, INDEXED_SESSION_ID);
+        assert!(
+            segments
+                .iter()
+                .all(|row| !Path::new(&row.relative_path).is_absolute()),
+            "an absolute path reached a segment row"
+        );
+
+        sink.handle(RecordingEvent::Stopping);
+        sink.handle(RecordingEvent::Finalized);
+        assert_eq!(spy.segments().len(), 48, "finalizing invented a segment");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The matrix's duplicate-finalize row, answered honestly at THIS seam.
+    ///
+    /// The sink sends exactly ONE completion per session, and it cannot be made to
+    /// send two through its own front door: `handle` only finalizes on a terminal
+    /// transition, and the machine rejects a second terminal event, so the second
+    /// `Finalized` never reaches `finalize` at all. Called directly — which the
+    /// production path never does — `finalize` sends a second completion, and that
+    /// is deliberate: it is the same `INSERT OR REPLACE` on the same session id, so
+    /// the archive still holds one row. The safety net exists; the code does not
+    /// lean on it.
+    #[test]
+    fn finalize_sends_one_completion_and_a_repeat_is_the_same_upsert() {
+        let root = scan_temp_dir("rec-42-1-finalize");
+        let folder = root.join("keeper-rec session");
+        let spy = Arc::new(ArchiveSpy::default());
+        let archive = archive_session(spy.clone(), &folder_destination(&root));
+        let mut sink = recording_sink_indexed(&folder, None, Some(archive));
+
+        drive_synthetic_session(&mut sink, 3);
+
+        let completions = spy.completions();
+        assert_eq!(completions.len(), 1, "a session completes its row once");
+        let row = &completions[0];
+        assert_eq!(row.session_id, INDEXED_SESSION_ID);
+        assert_eq!(row.relative_path, "keeper-rec session");
+        assert_eq!(row.title.as_deref(), Some("Weekly sync"));
+        assert_eq!(row.participants_json.as_deref(), Some(r#""Ada, Grace""#));
+        assert_eq!(row.note.as_deref(), Some("recorded for the archive"));
+        assert_eq!(row.tags_json.as_deref(), Some(r#"["standup","eng"]"#));
+        assert_eq!(
+            row.custom_json.as_deref(),
+            Some(r#"[{"name":"room","value":"Blue"}]"#)
+        );
+        assert_eq!(row.codec.as_deref(), Some("hevc"));
+        assert_eq!(row.fps, Some(30));
+        assert_eq!(row.width, None, "nothing in this app knows the frame size");
+        assert_eq!(row.height, None);
+        assert_eq!(
+            row.manifest_version,
+            keeper_core::recording::MANIFEST_VERSION
+        );
+        // Unwrapped rather than compared as `Option`s: `Some(_) >= None` is
+        // true, so an `Option` comparison here would still pass if the start
+        // stamp stopped being parsed at all.
+        let started = row
+            .started_ts
+            .expect("a completed row must carry when the session began");
+        let ended = row
+            .ended_ts
+            .expect("a completed row must carry when the session ended");
+        assert!(
+            ended >= started,
+            "the session ended before it began: {ended} < {started}"
+        );
+
+        // A second terminal event: the machine rejects it, so nothing downstream
+        // of the transition happens — no manifest write, no completion.
+        sink.handle(RecordingEvent::Finalized);
+        assert_eq!(
+            spy.completions().len(),
+            1,
+            "a second terminal event reached the archive through the sink"
+        );
+
+        // The direct call the production path never makes: a second, identical
+        // upsert onto the same key.
+        sink.finalize();
+        let completions = spy.completions();
+        assert_eq!(completions.len(), 2);
+        assert_eq!(
+            completions[1].session_id, completions[0].session_id,
+            "a duplicate finalize must key onto the same row, never a second one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The matrix's durability row: the column follows 41.6's floor, and follows
+    /// it exactly once per rung. A ~1 Hz poll of a settled session must not write
+    /// 3600 identical updates an hour — the send site sits inside the one `if`
+    /// that assigns the floor, so "the state changed" and "a write happens" are
+    /// the same event by construction.
+    #[test]
+    fn a_durability_climb_writes_once_per_rung_and_a_repeated_reading_writes_nothing() {
+        let folder = scan_temp_dir("rec-42-1-durability");
+        let spy = Arc::new(ArchiveSpy::default());
+        let archive = archive_session(spy.clone(), &profile_destination(&folder));
+        let port = Arc::new(CountingSyncPort::scripted(vec![
+            facts(false, false, false),
+            facts(false, false, false),
+            facts(true, false, false),
+            facts(true, false, false),
+            facts(true, true, false),
+            facts(true, true, false),
+            facts(true, true, true),
+            facts(true, true, true),
+        ]));
+        let slot = durability_slot_indexed(&folder, port, Some(archive));
+
+        for _ in 0..8 {
+            poll_durability(&slot);
+        }
+
+        let updates = spy.durability_updates();
+        assert_eq!(
+            updates.iter().map(|(_, state)| *state).collect::<Vec<_>>(),
+            vec![
+                RecordingDurabilityState::Committed,
+                RecordingDurabilityState::Pushed,
+                RecordingDurabilityState::Verified,
+            ],
+            "one update per rung the floor actually climbed, and nothing for the \
+             four polls that observed a state the session was already at"
+        );
+        assert!(
+            updates
+                .iter()
+                .all(|(session_id, _)| session_id == INDEXED_SESSION_ID),
+            "an update named a session other than its own"
+        );
+        assert_eq!(
+            spy.writes().len(),
+            3,
+            "reading durability inserted or completed something"
+        );
+
+        // The floor's own rule, seen from the archive: an engine answer that drops
+        // back is not a move, so it is not a write.
+        let sliding = Arc::new(ArchiveSpy::default());
+        let slid = archive_session(sliding.clone(), &profile_destination(&folder));
+        let port = Arc::new(CountingSyncPort::scripted(vec![
+            facts(true, true, false),
+            facts(true, false, false),
+            facts(false, false, false),
+        ]));
+        let slot = durability_slot_indexed(&folder, port, Some(slid));
+        for _ in 0..3 {
+            poll_durability(&slot);
+        }
+        assert_eq!(
+            sliding
+                .durability_updates()
+                .iter()
+                .map(|(_, state)| *state)
+                .collect::<Vec<_>>(),
+            vec![RecordingDurabilityState::Pushed],
+            "a regressing engine answer was written as an advance"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The archive is NOT sync (the epic's whole point): a plain folder publishes
+    /// nothing and asks no engine anything, and is indexed exactly as completely as
+    /// a profile — with `root_kind` saying which kind of place it is, and no
+    /// profile named, because there is none.
+    #[test]
+    fn a_plain_folder_destination_is_indexed_as_a_folder() {
+        let root = scan_temp_dir("rec-42-1-plain-folder");
+        let folder = root.join("keeper-rec session");
+        let spy = Arc::new(ArchiveSpy::default());
+        let archive = archive_session(spy.clone(), &folder_destination(&root));
+        let port = Arc::new(CountingSyncPort::new(SessionPushPolicy::PerSegment));
+        assert!(
+            begin_recording_sync(&folder_destination(&root), "mov", Some(port.clone())).is_none(),
+            "a plain folder has no profile to open a sync seam onto"
+        );
+
+        let mut sink = recording_sink_indexed(&folder, None, Some(archive.clone()));
+        archive.started(&sink.manifest);
+        drive_synthetic_session(&mut sink, 12);
+
+        assert_eq!(spy.starts().len(), 1, "a plain-folder session is indexed");
+        assert_eq!(spy.segments().len(), 12);
+        assert_eq!(spy.completions().len(), 1);
+        for row in spy.starts().iter().chain(spy.completions().iter()) {
+            assert_eq!(
+                row.root_kind, "folder",
+                "the row must say which kind of place it is under"
+            );
+            assert_eq!(
+                row.profile_id, None,
+                "a plain folder invented a destination profile"
+            );
+            assert_eq!(row.relative_path, "keeper-rec session");
+        }
+        assert!(
+            port.calls().is_empty(),
+            "indexing asked the sync engine something: {:?}",
+            port.calls()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The epic's posture, applied to the index (NFR-34 by analogy with 41.5's
+    /// refusing engine): an archive whose every write goes nowhere costs the
+    /// recording nothing. Not one ledger line, not the finalize, not the manifest,
+    /// not the snapshot — and every send site still ran, so the moment the writer
+    /// is back the next session indexes normally.
+    #[test]
+    fn an_archive_that_drops_every_write_costs_the_recording_nothing() {
+        let root = scan_temp_dir("rec-42-1-dropping");
+        let folder = root.join("keeper-rec session");
+        let dropping = Arc::new(DroppingArchive::default());
+        let archive = archive_session(dropping.clone(), &profile_destination(&root));
+        let port = Arc::new(CountingSyncPort::new(SessionPushPolicy::AtSessionEnd));
+        let sync = begin_recording_sync(&profile_destination(&root), "mov", Some(port))
+            .expect("the sync seam");
+
+        let mut sink = recording_sink_indexed(&folder, Some(sync), Some(archive.clone()));
+        archive.started(&sink.manifest);
+        drive_synthetic_session(&mut sink, 48);
+
+        assert_eq!(
+            sink.manifest.segments.len(),
+            48,
+            "a dropped index write cost a ledger line"
+        );
+        let written = SessionManifest::load(&folder).expect("the finalized manifest");
+        assert_eq!(written.segments.len(), 48);
+        assert!(matches!(written.status, ManifestStatus::Finalized));
+        assert_eq!(
+            status_lock(&sink.status).state,
+            RecordingUiState::Finalized,
+            "a dropped index write surfaced as a failed session"
+        );
+        assert_eq!(
+            dropping.attempts(),
+            50,
+            "one start, 48 segments and one completion were all still attempted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A session recording outside its own destination root cannot be described
+    /// relative to it, and the rule is absolute: no column may hold an absolute
+    /// path. So the row is declined rather than written wrong — and the recording
+    /// is, as ever, untouched.
+    #[test]
+    fn a_session_outside_the_destination_root_is_not_indexed_with_an_absolute_path() {
+        let root = scan_temp_dir("rec-42-1-outside");
+        let destination_root = root.join("recordings");
+        std::fs::create_dir_all(&destination_root).expect("destination root");
+        let folder = root.join("elsewhere");
+        let spy = Arc::new(ArchiveSpy::default());
+        let archive = archive_session(spy.clone(), &profile_destination(&destination_root));
+
+        let mut sink = recording_sink_indexed(&folder, None, Some(archive.clone()));
+        archive.started(&sink.manifest);
+        drive_synthetic_session(&mut sink, 3);
+
+        assert!(
+            spy.writes().is_empty(),
+            "a path the index cannot make relative was written anyway: {:?}",
+            spy.writes()
+        );
+        let written = SessionManifest::load(&folder).expect("the finalized manifest");
+        assert_eq!(written.segments.len(), 3, "the recording is unaffected");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The matrix's retitle row (Story 42.1, row 11): a Story 40.4 rename moves
+    /// the folder, and the row has to follow it. `session_id` is what makes that
+    /// possible — the row is keyed on the session's identity, not its location —
+    /// so the move sends the new path and nothing else.
+    #[test]
+    fn a_retitle_repoints_the_row_at_the_new_folder_and_leaves_the_identity_alone() {
+        let root = scan_temp_dir("rec-42-1-retitle");
+        let moved = root.join("2026").join("2026-01-02 1000 Retro");
+        // Only the template's year level: `create_with_meta` creates the session
+        // folder itself and refuses one that already exists.
+        std::fs::create_dir_all(root.join("2026")).expect("the template's year level");
+        let manifest = SessionManifest::create_with_meta(
+            moved.clone(),
+            CaptureTarget::display(None),
+            SessionDevices {
+                system_audio: true,
+                microphone: false,
+                camera: false,
+            },
+            Some(indexed_meta()),
+            Some(INDEXED_STARTED_AT.to_owned()),
+        )
+        .expect("the retitled session's manifest");
+        let spy = Arc::new(ArchiveSpy::default());
+
+        index_retitled_session_on(spy.as_ref(), &root, &moved, &manifest);
+
+        assert_eq!(
+            spy.moves(),
+            vec![(
+                INDEXED_SESSION_ID.to_owned(),
+                "2026/2026-01-02 1000 Retro".to_owned()
+            )],
+            "a retitle sends exactly one repoint, keyed on the session's identity"
+        );
+        assert!(
+            spy.starts().is_empty() && spy.completions().is_empty(),
+            "a retitle rewrote the whole row instead of just its path: {:?}",
+            spy.writes()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A session recorded before Story 40.3 has no minted identity, so its row
+    /// was keyed on the path it had then. The repoint derives the SAME fallback
+    /// rule from the new path — which is why it names a different key, and why
+    /// `fallback_session_id` documents that a legacy session's row stays behind.
+    /// Pinned rather than left implicit: the alternative reading, that a legacy
+    /// retitle silently repoints some other session's row, would be a bug.
+    #[test]
+    fn a_pre_identity_session_repoints_under_the_documented_legacy_fallback_key() {
+        let root = scan_temp_dir("rec-42-1-retitle-legacy");
+        let moved = root.join("2026").join("2026-01-02 1000 Retro");
+        std::fs::create_dir_all(root.join("2026")).expect("the template's year level");
+        let manifest = SessionManifest::create_with_meta(
+            moved.clone(),
+            CaptureTarget::display(None),
+            SessionDevices {
+                system_audio: true,
+                microphone: false,
+                camera: false,
+            },
+            None,
+            Some(INDEXED_STARTED_AT.to_owned()),
+        )
+        .expect("a session with no minted identity");
+        let spy = Arc::new(ArchiveSpy::default());
+
+        index_retitled_session_on(spy.as_ref(), &root, &moved, &manifest);
+
+        assert_eq!(
+            spy.moves(),
+            vec![(
+                "legacy:2026/2026-01-02 1000 Retro".to_owned(),
+                "2026/2026-01-02 1000 Retro".to_owned()
+            )],
+            "the legacy key is derived from the path, with the prefix no minted id can produce"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// No column may hold an absolute path, so a session that cannot be expressed
+    /// relative to the destination root is not repointed at all — the same
+    /// refusal the start and segment paths make, at the one other site that
+    /// writes a path.
+    #[test]
+    fn a_retitle_outside_the_destination_root_repoints_nothing() {
+        let root = scan_temp_dir("rec-42-1-retitle-outside");
+        let destination_root = root.join("destination");
+        let moved = root.join("elsewhere");
+        std::fs::create_dir_all(&destination_root).expect("the destination root");
+        let manifest = SessionManifest::create_with_meta(
+            moved.clone(),
+            CaptureTarget::display(None),
+            SessionDevices {
+                system_audio: true,
+                microphone: false,
+                camera: false,
+            },
+            Some(indexed_meta()),
+            Some(INDEXED_STARTED_AT.to_owned()),
+        )
+        .expect("the manifest");
+        let spy = Arc::new(ArchiveSpy::default());
+
+        index_retitled_session_on(spy.as_ref(), &destination_root, &moved, &manifest);
+
+        assert!(
+            spy.writes().is_empty(),
+            "a path the index cannot make relative was repointed anyway: {:?}",
+            spy.writes()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

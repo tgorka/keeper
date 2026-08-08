@@ -355,8 +355,16 @@ development_status:
   41-5-committed-at-close-pushed-on-policy: review
   41-6-durability-you-can-read: review
   epic-41-retrospective: optional
-  epic-42: backlog
-  42-1-a-session-is-a-row: backlog
+  epic-42: in-progress
+  # 42.1 went through an adversarial pass (an acceptance auditor against all 11
+  # I/O-matrix rows and the 4 ACs, plus a defect hunter) before it was committed.
+  # Verdict on the first pass was `incorrect`: two panics reachable from any
+  # on-disk manifest in the hand-rolled RFC 3339 parser, `rebuild_from_disk` with
+  # no production caller at all, matrix row 11 (a retitle repointing the row)
+  # unimplemented, and a rebuild that nulled the three columns no manifest
+  # carries. All are fixed here, and the macOS gate — the only one that compiles
+  # the shell crate — is green.
+  42-1-a-session-is-a-row: review
   42-2-searchable-sessions: backlog
   42-3-the-recordings-browser: backlog
   42-4-the-note-stub-at-the-only-moment-it-will-be-written: backlog
