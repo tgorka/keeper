@@ -1870,17 +1870,27 @@ pub fn get_account(data_dir: &Path, account_id: &str) -> Result<Option<AccountRo
 mod tests {
     use super::*;
 
+    /// A scratch directory no other test can land in.
+    ///
+    /// The pid plus a nanosecond stamp is NOT enough: two test threads that ask
+    /// inside the same clock tick get the same name, open the same SQLite file,
+    /// and then fail on whichever collision they reach first — a duplicate
+    /// migration column or a UNIQUE violation on a fixture inserted twice. Both
+    /// were observed on macOS under `cargo test --workspace`. The process-wide
+    /// counter is what makes the name unique per CALL, the way
+    /// `recording.rs`'s helper already does it.
     fn temp_dir() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
-        let unique = format!(
-            "keeper-registry-test-{}-{}",
+        dir.push(format!(
+            "keeper-registry-test-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
-        );
-        dir.push(unique);
+        ));
         dir
     }
 
