@@ -37,7 +37,9 @@
  *
  * This surface reads. There is no write path of any kind, no media player (Play
  * hands the file to the system handler and stops caring), and no tag
- * normalisation (42.5) — tags render and filter exactly as stored.
+ * normalisation — Story 42.5 put that in Rust, at the boundary where a
+ * recording's tags enter the index, so what arrives here is already the one
+ * vocabulary and re-shaping it would only be a way to disagree with the tree.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RecordingRow } from "@/components/recordings/recording-row";

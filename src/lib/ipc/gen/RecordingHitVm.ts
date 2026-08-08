@@ -79,10 +79,12 @@ totalBytes: number,
  */
 durability: string, 
 /**
- * The session's tags, decoded from the stored JSON array. Empty when the
+ * The session's tags, canonical (Story 42.5): what
+ * [`crate::notes::tags::normalise`] made of what the user typed, which is
+ * also exactly what the sidebar's tag node is called. Empty when the
  * session has none, or when the column holds something that is not a JSON
- * array of strings. Rendered and filtered exactly as stored — Story 42.5
- * is what normalises the vocabulary.
+ * array of strings. The session's `manifest.json` still holds the user's
+ * own text — this is the index's reading of it.
  */
 tags: Array<string>, 
 /**

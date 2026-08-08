@@ -24,6 +24,7 @@ import {
   recordingStatus,
   recordingStop,
 } from "@/lib/ipc/client";
+import type { RecordingMetaWire } from "@/lib/stores/recording-meta";
 
 /** The states with a session worth polling (anything non-terminal, non-idle). */
 const LIVE_STATES: ReadonlyArray<RecordingStatusVm["state"]> = [
@@ -118,13 +119,7 @@ export interface UseRecordingSession {
     micDeviceId?: string | null,
     cameraEnabled?: boolean,
     cameraDeviceId?: string | null,
-    meta?: {
-      title?: string;
-      participants?: string;
-      note?: string;
-      tags?: string[];
-      custom?: { name: string; value: string }[];
-    },
+    meta?: RecordingMetaWire,
   ) => Promise<void>;
   /** Request the graceful stop-and-finalize (idempotent). */
   stop: () => Promise<void>;
@@ -220,13 +215,7 @@ export function useRecordingSession(): UseRecordingSession {
       micDeviceId?: string | null,
       cameraEnabled?: boolean,
       cameraDeviceId?: string | null,
-      meta?: {
-        title?: string;
-        participants?: string;
-        note?: string;
-        tags?: string[];
-        custom?: { name: string; value: string }[];
-      },
+      meta?: RecordingMetaWire,
     ) => {
       // A new session owns its own folder — the previous session's rename is
       // no longer anything a snapshot needs projecting through.

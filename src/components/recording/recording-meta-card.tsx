@@ -9,6 +9,7 @@
  * changes nothing about the classic session naming.
  */
 import { Plus, X } from "lucide-react";
+import { TagVocabularyInput } from "@/components/tags/tag-vocabulary-input";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -23,7 +24,9 @@ export const META_TITLE_LABEL = "Title";
 export const META_PARTICIPANTS_LABEL = "Participants";
 export const META_NOTE_LABEL = "Program / session note";
 
-/** The tags field label (Story 22.3; comma-separated). */
+/** The tags field label (Story 22.3). The user types comma-separated text;
+ *  Story 42.5 moved the decision about what that text MEANS into Rust, and
+ *  gave the field completion over the shared tag vocabulary. */
 export const META_TAGS_LABEL = "Tags";
 
 /** The add-custom-field affordance's label (Story 22.3). */
@@ -84,11 +87,17 @@ export function RecordingMetaCard() {
         </div>
         <div className="flex flex-col gap-1.5">
           <Label htmlFor="recording-meta-tags">{META_TAGS_LABEL}</Label>
-          <Input
+          {/* Story 42.5: completion over the ONE tag vocabulary — the same
+              paths the notes tag tree is built from, so a tag that exists only
+              on notes is offered here. The field still takes comma-separated
+              text, but it no longer decides what a tag is: the raw string goes
+              to Rust, which splits and normalises it in the one place that
+              rule lives. */}
+          <TagVocabularyInput
             id="recording-meta-tags"
             value={fields.tags}
             placeholder="e.g. standup, q3, demo (comma-separated)"
-            onChange={(event) => setFields({ tags: event.target.value })}
+            onChange={(tags) => setFields({ tags })}
           />
         </div>
         {/* Story 22.3: repeatable custom name/value rows. Rows with a blank

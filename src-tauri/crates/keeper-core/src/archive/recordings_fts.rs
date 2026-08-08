@@ -88,10 +88,11 @@ const INDEX_JOIN: &str = " JOIN recordings_fts_docs \
 /// and silently widens every tag filter to its lexical neighbours, so the test
 /// is two arms: equal to the prefix, or the prefix followed by `/`. This is the
 /// identical rule `crate::notes::query::tag_descends` applies to note tags, and
-/// it is spelled out again here rather than shared for the reason
-/// `super::recordings`'s calendar arithmetic is: an `archive` → `notes`
-/// dependency edge costs more to maintain than one predicate does, and Story
-/// 42.5 is what actually unifies the two vocabularies.
+/// it is still spelled out again here rather than shared. Story 42.5 unified
+/// what a TAG is, which is the thing that was actually broken; how a hierarchy
+/// descends is a two-arm prefix test that has been fixed since FR-104 and
+/// cannot drift, and it is expressed here in SQL and there in Rust, so there
+/// was never one definition to share.
 ///
 /// **Matched over the stored JSON's decoded elements, not a normalised
 /// sidecar.** `tags_json` on the row is the truth (Story 42.1), and a sidecar
@@ -101,8 +102,14 @@ const INDEX_JOIN: &str = " JOIN recordings_fts_docs \
 /// the row set before it is evaluated. `json_each` is used rather than a `LIKE`
 /// over the raw JSON text because the raw text carries `[`, `"` and whatever
 /// escapes serde emitted, and a predicate that depends on an encoder's
-/// escaping choices is a predicate waiting to be wrong. Story 42.5 normalises
-/// the vocabulary; this story matches the tag text as stored.
+/// escaping choices is a predicate waiting to be wrong.
+///
+/// **Both sides of this comparison are now canonical** (Story 42.5): the stored
+/// elements were normalised on their way into the column by
+/// [`super::recordings::RecordingRow::from_manifest`], and the bound term is
+/// normalised by [`search_recordings`] before it gets here. So this is a
+/// straight comparison of two canonical tags, and there is no third place that
+/// decides what a tag is.
 ///
 /// `json_quote` is the fallback arm rather than `'[]'`: a column holding text
 /// that is not JSON at all (hand-edited, or written by a tool that is not this
@@ -164,8 +171,10 @@ pub struct RecordingFilter {
     /// Tags the session must carry, each matched hierarchically at the segment
     /// boundary (see [`TAG_PREDICATE_SQL`]). Several tags AND together, the way
     /// the notes surface's tag chips do: two chips narrow, they do not widen.
-    /// An empty string is not a filter and is skipped — a chip with no text in
-    /// it narrows nothing.
+    /// Taken as typed and normalised by [`search_recordings`] (Story 42.5), so a
+    /// chip reading `Client/Acme ` finds the same sessions the sidebar's
+    /// `client/acme` node does. A tag that normalises to nothing — an empty
+    /// chip, `///` — narrows nothing and is skipped.
     pub tags: Vec<String>,
     /// A case-insensitive substring of the session's participants; `None` (or
     /// empty) matches any.
@@ -590,12 +599,18 @@ pub fn search_recordings(
         INDEX_JOIN
     };
 
-    for tag in filter.tags.iter().filter(|tag| !tag.is_empty()) {
+    // Story 42.5: a filter tag joins the one vocabulary here, at the boundary
+    // where it becomes SQL. `crate::notes::query` normalises a `tag:` term the
+    // same way for the same reason — a person typing `Client/Acme ` into a chip
+    // means the tag the rows actually carry. A term that normalises to nothing
+    // narrows nothing and is dropped, which is also what the old
+    // `!tag.is_empty()` guard was for.
+    for tag in crate::notes::tags::normalise_all(filter.tags.iter().map(String::as_str)) {
         clauses.push(TAG_PREDICATE_SQL.to_owned());
-        // The equality arm takes the tag as typed; the descendant arm is a LIKE
+        // The equality arm takes the canonical tag; the descendant arm is a LIKE
         // and takes it escaped.
         params.push(Box::new(tag.clone()));
-        params.push(Box::new(escape_like(tag)));
+        params.push(Box::new(escape_like(&tag)));
     }
     if let Some(participant) = filter.participant.as_deref().filter(|p| !p.is_empty()) {
         clauses.push(PARTICIPANT_PREDICATE_SQL.to_owned());
@@ -2111,5 +2126,53 @@ mod tests {
                 .expect("an archive with no recordings tables is an empty answer, never an error");
 
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn a_tag_filter_is_normalised_before_it_becomes_a_predicate() {
+        // Story 42.5: rows carry canonical tags, so a chip must be read as the
+        // same vocabulary or the two would only agree by accident of `LOWER`.
+        // `Client/Acme ` is the AC1 shape; the trailing space is what a plain
+        // `LOWER` comparison would have missed.
+        let conn = memory_db();
+        upsert_recording(
+            &conn,
+            &row_with_meta(
+                "01DEVICE-01RENEWAL",
+                400,
+                "Renewal call",
+                "Ada",
+                "agreed the pricing",
+                &["client/acme/renewal"],
+            ),
+        )
+        .expect("index a tagged session");
+
+        for typed in [
+            "Client/Acme ",
+            "#client/acme",
+            "client//acme/",
+            "CLIENT/ACME",
+        ] {
+            assert_eq!(
+                found_tag(&conn, typed),
+                vec!["01DEVICE-01RENEWAL".to_owned()],
+                "`{typed}` is the same tag as `client/acme`"
+            );
+        }
+        // A term that is not a tag narrows nothing rather than matching nothing:
+        // an empty chip must not empty the list.
+        assert_eq!(
+            found(
+                &conn,
+                &RecordingFilter {
+                    tags: vec!["///".to_owned(), String::new()],
+                    ..RecordingFilter::default()
+                }
+            ),
+            vec!["01DEVICE-01RENEWAL".to_owned()]
+        );
+        // And the boundary still holds: `client/acmecorp` is not under it.
+        assert!(found_tag(&conn, "Client/AcmeCorp").is_empty());
     }
 }

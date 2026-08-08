@@ -3411,10 +3411,12 @@ pub struct RecordingHitVm {
     /// How far the session's bytes have travelled, as epic 41's wire word — the
     /// row's durability glyph.
     pub durability: String,
-    /// The session's tags, decoded from the stored JSON array. Empty when the
+    /// The session's tags, canonical (Story 42.5): what
+    /// [`crate::notes::tags::normalise`] made of what the user typed, which is
+    /// also exactly what the sidebar's tag node is called. Empty when the
     /// session has none, or when the column holds something that is not a JSON
-    /// array of strings. Rendered and filtered exactly as stored — Story 42.5
-    /// is what normalises the vocabulary.
+    /// array of strings. The session's `manifest.json` still holds the user's
+    /// own text — this is the index's reading of it.
     pub tags: Vec<String>,
     /// The absolute path of the file Play hands to the system handler: the
     /// session's first screen segment, or its first segment of any track when
@@ -3423,6 +3425,39 @@ pub struct RecordingHitVm {
     /// written, so there is nothing to play, and the surface omits the action
     /// rather than opening the folder and calling that playback.
     pub playable_path: Option<String>,
+}
+
+/// The tag vocabulary a completion surface offers: every known tag, flat, with
+/// its count (Story 42.5, FR-143).
+///
+/// **Flat, where [`crate::notes::vm::NoteTagTreeVm`] is nested, and that is the
+/// only difference between them.** Both are projected from the same posting map
+/// in the same snapshot, so they can never disagree about what a tag is or how
+/// many things carry it. The tree exists because the sidebar renders a
+/// hierarchy; this exists because the recording metadata card's tag field is a
+/// plain text input, and the notes surface's existing affordance is a CodeMirror
+/// `CompletionSource` that a plain input cannot consume. Forking the vocabulary
+/// to give the card a completion is the one thing this story is about not doing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TagVocabularyVm {
+    /// Every tag path, ascending, each ancestor prefix its own entry.
+    pub entries: Vec<TagVocabularyEntryVm>,
+}
+
+/// One tag in the vocabulary (Story 42.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TagVocabularyEntryVm {
+    /// The full canonical tag path — `client/acme` — which is both what a
+    /// completion inserts and what a `tag:` query matches.
+    pub path: String,
+    /// How many things carry this tag or anything under it, summed over BOTH
+    /// producers: notes and recording sessions. The same number the sidebar
+    /// node shows, because it is the same number.
+    pub count: u32,
 }
 
 /// How many rows a folder card's lists show, folded and unfolded.

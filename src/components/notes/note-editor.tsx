@@ -28,7 +28,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { useNotesBody } from "@/hooks/use-notes-body";
-import { type NoteTagNodeVm, type NoteWriteVm, notesTagTree } from "@/lib/ipc/client";
+import { type NoteWriteVm, notesTagTree } from "@/lib/ipc/client";
 import { markSaved, notesEditorStore, useNotesEditorStore } from "@/lib/stores/notes-editor";
 import { BacklinksPanel } from "./backlinks-panel";
 import { ConflictResolver } from "./conflict-resolver";
@@ -58,15 +58,6 @@ interface EditorRuntime {
   placeCaret: (at: number) => void;
   focus: () => void;
   destroy: () => void;
-}
-
-/** Flatten the tag tree to full paths, which is what completion matches on. */
-function tagPaths(nodes: readonly NoteTagNodeVm[], into: string[] = []): string[] {
-  for (const node of nodes) {
-    into.push(node.path);
-    tagPaths(node.children, into);
-  }
-  return into;
 }
 
 /** The note's title: its first body line, `#` stripped (FR-98). Derived from
@@ -260,7 +251,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
               override: [
                 wikilink.wikilinkSource(vaultId),
                 tags.tagCompleteSource(async () => {
-                  cachedTags ??= tagPaths((await notesTagTree(vaultId)).nodes);
+                  cachedTags ??= tags.tagPaths((await notesTagTree(vaultId)).nodes);
                   return cachedTags;
                 }),
                 slash.slashMenuSource(),

@@ -42,7 +42,7 @@ use keeper_core::notes::vm::{
     NoteTagTreeVm, NoteTemplateVm, NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
 };
 use keeper_core::notes::{naming, query, search, templates, NotesError};
-use keeper_core::vm::{IpcError, IpcErrorCode};
+use keeper_core::vm::{IpcError, IpcErrorCode, TagVocabularyEntryVm, TagVocabularyVm};
 use keeper_sync::profile::{NotesCadence, NotesConfig};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -438,11 +438,19 @@ fn matches_filter(entry: &IndexEntry, req: &NoteQueryReq, head: Option<&HeadRevi
 
 /// Segment-prefix tag matching: `project` matches `project` and
 /// `project/keeper`, and never `projects`.
+///
+/// The chip is read through the one normalisation (Story 42.5) rather than
+/// hand-stripped here, so a chip carrying a hash, a casing or a trailing space
+/// selects the node the sidebar named. A chip that is not a tag at all
+/// normalises to nothing and matches nothing — an empty chip must not silently
+/// select the whole vault.
 fn tag_matches(actual: &str, wanted: &str) -> bool {
-    let wanted = wanted.trim_start_matches('#');
+    let Some(wanted) = keeper_core::notes::tags::normalise(wanted) else {
+        return false;
+    };
     actual == wanted
         || (actual.len() > wanted.len()
-            && actual.starts_with(wanted)
+            && actual.starts_with(&wanted)
             && actual.as_bytes().get(wanted.len()) == Some(&b'/'))
 }
 
@@ -797,7 +805,8 @@ pub async fn notes_list(
     Ok(list)
 }
 
-/// The hierarchical tag tree with per-node counts (FR-104).
+/// The hierarchical tag tree with per-node counts (FR-104), over both producers
+/// of a tag (Story 42.5): notes and recording sessions.
 #[tauri::command]
 pub async fn notes_tag_tree(vault_id: String) -> Result<NoteTagTreeVm, IpcError> {
     let snapshot = notes_vault::snapshot(&vault_id)
@@ -815,6 +824,44 @@ fn tag_node_vm(node: &keeper_core::notes::tags::TagNode) -> NoteTagNodeVm {
         count: node.count,
         children: node.children.iter().map(tag_node_vm).collect(),
     }
+}
+
+/// The flat tag vocabulary, for a completion surface that cannot consume a tree
+/// (Story 42.5, FR-143).
+///
+/// `vault_id` is optional because the surface that most needs this — the
+/// recording metadata card — is not inside a vault: a recording belongs to the
+/// app, not to one set of notes. Absent, it resolves the active vault, which is
+/// the same vault whose sidebar the person is looking at. The vocabulary itself
+/// is not vault-scoped in spirit (a recording's tags reach every vault's index),
+/// but it is served from a snapshot, and a snapshot belongs to a vault.
+///
+/// An unknown or absent vault resolves with an empty vocabulary rather than an
+/// error. Completion is an affordance: offering nothing is a usable outcome, and
+/// rejecting an `invoke` would make the card's tag field print an error for the
+/// crime of having no vault behind it.
+#[tauri::command]
+pub async fn tags_vocabulary(
+    state: State<'_, AppState>,
+    vault_id: Option<String>,
+) -> Result<TagVocabularyVm, IpcError> {
+    let resolved = match vault_id {
+        Some(id) => Some(id),
+        None => notes_vault::active_vault(state.platform.as_ref()),
+    };
+    let entries: Vec<TagVocabularyEntryVm> = resolved
+        .and_then(|id| notes_vault::snapshot(&id))
+        .map(|snapshot| {
+            snapshot
+                .tag_vocabulary()
+                .map(|(path, count)| TagVocabularyEntryVm {
+                    path: path.to_owned(),
+                    count,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(TagVocabularyVm { entries })
 }
 
 /// One level of the physical folder lens (FR-106).
@@ -2514,6 +2561,14 @@ mod tests {
         assert!(!tag_matches("project", "project/keeper"));
         // A chip may arrive with its hash still on it.
         assert!(tag_matches("project/keeper", "#project"));
+        // Story 42.5: and through the one normalisation, so a chip carrying the
+        // casing or the trailing space a recording's card showed selects the
+        // node the sidebar named.
+        assert!(tag_matches("client/acme", "Client/Acme "));
+        assert!(tag_matches("client/acme/renewal", "CLIENT//ACME/"));
+        // A chip that is not a tag selects nothing rather than everything.
+        assert!(!tag_matches("client/acme", "///"));
+        assert!(!tag_matches("client/acme", ""));
     }
 
     #[test]

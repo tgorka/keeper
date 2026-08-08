@@ -29,6 +29,10 @@ vi.mock("@/lib/ipc/client", () => ({
       cameras: [],
     }),
   ),
+  // Story 42.5: the "Next session" card's Tags field completes over the one
+  // tag vocabulary, so mounting the pane now reads it. An empty vocabulary is
+  // this suite's world — nothing here is about completion.
+  tagsVocabulary: vi.fn(() => Promise.resolve({ entries: [] })),
   // The "Segmenting" / "Destination" / "Advanced" cards mount the shared
   // settings controls (Story 17.5 + 19.5), which lazily hydrate from this read.
   recordingSettingsGet: vi.fn(() =>

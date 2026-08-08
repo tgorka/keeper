@@ -97,7 +97,10 @@ describe("RecordingRow", () => {
     expect(screen.getByText("412 MB")).toBeInTheDocument();
   });
 
-  it("renders each stored tag as its own chip, exactly as stored", () => {
+  it("renders each indexed tag as its own chip, re-shaping nothing", () => {
+    // Story 42.5: what the index holds is already the canonical tag, so a row
+    // that lower-cased or re-split anything here could only disagree with the
+    // sidebar tree. The manifest keeps the user's text; the chip shows the tag.
     renderRow(hit({ sessionId: "s1", title: "Standup", tags: ["work/standup", "q3"] }));
 
     expect(screen.getByText("work/standup")).toBeInTheDocument();

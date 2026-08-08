@@ -151,7 +151,8 @@ pub struct NoteRefVm {
     pub title: String,
 }
 
-/// The hierarchical tag tree with counts (FR-104).
+/// The hierarchical tag tree with counts (FR-104), over every producer of a tag
+/// (FR-143).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -161,6 +162,9 @@ pub struct NoteTagTreeVm {
 }
 
 /// One node of the tag tree.
+///
+/// Named `Note…` because it is served by the notes surface; its contents are
+/// not notes-only (Story 42.5).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -169,8 +173,9 @@ pub struct NoteTagNodeVm {
     pub name: String,
     /// The full tag path, which is also the `tag:` value that selects it.
     pub path: String,
-    /// Distinct notes in this node's whole subtree, so the number the chip shows
-    /// is the number of rows clicking it produces.
+    /// Distinct things in this node's whole subtree — notes AND recording
+    /// sessions, summed (Story 42.5) — so the number the chip shows is the
+    /// number of things behind it rather than the number of one kind of thing.
     pub count: u32,
     pub children: Vec<NoteTagNodeVm>,
 }
