@@ -45,10 +45,27 @@
 //!    because a watcher that was never started, or a mount that emits no events
 //!    at all (NFS, CIFS, some FUSE), raises no flag either.
 //! 2. **Our own writes look like the user's.** A fetch that checks out 400
-//!    files would re-commit all 400 as local changes. inotify has no
-//!    self-filtering (FSEvents' `IgnoreSelf` only covers the same process, and
-//!    not reliably), so the engine registers paths in an [`EchoSuppressor`]
-//!    before writing and clears them after — Syncthing's `inProgress` set.
+//!    files delivers 400 events, and inotify has no self-filtering (FSEvents'
+//!    `IgnoreSelf` only covers the same process, and not reliably). This
+//!    module ships Syncthing's `inProgress` answer — [`EchoSuppressor`],
+//!    honoured by `fold_batch` — but **the engine deliberately does not use
+//!    it** (Story 34.9). An event is never on its own a reason to commit
+//!    anything: it only tells the supervisor to look, and `git status` then
+//!    decides what actually changed. A checkout leaves the tree clean against
+//!    the new HEAD, so its echo costs at most one fruitless walk and cannot
+//!    become a re-commit loop. Registration would buy that walk back at the
+//!    price of a register/clear pair around every write the engine makes, any
+//!    one of which — forgotten on an error path, or skipped by a `?` — would
+//!    mute a real user change indefinitely. That trades a performance cost for
+//!    a silent data-loss one, so it was declined.
+//!
+//!    Consequently [`EchoSuppressor`] has **no production registrar**:
+//!    `Engine::fold_watch_events` never takes the
+//!    [`FolderWatcher::suppressor`] handle, so the suppression branch in
+//!    `fold_batch` cannot fire outside this module's own tests. It is a
+//!    working helper with unit coverage and no live caller. Do not read a
+//!    green test over it as coverage of the shipped engine, and do not wire it
+//!    up without revisiting the reasoning above.
 //! 3. **Some filesystems never notify.** Network mounts, FUSE and unowned
 //!    macOS trees need [`notify::PollWatcher`], selected per profile through
 //!    [`WatchConfig::force_poll`].
@@ -155,13 +172,18 @@ impl WatchConfig {
     }
 }
 
-/// The set of paths the engine is currently writing itself.
+/// A set of paths a caller is writing itself, folded out of every batch.
 ///
-/// Cloneable and shared: the engine registers before a checkout and clears
-/// after, while the watcher thread reads it on every batch. Without this a
-/// fetch that materializes 400 files produces 400 "local changes" and the next
-/// push commits them straight back — a self-sustaining loop that looks exactly
-/// like a busy sync.
+/// Cloneable and shared: a registrar would register before a checkout and
+/// clear after, while the watcher thread reads it on every batch. It is
+/// Syncthing's `inProgress` set, and it works — but **nothing in this crate
+/// registers with it**. `Engine::fold_watch_events` never takes the
+/// [`FolderWatcher::suppressor`] handle, because an event there is only a
+/// prompt to run `git status` and a checkout leaves the tree clean against the
+/// new HEAD, so the echo costs one fruitless walk rather than the re-commit
+/// loop this type was written to prevent. See the module documentation for the
+/// full reasoning, and treat every `EchoSuppressor` test as a test of this
+/// type alone.
 ///
 /// Suppression is **subtree-wide**: registering a directory suppresses
 /// everything written beneath it, which is what a checkout actually does.
@@ -181,13 +203,14 @@ impl EchoSuppressor {
     }
 
     /// Stop suppressing `path`. Clearing a path that was never registered is a
-    /// no-op, so the engine's cleanup can be unconditional.
+    /// no-op, so a registrar's cleanup can be unconditional.
     pub fn clear(&self, path: &Path) {
         self.guard().remove(path);
     }
 
-    /// Forget every registration. Used when a profile is torn down mid-write:
-    /// a stale entry would silently mute a real user change forever.
+    /// Forget every registration. For a registrar tearing a profile down
+    /// mid-write: a stale entry would silently mute a real user change
+    /// forever.
     pub fn clear_all(&self) {
         self.guard().clear();
     }
@@ -282,9 +305,17 @@ impl Coalescer {
 
 /// Fold one debounced batch into the events it implies.
 ///
-/// Pure: no clock, no filesystem, no channel. Everything interesting about the
-/// watcher's behaviour is decided here, which is what makes it testable without
-/// waiting for a real inotify queue.
+/// Pure: no clock, no filesystem, no channel. Everything about *what an event
+/// means* is decided here, which is what makes it testable without waiting for
+/// a real inotify queue.
+///
+/// What an event is *worth* is not decided here. Tier 0 lives on the profile's
+/// [`crate::stability::StabilityGate`], with the per-profile patterns the user
+/// added, and `Engine::fold_watch_events` puts every drained path to it before
+/// letting it arm a walk (Story 34.9). Do not add a second exclusion filter
+/// here: this function has no profile and no `ExcludeSet`, so it could only
+/// consult a hard-coded copy of the corpus, and a copy that drifts from the
+/// gate's is a wake and a walk that disagree about what is worth looking at.
 fn fold_batch(
     events: &[DebouncedEvent],
     root: &Path,
@@ -508,7 +539,13 @@ impl FolderWatcher {
         &self.root
     }
 
-    /// A handle the engine registers its own writes with, before it makes them.
+    /// This watcher's [`EchoSuppressor`], for a caller that wants to fold its
+    /// own writes out of the batches this watcher emits.
+    ///
+    /// **No production caller takes this handle.** `Engine::fold_watch_events`
+    /// deliberately does not register — see the module documentation — so in
+    /// the shipped engine this returns a set that is always empty and the
+    /// suppression branch in `fold_batch` never fires.
     pub fn suppressor(&self) -> EchoSuppressor {
         self.suppressor.clone()
     }
@@ -678,8 +715,8 @@ mod tests {
         s.register(path);
         assert!(s.is_suppressed(path));
         assert_eq!(s.len(), 1);
-        // An unrelated sibling must still get through, or a checkout would mute
-        // every concurrent user edit in the profile.
+        // An unrelated sibling must still get through, or a registrar's
+        // checkout would mute every concurrent user edit in the profile.
         assert!(!s.is_suppressed(Path::new("/w/other.md")));
 
         s.clear(path);
@@ -690,8 +727,9 @@ mod tests {
     #[test]
     fn the_echo_suppressor_covers_a_registered_subtree() {
         let s = EchoSuppressor::new();
-        // A checkout registers the directory it is about to materialize; every
-        // file it writes underneath must be muted, not just the directory.
+        // A registrar would register the directory it is about to materialize;
+        // every file it writes underneath must be muted, not just the
+        // directory. No registrar exists today — see [`EchoSuppressor`].
         s.register("/w/docs");
         assert!(s.is_suppressed(Path::new("/w/docs")));
         assert!(s.is_suppressed(Path::new("/w/docs/a/b/c.md")));
@@ -793,8 +831,24 @@ mod tests {
         assert!(!events[0].close_write);
     }
 
+    /// A unit test of [`EchoSuppressor`] alone — **not** of any shipped
+    /// behaviour.
+    ///
+    /// Nothing in production registers a path with an `EchoSuppressor`:
+    /// `Engine::fold_watch_events` never takes [`FolderWatcher::suppressor`],
+    /// so in the shipped engine the set this exercises is permanently empty
+    /// and the branch below is unreachable. That is the deliberate choice
+    /// recorded in the module documentation (Story 34.9): an event is only a
+    /// prompt to run `git status`, so a checkout echo costs a fruitless walk
+    /// and never a re-commit.
+    ///
+    /// The test is kept because the type is kept: if a future registrar
+    /// appears, subtree-wide suppression and its release are the two
+    /// properties it will rely on. It is named for what it actually proves so
+    /// that nobody reads it as evidence that the engine suppresses its own
+    /// writes — it is not, and the engine does not.
     #[test]
-    fn suppressed_paths_never_reach_the_channel() {
+    fn a_registered_subtree_is_folded_out_of_a_batch_and_flows_again_once_cleared() {
         let root = Path::new("/w");
         let s = EchoSuppressor::new();
         s.register("/w/checkout");
@@ -810,10 +864,11 @@ mod tests {
                 path: PathBuf::from("/w/mine.txt"),
                 close_write: false,
             }],
-            "our own checkout writes must not become commits"
+            "a registered directory suppresses everything beneath it, and nothing else"
         );
 
-        // ...and once the checkout is done, the same events flow again.
+        // ...and clearing the registration lets the same batch through again,
+        // which is the half a registrar would get wrong by forgetting.
         s.clear(Path::new("/w/checkout"));
         assert_eq!(fold_batch(&batch, root, &s).len(), 3);
     }
