@@ -25,8 +25,10 @@ pub mod db;
 pub mod export;
 pub mod fts;
 mod ingest;
+pub mod recordings;
 
 pub use fts::{search, SearchFilter};
+pub use recordings::{RecordingRow, RecordingSegmentRow};
 
 use std::path::{Path, PathBuf};
 
@@ -119,6 +121,9 @@ pub struct ArchiveEvent {
 /// (`INSERT OR IGNORE`); `Redact` marks an existing row's `redacted_ts` without
 /// erasing its content; `DeleteAccount` purges exactly one account's rows +
 /// FTS entries and reports its outcome back on a `oneshot` completion channel.
+/// The three recording variants (Story 42.1) write the session index: a session
+/// row, one segment row, and a durability advance. They are here rather than on
+/// a writer of their own precisely so the count of writers stays one.
 ///
 /// Only `Debug` is derived: the `DeleteAccount` completion sender is move-only
 /// (not `Clone`/`Eq`), which is fine — nothing depends on `Clone`/`PartialEq`/`Eq`
@@ -147,6 +152,60 @@ pub enum ArchiveMsg {
         account_id: String,
         /// The completion channel the writer sends the purge `Result` on.
         done: oneshot::Sender<Result<(), ArchiveError>>,
+    },
+    /// Write (or complete) one recording session's row (Story 42.1).
+    ///
+    /// The same variant carries both the row a session start knows and the
+    /// completed row a finalize knows: the write is `INSERT OR REPLACE` on the
+    /// session id either way, so a start-then-finalize is one row and a repeated
+    /// finalize is still one row. Boxed like `Insert`, so the enum's variants
+    /// stay similarly sized.
+    UpsertRecording(Box<RecordingRow>),
+    /// Write one closed segment's row, keyed on `(session, index, track)`
+    /// (Story 42.1).
+    UpsertRecordingSegment(Box<RecordingSegmentRow>),
+    /// Advance a session row's durability as epic 41's state climbs (Story
+    /// 42.1). Never a regression — the writer applies the floor.
+    SetRecordingDurability {
+        /// The session whose row is being advanced.
+        session_id: String,
+        /// The new state as its column word (see
+        /// [`recordings::durability_label`]).
+        durability: String,
+    },
+    /// Repoint a session's row at the folder a Story 40.4 retitle just moved it
+    /// to (Story 42.1, matrix row 11).
+    ///
+    /// Not an `UpsertRecording` carrying a fresh row, deliberately. A retitle
+    /// knows where the session went and nothing else — not the codec, not the
+    /// frame rate, neither of which any manifest carries — so rebuilding a whole
+    /// row from what it happens to have would write nulls over the two facts the
+    /// row is the only home for. The path is the one thing that changed, so the
+    /// path is the only thing sent, and `session_id` stays untouched: that is
+    /// what makes the row follow the session rather than the folder.
+    MoveRecording {
+        /// The session whose row is being repointed.
+        session_id: String,
+        /// The session folder's new path, relative to the destination root.
+        relative_path: String,
+    },
+    /// Re-derive every recording row by walking the destination tree (Story
+    /// 42.1).
+    ///
+    /// The message exists so the rebuild runs on the writer's connection like
+    /// every other write. A caller holding its own `Connection` would be a second
+    /// connection to `archive.db`, which is the one thing this whole module is
+    /// arranged to prevent — and a rebuild is precisely when a second writer
+    /// would be worst, because it walks and rewrites the same rows the recorder
+    /// may be appending to.
+    RebuildRecordings {
+        /// The destination root to walk. Every path derived under it is stored
+        /// relative to it.
+        root: std::path::PathBuf,
+        /// `"folder"` or `"profile"` — which kind of destination that root is.
+        root_kind: String,
+        /// The destination profile, when the root is one.
+        profile_id: Option<String>,
     },
 }
 
@@ -221,6 +280,99 @@ impl ArchiveHandle {
             ))),
         }
     }
+
+    /// Record a session start in the archive index (Story 42.1).
+    ///
+    /// Non-blocking and infallible from the caller's view, exactly like
+    /// [`ArchiveHandle::ingest`]: the recorder must never wait on, or fail
+    /// because of, an index write. A closed channel is logged with ids only.
+    pub fn recording_started(&self, row: RecordingRow) {
+        self.send_recording_row(row);
+    }
+
+    /// Complete a session's row at finalize (Story 42.1). The same
+    /// `INSERT OR REPLACE` as [`ArchiveHandle::recording_started`] — two names
+    /// because the send sites mean two different things, one message because the
+    /// writer does one thing. A weaker `durability` on this row cannot pull the
+    /// stored one backwards (epic 41's floor, applied in the write).
+    pub fn recording_finalized(&self, row: RecordingRow) {
+        self.send_recording_row(row);
+    }
+
+    /// The shared non-blocking send behind the two row methods.
+    fn send_recording_row(&self, row: RecordingRow) {
+        if let Err(e) = self.tx.send(ArchiveMsg::UpsertRecording(Box::new(row))) {
+            log_dropped(&e.0);
+        }
+    }
+
+    /// Record one closed segment in the archive index (Story 42.1).
+    /// Non-blocking and best-effort, like every other producer-side call here.
+    pub fn recording_segment(&self, row: RecordingSegmentRow) {
+        if let Err(e) = self
+            .tx
+            .send(ArchiveMsg::UpsertRecordingSegment(Box::new(row)))
+        {
+            log_dropped(&e.0);
+        }
+    }
+
+    /// Advance a session's durability in the index as epic 41's state climbs
+    /// (Story 42.1). Takes the state itself rather than a word so a send site
+    /// cannot misspell one; the writer applies the floor, so an out-of-order or
+    /// weaker advance is a no-op rather than a regression.
+    pub fn recording_durability(
+        &self,
+        session_id: &str,
+        state: crate::vm::RecordingDurabilityState,
+    ) {
+        let msg = ArchiveMsg::SetRecordingDurability {
+            session_id: session_id.to_owned(),
+            durability: recordings::durability_label(state).to_owned(),
+        };
+        if let Err(e) = self.tx.send(msg) {
+            log_dropped(&e.0);
+        }
+    }
+
+    /// Repoint a session's row (and every one of its segment rows) at the folder
+    /// a retitle just moved it to (Story 42.1, matrix row 11).
+    ///
+    /// Best-effort like the rest of this seam: a retitle has already succeeded on
+    /// disk by the time this is sent, so a closed channel costs an index that is
+    /// briefly stale, never a rename that half happened.
+    pub fn recording_moved(&self, session_id: String, relative_path: String) {
+        let msg = ArchiveMsg::MoveRecording {
+            session_id,
+            relative_path,
+        };
+        if let Err(e) = self.tx.send(msg) {
+            log_dropped(&e.0);
+        }
+    }
+
+    /// Re-derive every recording row from the session folders under `root`
+    /// (Story 42.1).
+    ///
+    /// This is what makes "deleting `archive.db` loses nothing" a fact rather
+    /// than a claim: the manifests are the truth, and this replays them. Sent on
+    /// the ordinary channel, so it queues behind whatever the writer is already
+    /// doing and never races it.
+    pub fn rebuild_recordings(
+        &self,
+        root: std::path::PathBuf,
+        root_kind: String,
+        profile_id: Option<String>,
+    ) {
+        let msg = ArchiveMsg::RebuildRecordings {
+            root,
+            root_kind,
+            profile_id,
+        };
+        if let Err(e) = self.tx.send(msg) {
+            log_dropped(&e.0);
+        }
+    }
 }
 
 /// Log a dropped writer message with ids only (never content). A closed channel
@@ -244,6 +396,27 @@ fn log_dropped(msg: &ArchiveMsg) {
         ArchiveMsg::DeleteAccount { account_id, .. } => tracing::warn!(
             account_id = %account_id,
             "archive: writer channel closed; account archive purge not performed"
+        ),
+        ArchiveMsg::UpsertRecording(row) => tracing::warn!(
+            session_id = %row.session_id,
+            "archive: writer channel closed; dropping recording row"
+        ),
+        ArchiveMsg::UpsertRecordingSegment(row) => tracing::warn!(
+            session_id = %row.session_id,
+            index = row.index,
+            "archive: writer channel closed; dropping recording segment row"
+        ),
+        ArchiveMsg::SetRecordingDurability { session_id, .. } => tracing::warn!(
+            session_id = %session_id,
+            "archive: writer channel closed; dropping recording durability advance"
+        ),
+        ArchiveMsg::MoveRecording { session_id, .. } => tracing::warn!(
+            session_id = %session_id,
+            "archive: writer channel closed; dropping recording move"
+        ),
+        ArchiveMsg::RebuildRecordings { root, .. } => tracing::warn!(
+            root = %root.display(),
+            "archive: writer channel closed; the recordings index was not rebuilt"
         ),
     }
 }
