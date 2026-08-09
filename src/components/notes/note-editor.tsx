@@ -30,6 +30,7 @@ import { Button } from "@/components/ui/button";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import { type NoteWriteVm, notesTagTree } from "@/lib/ipc/client";
 import { markSaved, notesEditorStore, useNotesEditorStore } from "@/lib/stores/notes-editor";
+import { ATTACHMENTS_LABEL, AttachmentsPanel } from "./attachments-panel";
 import { BacklinksPanel } from "./backlinks-panel";
 import { ConflictResolver } from "./conflict-resolver";
 import { NoteDiffBar } from "./note-diff-bar";
@@ -56,6 +57,16 @@ interface EditorRuntime {
    * after it — the editor is constructed before either exists.
    */
   placeCaret: (at: number) => void;
+  /**
+   * Write text where the caret is, as the user's own edit (Story 43.7).
+   *
+   * The counterpart of `applyExternal`, and deliberately its opposite in every
+   * respect: this one IS the user's edit, so it goes into the undo history and
+   * it is reported back through `onEdit`. An insertion annotated `remote` would
+   * be unrecorded by the history and unreported to Rust — the attachment would
+   * appear in the buffer and never reach the file.
+   */
+  insertAtCursor: (text: string) => void;
   focus: () => void;
   destroy: () => void;
 }
@@ -151,10 +162,18 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
   const runtimeRef = useRef<EditorRuntime | null>(null);
   const [mode, setMode] = useState<EditorMode>("edit");
   const [showProperties, setShowProperties] = useState(false);
+  const [showAttachments, setShowAttachments] = useState(false);
   const [conflictTheirs, setConflictTheirs] = useState<string | null>(null);
 
   const openHistory = useCallback(() => setMode("history"), []);
   const toggleProperties = useCallback(() => setShowProperties((shown) => !shown), []);
+  const toggleAttachments = useCallback(() => setShowAttachments((shown) => !shown), []);
+  // Through the ref, because the runtime is built by an async effect: a panel
+  // pressed before the editor chunk lands writes nothing rather than throwing,
+  // and the same identity survives every re-render of the panel below.
+  const insertAtCursor = useCallback((text: string) => {
+    runtimeRef.current?.insertAtCursor(text);
+  }, []);
 
   // Refs, not effect dependencies: rebuilding the editor because a callback
   // identity changed would throw away the document, the undo stack and the
@@ -182,18 +201,29 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
     let disposed = false;
 
     void (async () => {
-      const [state, view, commands, markdown, autocomplete, preview, wikilink, tags, slash] =
-        await Promise.all([
-          import("@codemirror/state"),
-          import("@codemirror/view"),
-          import("@codemirror/commands"),
-          import("@codemirror/lang-markdown"),
-          import("@codemirror/autocomplete"),
-          import("./editor/live-preview"),
-          import("./editor/wikilink"),
-          import("./editor/tag-complete"),
-          import("./editor/slash-menu"),
-        ]);
+      const [
+        state,
+        view,
+        commands,
+        markdown,
+        autocomplete,
+        preview,
+        wikilink,
+        tags,
+        slash,
+        indent,
+      ] = await Promise.all([
+        import("@codemirror/state"),
+        import("@codemirror/view"),
+        import("@codemirror/commands"),
+        import("@codemirror/lang-markdown"),
+        import("@codemirror/autocomplete"),
+        import("./editor/live-preview"),
+        import("./editor/wikilink"),
+        import("./editor/tag-complete"),
+        import("./editor/slash-menu"),
+        import("./editor/indent-keymap"),
+      ]);
       if (disposed) {
         return;
       }
@@ -226,6 +256,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
               ...commands.defaultKeymap,
               ...commands.historyKeymap,
               ...autocomplete.completionKeymap,
+              ...indent.indentBindings,
               {
                 // ⌘S has no save semantic to attach to, so it force-flushes. A
                 // bound key that does something honest beats a no-op that
@@ -324,6 +355,16 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
             ],
           });
         },
+        insertAtCursor: (text: string) => {
+          // `replaceSelection` writes at every cursor and leaves the caret
+          // after what it wrote, which is where a person who had typed those
+          // characters would be. Plain and unannotated on purpose: this is the
+          // user's edit, so the update listener reports it and ⌘Z undoes it.
+          editorView.dispatch(editorView.state.replaceSelection(text));
+          // The click that got here took focus out of the editor. Handing it
+          // back is the difference between inserting and interrupting.
+          editorView.focus();
+        },
         focus: () => editorView.focus(),
         destroy: () => editorView.destroy(),
       };
@@ -389,6 +430,9 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
         <span className="text-[11px] text-muted-foreground">
           {saveStateWord({ saving: body.saving, dirty: body.dirty, savedAtMs, error })}
         </span>
+        <Button size="sm" variant="ghost" onClick={toggleAttachments}>
+          {ATTACHMENTS_LABEL}
+        </Button>
         <Button size="sm" variant="ghost" onClick={toggleProperties}>
           Properties
         </Button>
@@ -425,6 +469,15 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
           baseRev={rev}
           onSaved={adoptPanelWrite}
         />
+      ) : null}
+
+      {/* Below the properties, because that is the order of the question it
+          answers: the block says which files the note has, and this puts one
+          of them in the body. Unmounted rather than hidden — unlike the editor
+          it holds no state worth keeping, and its `files:` reading is a
+          function of the props it is given each time. */}
+      {showAttachments && mode === "edit" ? (
+        <AttachmentsPanel frontmatter={frontmatter} body={body.text} onInsert={insertAtCursor} />
       ) : null}
 
       {/* Hidden rather than unmounted: the caret, the selection and the undo

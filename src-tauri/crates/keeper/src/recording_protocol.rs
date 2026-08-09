@@ -32,11 +32,19 @@
 //! folder pointing at `~/.ssh` passes every string test and fails here — and
 //! only a regular file is servable.
 //!
-//! **Only `kind: Video` is served.** The allow-list `keeper-note://` uses covers
-//! images, audio and PDFs too, but nothing in a note asks this scheme for those:
-//! the one consumer is the live-preview video player. A scheme that serves the
-//! narrowest set its caller needs is a smaller hole than one that serves
-//! everything it could.
+//! **Only the kinds a note renders inline are served.** Story 42.4 served
+//! `kind: Video` alone, because the one consumer was the live-preview video
+//! player. Story 43.5 gives that widget an `<img>` and an `<audio>` too, so the
+//! allow-list widens to `Video | Image | Audio` — and stops there. A
+//! `kind: File` is rendered as a chip carrying Reveal and Copy path, which
+//! open through the system, so nothing ever asks this scheme for its bytes and
+//! serving them would be a hole opened for no caller. `Folder` is not a file.
+//!
+//! What widened is the set of KINDS. The root did not move, the resolution is
+//! still a membership test against the session's own composed targets, and the
+//! canonicalizing containment check below still runs on every request — a
+//! `.png` symlinked out of the recordings root is refused exactly as a `.mov`
+//! always was, which is asserted rather than asserted-about.
 //!
 //! Everything below resolution — `Range` parsing, the 8 MiB slice cap, 200 / 206
 //! / 416 / 404, `Content-Type` from the extension allow-list, `nosniff` — is
@@ -120,32 +128,39 @@ fn serve(
     rel: &str,
     range: Option<String>,
 ) -> Response<Vec<u8>> {
-    let Some(path) = resolve_video(data_dir, destination_root, session_id, rel) else {
+    let Some(path) = resolve_servable(data_dir, destination_root, session_id, rel) else {
         // Logged without the path, for `note_protocol`'s reason: a refused
         // request is often a traversal attempt, and echoing it into the log is
         // how a log becomes a reflection surface. The session id is keeper's own
         // identifier and says nothing about the filesystem.
         tracing::debug!(
             session = %session_id,
-            "keeper-recording: no video target of this session answers to that path"
+            "keeper-recording: no servable target of this session answers to that path"
         );
         return note_protocol::not_found();
     };
     let Some(mimetype) = note_protocol::mime_for(rel) else {
-        // Unreachable while `is_video_name` and the allow-list agree, and kept
-        // because the day they stop agreeing this must be a 404 and not a file
-        // served with a guessed type.
+        // Unreachable while the kind tables and this allow-list agree — which
+        // `every_servable_kind_has_a_content_type` pins — and kept because the
+        // day they stop agreeing this must be a 404 and not a file served with
+        // a guessed type.
         tracing::debug!("keeper-recording: extension is not on the allow-list");
         return note_protocol::not_found();
     };
     note_protocol::read_response(&path, mimetype, range)
 }
 
-/// The absolute path of the session's video target named by `rel`, or `None`.
+/// The absolute path of the session's servable target named by `rel`, or
+/// `None`.
 ///
 /// The list comes from the index, so the folder is wherever it is now; the
 /// membership test is what makes this a *lookup* rather than a join (AD-65).
-fn resolve_video(
+///
+/// The kind test is the allow-list this scheme widened in Story 43.5, and it is
+/// stated as the three kinds served rather than as "not `File`, not `Folder`":
+/// a kind added to the vocabulary later must be opted IN to being served, not
+/// find itself served because nobody remembered to exclude it.
+fn resolve_servable(
     data_dir: &Path,
     destination_root: &Path,
     session_id: &str,
@@ -154,10 +169,21 @@ fn resolve_video(
     let targets = crate::ipc::recording_note_targets_in(data_dir, destination_root, session_id)
         .ok()
         .flatten()?;
-    let target = targets.iter().find(|target| {
-        target.kind == RecordingNoteTargetKind::Video && target.relative_path == rel
-    })?;
+    let target = targets
+        .iter()
+        .find(|target| is_servable(target.kind) && target.relative_path == rel)?;
     contained_read(destination_root, Path::new(&target.absolute_path))
+}
+
+/// Whether a note renders this kind inline, and therefore whether this scheme
+/// hands out its bytes (Story 43.5, AD-73).
+fn is_servable(kind: RecordingNoteTargetKind) -> bool {
+    matches!(
+        kind,
+        RecordingNoteTargetKind::Video
+            | RecordingNoteTargetKind::Image
+            | RecordingNoteTargetKind::Audio
+    )
 }
 
 /// The canonicalizing containment check, AD-59's rule applied to a root that has
@@ -188,7 +214,7 @@ fn contained_read(destination_root: &Path, absolute: &Path) -> Option<PathBuf> {
 /// both halves percent-decoded; a query or fragment is discarded, since this
 /// scheme has no parameters and a URL carrying some is being probed.
 ///
-/// The component refusals are belt and braces — `resolve_video` matches the path
+/// The component refusals are belt and braces — `resolve_servable` matches the path
 /// against a composed list and never joins it onto anything, so a `..` could not
 /// escape even if it arrived. They stay because a refusal with a legible reason
 /// beats a silent no-match, and because a NUL must not reach a `Path` on a
@@ -332,6 +358,141 @@ mod tests {
             contained_read(&root, &escape),
             None,
             "a symlink inside the root pointing out of it fails the canonical check"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Story 43.5: the kinds this scheme serves grew, and the set of extensions
+    /// `note_protocol` will name a `Content-Type` for did not. Those two lists
+    /// live in different crates and nothing but this test makes them agree —
+    /// a disagreement is a target the widget renders an element for and the
+    /// scheme then 404s, which is precisely the dead player 42.6 refuses.
+    #[test]
+    fn every_servable_kind_has_a_content_type() {
+        use keeper_core::archive::recordings_fts::{
+            kind_for_file_name, AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS,
+        };
+
+        for extension in VIDEO_EXTENSIONS
+            .iter()
+            .chain(IMAGE_EXTENSIONS.iter())
+            .chain(AUDIO_EXTENSIONS.iter())
+        {
+            let name = format!("a.{extension}");
+            assert!(
+                is_servable(kind_for_file_name(&name)),
+                "{name} is on a kind table but this scheme would not serve it"
+            );
+            assert!(
+                note_protocol::mime_for(&name).is_some(),
+                "{name} would be served with no Content-Type"
+            );
+        }
+
+        // The other direction is deliberately NOT symmetric: `.pdf` has a
+        // Content-Type and is still refused, because a PDF renders as a chip
+        // and no element ever requests its bytes.
+        assert!(note_protocol::mime_for("paper.pdf").is_some());
+        assert!(!is_servable(kind_for_file_name("paper.pdf")));
+        assert!(!is_servable(kind_for_file_name("manifest.json")));
+        assert!(!is_servable(RecordingNoteTargetKind::Folder));
+    }
+
+    /// Index one session at `2026/Session` into a real `archive.db` under
+    /// `data_dir`, which is all [`resolve_servable`] needs to place a folder.
+    fn index_session(data_dir: &Path, session_id: &str) {
+        let conn = keeper_core::archive::db::open_archive_db(data_dir).expect("open the archive");
+        let row = keeper_core::archive::RecordingRow {
+            session_id: session_id.to_owned(),
+            device_id: None,
+            relative_path: "2026/Session".to_owned(),
+            root_kind: "folder".to_owned(),
+            profile_id: None,
+            started_ts: Some(1_000),
+            ended_ts: Some(61_000),
+            title: Some("Session".to_owned()),
+            participants_json: None,
+            note: None,
+            tags_json: None,
+            custom_json: None,
+            codec: None,
+            width: None,
+            height: None,
+            fps: None,
+            durability: "local".to_owned(),
+            manifest_version: 1,
+        };
+        keeper_core::archive::recordings::upsert_recording(&conn, &row).expect("index the session");
+    }
+
+    /// Story 43.5, the one the widening could have broken: serving images and
+    /// audio widened the ALLOW-LIST and not the root.
+    ///
+    /// Asserted through [`resolve_servable`] rather than over
+    /// [`contained_read`] alone, because the containment check being correct in
+    /// isolation says nothing about whether the widened kind path still reaches
+    /// it. A `.png` symlinked out of the recordings root is a target the index
+    /// composes, the kind test now admits, and canonicalisation must still
+    /// refuse — and before Story 43.5 that path could not even be expressed,
+    /// because a `.png` was never servable in the first place.
+    #[test]
+    fn a_widened_kind_did_not_widen_the_root() {
+        let base = std::env::temp_dir().join(format!(
+            "keeper-recording-widened-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        ));
+        let data_dir = base.join("data");
+        let root = base.join("Movies");
+        let outside = base.join("elsewhere");
+        let folder = root.join("2026").join("Session");
+        std::fs::create_dir_all(&folder).expect("the session folder");
+        std::fs::create_dir_all(&outside).expect("a temp sibling");
+        std::fs::write(outside.join("secrets.png"), b"bytes").expect("a file outside the root");
+        for name in ["whiteboard.png", "room-tone.wav", "manifest.json"] {
+            std::fs::write(folder.join(name), b"bytes").expect("a session file");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("secrets.png"), folder.join("escape.png"))
+            .expect("a symlink out of the root");
+        index_session(&data_dir, "01DEVICE-01SESSION");
+
+        let resolve = |rel: &str| resolve_servable(&data_dir, &root, "01DEVICE-01SESSION", rel);
+
+        assert_eq!(
+            resolve("2026/Session/whiteboard.png"),
+            Some(
+                folder
+                    .join("whiteboard.png")
+                    .canonicalize()
+                    .expect("a real path")
+            ),
+            "an image inside the root is what the widening was for"
+        );
+        assert!(
+            resolve("2026/Session/room-tone.wav").is_some(),
+            "audio inside the root is servable too"
+        );
+        assert_eq!(
+            resolve("2026/Session/manifest.json"),
+            None,
+            "a chip's file is never streamed: nothing renders it, so nothing may fetch it"
+        );
+        assert_eq!(
+            resolve("2026/Session"),
+            None,
+            "the session folder is not a servable file"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            resolve("2026/Session/escape.png"),
+            None,
+            "an image symlinked out of the recordings root is refused after canonicalisation, \
+             exactly as a video always was"
         );
 
         let _ = std::fs::remove_dir_all(&base);

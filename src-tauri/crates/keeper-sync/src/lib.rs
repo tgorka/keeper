@@ -36,6 +36,7 @@
 //! * **An absent volume is never a deletion** ([`volume`]).
 
 pub mod backoff;
+pub mod browse;
 pub mod copy;
 pub mod credential;
 pub mod db;

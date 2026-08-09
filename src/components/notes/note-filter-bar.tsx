@@ -8,9 +8,11 @@
  * chips, origin, pinned — is the reason removing a chip is a muscle movement
  * rather than a search.
  *
- * **Tags intersect.** Two chips mean "both", and removing one WIDENS the result
- * rather than replacing it. Rust evaluates that; this component only composes
- * the chip set and never inspects a row.
+ * **Tag terms intersect, and a tag chip has three states** (Story 43.3). Off,
+ * include, exclude — cycled by pressing the chip, and told apart on sight by a
+ * `+`/`−` sign and a colour rather than by a tooltip. A control whose state you
+ * have to point at to discover is a control with one state. Rust evaluates the
+ * terms; this component only composes them and never inspects a row.
  *
  * **Nothing here is a navigation** (UX-DR41). Adding a chip that excludes the
  * open note leaves that note open and simply stops listing its row. The chips do
@@ -22,11 +24,17 @@
  * clicked once — and a filter you can build but not keep trains people not to
  * build filters.
  */
-import { Search, X } from "lucide-react";
+import { Minus, Plus, Search, X } from "lucide-react";
 import { type KeyboardEvent, type Ref, useId } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { notesFiltersStore, scopeLabel, useNotesFiltersStore } from "@/lib/stores/notes-filters";
+import {
+  notesFiltersStore,
+  scopeLabel,
+  type TagChip,
+  useNotesFiltersStore,
+} from "@/lib/stores/notes-filters";
+import { cn } from "@/lib/utils";
 
 /** The header caption under the search field, kept verbatim. */
 export const NOTES_SEARCH_POSTURE = "Searching the files, not an index";
@@ -62,6 +70,76 @@ function FilterChip({
   );
 }
 
+/**
+ * A tag chip: the sign says which of the three states it is in, the body cycles
+ * to the next one, and the `×` takes it straight to off (FR-148, UX-DR54).
+ *
+ * Three things carry the state, deliberately redundantly, because each of them
+ * fails for someone: the `+`/`−` glyph (invisible to a screen reader, so it is
+ * `aria-hidden`), the background colour (invisible to a colour-blind user, and
+ * to anyone in a hurry), and the accessible name, which spells the state and
+ * what pressing will do. None of them is a tooltip: a chip whose state you have
+ * to hover to learn has, in practice, one state.
+ *
+ * `aria-pressed` is not used. It has two values and this control has three, and
+ * a toggle button that reports `pressed=false` while actively excluding notes is
+ * worse than no ARIA state at all — so the state lives in the name, where it can
+ * be said exactly.
+ *
+ * Exported, and told what to do rather than reaching for the store, because the
+ * space editor (Story 43.4) renders the same control over a draft term list that
+ * is deliberately NOT the live filter — editing a space must not re-filter the
+ * list behind the dialog. A second copy of the chip would be a second copy of
+ * the three rules above, and the first one to rot would be the accessible name,
+ * which nobody looks at.
+ */
+export function TagFilterChip({
+  chip,
+  onCycle,
+  onRemove,
+}: {
+  chip: TagChip;
+  onCycle: (tag: string) => void;
+  onRemove: (tag: string) => void;
+}) {
+  const excluded = chip.term === "exclude";
+  const Sign = excluded ? Minus : Plus;
+  return (
+    <span
+      data-slot="filter-chip"
+      data-tag-term={chip.term}
+      className={cn(
+        "inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-xs",
+        excluded
+          ? "bg-destructive/15 text-destructive line-through decoration-destructive/60"
+          : "bg-accent text-accent-foreground",
+      )}
+    >
+      <button
+        type="button"
+        aria-label={
+          excluded
+            ? `Tag ${chip.tag}: excluded. Stop filtering by it.`
+            : `Tag ${chip.tag}: included. Exclude it instead.`
+        }
+        onClick={() => onCycle(chip.tag)}
+        className="inline-flex items-center gap-0.5 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <Sign aria-hidden="true" className="size-3" />
+        {chip.tag}
+      </button>
+      <button
+        type="button"
+        aria-label={`Clear tag ${chip.tag} filter`}
+        onClick={() => onRemove(chip.tag)}
+        className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <X aria-hidden="true" className="size-3" />
+      </button>
+    </span>
+  );
+}
+
 export function NoteFilterBar({
   onSaveAsSpace,
   searchRef,
@@ -72,7 +150,7 @@ export function NoteFilterBar({
   searchRef?: Ref<HTMLInputElement>;
 }) {
   const scope = useNotesFiltersStore((s) => s.scope);
-  const tags = useNotesFiltersStore((s) => s.tags);
+  const tagTerms = useNotesFiltersStore((s) => s.tagTerms);
   const text = useNotesFiltersStore((s) => s.text);
   const agentOnly = useNotesFiltersStore((s) => s.agentOnly);
   const pinnedOnly = useNotesFiltersStore((s) => s.pinnedOnly);
@@ -81,7 +159,7 @@ export function NoteFilterBar({
   // "Beyond scope" is the trigger, not "any chip": scoping to Pinned is
   // navigation-shaped and saving it as a space would just duplicate the row that
   // is already in the sidebar.
-  const savable = tags.length > 0 || agentOnly || pinnedOnly || text.trim() !== "";
+  const savable = tagTerms.length > 0 || agentOnly || pinnedOnly || text.trim() !== "";
 
   const onSearchKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     if (event.key !== "Escape") {
@@ -108,12 +186,12 @@ export function NoteFilterBar({
             onClear={() => notesFiltersStore.getState().setScope(scope)}
           />
         )}
-        {tags.map((tag) => (
-          <FilterChip
-            key={tag}
-            label={tag}
-            clearLabel={`Clear tag ${tag} filter`}
-            onClear={() => notesFiltersStore.getState().removeTag(tag)}
+        {tagTerms.map((chip) => (
+          <TagFilterChip
+            key={chip.tag}
+            chip={chip}
+            onCycle={(tag) => notesFiltersStore.getState().cycleTag(tag)}
+            onRemove={(tag) => notesFiltersStore.getState().removeTag(tag)}
           />
         ))}
         {agentOnly && (

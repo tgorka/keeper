@@ -12,8 +12,16 @@
  * query that silently widens is how a saved view becomes a data-loss story.
  *
  * Selecting a space is a filter (UX-DR41): the open note stays open.
+ *
+ * **A space can be edited** (Story 43.4). Every row carries a pencil beside it
+ * that opens {@link SpaceEditor}; the icon a space was given is drawn where a
+ * bare dot used to be, so a column of saved views is told apart by shape rather
+ * than by reading eight labels. A space with no icon, and a space whose stored
+ * icon is not in the set any more, both draw the fallback glyph — never a hole.
  */
-import { useEffect, useState } from "react";
+import { Pencil } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { SpaceEditor, spaceIcon } from "@/components/notes/space-editor";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSpaces } from "@/lib/ipc/client";
 import { notesFiltersStore, useNotesFiltersStore } from "@/lib/stores/notes-filters";
@@ -24,12 +32,13 @@ export const SPACE_BROKEN_SUBTITLE = "This space's query can't be read";
 
 export function SpaceList({ vaultId }: { vaultId: string | null }) {
   const [spaces, setSpaces] = useState<NoteSpaceVm[]>([]);
+  const [editing, setEditing] = useState<string | null>(null);
   const activeSpaceId = useNotesFiltersStore((s) => (s.scope.kind === "space" ? s.scope.id : null));
 
-  useEffect(() => {
+  const reload = useCallback(() => {
     if (vaultId === null) {
       setSpaces([]);
-      return;
+      return () => {};
     }
     let cancelled = false;
     void notesSpaces(vaultId)
@@ -46,9 +55,13 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
     };
   }, [vaultId]);
 
+  useEffect(reload, [reload]);
+
   if (spaces.length === 0) {
     return null;
   }
+
+  const edited = spaces.find((space) => space.id === editing) ?? null;
 
   return (
     <section aria-label="Spaces" className="flex shrink-0 flex-col px-2 pb-1">
@@ -59,8 +72,9 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
         {spaces.map((space) => {
           const broken = space.error !== null;
           const active = space.id === activeSpaceId;
+          const Glyph = spaceIcon(space.icon);
           return (
-            <li key={space.id}>
+            <li key={space.id} className="group flex items-start">
               <button
                 type="button"
                 aria-current={active ? "true" : undefined}
@@ -69,7 +83,7 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
                 // not a carrier on its own (UX-DR43).
                 aria-label={broken ? `${space.name}, ${SPACE_BROKEN_SUBTITLE}` : space.name}
                 className={cn(
-                  "flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left outline-none",
+                  "flex min-w-0 flex-1 items-start gap-2 rounded-md px-2 py-1.5 text-left outline-none",
                   "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
                   active ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
                 )}
@@ -87,6 +101,12 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
                     broken ? "bg-bridge-degraded" : "bg-transparent",
                   )}
                 />
+                <Glyph
+                  aria-hidden="true"
+                  data-slot="space-icon"
+                  data-space-icon={space.icon ?? "none"}
+                  className="mt-0.5 size-4 shrink-0 text-muted-foreground"
+                />
                 <span className="flex min-w-0 flex-col">
                   <span className="truncate text-sm">{space.name}</span>
                   {broken && (
@@ -96,10 +116,39 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
                   )}
                 </span>
               </button>
+              {/* Always in the DOM, revealed on hover or focus: an affordance
+                  that only exists under a pointer is one a keyboard cannot
+                  reach. */}
+              <button
+                type="button"
+                aria-label={`Edit space ${space.name}`}
+                onClick={() => setEditing(space.id)}
+                className={cn(
+                  "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
+                  "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
+                  "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                )}
+              >
+                <Pencil aria-hidden="true" className="size-3.5" />
+              </button>
             </li>
           );
         })}
       </ul>
+      {vaultId !== null && edited !== null && (
+        // Keyed on the space, so opening a second editor after the first seeds
+        // its form from the right space rather than from stale state.
+        <SpaceEditor
+          key={edited.id}
+          vaultId={vaultId}
+          space={edited}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null);
+            reload();
+          }}
+        />
+      )}
     </section>
   );
 }

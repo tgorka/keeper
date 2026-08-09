@@ -387,6 +387,38 @@ describe("SidebarPane sync entry (Story 32.5)", () => {
   });
 });
 
+describe("SidebarPane files entry (Story 43.8)", () => {
+  it("omits the Files entry entirely when the sync capability is off (the default)", () => {
+    renderSidebar();
+    // Where no folder can be synced there is nothing for a browser to browse,
+    // so the row is absent rather than empty (FR-153, AD-27).
+    expect(screen.queryByRole("button", { name: "Files" })).not.toBeInTheDocument();
+  });
+
+  it("places Files immediately after Sync, before Settings", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    renderSidebar();
+
+    const labels = screen
+      .getAllByRole("button")
+      .map((button) => button.textContent)
+      .filter((label) => label === "Sync" || label === "Files" || label === "Settings");
+    expect(labels).toEqual(["Sync", "Files", "Settings"]);
+  });
+
+  it("switches the primary view to files, leaving Sync unmarked", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+
+    expect(primaryViewStore.getState().view).toBe("files");
+    expect(screen.getByRole("button", { name: "Files" })).toHaveAttribute("aria-current", "page");
+    // The diagnostics pane is a sibling, not the same row.
+    expect(screen.getByRole("button", { name: "Sync" })).not.toHaveAttribute("aria-current");
+  });
+});
+
 describe("SidebarPane notes entry (Story 37.1)", () => {
   it("omits the Notes entry entirely when the notes capability is off", () => {
     renderSidebar();

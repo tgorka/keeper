@@ -1,25 +1,39 @@
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as IpcClient from "@/lib/ipc/client";
 import type { RecordingNoteTargetVm } from "@/lib/ipc/client";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { livePreview } from "./live-preview";
 import {
   RECORDING_ASSET_SCHEME,
+  RECORDING_EMBED_COPY_PATH_LABEL,
+  RECORDING_EMBED_REVEAL_LABEL,
   RecordingEmbedWidget,
   recordingAssetUrl,
-  releaseRecordingVideo,
+  releaseRecordingMedia,
   renderRecordingEmbedInto,
 } from "./recording-embed";
+import {
+  BACK_LABEL,
+  MAX_DRIFT_SECONDS,
+  MUTE_LABEL,
+  PLAY_LABEL,
+  SCRUB_LABEL,
+  SKIP_SECONDS,
+  VOLUME_LABEL,
+} from "./recording-transport";
 import { WIKILINK_ATTR } from "./wikilink";
 
 /** What the renderer's own widget — the one it constructs, with no seam for a
  *  test to inject through — reaches for. */
 const indexed = vi.fn<typeof IpcClient.recordingNoteTargets>();
+const revealed = vi.fn<typeof IpcClient.revealPath>();
 
 vi.mock("@/lib/ipc/client", async (importOriginal) => ({
   ...(await importOriginal<typeof IpcClient>()),
   recordingNoteTargets: (sessionId: string) => indexed(sessionId),
+  revealPath: (path: string) => revealed(path),
 }));
 
 const SESSION = "01KYH5DXGP1XQRHTME8CJFVEJ6-01KZHS7EJB5QKR8T9CHXQ46RNS";
@@ -30,18 +44,25 @@ const WRITTEN = "recordings/2026/2026-08-08 15.52 test";
 /** Where the index says the session is NOW: same files, renamed folder. */
 const FOUND = "recordings/2026/2026-08-08 15.52 pricing call";
 
+/** One target of each kind, as Rust composes them: a session folder holding a
+ *  video, an image, an audio sidecar and two files nothing can render. */
+function target(name: string, kind: RecordingNoteTargetVm["kind"]): RecordingNoteTargetVm {
+  return {
+    relativePath: `${FOUND}/${name}`,
+    absolutePath: `/Volumes/Rec/${FOUND}/${name}`,
+    kind,
+  };
+}
+
 const TARGETS: RecordingNoteTargetVm[] = [
   { relativePath: FOUND, absolutePath: `/Volumes/Rec/${FOUND}`, kind: "folder" },
-  {
-    relativePath: `${FOUND}/screen-0000.mov`,
-    absolutePath: `/Volumes/Rec/${FOUND}/screen-0000.mov`,
-    kind: "video",
-  },
-  {
-    relativePath: `${FOUND}/manifest.json`,
-    absolutePath: `/Volumes/Rec/${FOUND}/manifest.json`,
-    kind: "file",
-  },
+  target("screen-0000.mov", "video"),
+  target("whiteboard.png", "image"),
+  target("room-tone.wav", "audio"),
+  target("manifest.json", "file"),
+  // An extension keeper has never heard of. Rust classified it `file`, which is
+  // the whole point of the catch-all: it is an attachment, not a broken player.
+  target("board.sketchpad", "file"),
 ];
 
 /** A host holding the link the widget renders before it resolves anything. */
@@ -55,6 +76,22 @@ function host(target: string): HTMLElement {
   node.append(anchor);
   return node;
 }
+
+/** Reveal is gated on the platform having a file manager, so every test states
+ *  which platform it is on rather than inheriting the last one's. */
+beforeEach(() => {
+  revealed.mockReset();
+  revealed.mockResolvedValue(undefined);
+  // jsdom lacks a clipboard by default.
+  Object.assign(navigator, { clipboard: { writeText: vi.fn(() => Promise.resolve()) } });
+  capabilitiesStore
+    .getState()
+    .applySnapshot({ ...DEFAULT_CAPABILITIES, revealInFileManager: true });
+});
+
+afterEach(() => {
+  capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+});
 
 describe("recordingAssetUrl", () => {
   it("escapes each segment and keeps the separators, so a space cannot end the path", () => {
@@ -85,15 +122,155 @@ describe("renderRecordingEmbedInto", () => {
     expect(node.querySelector(`[${WIKILINK_ATTR}]`)).toBeNull();
   });
 
-  it("leaves manifest.json the link it was — a target is not the same as a playable one", async () => {
-    const node = host(`${WRITTEN}/manifest.json`);
-
-    await renderRecordingEmbedInto(node, SESSION, `${WRITTEN}/manifest.json`, {
+  /** Render one of the session's files into a fresh host and hand it back. */
+  async function render(name: string): Promise<HTMLElement> {
+    const node = host(`${WRITTEN}/${name}`);
+    await renderRecordingEmbedInto(node, SESSION, `${WRITTEN}/${name}`, {
       load: async () => TARGETS,
     });
+    return node;
+  }
 
-    expect(node.querySelector("video")).toBeNull();
-    expect(node.querySelector(`[${WIKILINK_ATTR}]`)?.textContent).toBe(`${WRITTEN}/manifest.json`);
+  /**
+   * Every element the widget can produce. A kind's test asserts its own element
+   * is there AND that every other one is absent, because the failure this story
+   * is most exposed to is a branch that falls through to the wrong medium — an
+   * `<audio>` for a photo, a `<video>` for a `.zip`.
+   */
+  const ELEMENTS = ["video", "img", "audio", ".cm-lp-recording-chip"] as const;
+
+  it.each([
+    ["screen-0000.mov", "video"],
+    ["whiteboard.png", "img"],
+    ["room-tone.wav", "audio"],
+    ["manifest.json", ".cm-lp-recording-chip"],
+  ] as const)("renders %s as %s and as nothing else", async (name, expected) => {
+    const node = await render(name);
+
+    expect(node.querySelector(expected)).not.toBeNull();
+    for (const other of ELEMENTS.filter((element) => element !== expected)) {
+      expect(node.querySelector(other)).toBeNull();
+    }
+    // Whichever element it is, it replaced the link rather than joining it.
+    expect(node.querySelector(`[${WIKILINK_ATTR}]`)).toBeNull();
+  });
+
+  it("shows an image without fetching it before it is scrolled to", async () => {
+    const node = await render("whiteboard.png");
+
+    const image = node.querySelector("img") as HTMLImageElement;
+    expect(image.loading).toBe("lazy");
+    // The file name, never an empty alt: an embedded photo of a whiteboard is
+    // content, and content announced as decorative is content lost.
+    expect(image.alt).toBe("whiteboard.png");
+    expect(image.getAttribute("src")).toBe(recordingAssetUrl(SESSION, `${FOUND}/whiteboard.png`));
+  });
+
+  it("plays audio with controls and no preload, exactly as it plays video", async () => {
+    const node = await render("room-tone.wav");
+
+    const player = node.querySelector("audio") as HTMLAudioElement;
+    expect(player.controls).toBe(true);
+    expect(player.preload).toBe("metadata");
+    expect(player.autoplay).toBe(false);
+    expect(player.getAttribute("aria-label")).toBe("room-tone.wav");
+  });
+
+  it("makes an extension keeper has never seen a chip, never a broken player", async () => {
+    const node = await render("board.sketchpad");
+
+    const chip = node.querySelector(".cm-lp-recording-chip");
+    expect(chip).not.toBeNull();
+    expect(node.querySelector("video, audio, img")).toBeNull();
+    // The name is on screen; the absolute path is not, anywhere (FR-145).
+    expect(chip?.querySelector(".cm-lp-recording-chip-name")?.textContent).toBe("board.sketchpad");
+    expect(node.textContent).not.toContain("/Volumes/Rec");
+  });
+
+  it("reveals and copies the absolute path from a chip's own actions", async () => {
+    const node = await render("manifest.json");
+
+    const reveal = node.querySelector<HTMLButtonElement>(
+      `[aria-label="${RECORDING_EMBED_REVEAL_LABEL} manifest.json"]`,
+    );
+    const copy = node.querySelector<HTMLButtonElement>(
+      `[aria-label="${RECORDING_EMBED_COPY_PATH_LABEL} manifest.json"]`,
+    );
+    expect(reveal).not.toBeNull();
+    expect(copy).not.toBeNull();
+
+    reveal?.click();
+    copy?.click();
+
+    // The absolute path, composed in Rust — the argument of an action, never
+    // the note's text and never on screen.
+    expect(revealed).toHaveBeenCalledWith(`/Volumes/Rec/${FOUND}/manifest.json`);
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+      `/Volumes/Rec/${FOUND}/manifest.json`,
+    );
+  });
+
+  it("offers no Reveal on a platform with no file manager, and still copies", async () => {
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, revealInFileManager: false });
+
+    const node = await render("manifest.json");
+
+    // Absent, not disabled: an affordance that cannot work is worse than none.
+    expect(
+      node.querySelector(`[aria-label="${RECORDING_EMBED_REVEAL_LABEL} manifest.json"]`),
+    ).toBeNull();
+    expect(
+      node.querySelector(`[aria-label="${RECORDING_EMBED_COPY_PATH_LABEL} manifest.json"]`),
+    ).not.toBeNull();
+  });
+
+  it("keeps a chip's actions clickable by claiming their events from CodeMirror", async () => {
+    const widget = new RecordingEmbedWidget(
+      SESSION,
+      `${WRITTEN}/manifest.json`,
+      `${WRITTEN}/manifest.json`,
+      { load: async () => TARGETS },
+    );
+    const dom = widget.toDOM();
+    await vi.waitFor(() => expect(dom.querySelector("button")).not.toBeNull());
+    const button = dom.querySelector("button") as HTMLButtonElement;
+    const name = dom.querySelector(".cm-lp-recording-chip-name") as HTMLElement;
+
+    // A claimed event is one CodeMirror runs no handler for, so the caret stays
+    // put and the line keeps its decorations — without which pressing Copy path
+    // would un-render the chip instead of copying.
+    expect(widget.ignoreEvent({ target: button } as unknown as Event)).toBe(true);
+    // The chip's own name is not a control and behaves like the link it stands
+    // for: clicking it reveals the source.
+    expect(widget.ignoreEvent({ target: name } as unknown as Event)).toBe(false);
+  });
+
+  it("puts the link back when an image or an audio track cannot load", async () => {
+    for (const [name, selector] of [
+      ["whiteboard.png", "img"],
+      ["room-tone.wav", "audio"],
+    ] as const) {
+      const node = await render(name);
+      const element = node.querySelector(selector) as HTMLElement;
+
+      element.dispatchEvent(new Event("error"));
+
+      expect(node.querySelector(selector)).toBeNull();
+      expect(node.querySelector(`[${WIKILINK_ATTR}]`)?.textContent).toBe(`${WRITTEN}/${name}`);
+    }
+  });
+
+  it("leaves an embed of the session folder the link it was", async () => {
+    const folderName = "2026-08-08 15.52 pricing call";
+    const node = host(folderName);
+
+    await renderRecordingEmbedInto(node, SESSION, folderName, { load: async () => TARGETS });
+
+    // A directory is a target, and there is no element for a directory.
+    expect(node.querySelector("video, audio, img, .cm-lp-recording-chip")).toBeNull();
+    expect(node.querySelector(`[${WIKILINK_ATTR}]`)?.textContent).toBe(folderName);
   });
 
   it("degrades to the link when the session names no such file", async () => {
@@ -261,11 +438,11 @@ describe("RecordingEmbedWidget", () => {
   });
 });
 
-describe("releaseRecordingVideo", () => {
-  it("does nothing to a host that never got a player", () => {
+describe("releaseRecordingMedia", () => {
+  it("does nothing to a host that never got a media element", () => {
     const node = host("a/clip.mov");
 
-    releaseRecordingVideo(node);
+    releaseRecordingMedia(node);
 
     expect(node.querySelector(`[${WIKILINK_ATTR}]`)).not.toBeNull();
   });
@@ -370,17 +547,240 @@ describe("livePreview, over a recording note", () => {
     view.destroy();
   });
 
-  it("degrades an embed of the manifest to the link, inside the real editor", async () => {
+  it("turns an embed of the manifest into a chip, inside the real editor", async () => {
     // Off the first line: the caret starts at 0, and a line under the caret
     // shows its source instead of its decorations (UX-DR40).
     const view = open(`intro\n\n![[${WRITTEN}/manifest.json]]\n`, SESSION);
 
     await settle();
-    expect(view.contentDOM.querySelector("video")).toBeNull();
-    expect(view.contentDOM.querySelector(`[${WIKILINK_ATTR}]`)?.textContent).toBe(
-      `${WRITTEN}/manifest.json`,
-    );
+    // Scoped to the widget's own host: CodeMirror pads a block widget with its
+    // own `img.cm-widgetBuffer`, which is the editor's furniture and not ours.
+    const embed = view.contentDOM.querySelector(".cm-lp-recording") as HTMLElement;
+    // Not a player, and not a bare line of text either: an attachment keeper
+    // cannot render is still an attachment.
+    expect(embed.querySelector("video, audio, img")).toBeNull();
+    const chip = embed.querySelector(".cm-lp-recording-chip");
+    expect(chip?.querySelector(".cm-lp-recording-chip-name")?.textContent).toBe("manifest.json");
+    expect(
+      chip?.querySelector(`[aria-label="${RECORDING_EMBED_COPY_PATH_LABEL} manifest.json"]`),
+    ).not.toBeNull();
 
     view.destroy();
+  });
+
+  /**
+   * The impure shell, as far as it goes on this machine.
+   *
+   * Everything below drives REAL `<video>` elements, created by the real
+   * widget, inside a real `EditorView`, through the real decoration layer — the
+   * seam where the two embeds have to find each other. What jsdom will not do
+   * is play: `play()` and `pause()` are stubbed because jsdom's raise "not
+   * implemented", and `seeking`/`seeked`/`timeupdate` are dispatched by hand
+   * because jsdom's media elements never fire them. So what is proved here is
+   * the wiring and the reaction, not that two `.mov` files decode in step.
+   */
+  describe("two videos of one session", () => {
+    /** The same session, now with a camera track beside the screen track. */
+    const PAIRED = [...TARGETS, target("camera-0000.mov", "video")];
+
+    const SCREEN = `${WRITTEN}/screen-0000.mov`;
+    const CAMERA = `${WRITTEN}/camera-0000.mov`;
+
+    // jsdom's own `play()` and `pause()` raise "not implemented", so the two
+    // calls the transport makes are stubbed. Which elements were asked is the
+    // assertion; what a decoder would have done with the answer is not
+    // reachable here or on any machine running this suite.
+    const played = vi.fn<() => Promise<void>>();
+
+    beforeEach(() => {
+      indexed.mockResolvedValue(PAIRED);
+      played.mockReset();
+      played.mockResolvedValue(undefined);
+      vi.spyOn(HTMLMediaElement.prototype, "play").mockImplementation(played);
+      vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    /** Both embeds, off the first line so neither sits under the caret. */
+    function openPair(): EditorView {
+      return open(`intro\n\n![[${SCREEN}]]\n\n![[${CAMERA}]]\n`, SESSION);
+    }
+
+    function videosOf(view: EditorView): HTMLVideoElement[] {
+      return Array.from(view.contentDOM.querySelectorAll("video"));
+    }
+
+    /** jsdom raises no `seeked` of its own, so the platform's confirmation is
+     *  supplied here — without it the transport correctly stays "seeking". */
+    function confirmSeeks(view: EditorView): void {
+      for (const video of videosOf(view)) {
+        video.dispatchEvent(new Event("seeked"));
+      }
+    }
+
+    /**
+     * Report a duration from real `<video>` elements.
+     *
+     * jsdom decodes nothing, so `duration` is `NaN` forever and the transport
+     * correctly disables a scrub bar for a pair with no span. The span has to
+     * come from somewhere for the scrub to be exercised at all, and this is the
+     * smallest lie that lets the real elements be driven.
+     */
+    function measure(view: EditorView, seconds: number): void {
+      for (const video of videosOf(view)) {
+        Object.defineProperty(video, "duration", { configurable: true, value: seconds });
+        video.dispatchEvent(new Event("durationchange"));
+      }
+    }
+
+    it("puts both players under one transport and takes their own controls away", async () => {
+      const view = openPair();
+      await settle();
+
+      const videos = videosOf(view);
+      expect(videos).toHaveLength(2);
+      // A native transport carries its own scrub bar, and a second scrub bar is
+      // a second clock.
+      expect(videos.map((video) => video.controls)).toEqual([false, false]);
+      expect(view.contentDOM.querySelectorAll(".cm-lp-recording-transport")).toHaveLength(1);
+      // Under the first embed in the note, and inside that widget's own host.
+      const bar = view.contentDOM.querySelector(".cm-lp-recording-transport");
+      expect(bar?.parentElement?.contains(videos[0])).toBe(true);
+      // Volume and mute stayed per track: two mixers, one beside each video.
+      expect(view.contentDOM.querySelectorAll(".cm-lp-recording-mix")).toHaveLength(2);
+
+      view.destroy();
+    });
+
+    it("plays, scrubs and skips both real players from the one bar", async () => {
+      const view = openPair();
+      await settle();
+      const videos = videosOf(view);
+      measure(view, 120);
+      const bar = view.contentDOM.querySelector(".cm-lp-recording-transport") as HTMLElement;
+
+      bar.querySelector<HTMLButtonElement>(`[aria-label="${PLAY_LABEL}"]`)?.click();
+      await settle();
+
+      // `play()` on BOTH — the promise `allSettled` waits on is per element.
+      expect(played).toHaveBeenCalledTimes(2);
+
+      const scrub = bar.querySelector<HTMLInputElement>(`[aria-label="${SCRUB_LABEL}"]`);
+      if (scrub === null) {
+        throw new Error("the transport has no scrub bar");
+      }
+      scrub.value = "40";
+      scrub.dispatchEvent(new Event("input"));
+
+      expect(videos.map((video) => video.currentTime)).toEqual([40, 40]);
+
+      confirmSeeks(view);
+      bar.querySelector<HTMLButtonElement>(`[aria-label="${BACK_LABEL}"]`)?.click();
+
+      expect(videos.map((video) => video.currentTime)).toEqual([
+        40 - SKIP_SECONDS,
+        40 - SKIP_SECONDS,
+      ]);
+
+      view.destroy();
+    });
+
+    it("mutes one real player and leaves the other audible", async () => {
+      const view = openPair();
+      await settle();
+      const videos = videosOf(view);
+
+      view.contentDOM
+        .querySelector<HTMLButtonElement>(`[aria-label="${MUTE_LABEL} camera-0000.mov"]`)
+        ?.click();
+
+      expect(videos[1].muted).toBe(true);
+      expect(videos[0].muted).toBe(false);
+
+      view.destroy();
+    });
+
+    it("turns one real player down and leaves the other where it was", async () => {
+      const view = openPair();
+      await settle();
+      const videos = videosOf(view);
+      const volume = view.contentDOM.querySelector<HTMLInputElement>(
+        `[aria-label="${VOLUME_LABEL} screen-0000.mov"]`,
+      );
+      if (volume === null) {
+        throw new Error("the screen track has no volume control");
+      }
+
+      volume.value = "0.25";
+      volume.dispatchEvent(new Event("input"));
+
+      // Turning the screen recording down under the camera is a MIXING
+      // decision, and the one thing a two-view recording actually needs. It is
+      // the only control the transport deliberately did not centralise.
+      expect(videos[0].volume).toBe(0.25);
+      expect(videos[1].volume).toBe(1);
+
+      view.destroy();
+    });
+
+    it("claims the transport's slider events, so a drag cannot un-render the slider", async () => {
+      const view = openPair();
+      await settle();
+      const scrub = view.contentDOM.querySelector(`input[aria-label="${SCRUB_LABEL}"]`);
+      const widget = new RecordingEmbedWidget(SESSION, SCREEN, SCREEN);
+
+      // A claimed event is one CodeMirror runs no handler for. Letting a
+      // `mousedown` on the scrub bar through would reveal the line, a revealed
+      // line drops its decorations, and the reader's drag would destroy the
+      // control mid-gesture.
+      expect(widget.ignoreEvent({ target: scrub } as unknown as Event)).toBe(true);
+
+      view.destroy();
+    });
+
+    it("corrects a real player that drifted past the threshold", async () => {
+      const view = openPair();
+      await settle();
+      const videos = videosOf(view);
+
+      // Two real `<video>` elements whose clocks disagree. Assigning
+      // `currentTime` is all the drift there is: neither element announces it,
+      // which is exactly why nothing but the transport can notice.
+      videos[1].currentTime = 12 + MAX_DRIFT_SECONDS + 0.5;
+      videos[0].currentTime = 12;
+      // A real webview would have confirmed those two assignments with
+      // `seeked`; jsdom raises nothing, so the confirmation is supplied here.
+      // Without it the transport would correctly refuse to trust either clock.
+      confirmSeeks(view);
+      videos[0].dispatchEvent(new Event("timeupdate"));
+
+      expect(videos[0].currentTime).toBe(12);
+      expect(videos[1].currentTime).toBe(12);
+
+      view.destroy();
+    });
+
+    it("gives the remaining player its own controls back when an embed is deleted", async () => {
+      const view = openPair();
+      await settle();
+      expect(videosOf(view)).toHaveLength(2);
+
+      // The author deletes the camera embed. The pair is a single video again,
+      // and a single video is the platform's job.
+      const line = view.state.doc.line(5);
+      view.dispatch({ changes: { from: line.from, to: line.to, insert: "" } });
+      await settle();
+
+      const videos = videosOf(view);
+      expect(videos).toHaveLength(1);
+      expect(videos[0].controls).toBe(true);
+      expect(view.contentDOM.querySelector(".cm-lp-recording-transport")).toBeNull();
+      expect(view.contentDOM.querySelector(".cm-lp-recording-mix")).toBeNull();
+
+      view.destroy();
+    });
   });
 });

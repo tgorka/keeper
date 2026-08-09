@@ -29,6 +29,7 @@ import {
 } from "@codemirror/view";
 import { MermaidWidget } from "./mermaid-widget";
 import { RecordingEmbedWidget } from "./recording-embed";
+import { transportFor } from "./recording-transport";
 import { WIKILINK, WIKILINK_ATTR } from "./wikilink";
 
 /** How long an externally applied change stays highlighted. */
@@ -252,7 +253,12 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
             if (sessionId !== null) {
               decorations.push(
                 Decoration.replace({
-                  widget: new RecordingEmbedWidget(sessionId, target, label),
+                  widget: new RecordingEmbedWidget(sessionId, target, label, {
+                    // Scoped to this view: two editors open on one note are two
+                    // readers, and one pressing play must not move the other's
+                    // video (Story 43.6).
+                    transport: transportFor(view, sessionId),
+                  }),
                 }).range(start, end),
               );
               continue;
@@ -384,15 +390,76 @@ const livePreviewTheme = EditorView.baseTheme({
   },
   ".cm-lp-image img": { maxWidth: "100%", borderRadius: "4px" },
   // The host stays inline so an unresolved embed sits in its sentence like the
-  // link it still is; the player itself goes block, because a video wedged into
-  // a line of prose is neither readable nor watchable.
-  ".cm-lp-recording-player": {
+  // link it still is; a rendered video or image goes block, because either one
+  // wedged into a line of prose is neither readable nor watchable. Audio does
+  // too: a native transport bar is a couple of hundred pixels wide and its own
+  // paragraph either way (Story 42.4, widened by Story 43.5).
+  ".cm-lp-recording-player, .cm-lp-recording-image": {
     display: "block",
     maxWidth: "100%",
     maxHeight: "60vh",
     borderRadius: "4px",
     backgroundColor: "var(--muted)",
   },
+  ".cm-lp-recording-audio": { display: "block", width: "100%", maxWidth: "24rem" },
+  // The chip stays INLINE, unlike the three that render: it is a reference to a
+  // file, closer to the link it replaced than to a player, and a block-level
+  // box for `manifest.json` would shout louder than the recording above it.
+  ".cm-lp-recording-chip": {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "0.375em",
+    padding: "0.1em 0.5em",
+    borderRadius: "4px",
+    border: "1px solid var(--border)",
+    backgroundColor: "var(--muted)",
+    fontSize: "0.9em",
+  },
+  ".cm-lp-recording-chip-name": {
+    fontFamily: "var(--font-mono, ui-monospace, monospace)",
+  },
+  ".cm-lp-recording-chip-action": {
+    color: "var(--primary)",
+    cursor: "pointer",
+    // The two actions are text, not icons: this module has no icon set that is
+    // not React, and a labelled control is legible to everyone anyway.
+    textDecoration: "underline",
+  },
+  // The shared transport of a session's videos (Story 43.6). Block, and full
+  // width under the leading track, because it is the pair's one clock and a bar
+  // that looked like it belonged to the video above it would be read as that
+  // video's own controls.
+  ".cm-lp-recording-transport": {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.5em",
+    padding: "0.25em 0",
+    fontSize: "0.9em",
+  },
+  ".cm-lp-recording-transport-toggle, .cm-lp-recording-transport-skip": {
+    color: "var(--primary)",
+    cursor: "pointer",
+  },
+  ".cm-lp-recording-scrub": { flex: "1 1 auto", minWidth: "6rem" },
+  ".cm-lp-recording-time": {
+    fontFamily: "var(--font-mono, ui-monospace, monospace)",
+    color: "var(--muted-foreground)",
+    // Tabular figures would still reflow as the minutes tick over in a
+    // proportional fallback, and a readout that shifts the scrub bar sideways
+    // once a second is unusable.
+    fontVariantNumeric: "tabular-nums",
+  },
+  ".cm-lp-recording-transport-status": { color: "var(--muted-foreground)" },
+  // Volume and mute stay per track, so the mixer sits with its own video rather
+  // than on the shared bar (UX-DR53).
+  ".cm-lp-recording-mix": {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.5em",
+    fontSize: "0.85em",
+  },
+  ".cm-lp-recording-mix-mute": { color: "var(--primary)", cursor: "pointer" },
+  ".cm-lp-recording-mix-volume": { width: "6rem" },
   ".cm-lp-image-missing, .cm-mermaid-error-message": {
     color: "var(--muted-foreground)",
     fontSize: "0.85em",

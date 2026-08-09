@@ -24,8 +24,12 @@
 //! never cross IPC at all — [`NoteAttachmentVm`] carries a URL for the custom
 //! protocol to serve.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
+
+use crate::notes::index::NoteTagTerm;
 
 /// One notes-flagged sync profile, with its index state (FR-94, FR-95).
 ///
@@ -208,9 +212,64 @@ pub struct NoteSpaceVm {
     pub sort: String,
     /// Maximum rows the space yields.
     pub limit: u32,
+    /// The icon the sidebar draws for this space, as the name of one member of
+    /// the fixed set the editor offers (FR-149, UX-DR55). `None` for a space
+    /// nobody has given one, and — deliberately — also the spelling for a space
+    /// whose stored name is not in that set any more: the *name* survives on
+    /// disk untouched, because keeper rewriting an icon it did not recognise is
+    /// the same class of mistake as rewriting a query term it could not parse.
+    pub icon: Option<String>,
     /// The parse failure, when the stored query does not parse. A broken space
     /// matches nothing and says so; it never falls back to matching everything.
     pub error: Option<String>,
+}
+
+/// One tag term of a space's query, in the shape the three-state chip holds
+/// (Story 43.3's `TagChip`, field for field).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteSpaceTagVm {
+    /// The tag, already read through the one vocabulary (Story 42.5).
+    pub tag: String,
+    pub term: NoteTagTerm,
+}
+
+/// A space's stored query said in the vocabulary the editor's controls speak,
+/// or the reason it cannot be (FR-149, UX-DR55).
+///
+/// Two variants rather than one struct with a residue list, because the residue
+/// is not extra information about an editable query — it is the fact that the
+/// query is **not** editable through chips. A struct carrying both would let a
+/// caller render three chips out of a four-term query and save it, which is
+/// exactly the silent term-dropping this story exists to refuse. Here that call
+/// site does not compile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum NoteSpaceTermsVm {
+    /// Every term of the query, and the chip vocabulary holds all of them.
+    Chips {
+        /// Tag terms in the order the query wrote them — the order the chip bar
+        /// will show, so an edited space keeps the shape its author gave it.
+        tags: Vec<NoteSpaceTagVm>,
+        /// `is:` flags, verbatim as written. The editor shows them and does not
+        /// let them be cycled (this story widens tags, not lenses), so they are
+        /// carried only so that re-emitting the query cannot lose them.
+        flags: Vec<String>,
+        /// `origin:`'s value, verbatim.
+        origin: Option<String>,
+        /// `text:`'s needle, unquoted — the editor re-quotes it on the way out.
+        text: Option<String>,
+    },
+    /// At least one term is outside the chip vocabulary, so no chip may claim to
+    /// stand for this query. `terms` is the offending source text, verbatim, for
+    /// a surface that has to name what it will not touch.
+    Unrepresentable { terms: Vec<String> },
 }
 
 /// The result of parsing a query without running it — the live underline while
@@ -497,8 +556,16 @@ pub struct NoteIndexProgressVm {
 pub struct NoteQueryReq {
     /// Free text; `None` for no text filter.
     pub text: Option<String>,
-    /// Tag chips, ANDed together.
-    pub tags: Vec<String>,
+    /// The tag chips, keyed by tag and ANDed together (FR-148, UX-DR54).
+    ///
+    /// A map rather than an include list beside an exclude list, because the
+    /// chip that produces these has three states and a tag is in exactly one of
+    /// them: keyed by tag, "include and exclude the same tag" is a request that
+    /// cannot be written down rather than one
+    /// [`IndexEntry::matches_tags`](crate::notes::index::IndexEntry::matches_tags)
+    /// has to resolve by precedence. An off chip is an absent key — a term that
+    /// admits everything has no business on the wire.
+    pub tags: BTreeMap<String, NoteTagTerm>,
     /// When set, the space whose query further narrows the result.
     pub space_id: Option<String>,
     /// `local` | `agent` | `remote` | `device:<label>`.
@@ -534,17 +601,30 @@ pub struct NoteSearchReq {
     pub limit: u32,
 }
 
-/// Create or update a space (FR-105).
+/// Create or update a space (FR-105, FR-149).
+///
+/// A complete description of the space, not a patch: an update rewrites the
+/// definition wholesale, so a caller that omits a field is saying "this space
+/// has none" rather than "leave it alone". That is the opposite of
+/// [`NoteVaultSettingsReq`]'s rule and it is deliberate — a space is four
+/// values on one form, all of them on screen at once, so "absent means
+/// unchanged" would only be a way for a stale form to resurrect a term the
+/// user deleted.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct NoteSpaceReq {
     /// The space note's id when updating; `None` creates one.
     pub id: Option<String>,
+    /// The space's name. On an update this retitles the note and renames its
+    /// file, so it is the one field here that touches bytes outside the
+    /// `keeper:` key.
     pub name: String,
     pub query: String,
     pub sort: String,
     pub limit: u32,
+    /// The chosen icon's name, or `None` to leave the space without one.
+    pub icon: Option<String>,
 }
 
 /// Change a vault's settings (FR-120).

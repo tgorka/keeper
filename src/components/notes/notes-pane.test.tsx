@@ -88,14 +88,17 @@ let activeVault = "vault-a";
 let vaultList: NoteVaultVm[] = [VAULT_A, VAULT_B];
 
 /**
- * The predicate `notes_list` applies: tags intersect, text is a substring, and
- * every requested flag must be one the entry carries. No row here carries any
- * flag but `recording`, exactly as `has_flag` would report.
+ * The predicate `notes_list` applies: tag terms intersect — every `include`
+ * present, every `exclude` absent — text is a substring, and every requested
+ * flag must be one the entry carries. No row here carries any flag but
+ * `recording`, exactly as `has_flag` would report.
  */
 function evaluate(vaultId: string, query: NoteQueryReq): NoteListVm {
   const rows = (contents[vaultId] ?? []).filter((candidate) => {
-    if (!query.tags.every((tag) => candidate.tags.includes(tag))) {
-      return false;
+    for (const [tag, term] of Object.entries(query.tags)) {
+      if (candidate.tags.includes(tag) !== (term === "include")) {
+        return false;
+      }
     }
     if (query.text !== null && !candidate.title.toLowerCase().includes(query.text.toLowerCase())) {
       return false;

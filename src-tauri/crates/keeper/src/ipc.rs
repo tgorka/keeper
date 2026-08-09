@@ -16376,8 +16376,14 @@ mod tests {
         assert_eq!(fm.as_string("participants"), Some("Ada, Grace"));
         assert_eq!(
             fm.as_list("tags"),
-            Some(vec!["standup".to_owned(), "eng".to_owned()]),
-            "tags are carried as stored — 42.5 owns resolving them"
+            Some(vec![
+                "standup".to_owned(),
+                "eng".to_owned(),
+                "recordings".to_owned()
+            ]),
+            "the session's own tags are carried as stored and keep their order — 42.5 owns \
+             resolving them — and story 43.2 appends the one keeper owns, last, because the \
+             head of a truncated property row should be the tag the writer chose"
         );
         assert_eq!(
             fm.as_string("session"),

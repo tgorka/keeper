@@ -12,8 +12,10 @@
 
 use std::sync::Arc;
 
-use keeper_core::vm::{IpcError, IpcErrorCode};
+use keeper_core::vm::{FilesEntryVm, FilesListingState, FilesListingVm, IpcError, IpcErrorCode};
+use keeper_sync::browse;
 use keeper_sync::engine::{PendingReason, SyncOutcome};
+use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::profile::{
     LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_RECORDINGS_SUBFOLDER, DEFAULT_SETTLE_MS,
@@ -1446,6 +1448,188 @@ pub async fn sync_unsubscribe_progress(
     let engine = engine_of(&state)?;
     engine.unsubscribe(id);
     Ok(())
+}
+
+/// One directory of one synced folder, for the Files tab (Story 43.8, FR-153,
+/// AD-74, AD-75, AD-65).
+///
+/// **Listing is the shell's job, and this is the only place it is done.** The
+/// frontend hands back a `subpath` this command previously produced and never
+/// composes one; `keeper_sync::browse` resolves it against the profile's own
+/// root, refuses anything that is not a plain descendant of it — lexically and
+/// again after symlinks are followed — and applies the profile's tier-0
+/// exclusions. A webview that asked for `../../.ssh` would have to have
+/// persuaded the engine to store a profile pointing there first.
+///
+/// **Lazy, one directory per call.** These trees hold a hundred thousand files.
+/// Nothing here descends, and the cap is reported rather than hidden.
+///
+/// **Read-only about the engine, not only about the disk.** `browse` takes a
+/// `&SyncProfile` and not the engine, so looking at a folder cannot spend the
+/// stability gate's verdict, clear `file_state`, move the scan clock or wake
+/// the watcher. The listing runs on the blocking pool because a directory on a
+/// pendrive can take hundreds of milliseconds to stat, and stalling the async
+/// runtime would freeze every other profile's poll behind a click.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a malformed
+/// profile exclude pattern, a subpath that escapes the root, an unreadable
+/// directory).
+#[tauri::command]
+pub async fn sync_browse(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<FilesListingVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    let profile = find_profile(&profiles, &id)?.clone();
+    let excludes = ExcludeSet::new(&profile.excludes).map_err(|e| sync_ipc_error(&e))?;
+
+    let listing = {
+        let profile = profile.clone();
+        let subpath = subpath.clone();
+        tokio::task::spawn_blocking(move || browse::browse(&profile, &subpath, &excludes))
+            .await
+            .map_err(|err| open_failure(format!("could not read the folder: {err}")))?
+    }
+    .map_err(|refusal| open_failure(refusal.to_string()))?;
+
+    Ok(files_listing_vm(&profile, subpath, listing))
+}
+
+/// Project one [`BrowseListing`] into the VM the Files tab renders.
+///
+/// The `entries`/`state` pairing is the contract the surface depends on:
+/// `Some` only under [`FilesListingState::Listed`], so a pane cannot render
+/// "this folder is empty" for a drive that is out without first unwrapping and
+/// meeting the state that says otherwise.
+fn files_listing_vm(
+    profile: &SyncProfile,
+    subpath: String,
+    listing: browse::BrowseListing,
+) -> FilesListingVm {
+    let (state, entries, detail, truncated) = match listing {
+        browse::BrowseListing::Listed(dir) => {
+            let entries = dir
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    FilesEntryVm::new(
+                        entry.name,
+                        entry.relative_path,
+                        entry.absolute_path.to_string_lossy().into_owned(),
+                        entry.is_dir,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let detail = dir.truncated.then(|| {
+                format!(
+                    "This folder holds more than {cap} items — showing the first \
+                     {cap}. Open it in Finder to see the rest.",
+                    cap = browse::LISTING_CAP,
+                )
+            });
+            (
+                FilesListingState::Listed,
+                Some(entries),
+                detail,
+                dir.truncated,
+            )
+        }
+        // The same sentence `sync_open_path` refuses with, because it is the
+        // same fact: this folder is not reachable right now, and the next step
+        // depends only on whether it lives on removable media.
+        browse::BrowseListing::MediaAbsent => (
+            FilesListingState::MediaAbsent,
+            None,
+            Some(unavailable_sentence(profile)),
+            false,
+        ),
+        browse::BrowseListing::MediaUnexpected { found_id } => (
+            FilesListingState::MediaUnexpected,
+            None,
+            Some(format!(
+                "A different volume ({found_id}) is mounted where {} lives. \
+                 keeper will not list a folder it cannot prove is yours — \
+                 eject it and reattach the right drive.",
+                profile.name
+            )),
+            false,
+        ),
+        browse::BrowseListing::Missing => (
+            FilesListingState::Missing,
+            None,
+            Some(missing_sentence(profile, &subpath)),
+            false,
+        ),
+    };
+    FilesListingVm {
+        profile_id: profile.id.clone(),
+        subpath,
+        state,
+        entries,
+        detail,
+        truncated,
+    }
+}
+
+/// Why a directory that should be there is not.
+///
+/// The profile root and a folder inside it are different sentences: the root
+/// being gone is a profile problem with a profile remedy, which
+/// [`unavailable_sentence`] already words. A subfolder that vanished is not —
+/// re-pointing the profile would be the wrong advice — so it is named by its
+/// own relative path, and by the profile's NAME rather than its absolute path,
+/// which keeps a home-directory name out of a surface people screenshot.
+fn missing_sentence(profile: &SyncProfile, subpath: &str) -> String {
+    if subpath.is_empty() {
+        return unavailable_sentence(profile);
+    }
+    format!(
+        "{subpath} is no longer in {}. It was moved, renamed or deleted outside keeper.",
+        profile.name
+    )
+}
+
+/// Hand one file inside a synced folder to the system's default handler
+/// (Story 43.8, FR-153, AD-65).
+///
+/// **Why this is not `recording_open_path`.** That command's containment root
+/// is the *recordings destination*, deliberately and permanently: it is the one
+/// place keeper serves recordings from, and AD-74 says the Files tab must not
+/// reach for it to browse folders that are not recordings roots. Pointed at a
+/// note in a vault it would refuse, correctly, and a browser whose Open works
+/// for one folder in five is worse than one with no Open at all.
+///
+/// So the root here is the profile's own, and the containment rule is not a
+/// second one: it is [`browse::resolve`], the same function the listing uses,
+/// which refuses `..` lexically and refuses a symlink out of the tree after
+/// canonicalisation.
+///
+/// Takes a profile id and a profile-relative subpath, never a path: a webview
+/// that asked for `/etc/passwd` would have to have persuaded the engine to
+/// store a profile pointing there first. This opens; it does not stream, and it
+/// has no counterpart that writes.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+/// escapes the root, a file that is no longer on disk, an opener failure).
+#[tauri::command]
+pub async fn sync_open_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<(), IpcError> {
+    let engine = engine_of(&state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    let profile = find_profile(&profiles, &id)?;
+    let resolved = browse::resolve(&profile.local_path, &subpath)
+        .map_err(|refusal| open_failure(refusal.to_string()))?
+        .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+    tauri_plugin_opener::open_path(&resolved, None::<&str>).map_err(|error| {
+        open_failure(format!(
+            "could not open {subpath} with the system's default application: {error}"
+        ))
+    })
 }
 
 /// The tray's view of folder sync: one composed state and one line.

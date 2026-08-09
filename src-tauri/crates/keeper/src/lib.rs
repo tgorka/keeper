@@ -641,6 +641,11 @@ pub fn run() {
         sync_ipc::sync_verify,
         sync_ipc::sync_rescan,
         sync_ipc::sync_open_path,
+        // The Files tab's listing command and its one action (Story 43.8).
+        // Desktop-only with the rest of sync: a build with no folder sync has
+        // no synced folder to browse. Neither writes.
+        sync_ipc::sync_browse,
+        sync_ipc::sync_open_entry,
         sync_ipc::sync_subscribe_progress,
         sync_ipc::sync_unsubscribe_progress,
         sync_ipc::sync_activity,
@@ -668,6 +673,7 @@ pub fn run() {
         notes_ipc::notes_spaces,
         notes_ipc::notes_space_save,
         notes_ipc::notes_space_validate,
+        notes_ipc::notes_space_terms,
         notes_ipc::notes_create,
         notes_ipc::notes_journal_today,
         notes_ipc::notes_templates,

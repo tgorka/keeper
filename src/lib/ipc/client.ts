@@ -12,6 +12,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
+import type { FilesListingVm } from "./gen/FilesListingVm";
 import type { IpcError } from "./gen/IpcError";
 import type { LifecyclePhase } from "./gen/LifecyclePhase";
 import type { NavState } from "./gen/NavState";
@@ -58,6 +59,9 @@ export type { ExportPhase } from "./gen/ExportPhase";
 export type { ExportProgressVm } from "./gen/ExportProgressVm";
 export type { ExportRequestVm } from "./gen/ExportRequestVm";
 export type { ExportScopeKind } from "./gen/ExportScopeKind";
+export type { FilesEntryVm } from "./gen/FilesEntryVm";
+export type { FilesListingState } from "./gen/FilesListingState";
+export type { FilesListingVm } from "./gen/FilesListingVm";
 export type { HeldSendVm } from "./gen/HeldSendVm";
 export type { HotkeyVm } from "./gen/HotkeyVm";
 export type { InboxBatch } from "./gen/InboxBatch";
@@ -103,8 +107,11 @@ export type { NoteSearchBatch } from "./gen/NoteSearchBatch";
 export type { NoteSearchHitVm } from "./gen/NoteSearchHitVm";
 export type { NoteSearchReq } from "./gen/NoteSearchReq";
 export type { NoteSpaceReq } from "./gen/NoteSpaceReq";
+export type { NoteSpaceTagVm } from "./gen/NoteSpaceTagVm";
+export type { NoteSpaceTermsVm } from "./gen/NoteSpaceTermsVm";
 export type { NoteSpaceVm } from "./gen/NoteSpaceVm";
 export type { NoteTagNodeVm } from "./gen/NoteTagNodeVm";
+export type { NoteTagTerm } from "./gen/NoteTagTerm";
 export type { NoteTagTreeVm } from "./gen/NoteTagTreeVm";
 export type { NoteTemplateVm } from "./gen/NoteTemplateVm";
 export type { NoteVaultSettingsReq } from "./gen/NoteVaultSettingsReq";
@@ -225,6 +232,7 @@ import type { NoteRowVm } from "./gen/NoteRowVm";
 import type { NoteSearchBatch } from "./gen/NoteSearchBatch";
 import type { NoteSearchReq } from "./gen/NoteSearchReq";
 import type { NoteSpaceReq } from "./gen/NoteSpaceReq";
+import type { NoteSpaceTermsVm } from "./gen/NoteSpaceTermsVm";
 import type { NoteSpaceVm } from "./gen/NoteSpaceVm";
 import type { NoteTagTreeVm } from "./gen/NoteTagTreeVm";
 import type { NoteTemplateVm } from "./gen/NoteTemplateVm";
@@ -817,11 +825,13 @@ export async function recordingOpenPath(path: string): Promise<void> {
 
 /**
  * Everything the reader of a recording note can act on, for the session the
- * note names by id (FR-142, FR-145, AD-65, Story 42.4). The session folder
- * first, then every file in it, each as a {@link RecordingNoteTargetVm}
- * carrying the relative path the note itself is written in, the absolute path
- * composed in Rust from the effective recordings destination, and whether it
- * is a video.
+ * note names by id (FR-142, FR-145, AD-65, Story 42.4; Story 43.5, FR-150).
+ * The session folder first, then every file in it, each as a
+ * {@link RecordingNoteTargetVm} carrying the relative path the note itself is
+ * written in, the absolute path composed in Rust from the effective recordings
+ * destination, and what the file IS — the one vocabulary the note body, the
+ * properties panel and `keeper-recording://` all branch on, decided by
+ * extension in Rust so no surface classifies a file for itself (AD-73).
  *
  * `sessionId` is the note's `session:` value, not one of its paths: a note
  * records where the recording was when the stub was written, and a Story 40.4
@@ -2887,6 +2897,58 @@ export async function syncOpenPath(id: string): Promise<void> {
 }
 
 /**
+ * List one directory of one synced folder, for the Files tab (FR-153, AD-65,
+ * AD-74, AD-75, Story 43.8).
+ *
+ * Takes the profile id and a profile-relative `subpath` -- `""` for the folder
+ * root, and otherwise a `relativePath` this command previously returned. The
+ * frontend never joins a root and a subpath: Rust resolves it against the
+ * stored profile and refuses anything that is not a plain descendant of it,
+ * both lexically and after symlinks are followed.
+ *
+ * One directory per call, never a tree. A synced folder can hold a hundred
+ * thousand files, so children are asked for on expand and the answer says when
+ * it was capped.
+ *
+ * Read-only in both senses: there is no listing side effect on the sync engine,
+ * and this command has no counterpart that writes, renames, moves or deletes.
+ * Reveal, copy path and open-with go through {@link revealPath} and
+ * {@link recordingOpenPath}; nothing here streams bytes.
+ *
+ * `entries` is non-null exactly when `state` is `"listed"` -- an unplugged
+ * drive resolves with `entries: null`, never an empty array, so a folder that
+ * is genuinely empty and a drive that is out cannot render the same way.
+ *
+ * Rejects with: `unsupported` (no usable git), `internal` (no such profile, a
+ * subpath that escapes the root, an unreadable directory). The message is
+ * written to be shown verbatim.
+ */
+export async function syncBrowse(id: string, subpath: string): Promise<FilesListingVm> {
+  return await invoke<FilesListingVm>("sync_browse", { id, subpath });
+}
+
+/**
+ * Hand one file inside a synced folder to the system's default handler
+ * (FR-153, AD-65, Story 43.8).
+ *
+ * Takes the profile id and a profile-relative `subpath` -- one this surface was
+ * handed by {@link syncBrowse} -- never a path, so this cannot be used to open
+ * an arbitrary location on disk. Rust re-resolves it through the same
+ * containment rule the listing uses.
+ *
+ * Deliberately not {@link recordingOpenPath}: that command's root is the
+ * recordings destination, and pointing it at a note in a vault would refuse
+ * (AD-74 -- the files tab lists and reveals, it does not reach into the
+ * recordings protocol). This one's root is the profile's own folder.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+ * escapes the root, a file no longer on disk, an opener failure).
+ */
+export async function syncOpenEntry(id: string, subpath: string): Promise<void> {
+  await invoke<void>("sync_open_entry", { id, subpath });
+}
+
+/**
  * Read the newest recorded activity for a profile -- what sync has actually
  * done to which files, newest first.
  *
@@ -3338,6 +3400,20 @@ export async function notesSpaceSave(vaultId: string, space: NoteSpaceReq): Prom
  */
 export async function notesSpaceValidate(query: string): Promise<NoteQueryCheckVm> {
   return await invoke<NoteQueryCheckVm>("notes_space_validate", { query });
+}
+
+/**
+ * Read a space's stored query back into the chip vocabulary its editor edits
+ * with (FR-149). Either every term comes back as a chip or none do: a query
+ * holding a term the chips cannot express comes back as `unrepresentable`, with
+ * those terms verbatim, and the editor shows the query read-only rather than
+ * offering controls that would drop them on save.
+ *
+ * Rejects with: `invalidInput` (the query does not parse — the space's row
+ * already renders that failure), `unsupported`, `internal`.
+ */
+export async function notesSpaceTerms(query: string): Promise<NoteSpaceTermsVm> {
+  return await invoke<NoteSpaceTermsVm>("notes_space_terms", { query });
 }
 
 /**

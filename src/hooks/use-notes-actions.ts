@@ -31,6 +31,7 @@ import {
   notesSetFlag,
   notesSpaceSave,
 } from "@/lib/ipc/client";
+import type { TagChip } from "@/lib/stores/notes-filters";
 import { noteQueryFor, notesFiltersStore } from "@/lib/stores/notes-filters";
 import { notesListStore } from "@/lib/stores/notes-list";
 import { notesVaultsStore } from "@/lib/stores/notes-vaults";
@@ -151,44 +152,64 @@ export async function saveFilterAsSpace(name: string): Promise<NoteRefVm | null>
     return null;
   }
   const { limit } = notesListStore.getState();
-  const query = noteQueryFor(notesFiltersStore.getState(), 0, limit);
+  const filters = notesFiltersStore.getState();
+  const query = noteQueryFor(filters, 0, limit);
   return await notesSpaceSave(vaultId, {
     id: null,
     name,
     // The space note carries the query as text, because that is what an agent or
     // Obsidian will read and edit. Rust composes it from the same request the
     // list ran, so the two can never drift into different result sets.
-    query: spaceQueryText(query),
+    query: spaceQueryText({
+      tags: filters.tagTerms,
+      flags: query.flags,
+      origin: query.origin,
+      text: query.text,
+    }),
     sort: "modified desc",
     limit,
+    icon: null,
   });
 }
 
 /**
- * Render a composed query back into the one-line DSL a space note stores.
+ * Render a chip set into the one-line DSL a space note stores.
  *
  * The grammar is `keeper_core::notes::query`'s: juxtaposition is AND, `-`
  * negates, and a bareword is sugar for `text:`. Quoting the free-text term is
  * what keeps a two-word search from becoming two AND-ed terms.
+ *
+ * An excluded chip becomes `-tag:x` (Story 43.3). That is the whole reason the
+ * three-state chip needed no new grammar: `-` has negated a term since FR-105,
+ * so a space saved from the bar and a space typed by hand in Obsidian are the
+ * same text, and the chip is a face for what the DSL already said.
+ *
+ * Exported because the space editor (Story 43.4) writes the same text when it
+ * saves an edited space, and two writers of one grammar is how a space saved
+ * from the bar and a space saved from the editor start disagreeing.
+ *
+ * Tags arrive as an ordered list rather than as {@link NoteQueryReq}'s map: an
+ * object's key order puts integer-like keys first, so a vault with a `2026` tag
+ * would silently reorder its own saved query.
  */
-function spaceQueryText(query: {
-  text: string | null;
-  tags: string[];
+export function spaceQueryText(parts: {
+  tags: readonly TagChip[];
+  flags: readonly string[];
   origin: string | null;
-  flags: string[];
+  text: string | null;
 }): string {
   const terms: string[] = [];
-  for (const tag of query.tags) {
-    terms.push(`tag:${tag}`);
+  for (const { tag, term } of parts.tags) {
+    terms.push(term === "exclude" ? `-tag:${tag}` : `tag:${tag}`);
   }
-  for (const flag of query.flags) {
+  for (const flag of parts.flags) {
     terms.push(`is:${flag}`);
   }
-  if (query.origin !== null) {
-    terms.push(`origin:${query.origin}`);
+  if (parts.origin !== null) {
+    terms.push(`origin:${parts.origin}`);
   }
-  if (query.text !== null) {
-    terms.push(`text:"${query.text.replace(/"/g, '\\"')}"`);
+  if (parts.text !== null) {
+    terms.push(`text:"${parts.text.replace(/"/g, '\\"')}"`);
   }
   return terms.join(" ");
 }

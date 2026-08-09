@@ -8,6 +8,7 @@ import { BridgesPane } from "@/components/layout/bridges-pane";
 import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
+import { FilesPane } from "@/components/layout/files-pane";
 import { PhoneShell } from "@/components/layout/phone-shell";
 import { RecordingPane } from "@/components/layout/recording-pane";
 import { SettingsPane } from "@/components/layout/settings-pane";
@@ -230,6 +231,11 @@ export function AppShell() {
                 <RecordingsPane />
               ) : sync && primaryView === "sync" ? (
                 <SyncPane />
+              ) : sync && primaryView === "files" ? (
+                // Story 43.8: the browser over what sync holds, gated on the
+                // SAME `sync` capability as sync itself — where no folder can be
+                // synced there is nothing for a file browser to browse.
+                <FilesPane />
               ) : notes && primaryView === "notes" ? (
                 <NotesPane />
               ) : primaryView === "bridges" ? (

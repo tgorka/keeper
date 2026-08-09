@@ -33,13 +33,13 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use keeper_core::notes::frontmatter::{FieldValue, Frontmatter};
-use keeper_core::notes::index::{IndexEntry, IndexSnapshot};
+use keeper_core::notes::index::{IndexEntry, IndexSnapshot, TagTerms};
 use keeper_core::notes::vm::{
     NoteAttachmentVm, NoteBodyBatch, NoteChangeBatch, NoteConflictChoiceReq, NoteConflictVm,
     NoteCreateReq, NoteDiffVm, NoteFlag, NoteFolderVm, NoteIndexProgressVm, NoteLinkTargetVm,
     NoteListOp, NoteListVm, NoteQueryCheckVm, NoteQueryReq, NoteRefVm, NoteRevisionVm, NoteRowVm,
-    NoteSearchBatch, NoteSearchHitVm, NoteSearchReq, NoteSpaceReq, NoteSpaceVm, NoteTagNodeVm,
-    NoteTagTreeVm, NoteTemplateVm, NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
+    NoteSearchBatch, NoteSearchHitVm, NoteSearchReq, NoteSpaceReq, NoteSpaceTermsVm, NoteSpaceVm,
+    NoteTagNodeVm, NoteTagTreeVm, NoteTemplateVm, NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
 };
 use keeper_core::notes::{naming, query, search, templates, NotesError};
 use keeper_core::vm::{IpcError, IpcErrorCode, TagVocabularyEntryVm, TagVocabularyVm};
@@ -80,6 +80,10 @@ const MAX_SEARCH_HITS: usize = 200;
 
 /// How many notes a wikilink autocomplete offers.
 const MAX_LINK_TARGETS: usize = 30;
+
+/// The longest an icon name may be before it is treated as noise rather than as
+/// an icon. Lucide's longest name is well under this.
+const MAX_ICON_BYTES: usize = 64;
 
 /// The vault-relative directories keeper creates lazily, on first use.
 const SPACES_DIR: &str = "spaces";
@@ -393,21 +397,27 @@ fn list_order(a: &IndexEntry, b: &IndexEntry) -> std::cmp::Ordering {
 /// is what keeps NFR-28's 100 ms list paint true. Full-body matching is
 /// `notes_search`, which streams because it reads files.
 ///
-/// The predicate itself lives in `keeper-core` rather than here, so what a
-/// search term is allowed to see is stated once, in the crate that can be
-/// tested on any host (AD-55/AD-56). This function keeps only the axes that
-/// need the shell's own facts — the commit head behind `origin:`.
-fn matches_filter(entry: &IndexEntry, req: &NoteQueryReq, head: Option<&HeadRevision>) -> bool {
+/// Both content axes live in `keeper-core` rather than here — free text in
+/// [`IndexEntry::matches_text`] and the tag chips in
+/// [`IndexEntry::matches_tags`] — so what a chip selects is stated once, in the
+/// crate that can be tested on any host (AD-55/AD-56). The tag terms are
+/// normalised once per query rather than once per entry, which is why they
+/// arrive already folded instead of being read out of `req`. This function keeps
+/// only the axes that need the shell's own facts — the commit head behind
+/// `origin:`.
+fn matches_filter(
+    entry: &IndexEntry,
+    req: &NoteQueryReq,
+    tags: &TagTerms,
+    head: Option<&HeadRevision>,
+) -> bool {
     if let Some(text) = req.text.as_ref() {
         if !entry.matches_text(text) {
             return false;
         }
     }
-    // Every chip must match: chips narrow, they do not widen.
-    for tag in &req.tags {
-        if !entry.tags.iter().any(|existing| tag_matches(existing, tag)) {
-            return false;
-        }
+    if !entry.matches_tags(tags) {
+        return false;
     }
     if let Some(origin) = req.origin.as_ref() {
         if !origin.is_empty() {
@@ -432,24 +442,6 @@ fn matches_filter(entry: &IndexEntry, req: &NoteQueryReq, head: Option<&HeadRevi
         return false;
     }
     true
-}
-
-/// Segment-prefix tag matching: `project` matches `project` and
-/// `project/keeper`, and never `projects`.
-///
-/// The chip is read through the one normalisation (Story 42.5) rather than
-/// hand-stripped here, so a chip carrying a hash, a casing or a trailing space
-/// selects the node the sidebar named. A chip that is not a tag at all
-/// normalises to nothing and matches nothing — an empty chip must not silently
-/// select the whole vault.
-fn tag_matches(actual: &str, wanted: &str) -> bool {
-    let Some(wanted) = keeper_core::notes::tags::normalise(wanted) else {
-        return false;
-    };
-    actual == wanted
-        || (actual.len() > wanted.len()
-            && actual.starts_with(&wanted)
-            && actual.as_bytes().get(wanted.len()) == Some(&b'/'))
 }
 
 /// Case-fold for the wikilink completion prefix, its one caller. Cheap on
@@ -491,11 +483,15 @@ fn project_list(
                 })
                 .collect()
         }
-        None => snapshot
-            .entries()
-            .iter()
-            .filter(|entry| matches_filter(entry, req, heads.get(&entry.path)))
-            .collect(),
+        None => {
+            // Folded once for the whole walk, not once per entry (NFR-28).
+            let tags = TagTerms::new(&req.tags);
+            snapshot
+                .entries()
+                .iter()
+                .filter(|entry| matches_filter(entry, req, &tags, heads.get(&entry.path)))
+                .collect()
+        }
     };
     matched.sort_by(|a, b| list_order(a, b));
 
@@ -544,6 +540,7 @@ struct SpaceDef {
     query: String,
     sort: String,
     limit: u32,
+    icon: Option<String>,
 }
 
 /// Read the space definition out of a space note's frontmatter.
@@ -562,6 +559,7 @@ fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
         query: String::new(),
         sort: "modified desc".to_owned(),
         limit: MAX_LIMIT,
+        icon: None,
     };
     let Some(FieldValue::Map(pairs)) = fm.get("keeper") else {
         return def;
@@ -569,18 +567,14 @@ fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
     for (key, value) in pairs {
         match (key.as_str(), value) {
             ("space", FieldValue::Str(query)) => def.query = query.clone(),
-            ("space", FieldValue::Map(inner)) => {
-                for (key, value) in inner {
-                    match (key.as_str(), value) {
-                        ("query", FieldValue::Str(query)) => def.query = query.clone(),
-                        ("sort", FieldValue::Str(sort)) => def.sort = sort.clone(),
-                        ("limit", FieldValue::Num(limit)) => def.limit = clamp_limit(*limit),
-                        _ => {}
-                    }
-                }
-            }
+            // No `("space", FieldValue::Map(_))` arm: `Frontmatter` models one
+            // level of nesting and says so at its `lookahead` — a second level
+            // is claimed as opaque, never as a map. An arm for it would be code
+            // that cannot run, which is worse than an absent feature because it
+            // reads as support.
             ("sort", FieldValue::Str(sort)) => def.sort = sort.clone(),
             ("limit", FieldValue::Num(limit)) => def.limit = clamp_limit(*limit),
+            ("icon", FieldValue::Str(icon)) => def.icon = space_icon(icon),
             _ => {}
         }
     }
@@ -595,6 +589,28 @@ fn clamp_limit(raw: f64) -> u32 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let limit = raw.min(f64::from(MAX_LIMIT)) as u32;
     limit
+}
+
+/// The icon name a space carries, or `None` when the key holds nothing usable.
+///
+/// Trimmed, length-capped, and otherwise passed through **unread**. The fixed
+/// set is the editor's, because the set is a set of drawings and this crate has
+/// no drawings — so a name Rust does not recognise is not an error here, and a
+/// name the editor does not recognise is not rewritten there. A space whose
+/// icon was renamed out of the set keeps the name it was given on disk and
+/// draws the fallback glyph; the alternative is keeper silently editing a value
+/// it did not understand, which is the same mistake as rewriting a query term
+/// it could not parse.
+///
+/// The cap is the one judgement made here: frontmatter is agent-writable and an
+/// icon name is a short identifier, so a value this long is a bug rather than
+/// an icon, and it has no business reaching a `<title>` in the sidebar.
+fn space_icon(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_ICON_BYTES {
+        return None;
+    }
+    Some(trimmed.to_owned())
 }
 
 /// Parse the query of one space, by note id.
@@ -927,6 +943,7 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
                 query: def.query,
                 sort: def.sort,
                 limit: def.limit,
+                icon: def.icon,
                 error,
             }
         })
@@ -935,7 +952,12 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
     Ok(spaces)
 }
 
-/// Create or update a space note (FR-105).
+/// Create or update a space note (FR-105, FR-149).
+///
+/// The one write behind the space editor, so a rename, an icon and a set of
+/// terms land together or not at all — three commands would leave a space
+/// renamed but still carrying the terms the user just deleted if the second one
+/// failed.
 #[tauri::command]
 pub async fn notes_space_save(
     vault_id: String,
@@ -944,33 +966,63 @@ pub async fn notes_space_save(
     let vault = vault_of(&vault_id)?;
     // Refuse a broken query at the edge: a space is a surface people run bulk
     // actions from, so storing one that matches nothing silently is worse than
-    // saying no.
+    // saying no. An empty query is one of those failures — `parse` rejects it
+    // rather than reading it as "everything" — which is the backstop under the
+    // editor's own refusal to save a space with no terms left in it.
     query::parse(&space.query).map_err(|error| {
         notes_error(NotesError::Query {
             message: error.message,
             token_index: error.token_index,
         })
     })?;
-    let definition = FieldValue::Map(vec![
+    let mut pairs = vec![
         ("space".to_owned(), FieldValue::Str(space.query.clone())),
         ("sort".to_owned(), FieldValue::Str(space.sort.clone())),
         (
             "limit".to_owned(),
             FieldValue::Num(f64::from(space.limit.min(MAX_LIMIT))),
         ),
-    ]);
+    ];
+    // Written only when there is one, so a space nobody gave an icon keeps the
+    // frontmatter it had rather than growing an empty key to explain.
+    if let Some(icon) = space.icon.as_deref().and_then(space_icon) {
+        pairs.push(("icon".to_owned(), FieldValue::Str(icon)));
+    }
+    let definition = FieldValue::Map(pairs);
 
-    // An existing space keeps every other byte of its note (FR-121): only the
-    // definition key is spliced.
+    // An existing space keeps every byte outside the keys this touches
+    // (FR-121): the definition is spliced, and the name is spliced only when it
+    // actually changed.
     if let Some(id) = space.id.as_ref().filter(|id| !id.is_empty()) {
         let entry = entry_of(&vault_id, id)?;
         let source = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
-        let updated = Frontmatter::set_in(&source, "keeper", definition);
+        let mut updated = Frontmatter::set_in(&source, "keeper", definition);
+        let renamed = space.name != entry.title;
+        if renamed {
+            // `title` rather than the heading alone, because `note_title` reads
+            // frontmatter first and a space's body belongs to whoever last
+            // edited it: the key is the only place a name is guaranteed to
+            // stick.
+            updated = Frontmatter::set_in(&updated, "title", FieldValue::Str(space.name.clone()));
+            // Only the heading keeper itself wrote follows; `naming` owns that
+            // rule, beside `title_from_body`, which is the line it matches.
+            let (_, body_offset) = Frontmatter::parse(&updated);
+            if let Some(body) =
+                naming::retitle_heading(&updated[body_offset..], &entry.title, &space.name)
+            {
+                updated = format!("{}{body}", &updated[..body_offset]);
+            }
+        }
         notes_vault::write_note(&vault, &entry.path, &updated).map_err(notes_error)?;
+        let path = if renamed {
+            rename_in_place(&vault, &entry.path, &space.name)?
+        } else {
+            entry.path
+        };
         return Ok(NoteRefVm {
             vault_id,
             id: entry.id,
-            path: entry.path,
+            path,
             title: space.name,
         });
     }
@@ -995,6 +1047,44 @@ pub async fn notes_space_save(
         id,
         path: rel,
         title: space.name,
+    })
+}
+
+/// Rename a note's file to match a new title, keeping it in its own directory.
+///
+/// The filename half of what [`notes_rename`] does, reused here because a space
+/// whose file still says `active-work` while the sidebar says "Archive triage"
+/// is a vault that disagrees with the app about what it holds — and the vault is
+/// the thing Obsidian and the sync see.
+fn rename_in_place(vault: &Vault, from_rel: &str, title: &str) -> Result<String, IpcError> {
+    let dir = from_rel
+        .rsplit_once('/')
+        .map_or(String::new(), |(dir, _)| dir.to_owned());
+    let filename = naming::note_filename(title, &today(), &notes_vault::siblings(vault, &dir));
+    let to_rel = if dir.is_empty() {
+        filename
+    } else {
+        format!("{dir}/{filename}")
+    };
+    notes_vault::rename_note(vault, from_rel, &to_rel).map_err(notes_error)?;
+    Ok(to_rel)
+}
+
+/// A space's stored query, read back into the editor's chip vocabulary
+/// (FR-149, UX-DR55).
+///
+/// Parse-only and pure, beside [`notes_space_validate`] for the same reason: the
+/// editor asks about a query before it owns one, and neither question needs the
+/// vault. The whole decision — which terms a chip can hold and what happens to a
+/// query holding one it cannot — is `keeper-core`'s, so this is a call, not a
+/// second opinion.
+#[tauri::command]
+pub async fn notes_space_terms(query: String) -> Result<NoteSpaceTermsVm, IpcError> {
+    query::decompose(&query).map_err(|error| {
+        notes_error(NotesError::Query {
+            message: error.message,
+            token_index: error.token_index,
+        })
     })
 }
 
@@ -2066,7 +2156,7 @@ fn current_window(
 fn default_query() -> NoteQueryReq {
     NoteQueryReq {
         text: None,
-        tags: Vec::new(),
+        tags: std::collections::BTreeMap::new(),
         space_id: None,
         origin: None,
         flags: Vec::new(),
@@ -2428,6 +2518,7 @@ fn contained_in_profile(vault: &Vault, rel_path: &str) -> Result<PathBuf, IpcErr
 
 #[cfg(test)]
 mod tests {
+    use keeper_core::notes::index::NoteTagTerm;
     use keeper_core::notes::vm::NoteCadenceVm;
 
     use super::*;
@@ -2551,25 +2642,38 @@ mod tests {
         }
     }
 
+    /// The chip axis, exercised through this call site. The rule itself is
+    /// `keeper-core`'s and tested there against every spelling and every segment
+    /// boundary; what only this side can go wrong at is the wiring — a shell that
+    /// folds the chips once per query and then forgets to hand them to the
+    /// predicate would filter nothing and look entirely correct doing it.
     #[test]
-    fn a_tag_chip_matches_by_segment_and_never_by_prefix() {
-        assert!(tag_matches("project", "project"));
-        assert!(tag_matches("project/keeper", "project"));
-        assert!(
-            !tag_matches("projects", "project"),
-            "a longer word is a different tag"
-        );
-        assert!(!tag_matches("project", "project/keeper"));
-        // A chip may arrive with its hash still on it.
-        assert!(tag_matches("project/keeper", "#project"));
-        // Story 42.5: and through the one normalisation, so a chip carrying the
-        // casing or the trailing space a recording's card showed selects the
-        // node the sidebar named.
-        assert!(tag_matches("client/acme", "Client/Acme "));
-        assert!(tag_matches("client/acme/renewal", "CLIENT//ACME/"));
-        // A chip that is not a tag selects nothing rather than everything.
-        assert!(!tag_matches("client/acme", "///"));
-        assert!(!tag_matches("client/acme", ""));
+    fn the_shell_hands_the_chip_terms_to_the_core_predicate() {
+        let mut note = entry("a.md", "a");
+        note.tags = vec!["client/acme".to_owned(), "draft".to_owned()];
+        let req = |terms: &[(&str, NoteTagTerm)]| NoteQueryReq {
+            tags: terms
+                .iter()
+                .map(|(tag, term)| ((*tag).to_owned(), *term))
+                .collect(),
+            ..default_query()
+        };
+
+        let included = req(&[("Client/Acme ", NoteTagTerm::Include)]);
+        assert!(matches_filter(
+            &note,
+            &included,
+            &TagTerms::new(&included.tags),
+            None
+        ));
+
+        let excluded = req(&[("draft", NoteTagTerm::Exclude)]);
+        assert!(!matches_filter(
+            &note,
+            &excluded,
+            &TagTerms::new(&excluded.tags),
+            None
+        ));
     }
 
     #[test]
@@ -2577,20 +2681,30 @@ mod tests {
         let req = default_query();
         let mut conflict = entry("a.sync-conflict-20260802-120000-mini.md", "a");
         conflict.flags.push("conflict".to_owned());
-        assert!(!matches_filter(&conflict, &req, None));
+        assert!(!matches_filter(&conflict, &req, &TagTerms::default(), None));
 
         let mut archived = entry("b.md", "b");
         archived.flags.push("archived".to_owned());
-        assert!(!matches_filter(&archived, &req, None));
+        assert!(!matches_filter(&archived, &req, &TagTerms::default(), None));
 
         // Asked for by name, they appear.
         let asked = NoteQueryReq {
             flags: vec!["conflict".to_owned()],
             ..default_query()
         };
-        assert!(matches_filter(&conflict, &asked, None));
+        assert!(matches_filter(
+            &conflict,
+            &asked,
+            &TagTerms::default(),
+            None
+        ));
         // A plain note is in the default lens.
-        assert!(matches_filter(&entry("c.md", "c"), &req, None));
+        assert!(matches_filter(
+            &entry("c.md", "c"),
+            &req,
+            &TagTerms::default(),
+            None
+        ));
     }
 
     /// The list's free-text axis, exercised through this call site: the predicate
@@ -2607,15 +2721,16 @@ mod tests {
             text: Some(text.to_owned()),
             ..default_query()
         };
-        assert!(matches_filter(&note, &filter("vault"), None));
-        assert!(matches_filter(&note, &filter("LENS"), None));
-        assert!(matches_filter(&note, &filter("journal/"), None));
-        assert!(matches_filter(&note, &filter("keeper"), None));
+        let hit = |text: &str| matches_filter(&note, &filter(text), &TagTerms::default(), None);
+        assert!(hit("vault"));
+        assert!(hit("LENS"));
+        assert!(hit("journal/"));
+        assert!(hit("keeper"));
         // Nowhere in the title, the path, the tags or the body.
-        assert!(matches_filter(&note, &filter("kowalska"), None));
-        assert!(!matches_filter(&note, &filter("nothing here"), None));
+        assert!(hit("kowalska"));
+        assert!(!hit("nothing here"));
         // An empty needle is not a filter.
-        assert!(matches_filter(&note, &filter("   "), None));
+        assert!(hit("   "));
     }
 
     /// The editor never sees a `---`, which is what makes "the first keystroke
@@ -2819,6 +2934,69 @@ mod tests {
         assert_eq!(clamp_limit(100_000.0), MAX_LIMIT);
         assert_eq!(clamp_limit(0.0), MAX_LIMIT);
         assert_eq!(clamp_limit(-5.0), MAX_LIMIT);
+    }
+
+    /// The icon sits beside `space` under `keeper:`, at ONE level of nesting,
+    /// because one level is all there is. `Frontmatter`'s parser models exactly
+    /// one — "a second nesting level. One is all the subset allows"
+    /// (`frontmatter.rs`) — and that is not a gap to route around: the parser
+    /// exists to leave every byte outside an edited span identical, which a
+    /// general YAML model cannot promise. A `keeper.space.icon` would therefore
+    /// never be read by anyone, so it is not a form this reads; it is a form
+    /// nobody can write.
+    #[test]
+    fn a_space_definition_reads_its_icon_beside_the_query() {
+        let flat = concat!(
+            "---\n",
+            "id: 01J8ZQ4M7T5R9V3XK2B6C0DFGH\n",
+            "keeper:\n",
+            "  space: 'tag:a'\n",
+            "  icon: star\n",
+            "---\n",
+            "\n# Active\n"
+        );
+        assert_eq!(
+            space_def(&entry("spaces/active.md", "Active"), flat).icon,
+            Some("star".to_owned())
+        );
+
+        // Two levels deep is not a second supported spelling — the parser does
+        // not produce a map there at all, so the key is invisible. Asserted so
+        // that a future reader reaching for nesting learns it here rather than
+        // from an icon that silently never appears.
+        let too_deep = concat!(
+            "---\n",
+            "id: 01J8ZQ4M7T5R9V3XK2B6C0DFGH\n",
+            "keeper:\n",
+            "  space:\n",
+            "    query: 'tag:a'\n",
+            "    icon: flag\n",
+            "---\n",
+            "\n# Active\n"
+        );
+        assert!(space_def(&entry("spaces/active.md", "Active"), too_deep)
+            .icon
+            .is_none());
+
+        // A space with no icon key is a space with no icon, not an error.
+        assert!(
+            space_def(&entry("spaces/new.md", "New"), "---\nid: x\n---\n")
+                .icon
+                .is_none()
+        );
+    }
+
+    /// An icon name this crate does not recognise is not this crate's business:
+    /// the set is the editor's, and rewriting a value keeper did not understand
+    /// is the same mistake as rewriting a query term it could not parse. Only
+    /// noise is refused.
+    #[test]
+    fn an_unrecognised_icon_name_survives_and_only_noise_is_refused() {
+        assert_eq!(space_icon("sparkles"), Some("sparkles".to_owned()));
+        assert_eq!(space_icon("  star  "), Some("star".to_owned()));
+        assert_eq!(space_icon(""), None);
+        assert_eq!(space_icon("   "), None);
+        assert_eq!(space_icon(&"x".repeat(MAX_ICON_BYTES + 1)), None);
     }
 
     /// Dirtiness is a body-against-body question. `base` is the whole document,

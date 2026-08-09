@@ -168,6 +168,12 @@ pub const BUILTIN_EXCLUDES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct ExcludeSet {
     set: GlobSet,
+    /// The same corpus, read as a question about directories: every pattern
+    /// that excludes a *subtree* (`.git/**`, `**/node_modules/**`) contributes
+    /// the directory it is rooted at (`.git`, `**/node_modules`). Derived from
+    /// the one list in [`ExcludeSet::new`] — including the profile's own
+    /// patterns — so there is still exactly one place a path can be named.
+    dir_set: GlobSet,
 }
 
 impl ExcludeSet {
@@ -179,16 +185,27 @@ impl ExcludeSet {
     /// startup path.
     pub fn new(extra: &[String]) -> Result<Self> {
         let mut builder = GlobSetBuilder::new();
-        for pattern in BUILTIN_EXCLUDES {
+        let mut dir_builder = GlobSetBuilder::new();
+        let corpus = BUILTIN_EXCLUDES
+            .iter()
+            .copied()
+            .chain(extra.iter().map(String::as_str));
+        for pattern in corpus {
             add_pattern(&mut builder, pattern)?;
-        }
-        for pattern in extra {
-            add_pattern(&mut builder, pattern)?;
+            // A `…/**` pattern is already anchored by its own `/`, so its
+            // directory form goes in verbatim rather than back through the
+            // basename rule.
+            if let Some(directory) = pattern.trim().strip_suffix("/**") {
+                add_glob(&mut dir_builder, directory, pattern)?;
+            }
         }
         let set = builder
             .build()
             .map_err(|err| SyncError::Config(format!("could not compile exclude set: {err}")))?;
-        Ok(Self { set })
+        let dir_set = dir_builder
+            .build()
+            .map_err(|err| SyncError::Config(format!("could not compile exclude set: {err}")))?;
+        Ok(Self { set, dir_set })
     }
 
     /// Whether `relative_path` — repository-relative, never absolute — is
@@ -201,6 +218,29 @@ impl ExcludeSet {
             return false;
         }
         self.set.is_match(candidate.as_str())
+    }
+
+    /// Whether `relative_path`, known to be a **directory**, is one the corpus
+    /// excludes wholesale.
+    ///
+    /// A second question against the same rules, not a second rule set. The
+    /// scan path never needed it: the tree walk asks about files, and a file
+    /// under `.git/` is caught by `.git/**` on its own. A *browser* needs it,
+    /// because a directory whose every descendant is excluded is a folder that
+    /// can only ever open onto nothing — and `.git/` and `.keeper-sync/`, which
+    /// the corpus calls engine state and never user content, are exactly that.
+    /// Showing them would be the "browser nobody scrolls twice" this exists to
+    /// prevent.
+    ///
+    /// Directory-only on purpose. Applying the subtree rules to a *file* would
+    /// hide a plain file named `.git`, which the corpus deliberately does not
+    /// exclude.
+    pub fn is_excluded_directory(&self, relative_path: &Path) -> bool {
+        if self.is_excluded(relative_path) {
+            return true;
+        }
+        let candidate = match_string(relative_path);
+        !candidate.is_empty() && self.dir_set.is_match(candidate.as_str())
     }
 }
 
@@ -221,10 +261,22 @@ fn add_pattern(builder: &mut GlobSetBuilder, pattern: &str) -> Result<()> {
     } else {
         Cow::Owned(format!("**/{pattern}"))
     };
-    let glob = GlobBuilder::new(&effective)
+    add_glob(builder, &effective, pattern)
+}
+
+/// Compile and add one already-anchored pattern.
+///
+/// Split out from [`add_pattern`] because the directory question derives its
+/// patterns by stripping `/**`, and a stripped pattern must keep the anchoring
+/// the original had. Re-running `scratch/**`'s remainder through the basename
+/// rule would turn a profile's root-anchored pattern into "any `scratch` at any
+/// depth" — a rule the user never wrote, silently hiding their folders.
+/// `original` is named in the error so a user reads back the string they typed.
+fn add_glob(builder: &mut GlobSetBuilder, effective: &str, original: &str) -> Result<()> {
+    let glob = GlobBuilder::new(effective)
         .literal_separator(true)
         .build()
-        .map_err(|err| SyncError::Config(format!("invalid exclude pattern {pattern:?}: {err}")))?;
+        .map_err(|err| SyncError::Config(format!("invalid exclude pattern {original:?}: {err}")))?;
     builder.add(glob);
     Ok(())
 }
@@ -416,6 +468,56 @@ mod tests {
         for path in ["sub/.keeperrc", "keeper/index.json"] {
             assert!(!excluded(&set, path), "{path} is the user's file");
         }
+    }
+
+    /// The subtree rules read as a directory question (Story 43.8). `.git` and
+    /// `.keeper-sync` are named in the corpus only as `…/**`, so the file
+    /// question rightly says nothing about the directories themselves — and a
+    /// browser that asked only the file question would put both of them on
+    /// screen at the root of every synced folder.
+    #[test]
+    fn a_directory_whose_whole_subtree_is_excluded_is_excluded_as_a_directory() {
+        let set = default_set();
+        for path in [
+            ".git",
+            ".keeper-sync",
+            "sub/.git",
+            "node_modules",
+            ".keeper",
+        ] {
+            assert!(
+                set.is_excluded_directory(Path::new(path)),
+                "{path} opens onto nothing a browser may show"
+            );
+            // …and the file question is deliberately unchanged, which is the
+            // whole reason the directory question had to be added.
+            if path == ".git" || path == ".keeper-sync" || path == "sub/.git" {
+                assert!(
+                    !excluded(&set, path),
+                    "{path} must stay visible to the file question"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_ordinary_directory_is_not_excluded_by_the_directory_question() {
+        let set = default_set();
+        for path in ["Notes", "2026/Standup", "target", "build", "git"] {
+            assert!(
+                !set.is_excluded_directory(Path::new(path)),
+                "{path} is the user's folder"
+            );
+        }
+    }
+
+    /// A profile's own `foo/**` becomes a directory rule too, so the pair stays
+    /// derived from one list rather than from a second hard-coded one.
+    #[test]
+    fn a_profile_subtree_pattern_also_answers_the_directory_question() {
+        let set = ExcludeSet::new(&["scratch/**".to_owned()]).expect("compiles");
+        assert!(set.is_excluded_directory(Path::new("scratch")));
+        assert!(!set.is_excluded_directory(Path::new("sub/scratch")));
     }
 
     /// A segment being written is `<name>.<ext>.partial`, and the recordings

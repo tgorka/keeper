@@ -89,7 +89,7 @@ const INDEX_JOIN: &str = " JOIN recordings_fts_docs \
 /// or `client/other`. A plain `LIKE 'client/acme%'` matches `client/acmecorp`
 /// and silently widens every tag filter to its lexical neighbours, so the test
 /// is two arms: equal to the prefix, or the prefix followed by `/`. This is the
-/// identical rule `crate::notes::query::tag_descends` applies to note tags, and
+/// identical rule `crate::notes::index::tag_covers` applies to note tags, and
 /// it is still spelled out again here rather than shared. Story 42.5 unified
 /// what a TAG is, which is the thing that was actually broken; how a hierarchy
 /// descends is a two-arm prefix test that has been fixed since FR-104 and
@@ -914,41 +914,75 @@ pub fn session_note_targets(
                 format!("{relative_folder}/{name}")
             },
             absolute_path: path_string(&folder.join(&name)),
-            kind: if is_video_name(&name) {
-                RecordingNoteTargetKind::Video
-            } else {
-                RecordingNoteTargetKind::File
-            },
+            kind: kind_for_file_name(&name),
         });
     }
     Ok(Some(targets))
 }
 
-/// The extensions Preview is offered for: what the recorder writes video into
-/// (`.mov`, Story 20.1) and the two containers a synced recordings folder
+/// The extensions a `<video>` is offered for: what the recorder writes video
+/// into (`.mov`, Story 20.1) and the containers a synced recordings folder
 /// plausibly already holds beside it.
-const VIDEO_EXTENSIONS: [&str; 3] = ["mov", "mp4", "m4v"];
-
-/// Whether a file name is one Preview means something for.
 ///
-/// By extension, and deliberately not by reading the file. Targets are
+/// Public because the shell serves exactly these over `keeper-recording://`
+/// and the files tab types its listing with the same vocabulary (Story 43.5,
+/// Story 43.8). A second table anywhere is a table that drifts.
+pub const VIDEO_EXTENSIONS: [&str; 4] = ["mov", "mp4", "m4v", "webm"];
+
+/// The extensions an `<img>` is offered for (Story 43.5).
+///
+/// SVG is here rather than under [`RecordingNoteTargetKind::File`] because
+/// an inline `<img src>` cannot run script from one, and the shell serves it
+/// with `nosniff` under the app's CSP — the same reading `keeper-note://`
+/// already takes of a vault's own SVG.
+pub const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "svg"];
+
+/// The extensions an `<audio>` is offered for (Story 43.5).
+pub const AUDIO_EXTENSIONS: [&str; 6] = ["mp3", "m4a", "wav", "ogg", "oga", "flac"];
+
+/// What a file of this name is, decided by its extension alone (Story 43.5,
+/// FR-150, AD-73).
+///
+/// **By extension, and deliberately not by reading the file.** Targets are
 /// composed for every file in a session folder at once, so sniffing each one's
 /// header would turn opening a note into a burst of reads on what may be a
-/// network share — and the cost of being wrong is the system opening the file
-/// in the wrong application, not a lost byte.
+/// network share — and the cost of being wrong is an element that shows
+/// nothing, not a lost byte.
 ///
-/// Case-insensitively, because a file copied in from another machine may be
-/// `.MOV`, and a Preview that is absent for the same video under a different
+/// **Case-insensitively**, because a file copied in from another machine may be
+/// `.MOV`, and a player that is absent for the same video under a different
 /// spelling reads as a bug.
-fn is_video_name(name: &str) -> bool {
-    Path::new(name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            VIDEO_EXTENSIONS
-                .iter()
-                .any(|known| extension.eq_ignore_ascii_case(known))
-        })
+///
+/// **The last extension decides**, which is what `Path::extension` means:
+/// `clip.mov.bak` is a backup and not a video, and a note that put a `<video>`
+/// on it would show a broken player for a file nothing can play.
+///
+/// A name with no extension at all — `Makefile`, `manifest`, a dotfile — is a
+/// [`RecordingNoteTargetKind::File`], never a guess. So is every extension
+/// not named above: the catch-all is what makes an unanticipated file an
+/// attachment with working actions instead of a dead player.
+///
+/// Never returns [`RecordingNoteTargetKind::Folder`]. A directory is known from
+/// the dirent that listed it, not from its name — `2026.08` is a folder and
+/// `notes.zip` is not, and no extension table can tell them apart.
+pub fn kind_for_file_name(name: &str) -> RecordingNoteTargetKind {
+    let Some(extension) = Path::new(name).extension().and_then(|ext| ext.to_str()) else {
+        return RecordingNoteTargetKind::File;
+    };
+    let listed = |table: &[&str]| {
+        table
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+    };
+    if listed(&VIDEO_EXTENSIONS) {
+        RecordingNoteTargetKind::Video
+    } else if listed(&IMAGE_EXTENSIONS) {
+        RecordingNoteTargetKind::Image
+    } else if listed(&AUDIO_EXTENSIONS) {
+        RecordingNoteTargetKind::Audio
+    } else {
+        RecordingNoteTargetKind::File
+    }
 }
 
 /// Join a stored `/`-joined relative path onto the destination root, one
@@ -2333,16 +2367,26 @@ mod tests {
             .collect()
     }
 
-    /// Story 42.4: the note's reader gets the folder and every file in it, and
-    /// only a video is a Preview target — `manifest.json` is not, and neither
-    /// is the folder.
+    /// Story 42.4, widened by Story 43.5: the note's reader gets the folder and
+    /// every file in it, each typed with the vocabulary the note body, the
+    /// panel and `keeper-recording://` all branch on. Asserted through the real
+    /// directory read rather than over [`kind_for_file_name`] alone, because
+    /// the classification only matters where the name comes off a disk.
     #[test]
-    fn a_session_offers_its_folder_then_its_files_with_only_videos_marked_playable() {
+    fn a_session_types_every_file_it_holds_with_the_one_attachment_vocabulary() {
         let root = temp_dir();
         session_folder(
             &root,
             "2026/2026-08-08 15.52 test",
-            &["screen-0000.mov", "camera-0000.MOV", "manifest.json"],
+            &[
+                "camera-0000.MOV",
+                "clip.mov.bak",
+                "manifest.json",
+                "notes",
+                "room-tone.WAV",
+                "screen-0000.mov",
+                "whiteboard.png",
+            ],
         );
         let conn = memory_db();
         let mut row = bare_row("01DEVICE-01SESSION", Some(1_000));
@@ -2360,17 +2404,38 @@ mod tests {
                     "2026/2026-08-08 15.52 test",
                     RecordingNoteTargetKind::Folder
                 ),
+                // Uppercase: a file copied in from another machine is the same
+                // video, and a player that vanished with the spelling is a bug.
                 (
                     "2026/2026-08-08 15.52 test/camera-0000.MOV",
                     RecordingNoteTargetKind::Video
+                ),
+                // Double extension: the LAST one decides, so a backup of a
+                // video is not a video and gets no player to break.
+                (
+                    "2026/2026-08-08 15.52 test/clip.mov.bak",
+                    RecordingNoteTargetKind::File
                 ),
                 (
                     "2026/2026-08-08 15.52 test/manifest.json",
                     RecordingNoteTargetKind::File
                 ),
+                // No extension at all: a plain file, never a guess.
+                (
+                    "2026/2026-08-08 15.52 test/notes",
+                    RecordingNoteTargetKind::File
+                ),
+                (
+                    "2026/2026-08-08 15.52 test/room-tone.WAV",
+                    RecordingNoteTargetKind::Audio
+                ),
                 (
                     "2026/2026-08-08 15.52 test/screen-0000.mov",
                     RecordingNoteTargetKind::Video
+                ),
+                (
+                    "2026/2026-08-08 15.52 test/whiteboard.png",
+                    RecordingNoteTargetKind::Image
                 ),
             ],
             "the folder leads, its files follow in name order, and `nested` is not a target"
@@ -2381,6 +2446,84 @@ mod tests {
             "the absolute path is composed here, once, from the destination root"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Story 43.5: the whole vocabulary, pinned. Every extension the three
+    /// tables name resolves to its kind, no name is on two tables, and the
+    /// catch-all catches the shapes that get misread as "probably a video".
+    #[test]
+    fn every_extension_resolves_to_exactly_one_kind_and_the_rest_are_plain_files() {
+        for extension in VIDEO_EXTENSIONS {
+            assert_eq!(
+                kind_for_file_name(&format!("a.{extension}")),
+                RecordingNoteTargetKind::Video,
+                "{extension} is on the video table"
+            );
+            assert_eq!(
+                kind_for_file_name(&format!("a.{}", extension.to_uppercase())),
+                RecordingNoteTargetKind::Video,
+                "{extension} uppercase is the same video"
+            );
+        }
+        for extension in IMAGE_EXTENSIONS {
+            assert_eq!(
+                kind_for_file_name(&format!("a.{extension}")),
+                RecordingNoteTargetKind::Image,
+                "{extension} is on the image table"
+            );
+        }
+        for extension in AUDIO_EXTENSIONS {
+            assert_eq!(
+                kind_for_file_name(&format!("a.{extension}")),
+                RecordingNoteTargetKind::Audio,
+                "{extension} is on the audio table"
+            );
+        }
+        // No table may claim a name another one already claims: an overlap
+        // would make the kind depend on the order of the branches.
+        for extension in VIDEO_EXTENSIONS {
+            assert!(
+                !IMAGE_EXTENSIONS.contains(&extension) && !AUDIO_EXTENSIONS.contains(&extension),
+                "{extension} is on two tables"
+            );
+        }
+        for extension in IMAGE_EXTENSIONS {
+            assert!(
+                !AUDIO_EXTENSIONS.contains(&extension),
+                "{extension} is on two tables"
+            );
+        }
+
+        for name in [
+            "manifest.json",
+            "transcript.txt",
+            "paper.pdf",
+            "notes",
+            "Makefile",
+            ".gitignore",
+            "clip.mov.bak",
+            "archive.mov.zip",
+            "a.mov.",
+            "",
+        ] {
+            assert_eq!(
+                kind_for_file_name(name),
+                RecordingNoteTargetKind::File,
+                "{name:?} is not something keeper can render inline"
+            );
+        }
+
+        // A path, not just a bare name: only the last component's extension
+        // may decide, or a session folder called `2026.mov` would type its
+        // whole contents as video.
+        assert_eq!(
+            kind_for_file_name("2026/a.mov/notes.txt"),
+            RecordingNoteTargetKind::File
+        );
+        assert_eq!(
+            kind_for_file_name("2026/notes.txt/a.mov"),
+            RecordingNoteTargetKind::Video
+        );
     }
 
     /// Story 42.4 × Story 40.4: the note keeps saying where the recording was

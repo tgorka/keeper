@@ -3511,29 +3511,50 @@ pub struct RecordingHitVm {
     pub playable_path: Option<String>,
 }
 
-/// What one [`RecordingNoteTargetVm`] is (Story 42.4, FR-142).
+/// What one [`RecordingNoteTargetVm`] is (Story 42.4, FR-142; widened by Story
+/// 43.5, FR-150, AD-73).
 ///
-/// The surface asks exactly one question of a target beyond "where is it":
-/// does handing this to the system's default application mean anything a
-/// person would call Preview? For the session folder it does not — Reveal
-/// already does that job, and a Preview that opens a Finder window is Reveal
-/// wearing a different label. For `manifest.json` it does not either: a
-/// Preview that opens a text editor full of JSON is a mislabelled button.
-/// So the distinction the wire carries is video versus everything else, and
-/// the surface offers Preview for exactly one of the three.
+/// **One vocabulary, because there is one question.** A surface holding a
+/// target asks *what is this file and how should it be shown*, and every
+/// answer keeper has — offer Preview, put a `<video>` in the note, put an
+/// `<img>` there, serve the bytes over `keeper-recording://` — is a reading of
+/// that one answer. Story 42.4 could answer it with `video` versus everything
+/// else because the only consumer was a Preview item. Story 43.5 renders four
+/// different elements, and the alternative to widening this was each surface
+/// growing a private extension table: three tables that drift, so a file plays
+/// in the note and offers no Preview in the panel.
+///
+/// Decided by extension in exactly one place —
+/// [`crate::archive::recordings_fts::kind_for_file_name`] — and never by
+/// reading the file. See that function for why sniffing is the wrong cost.
+///
+/// The order below is the vocabulary from most specific claim to least: the
+/// three kinds keeper renders inline, then the two it can only act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub enum RecordingNoteTargetKind {
-    /// The session folder itself — the target of the note's `recording:` line.
-    Folder,
-    /// A file the recorder writes video into. The one kind Preview is offered
-    /// for.
+    /// A file a `<video>` can play, and the one kind Preview is offered for.
     Video,
-    /// Any other file in the session folder: the manifest, an audio sidecar, a
-    /// file another tool dropped in. Reveal and Copy path, and nothing that
-    /// claims to play it.
+    /// A file an `<img>` can show.
+    Image,
+    /// A file an `<audio>` can play.
+    Audio,
+    /// Any file keeper does not render inline: the session's `manifest.json`, a
+    /// PDF, an archive, a `.partial` from a rotation in flight, an
+    /// extensionless dotfile. Reveal and Copy path, and nothing that claims to
+    /// play it.
+    ///
+    /// Named for what keeper is claiming — that it is a file — and not for what
+    /// it might contain. It is the catch-all, so an extension nobody
+    /// anticipated is an attachment with working actions rather than a broken
+    /// player: Story 42.6's rule that a dead player is worse than a plain link,
+    /// applied to every file the tables above do not name.
     File,
+    /// The session folder itself — the target of the note's `recording:` line.
+    /// Never produced by extension: the caller knows a directory when it lists
+    /// one.
+    Folder,
 }
 
 /// One thing the reader of a recording note can act on: the session's folder,
@@ -3570,7 +3591,9 @@ pub struct RecordingNoteTargetVm {
     /// (Story 41.2). Only ever the argument of an action — never rendered as
     /// the note's text, and never written back into a note.
     pub absolute_path: String,
-    /// What the target is, which is what decides whether Preview is offered.
+    /// What the target is: which element a note embeds it as, whether the
+    /// panel offers Preview, and whether `keeper-recording://` will serve its
+    /// bytes. One answer, so those three cannot disagree (AD-73).
     pub kind: RecordingNoteTargetKind,
 }
 
@@ -3626,6 +3649,142 @@ pub struct SyncListSettingsVm {
     /// Rows visible after unfolding (default 100). Also the `LIMIT` the activity
     /// query runs with, so it bounds what the card can show at all.
     pub unfolded: u32,
+}
+
+/// Why a browsed directory has no entries — or that it has them (Story 43.8,
+/// FR-153, AD-75).
+///
+/// **An empty folder and an absent drive are different facts, and the whole of
+/// a user's trust in a file browser is that it never confuses them.** To
+/// `read_dir` they are identical: an unplugged pendrive simply has no directory
+/// there. A browser that reported both as "nothing here" would be telling
+/// someone their recordings are gone every time they close their laptop lid,
+/// which is the single fastest way to make a surface unusable.
+///
+/// The three failure answers are separate because their next steps are
+/// different: reattach the drive, work out whose disk is mounted there, or
+/// re-point the profile at a folder that moved. That is the same reasoning
+/// [`RecordingVolumeState`] follows, and this is deliberately NOT that enum:
+/// this one also has to carry "the folder is gone on a disk that is present",
+/// which a volume state has no way to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum FilesListingState {
+    /// The directory was read. This is the only state whose entry list means
+    /// anything, and an empty list under it is the honest "this folder is
+    /// empty".
+    Listed,
+    /// The profile is on removable media (AD-48) and the media is not attached.
+    /// A pause, not a fault: nothing on disk is missing.
+    MediaAbsent,
+    /// Something is mounted where this profile's volume lives and it is not
+    /// provably that volume. Never listed — those files belong to a different
+    /// disk, and showing them under this profile's name would misattribute
+    /// somebody else's folder.
+    MediaUnexpected,
+    /// The directory is not on disk, on media that is attached. Moved, renamed
+    /// or deleted outside keeper.
+    Missing,
+}
+
+/// One entry in a browsed synced folder (Story 43.8, FR-153, FR-145, AD-65,
+/// AD-73).
+///
+/// **Both paths, for two different jobs.** `relative_path` is what the surface
+/// shows and what it hands back to list this entry's children — the frontend
+/// never composes it, it echoes one this VM already carried, which is AD-65
+/// applied to a tree that is expanded a node at a time. `absolute_path` is only
+/// ever the argument of an action (reveal, copy path, open with the system
+/// handler) and is composed in Rust from the profile's own root, so no synced
+/// folder's location is ever assembled in TypeScript.
+///
+/// **The kind is the one attachment vocabulary** (AD-73). A `.mov` in a synced
+/// folder is the same kind of thing as a `.mov` a note embeds, and giving the
+/// browser a private extension table is how the two surfaces would come to
+/// disagree about what a file is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FilesEntryVm {
+    /// The entry's own name, with no path in it — what the row renders.
+    pub name: String,
+    /// The entry's path relative to the profile root, `/`-joined. Never
+    /// absolute: this is the string that appears on screen, and FR-145's rule
+    /// against writing an absolute path into a synced artefact is the same rule
+    /// that keeps a home-directory name out of a screenshot.
+    pub relative_path: String,
+    /// The same entry resolved against the profile's local path, composed in
+    /// Rust. Only ever an action's argument.
+    pub absolute_path: String,
+    /// What this entry is. [`RecordingNoteTargetKind::Folder`] exactly when the
+    /// dirent said directory; every other value is decided by extension in
+    /// [`crate::archive::recordings_fts::kind_for_file_name`].
+    pub kind: RecordingNoteTargetKind,
+}
+
+impl FilesEntryVm {
+    /// Project one listed entry, applying the one attachment vocabulary.
+    ///
+    /// `is_dir` comes from the dirent rather than from the name, because a
+    /// directory called `notes.md` exists and an extension table would call it
+    /// a document and offer to open it in a text editor.
+    pub fn new(
+        name: impl Into<String>,
+        relative_path: impl Into<String>,
+        absolute_path: impl Into<String>,
+        is_dir: bool,
+    ) -> Self {
+        let name = name.into();
+        let kind = if is_dir {
+            RecordingNoteTargetKind::Folder
+        } else {
+            crate::archive::recordings_fts::kind_for_file_name(&name)
+        };
+        Self {
+            name,
+            relative_path: relative_path.into(),
+            absolute_path: absolute_path.into(),
+            kind,
+        }
+    }
+}
+
+/// One directory of one synced folder, as the Files tab renders it (Story 43.8,
+/// FR-153).
+///
+/// **`entries` is `None` for every state but [`FilesListingState::Listed`], and
+/// that is a contract rather than a convenience.** An empty array and a null
+/// are different in TypeScript, so a surface that renders `entries.length === 0`
+/// as "this folder is empty" cannot accidentally say it about a drive that is
+/// out — it has to unwrap first, and unwrapping is where it meets the state.
+/// Carrying `[]` for an unreadable folder would make the wrong rendering the
+/// path of least resistance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FilesListingVm {
+    /// The profile this listing came from, echoed back so a surface with
+    /// several expansions in flight can attribute a late answer.
+    pub profile_id: String,
+    /// The profile-relative directory that was listed; `""` is the profile
+    /// root. Echoed for the same reason.
+    pub subpath: String,
+    /// Whether the directory was read, and if not, why.
+    pub state: FilesListingState,
+    /// The directory's children, `Some` exactly when `state` is
+    /// [`FilesListingState::Listed`].
+    pub entries: Option<Vec<FilesEntryVm>>,
+    /// The one sentence to show alongside this listing, composed in Rust: why a
+    /// non-`listed` state has no entries, or — under `listed` — that the list
+    /// was capped. One field rather than two because the surface has one place
+    /// to put a sentence, and because the folder-open action words "this folder
+    /// is not reachable" from the same function, so the two can never disagree.
+    /// `None` when there is nothing to explain.
+    pub detail: Option<String>,
+    /// Whether the listing was cut short at the shell's cap. `false` for every
+    /// state that has no entries — there was nothing to cut.
+    pub truncated: bool,
 }
 
 #[cfg(test)]
@@ -5415,5 +5574,85 @@ mod tests {
             "json was: {json}"
         );
         assert!(json.contains("\"hitStart\":false"), "json was: {json}");
+    }
+
+    /// Story 43.8: the browser classifies through the one attachment
+    /// vocabulary, so a `.mov` in a synced folder and a `.mov` a note embeds
+    /// are the same kind of thing.
+    #[test]
+    fn a_files_entry_takes_its_kind_from_the_one_vocabulary() {
+        for (name, expected) in [
+            ("clip.mov", RecordingNoteTargetKind::Video),
+            ("shot.PNG", RecordingNoteTargetKind::Image),
+            ("voice.m4a", RecordingNoteTargetKind::Audio),
+            ("manifest.json", RecordingNoteTargetKind::File),
+            ("Makefile", RecordingNoteTargetKind::File),
+        ] {
+            let entry =
+                FilesEntryVm::new(name, format!("sub/{name}"), format!("/v/sub/{name}"), false);
+            assert_eq!(entry.kind, expected, "{name}");
+        }
+    }
+
+    /// The dirent decides folder-ness, never the name: a directory called
+    /// `notes.md` is a folder, and an extension table would offer to open it in
+    /// a text editor.
+    #[test]
+    fn a_directory_is_a_folder_whatever_it_is_named() {
+        let entry = FilesEntryVm::new("notes.md", "notes.md", "/v/notes.md", true);
+        assert_eq!(entry.kind, RecordingNoteTargetKind::Folder);
+    }
+
+    /// The distinction the whole surface rests on, asserted on the wire: an
+    /// empty folder serializes `"entries":[]` and an absent drive serializes
+    /// `"entries":null`, so no frontend can read one as the other.
+    #[test]
+    fn an_empty_listing_and_an_absent_drive_are_different_on_the_wire() {
+        let empty = FilesListingVm {
+            profile_id: "01PROFILE".to_owned(),
+            subpath: String::new(),
+            state: FilesListingState::Listed,
+            entries: Some(Vec::new()),
+            detail: None,
+            truncated: false,
+        };
+        let json = serde_json::to_string(&empty).expect("serialize empty listing");
+        assert!(json.contains("\"state\":\"listed\""), "json was: {json}");
+        assert!(json.contains("\"entries\":[]"), "json was: {json}");
+
+        let absent = FilesListingVm {
+            entries: None,
+            state: FilesListingState::MediaAbsent,
+            detail: Some("merope is not attached.".to_owned()),
+            ..empty.clone()
+        };
+        let json = serde_json::to_string(&absent).expect("serialize absent media");
+        assert!(
+            json.contains("\"state\":\"mediaAbsent\""),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"entries\":null"), "json was: {json}");
+        let back: FilesListingVm = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, absent);
+    }
+
+    #[test]
+    fn files_entry_camel_cases_both_paths_and_never_leaks_one_into_the_other() {
+        let entry = FilesEntryVm::new(
+            "clip.mov",
+            "2026/clip.mov",
+            "/Volumes/m/2026/clip.mov",
+            false,
+        );
+        let json = serde_json::to_string(&entry).expect("serialize files entry");
+        assert!(
+            json.contains("\"relativePath\":\"2026/clip.mov\""),
+            "json was: {json}"
+        );
+        assert!(
+            json.contains("\"absolutePath\":\"/Volumes/m/2026/clip.mov\""),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"kind\":\"video\""), "json was: {json}");
     }
 }

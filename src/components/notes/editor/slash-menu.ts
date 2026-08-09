@@ -68,10 +68,20 @@ export function slashMenuSource(
       detail: command.detail,
       // Computed on accept, not on open: a menu left hanging over midnight
       // must not insert yesterday.
+      //
+      // `from` is the character after the `/`, so the slash itself is one to
+      // the left and has to be swallowed with the word — otherwise picking
+      // "Task" would leave `/- [ ] ` in the note.
       apply: (view: EditorView, _completion: Completion, from: number, to: number) => {
-        view.dispatch({ changes: { from, to, insert: command.text(new Date()) } });
+        view.dispatch({ changes: { from: from - 1, to, insert: command.text(new Date()) } });
       },
     }));
-    return { from: line.from, options, validFor: OPEN_SLASH };
+    // **After the `/`, not at it (Story 43.9).** Completion filters options by
+    // fuzzy-matching the text between `from` and the caret against each label.
+    // Anchoring `from` at the slash put a `/` into that pattern, no label
+    // contains one, every option was filtered out — and a completion with zero
+    // options is not a menu, so the popup never appeared at all. `validFor`
+    // describes the same span and therefore drops the slash with it.
+    return { from: line.from + 1, options, validFor: /^\w*$/ };
   };
 }

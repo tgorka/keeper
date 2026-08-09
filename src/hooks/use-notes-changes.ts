@@ -75,7 +75,7 @@ export function useNotesChanges(vaultId: string | null): void {
   // The chip set as one string, so the query effect re-runs on a real change
   // rather than on every render that rebuilds an equal array.
   const filterKey = useNotesFiltersStore((s) =>
-    JSON.stringify([s.scope, s.tags, s.text.trim(), s.agentOnly, s.pinnedOnly]),
+    JSON.stringify([s.scope, s.tagTerms, s.text.trim(), s.agentOnly, s.pinnedOnly]),
   );
   const limit = useNotesListStore((s) => s.limit);
 

@@ -25,6 +25,15 @@ sort: string,
  */
 limit: number, 
 /**
+ * The icon the sidebar draws for this space, as the name of one member of
+ * the fixed set the editor offers (FR-149, UX-DR55). `None` for a space
+ * nobody has given one, and — deliberately — also the spelling for a space
+ * whose stored name is not in that set any more: the *name* survives on
+ * disk untouched, because keeper rewriting an icon it did not recognise is
+ * the same class of mistake as rewriting a query term it could not parse.
+ */
+icon: string | null, 
+/**
  * The parse failure, when the stored query does not parse. A broken space
  * matches nothing and says so; it never falls back to matching everything.
  */

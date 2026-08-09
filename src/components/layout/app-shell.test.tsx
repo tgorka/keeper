@@ -179,6 +179,29 @@ describe("AppShell", () => {
     expect(screen.queryByRole("region", { name: "Sync" })).not.toBeInTheDocument();
   });
 
+  // ── Files view (Story 43.8) ────────────────────────────────────────────────
+  it("renders the Files pane for the files view when the sync capability is on", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    primaryViewStore.getState().setView("files");
+    render(<AppShell />);
+
+    expect(screen.getByRole("region", { name: "Files" })).toBeInTheDocument();
+    // The browser replaces the chat cluster rather than sitting beside it.
+    expect(screen.queryByText("Select a conversation to start reading.")).not.toBeInTheDocument();
+    // Sibling surfaces, not the same one.
+    expect(screen.queryByRole("region", { name: "Sync" })).not.toBeInTheDocument();
+  });
+
+  it("does not render the Files pane when the sync capability is off", () => {
+    // A stale "files" primary-view must never show a browser over folders this
+    // build cannot sync — the same rule the Sync pane above is gated by.
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: true });
+    primaryViewStore.getState().setView("files");
+    render(<AppShell />);
+
+    expect(screen.queryByRole("region", { name: "Files" })).not.toBeInTheDocument();
+  });
+
   // ── Overlay-titlebar drag band (Story 34.2) ────────────────────────────────
   it("renders no drag band where the platform draws its own title bar", () => {
     // Off macOS the window controls live in a real title bar above the webview, so

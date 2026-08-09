@@ -31,9 +31,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 use crate::notes::search;
-use crate::notes::tags::TagNode;
+use crate::notes::tags::{normalise, TagNode};
 
 /// Schema version of the on-disk [`IndexCache`]. Bump it whenever the meaning or
 /// the shape of an [`IndexEntry`] field changes; the loader's only response to a
@@ -178,6 +179,40 @@ impl IndexEntry {
             .any(|hay| search::fold_str(hay).contains(&needle))
     }
 
+    /// Whether the note list's tag chips admit this entry (FR-148, UX-DR54).
+    ///
+    /// Beside [`Self::matches_text`] because it is the same kind of thing: one
+    /// axis of the chip bar, answered from the index alone, defined once in the
+    /// crate that can be tested on any host rather than in the Tauri shell that
+    /// cannot (AD-55/AD-56).
+    ///
+    /// **The semantics are the space DSL's, not a second dialect.** An
+    /// [`NoteTagTerm::Include`] term is `tag:x` and an [`NoteTagTerm::Exclude`]
+    /// term is `-tag:x`, down to the segment rule the two share
+    /// ([`is_tag_descendant`]) — so `client/acme` admits `client/acme/renewal`
+    /// and never `client/acmecorp`, and **excluding `draft` removes `draft/legal`
+    /// with it**. An exclusion is the negation of the inclusion spelled with the
+    /// same tag: if a chip's `+` selects a subtree, its `−` has to deselect that
+    /// same subtree, or the sign on a chip would silently change which tags the
+    /// chip is talking about.
+    ///
+    /// Terms intersect — every one must hold — which is what makes a
+    /// contradiction answer itself. `draft` included *and* excluded is
+    /// unsatisfiable rather than resolved by precedence, exactly as
+    /// `tag:draft -tag:draft` is in the DSL. The chip bar cannot express it and
+    /// [`NoteQueryReq`](crate::notes::vm::NoteQueryReq) keys its terms by tag so
+    /// the wire cannot either; this is the backstop for the one way two chips
+    /// can still collide, which is two spellings of one tag ([`TagTerms::new`]).
+    pub fn matches_tags(&self, terms: &TagTerms) -> bool {
+        terms.iter().all(|(tag, term)| {
+            let carried = self.tags.iter().any(|held| tag_covers(held, tag));
+            match term {
+                NoteTagTerm::Include => carried,
+                NoteTagTerm::Exclude => !carried,
+            }
+        })
+    }
+
     /// Every string [`Self::matches_text`] is allowed to look in, in the order
     /// that finds the common case soonest.
     ///
@@ -222,6 +257,71 @@ impl IndexEntry {
             }
         }
         keys
+    }
+}
+
+/// The state one tag chip contributes to the note-list query (FR-148, UX-DR54).
+///
+/// **There is no `Off`.** A chip nobody has touched contributes no term, and off
+/// is therefore the absence of a key rather than a third value every reader of a
+/// query would have to prove harmless. That is also why
+/// [`NoteQueryReq`](crate::notes::vm::NoteQueryReq) carries a *map* from tag to
+/// term instead of an include list beside an exclude list: with two lists,
+/// `draft` in both is a state the wire can carry and something downstream would
+/// have to resolve by precedence. Keyed by tag, it is a state that cannot be
+/// written down — which is the same thing the three-state chip guarantees at the
+/// other end of the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum NoteTagTerm {
+    /// The note must carry this tag or one beneath it (`tag:x`).
+    Include,
+    /// The note must carry neither this tag nor anything beneath it (`-tag:x`).
+    Exclude,
+}
+
+/// A query's tag chips, normalised once so the predicate allocates nothing per
+/// entry.
+///
+/// [`normalise`] allocates, and [`IndexEntry::matches_tags`] runs against every
+/// entry in the vault on every keystroke — folding ten thousand times what can
+/// be folded once is the difference NFR-28's 100 ms list paint is made of.
+///
+/// A `Vec` rather than a map, because normalisation is many-to-one: `Draft` and
+/// `draft` are distinct keys on the wire and the same tag here. Keeping both
+/// entries is what makes that collision resolve the way the DSL resolves it —
+/// `tag:draft -tag:draft` is unsatisfiable, so the list is empty and the user
+/// can see both chips that made it so. Collapsing them into a map would pick a
+/// winner, and a filter that quietly drops one of the terms you can see on
+/// screen is the failure this whole story is against.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagTerms(Vec<(String, NoteTagTerm)>);
+
+impl TagTerms {
+    /// Fold the request's chips into canonical tags.
+    ///
+    /// A chip that is not a tag at all normalises to nothing, and nothing is
+    /// neither equal to nor an ancestor of any indexed tag: an `Include` of it
+    /// matches no note, an `Exclude` of it removes none. That is deliberately
+    /// the same degradation `tag:---` takes in the DSL — a search that finds
+    /// nothing, not an error, and never a chip that silently selects the vault.
+    pub fn new(chips: &BTreeMap<String, NoteTagTerm>) -> Self {
+        Self(
+            chips
+                .iter()
+                .map(|(raw, term)| (normalise(raw).unwrap_or_default(), *term))
+                .collect(),
+        )
+    }
+
+    /// Whether no chip is set, so the caller can skip the walk entirely.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&str, NoteTagTerm)> + '_ {
+        self.0.iter().map(|(tag, term)| (tag.as_str(), *term))
     }
 }
 
@@ -541,9 +641,21 @@ fn close_tag_node(open: &mut Vec<TagNode>, roots: &mut Vec<TagNode>) {
 
 /// Whether `path` is a strict tag descendant of `ancestor` (`a/b` under `a`, but
 /// `ab` not under `a`).
-fn is_tag_descendant(path: &str, ancestor: &str) -> bool {
+///
+/// Public because it is the segment rule the whole system means by "tag": the
+/// tree rolls counts up it, `tag:x/*` in the space DSL is exactly it, and
+/// [`IndexEntry::matches_tags`] both selects and deselects subtrees by it. Three
+/// copies of `starts_with` plus a `/` check is three chances for `client/acme`
+/// to start matching `client/acmecorp` in one surface and not another.
+pub fn is_tag_descendant(path: &str, ancestor: &str) -> bool {
     path.strip_prefix(ancestor)
         .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether a tag chip naming `term` covers the indexed tag `path` — the tag
+/// itself or anything beneath it. What `tag:` means, in one place.
+pub fn tag_covers(path: &str, term: &str) -> bool {
+    path == term || is_tag_descendant(path, term)
 }
 
 /// The last `/`-separated segment of a tag path — its display name.
@@ -894,6 +1006,120 @@ mod tests {
     #[test]
     fn a_blank_needle_matches_everything() {
         assert!(entry("n-1", "a.md", "A").matches_text("   "));
+    }
+
+    /// The chip set as the wire carries it: keyed by tag, so a tag has exactly
+    /// one state and no test here can accidentally build a request the three-
+    /// state chip could not have produced.
+    fn chips(pairs: &[(&str, NoteTagTerm)]) -> TagTerms {
+        TagTerms::new(
+            &pairs
+                .iter()
+                .map(|(tag, term)| ((*tag).to_owned(), *term))
+                .collect(),
+        )
+    }
+
+    /// The story in one test: the same note, shown by an inclusion and then
+    /// taken away by an exclusion.
+    #[test]
+    fn an_exclusion_removes_what_an_inclusion_would_have_shown() {
+        let e = tagged("n-1", "a.md", &["client/acme", "draft"]);
+        assert!(e.matches_tags(&chips(&[("draft", NoteTagTerm::Include)])));
+        assert!(!e.matches_tags(&chips(&[("draft", NoteTagTerm::Exclude)])));
+    }
+
+    /// `client/acme` and not `draft` — the epic's own example. The two terms
+    /// intersect, so the untagged sibling is admitted and the drafted one is not.
+    #[test]
+    fn an_inclusion_and_an_exclusion_compose() {
+        let terms = chips(&[
+            ("client/acme", NoteTagTerm::Include),
+            ("draft", NoteTagTerm::Exclude),
+        ]);
+        assert!(tagged("keep", "a.md", &["client/acme"]).matches_tags(&terms));
+        assert!(!tagged("drafted", "b.md", &["client/acme", "draft"]).matches_tags(&terms));
+        // Excluding `draft` must not widen the inclusion: a note outside the
+        // client is still outside it.
+        assert!(!tagged("other", "c.md", &["client/other"]).matches_tags(&terms));
+    }
+
+    /// An excluded ancestor takes its whole subtree with it, because `-tag:x` is
+    /// the negation of `tag:x` and `tag:x` selects the subtree. A `+` and a `−`
+    /// on the same chip have to be talking about the same set of notes.
+    #[test]
+    fn an_excluded_ancestor_excludes_its_descendants() {
+        let terms = chips(&[("client", NoteTagTerm::Exclude)]);
+        assert!(!tagged("parent", "a.md", &["client"]).matches_tags(&terms));
+        assert!(!tagged("child", "b.md", &["client/acme"]).matches_tags(&terms));
+        assert!(!tagged("deep", "c.md", &["client/acme/renewal"]).matches_tags(&terms));
+        // The segment rule holds on the exclusion side too: a lexical neighbour
+        // is a different tag and survives. Without it, hiding `client` would
+        // silently hide `clients` as well.
+        assert!(tagged("neighbour", "d.md", &["clients"]).matches_tags(&terms));
+    }
+
+    /// The inclusion side of the same rule, so the two can never drift apart.
+    #[test]
+    fn an_included_ancestor_admits_its_descendants_and_not_its_neighbours() {
+        let terms = chips(&[("client/acme", NoteTagTerm::Include)]);
+        assert!(tagged("exact", "a.md", &["client/acme"]).matches_tags(&terms));
+        assert!(tagged("under", "b.md", &["client/acme/renewal"]).matches_tags(&terms));
+        assert!(!tagged("neighbour", "c.md", &["client/acmecorp"]).matches_tags(&terms));
+        assert!(!tagged("sibling", "d.md", &["client/other"]).matches_tags(&terms));
+    }
+
+    /// A chip carries whatever the surface that made it carried — a hash, a
+    /// casing, a stray space — and the tag vocabulary is what decides it names
+    /// the node the sidebar named (Story 42.5).
+    #[test]
+    fn a_chip_is_read_through_the_tag_vocabulary() {
+        let e = tagged("n-1", "a.md", &["client/acme"]);
+        assert!(e.matches_tags(&chips(&[("#Client/Acme ", NoteTagTerm::Include)])));
+        assert!(!e.matches_tags(&chips(&[("#Client/Acme ", NoteTagTerm::Exclude)])));
+    }
+
+    /// A chip that is not a tag selects nothing rather than everything: an
+    /// inclusion of it admits no note, an exclusion of it removes none. The
+    /// failure prevented is a malformed chip quietly turning the filter off.
+    #[test]
+    fn a_chip_that_is_not_a_tag_matches_nothing_and_excludes_nothing() {
+        let e = tagged("n-1", "a.md", &["client/acme"]);
+        assert!(!e.matches_tags(&chips(&[("---", NoteTagTerm::Include)])));
+        assert!(e.matches_tags(&chips(&[("---", NoteTagTerm::Exclude)])));
+    }
+
+    /// Two spellings of one tag are the one collision the map key cannot stop,
+    /// and it resolves the way the DSL resolves `tag:draft -tag:draft`: nothing
+    /// matches. Not a precedence rule — an unsatisfiable filter, which leaves
+    /// both chips on screen for the user to undo.
+    #[test]
+    fn a_tag_included_and_excluded_under_two_spellings_is_unsatisfiable() {
+        let terms = chips(&[
+            ("Draft", NoteTagTerm::Include),
+            ("draft", NoteTagTerm::Exclude),
+        ]);
+        assert!(!tagged("tagged", "a.md", &["draft"]).matches_tags(&terms));
+        assert!(!tagged("untagged", "b.md", &["other"]).matches_tags(&terms));
+    }
+
+    /// An empty chip set is not a filter. A bar with nothing in it must show the
+    /// vault, never nothing.
+    #[test]
+    fn no_chips_admit_every_note() {
+        let terms = TagTerms::default();
+        assert!(terms.is_empty());
+        assert!(tagged("n-1", "a.md", &["anything"]).matches_tags(&terms));
+        assert!(entry("n-2", "b.md", "B").matches_tags(&terms));
+    }
+
+    /// An untagged note is admitted by every exclusion and by no inclusion —
+    /// the boundary an `is:untagged` lens would otherwise have to special-case.
+    #[test]
+    fn an_untagged_note_survives_exclusions_and_fails_inclusions() {
+        let e = entry("n-1", "a.md", "A");
+        assert!(e.matches_tags(&chips(&[("draft", NoteTagTerm::Exclude)])));
+        assert!(!e.matches_tags(&chips(&[("draft", NoteTagTerm::Include)])));
     }
 
     #[test]

@@ -389,6 +389,29 @@ development_status:
   42-6-a-note-knows-where-its-files-are: review
   epic-42-retrospective: optional
 
+  # Epic 43, opened 2026-08-09 from a field report after epics 41/42 merged and
+  # the owner used the result. Eight items, and seven of them are one sentence
+  # from different seats: keeper knows where a file is and still will not show
+  # it. The eighth is a plain editor bug. See
+  # planning-artifacts/epic-43-a-note-can-show-you-the-file.md for the positions
+  # taken, chiefly AD-73 (one attachment vocabulary, not three widgets) and
+  # AD-75 (the files tab is a reader and stays one).
+  epic-43: in-progress
+  43-1-tab-belongs-to-the-editor: review
+  43-2-a-recording-note-says-it-is-one: review
+  43-3-include-exclude-off: review
+  43-4-spaces-you-can-edit: review
+  43-5-one-attachment-vocabulary: review
+  43-6-two-videos-one-transport: review
+  43-7-the-attachment-panel: review
+  43-8-the-files-tab: review
+  # Found while proving 43.1 — the `/` menu shipped in 37.6 has never opened for
+  # anybody: `slashMenuSource` reported a match span that included the leading
+  # slash, so the fuzzy matcher rejected every command label. Separate story so
+  # it reverts on its own rather than riding inside a Tab fix.
+  43-9-the-slash-menu-can-open: review
+  epic-43-retrospective: optional
+
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
   # is implemented, gated and open as a stacked PR; none is `done`, because in
   # this repo `done` means the PR merged and the ledger closed, and the stack has

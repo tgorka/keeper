@@ -15,8 +15,12 @@
 //! Only facts keeper already holds. No transcription, no summarisation, no
 //! inference of any kind — named here because "a note about a recording" invites
 //! exactly that, and a machine-written paragraph in the one field a human was
-//! about to write in is worse than a blank one. No tag normalisation against the
-//! notes tag tree either (that is 42.5); tags are carried as stored.
+//! about to write in is worse than a blank one. The session's own tags are
+//! carried **as stored**, because normalising them would rewrite the user's own
+//! text in one of the two places Story 42.5 promises it survives. The single
+//! tag keeper adds of its own accord is [`RECORDINGS_TAG`], and that one is
+//! resolved through 42.5's vocabulary rather than written as a literal (Story
+//! 43.2).
 //!
 //! # Two rules the shape of this module is built around
 //!
@@ -50,6 +54,7 @@
 
 use crate::notes::frontmatter::{FieldValue, Frontmatter};
 use crate::notes::naming;
+use crate::notes::tags;
 use crate::notes::templates::Stamp;
 
 /// The frontmatter key whose presence makes a note a recording note.
@@ -72,6 +77,22 @@ pub fn is_recording_note(fm: &Frontmatter) -> bool {
     fm.as_string(SESSION_KEY)
         .is_some_and(|id| !id.trim().is_empty())
 }
+
+/// The tag every recording note carries so a *human* can find one (Story 43.2,
+/// FR-147).
+///
+/// [`SESSION_KEY`] is the machine's predicate and it is invisible in the vault:
+/// browsing the tag tree shows a note's own tags and nothing saying what KIND
+/// of note it is, so the notes keeper writes are the only ones a person cannot
+/// reach without already knowing they exist.
+///
+/// Spelled here in the canonical form [`tags::normalise`] produces, and put
+/// through that function anyway before it is emitted: the vocabulary is the
+/// authority on what this tag is, not this constant. The test
+/// `the_kind_tag_is_already_what_the_vocabulary_makes_of_it` pins the two
+/// together, so a future normalisation rule cannot leave this file emitting a
+/// tag the tree files under a different name.
+pub const RECORDINGS_TAG: &str = "recordings";
 
 /// Everything about a session that the stub is allowed to state, as the shell
 /// reads it off `manifest.json`.
@@ -177,13 +198,22 @@ pub fn compose(facts: &SessionFacts<'_>, taken: &[String]) -> NoteStub {
     // Blank entries dropped rather than emitted: `meta.tags` is a UI split of a
     // comma-separated field, so a trailing comma leaves an empty string behind,
     // and `tags: ["work", ""]` would put a nameless tag in the vault's tag tree.
-    let tags: Vec<FieldValue> = facts
+    let mut tags: Vec<FieldValue> = facts
         .tags
         .iter()
         .map(|tag| tag.trim())
         .filter(|tag| !tag.is_empty())
         .map(|tag| FieldValue::Str(tag.to_owned()))
         .collect();
+
+    // Keeper's kind tag goes **after** the session's own, for the reason the
+    // three bookkeeping keys below come last: what the writer typed leads, and
+    // what keeper added trails it. Prepending would also displace the user's
+    // first tag from the one position a truncated property row is sure to show,
+    // and would make keeper's addition look like something they chose first.
+    if let Some(kind) = kind_tag(facts.tags) {
+        tags.push(FieldValue::Str(kind));
+    }
     if !tags.is_empty() {
         pairs.push(("tags".to_owned(), FieldValue::List(tags)));
     }
@@ -257,6 +287,29 @@ fn title_of(facts: &SessionFacts<'_>, date: &str) -> String {
         return date.to_owned();
     }
     facts.session_id.to_owned()
+}
+
+/// [`RECORDINGS_TAG`] in canonical form, or `None` when the session already
+/// carries it under some spelling of its own.
+///
+/// **The question is asked of [`tags::normalise`], never of the strings.**
+/// `Recordings`, `recordings ` and `#recordings` are all already this tag, and
+/// emitting a second spelling beside one of them is precisely the twin node
+/// Story 42.5 exists to prevent — the tree would show `recordings` counted
+/// twice off one note, or worse, the writer would see keeper disagree with them
+/// about their own vocabulary. What the user typed is left byte-identical;
+/// keeper only declines to say it again.
+///
+/// Returning `None` for an unnormalisable constant rather than panicking keeps
+/// [`compose`] total, which is the promise this whole module makes: there is no
+/// session for which the one minute in which a note would have been written is
+/// lost to a composer that refused.
+fn kind_tag(own: &[String]) -> Option<String> {
+    let kind = tags::normalise(RECORDINGS_TAG)?;
+    let already = own
+        .iter()
+        .any(|tag| tags::normalise(tag).as_deref() == Some(kind.as_str()));
+    (!already).then_some(kind)
 }
 
 /// Push `key: value`, or nothing at all when the value is blank.
@@ -355,7 +408,11 @@ mod tests {
         assert_eq!(fm.as_string("participants"), Some("Jane Doe, Sam"));
         assert_eq!(
             fm.as_list("tags"),
-            Some(vec!["work".to_owned(), "quarterly".to_owned()])
+            Some(vec![
+                "work".to_owned(),
+                "quarterly".to_owned(),
+                RECORDINGS_TAG.to_owned()
+            ])
         );
         assert_eq!(
             fm.as_string("session"),
@@ -627,8 +684,11 @@ mod tests {
         );
     }
 
+    /// `participants:` is still an omit-do-not-label field. `tags:` no longer
+    /// can be: Story 43.2 gives every stub the kind tag, so a session carrying
+    /// none of its own has a tag list of exactly one.
     #[test]
-    fn a_session_with_no_participants_and_no_tags_omits_those_lines_entirely() {
+    fn a_session_with_no_participants_omits_that_line_and_still_carries_its_kind_tag() {
         let stub = compose(
             &SessionFacts {
                 participants: None,
@@ -640,12 +700,15 @@ mod tests {
         let (fm, _) = Frontmatter::parse(&stub.contents);
 
         assert_eq!(fm.get("participants"), None);
-        assert_eq!(fm.get("tags"), None);
         assert!(
             !stub.contents.contains("participants:"),
             "an absent fact is omitted, not emitted as an empty label"
         );
-        assert!(!stub.contents.contains("tags:"));
+        assert!(
+            stub.contents.contains("tags:"),
+            "a session with no tags of its own is still findable as a recording"
+        );
+        assert_eq!(fm.as_list("tags"), Some(vec![RECORDINGS_TAG.to_owned()]));
         // What it does still say, so the omission is not mistaken for the
         // composer having given up.
         assert_eq!(fm.as_string("title"), Some("Quarterly review"));
@@ -667,7 +730,7 @@ mod tests {
     /// `meta.tags` is a UI split of a comma-separated field, so a trailing comma
     /// really does arrive as an empty element.
     #[test]
-    fn empty_tags_are_dropped_and_an_all_blank_tag_list_omits_the_line() {
+    fn empty_tags_are_dropped_and_an_all_blank_tag_list_leaves_only_the_kind_tag() {
         let mixed = ["work".to_owned(), "  ".to_owned(), " late ".to_owned()];
         let stub = compose(
             &SessionFacts {
@@ -678,7 +741,11 @@ mod tests {
         );
         assert_eq!(
             Frontmatter::parse(&stub.contents).0.as_list("tags"),
-            Some(vec!["work".to_owned(), "late".to_owned()])
+            Some(vec![
+                "work".to_owned(),
+                "late".to_owned(),
+                RECORDINGS_TAG.to_owned()
+            ])
         );
 
         let blank = ["".to_owned(), "   ".to_owned()];
@@ -689,10 +756,95 @@ mod tests {
             },
             &[],
         );
-        assert!(
-            !stub.contents.contains("tags:"),
-            "a list with nothing in it is no list"
+        assert_eq!(
+            Frontmatter::parse(&stub.contents).0.as_list("tags"),
+            Some(vec![RECORDINGS_TAG.to_owned()]),
+            "a list with nothing in it is the kind tag alone, never a nameless entry"
         );
+    }
+
+    /// The constant is only allowed to be a literal because it is *also* what
+    /// the vocabulary makes of it. If a future normalisation rule ever changed
+    /// that, this file would emit a tag the tag tree files under a different
+    /// name — the exact twin-node failure Story 42.5 closed — and it would show
+    /// up here rather than in somebody's sidebar.
+    #[test]
+    fn the_kind_tag_is_already_what_the_vocabulary_makes_of_it() {
+        assert_eq!(
+            tags::normalise(RECORDINGS_TAG).as_deref(),
+            Some(RECORDINGS_TAG)
+        );
+    }
+
+    /// AC, first half (Story 43.2, FR-147): the stub says what KIND of note it
+    /// is, and it says so *after* the session's own tags, which arrive
+    /// untouched and in the order the user typed them.
+    #[test]
+    fn the_kind_tag_follows_the_sessions_own_tags_and_changes_none_of_them() {
+        let own = [
+            "Zeta".to_owned(),
+            "client/Acme ".to_owned(),
+            "alpha".to_owned(),
+        ];
+        let stub = compose(
+            &SessionFacts {
+                tags: &own,
+                ..facts()
+            },
+            &[],
+        );
+        assert_eq!(
+            Frontmatter::parse(&stub.contents).0.as_list("tags"),
+            Some(vec![
+                "Zeta".to_owned(),
+                "client/Acme".to_owned(),
+                "alpha".to_owned(),
+                RECORDINGS_TAG.to_owned()
+            ]),
+            "the user's own text and their own order survive; keeper's tag trails it"
+        );
+    }
+
+    /// AC, second half: the tag is the vocabulary's, not a literal. Every one
+    /// of these spellings already *is* `recordings` to the tag tree, so
+    /// appending keeper's own would put two chips on one note that resolve to
+    /// one node — and the writer would see keeper disagree with them about
+    /// their own vocabulary.
+    #[test]
+    fn a_session_that_already_says_recordings_in_any_spelling_gets_exactly_one() {
+        for spelling in [
+            "recordings",
+            "Recordings",
+            "RECORDINGS",
+            "recordings ",
+            "  Recordings",
+            "#recordings",
+        ] {
+            let own = ["work".to_owned(), spelling.to_owned()];
+            let stub = compose(
+                &SessionFacts {
+                    tags: &own,
+                    ..facts()
+                },
+                &[],
+            );
+            let written = Frontmatter::parse(&stub.contents)
+                .0
+                .as_list("tags")
+                .expect("a stub always carries a tag list");
+
+            assert_eq!(
+                written,
+                vec!["work".to_owned(), spelling.trim().to_owned()],
+                "{spelling:?}: keeper adds nothing beside a tag that is already this one"
+            );
+            let canonical = tags::normalise_all(written.iter().map(String::as_str));
+            assert_eq!(
+                canonical.iter().filter(|t| *t == RECORDINGS_TAG).count(),
+                1,
+                "{spelling:?}: exactly one node in the tag tree, not a near-identical pair"
+            );
+        }
     }
 
     /// A manifest that predates Story 21.5 has no stamps at all. The stub must

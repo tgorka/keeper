@@ -49,6 +49,7 @@ import {
 import { useNotesChanges } from "@/hooks/use-notes-changes";
 import type { NoteRowVm } from "@/lib/ipc/client";
 import {
+  emptyFilterReason,
   isFiltered,
   isScopeOnly,
   type NoteScope,
@@ -92,10 +93,12 @@ export function NotesPane() {
   const activeVaultId = useNotesVaultsStore((s) => s.activeVaultId);
   const activeVault = useActiveVault();
   const scope = useNotesFiltersStore((s) => s.scope);
-  const tags = useNotesFiltersStore((s) => s.tags);
+  const tagTerms = useNotesFiltersStore((s) => s.tagTerms);
   const searchText = useNotesFiltersStore((s) => s.text);
   const agentOnly = useNotesFiltersStore((s) => s.agentOnly);
   const filtered = useNotesFiltersStore(isFiltered);
+  // A string, so subscribing to it re-renders on value rather than on identity.
+  const filterReason = useNotesFiltersStore(emptyFilterReason);
   const scopeOnly = useNotesFiltersStore(isScopeOnly);
   const searchNonce = useNotesFiltersStore((s) => s.searchNonce);
   const rows = useNotesListStore((s) => s.rows);
@@ -141,13 +144,13 @@ export function NotesPane() {
   const onSaveAsSpace = useCallback(() => {
     const parts = [
       scope.kind === "all" ? null : scopeLabel(scope),
-      ...tags,
+      ...tagTerms.map((chip) => (chip.term === "exclude" ? `not ${chip.tag}` : chip.tag)),
       agentOnly ? "Changed by agent" : null,
       searchText.trim() === "" ? null : `"${searchText.trim()}"`,
     ].filter((part): part is string => part !== null && part !== "");
     const name = parts.length === 0 ? UNTITLED_SPACE_NAME : parts.join(" · ");
     void saveFilterAsSpace(name).catch(report);
-  }, [scope, tags, agentOnly, searchText, report]);
+  }, [scope, tagTerms, agentOnly, searchText, report]);
 
   // Two chords are scoped to this view by being mounted with it — nothing else
   // mounts this listener, so neither can fire from another surface.
@@ -234,6 +237,12 @@ export function NotesPane() {
             ? "no-matches"
             : "empty-vault";
   }
+
+  // Which terms are narrowing, for the two states a filter can cause. The empty
+  // vault and the empty lens are facts about the vault, not about the bar, so
+  // naming terms under them would answer a question nobody asked.
+  const emptyDetail =
+    emptyKind === "no-matches" || emptyKind === "no-search-matches" ? filterReason : null;
 
   const onEmptyAction = () => {
     switch (emptyKind) {
@@ -338,14 +347,14 @@ export function NotesPane() {
           </p>
         )}
         {emptyKind !== null ? (
-          <NotesEmptyState kind={emptyKind} onAction={onEmptyAction} />
+          <NotesEmptyState kind={emptyKind} detail={emptyDetail} onAction={onEmptyAction} />
         ) : (
           <NoteList
             rows={rows}
             total={total}
             selectedId={openNoteId}
             onSelect={openRow}
-            onToggleTag={(tag) => notesFiltersStore.getState().toggleTag(tag)}
+            onToggleTag={(tag) => notesFiltersStore.getState().cycleTag(tag)}
             onVerb={runVerb}
             onGrow={() => notesListStore.getState().growWindow()}
           />
