@@ -52,6 +52,27 @@ use crate::notes::frontmatter::{FieldValue, Frontmatter};
 use crate::notes::naming;
 use crate::notes::templates::Stamp;
 
+/// The frontmatter key whose presence makes a note a recording note.
+///
+/// Not a folder name, not a tag, not a filename convention. `session:` is the
+/// only marker because it is the only one keeper mints and nobody can move: a
+/// Story 40.4 retitle renames the session folder and rewrites nothing here, and
+/// a user is free to rename the note file itself. Keying the predicate on
+/// anything else would let a note quietly stop being a recording note because
+/// somebody tidied a folder.
+pub const SESSION_KEY: &str = "session";
+
+/// Whether a note's frontmatter says keeper wrote it about a recording.
+///
+/// A blank value does not count. [`Frontmatter::parse`] keeps a key whose value
+/// is empty, so a bare `session:` line would otherwise mark a note as a
+/// recording whose session can never be resolved — the one state no caller can
+/// do anything with, and the one that would put a dead Reveal button on a note.
+pub fn is_recording_note(fm: &Frontmatter) -> bool {
+    fm.as_string(SESSION_KEY)
+        .is_some_and(|id| !id.trim().is_empty())
+}
+
 /// Everything about a session that the stub is allowed to state, as the shell
 /// reads it off `manifest.json`.
 ///
@@ -172,7 +193,7 @@ pub fn compose(facts: &SessionFacts<'_>, taken: &[String]) -> NoteStub {
     // folder name, then where the folder was relative to its root, then what is
     // inside it — in that same frame, so the reader never has to join the two.
     pairs.push((
-        "session".to_owned(),
+        SESSION_KEY.to_owned(),
         FieldValue::Str(facts.session_id.to_owned()),
     ));
     push_text(
@@ -805,5 +826,33 @@ mod tests {
         );
         assert_eq!(&stub.contents[stub.body_offset..], "# Café résumé\n\n");
         assert!(stub.contents[..stub.body_offset].ends_with("---\n\n"));
+    }
+
+    /// The predicate the Recordings lens and the properties panel both key on,
+    /// asserted against a stub this module composed rather than against a
+    /// hand-written block — so the writer and the reader cannot drift apart.
+    #[test]
+    fn a_composed_stub_is_recognised_as_a_recording_note() {
+        let stub = compose(&facts(), &[]);
+        let (fm, _) = Frontmatter::parse(&stub.contents);
+        assert!(is_recording_note(&fm));
+    }
+
+    /// A note that merely mentions files is somebody's own note. Keeper does not
+    /// claim it, list it under Recordings, or put a recording's buttons in it.
+    #[test]
+    fn a_note_without_a_session_is_not_a_recording_note() {
+        let (fm, _) = Frontmatter::parse(
+            "---\ntitle: Groceries\nfiles:\n  - list.txt\nrecording: 2026/whatever\n---\n\nbody\n",
+        );
+        assert!(!is_recording_note(&fm));
+    }
+
+    /// A bare `session:` parses to a key with an empty value, and a recording
+    /// whose identity is blank can never be resolved — so it is not one.
+    #[test]
+    fn a_blank_session_value_is_not_an_identity() {
+        let (fm, _) = Frontmatter::parse("---\ntitle: Half a stub\nsession:   \n---\n\nbody\n");
+        assert!(!is_recording_note(&fm));
     }
 }

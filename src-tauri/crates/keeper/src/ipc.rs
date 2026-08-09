@@ -2430,7 +2430,12 @@ pub fn recording_note_targets(
 /// state can give — [`search_recordings_in`]'s split, and for its reason: the
 /// rules above are then asserted over a temp directory with no Tauri app and
 /// no registry, including the first-run one.
-fn recording_note_targets_in(
+///
+/// `pub(crate)` because the `keeper-recording://` handler resolves through this
+/// too (Story 42.4): a protocol handler that answered from its own lookup would
+/// be a second opinion on where a session's files are, and the note's actions
+/// and its embedded player would drift apart after a Story 40.4 retitle.
+pub(crate) fn recording_note_targets_in(
     data_dir: &Path,
     destination_root: &Path,
     session_id: &str,
@@ -7475,7 +7480,7 @@ fn default_recording_destination(
 /// recorder resolves to something else would be two destinations. The platform is
 /// threaded in for the engine the resolution may need, exactly as Story 40.4's
 /// `sync_retitled_session` takes one.
-fn effective_destination_dir(data_dir: &Path, platform: &Arc<dyn Platform>) -> PathBuf {
+pub(crate) fn effective_destination_dir(data_dir: &Path, platform: &Arc<dyn Platform>) -> PathBuf {
     effective_recording_destination(data_dir, &|need| destination_profile_table(platform, need))
         .root
 }

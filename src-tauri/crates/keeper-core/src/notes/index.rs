@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::notes::search;
 use crate::notes::tags::TagNode;
 
 /// Schema version of the on-disk [`IndexCache`]. Bump it whenever the meaning or
@@ -72,6 +73,14 @@ pub const FIELD_TOUCHED: &str = "keeper.touched";
 /// ("Doe, Jane"). The `field:` predicate splits on this to implement the
 /// "`=` against a list means contains" rule.
 pub const FIELD_LIST_SEPARATOR: char = '\n';
+
+/// The namespace [`IndexEntry::fields`] reserves for keeper's own bookkeeping —
+/// [`FIELD_ORIGIN`], [`FIELD_DEVICE`], [`FIELD_TOUCHED`]. Every other key in the
+/// map is the note's own frontmatter.
+///
+/// The dot is load-bearing: a user's top-level `keeper:` map indexes under the
+/// bare key `keeper`, so this prefix can never shadow something they wrote.
+pub const RESERVED_FIELD_PREFIX: &str = "keeper.";
 
 /// One indexed note: everything a list row, a space query or a link lookup needs,
 /// without reopening the file.
@@ -123,8 +132,8 @@ pub struct IndexEntry {
     pub links: Vec<String>,
     /// Index-computed booleans, as strings so the set can grow without a schema
     /// bump: `pinned`, `archived`, `unread`, `conflict`, `journal`, `template`,
-    /// `space`, `capture`, `orphan`, `unstable_identity`, `unparsed`. Backs the
-    /// `is:` predicate.
+    /// `space`, `capture`, `recording`, `orphan`, `unstable_identity`,
+    /// `unparsed`. Backs the `is:` predicate.
     pub flags: Vec<String>,
     /// A short body excerpt for the list row, so rendering a window of rows never
     /// touches the filesystem.
@@ -135,6 +144,59 @@ impl IndexEntry {
     /// Whether this entry carries `flag` (the `is:` predicate's storage).
     pub fn has_flag(&self, flag: &str) -> bool {
         self.flags.iter().any(|f| f.as_str() == flag)
+    }
+
+    /// Whether the note-list's free-text chip matches this entry, answered
+    /// without opening the file (FR-104).
+    ///
+    /// Index-only is the point: this runs once per entry on every keystroke, so
+    /// it may read nothing the index does not already hold. Full-body matching
+    /// is `notes_search`, which streams because it reads files.
+    ///
+    /// **Frontmatter values are searched; frontmatter keys are not.** A key name
+    /// is structure, not content: it is identical across every note of a kind,
+    /// so accepting `participants` as a query term would return every recording
+    /// note in the vault and quietly cost the word its meaning as a search. The
+    /// Recordings lens is how you ask for "all of them"; a search term is how
+    /// you ask for one. Values are what a person actually remembers — a name, a
+    /// duration, the clock time a call started.
+    ///
+    /// The reserved [`RESERVED_FIELD_PREFIX`] namespace is skipped for the same
+    /// reason turned around: it is keeper's bookkeeping rather than anything
+    /// anyone typed, and matching it would make `local` select the whole vault
+    /// while `origin:` and `date:touched` already answer those questions
+    /// precisely.
+    ///
+    /// An empty or whitespace-only needle matches everything. A user resting on
+    /// the space bar must not empty their own note list.
+    pub fn matches_text(&self, needle: &str) -> bool {
+        let needle = search::fold_str(needle.trim());
+        if needle.is_empty() {
+            return true;
+        }
+        self.searchable()
+            .any(|hay| search::fold_str(hay).contains(&needle))
+    }
+
+    /// Every string [`Self::matches_text`] is allowed to look in, in the order
+    /// that finds the common case soonest.
+    ///
+    /// Borrowed and lazy: a hit on the title must not have cost a walk of the
+    /// frontmatter of a note with fifty keys in it.
+    fn searchable(&self) -> impl Iterator<Item = &str> + '_ {
+        [
+            self.title.as_str(),
+            self.snippet.as_str(),
+            self.path.as_str(),
+        ]
+        .into_iter()
+        .chain(self.tags.iter().map(String::as_str))
+        .chain(
+            self.fields
+                .iter()
+                .filter(|(key, _)| !key.starts_with(RESERVED_FIELD_PREFIX))
+                .map(|(_, value)| value.as_str()),
+        )
     }
 
     /// Every key something can use to link to this note: its id, its
@@ -741,6 +803,97 @@ mod tests {
             }
         }
         None
+    }
+
+    /// A recording note as Story 42.4 writes it: the facts live in the
+    /// frontmatter, and the body is a bare heading.
+    fn recording_note() -> IndexEntry {
+        let mut e = entry("rec-1", "recordings/2026-08-08-standup.md", "Standup");
+        e.snippet = "# Standup".to_owned();
+        e.flags = vec!["recording".to_owned()];
+        e.fields = BTreeMap::from([
+            ("title".to_owned(), "Standup".to_owned()),
+            ("participants".to_owned(), "Ala Kowalska, Tomasz".to_owned()),
+            ("duration".to_owned(), "18m".to_owned()),
+            ("start".to_owned(), "15:52".to_owned()),
+            ("end".to_owned(), "16:10".to_owned()),
+            (
+                "session".to_owned(),
+                "01KYH5DXGP1XQRHTME8CJFVEJ6-01KZHS7EJB5QKR8T9CHXQ46RNS".to_owned(),
+            ),
+            (
+                "recording".to_owned(),
+                "recordings/2026/2026-08-08 15.52 test".to_owned(),
+            ),
+            (FIELD_ORIGIN.to_owned(), "agent".to_owned()),
+            (FIELD_DEVICE.to_owned(), "hesperia".to_owned()),
+        ]);
+        e
+    }
+
+    /// The point of the whole change: "the one with Ala, about 20 minutes" has
+    /// to be findable, and none of what the user remembers is in the body. Every
+    /// needle here appears ONLY in the frontmatter — the body is `# Standup`.
+    #[test]
+    fn a_recording_note_is_found_by_a_property_that_is_nowhere_in_its_body() {
+        let e = recording_note();
+        assert!(
+            !e.snippet.contains("Ala"),
+            "the body must not carry the term"
+        );
+        for needle in [
+            "Ala",
+            "kowalska",
+            "Tomasz",
+            "18m",
+            "15:52",
+            "16:10",
+            "01KZHS7EJB5QKR8T9CHXQ46RNS",
+            "2026-08-08 15.52 test",
+        ] {
+            assert!(e.matches_text(needle), "{needle} should have matched");
+        }
+    }
+
+    /// A key name is structure, not content. If `participants` matched, the word
+    /// would select every recording note in the vault and stop being a search.
+    #[test]
+    fn a_frontmatter_key_name_is_not_a_search_term() {
+        assert!(!recording_note().matches_text("participants"));
+        assert!(!recording_note().matches_text("duration"));
+    }
+
+    /// keeper's own bookkeeping is not the user's text. `agent` must not select
+    /// every note the agent last touched — `origin:agent` is that question, and
+    /// it answers it exactly.
+    #[test]
+    fn the_reserved_namespace_is_not_searched() {
+        let e = recording_note();
+        assert!(!e.matches_text("hesperia"));
+        assert!(
+            !e.matches_text("agent"),
+            "keeper.origin must not leak into free text"
+        );
+    }
+
+    /// The pre-existing haystacks still match, and a note that carries none of
+    /// the term anywhere still does not.
+    #[test]
+    fn title_snippet_path_and_tags_still_match_and_a_miss_is_still_a_miss() {
+        let mut e = tagged("n-1", "work/pricing.md", &["client/acme"]);
+        e.title = "Pricing".to_owned();
+        e.snippet = "we settled on per-seat".to_owned();
+        assert!(e.matches_text("pricing"), "title");
+        assert!(e.matches_text("per-seat"), "snippet");
+        assert!(e.matches_text("work/"), "path");
+        assert!(e.matches_text("acme"), "tag");
+        assert!(!e.matches_text("kowalska"));
+    }
+
+    /// A user resting on the space bar must not empty their own note list.
+    #[test]
+    fn a_blank_needle_matches_everything() {
+        assert!(entry("n-1", "a.md", "A").matches_text("   "));
     }
 
     #[test]

@@ -40,6 +40,7 @@ export type NoteScope =
   | { readonly kind: "inbox" }
   | { readonly kind: "journal" }
   | { readonly kind: "pinned" }
+  | { readonly kind: "recording" }
   | { readonly kind: "space"; readonly id: string; readonly name: string }
   | { readonly kind: "folder"; readonly path: string };
 
@@ -53,12 +54,18 @@ export const ALL_NOTES_SCOPE: NoteScope = { kind: "all" };
  *
  * `inbox` maps to `untagged` — the honest home of the unfiled is the note no tag
  * has claimed, and `untagged` is what the index computes.
+ *
+ * `recording` maps to the flag the index sets from a note's `session:`
+ * frontmatter (Story 42.4). That one key is the whole predicate, so the lens
+ * costs nothing but a row: no second filtering path, no folder convention, and
+ * a stub filed anywhere in the vault is still listed.
  */
 const SCOPE_FLAG: Record<NoteScope["kind"], string | null> = {
   all: null,
   inbox: "untagged",
   journal: "journal",
   pinned: "pinned",
+  recording: "recording",
   space: null,
   folder: null,
 };
@@ -72,6 +79,8 @@ export function scopeLabel(scope: NoteScope): string {
       return "Journal";
     case "pinned":
       return "Pinned";
+    case "recording":
+      return "Recordings";
     case "space":
       return scope.name;
     case "folder":
@@ -204,6 +213,21 @@ export function isFiltered(state: NotesFiltersState): boolean {
     state.text.trim() !== "" ||
     state.agentOnly ||
     state.pinnedOnly
+  );
+}
+
+/**
+ * Whether the sidebar scope is the ONLY thing narrowing the list.
+ *
+ * A lens with nothing in it is entitled to say so in its own voice — but only
+ * while the lens is all that is applied. Once a chip or a query sits on top,
+ * "this vault has no recordings" is a lie about the vault rather than a fact
+ * about the filter. Every axis is enumerated here, beside {@link isFiltered},
+ * so a chip added later cannot leave that sentence quietly wrong.
+ */
+export function isScopeOnly(state: NotesFiltersState): boolean {
+  return (
+    state.tags.length === 0 && state.text.trim() === "" && !state.agentOnly && !state.pinnedOnly
   );
 }
 

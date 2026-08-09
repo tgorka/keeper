@@ -530,8 +530,13 @@ export const NOTE_COPY_PATH_LABEL = "Copy path";
  * only handle that survives a retitle, so a note carrying one is a recording
  * note; a note without one that happens to have a `files:` key is somebody's
  * own note, and keeper does not put buttons in it.
+ *
+ * Exported because the live-preview layer asks the same question of the same
+ * block to decide whether an `![[…]]` embed is a recording's file: two readings
+ * of one predicate is how a note grows a player its properties panel refuses to
+ * put a Preview button on.
  */
-function recordingSessionId(parsed: ParsedFrontmatter): string | null {
+export function recordingSessionId(parsed: ParsedFrontmatter): string | null {
   if (parsed.unparsed) {
     return null;
   }

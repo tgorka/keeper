@@ -437,8 +437,12 @@ mod tests {
         assert_eq!(b.reads(), 1);
         // And invalidating one leaves the other held.
         cache.invalidate("session/a");
-        let _ = cache.read_through("session/a", || a.read()).expect("a again");
-        let _ = cache.read_through("session/b", || b.read()).expect("b again");
+        let _ = cache
+            .read_through("session/a", || a.read())
+            .expect("a again");
+        let _ = cache
+            .read_through("session/b", || b.read())
+            .expect("b again");
         assert_eq!(a.reads(), 2, "the invalidated key is re-read");
         assert_eq!(b.reads(), 1, "its neighbour is untouched");
     }

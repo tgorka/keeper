@@ -32,6 +32,14 @@
 //! image sources in a note body are not fetched at all (that is the editor's
 //! rule, not this handler's): a note that auto-fetches a URL an agent wrote is a
 //! tracking pixel, and it would falsify the NFR-11 egress claim.
+//!
+//! **The half below the resolution is shared, not copied.** Everything from
+//! [`read_response`] down — the `Range` parser, the 8 MiB slice cap, the
+//! 200/206/416/404 shapes, the extension allow-list and the percent-decoder —
+//! answers "serve THIS path" and knows nothing about vaults. `keeper-recording://`
+//! (Story 42.4) needs exactly that half and a different root, so it calls these
+//! rather than growing a second copy: a `Content-Range` off by one in one of two
+//! copies is a seek bug that only reproduces in one player.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -183,7 +191,7 @@ fn parse_note_url(raw: &str) -> Option<(String, String)> {
 }
 
 /// Percent-decode one segment to UTF-8, or `None` when the bytes are not UTF-8.
-fn decode(segment: &str) -> Option<String> {
+pub(crate) fn decode(segment: &str) -> Option<String> {
     percent_encoding::percent_decode_str(segment)
         .decode_utf8()
         .ok()
@@ -197,7 +205,7 @@ fn decode(segment: &str) -> Option<String> {
 /// `application/octet-stream`: the webview asked for an image, a video, a sound
 /// or a PDF, and anything else it can be handed is a way to make a vault file
 /// render as something it is not.
-fn mime_for(rel: &str) -> Option<&'static str> {
+pub(crate) fn mime_for(rel: &str) -> Option<&'static str> {
     Some(match notes_vault::extension(rel)?.as_str() {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -226,7 +234,11 @@ fn mime_for(rel: &str) -> Option<&'static str> {
 /// Unlike `media_protocol.rs`, which slices a `Vec<u8>` the SDK already
 /// materialized, this seeks: a vault asset is a file on disk, so a Range request
 /// reads only the bytes it asked for and a 200 reads only up to the cap.
-fn read_response(path: &Path, mimetype: &str, range: Option<String>) -> Response<Vec<u8>> {
+pub(crate) fn read_response(
+    path: &Path,
+    mimetype: &str,
+    range: Option<String>,
+) -> Response<Vec<u8>> {
     let Ok(mut file) = std::fs::File::open(path) else {
         return not_found();
     };
@@ -337,7 +349,7 @@ fn base(status: StatusCode, mimetype: &str) -> tauri::http::response::Builder {
 /// A 404 with an empty body — the honest "no such asset" answer, and the single
 /// answer every refusal collapses to, so a probe cannot tell "outside the vault"
 /// from "not there".
-fn not_found() -> Response<Vec<u8>> {
+pub(crate) fn not_found() -> Response<Vec<u8>> {
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")

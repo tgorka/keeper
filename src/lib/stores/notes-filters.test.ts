@@ -37,6 +37,18 @@ describe("noteQueryFor", () => {
     expect(noteQueryFor(notesFiltersStore.getState(), 0, 200).flags).toEqual(["pinned"]);
   });
 
+  it("asks for recording notes by the flag the index computes, not by a path convention", () => {
+    notesFiltersStore.getState().setScope({ kind: "recording" });
+
+    const query = noteQueryFor(notesFiltersStore.getState(), 0, 200);
+    // The literal string `keeper_core::notes::query`'s closed `is:` set parses.
+    // Spelt out rather than imported because this table IS the bridge between
+    // the two vocabularies, and a test that read it from the same constant would
+    // agree with any typo.
+    expect(query.flags).toEqual(["recording"]);
+    expect(query.spaceId).toBeNull();
+  });
+
   it("sends a space id rather than a flag for a space scope", () => {
     notesFiltersStore.getState().setScope({ kind: "space", id: "space-1", name: "Active work" });
 

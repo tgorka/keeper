@@ -85,8 +85,16 @@ describe("RecordingNoteStub", () => {
     // UX-DR51: the cursor is IN THE BODY, at the end of what keeper prefilled,
     // so the first keystroke continues the note instead of shoving keeper's own
     // first line down the page.
-    expect(field).toHaveFocus();
-    expect(field.selectionStart).toBe(BODY.length);
+    //
+    // Waited for, not asserted straight after the `findBy`: the field is in the
+    // DOM as soon as the stub resolves, and the caret is placed by an effect a
+    // tick later. Asserting across that gap passed alone and failed in a loaded
+    // full run, which is the worst kind of test — one that is only true when
+    // nothing else is happening.
+    await waitFor(() => {
+      expect(field).toHaveFocus();
+      expect(field.selectionStart).toBe(BODY.length);
+    });
     expect(screen.getByTestId(NOTE_STUB_HINT_TESTID)).toHaveTextContent(NOTE_STUB_HINT);
   });
 

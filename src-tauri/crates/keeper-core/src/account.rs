@@ -982,7 +982,10 @@ impl AccountManager {
             // non-secret VM, and the session blob the scan already read goes
             // straight into activation. Re-reading `session/<id>` there would cost
             // a second macOS authorization dialog for a secret already in hand.
-            let auth::RestorableAccount { vm: account, session } = restorable;
+            let auth::RestorableAccount {
+                vm: account,
+                session,
+            } = restorable;
             let account_id = account.account_id.clone();
             // Activate + acquire the room list. A single account's activation
             // failure is not fatal to the whole inbox: skip it (its rooms simply
@@ -6258,7 +6261,8 @@ mod tests {
             written
         }
         fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError> {
-            self.cache.read_through(key, || self.inner.keychain_get(key))
+            self.cache
+                .read_through(key, || self.inner.keychain_get(key))
         }
         fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
             let deleted = self.inner.keychain_delete(key);
@@ -6382,7 +6386,13 @@ mod tests {
     /// build/restore time, and the session blob is the tagged password shape the
     /// Keychain stores (same flat `MatrixSession` JSON as the auth tests).
     fn seed_restorable_account(platform: &FakePlatform, data_dir: &Path, account_id: &str) {
-        seed_restorable_account_as(platform, data_dir, account_id, "@alice:example.org", "DEVID");
+        seed_restorable_account_as(
+            platform,
+            data_dir,
+            account_id,
+            "@alice:example.org",
+            "DEVID",
+        );
     }
 
     /// As [`seed_restorable_account`], with the Matrix identity named — so a test
@@ -6726,7 +6736,8 @@ mod tests {
         // platform so the seeding itself is not counted as a read.
         let credential_keys = ["sync/p1/credential", "sync/p2/credential"];
         for key in credential_keys {
-            fake.keychain_set(key, "forge-token").expect("seed credential");
+            fake.keychain_set(key, "forge-token")
+                .expect("seed credential");
         }
         let platform: Arc<dyn Platform> = Arc::new(CachingPlatform::new(fake.clone()));
 
@@ -6761,7 +6772,10 @@ mod tests {
         for _ in 0..5 {
             for key in credential_keys {
                 assert_eq!(
-                    platform.keychain_get(key).expect("credential read").as_deref(),
+                    platform
+                        .keychain_get(key)
+                        .expect("credential read")
+                        .as_deref(),
                     Some("forge-token"),
                     "every sync operation still gets the credential"
                 );

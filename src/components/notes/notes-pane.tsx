@@ -29,7 +29,7 @@
  * The one row in the column that is NOT a filter is Today: it opens or creates
  * today's journal entry (FR-99), which is an action on one note.
  */
-import { CalendarDays, Inbox, NotebookPen, Pin } from "lucide-react";
+import { CalendarDays, Inbox, NotebookPen, Pin, Video } from "lucide-react";
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import { NoteEditor } from "@/components/notes/note-editor";
 import { NoteFilterBar } from "@/components/notes/note-filter-bar";
@@ -50,6 +50,7 @@ import { useNotesChanges } from "@/hooks/use-notes-changes";
 import type { NoteRowVm } from "@/lib/ipc/client";
 import {
   isFiltered,
+  isScopeOnly,
   type NoteScope,
   notesFiltersStore,
   scopeLabel,
@@ -65,11 +66,19 @@ import { primaryViewStore } from "@/lib/stores/primary-view";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
-/** The scope rows above the data-driven groups, in the order the spine fixes. */
+/**
+ * The scope rows above the data-driven groups, in the order the spine fixes.
+ *
+ * Recordings is one of these and nothing more: a scope that resolves to an `is:`
+ * flag, evaluated by the same `notes_list` call every other row uses. The lens
+ * exists because `session:` frontmatter exists — there is no second filter path
+ * here to keep in step with the first.
+ */
 const SCOPE_ROWS: { scope: NoteScope; label: string; icon: typeof Inbox }[] = [
   { scope: { kind: "inbox" }, label: "Inbox", icon: Inbox },
   { scope: { kind: "journal" }, label: "Journal", icon: CalendarDays },
   { scope: { kind: "pinned" }, label: "Pinned", icon: Pin },
+  { scope: { kind: "recording" }, label: "Recordings", icon: Video },
 ];
 
 /** What a failed verb reads as when the rejection carries no message. */
@@ -87,6 +96,7 @@ export function NotesPane() {
   const searchText = useNotesFiltersStore((s) => s.text);
   const agentOnly = useNotesFiltersStore((s) => s.agentOnly);
   const filtered = useNotesFiltersStore(isFiltered);
+  const scopeOnly = useNotesFiltersStore(isScopeOnly);
   const searchNonce = useNotesFiltersStore((s) => s.searchNonce);
   const rows = useNotesListStore((s) => s.rows);
   const total = useNotesListStore((s) => s.total);
@@ -210,12 +220,19 @@ export function NotesPane() {
   } else if (loaded && rows.length === 0 && !scanning) {
     // "Nothing here" and "nothing matches" are different facts and get different
     // sentences; a search that matched nothing gets a third, because the way out
-    // of it is the field rather than the chips. None of them may be shown while
-    // the vault is still being read — "this vault is empty" said over a scan in
-    // flight is simply false, and it is false for exactly as long as the user is
-    // waiting to find out otherwise.
+    // of it is the field rather than the chips, and an empty lens a fourth,
+    // because nothing the user can clear will fill it. None of them may be shown
+    // while the vault is still being read — "this vault is empty" said over a
+    // scan in flight is simply false, and it is false for exactly as long as the
+    // user is waiting to find out otherwise.
     emptyKind =
-      searchText.trim() !== "" ? "no-search-matches" : filtered ? "no-matches" : "empty-vault";
+      searchText.trim() !== ""
+        ? "no-search-matches"
+        : scope.kind === "recording" && scopeOnly
+          ? "no-recordings"
+          : filtered
+            ? "no-matches"
+            : "empty-vault";
   }
 
   const onEmptyAction = () => {

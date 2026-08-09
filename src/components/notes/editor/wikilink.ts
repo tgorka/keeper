@@ -1,5 +1,6 @@
 /**
- * `[[` wikilink completion and create-on-Enter (Story 37.7, FR-108).
+ * The `[[` wikilink grammar, plus completion and create-on-Enter (Story 37.7,
+ * FR-108).
  *
  * The candidate list comes from the core link graph over `notes_link_targets`,
  * never from anything the webview keeps — the index lives in Rust and a second
@@ -9,6 +10,11 @@
  * not an error and not a dead end. Accepting it writes the note through the
  * ordinary writer and links it, so following a link you have just invented is
  * the same act as following one that was already there.
+ *
+ * {@link WIKILINK} lives here rather than beside the decorations that use it
+ * because it is now read by two of them — the live-preview renderer and the
+ * recording-embed widget — and a wikilink that the renderer and the embed
+ * disagreed about would be a link that renders one way and resolves another.
  */
 import type {
   Completion,
@@ -21,6 +27,22 @@ import { notesCreate, notesLinkTargets } from "@/lib/ipc/client";
 
 /** The text between `[[` and the caret. */
 const OPEN_WIKILINK = /\[\[([^[\]|]*)$/;
+
+/**
+ * `[[target]]`, `[[target|alias]]` and the `![[…]]` embed form, anywhere in a
+ * line. Lezer's markdown grammar knows nothing about wikilinks, so this is the
+ * whole of keeper's knowledge of the syntax.
+ *
+ * Group 1 is the target, group 2 the alias when there is one, and a leading `!`
+ * survives in group 0 — which is how a caller tells an embed from a link
+ * without a second pattern.
+ *
+ * Stateful (`g`): reset `lastIndex` or use `matchAll`, never `test`.
+ */
+export const WIKILINK = /!?\[\[([^[\]|]+)(?:\|([^[\]]+))?]]/g;
+
+/** The attribute a click handler reads the link target back out of. */
+export const WIKILINK_ATTR = "data-keeper-wikilink";
 
 /** Replace the typed name with `name]]`, swallowing brackets already closed
  *  for us, and park the caret after the link. */
